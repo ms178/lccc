@@ -1252,13 +1252,6 @@ impl<'a> ExprTypeChecker<'a> {
         }
     }
 
-    /// Infer the CType of an expression using a supplementary local scope
-    /// for identifiers not found in the symbol table.
-    /// Handles common typeof patterns (identifier, deref, address-of).
-    /// More complex expressions (member access, subscript, etc.) are not supported.
-    /// Segment space of the object an address-of operand names. `&x` for a
-    /// `__seg_gs` object (the kernel's per-CPU variables) is a `__seg_gs`
-    /// pointer; the object's space is recorded on its symbol at declaration.
     /// The identifier an lvalue chain (`a.b[i].c`) is rooted at, if any.
     fn root_identifier(expr: &Expr) -> Option<&str> {
         match expr {
@@ -1270,6 +1263,9 @@ impl<'a> ExprTypeChecker<'a> {
         }
     }
 
+    /// Segment space of the object an address-of operand names. `&x` for a
+    /// `__seg_gs` object (the kernel's per-CPU variables) is a `__seg_gs`
+    /// pointer; the object's space is recorded on its symbol at declaration.
     fn object_address_space(&self, inner: &Expr) -> AddressSpace {
         match inner {
             Expr::Identifier(name, _) => self
@@ -1296,6 +1292,10 @@ impl<'a> ExprTypeChecker<'a> {
         }
     }
 
+    /// Infer the CType of an expression using a supplementary local scope
+    /// for identifiers not found in the symbol table.
+    /// Handles common typeof patterns (identifier, deref, address-of).
+    /// More complex expressions (member access, subscript, etc.) are not supported.
     fn infer_expr_ctype_with_scope(
         &self,
         expr: &Expr,

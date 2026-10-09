@@ -41,15 +41,26 @@ __asm__(
 	"\t.else\n"
 	"\t\tmovl $12, %eax\n"
 	"\t.endif\n"
+	"\tret\n"
+	/* Unspaced modulo: the `%` directly follows an operand. */
+	".globl probe_mod_tight\n"
+	"probe_mod_tight:\n"
+	"\t.if 17%5 == 2\n"
+	"\t\tmovl $11, %eax\n"
+	"\t.else\n"
+	"\t\tmovl $12, %eax\n"
+	"\t.endif\n"
 	"\tret\n");
 
 int probe_default(void);
 int probe_rbp(void);
 int probe_rdi(void);
 int probe_mod(void);
+int probe_mod_tight(void);
 
 int main(void)
 {
-	printf("%d %d %d %d\n", probe_default(), probe_rbp(), probe_rdi(), probe_mod());
+	printf("%d %d %d %d %d\n", probe_default(), probe_rbp(), probe_rdi(), probe_mod(),
+	       probe_mod_tight());
 	return 0;
 }

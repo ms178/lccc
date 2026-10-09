@@ -625,26 +625,37 @@ impl Parser {
                 let param_alignas_type = self.attrs.parsed_alignas_type.take();
                 self.skip_gcc_extensions();
 
-                // Apply pointer levels
-                // Each level carries the space of its pointee, so
-                // `T * __seg_gs *p` is a pointer to a %gs-resident `T *`.
+                // Pointer levels. `param_star_spaces` holds the stars written
+                // outside the declarator parentheses, each carrying the space
+                // of its pointee (`T * __seg_gs *p` is a pointer to a %gs
+                // resident `T *`). `total_ptr_depth` also counts the
+                // parenthesized stars beyond the first, which the declarator
+                // parser reports separately; those are `extra_levels`.
+                let extra_levels = total_ptr_depth.saturating_sub(param_star_spaces.len() as u32);
                 for space in &param_star_spaces {
                     type_spec = TypeSpecifier::Pointer(Box::new(type_spec), *space);
                 }
-
-                // Pointer-to-array: int (*p)[N][M]
-                if !ptr_to_array_dims.is_empty() {
+                if ptr_to_array_dims.is_empty() {
+                    // `int (*a[N])` is an array of pointers and decays to
+                    // `int **`. Function-pointer declarators get the same count
+                    // as before this branch existed (the function-pointer path
+                    // strips the return-type level again), so `int (**fp)(int)`
+                    // and `int *(**fp)(int)` keep their return types.
+                    for _ in 0..extra_levels {
+                        type_spec =
+                            TypeSpecifier::Pointer(Box::new(type_spec), AddressSpace::Default);
+                    }
+                } else {
+                    // Pointer-to-array: int (*p)[N][M]
                     for dim in ptr_to_array_dims.iter().rev() {
                         type_spec = TypeSpecifier::Array(Box::new(type_spec), dim.clone());
                     }
                     type_spec = TypeSpecifier::Pointer(Box::new(type_spec), AddressSpace::Default);
-                    // `(**p)[N]`: the parenthesized stars beyond the one that
-                    // makes the pointer-to-array are extra indirection levels
-                    // outside it (pointer to pointer to array).
-                    let extra_levels = total_ptr_depth
-                        .saturating_sub(param_star_spaces.len() as u32);
+                    // `(**p)[N]`: extra indirection outside the pointer-to-array
+                    // (pointer to pointer to array).
                     for _ in 0..extra_levels {
-                        type_spec = TypeSpecifier::Pointer(Box::new(type_spec), AddressSpace::Default);
+                        type_spec =
+                            TypeSpecifier::Pointer(Box::new(type_spec), AddressSpace::Default);
                     }
                 }
 

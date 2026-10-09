@@ -336,6 +336,11 @@ gate "seg-param-deref" fast \
 gate "noreturn-definition-tail" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_noreturn_definition_tail.sh
 
+# The decompressor must not use BMI/LZCNT/POPCNT/MOVBE (the default ISA is
+# x86-64-v3): the gate reads BOOT_NO_ISA from build_kernel_compressed.sh.
+gate "boot-decompressor-isa" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_boot_decompressor_isa.sh
+
 gate "bool-pair-tail-jmp-contract" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_bool_pair_tail_jmp.sh
 

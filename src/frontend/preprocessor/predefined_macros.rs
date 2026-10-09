@@ -656,16 +656,6 @@ impl Preprocessor {
         }
     }
 
-    /// Define x86/x86_64 SIMD feature macros (__SSE__, __SSE2__, __MMX__, etc.).
-    ///
-    /// GCC/Clang always define these for x86_64 (SSE2 is baseline for the ISA).
-    /// For i686, GCC only defines them with explicit -msse/-msse2, but since our
-    /// i686 backend always uses SSE2 instructions, we define them unconditionally.
-    ///
-    /// When `no_sse` is true (from -mno-sse or similar flags), these macros are
-    /// not defined (matching GCC behavior for kernel builds).
-    ///
-    /// Must be called after set_target() since it checks which arch is active.
     /// `-fshort-wchar` redefines the wchar_t macros for a 2-byte `wchar_t`
     /// (`unsigned short`), matching GCC's predefined values.
     pub fn set_short_wchar_macros(&mut self, short: bool) {
@@ -682,6 +672,16 @@ impl Preprocessor {
         self.define_simple_macro("__SIZEOF_WCHAR_T__", size);
     }
 
+    /// Define x86/x86_64 SIMD feature macros (__SSE__, __SSE2__, __MMX__, etc.).
+    ///
+    /// GCC/Clang always define these for x86_64 (SSE2 is baseline for the ISA).
+    /// For i686, GCC only defines them with explicit -msse/-msse2, but since our
+    /// i686 backend always uses SSE2 instructions, we define them unconditionally.
+    ///
+    /// When `no_sse` is true (from -mno-sse or similar flags), these macros are
+    /// not defined (matching GCC behavior for kernel builds).
+    ///
+    /// Must be called after set_target() since it checks which arch is active.
     pub fn set_sse_macros(&mut self, no_sse: bool) {
         if no_sse {
             // The baseline macros are pre-defined in PREDEFINED_OBJECT_MACROS

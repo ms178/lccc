@@ -15,7 +15,7 @@
 use super::ast::*;
 use super::parse::Parser;
 use crate::common::types::AddressSpace;
-use crate::frontend::lexer::token::TokenKind;
+use crate::frontend::lexer::token::{TokenKind, WideCharKind};
 
 /// C operator precedence levels (loosest to tightest binding).
 /// Used by the table-driven binary expression parser.
@@ -703,6 +703,23 @@ impl Parser {
                 let span = self.peek_span();
                 self.advance();
                 Expr::CharLiteral(c, span)
+            }
+            TokenKind::WideCharLiteral(value, kind) => {
+                // Typed character constant: the value is an int constant
+                // converted to the element type. Expr::IntLiteral keeps the
+                // const-evaluator and the usual conversions in charge.
+                let (value, kind) = (*value, *kind);
+                let span = self.peek_span();
+                self.advance();
+                let ty = match kind {
+                    // The lexer emits Wchar only under -fshort-wchar; the
+                    // default L'x' is an IntLiteral (wchar_t is int).
+                    WideCharKind::Wchar => TypeSpecifier::UnsignedShort,
+                    WideCharKind::Char16 => TypeSpecifier::UnsignedShort,
+                    WideCharKind::Char32 => TypeSpecifier::UnsignedInt,
+                    WideCharKind::Char8 => TypeSpecifier::UnsignedChar,
+                };
+                Expr::Cast(ty, Box::new(Expr::IntLiteral(value, span)), span)
             }
             TokenKind::Identifier(name) => {
                 let name = name.clone();

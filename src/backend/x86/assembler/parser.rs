@@ -4547,12 +4547,24 @@ fn reject_non_constant(expr: &str, directive: &str) -> Result<(), String> {
             }
             continue;
         }
-        // A `%` opens a register spelling (`%rsp`, the kernel's
-        // `UNWIND_HINT_REGS base=%rsp` default compares `\base == %rsp`). The
-        // sigil must be consumed with its name: scanning from a bare `%` yields
-        // an empty identifier, which used to be rejected as non-constant.
-        // A `%` with no name after it is the modulo operator and is accepted.
+        // `%` is either the binary modulo operator or the sigil of a register
+        // spelling (`%rsp`; the kernel's `UNWIND_HINT_REGS base=%rsp` default
+        // compares `\base == %rsp`). After an operand it is modulo, and the
+        // right-hand operand is then checked like any other token (`5%3` and
+        // `N%8` are accepted, `5%FOO` is not). Elsewhere the sigil must name a
+        // register that the evaluator resolves.
         if c == b'%' {
+            let after_operand = expr[..k]
+                .bytes()
+                .rev()
+                .find(|b| !b.is_ascii_whitespace())
+                .is_some_and(|b| {
+                    b.is_ascii_alphanumeric() || matches!(b, b'_' | b')' | b'"' | b'\'')
+                });
+            if after_operand {
+                k += 1;
+                continue;
+            }
             let start = k;
             k += 1;
             while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {

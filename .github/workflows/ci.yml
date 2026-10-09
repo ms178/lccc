@@ -111,6 +111,15 @@ jobs:
       - name: Variadic pack count inlining contracts
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_va_arg_pack_len.sh
 
+      - name: Segment address-space gate (parameters and pointer objects)
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_seg_param_deref.sh
+
+      - name: Noreturn definition tail gate
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_noreturn_definition_tail.sh
+
+      - name: Boot decompressor ISA gate (no BMI, LZCNT, POPCNT or MOVBE)
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_boot_decompressor_isa.sh
+
       - name: Run tests
         env:
           CARGO_BUILD_JOBS: "2"

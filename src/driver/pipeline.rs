@@ -2689,13 +2689,13 @@ impl Driver {
     pub(super) fn resolved_bmi1(&self) -> bool {
         self.target == Target::X86_64
             && !self.bmi_explicitly_disabled
-            && self.enable_bmi
+            && (self.enable_bmi || !self.x86_march_explicit)
     }
 
     pub(super) fn resolved_bmi2(&self) -> bool {
         self.target == Target::X86_64
             && !self.bmi2_explicitly_disabled
-            && self.enable_bmi2
+            && (self.enable_bmi2 || !self.x86_march_explicit)
     }
 
     /// Soundness of the default grant: `tzcnt` is at least as correct as
@@ -2721,7 +2721,7 @@ impl Driver {
             return false;
         }
         match self.target {
-            Target::X86_64 => self.enable_lzcnt,
+            Target::X86_64 => self.enable_lzcnt || !self.x86_march_explicit,
             Target::I686 => self.enable_lzcnt,
             _ => false,
         }
@@ -2744,7 +2744,7 @@ impl Driver {
             return false;
         }
         match self.target {
-            Target::X86_64 => self.enable_popcnt,
+            Target::X86_64 => self.enable_popcnt || !self.x86_march_explicit,
             Target::I686 => self.enable_popcnt,
             _ => false,
         }
@@ -2753,7 +2753,7 @@ impl Driver {
     pub(super) fn resolved_movbe(&self) -> bool {
         self.target == Target::X86_64
             && !self.movbe_explicitly_disabled
-            && self.enable_movbe
+            && (self.enable_movbe || !self.x86_march_explicit)
     }
 
     /// Code-generation ISA permission for the x86-64 SIMD world.
@@ -2773,10 +2773,7 @@ impl Driver {
                 fma: self.enable_fma,
             }
         } else {
-            // No `-march=`: the GCC/Clang baseline, x86-64 (SSE2 only). BMI,
-            // LZCNT, POPCNT, MOVBE and AVX are granted only by an explicit
-            // `-march=` or `-m` flag.
-            X86Isa::SSE2
+            X86Isa::V3
         };
         X86Isa {
             simd: true,

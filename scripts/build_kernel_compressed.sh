@@ -105,12 +105,19 @@ INC=(
   -include "$K/include/linux/compiler_types.h"
   -include "$K/include/linux/hidden.h"
 )
+# The decompressor runs before the kernel has probed the CPU, so it may use
+# only the x86-64 baseline integer ISA. lccc's default is x86-64-v3, which
+# would emit BMI2/LZCNT/POPCNT/MOVBE (reported as SHRX in misc.o) that CPU models such as
+# QEMU's default qemu64 lack. The denials are explicit, so they hold against
+# any -march, and they are applied per translation unit: the kernel proper
+# keeps the default ISA.
+BOOT_NO_ISA=(-mno-bmi -mno-bmi2 -mno-lzcnt -mno-popcnt -mno-movbe)
 CF=(
   -std=gnu18 -m64 -O2 -fno-strict-aliasing -fPIE -fno-jump-tables
   -Wundef -DDISABLE_BRANCH_PROFILING -mcmodel=small -mno-red-zone
   -mno-mmx -ffreestanding -fshort-wchar -fno-stack-protector
   -Wno-pointer-sign -fno-asynchronous-unwind-tables -D__DISABLE_EXPORTS
-  -D__KERNEL__ -fno-strict-overflow -mno-sse
+  -D__KERNEL__ -fno-strict-overflow -mno-sse "${BOOT_NO_ISA[@]}"
 )
 cc() { # cc <stem>
   local s=$1
@@ -134,7 +141,7 @@ ST_CF=(
   -std=gnu11 -m64 -Os -fPIC -mcmodel=small -fno-stack-protector
   -fno-jump-tables -ffreestanding -fno-asynchronous-unwind-tables
   -D__DISABLE_EXPORTS -DDISABLE_BRANCH_PROFILING -D__NO_FORTIFY -D__KERNEL__
-  -mno-mmx -mno-sse
+  -mno-mmx -mno-sse "${BOOT_NO_ISA[@]}"
 )
 st_cc() {
   local s=$1

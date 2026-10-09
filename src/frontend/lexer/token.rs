@@ -1,5 +1,19 @@
 use crate::common::source::Span;
 
+/// Element type of a wide or unicode character constant (C11 6.4.4.4p10-11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WideCharKind {
+    /// `L'x'`: `wchar_t`, which is `int` by default and `unsigned short` under
+    /// `-fshort-wchar`.
+    Wchar,
+    /// `u'x'`: `char16_t`, always `unsigned short`.
+    Char16,
+    /// `U'x'`: `char32_t`, always `unsigned int`.
+    Char32,
+    /// `u8'x'` (C23): `char8_t`, which is `unsigned char`.
+    Char8,
+}
+
 /// All token kinds recognized by the C lexer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
@@ -38,6 +52,11 @@ pub enum TokenKind {
     /// char16_t string literal (u"..."), stores content as Rust chars (each becomes char16_t = u16)
     Char16StringLiteral(String),
     CharLiteral(char),
+    /// Wide or unicode character constant whose type is not `int`:
+    /// `L'x'` under `-fshort-wchar`, `u'x'` (char16_t), `U'x'` (char32_t) and
+    /// `u8'x'` (char8_t).
+    /// The value is the code point, already truncated to the constant's width.
+    WideCharLiteral(i64, WideCharKind),
 
     // Identifiers and keywords
     Identifier(String),
@@ -235,7 +254,9 @@ impl std::fmt::Display for TokenKind {
             TokenKind::StringLiteral(_) => write!(f, "string literal"),
             TokenKind::WideStringLiteral(_) => write!(f, "wide string literal"),
             TokenKind::Char16StringLiteral(_) => write!(f, "char16_t string literal"),
-            TokenKind::CharLiteral(_) => write!(f, "character constant"),
+            TokenKind::CharLiteral(_) | TokenKind::WideCharLiteral(_, _) => {
+                write!(f, "character constant")
+            }
 
             // Identifiers
             TokenKind::Identifier(name) => write!(f, "'{}'", name),

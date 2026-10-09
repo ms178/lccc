@@ -244,7 +244,7 @@ impl SemanticAnalyzer {
             name: func.name.clone(),
             ty: func_ctype,
             explicit_alignment: None,
-address_space: AddressSpace::Default,
+            address_space: AddressSpace::Default,
         });
 
         // Analyze the body in its own scope, with its own return type.
@@ -257,7 +257,7 @@ address_space: AddressSpace::Default,
                     name: name.clone(),
                     ty,
                     explicit_alignment: None,
-address_space: AddressSpace::Default,
+                    address_space: AddressSpace::Default,
                 });
             }
         }
@@ -312,7 +312,7 @@ address_space: AddressSpace::Default,
             name: func.name.clone(),
             ty: func_ctype,
             explicit_alignment: None,
-address_space: AddressSpace::Default,
+            address_space: AddressSpace::Default,
         });
 
         // Push scope for function body (both symbol table and type context,
@@ -331,7 +331,7 @@ address_space: AddressSpace::Default,
                     name: name.clone(),
                     ty,
                     explicit_alignment: None,
-address_space: AddressSpace::Default,
+                    address_space: AddressSpace::Default,
                 });
             }
         }
@@ -988,7 +988,7 @@ address_space: AddressSpace::Default,
                 name: variant.name.clone(),
                 ty: sym_ty,
                 explicit_alignment: None,
-address_space: AddressSpace::Default,
+                address_space: AddressSpace::Default,
             });
             self.enum_counter += 1;
         }
@@ -2979,9 +2979,6 @@ fn function_types_compatible(a: &FunctionType, b: &FunctionType) -> bool {
             .all(|((a_ty, _), (b_ty, _))| a_ty == b_ty)
 }
 
-/// Compatibility of two pointed-to types (C23 6.7.6.1p2). Recurses through
-/// pointer and array chains, which is what makes `struct S **` an error too
-/// rather than only the single-level case.
 /// The integer type a non-packed enum is compatible with (C11 6.7.2.2p4): GCC
 /// and Clang pick `unsigned int` when no enumerator is negative and `int`
 /// otherwise. `enum pg_level *` therefore converts to `unsigned int *`
@@ -2997,6 +2994,9 @@ fn enum_compatible_integer(t: &CType) -> Option<CType> {
     }
 }
 
+/// Compatibility of two pointed-to types (C23 6.7.6.1p2). Recurses through
+/// pointer and array chains, which is what makes `struct S **` an error too
+/// rather than only the single-level case.
 fn pointee_compat(from: &CType, to: &CType) -> PtrCompat {
     if from == to {
         return PtrCompat::Compatible;

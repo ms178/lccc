@@ -1,4 +1,5 @@
-use super::token::{Token, TokenKind};
+use super::token::{Token, TokenKind, WideCharKind};
+use crate::common::types::short_wchar;
 use crate::common::encoding::decode_pua_byte;
 use crate::common::source::Span;
 
@@ -1074,8 +1075,24 @@ impl Lexer {
             self.pos += 1; // skip closing '
         }
         let span = Span::new(start as u32, self.pos as u32, self.file_id);
-        // Wide char literals have type int (wchar_t)
-        Token::new(TokenKind::IntLiteral(value as i64), span)
+        // The element type comes from the prefix (C11 6.4.4.4p10-11, C23
+        // 6.4.4.4). `L'x'` is `int` (wchar_t) unless -fshort-wchar, in which
+        // case it is `unsigned short`; the parser lowers the typed variants.
+        let prefix = &self.input[start..start + 1];
+        let kind = match (prefix, self.input[start + 1] == b'8') {
+            (_, true) => WideCharKind::Char8,
+            (b"u", _) => WideCharKind::Char16,
+            (b"U", _) => WideCharKind::Char32,
+            _ if short_wchar() => WideCharKind::Wchar,
+            _ => return Token::new(TokenKind::IntLiteral(value as i64), span),
+        };
+        // Truncate to the element width, as the element type would.
+        let value = match kind {
+            WideCharKind::Char8 => (value & 0xff) as i64,
+            WideCharKind::Char16 | WideCharKind::Wchar => (value & 0xffff) as i64,
+            WideCharKind::Char32 => value as i64,
+        };
+        Token::new(TokenKind::WideCharLiteral(value, kind), span)
     }
 
     fn lex_char(&mut self, start: usize) -> Token {

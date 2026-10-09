@@ -484,25 +484,6 @@ pub fn build_full_ctype_with_base(
     }
 }
 
-/// Plant a declaration-level address-space qualifier (`__seg_fs`/`__seg_gs`)
-/// on the pointer level it qualifies in C: the INNERMOST one.
-///
-/// GCC named address spaces qualify the *pointee* memory:
-///   `T __seg_fs *p`   — p (ordinary memory) points into %fs
-///   `T __seg_fs **pp` — pp and *pp are ordinary; **pp reads %fs
-///   `T __seg_fs *a[4]`— each element points into %fs
-/// In this IR, `CType::Pointer(pointee, AddressSpace)` carries "the space the
-/// pointer points into", so the qualifier belongs on the innermost Pointer
-/// (the one whose pointee is the qualified data), reached through Array
-/// elements and outer Pointer levels.
-///
-/// The parser records the qualifier on the whole `Declaration`
-/// (`parsing_address_space`), but `build_full_ctype*` used to hardcode
-/// `AddressSpace::Default` for every derived Pointer, so any *named* variable
-/// or typedef of a segment pointer silently lost its qualifier and its
-/// dereferences read absolute addresses (glibc TLS: `%fs:16`/`%fs:40`
-/// stack-guard loads compiled to NULL-page loads). Only direct
-/// `*(T __seg_fs *)N` casts survived, via TypeSpecifier::Pointer's own field.
 /// Segment space of the object a declarator names.
 ///
 /// A non-pointer object takes its space from the declaration qualifier
@@ -534,7 +515,10 @@ pub fn object_declaration_address_space(
 /// level the qualifier is the object's own space (`__seg_gs __typeof__(T *) x`,
 /// `__seg_gs typedef_ptr_t x`), and the pointer's pointee must stay as written.
 /// See `object_declaration_address_space`.
-pub fn declaration_pointee_space(decl_space: AddressSpace, derived: &[DerivedDeclarator]) -> AddressSpace {
+pub fn declaration_pointee_space(
+    decl_space: AddressSpace,
+    derived: &[DerivedDeclarator],
+) -> AddressSpace {
     if derived
         .iter()
         .any(|d| matches!(d, DerivedDeclarator::Pointer(_)))
@@ -545,6 +529,25 @@ pub fn declaration_pointee_space(decl_space: AddressSpace, derived: &[DerivedDec
     }
 }
 
+/// Plant a declaration-level address-space qualifier (`__seg_fs`/`__seg_gs`)
+/// on the pointer level it qualifies in C: the INNERMOST one.
+///
+/// GCC named address spaces qualify the *pointee* memory:
+///   `T __seg_fs *p`   — p (ordinary memory) points into %fs
+///   `T __seg_fs **pp` — pp and *pp are ordinary; **pp reads %fs
+///   `T __seg_fs *a[4]`— each element points into %fs
+/// In this IR, `CType::Pointer(pointee, AddressSpace)` carries "the space the
+/// pointer points into", so the qualifier belongs on the innermost Pointer
+/// (the one whose pointee is the qualified data), reached through Array
+/// elements and outer Pointer levels.
+///
+/// The parser records the qualifier on the whole `Declaration`
+/// (`parsing_address_space`), but `build_full_ctype*` used to hardcode
+/// `AddressSpace::Default` for every derived Pointer, so any *named* variable
+/// or typedef of a segment pointer silently lost its qualifier and its
+/// dereferences read absolute addresses (glibc TLS: `%fs:16`/`%fs:40`
+/// stack-guard loads compiled to NULL-page loads). Only direct
+/// `*(T __seg_fs *)N` casts survived, via TypeSpecifier::Pointer's own field.
 pub fn apply_declaration_address_space(ty: &mut CType, space: AddressSpace) {
     if space == AddressSpace::Default {
         return;

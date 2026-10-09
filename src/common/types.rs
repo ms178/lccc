@@ -1629,19 +1629,25 @@ pub fn char_is_unsigned() -> bool {
     CHAR_UNSIGNED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-static SHORT_WCHAR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    // Thread-local rather than a process global: the driver parses and
+    // compiles on the thread that read the command line, and each unit-test
+    // thread gets its own value, so a test enabling -fshort-wchar cannot leak
+    // into a concurrently running test.
+    static SHORT_WCHAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// Record `-fshort-wchar`: `wchar_t` becomes `unsigned short` (2 bytes) and
 /// `L"..."` literals are UTF-16 code units. Set by the driver before any
 /// parsing, like `set_char_unsigned`. The kernel builds EFI code with it
 /// (`get_var(L"SecureBoot", ...)` takes `efi_char16_t *`).
 pub fn set_short_wchar(short: bool) {
-    SHORT_WCHAR.store(short, std::sync::atomic::Ordering::Relaxed);
+    SHORT_WCHAR.with(|c| c.set(short));
 }
 
-/// Whether `-fshort-wchar` is in effect.
+/// Whether `-fshort-wchar` is in effect on the current thread.
 pub fn short_wchar() -> bool {
-    SHORT_WCHAR.load(std::sync::atomic::Ordering::Relaxed)
+    SHORT_WCHAR.with(|c| c.get())
 }
 
 /// The C type `wchar_t` denotes under the current wide-character ABI.
