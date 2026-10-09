@@ -60,7 +60,7 @@ pub fn extract_fptr_typedef_info(
     let ptr_count_before_fptr = derived
         .iter()
         .take_while(|d| !matches!(d, DerivedDeclarator::FunctionPointer(_, _)))
-        .filter(|d| matches!(d, DerivedDeclarator::Pointer))
+        .filter(|d| matches!(d, DerivedDeclarator::Pointer(_)))
         .count();
     let ret_ptr_count = ptr_count_before_fptr.saturating_sub(1);
     let mut return_type = base_type.clone();
@@ -250,7 +250,7 @@ impl TypeContext {
             ("size_t", size_type.clone()),
             ("ssize_t", ssize_type.clone()),
             ("ptrdiff_t", ptrdiff_type),
-            ("wchar_t", CType::Int),
+            ("wchar_t", crate::common::types::wchar_ctype()),
             ("wint_t", CType::UInt),
             // <stdint.h> - exact width types
             ("int8_t", CType::Char),

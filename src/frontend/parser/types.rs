@@ -1061,9 +1061,19 @@ impl Parser {
             // Attach the address-space qualifier (e.g. `__percpu`) to the
             // outermost pointer: `unsigned int __percpu *read_count` declares a
             // %gs-qualified POINTER, and the load through it must use %gs:.
+            // A qualifier written before the declarator's stars qualifies the
+            // pointee of the innermost star (`struct rt __seg_gs **b` is a
+            // pointer to a pointer to a %gs `struct rt`), so plant it on the
+            // innermost Pointer node, not the outermost one.
             if field_addr_space != AddressSpace::Default {
-                if let TypeSpecifier::Pointer(_, addr_slot) = &mut field_type {
-                    *addr_slot = field_addr_space;
+                let mut node = &mut field_type;
+                while let TypeSpecifier::Pointer(inner, addr_slot) = node {
+                    if matches!(**inner, TypeSpecifier::Pointer(..)) {
+                        node = inner.as_mut();
+                    } else {
+                        *addr_slot = field_addr_space;
+                        break;
+                    }
                 }
             }
 
@@ -1147,8 +1157,8 @@ impl Parser {
         let mut i = 0;
         while i < derived.len() {
             match &derived[i] {
-                DerivedDeclarator::Pointer => {
-                    result = TypeSpecifier::Pointer(Box::new(result), AddressSpace::Default);
+                DerivedDeclarator::Pointer(space) => {
+                    result = TypeSpecifier::Pointer(Box::new(result), *space);
                     i += 1;
                 }
                 DerivedDeclarator::Array(_) => {

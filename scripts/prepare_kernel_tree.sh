@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# prepare_kernel_tree.sh — regenerate the patched linux-cachymod-6.18.52 tree
+# prepare_kernel_tree.sh — regenerate the patched linux-cachymod-6.18.55 tree
 # used by build_kernel_boot.sh / realmode_corpus.sh.
 #
 # The Arena workspace snapshot is capped (~128 MiB / 10k files), so the
@@ -34,7 +34,7 @@ LCCC_PREPARED_CANARIES=(
 )
 #
 # Usage:
-#   prepare_kernel_tree.sh [kernel-dir]          (default: /home/user/target/kernel-work/linux-6.18.52)
+#   prepare_kernel_tree.sh [kernel-dir]          (default: /home/user/target/kernel-work/linux-6.18.55)
 # Environment:
 #   PKG_ROOT archpkgbuilds checkout root (default: /home/user/archpkgbuilds).
 #            Point it outside the workspace snapshot (e.g. /opt/archpkgbuilds)
@@ -42,12 +42,12 @@ LCCC_PREPARED_CANARIES=(
 #            size-capped persisted snapshot.
 #   PKGDIR   archpkgbuilds sparse checkout of packages/linux-cachymod-6.18
 #            (default: $PKG_ROOT/packages/linux-cachymod-6.18)
-#   KVER     kernel version (default 6.18.52)
+#   KVER     kernel version (default 6.18.55)
 # ============================================================================
 set -euo pipefail
 
-KDIR=${1:-${KERNEL_DIR:-/home/user/target/kernel-work/linux-6.18.52}}
-KVER=${KVER:-6.18.52}
+KDIR=${1:-${KERNEL_DIR:-/home/user/target/kernel-work/linux-6.18.55}}
+KVER=${KVER:-6.18.55}
 WORK=$(dirname "$KDIR")
 TARBALL="$WORK/linux-$KVER.tar.xz"
 

@@ -1389,6 +1389,7 @@ impl Driver {
         // Our i686 backend also uses SSE2, so we define them for i686 as well.
         // Projects like stb_image, minimp3, dr_libs use #ifdef __SSE2__ to enable SIMD paths.
         preprocessor.set_sse_macros(self.no_sse);
+        preprocessor.set_short_wchar_macros(crate::common::types::short_wchar());
         // Define extended feature macros (__SSE3__, __AVX__, __BMI__, ...).
         // The SIMD half is gated on the xmm file being open (`x86_isa()`
         // returns NONE under -mno-sse, and macros must mirror codegen —
@@ -2688,13 +2689,13 @@ impl Driver {
     pub(super) fn resolved_bmi1(&self) -> bool {
         self.target == Target::X86_64
             && !self.bmi_explicitly_disabled
-            && (self.enable_bmi || !self.x86_march_explicit)
+            && self.enable_bmi
     }
 
     pub(super) fn resolved_bmi2(&self) -> bool {
         self.target == Target::X86_64
             && !self.bmi2_explicitly_disabled
-            && (self.enable_bmi2 || !self.x86_march_explicit)
+            && self.enable_bmi2
     }
 
     /// Soundness of the default grant: `tzcnt` is at least as correct as
@@ -2720,7 +2721,7 @@ impl Driver {
             return false;
         }
         match self.target {
-            Target::X86_64 => self.enable_lzcnt || !self.x86_march_explicit,
+            Target::X86_64 => self.enable_lzcnt,
             Target::I686 => self.enable_lzcnt,
             _ => false,
         }
@@ -2743,7 +2744,7 @@ impl Driver {
             return false;
         }
         match self.target {
-            Target::X86_64 => self.enable_popcnt || !self.x86_march_explicit,
+            Target::X86_64 => self.enable_popcnt,
             Target::I686 => self.enable_popcnt,
             _ => false,
         }
@@ -2752,7 +2753,7 @@ impl Driver {
     pub(super) fn resolved_movbe(&self) -> bool {
         self.target == Target::X86_64
             && !self.movbe_explicitly_disabled
-            && (self.enable_movbe || !self.x86_march_explicit)
+            && self.enable_movbe
     }
 
     /// Code-generation ISA permission for the x86-64 SIMD world.
@@ -2772,7 +2773,10 @@ impl Driver {
                 fma: self.enable_fma,
             }
         } else {
-            X86Isa::V3
+            // No `-march=`: the GCC/Clang baseline, x86-64 (SSE2 only). BMI,
+            // LZCNT, POPCNT, MOVBE and AVX are granted only by an explicit
+            // `-march=` or `-m` flag.
+            X86Isa::SSE2
         };
         X86Isa {
             simd: true,

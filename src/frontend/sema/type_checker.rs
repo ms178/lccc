@@ -185,7 +185,10 @@ impl<'a> ExprTypeChecker<'a> {
             // Address-of wraps in Pointer
             Expr::AddressOf(inner, _) => {
                 if let Some(inner_ct) = self.infer_expr_ctype(inner) {
-                    Some(CType::Pointer(Box::new(inner_ct), AddressSpace::Default))
+                    Some(CType::Pointer(
+                        Box::new(inner_ct),
+                        self.object_address_space(inner),
+                    ))
                 } else {
                     // Even if inner type unknown, result is some pointer
                     Some(CType::Pointer(Box::new(CType::Void), AddressSpace::Default))
@@ -911,7 +914,7 @@ impl<'a> ExprTypeChecker<'a> {
         let mut ctype = self.resolve_type_spec(&f.type_spec);
         for derived in &f.derived {
             match derived {
-                DerivedDeclarator::Pointer => {
+                DerivedDeclarator::Pointer(_) => {
                     ctype = CType::Pointer(Box::new(ctype), AddressSpace::Default);
                 }
                 DerivedDeclarator::Array(Some(size_expr)) => {
@@ -1118,7 +1121,7 @@ impl<'a> ExprTypeChecker<'a> {
                         self.resolve_type_spec_with_scope(&decl.type_spec, &local_scope);
                     for derived in &declarator.derived {
                         match derived {
-                            DerivedDeclarator::Pointer => {
+                            DerivedDeclarator::Pointer(_) => {
                                 ctype = CType::Pointer(Box::new(ctype), AddressSpace::Default);
                             }
                             DerivedDeclarator::Array(Some(size_expr)) => {
@@ -1167,7 +1170,7 @@ impl<'a> ExprTypeChecker<'a> {
                         self.resolve_type_spec_with_scope(&decl.type_spec, &local_scope);
                     for derived in &declarator.derived {
                         match derived {
-                            DerivedDeclarator::Pointer => {
+                            DerivedDeclarator::Pointer(_) => {
                                 ctype = CType::Pointer(Box::new(ctype), AddressSpace::Default);
                             }
                             DerivedDeclarator::Array(Some(size_expr)) => {
@@ -1253,6 +1256,46 @@ impl<'a> ExprTypeChecker<'a> {
     /// for identifiers not found in the symbol table.
     /// Handles common typeof patterns (identifier, deref, address-of).
     /// More complex expressions (member access, subscript, etc.) are not supported.
+    /// Segment space of the object an address-of operand names. `&x` for a
+    /// `__seg_gs` object (the kernel's per-CPU variables) is a `__seg_gs`
+    /// pointer; the object's space is recorded on its symbol at declaration.
+    /// The identifier an lvalue chain (`a.b[i].c`) is rooted at, if any.
+    fn root_identifier(expr: &Expr) -> Option<&str> {
+        match expr {
+            Expr::Identifier(name, _) => Some(name.as_str()),
+            Expr::ArraySubscript(base, _, _) | Expr::MemberAccess(base, _, _) => {
+                Self::root_identifier(base)
+            }
+            _ => None,
+        }
+    }
+
+    fn object_address_space(&self, inner: &Expr) -> AddressSpace {
+        match inner {
+            Expr::Identifier(name, _) => self
+                .symbols
+                .lookup(name)
+                .map_or(AddressSpace::Default, |sym| sym.address_space),
+            // `&arr[i]` of a `__seg_gs` array lies in the array's space; `&p[i]`
+            // takes the space carried by the pointer's own type.
+            Expr::ArraySubscript(base, _, _) => match self.infer_expr_ctype(base) {
+                Some(CType::Pointer(_, space)) => space,
+                Some(CType::Array(_, _)) => self.object_address_space(base),
+                _ => AddressSpace::Default,
+            },
+            // `&cpu_fbatches.op` lies in the space of the enclosing object;
+            // `&p->op` and `&(*p)` in the space the pointer points into.
+            Expr::MemberAccess(base, _, _) => self.object_address_space(base),
+            Expr::PointerMemberAccess(base, _, _) | Expr::Deref(base, _) => {
+                match self.infer_expr_ctype(base) {
+                    Some(CType::Pointer(_, space)) => space,
+                    _ => AddressSpace::Default,
+                }
+            }
+            _ => AddressSpace::Default,
+        }
+    }
+
     fn infer_expr_ctype_with_scope(
         &self,
         expr: &Expr,
@@ -1274,7 +1317,18 @@ impl<'a> ExprTypeChecker<'a> {
                 let inner_ct = self
                     .infer_expr_ctype(inner)
                     .or_else(|| self.infer_expr_ctype_with_scope(inner, scope))?;
-                Some(CType::Pointer(Box::new(inner_ct), AddressSpace::Default))
+                // A statement-expression local shadows any file-scope object of
+                // the same name, so only a non-shadowed name carries its space.
+                let root_is_local = match Self::root_identifier(inner.as_ref()) {
+                    Some(name) => scope.contains_key(name),
+                    None => false,
+                };
+                let space = if root_is_local {
+                    AddressSpace::Default
+                } else {
+                    self.object_address_space(inner)
+                };
+                Some(CType::Pointer(Box::new(inner_ct), space))
             }
             // Statement expression: thread the current scope down so nested
             // typeof() patterns (kernel xchg/cmpxchg macros) resolve.

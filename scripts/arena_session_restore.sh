@@ -155,9 +155,9 @@ log "exec bits restored: $n_modes"
 
 # ---- 5. optional: kernel tree regeneration -----------------------------------
 if [[ ${1:-} == --with-kernel ]]; then
-    if [[ ! -f /home/user/target/kernel-work/linux-6.18.52/.lccc-prepared ]] \
-       || [[ ! -f /home/user/target/kernel-work/linux-6.18.52/arch/x86/boot/setup.ld ]]; then
-        log 'regenerating linux-cachymod-6.18.52 tree'
+    if [[ ! -f /home/user/target/kernel-work/linux-6.18.55/.lccc-prepared ]] \
+       || [[ ! -f /home/user/target/kernel-work/linux-6.18.55/arch/x86/boot/setup.ld ]]; then
+        log 'regenerating linux-cachymod-6.18.55 tree'
         ./scripts/prepare_kernel_tree.sh || log 'KERNEL TREE RESTORE FAILED'
     else
         log 'kernel tree present'

@@ -1696,10 +1696,12 @@ impl Lowerer {
                 64 => Some(CType::Decimal64),
                 _ => Some(CType::Decimal128),
             },
-            // Wide string literal L"..." has type wchar_t* (which is int* on all targets)
-            Expr::WideStringLiteral(_, _) => {
-                Some(CType::Pointer(Box::new(CType::Int), AddressSpace::Default))
-            }
+            // Wide string literal L"..." has type wchar_t* (int* by default,
+            // unsigned short* under -fshort-wchar)
+            Expr::WideStringLiteral(_, _) => Some(CType::Pointer(
+                Box::new(crate::common::types::wchar_ctype()),
+                AddressSpace::Default,
+            )),
             // char16_t string literal u"..." has type char16_t* (which is unsigned short*)
             Expr::Char16StringLiteral(_, _) => Some(CType::Pointer(
                 Box::new(CType::UShort),

@@ -702,7 +702,7 @@ impl Lowerer {
                     let mut func_info = None;
                     for d in &declarator.derived {
                         match d {
-                            DerivedDeclarator::Pointer => ptr_count += 1,
+                            DerivedDeclarator::Pointer(_) => ptr_count += 1,
                             DerivedDeclarator::Function(p, v) => {
                                 func_info = Some((p.clone(), *v));
                                 break;
@@ -827,6 +827,17 @@ impl Lowerer {
         for decl in &tu.decls {
             match decl {
                 ExternalDecl::FunctionDef(func) => {
+                    // `__noreturn` on a DEFINITION terminates control flow at
+                    // its call sites exactly like a declaration's does. Sema
+                    // already honours it (`FunctionInfo::is_noreturn`); lowering
+                    // only learnt names from declarators, so a `static
+                    // noinline __noreturn` definition such as the kernel's
+                    // `rest_init()` left the dead tail of `start_kernel()` in
+                    // the object (objtool: "missing __noreturn" + unreachable
+                    // instructions). GCC emits no code after such a call.
+                    if func.attrs.is_noreturn() && !func.name.is_empty() {
+                        self.noreturn_functions.insert(func.name.clone());
+                    }
                     // __diagnose_as on a DEFINITION (the fortify-string
                     // family defines and declares in one shape).
                     if let Some(ref da) = func.attrs.diagnose_as {

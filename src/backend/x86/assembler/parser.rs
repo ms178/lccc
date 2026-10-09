@@ -4547,7 +4547,29 @@ fn reject_non_constant(expr: &str, directive: &str) -> Result<(), String> {
             }
             continue;
         }
-        if c.is_ascii_alphabetic() || c == b'_' || c == b'$' || c == b'%' {
+        // A `%` opens a register spelling (`%rsp`, the kernel's
+        // `UNWIND_HINT_REGS base=%rsp` default compares `\base == %rsp`). The
+        // sigil must be consumed with its name: scanning from a bare `%` yields
+        // an empty identifier, which used to be rejected as non-constant.
+        // A `%` with no name after it is the modulo operator and is accepted.
+        if c == b'%' {
+            let start = k;
+            k += 1;
+            while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
+                k += 1;
+            }
+            if k == start + 1 {
+                continue; // bare `%`: modulo operator
+            }
+            let reg = &expr[start..k];
+            if asm_preprocess::resolve_x86_registers(reg) != reg {
+                continue; // a register spelling the evaluator resolves
+            }
+            return Err(format!(
+                "non-constant expression in \"{directive}\" statement"
+            ));
+        }
+        if c.is_ascii_alphabetic() || c == b'_' || c == b'$' {
             let start = k;
             while k < bytes.len()
                 && (bytes[k].is_ascii_alphanumeric() || matches!(bytes[k], b'_' | b'$' | b'@'))

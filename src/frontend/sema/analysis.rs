@@ -244,6 +244,7 @@ impl SemanticAnalyzer {
             name: func.name.clone(),
             ty: func_ctype,
             explicit_alignment: None,
+address_space: AddressSpace::Default,
         });
 
         // Analyze the body in its own scope, with its own return type.
@@ -256,6 +257,7 @@ impl SemanticAnalyzer {
                     name: name.clone(),
                     ty,
                     explicit_alignment: None,
+address_space: AddressSpace::Default,
                 });
             }
         }
@@ -310,6 +312,7 @@ impl SemanticAnalyzer {
             name: func.name.clone(),
             ty: func_ctype,
             explicit_alignment: None,
+address_space: AddressSpace::Default,
         });
 
         // Push scope for function body (both symbol table and type context,
@@ -328,6 +331,7 @@ impl SemanticAnalyzer {
                     name: name.clone(),
                     ty,
                     explicit_alignment: None,
+address_space: AddressSpace::Default,
                 });
             }
         }
@@ -587,6 +591,18 @@ impl SemanticAnalyzer {
                 )
             };
 
+            // The declaration-level segment qualifier (`struct s __percpu *p`)
+            // belongs to the object's type. Lowering applies it to the symbol
+            // it creates; sema must record the same type or it reports a
+            // spurious address-space mismatch when `p` is passed on.
+            type_builder::apply_declaration_address_space(
+                &mut full_type,
+                crate::common::type_builder::declaration_pointee_space(
+                    decl.address_space,
+                    &init_decl.derived,
+                ),
+            );
+
             // Resolve incomplete array sizes from initializers (e.g., int arr[] = {1,2,3})
             // This must happen before storing the symbol so sizeof(arr) works in
             // subsequent global initializer const-evaluation.
@@ -703,10 +719,20 @@ impl SemanticAnalyzer {
                 }
             }
 
+            // The object's own segment space (`__seg_gs struct s x`, every
+            // DEFINE_PER_CPU object) is the declaration qualifier only when no
+            // pointer level intervenes: `T __seg_gs *p` qualifies what `p`
+            // points into, and `p` itself is ordinary memory.
+            let object_space = crate::common::type_builder::object_declaration_address_space(
+                decl.address_space,
+                &init_decl.derived,
+                init_decl.attrs.object_space,
+            );
             self.symbol_table.declare(Symbol {
                 name: init_decl.name.clone(),
                 ty: full_type,
                 explicit_alignment,
+                address_space: object_space,
             });
             if links && !self.symbol_table.at_file_scope() {
                 self.symbol_table.mark_linked(&init_decl.name);
@@ -962,6 +988,7 @@ impl SemanticAnalyzer {
                 name: variant.name.clone(),
                 ty: sym_ty,
                 explicit_alignment: None,
+address_space: AddressSpace::Default,
             });
             self.enum_counter += 1;
         }
@@ -2955,11 +2982,31 @@ fn function_types_compatible(a: &FunctionType, b: &FunctionType) -> bool {
 /// Compatibility of two pointed-to types (C23 6.7.6.1p2). Recurses through
 /// pointer and array chains, which is what makes `struct S **` an error too
 /// rather than only the single-level case.
+/// The integer type a non-packed enum is compatible with (C11 6.7.2.2p4): GCC
+/// and Clang pick `unsigned int` when no enumerator is negative and `int`
+/// otherwise. `enum pg_level *` therefore converts to `unsigned int *`
+/// (linux-6.18.55 arch/x86/mm/pat/set_memory.c passes it to `lookup_address`).
+fn enum_compatible_integer(t: &CType) -> Option<CType> {
+    match t {
+        CType::Enum(e) if !e.is_packed => Some(if e.variants.iter().any(|(_, v)| *v < 0) {
+            CType::Int
+        } else {
+            CType::UInt
+        }),
+        _ => None,
+    }
+}
+
 fn pointee_compat(from: &CType, to: &CType) -> PtrCompat {
     if from == to {
         return PtrCompat::Compatible;
     }
     if same_scalar_modulo_sign(from, to) {
+        return PtrCompat::Compatible;
+    }
+    if enum_compatible_integer(from).as_ref() == Some(to)
+        || enum_compatible_integer(to).as_ref() == Some(from)
+    {
         return PtrCompat::Compatible;
     }
     match (from, to) {

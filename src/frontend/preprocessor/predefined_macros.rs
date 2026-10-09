@@ -666,6 +666,22 @@ impl Preprocessor {
     /// not defined (matching GCC behavior for kernel builds).
     ///
     /// Must be called after set_target() since it checks which arch is active.
+    /// `-fshort-wchar` redefines the wchar_t macros for a 2-byte `wchar_t`
+    /// (`unsigned short`), matching GCC's predefined values.
+    pub fn set_short_wchar_macros(&mut self, short: bool) {
+        let (ty, max, min, size) = if short {
+            ("unsigned short", "65535", "0", "2")
+        } else {
+            ("int", "2147483647", "(-2147483647-1)", "4")
+        };
+        self.define_simple_macro("__WCHAR_TYPE__", ty);
+        self.define_simple_macro("__WCHAR_MAX__", max);
+        self.define_simple_macro("__WCHAR_MIN__", min);
+        self.define_simple_macro("WCHAR_MAX", max);
+        self.define_simple_macro("WCHAR_MIN", min);
+        self.define_simple_macro("__SIZEOF_WCHAR_T__", size);
+    }
+
     pub fn set_sse_macros(&mut self, no_sse: bool) {
         if no_sse {
             // The baseline macros are pre-defined in PREDEFINED_OBJECT_MACROS

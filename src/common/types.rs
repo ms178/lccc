@@ -1629,6 +1629,30 @@ pub fn char_is_unsigned() -> bool {
     CHAR_UNSIGNED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+static SHORT_WCHAR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record `-fshort-wchar`: `wchar_t` becomes `unsigned short` (2 bytes) and
+/// `L"..."` literals are UTF-16 code units. Set by the driver before any
+/// parsing, like `set_char_unsigned`. The kernel builds EFI code with it
+/// (`get_var(L"SecureBoot", ...)` takes `efi_char16_t *`).
+pub fn set_short_wchar(short: bool) {
+    SHORT_WCHAR.store(short, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether `-fshort-wchar` is in effect.
+pub fn short_wchar() -> bool {
+    SHORT_WCHAR.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The C type `wchar_t` denotes under the current wide-character ABI.
+pub fn wchar_ctype() -> CType {
+    if short_wchar() {
+        CType::UShort
+    } else {
+        CType::Int
+    }
+}
+
 impl CType {
     /// Size in bytes, with struct/union layout lookup via context.
     /// Uses the thread-local target pointer size for target-dependent types
