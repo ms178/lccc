@@ -934,7 +934,9 @@ impl Lowerer {
             // If the non-trailing part has Pointer entries, the element type includes
             // those pointer levels. E.g., for Node* (*p)[2], rest=[Pointer, Array(2)],
             // the Pointer makes the element type Node* (a pointer), so elem size = ptr_sz.
-            let rest_has_pointer = rest.iter().any(|d| matches!(d, DerivedDeclarator::Pointer(_)));
+            let rest_has_pointer = rest
+                .iter()
+                .any(|d| matches!(d, DerivedDeclarator::Pointer(_)));
             let base_elem_size = if rest_has_pointer {
                 ptr_sz
             } else {

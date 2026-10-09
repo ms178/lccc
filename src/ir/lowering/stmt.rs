@@ -436,7 +436,10 @@ impl Lowerer {
                 let ptr_count_before = declarator.derived[..i]
                     .iter()
                     .filter(|d| {
-                        matches!(d, DerivedDeclarator::Pointer(_) | DerivedDeclarator::Array(_))
+                        matches!(
+                            d,
+                            DerivedDeclarator::Pointer(_) | DerivedDeclarator::Array(_)
+                        )
                     })
                     .count();
                 // Subtract 1 for the syntax marker pointer
@@ -680,7 +683,10 @@ impl Lowerer {
                 let ptr_count_before = declarator.derived[..i]
                     .iter()
                     .filter(|d| {
-                        matches!(d, DerivedDeclarator::Pointer(_) | DerivedDeclarator::Array(_))
+                        matches!(
+                            d,
+                            DerivedDeclarator::Pointer(_) | DerivedDeclarator::Array(_)
+                        )
                     })
                     .count();
                 let return_type_ptrs = ptr_count_before.saturating_sub(1);

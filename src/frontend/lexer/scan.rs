@@ -1,7 +1,7 @@
 use super::token::{Token, TokenKind, WideCharKind};
-use crate::common::types::short_wchar;
 use crate::common::encoding::decode_pua_byte;
 use crate::common::source::Span;
+use crate::common::types::short_wchar;
 
 /// C lexer that tokenizes source input with source locations.
 pub struct Lexer {
