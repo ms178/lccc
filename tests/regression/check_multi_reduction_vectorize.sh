@@ -52,8 +52,9 @@ EOF
 
 "$CCC" -O2 -S "$td/mred.c" -o "$td/mred.s"
 
-# The independent dot/sum loops must be packed-vectorized.  AVX2 emits vpaddd
-# (8-wide I32); a forced-2-wide/older path emits paddd.  Either proves the
+# The independent dot/sum loops must be packed-vectorized.  The compiler's
+# default target is x86-64-v3 (AVX2), so the loops emit vpaddd (8-wide I32);
+# a target without AVX2 emits paddd (4-wide).  Either proves the
 # multi-reduction transform fired.
 if ! grep -Eq 'vpaddd|paddd' "$td/mred.s"; then
     echo "multi-reduction loop did not vectorize (no packed add emitted)" >&2

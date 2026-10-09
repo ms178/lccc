@@ -869,6 +869,7 @@ mod declarator_law_tests {
     use super::DerivedDeclarator::*;
     use super::ParamDecl;
     use super::TypeSpecifier;
+    use crate::common::types::AddressSpace;
 
     fn param() -> ParamDecl {
         ParamDecl {
@@ -894,6 +895,11 @@ mod declarator_law_tests {
         DerivedDeclarator::Function(vec![param(); params], false)
     }
 
+    /// An ordinary pointer level (pointee in the default address space).
+    fn ptr() -> DerivedDeclarator {
+        Pointer(AddressSpace::Default)
+    }
+
     /// The canonical predicate pair: `declares_function` keys on the
     /// entity's OWN parameter list being last; `return_pointer_depth`
     /// counts the Pointer indirections of the return type (the prefix for
@@ -907,27 +913,27 @@ mod declarator_law_tests {
             // int f(void) — plain function.
             (vec![func(0)], true, 0),
             // int *f(int) — pointer return.
-            (vec![Pointer, func(1)], true, 1),
+            (vec![ptr(), func(1)], true, 1),
             // int **f(int) — two indirections.
-            (vec![Pointer, Pointer, func(1)], true, 2),
+            (vec![ptr(), ptr(), func(1)], true, 2),
             // void (*f(int))(void) — function RETURNING a function pointer
             // (SQLite's sqlite3OsDlSym shape): the prefix has ONE Pointer.
-            (vec![Pointer, fnp(0), func(1)], true, 1),
+            (vec![ptr(), fnp(0), func(1)], true, 1),
             // void (*(*f(int))(void))(int) — function returning a POINTER
             // TO a function pointer: the prefix interleaves a
             // FunctionPointer between two Pointers, exactly the shape a
             // leading-run count undercounts (1 instead of 2).
-            (vec![Pointer, fnp(0), Pointer, fnp(1), func(1)], true, 2),
+            (vec![ptr(), fnp(0), ptr(), fnp(1), func(1)], true, 2),
             // int (*fp)(int) — function-pointer OBJECT: not a function,
             // whole-list depth 1 (the typedef return is depth-1 = 0: int).
-            (vec![Pointer, fnp(1)], false, 1),
+            (vec![ptr(), fnp(1)], false, 1),
             // int *(*fp)(int) — fn-ptr object returning int*: depth 2,
             // typedef return depth 1.
-            (vec![Pointer, Pointer, fnp(1)], false, 2),
+            (vec![ptr(), ptr(), fnp(1)], false, 2),
             // int (*fps[3])(int) — array of fn-ptrs: not a function.
             (vec![Array(None), fnp(1)], false, 0),
             // Plain pointer object.
-            (vec![Pointer], false, 1),
+            (vec![ptr()], false, 1),
             // Empty declarator (abstract params of a bare type).
             (vec![], false, 0),
         ];
