@@ -45,7 +45,7 @@ impl Lowerer {
             ("size_t", size_type.clone()),
             ("ssize_t", ssize_type.clone()),
             ("ptrdiff_t", ptrdiff_type),
-            ("wchar_t", CType::Int),
+            ("wchar_t", crate::common::types::wchar_ctype()),
             ("wint_t", CType::UInt),
             // <stdint.h> - exact width types
             ("int8_t", CType::Char),

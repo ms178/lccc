@@ -239,7 +239,10 @@ impl Lowerer {
             let mut resolved_ctype = self.build_full_ctype(type_spec, &declarator.derived);
             crate::common::type_builder::apply_declaration_address_space(
                 &mut resolved_ctype,
-                decl.address_space,
+                crate::common::type_builder::declaration_pointee_space(
+                    decl.address_space,
+                    &declarator.derived,
+                ),
             );
             if let Some(vs) = decl.resolve_vector_size(resolved_ctype.size()) {
                 resolved_ctype = CType::Vector(Box::new(resolved_ctype), vs);
@@ -382,13 +385,24 @@ impl Lowerer {
         vla_size: Option<Value>,
     ) {
         let mut local_info = LocalInfo::from_analysis(da, alloca, decl.is_const());
-        local_info.var.address_space = decl.address_space;
+        local_info.var.address_space =
+            crate::common::type_builder::object_declaration_address_space(
+                decl.address_space,
+                &declarator.derived,
+                declarator.attrs.object_space,
+            );
         // `T __seg_fs *p`: the qualifier lives on the pointer's CType (the
         // space the pointer points into), not just on the variable slot.
         // Without this, `*p` resolves AddressSpace::Default through
         // get_expr_ctype and the segment prefix is silently dropped.
         if let Some(ref mut ct) = local_info.var.c_type {
-            crate::common::type_builder::apply_declaration_address_space(ct, decl.address_space);
+            crate::common::type_builder::apply_declaration_address_space(
+                ct,
+                crate::common::type_builder::declaration_pointee_space(
+                    decl.address_space,
+                    &declarator.derived,
+                ),
+            );
         }
         if explicit_align > 0 {
             local_info.var.explicit_alignment = Some(explicit_align);
@@ -422,7 +436,7 @@ impl Lowerer {
                 let ptr_count_before = declarator.derived[..i]
                     .iter()
                     .filter(|d| {
-                        matches!(d, DerivedDeclarator::Pointer | DerivedDeclarator::Array(_))
+                        matches!(d, DerivedDeclarator::Pointer(_) | DerivedDeclarator::Array(_))
                     })
                     .count();
                 // Subtract 1 for the syntax marker pointer
@@ -666,7 +680,7 @@ impl Lowerer {
                 let ptr_count_before = declarator.derived[..i]
                     .iter()
                     .filter(|d| {
-                        matches!(d, DerivedDeclarator::Pointer | DerivedDeclarator::Array(_))
+                        matches!(d, DerivedDeclarator::Pointer(_) | DerivedDeclarator::Array(_))
                     })
                     .count();
                 let return_type_ptrs = ptr_count_before.saturating_sub(1);
@@ -1949,7 +1963,7 @@ impl Lowerer {
     ) -> usize {
         let has_pointer = derived
             .iter()
-            .any(|d| matches!(d, DerivedDeclarator::Pointer));
+            .any(|d| matches!(d, DerivedDeclarator::Pointer(_)));
         let has_func_ptr = derived.iter().any(|d| {
             matches!(
                 d,

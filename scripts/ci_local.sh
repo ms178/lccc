@@ -330,6 +330,12 @@ gate "comdat-signature-identity" fast \
 gate "loop-memset-decisions" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_loop_memset.sh
 
+gate "seg-param-deref" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_seg_param_deref.sh
+
+gate "noreturn-definition-tail" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_noreturn_definition_tail.sh
+
 gate "bool-pair-tail-jmp-contract" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_bool_pair_tail_jmp.sh
 

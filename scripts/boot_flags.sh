@@ -41,7 +41,7 @@ LCCC_BOOT_GATE_BYTES=32768
 # states it — `cc_stack_align4 := -mpreferred-stack-boundary=2` under
 # CONFIG_CC_IS_GCC and `:= -mstack-alignment=4` under CONFIG_CC_IS_CLANG — and
 # the same Makefile appends -Wno-gnu to REALMODE_CFLAGS for clang.  Verified
-# against linux-6.18.52: clang 19 compiles all 24 arch/x86/boot objects with
+# against linux-6.18.55: clang 19 compiles all 24 arch/x86/boot objects with
 # the translated line and no diagnostics beyond the stubbed zoffset.h
 # redefinitions gcc also reports.
 #

@@ -149,6 +149,7 @@ impl Parser {
 
         let (name, derived, decl_mode, decl_common, decl_aligned, _) =
             self.parse_declarator_with_attrs();
+        let decl_object_space = self.attrs.parsing_object_space;
         let (post_ctor, post_dtor, post_mode, post_common, post_aligned, first_asm_reg) =
             self.parse_asm_and_attributes();
         let mode_kind = decl_mode.or(post_mode);
@@ -245,13 +246,14 @@ impl Parser {
                 merged_alignment,
             )
         } else {
-            let ctx = DeclContext {
+            let mut ctx = DeclContext {
                 attrs: decl_attrs,
                 alignment: merged_alignment,
                 alignas_type,
                 alignment_sizeof_type,
                 is_common,
             };
+            ctx.attrs.object_space = decl_object_space;
             self.parse_declaration_rest(type_spec, name, derived, start, ctx)
         }
     }
@@ -376,7 +378,7 @@ impl Parser {
                         return_type =
                             TypeSpecifier::Array(Box::new(return_type), size_expr.clone());
                     }
-                    DerivedDeclarator::Pointer => {
+                    DerivedDeclarator::Pointer(_) => {
                         return_type =
                             TypeSpecifier::Pointer(Box::new(return_type), AddressSpace::Default);
                     }
@@ -397,7 +399,7 @@ impl Parser {
             let mut i = 0;
             while i < prefix.len() {
                 match &prefix[i] {
-                    DerivedDeclarator::Pointer => {
+                    DerivedDeclarator::Pointer(_) => {
                         if let Some(DerivedDeclarator::FunctionPointer(params, variadic)) =
                             prefix.get(i + 1)
                         {
@@ -437,7 +439,7 @@ impl Parser {
             // No Function in derived - just apply pointer derivations
             for d in derived {
                 match d {
-                    DerivedDeclarator::Pointer => {
+                    DerivedDeclarator::Pointer(_) => {
                         return_type =
                             TypeSpecifier::Pointer(Box::new(return_type), AddressSpace::Default);
                     }
@@ -470,7 +472,7 @@ impl Parser {
                                     | DerivedDeclarator::Function(_, _) => {
                                         found_fptr = true;
                                     }
-                                    DerivedDeclarator::Pointer if found_fptr => {
+                                    DerivedDeclarator::Pointer(_) if found_fptr => {
                                         ptrs_after += 1;
                                     }
                                     _ => {}
@@ -538,7 +540,7 @@ impl Parser {
             //   First Pointer is return-type pointer, second is syntax marker.
             let ptr_count = pderived
                 .iter()
-                .filter(|d| matches!(d, DerivedDeclarator::Pointer))
+                .filter(|d| matches!(d, DerivedDeclarator::Pointer(_)))
                 .count();
             // Apply all pointers except the syntax marker (last one)
             for _ in 0..ptr_count.saturating_sub(1) {
@@ -552,8 +554,8 @@ impl Parser {
         // Not a function pointer - apply all derivations normally.
         // Apply pointers
         for d in pderived {
-            if let DerivedDeclarator::Pointer = d {
-                full_type = TypeSpecifier::Pointer(Box::new(full_type), AddressSpace::Default);
+            if let DerivedDeclarator::Pointer(sp) = d {
+                full_type = TypeSpecifier::Pointer(Box::new(full_type), *sp);
             }
         }
         // Collect array dimensions
@@ -694,6 +696,7 @@ impl Parser {
         // Parse additional declarators separated by commas
         while self.consume_if(&TokenKind::Comma) {
             let (dname, dderived) = self.parse_declarator();
+            let d_object_space = self.attrs.parsing_object_space;
             let (d_ctor, d_dtor, _, d_common, _, d_asm_reg) = self.parse_asm_and_attributes();
             ctx.is_common = ctx.is_common || d_common;
             let d_weak = self.attrs.parsing_weak();
@@ -738,6 +741,7 @@ impl Parser {
                 init: dinit,
                 attrs: {
                     let mut da = DeclAttributes::default();
+                    da.object_space = d_object_space;
                     da.set_constructor(d_ctor);
                     da.set_destructor(d_dtor);
                     da.set_weak(d_weak);
@@ -865,6 +869,7 @@ impl Parser {
         let mut alignment: Option<usize> = None;
         loop {
             let (name, derived, decl_mode, _, decl_aligned, _) = self.parse_declarator_with_attrs();
+            let decl_object_space = self.attrs.parsing_object_space;
             let (skip_mode, skip_aligned, skip_asm_reg) = self.skip_asm_and_attributes();
             let local_cleanup_fn = self.attrs.parsing_cleanup_fn.take();
             let local_section = self.attrs.parsing_section.take();
@@ -884,6 +889,7 @@ impl Parser {
                 init,
                 attrs: {
                     let mut da = DeclAttributes::default();
+                    da.object_space = decl_object_space;
                     da.section = local_section;
                     da.asm_register = skip_asm_reg;
                     da.cleanup_fn = local_cleanup_fn;
@@ -1418,7 +1424,7 @@ impl Parser {
     ) -> TypeSpecifier {
         for d in derived {
             match d {
-                DerivedDeclarator::Pointer => {
+                DerivedDeclarator::Pointer(_) => {
                     spec = TypeSpecifier::Pointer(Box::new(spec), AddressSpace::Default);
                 }
                 DerivedDeclarator::Array(n) => {

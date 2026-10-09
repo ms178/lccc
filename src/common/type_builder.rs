@@ -232,7 +232,7 @@ pub trait TypeConvertContext {
 fn find_function_pointer_core(derived: &[DerivedDeclarator]) -> Option<usize> {
     for i in 0..derived.len() {
         // Look for Pointer followed by FunctionPointer
-        if matches!(&derived[i], DerivedDeclarator::Pointer)
+        if matches!(&derived[i], DerivedDeclarator::Pointer(_))
             && i + 1 < derived.len()
             && matches!(&derived[i + 1], DerivedDeclarator::FunctionPointer(_, _))
         {
@@ -361,8 +361,8 @@ pub fn build_full_ctype_with_base(
         // We fold prefix Pointer declarators into the base to form the return type.
         let mut result = base;
         for d in &derived[..fp_start] {
-            if matches!(d, DerivedDeclarator::Pointer) {
-                result = CType::Pointer(Box::new(result), AddressSpace::Default);
+            if let DerivedDeclarator::Pointer(sp) = d {
+                result = CType::Pointer(Box::new(result), *sp);
             }
             // Array declarators in prefix are outer wrappers, handled after the core.
         }
@@ -372,7 +372,7 @@ pub fn build_full_ctype_with_base(
         let mut i = fp_start;
         while i < derived.len() {
             match &derived[i] {
-                DerivedDeclarator::Pointer => {
+                DerivedDeclarator::Pointer(sp) => {
                     if i + 1 < derived.len()
                         && matches!(
                             &derived[i + 1],
@@ -393,10 +393,10 @@ pub fn build_full_ctype_with_base(
                             params: param_types,
                             variadic,
                         }));
-                        result = CType::Pointer(Box::new(func_type), AddressSpace::Default);
+                        result = CType::Pointer(Box::new(func_type), *sp);
                         i += 2;
                     } else {
-                        result = CType::Pointer(Box::new(result), AddressSpace::Default);
+                        result = CType::Pointer(Box::new(result), *sp);
                         i += 1;
                     }
                 }
@@ -455,8 +455,8 @@ pub fn build_full_ctype_with_base(
         let mut i = 0;
         while i < derived.len() {
             match &derived[i] {
-                DerivedDeclarator::Pointer => {
-                    result = CType::Pointer(Box::new(result), AddressSpace::Default);
+                DerivedDeclarator::Pointer(sp) => {
+                    result = CType::Pointer(Box::new(result), *sp);
                     i += 1;
                 }
                 DerivedDeclarator::Array(_) => {
@@ -503,6 +503,48 @@ pub fn build_full_ctype_with_base(
 /// dereferences read absolute addresses (glibc TLS: `%fs:16`/`%fs:40`
 /// stack-guard loads compiled to NULL-page loads). Only direct
 /// `*(T __seg_fs *)N` casts survived, via TypeSpecifier::Pointer's own field.
+/// Segment space of the object a declarator names.
+///
+/// A non-pointer object takes its space from the declaration qualifier
+/// (`static int __seg_gs x`). A declarator with a pointer level takes it from
+/// the qualifier written after its last `*` (`struct item *__percpu slot`,
+/// `struct item *__percpu table[3]`): the pointer object itself, or the array
+/// elements, live in that space. A declaration qualifier on such a declarator
+/// (`__seg_gs struct item *p`) instead qualifies the pointee, handled by
+/// `apply_declaration_address_space`, so it is not the object's space.
+pub fn object_declaration_address_space(
+    decl_space: AddressSpace,
+    derived: &[DerivedDeclarator],
+    object_space: AddressSpace,
+) -> AddressSpace {
+    if derived
+        .iter()
+        .any(|d| matches!(d, DerivedDeclarator::Pointer(_)))
+    {
+        object_space
+    } else {
+        decl_space
+    }
+}
+
+/// Segment space a declaration qualifier gives to the pointee of a declarator.
+///
+/// `__seg_gs struct item *p` qualifies the pointee (the declarator has a
+/// pointer level), so the space goes to the pointer's CType. Without a pointer
+/// level the qualifier is the object's own space (`__seg_gs __typeof__(T *) x`,
+/// `__seg_gs typedef_ptr_t x`), and the pointer's pointee must stay as written.
+/// See `object_declaration_address_space`.
+pub fn declaration_pointee_space(decl_space: AddressSpace, derived: &[DerivedDeclarator]) -> AddressSpace {
+    if derived
+        .iter()
+        .any(|d| matches!(d, DerivedDeclarator::Pointer(_)))
+    {
+        decl_space
+    } else {
+        AddressSpace::Default
+    }
+}
+
 pub fn apply_declaration_address_space(ty: &mut CType, space: AddressSpace) {
     if space == AddressSpace::Default {
         return;

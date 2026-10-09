@@ -650,7 +650,7 @@ impl Parser {
                     }
                 }
                 if is_wide {
-                    Expr::WideStringLiteral(result, span)
+                    wide_string_expr(result, span)
                 } else if is_char16 {
                     Expr::Char16StringLiteral(result, span)
                 } else {
@@ -670,7 +670,7 @@ impl Parser {
                     result.push_str(s2);
                     self.advance();
                 }
-                Expr::WideStringLiteral(result, span)
+                wide_string_expr(result, span)
             }
             TokenKind::Char16StringLiteral(s) => {
                 let mut result = s.clone();
@@ -693,7 +693,7 @@ impl Parser {
                     }
                 }
                 if is_wide {
-                    Expr::WideStringLiteral(result, span)
+                    wide_string_expr(result, span)
                 } else {
                     Expr::Char16StringLiteral(result, span)
                 }
@@ -859,5 +859,16 @@ impl Parser {
         }
         self.expect_closing(&TokenKind::RParen, open);
         Expr::GenericSelection(Box::new(controlling), associations, span)
+    }
+}
+
+/// Build an `L"..."` literal. Under `-fshort-wchar` a wide literal is a
+/// 2-byte UTF-16 array, i.e. exactly a `u"..."` literal, so it takes that
+/// representation and every sizing/emission path already handles it.
+fn wide_string_expr(text: String, span: crate::common::source::Span) -> Expr {
+    if crate::common::types::short_wchar() {
+        Expr::Char16StringLiteral(text, span)
+    } else {
+        Expr::WideStringLiteral(text, span)
     }
 }

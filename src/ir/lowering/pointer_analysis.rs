@@ -68,7 +68,7 @@ impl Lowerer {
         // Count pointer and array levels
         let ptr_count = derived
             .iter()
-            .filter(|d| matches!(d, DerivedDeclarator::Pointer))
+            .filter(|d| matches!(d, DerivedDeclarator::Pointer(_)))
             .count();
         let has_array = derived
             .iter()

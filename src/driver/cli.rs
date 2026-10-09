@@ -1373,6 +1373,12 @@ impl Driver {
                 arg if arg == "-fsigned-char" => {
                     crate::common::types::set_char_unsigned(false);
                 }
+                arg if arg == "-fshort-wchar" => {
+                    crate::common::types::set_short_wchar(true);
+                }
+                arg if arg == "-fno-short-wchar" => {
+                    crate::common::types::set_short_wchar(false);
+                }
                 // S13: function entry/exit instrumentation via the
                 // __cyg_profile_func_enter/exit hooks (GCC contract).
                 arg if arg == "-finstrument-functions" => {
@@ -2874,30 +2880,47 @@ mod cli_tests {
     /// explicit-only, so default `-O2` emitted `notq;andq` where `-mbmi`
     /// emitted one `andn` — while AVX2 (also v3) was already on by default.
     #[test]
-    fn bmi_defaults_to_v3_baseline() {
+     /// Without `-march=` the code-generation baseline is x86-64 (GCC and
+    /// Clang parity), so BMI1/BMI2 are NOT granted. The kernel boot
+    /// decompressor depends on this: its `misc.o` has no `-march`, and BMI2
+    /// `shrx` there faults with #UD on CPUs without BMI2 (QEMU's default).
+    #[test]
+    fn bmi_absent_from_default_baseline() {
         let mut d = Driver::new();
         let args: Vec<String> = ["ccc", "x.c"].iter().map(|s| s.to_string()).collect();
         assert!(d.parse_cli_args(&args).is_ok());
-        assert!(d.resolved_bmi1(), "v3 default baseline carries BMI1");
-        assert!(d.resolved_bmi2(), "v3 default baseline carries BMI2");
+        assert!(!d.resolved_bmi1(), "x86-64 baseline must not carry BMI1");
+        assert!(!d.resolved_bmi2(), "x86-64 baseline must not carry BMI2");
     }
 
-    /// `-mno-bmi` is a STICKY denial against the v3 default baseline — the
-    /// default must not revive the class behind the user's back (GCC keeps
-    /// the last-explicit ISA decision).
+    /// `-march=x86-64-v3` grants the BMI classes explicitly.
     #[test]
-    fn mno_bmi_sticky_denial_beats_default_baseline() {
+    fn bmi_granted_by_march_v3() {
         let mut d = Driver::new();
-        let args: Vec<String> = ["ccc", "-mno-bmi", "x.c"]
+        let args: Vec<String> = ["ccc", "-march=x86-64-v3", "x.c"]
             .iter()
             .map(|s| s.to_string())
             .collect();
         assert!(d.parse_cli_args(&args).is_ok());
-        assert!(!d.resolved_bmi1(), "-mno-bmi must deny the v3 default");
+        assert!(d.resolved_bmi1(), "v3 carries BMI1");
+        assert!(d.resolved_bmi2(), "v3 carries BMI2");
+    }
+
+    /// `-mno-bmi` is a STICKY denial against an explicit v3 ceiling (GCC keeps
+    /// the last-explicit ISA decision).
+    #[test]
+    fn mno_bmi_sticky_denial_beats_v3_march() {
+        let mut d = Driver::new();
+        let args: Vec<String> = ["ccc", "-march=x86-64-v3", "-mno-bmi", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d.parse_cli_args(&args).is_ok());
+        assert!(!d.resolved_bmi1(), "-mno-bmi must deny the v3 class");
         assert!(d.resolved_bmi2(), "-mno-bmi leaves the BMI2 class alone");
 
         let mut d2 = Driver::new();
-        let args2: Vec<String> = ["ccc", "-mno-bmi2", "x.c"]
+        let args2: Vec<String> = ["ccc", "-march=x86-64-v3", "-mno-bmi2", "x.c"]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -2919,28 +2942,27 @@ mod cli_tests {
         assert!(d.resolved_bmi1());
     }
 
-    /// ABM (LZCNT/TZCNT) is an x86-64-v3 member: the absent-`-march`
-    /// baseline projects it, so `tzcnt`/`lzcnt` are the default codegen
-    /// choices (they supersede `bsf`/`bsr` and are defined on zero input).
+    /// ABM (LZCNT/TZCNT) is an x86-64-v3 member, not part of the x86-64
+    /// baseline: without `-march=` it stays off (`bsf`/`bsr` are emitted).
     #[test]
-    fn lzcnt_baseline_default_on() {
+    fn lzcnt_absent_from_default_baseline() {
         let mut d = Driver::new();
         let args: Vec<String> = ["ccc", "x.c"].iter().map(|s| s.to_string()).collect();
         assert!(d.parse_cli_args(&args).is_ok());
-        assert!(d.resolved_lzcnt(), "v3 baseline must project ABM");
+        assert!(!d.resolved_lzcnt(), "x86-64 baseline must not project ABM");
     }
 
-    /// Sticky `-mno-lzcnt` denial beats the v3 default baseline; the BMI
+    /// Sticky `-mno-lzcnt` denial beats an explicit v3 ceiling; the BMI
     /// classes are unaffected (independent ISA groups).
     #[test]
-    fn mno_lzcnt_sticky_denial_beats_default_baseline() {
+    fn mno_lzcnt_sticky_denial_beats_v3_march() {
         let mut d = Driver::new();
-        let args: Vec<String> = ["ccc", "-mno-lzcnt", "x.c"]
+        let args: Vec<String> = ["ccc", "-march=x86-64-v3", "-mno-lzcnt", "x.c"]
             .iter()
             .map(|s| s.to_string())
             .collect();
         assert!(d.parse_cli_args(&args).is_ok());
-        assert!(!d.resolved_lzcnt(), "-mno-lzcnt must deny the v3 default");
+        assert!(!d.resolved_lzcnt(), "-mno-lzcnt must deny the v3 class");
         assert!(d.resolved_bmi1());
         assert!(d.resolved_bmi2());
     }
@@ -2958,18 +2980,19 @@ mod cli_tests {
         assert!(d.resolved_lzcnt());
     }
 
-    /// POPCNT joined the baseline at x86-64-v2, so the v3 default
-    /// projects it; sticky `-mno-popcnt` wins; a later `-mpopcnt` lifts
-    /// the denial; an explicit v1 ceiling removes it.
+    /// POPCNT is a x86-64-v2 member: absent `-march=` (the x86-64 baseline)
+    /// it is off. Under an explicit v3 ceiling a sticky `-mno-popcnt` wins,
+    /// a later `-mpopcnt` lifts the denial, and an explicit v1 ceiling
+    /// removes it.
     #[test]
-    fn popcnt_baseline_default_on_sticky_denial_and_ceiling() {
+    fn popcnt_absent_by_default_sticky_denial_and_ceiling() {
         let mut d = Driver::new();
         let args: Vec<String> = ["ccc", "x.c"].iter().map(|s| s.to_string()).collect();
         assert!(d.parse_cli_args(&args).is_ok());
-        assert!(d.resolved_popcnt(), "v3 baseline must project POPCNT");
+        assert!(!d.resolved_popcnt(), "x86-64 baseline must not project POPCNT");
 
         let mut d2 = Driver::new();
-        let args2: Vec<String> = ["ccc", "-mno-popcnt", "x.c"]
+        let args2: Vec<String> = ["ccc", "-march=x86-64-v3", "-mno-popcnt", "x.c"]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -2980,7 +3003,7 @@ mod cli_tests {
         );
 
         let mut d3 = Driver::new();
-        let args3: Vec<String> = ["ccc", "-mno-popcnt", "-mpopcnt", "x.c"]
+        let args3: Vec<String> = ["ccc", "-march=x86-64-v3", "-mno-popcnt", "-mpopcnt", "x.c"]
             .iter()
             .map(|s| s.to_string())
             .collect();

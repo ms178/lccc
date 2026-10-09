@@ -168,6 +168,10 @@ pub(super) struct ParsedDeclAttrs {
 
     /// `__seg_gs` or `__seg_fs` qualifier encountered.
     pub parsing_address_space: AddressSpace,
+    /// Object space of the most recently parsed declarator (see
+    /// `DeclAttributes::object_space`). Read by the caller right after it parses
+    /// a declarator; always written by `parse_declarator_with_attrs`.
+    pub parsing_object_space: AddressSpace,
 
     // --- GCC attributes with values ---
     /// `__attribute__((alias("target")))` target symbol name.

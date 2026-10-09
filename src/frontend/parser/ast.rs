@@ -615,6 +615,12 @@ pub struct DeclAttributes {
     pub diagnose_as: Option<String>,
     /// __attribute__((regparm(N))) on a function declaration.
     pub regparm: Option<u8>,
+    /// Segment space of the declared OBJECT itself when the declarator has a
+    /// pointer level: the `__percpu`/`__seg_gs` written after the last `*`
+    /// (`struct item *__percpu slot`, `struct item *__percpu table[3]`).
+    /// `Default` otherwise; a non-pointer object takes its space from the
+    /// declaration qualifier instead.
+    pub object_space: AddressSpace,
 }
 
 /// Bit masks for boolean flags in `DeclAttributes::flags`.
@@ -792,7 +798,11 @@ pub struct InitDeclarator {
 /// Derived parts of a declarator (pointers, arrays, function params).
 #[derive(Debug, Clone)]
 pub enum DerivedDeclarator {
-    Pointer,
+    /// A pointer level. The space is the address space of the POINTEE: the
+    /// `__seg_gs`/`__percpu` qualifier written between this `*` and the `*`
+    /// before it (`struct perf_event * __percpu *p`: the second level's pointee
+    /// `struct perf_event *` lives in %gs). `Default` for an ordinary level.
+    Pointer(AddressSpace),
     Array(Option<Box<Expr>>),
     Function(Vec<ParamDecl>, bool), // params, variadic
     /// Function pointer: (*name)(params) - distinguishes from pointer-to-return-type
@@ -848,7 +858,7 @@ impl DerivedDeclarator {
         };
         slice
             .iter()
-            .filter(|d| matches!(d, DerivedDeclarator::Pointer))
+            .filter(|d| matches!(d, DerivedDeclarator::Pointer(_)))
             .count()
     }
 }

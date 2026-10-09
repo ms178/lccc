@@ -19,7 +19,7 @@ Usage (two terminals, or background the QEMU side):
 
     qemu-system-x86_64 ... -s -S -accel tcg &      # -s = gdbstub on :1234
     scripts/qemu_gdbstub_probe.py --port 1234 \\
-        --system-map /opt/kwork/linux-6.18.52/System.map \\
+        --system-map /opt/kwork/linux-6.18.55/System.map \\
         --break free_large_kmalloc \\
         --reg rsi --until-range 0xffffffff81000000-0xffffffff82300000 \\
         --stack-scan --max-hits 4000

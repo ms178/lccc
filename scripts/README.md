@@ -16,7 +16,7 @@ standalone `LCCC-RECOVER.py` survives a worktree reset. See the
 | `build_lccc_o1_j2.sh` | Ship-quality release: Rust opt-level 1, two Cargo jobs, thin LTO, swap active, manifest-selected current Rust/Cargo release, and warnings denied by default. |
 | `ensure_swap.sh` | Idempotently verify swap or recreate/activate the disposable 8 GiB `/swapfile` after a constrained-harness root reset; both compiler build scripts invoke it. |
 | `arena_session_restore.sh` | Rehydrates swap, the manifest-selected current Rust/Cargo toolchain, host multilib/kernel packages, git metadata and fastbuild after an Arena reset. |
-| `prepare_kernel_tree.sh` | Recreate Linux 6.18.52 with the linux-cachymod patch series and generated boot headers after a harness wipe. |
+| `prepare_kernel_tree.sh` | Recreate Linux 6.18.55 with the linux-cachymod patch series and generated boot headers after a harness wipe. |
 | `build_kernel_boot.sh` | Build all x86 real-mode setup objects with LCCC (`-ffunction-sections`), link with `lccc-ld --gc-sections`, preserve non-relocation boot payloads through a build-local `KEEP` script, enforce the authentic 32 KiB ASSERTs, and require flat-image byte identity with available BFD/LLD oracles. |
 | `elf_sections.sh` | Shared ELF section helper: `lccc_elf_code_bytes` sums every `SHF_EXECINSTR` section of an object. Sourced by the size harnesses, because summing sections named `.text*` reports `header.o` and `bioscall.o` as 0 bytes (their code is in `.bstext`/`.entrytext`/`.inittext`) and understates `tty.o`'s gap against GCC from +184 to +57. |
 | `realmode_corpus.sh` | Compare LCCC/GCC executable (`SHF_EXECINSTR`) bytes per `arch/x86/boot` C file under the real `-m16 -Os` flags. |
