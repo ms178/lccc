@@ -436,6 +436,14 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_seg_named_decl_qualifier.sh
 
+      # Executed __seg_gs regression: GS base points at a buffer, every
+      # segment load/store/aggregate copy/typedef pointer is self-checked at
+      # -O0/-O1/-O2 and compared with gcc -O2 output (D2, D4, D7).
+      - name: Run __seg_gs runtime regression
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_seg_gs_runtime.sh
+
       # BB-SLP red-team battery: the 2026-09-16 semantic audit closed three
       # P0 soundness holes (dangling lane uses via Call/Phi/InlineAsm/
       # atomics; the store->load forwarding hazard; cross-seed reordering

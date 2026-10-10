@@ -211,6 +211,16 @@ pub enum AddressSpace {
     SegFs,
 }
 
+impl std::fmt::Display for AddressSpace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            AddressSpace::Default => "generic",
+            AddressSpace::SegGs => "__seg_gs",
+            AddressSpace::SegFs => "__seg_fs",
+        })
+    }
+}
+
 /// Represents C types in the compiler.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CType {

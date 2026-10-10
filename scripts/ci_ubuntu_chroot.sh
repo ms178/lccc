@@ -61,7 +61,11 @@ case $REPO in
 esac
 # What the runner image provides that the gates use (compiler, binutils, make,
 # python3, git, file), plus what ci.yml's "Install i686 C runtime" step adds.
-PACKAGES=build-essential,gcc-multilib,libc6-dev-i386,python3,python3-yaml,git,file,binutils,make,bc,xz-utils,ca-certificates,perl
+PACKAGES=build-essential,gcc-multilib,libc6-dev-i386,python3,python3-yaml,git,file,binutils,make,bc,xz-utils,ca-certificates,perl,curl
+# The runner image also carries GCC 14 with its C++ runtime development files:
+# the lccc driver picks the newest /usr/lib/gcc/<triple>/<ver> and links -lstdc++
+# from it, so gcc-14 without libstdc++-14-dev fails the C++ linker tests.
+PACKAGES=$PACKAGES,gcc-14,g++-14,libstdc++-14-dev
 
 stamp=$ROOT/.lccc-ci-ready
 if [[ ! -e $stamp ]]; then
@@ -93,6 +97,16 @@ if [[ ! -e $stamp ]]; then
         getent passwd $uid >/dev/null || useradd -m -u $uid -g $gid -s /bin/bash $name"
     sudo touch "$stamp"
 fi
+# A chroot bootstrapped before a package was added to PACKAGES keeps the stamp,
+# so any package it lacks is installed here instead of being silently absent.
+missing=()
+for pkg in ${PACKAGES//,/ }; do
+    sudo chroot "$ROOT" dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
+done
+if ((${#missing[@]})); then
+    echo "[ci-chroot] installing into the existing chroot: ${missing[*]}"
+    sudo chroot "$ROOT" sh -c "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends ${missing[*]} >/dev/null"
+fi
 [[ $SETUP_ONLY == 1 ]] && { echo "[ci-chroot] ready: $ROOT"; exit 0; }
 
 # Bind mounts are torn down on every exit path; a leaked /proc mount would
@@ -112,9 +126,21 @@ bind() { # bind SRC DST-inside-root
 }
 bind /proc /proc
 bind /dev /dev
+bind /dev/pts /dev/pts
 bind /sys /sys
 bind /dev/shm /dev/shm
 bind "$HOME" "$HOME"
+# Symlinks directly under $HOME may point outside it: a workstation can keep the
+# repository, cargo and rustup in a bulk store (`~/lccc -> /var/tmp/...`). The
+# link resolves on the host but dangles inside the chroot, so every such target
+# is bound at its own path. Bound paths are unmounted by the cleanup trap.
+while IFS= read -r -d '' link; do
+    target=$(readlink -f -- "$link")
+    case $target in
+        "$HOME" | "$HOME"/*) ;;
+        *) bind "$target" "$target" ;;
+    esac
+done < <(find "$HOME" -mindepth 1 -maxdepth 1 -type l -print0)
 sudo mkdir -p "$ROOT/tmp" && sudo chmod 1777 "$ROOT/tmp"
 
 cmd=$(printf '%q ' "$@")

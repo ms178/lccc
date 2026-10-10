@@ -850,7 +850,7 @@ impl Lowerer {
             .iter()
             .enumerate()
             .map(|(i, a)| {
-                let mut val = self.lower_expr(a);
+                let mut val = self.lower_aggregate_rvalue(a);
                 // A call argument is a **conversion boundary**, so the source
                 // type must be the type of the value `lower_expr` actually
                 // produced, not the storage-level query.

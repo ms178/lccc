@@ -1277,7 +1277,7 @@ impl Lowerer {
         // (packed bitfields that span storage unit boundaries).
         if let Some((bit_offset, bit_width)) = bitfield {
             return self.extract_bitfield_from_addr(
-                field_addr, storage_ty, bit_offset, bit_width, sso, is_vol,
+                field_addr, storage_ty, bit_offset, bit_width, sso, is_vol, addr_space,
             );
         }
 

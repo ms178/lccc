@@ -75,13 +75,12 @@ impl Lowerer {
             // Register before evaluating initializer so self-referential
             // initializers (e.g., `struct Node n = {&n}`) can resolve.
             let mut ginfo = GlobalInfo::from_analysis(&da);
-            ginfo.var.address_space = decl.address_space;
-            if let Some(ref mut ct) = ginfo.var.c_type {
-                crate::common::type_builder::apply_declaration_address_space(
-                    ct,
-                    decl.address_space,
-                );
-            }
+            ginfo.var.address_space = crate::common::type_builder::place_declared_space(
+                ginfo.var.c_type.as_mut(),
+                decl.address_space,
+                &decl.type_spec,
+                &declarator.derived,
+            );
             self.globals.insert(declarator.name.clone(), ginfo);
 
             let init = self.lower_declarator_init(decl, declarator, &da);
@@ -230,10 +229,12 @@ impl Lowerer {
         }
         let mut ginfo = GlobalInfo::from_analysis(&da);
         ginfo.asm_register = Some(reg_name.clone());
-        ginfo.var.address_space = decl.address_space;
-        if let Some(ref mut ct) = ginfo.var.c_type {
-            crate::common::type_builder::apply_declaration_address_space(ct, decl.address_space);
-        }
+        ginfo.var.address_space = crate::common::type_builder::place_declared_space(
+            ginfo.var.c_type.as_mut(),
+            decl.address_space,
+            &decl.type_spec,
+            &declarator.derived,
+        );
         self.globals.insert(declarator.name.clone(), ginfo);
         true
     }
@@ -270,13 +271,12 @@ impl Lowerer {
                 da.apply_vector_size(vs);
             }
             let mut ginfo = GlobalInfo::from_analysis(&da);
-            ginfo.var.address_space = decl.address_space;
-            if let Some(ref mut ct) = ginfo.var.c_type {
-                crate::common::type_builder::apply_declaration_address_space(
-                    ct,
-                    decl.address_space,
-                );
-            }
+            ginfo.var.address_space = crate::common::type_builder::place_declared_space(
+                ginfo.var.c_type.as_mut(),
+                decl.address_space,
+                &decl.type_spec,
+                &declarator.derived,
+            );
             self.globals.insert(declarator.name.clone(), ginfo);
         }
         // For extern TLS variables, emit an IrGlobal so codegen uses TLS access patterns.

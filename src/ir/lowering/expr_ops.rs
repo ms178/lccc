@@ -1835,12 +1835,13 @@ impl Lowerer {
         is_inc: bool,
         return_new: bool,
     ) -> Option<Operand> {
-        let (field_addr, storage_ty, bit_offset, bit_width, sso) =
+        let (field_addr, storage_ty, bit_offset, bit_width, sso, seg) =
             self.resolve_bitfield_lvalue(inner)?;
 
         let is_vol = self.expr_access_is_volatile(inner);
-        let current_val = self
-            .extract_bitfield_from_addr(field_addr, storage_ty, bit_offset, bit_width, sso, is_vol);
+        let current_val = self.extract_bitfield_from_addr(
+            field_addr, storage_ty, bit_offset, bit_width, sso, is_vol, seg,
+        );
         let current_ty = crate::ir::lowering::expr_types::bitfield_promoted_type(
             storage_ty,
             Some((bit_offset, bit_width)),
@@ -1866,6 +1867,7 @@ impl Lowerer {
             store_val,
             self.expr_access_is_volatile(inner),
             sso,
+            seg,
         );
 
         if return_new {

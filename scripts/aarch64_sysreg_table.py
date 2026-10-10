@@ -121,12 +121,52 @@ def sha256_of(path: Path) -> str:
     return digest.hexdigest()
 
 
-def find_def(explicit_def: str | None, tarball: str | None) -> tuple[list[str], dict[str, int]]:
+def provenance_sysregs_digest(prefix: Path) -> str | None:
+    """The sysregs_def_sha256 recorded by ensure_gas_247.sh for this prefix."""
+    marker = prefix / ".lccc-binutils-provenance"
+    if not marker.is_file():
+        return None
+    for line in marker.read_text().splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key == "sysregs_def_sha256":
+            return value
+    return None
+
+
+def installed_def(as_bin: str | None) -> Path | None:
+    """The table ensure_gas_247.sh installed beside the --as binary, if any.
+
+    This is the table of the exact binutils that the differential checks run
+    against, and it is what a cache hit restores (the prefix is cached; ~/dl
+    is not). Its bytes must match the digest the provisioner recorded.
+    """
+    if not as_bin:
+        return None
+    prefix = Path(as_bin).resolve().parent.parent
+    cand = prefix / "share" / "lccc" / "aarch64-sys-regs.def"
+    return cand if cand.is_file() else None
+
+
+def find_def(explicit_def: str | None, tarball: str | None,
+             as_bin: str | None = None) -> tuple[list[str], dict[str, int]]:
     """(names, name -> encoding) from binutils' own system-register table."""
     text = None
     if explicit_def:
         text = Path(explicit_def).read_text()
     else:
+        installed = installed_def(as_bin)
+        if installed is not None:
+            prefix = installed.parents[2]
+            want = provenance_sysregs_digest(prefix)
+            if want is None:
+                die(f"{installed} has no recorded digest in {prefix}/"
+                    ".lccc-binutils-provenance; re-provision with ensure_gas_247.sh", 2)
+            got = sha256_of(installed)
+            if got != want:
+                die(f"{installed} sha256 {got} does not match the provisioned "
+                    f"digest {want}; re-provision with ensure_gas_247.sh", 2)
+            text = installed.read_text()
+    if text is None:
         candidates = []
         if tarball:
             candidates.append(Path(tarball))
@@ -410,7 +450,7 @@ def main() -> int:
 
     as_bin = args.as_bin or shutil.which("aarch64-linux-gnu-as")
     objcopy = args.objcopy or shutil.which("aarch64-linux-gnu-objcopy")
-    names, def_enc = find_def(args.def_file, args.tarball)
+    names, def_enc = find_def(args.def_file, args.tarball, as_bin)
     candidates = names + [n for n in PSTATE_CANDIDATES if n not in def_enc]
 
     if args.regenerate:
