@@ -33,6 +33,26 @@ struct DeclContext {
     is_common: bool,
 }
 
+/// Apply a declaration-level named address space to a parsed type: it lands
+/// on the innermost pointer (closest to the base type), matching
+/// `type_builder::apply_declaration_address_space` on the CType side.
+fn apply_decl_address_space_to_spec(ts: &mut TypeSpecifier, space: AddressSpace) {
+    if space == AddressSpace::Default {
+        return;
+    }
+    match ts {
+        TypeSpecifier::Pointer(inner, sp) => {
+            if matches!(inner.as_ref(), TypeSpecifier::Pointer(..)) {
+                apply_decl_address_space_to_spec(inner, space);
+            } else {
+                *sp = space;
+            }
+        }
+        TypeSpecifier::Array(elem, _) => apply_decl_address_space_to_spec(elem, space),
+        _ => {}
+    }
+}
+
 impl Parser {
     pub(super) fn parse_external_decl(&mut self) -> Option<ExternalDecl> {
         // Reset all declaration-level flags before parsing the next declaration.
@@ -114,6 +134,9 @@ impl Parser {
             }
             None
         })?;
+        // Capture the declaration's named address space before any declarator
+        // (parameter lists in particular) is parsed; see ParsedDeclAttrs.
+        self.attrs.decl_address_space = std::mem::take(&mut self.attrs.parsing_address_space);
 
         // Capture constructor/destructor from type-level attributes
         let type_level_ctor = self.attrs.parsing_constructor();
@@ -128,7 +151,7 @@ impl Parser {
                 None,
                 None,
                 None,
-                self.attrs.parsing_address_space,
+                self.attrs.decl_address_space,
                 self.attrs.parsing_vector_size.take(),
                 self.attrs.parsing_ext_vector_nelem.take(),
                 start,
@@ -289,7 +312,11 @@ impl Parser {
         let is_noinline = self.attrs.parsing_noinline();
 
         // Build return type from derived declarators
-        let return_type = self.build_return_type(type_spec, &derived);
+        let mut return_type = self.build_return_type(type_spec, &derived);
+        // `struct c __seg_gs *f(void) { ... }`: the declaration-level qualifier
+        // qualifies the return type's innermost pointer, as it does for
+        // prototypes (sema applies it to CType::Function's return type).
+        apply_decl_address_space_to_spec(&mut return_type, self.attrs.decl_address_space);
 
         // Shadow typedef names used as parameter names
         let mut shadowed_added: Vec<String> = Vec::new();
@@ -596,7 +623,7 @@ impl Parser {
         // Same snapshot rationale as parse_local_declaration: initializer
         // casts to segment-qualified pointers clear parsing_address_space
         // before Declaration::new would read it.
-        let decl_addr_space = self.attrs.parsing_address_space;
+        let decl_addr_space = self.attrs.decl_address_space;
         let init = if self.consume_if(&TokenKind::Assign) {
             Some(self.parse_initializer())
         } else {

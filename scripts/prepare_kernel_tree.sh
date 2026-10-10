@@ -1,16 +1,31 @@
 #!/usr/bin/env bash
 # ============================================================================
-# prepare_kernel_tree.sh — regenerate the patched linux-cachymod-6.18.52 tree
-# used by build_kernel_boot.sh / realmode_corpus.sh.
+# prepare_kernel_tree.sh — regenerate the patched linux-cachymod-6.18.55 tree
+# used by build_kernel_boot.sh / build_kernel_vm.sh / realmode_corpus.sh.
 #
 # The Arena workspace snapshot is capped (~128 MiB / 10k files), so the
 # ~55k-file kernel tree and the 155 MiB tarball do NOT survive a harness wipe
 # between turns even though /home/user is persisted.  This script makes the
-# tree cheap to regenerate deterministically (~3 min): download, extract,
-# apply the 28 CachyMod patches in PKGBUILD source order, configure with the
-# package's real config, run `make prepare` (host tooling = gcc), and create
-# the boot-code stubs (capflags.c, utsversion.h, zoffset.h, voffset.h) that a
-# full Kbuild would otherwise generate.
+# tree cheap to regenerate deterministically (~3 min): download, verify,
+# extract, apply the CachyMod patch series, configure with the package's real
+# config, run `make prepare` with LCCC, and create the boot-code stubs
+# (capflags.c, utsversion.h, zoffset.h, voffset.h) that a full Kbuild would
+# otherwise generate.
+#
+# Single sources of truth (read from the archpkgbuilds PKGBUILD, never copied):
+#   * version      _major / _minor          (-> KVER)
+#   * release      pkgrel                   (-> localversion.10-pkgrel)
+#   * tarball      sha256sums[0]            (verified before extraction)
+#   * patch list   source=() *.patch order, with prepare()'s own filters
+#                  (-prevent-avx2, -prjc, -prjc-s) — so a PKGBUILD bump is
+#                  picked up without touching this script.
+#
+# Compiler policy: kernel translation units are compiled ONLY by LCCC.
+# `make prepare` builds include/generated/asm-offsets.h from
+# kernel/asm-offsets.c, which is kernel code, so it runs with CC=$LCCC.  Host
+# tools (kconfig, fixdep, mkcpustr, ...) stay on HOSTCC=gcc: they are build
+# machinery, not generated code.  The stamp records the compiler, and a stamp
+# written by an older GCC-prepared tree forces a re-run under LCCC.
 #
 # Idempotent: a completed tree is stamped with .lccc-prepared and skipped.
 # The canary set below must all exist; the ~10k-file snapshot cap truncates
@@ -34,7 +49,7 @@ LCCC_PREPARED_CANARIES=(
 )
 #
 # Usage:
-#   prepare_kernel_tree.sh [kernel-dir]          (default: /home/user/target/kernel-work/linux-6.18.52)
+#   prepare_kernel_tree.sh [kernel-dir]          (default: $KERNEL_WORK/linux-$KVER)
 # Environment:
 #   PKG_ROOT archpkgbuilds checkout root (default: /home/user/archpkgbuilds).
 #            Point it outside the workspace snapshot (e.g. /opt/archpkgbuilds)
@@ -42,16 +57,19 @@ LCCC_PREPARED_CANARIES=(
 #            size-capped persisted snapshot.
 #   PKGDIR   archpkgbuilds sparse checkout of packages/linux-cachymod-6.18
 #            (default: $PKG_ROOT/packages/linux-cachymod-6.18)
-#   KVER     kernel version (default 6.18.52)
+#   KVER     kernel version (default: derived from PKGBUILD _major.minor)
+#   LCCC     compiler for kernel TUs (default: <repo>/target/fastbuild/lccc)
+#   LCCC_CPUSCHED / LCCC_PREVENT_AVX2   PKGBUILD option mirrors (eevdf / no)
+#   LCCC_PKGREL  override pkgrel (default: PKGBUILD pkgrel)
 # ============================================================================
 set -euo pipefail
 
-KDIR=${1:-${KERNEL_DIR:-/home/user/target/kernel-work/linux-6.18.52}}
-KVER=${KVER:-6.18.52}
-WORK=$(dirname "$KDIR")
-TARBALL="$WORK/linux-$KVER.tar.xz"
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+LCCC=${LCCC:-$REPO_ROOT/target/fastbuild/lccc}
+KERNEL_WORK=${KERNEL_WORK:-/home/user/target/kernel-work}
 
-# The 28 CachyMod patches and the package config live in a sibling repository,
+# The 28+ CachyMod patches and the package config live in a sibling repository,
 # and the Arena snapshot does not persist it: a fresh sandbox has the tarball URL
 # but nothing to patch with, so this script used to die before downloading
 # anything.  Fetch it bloblessly (one directory of one repo) instead, which makes
@@ -94,6 +112,46 @@ ensure_pkgdir || {
   echo "  clone $PKG_REPO yourself, or point PKGDIR at an existing checkout" >&2
   exit 1
 }
+PKGBUILD="$PKGDIR/PKGBUILD"
+[[ -r $PKGBUILD ]] || { echo "prepare_kernel_tree: no PKGBUILD in $PKGDIR" >&2; exit 1; }
+
+# ---- PKGBUILD readers --------------------------------------------------------
+pkgbuild_scalar() { # pkgbuild_scalar <name> -> value of `name=value` (first match)
+  sed -n "s/^$1=\\([^ #]*\\).*/\\1/p" "$PKGBUILD" | head -n 1
+}
+# Patch names in source=() order, exactly the entries prepare() would consider.
+# Comments are stripped first (the array carries commented-out URLs); URLs and
+# unexpanded variables are not local patch files and are skipped.
+pkgbuild_patch_sources() {
+  awk '/^source=\(/{f=1; next} f && /^\)/{f=0} f' "$PKGBUILD" \
+    | sed 's/#.*$//' | tr -s ' \t' '\n' | tr -d '"' \
+    | grep -E '\.patch$' | grep -vE '[$:/]' || true
+}
+
+PKG_MAJOR=$(pkgbuild_scalar _major)
+PKG_MINOR=$(pkgbuild_scalar _minor)
+PKG_RELEASE=$(pkgbuild_scalar pkgrel)
+[[ -n $PKG_MAJOR && -n $PKG_MINOR && -n $PKG_RELEASE ]] || {
+  echo "prepare_kernel_tree: cannot read _major/_minor/pkgrel from $PKGBUILD" >&2
+  exit 1
+}
+PKG_KVER="$PKG_MAJOR.$PKG_MINOR"
+KVER=${KVER:-$PKG_KVER}
+if [[ $KVER != "$PKG_KVER" ]]; then
+  # A tree for a different revision than the PKGBUILD describes would apply the
+  # wrong patch series.  Refuse rather than silently mix revisions.
+  echo "prepare_kernel_tree: KVER=$KVER but $PKGBUILD pins $PKG_KVER" >&2
+  exit 1
+fi
+PKG_TARBALL_SHA256=$(sed -n "s/^sha256sums=('\\([0-9a-f]\\{64\\}\\)'.*/\\1/p" "$PKGBUILD" | head -n 1)
+[[ -n $PKG_TARBALL_SHA256 ]] || { echo "prepare_kernel_tree: no sha256sums[0] in $PKGBUILD" >&2; exit 1; }
+
+KDIR=${1:-${KERNEL_DIR:-$KERNEL_WORK/linux-$KVER}}
+WORK=$(dirname "$KDIR")
+TARBALL="$WORK/linux-$KVER.tar.xz"
+PKGREL=${LCCC_PKGREL:-$PKG_RELEASE}
+CPUSCHED=${LCCC_CPUSCHED:-eevdf}
+PREVENT_AVX2=${LCCC_PREVENT_AVX2:-no}
 
 # `make olddefconfig`/`make prepare` need host tools that are not part of the
 # LCCC build and therefore easy to have absent on a fresh machine; failing
@@ -102,7 +160,7 @@ preflight_host_tools() {
   local missing=() tool comp cfgname
   # kconfig lexers/parsers, plus the unconditional build-time host tools.
   for tool in make gcc ld ar nm objcopy perl awk sed bc flex bison cpio \
-              xz patch tar; do
+              xz patch tar sha256sum; do
     command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
   done
   # Compression tool implied by the package config (KERNEL_ZSTD=y upstream).
@@ -128,7 +186,7 @@ preflight_host_tools() {
     echo "prepare_kernel_tree: missing host tools: ${missing[*]}" >&2
     echo "  Build machines only; never built with LCCC." >&2
     echo "  Debian/Ubuntu: apt-get install build-essential flex bison libelf-dev \\" >&2
-    echo "    libssl-dev bc cpio kmod dwarves zstd xz-utils lz4 lzop bzip2" >&2
+    echo "    libssl-dev bc cpio kmod dwarves zstd lz4 lzop bzip2" >&2
     return 1
   fi
   echo "prepare_kernel_tree: host tools OK"
@@ -137,15 +195,43 @@ preflight_host_tools || exit 1
 
 # Already prepared?  Verify the stamp AND a canary file the snapshot truncation
 # removed last time (setup.ld); a damaged tree must regenerate, not half-work.
-if [[ -f "$KDIR/.lccc-prepared" ]] && [[ -f "$KDIR/${LCCC_PREPARED_CANARIES[0]}" ]]; then
-  ok=1
+# A tree stamped by another compiler gets only the LCCC `make prepare` rerun.
+compiler_id() { # identity of the kernel compiler, recorded in the stamp
+  printf 'compiler=%s version=%s\n' "$LCCC" "$("$LCCC" --version 2>/dev/null | head -n 1)"
+}
+require_lccc() {
+  [[ -x $LCCC ]] || {
+    echo "prepare_kernel_tree: LCCC compiler missing: $LCCC" >&2
+    echo "  Kernel translation units (asm-offsets.c) must be built by LCCC, never GCC." >&2
+    echo "  Build it first: scripts/build_lccc_fast.sh" >&2
+    exit 1
+  }
+}
+# Configure + generate headers with LCCC for the kernel TUs; host tools via gcc.
+lccc_make_prepare() {
+  # olddefconfig FIRST, under the same CC: it answers NEW symbols with defaults
+  # without reading stdin, so the syncconfig inside `prepare` cannot prompt
+  # (the kernel's cc-option visibility differs between gcc and lccc).
+  make ARCH=x86_64 CC="$LCCC" HOSTCC=gcc olddefconfig >/dev/null
+  make ARCH=x86_64 CC="$LCCC" HOSTCC=gcc prepare -j"$(nproc)"
+}
+canaries_ok() {
+  local c
   for c in "${LCCC_PREPARED_CANARIES[@]}"; do
-    [[ -f "$KDIR/$c" ]] || { ok=0; echo "prepare_kernel_tree: canary missing: $c" >&2; break; }
+    [[ -f "$KDIR/$c" ]] || { echo "prepare_kernel_tree: canary missing: $c" >&2; return 1; }
   done
-  if [[ $ok == 1 ]]; then
+}
+if [[ -f "$KDIR/.lccc-prepared" ]] && [[ -f "$KDIR/${LCCC_PREPARED_CANARIES[0]}" ]] && canaries_ok; then
+  require_lccc
+  if [[ $(cat "$KDIR/.lccc-prepared") == "$(compiler_id)" ]]; then
     echo "prepare_kernel_tree: $KDIR already prepared (stamp + canaries OK)"
     exit 0
   fi
+  echo "prepare_kernel_tree: $KDIR was prepared by a different compiler; re-running LCCC make prepare"
+  (cd "$KDIR" && lccc_make_prepare)
+  (cd "$KDIR" && compiler_id > .lccc-prepared)
+  echo "prepare_kernel_tree: $KDIR re-prepared with LCCC"
+  exit 0
 fi
 
 mkdir -p "$WORK"
@@ -154,11 +240,20 @@ cd "$WORK"
 # ---- 1. source tarball ------------------------------------------------------
 # The workspace snapshot truncates large files (~128 MB cap): a stale tarball
 # can be present but truncated. `xz -t` validates integrity cheaply (~2 s);
-# a corrupt archive is re-downloaded instead of failing mid-extract.
-if [[ ! -f "linux-$KVER.tar.xz" ]] || ! xz -t "linux-$KVER.tar.xz" 2>/dev/null; then
+# a corrupt archive is re-downloaded instead of failing mid-extract.  The
+# PKGBUILD's sha256 is the authority: an archive that passes `xz -t` but is
+# not the kernel.org release is rejected.
+tarball_ok() {
+  [[ -f $TARBALL ]] && xz -t "$TARBALL" 2>/dev/null \
+    && [[ $(sha256sum "$TARBALL" | cut -d' ' -f1) == "$PKG_TARBALL_SHA256" ]]
+}
+if ! tarball_ok; then
   echo "prepare_kernel_tree: downloading linux-$KVER.tar.xz"
-  curl -sSL -o "linux-$KVER.tar.xz" "https://cdn.kernel.org/pub/linux/kernel/v${KVER%%.*}.x/linux-$KVER.tar.xz"
-  xz -t "linux-$KVER.tar.xz" || { echo "prepare_kernel_tree: download corrupt" >&2; exit 1; }
+  curl -sSL -o "$TARBALL" "https://cdn.kernel.org/pub/linux/kernel/v${KVER%%.*}.x/linux-$KVER.tar.xz"
+  tarball_ok || {
+    echo "prepare_kernel_tree: download failed sha256 check against PKGBUILD ($PKG_TARBALL_SHA256)" >&2
+    exit 1
+  }
 fi
 
 # ---- 2. extract -------------------------------------------------------------
@@ -167,33 +262,29 @@ rm -rf "$KDIR"
 # tar may exit non-zero on benign "Directory renamed before its status could
 # be extracted" warnings (a GNU tar quirk when a directory's metadata changes
 # between tar's open and its later utime/chmod pass, seen under load on
-# FUSE/overlayfs). Real corruption is caught by the `xz -t` above and by the
+# FUSE/overlayfs). Real corruption is caught by the sha256 above and by the
 # sentinel check below; tolerate the warning stream but verify the tree.
 tar_err=$(mktemp)
 tar -xf "linux-$KVER.tar.xz" 2>"$tar_err" || true
 grep -v "Directory renamed before its status could be extracted" "$tar_err" >&2 || true
 rm -f "$tar_err"
-# Post-extract integrity: the archive passed `xz -t`, so a short tree means a
-# filesystem-level extraction problem. Check sentinel files spread across the
-# tree (not just the top-level Makefile) before trusting it.
-for sentinel in Makefile init/main.c arch/x86/Makefile kernel/sched/core.c include/linux/sched.h; do
-  if [ ! -f "$KDIR/$sentinel" ]; then
-    echo "prepare_kernel_tree: extraction incomplete (missing $sentinel); retrying" >&2
-    rm -rf "$KDIR"
-    tar -xf "linux-$KVER.tar.xz" || { echo "prepare_kernel_tree: tar failed on retry" >&2; exit 1; }
-    break
-  fi
-done
-for sentinel in Makefile init/main.c arch/x86/Makefile kernel/sched/core.c include/linux/sched.h; do
-  [ -f "$KDIR/$sentinel" ] || { echo "prepare_kernel_tree: tar extraction incomplete ($sentinel missing)" >&2; exit 1; }
-done
-# Whole-tree completeness: early sentinels all live in the alphabetical
-# head of the archive, so a mid-archive truncation passes them while
-# later files (observed: arch/x86/boot/compressed/vmlinux.lds.S, 97
-# files total) are silently absent and the failure only surfaces deep
-# inside a kernel build ("No rule to make target ... vmlinux.lds").
-# Compare the file count against the archive listing instead; a short
-# tree is re-extracted once before giving up.
+# Post-extract integrity: check sentinel files spread across the tree (not just
+# the top-level Makefile) before trusting it.  Early sentinels all live in the
+# alphabetical head of the archive, so a mid-archive truncation passes them
+# while later files are silently absent.  Compare the file count against the
+# archive listing; a short tree is re-extracted once before giving up.
+sentinels_ok() {
+  local s
+  for s in Makefile init/main.c arch/x86/Makefile kernel/sched/core.c include/linux/sched.h; do
+    [[ -f "$KDIR/$s" ]] || return 1
+  done
+}
+sentinels_ok || {
+  echo "prepare_kernel_tree: extraction incomplete (sentinel missing); retrying" >&2
+  rm -rf "$KDIR"
+  tar -xf "linux-$KVER.tar.xz" || { echo "prepare_kernel_tree: tar failed on retry" >&2; exit 1; }
+}
+sentinels_ok || { echo "prepare_kernel_tree: tar extraction incomplete (sentinel missing)" >&2; exit 1; }
 n_tar=$(tar -tf "linux-$KVER.tar.xz" | grep -v '/$' | wc -l)
 n_tree=$(cd "$KDIR" && find . \( -type f -o -type l \) -not -path './.git/*' | wc -l)
 if (( n_tree < n_tar )); then
@@ -208,71 +299,55 @@ cd "$KDIR"
 # ---- 2b. localversion files, exactly like prepare() --------------------------
 # PKGBUILD: echo "-$pkgrel" > localversion.10-pkgrel;
 #           echo "${pkgbase#linux}" > localversion.20-pkgname
-# (pkgrel=2.1, pkgbase=linux-cachymod at 6.18.52 time of writing).
-printf -- '-%s\n' "${LCCC_PKGREL:-2.1}" > localversion.10-pkgrel
+printf -- '-%s\n' "$PKGREL" > localversion.10-pkgrel
 printf -- '%s\n' "${LCCC_PKGBASE_SUFFIX:--cachymod}" > localversion.20-pkgname
 
 # ---- 3. apply the CachyMod patch series (PKGBUILD source order) -------------
-# Mirrors prepare() of the linux-cachymod-6.18 PKGBUILD with the default
-# options: _cpusched=eevdf, _prevent_avx2=no (0300-…-prevent-avx2 patch is
-# conditional and not in source=).
-# Updated for 6.18.52: 0300-oom-reaper-check-ms178.patch (v2, now in source=)
-# and 2000-kbuild-speedup-series-ms178.patch were added in PKGBUILD source
-# order; the localversion files are created exactly like prepare() does.
-PATCHES=(
-  0000-rt.patch
-  0004-bbr3.patch
-  0005-cachy.patch
-  0006-crypto.patch
-  0007-fixes.patch
-  0008-hdmi.patch
-  0010-sched-ext.patch
-  0040-revert-dot5-sched-change.patch
-  0050-misc-sched-fixes.patch
-  0060-fair-drm-sched.patch
-  0100-kconfig-add-800Hz.patch
-  0200-clearlinux-extras.patch
-  0210-cachymod-misc.patch
-  0260-fair-update-cachy-mods.patch
-  0280-prefer-prevcpu-for-wakeup.patch
-  0300-oom-reaper-check-ms178.patch
-  0001-ms178.patch
-  0002-ms178-stringopts.patch
-  0001-raptorlake-ms178.patch
-  0001-vega-ms178.patch
-  0001-bore.patch
-  0001-6.18.35-nap-v0.4.0.patch
-  0001-amd-vram-ms178.patch
-  0001-amd-explicit-sync-ms178.patch
-  0400-cache-aware-scheduling-v4-ms178.patch
-  0410-cache-aware-scheduling-cluster-aware-raptorlake.patch
-  1020-r8169-rtl8125-multi-queue-godlike.patch
-  2000-kbuild-speedup-series-ms178.patch
-)
-n=0
-for p in "${PATCHES[@]}"; do
-  if patch -Np1 --silent --forward < "$PKGDIR/$p" >/tmp/prepare-patch.log 2>&1; then
-    n=$((n+1))
-  elif grep -q "previously applied" /tmp/prepare-patch.log; then
-    n=$((n+1))
-  else
-    echo "prepare_kernel_tree: patch FAILED: $p" >&2
-    tail -5 /tmp/prepare-patch.log >&2
-    exit 1
-  fi
-done
-echo "prepare_kernel_tree: applied $n/${#PATCHES[@]} patches"
+# Mirrors prepare() of the PKGBUILD, including its option filters.  Deriving the
+# list from source=() (instead of a copy in this script) means the series can
+# never drift from the package: a 6.18.5x bump that adds or reorders a patch is
+# picked up automatically.
+apply_patch_series() {
+  local n=0 total=0 src
+  while IFS= read -r src; do
+    [[ -n $src ]] || continue
+    total=$((total+1))
+    case $src in
+      *-prevent-avx2*)
+        [[ $PREVENT_AVX2 =~ ^(yes|y|1)$ ]] || continue ;;
+    esac
+    case $src in
+      *-prjc.patch)
+        [[ $CPUSCHED =~ ^(bmq|pds)$ ]] || continue ;;
+      *-prjc-s.patch)
+        [[ $CPUSCHED =~ ^(bmq|pds)$ ]] || continue ;;
+    esac
+    [[ -f "$PKGDIR/$src" ]] || {
+      echo "prepare_kernel_tree: PKGBUILD lists $src but $PKGDIR lacks it" >&2
+      return 1
+    }
+    if patch -Np1 --silent --forward < "$PKGDIR/$src" >/tmp/prepare-patch.log 2>&1; then
+      n=$((n+1))
+    elif grep -q "previously applied" /tmp/prepare-patch.log; then
+      n=$((n+1))
+    else
+      echo "prepare_kernel_tree: patch FAILED: $src" >&2
+      tail -5 /tmp/prepare-patch.log >&2
+      return 1
+    fi
+  done < <(pkgbuild_patch_sources)
+  echo "prepare_kernel_tree: applied $n patches (PKGBUILD source=() lists $total .patch entries)"
+}
+apply_patch_series || exit 1
 
-# ---- 4. config + generated headers (host gcc) -------------------------------
-echo "prepare_kernel_tree: configuring (package config + olddefconfig + prepare)"
+# ---- 4. config + generated headers (LCCC for kernel TUs) --------------------
+require_lccc
+echo "prepare_kernel_tree: configuring (package config + olddefconfig + prepare with LCCC)"
 cp "$PKGDIR/config" .config
-# olddefconfig answers new symbols with defaults; it reads no stdin.  (A
-# `yes '' | make` here would abort the script under `set -o pipefail`: when
-# make exits, `yes` dies of SIGPIPE and its 141 poisons the pipeline status.)
-make ARCH=x86_64 olddefconfig >/dev/null
-# NOTE: stdout must stay visible — a silently-short `make prepare` once left
-# arch/x86/include/generated/asm/rwonce.h missing and every boot compile broke.
-make ARCH=x86_64 prepare -j"$(nproc)"
+# NOTE: stdout of make must stay visible — a silently-short `make prepare` once
+# left arch/x86/include/generated/asm/rwonce.h missing and every boot compile
+# broke.
+lccc_make_prepare
 
 # ---- 5. boot-code stubs a full Kbuild would generate ------------------------
 # capflags.c (mkcapflags.sh over cpufeatures.h)
@@ -280,7 +355,7 @@ make ARCH=x86_64 prepare -j"$(nproc)"
     ../../include/asm/cpufeatures.h ../../include/asm/vmxfeatures.h )
 
 # cpustr.h (arch/x86/boot/Makefile builds it with the mkcpustr host tool;
-# realmode_corpus.sh needs it for cpu.c but does not drive Kbuild)
+# realmode_corpus.sh needs it for cpu.c but does not drive Kbuild).  Host tool.
 if [[ ! -f arch/x86/boot/cpustr.h ]]; then
   gcc -O2 -Iarch/x86/include -Iarch/x86/include/generated -Iinclude \
       arch/x86/boot/mkcpustr.c -o "$WORK/mkcpustr"
@@ -328,5 +403,5 @@ EOF
 for c in "${LCCC_PREPARED_CANARIES[@]}"; do
   [[ -f "$c" ]] || { echo "prepare_kernel_tree: post-check failed, missing: $c" >&2; exit 1; }
 done
-touch .lccc-prepared
-echo "prepare_kernel_tree: $KDIR ready (stamp written)"
+compiler_id > .lccc-prepared
+echo "prepare_kernel_tree: $KDIR ready (stamp written: $(cat .lccc-prepared))"

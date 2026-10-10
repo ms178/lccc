@@ -183,7 +183,7 @@ def publish(patch: Path, workspace: Path, metadata: dict, *,
                   'git apply --check ms178-1.patch\ngit apply ms178-1.patch\n```\n\n'
                   f'Patch: **{identity.st_size:,} Bytes**  \nSHA-256: `{patch_sha}`\n\n'
                   '`UNGATED` bedeutet Zwischenstand, **keine** bestandene Gesamt-CI. '
-                  'Ein `PARTIAL-NOT-DELIVERABLE`-Stamp ersetzt ebenfalls keine vollständige CI. '
+                  'Der Stand wurde lokal mit `ci_local.sh --fast` geprüft; GitHub CI führt die übrigen Gates aus. '
                   'Einzelne validierte Änderungen stehen im Snapshot-Ledger; '
                   'der eingebettete Status wird nicht durch die Transportprüfung aufgewertet.\n').encode('utf-8')
         fd, name = tempfile.mkstemp(prefix='.ms178-1.zip-', suffix='.tmp', dir=workspace)

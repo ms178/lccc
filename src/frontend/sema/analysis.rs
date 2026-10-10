@@ -491,7 +491,7 @@ impl SemanticAnalyzer {
                 // Store resolved CType for the typedef.
                 // Use build_full_ctype_with_base to reuse the already-resolved base
                 // type, avoiding re-resolution of anonymous struct type specs.
-                let resolved_ctype = if declarator.derived.is_empty() {
+                let mut resolved_ctype = if declarator.derived.is_empty() {
                     base_type.clone()
                 } else {
                     type_builder::build_full_ctype_with_base(
@@ -500,6 +500,13 @@ impl SemanticAnalyzer {
                         &declarator.derived,
                     )
                 };
+                // Same declaration-level address space rule as variables
+                // (see analyze_declaration); lowering applies it to typedefs
+                // too (stmt.rs lower_local_typedef).
+                type_builder::apply_declaration_address_space(
+                    &mut resolved_ctype,
+                    decl.address_space,
+                );
                 // Mirror lowering's __attribute__((vector_size(N))) handling:
                 // without the Vector wrap, sema records `typedef float xmm_t
                 // __attribute__((vector_size(16)))` as a plain 4-byte float,
@@ -586,6 +593,12 @@ impl SemanticAnalyzer {
                     &init_decl.derived,
                 )
             };
+            // The declaration-level named address space (`struct c __seg_gs *p`,
+            // `struct c __seg_gs *f(void)`) qualifies the pointer it sits on.
+            // Lowering applies the same rule (stmt.rs / global_decl.rs); sema must
+            // agree or every expression naming this object is typed generic and
+            // a correct call is rejected as an address-space mismatch.
+            type_builder::apply_declaration_address_space(&mut full_type, decl.address_space);
 
             // Resolve incomplete array sizes from initializers (e.g., int arr[] = {1,2,3})
             // This must happen before storing the symbol so sizeof(arr) works in
