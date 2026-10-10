@@ -125,10 +125,22 @@ pub enum Directive {
     Type(String, SymbolType),
     /// `.size sym, expr`
     Size(String, SizeExpr),
-    /// `.align N` or `.p2align N` — power-of-2 alignment
-    Align(u64),
-    /// `.balign N` — byte alignment
-    Balign(u64),
+    /// `.align N` / `.p2align N[, fill[, max]]` — power-of-2 alignment.
+    ///
+    /// `bytes` is the resolved alignment (1 << exponent) and `tail` the fill
+    /// byte / padding cap. Both used to be dropped on the floor here: the same
+    /// source assembled to different bytes than GAS (`.p2align 4, 0xff` filled
+    /// with NOPs, `.p2align 4,,3` padded where GAS skips), which moves the
+    /// address of every label after the directive.
+    Align {
+        bytes: u64,
+        tail: crate::backend::asm_expr::AlignTail,
+    },
+    /// `.balign N[, fill]` — byte alignment, and deliberately no cap field:
+    /// GAS's `balign_directive` hands the backend an unlimited cap, so
+    /// `.balign 8,,2` pads 5 bytes where `.p2align 3,,2` skips (both measured
+    /// on as 2.47.20260726). A stray third operand is tolerated, not applied.
+    Balign { bytes: u64, fill: Option<u8> },
     /// `.byte val, val, ...`
     Byte(Vec<DataValue>),
     /// `.short val, ...` / `.hword` / `.2byte` / `.half`
@@ -380,36 +392,65 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
             // (the old `unwrap_or(0)` silently assembled `.align junk`
             // as align-1) and out-of-range exponents clamp to 63 into
             // the writer's signed-shift bucket.
-            let raw = args
-                .trim()
-                .split(',')
-                .next()
-                .and_then(|s| parse_int_literal(s.trim()).ok())
-                .ok_or_else(|| format!(".align: bad operand: {args}"))?;
+            let (first, rest) = split_align_args(args);
+            let raw =
+                parse_int_literal(first).map_err(|_| format!(".align: bad operand: {args}"))?;
             // Out-of-range exponents (negative or > 63) clamp to 63 —
             // NOT to 0: measured `.p2align -1` behaves like `.p2align 63`
             // (read.c's `address16 = ...` — same rule on every GAS
             // target), landing in the writer's signed-shift bucket.
-            Directive::Align(if (0..=63).contains(&raw) {
+            let exp = if (0..=63).contains(&raw) {
                 raw as u64
             } else {
                 63
-            })
+            };
+            let mut tail =
+                crate::backend::asm_expr::parse_align_tail(rest, ".p2align", parse_int_literal)
+                    .map_err(|e| e.replace(".p2align:", ".align:"))?;
+            // RISC-V has no padding cap. Its `.p2align` handler is
+            // `riscv_frag_align_code (int n)` — a single argument — and the
+            // generic fall-back it shares with `.balign` never sees the cap
+            // either, so the operand is read, validated, and dropped. Measured:
+            // `.p2align E,,M` pads identically for every M in {0,1,2,3,4,5,8,
+            // 11,12,20,40,2048,2049}. Silently honouring the cap instead — as
+            // this parser did until now — skips padding that GAS emits, moving
+            // every later address by up to the whole alignment quantum.
+            tail.max_pad = None;
+            Directive::Align {
+                bytes: 1u64 << exp,
+                tail,
+            }
         }
         ".balign" => {
             // Byte-count form: bare is a no-op (GAS-accepted), anything
             // else must be a non-negative power of two or it is an error
             // ("alignment not a power of 2"), never a silent default.
-            let tok = args.trim().split(',').next().unwrap_or("").trim();
-            let raw: i64 = if tok.is_empty() {
+            let (first, rest) = split_align_args(args);
+            let raw: i64 = if first.is_empty() {
                 1
             } else {
-                parse_int_literal(tok).map_err(|_| format!(".balign: bad operand: {args}"))?
+                parse_int_literal(first).map_err(|_| format!(".balign: bad operand: {args}"))?
             };
             if raw < 0 || (raw != 0 && !(raw as u64).is_power_of_two()) {
                 return Err(format!(".balign: alignment {raw} is not a power of 2"));
             }
-            Directive::Balign(if raw == 0 { 1 } else { raw as u64 })
+            // Read the tail for its fill byte and *only* that: `too many
+            // operands` still has to be reported (GAS rejects 4 operands), but
+            // a cap that is not an integer is not either, because GAS never
+            // looks at it (measured: `.balign 8,,junk` assembles).
+            let fill = match crate::backend::asm_expr::parse_align_tail(
+                rest,
+                ".balign",
+                parse_int_literal,
+            ) {
+                Ok(t) => t.fill,
+                Err(e) if e.contains("fill") || e.contains("too many") => return Err(e),
+                Err(_) => None,
+            };
+            Directive::Balign {
+                bytes: if raw == 0 { 1 } else { raw as u64 },
+                fill,
+            }
         }
 
         ".byte" => {
@@ -1173,6 +1214,18 @@ pub fn is_register(s: &str) -> bool {
     (s.starts_with('v') && s.len() >= 2 && s.len() <= 3 && {
         if let Ok(n) = s[1..].parse::<u32>() { n <= 31 } else { false }
     })
+}
+
+/// Split an alignment directive's operands into the alignment itself and the
+/// raw text after the first comma (`""` when there is none), so the shared
+/// [`crate::backend::asm_expr::parse_align_tail`] can read `[, fill[, max]]`
+/// with exactly the grammar every other GAS target applies.
+fn split_align_args(args: &str) -> (&str, &str) {
+    let args = args.trim();
+    match args.find(',') {
+        Some(i) => (&args[..i], args[i + 1..].trim()),
+        None => (args, ""),
+    }
 }
 
 pub fn parse_int_literal(s: &str) -> Result<i64, String> {

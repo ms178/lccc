@@ -528,11 +528,40 @@ pub(crate) fn fcmp_is_positive_zero(op: Option<&Operand>, raw_operand: &str) -> 
             let after_paren = after_hash.strip_prefix('(').unwrap_or(after_hash);
             !after_paren.starts_with('-')
         }
-        Some(Operand::Expr(e)) => {
-            matches!(e.trim().parse::<f64>(), Ok(v) if v == 0.0 && !v.is_sign_negative())
-        }
+        Some(Operand::Expr(e)) | Some(Operand::Symbol(e)) => fp_zero_spelling(e),
         _ => false,
     }
+}
+
+/// Is this operand *spelling* the constant zero that GAS's
+/// `verify_float_immediate_zero_only` demands?
+///
+/// The `#` is optional to GAS and this lexer files an unprefixed token under
+/// [`Operand::Symbol`] unless it happens to look like a plain decimal, so both
+/// variants have to be consulted. Measured on GNU as 2.47: `#0.0`, `#0`, `#0x0`,
+/// `#+0.0` and `0.0` all encode `fcmeq v0.4s, v1.4s, <op>` (and `fcmp s0, 0.0` =
+/// 0x1e202008), while `(0.0)`, `#-0.0` and a symbol named `zero` are rejected --
+/// the first because a parenthesized token is not a bare constant to GAS's
+/// reader, the second because a unary minus leaves a negate expression behind,
+/// the third because the symbol never resolves inside an assembler operand.
+///
+/// A `.equ`-defined zero does fold to a constant for GAS and is refused here:
+/// this pass classifies operands before any symbol table is in reach, and a
+/// refusal is a diagnostic while a guessed encoding would be a wrong program.
+fn fp_zero_spelling(text: &str) -> bool {
+    let text = text.trim();
+    let body = text.strip_prefix('#').unwrap_or(text);
+    let body = body.strip_prefix('+').unwrap_or(body);
+    if body.is_empty() || body.starts_with('-') || body.starts_with('(') {
+        return false;
+    }
+    if let Ok(value) = body.parse::<f64>() {
+        // `inf`/`nan` land here too and fail the comparison, as they should.
+        // A `-0.0` that reached this point without its sign (`-` was stripped
+        // by the lexer) would be `0.0` and `+0.0`, both of which GAS accepts.
+        return value == 0.0 && !value.is_sign_negative();
+    }
+    crate::backend::asm_expr::parse_integer_expr(body).is_ok_and(|v| v == 0)
 }
 
 /// `FCMP`/`FCMPE` share one encoding; `fcmpe` sets bit 4 of Rt in both the

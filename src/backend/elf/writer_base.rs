@@ -102,6 +102,25 @@ pub struct ElfWriterBase {
     /// NOP instruction bytes for code section alignment padding.
     /// ARM: `[0x1f, 0x20, 0x03, 0xd5]` (d503201f), RISC-V: `[0x13, 0x00, 0x00, 0x00]` (00000013)
     nop_bytes: [u8; 4],
+    /// A half-width NOP the target may use for the bytes a full NOP cannot
+    /// cover at its own alignment, as `Some((bytes, size))`: RISC-V `c.nop`
+    /// (`0x0001`, 2 bytes) when the march carries `c`. `None` for every target
+    /// without a compressed encoding, where the prefix is zeros.
+    ///
+    /// This exists because GAS's fill is *not* "zeros then NOPs" or "NOPs then
+    /// zeros" but "each NOP at its own alignment, largest last", so a 7-byte
+    /// pad at offset 1 on rv64gc is `00 01 00 13 00 00 00` — zero, `c.nop`,
+    /// `nop` — and a table with one entry cannot spell that.
+    small_nop: Option<([u8; 2], u64)>,
+    /// Smallest alignment ever recorded for an executable section, or 0 for no
+    /// floor. RISC-V sets 4: GNU as 2.47 raises `.p2align 0' and `.p2align 1'
+    /// in `.text' to a 4-byte boundary and records `sh_addralign` 4 (measured:
+    /// payload 1 + `.p2align 1` -> size 4, addralign 2**2), because the padding
+    /// run is written on the NOP grid and that grid starts at the uncompressed
+    /// instruction size. `.data` keeps what was asked for (same cell: size 2,
+    /// addralign 2**1), and AArch64 has no floor at all — `.p2align 1` there
+    /// aligns to 2 exactly.
+    code_align_floor: u64,
     /// Default text section alignment (4 for ARM, 2 for RISC-V with compressed instructions)
     text_align: u64,
     /// Bytes of directive-generated fill materialized so far by this
@@ -110,6 +129,18 @@ pub struct ElfWriterBase {
 }
 
 impl ElfWriterBase {
+    /// See [`Self::small_nop`].
+    pub fn with_small_nop(mut self, bytes: [u8; 2]) -> Self {
+        self.small_nop = Some((bytes, 2));
+        self
+    }
+
+    /// See [`Self::code_align_floor`].
+    pub fn with_code_align_floor(mut self, floor: u64) -> Self {
+        self.code_align_floor = floor;
+        self
+    }
+
     pub fn new(nop_bytes: [u8; 4], text_align: u64) -> Self {
         Self {
             current_section: String::new(),
@@ -126,10 +157,18 @@ impl ElfWriterBase {
             section_stack: Vec::new(),
             previous_section: String::new(),
             nop_bytes,
+            small_nop: None,
+            code_align_floor: 0,
             text_align,
             fill_budget_used: 0,
         }
     }
+
+    /// Offer the target's half-width NOP (RISC-V `c.nop`) for the bytes a full
+    /// NOP cannot cover at its own alignment. Only a target with a 2-byte
+    /// instruction encoding has one to offer; the notes on
+    /// [`Self::small_nop`] record that
+    /// GNU as 2.47 uses it for padding regardless of `-march=`.
 
     /// Ensure a section exists. If it doesn't, create it with the given properties.
     pub fn ensure_section(&mut self, name: &str, sh_type: u32, sh_flags: u64, align: u64) {
@@ -365,9 +404,26 @@ impl ElfWriterBase {
     ///
     /// When `fill` is `Some`, every pad byte is that value in every section
     /// (`.text` included: `.p2align 3, 0xff` is 0xff, not NOP). When `fill`
-    /// is `None`, executable sections emit the architecture NOP at NOP-sized
-    /// boundaries and zeros in the unaligned prefix; other sections zero-fill.
-    /// That is the GNU as 2.44/2.47 pattern for `.byte 1; .p2align 3`.
+    /// is `None`, an executable section is filled with the target's NOPs —
+    /// each placed only where its own size permits it to be fetched, so the
+    /// bytes before the first legal NOP slot are zeros (or, on RISC-V, the
+    /// 2-byte `c.nop`) and the NOPs end the run flush against the boundary —
+    /// while other sections zero-fill. That is `riscv_make_nops` and its
+    /// aarch64 equivalent, byte for byte.
+    ///
+    /// The run then stops at the boundary, which is *not* what GNU as 2.47
+    /// emits on RISC-V: at offset 5, `.p2align 5` pads 16 bytes here and 48
+    /// there, because `riscv_frag_align_code` writes a worst-case
+    /// `align - insn_alignment` NOP run plus a `BFD_RELOC_RISCV_ALIGN` fixup
+    /// and leaves the *linker* to relax the run to the true excess. Copying
+    /// the sizes without copying the relaxation would keep up to a whole
+    /// alignment quantum of dead bytes in front of every aligned label of
+    /// every RISC-V object LCCC writes — in exactly the hot code the directive
+    /// was written to place — since LCCC's linker documents `R_RISCV_ALIGN` as
+    /// a hint it skips. Padding to the boundary is what a relaxed link
+    /// produces, so it is what LCCC produces; the divergent sizes are recorded
+    /// (with the measurement) by `scripts/gas_fill_census.py`, and the pad
+    /// *content* law that does apply to the final image is matched exactly.
     ///
     /// Two refusal rules keep this function fail-closed without ever
     /// touching an unbounded allocation (all verdicts measured on GNU as
@@ -395,11 +451,26 @@ impl ElfWriterBase {
         max_pad: Option<u64>,
         fill: Option<u8>,
     ) -> Result<(), String> {
+        self.ensure_default_section();
+        // The floor is decided before the `align <= 1` no-op test, because on
+        // a section that needs one the raising *is* the work the directive asks
+        // for (see [`Self::code_align_floor`]).
+        let align = if self.code_align_floor > 0
+            && align < self.code_align_floor
+            && self
+                .sections
+                .get(&self.current_section)
+                .is_some_and(|s| s.sh_flags & SHF_EXECINSTR != 0)
+        {
+            self.code_align_floor
+        } else {
+            align
+        };
         if align <= 1 {
             return Ok(());
         }
-        self.ensure_default_section();
         let nop = self.nop_bytes.clone();
+        let small_nop = self.small_nop;
         // Phase 1 — decide under a single shared borrow (no allocation).
         let decided = {
             let Some(section) = self.sections.get(&self.current_section) else {
@@ -440,13 +511,49 @@ impl ElfWriterBase {
             if padding > 0 {
                 if let Some(b) = fill {
                     section.data.extend(std::iter::repeat_n(b, padding));
-                } else if section.sh_flags & SHF_EXECINSTR != 0 && align >= 4 {
-                    let full_nops = padding / 4;
-                    let remainder = padding % 4;
-                    for _ in 0..full_nops {
-                        section.data.extend_from_slice(&nop);
+                } else if section.sh_flags & SHF_EXECINSTR != 0 {
+                    // GAS's fill law, measured on GNU as 2.47.20260726 for
+                    // both pinned targets: an executable section is padded with
+                    // the architecture's NOP, but a NOP may only sit where it
+                    // is *legal to fetch it* — at its own size's alignment —
+                    // so the bytes that cannot host one are filled from the
+                    // front with the largest encoding that fits there, and the
+                    // NOPs land at the tail on their natural grid.
+                    //
+                    //   aarch64  `.byte 1; .p2align 3`  (pad 7)
+                    //       00 00 00 1f 20 03 d5   3 zeros, then one NOP at 4
+                    //   riscv64  `.byte 1; .p2align 3`  (pad 7, rv64gc)
+                    //       00 01 00 13 00 00 00   zero, c.nop at 2, NOP at 4
+                    //   riscv64  `.byte 1; .p2align 2`  (pad 3, rv64gc)
+                    //       00 01 00               zero, c.nop at 2 (no NOP room)
+                    //
+                    // Emitting NOPs first instead (the previous behaviour) put a
+                    // 4-byte NOP at offset 1: valid to decode on both targets,
+                    // but a byte-for-byte divergence from the oracle, and on
+                    // aarch64 a NOP straddling the requested boundary is what an
+                    // instruction-aligned fetch of the *pad* would trip over.
+                    let start = section.data.len() as u64;
+                    let end = start + padding as u64;
+                    let mut pos = start;
+                    while pos < end {
+                        let room = end - pos;
+                        if pos % 4 == 0 && room >= 4 {
+                            section.data.extend_from_slice(&nop);
+                            pos += 4;
+                        } else if let Some((sb, ss)) = small_nop {
+                            if pos % ss == 0 && room >= ss {
+                                section.data.extend_from_slice(&sb);
+                                pos += ss;
+                            } else {
+                                section.data.push(0);
+                                pos += 1;
+                            }
+                        } else {
+                            section.data.push(0);
+                            pos += 1;
+                        }
                     }
-                    section.data.extend(std::iter::repeat_n(0u8, remainder));
+                    debug_assert_eq!(pos, end, "fill law must cover the pad exactly");
                 } else {
                     section.data.extend(std::iter::repeat_n(0u8, padding));
                 }

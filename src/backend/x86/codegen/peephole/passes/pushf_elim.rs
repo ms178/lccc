@@ -13,22 +13,51 @@
 //! never removes conditional branches, and never touches anything it cannot
 //! prove safe. It runs on every compilation (independent of `CCC_PEEPHOLE`).
 
-/// Instructions whose mnemonics never modify the arithmetic/flag bits used by
-/// `cmovcc`/`setcc` (OF/SF/ZF/AF/CF/PF). Everything else is treated as
-/// flag-clobbering and will block elimination.
-fn is_flag_neutral_mnemonic(m: &str) -> bool {
+/// Whether one line of the window is provably unable to modify the
+/// arithmetic/flag bits `cmovcc`/`setcc` read (OF/SF/ZF/AF/CF/PF).
+///
+/// Three rules carry the safety of this predicate, ordered so the structural
+/// ones win over the prefix-matching ones:
+///
+/// 1. A **label definition ends the window**, before anything else is
+///    consulted. Every mnemonic rule below matches on a prefix, and a label may
+///    share a prefix with a neutral mnemonic (`.Lfb_cloned:` is a `.`-line,
+///    `movsb_done:` is a `mov`-line). A branch can target any label, and
+///    control entering the middle of the window would read the flags that the
+///    deleted `popfq` was there to restore — so a label is never merely
+///    positional. (The old order consulted the directive rule first and
+///    returned "neutral" for every `.`-line, which silently exempted every
+///    `.L`-prefixed label in the window.)
+/// 2. A **dot-line is an assembler directive**, and a directive is neutral only
+///    when it emits no bytes. `.byte 0xF8` sitting between the pair *is* a
+///    `clc`, and `.zero 8` emits `0x00 0x00`, which decodes as
+///    `add %al,(%rax)` — another flag writer. So classification is delegated to
+///    [`super::helpers::directive_emits_data`], the table the flag-walking
+///    peepholes already use; sharing it is the point, because two independent
+///    lists of "harmless directives" drift apart and the narrower one then
+///    silently deletes a pair across a byte that changes flags. Anything the
+///    table does not name is data, so a malformed or unknown directive line
+///    closes the window instead of opening a hole.
+/// 3. **Everything else is admitted only by an explicit mnemonic rule**, and
+///    anything not named is treated as flag-clobbering.
+fn is_flag_neutral_line(m: &str) -> bool {
     let m = m.trim();
     if m.is_empty() || m.starts_with('#') || m.starts_with("//") || m.starts_with(';') {
         return true; // comment / blank
     }
-    // Directives never affect the CPU flags.
-    if m.starts_with('.') {
-        return true;
+    // Rule 1: a label definition (optionally followed by nothing but the
+    // terminator) is a control-flow boundary.
+    if m.ends_with(':') {
+        return false;
     }
-    // Conditional/unconditional branches, calls, returns, ret — control flow
+    // Rule 2: directives are neutral exactly when they carry no bytes.
+    if m.starts_with('.') {
+        return !super::helpers::directive_emits_data(m);
+    }
+    // Conditional/unconditional branches, calls, returns — control flow
     // boundary; must not be skipped over (a branch target inside the window
     // would make the popfq not necessarily match this pushfq).
-    if m.starts_with('j') && (m.starts_with("jmp") || m.starts_with('j')) {
+    if m.starts_with('j') {
         // Any jcc (je, jne, jl, ...) or jmp terminates the linear window.
         return false;
     }
@@ -48,7 +77,13 @@ fn is_flag_neutral_mnemonic(m: &str) -> bool {
     if m.starts_with("movsb") || m.starts_with("movsw") || m.starts_with("movslq") {
         return true;
     }
-    // push/pop modify RSP but not flags.
+    // push/pop modify RSP but not flags — except the flag stack itself, which
+    // `popf`-family writes. `popfq`/`popf` are the pair's terminator and are
+    // handled by the caller; `popfl`/`popfw` are not, so they must not be
+    // waved through by a bare `pop` prefix.
+    if m.starts_with("popf") {
+        return false;
+    }
     if m.starts_with("push") {
         return true;
     }
@@ -64,33 +99,27 @@ fn is_flag_neutral_mnemonic(m: &str) -> bool {
     if m.starts_with("cmov") {
         return true;
     } // cmovcc reads flags
-    if m.starts_with("rep") {
-        return true;
-    }
     if m.starts_with("xchg") {
         return true;
     }
-    // A bare label line ends the linear window (a branch could target it).
-    if m.ends_with(':') {
-        return false;
+    // `rep`-prefixed string operations split by the operation, not the prefix:
+    // MOVS/STOS/LODS/OUTS leave EFLAGS alone, while CMPS and SCAS are flag
+    // WRITERS (they set ZF every iteration, which is exactly how `repe cmpsb`
+    // decides to stop). A bare `rep`, or a `rep` on an operation this rule does
+    // not name, closes the window.
+    if m.starts_with("rep") {
+        let Some(word) = m.split_whitespace().nth(1) else {
+            return false;
+        };
+        return word.starts_with("movs")
+            || word.starts_with("stos")
+            || word.starts_with("lods")
+            || word.starts_with("outs");
     }
     // Anything else is conservatively flag-clobbering.
     false
 }
 
-/// Returns true if a trimmed instruction line contains an operand whose
-/// meaning would CHANGE if the surrounding `pushfq`/`popfq` were removed.
-///
-/// `pushfq` shifts RSP by 8 for the duration of the window, so only operands
-/// whose address/value depends on RSP are unsafe:
-///   * any explicit `%rsp`/`%esp` register (as base, index or data — a data
-///     value of RSP differs by 8 inside the window),
-///   * implicitly RSP-touching instructions: `push`/`pop`/`call`/`ret`.
-///
-/// Everything else is address-independent of the pushfq shift: RIP-relative
-/// operands, RBP-relative memory operands (RBP is never changed by pushfq),
-/// plain register operands (including `%rbp` as a data register in
-/// frame-pointer-omitted code), absolute addresses, immediates.
 fn has_rsp_dependent_operand(t: &str) -> bool {
     if t.contains("%rsp") || t.contains("%esp") {
         return true;
@@ -192,7 +221,7 @@ pub(super) fn eliminate_redundant_pushfq(asm: &mut String) -> bool {
                 break;
             }
             let m = first_mnemonic(&t);
-            if is_flag_neutral_mnemonic(m) {
+            if is_flag_neutral_line(m) {
                 j += 1;
                 continue;
             }
@@ -346,5 +375,104 @@ mod tests {
         assert!(eliminate_redundant_pushfq(&mut asm));
         assert!(!asm.contains("pushfq"), "asm was:\n{asm}");
         assert!(!asm.contains("popfq"), "asm was:\n{asm}");
+    }
+
+    /// A directive inside the window is neutral only when it emits no bytes.
+    /// `.byte 0xf8` *is* `clc` and `.zero 2` *is* `add %al,(%rax)` — both write
+    /// flags — so a pair spanning them must survive. The predicate used to
+    /// return "neutral" for every `.`-prefixed line.
+    #[test]
+    fn data_emitting_directive_in_the_window_blocks_elimination() {
+        for directive in [
+            "    .byte 0xf8",
+            "    .zero 2",
+            "    .space 4",
+            "    .skip 4",
+            "    .fill 1,1,0xf8",
+            "    .long 0x90909090",
+        ] {
+            let input = format!("f:\n    pushfq\n{directive}\n    popfq\n    ret\n");
+            let mut asm = input.clone();
+            let changed = eliminate_redundant_pushfq(&mut asm);
+            assert!(
+                !changed && asm == input,
+                "`{directive}` emits bytes the pair may not step over; asm became:\n{asm}"
+            );
+        }
+    }
+
+    /// Position-only directives stay harmless, so the fix costs no fold: this
+    /// is the shape the compiler itself emits inside a staging window.
+    #[test]
+    fn benign_directive_in_the_window_still_elides_the_pair() {
+        for directive in [
+            "    .cfi_def_cfa_offset 16",
+            "    .p2align 4",
+            "    .loc 1 42 7",
+        ] {
+            let input =
+                format!("f:\n    pushfq\n{directive}\n    movq %rbx, %rax\n    popfq\n    ret\n");
+            let mut asm = input;
+            assert!(
+                eliminate_redundant_pushfq(&mut asm),
+                "`{directive}` cannot affect flags; asm stayed:\n{asm}"
+            );
+        }
+    }
+
+    /// A label is a branch target, so control can enter the window at it and
+    /// read the flags the deleted `popfq` would have restored. `.L`-prefixed
+    /// labels used to be exempt, because the directive rule fired first.
+    #[test]
+    fn any_label_in_the_window_blocks_elimination() {
+        for label in ["    .Ltmp7:", "    movsb_loop:", "    .L2:"] {
+            let input =
+                format!("f:\n    pushfq\n{label}\n    movq %rbx, %rax\n    popfq\n    ret\n");
+            let mut asm = input.clone();
+            let changed = eliminate_redundant_pushfq(&mut asm);
+            assert!(
+                !changed && asm == input,
+                "`{label}` is an entry point into the window; asm became:\n{asm}"
+            );
+        }
+    }
+
+    /// `rep` splits by operation: MOVS/STOS/LODS/OUTS leave EFLAGS alone, while
+    /// CMPS and SCAS are flag writers every iteration (that is how `repe`
+    /// decides to stop).
+    #[test]
+    fn rep_prefix_is_judged_by_the_string_operation() {
+        let neutral = "f:\n    pushfq\n    rep movsl %ds:(%rsi),%es:(%rdi)\n    popfq\n    ret\n";
+        let mut asm = neutral.to_string();
+        assert!(
+            eliminate_redundant_pushfq(&mut asm),
+            "`rep movsl` does not touch flags; asm stayed:\n{asm}"
+        );
+        for clobbers in [
+            "    repe cmpsb %ds:(%rsi),%es:(%rdi)",
+            "    repne scasb %al,(%rdi)",
+            // An operation the rule does not name: "unrecognized" is not
+            // "harmless", so a `rep`-prefixed line with no recognizable string
+            // operation closes the window.
+            "    rep",
+        ] {
+            let input = format!("f:\n    pushfq\n{clobbers}\n    popfq\n    ret\n");
+            let mut asm = input.clone();
+            let changed = eliminate_redundant_pushfq(&mut asm);
+            assert!(
+                !changed && asm == input,
+                "`{clobbers}` writes flags; asm became:\n{asm}"
+            );
+        }
+    }
+
+    /// `popfl` is not the partner of a `pushfq` and restores the flags the pair
+    /// is preserving; a bare `pop` prefix must not admit it.
+    #[test]
+    fn flag_stack_pop_is_not_mere_stack_pop() {
+        let input = "f:\n    pushfq\n    popfl\n    movq %rbx, %rax\n    popfq\n    ret\n";
+        let mut asm = input.to_string();
+        let changed = eliminate_redundant_pushfq(&mut asm);
+        assert!(!changed && asm == input, "asm became:\n{asm}");
     }
 }

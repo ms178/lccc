@@ -5,6 +5,9 @@
 # re-derives the arm set and re-assembles every row through the full
 # parser->dispatcher->leaf path, so a new arm without a row, or a
 # drifted word, fails cargo test --lib on a host with no cross tools.
+# arms: 526 -- arm count as enumerated by this script;
+# the ratchet test compares its own re-derivation against it, so
+# the two copies of the enumeration rule cannot drift apart.
 # mnemonic	instruction	encoding (GNU as 2.47, LE hex)
 abs	abs v0.16b, v1.16b	20b8204e
 adc	adc w28, w1, w11	3c000b1a
@@ -40,7 +43,21 @@ brk	brk #0xad08	00a135d4
 bsl	bsl v11.16b, v31.16b, v29.16b	eb1f7d6e
 bti	bti	1f2403d5
 cas	cas w1, w21, [sp]	f57fa188
+casa	casa w13, w0, [x8]	007ded88
+casab	casab w21, w3, [x12]	837df508
+casah	casah w13, w16, [x30]	d07fed48
+casal	casal w21, w30, [x28]	9efff588
+casalb	casalb w19, w24, [x24]	18fff308
+casalh	casalh w10, w3, [x13]	a3fdea48
+casb	casb w12, w26, [x16]	1a7eac08
+cash	cash w0, w1, [x2]	417ca048
+casl	casl w0, w27, [x19]	7bfea088
+caslb	caslb w18, w3, [x15]	e3fdb208
+caslh	caslh w21, w30, [x7]	fefcb548
 casp	casp w0, w1, w2, w3, [x4]	827c2008
+caspa	caspa w4, w5, w30, wzr, [x5]	be7c6408
+caspal	caspal x24, x25, x8, x9, [x21]	a8fe7848
+caspl	caspl x0, x1, x2, x3, [x4]	82fc2048
 cbnz	cbnz w0, 0x1eef4	a0770f35
 cbz	cbz w0, 0x1416c	600b0a34
 ccmn	ccmn w1, #0x1c, #0x2, cs	22285c3a
@@ -63,6 +80,13 @@ cmtst	cmtst v14.4h, v3.4h, v2.4h	6e8c620e
 cneg	cneg w17, w23, vc	f166975a
 cnt	cnt v0.16b, v1.16b	2058204e
 crc32b	crc32b w1, wzr, w7	e143c71a
+crc32cb	crc32cb w21, w17, w22	3552d61a
+crc32ch	crc32ch w10, w0, wzr	0a54df1a
+crc32cw	crc32cw w18, w30, w24	d25bd81a
+crc32cx	crc32cx w17, w25, x21	315fd59a
+crc32h	crc32h w0, w1, w2	2044c21a
+crc32w	crc32w w26, w7, w8	fa48c81a
+crc32x	crc32x w24, w5, x4	b84cc49a
 csel	csel w0, w7, w9, vc	e070891a
 cset	cset x0, eq	e0179f9a
 csetm	csetm x0, eq	e0139fda
@@ -151,6 +175,17 @@ ld3r	ld3r {v12.2d-v14.2d}, [x0], x0	0cecc04d
 ld4	ld4 {v13.2d-v16.2d}, [x10], x13	4d0dcd4c
 ld4r	ld4r {v1.2d-v4.2d}, [x2], x25	41ecf94d
 ldadd	ldadd x30, x12, [x22]	cc023ef8
+ldadda	ldadda w8, w27, [x5]	bb00a8b8
+ldaddab	ldaddab w11, w2, [x16]	0202ab38
+ldaddah	ldaddah w13, w26, [x30]	da03ad78
+ldaddal	ldaddal w11, w6, [x24]	0603ebb8
+ldaddalb	ldaddalb w0, w1, [x2]	4100e038
+ldaddalh	ldaddalh w22, w3, [x22]	c302f678
+ldaddb	ldaddb w12, w8, [x21]	a8022c38
+ldaddh	ldaddh w0, w1, [x2]	41002078
+ldaddl	ldaddl w27, w9, [x25]	29037bb8
+ldaddlb	ldaddlb w0, w1, [x2]	41006038
+ldaddlh	ldaddlh w0, w1, [x2]	41006078
 ldar	ldar x0, [x1]	20fcdfc8
 ldarb	ldarb w0, [x1]	20fcdf08
 ldarh	ldarh w0, [x1]	20fcdf48
@@ -158,6 +193,30 @@ ldaxp	ldaxp w0, w0, [x16]	00827f88
 ldaxr	ldaxr w0, [x20]	80fe5f88
 ldaxrb	ldaxrb w0, [x15]	e0fd5f08
 ldaxrh	ldaxrh w0, [x25]	20ff5f48
+ldclr	ldclr w16, w24, [sp]	f81330b8
+ldclra	ldclra w17, w24, [x23]	f812b1b8
+ldclrab	ldclrab w3, w28, [x6]	dc10a338
+ldclrah	ldclrah w6, w20, [x16]	1412a678
+ldclral	ldclral w6, w1, [x9]	2111e6b8
+ldclralb	ldclralb w5, wzr, [x14]	df11e538
+ldclralh	ldclralh w21, w27, [x9]	3b11f578
+ldclrb	ldclrb w25, w4, [x15]	e4113938
+ldclrh	ldclrh w0, w1, [x2]	41102078
+ldclrl	ldclrl w2, w25, [x30]	d91362b8
+ldclrlb	ldclrlb w6, w16, [sp]	f0136638
+ldclrlh	ldclrlh w11, w4, [x19]	64126b78
+ldeor	ldeor w1, w17, [x1]	312021b8
+ldeora	ldeora x2, x9, [x5]	a920a2f8
+ldeorab	ldeorab wzr, w13, [x0]	0d20bf38
+ldeorah	ldeorah w2, w13, [x11]	6d21a278
+ldeoral	ldeoral w23, w20, [x25]	3423f7b8
+ldeoralb	ldeoralb w24, w5, [sp]	e523f838
+ldeoralh	ldeoralh w0, w1, [x2]	4120e078
+ldeorb	ldeorb w15, w4, [x15]	e4212f38
+ldeorh	ldeorh w15, w8, [x27]	68232f78
+ldeorl	ldeorl x30, x0, [x17]	20227ef8
+ldeorlb	ldeorlb w23, w11, [x1]	2b207738
+ldeorlh	ldeorlh w0, w1, [x2]	41206078
 ldnp	ldnp d0, d18, [x25, #240]	204b4f6c
 ldp	ldp d0, d0, [x13, #344]!	a081d56d
 ldr	ldr b0, [x0, #343]	005c453d
@@ -165,7 +224,20 @@ ldrb	ldrb w0, [x15, #2124]	e0316139
 ldrh	ldrh w0, [x0, #4312]	00b06179
 ldrsb	ldrsb w0, [x23, #-40]!	e08edd38
 ldrsh	ldrsh w0, [x26, #3564]	40dbdb79
+ldrsw	ldrsw x0, [sp, #10076]	e05fa7b9
 ldrw	ldr w0, [x1]	200040b9
+ldset	ldset w14, w17, [x1]	31302eb8
+ldseta	ldseta w14, w4, [x5]	a430aeb8
+ldsetab	ldsetab w9, w20, [x6]	d430a938
+ldsetah	ldsetah w13, w10, [x19]	6a32ad78
+ldsetal	ldsetal x11, x30, [x19]	7e32ebf8
+ldsetalb	ldsetalb w26, w10, [x23]	ea32fa38
+ldsetalh	ldsetalh w0, w1, [x2]	4130e078
+ldsetb	ldsetb w10, w29, [x30]	dd332a38
+ldseth	ldseth w19, w6, [x23]	e6323378
+ldsetl	ldsetl w7, w4, [x6]	c43067b8
+ldsetlb	ldsetlb w1, w6, [x1]	26306138
+ldsetlh	ldsetlh w0, w3, [x19]	63326078
 ldtr	ldtr w1, [x9, #217]	21994db8
 ldtrb	ldtrb w0, [x18, #-189]	403a5438
 ldtrh	ldtrh w0, [x20, #-41]	807a5d78
@@ -314,6 +386,23 @@ st2	st2 {v1.4h-v2.4h}, [sp], x21	e187950c
 st3	st3 {v10.2s-v12.2s}, [x10], x21	4a49950c
 st4	st4 {v11.16b-v14.16b}, [x23], x13	eb028d4c
 stadd	stadd x0, [x1]	3f0020f8
+staddb	staddb w0, [x2]	5f002038
+staddh	staddh w0, [x2]	5f002078
+staddl	staddl x0, [x2]	5f0060f8
+staddlb	staddlb w0, [x2]	5f006038
+staddlh	staddlh w0, [x2]	5f006078
+stclr	stclr x0, [x2]	5f1020f8
+stclrb	stclrb w0, [x2]	5f102038
+stclrh	stclrh w0, [x2]	5f102078
+stclrl	stclrl x0, [x2]	5f1060f8
+stclrlb	stclrlb w0, [x2]	5f106038
+stclrlh	stclrlh w0, [x2]	5f106078
+steor	steor x0, [x2]	5f2020f8
+steorb	steorb w0, [x2]	5f202038
+steorh	steorh w0, [x2]	5f202078
+steorl	steorl x0, [x2]	5f2060f8
+steorlb	steorlb w0, [x2]	5f206038
+steorlh	steorlh w0, [x2]	5f206078
 stlr	stlr w0, [x13]	a0fd9f88
 stlrb	stlrb w0, [x14]	c0fd9f08
 stlrh	stlrh w1, [x22]	c1fe9f48
@@ -326,6 +415,12 @@ stp	stp d0, d12, [x10, #-160]!	4031b66d
 str	str b0, [x15, #2674]	e0c9293d
 strb	strb w0, [sp, #444]	e0f30639
 strh	strh w0, [sp, #7072]	e0433779
+stset	stset x0, [x2]	5f3020f8
+stsetb	stsetb w0, [x2]	5f302038
+stseth	stseth w0, [x2]	5f302078
+stsetl	stsetl x0, [x2]	5f3060f8
+stsetlb	stsetlb w0, [x2]	5f306038
+stsetlh	stsetlh w0, [x2]	5f306078
 sttr	sttr w0, [sp, #-66]	e0eb1bb8
 sttrb	sttrb w0, [x1, #109]	20d80638
 sttrh	sttrh w1, [x23, #-162]	e1ea1578
@@ -342,6 +437,17 @@ subhn2	subhn2 v15.16b, v10.8h, v19.8h	4f61334e
 subs	subs w0, w1, #0xf4c, lsl #12	20307d71
 svc	svc #0x2859	210b05d4
 swp	swp w1, w4, [sp]	e48321b8
+swpa	swpa w13, w0, [x6]	c080adb8
+swpab	swpab w15, w4, [x30]	c483af38
+swpah	swpah w4, w15, [x2]	4f80a478
+swpal	swpal x26, x4, [x25]	2483faf8
+swpalb	swpalb w0, w1, [x2]	4180e038
+swpalh	swpalh wzr, w29, [sp]	fd83ff78
+swpb	swpb w23, w4, [x0]	04803738
+swph	swph w3, w16, [x29]	b0832378
+swpl	swpl w16, w14, [x7]	ee8070b8
+swplb	swplb w19, w20, [x15]	f4817338
+swplh	swplh w30, w29, [x30]	dd837e78
 sxtb	sxtb w1, w0	011c0013
 sxth	sxth x1, w16	013e4093
 sxtl	sxtl v0.4s, v0.4h	00a4100f

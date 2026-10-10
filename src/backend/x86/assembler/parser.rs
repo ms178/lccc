@@ -3387,37 +3387,35 @@ const MAX_MACRO_FRAMES: u32 = 101;
 /// * `grown_lines` / `grown_bytes` — everything `.irp`, `.irpc` and
 ///   macro invocation materialize *before* any parse can run.  An
 ///   `items x body` product is quadratic in a linear input, so the
-///   shared [`asm_preprocess::check_expansion_growth`] ceilings
-///   (4194304 lines / 256 MiB of line text, each line counted as
-///   `len + 1` exactly like [`asm_preprocess::expansion_size`]) are
-///   charged incrementally and checked *before* the next block is
-///   appended: the same deterministic-stand-in law as
+/// * `totals` — [`asm_preprocess::ExpansionTotals`]: the 4194304-line /
+///   256 MiB-of-text ceilings of [`asm_preprocess::check_expansion_growth`]
+///   (each line counted as `len + 1`, exactly [`asm_preprocess::expansion_size`]),
+///   charged incrementally and checked *before* the next block is appended.
+///   The same deterministic-stand-in law as
 ///   `MAX_DIRECTIVE_FILL`, whose GAS-side verdict degrades into
 ///   machine memory state at these sizes (FOLLOWUP deviation
 ///   register).  One budget spans the whole recursive expansion, so
 ///   nested constructs can never reset the totals.
 struct ExpansionBudget {
-    grown_lines: u64,
-    grown_bytes: u64,
+    totals: asm_preprocess::ExpansionTotals,
     depth: u32,
 }
 
 impl ExpansionBudget {
     fn new() -> Self {
         Self {
-            grown_lines: 0,
-            grown_bytes: 0,
+            totals: asm_preprocess::ExpansionTotals::default(),
             depth: 0,
         }
     }
 
-    /// Charge `lines` freshly materialized lines (with their text) and
-    /// fail closed the moment either ceiling is crossed.
+    /// Charge `lines` freshly materialized lines (with their text) and fail
+    /// closed the moment either ceiling is crossed.  Delegation, not a second
+    /// implementation: the arm and riscv front ends charge the same shared
+    /// totals, so the three expanders cannot grow three different ceilings --
+    /// which is what they had until `.macro` joined the party.
     fn charge(&mut self, lines: &[String], kind: &str) -> Result<(), String> {
-        let (l, b) = asm_preprocess::expansion_size(lines);
-        self.grown_lines = self.grown_lines.saturating_add(l);
-        self.grown_bytes = self.grown_bytes.saturating_add(b);
-        asm_preprocess::check_expansion_growth(kind, self.grown_lines, self.grown_bytes)
+        self.totals.charge(kind, lines)
     }
 }
 

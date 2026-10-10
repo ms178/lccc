@@ -9,6 +9,101 @@ use super::super::types::*;
 
 /// Check if a register ID refers to a valid general-purpose register (0..=15).
 #[inline]
+/// Directives that emit DATA.  A `.byte`/`.long`/`.quad` sequence inside a
+/// function body can encode any instruction -- `adc`, `clc`, a branch -- that
+/// the textual predicates above cannot see, exactly like inline asm.  The
+/// walker must therefore NOT step over them as if they had no effect.  The
+/// benign directives (`.cfi_*`, alignment, location, section, symbol
+/// bookkeeping) cannot encode an instruction and are skipped; anything the
+/// classification does not name is treated as data, because "unrecognized" is
+/// not "harmless".
+pub(super) fn directive_emits_data(text: &str) -> bool {
+    let Some(rest) = text.strip_prefix('.') else {
+        return false;
+    };
+    let name = rest
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .next()
+        .unwrap_or("");
+    if matches!(
+        name,
+        // Benign: position, bookkeeping, sections, debug info, symbol attrs.
+        "cfi_startproc"
+            | "cfi_endproc"
+            | "cfi_def_cfa"
+            | "cfi_def_cfa_offset"
+            | "cfi_def_cfa_register"
+            | "cfi_offset"
+            | "cfi_restore"
+            | "cfi_same_value"
+            | "cfi_remember_state"
+            | "cfi_restore_state"
+            | "cfi_return_column"
+            | "cfi_undefined"
+            | "cfi_personality"
+            | "cfi_lsda"
+            | "cfi_escape"
+            | "p2align"
+            | "p2alignw"
+            | "p2alignl"
+            | "align"
+            | "balign"
+            | "balignw"
+            | "balignl"
+            | "loc"
+            | "file"
+            | "text"
+            | "data"
+            | "bss"
+            | "section"
+            | "rodata"
+            | "globl"
+            | "global"
+            | "weak"
+            | "local"
+            | "type"
+            | "size"
+            | "ident"
+            | "set"
+            | "equ"
+            | "end"
+            | "intel_syntax"
+            | "att_syntax"
+            | "code64"
+            | "code32"
+            | "code16"
+            | "arch"
+            | "version"
+            | "comm"
+            | "lcomm"
+            | "pushsection"
+            | "popsection"
+            | "previous"
+            | "subsection"
+    ) {
+        return false;
+    }
+    // `.byte`, `.2byte`/`.word`, `.4byte`/`.long`, `.8byte`/`.quad`,
+    // `.value`, `.inst`, `.insn`, `.ascii`, `.asciz`, `.string`, `.uleb128`,
+    // `.sleb128`, `.float`, `.double` -- and anything unrecognized.
+    //
+    // `.zero`, `.skip`, `.space` and `.fill` belong here too, NOT in the benign
+    // set above: all four emit bytes into the section they appear in.  The
+    // first three emit zeros, and `0x00 0x00` decodes as `add %al, (%rax)` --
+    // a flag WRITER -- while `.fill repeat, size, value` emits an arbitrary
+    // repeated pattern, so `.fill 1, 1, 0xF8` is a bare `clc`.  Treating them
+    // as positions rather than effects is the exact error this classifier
+    // exists to remove, and the rule it states for itself ("unrecognized is not
+    // harmless") applies with more force to a directive whose payload is a
+    // literal byte.  The cost is measured, not assumed: the reach of all four
+    // inside function bodies is 0 across the 106-source benchmark, oracle,
+    // kernel and pattern corpora at -O1/-O2/-O3 on x86-64 and i686 (see
+    // `engineering/evidence/2026-10-08-pr-audit/directive-census.txt`), so the
+    // correction closes the hole without refusing a single real fold.
+    let _ = name;
+    true
+}
+
 pub(super) fn is_valid_gp_reg(reg: RegId) -> bool {
     reg != REG_NONE && reg <= REG_GP_MAX
 }
