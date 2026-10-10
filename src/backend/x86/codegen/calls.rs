@@ -469,19 +469,58 @@ impl X86Codegen {
                 | CallArgClass::LargeStructStack { size } => {
                     self.operand_to_rax(&args[si]);
                     let n_qwords = size.div_ceil(8);
-                    for qi in (0..n_qwords).rev() {
-                        let offset = qi * 8;
-                        if offset + 8 <= size {
-                            self.state
-                                .emit_fmt(format_args!("    pushq {}(%rax)", offset));
-                        } else {
-                            self.state.out.emit_instr_mem_reg(
-                                "    movq",
-                                offset as i64,
-                                "rax",
-                                "rcx",
-                            );
-                            self.state.emit("    pushq %rcx");
+                    if size >= crate::backend::call_abi::LARGE_ARG_COPY_THRESHOLD {
+                        let push_bytes = (n_qwords * 8) as i64;
+                        self.state
+                            .out
+                            .emit_instr_imm_reg("    subq", push_bytes, "rsp");
+                        // Register arguments are staged AFTER stack arguments.
+                        // Preserve their possible homes, and leave the temporary
+                        // save area BELOW the ABI argument so popping it does
+                        // not introduce a hole between adjacent arguments.
+                        self.state.emit("    pushq %rdi");
+                        self.state.emit("    pushq %rsi");
+                        self.state.emit("    pushq %rcx");
+                        self.state.emit("    movq %rax, %rsi");
+                        self.state.emit("    leaq 24(%rsp), %rdi");
+                        self.state
+                            .out
+                            .emit_instr_imm_reg("    movq", size as i64, "rcx");
+                        self.state.emit("    rep movsb");
+                        self.state.emit("    popq %rcx");
+                        self.state.emit("    popq %rsi");
+                        self.state.emit("    popq %rdi");
+                    } else {
+                        for qi in (0..n_qwords).rev() {
+                            let offset = qi * 8;
+                            if offset + 8 <= size {
+                                self.state
+                                    .emit_fmt(format_args!("    pushq {}(%rax)", offset));
+                            } else {
+                                // ABI rounding reserves a whole stack word,
+                                // but does not license a read past the C object.
+                                // In particular a packed object can end at a
+                                // guard page. Copy only its 1..7 actual bytes.
+                                self.state.emit("    pushq $0");
+                                let mut copied = 0usize;
+                                for (width, mnemonic, reg) in
+                                    [(4, "movl", "ecx"), (2, "movw", "cx"), (1, "movb", "cl")]
+                                {
+                                    if copied + width <= size - offset {
+                                        self.state.emit_fmt(format_args!(
+                                            "    {} {}(%rax), %{}",
+                                            mnemonic,
+                                            offset + copied,
+                                            reg
+                                        ));
+                                        self.state.emit_fmt(format_args!(
+                                            "    {} %{}, {}(%rsp)",
+                                            mnemonic, reg, copied
+                                        ));
+                                        copied += width;
+                                    }
+                                }
+                            }
                         }
                     }
                     let push_bytes = (n_qwords * 8) as i64;

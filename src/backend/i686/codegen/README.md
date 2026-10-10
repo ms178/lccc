@@ -151,8 +151,11 @@ fields on the codegen struct.
 
 The layout follows the GCC i386 fastcall rules exactly: float and `_Decimal`
 scalars are *skipped* (they neither consume a register nor end the chain),
-aggregates and 64/128-bit integers *break* the chain, and variadic fastcall
-passes everything on the stack with a plain `ret`.  One layout drives the
+nonempty aggregates and 64/128-bit integers *break* the chain, and variadic
+fastcall passes everything on the stack with a plain `ret`. Zero-sized GNU
+aggregates neither consume bytes/registers nor break the chain; the native
+mixed-compiler gate `tests/regression/check_empty_aggregate_abi.sh` checks both
+caller/callee directions so a shared wrong convention cannot pass unnoticed.  One layout drives the
 prologue capture, `emit_param_ref` and the epilogue `ret $N`, replacing the
 previous three independently-derived assignments whose positional counting
 diverged from GCC for every float-interleaved signature.

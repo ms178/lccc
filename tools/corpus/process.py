@@ -20,7 +20,7 @@ LIMIT = 256 * 1024
 DRAIN_GRACE = 0.5
 
 
-def run(argv, timeout, *, env=None, output_limit=LIMIT):
+def run(argv, timeout, *, env=None, cwd=None, output_limit=LIMIT):
     if (type(timeout) not in (int, float) or not math.isfinite(timeout)
             or timeout <= 0 or type(output_limit) is not int or output_limit < 1):
         raise ValueError('positive finite process timeout/output budget required')
@@ -33,7 +33,7 @@ def run(argv, timeout, *, env=None, output_limit=LIMIT):
     reason = None
     failed_at = None
     proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, env=environment,
+                            stderr=subprocess.PIPE, env=environment, cwd=cwd,
                             start_new_session=True)
 
     def terminate():

@@ -3,8 +3,11 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 source tools/linker/oracle_versions.sh
 oracle_version_matches 'GNU ld (GNU Binutils) 2.47' 2.47
+oracle_version_matches 'GNU ld (GNU Binutils) 2.47.20260726' 2.47
 oracle_version_matches 'mold 2.42.1 (compatible with GNU ld)' 2.42.1
-for wrong in 'GNU ld 2.44' 'GNU ld 2.470' 'GNU ld 2.47.1' 'GNU ld x2.47' ''; do
+for wrong in 'GNU ld 2.44' 'GNU ld 2.470' 'GNU ld 2.47.1' 'GNU ld x2.47' \
+             'GNU ld 2.47.20260725' 'GNU ld 2.47.202607260' \
+             'GNU ld 2.47.20260726-dirty' ''; do
     if oracle_version_matches "$wrong" 2.47; then
         echo "FAIL: accepted $wrong"; exit 1
     fi

@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 # Source-only helpers: a directory name is not proof of the binary's version.
 # Match a complete whitespace-delimited release token (2.47 != 2.470/2.47.1).
+# The pinned binutils-2.47 release archive itself emits 2.47.20260726, just
+# like the GAS pair built from those bytes. Permit exactly that archive's
+# dated banner too, NOT arbitrary patch levels or unrelated dated snapshots.
 oracle_version_matches() {
     local banner=$1 version=$2 escaped
     [[ $version =~ ^[0-9]+(\.[0-9]+)+$ ]] || return 2
     escaped=${version//./\\.}
+    if [[ $version == 2.47 ]]; then
+        escaped='2\.47(\.20260726)?'
+    fi
     [[ $banner =~ (^|[[:space:]])${escaped}($|[[:space:]]) ]]
 }
 
