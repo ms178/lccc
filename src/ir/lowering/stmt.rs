@@ -382,14 +382,16 @@ impl Lowerer {
         vla_size: Option<Value>,
     ) {
         let mut local_info = LocalInfo::from_analysis(da, alloca, decl.is_const());
-        local_info.var.address_space = decl.address_space;
-        // `T __seg_fs *p`: the qualifier lives on the pointer's CType (the
-        // space the pointer points into), not just on the variable slot.
-        // Without this, `*p` resolves AddressSpace::Default through
-        // get_expr_ctype and the segment prefix is silently dropped.
-        if let Some(ref mut ct) = local_info.var.c_type {
-            crate::common::type_builder::apply_declaration_address_space(ct, decl.address_space);
-        }
+        // `T __seg_fs *p`: the qualifier lives on the pointer's CType (the space
+        // the pointer points into), not just on the variable slot. For a
+        // whole-type qualifier (`__seg_fs __typeof__(T *) p`) the slot itself
+        // is the segment object. See `place_declared_space`.
+        local_info.var.address_space = crate::common::type_builder::place_declared_space(
+            local_info.var.c_type.as_mut(),
+            decl.address_space,
+            &decl.type_spec,
+            &declarator.derived,
+        );
         if explicit_align > 0 {
             local_info.var.explicit_alignment = Some(explicit_align);
         }
@@ -1097,7 +1099,14 @@ impl Lowerer {
                             (field.bit_offset, field.bit_width)
                         {
                             self.store_bitfield(
-                                field_addr, field_ty, bit_offset, bit_width, val, false, field.sso,
+                                field_addr,
+                                field_ty,
+                                bit_offset,
+                                bit_width,
+                                val,
+                                false,
+                                field.sso,
+                                AddressSpace::Default,
                             );
                         } else {
                             let val = self.emit_sso_store_fixup(val, field_ty, field.sso);

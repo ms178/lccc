@@ -33,22 +33,33 @@ struct DeclContext {
     is_common: bool,
 }
 
-/// Apply a declaration-level named address space to a parsed type: it lands
-/// on the innermost pointer (closest to the base type), matching
-/// `type_builder::apply_declaration_address_space` on the CType side.
+/// Parser-side mirror of `common::type_builder::apply_declaration_address_space`
+/// (the two must stay in step). The named space goes to the innermost pointer:
+/// the walk descends through pointers, arrays and function return types. A
+/// function-pointer node (`FunctionPointer`) is itself a generic pointer, so
+/// the walk continues into its return type, as for `struct c __seg_gs *(*f)(void)`.
 fn apply_decl_address_space_to_spec(ts: &mut TypeSpecifier, space: AddressSpace) {
     if space == AddressSpace::Default {
         return;
     }
     match ts {
         TypeSpecifier::Pointer(inner, sp) => {
-            if matches!(inner.as_ref(), TypeSpecifier::Pointer(..)) {
+            if matches!(
+                inner.as_ref(),
+                TypeSpecifier::Pointer(..)
+                    | TypeSpecifier::Array(..)
+                    | TypeSpecifier::FunctionPointer(..)
+                    | TypeSpecifier::BareFunction(..)
+            ) {
                 apply_decl_address_space_to_spec(inner, space);
             } else {
                 *sp = space;
             }
         }
         TypeSpecifier::Array(elem, _) => apply_decl_address_space_to_spec(elem, space),
+        TypeSpecifier::FunctionPointer(ret, _, _) | TypeSpecifier::BareFunction(ret, _, _) => {
+            apply_decl_address_space_to_spec(ret, space)
+        }
         _ => {}
     }
 }
@@ -1589,5 +1600,98 @@ impl Parser {
         // references (e.g. sizeof, offsetof, compiler builtins), silently accept.
         // This matches real-world behavior where complex expressions may not be
         // evaluable at parse time but are valid constant expressions.
+    }
+}
+
+#[cfg(test)]
+mod seg_placement_tests {
+    //! Mirrors `common::type_builder`'s placement tests on the parser's
+    //! `TypeSpecifier`, so the two placement rules are checked against the same
+    //! declarator shapes. Keep the case lists in step with that module.
+    use super::*;
+
+    fn base() -> TypeSpecifier {
+        TypeSpecifier::Long
+    }
+    fn ptr(inner: TypeSpecifier) -> TypeSpecifier {
+        TypeSpecifier::Pointer(Box::new(inner), AddressSpace::Default)
+    }
+    fn innermost_space(ts: &TypeSpecifier) -> Option<AddressSpace> {
+        match ts {
+            TypeSpecifier::Pointer(inner, sp) => match inner.as_ref() {
+                TypeSpecifier::Pointer(..)
+                | TypeSpecifier::Array(..)
+                | TypeSpecifier::FunctionPointer(..)
+                | TypeSpecifier::BareFunction(..) => innermost_space(inner),
+                _ => Some(*sp),
+            },
+            TypeSpecifier::Array(elem, _) => innermost_space(elem),
+            TypeSpecifier::FunctionPointer(ret, _, _) | TypeSpecifier::BareFunction(ret, _, _) => {
+                innermost_space(ret)
+            }
+            _ => None,
+        }
+    }
+    fn outer_space(ts: &TypeSpecifier) -> Option<AddressSpace> {
+        match ts {
+            TypeSpecifier::Pointer(_, sp) => Some(*sp),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn plain_pointer() {
+        let mut t = ptr(base());
+        apply_decl_address_space_to_spec(&mut t, AddressSpace::SegGs);
+        assert_eq!(outer_space(&t), Some(AddressSpace::SegGs));
+    }
+
+    #[test]
+    fn pointer_to_pointer_qualifies_inner_only() {
+        let mut t = ptr(ptr(base()));
+        apply_decl_address_space_to_spec(&mut t, AddressSpace::SegGs);
+        assert_eq!(outer_space(&t), Some(AddressSpace::Default));
+        assert_eq!(innermost_space(&t), Some(AddressSpace::SegGs));
+    }
+
+    #[test]
+    fn function_pointer_qualifies_return_pointer_not_itself() {
+        // struct c __seg_gs *(*fp)(void)
+        let mut t = TypeSpecifier::FunctionPointer(Box::new(ptr(base())), Vec::new(), false);
+        apply_decl_address_space_to_spec(&mut t, AddressSpace::SegGs);
+        assert_eq!(innermost_space(&t), Some(AddressSpace::SegGs));
+    }
+
+    #[test]
+    fn bare_function_qualifies_return_pointer() {
+        // struct c __seg_gs *f(void)
+        let mut t = TypeSpecifier::BareFunction(Box::new(ptr(base())), Vec::new(), false);
+        apply_decl_address_space_to_spec(&mut t, AddressSpace::SegGs);
+        assert_eq!(innermost_space(&t), Some(AddressSpace::SegGs));
+    }
+
+    #[test]
+    fn array_of_pointers_qualifies_elements() {
+        // struct c __seg_gs *a[4]
+        let mut t = TypeSpecifier::Array(Box::new(ptr(base())), None);
+        apply_decl_address_space_to_spec(&mut t, AddressSpace::SegGs);
+        assert_eq!(innermost_space(&t), Some(AddressSpace::SegGs));
+    }
+
+    #[test]
+    fn pointer_to_array_of_pointers_keeps_outer_generic() {
+        // struct c __seg_gs *(*pa)[4]
+        let mut t = ptr(TypeSpecifier::Array(Box::new(ptr(base())), None));
+        apply_decl_address_space_to_spec(&mut t, AddressSpace::SegGs);
+        assert_eq!(outer_space(&t), Some(AddressSpace::Default));
+        assert_eq!(innermost_space(&t), Some(AddressSpace::SegGs));
+    }
+
+    #[test]
+    fn default_space_is_a_no_op() {
+        let mut t = ptr(ptr(base()));
+        let before = format!("{t:?}");
+        apply_decl_address_space_to_spec(&mut t, AddressSpace::Default);
+        assert_eq!(format!("{t:?}"), before);
     }
 }

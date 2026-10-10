@@ -446,6 +446,7 @@ impl std::fmt::Debug for ParsedDeclAttrs {
             .field("parsing_const", &self.parsing_const())
             .field("parsing_volatile", &self.parsing_volatile())
             .field("parsing_address_space", &self.parsing_address_space)
+            .field("decl_address_space", &self.decl_address_space)
             .field("parsing_constructor", &self.parsing_constructor())
             .field("parsing_destructor", &self.parsing_destructor())
             .field("parsing_weak", &self.parsing_weak())

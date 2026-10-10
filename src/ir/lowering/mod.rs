@@ -32,6 +32,7 @@ pub(crate) mod lvalue;
 mod nested_functions;
 mod pointer_analysis;
 mod ref_collection;
+mod seg_copy;
 pub(crate) mod stmt;
 mod stmt_asm;
 mod stmt_control_flow;

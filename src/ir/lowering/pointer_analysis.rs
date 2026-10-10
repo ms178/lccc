@@ -521,16 +521,26 @@ impl Lowerer {
             }
             // Nested member access: s.inner.field — propagate from outermost base
             Expr::MemberAccess(base, _, _) => self.get_addr_space_of_struct_expr(base),
-            // Array element access: arr[i] (and a[i][j], i[a]) live in the
-            // base object's address space. Without this arm, the kernel's
-            // `__this_cpu_read(vector_irq[vector])` — which lowers through
-            // `&(vector_irq[vector])` — walked into the catch-all and lost
-            // `__seg_gs`, so common_interrupt looked the handler up in the
-            // STATIC percpu image instead of the per-CPU area and every
-            // timer interrupt hit "No irq handler for 0.48" (vector 0x30,
-            // the legacy timer IRQ whose desc binding lives precisely in
-            // that array) until "IO-APIC + timer doesn't work!" panicked.
-            Expr::ArraySubscript(base, _, _) => self.get_addr_space_of_struct_expr(base),
+            // Array element access: arr[i] (and a[i][j], i[a]) lives in the
+            // space of the memory the subscript walks into.
+            //  * Array base (`__seg_gs T arr[N]`): the array object's own
+            //    space. Without this arm, the kernel's
+            //    `__this_cpu_read(vector_irq[vector])` — which lowers through
+            //    `&(vector_irq[vector])` — walked into the catch-all and lost
+            //    `__seg_gs`, so common_interrupt looked the handler up in the
+            //    STATIC percpu image instead of the per-CPU area and every
+            //    timer interrupt hit "No irq handler for 0.48" (vector 0x30,
+            //    the legacy timer IRQ whose desc binding lives precisely in
+            //    that array) until "IO-APIC + timer doesn't work!" panicked.
+            //  * Pointer base (`gp[i]`, `gp` of type `T __seg_gs *`): the
+            //    elements live in the pointee space of gp's type, NOT in the
+            //    space of the variable gp itself. Walking the variable's
+            //    space made `gp[1].v[0]` load from generic memory, a silent
+            //    wrong-memory access (oracle: GCC 14.2 emits `%gs:` there).
+            Expr::ArraySubscript(base, _, _) => match self.get_expr_ctype(base) {
+                Some(CType::Pointer(_, pointee_space)) => pointee_space,
+                _ => self.get_addr_space_of_struct_expr(base),
+            },
             // p->field where p is a segment-qualified pointer: the member
             // (including member ARRAYS, whose CType is Array not Pointer and
             // therefore invisible to get_addr_space_of_ptr_expr) lives in

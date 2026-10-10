@@ -448,7 +448,7 @@ impl Lowerer {
                 // We must spill it to an alloca before memcpy.
                 let total_size = ct.size();
                 let is_small_vec_call = self.rhs_is_small_vector_call(expr, total_size);
-                let src = self.lower_expr(expr);
+                let src = self.lower_aggregate_rvalue(expr);
                 let src_val = self.operand_to_value(src);
                 if is_small_vec_call {
                     // Packed register value: store to alloca, then memcpy from alloca
@@ -581,11 +581,7 @@ impl Lowerer {
             });
         } else {
             let src_addr = self.get_struct_base_addr(expr);
-            self.emit(Instruction::Memcpy {
-                dest: alloca,
-                src: src_addr,
-                size: da.actual_alloc_size,
-            });
+            self.copy_aggregate_from_expr(alloca, expr, src_addr, da.actual_alloc_size);
         }
     }
 
