@@ -199,19 +199,162 @@ fn encode_fmov_general(fp_name: &str, gp_name: &str, to_fp: bool) -> Result<Enco
     Ok(EncodeResult::Word(word))
 }
 
+/// Decode the FMOV 8-bit floating-point immediate (GAS 2.47 probe law):
+/// `imm8<7>` is the sign, `imm8<6:4>` selects the exponent --
+/// `E = eraw <= 3 ? eraw + 1 : eraw - 7` (so E spans -3..=4) -- and
+/// `imm8<3:0>` is the fraction in sixteenths: value = (-1)^s * 2^E *
+/// (1 + F/16).  Every probe row fits: 1.0 = 0x70, -1.0 = 0xf0,
+/// 0.5 = 0x60, 2.0 = 0x00, 3.0 = 0x08, 10.0 = 0x24, 15.5 = 0x2f,
+/// 24.0 = 0x70... (and 0.0, 0.0625 = 2^-4, 256.0 have no encoding at all).
+fn fmov_imm8_value(imm8: u32) -> f64 {
+    let sign = if imm8 & 0x80 != 0 { -1.0 } else { 1.0 };
+    let eraw = ((imm8 >> 4) & 0x7) as i32;
+    let frac = (imm8 & 0xF) as f64 / 16.0;
+    let e = if eraw <= 3 { eraw + 1 } else { eraw - 7 };
+    sign * 2f64.powi(e) * (1.0 + frac)
+}
+
+/// Round `x` to half-precision (round-to-nearest-even, normal range) and
+/// return the value again as f64 -- exactly what the hardware will store for
+/// `fmov Hd, #imm`.  Out-of-half-range inputs return `None` (they can never
+/// equal an encodable candidate).
+fn f64_as_f16(x: f64) -> Option<f64> {
+    let bits = x.to_bits();
+    let sign = bits & 0x8000_0000_0000_0000;
+    let exp_bits = ((bits >> 52) & 0x7FF) as i32;
+    let frac = bits & 0x000F_FFFF_FFFF_FFFF;
+    // Decompose into (sign, binary exponent e with 1 <= m < 2, mantissa bits).
+    let (e, m_bits) = match exp_bits {
+        0 => {
+            // Zero or subnormal f64: too small for f16 normals (min normal
+            // 2^-14); subnormal f16 (if any) is produced only from 2^-25
+            // scale inputs -- below every candidate, so None is fine only if
+            // we cannot round INTO a candidate.  The smallest candidate is
+            // 0.125, far above the f16 subnormal range, so reject.
+            return None;
+        }
+        0x7FF => return None, // inf/NaN
+        _ => {
+            let e = exp_bits - 1023;
+            (e, frac | (1 << 52))
+        }
+    };
+    // Value = m_bits / 2^52 * 2^e, m in [2^52, 2^53).
+    // f16: 10 mantissa bits kept after the leading one (ulp = 2^(e-10)).
+    let shift = 52 - 10; // bits to drop (keeping 10)
+    let dropped = m_bits & ((1u64 << shift) - 1);
+    let keep = m_bits >> shift;
+    let mut keep128 = keep;
+    let half = 1u64 << (shift - 1);
+    let round_up = dropped > half || (dropped == half && (keep & 1) == 1);
+    if round_up {
+        keep128 += 1;
+    }
+    // carry: keep was 2^11 (10 bits + leading one) after increment
+    let mut e = e;
+    if keep128 == (1u64 << 11) {
+        keep128 >>= 1;
+        e += 1;
+    }
+    // f16 normal range: 2^-14 <= 2^e * (m/2^52) < 2^15 (with E+bias<=30)
+    let exp15 = e + 15;
+    if !(1..=30).contains(&exp15) {
+        return None;
+    }
+    let mant = (keep128 & 0x3FF) as u64;
+    let f16_bits = (sign >> 48) | ((exp15 as u64) << 10) | mant;
+    // Back to f64 (exact: f16 normals are a subset of f64).  Only the
+    // sign BIT moves to bit 63 -- shifting the whole pattern would OR
+    // mantissa bits into the exponent (that bug produced 2.23e44 for
+    // f16(10.0)).
+    let b_sign = (f16_bits & 0x8000) << 48;
+    let b_exp = ((f16_bits >> 10) & 0x1F) as i32;
+    let b_frac = f16_bits & 0x3FF;
+    if b_exp == 0 {
+        // Subnormal f16: unreachable here -- exp15 >= 1 guarantees a
+        // normal result, and no candidate is subnormal.
+        return None;
+    }
+    let e64 = (b_exp - 15) + 1023;
+    let val = f64::from_bits(b_sign | ((e64 as u64) << 52) | (b_frac << 42));
+    let _ = m_bits;
+    Some(val)
+}
+
 pub(crate) fn encode_fmov(operands: &[Operand]) -> Result<EncodeResult, String> {
     if operands.len() != 2 {
         return Err(format!("fmov requires 2 operands, got {}", operands.len()));
     }
 
+    // FMOV <Sd|Dd|Hd>, #<imm> -- the immediate form enumerates the 256
+    // encodings rather than trusting a hand-derived inverse of the bit
+    // grammar: a candidate matches iff its value equals the requested one
+    // under the destination's precision (GAS rounds `#1.00000001` into
+    // f32 1.0 for `fmov s0` and rejects `#1.0000001`, measured).
+    if !matches!(operands[1], Operand::Reg(_)) {
+        let want: f64 = match &operands[1] {
+            Operand::Imm(v) => *v as f64,
+            Operand::Expr(e) => e
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| format!("fmov: `{e}` is not a floating-point immediate literal"))?,
+            other => {
+                return Err(format!(
+                    "fmov: expected a floating-point immediate, got {other:?}"
+                ));
+            }
+        };
+        let rd_name = match &operands[0] {
+            Operand::Reg(r) => r.to_lowercase(),
+            other => {
+                return Err(format!(
+                    "fmov: expected an FP destination register, got {other:?}"
+                ));
+            }
+        };
+        let letter = rd_name.as_bytes().first().copied().unwrap_or(b'?');
+        if !matches!(letter, b'h' | b's' | b'd') {
+            return Err(format!(
+                "fmov: `{rd_name}` cannot take a floating-point immediate (only h/s/d)"
+            ));
+        }
+        let rd = parse_reg_num(&rd_name).ok_or_else(|| format!("fmov: bad dest `{rd_name}`"))?;
+        let ftype = fp_ftype_letter(letter, "fmov")?;
+        for imm8 in 0u32..=0xFF {
+            let cand = fmov_imm8_value(imm8);
+            let hit = match letter {
+                b'd' => cand == want,
+                b's' => (want as f32) as f64 == cand,
+                _ => f64_as_f16(want) == Some(cand),
+            };
+            if hit {
+                // 0 00 11110 ftype 1 imm8 1 Rn(=0) Rd
+                let word = (0b00011110u32 << 24)
+                    | (ftype << 22)
+                    | (1 << 21)
+                    | (imm8 << 13)
+                    | (1 << 12)
+                    | rd;
+                return Ok(EncodeResult::Word(word));
+            }
+        }
+        return Err(format!(
+            "fmov: the value {} is not representable by the 8-bit floating-point \
+             immediate (no imm8 decodes to it; 0.0 and out-of-range magnitudes \
+             have no encoding)",
+            {
+                // Print the parsed value, not the raw text, so diagnostics
+                // are stable across spellings (`#1e1`, `#10.0`).
+                match &operands[1] {
+                    Operand::Imm(v) => v.to_string(),
+                    other => format!("{other:?}"),
+                }
+            }
+        ));
+    }
+
     let (rd_name, rm_name) = match (&operands[0], &operands[1]) {
         (Operand::Reg(a), Operand::Reg(b)) => (a.clone(), b.clone()),
-        (Operand::Reg(_), Operand::Imm(_)) => {
-            return Err(
-                "fmov with an immediate operand is not supported; materialise the constant with `mov` into a GP register, or load it from .rodata"
-                    .to_string(),
-            );
-        }
         _ => return Err("fmov needs register operands".to_string()),
     };
 
@@ -363,32 +506,91 @@ pub(crate) fn encode_fnmadd_fnmsub(
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_fcmp(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let (rn, letter, _) = fp_reg(operands, 0, "fcmp")?;
-    let ftype = fp_ftype_letter(letter, "fcmp")?;
+/// Raw, un-parsed spelling of operand `index` (fcmp-shaped instructions
+/// have no commas inside an operand, so a flat split is exact).
+pub(crate) fn fcmp_raw_operand(raw_operands: &str, index: usize) -> &str {
+    raw_operands.split(',').nth(index).unwrap_or("").trim()
+}
 
-    // FCMP Dn, #0.0
-    if operands.len() < 2 || matches!(operands.get(1), Some(Operand::Imm(0))) {
-        let word = ((0b00011110 << 24) | (ftype << 22) | (1 << 21))
-            | (0b001000 << 10)
-            | (rn << 5)
-            | 0b01000;
+/// True iff the operand denotes the *positive* floating-point zero that
+/// `FCMP Rn, #0.0` accepts.  GAS 2.47 accepts `#0`, `#0.0`, `#0.00`,
+/// `#+0.0`, `#0e0` and rejects `#-0`, `#-0.0`, `#1`, `#1.0` (measured).
+/// Integer spellings arrive as `Imm` (where `#-0` shares i64 0 with `#0`,
+/// so the sign must be read from that operand's raw text); float spellings
+/// arrive as `Expr` and carry their own sign.  Parenthesised forms
+/// (`#(0.0)`) are rejected by GAS and fall through here because they do
+/// not parse.
+pub(crate) fn fcmp_is_positive_zero(op: Option<&Operand>, raw_operand: &str) -> bool {
+    match op {
+        Some(Operand::Imm(0)) => {
+            // Raw text of this operand: `#-0` must not pass as `#0`.
+            let after_hash = raw_operand.strip_prefix('#').unwrap_or(raw_operand).trim();
+            let after_paren = after_hash.strip_prefix('(').unwrap_or(after_hash);
+            !after_paren.starts_with('-')
+        }
+        Some(Operand::Expr(e)) => {
+            matches!(e.trim().parse::<f64>(), Ok(v) if v == 0.0 && !v.is_sign_negative())
+        }
+        _ => false,
+    }
+}
+
+/// `FCMP`/`FCMPE` share one encoding; `fcmpe` sets bit 4 of Rt in both the
+/// register form (Rt = 0b01000) and the `#0.0` form (Rt = 0b11000), which
+/// is what GAS 2.47 emits (`fcmpe s8, s9` = 0x1e292110,
+/// `fcmpe d8, #0.0` = 0x1e602118).
+pub(crate) fn encode_fcmp(
+    operands: &[Operand],
+    raw_operands: &str,
+    fcmpe: bool,
+) -> Result<EncodeResult, String> {
+    let mn = if fcmpe { "fcmpe" } else { "fcmp" };
+    if operands.len() != 2 {
+        return Err(format!(
+            "{mn} requires exactly 2 operands (Rn and Rm or #0.0), got {}",
+            operands.len()
+        ));
+    }
+    let (rn, letter, _) = fp_reg(operands, 0, mn)?;
+    let ftype = fp_ftype_letter(letter, mn)?;
+
+    // Immediate operand: only +0.0 exists (`FCMP <Rn>, #0.0`).
+    if !matches!(operands.get(1), Some(Operand::Reg(_))) {
+        if !fcmp_is_positive_zero(operands.get(1), fcmp_raw_operand(raw_operands, 1)) {
+            return Err(format!(
+                "{mn}: the only allowed immediate is +0.0; `{:?}` is not it \
+                 (GAS rejects `#-0.0`, `#1`, `#1.0` and parentheses)",
+                operands.get(1)
+            ));
+        }
+        // 0 00 11110 ftype 1 0000000 0000 001000 Rn Rt -- Rt = 0b01000,
+        // plus 0b01000 for fcmpe (bit 4).
+        let rt = 0b01000u32 | if fcmpe { 0b10000 } else { 0 };
+        let word =
+            ((0b00011110 << 24) | (ftype << 22) | (1 << 21)) | (0b001000 << 10) | (rn << 5) | rt;
         return Ok(EncodeResult::Word(word));
     }
 
-    let (rm, rm_letter, rm_name) = fp_reg(operands, 1, "fcmp")?;
+    let (rm, rm_letter, rm_name) = fp_reg(operands, 1, mn)?;
     if rm_letter != letter {
         return Err(format!(
-            "fcmp: the two operands must be the same floating-point width \
+            "{mn}: the two operands must be the same floating-point width \
              (`{}`-register form and `{}`-register form given)",
             char::from(letter),
             char::from(rm_letter)
         ));
     }
     let _ = rm_name;
-    // FCMP Dn, Dm: 0 00 11110 ftype 1 Rm 00 1000 Rn 00 000
-    let word =
-        (0b00011110 << 24) | (ftype << 22) | (1 << 21) | (rm << 16) | (0b001000 << 10) | (rn << 5);
+    // FCMP Dn, Dm: 0 00 11110 ftype 1 Rm 00 1000 Rn 00 000; fcmpe sets Rt
+    // bit 4 (0b10000): fcmpe s8,s9 = 0x1e292110, fcmp = 0x1e292100.
+    let rt = if fcmpe { 0b10000u32 } else { 0 };
+    let word = (0b00011110 << 24)
+        | (ftype << 22)
+        | (1 << 21)
+        | (rm << 16)
+        | (0b001000 << 10)
+        | (rn << 5)
+        | rt;
     Ok(EncodeResult::Word(word))
 }
 

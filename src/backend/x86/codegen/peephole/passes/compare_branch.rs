@@ -1220,6 +1220,55 @@ mod fusion_flags_flow_tests {
     }
 
     #[test]
+    fn refuses_across_a_data_directive_that_can_encode_an_instruction() {
+        // `.byte`/`.long` inside a body can be any instruction -- `adc`, `clc`,
+        // a branch -- so it must not be stepped over as if it had no effect.
+        // Unrecognized text is not harmless text.
+        let out = run(&shape("    .byte 0x83, 0xd0, 0x00\n"));
+        assert!(
+            out.contains("setl"),
+            "fused across a data directive that can encode a flag writer: {out}"
+        );
+    }
+
+    #[test]
+    fn fuses_across_benign_directives() {
+        // Control for the test above: the same position carrying directives
+        // that CANNOT encode an instruction (alignment, frame info, location).
+        // Refusing these would cost every real function its fold.
+        let out = run(&shape("    .p2align 3\n    .cfi_def_cfa_offset 16\n"));
+        assert!(
+            out.contains("jl .LBB1"),
+            "control did not fuse, so the refusal above proves nothing: {out}"
+        );
+    }
+
+    #[test]
+    fn refuses_across_a_fill_directive_whose_payload_is_a_flag_writer() {
+        // `.fill 1, 1, 0xF8` emits ONE byte, 0xF8, which decodes as `clc`.
+        // A directive whose payload is a literal byte pattern is data, not a
+        // position -- and `.fill repeat, size, value` can spell any bytes at
+        // all, so it is strictly more dangerous than the `.byte` case above.
+        let out = run(&shape("    .fill 1, 1, 0xF8\n"));
+        assert!(
+            out.contains("setl"),
+            "fused across `.fill` bytes that encode a flag writer: {out}"
+        );
+    }
+
+    #[test]
+    fn refuses_across_a_zero_directive() {
+        // `.zero 2` emits 0x00 0x00, which decodes as `add %al, (%rax)` -- a
+        // FULL flag writer.  `.skip`/`.space` are spelled differently and emit
+        // the same zeros.
+        let out = run(&shape("    .zero 2\n"));
+        assert!(
+            out.contains("setl"),
+            "fused across `.zero` bytes that encode a flag writer: {out}"
+        );
+    }
+
+    #[test]
     fn refuses_when_the_reader_sits_only_in_the_taken_target() {
         // The flags travel along the taken edge too.  A reader in the target
         // block is invisible to any scan of the fall-through text, which is

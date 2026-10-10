@@ -444,16 +444,18 @@ pub fn lower_binop(
                 }
                 // Strength reduction through the CPU tuning model
                 // (`X86Tune::mul_const_plan`): a LEA/SHL/ADD/SUB/NEG chain
-                // replaces `imul $k` when its latency beats IMUL on the
-                // tuned core.  Budget `imul_latency − 1`: 2 steps on every
-                // P-core and Zen (×10 → `lea (r,r,4); add r,r`, ×12 →
-                // `lea (r,r,2); shl $2`, ×17 → `shl $4; add src`, ×7 →
-                // `shl $3; sub src`), 4 on Gracemont whose IMUL is 5
-                // cycles.  Shapes that read the multiplicand after the
-                // first step need it in a register other than `dst`;
-                // otherwise IMUL stays.  The leading `mov` is eliminated
-                // at rename on every modelled core.  This reproduces GCC
-                // 16.2 / Clang 23.1 for these constants on generic tuning
+                // replaces `imul $k` when the chain's measured latency
+                // (LEA steps cost the row's `lea_scaled_latency` — 2 ticks
+                // for the scaled-index form on Golden/Raptor Cove — ALU and
+                // shift steps 1) is strictly below IMUL's.  Budget
+                // `imul_latency − 1` in cost units: 2 on every P-core and
+                // Zen (×9 → single `lea (r,r,8)`, ×17 → `shl $4; add src`,
+                // ×31 → `shl $5; sub src`; 2-LEA chains like ×45 cost 4 and
+                // fall back to `imull $45`, exactly GCC's choice), 4 on
+                // Gracemont whose IMUL is 5 cycles.  Shapes that read the
+                // multiplicand after the first step need it in a register
+                // other than `dst`; otherwise IMUL stays.  The leading
+                // `mov` is eliminated at rename on every modelled core.
                 // (docs/CPU_MODEL_AUDIT.md §4).
                 if imm != 0 && imm != 1 && !matches!(size, OpSize::S8 | OpSize::S16) {
                     let tune = crate::backend::x86::cpu_model::active();

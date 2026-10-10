@@ -1146,13 +1146,56 @@ pub fn link_shared(
         objects.push(carrier);
     }
 
+    // Identical Code Folding: `--icf=safe|all` must mean the same thing
+    // for `-shared` as for executables (lld and mold fold shared images;
+    // a flag that parses and then silently does nothing is fail-open).
+    // Folded sections enter `dead_sections`, are skipped by the merge, and
+    // are aliased onto their representative below — the same three-step
+    // contract as `link_builtin`. The emit-side relocation loop in
+    // `emit_shared` skips `dead_sections` so a folded twin's sequence-shaped
+    // TLS GD/LD rewrite cannot run twice over bytes the first application
+    // already rewrote (the `__cxa_get_globals` class).
+    let icf_mode: Option<String> = parsed
+        .icf
+        .clone()
+        .or_else(|| icf::icf_mode_from_env().map(str::to_string));
+    let mut dead_sections: FxHashSet<(usize, usize)> = FxHashSet::default();
+    let icf_plan = match icf_mode.as_deref() {
+        Some(mode) => icf::plan(&objects, mode == "safe", &dead_sections),
+        None => icf::IcfPlan::default(),
+    };
+    for folded in icf_plan.redirect.keys() {
+        dead_sections.insert(*folded);
+    }
+    // Folded FDEs duplicate the survivor's unwind rows at the aliased
+    // address; drop them before packing, as the executable path does.
+    if !icf_plan.is_empty() {
+        let folded: FxHashSet<(usize, usize)> = icf_plan.redirect.keys().copied().collect();
+        let _dropped = linker_common::prune_dead_fdes(&mut objects, &folded);
+    }
+
     // Merge sections (no gc-sections for shared libraries), packing
-    // .eh_frame as on the executable path.
-    let eh_packing = linker_common::pack_eh_frame_sections(&mut objects, &FxHashSet::default());
+    // .eh_frame as on the executable path. The gc-aware merge with an
+    // empty dead set is the plain merge.
+    let eh_packing = linker_common::pack_eh_frame_sections(&mut objects, &dead_sections);
     let mut output_sections: Vec<OutputSection> = Vec::new();
     let mut section_map: FxHashMap<(usize, usize), (usize, u64)> = FxHashMap::default();
-    linker_common::merge_sections_elf64(&objects, &mut output_sections, &mut section_map);
+    linker_common::merge_sections_elf64_gc(
+        &objects,
+        &mut output_sections,
+        &mut section_map,
+        &dead_sections,
+    );
     linker_common::apply_cie_redirects(&mut objects, &section_map, &eh_packing)?;
+    // Point folded sections at the representative's placement: same order
+    // as `link_builtin` (after the merge, before any address assignment).
+    if !icf_plan.is_empty() {
+        for (&folded, &rep) in icf_plan.redirect.iter() {
+            if let Some(&placement) = section_map.get(&rep) {
+                section_map.insert(folded, placement);
+            }
+        }
+    }
 
     // Allocate COMMON symbols
     linker_common::allocate_common_symbols_elf64(&mut globals, &mut output_sections, sort_common);
@@ -1164,6 +1207,7 @@ pub fn link_shared(
         &mut output_sections,
         parsed.hash_style,
         &section_map,
+        &dead_sections,
         &needed_sonames,
         output_path,
         soname,
