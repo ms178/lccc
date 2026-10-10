@@ -129,6 +129,8 @@ BENCHMARKS: tuple[Benchmark, ...] = (
               ("zlib_ng_adler32_combine.c",), ("workload", "zlib-ng", "checksum", "integer")),
     Benchmark("expat_xml_scan", "Expat UTF-8 XML name-token scan",
               ("expat_xml_scan.c",), ("workload", "expat", "parser", "branch")),
+    Benchmark("expat_siphash24", "Expat SipHash-2-4 keyed name hashing / short variable messages",
+              ("expat_siphash24.c",), ("workload", "expat", "hash", "arx", "integer")),
     Benchmark("sqlite_varint", "SQLite 1–9 byte varint decoder",
               ("sqlite_varint.c",), ("workload", "sqlite", "branch", "integer")),
     Benchmark("linux_find_bit", "Linux sparse find_next_andnot_bit",

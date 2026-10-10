@@ -14,6 +14,7 @@ extraction boundaries, and the authoritative per-file mapping; see
 | `gzip_crc32.c` | `GNU-LGPL-3.0-or-later.txt` |
 | `zlib_ng_adler32.c` | `Zlib.txt` |
 | `expat_xml_scan.c` | `Expat-MIT.txt` |
+| `expat_siphash24.c` | `CC0-1.0.txt` |
 | `sqlite_varint.c` | `SQLite-public-domain.txt` |
 | `linux_find_bit.c` | `Linux-GPL-2.0-or-later.txt` |
 | `glibc_memcmp.c` | `GNU-LGPL-2.1-or-later.txt` |

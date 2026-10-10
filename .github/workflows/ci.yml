@@ -118,6 +118,12 @@ jobs:
       - name: Variadic pack count inlining contracts
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_va_arg_pack_len.sh
 
+      - name: Empty-aggregate cross-compiler ABI contracts
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_empty_aggregate_abi.sh
+
+      - name: Aggregate-call byte boundaries and cross-compiler ABI
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_aggregate_call_abi.sh
+
       - name: Run tests
         env:
           CARGO_BUILD_JOBS: "2"

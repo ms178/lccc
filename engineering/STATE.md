@@ -4,6 +4,14 @@ State refreshed against **`main`** (`ms178/lccc`) with Rust 2024 Edition / Rust 
 
 The item catalog is [`agent/BACKLOG.md`](agent/BACKLOG.md); the active queue is [`tasks/`](tasks/README.md); the negative-results ledger is [`DECISIONS.md`](DECISIONS.md).
 
+## Active 2026-10-10 correctness campaign
+
+See [GCC 17 native-torture follow-up](FOLLOWUP-2026-10-10-gcc17-native-torture.md)
+for the exact development-corpus pin, frozen x86-64/i686 baseline, K&R
+prototype/ABI fixes, evidence limits, oracle provisioning and remaining work.
+Intermediate autosaves are UNGATED until the exact tree passes CI; no new
+performance-superiority claim is made by this campaign.
+
 ---
 
 ## What is production

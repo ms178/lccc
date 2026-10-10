@@ -13,14 +13,21 @@ Architectures Supported:
     (`-m elf_i386`) + multilib CRT; --link-mode=driver keeps the legacy
     one-step lccc-i686 compile+link through its built-in linker.
 
-Corpus: scripts/ensure_gcc_torture.sh provisions gcc.c-torture (GCC 16.2.0 by
-default) into the snapshot-excluded ~/.cache zone; GCC_TORTURE overrides.
+Corpus: scripts/ensure_gcc_torture.sh provisions the GCC 16.2 release;
+scripts/ensure_gcc_torture_git.py provisions revision-pinned GCC 17 development
+sources. Select the latter with --suite; GCC_TORTURE overrides the default.
 
 Features:
   - Multi-threaded execution pool.
   - Reference compiler validation (GCC) to establish host/test eligibility.
   - Sandbox and cross-execution support (--runner, e.g. qemu-i386).
-  - JSON reporting and automated failure triage logs.
+  - Atomic partial JSON checkpoints, binary/source identities, and failure logs.
+  - Reference multilib preflight; missing tools/timeouts cannot become skips.
+
+This is a native differential subset, NOT a full DejaGnu implementation.
+Only unconditional dg-options and the documented expensive/timeout directives
+are interpreted. Reference skips retain diagnostics and are not passes. The
+default five -O levels are not GCC's full LTO/loop-flag torture option matrix.
   - Failure-focused re-runs: --from-list FILE restricts the corpus to the
     test names listed in a previous report (one JSON `test` value per line).
 
@@ -38,6 +45,10 @@ import argparse
 import concurrent.futures
 import dataclasses
 import glob
+import functools
+import hashlib
+import math
+import platform
 import json
 import os
 import re
@@ -52,6 +63,9 @@ from pathlib import Path
 from typing import Sequence
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+from tools.corpus import process, publication
+
 DEFAULT_LCCC_X86_64 = REPO / "target" / "fastbuild" / "lccc"
 DEFAULT_LCCC_I686 = REPO / "target" / "fastbuild" / "lccc-i686"
 DEFAULT_LD = REPO / "target" / "fastbuild" / "lccc-ld"
@@ -91,6 +105,7 @@ _EXPENSIVE = re.compile(r"\{\s*dg-require-effective-target\s+run_expensive_tests
 QUIET_STATUSES = frozenset({"pass", "reference-compile-skip", "reference-run-skip", "unsupported"})
 
 
+@functools.lru_cache(maxsize=8)
 def _gcc_private_include(gcc: str, m32: bool = False) -> list[str]:
     cmd = [gcc]
     if m32:
@@ -136,12 +151,17 @@ class Result:
 
 
 def run(command: Sequence[str], timeout: float, *, cwd: Path | None = None) -> subprocess.CompletedProcess[bytes]:
+    # Share the corpus runner's bounded output/process-group containment. A
+    # GCC driver timeout must kill cc1/collect2 too, not leave them consuming
+    # the constrained host after their parent has been reaped.
     try:
-        return subprocess.run(command, cwd=cwd, capture_output=True, timeout=timeout, check=False)
-    except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout or b""
-        stderr = (exc.stderr or b"") + f"\nTIMEOUT after {timeout:.0f}s".encode()
-        return subprocess.CompletedProcess(command, 124, stdout, stderr)
+        result = process.run(command, timeout, cwd=cwd)
+        code = result["returncode"]
+        stderr = result["stderr"]
+        if result["failure"]:
+            code = 124 if result["failure"] == "timeout" else 125
+            stderr += f"\nHARNESS {result['failure']} (timeout={timeout:g}s)".encode()
+        return subprocess.CompletedProcess(command, code, result["stdout"], stderr)
     except OSError as exc:
         return subprocess.CompletedProcess(command, 125, b"", str(exc).encode())
 
@@ -165,7 +185,8 @@ def native_directive_flags(source: Path) -> tuple[str, ...]:
 def directive_timeout_factor(source: Path) -> float:
     match = _TIMEOUT_FACTOR.search(source.read_text(errors="replace")[:8192])
     try:
-        return max(1.0, float(match.group(1))) if match else 1.0
+        factor = float(match.group(1)) if match else 1.0
+        return max(1.0, factor) if math.isfinite(factor) else 1.0
     except ValueError:
         return 1.0
 
@@ -216,7 +237,7 @@ def compile_case(
         )
     compile_timeout *= case.timeout_factor
     is_32 = arch in ("i686", "i386", "x86_32")
-    common = ["-w", case.opt_flags, *case.directive_flags, *append_args,
+    common = ["-w", *shlex.split(case.opt_flags), *case.directive_flags, *append_args,
               *_includes(gcc, suite, is_32)]
     with tempfile.TemporaryDirectory(prefix="lccc-gcc-torture-") as temp_name:
         temp = Path(temp_name)
@@ -225,7 +246,7 @@ def compile_case(
         if proc.returncode:
             return Result(
                 case.source.name, case.opt_flags, list(case.directive_flags),
-                "reference-compile-skip", "reference-compile", proc.returncode,
+                reference_status(proc, "compile"), "reference-compile", proc.returncode,
                 time.monotonic() - started, detail_of(proc),
             )
         obj = temp / "test.o"
@@ -237,17 +258,13 @@ def compile_case(
                 "compile-fail", "lccc-i686" if is_32 else "lccc-compile",
                 proc.returncode, time.monotonic() - started, detail_of(proc),
             )
-        # A zero exit status without an object (or with a truncated one) is
-        # a failure too: the ELF magic is the minimum an assembler must emit.
-        try:
-            magic = obj.read_bytes()[:4]
-        except OSError:
-            magic = b""
-        if magic != b"\x7fELF":
+        # Do not accept four ELF-magic bytes (or a 64-bit object in the i686
+        # leg) as successful integrated assembly.
+        if not valid_object(obj, is_32):
             return Result(
                 case.source.name, case.opt_flags, list(case.directive_flags),
-                "compile-fail", "no-object", proc.returncode,
-                time.monotonic() - started, "lccc exited 0 without an ELF object",
+                "compile-fail", "invalid-object", proc.returncode,
+                time.monotonic() - started, "lccc exited 0 without a target ELF relocatable object",
             )
     return Result(
         case.source.name, case.opt_flags, list(case.directive_flags),
@@ -280,7 +297,7 @@ def execute_case(
         )
     compile_timeout *= case.timeout_factor
     run_timeout *= case.timeout_factor
-    all_flags = [case.opt_flags, *case.directive_flags, *append_args]
+    all_flags = [*shlex.split(case.opt_flags), *case.directive_flags, *append_args]
     is_32 = arch in ("i686", "i386", "x86_32")
     common = ["-w", *all_flags, *_includes(gcc, suite, is_32)]
 
@@ -298,7 +315,7 @@ def execute_case(
         if proc.returncode:
             return Result(
                 case.source.name, case.opt_flags, list(case.directive_flags),
-                "reference-compile-skip", "reference-compile", proc.returncode,
+                reference_status(proc, "compile"), "reference-compile", proc.returncode,
                 time.monotonic() - started, detail_of(proc),
             )
 
@@ -307,7 +324,7 @@ def execute_case(
         if proc.returncode:
             return Result(
                 case.source.name, case.opt_flags, list(case.directive_flags),
-                "reference-run-skip", "reference-run", proc.returncode,
+                reference_status(proc, "run"), "reference-run", proc.returncode,
                 time.monotonic() - started, detail_of(proc),
             )
 
@@ -392,9 +409,8 @@ def revision(path: Path) -> str | None:
 
 def atomic_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    temporary.replace(path)
+    publication.atomic_bytes(path, (json.dumps(payload, indent=2, sort_keys=True,
+                                               allow_nan=False) + "\n").encode())
 
 
 def read_test_list(path: Path) -> list[str]:
@@ -475,6 +491,113 @@ def discover(args: argparse.Namespace) -> list[Path]:
     return selected
 
 
+def valid_object(path: Path, is_32: bool) -> bool:
+    """Minimum ELF header contract, not a full ELF verifier."""
+    size = 52 if is_32 else 64
+    try:
+        with path.open("rb") as stream:
+            header = stream.read(size)
+    except OSError:
+        return False
+    return (len(header) == size and header[:7] == b"\x7fELF" +
+            bytes((1 if is_32 else 2, 1, 1)) and
+            int.from_bytes(header[16:18], "little") == 1 and
+            int.from_bytes(header[18:20], "little") == (3 if is_32 else 62) and
+            int.from_bytes(header[20:24], "little") == 1 and
+            int.from_bytes(header[40:42] if is_32 else header[52:54], "little") == size)
+
+
+def reference_status(proc: subprocess.CompletedProcess[bytes], phase: str) -> str:
+    """Host rejection is ineligibility; missing tools/resource failures are not."""
+    if (proc.returncode in (124, 125, 126, 127) or
+            (phase == "compile" and (proc.returncode < 0 or
+             b"internal compiler error" in proc.stderr.lower()))):
+        return "reference-fail"
+    return f"reference-{phase}-skip"
+
+
+def file_sha256(path: Path) -> str | None:
+    try:
+        # hashlib.file_digest is Python 3.11+, but the tooling floor is 3.9.
+        # Streaming also avoids loading a large debug compiler into memory.
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def reference_preflight(args: argparse.Namespace, runner: list[str]) -> str | None:
+    """Detect unavailable GCC/multilib/runtime before thousands of false skips."""
+    is_32 = args.arch in ("i686", "i386")
+    with tempfile.TemporaryDirectory(prefix="lccc-torture-preflight-") as td:
+        root = Path(td)
+        source = root / "probe.c"
+        source.write_text(
+            "#include <stddef.h>\n#include <math.h>\n"
+            "volatile double x;\n"
+            f"int main(void) {{ return sizeof(void *) != {4 if is_32 else 8} || sin(x) != 0; }}\n"
+        )
+        output = root / ("probe.o" if args.mode == "compile" else "probe")
+        command = [args.gcc, *(["-m32"] if is_32 else []), "-O0",
+                   *(["-c"] if args.mode == "compile" else []), str(source),
+                   *([] if args.mode == "compile" else ["-lm"]), "-o", str(output)]
+        proc = run(command, args.compile_timeout)
+        if proc.returncode or not output.is_file():
+            return f"reference {args.arch} compile/link preflight failed: " + detail_of(proc)
+        if args.mode == "compile" and not valid_object(output, is_32):
+            return "reference preflight did not produce a target ELF relocatable object"
+        if args.mode == "execute":
+            proc = run([*runner, str(output)], args.run_timeout)
+            if proc.returncode:
+                return f"reference {args.arch} execution preflight failed: " + detail_of(proc)
+    return None
+
+
+def public_environment() -> dict[str, str]:
+    """Feature knobs are evidence; credential-bearing environment is not."""
+    return {k: v for k, v in sorted(os.environ.items())
+            if k.startswith(("CCC_", "LCCC_")) and not any(
+                marker in k.upper() for marker in ("TOKEN", "SECRET", "PASSWORD", "KEY", "AUTH"))}
+
+
+def run_identity(args: argparse.Namespace, sources: list[Path]) -> dict:
+    tools = {}
+    for name, command in (("lccc", str(args.lccc)), ("lccc_ld", str(args.lccc_ld)),
+                          ("gcc", args.gcc)):
+        if name == "lccc_ld" and (args.mode == "compile" or args.link_mode == "driver"):
+            continue
+        banner = run([command, "--version"], 15)
+        tools[name] = dict(path=command, sha256=file_sha256(Path(command)),
+                           version=detail_of(banner, 4096).strip(),
+                           version_returncode=banner.returncode)
+    selected = hashlib.sha256()
+    for source in sorted(sources):
+        selected.update(source.name.encode() + b"\0" + source.read_bytes() + b"\0")
+    stamp = args.suite.parents[1] / ".lccc-provisioned"
+    return {
+        "arch": args.arch, "mode": args.mode, "suite": str(args.suite),
+        "lccc": str(args.lccc), "lccc_ld": str(args.lccc_ld), "gcc": args.gcc,
+        "lccc_head": revision(REPO), "link_mode": args.link_mode,
+        "runner_sha256": file_sha256(Path(__file__)),
+        "gcc_checkout_head": revision(args.suite),
+        "gcc_testsuite": _testsuite_version(args.suite),
+        "corpus_stamp_sha256": file_sha256(stamp), "tools": tools,
+        "selection": {"tests": args.tests, "filter": args.filter,
+                      "from_list": str(args.from_list) if args.from_list else None,
+                      "sources": len(sources), "selected_sources_sha256": selected.hexdigest()},
+        **({"from_list": str(args.from_list)} if args.from_list else {}),
+        "append": args.append, "runner": args.runner, "expensive": args.expensive,
+        "compile_timeout": args.compile_timeout, "run_timeout": args.run_timeout,
+        "jobs": args.jobs, "host": platform.platform(),
+        "environment": public_environment(),
+        "coverage_contract": "top-level C sources; native reference eligibility; "
+                             "not full DejaGnu directive/option coverage",
+    }
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -525,12 +648,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--json", type=Path)
     parser.add_argument("--failure-log", type=Path)
     parser.add_argument("-v", "--verbose", action="store_true")
-    return parser.parse_args(argv)
+    return parser.parse_intermixed_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    sys.stdout.reconfigure(line_buffering=True)
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
     args = parse_args(argv)
+    if (args.jobs < 1 or any(not math.isfinite(t) or t <= 0
+                             for t in (args.compile_timeout, args.run_timeout))):
+        print("error: jobs and finite timeouts must be positive", file=sys.stderr)
+        return 2
     if args.suite is None:
         args.suite = DEFAULT_SUITE if args.mode == "execute" else DEFAULT_SUITE.parent / "compile"
     args.suite = args.suite.expanduser().resolve()
@@ -565,14 +693,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("error: no tests/configurations selected", file=sys.stderr)
         return 2
 
+    if len({source.name for source in sources}) != len(sources) or len(set(flags)) != len(flags):
+        print("error: duplicate test names/configurations make report keys ambiguous", file=sys.stderr)
+        return 2
+    try:
+        for flag in flags:
+            shlex.split(flag)
+        runner_cmd = shlex.split(args.runner)
+        append_args = shlex.split(args.append)
+    except ValueError as exc:
+        print(f"error: invalid option quoting: {exc}", file=sys.stderr)
+        return 2
+
     cases = [
         Case(source, opt, native_directive_flags(source),
              directive_timeout_factor(source), requires_expensive(source))
         for source in sources
         for opt in flags
     ]
-    runner_cmd = shlex.split(args.runner) if args.runner else []
-    append_args = shlex.split(args.append) if args.append else []
 
     print(f"suite:   {args.suite} ({len(sources)} sources)")
     if args.from_list:
@@ -590,6 +728,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     started = time.monotonic()
     results: list[Result] = []
     counts: Counter[str] = Counter()
+    # Identity is captured before the matrix, never inferred later from a
+    # possibly rebuilt binary or a rebased checkout. Paths alone are not pins.
+    identity = run_identity(args, sources)
+    fatal = reference_preflight(args, runner_cmd)
+
+    def save(complete: bool) -> None:
+        if args.json:
+            atomic_json(args.json, {
+                "schema": 2, **identity, "complete": complete,
+                "expected_cases": len(cases), "completed_cases": len(results),
+                "fatal": fatal, "flags": flags,
+                "elapsed_s": round(time.monotonic() - started, 3),
+                "counts": dict(sorted(counts.items())),
+                "results": [dataclasses.asdict(r) for r in sorted(
+                    results, key=lambda r: (r.test, flags.index(r.flags)))],
+            })
+
+    save(False)
+    if fatal:
+        print("error: " + fatal, file=sys.stderr)
+        return 2
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
         futures = {
             pool.submit(
@@ -613,6 +772,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = future.result()
             results.append(result)
             counts[result.status] += 1
+            # At most 24 completed cases can be lost by an external SIGKILL.
+            # Partial reports explicitly carry complete=false; no consumer
+            # may mistake them for an all-corpus success.
+            if index % 25 == 0 or result.status not in QUIET_STATUSES:
+                save(False)
             if result.status not in QUIET_STATUSES:
                 print(f"{result.status.upper():<20} {result.test}[{result.flags}] rc={result.returncode}")
                 if result.detail:
@@ -624,34 +788,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     results.sort(key=lambda item: (item.test, flags.index(item.flags)))
     elapsed = time.monotonic() - started
-    payload = {
-        "schema": 1,
-        "arch": args.arch,
-        # Present only for the compile leg; execute-leg reports keep the
-        # pre-`--mode` schema.
-        **({"mode": "compile"} if args.mode == "compile" else {}),
-        "suite": str(args.suite),
-        # Present only for --from-list partial runs so downstream evidence
-        # tooling (torture_evidence.py & friends) can see the report covers a
-        # filtered subset rather than the full corpus; full-run reports keep
-        # the exact pre-`--from-list` schema (no extra key).
-        **({"from_list": str(args.from_list)} if args.from_list else {}),
-        "gcc_checkout_head": revision(args.suite.parents[3]) if len(args.suite.parents) > 3 else None,
-        "lccc": str(args.lccc),
-        "lccc_ld": str(args.lccc_ld),
-        "link_mode": args.link_mode,
-        "gcc_testsuite": _testsuite_version(args.suite),
-        "lccc_head": revision(REPO),
-        "gcc": args.gcc,
-        "flags": flags,
-        "expensive": args.expensive,
-        "jobs": max(1, args.jobs),
-        "elapsed_s": round(elapsed, 3),
-        "counts": dict(sorted(counts.items())),
-        "results": [dataclasses.asdict(result) for result in results],
-    }
-    if args.json:
-        atomic_json(args.json, payload)
+    if not counts["pass"] and all(status in QUIET_STATUSES for status in counts):
+        fatal = "no eligible case passed; an all-skipped run is not validation"
+    save(True)
     if args.failure_log:
         args.failure_log.parent.mkdir(parents=True, exist_ok=True)
         with args.failure_log.open("w") as stream:
@@ -668,6 +807,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     for status, count in sorted(counts.items()):
         print(f"{status:>24}: {count}")
     failures = sum(count for status, count in counts.items() if status.endswith("-fail"))
+    if fatal:
+        print("error: " + fatal, file=sys.stderr)
+        return 2
     return 1 if failures else 0
 
 

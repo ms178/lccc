@@ -34,6 +34,41 @@ How to gather data (mandatory):
 
 ---
 
+## GCC 17 native torture — 2026-10-10 (correctness before performance)
+
+Evidence and exact reproduction scope:
+[session follow-up](../FOLLOWUP-2026-10-10-gcc17-native-torture.md).
+
+- Closed under focused gates: K&R body/prototype distinction and the
+  later-prototype F32/F64 call-ABI miscompile; 20 native execute cases across
+  both x86 targets, eight semantic contracts, existing 50-row type gate.
+- Closed under focused gates: i686 `ZeroSizeSkip` callee ICE and empty-
+  aggregate fastcall-chain ABI; 20 mixed-compiler, 10 native standalone-link,
+  20 GCC compile/assemble cases, and four Rust tests passed.
+- P1 research: `expat_siphash24` now has 64 known answers, streaming-split
+  checks and a 30-execution cross-compiler/target matrix. Callgrind Ir is
+  1.656739x GCC14.2, not a speed ratio. Investigate adjacent-byte load folding
+  (eight exact byte reads → one little-endian word) and aggregate round-state
+  promotion, with explicit alias/volatile/address-space proofs and regression
+  gates. Full Expat 2.8.5 C tests pass (4,932 checks per compiler) and
+  eight XML oracle pairs pass; native Clang23.1.2 is installed.
+- Closed under focused gates: bounded 2-KiB+ call-site aggregate copies,
+  x86-64 / i686-fastcall tail overreads and regparm-to-cdecl zero override.
+  390 cross-compiler executions, 10 standalone-copy and 20 transition cases,
+  plus 10 formerly unbounded GCC compile cases pass. 72-MiB copies now emit
+  58/64 text bytes; no application-throughput gain is asserted.
+- P0: `pr46534.c` 20-MB string-literal memory/time use; audit remaining
+  callee-side aggregate expansion separately from the fixed call site.
+- P0: end-of-TU tentative-record obligations; length-only NOBITS without weakening materialization caps; huge-frame
+  addressing/CFI; isolated retries of bounded compile-time failures.
+- P1: fixed-underlying enums, implicit-int / permissive-mode policy,
+  general shufflevector lowering/diagnostics, accurate target eligibility.
+- Full five-level native execute matrix: 16,872 eligible executions pass;
+  compile-O2 retains 41/35 LCCC failures and three GCC14.2 ICEs per target.
+  Acceptance still includes compile-leg triage, fast CI, full-project gzip /
+  zlib-ng correctness and fresh upstream-main/rebase verification.
+  Inventory coverage is not a full scripts/codebase semantic audit.
+
 ## 1. Open items
 
 ### 1.0 x86 peephole ledger — PF

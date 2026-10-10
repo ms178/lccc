@@ -63,9 +63,25 @@ pub struct FunctionInfo {
     pub return_type: CType,
     pub params: Vec<(CType, Option<String>)>,
     pub variadic: bool,
+    /// Visible call-site prototype, distinct from a K&R definition's body
+    /// parameters. Keeping body types does not make an identifier-list
+    /// definition a prototype (C11 6.7.6.3p14).
+    pub prototype: Option<FunctionType>,
     pub is_defined: bool,
     /// Whether the function is declared with __attribute__((noreturn)) or _Noreturn
     pub is_noreturn: bool,
+}
+
+impl FunctionInfo {
+    /// Callable type, without leaking K&R body parameter declarations into
+    /// function-pointer inference. Lowering still reads `params` for the ABI.
+    pub(super) fn call_type(&self) -> FunctionType {
+        self.prototype.clone().unwrap_or_else(|| FunctionType {
+            return_type: self.return_type.clone(),
+            params: Vec::new(),
+            variadic: self.variadic,
+        })
+    }
 }
 
 /// Results of semantic analysis, used by the lowering phase.
@@ -224,22 +240,36 @@ impl SemanticAnalyzer {
             .map(|p| (self.param_decl_ctype(p), p.name.clone()))
             .collect();
 
+        let prototype = if func.is_kr {
+            self.symbol_table
+                .lookup_current(&func.name)
+                .and_then(|symbol| {
+                    if let CType::Function(ft) = &symbol.ty {
+                        (!ft.params.is_empty()).then(|| ft.as_ref().clone())
+                    } else {
+                        None
+                    }
+                })
+        } else {
+            Some(FunctionType {
+                return_type: return_type.clone(),
+                params: params.clone(),
+                variadic: func.variadic,
+            })
+        };
         let func_info = FunctionInfo {
             return_type: return_type.clone(),
             params: params.clone(),
             variadic: func.variadic,
+            prototype,
             is_defined: true,
             is_noreturn: func.attrs.is_noreturn(),
         };
+        let func_ctype = CType::Function(Box::new(func_info.call_type()));
         self.result.functions.insert(mangled, func_info);
 
         // Declare the symbol in the enclosing block scope so identifier
         // resolution finds it with proper lexical scoping.
-        let func_ctype = CType::Function(Box::new(FunctionType {
-            return_type: return_type.clone(),
-            params: params.clone(),
-            variadic: func.variadic,
-        }));
         self.symbol_table.declare(Symbol {
             name: func.name.clone(),
             ty: func_ctype,
@@ -289,23 +319,32 @@ impl SemanticAnalyzer {
             .functions
             .get(&func.name)
             .is_some_and(|fi| fi.is_noreturn);
+        let prototype = if func.is_kr {
+            self.result
+                .functions
+                .get(&func.name)
+                .and_then(|info| info.prototype.clone())
+        } else {
+            Some(FunctionType {
+                return_type: return_type.clone(),
+                params: params.clone(),
+                variadic: func.variadic,
+            })
+        };
         let func_info = FunctionInfo {
             return_type: return_type.clone(),
             params: params.clone(),
             variadic: func.variadic,
+            prototype,
             is_defined: true,
             is_noreturn: func.attrs.is_noreturn() || prior_noreturn,
         };
+        let func_ctype = CType::Function(Box::new(func_info.call_type()));
 
-        // Register in function table
+        // Register body metadata separately from the visible callable type.
         self.result.functions.insert(func.name.clone(), func_info);
 
         // Register in symbol table
-        let func_ctype = CType::Function(Box::new(FunctionType {
-            return_type: return_type.clone(),
-            params: params.clone(),
-            variadic: func.variadic,
-        }));
         self.symbol_table.declare(Symbol {
             name: func.name.clone(),
             ty: func_ctype,
@@ -601,34 +640,36 @@ impl SemanticAnalyzer {
             // Check if this is a function declaration (prototype)
             if let CType::Function(ref ft) = full_type {
                 let is_noreturn = init_decl.attrs.is_noreturn();
-                // If redeclared with noreturn, update existing entry
-                if is_noreturn {
-                    if let Some(existing) = self.result.functions.get_mut(&init_decl.name) {
-                        existing.is_noreturn = true;
-                    } else {
-                        let func_info = FunctionInfo {
+                let prototype = (!ft.params.is_empty()).then(|| ft.as_ref().clone());
+                if let Some(existing) = self.result.functions.get_mut(&init_decl.name) {
+                    existing.is_noreturn |= is_noreturn;
+                    if prototype.is_some() {
+                        existing.prototype = prototype;
+                        // A later prototype refines an implicit declaration;
+                        // it must not overwrite a definition's body types.
+                        if !existing.is_defined {
+                            existing.return_type = ft.return_type.clone();
+                            existing.params = ft.params.clone();
+                            existing.variadic = ft.variadic;
+                        }
+                    }
+                } else {
+                    self.result.functions.insert(
+                        init_decl.name.clone(),
+                        FunctionInfo {
                             return_type: ft.return_type.clone(),
                             params: ft.params.clone(),
                             variadic: ft.variadic,
+                            prototype,
                             is_defined: false,
-                            is_noreturn: true,
-                        };
-                        self.result
-                            .functions
-                            .insert(init_decl.name.clone(), func_info);
-                    }
-                } else if !self.result.functions.contains_key(&init_decl.name) {
-                    let func_info = FunctionInfo {
-                        return_type: ft.return_type.clone(),
-                        params: ft.params.clone(),
-                        variadic: ft.variadic,
-                        is_defined: false,
-                        is_noreturn: false,
-                    };
-                    self.result
-                        .functions
-                        .insert(init_decl.name.clone(), func_info);
+                            is_noreturn,
+                        },
+                    );
                 }
+                // An unspecified-parameter redeclaration must not erase an
+                // already visible prototype from the scoped callable type.
+                full_type =
+                    CType::Function(Box::new(self.result.functions[&init_decl.name].call_type()));
             }
 
             // Check for incomplete struct/union types in variable declarations.
@@ -1649,6 +1690,7 @@ impl SemanticAnalyzer {
                             return_type: CType::Int, // implicit return int
                             params: Vec::new(),
                             variadic: true, // unknown params
+                            prototype: None,
                             is_defined: false,
                             is_noreturn: false,
                         };
@@ -1659,67 +1701,34 @@ impl SemanticAnalyzer {
                 for arg in args {
                     self.analyze_expr(arg);
                 }
-                // Validate real prototypes. Empty parameter lists are kept
-                // permissive because sema also carries legacy `f()` and fallback
-                // libc declarations with unspecified arguments.
-                //
-                // C scoping: a local object (parameter or variable) SHADOWS a
-                // file-scope function of the same name. glibc nss_module.c
-                // declares `void (*bind)(...)` as a parameter while
-                // <sys/socket.h> declares the 3-argument socket bind();
-                // resolving the call against the global prototype rejected
-                // the 1-argument call through the parameter. When shadowed,
-                // fall through to the function-pointer signature path, which
-                // resolves the identifier through the scoped symbol table.
-                let shadowed_by_object = if let Expr::Identifier(name, _) = callee.as_ref() {
-                    self.symbol_table
-                        .lookup(name)
-                        .map(|s| !matches!(&s.ty, CType::Function(_)))
-                        .unwrap_or(false)
-                } else {
-                    false
+                // Resolve the callable through lexical scope, not through
+                // the TU-wide body-metadata map. Local function pointers and
+                // GNU nested functions both shadow a file-scope function.
+                // K&R body declarations intentionally contribute no prototype;
+                // only a separately visible declaration can supply one.
+                let checker = super::type_checker::ExprTypeChecker {
+                    symbols: &self.symbol_table,
+                    types: &self.result.type_context,
+                    functions: &self.result.functions,
+                    expr_types: Some(&self.result.expr_types),
                 };
-                let direct = if let Expr::Identifier(name, _) = callee.as_ref() {
-                    if shadowed_by_object {
-                        None
-                    } else {
-                        self.result
-                            .functions
-                            .get(name)
-                            .filter(|fi| !fi.params.is_empty())
-                            .map(|fi| (name.clone(), fi.params.clone(), fi.variadic))
-                    }
-                } else {
-                    None
-                };
-                if let Some((name, params, variadic)) = direct {
-                    self.check_call_arguments(&name, args, &params, variadic, expr.span());
-                } else if shadowed_by_object
-                    || !matches!(callee.as_ref(), Expr::Identifier(name, _) if self.result.functions.contains_key(name))
-                {
-                    let checker = super::type_checker::ExprTypeChecker {
-                        symbols: &self.symbol_table,
-                        types: &self.result.type_context,
-                        functions: &self.result.functions,
-                        expr_types: Some(&self.result.expr_types),
-                    };
-                    let signature = match checker.infer_expr_ctype(callee) {
-                        Some(CType::Function(ft)) if !ft.params.is_empty() => Some(*ft),
-                        Some(CType::Pointer(inner, _)) => match *inner {
-                            CType::Function(ft) if !ft.params.is_empty() => Some(*ft),
-                            _ => None,
-                        },
+                let signature = match checker.infer_expr_ctype(callee) {
+                    Some(CType::Function(ft)) => Some(*ft),
+                    Some(CType::Pointer(inner, _)) => match *inner {
+                        CType::Function(ft) => Some(*ft),
                         _ => None,
+                    },
+                    _ => None,
+                };
+                // Empty lists retain the existing unspecified-arguments
+                // convention; distinguishing f(void) from f() is independent
+                // of preserving a nonempty prototype vs a K&R body list.
+                if let Some(ft) = signature.filter(|ft| !ft.params.is_empty()) {
+                    let name = match callee.as_ref() {
+                        Expr::Identifier(name, _) => name.as_str(),
+                        _ => "function pointer",
                     };
-                    if let Some(ft) = signature {
-                        self.check_call_arguments(
-                            "function pointer",
-                            args,
-                            &ft.params,
-                            ft.variadic,
-                            expr.span(),
-                        );
-                    }
+                    self.check_call_arguments(name, args, &ft.params, ft.variadic, expr.span());
                 }
             }
             Expr::BinaryOp(op, lhs, rhs, span) => {
@@ -2552,6 +2561,7 @@ impl SemanticAnalyzer {
                 return_type: ret_type.clone(),
                 params: Vec::new(),
                 variadic: *variadic,
+                prototype: None,
                 is_defined: false,
                 is_noreturn,
             };
@@ -3531,5 +3541,122 @@ mod pointer_argument_compat_tests {
             pointer_argument_compat(&ptr(record("struct.A")), &ptr(record("struct.B"))),
             PtrCompat::Incompatible
         );
+    }
+}
+
+#[cfg(test)]
+mod kr_prototype_tests {
+    use super::SemanticAnalyzer;
+    use crate::common::types::CType;
+    use crate::frontend::lexer::Lexer;
+    use crate::frontend::parser::Parser;
+
+    fn analyze(source: &str) -> (SemanticAnalyzer, Result<(), usize>) {
+        let tokens = Lexer::new(source, 0).tokenize();
+        let mut parser = Parser::new(tokens);
+        let tu = parser.parse();
+        assert_eq!(parser.error_count, 0, "fixture must parse");
+        let mut sema = SemanticAnalyzer::new();
+        let result = sema.analyze(&tu);
+        (sema, result)
+    }
+
+    #[test]
+    fn body_parameter_information_is_not_a_call_prototype() {
+        let (sema, result) = analyze(
+            "int old(p) short *p; { return *p; }\n\
+             int use(void) { short a[2]; return old(&a); }",
+        );
+        // The mismatched pointer is deliberate: without a prototype this is
+        // not a call-site constraint. It is NOT executed as a defined-C test.
+        assert!(result.is_ok());
+        let info = &sema.result.functions["old"];
+        assert_eq!(info.params.len(), 1, "lowering still needs the body types");
+        assert!(info.prototype.is_none());
+        assert!(info.call_type().params.is_empty());
+    }
+
+    #[test]
+    fn known_kr_definition_does_not_enforce_prototype_arity() {
+        for call in ["old()", "old(1, 2, 3)"] {
+            let source =
+                format!("int old(x) int x; {{ return x; }} int use(void) {{ return {call}; }}");
+            assert!(analyze(&source).1.is_ok());
+        }
+    }
+
+    #[test]
+    fn prior_prototype_survives_kr_definition_with_body_types_intact() {
+        let (sema, result) = analyze("double old(double); double old(x) float x; { return x; }");
+        assert!(result.is_ok());
+        let info = &sema.result.functions["old"];
+        assert_eq!(info.params[0].0, CType::Float);
+        assert_eq!(info.prototype.as_ref().unwrap().params[0].0, CType::Double);
+        assert!(
+            analyze(
+                "int old(int); int old(x) int x; { return x; } int use(void) { return old(); }"
+            )
+            .1
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn later_prototype_refines_kr_definition_without_erasing_body_types() {
+        let (sema, result) = analyze("double old(x) float x; { return x; } double old(double);");
+        assert!(result.is_ok());
+        let info = &sema.result.functions["old"];
+        assert_eq!(info.params[0].0, CType::Float);
+        assert_eq!(info.prototype.as_ref().unwrap().params[0].0, CType::Double);
+        assert!(
+            analyze(
+                "int old(x) int x; { return x; } int old(int); int use(void) { return old(); }"
+            )
+            .1
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn real_prototypes_keep_pointer_constraints() {
+        assert!(
+            analyze("int typed(short *); int use(void) { short a[2]; return typed(&a); }")
+                .1
+                .is_err()
+        );
+        assert!(
+            analyze(
+                "int typed(short *p) { return *p; } int use(void) { short a[2]; return typed(&a); }"
+            )
+            .1
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn unrelated_outer_prototype_does_not_type_a_nested_kr_definition() {
+        assert!(analyze("int old(short *); int outer(void) { int old(p) short *p; { return *p; } short a[2]; return old(&a); }").1.is_ok());
+        assert!(
+            analyze(
+                "int old(int, int); int outer(void) { int old(int x) { return x; } return old(1); }"
+            )
+            .1
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn unspecified_redeclaration_keeps_prior_prototype() {
+        assert!(
+            analyze("int f(int); int f(); int use(void) { return f(); }")
+                .1
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn nested_and_indirect_kr_calls_do_not_acquire_body_prototypes() {
+        assert!(analyze("int outer(void) { int old(p) short *p; { return *p; } short a[2]; return old(&a); }").1.is_ok());
+        assert!(analyze("int old(p) short *p; { return *p; } int use(void) { short a[2]; return (&old)(&a); }").1.is_ok());
     }
 }

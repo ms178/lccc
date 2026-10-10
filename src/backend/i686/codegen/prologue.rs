@@ -438,6 +438,28 @@ impl I686Codegen {
             self.used_callee_saved.insert(0, PhysReg(0));
         }
 
+        // Large by-value call arguments use REP MOVSB. Preserve ESI/EDI
+        // from function entry, not just around the copy: CFI must describe
+        // the caller's original values even while REP temporarily owns them.
+        let has_large_arg_copy = func.blocks.iter().any(|block| {
+            block.instructions.iter().any(|inst| match inst {
+                Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => info
+                    .struct_arg_sizes
+                    .iter()
+                    .flatten()
+                    .any(|&size| size >= crate::backend::call_abi::LARGE_ARG_COPY_THRESHOLD),
+                _ => false,
+            })
+        });
+        if has_large_arg_copy {
+            for reg in [PhysReg(1), PhysReg(2)] {
+                if !self.used_callee_saved.contains(&reg) {
+                    self.used_callee_saved.push(reg);
+                }
+            }
+            self.used_callee_saved.sort_by_key(|reg| reg.0);
+        }
+
         // Incoming register parameters whose destinations share one
         // physical register get 4-byte conflict slots (allocated below)
         // instead of an entry-time register capture.
@@ -1150,6 +1172,13 @@ impl I686Codegen {
 
         for (i, _param) in func.params.iter().enumerate() {
             let class = param_classes[i];
+            // GNU empty aggregates consume no argument bytes or registers.
+            // Their addressable local object may still have an alloca, but
+            // there is nothing to capture into it. In particular do not fall
+            // through to the stack-copy arm (or shift the following argument).
+            if matches!(class, ParamClass::ZeroSizeSkip) {
+                continue;
+            }
 
             // mem2reg commonly removes the frontend's parameter alloca.  A
             // regparm value still arrives in EAX/EDX/ECX and must be captured

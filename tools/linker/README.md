@@ -32,7 +32,13 @@ Pinned oracles (user directive): **GNU ld 2.47** (bfd + ld only), **mold
 2.42.1** built with `-DMOLD_TARGETS='X86_64;I386'` (mold's own CMake cache
 variable — the x86 preset cuts template instantiation ~10x on the 2-vCPU host),
 **LLVM lld 23.1.x** (apt.llvm.org release build; the script asserts the `23.1.`
-banner) and wild at git HEAD. `WITH_WILD=0` removes wild from the oracle set
+banner) and wild at git HEAD. The binutils release download is SHA-256-pinned
+like the GAS oracle. Its actual banner is `2.47.20260726`, which the version
+check accepts explicitly alongside `2.47`; it still rejects `2.470`, `2.47.1`,
+and other dated snapshots. This is not permission to substitute any version
+whose directory happens to contain `2.47`.
+
+`WITH_WILD=0` removes wild from the oracle set
 for that run: no build, no `wild` wrapper (a stale one is deleted) and no
 inventory entry; an already-built binary stays cached for a later
 `WITH_WILD=1` run. Installed binaries live

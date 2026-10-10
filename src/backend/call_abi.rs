@@ -14,6 +14,12 @@ use super::generation::is_i128_type;
 use crate::common::types::IrType;
 use crate::ir::reexports::{IrConst, IrFunction, Operand};
 
+/// Keep call-site aggregate copies bounded in generated instruction count.
+/// Below this size the existing small-copy paths remain unchanged; above it
+/// the x86 backends use an exact-size string copy, not millions of pushes /
+/// scalar stores (GCC torture 20050622-1 passes a 72-MiB object by value).
+pub(super) const LARGE_ARG_COPY_THRESHOLD: usize = 2048;
+
 // ---------------------------------------------------------------------------
 // CallArgClass — caller-side classification (used by emit_call_*)
 // ---------------------------------------------------------------------------

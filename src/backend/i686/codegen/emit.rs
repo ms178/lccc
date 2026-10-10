@@ -1009,9 +1009,11 @@ impl I686Codegen {
     ///   SKIPPED: they neither consume a register slot nor end the chain
     ///   (`f(double,int)`: the int still arrives in %ecx — GCC oracle
     ///   `fldl 16(%esp) … addl %ecx,%eax; ret $8`).
-    /// - Aggregates and 64/128-bit integers BREAK the chain: they and every
+    /// - Nonempty aggregates and 64/128-bit integers BREAK the chain: they and every
     ///   following parameter go on the stack (`f(int,S2,int)`: the trailing
     ///   int is a stack argument — GCC oracle `ret $12` with %ecx only).
+    /// - Zero-sized GNU aggregates consume no register or stack bytes and
+    ///   do not break the chain (confirmed by mixed-compiler ABI tests).
     /// - The sret hidden pointer is an explicit leading `Ptr` parameter, so
     ///   it takes %ecx and the first eligible argument shifts to %edx (the
     ///   GCC -O2 protocol, which is what optimized callers emit).
@@ -1057,8 +1059,11 @@ impl I686Codegen {
                 }
             }
 
-            // Aggregates and wide integers end the register chain.
-            if aggregate.is_some() || matches!(ty, IrType::I64 | IrType::U64) || is_i128_type(*ty) {
+            // Empty aggregates are zero-byte stack slots, not chain breaks.
+            if aggregate.is_some_and(|size| size != 0)
+                || matches!(ty, IrType::I64 | IrType::U64)
+                || is_i128_type(*ty)
+            {
                 chain_broken = true;
             }
 
@@ -1616,7 +1621,7 @@ impl I686Codegen {
         }
 
         for (i, slot) in slots.iter().enumerate() {
-            let I686FastcallSlot::Stack { offset, size } = *slot else {
+            let I686FastcallSlot::Stack { offset, .. } = *slot else {
                 continue;
             };
             let arg = &args[i];
@@ -1628,8 +1633,10 @@ impl I686Codegen {
             // long double / i128 arguments were silently NOT written to the
             // outgoing area, and aggregate arguments were truncated to one
             // word — the callee then read garbage.
-            if struct_arg_sizes.get(i).copied().flatten().is_some() {
-                self.emit_call_struct_stack_arg(arg, offset as usize, size);
+            if let Some(object_size) = struct_arg_sizes.get(i).copied().flatten() {
+                // The slot includes ABI padding. Only the actual object is
+                // readable: copying the rounded size can cross a guard page.
+                self.emit_call_struct_stack_arg(arg, offset as usize, object_size);
                 continue;
             }
 
@@ -2004,6 +2011,41 @@ impl I686Codegen {
         }
     }
 
+    /// Bounded call-site copy. Source is staged before temporary pushes,
+    /// so frame-pointer-less slot addresses keep their existing coordinate.
+    /// ESI/EDI are saved in the function prologue as well (see the frame
+    /// planner), giving correct unwind rules even in the middle of REP.
+    fn emit_large_struct_stack_arg(&mut self, v: Value, stack_offset: usize, size: usize) {
+        if self.state.is_alloca(v.0) {
+            let slot = self
+                .state
+                .get_slot(v.0)
+                .expect("aggregate alloca needs a slot");
+            let sr = self.slot_ref(slot);
+            emit!(self.state, "    leal {}, %eax", sr);
+            if let Some(a) = self.state.alloca_over_align(v.0) {
+                emit!(self.state, "    addl ${}, %eax", a - 1);
+                emit!(self.state, "    andl ${}, %eax", -(a as i32));
+            }
+        } else {
+            self.operand_to_eax(&Operand::Value(v));
+        }
+        // These registers may hold other argument values or caller-local
+        // live homes. Save all of them, even when the callee will clobber
+        // caller-saved ECX: its input has not necessarily been staged yet.
+        self.state.emit("    pushl %esi");
+        self.state.emit("    pushl %edi");
+        self.state.emit("    pushl %ecx");
+        self.state.emit("    movl %eax, %esi");
+        emit!(self.state, "    leal {}(%esp), %edi", stack_offset + 12);
+        emit!(self.state, "    movl ${}, %ecx", size);
+        self.state.emit("    rep movsb");
+        self.state.emit("    popl %ecx");
+        self.state.emit("    popl %edi");
+        self.state.emit("    popl %esi");
+        self.state.reg_cache.invalidate_acc();
+    }
+
     /// Emit struct-by-value argument to call stack.
     pub(super) fn emit_call_struct_stack_arg(
         &mut self,
@@ -2011,6 +2053,12 @@ impl I686Codegen {
         stack_offset: usize,
         size: usize,
     ) {
+        if size >= crate::backend::call_abi::LARGE_ARG_COPY_THRESHOLD {
+            if let Operand::Value(v) = arg {
+                self.emit_large_struct_stack_arg(*v, stack_offset, size);
+                return;
+            }
+        }
         if let Operand::Const(c @ (IrConst::I128(_) | IrConst::Zero)) = arg {
             // 16-byte carrier constant (_Float128/_Decimal128 literal, i686
             // TFmode by-value stack arg): four immediate stores into the
@@ -2629,9 +2677,11 @@ impl ArchCodegen for I686Codegen {
         // wins over the command-line flag).
         self.current_call_regparm = is_regparm.unwrap_or(self.base_regparm).min(3);
         let mut config = self.call_abi_config();
-        if self.current_call_regparm > 0 {
-            config.max_int_regs = self.current_call_regparm as usize;
-        }
+        // Zero is an override too: call_abi_config() describes the current
+        // function's parameters, not this callee. Leaving its register count
+        // behind for a regparm -> cdecl call classifies register arguments
+        // which neither the stack writer nor the cdecl register writer emits.
+        config.max_int_regs = self.current_call_regparm as usize;
         let arg_classes_vec = classify_call_args(
             args,
             arg_types,
@@ -3907,6 +3957,68 @@ impl I686Codegen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fastcall_zero_aggregate_keeps_register_chain() {
+        use I686FastcallSlot::{Reg, Stack};
+        let cg = I686Codegen::new();
+        let (slots, bytes) = cg.fastcall_layout(
+            &[IrType::I32, IrType::Ptr, IrType::I32, IrType::I32],
+            &[None, Some(0), None, None],
+            false,
+        );
+        assert_eq!(
+            slots,
+            vec![
+                Reg(0),
+                Stack { offset: 0, size: 0 },
+                Reg(1),
+                Stack { offset: 0, size: 4 }
+            ]
+        );
+        assert_eq!(bytes, 4);
+    }
+
+    #[test]
+    fn fastcall_zero_aggregate_cannot_reopen_broken_chain() {
+        use I686FastcallSlot::{Reg, Stack};
+        let cg = I686Codegen::new();
+        let (slots, bytes) = cg.fastcall_layout(
+            &[IrType::I32, IrType::Ptr, IrType::Ptr, IrType::I32],
+            &[None, Some(4), Some(0), None],
+            false,
+        );
+        assert_eq!(
+            slots,
+            vec![
+                Reg(0),
+                Stack { offset: 0, size: 4 },
+                Stack { offset: 4, size: 0 },
+                Stack { offset: 4, size: 4 }
+            ]
+        );
+        assert_eq!(bytes, 8);
+    }
+
+    #[test]
+    fn fastcall_variadic_zero_aggregate_stays_stack_only() {
+        use I686FastcallSlot::Stack;
+        let cg = I686Codegen::new();
+        let (slots, bytes) = cg.fastcall_layout(
+            &[IrType::I32, IrType::Ptr, IrType::I32],
+            &[None, Some(0), None],
+            true,
+        );
+        assert_eq!(
+            slots,
+            vec![
+                Stack { offset: 0, size: 4 },
+                Stack { offset: 4, size: 0 },
+                Stack { offset: 4, size: 4 }
+            ]
+        );
+        assert_eq!(bytes, 8);
+    }
 
     /// One row per `IrConst` arm: the constant, the 32 bits a register
     /// materialization of it produces (and therefore the 32 bits a direct
