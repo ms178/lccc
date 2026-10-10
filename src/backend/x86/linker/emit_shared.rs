@@ -182,6 +182,21 @@ pub(super) fn emit_shared_library(
     output_sections: &mut [OutputSection],
     hash_style: crate::backend::linker_common::HashStyle,
     section_map: &FxHashMap<(usize, usize), (usize, u64)>,
+    // Same discriminator as `emit_executable`: sections that are absent
+    // from the output image.  In `-shared` this set is exactly the
+    // ICF-folded sections — `link_shared` runs `icf::plan` and inserts
+    // every redirect key (there is no --gc-sections on this path) — and
+    // each folded key is remapped onto its representative in
+    // `section_map` before addresses are assigned.  That is why the
+    // `.symtab`/`.dynsym` loops below consult the set only indirectly:
+    // a folded symbol resolves through the remap to the survivor's
+    // address (pinned by `run_linker_tests.py::shared_icf_tls_twin`,
+    // both tables), and a section missing from `section_map` was never
+    // emitted at all.  The relocation loop consults it directly so a
+    // folded twin's sequence-shaped TLS rewrites cannot re-apply over
+    // bytes the first application already rewrote (the
+    // `__cxa_get_globals` class).
+    dead_sections: &crate::common::fx_hash::FxHashSet<(usize, usize)>,
     needed_sonames: &[String],
     output_path: &str,
     soname: Option<String>,
@@ -2633,6 +2648,9 @@ pub(super) fn emit_shared_library(
         for sec_idx in 0..objects[obj_idx].sections.len() {
             let relas = &objects[obj_idx].relocations[sec_idx];
             if relas.is_empty() {
+                continue;
+            }
+            if dead_sections.contains(&(obj_idx, sec_idx)) {
                 continue;
             }
             let (out_idx, sec_off) = match section_map.get(&(obj_idx, sec_idx)) {

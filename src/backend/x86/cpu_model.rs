@@ -291,6 +291,26 @@ pub struct X86Tune {
     pub lea3_rtp_x100: u16,
     /// µops of the same LEA (2 on Zen3+, 1 elsewhere).
     pub lea3_uops: u8,
+    /// Latency of the **2-component scaled-index LEA** (`base + index*scale`,
+    /// no displacement — the `LEA_B_IS` form, i.e. `leaq (%r,%r,4)`), which
+    /// is exactly the shape every `MulPlan` `LeaScale`/`LeaMul` step emits.
+    ///
+    /// This form's latency is NOT the `B_I_D8` latency above: on the
+    /// Golden Cove lineage (`InstLatX64`, corroborated by `uops.info`
+    /// `LEA_B_IS (R64)` re-read 2025) `lea r64, [r64 + r64*8]` measures
+    /// **2 ticks on Alder Lake-P and Raptor Cove**, while the base+index+disp8
+    /// form measures 1 on the same cores — the distinction is documented in
+    /// the module's LEA section and is why `mul_const_plan` must price steps
+    /// with THIS latency, not an assumed 1.  A dependent `×k` chain of two
+    /// scaled-index LEAs therefore takes 4 cycles on Raptor Lake, which is
+    /// *slower* than one `imull $k` (3 cycles), matching GCC's `imull $45`
+    /// choice; an independent rdtsc chain benchmark on this class of core
+    /// measured the 2-LEA `×45` at 2.53 cyc/iter vs 2.04 for `imull $45`
+    /// (1-LEA `×9`: 1.36).  Legacy cores (SNB..ICL) measure 1 tick for the
+    /// scaled-index form (Haswell-class measurements), and Gracemont's small
+    /// core keeps 1; Zen 1/2 measure 2 (Zen 3+ split 2 base / 1 index, so the
+    /// both-paths form is priced at the conservative 2).
+    pub lea_scaled_latency: u8,
 
     // ------------------------------------------------------------------
     // CMOV.  `[uops.info]` CMOVB_R64_R64: 2 µops (p015+p05 / p0156+p06),
@@ -762,6 +782,10 @@ impl X86Cpu {
                 lea3_latency: 3,
                 lea3_rtp_x100: 100,
                 lea3_uops: 1,
+                // SNB..ICL measure 1 tick for the scaled-index `LEA_B_IS`
+                // form; the Golden/Zen override below raises it where the
+                // hardware measures 2.
+                lea_scaled_latency: 1,
                 cmov_uops: 2,
                 cmov_latency: 2,
                 imul64_latency: 3,
@@ -929,6 +953,12 @@ impl X86Cpu {
                 vec_load_port_bits: 256,
                 mispredict_penalty: 17,
                 lea3_rtp_x100: 20,
+                // [uops.info LEA_B_IS (R64) / InstLatX64 Golden Cove]:
+                // `lea r64, [r64 + r64*8]` measures 2 ticks on Alder Lake-P
+                // and Raptor Cove (the base+index+disp8 form above is the
+                // 1-tick one — different uops.info shapes).  Inherited by
+                // RaptorLake/MeteorLake/SapphireRapids/ArrowLake.
+                lea_scaled_latency: 2,
                 // [uops.info] VADDPS ymm on ADL-P: latency 2 (p15 adders).
                 fadd_latency: 2,
                 rob_entries: 512,
@@ -1021,6 +1051,13 @@ impl X86Cpu {
                 lea3_latency: 2,
                 lea3_rtp_x100: 100,
                 lea3_uops: 1,
+                // Gracemont's LEA with an index and NO displacement stays
+                // 1-cycle latency (its D8 form costs 2 only with the
+                // displacement in the AGU path); the small core keeps
+                // one-cycle mul steps, which is what lets mul_const_plan
+                // run 3–4 step chains here against the 5-cycle divider-class
+                // IMUL.
+                lea_scaled_latency: 1,
                 // [uops.info] ADL-E CMOVB: latency 2 (operands 2/3 → 1).
                 cmov_uops: 1,
                 cmov_latency: 2,
@@ -1072,6 +1109,11 @@ impl X86Cpu {
                 lea3_latency: 2,
                 lea3_rtp_x100: 50,
                 lea3_uops: 1,
+                // Zen's scaled-index LEA is the 2-cycle, 2/clock form
+                // (Agner/uops.info: "slower when there's a scaled index");
+                // Zen 3+ split 2 (base) / 1 (index), so the both-paths
+                // form stays 2 here.
+                lea_scaled_latency: 2,
                 cmov_uops: 1,
                 cmov_latency: 1,
                 imul64_latency: 3,
@@ -1202,6 +1244,13 @@ impl X86Cpu {
                 lea3_latency: 3,
                 lea3_rtp_x100: 100,
                 lea3_uops: 2,
+                // The generic row describes a modern x86-64 core: price the
+                // scaled-index LEA at the 2 ticks every current-generation
+                // Intel P-core measures (and GCC's generic codegen agrees:
+                // `x*45` -> `imull $45`, not a 2-LEA chain), so 2-step LEA
+                // chains lose to IMUL here and only the single-LEA (x3/5/9)
+                // and LEA-free plans survive.
+                lea_scaled_latency: 2,
                 cmov_uops: 2,
                 cmov_latency: 2,
                 imul64_latency: 3,
@@ -1539,27 +1588,44 @@ impl X86Tune {
             || matches!(self.ecore, Some(e) if e.lea3_latency > 1 && e.lea3_rtp_x100 >= 100)
     }
 
-    /// Maximum number of 1-cycle ALU/LEA steps a synthesised
-    /// multiply-by-constant may use instead of one `imul $k`.  A chain of
-    /// `n` single-cycle steps has latency `n`; it beats IMUL on the
-    /// critical path only when `n < imul_latency`, and it costs `n − 1`
-    /// extra µops, so the budget is `imul_latency − 1`: 2 on every P-core
-    /// and Zen (IMUL 3), 4 on Gracemont (IMUL 5).  This reproduces GCC's
-    /// and LLVM's 2-instruction decompositions (`lea+add`, `shl+sub`) on
-    /// generic tuning and goes further only where the divider-class IMUL
-    /// of the E-core justifies it.  Hybrid rows follow the P-core (the
-    /// hot code runs there) — Gracemont's IMUL is *not* pathological, so
-    /// the E-core rule does not apply.
+    /// Maximum total **step cost** (sum of the per-step latencies in
+    /// [`Self::mul_const_step_cost`]) a synthesised multiply-by-constant
+    /// may spend instead of one `imul $k`.  A chain beats IMUL on the
+    /// critical path only when its total latency is strictly below
+    /// `imul_latency`, so the budget is `imul_latency − 1`: 2 on every
+    /// P-core and Zen (IMUL 3), 4 on Gracemont (IMUL 5).  Steps are NOT
+    /// uniformly 1 cycle: the scaled-index LEA form the plan emits costs
+    /// `lea_scaled_latency` (2 on the Golden/Zen rows), which is what
+    /// keeps 2-LEA chains (`×45`, `×15`, …) out of the plan where they
+    /// would measure 4 cycles against IMUL's 3, while single-LEA `×3/5/9`
+    /// (2 < 3) and LEA-free `shl+add/sub` plans (2 < 3) survive — and the
+    /// whole 3–4 step family still fires on Gracemont's divider-class
+    /// 5-cycle IMUL.  Hybrid rows follow the P-core (the hot code runs
+    /// there).
     #[inline]
     pub fn mul_const_op_budget(&self) -> usize {
         (self.imul64_latency as usize).saturating_sub(1).clamp(1, 4)
     }
 
-    /// Synthesise `acc = src * k` from LEA/SHL/ADD/SUB/NEG steps when that
-    /// is shorter in latency than `imul $k` on this core; `None` means
-    /// "use IMUL".  `k` must not be 0 or 1.  The plan's
-    /// `needs_distinct_src` tells the caller whether the multiplicand
-    /// must survive in a register other than the destination.
+    /// Latency of one plan step on this core: LEA steps cost the row's
+    /// measured scaled-index LEA latency ([`X86Tune::lea_scaled_latency`]),
+    /// every ALU/shift/negate step costs 1.  This is the quantity the
+    /// budget and the final `cost < imul` gate compare against — using
+    /// "1 cycle per step" priced Raptor Lake's 2-tick scaled-index LEA
+    /// at half its real cost and let `×45` emit a 4-cycle chain against
+    /// a 3-cycle `imull`.
+    fn mul_const_step_cost(&self, step: &MulStep) -> usize {
+        match step {
+            MulStep::LeaScale(_) | MulStep::LeaMul(_) => self.lea_scaled_latency as usize,
+            _ => 1,
+        }
+    }
+
+    /// Synthesise `acc = src * k` from LEA/SHL/ADD/SUB/NEG steps when the
+    /// chain's measured latency is strictly below `imul $k`'s on this
+    /// core; `None` means "use IMUL".  `k` must not be 0 or 1.  The
+    /// plan's `needs_distinct_src` tells the caller whether the
+    /// multiplicand must survive in a register other than the destination.
     pub fn mul_const_plan(&self, k: i64) -> Option<MulPlan> {
         if k == 0 || k == 1 {
             return None;
@@ -1572,21 +1638,37 @@ impl X86Tune {
         }
         let m = m as i64;
         let extra = usize::from(neg);
-        let fits = |p: &MulPlan| p.len() + extra <= budget;
+        // `step_sum` is the latency of the plan's steps as written.  Before
+        // the NEG is appended (`fits`/`consider`) the pending negate must
+        // be counted too — hence `+ extra` there — while the final gate
+        // sees `p` with its Neg step already present and must NOT add it
+        // a second time.
+        let step_sum = |p: &MulPlan| -> usize {
+            p.steps()
+                .iter()
+                .map(|s| self.mul_const_step_cost(s))
+                .sum::<usize>()
+        };
+        let fits = |p: &MulPlan| step_sum(p) + extra <= budget;
 
         let mut best: Option<MulPlan> = None;
         let mut consider = |p: MulPlan| {
             if !fits(&p) {
                 return;
             }
-            // Shortest wins; on a tie prefer the in-place plan (no
-            // register constraint) over the one that needs a distinct
-            // source.
+            // Cheapest wins; on a tie prefer fewer steps (fewer µops), and
+            // on a further tie prefer the in-place plan (no register
+            // constraint) over the one that needs a distinct source.
             let better = match &best {
                 None => true,
                 Some(b) => {
-                    p.len() < b.len()
-                        || (p.len() == b.len() && b.needs_distinct_src && !p.needs_distinct_src)
+                    let (c_new, c_old) = (step_sum(&p), step_sum(b));
+                    c_new < c_old
+                        || (c_new == c_old
+                            && (p.len() < b.len()
+                                || (p.len() == b.len()
+                                    && b.needs_distinct_src
+                                    && !p.needs_distinct_src)))
                 }
             };
             if better {
@@ -1652,8 +1734,11 @@ impl X86Tune {
         if neg {
             p = p.push(MulStep::Neg);
         }
-        // Never longer in latency than IMUL itself.
-        if p.len() >= self.imul64_latency as usize {
+        // Never as slow on the critical path as IMUL itself (measured
+        // step latencies, not step counts — a 2-LEA chain costs 4 on
+        // Golden/Raptor Cove).  `p` already carries its Neg step, so the
+        // raw step sum is the full chain latency here.
+        if step_sum(&p) >= self.imul64_latency as usize {
             return None;
         }
         Some(p)
@@ -1839,6 +1924,7 @@ impl X86Tune {
         kv("lea3_latency", self.lea3_latency.to_string());
         kv("lea3_rtp_x100", self.lea3_rtp_x100.to_string());
         kv("lea3_uops", self.lea3_uops.to_string());
+        kv("lea_scaled_latency", self.lea_scaled_latency.to_string());
         kv("cmov_uops", self.cmov_uops.to_string());
         kv("cmov_latency", self.cmov_latency.to_string());
         kv("imul64_latency", self.imul64_latency.to_string());
@@ -2380,10 +2466,15 @@ mod tests {
     }
 
     #[test]
-    fn mul_const_plans_match_gcc_llvm_on_generic_and_go_further_on_gracemont() {
+    fn mul_const_plans_price_steps_by_measured_latency_and_go_further_on_gracemont() {
         use MulStep::*;
         let g = X86Tune::GENERIC;
         let steps = |k: i64| g.mul_const_plan(k).map(|p| p.steps().to_vec());
+        // Generic prices the scaled-index LEA at 2 ticks (Golden Cove
+        // lineage) and the ALU/shift steps at 1, against a 3-cycle IMUL:
+        // only plans of total cost <= 2 (budget = imul - 1) with a final
+        // cost < 3 survive.  That is exactly what GCC 16.2 emits for the
+        // pinned shapes: `imull $45`, single-LEA `x9`, `shl+sub` `x31`.
         assert_eq!(steps(0), None);
         assert_eq!(steps(1), None);
         assert_eq!(steps(2), Some(vec![Shl(1)]));
@@ -2391,39 +2482,45 @@ mod tests {
         assert_eq!(steps(3), Some(vec![LeaMul(2)]));
         assert_eq!(steps(5), Some(vec![LeaMul(4)]));
         assert_eq!(steps(9), Some(vec![LeaMul(8)]));
-        assert_eq!(steps(6), Some(vec![LeaMul(2), Shl(1)]));
-        assert_eq!(steps(10), Some(vec![LeaMul(4), Shl(1)]));
-        assert_eq!(steps(12), Some(vec![LeaMul(2), Shl(2)]));
-        assert_eq!(steps(24), Some(vec![LeaMul(2), Shl(3)]));
-        assert_eq!(steps(36), Some(vec![LeaMul(8), Shl(2)]));
-        assert_eq!(steps(40), Some(vec![LeaMul(4), Shl(3)]));
-        assert_eq!(steps(15), Some(vec![LeaMul(2), LeaMul(4)]));
-        assert_eq!(steps(25), Some(vec![LeaMul(4), LeaMul(4)]));
-        assert_eq!(steps(27), Some(vec![LeaMul(2), LeaMul(8)]));
-        assert_eq!(steps(45), Some(vec![LeaMul(4), LeaMul(8)]));
-        assert_eq!(steps(81), Some(vec![LeaMul(8), LeaMul(8)]));
-        assert_eq!(steps(7), Some(vec![LeaScale(8), SubSrc]));
-        assert_eq!(steps(31), Some(vec![Shl(5), SubSrc]));
+        // LEA+X chains cost >= 3 on modern rows: IMUL wins (fewer muops
+        // at equal-or-better latency).  These were Some when every step
+        // was priced at 1 cycle — the mispricing that emitted a 4-cycle
+        // 2-LEA chain for `x45` where GCC emits `imull $45`.
+        assert_eq!(steps(6), None);
+        assert_eq!(steps(7), None);
+        assert_eq!(steps(10), None);
+        assert_eq!(steps(12), None);
+        assert_eq!(steps(14), None);
+        // x15 survives as the LEA-free (x<<4) - x form: cost 2 < IMUL.
+        assert_eq!(steps(15), Some(vec![Shl(4), SubSrc]));
+        assert_eq!(steps(24), None);
+        assert_eq!(steps(25), None);
+        assert_eq!(steps(27), None);
+        assert_eq!(steps(36), None);
+        assert_eq!(steps(40), None);
+        assert_eq!(steps(45), None);
+        assert_eq!(steps(81), None);
+        // LEA-free two-step plans stay inside the budget.
         assert_eq!(steps(17), Some(vec![Shl(4), AddSrc]));
+        assert_eq!(steps(31), Some(vec![Shl(5), SubSrc]));
         assert_eq!(steps(65), Some(vec![Shl(6), AddSrc]));
-        assert_eq!(steps(-3), Some(vec![LeaMul(2), Neg]));
         assert_eq!(steps(-8), Some(vec![Shl(3), Neg]));
-        // 3-op shapes stay IMUL on a 3-cycle multiplier.
+        // x-3 would be single LEA + NEG = 3 >= budget.
+        assert_eq!(steps(-3), None);
+        // Register constraint is reported on the plans that need it.
+        assert!(g.mul_const_plan(17).unwrap().needs_distinct_src);
+        assert!(!g.mul_const_plan(3).unwrap().needs_distinct_src);
         for k in [
-            11, 13, 14, 19, 21, 22, 23, 26, 28, 29, 30, 50, 100, 1000, -7, -10, -100,
+            11, 13, 19, 21, 22, 23, 26, 28, 29, 30, 50, 100, 1000, -7, -10, -100,
         ] {
             assert_eq!(steps(k), None, "k={k}");
         }
-        // Register constraint is reported.
-        assert!(g.mul_const_plan(7).unwrap().needs_distinct_src);
-        assert!(!g.mul_const_plan(15).unwrap().needs_distinct_src);
-        // Every P-core and Zen row agrees with Generic — except Arrow Lake,
-        // where the measured `IMUL_R64_R64` latency is 4 cycles (3 only for the
-        // same-register form; uops.info ARL-P `1->1 cyc=4 same_reg=3`), so
-        // `mul_const_op_budget()` (= imul64_latency - 1) admits a 3-step plan.
-        // Pinning the old 2 here is what turned the tuning refresh red: the
-        // budget is derived from the latency column, so a corrected IMUL
-        // latency MUST move it.
+        // Every other P-core and Zen row agrees with Generic — except rows
+        // that legitimately differ from it: rows whose scaled-index LEA is
+        // measured at 1 tick (the SNB..ICL base, Gracemont — skipped below,
+        // ArrowLake inherits Generic's 2) only ever ADD plans relative to
+        // Generic, and ArrowLake's 4-cycle IMUL widens the budget so it may
+        // add plans too.  Losing a plan Generic has is always a regression.
         for cpu in X86Cpu::ALL {
             let t = cpu.tune();
             if cpu == X86Cpu::Gracemont {
@@ -2431,18 +2528,25 @@ mod tests {
             }
             let expected = if cpu == X86Cpu::ArrowLake { 3 } else { 2 };
             assert_eq!(t.mul_const_op_budget(), expected, "{:?}", cpu);
-            for k in [-100, -10, 6, 7, 10, 15, 17, 31, 100, 1000] {
-                // A row with the wider budget may only ever *add* plans: every
-                // k Generic already plans must plan identically (a divergence
-                // there is a regression in the shared search, not a budget
-                // effect), and only ArrowLake may add the extra step that its
-                // measured 4-cycle IMUL pays for.
+            // Rows with Generic's cost model must plan *identically*
+            // (shared-search regression detector); rows with a cheaper
+            // measured LEA or a wider budget may pick a different — still
+            // legal-for-them — shape (SNB's 1-tick LEA prefers the 2-LEA
+            // x15 where Generic uses (x<<4)-x) but may never come out
+            // None where Generic is Some.
+            let same_model = t.lea_scaled_latency == g.lea_scaled_latency
+                && t.mul_const_op_budget() == g.mul_const_op_budget();
+            for k in [-100, -10, 6, 7, 10, 12, 15, 17, 31, 45, 100, 1000] {
                 match (t.mul_const_plan(k), g.mul_const_plan(k)) {
-                    (Some(plan), Some(base)) => assert_eq!(plan, base, "{:?} k={k}", cpu),
-                    (Some(plan), None) => assert_eq!(
-                        cpu,
-                        X86Cpu::ArrowLake,
-                        "only the ARL-P budget may add a plan: {:?} k={k} {:?}",
+                    (Some(plan), Some(base)) => {
+                        if same_model {
+                            assert_eq!(plan, base, "{:?} k={k}", cpu);
+                        }
+                    }
+                    (Some(plan), None) => assert!(
+                        t.lea_scaled_latency < g.lea_scaled_latency
+                            || t.mul_const_op_budget() > g.mul_const_op_budget(),
+                        "unexpected extra plan: {:?} k={k} {:?}",
                         cpu,
                         plan
                     ),
@@ -2453,16 +2557,17 @@ mod tests {
                 }
             }
             if cpu == X86Cpu::ArrowLake {
-                // The budget must be *live*: -10 = 5x·2 then negate is 3 steps,
-                // which only this row may use (`Generic` returns none for it).
-                assert_eq!(
-                    t.mul_const_plan(-10).unwrap().steps(),
-                    [LeaMul(4), Shl(1), Neg]
-                );
-                assert_eq!(g.mul_const_plan(-10), None);
+                // The budget must be *live*: x12 = lea(x2) then shl costs
+                // 3, which only ARL's 3-wide budget may spend (`Generic`
+                // returns none for it), and the final cost < IMUL(4) gate
+                // keeps it legal.
+                assert_eq!(t.mul_const_plan(12).unwrap().steps(), [LeaMul(2), Shl(2)]);
+                assert_eq!(g.mul_const_plan(12), None);
             }
         }
         // Gracemont (IMUL 5): up to 4 one-cycle steps beat the multiplier.
+        // Its scaled-index LEA is the 1-tick form (index, no displacement),
+        // so the 3-4 step chains still fit the cost budget here.
         let e = X86Cpu::Gracemont.tune();
         assert_eq!(e.mul_const_op_budget(), 4);
         let es = |k: i64| e.mul_const_plan(k).map(|p| p.steps().to_vec());
@@ -2472,14 +2577,16 @@ mod tests {
         assert_eq!(es(-100), Some(vec![LeaMul(4), LeaMul(4), Shl(2), Neg]));
         assert_eq!(es(11), None);
         assert_eq!(es(1000), None);
-        // Plans are never as long as IMUL itself.
+        // Plans are never as slow on the critical path as IMUL itself
+        // (measured step latencies, not step counts).
         for cpu in X86Cpu::ALL {
             let t = cpu.tune();
             for k in -200i64..=200 {
                 if let Some(p) = t.mul_const_plan(k) {
+                    let cost: usize = p.steps().iter().map(|s| t.mul_const_step_cost(s)).sum();
                     assert!(
-                        p.len() < t.imul64_latency as usize,
-                        "{:?} k={k} {:?}",
+                        cost < t.imul64_latency as usize,
+                        "{:?} k={k} cost={cost} {:?}",
                         cpu,
                         p
                     );
@@ -2487,6 +2594,25 @@ mod tests {
                 }
             }
         }
+        // The Raptor Lake target row itself: x45 and x7 -> IMUL (their
+        // LEA-based chains cost >= 3 against IMUL's 3), x15 -> the LEA-free
+        // (x<<4) - x (cost 2), x9 -> single LEA (2), x31 -> shl+sub (2).
+        let rpl = X86Cpu::RaptorLake.tune();
+        assert_eq!(rpl.lea_scaled_latency, 2);
+        assert_eq!(rpl.mul_const_plan(45), None);
+        assert_eq!(
+            rpl.mul_const_plan(15).map(|p| p.steps().to_vec()),
+            Some(vec![Shl(4), SubSrc])
+        );
+        assert_eq!(rpl.mul_const_plan(7), None);
+        assert_eq!(
+            rpl.mul_const_plan(9).map(|p| p.steps().to_vec()),
+            Some(vec![LeaMul(8)])
+        );
+        assert_eq!(
+            rpl.mul_const_plan(31).map(|p| p.steps().to_vec()),
+            Some(vec![Shl(5), SubSrc])
+        );
     }
 
     #[test]

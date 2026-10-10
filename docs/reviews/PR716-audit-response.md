@@ -298,3 +298,83 @@ refuse everything else, and prove the properties the transform depends on
 And every guard has to carry its own reach measurement, because a refusal is
 silent. The corpus counter, the packed-FMA counts and the probe suite exist so
 that "fail closed" costs a number, not an argument.
+
+---
+
+## 12. Re-adjudication on latest main (2026-10-02)
+
+The review re-filed the same five findings against "PR #716" a second time,
+this time with a finding-by-finding instruction list and a 4/10 readiness
+rating. Two facts had to be established before adjudicating, and both are
+checkable in one command:
+
+1. **The revision the review describes is not the current one.** `git log
+   --oneline --stat -- tests/regression/check_fma_matcher_guards.sh` shows that
+   gate entering history in `fc174f03` (upstream PR #717) with the same
+   19-file, +2851/−119 diffstat this document's §9 recorded — and the file is
+   byte-identical to the S08 deliverable (`md5 5b7766a8530d6af74ed128d87000c968`).
+   The guards this document describes (§1–§6) are in `origin/main`, not merely
+   in a patch: `flags_reach_consumer_after_branch`, `limit_is_loop_invariant`,
+   `idx_const(iv_ty, …)`, the canonical-orientation refusal, and
+   `reduction_exit_is_canonical` are all present in `origin/main`'s sources.
+
+2. **Every finding is closed by that code, and this time it was measured on
+   the current tree rather than argued.** The verdict table below records the
+   commands; all of them were run against `origin/main` at `67a29473` (after
+   the two later upstream commits `fc174f03`, `71e6d49c`) with a fresh
+   `fastbuild`.
+
+| # | Review's finding | Status on `67a29473` | Evidence |
+|---|------------------|----------------------|----------|
+| 1 | flags scan stops at a partial writer; taken edge unscanned | **Closed** | `fusion_flags_flow_tests`: 6 tests, each refusal paired with a live control (a `clc`+`setne` case must refuse; the same text with a full writer must fuse). Plus `refuses_when_the_reader_sits_only_in_the_taken_target` and its control. |
+| 2 | FMA matcher does not prove the continuation edge | **Closed** | the matcher requires the canonical orientation, refusal string present at `vectorize.rs:1334`; `p2_ne_break` at limits 0/1/3/17 all match `gcc -O0`, 0 matmul matches on the inverted shape |
+| 3 | legality check is an incomplete blacklist | **Closed** | allowlist + terminator refusal + `limit_is_loop_invariant`; the switch shape refuses with *"matmul loop has control flow the transform has not proven safe"*, the internal-branch shape with *"defines a value that is read outside it (unmodeled loop-carried state)"* — distinct diagnostics, not a wildcard |
+| 4 | I64 IV accepted, I32 remainder generated | **Closed** | `idx_const(iv_ty, …)` at `vectorize.rs:17764`+; the guaranteed zero-trip shape was moved onto the width that can actually truncate (see §13) |
+| 5 | the reduction guard is dead code | **Closed** | `reduction_exit_is_canonical` has 2 references in `origin/main`'s `vectorize.rs` (definition + the pre-mutation dispatch call); `check_fma_matcher_guards.sh` contract 6 asserts the refusal and the preserved reach |
+| a | i32 inclusive-bound wrap | **Closed** | `i32::try_from(plus)` refusal |
+| b | volatile RMW policy | **Closed, and now gated** | §13, contract 6 of `check_volatile_access_semantics.sh` |
+| c | FMA oracle strength / spellings | **Closed** | elementwise fold compared forward and reversed plus `%a` bit patterns; `total()`/`packed()` match every FMA spelling |
+| d | awk escape; audit-repro section | **Closed** | `[[:space:]]`; §14 runs with one libtest filter per invocation |
+| e | stale `loop_rotate` comment | **Closed** | the comment states the preserved-operator algebra |
+
+Also verified on the current tree, since "closed" is a claim about behaviour,
+not about text: **39/39 adversarial probes agree with `gcc -O0`** (including the
+guard-page reduction probe that segfaulted the pre-fix compiler and the
+asm-effect counters), all four FMA/reduction/fusion gates PASS, and the 33
+targeted library tests in the touched modules PASS (4 `fusion_flags_flow`, 3
+`flags_horizon`, 24 `compare_branch_fusion`).
+
+## 13. What the review did not file (this round)
+
+Two residual holes were found by attacking the guards rather than re-reading
+them; both are now closed, and both cost nothing on real output because that
+cost was measured first.
+
+* **A data directive was invisible to the flags walker.** The walker stepped
+  over every `LineKind::Directive` as "a position, not an effect". That is
+  right for alignment and CFI, and wrong for `.byte`/`.long`/`.quad`: a hand
+  encoded sequence is an instruction the textual predicates cannot see —
+  `adc`, `clc`, a branch — which is exactly the class inline asm is already
+  charged for. The walker now classifies directives: the benign set is skipped,
+  a data directive is charged as a reader of every flag *and* leaves the walk
+  unproved (fail closed), and anything unrecognized is treated as data. The
+  reach cost is zero by construction: **0 data directives inside function
+  bodies across all 52 corpus programs** (measured). Pinned by
+  `refuses_across_a_data_directive_that_can_encode_an_instruction` with a
+  benign-directive control that must still fuse.
+* **The volatile/`_Atomic` policy was documented but not gated where
+  volatility is still visible** — the review's item (b), which asked for
+  exactly this. Contract 6 of `check_volatile_access_semantics.sh` builds
+  `_Atomic int` and `volatile int` accumulate loops, compares the values
+  against `gcc -O0` (3000 3000), and asserts the *shape*: the object is still
+  referenced inside a region bounded by a real back edge, so no pass collapsed
+  N read+write pairs into a closed form. The contract states what it proves
+  (shape + value) and what it does not (an access COUNT is not observable from
+  stdout in a single-threaded program); the detector was checked against a
+  hand-written closed form, where it fails as intended.
+
+One further probe class came back **sound**, and is recorded because a refusal
+is a boundary worth measuring: store indices that are affine in the IV but not
+equal to it (`C[i][j+1]`, `C[i][2*j]`, a loop-carried `t`) are all **refused**
+(0 matmul matches) and oracle-correct, so the matcher requires the bare IV
+rather than accepting any IV-affine address.

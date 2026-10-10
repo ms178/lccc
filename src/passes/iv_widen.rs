@@ -62,6 +62,46 @@
 //!    constant folding. This is the same discipline SCEV-based compilers
 //!    apply.
 //!
+//! 5′. **Trajectory of the counted bound (exposed latches).** Theorem 5's
+//!    no-wrap construction assumes every body pass is *gated* by the exit
+//!    test — true for a phi-guarded header (`preheader → header(cmp) → body
+//!    → latch → header`) and FALSE for rotated/bottom-tested loops, whose
+//!    first body pass runs at the untested seed. At a ring-top seed
+//!    (`0xFFFFFFFF`) the narrow latch wraps to 0 where the wide latch does
+//!    not, and every consumer of that divergent value sees the wide one
+//!    (the IVW-RANGE-1 miscompile: a rotated do-while read `buf[2^32]`
+//!    instead of `buf[0]`). Theorem 5′ therefore classifies the proof by the
+//!    cmp's trajectory position — `latch_exposed = cmp_is_latch ∨
+//!    ¬cmp_is_header ∨ ¬header_clean` — behind three structural gates (body
+//!    entry closure, no inner cycle through the latch, and obligation P:
+//!    branch-target LABELS resolved to block INDICES before any body-membership
+//!    test, the two numbering domains diverging after every CFG
+//!    simplification):
+//!
+//!    * **phi-guarded** proofs keep the STRICT post-entry range (`[0, n-1]`
+//!      incrementing): the seed itself never reaches the body untested, so
+//!      no value can wrap and the whole closure widens as under theorem 5.
+//!    * **latch-exposed** proofs use the SEED-INCLUSIVE range: a const seed
+//!      (resolved through the single `Copy{src: Const}` level mem2reg leaves)
+//!      folds into `[0, max(seed, n-1+mag)]` and widens normally; a RUNTIME
+//!      seed admits only the full domain `[0, max]`, and the worklist
+//!      INTERCEPT takes over: of the divergent (non-value-exact) members,
+//!      only bit-exact `& const` reads are admitted (theorem 3 holds for
+//!      every value, divergent or not), guard cmps and out-of-loop escapes
+//!      are repaired by truncation (the narrow bits of a diverged wide value
+//!      ARE the narrow value), and Cast/GEP/Intrinsic offset slots DECLINE —
+//!      a wide address computed from a value the narrow program wrapped is
+//!      a different address. Arithmetic folds decline by themselves: the
+//!      seed-inclusive `[0, max]` range overflows the narrow type at the
+//!      first `+mag`.
+//!    * Signed predicates (`Slt`/`Sle`/`Sgt`/`Sge`) on an UNSIGNED phi
+//!      decline the whole proof: a signed test does not confine an unsigned
+//!      value (`0xFFFFFFFF <s 64` is true), so no unsigned range follows
+//!      from it. Both branch polarities are recognised: an exit-on-true arm
+//!      normalises to the negated continue-condition before the bound is
+//!      read.
+
+//!
 //! # Provenance
 //!
 //! The derived **closure** is built forward from the seed phi. Every admitted
@@ -94,6 +134,12 @@
 //!   truncations rather than widened, keeping the mixed-signedness cmp exact.
 //! - Rotated self-loops (header == latch) are widenable when a preheader
 //!   exists for the hoists.
+//! - Duplicated latch steps (`a[(i + 1) & m]` + `while (i++ < n)` — the
+//!   frontend emits two value-identical `Add(phi, c)`s because iv_widen runs
+//!   ahead of the merging CSE): `canonicalise_latch_twin` redirects the back
+//!   edge to the earlier twin and deletes the dead original, routing the
+//!   shape through the intercept's bit-exact And arm instead of a fold that
+//!   overflows at the ring top.
 //! - Loop-exit comparisons that cannot be safely widened (incompatible
 //!   predicate, a loop-variant other operand, or an other operand that is not
 //!   available in the preheader, e.g. a bound reloaded after the loop) keep a
@@ -483,6 +529,36 @@ fn try_widen_loop(
     let preheader_label = func.blocks[preheader].label;
     let latch_label = func.blocks[latch].label;
 
+    // Canonicalise chained latch recurrences first (see
+    // `canonicalise_chained_latch`): every recogniser below requires the latch
+    // to name the phi directly, and an unrolled counted loop never does.
+    let chained: Vec<(Value, Value)> = func.blocks[lp.header]
+        .instructions
+        .iter()
+        .filter_map(|inst| match inst {
+            Instruction::Phi { dest, ty, incoming }
+                if matches!(*ty, IrType::I32 | IrType::U32) && incoming.len() == 2 =>
+            {
+                incoming
+                    .iter()
+                    .find(|(_, blk)| *blk == latch_label)
+                    .and_then(|(op, _)| match op {
+                        Operand::Value(v) => Some((*dest, *v)),
+                        Operand::Const(_) => None,
+                    })
+            }
+            _ => None,
+        })
+        .collect();
+    for (phi_dest, latch_val) in chained {
+        canonicalise_chained_latch(func, latch, latch_val, phi_dest);
+        // A duplicated step (`a[(i + 1) & m]` + `while (i++ < n)`) leaves a
+        // value-identical twin ahead of the latch value in the same block;
+        // redirecting the back edge to it routes the body read through the
+        // intercept's bit-exact And arm (see `canonicalise_latch_twin`).
+        canonicalise_latch_twin(func, latch, latch_val, phi_dest);
+    }
+
     let candidates: Vec<PhiCandidate> =
         collect_widenable_phis(func, lp, preheader_label, latch, latch_label);
     if candidates.is_empty() {
@@ -496,12 +572,14 @@ fn try_widen_loop(
         let Some(plan) = analyze_iv(
             func,
             lp,
+            &cfg.preds,
             &cfg.succs,
             &uses,
             &hoist,
             cand.phi_dest,
             cand.phi_ty,
             cand.init_op,
+            latch,
             cand.latch_op_dest,
             cand.latch_is_sub,
         ) else {
@@ -542,6 +620,257 @@ fn try_widen_loop(
 /// Collect narrow phi candidates in the header that have a 2-incoming shape
 /// (preheader init + latch step) whose latch value is produced by
 /// `Add(phi, step)` / `Add(step, phi)` / `Sub(phi, step)`.
+/// Maximum chain links followed by [`canonicalise_chained_latch`].  Unroll
+/// factors are small; the cap only bounds the walk on pathological IR.
+const LATCH_CHAIN_HOP_LIMIT: usize = 64;
+
+/// Re-spell a CHAINED latch recurrence as a single stride: `phi + total`.
+///
+/// An unrolled counted loop does not spell its latch `i += 4`.  It spells it
+/// `v1 = i+1; v2 = v1+1; v3 = v2+1; i' = v3+1`, because every intermediate is
+/// also an addressing offset the body needs (`p[i+1]`, `p[i+2]`, `p[i+3]`).
+/// Value numbering will not collapse that chain: re-associating `v2` to `i+2`
+/// leaves `v1` live for its own offset use, so the rewrite would add an
+/// instruction instead of removing one, and a local simplifier rightly declines
+/// it.
+///
+/// Every recogniser in this pass — `latch_step_uses_phi`, `plan_step_operand`,
+/// the `verify_plan` re-derivation and the apply-phase latch rewrite — requires
+/// the latch to name the phi directly, so a chained latch is not a candidate at
+/// all and the whole loop stays narrow.  Collapsing ONLY the final link
+/// canonicalises the recurrence at zero cost:
+///
+/// * no instruction is added, removed or duplicated — the last link is rewritten
+///   in place and the intermediates keep their offset uses;
+/// * the value is identical with no bound argument whatsoever, because modular
+///   addition is associative: `(((i+1)+1)+1)+1 == i+4` in the u32 ring for every
+///   `i`, wrapping or not.  For a signed chain the two spellings differ only on
+///   executions whose intermediate step overflows, which C17 6.5/5 makes
+///   undefined, so defined behaviour cannot change.
+///
+/// Returns true when the latch instruction was rewritten.  The chain must be
+/// local to the latch block, must consist solely of `Add`/`Sub` against integer
+/// constants with the recurrence on the left of a `Sub`, and must terminate at
+/// the phi; anything else leaves the IR untouched.
+fn canonicalise_chained_latch(
+    func: &mut IrFunction,
+    latch: usize,
+    latch_val: Value,
+    phi: Value,
+) -> bool {
+    if latch_val == phi {
+        return false;
+    }
+    // Collect the chain links: (dest, op, recurrence operand, const).
+    let mut links: Vec<(Value, IrBinOp, Value, IrConst)> = Vec::new();
+    for inst in &func.blocks[latch].instructions {
+        if let Instruction::BinOp {
+            dest,
+            op: op @ (IrBinOp::Add | IrBinOp::Sub),
+            lhs,
+            rhs,
+            ty: _,
+        } = inst
+        {
+            let (rec, k) = match (lhs, rhs) {
+                // `Sub(c, x)` is not an induction recurrence; skip the link.
+                (Operand::Value(v), Operand::Const(c)) => (*v, *c),
+                (Operand::Const(c), Operand::Value(v)) if *op == IrBinOp::Add => (*v, *c),
+                _ => continue,
+            };
+            links.push((*dest, *op, rec, k));
+        }
+    }
+    let link_of = |v: Value| links.iter().find(|(d, _, _, _)| *d == v).copied();
+
+    // Walk latch_val back to the phi, accumulating the signed stride.
+    let mut total: i128 = 0;
+    let mut cur = latch_val;
+    let mut visited: Vec<Value> = Vec::new();
+    while cur != phi {
+        if visited.len() >= LATCH_CHAIN_HOP_LIMIT || visited.contains(&cur) {
+            return false;
+        }
+        let Some((_, op, rec, k)) = link_of(cur) else {
+            return false;
+        };
+        let Some(mag) = k.to_i64() else {
+            return false;
+        };
+        let mag = mag as i128;
+        total += match op {
+            IrBinOp::Add => mag,
+            // The recurrence is the left operand, so this link is `rec - mag`.
+            _ => -mag,
+        };
+        visited.push(cur);
+        cur = rec;
+    }
+    // One link is already canonical; a zero stride is not an IV at all.
+    if visited.len() < 2 || total == 0 {
+        return false;
+    }
+    let (op, mag) = if total > 0 {
+        (IrBinOp::Add, total)
+    } else {
+        (IrBinOp::Sub, -total)
+    };
+    // The stride must fit the i64 constant carrier; a chain of huge constants
+    // is left alone rather than truncated.
+    let Ok(mag) = i64::try_from(mag) else {
+        return false;
+    };
+    for inst in &mut func.blocks[latch].instructions {
+        if let Instruction::BinOp {
+            dest,
+            op: slot_op,
+            lhs,
+            rhs,
+            ty: _,
+        } = inst
+        {
+            if *dest != latch_val {
+                continue;
+            }
+            *slot_op = op;
+            *lhs = Operand::Value(phi);
+            *rhs = Operand::Const(IrConst::I64(mag));
+            return true;
+        }
+    }
+    false
+}
+
+/// Canonicalise a DUPLICATED latch step onto its earlier twin.
+///
+/// When the source spells the step twice — `a[(i + 1) & m]` inside the body
+/// plus `while (i++ < n)` in the condition — the frontend emits two
+/// value-identical `Add(phi, c)` instructions in the latch block, because
+/// iv_widen runs ahead of the CSE that would merge them.  The twin that is
+/// NOT the latch value is an ordinary body member: under theorem 5′ it must
+/// fold from the seed-inclusive range, which overflows the narrow type at
+/// the ring top (`[0, max] + 1`), declining plans whose only body read is
+/// the bit-exact `& m` the intercept would happily admit.
+///
+/// Redirecting the back edge to the earlier twin and deleting the dead
+/// original makes the body read the LATCH member instead, routing the shape
+/// through the intercept's unconditional And arm.  Value identity needs no
+/// bound argument (same op, same operands, same type, pure SSA), and
+/// dominance is trivial: the twin is earlier in the same block.
+///
+/// Returns true when the back edge was redirected.  Declines when the latch
+/// value has any use beyond the phi's back-edge incoming (the original is
+/// not dead and removing it would strand those uses), when no earlier
+/// value-identical twin exists, or when the latch value is not a step of
+/// the phi at all.
+fn canonicalise_latch_twin(
+    func: &mut IrFunction,
+    latch: usize,
+    latch_val: Value,
+    phi: Value,
+) -> bool {
+    if latch_val == phi {
+        return false;
+    }
+    // Locate the latch instruction and its exact shape.
+    let mut latch_pos: Option<usize> = None;
+    let mut latch_key: Option<(IrBinOp, Operand, Operand, IrType)> = None;
+    for (ii, inst) in func.blocks[latch].instructions.iter().enumerate() {
+        if let Instruction::BinOp {
+            dest,
+            op,
+            lhs,
+            rhs,
+            ty,
+        } = inst
+        {
+            if *dest == latch_val {
+                latch_pos = Some(ii);
+                latch_key = Some((*op, *lhs, *rhs, *ty));
+            }
+        }
+    }
+    let (Some(latch_pos), Some((op, lhs, rhs, ty))) = (latch_pos, latch_key) else {
+        return false;
+    };
+    let reads_phi = matches!(lhs, Operand::Value(v) if v == phi)
+        || matches!(rhs, Operand::Value(v) if v == phi);
+    if !reads_phi {
+        return false;
+    }
+    // The earlier value-identical twin in the SAME block (dominance is then
+    // trivial: same block, earlier position).
+    let mut twin: Option<Value> = None;
+    for inst in func.blocks[latch].instructions.iter().take(latch_pos) {
+        if let Instruction::BinOp {
+            dest,
+            op: o2,
+            lhs: l2,
+            rhs: r2,
+            ty: t2,
+        } = inst
+        {
+            if *o2 == op && *l2 == lhs && *r2 == rhs && *t2 == ty {
+                twin = Some(*dest);
+                break;
+            }
+        }
+    }
+    let Some(twin) = twin else {
+        return false;
+    };
+    // The latch value must be dead once the back edge moves: its only
+    // remaining readers may be the phi's own incoming (redirected below).
+    for b in &func.blocks {
+        for inst in &b.instructions {
+            if let Instruction::Phi { dest, .. } = inst {
+                if *dest == phi {
+                    continue;
+                }
+            }
+            let mut used = false;
+            inst.for_each_used_value(|id| {
+                if id == latch_val.0 {
+                    used = true;
+                }
+            });
+            if used {
+                return false;
+            }
+        }
+        let mut tused = false;
+        b.terminator.for_each_used_value(|id| {
+            if id == latch_val.0 {
+                tused = true;
+            }
+        });
+        if tused {
+            return false;
+        }
+    }
+    // Redirect the phi's latch-side incoming to the twin (matched by edge
+    // label AND value so a coincidentally-equal init operand on the
+    // preheader edge can never be corrupted).
+    let latch_label = func.blocks[latch].label;
+    for b in &mut func.blocks {
+        for inst in &mut b.instructions {
+            if let Instruction::Phi { dest, incoming, .. } = inst {
+                if *dest != phi {
+                    continue;
+                }
+                for (slot, blk) in incoming.iter_mut() {
+                    if *blk == latch_label && matches!(slot, Operand::Value(v) if *v == latch_val) {
+                        *slot = Operand::Value(twin);
+                    }
+                }
+            }
+        }
+    }
+    // Remove the dead original (source_spans stay parallel via remove_inst).
+    remove_inst(&mut func.blocks[latch], latch_pos);
+    true
+}
+
 fn collect_widenable_phis(
     func: &IrFunction,
     lp: &NaturalLoop,
@@ -748,12 +1077,14 @@ fn defining_type(func: &IrFunction, v: Value) -> Option<IrType> {
 fn analyze_iv(
     func: &IrFunction,
     lp: &NaturalLoop,
+    preds: &FlatAdj,
     succs: &FlatAdj,
     uses: &UseMap,
     hoist: &PreheaderSite<'_>,
     phi_dest: Value,
     phi_ty: IrType,
     init: Operand,
+    latch: usize,
     latch_dest: Value,
     latch_is_sub: bool,
 ) -> Option<WidenPlan> {
@@ -761,19 +1092,50 @@ fn analyze_iv(
     let wide_ty = wide_ty_for(phi_ty);
     let step = plan_step_operand(func, phi_dest, latch_dest)?;
 
-    // Unsigned IVs need a provable counted-loop bound (theorem 5).
-    let seed_range: Option<Range> = if ext == ExtKind::Ze {
-        Some(prove_counted_bound(
+    // Unsigned IVs need a provable counted-loop bound (theorems 5/5′).
+    let (seed_range, intercept): (Option<Range>, bool) = if ext == ExtKind::Ze {
+        let proof = prove_counted_bound(
             func,
             lp,
+            preds,
             succs,
             uses,
             phi_dest,
+            phi_ty,
+            latch,
+            init,
             latch_is_sub,
             step,
-        )?)
+        )?;
+        // The exposed-latch intercept activates when the first body pass runs
+        // at a seed the proof could not confine AND the proof's range cannot
+        // close the exiting latch step: the narrow recurrence then wraps at
+        // the ring top where the wide one does not, member values diverge
+        // from `zext(narrow)`, and only value-exact uses are admissible. A
+        // phi-guarded strict range, or a seed-inclusive range with
+        // `hi + mag <= max` (incrementing; `lo - mag >= 0` decrementing),
+        // proves no-wrap over the WHOLE trajectory — the intercept stays off
+        // and the ordinary closure rules apply.
+        let step_val = match step {
+            Operand::Const(c) => c.to_i64().unwrap_or(0),
+            _ => 0,
+        };
+        let delta: i128 = if latch_is_sub {
+            -(step_val as i128)
+        } else {
+            step_val as i128
+        };
+        let max = type_max_i128(phi_ty);
+        let wrap_closed = if delta > 0 {
+            proof.range.hi + delta <= max
+        } else if delta < 0 {
+            proof.range.lo + delta >= 0
+        } else {
+            true
+        };
+        (Some(proof.range), proof.latch_exposed && !wrap_closed)
     } else {
-        None
+        (None, false)
     };
 
     let mut members: Vec<Member> = Vec::new();
@@ -799,14 +1161,19 @@ fn analyze_iv(
     let mut escapes: Vec<(usize, Value)> = Vec::new();
     let mut has_addressing = false;
 
-    // Worklist of (value, is_narrow_member). Narrow members get retyped to
-    // wide during apply; chain values are already wide (cast/copy dests that
-    // will be aliased to the underlying wide value, or wide chain binops) and
-    // only need their uses classified.
+    // Worklist of (value, is_narrow_member, value_exact). Narrow members get
+    // retyped to wide during apply; chain values are already wide (cast/copy
+    // dests that will be aliased to the underlying wide value, or wide chain
+    // binops) and only need their uses classified. `value_exact` records the
+    // theorem-5′ invariant `wide value == zext(narrow value)` on every
+    // executed pass: true for everything outside the intercept, and inside it
+    // true only for members whose derivation masks divergence away (bit-exact
+    // `& const`) or folds within the narrow type.
     let mut visited: FxHashSet<u32> = FxHashSet::default();
-    let mut queue: Vec<(Value, bool)> = vec![(phi_dest, true), (latch_dest, true)];
+    let mut queue: Vec<(Value, bool, bool)> =
+        vec![(phi_dest, true, !intercept), (latch_dest, true, !intercept)];
 
-    while let Some((cur, narrow)) = queue.pop() {
+    while let Some((cur, narrow, cur_exact)) = queue.pop() {
         if !visited.insert(cur.0) {
             continue;
         }
@@ -823,8 +1190,16 @@ fn analyze_iv(
                 match term {
                     Terminator::CondBranch { cond, .. } => {
                         // A branch on a truth value: widening preserves
-                        // non-zero-ness, so reading the wide value is exact.
+                        // non-zero-ness, so reading the wide value is exact
+                        // — but only while `wide == zext(narrow)`. Under the
+                        // intercept a diverged value can flip zero-ness
+                        // (narrow 0 vs wide 2^32), so the branch must read
+                        // the truncation: an escape repair outside the loop,
+                        // a decline inside it.
                         if matches!(cond, Operand::Value(v) if v.0 == cur.0) {
+                            if intercept && !cur_exact {
+                                narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
+                            }
                             continue;
                         }
                     }
@@ -879,17 +1254,19 @@ fn analyze_iv(
                     }
 
                     // Wide-type chain ops (already 64-bit): pure pass-through,
-                    // nothing to widen — classify their uses.
+                    // nothing to widen — classify their uses. A chain op over
+                    // a divergent member stays divergent (it copies the wide
+                    // value through), so the exactness flag propagates.
                     if ty.size() >= 8 {
                         match other {
                             Operand::Const(_) => {
-                                queue.push((*dest, false));
+                                queue.push((*dest, false, cur_exact));
                                 continue;
                             }
                             Operand::Value(ov) => {
                                 let other_admitted = members.iter().any(|m| m.value.0 == ov.0);
                                 if other_admitted || ov.0 == cur.0 {
-                                    queue.push((*dest, false));
+                                    queue.push((*dest, false, cur_exact));
                                     continue;
                                 }
                             }
@@ -942,7 +1319,11 @@ fn analyze_iv(
                                         ext,
                                         Some(nr),
                                     ));
-                                    queue.push((*dest, true));
+                                    // A fold that stays within the narrow
+                                    // type cannot carry divergence (no wrap
+                                    // ⇒ wide == zext(narrow)) only if the
+                                    // input itself was exact; inherit.
+                                    queue.push((*dest, true, cur_exact));
                                     continue;
                                 }
                                 // Signed: the UB theorem makes every constant
@@ -964,7 +1345,7 @@ fn analyze_iv(
                                     ext,
                                     nr,
                                 ));
-                                queue.push((*dest, true));
+                                queue.push((*dest, true, cur_exact));
                                 continue;
                             }
                             // Two-member arithmetic: sound for signed members
@@ -983,7 +1364,7 @@ fn analyze_iv(
                                         ext,
                                         None,
                                     ));
-                                    queue.push((*dest, true));
+                                    queue.push((*dest, true, cur_exact));
                                     continue;
                                 }
                             }
@@ -993,16 +1374,36 @@ fn analyze_iv(
                             // Bitwise identity (theorem 3): unconditional for
                             // both extensions, any constant.
                             if let Operand::Const(c) = other {
+                                // `Or`/`Xor` pass the upper bits of a
+                                // divergent wide value through, so under the
+                                // intercept they are admissible only on an
+                                // exact input. `And` MASKS the divergence
+                                // away: `wide & c` depends solely on the low
+                                // narrow bits for any `c < 2^w`, so its
+                                // result is value-exact for EVERY input —
+                                // this is the exposed latch's one admissible
+                                // in-loop read (the `a[(i + 1) & m]`
+                                // ring-buffer idiom).
+                                if intercept && !cur_exact && *op != IrBinOp::And {
+                                    narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
+                                    continue;
+                                }
+                                // The And arm never depended on the input
+                                // range: `x & c ∈ [0, c]` holds for every
+                                // unsigned `x`, including the range-None
+                                // LatchResult member the twin
+                                // canonicalisation routes here.
                                 let nr = match (
                                     op,
+                                    cur_is_unsigned,
                                     member_range(&members, cur),
                                     const_as_range(*c, *ty),
                                 ) {
-                                    (IrBinOp::And, Some(_r), Some(cr)) => {
+                                    (IrBinOp::And, true, _, Some(cr)) => {
                                         // x & c ∈ [0, c] (bitwise subset).
                                         Some(Range { lo: 0, hi: cr.hi })
                                     }
-                                    (IrBinOp::Or, Some(_r), Some(cr)) => {
+                                    (IrBinOp::Or, true, Some(_r), Some(cr)) => {
                                         // x | c ≥ c, and < 2^w.
                                         Some(Range {
                                             lo: cr.lo,
@@ -1011,6 +1412,7 @@ fn analyze_iv(
                                     }
                                     _ => None,
                                 };
+                                let member_exact = cur_exact || *op == IrBinOp::And;
                                 members.push(Member::of(
                                     *dest,
                                     MemberKind::BinOpConst {
@@ -1023,12 +1425,20 @@ fn analyze_iv(
                                     ext,
                                     nr,
                                 ));
-                                queue.push((*dest, true));
+                                queue.push((*dest, true, member_exact));
                                 continue;
                             }
                             narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
                         }
                         IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr => {
+                            // Under the intercept a shift of a divergent
+                            // value moves the upper bits into (LShr) or past
+                            // (Shl) the narrow result: neither commutes with
+                            // the truncation, so only exact inputs shift.
+                            if intercept && !cur_exact {
+                                narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
+                                continue;
+                            }
                             // Narrow shift by a constant count. The count is a
                             // shift amount — it is NOT widened; only the
                             // member and the op's type are retyped.
@@ -1106,7 +1516,7 @@ fn analyze_iv(
                                 ext,
                                 nr,
                             ));
-                            queue.push((*dest, true));
+                            queue.push((*dest, true, cur_exact));
                         }
                         _ => {
                             // Division, remainder, BitTest: not
@@ -1123,6 +1533,16 @@ fn analyze_iv(
                 } => {
                     if !matches!(src, Operand::Value(v) if v.0 == cur.0) {
                         continue;
+                    }
+                    // Exposed-latch intercept: a cast of a divergent value
+                    // aliases its consumers to the wide bits (a dropped
+                    // widening cast) or reinterprets them (a cross cast) —
+                    // either way the consumer no longer reads
+                    // `zext(narrow)`, which is exactly how the rotated
+                    // do-while escape miscompiled (`buf[2^32]` instead of
+                    // `buf[0]`). Decline the plan; the loop stays narrow.
+                    if intercept && !cur_exact {
+                        return None;
                     }
                     // `is_unsigned_ty` answers `false` for every non-integer
                     // type, so a bare `same_sign` test cannot distinguish
@@ -1152,7 +1572,7 @@ fn analyze_iv(
                             ext,
                             None,
                         ));
-                        queue.push((*dest, false));
+                        queue.push((*dest, false, cur_exact));
                         continue;
                     }
                     if to_is_int && to_ty.size() >= 4 && *to_ty != IrType::Ptr && same_sign {
@@ -1176,7 +1596,7 @@ fn analyze_iv(
                             ext,
                             None,
                         ));
-                        queue.push((*dest, false));
+                        queue.push((*dest, false, cur_exact));
                         continue;
                     }
                     // Narrowing, same-width (i32→u32 for C's `int < unsigned`
@@ -1227,6 +1647,23 @@ fn analyze_iv(
                     if matches!(other, Operand::Value(v) if v.0 == cur.0) {
                         // cmp(member, member): self-comparison — decline.
                         return None;
+                    }
+                    // Under the intercept the cmp MUST read the truncation:
+                    // a wide compare of a divergent value follows a
+                    // DIFFERENT trajectory than the narrow program at the
+                    // ring top (narrow `0 < n` continues where wide
+                    // `2^32 < n` exits). The truncation's low bits ARE the
+                    // narrow value, so the guarded trajectory — and with it
+                    // the counted proof — survives the widening. (On x86-64
+                    // the trunc is free: `cmpl` reads the low half of the
+                    // wide register.)
+                    if intercept && !cur_exact {
+                        cmps.push(CmpAction::Trunc {
+                            cmp_dest: *dest,
+                            member: cur,
+                            iv_is_lhs: lhs_is_cur,
+                        });
+                        continue;
                     }
                     // A loop-variant other operand cannot be widened (the
                     // cast would have to run per iteration): keep the cmp
@@ -1289,9 +1726,28 @@ fn analyze_iv(
                 }
                 Instruction::GetElementPtr { offset, .. } => {
                     if matches!(offset, Operand::Value(v) if v.0 == cur.0) {
+                        // Exposed-latch intercept: a wide address computed
+                        // from a value the narrow program wrapped is a
+                        // DIFFERENT address — the IVW-RANGE-1 miscompile
+                        // itself. Only value-exact members (a bit-exact
+                        // `& const` chain, or a fold that stayed inside the
+                        // narrow type) may address.
+                        if intercept && !cur_exact {
+                            return None;
+                        }
                         has_addressing = true;
                         continue;
                     }
+                }
+                Instruction::Intrinsic { .. } => {
+                    // An intrinsic index/offset slot is address arithmetic
+                    // like a GEP offset: decline it under the intercept on a
+                    // divergent member. Any other intrinsic read is an
+                    // ordinary narrow use.
+                    if intercept && !cur_exact {
+                        return None;
+                    }
+                    narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
                 }
                 Instruction::Select {
                     dest,
@@ -1303,6 +1759,14 @@ fn analyze_iv(
                     let cur_is_true = matches!(true_val, Operand::Value(v) if v.0 == cur.0);
                     let cur_is_false = matches!(false_val, Operand::Value(v) if v.0 == cur.0);
                     if (cur_is_true || cur_is_false) && ty.is_integer() {
+                        // Under the intercept a divergent select-data value
+                        // propagates the divergence into the result without
+                        // a range that could confine it: treat as a narrow
+                        // use (escape repair outside, decline inside).
+                        if intercept && !cur_exact {
+                            narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
+                            continue;
+                        }
                         // A member used as select *data*: admissible when the
                         // other data operand is a const or an admitted member.
                         let other_op = if cur_is_true { false_val } else { true_val };
@@ -1347,13 +1811,19 @@ fn analyze_iv(
                                 ext,
                                 nr,
                             ));
-                            queue.push((*dest, true));
+                            queue.push((*dest, true, cur_exact));
                             continue;
                         }
                     }
                     // Member as select condition: a truth-value use; widening
-                    // preserves non-zero-ness, so no rewrite is needed.
+                    // preserves non-zero-ness, so no rewrite is needed —
+                    // except under the intercept, where a divergent value
+                    // can flip zero-ness and the select must read the
+                    // truncation like any narrow consumer.
                     if matches!(cond, Operand::Value(v) if v.0 == cur.0) {
+                        if intercept && !cur_exact {
+                            narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
+                        }
                         continue;
                     }
                     narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
@@ -1370,8 +1840,11 @@ fn analyze_iv(
                     return None;
                 }
                 _ => {
-                    // Load/Store/atomics/calls/intrinsics/va_*/memcpy and
-                    // every other shape reading the member: a narrow use.
+                    // Load/Store/atomics/calls/va_*/memcpy and every other
+                    // shape reading the member: a narrow use. The escape
+                    // truncation is exact even for a divergent wide value —
+                    // its low bits ARE the narrow value — so the intercept
+                    // needs no extra gate here.
                     narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
                 }
             }
@@ -1471,30 +1944,240 @@ fn narrow_escape_or_bail(
     Some(())
 }
 
-/// Theorem 5 for unsigned IVs: prove the loop is a counted loop with a unit
-/// step and an upper (or lower) exit bound, so no body value and no latch
-/// result can wrap. Returns the seed's provable value range.
+/// The counted-loop proof result (theorems 5/5′): the provable value range of
+/// the IV across body passes, and the trajectory class of the exit test that
+/// proved it.
+#[derive(Debug, Clone, Copy)]
+struct CountedProof {
+    /// Provable range of the phi's value at body-member evaluations.
+    /// phi-guarded proofs are STRICT (post-entry: the seed is tested before
+    /// any body work runs); latch-exposed proofs are SEED-INCLUSIVE (the
+    /// first body pass runs at the untested seed — a const seed folds into
+    /// the range, a runtime seed admits only the full domain).
+    range: Range,
+    /// True when the exit test does not precede every body pass: a rotated
+    /// do-while (cmp in the latch block), a cmp outside the header, or a
+    /// header carrying body work ahead of its own test. The range is then
+    /// seed-inclusive, and when it cannot close the exiting latch step
+    /// (`hi + mag` wraps the narrow type), `analyze_iv` activates the
+    /// exposed-latch intercept.
+    latch_exposed: bool,
+}
+
+/// Resolve the seed operand to a constant, through the single `Copy{src:
+/// Const}` level mem2reg leaves for `uint32_t i = 8;` (the init arrives as a
+/// copy of the constant, not a bare constant). Any other shape — a load, a
+/// param, arithmetic, chained copies — is a runtime seed: `None`. The value
+/// is extended by the phi's own type, so an `I32(-1)` carrier for a `U32`
+/// seed resolves to `0xFFFFFFFF`.
+fn resolve_init_const(func: &IrFunction, init: Operand, phi_ty: IrType) -> Option<i128> {
+    let c = match init {
+        Operand::Const(c) => c,
+        Operand::Value(v) => {
+            let (_, inst) = find_def(func, v)?;
+            let Instruction::Copy { src, .. } = inst else {
+                return None;
+            };
+            match src {
+                Operand::Const(c) => *c,
+                _ => return None,
+            }
+        }
+    };
+    widen_const(c, phi_ty)?.to_i64().map(|v| v as i128)
+}
+
+/// Theorem 5′ trajectory gate: every body block except the header is entered
+/// only from inside the body. An outside edge into the middle of the body
+/// would run body work on a pass whose IV value no header test gated,
+/// invalidating every range argument (strict AND seed-inclusive).
+fn body_entry_closed(lp: &NaturalLoop, preds: &FlatAdj) -> bool {
+    lp.body.iter().all(|&b| {
+        b == lp.header
+            || preds
+                .row(b)
+                .iter()
+                .all(|&p| lp.body.contains(&(p as usize)))
+    })
+}
+
+/// Theorem 5′ trajectory gate: the latch's only in-body successor is the
+/// header. A latch that re-enters the body (or itself) steps the recurrence
+/// without re-passing the exit test, letting the IV outrun any proven bound
+/// (an inner cycle through the latch).
+fn latch_on_inner_cycle(lp: &NaturalLoop, succs: &FlatAdj, latch: usize) -> bool {
+    succs
+        .row(latch)
+        .iter()
+        .any(|&s| lp.body.contains(&(s as usize)) && s as usize != lp.header)
+}
+
+/// Theorem 5′ trajectory gate: the header carries no body work — only phis
+/// and the exit test. A header computing member values ahead of its own test
+/// evaluates them at the untested seed (the rotated shape), so the loop is
+/// latch-exposed even when the cmp nominally sits in the header.
+fn header_is_clean(func: &IrFunction, lp: &NaturalLoop) -> bool {
+    func.blocks[lp.header]
+        .instructions
+        .iter()
+        .all(|i| matches!(i, Instruction::Phi { .. } | Instruction::Cmp { .. }))
+}
+
+/// The negation of an unsigned comparison predicate, for normalising an
+/// exit-on-true branch to its continue-condition. `Eq`/`Ne` have no bounding
+/// negation (an equality test does not confine a counted trajectory to an
+/// interval): `None`.
+fn negated_unsigned_pred(op: IrCmpOp) -> Option<IrCmpOp> {
+    Some(match op {
+        IrCmpOp::Ult => IrCmpOp::Uge,
+        IrCmpOp::Ule => IrCmpOp::Ugt,
+        IrCmpOp::Ugt => IrCmpOp::Ule,
+        IrCmpOp::Uge => IrCmpOp::Ult,
+        _ => return None,
+    })
+}
+
+/// Normalise the CONTINUE condition over the invariant other operand
+/// (`phi <cont_op> other`, or the commuted `other <cont_op> phi`) to a strict
+/// threshold on the phi.
+///
+/// Returns `Some((is_upper, threshold))`: continue ⇔ `phi < threshold`
+/// (an upper bound, incrementing loops) or ⇔ `phi > threshold` (a lower
+/// bound, decrementing loops). `threshold` is `None` for a runtime
+/// (loop-invariant value) bound in strict form. Non-strict forms shift the
+/// constant by one (`phi <= c` ⇔ `phi < c+1`); shifting a runtime value
+/// would need IR materialisation, which this proof does not do, so a
+/// non-strict form over a runtime bound declines (`None`).
+fn normalise_bound_threshold(
+    cont_op: IrCmpOp,
+    phi_is_lhs: bool,
+    other: Operand,
+    phi_ty: IrType,
+) -> Option<(bool, Option<i128>)> {
+    let const_thr: Option<i128> = match other {
+        Operand::Const(c) => widen_const(c, phi_ty)?.to_i64().map(|v| v as i128),
+        Operand::Value(_) => None,
+    };
+    // A non-strict form is only normalisable over a CONST bound.
+    let shifted = |k: i128| -> Option<Option<i128>> { const_thr.map(|t| t + k).map(Some) };
+    Some(match (cont_op, phi_is_lhs) {
+        (IrCmpOp::Ult, true) => (true, const_thr),
+        (IrCmpOp::Ugt, false) => (true, const_thr),
+        (IrCmpOp::Ule, true) => (true, shifted(1)?),
+        (IrCmpOp::Uge, false) => (true, shifted(1)?),
+        (IrCmpOp::Ugt, true) => (false, const_thr),
+        (IrCmpOp::Ult, false) => (false, const_thr),
+        (IrCmpOp::Uge, true) => (false, shifted(-1)?),
+        (IrCmpOp::Ule, false) => (false, shifted(-1)?),
+        _ => return None,
+    })
+}
+
+/// The no-wrap room obligation on a normalised CONST exit threshold: the
+/// incrementing latch result reaches `thr - 1 + mag` (body values pass the
+/// test at `≤ thr-1`) and the decrementing one reaches `thr + 1 - mag`;
+/// neither may leave the narrow domain, else the narrow recurrence wraps
+/// where the wide one does not. One interval test covers both directions
+/// because `thr` is the exit threshold either way. The endpoints cannot
+/// overflow: `mag >= 1`, `max = 2^w - 1` with `w <= 32`, all in i128.
+fn bound_leaves_room(thr: i128, max: i128, mag: i128) -> bool {
+    thr >= mag - 1 && thr <= max - mag + 1
+}
+
+/// Theorems 5/5′ for unsigned IVs: prove the loop is a counted loop whose
+/// exit test confines the IV to a no-wrap range under a constant step, and
+/// classify the trajectory (phi-guarded vs latch-exposed).
+///
+/// The per-iteration delta is `-step` for a `Sub` latch and `+step` for an
+/// `Add` latch.  Writing `mag = |delta|` and `max = 2^w - 1`:
+///
+/// * The exit cmp must read the phi directly, feed its block's conditional
+///   branch, and have exactly ONE arm leaving the loop body — resolved
+///   through a label→index map (obligation P): branch targets are `BlockId`
+///   LABELS while `lp.body`, `preds` and `succs` are block INDICES, and the
+///   two numbering domains diverge after any CFG simplification (a live repro
+///   had body index 3 under label 5; comparing the domains directly failed
+///   every well-formed loop in real frontend IR). Both branch polarities are
+///   accepted: an exit-on-true arm normalises to the negated
+///   continue-condition before the bound is read.
+/// * Signed predicates (`Slt`/`Sle`/`Sgt`/`Sge`) on an unsigned phi decline
+///   the WHOLE proof: `0xFFFFFFFF <s 64` is true, so a signed test confines
+///   an unsigned value to no interval at all. (An earlier revision admitted
+///   `Slt` here and a unit fixture codified the unsound strict range that
+///   followed — a ring-top seed satisfies `phi <s 64` and runs the body
+///   outside `[0, 63]`.)
+/// * `mag > 1` needs a CONSTANT threshold with room for the final stride
+///   (`bound_leaves_room`).  `mag == 1` also accepts a RUNTIME loop-invariant
+///   threshold — the no-wrap argument is by construction (every continuing
+///   value `< thr ≤ max`, unit steps, latch `≤ max`), not by constant
+///   folding.  This is the same discipline SCEV-based compilers apply.
+/// * The structural trajectory gates (body-entry closure, no inner cycle
+///   through the latch) are unconditional; header cleanliness decides the
+///   RANGE CLASS: a phi-guarded proof (`cmp_is_header && !cmp_is_latch &&
+///   header_clean`) returns the STRICT post-entry range; a latch-exposed
+///   proof (`cmp_is_latch || !cmp_is_header || !header_clean`) returns the
+///   SEED-INCLUSIVE range — a const seed (resolved through the single
+///   `Copy{src: Const}` level mem2reg leaves) folds into it, a runtime seed
+///   admits only the full domain `[0, max]`, whose first arithmetic fold
+///   overflows and whose divergent members the exposed-latch intercept in
+///   `analyze_iv` confines to value-exact uses.
+///
+/// Refusing shapes whose latch step can wrap is not merely a missed
+/// optimisation.  A narrow index forces the backend to refuse the SIB scale
+/// and displacement folds (`scale_ring_is_linear`,
+/// `backend/generation.rs`): `add(iv, k)` evaluated in the u32 ring is a
+/// different address from `add(iv, k)` in the pointer ring whenever
+/// `iv + k` wraps, so the fold is only sound on a pointer-width index.
+/// Proving the stride here widens the IV, after which the fold is both legal
+/// and free -- the counted loop keeps its `k(%base,%iv)` addressing instead
+/// of paying a narrow `leal` per unrolled access.
 fn prove_counted_bound(
     func: &IrFunction,
     lp: &NaturalLoop,
+    preds: &FlatAdj,
     succs: &FlatAdj,
     uses: &UseMap,
     phi_dest: Value,
+    phi_ty: IrType,
+    latch: usize,
+    init: Operand,
     latch_is_sub: bool,
     step: Operand,
-) -> Option<Range> {
-    // Unit step only: |delta| must be 1 (Add +1 / Sub -1 / Add -1 / Sub +1
-    // with the const being the magnitude-1 operand).
+) -> Option<CountedProof> {
+    // Constant step only, in either latch spelling (`Add(i, s)` / `Sub(i, s)`),
+    // so the true delta carries the latch's sign rather than assuming `s == 1`.
     let step_val = match step {
         Operand::Const(c) => c.to_i64()?,
         _ => return None,
     };
-    if step_val != 1 {
+    let delta: i128 = if latch_is_sub {
+        -(step_val as i128)
+    } else {
+        step_val as i128
+    };
+    if delta == 0 {
         return None;
     }
-    let delta: i8 = if latch_is_sub { -1 } else { 1 };
+    let mag: i128 = delta.abs();
     let w = narrow_bit_width(defining_type(func, phi_dest)?);
     let max = (1i128 << w) - 1;
+
+    // Theorem 5′ structural trajectory gates.
+    if !body_entry_closed(lp, preds) {
+        return None;
+    }
+    if latch_on_inner_cycle(lp, succs, latch) {
+        return None;
+    }
+    let header_clean = header_is_clean(func, lp);
+
+    // Obligation P: branch targets are BlockId LABELS; the loop body and the
+    // adjacency rows are block INDICES. Resolve through this map — never
+    // compare the two domains directly.
+    let mut label_to_idx: FxHashMap<BlockId, usize> = FxHashMap::default();
+    for (i, b) in func.blocks.iter().enumerate() {
+        label_to_idx.insert(b.label, i);
+    }
 
     let uselist = uses.get(&phi_dest.0)?;
     for &(bi, ii) in uselist {
@@ -1511,18 +2194,16 @@ fn prove_counted_bound(
         else {
             continue;
         };
-        // The cmp result must feed an exit branch.
-        let Terminator::CondBranch { cond, .. } = &func.blocks[bi].terminator else {
+        // The cmp result must feed its block's conditional branch.
+        let Terminator::CondBranch {
+            cond,
+            true_label,
+            false_label,
+        } = &func.blocks[bi].terminator
+        else {
             continue;
         };
         if !matches!(cond, Operand::Value(v) if v.0 == dest.0) {
-            continue;
-        }
-        let exits = succs
-            .row(bi)
-            .iter()
-            .any(|&s| !lp.body.contains(&(s as usize)));
-        if !exits {
             continue;
         }
         let lhs_is_phi = matches!(lhs, Operand::Value(v) if v.0 == phi_dest.0);
@@ -1530,25 +2211,106 @@ fn prove_counted_bound(
         if !lhs_is_phi && !rhs_is_phi {
             continue;
         }
+        // Obligation P (label resolution): exactly one arm leaves the body —
+        // that arm is the exit edge and the other is the continue edge. Arms
+        // that both stay (an internal routing test) or both leave (ill-formed
+        // for a natural loop) prove no exit trajectory.
+        let true_idx = *label_to_idx.get(true_label)?;
+        let false_idx = *label_to_idx.get(false_label)?;
+        let true_in = lp.body.contains(&true_idx);
+        let false_in = lp.body.contains(&false_idx);
+        if true_in == false_in {
+            continue;
+        }
+        let exits_on_true = !true_in;
         let other = if lhs_is_phi { rhs } else { lhs };
         if !operand_is_const_or_loop_invariant(other, lp, func, phi_dest) {
             continue;
         }
-        // Strict upper bound `i < n` (incrementing) or strict lower bound
-        // `i > b` (decrementing). The direction must match the step sign.
-        let upper_bound = matches!((op, lhs_is_phi), (IrCmpOp::Ult | IrCmpOp::Slt, true))
-            || matches!((op, rhs_is_phi), (IrCmpOp::Ugt | IrCmpOp::Sgt, true));
-        let lower_bound = matches!((op, rhs_is_phi), (IrCmpOp::Ult | IrCmpOp::Slt, true))
-            || matches!((op, lhs_is_phi), (IrCmpOp::Ugt | IrCmpOp::Sgt, true));
-        if upper_bound && delta > 0 {
-            // Body values ≤ n-1 ≤ max-1; latch result ≤ max — no wrap.
-            return Some(Range { lo: 0, hi: max - 1 });
+        // A signed predicate over an unsigned phi confines it to no interval
+        // (0xFFFFFFFF <s 64 is true): decline the whole proof.
+        if matches!(
+            op,
+            IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge
+        ) {
+            return None;
         }
-        if lower_bound && delta < 0 {
-            // Body values ≥ 1; latch result ≥ 0 — no wrap.
-            return Some(Range { lo: 1, hi: max });
+        // Normalise to the CONTINUE condition (an exit-on-true arm negates).
+        let cont_op = if exits_on_true {
+            negated_unsigned_pred(*op)?
+        } else {
+            *op
+        };
+        let Some((is_upper, thr)) = normalise_bound_threshold(cont_op, lhs_is_phi, *other, phi_ty)
+        else {
+            return None;
+        };
+        // The bound direction must match the step sign.
+        if is_upper != (delta > 0) {
+            return None;
         }
-        return None;
+        // The no-wrap room obligation. A runtime threshold is provable only
+        // for a unit step, by construction (every continuing value ≤ max-1
+        // under a strict `phi < thr ≤ max` test, latch ≤ max).
+        match thr {
+            Some(t) => {
+                if !bound_leaves_room(t, max, mag) {
+                    return None;
+                }
+            }
+            None => {
+                if mag > 1 {
+                    return None;
+                }
+            }
+        }
+
+        // Trajectory class: the guard confines body work only when it
+        // precedes ALL of it — the cmp in a clean header, not the latch.
+        let cmp_is_header = bi == lp.header;
+        let cmp_is_latch = bi == latch;
+        let latch_exposed = cmp_is_latch || !cmp_is_header || !header_clean;
+
+        // Strict (phi-guarded) vs seed-inclusive (latch-exposed) range. The
+        // seed-inclusive upper bound is `max(seed, thr-1+mag)`: the untested
+        // seed itself AND the tested overshoot (a pass continues at `phi <
+        // thr`, so the NEXT body pass runs at up to `thr-1+mag` before its
+        // own test). A runtime seed or runtime threshold admits only the
+        // full domain — tight enough that the first arithmetic fold overflows
+        // and the intercept confines what remains.
+        let init_const = if latch_exposed {
+            resolve_init_const(func, init, phi_ty)
+        } else {
+            None
+        };
+        let range = match (is_upper, latch_exposed) {
+            (true, false) => Range {
+                lo: 0,
+                hi: thr.map(|t| (t - 1).min(max)).unwrap_or(max - 1),
+            },
+            (true, true) => match (init_const, thr) {
+                (Some(c), Some(t)) => Range {
+                    lo: 0,
+                    hi: c.max(t - 1 + mag).min(max),
+                },
+                _ => Range { lo: 0, hi: max },
+            },
+            (false, false) => Range {
+                lo: thr.map(|t| (t + 1).max(0)).unwrap_or(1),
+                hi: max,
+            },
+            (false, true) => match (init_const, thr) {
+                (Some(c), Some(t)) => Range {
+                    lo: c.min(t + 1 - mag).max(0),
+                    hi: max,
+                },
+                _ => Range { lo: 0, hi: max },
+            },
+        };
+        return Some(CountedProof {
+            range,
+            latch_exposed,
+        });
     }
     None
 }
@@ -3241,11 +4003,19 @@ mod tests {
         check(&mut func, 0);
     }
 
-    /// Unsigned IV with a signed-predicate cmp: the cmp must be kept narrow
-    /// via a truncation, not widened (zext is not order-preserving for
-    /// signed comparisons).
+    /// Unsigned IV whose exit cmp uses a SIGNED predicate (`i <s 64` on a
+    /// U32 phi): theorem 5′ declines the WHOLE proof. A signed test confines
+    /// an unsigned value to no interval at all — a ring-top seed satisfies
+    /// `0xFFFFFFFF <s 64`, so the body runs at values outside every unsigned
+    /// interval derived from the cmp. The pre-theorem-5′ pass proved `[0, 63]`
+    /// from this shape and widened (the former fixture
+    /// `test_unsigned_signed_pred_cmp_trunc` codified that unsound behaviour:
+    /// it asserted a widened plan whose strict range a ring-top seed
+    /// falsifies). Declining is the only sound reading; the cmp-action-level
+    /// rule that a signed predicate keeps a narrow cmp (truncation) still
+    /// holds for signed IVs and for non-exit cmps.
     #[test]
-    fn test_unsigned_signed_pred_cmp_trunc() {
+    fn test_unsigned_signed_pred_bound_declines() {
         let cmp = Instruction::Cmp {
             dest: Value(99),
             op: IrCmpOp::Slt,
@@ -3270,30 +4040,14 @@ mod tests {
             rhs: Operand::Const(IrConst::I32(1)),
             ty: IrType::U32,
         };
-        check(&mut func, 1);
-        let cmp_inst = func.blocks[1]
-            .instructions
-            .iter()
-            .find(|i| matches!(i, Instruction::Cmp { .. }))
-            .unwrap();
+        check(&mut func, 0);
         assert!(matches!(
-            cmp_inst,
-            Instruction::Cmp {
+            &func.blocks[1].instructions[0],
+            Instruction::Phi {
                 ty: IrType::U32,
-                op: IrCmpOp::Slt,
                 ..
             }
         ));
-        let has_trunc = func.blocks[1].instructions.iter().any(|i| {
-            matches!(
-                i,
-                Instruction::Cast {
-                    to_ty: IrType::U32,
-                    ..
-                }
-            )
-        });
-        assert!(has_trunc, "a truncation must feed the narrow cmp");
     }
 
     /// Signed IV + unsigned predicate with a constant bound: widened
@@ -4316,6 +5070,1300 @@ mod tests {
             Instruction::Cast {
                 from_ty: IrType::U64,
                 to_ty: IrType::I64,
+                ..
+            }
+        )));
+    }
+    // ---------------------------------------------------------------------
+    // Theorem 5 with a stride: `mag > 1` needs a CONSTANT bound with room for
+    // the final stride.  Regression anchor for the unrolled counted loop, whose
+    // latch an unroller spells as a chain of unit adds.
+    // ---------------------------------------------------------------------
+
+    fn strided_loop(bound: Operand, latch_const: i64, name: &str) -> IrFunction {
+        let cmp = Instruction::Cmp {
+            dest: Value(99),
+            op: IrCmpOp::Ult,
+            lhs: Operand::Value(Value(1)),
+            rhs: bound,
+            ty: IrType::U32,
+        };
+        let body = vec![
+            Instruction::Cast {
+                dest: Value(10),
+                src: Operand::Value(Value(1)),
+                from_ty: IrType::U32,
+                to_ty: IrType::U64,
+            },
+            gep_inst(11, 10, IrType::I8),
+        ];
+        let mut func = counting_loop(name, IrType::U32, IrBinOp::Add, body, Some(cmp));
+        func.blocks[3].instructions[0] = Instruction::BinOp {
+            dest: Value(5),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I64(latch_const)),
+            ty: IrType::U32,
+        };
+        func
+    }
+
+    #[test]
+    fn strided_counted_loop_with_a_constant_bound_is_widened() {
+        // `i += 4` with `i < 262144`: the latch reaches 262144 <= 2^32-4, so no
+        // body value and no latch result can wrap.  This is the shape an
+        // unrolled counted loop has, and refusing it is what stranded the SIB
+        // displacement fold (histogram, +8.03% Ir before this theorem).
+        let mut func = strided_loop(Operand::Const(IrConst::I64(262144)), 4, "strided_const");
+        check(&mut func, 1);
+        assert!(matches!(
+            &func.blocks[1].instructions[0],
+            Instruction::Phi {
+                ty: IrType::U64,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn strided_counted_loop_with_a_runtime_bound_stays_narrow() {
+        // Same stride, but the bound is a runtime loop-invariant: `n-1+4`
+        // exceeds 2^32-1 for any `n > 2^32-4`, which no local argument can
+        // exclude.  The unit-step theorem is the tightest case that survives a
+        // runtime bound, and a stride must not be waved through on its account.
+        let mut func = strided_loop(Operand::Value(Value(60)), 4, "strided_runtime");
+        func.blocks[0].instructions.push(Instruction::Copy {
+            dest: Value(60),
+            src: Operand::Const(IrConst::I32(1000)),
+        });
+        check(&mut func, 0);
+        assert!(matches!(
+            &func.blocks[1].instructions[0],
+            Instruction::Phi {
+                ty: IrType::U32,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn strided_counted_loop_with_no_room_for_the_stride_stays_narrow() {
+        // `i += 4` with `i < 0xFFFFFFFF`: the latch result reaches
+        // 0x100000002, which wraps the u32 ring.  The constant bound is present
+        // and unsigned, so this is the arithmetic obligation itself failing --
+        // `n <= max - mag + 1` -- not a missing proof input.
+        let mut func = strided_loop(Operand::Const(IrConst::I64(4294967295)), 4, "strided_tight");
+        check(&mut func, 0);
+        assert!(matches!(
+            &func.blocks[1].instructions[0],
+            Instruction::Phi {
+                ty: IrType::U32,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unit_step_with_a_runtime_bound_still_widens() {
+        // Control for the two refusals above: the original theorem must not have
+        // been narrowed by the stride work.  `i += 1` with a runtime bound is
+        // provable because the latch reaches at most `max`.
+        let mut func = strided_loop(Operand::Value(Value(60)), 1, "unit_runtime");
+        func.blocks[0].instructions.push(Instruction::Copy {
+            dest: Value(60),
+            src: Operand::Const(IrConst::I32(1000)),
+        });
+        check(&mut func, 1);
+    }
+
+    #[test]
+    fn chained_latch_is_canonicalised_and_then_widened() {
+        // The unrolled shape exactly: the latch is `v6=v1+1; v7=v6+1; v8=v7+1;
+        // v5=v8+1`, and `v6` is ALSO an addressing offset the body needs, so no
+        // value-numbering pass will re-associate the chain (it would add an
+        // instruction rather than remove one).  Recognising the recurrence
+        // requires re-spelling the final link as `v5 = v1 + 4`, which is
+        // value-identical by associativity of modular addition.
+        let cmp = Instruction::Cmp {
+            dest: Value(99),
+            op: IrCmpOp::Ult,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I64(262144)),
+            ty: IrType::U32,
+        };
+        let body = vec![
+            Instruction::Cast {
+                dest: Value(10),
+                src: Operand::Value(Value(1)),
+                from_ty: IrType::U32,
+                to_ty: IrType::U64,
+            },
+            gep_inst(11, 10, IrType::I8),
+        ];
+        let mut func = counting_loop("chained", IrType::U32, IrBinOp::Add, body, Some(cmp));
+        let link = |dest: i64, src: i64| Instruction::BinOp {
+            dest: Value(dest as u32),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(src as u32)),
+            rhs: Operand::Const(IrConst::I64(1)),
+            ty: IrType::U32,
+        };
+        // One block holds both the chain and the offset use of an intermediate,
+        // which is the real unrolled shape (the body block IS the latch block):
+        // a link defined in the latch cannot be used from the body, so the
+        // fixture would be invalid SSA if the second address lived there.
+        func.blocks[3].instructions = vec![
+            link(6, 1),
+            link(7, 6),
+            link(8, 7),
+            link(5, 8),
+            Instruction::Cast {
+                dest: Value(12),
+                src: Operand::Value(Value(6)),
+                from_ty: IrType::U32,
+                to_ty: IrType::U64,
+            },
+            gep_inst(13, 12, IrType::I8),
+        ];
+        check(&mut func, 1);
+        // The recurrence must have been canonicalised to a single stride, and
+        // then widened: the latch add reads the phi directly with step 4.
+        let latch_add = func.blocks[3]
+            .instructions
+            .iter()
+            .find(|i| matches!(i, Instruction::BinOp { dest, .. } if *dest == Value(5)))
+            .expect("latch add survived");
+        match latch_add {
+            Instruction::BinOp { lhs, rhs, ty, .. } => {
+                assert!(
+                    matches!(lhs, Operand::Value(Value(1))),
+                    "latch still does not name the phi directly: {latch_add:?}"
+                );
+                assert!(
+                    matches!(rhs, Operand::Const(c) if c.to_i64() == Some(4)),
+                    "latch stride was not collapsed to the total: {latch_add:?}"
+                );
+                assert!(matches!(ty, IrType::U64), "latch not widened: {ty:?}");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Theorem 5′ battery: exposed-latch trajectory gates, the intercept, the
+    // label/index Obligation-P pin and the latch-twin canonicalisation.
+    // -----------------------------------------------------------------------
+
+    /// Preheader instructions defining `Value(0)` as a RUNTIME seed: a
+    /// volatile load (the `ung1` shape — no constant resolution possible).
+    fn volatile_seed_insts() -> Vec<Instruction> {
+        vec![
+            Instruction::GlobalAddr {
+                dest: Value(60),
+                name: "v_seed".to_string(),
+            },
+            Instruction::Load {
+                dest: Value(0),
+                ptr: Value(60),
+                ty: IrType::U32,
+                seg_override: AddressSpace::Default,
+                volatile: true,
+            },
+        ]
+    }
+
+    /// Preheader instructions defining `Value(0)` as a CONST seed through the
+    /// single `Copy{src: Const}` level mem2reg leaves for `uint32_t i = c;`.
+    fn const_seed_insts(v: i64) -> Vec<Instruction> {
+        vec![Instruction::Copy {
+            dest: Value(0),
+            src: Operand::Const(IrConst::I64(v)),
+        }]
+    }
+
+    /// Preheader instructions defining `Value(17)` as a runtime loop-invariant
+    /// cmp bound (volatile load, hoisted by construction).
+    fn volatile_bound_insts() -> Vec<Instruction> {
+        vec![
+            Instruction::GlobalAddr {
+                dest: Value(61),
+                name: "v_bound".to_string(),
+            },
+            Instruction::Load {
+                dest: Value(17),
+                ptr: Value(61),
+                ty: IrType::U32,
+                seg_override: AddressSpace::Default,
+                volatile: true,
+            },
+        ]
+    }
+
+    /// Rotated do-while (self-loop) builder: B0 preheader (seed + invariant
+    /// defs + the GEP base), B1 = header == latch (phi, body insts, latch
+    /// step defining `Value(5)`, guard cmp `Value(99)` reading the phi),
+    /// B2 exit. LABELS deliberately diverge from indices (label = index + 7),
+    /// so every fixture built here also exercises obligation P's label→index
+    /// resolution — the pre-fix P rewrite compared the domains directly and
+    /// failed every well-formed loop in real frontend IR (fixtures with
+    /// label == index cannot catch that class).
+    fn rotated_loop(
+        name: &str,
+        phi_ty: IrType,
+        mut seed_insts: Vec<Instruction>,
+        body_insts: Vec<Instruction>,
+        latch_inst: Instruction,
+        cmp: Instruction,
+        exit_insts: Vec<Instruction>,
+    ) -> IrFunction {
+        let mut func = IrFunction::new(name.to_string(), IrType::I32, vec![], false);
+        seed_insts.push(Instruction::GlobalAddr {
+            dest: Value(50),
+            name: "arr".to_string(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(7),
+            instructions: seed_insts,
+            terminator: Terminator::Branch(BlockId(8)),
+            source_spans: Vec::new(),
+        });
+        let mut head = vec![Instruction::Phi {
+            dest: Value(1),
+            ty: phi_ty,
+            incoming: vec![
+                (Operand::Value(Value(0)), BlockId(7)),
+                (Operand::Value(Value(5)), BlockId(8)),
+            ],
+        }];
+        head.extend(body_insts);
+        head.push(latch_inst);
+        head.push(cmp);
+        func.blocks.push(BasicBlock {
+            label: BlockId(8),
+            instructions: head,
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(99)),
+                true_label: BlockId(8),
+                false_label: BlockId(9),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(9),
+            instructions: exit_insts,
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 100;
+        func.next_label = 10;
+        func
+    }
+
+    /// U32 latch `Value(5) = phi op const` in the rotated builder's spelling.
+    fn rotated_latch(op: IrBinOp, k: i64) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(5),
+            op,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I64(k)),
+            ty: IrType::U32,
+        }
+    }
+
+    /// IVW-RANGE-1 (case A of tests/regression/ivwiden_exposed_latch.c):
+    /// rotated do-while at a runtime ring-top seed whose latch value escapes
+    /// the loop through a Cast feeding a GEP. The exiting pass evaluates the
+    /// latch `phi+1` at the untested seed: narrow wraps to 0 where wide does
+    /// not, and the pre-fix pass let the GEP keep the wide value (read
+    /// `buf[2^32]` instead of `buf[0]` — 99 vs gcc's 11). Theorem 5′:
+    /// exposed latch + runtime seed ⇒ intercept; the Cast of the divergent
+    /// latch member is the documented Cast-bail ⇒ decline. The in-loop
+    /// bit-exact `& 63` read alone would have been admissible.
+    #[test]
+    fn test_rotated_escape_exit_cast_declines() {
+        let mut seed = volatile_seed_insts();
+        seed.extend(volatile_bound_insts());
+        let body = vec![
+            Instruction::BinOp {
+                dest: Value(8),
+                op: IrBinOp::And,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I64(63)),
+                ty: IrType::U32,
+            },
+            Instruction::Cast {
+                dest: Value(9),
+                src: Operand::Value(Value(8)),
+                from_ty: IrType::U32,
+                to_ty: IrType::I64,
+            },
+            gep_inst(11, 9, IrType::I8),
+        ];
+        let cmp = Instruction::Cmp {
+            dest: Value(99),
+            op: IrCmpOp::Ult,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Value(Value(17)),
+            ty: IrType::U32,
+        };
+        let exit = vec![
+            Instruction::Cast {
+                dest: Value(20),
+                src: Operand::Value(Value(5)),
+                from_ty: IrType::U32,
+                to_ty: IrType::I64,
+            },
+            gep_inst(21, 20, IrType::I8),
+        ];
+        let mut func = rotated_loop(
+            "rot_escape",
+            IrType::U32,
+            seed,
+            body,
+            rotated_latch(IrBinOp::Add, 1),
+            cmp,
+            exit,
+        );
+        check(&mut func, 0);
+        assert!(matches!(
+            &func.blocks[1].instructions[0],
+            Instruction::Phi {
+                ty: IrType::U32,
+                ..
+            }
+        ));
+    }
+
+    /// Case B of the executed regression (`a[(i + 1) & m]` + `while (i++ <
+    /// n)`): the frontend emits TWO value-identical `Add(phi, 1)`s because
+    /// iv_widen runs ahead of the merging CSE. `canonicalise_latch_twin`
+    /// redirects the back edge to the earlier twin and deletes the dead
+    /// original, so the body read becomes a use of the LATCH member and goes
+    /// through the intercept's unconditional bit-exact And arm
+    /// (`x & c ∈ [0, c]` for EVERY unsigned x — the LatchResult member
+    /// legitimately has no input range). The plan widens; the guard cmp reads
+    /// a divergent-capable member, so the intercept forces the Trunc action
+    /// (the narrow bits ARE the narrow value — the guarded trajectory, and
+    /// with it the counted proof, survives the widening).
+    #[test]
+    fn test_and_const_widens() {
+        let mut seed = volatile_seed_insts();
+        seed.extend(volatile_bound_insts());
+        let body = vec![
+            // The twin: value-identical to the latch step, EARLIER in the
+            // same block.
+            Instruction::BinOp {
+                dest: Value(10),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I64(1)),
+                ty: IrType::U32,
+            },
+            Instruction::BinOp {
+                dest: Value(13),
+                op: IrBinOp::And,
+                lhs: Operand::Value(Value(10)),
+                rhs: Operand::Const(IrConst::I64(63)),
+                ty: IrType::U32,
+            },
+            Instruction::Cast {
+                dest: Value(14),
+                src: Operand::Value(Value(13)),
+                from_ty: IrType::U32,
+                to_ty: IrType::I64,
+            },
+            gep_inst(15, 14, IrType::I8),
+        ];
+        let cmp = Instruction::Cmp {
+            dest: Value(99),
+            op: IrCmpOp::Ult,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Value(Value(17)),
+            ty: IrType::U32,
+        };
+        let mut func = rotated_loop(
+            "twin_and",
+            IrType::U32,
+            seed,
+            body,
+            rotated_latch(IrBinOp::Add, 1),
+            cmp,
+            vec![],
+        );
+        check(&mut func, 1);
+        // The phi, the surviving twin and the And are wide.
+        assert!(matches!(
+            &func.blocks[1].instructions[0],
+            Instruction::Phi {
+                ty: IrType::U64,
+                ..
+            }
+        ));
+        assert!(func.blocks[1].instructions.iter().any(|i| matches!(
+            i,
+            Instruction::BinOp {
+                dest: Value(10),
+                ty: IrType::U64,
+                ..
+            }
+        )));
+        assert!(func.blocks[1].instructions.iter().any(|i| matches!(
+            i,
+            Instruction::BinOp {
+                dest: Value(13),
+                op: IrBinOp::And,
+                ty: IrType::U64,
+                ..
+            }
+        )));
+        // The dead original latch step was deleted...
+        assert!(
+            !func.blocks[1]
+                .instructions
+                .iter()
+                .any(|i| i.dest() == Some(Value(5))),
+            "the duplicated latch step must be deleted after the redirect"
+        );
+        // ...and the back edge now reads the twin.
+        assert!(matches!(
+            &func.blocks[1].instructions[0],
+            Instruction::Phi { incoming, .. } if incoming.iter().any(|(op, _)| matches!(op, Operand::Value(v) if *v == Value(10)))
+        ));
+        // The guard cmp stayed NARROW (intercept-forced Trunc) with a
+        // truncation feeding it.
+        let cmp_inst = func.blocks[1]
+            .instructions
+            .iter()
+            .find(|i| {
+                matches!(
+                    i,
+                    Instruction::Cmp {
+                        dest: Value(99),
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert!(matches!(
+            cmp_inst,
+            Instruction::Cmp {
+                ty: IrType::U32,
+                op: IrCmpOp::Ult,
+                ..
+            }
+        ));
+        assert!(
+            func.blocks[1].instructions.iter().any(|i| matches!(
+                i,
+                Instruction::Cast {
+                    to_ty: IrType::U32,
+                    ..
+                }
+            )),
+            "a truncation must feed the narrow guard cmp"
+        );
+    }
+
+    /// Case C of the executed regression: exposed latch (cmp in the latch
+    /// block), RUNTIME ring-top seed, CONST bound, and a body twin
+    /// `Add(phi, 2)` feeding the addressing chain. The seed-inclusive fold is
+    /// `[0, max] + 2`, which leaves U32 — the twin cannot be admitted and the
+    /// plan declines (pre-fix this widened and read `buf[2^32+1]` = 91
+    /// instead of `buf[1]` = 21). The stride-2 twin is NOT value-identical to
+    /// the unit latch step, so the twin canonicalisation must not fire.
+    #[test]
+    fn test_exposed_runtime_seed_fold_overflows_and_declines() {
+        let body = vec![
+            Instruction::BinOp {
+                dest: Value(10),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I64(2)),
+                ty: IrType::U32,
+            },
+            Instruction::Cast {
+                dest: Value(11),
+                src: Operand::Value(Value(10)),
+                from_ty: IrType::U32,
+                to_ty: IrType::I64,
+            },
+            gep_inst(12, 11, IrType::I8),
+        ];
+        let cmp = Instruction::Cmp {
+            dest: Value(99),
+            op: IrCmpOp::Ult,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I64(8)),
+            ty: IrType::U32,
+        };
+        let mut func = rotated_loop(
+            "exposed_runtime",
+            IrType::U32,
+            volatile_seed_insts(),
+            body,
+            rotated_latch(IrBinOp::Add, 1),
+            cmp,
+            vec![],
+        );
+        check(&mut func, 0);
+        assert!(matches!(
+            &func.blocks[1].instructions[0],
+            Instruction::Phi {
+                ty: IrType::U32,
+                ..
+            }
+        ));
+    }
+
+    /// The const-seed half of the seed-inclusive fold ("selfconst"): same
+    /// exposed shape as the decline above, but the seed resolves through the
+    /// `Copy{src: Const}` level mem2reg leaves. The fold becomes
+    /// `[0, max(0, 8-1+1)] = [0, 8]`, the twin `+2` stays inside U32
+    /// (`[2, 10]`), the exiting latch step closes (`8 + 1 <= max`) and the
+    /// intercept stays OFF: the loop widens.
+    #[test]
+    fn test_exposed_const_seed_folds_and_widens() {
+        let body = vec![
+            Instruction::BinOp {
+                dest: Value(10),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I64(2)),
+                ty: IrType::U32,
+            },
+            Instruction::Cast {
+                dest: Value(11),
+                src: Operand::Value(Value(10)),
+                from_ty: IrType::U32,
+                to_ty: IrType::I64,
+            },
+            gep_inst(12, 11, IrType::I8),
+        ];
+        let cmp = Instruction::Cmp {
+            dest: Value(99),
+            op: IrCmpOp::Ult,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I64(8)),
+            ty: IrType::U32,
+        };
+        let mut func = rotated_loop(
+            "exposed_const",
+            IrType::U32,
+            const_seed_insts(0),
+            body,
+            rotated_latch(IrBinOp::Add, 1),
+            cmp,
+            vec![],
+        );
+        check(&mut func, 1);
+        assert!(matches!(
+            &func.blocks[1].instructions[0],
+            Instruction::Phi {
+                ty: IrType::U64,
+                ..
+            }
+        ));
+        // The twin member widened with its constant.
+        assert!(func.blocks[1].instructions.iter().any(|i| matches!(
+            i,
+            Instruction::BinOp {
+                dest: Value(10),
+                ty: IrType::U64,
+                rhs: Operand::Const(IrConst::I64(2)),
+                ..
+            }
+        )));
+    }
+
+    /// Exit-on-TRUE branch polarity over a stride-2 recurrence
+    /// (`for (;;) { use(i & 3); if (i > 6) break; i += 2; }`): the cmp sits
+    /// in a non-header block and the EXIT is the true arm, so the
+    /// continue-condition is the negation (`i <= 6` ⇔ `i < 7`). The
+    /// normalised threshold discharges the room obligation (`7 <= max-1`),
+    /// the const seed folds seed-inclusively to `[0, max(0, 7-1+2)] = [0, 8]`
+    /// (the trajectory's body values are {0,2,4,6,8} and the exiting latch
+    /// reaches 10 — both covered, `8+2 <= max` closes the wrap), and the
+    /// loop widens. Pre-theorem-5′ this shape found no bound at all (the
+    /// pass matched only continue-on-true spellings).
+    #[test]
+    fn test_exit_on_true_polarity() {
+        let mut func = IrFunction::new("exit_true".to_string(), IrType::I32, vec![], false);
+        // Labels diverge from indices (+10) — obligation P coverage.
+        func.blocks.push(BasicBlock {
+            label: BlockId(10),
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I64(0)),
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(50),
+                    name: "arr".to_string(),
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(11)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(11),
+            instructions: vec![Instruction::Phi {
+                dest: Value(1),
+                ty: IrType::U32,
+                incoming: vec![
+                    (Operand::Value(Value(0)), BlockId(10)),
+                    (Operand::Value(Value(5)), BlockId(14)),
+                ],
+            }],
+            terminator: Terminator::Branch(BlockId(12)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(12),
+            instructions: vec![
+                Instruction::BinOp {
+                    dest: Value(10),
+                    op: IrBinOp::And,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I64(3)),
+                    ty: IrType::U32,
+                },
+                Instruction::Cast {
+                    dest: Value(11),
+                    src: Operand::Value(Value(10)),
+                    from_ty: IrType::U32,
+                    to_ty: IrType::I64,
+                },
+                gep_inst(12, 11, IrType::I8),
+            ],
+            terminator: Terminator::Branch(BlockId(13)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(13),
+            instructions: vec![Instruction::Cmp {
+                dest: Value(99),
+                op: IrCmpOp::Ugt,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I64(6)),
+                ty: IrType::U32,
+            }],
+            // EXIT ON TRUE: the true arm leaves the body.
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(99)),
+                true_label: BlockId(15),
+                false_label: BlockId(14),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(14),
+            instructions: vec![Instruction::BinOp {
+                dest: Value(5),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I64(2)),
+                ty: IrType::U32,
+            }],
+            terminator: Terminator::Branch(BlockId(11)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(15),
+            instructions: vec![],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 100;
+        func.next_label = 16;
+        check(&mut func, 1);
+        assert!(matches!(
+            &func.blocks[1].instructions[0],
+            Instruction::Phi {
+                ty: IrType::U64,
+                ..
+            }
+        ));
+        // The cmp widened (const bound, unsigned predicate — the normal
+        // action once the polarity normalisation found the bound).
+        let cmp_inst = func.blocks[3]
+            .instructions
+            .iter()
+            .find(|i| matches!(i, Instruction::Cmp { .. }))
+            .unwrap();
+        assert!(matches!(
+            cmp_inst,
+            Instruction::Cmp {
+                ty: IrType::U64,
+                op: IrCmpOp::Ugt,
+                ..
+            }
+        ));
+    }
+
+    /// Obligation P pin (documented name): the strided guarded counted loop
+    /// with EVERY label renumbered +5, so labels and indices diverge in every
+    /// block, terminator and phi incoming. The pre-fix P rewrite compared
+    /// branch-target labels against the index-based loop body directly and
+    /// declined every well-formed loop in real frontend IR (live repro: body
+    /// index 3 under label 5). Resolving through the label→index map keeps
+    /// the widening.
+    #[test]
+    fn test_p_edge_resolves_block_labels_not_indices() {
+        let mut func = strided_loop(Operand::Const(IrConst::I64(262144)), 4, "p_labels");
+        for b in &mut func.blocks {
+            b.label = BlockId(b.label.0 + 5);
+            match &mut b.terminator {
+                Terminator::Branch(l) => *l = BlockId(l.0 + 5),
+                Terminator::CondBranch {
+                    true_label,
+                    false_label,
+                    ..
+                } => {
+                    *true_label = BlockId(true_label.0 + 5);
+                    *false_label = BlockId(false_label.0 + 5);
+                }
+                _ => {}
+            }
+            for inst in &mut b.instructions {
+                if let Instruction::Phi { incoming, .. } = inst {
+                    for (_, blk) in incoming.iter_mut() {
+                        *blk = BlockId(blk.0 + 5);
+                    }
+                }
+            }
+        }
+        func.next_label += 5;
+        check(&mut func, 1);
+        assert!(matches!(
+            &func.blocks[1].instructions[0],
+            Instruction::Phi {
+                ty: IrType::U64,
+                ..
+            }
+        ));
+    }
+
+    /// Trajectory gate: a latch with an in-body successor other than the
+    /// header sits on an inner cycle — the recurrence steps without
+    /// re-passing the exit test and the IV can outrun any proven bound.
+    /// Without the gate this loop's clean guarded header cmp would prove
+    /// `[0, 63]` and widen.
+    #[test]
+    fn test_latch_on_inner_cycle_declines() {
+        let mut func = IrFunction::new("inner_cycle".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I64(0)),
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(50),
+                    name: "arr".to_string(),
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(1),
+                    ty: IrType::U32,
+                    incoming: vec![
+                        (Operand::Value(Value(0)), BlockId(0)),
+                        (Operand::Value(Value(5)), BlockId(3)),
+                    ],
+                },
+                Instruction::Cmp {
+                    dest: Value(99),
+                    op: IrCmpOp::Ult,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I64(64)),
+                    ty: IrType::U32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(99)),
+                true_label: BlockId(2),
+                false_label: BlockId(5),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::Cast {
+                    dest: Value(10),
+                    src: Operand::Value(Value(1)),
+                    from_ty: IrType::U32,
+                    to_ty: IrType::U64,
+                },
+                gep_inst(11, 10, IrType::I8),
+            ],
+            terminator: Terminator::Branch(BlockId(3)),
+            source_spans: Vec::new(),
+        });
+        // The latch: steps the IV, then re-enters the body (block 4) on a
+        // secondary condition instead of branching straight to the header.
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![
+                Instruction::BinOp {
+                    dest: Value(5),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I64(1)),
+                    ty: IrType::U32,
+                },
+                Instruction::Cmp {
+                    dest: Value(98),
+                    op: IrCmpOp::Ult,
+                    lhs: Operand::Value(Value(5)),
+                    rhs: Operand::Const(IrConst::I64(100)),
+                    ty: IrType::U32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(98)),
+                true_label: BlockId(4),
+                false_label: BlockId(1),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(4),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(3)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(5),
+            instructions: vec![],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 100;
+        func.next_label = 6;
+        check(&mut func, 0);
+        assert!(matches!(
+            &func.blocks[1].instructions[0],
+            Instruction::Phi {
+                ty: IrType::U32,
+                ..
+            }
+        ));
+    }
+
+    /// Trajectory gate: an outside edge into the middle of the body (the
+    /// exit block jumps into B2) runs body work on passes no header test
+    /// gated — the strict range argument is invalid and the proof declines,
+    /// even though the header cmp itself is clean and correctly positioned.
+    #[test]
+    fn test_body_entry_not_closed_declines() {
+        let cmp = Instruction::Cmp {
+            dest: Value(99),
+            op: IrCmpOp::Ult,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I64(64)),
+            ty: IrType::U32,
+        };
+        let body = vec![
+            Instruction::Cast {
+                dest: Value(10),
+                src: Operand::Value(Value(1)),
+                from_ty: IrType::U32,
+                to_ty: IrType::U64,
+            },
+            gep_inst(11, 10, IrType::I8),
+        ];
+        let mut func = counting_loop("entry_open", IrType::U32, IrBinOp::Add, body, Some(cmp));
+        func.blocks[3].instructions[0] = Instruction::BinOp {
+            dest: Value(5),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I64(1)),
+            ty: IrType::U32,
+        };
+        // The exit block re-enters the BODY block directly (irregular entry),
+        // then falls through to a new return block.
+        func.blocks[4].terminator = Terminator::Branch(BlockId(2));
+        func.blocks.push(BasicBlock {
+            label: BlockId(5),
+            instructions: vec![],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        func.next_label = 6;
+        check(&mut func, 0);
+        assert!(matches!(
+            &func.blocks[1].instructions[0],
+            Instruction::Phi {
+                ty: IrType::U32,
+                ..
+            }
+        ));
+    }
+
+    /// The gates must not over-refuse: an outer guarded counted loop whose
+    /// body CONTAINS a well-formed inner loop still widens (the inner
+    /// blocks are entered only from inside the outer body, and the outer
+    /// latch's only in-body successor is the outer header). The inner IV has
+    /// no addressing use and stays narrow on its own merits.
+    #[test]
+    fn test_nested_inner_loop_guarded_outer_widens() {
+        let mut func = IrFunction::new("nested".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I64(0)),
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(50),
+                    name: "arr".to_string(),
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        // Outer header: phi + guard cmp (clean).
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(1),
+                    ty: IrType::U32,
+                    incoming: vec![
+                        (Operand::Value(Value(0)), BlockId(0)),
+                        (Operand::Value(Value(5)), BlockId(3)),
+                    ],
+                },
+                Instruction::Cmp {
+                    dest: Value(99),
+                    op: IrCmpOp::Ult,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I64(64)),
+                    ty: IrType::U32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(99)),
+                true_label: BlockId(2),
+                false_label: BlockId(7),
+            },
+            source_spans: Vec::new(),
+        });
+        // Outer body: addressing read of the outer IV, then the inner loop.
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::Cast {
+                    dest: Value(10),
+                    src: Operand::Value(Value(1)),
+                    from_ty: IrType::U32,
+                    to_ty: IrType::U64,
+                },
+                gep_inst(11, 10, IrType::I8),
+            ],
+            terminator: Terminator::Branch(BlockId(5)),
+            source_spans: Vec::new(),
+        });
+        // Outer latch.
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![Instruction::BinOp {
+                dest: Value(5),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I64(1)),
+                ty: IrType::U32,
+            }],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        // Inner header (index 4, LABEL 5 — the label/index gap doubles as
+        // obligation-P coverage for the inner loop's edges).
+        func.blocks.push(BasicBlock {
+            label: BlockId(5),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(32),
+                    ty: IrType::U32,
+                    incoming: vec![
+                        (Operand::Const(IrConst::I64(0)), BlockId(2)),
+                        (Operand::Value(Value(33)), BlockId(6)),
+                    ],
+                },
+                Instruction::Cmp {
+                    dest: Value(96),
+                    op: IrCmpOp::Ult,
+                    lhs: Operand::Value(Value(32)),
+                    rhs: Operand::Const(IrConst::I64(16)),
+                    ty: IrType::U32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(96)),
+                true_label: BlockId(6),
+                false_label: BlockId(3),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(6),
+            instructions: vec![Instruction::BinOp {
+                dest: Value(33),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(32)),
+                rhs: Operand::Const(IrConst::I64(1)),
+                ty: IrType::U32,
+            }],
+            terminator: Terminator::Branch(BlockId(5)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(7),
+            instructions: vec![],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 100;
+        func.next_label = 8;
+        check(&mut func, 1);
+        // The OUTER IV widened; the inner IV (no addressing use) stayed.
+        assert!(matches!(
+            &func.blocks[1].instructions[0],
+            Instruction::Phi {
+                ty: IrType::U64,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &func.blocks[4].instructions[0],
+            Instruction::Phi {
+                ty: IrType::U32,
+                ..
+            }
+        ));
+    }
+
+    /// The twin canonicalisation's liveness guard: when the latch value has
+    /// a use beyond the phi's back-edge incoming (here a loop-exit Cast),
+    /// the redirect must NOT happen — deleting the original would strand
+    /// that use. The signed plan still widens through both steps (the UB
+    /// theorem needs no trajectory), with the original latch intact.
+    #[test]
+    fn test_twin_with_other_uses_is_not_canonicalised() {
+        let mut func = IrFunction::new("twin_live".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I32(3)),
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(50),
+                    name: "arr".to_string(),
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(1),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Value(Value(0)), BlockId(0)),
+                        (Operand::Value(Value(5)), BlockId(1)),
+                    ],
+                },
+                // The twin (earlier in the block).
+                Instruction::BinOp {
+                    dest: Value(10),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                },
+                Instruction::Cast {
+                    dest: Value(11),
+                    src: Operand::Value(Value(10)),
+                    from_ty: IrType::I32,
+                    to_ty: IrType::I64,
+                },
+                gep_inst(12, 11, IrType::I8),
+                // The latch step: value-identical, but with an exit use.
+                Instruction::BinOp {
+                    dest: Value(5),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                },
+                Instruction::Cmp {
+                    dest: Value(99),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(64)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(99)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::Cast {
+                    dest: Value(20),
+                    src: Operand::Value(Value(5)),
+                    from_ty: IrType::I32,
+                    to_ty: IrType::I64,
+                },
+                gep_inst(21, 20, IrType::I8),
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 100;
+        func.next_label = 3;
+        check(&mut func, 1);
+        // The original latch step survived (it has an exit-block use)...
+        assert!(
+            func.blocks[1]
+                .instructions
+                .iter()
+                .any(|i| i.dest() == Some(Value(5))),
+            "the latch step with other uses must not be deleted"
+        );
+        // ...and the back edge still names it.
+        assert!(matches!(
+            &func.blocks[1].instructions[0],
+            Instruction::Phi { incoming, .. } if incoming.iter().any(|(op, _)| matches!(op, Operand::Value(v) if *v == Value(5)))
+        ));
+    }
+
+    /// The intercept's GEP-offset decline in isolation: a GEP reading a
+    /// divergent member directly as its offset declines the plan (a wide
+    /// address computed from a value the narrow program wrapped is a
+    /// different address), while the IDENTICAL shape behind a phi-guarded
+    /// header (strict range, intercept off) widens — the decline is
+    /// intercept-specific, not a new GEP rule.
+    #[test]
+    fn test_gep_offset_on_exposed_member_declines() {
+        let mut seed = volatile_seed_insts();
+        seed.extend(volatile_bound_insts());
+        let cmp = Instruction::Cmp {
+            dest: Value(99),
+            op: IrCmpOp::Ult,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Value(Value(17)),
+            ty: IrType::U32,
+        };
+        // Exposed: the GEP offset reads the phi itself.
+        let mut func = rotated_loop(
+            "gep_exposed",
+            IrType::U32,
+            seed,
+            vec![gep_inst(11, 1, IrType::I8)],
+            rotated_latch(IrBinOp::Add, 1),
+            cmp,
+            vec![],
+        );
+        check(&mut func, 0);
+
+        // Guarded control: counting_loop puts the cmp in a clean header
+        // (with a const bound — the runtime-bound spelling has no v17 def
+        // in that scaffold).
+        let cmp_guarded = Instruction::Cmp {
+            dest: Value(99),
+            op: IrCmpOp::Ult,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I64(64)),
+            ty: IrType::U32,
+        };
+        let mut guarded = counting_loop(
+            "gep_guarded",
+            IrType::U32,
+            IrBinOp::Add,
+            vec![gep_inst(11, 1, IrType::I8)],
+            Some(cmp_guarded),
+        );
+        guarded.blocks[3].instructions[0] = Instruction::BinOp {
+            dest: Value(5),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I64(1)),
+            ty: IrType::U32,
+        };
+        check(&mut guarded, 1);
+    }
+
+    /// The decrementing mirror of the exposed const-seed fold: a rotated
+    /// `do { use(i & 7); } while (i-- > 4)` at const seed 10 proves the
+    /// seed-inclusive lower range `[min(10, 4+1-1), max] = [4, max]`, the
+    /// exiting latch step closes (`4 - 1 >= 0`), the intercept stays off and
+    /// the loop widens.
+    #[test]
+    fn test_exposed_decrement_lower_bound_widens() {
+        let body = vec![
+            Instruction::BinOp {
+                dest: Value(10),
+                op: IrBinOp::And,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I64(7)),
+                ty: IrType::U32,
+            },
+            Instruction::Cast {
+                dest: Value(11),
+                src: Operand::Value(Value(10)),
+                from_ty: IrType::U32,
+                to_ty: IrType::I64,
+            },
+            gep_inst(12, 11, IrType::I8),
+        ];
+        let cmp = Instruction::Cmp {
+            dest: Value(99),
+            op: IrCmpOp::Ugt,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I64(4)),
+            ty: IrType::U32,
+        };
+        let mut func = rotated_loop(
+            "exposed_dec",
+            IrType::U32,
+            const_seed_insts(10),
+            body,
+            rotated_latch(IrBinOp::Sub, 1),
+            cmp,
+            vec![],
+        );
+        check(&mut func, 1);
+        assert!(matches!(
+            &func.blocks[1].instructions[0],
+            Instruction::Phi {
+                ty: IrType::U64,
+                ..
+            }
+        ));
+        assert!(func.blocks[1].instructions.iter().any(|i| matches!(
+            i,
+            Instruction::BinOp {
+                dest: Value(5),
+                op: IrBinOp::Sub,
+                ty: IrType::U64,
                 ..
             }
         )));

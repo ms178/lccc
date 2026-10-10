@@ -9,6 +9,14 @@
 #  3. a dead-result volatile load must survive DCE
 #  4. *p through a pointer-to-volatile parameter must load
 #  5. volatile locals keep their RMW shape (no mem2reg promotion)
+#  6. a volatile or _Atomic object read-modify-written in a loop keeps its
+#     per-iteration access: no pass may collapse N read+write pairs into one
+#     accumulated update.  This is the PR #716 review's "gate the policy where
+#     volatility is still visible" item: the peephole RMW fold (one read, one
+#     write, no other access in between) is sound for a single-threaded
+#     observer, but nothing downstream may multiply that into a whole loop.
+#     The check is SHAPE + ORACLE, and says so: the loop must still contain a
+#     reference to the object and a back edge.
 set -euo pipefail
 
 CCC=${CCC:-./target/fastbuild/lccc}
@@ -23,6 +31,19 @@ int reads_in_loop(int n) { int t = 0; for (int i = 0; i < n; i++) t += counter; 
 int dead_read(void) { counter; sink = 1; return 0; }          /* load must survive */
 int deref_param(volatile int *p) { return *p; }
 int volatile_local(void) { volatile int loc = 3; loc = loc + 1; return loc; }
+_Atomic int atomic_sum = 0;
+volatile int vol_sum = 0;
+void atomic_acc(int n) { for (int i = 0; i < n; i++) atomic_sum += 3; }
+void vol_acc(int n) { for (int i = 0; i < n; i++) vol_sum += 3; }
+EOF
+
+cat >"$td/acc.c" <<'EOF'
+#include <stdio.h>
+_Atomic int atomic_sum = 0;
+volatile int vol_sum = 0;
+void atomic_acc(int n) { for (int i = 0; i < n; i++) atomic_sum += 3; }
+void vol_acc(int n) { for (int i = 0; i < n; i++) vol_sum += 3; }
+int main(void) { atomic_acc(1000); vol_acc(1000); printf("%d %d\n", (int)atomic_sum, vol_sum); return 0; }
 EOF
 
 rc=0
@@ -102,6 +123,48 @@ for lvl in O0 O1 O2 Os; do
     n=$(echo "$body" | grep -Ec 'mov[a-z]* +[^#]*\(%(rsp|rbp|esp|ebp)' || true)
     case $n in ''|*[!0-9]*) echo "FAIL: mem access count unreadable ('$n')"; rc=1; n=0 ;; esac
     if [ "$n" -ge 3 ]; then echo "ok: volatile local keeps RMW"; else echo "FAIL: volatile local promoted (mem access count $n < 3)"; rc=1; fi
+done
+
+# 6. the accumulated-RMW loop, for the two spellings whose accesses are
+# observable.  `gcc -O0` is the oracle for the VALUE; the pattern is for the
+# SHAPE, because access COUNT is not observable from stdout in a
+# single-threaded program -- an interpreter of the asm is what would count it,
+# and the honest static claim is "the object is still accessed every iteration
+# and the loop still loops".
+cat >"$td/acc_oracle.c" <<'EOF'
+#include <stdio.h>
+_Atomic int atomic_sum = 0;
+volatile int vol_sum = 0;
+void atomic_acc(int n) { for (int i = 0; i < n; i++) atomic_sum += 3; }
+void vol_acc(int n) { for (int i = 0; i < n; i++) vol_sum += 3; }
+int main(void) { atomic_acc(1000); vol_acc(1000); printf("%d %d\n", (int)atomic_sum, vol_sum); return 0; }
+EOF
+if command -v gcc >/dev/null 2>&1; then
+    gcc -O0 "$td/acc_oracle.c" -o "$td/acc.ref" && ref=$("$td/acc.ref")
+    "$CCC" -O2 "$td/acc_oracle.c" -o "$td/acc.got" && got=$("$td/acc.got")
+    if [ "$ref" = "$got" ]; then echo "ok: _Atomic/volatile accumulate matches gcc -O0 ($got)"
+    else echo "FAIL: _Atomic/volatile accumulate lccc='$got' oracle='$ref'"; rc=1; fi
+fi
+"$CCC" -O2 -S "$td/acc.c" -o "$td/acc.s" || { echo "FAIL: compile acc.c"; rc=1; }
+for fn in atomic_acc vol_acc; do
+    obj=$([ "$fn" = atomic_acc ] && echo atomic_sum || echo vol_sum)
+    body=$(awk -v f="$fn" '$0==f":"{ins=1} ins{print} /^\.size/{if(ins)exit}' "$td/acc.s")
+    if [ -z "$body" ]; then echo "FAIL: $fn not found"; rc=1; continue; fi
+    # the loop region: from the backward branch's target to the branch itself
+    tail_ln=$(echo "$body" | grep -nE '^[[:space:]]*j[a-z]+ +\.[A-Za-z]' | tail -1 | cut -d: -f1)
+    tail_lbl=$(echo "$body" | sed -n "${tail_ln}p" | grep -oE '\.[A-Za-z][A-Za-z0-9_]*' | tail -1)
+    head_ln=$(echo "$body" | grep -n "^${tail_lbl}:" | sed -n '1,1p' | cut -d: -f1)
+    loop=$(echo "$body" | sed -n "${head_ln},${tail_ln}p")
+    n_ref=$(echo "$loop" | grep -c "$obj" || true)
+    case $n_ref in ''|*[!0-9]*) n_ref=0 ;; esac
+    # Here-string, not `echo | grep -q`: under `set -o pipefail` the early-exiting
+# consumer SIGPIPEs the producer and the pipeline reports failure even when the
+# pattern matched (the pipefail-sigpipe gate exists for exactly this).
+if [ "$n_ref" -ge 1 ] && grep -qE '^[[:space:]]*j[a-z]+ +\.' <<<"$loop"; then
+        echo "ok: $fn keeps its per-iteration $obj access inside a real loop"
+    else
+        echo "FAIL: $fn collapsed to a closed form (refs=$n_ref)"; echo "      loop was: $loop"; rc=1
+    fi
 done
 
 exit $rc

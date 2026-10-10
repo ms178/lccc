@@ -2038,6 +2038,70 @@ mod tests {
         assert!(unsigned_iv_bound(&g, &lp, &iv, &[2]).is_none());
     }
 
+    /// The limit constant is decoded in the IV's OWN ring, and the product
+    /// certificate is built from the decoded value: `uint32_t` `0x80000003`
+    /// arrives as `I32(-2147483645)`. Reading the carrier raw gave
+    /// `hi = -2147483646`, a "proof" that `2*i` cannot exceed 2^32 -- exactly
+    /// the wrap the certificate exists to refuse (IVSR-WRAP-2). End to end on
+    /// the shipped shape, both directions.
+    #[test]
+    fn unsigned_wrap_certificate_uses_the_decoded_limit() {
+        use crate::ir::reexports::IrCmpOp as C;
+        let lp = NaturalLoop {
+            header: 1,
+            body: [1, 2].into_iter().collect(),
+        };
+        let iv = BasicIV {
+            phi_dest: Value(0),
+            ty: IrType::U32,
+            init: Operand::Const(IrConst::I32(0)),
+            step: 1,
+        };
+        let mut f = cast_backedge(IrType::U32, IrType::U32);
+        // Limit 0x80000003 in the U32 ring: 2*i wraps on the top iterations.
+        if let Instruction::Cmp { rhs, op, .. } = &mut f.blocks[1].instructions[1] {
+            *op = C::Ult;
+            *rhs = Operand::Const(IrConst::I32(-2147483645));
+        }
+        let b = unsigned_iv_bound(&f, &lp, &iv, &[2]).expect("constant bound");
+        assert!(b.bounded && b.lo == 0 && b.hi == 0x8000_0002, "{b:?}");
+        assert!(
+            !offset_product_cannot_overflow(IrType::U32, 2, 0, Some(b)),
+            "2*i over a bound above 2^31 must not be certified"
+        );
+        // The same product under a small bound is genuinely linear.
+        if let Instruction::Cmp { rhs, .. } = &mut f.blocks[1].instructions[1] {
+            *rhs = Operand::Const(IrConst::I32(8));
+        }
+        let b = unsigned_iv_bound(&f, &lp, &iv, &[2]).expect("constant bound");
+        assert!(offset_product_cannot_overflow(IrType::U32, 2, 0, Some(b)));
+        // An unbounded interval is never a certificate...
+        assert!(!offset_product_cannot_overflow(
+            IrType::U32,
+            2,
+            0,
+            Some(UnsignedIvBound {
+                lo: 0,
+                hi: 10,
+                bounded: false,
+            })
+        ));
+        // ...and a small bounded one is (2 * 7 == 14 < 2^32).
+        assert!(offset_product_cannot_overflow(
+            IrType::U32,
+            2,
+            0,
+            Some(UnsignedIvBound {
+                lo: 0,
+                hi: 7,
+                bounded: true,
+            })
+        ));
+        // Products at or above the pointer ring are exact by construction.
+        assert!(offset_product_cannot_overflow(IrType::U64, 2, 0, None));
+        assert!(offset_product_cannot_overflow(IrType::I32, 2, 0, None));
+    }
+
     #[test]
     fn derived_cast_proof_is_about_values_not_storage_size() {
         let ints = [

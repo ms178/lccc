@@ -74,8 +74,14 @@ pub(crate) fn encode_mov(operands: &[Operand]) -> Result<EncodeResult, String> {
     }
 
     // NEON lane extract: mov x0, v0.d[1] -> UMOV Xd, Vn.D[index]
+    // ...or, for an SIMD&FP destination, the scalar element move
+    // `mov s15, v5.s[3]` (MOV Sd, Vn.Ts[index], an INS alias): GAS
+    // 0x5e1c04af.  The FP destination used to fall through to the UMOV
+    // (general-purpose) encoder, so `mov s15, v5.s[3]` assembled as
+    // 0x0e1c3caf -- the word for `mov w15, v5.s[3]`, a move into the
+    // wrong register file.
     if let (
-        Some(Operand::Reg(_)),
+        Some(Operand::Reg(rd_name)),
         Some(Operand::RegLane {
             reg: vn_name,
             elem_size,
@@ -83,15 +89,62 @@ pub(crate) fn encode_mov(operands: &[Operand]) -> Result<EncodeResult, String> {
         }),
     ) = (operands.first(), operands.get(1))
     {
-        // UMOV Rd, Vn.Ts[index]
-        // Encoding: 0 Q 0 0 1110 000 imm5 0 0111 1 Rn Rd
+        // ── SIMD&FP destination: MOV <Bd|Hd|Sd|Dd>, <Vn>.<Ts>[<index>] ──
+        // (GAS 2.47: `mov s15, v5.s[3]` = 0x5e1c04af, `mov b0, v0.b[1]` =
+        // 0x5e030400.)  It must not reach the GP encoder below, which would
+        // emit the UMOV word (0x0e1c3caf for `mov s15, v5.s[3]`) -- a move
+        // into the wrong register file.  GAS additionally requires the
+        // destination letter to equal the source element type and the index
+        // to be in range: `mov s0, v0.d[1]`, `mov d0, v0.d[2]` and
+        // `mov h0, v0.h[8]` are all rejected.
         //
-        // The `mov Rd, Vn.Ts[i]` *alias* is narrower than UMOV itself: GNU as
-        // accepts it only for `.s` into a W register and `.d` into an X
-        // register, and rejects `mov w0,v1.b[3]`, `mov x0,v1.h[2]` and
-        // `mov x0,v1.s[2]` -- the sizes are written explicitly when those are
-        // meant (`umov`/`smov`).  Encodings borrowed from the wide rule would
-        // accept assembly the oracle rejects.
+        // The destination must be a REAL SIMD&FP register name, not just
+        // one starting with b/h/s/d: `mov sp, v1.s[1]` (GAS REJECT,
+        // matrix sweep) starts with `s` but names the stack pointer,
+        // which encodes as 31 in no FP slot at all -- it must fall
+        // through to the general-purpose branch below, where
+        // `GpRole::RegOrZr` rejects it with a proper diagnostic.
+        let rd_is_fp_name = {
+            let b = rd_name.as_bytes();
+            matches!(b.first(), Some(b'b' | b'h' | b's' | b'd'))
+                && b.len() >= 2
+                && b[1..].iter().all(u8::is_ascii_digit)
+                && rd_name[1..].parse::<u32>().is_ok_and(|n| n <= 31)
+        };
+        if let Some(prefix @ (b'b' | b'h' | b's' | b'd')) = if rd_is_fp_name {
+            rd_name.as_bytes().first().map(|b| b.to_ascii_lowercase())
+        } else {
+            None
+        } {
+            let dst_ty = char::from(prefix);
+            if !elem_size.starts_with(dst_ty) {
+                return Err(format!(
+                    "mov: destination `.{dst_ty}` and source `.{elem_size}` \
+                     element types differ; the scalar element move requires \
+                     the same type on both sides"
+                ));
+            }
+            let vn = parse_reg_num(vn_name).ok_or("invalid NEON vn")?;
+            let rd = parse_reg_num(rd_name).ok_or("invalid rd")?;
+            check_lane(*index, elem_size, "mov", "source element")?;
+            let imm5 = match elem_size.as_str() {
+                "b" => (*index << 1) | 0b00001,
+                "h" => (*index << 2) | 0b00010,
+                "s" => (*index << 3) | 0b00100,
+                _ => (*index << 4) | 0b01000,
+            };
+            // 0101 1110 imm5 00000 1 00000 Rn Rd (imm4 = 0: the source
+            // index is carried by imm5 alone).
+            let word = (0x5eu32 << 24) | (imm5 << 16) | (1 << 10) | (vn << 5) | rd;
+            return Ok(EncodeResult::Word(word));
+        }
+        // ── General-purpose destination: the `mov` alias is narrower than
+        // UMOV itself: GNU as accepts it only for `.s` into a W register and
+        // `.d` into an X register, and rejects `mov w0,v1.b[3]`,
+        // `mov x0,v1.h[2]` and `mov x0,v1.s[2]` -- the sizes are written
+        // explicitly when those are meant (`umov`/`smov`).  Encodings
+        // borrowed from the wide rule would accept assembly the oracle
+        // rejects.
         let rd = reg_operand(operands, 0, GpRole::RegOrZr, "mov")?;
         if rd.is_sp {
             return Err(

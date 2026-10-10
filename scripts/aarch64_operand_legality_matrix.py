@@ -1348,14 +1348,26 @@ def assemble(
         if f.exists():
             f.unlink()
     r = subprocess.run(
-        [*command, str(src), "-o", str(obj)], capture_output=True, text=True
+        [*command, str(src), "-o", str(obj)],
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
+    # A panic (101), a signal, or an internal abort is not a legal REJECT.
+    # The previous mapping of every non-zero exit to REJECT made a crashed
+    # encoder look fail-closed.
+    err = r.stderr or ""
+    if r.returncode not in (0, 1) or "panicked" in err:
+        raise SystemExit(
+            f"assembler crashed on {insn!r}: rc={r.returncode}\n{err}"
+        )
     if r.returncode != 0:
         return "REJECT"
     subprocess.run(
         [objcopy, "-O", "binary", "--only-section=.text", str(obj), str(binf)],
         check=True,
         capture_output=True,
+        timeout=30,
     )
     return "OK " + binf.read_bytes().hex()
 

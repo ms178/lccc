@@ -105,6 +105,13 @@ jobs:
       - name: IVSR integer-domain contracts
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_ivsr_domains.sh
 
+      # Executed miscompile regression for the iv_widen theorem-5'
+      # trajectory gates and the exposed-latch intercept (runtime ring-top
+      # seeds, 2^32-span marker buffer, gcc-parity matrix over -O0..-O3
+      # with the CCC_NO_IV_WIDEN kill switch and the -m32 SKIP path).
+      - name: IV-widen exposed-latch trajectory gates
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_ivwiden_exposed_latch.sh
+
       - name: Scalar lane types, stack boundaries and opt-in homes
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_fp_extract_homes.sh
 
@@ -735,6 +742,17 @@ jobs:
       # The isolated PR #629 x86-64 corpus uses APX encodings unavailable
       # in ubuntu-latest's distro binutils. Install the pinned oracle instead
       # of silently skipping its 90-case accepted/rejected differential gate.
+      # Binutils 2.47 is built from source (multi-minute); the installed
+      # prefixes are cached, keyed on the provisioner that carries the pin
+      # (version + tarball digest live in that script).
+      - name: Cache GNU as 2.47 prefixes
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/gas-2.47-x86_64-linux-gnu
+            ~/.cache/gas-2.47-aarch64-linux-gnu
+          key: ${{ runner.os }}-gas-2.47-${{ hashFiles('scripts/ensure_gas_247.sh') }}
+
       - name: Install GNU as 2.47 for x86-64 differential
         run: bash scripts/ensure_gas_247.sh x86_64-linux-gnu
 
@@ -831,6 +849,30 @@ jobs:
             --as "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/as" \
             --objcopy "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/objcopy"
 
+      # Documentation cross-check against the Arm source of truth: every
+      # golden row of tests/aarch64/dispatcher-goldens.tsv must satisfy the
+      # fixed-bit constraints of the Arm A64 ISA XML 2026-09 package
+      # (ARM DDI 0487 M.d).  The provisioner pins the tarball by SHA-256 and
+      # extracts only the 2026-09 member; the checker itself NAKs any other
+      # release, so a stale or doctored extract can never bless old
+      # encodings.  Cached the way the GAS prefixes are, keyed on the
+      # provisioner that carries the digest.
+      - name: Cache Arm A64 ISA XML 2026-09 package
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/arm-isa-a64-2026-09
+            ~/dl/ISA_A64_xml_A_profile-2026-09_md.tar.gz
+          key: ${{ runner.os }}-arm-a64-xml-2026-09-${{ hashFiles('scripts/ensure_arm_a64_xml.sh') }}
+
+      - name: Arm A64 documentation cross-check (2026-09)
+        run: |
+          set -euo pipefail
+          bash scripts/ensure_arm_a64_xml.sh
+          python3 scripts/aarch64_doccheck_2026_09.py \
+            --xml-dir "$HOME/.cache/arm-isa-a64-2026-09/ISA_A64_xml_A_profile-2026-09_md" \
+            --goldens tests/aarch64/dispatcher-goldens.tsv
+
       # The two instruments the matrix cannot replace.  The spelling differ
       # reaches "the same instruction written another way" (a rejected spelling
       # that objdump never prints, and an accepted alias the table never
@@ -862,6 +904,21 @@ jobs:
             --lccc target/fastbuild/lccc \
             --as "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/as" \
             --objcopy "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/objcopy"
+      # Directive-legality matrix, both halves: `--check` re-derives every
+      # row from the pinned GNU as 2.47 pair on BOTH targets (section-kind
+      # axes, absurd align caps, fill ceilings, the REPT `excessive count`
+      # boundary, the x86-only jump-range class), and `--check-lccc`
+      # asserts the same rows against our own two front ends.  The operand
+      # matrix cannot see directives at all; this is the instrument for
+      # them.  Same provisioning pair as the steps above.
+      - name: Directive-legality matrix
+        run: |
+          set -euo pipefail
+          python3 scripts/directive_legality_matrix.py --check \
+            --gas-a64 "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/as" \
+            --gas-x64 "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"
+          python3 scripts/directive_legality_matrix.py \
+            --check-lccc target/fastbuild/lccc
 
       # Layout/directive bugs (`.p2align N,,M`) are invisible to the word
       # oracle: compile every tests/regression/arm_*.c, assemble it with the

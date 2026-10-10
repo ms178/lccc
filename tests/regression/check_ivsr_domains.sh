@@ -6,7 +6,8 @@ td=$(mktemp -d)
 trap 'rm -rf "$td"' EXIT
 inc=$(gcc -print-file-name=include)
 for opt in -O0 -O1 -O2 -O3; do
-    for test in ivsr_narrow_wrap ivsr_signedness_domain ivsr_signed_wrap_impldef ivsr_unsigned_sparse_wrap ivsr_address_add; do
+    for test in ivsr_narrow_wrap ivsr_signedness_domain ivsr_signed_wrap_impldef ivsr_unsigned_sparse_wrap \
+            ivsr_address_add ivsr_scale_ring_wrap; do
         echo "IVSR: $test $opt"
         "$ccc" "$opt" tests/regression/"$test".c -o "$td/test"
         "$td/test"

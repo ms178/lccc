@@ -76,4 +76,4 @@ pub use numeric_labels::{
 pub use symbol_table::{ObjSymbol, SymbolTableInput, build_elf_symbol_table};
 
 // writer_base
-pub use writer_base::ElfWriterBase;
+pub use writer_base::{ElfWriterBase, MAX_DIRECTIVE_FILL, MAX_TOTAL_DIRECTIVE_FILL};

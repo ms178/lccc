@@ -3040,6 +3040,90 @@ def _multi_version_node_test(args, oracles):
         shutil.rmtree(td, ignore_errors=True)
 
 
+def _shared_icf_tls_twin_test(args, oracles):
+    """`-shared --icf=all` folds byte-identical TLS-GD twins safely.
+
+    The executable path hit this on libstdc++ (eh_globals.o): two functions
+    with identical bytes and identical TLSGD sequences, so the twin's second
+    TLS rewrite inspected bytes the first application had already rewritten
+    and died with "unrecognized code sequence". `emit_shared` now carries
+    the same `dead_sections` discriminator as `emit_exec`. Pins: the link
+    succeeds (guard), BOTH names survive in .symtab at ONE address (folded,
+    not dropped; a silently-ignored --icf fails here), and the .so runs.
+    """
+    name = "shared_icf_tls_twin"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        with open(os.path.join(td, "tls_twin.c"), "w") as f:
+            f.write("__thread int tls_x = 7;\n"
+                    "__attribute__((noinline)) int tls_get_a(void){ return tls_x; }\n"
+                    "__attribute__((noinline)) int tls_get_b(void){ return tls_x; }\n")
+        r = sh([CC, "-c", "-O1", "-fPIC", "-ffunction-sections",
+                "tls_twin.c", "-o", "tls_twin.o"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", r.stderr.decode()[:150])
+        lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+        r = sh([lccc_ld, "-shared", "--icf=all", "tls_twin.o", "-o", "libtls.so"],
+               cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL",
+                          f"lccc-ld -shared --icf=all failed: "
+                          f"{r.stderr.decode()[:400]}")
+        syms = sh(["readelf", "-sW", "libtls.so"], cwd=td).stdout.decode()
+        vals = {}
+        for line in syms.splitlines():
+            fields = line.split()
+            if len(fields) >= 8 and fields[3] == "FUNC":
+                if fields[-1] in ("tls_get_a", "tls_get_b"):
+                    vals[fields[-1]] = int(fields[1], 16)
+        if set(vals) != {"tls_get_a", "tls_get_b"}:
+            return Result(name, "FAIL",
+                          f"folded-twin symbols missing from symtab: {vals}")
+        if vals["tls_get_a"] != vals["tls_get_b"]:
+            return Result(name, "FAIL",
+                          f"--icf=all did not fold the twins: {vals}")
+        # .dynsym is a separate table with its own emission path inside
+        # `emit_shared` (PR768 M3 emit-contract symmetry): both folded
+        # twins must be exported there as well, at the same aliased
+        # address — dropping one (dead-set over-match) or disagreeing
+        # with .symtab would mean the two tables drifted apart.
+        dyn = sh(["readelf", "--dyn-syms", "-W", "libtls.so"],
+                 cwd=td).stdout.decode()
+        dvals = {}
+        for line in dyn.splitlines():
+            fields = line.split()
+            if len(fields) >= 8 and fields[3] == "FUNC":
+                if fields[-1] in ("tls_get_a", "tls_get_b"):
+                    dvals[fields[-1]] = int(fields[1], 16)
+        if set(dvals) != {"tls_get_a", "tls_get_b"}:
+            return Result(name, "FAIL",
+                          f"folded twins missing from .dynsym: {dvals}")
+        if dvals["tls_get_a"] != dvals["tls_get_b"]:
+            return Result(name, "FAIL",
+                          f".dynsym folded addresses differ: {dvals}")
+        if dvals != vals:
+            return Result(name, "FAIL",
+                          f".dynsym/.symtab disagree: {dvals} vs {vals}")
+        with open(os.path.join(td, "use.c"), "w") as f:
+            f.write("#include <stdio.h>\n"
+                    "extern int tls_get_a(void), tls_get_b(void);\n"
+                    "int main(void){ printf(\"%d %d\\n\", tls_get_a(), tls_get_b());"
+                    " return 0; }\n")
+        r = sh([CC, "-O1", "use.c", os.path.join(td, "libtls.so"),
+                "-Wl,-rpath," + td, "-o", "use.bin"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL",
+                          f"driver link failed: {r.stderr.decode()[:300]}")
+        code, out = run_bin(os.path.join(td, "use.bin"), [], td)
+        if (code, out) != (0, "7 7\n"):
+            return Result(name, "FAIL", f"runtime: {(code, out)!r}")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
 def _script_overlay_test(args, oracles):
     """OVERLAY: members share a VMA while their load images stay distinct.
 
@@ -11005,6 +11089,7 @@ def _registry(args, oracles):
                ("shared",)),
         one("so_z_defs_rejects_undefined", _zdefs_test, "shared"),
         one("so_shared_flag_parity", _so_shared_flags_test, "shared"),
+        one("shared_icf_tls_twin", _shared_icf_tls_twin_test, "shared", "icf"),
         group(("export_dynamic_exports_globals", "export_dynamic_dlopen_callback",
                "export_dynamic_version_script", "export_dynamic_matches_gnu_ld"),
               _export_dynamic_test, "exports", aux=("export_dynamic",)),

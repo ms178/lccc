@@ -303,11 +303,28 @@ fn eval_shift(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
         match &tokens[*pos] {
             ExprToken::Op2("<<") => {
                 *pos += 1;
-                val <<= eval_add(tokens, pos)?;
+                let rhs = eval_add(tokens, pos)?;
+                // GNU as 2.47 (measured): a shift count outside 0..64
+                // warns ("shift count out of range (64 is not between 0
+                // and 63)") and yields 0.  Letting Rust mask the count
+                // (1 << 64 -> 1 << 0 -> 1) made `.rept 1<<64` expand
+                // once instead of zero times, and a negative count
+                // panicked the assembler instead of erroring.
+                val = if (0..64).contains(&rhs) {
+                    val << rhs
+                } else {
+                    0
+                };
             }
             ExprToken::Op2(">>") => {
                 *pos += 1;
-                val = ((val as u64) >> eval_add(tokens, pos)?) as i64;
+                let rhs = eval_add(tokens, pos)?;
+                // Same out-of-range law as `<<` (GAS warns and yields 0).
+                val = if (0..64).contains(&rhs) {
+                    ((val as u64) >> rhs) as i64
+                } else {
+                    0
+                };
             }
             _ => break,
         }
@@ -321,11 +338,14 @@ fn eval_add(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
         match &tokens[*pos] {
             ExprToken::Op('+') => {
                 *pos += 1;
-                val += eval_mul(tokens, pos)?;
+                // GAS evaluates in bignum and keeps the low bits; wrapping
+                // arithmetic reproduces them identically in every profile
+                // (plain +,- would panic in debug on overflow).
+                val = val.wrapping_add(eval_mul(tokens, pos)?);
             }
             ExprToken::Op('-') => {
                 *pos += 1;
-                val -= eval_mul(tokens, pos)?;
+                val = val.wrapping_sub(eval_mul(tokens, pos)?);
             }
             _ => break,
         }
@@ -339,23 +359,38 @@ fn eval_mul(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
         match &tokens[*pos] {
             ExprToken::Op('*') => {
                 *pos += 1;
-                val *= eval_unary(tokens, pos)?;
+                val = val.wrapping_mul(eval_unary(tokens, pos)?);
             }
             ExprToken::Op('/') => {
                 *pos += 1;
                 let rhs = eval_unary(tokens, pos)?;
-                if rhs == 0 {
-                    return Err("division by zero".to_string());
-                }
-                val /= rhs;
+                // GNU as 2.47 (measured): `/0` WARNS ("division by
+                // zero") and yields the left-hand side (`7/0` = 7,
+                // `0/0` = 0); `.rept 7/0` therefore expands 7 times
+                // with rc 0.  Hard-erroring here rejected input GAS
+                // accepts.  `MIN/-1` would panic Rust in every profile;
+                // GAS's bignum result -2^63 has the i64::MIN pattern.
+                val = if rhs == 0 {
+                    val
+                } else if rhs == -1 {
+                    val.wrapping_neg()
+                } else {
+                    val / rhs
+                };
             }
             ExprToken::Op('%') => {
                 *pos += 1;
                 let rhs = eval_unary(tokens, pos)?;
-                if rhs == 0 {
-                    return Err("modulo by zero".to_string());
-                }
-                val %= rhs;
+                // Same law: `%0` warns and yields 0 (`7%0` = 0);
+                // `x % -1` is 0 for every x, and Rust would panic on
+                // `MIN % -1`.
+                val = if rhs == 0 {
+                    0
+                } else if rhs == -1 {
+                    0
+                } else {
+                    val % rhs
+                };
             }
             _ => break,
         }
@@ -370,7 +405,9 @@ fn eval_unary(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
     match &tokens[*pos] {
         ExprToken::Op('-') => {
             *pos += 1;
-            Ok(-eval_unary(tokens, pos)?)
+            // wrapping: `-(1<<63)` must be i64::MIN (GAS keeps the
+            // two's-complement pattern) instead of a debug-profile panic.
+            Ok(eval_unary(tokens, pos)?.wrapping_neg())
         }
         ExprToken::Op('+') => {
             *pos += 1;
@@ -674,6 +711,33 @@ pub fn parse_integer_expr(s: &str) -> Result<i64, String> {
 mod tests {
     use super::*;
 
+    /// GNU as 2.47 (measured): a decimal literal in 2^63..2^64-1 is the
+    /// two's-complement pattern (negative as i64); anything ABOVE u64::MAX
+    /// is an expression error, not a wrap to some other value.
+    #[test]
+    fn gas247_literal_range_edges() {
+        assert_eq!(
+            parse_integer_expr("18446744073709551615").ok(),
+            Some(-1),
+            "u64max is the all-ones pattern"
+        );
+        assert_eq!(
+            parse_integer_expr("9223372036854775808").ok(),
+            Some(i64::MIN),
+            "2^63 is its two's-complement pattern"
+        );
+        assert_eq!(
+            parse_integer_expr("0xffffffffffffffff").ok(),
+            Some(-1),
+            "hex u64max likewise"
+        );
+        assert!(
+            parse_integer_expr("18446744073709551616").is_err(),
+            "2^64 must be an expression error, got {:?}",
+            parse_integer_expr("18446744073709551616")
+        );
+    }
+
     /// test the GAS comparison semantics
     #[test]
     fn test_gas_comparisons() {
@@ -703,6 +767,45 @@ mod tests {
         // A shift still beats a comparison: 1 < (2 << 3).
         assert_eq!(parse_integer_expr("1 < 2 << 3").unwrap(), -1);
         assert_eq!(parse_integer_expr("16 < 1 << 3").unwrap(), 0);
+    }
+
+    #[test]
+    fn gas247_shift_out_of_range_is_zero() {
+        // GNU as 2.47 (measured): a shift count outside 0..64 warns
+        // ("shift count out of range (64 is not between 0 and 63)") and
+        // yields 0.  Rust's masked shift (1 << 64 == 1) made `.rept
+        // 1<<64` expand once instead of zero times, and `1 << -1`
+        // panicked the assembler instead of yielding a value.
+        assert_eq!(parse_integer_expr("1 << 64").unwrap(), 0);
+        assert_eq!(parse_integer_expr("1 << 65").unwrap(), 0);
+        assert_eq!(parse_integer_expr("1 << -1").unwrap(), 0);
+        assert_eq!(parse_integer_expr("1 >> 64").unwrap(), 0);
+        assert_eq!(parse_integer_expr("8 >> -2").unwrap(), 0);
+        // In-range counts keep the hardware result.
+        assert_eq!(parse_integer_expr("1 << 63").unwrap(), i64::MIN);
+        assert_eq!(parse_integer_expr("(1 << 62) >> 62").unwrap(), 1);
+        assert_eq!(parse_integer_expr("255 >> 4").unwrap(), 15);
+    }
+
+    #[test]
+    fn gas247_divmod_zero_and_wrap_law() {
+        // GNU as 2.47 (measured): div/mod by zero WARN and yield the
+        // left-hand side / 0 (`7/0`=7, `7%0`=0, `0/0`=0); `.rept 7/0`
+        // expands 7 times with rc 0, so hard-erroring on a zero
+        // divisor rejected input GAS accepts.  Overflowing +/-/* and
+        // `MIN/-1` keep the bignum low bits in every profile.
+        assert_eq!(parse_integer_expr("7 / 0").unwrap(), 7);
+        assert_eq!(parse_integer_expr("7 % 0").unwrap(), 0);
+        assert_eq!(parse_integer_expr("0 / 0").unwrap(), 0);
+        assert_eq!(parse_integer_expr("(1 << 63) / -1").unwrap(), i64::MIN);
+        assert_eq!(parse_integer_expr("(1 << 63) % -1").unwrap(), 0);
+        assert_eq!(parse_integer_expr("(1 << 62) * 4").unwrap(), 0);
+        assert_eq!(parse_integer_expr("(1 << 63) - 1").unwrap(), i64::MAX);
+        assert_eq!(parse_integer_expr("-(1 << 63)").unwrap(), i64::MIN);
+        // Truncated sign law, measured: -7/3 = -2, -7%3 = -1, 7%-3 = 1.
+        assert_eq!(parse_integer_expr("(-7) / 3").unwrap(), -2);
+        assert_eq!(parse_integer_expr("(-7) % 3").unwrap(), -1);
+        assert_eq!(parse_integer_expr("7 % (-3)").unwrap(), 1);
     }
 
     #[test]

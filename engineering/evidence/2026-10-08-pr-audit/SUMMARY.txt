@@ -1,0 +1,128 @@
+PR AUDIT 2026-10-08 -- MEASURED SUMMARY
+=======================================
+Host: 2-core Xeon VM (Debian 13, gcc 14.2, valgrind 3.24.0), NOT the i7-14700KF.
+No PMU: every dynamic number below is Callgrind simulated Ir, never cycles, uops
+or wall-clock speedup.  Binaries: /tmp/lccc-main (main 500e652e),
+/tmp/lccc-pr777 (cc93cda1), /tmp/lccc-u776 (this tree: PR #777 gate + the three
+fixes below + PR #725 corrected + PR #776).
+
+1. THE WRAP MISCOMPILE IS REAL, AND WORSE THAN PR #777 DOCUMENTS
+   scripts/wrap_ring_sweep.py, 39 shapes x {constant index, index routed through
+   a volatile} x {-O0,-O1,-O2,-O3}, gcc 14.2 executed as the reference:
+                            constant index      runtime (opaque) index
+     main  -O0                 39/39                 78/78
+     main  -O1                 18/39                 36/78   <- 42 divergent
+     main  -O2                 39/39                 57/78   <- 21 divergent
+     main  -O3                 39/39                 57/78   <- 21 divergent
+     PR #777                   all agree             all agree
+     this tree                 all agree             all agree
+   PR #777 files the class as an -O1 phenomenon.  At the default -O2 it is 21
+   shapes; the constant-index column is why it looked -O1-only (a folded index
+   hides it).  One shape SIGSEGVs (u32_top_mul2 at -O1).
+
+2. PR #777'S OWN TEST CANNOT SEE THE -O2 CLASS IT FIXES
+   tests/regression/ivsr_scale_ring_wrap.c as shipped, compiled with UNFIXED main:
+     -O1  FAIL const / FAIL param / FAIL dynamic   (exit 5)
+     -O2  FAIL param only                          (exit 5)
+     -O3  FAIL param only                          (exit 5)
+   Its "dynamic" case is not dynamic: `0x80000003u + (k & 0u)` folds under SCCP
+   and main compiles walk_dynamic to four straight-line loads (no loop at all).
+   Its diagnostic is also wrong at runtime -- it prints `linear=264` while the
+   observed linear total is 209, and its markers sum to 209.
+   The rewritten test in this tree, same compiler:
+     main  -O1  SIGSEGV (139)   -O2  exit 5, FAIL mul2-opaque got 209 want 110
+     main  -O3  exit 5          PR #777  OK at -O1/-O2/-O3
+     this tree  OK at -O1/-O2/-O3, and gcc -O0..-O3 OK (reference self-check)
+
+3. THE COST PR #777 REPORTS IS REAL, AND IS NOT NECESSARY
+   Callgrind Ir, PR #777 vs main:  histogram 1.08034 (+8.03%), glibc_strstr
+   1.04097 (+4.10%) -- both reproduce its claimed numbers exactly.
+   Root cause of the histogram cost, traced: a constant trip count lets the
+   unroller run, the unroller spells the latch as a CHAIN of unit adds
+   (v60=v19+1, v61=v60+1, v62=v61+1, v63=v62+1), iv_widen's recognisers require
+   the latch to name the phi directly, so the counted loop is never widened, the
+   index stays U32, and the SIB displacement fold is (correctly) unsound.
+   Three fixes in this tree, each with its own proof and tests:
+     (a) canonicalise the final chain link to `phi + total` -- value-identical by
+         associativity of modular addition, no bound argument, zero cost;
+     (b) generalise theorem 5 to mag>1 with a constant bound (n <= max-mag+1);
+     (c) tighten the seed range to n-1+mag, without which the unrolled body's
+         i+1/i+2/i+3 members leave the narrow type and the closure aborts.
+   Plus a pre-existing defect neither PR touches: the SIB cast peel used the
+   VALUE-only predicate, so a pointer-width index (`size_t i`, the shape gzip,
+   zlib-ng, expat, SQLite and glibc strings are written in) never reached the
+   affine fold.  generation.rs now uses the pointer-ring arm on LP64.
+
+4. RESULT OF THIS TREE vs main (FINAL, after PERF-9 was held back -- see 4b)
+   Callgrind Ir, 30-bench DEFAULT_FAST corpus at -O2:
+     libm_round_family  1720907919 -> 1679947919   ratio 0.97620  (-2.38%)
+     linux_rbtree          21853215 ->    21591071   ratio 0.98800  (-1.20%)
+     linux_find_bit       181367833 ->   181366809   ratio 0.99999
+     ascii_case_fold       2212998 ->     2212998   ratio 1.00000
+     histogram             3263371 ->     3459982   ratio 1.06025  (+6.03%)
+     25 other benches: identical Ir, identical miss and branch counts
+     fast-corpus geomean 1.00072
+   Static, 402-comparison benchmark+oracle matrix: 98002 -> 97931 insns (-71),
+   stack 25745 -> 25745 (+0); x86-64 29 files better / 7 worse / 1 same-code;
+   i686 byte-identical (0 changed).
+   scripts/census_ab.py (the repo's own screening gate) main -> final, 190
+   functions at -O2: TOTAL -16 insns, -4 rrmov, +0 stkref, 179/190 unchanged,
+   11 improved, 0 regressed, "gate: HOT stkref 171->171, insns 5597->5581 => PASS".
+   Regression suite: PASS=846 FAIL=0 SKIP=8, AB-diff failures 0.
+   Wrap sweep: 468/468.  tests/regression/ivsr_scale_ring_wrap.c: OK at
+   -O1/-O2/-O3 (SIGSEGV and exit 5 respectively on unfixed main).
+
+4b. PERF-9, MEASURED AND DELIBERATELY HELD BACK
+   The SIB cast peel tests the VALUE-only predicate, so a pointer-width index
+   (`size_t i`) never reaches the affine displacement fold.  Enabling the tree's
+   own cast_preserves_offset_value arm on LP64 is sound and locally profitable:
+   histogram Ir 1.06025 -> 0.95983, w_s8 goes from `leaq 1(%rsi),%rsi` +
+   `movq (%rdi,%rsi,8)` to `movq 8(%rdi,%rsi,8)`.  It is NOT in this tree, for
+   two measured reasons:
+     (i)  it breaks contract 2 of tests/regression/check_select_from_compare.sh.
+          In ascii_case_fold's byte-fold kernel the fold frees %r13/%r14/%r15 and
+          the fourth lane then loses its cmovbe fusion, materialising
+          `setbe %r15b` + movzbl + movsbq + `testl` (+1 insn, Ir 1.00740).  main
+          PASSES that gate; the tree with the arm FAILS it.  No knob reproduces
+          the loss (CCC_NO_IV_WIDEN, CCC_NO_GEP_FOLD, CCC_NO_PF06_ADD_PEEL,
+          CCC_NO_FLAG_PEEPHOLES all leave setbe=1), no data directive sits in the
+          fusion window, and -march makes no difference (identical with and
+          without x86-64-v3), so PR #725's classifier and the march are both
+          excluded: it is a fold/RA interaction.
+     (ii) it interferes with the widening's own wins: the 402 matrix moves
+          98002 -> 97984 (-18) with the arm, but 98002 -> 97931 (-71) without it,
+          because i686_alu_chains (-12 x3), struct_copy (-6), pixmap (-5 x2) and
+          csv_field_sum (-4 x2, -2) only improve once it stops competing for
+          registers.
+   On ILP32 the arm is sound but unprofitable outright (+60 insns vs -18 on
+   x86-64).  Recorded in-tree at the peel site so the next reader inherits the
+   numbers instead of the investigation.
+
+5. PR #725: AGREE, WITH ONE DEFECT FIXED
+   636 comparisons with and without it: byte-identical (0 changed), so its
+   fail-closed classifier refuses no real fold.  But its benign allowlist named
+   `.zero`, `.skip`, `.space` and `.fill` as positions rather than data: `.zero 2`
+   emits 0x00 0x00 == `add %al,(%rax)` (a full flag writer) and `.fill 1,1,0xF8`
+   emits a bare `clc`.  Two tests added that FAIL on the PR as shipped (6 passed,
+   2 failed) and pass once the four move to the data arm (8/8).  In-body reach of
+   all four is 0 (directive-census.txt), so the correction costs nothing.
+
+6. PR #777'S loop_invert HALF: REJECT
+   Its own summary says the switch is "off by default, pending a reach
+   measurement" and its §6 admits the win it measured is concentrated in programs
+   the licence does not change.  Measured reach, CCC_LOOP_INVERT_MEMORY 0 -> 1 on
+   636 comparisons: 26 changed, 0 smaller, 26 LARGER, +124 insns, +5 stack refs
+   (strlen_bench +21, strings +18).  Dynamic on the only affected bench in the
+   callgrind set: linux_rbtree Ir 21853219 -> 21853219, ratio 1.00000.  346 lines
+   of pass code + 197 lines of census script + pipeline env threading for an
+   off-by-default switch with no measured gain and a measured static cost.
+
+7. PR #776: ACCEPT (x86-64 half measured; AArch64 half not executable here)
+   Applies cleanly on this tree (33 files, no conflicts) and BUILDS with 0 errors
+   and 0 warnings -- its author's stated constraint was that no build was run.
+   x86-64 codegen, 636 comparisons: 26 files smaller, 0 larger, 1
+   same-size-different-code.  Wrap sweep with it applied: 78/78 at -O1/-O2/-O3.
+   Regression suite with it applied: 846/0/8.  The AArch64 encoder, ELF writer
+   and dispatcher goldens CANNOT be executed on this host (no aarch64 runner, no
+   qemu), so they are carried on the strength of the clean build plus their own
+   golden/doccheck scripts, and that limit is stated rather than hidden.
