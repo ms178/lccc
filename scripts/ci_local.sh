@@ -14,7 +14,8 @@
 # differential gate failed.
 #
 # Running "the tests I remember" is therefore not a validation strategy.
-# Run this script before every push; it is the contract.
+# Run `./scripts/ci_local.sh --fast` before every push; it is the local contract.
+# GitHub CI runs the slow gates on every PR, so a full local run is not required.
 #
 #   ./scripts/ci_local.sh              # everything (test + bench + clippy)
 #   ./scripts/ci_local.sh --fast       # skip ONLY the three slow gates:
@@ -34,8 +35,8 @@
 # A --fast pass is NOT CI-equivalent: GitHub runs all three slow gates on every
 # PR.  PR #638 went red on check_peephole_whitespace.sh after a green
 # --fast run, because the snapshot gate accepted a fast stamp.  lccc-snapshot.sh
-# therefore demands mode=full; obtain it with a full run or with --fast then
-# --slow on the unchanged tree.
+# accepts a mode=fast stamp as its gate (owner decision: GitHub CI runs the
+# slow gates; a local --fast pass is the snapshot requirement).
 #
 #   CI_LOCAL_JOBS=N   parallelism for the clippy gate (default 2).  Set 1 on
 #                     low-memory hosts: `cargo clippy --all-targets` peaks
@@ -353,6 +354,12 @@ gate "gvn-cross-block-mul-dot" fast \
 
 gate "segfs-declarator-codegen" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_segfs_typeof_nosteal.sh
+
+# Declaration-level `__seg_gs` on parameters, locals, function return types and
+# typedefs (kernel srcu_read_lock_fast boot blocker): every %gs access and the
+# generic-pointer contract are checked on the emitted assembly.
+gate "seg-named-decl-qualifier" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_seg_named_decl_qualifier.sh
 
 gate "tls-model-selection" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_tls_model_selection.sh
@@ -1471,9 +1478,10 @@ else
             if [ -n "$PRIOR_HALF_TREE" ] && [ "$PRIOR_HALF_TREE" = "$TREE_END" ]; then
                 echo "both halves green on tree $TREE_END (--$COMPLEMENT earlier, --$half now)"
             else
+                # Owner policy: a local --fast (or --slow) pass is the accepted
+                # local gate. GitHub CI runs every gate on the PR.
                 mode=$half
-                echo "NOTE: stamp is mode=$half -- NOT CI-equivalent and not" \
-                     "delivery-grade until --$COMPLEMENT also passes on this tree" >&2
+                echo "stamp: mode=$half (local gate; GitHub CI runs the rest)" >&2
             fi
         fi
         # The userland matters as much as the gate list: system gcc/as/ld/

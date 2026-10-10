@@ -23,8 +23,10 @@
 # Usage:  ./lccc-snapshot.sh "<slug>" "<one-line description>"
 # Env:    LCCC_REPO, LCCC_ARTIFACTS, LCCC_DELIVERABLE
 #         LCCC_CI_STAMP — ci_local.sh pass stamp (default target/ci_local.pass);
+#                         a mode=fast or mode=full stamp for this tree is accepted.
 #                         the snapshot refuses a tree without a matching
-#                         mode=full one (--fast alone is not CI-equivalent).
+#                         ci_local.sh --fast pass is the local gate; GitHub CI
+#                         runs the rest.
 #         LCCC_SNAPSHOT_ALLOW_PARTIAL=1 — accept a --fast/--slow stamp for an
 #                         interim autosave (ledger: *-PARTIAL-NOT-DELIVERABLE).
 #         LCCC_SNAPSHOT_UNGATED=1 — emergency pre-wipe save without that proof
@@ -186,14 +188,16 @@ if [[ -r $CI_STAMP ]]; then
   stamp_mode=$(sed -n 's/^mode=//p' "$CI_STAMP" | head -1)
   stamp_os=$(sed -n 's/^os=//p' "$CI_STAMP" | head -1)
 fi
-if [[ -n $stamp_tree && $stamp_tree == "$tree_now" && $stamp_mode == full ]]; then
+# Policy (owner decision): a local `--fast` pass is the snapshot gate. GitHub CI
+# runs the slow gates on every PR, so the local full run is not required here.
+if [[ -n $stamp_tree && $stamp_tree == "$tree_now" && ( $stamp_mode == fast || $stamp_mode == full ) ]]; then
   # Recorded, not enforced: GitHub's ubuntu-latest moves (24.04 -> 26.04 on
   # 2026-10-19) and not every host can run the chroot mirror. A non-Ubuntu
   # userland is shown in the ledger so a reviewer knows what was mirrored.
-  ci_gate="ci_local-full-PASS@${stamp_os:-unknown-os}"
+  ci_gate="ci_local-${stamp_mode}-PASS@${stamp_os:-unknown-os}"
   if [[ ${stamp_os:-} != ubuntu-* ]]; then
     echo "WARNING: gates ran on ${stamp_os:-an unrecorded userland}, not the Ubuntu" \
-         "runner's; scripts/ci_ubuntu_chroot.sh -- bash scripts/ci_local.sh mirrors it." >&2
+         "runner's; scripts/ci_ubuntu_chroot.sh -- bash scripts/ci_local.sh --fast mirrors it." >&2
   fi
 elif [[ -n $stamp_tree && $stamp_tree == "$tree_now" &&
         ${LCCC_SNAPSHOT_ALLOW_PARTIAL:-0} == 1 ]]; then
@@ -210,10 +214,9 @@ elif [[ ${LCCC_SNAPSHOT_UNGATED:-0} == 1 ]]; then
        "recorded as UNGATED -- not a delivery candidate." >&2
 else
   cat >&2 <<MSG
-refusing to snapshot: tree $tree_now has no matching FULL ci_local.sh pass
+refusing to snapshot: tree $tree_now has no matching ci_local.sh --fast pass
   stamp: $CI_STAMP (tree=${stamp_tree:-none}, mode=${stamp_mode:-none})
-GitHub CI runs every gate, so only mode=full is delivery-grade. Run
-./scripts/ci_local.sh (full), or --fast and then --slow on this exact tree.
+Run ./scripts/ci_local.sh --fast on this exact tree (GitHub CI runs the slow gates).
 Interim autosave with a partial stamp: LCCC_SNAPSHOT_ALLOW_PARTIAL=1.
 Emergency pre-wipe save without any stamp: LCCC_SNAPSHOT_UNGATED=1.
 MSG

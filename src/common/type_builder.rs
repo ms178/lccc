@@ -516,6 +516,12 @@ pub fn apply_declaration_address_space(ty: &mut CType, space: AddressSpace) {
             }
         }
         CType::Array(elem, _) => apply_declaration_address_space(elem, space),
+        // `T __seg_gs *f(void)`: the qualifier belongs to the pointer in the
+        // return type, not to the function designator itself. Without this arm
+        // a function returning a per-CPU pointer (srcu_read_lock_fast) reported
+        // a plain pointer at every call site, so a correctly qualified argument
+        // was rejected as "incompatible pointer type".
+        CType::Function(ft) => apply_declaration_address_space(&mut ft.return_type, space),
         _ => {}
     }
 }

@@ -169,6 +169,12 @@ pub(super) struct ParsedDeclAttrs {
     /// `__seg_gs` or `__seg_fs` qualifier encountered.
     pub parsing_address_space: AddressSpace,
 
+    /// Named address space of the declaration being parsed, moved out of
+    /// `parsing_address_space` right after its type specifier. Parameter
+    /// lists and initializers reuse that slot, so the declaration's own
+    /// qualifier must be captured here before any declarator is parsed.
+    pub decl_address_space: AddressSpace,
+
     // --- GCC attributes with values ---
     /// `__attribute__((alias("target")))` target symbol name.
     pub parsing_alias_target: Option<String>,

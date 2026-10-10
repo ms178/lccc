@@ -542,7 +542,19 @@ impl Parser {
             let saved_const = self.attrs.parsing_const();
             self.attrs.set_const(false);
             self.attrs.set_noreturn(saved_noreturn);
+            // Each parameter's named address space is its own: clear the slot so
+            // a qualifier left over from the enclosing declaration cannot be
+            // taken as this parameter's.
+            self.attrs.parsing_address_space = AddressSpace::Default;
             if let Some(mut type_spec) = self.parse_type_specifier() {
+                // Snapshot the declaration-level named address space NOW, before
+                // the declarator parser runs (the same rule struct fields follow
+                // in parse_struct_fields). `struct c __seg_gs *p` records
+                // `__seg_gs` in `parsing_address_space`; without this read the
+                // parameter's pointer was built with AddressSpace::Default and
+                // every `p->member` load was emitted without the %gs prefix
+                // (kernel: srcu_read_unlock_fast's per-CPU counter pointer).
+                let param_addr_space = std::mem::take(&mut self.attrs.parsing_address_space);
                 // Capture whether the base type (before pointer declarators) was const.
                 // For `const int *p`, parsing_const is true here; the `*` is handled below.
                 let param_is_const = self.attrs.parsing_const();
@@ -579,9 +591,18 @@ impl Parser {
                 let param_alignas_type = self.attrs.parsed_alignas_type.take();
                 self.skip_gcc_extensions();
 
-                // Apply pointer levels
-                for _ in 0..pointer_depth {
-                    type_spec = TypeSpecifier::Pointer(Box::new(type_spec), AddressSpace::Default);
+                // Apply pointer levels. A named address space qualifies the
+                // memory the INNERMOST pointer points into (GCC: `T __seg_gs **pp`
+                // makes only `*pp` a %gs access), so it lands on the first level
+                // built, exactly as `apply_declaration_address_space` places it
+                // for declarations. The outer levels stay ordinary memory.
+                for level in 0..pointer_depth {
+                    let space = if level == 0 {
+                        param_addr_space
+                    } else {
+                        AddressSpace::Default
+                    };
+                    type_spec = TypeSpecifier::Pointer(Box::new(type_spec), space);
                 }
 
                 // Pointer-to-array: int (*p)[N][M]
