@@ -1373,6 +1373,17 @@ impl Driver {
                 arg if arg == "-fsigned-char" => {
                     crate::common::types::set_char_unsigned(false);
                 }
+                // `-fshort-wchar`: 16-bit unsigned `wchar_t` (GCC's
+                // `__WCHAR_TYPE__ = short unsigned int`). Recorded here, before
+                // any input file is parsed, so the parser, sema and lowering all
+                // see one consistent `wchar_t`. Required by the Linux kernel,
+                // which builds with this flag.
+                arg if arg == "-fshort-wchar" => {
+                    crate::common::types::set_short_wchar(true);
+                }
+                arg if arg == "-fno-short-wchar" => {
+                    crate::common::types::set_short_wchar(false);
+                }
                 // S13: function entry/exit instrumentation via the
                 // __cyg_profile_func_enter/exit hooks (GCC contract).
                 arg if arg == "-finstrument-functions" => {

@@ -36,7 +36,7 @@
 # Environment:
 #   LCCC          compiler under test      (default target/fastbuild/lccc)
 #   LCCC_PRE      pre-change binary, for the A/B claims (default: none -> SKIP)
-#   KERNEL_DIR    kernel tree              (default /home/user/kernel-work/linux-6.18.52)
+#   KERNEL_DIR    kernel tree              (default /home/user/kernel-work/linux-6.18.55)
 #   PROFILE JOBS  cargo profile / -j       (default fastbuild / 2)
 #   SWEEP_JOBS    width of the 37-TU sweep pool (default 2 = this host's cores)
 #   DOC           the document the claims are quoted from
@@ -48,7 +48,7 @@ cd "$repo_root"
 
 LCCC=${LCCC:-target/fastbuild/lccc}
 LCCC_PRE=${LCCC_PRE:-}
-KERNEL_DIR=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.52}
+KERNEL_DIR=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.55}
 PROFILE=${PROFILE:-fastbuild}
 JOBS=${JOBS:-2}
 DOC=${DOC:-engineering/FOLLOWUP-2026-09-19C-deferred-items-closed-with-kernel-harness.md}

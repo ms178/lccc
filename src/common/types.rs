@@ -301,6 +301,59 @@ pub struct EnumType {
 }
 
 impl EnumType {
+    /// The integer type this enumeration is *compatible* with.
+    ///
+    /// C11 6.7.2.2p4: "Each enumerated type shall be compatible with char, a
+    /// signed integer type, or an unsigned integer type. The choice of type is
+    /// implementation-defined". GCC's choice — which the Linux kernel depends
+    /// on — is `unsigned int` when no enumerator is negative and all values fit
+    /// 32 bits, `int` when some are negative, and a 64-bit type otherwise.
+    ///
+    /// This is not pedantry: pointers to compatible types are compatible, so
+    /// `unsigned int *` and `enum pg_level *` must interchange. The kernel does
+    /// exactly that — arch/x86/mm/pat/set_memory.c passes `enum pg_level level`
+    /// to `lookup_address(addr, unsigned int *level)` (declared in
+    /// arch/x86/include/asm/pgtable_types.h) — and GCC accepts it even under
+    /// -Werror=incompatible-pointer-types, while lccc rejected it and stopped
+    /// the build at arch/x86/mm/pat/set_memory.o.
+    ///
+    /// Signedness follows the presence of a negative enumerator, and the width
+    /// follows `packed_size` so a packed enum's compatible type is the same
+    /// smallest type it occupies.
+    pub fn compatible_ctype(&self) -> CType {
+        let any_negative = self.variants.iter().any(|(_, v)| *v < 0);
+        match self.packed_size() {
+            1 => {
+                if any_negative {
+                    CType::Char
+                } else {
+                    CType::UChar
+                }
+            }
+            2 => {
+                if any_negative {
+                    CType::Short
+                } else {
+                    CType::UShort
+                }
+            }
+            8 => {
+                if any_negative {
+                    CType::LongLong
+                } else {
+                    CType::ULongLong
+                }
+            }
+            _ => {
+                if any_negative {
+                    CType::Int
+                } else {
+                    CType::UInt
+                }
+            }
+        }
+    }
+
     /// Returns the size (and alignment) in bytes for this enum.
     /// Non-packed enums are always 4 bytes (int). Packed enums use the
     /// smallest integer type that can represent all variant values.
@@ -1627,6 +1680,85 @@ pub fn set_char_unsigned(unsigned: bool) {
 /// The target's plain-char signedness (true: `char` behaves as `unsigned char`).
 pub fn char_is_unsigned() -> bool {
     CHAR_UNSIGNED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `-fshort-wchar`: `wchar_t` is a 16-bit unsigned type instead of a 32-bit
+/// signed one.
+///
+/// This is not a cosmetic width knob — it changes the type of every `L"..."`
+/// literal, so it has to be visible to the parser, sema, sizeof, array
+/// initialisation and the backend alike. It is recorded process-globally for
+/// the same reason plain-char signedness is: the whole front end is otherwise
+/// target-blind and there is exactly one language definition per driver
+/// process. The driver installs it while parsing arguments, before any input
+/// file is read.
+///
+/// The Linux kernel builds with `-fshort-wchar` (its `wchar_t` must match the
+/// 16-bit `CHAR16` used by EFI: `include/linux/efi.h` passes `L"SecureBoot"`
+/// to a function taking `unsigned short *`), so honouring the flag is a hard
+/// requirement for kernel compilation, not an optional GCC compatibility.
+static SHORT_WCHAR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record `-fshort-wchar` / `-fno-short-wchar`. Called by the driver before
+/// any parsing/sema/lowering runs.
+pub fn set_short_wchar(short: bool) {
+    SHORT_WCHAR.store(short, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether `wchar_t` is the 16-bit `-fshort-wchar` type.
+pub fn short_wchar() -> bool {
+    SHORT_WCHAR.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The C type of `wchar_t` for the current options.
+///
+/// GCC's `__WCHAR_TYPE__` is `int` by default and `short unsigned int` under
+/// `-fshort-wchar` (its `__WCHAR_MIN__`/`__WCHAR_MAX__` follow: 0/0xffff).
+/// Every place that needs to name `wchar_t` goes through here so the two can
+/// never disagree.
+pub fn wchar_ctype() -> CType {
+    if short_wchar() {
+        CType::UShort
+    } else {
+        CType::Int
+    }
+}
+
+/// Spelling of `wchar_t` for `__WCHAR_TYPE__` (GCC: `int` / `short unsigned int`).
+pub fn wchar_type_spelling() -> &'static str {
+    if short_wchar() {
+        "short unsigned int"
+    } else {
+        "int"
+    }
+}
+
+/// `__WCHAR_MAX__` (GCC: 0xffff / 0x7fffffff).
+pub fn wchar_max() -> &'static str {
+    if short_wchar() {
+        "0xffff"
+    } else {
+        "2147483647"
+    }
+}
+
+/// `__WCHAR_MIN__` (GCC writes the width-dependent spelling shown).
+pub fn wchar_min() -> &'static str {
+    if short_wchar() {
+        "0"
+    } else {
+        "(-__WCHAR_MAX__ - 1)"
+    }
+}
+
+/// `__WCHAR_WIDTH__`.
+pub fn wchar_width() -> &'static str {
+    if short_wchar() { "16" } else { "32" }
+}
+
+/// `__SIZEOF_WCHAR_T__`.
+pub fn wchar_sizeof() -> &'static str {
+    if short_wchar() { "2" } else { "4" }
 }
 
 impl CType {

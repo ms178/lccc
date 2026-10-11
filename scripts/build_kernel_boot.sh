@@ -21,7 +21,7 @@
 # ============================================================================
 set -euo pipefail
 
-K=${KERNEL_DIR:-/home/user/target/kernel-work/linux-6.18.52}
+K=${KERNEL_DIR:-/home/user/target/kernel-work/linux-6.18.55}
 OUT=${OUT:-/tmp/bootbuild}
 # Resolve the script directory before `cd "$K"`: $0 is relative to the caller's
 # cwd, so sourcing boot_flags.sh after the cd would look inside the kernel tree.
@@ -192,6 +192,11 @@ if "$LCCC_LD" --gc-sections -m elf_i386 -z noexecstack -T "$SETUP_LD" \
   report_layout "$OUT/setup.elf"
   validate_payloads "$OUT/setup.elf"
   validate_flat_oracles "$OUT/setup.elf"
+  # ISA audit of the built setup objects: the 16-bit path is compiled with
+  # REALMODE_CFLAGS (`-march=i386 -mno-mmx -mno-sse`), so a BMI/ABM/VEX/SSE4.2
+  # mnemonic in here means that flag set stopped being honored — and this code
+  # runs before the kernel exists, on the CPU the boot sector just woke up on.
+  "$SCRIPT_DIR/kernel_boot_isa.sh" scan "$OUT"
   exit 0
 else
   link_status=$?

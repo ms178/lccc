@@ -71,7 +71,8 @@
 //! Negative immediates need the sign-extending forms and are left alone.
 //!
 //! Every pass is individually switchable through `CCC_PEEPHOLE_SKIP=
-//! load_alu_fuse,recurrence_inplace,copy_dying_operand,symbol_lea_cse,narrow_imm` for bisection.
+//! load_alu_fuse,load_lea_inplace,recurrence_inplace,copy_dying_operand,symbol_lea_cse,narrow_imm`
+//! for bisection.
 
 use super::super::types::*;
 use super::liveness::FileLiveness;
@@ -228,15 +229,36 @@ fn memory_operand_families(mem: &str) -> u16 {
 }
 
 /// A memory source operand this pass is willing to carry into an ALU op:
-/// contains a parenthesised address, no segment override, no immediate or
-/// register form, no `*` indirection marker.
+/// contains a parenthesised address, no immediate or register form, no `*`
+/// indirection marker, and at most a *validated* segment override.
+///
+/// The override is an address-space qualifier, not part of the operand shape:
+/// `movq %gs:8(%rsi), %rax` is the per-CPU spelling of `movq 8(%rsi), %rax`
+/// and folds the same way — the reuse sites re-emit the operand verbatim, so
+/// the prefix travels with it.  Validation is exactly the shared
+/// [`relay_and_lea::segment_prefix_len`], which refuses `%gss:…` (not one of
+/// the six segment registers) and `*%gs:…` (indirection marker), and leaves
+/// every other colon — a symbol/instruction-label form — refused as before.
+///
+/// `CCC_NO_SEG_OPERAND_FUSE=1` restores the pre-fusion behaviour (every
+/// segment override refused) so an A/B instruction-count or Callgrind run can
+/// attribute a delta to this rule alone.
 fn is_plain_memory_operand(op: &str) -> bool {
-    op.contains('(')
-        && op.ends_with(')')
-        && !op.starts_with('$')
-        && !op.starts_with('%')
-        && !op.starts_with('*')
-        && !op.contains(':')
+    if std::env::var_os("CCC_NO_SEG_OPERAND_FUSE").is_some() {
+        return op.contains('(')
+            && op.ends_with(')')
+            && !op.starts_with('$')
+            && !op.starts_with('%')
+            && !op.starts_with('*')
+            && !op.contains(':');
+    }
+    let (_, body) = super::relay_and_lea::strip_segment_prefix(op);
+    body.contains('(')
+        && body.ends_with(')')
+        && !body.starts_with('$')
+        && !body.starts_with('%')
+        && !body.starts_with('*')
+        && !body.contains(':')
 }
 
 fn is_reg_or_imm(op: &str) -> bool {
@@ -555,6 +577,21 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) 
             i += 1;
             continue;
         };
+        // A segment-qualified operand is a promise about a SEGMENT BASE, and
+        // the instruction text cannot enumerate every way one can change
+        // (`swapgs`, `wrgsbase`/`wrfsbase`, `wrmsr` on MSR_GS_BASE/MSR_FS_BASE,
+        // a raw encoding inside an inline-asm `.byte` line).  Re-reading
+        // `%gs:MEM` at the consumer therefore has to be as close to the load as
+        // possible: require the consumer to be the immediately following
+        // instruction, so that *no* instruction can sit in between.  The
+        // unqualified (DS-relative) fold keeps its gap tolerance — in 64-bit
+        // mode there is no instruction that rebases DS.  (Labels and calls are
+        // already window barriers in both cases, so no control flow can reach
+        // the consumer on a different segment base.)
+        if gap != 0 && super::relay_and_lea::segment_prefix_len(mem).is_some() {
+            i += 1;
+            continue;
+        }
         let cons = infos[j].trimmed(store.get(j)).to_string();
         let suffix = if load_q { "q" } else { "l" };
         let width = if load_q { 0 } else { 1 };
@@ -693,6 +730,15 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) 
             i += 1;
             continue;
         };
+        // The copy-bridged form moves the load's memory operand to a LATER
+        // line, so the same distance argument as the direct form applies (see
+        // the segmented-operand guard above): with any instruction between the
+        // copy and the op, that instruction could rebase the segment.  The
+        // copy itself is a validated register-to-register mov and cannot.
+        if gap2 != 0 && super::relay_and_lea::segment_prefix_len(mem).is_some() {
+            i += 1;
+            continue;
+        }
         let op_text = infos[k].trimmed(store.get(k)).to_string();
         let Some((op, op_q, c_fam, dst)) = parse_reg_reg_alu(&op_text) else {
             i += 1;
@@ -963,6 +1009,253 @@ pub(super) fn fold_recurrence_update(store: &mut LineStore, infos: &mut [LineInf
         lv.refresh_at(store, infos, j);
         changed = true;
         i = m + 1;
+    }
+    changed
+}
+
+// ── load + LEA-add into the dying accumulator ────────────────────────────────
+
+/// Flag-clobbering ALU consumers whose FIRST window instruction makes the
+/// `add` below safe: each writes all six arithmetic flags (CF, OF, SF, ZF, AF,
+/// PF) and reads none, so any flag state that was live across the LEA is dead
+/// before it can be observed — the flag state after this instruction is its
+/// own, identical in the folded and unfolded spellings.  Deliberately excludes
+/// `inc`/`dec` (no CF), `not` (no flags) and every flag READER (`adc`, `sbb`,
+/// `rcl`, `setcc`, `jcc`, `cmovcc`), all of which could observe the inserted
+/// `add`.  A `mov`/`lea`/`push`/`pop` reader would keep the earlier flags live
+/// across the fold, so it vetoes too.
+const LEA_FOLD_FLAG_CLOBBER: &[&str] = &["add", "sub", "and", "or", "xor", "cmp", "test"];
+
+/// True when `t` is a two-operand `OP{l,q} ...` with `OP` a full flag clobber.
+fn is_full_flag_clobber(t: &str) -> bool {
+    let Some(mnemonic) = t.split_whitespace().next() else {
+        return false;
+    };
+    let Some((op, suffix)) = mnemonic.split_at_checked(mnemonic.len().saturating_sub(1)) else {
+        return false;
+    };
+    if suffix != "l" && suffix != "q" {
+        return false;
+    }
+    LEA_FOLD_FLAG_CLOBBER.contains(&op)
+}
+
+/// Parse the two-register `lea`-add the allocator emits for `acc + x` when the
+/// result needs its own home: `leaq (%B,%T,1), %S` (scale explicit or omitted).
+/// Returns `(is_q, base_fam, index_fam, dest_fam)`.  A displacement, a scale
+/// other than 1, or any operand that is not the exact register spelling of the
+/// suffix width is refused — `add` cannot reproduce those.
+fn parse_lea_add(t: &str) -> Option<(bool, RegId, RegId, RegId)> {
+    let mnemonic = t.split_whitespace().next()?;
+    let is_q = match mnemonic {
+        "leaq" => true,
+        "leal" => false,
+        _ => return None,
+    };
+    let width = if is_q { 0 } else { 1 };
+    let rest = t[mnemonic.len()..].trim();
+    let (src, dst) = split_two_operands(rest)?;
+    let dst_fam = plain_gp_operand(dst)?;
+    if dst != REG_NAMES[width][dst_fam as usize] {
+        return None;
+    }
+    // SRC must be exactly `(%a,%b)` / `(%a, %b)` / `(%a, %b, 1)`.
+    let inner = src.strip_prefix('(')?.strip_suffix(')')?;
+    let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+    if parts.len() != 2 && parts.len() != 3 {
+        return None;
+    }
+    if parts.len() == 3 && parts[2] != "1" {
+        return None;
+    }
+    let mut fams = [0 as RegId; 2];
+    for (k, p) in parts.iter().take(2).enumerate() {
+        let fam = plain_gp_operand(p)?;
+        if *p != REG_NAMES[width][fam as usize] {
+            return None;
+        }
+        fams[k] = fam;
+    }
+    if fams[0] == fams[1] {
+        return None;
+    }
+    Some((is_q, fams[0], fams[1], dst_fam))
+}
+
+/// `mov MEM, %T` + `leaq (%B,%T,1), %S` → `add MEM, %B` with every use of `%S`
+/// up to the end of its live range renamed to `%B`.
+///
+/// This is gcc's accumulation shape: the allocator keeps an SSA chain in one
+/// register (`addq MEM, %acc; xorq MEM2, %acc; ...`) while lccc materialises
+/// each link three-operand (`movq MEM, %t; leaq (%acc,%t,1), %s`), costing one
+/// extra instruction per link — measured on the pointer-chasing accumulator
+/// kernel (`struct node *p; acc += p->hits; acc ^= p->miss; acc += p->tag & 7;
+/// p = p->next`) lccc 9 vs gcc 8 instructions per iteration, and on
+/// tests/benchmark/programs/percpu_ptr_walk.c 10 vs 8.
+///
+/// Soundness, in the order the gates are checked:
+///
+/// * The folded `add MEM, %B` reads MEM at the LEA's position with nothing in
+///   between (the LEA must be the immediately following instruction), so the
+///   memory access and its trap behaviour are unchanged, and a segment-qualified
+///   MEM cannot be invalidated by an instruction in the window.
+/// * The LEA computes `%B + %T`; `add` is commutative and `add MEM, %B` writes
+///   the identical value into the identical register, so the renamed chain
+///   computes what the moved value computes.  A read of MEM's address
+///   registers inside the same instruction still sees their pre-fold values
+///   (x86 reads every source before writing a destination) — including the
+///   self-addressing `add (%B), %B` case.
+/// * `%T` is dead after the LEA (its only use was the add), so dropping its
+///   definition cannot be observed.
+/// * `%B` is dead after the LEA: its value has been consumed, so the result may
+///   be written back into it.  Every use of `%S` is then renamed to `%B` until
+///   `%S` dies; the scan aborts if any visited instruction writes `%B` without
+///   mentioning `%S` (the rename would feed it a wrong value) or is a barrier,
+///   a label, an opaque `ALL_GPR` writer, or further away than `MAX_GAP`.
+/// * The first window instruction must be a full flag clobber (see
+///   [`LEA_FOLD_FLAG_CLOBBER`]): `lea` writes no flags while `add` does, and
+///   this instruction kills every arithmetic flag before any reader can see
+///   the difference.
+pub(super) fn fuse_load_into_lea_add(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut lv = FileLiveness::new(store, infos);
+    let mut changed = false;
+    // Frame setup detection (see the frame-register guard below): any
+    // `movq %rsp, %rbp` in the file means %rbp may be the frame base here.
+    let frame_pointer_in_use = {
+        let mut found = false;
+        for n in 0..len {
+            if infos[n].is_nop() {
+                continue;
+            }
+            let t = infos[n].trimmed(store.get(n));
+            if t.starts_with("movq %rsp, %rbp") {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let load = infos[i].trimmed(store.get(i)).to_string();
+        let Some((load_q, mem, t_fam)) = parse_memory_load(&load) else {
+            i += 1;
+            continue;
+        };
+        let j = next_insn(infos, i + 1, len);
+        if j >= len || infos[j].pinned || !matches!(infos[j].kind, LineKind::Other { .. }) {
+            i += 1;
+            continue;
+        }
+        let cons = infos[j].trimmed(store.get(j)).to_string();
+        let Some((lea_q, base_fam, idx_fam, dst_fam)) = parse_lea_add(&cons) else {
+            i += 1;
+            continue;
+        };
+        if lea_q != load_q
+            || idx_fam != t_fam
+            || base_fam == t_fam
+            || dst_fam == t_fam
+            || dst_fam == base_fam
+        {
+            i += 1;
+            continue;
+        }
+        // Frame-register guard.  The rewrite writes the sum into `%B` and
+        // renames the chain onto it, so `%B` must be a plain VALUE home.
+        // `%rsp` is never one — no allocator pool contains PhysReg 4
+        // (X86_CALLEE_SAVED/WITH_RBP are 1..=6, the caller-saved set 10..=16,
+        // APX 40..=55, and RSP is not among them) — but a `leaq (%rsp,%t,1)`
+        // can still appear while *computing* an address (alloca plus a runtime
+        // index), and folding THAT would corrupt the stack pointer for every
+        // later stack access.  `%rbp` is a value home only when the frame
+        // pointer is omitted, so it is refused whenever this file contains a
+        // frame setup (`movq %rsp, %rbp`); the check is per file and costs one
+        // store scan, and refusing only loses the fold in the mixed case.
+        if base_fam == 4 || (base_fam == 5 && frame_pointer_in_use) {
+            i += 1;
+            continue;
+        }
+        if lv.live_after(j, t_fam) != Some(false) || lv.live_after(j, base_fam) != Some(false) {
+            i += 1;
+            continue;
+        }
+        // The renamed chain must start at the very next instruction, and that
+        // instruction must kill every flag the inserted `add` could disturb.
+        let k = next_insn(infos, j + 1, len);
+        if k >= len || infos[k].pinned || !is_window_kind(infos[k].kind) {
+            i += 1;
+            continue;
+        }
+        let dst_bit = 1u16 << dst_fam;
+        let base_bit = 1u16 << base_fam;
+        if infos[k].reg_refs & dst_bit == 0 || infos[k].reg_refs & base_bit != 0 {
+            i += 1;
+            continue;
+        }
+        let k_text = infos[k].trimmed(store.get(k)).to_string();
+        if !is_full_flag_clobber(&k_text) {
+            i += 1;
+            continue;
+        }
+        // Collect the rename: every mention of %S from k until %S dies.
+        let mut rename: Vec<(usize, String)> = Vec::new();
+        let mut n = k;
+        let mut steps = 0usize;
+        let last = loop {
+            if n >= len || infos[n].pinned || !is_window_kind(infos[n].kind) {
+                break None;
+            }
+            let text = infos[n].trimmed(store.get(n)).to_string();
+            let written = may_write_families(&text, &infos[n]);
+            if written == ALL_GPR {
+                break None;
+            }
+            // A write to %B that does not come from the renamed value would
+            // make later renamed reads observe it.
+            if written & base_bit != 0 && infos[n].reg_refs & dst_bit == 0 {
+                break None;
+            }
+            if infos[n].reg_refs & dst_bit != 0 {
+                let Some(new_text) = rename_family(&text, dst_fam, base_fam) else {
+                    break None;
+                };
+                rename.push((n, new_text));
+            }
+            match lv.live_after(n, dst_fam) {
+                Some(false) => break Some(n),
+                Some(true) => {}
+                None => break None,
+            }
+            steps += 1;
+            if steps > MAX_GAP {
+                break None;
+            }
+            n = next_insn(infos, n + 1, len);
+        };
+        let Some(last) = last else {
+            i += 1;
+            continue;
+        };
+        let width = if load_q { 0 } else { 1 };
+        let suffix = if load_q { "q" } else { "l" };
+        let new_line = format!(
+            "    add{suffix} {mem}, {}",
+            REG_NAMES[width][base_fam as usize]
+        );
+        mark_nop(&mut infos[i]);
+        replace_line(store, &mut infos[j], j, new_line);
+        for (idx, text) in rename {
+            replace_line(store, &mut infos[idx], idx, format!("    {text}"));
+        }
+        lv.refresh_span(store, infos, i, last);
+        changed = true;
+        i = last + 1;
     }
     changed
 }
@@ -1270,6 +1563,124 @@ mod tests {
         );
         let out = body(&run(&asm, fuse_load_into_alu));
         assert!(has(&out, "addq tbl(%rip), %rdx"), "{out:?}");
+    }
+
+    #[test]
+    fn fuses_segment_qualified_load_into_alu() {
+        // The per-CPU shape `this_cpu_ptr(p)->b` in an accumulator:
+        // `movq %gs:8(%rsi), %rax; addq %rax, %r8` is one instruction and one
+        // live GPR more than GCC's `addq %gs:8(%rsi), %r8`.
+        let asm = format!(
+            "{PRO}    movq %gs:8(%rsi), %rax\n    addq %rax, %r8\n    movq %r8, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "addq %gs:8(%rsi), %r8"), "{out:?}");
+        assert!(!out.iter().any(|l| l.starts_with("movq %gs:")), "{out:?}");
+    }
+
+    #[test]
+    fn fuses_segment_qualified_cmp_mirror_and_case_insensitive_prefix() {
+        // Direct form: the loaded scratch is the cmp SOURCE (`cmpl %ecx, %esi`
+        // computes `%esi - %ecx`), and the folded `cmpl {mem}, %esi` keeps the
+        // operand roles — the pre-existing non-segment twin folds identically.
+        let asm = format!(
+            "{PRO}    movl %gs:8(%rdi), %ecx\n    cmpl %ecx, %esi\n    setl %al\n    movzbl %al, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "cmpl %gs:8(%rdi), %esi"), "{out:?}");
+        // Mirror form: the loaded scratch is the cmp DESTINATION slot — the
+        // only slot cmp may take a memory operand in besides the left one —
+        // and the prefix travels with it.  (The kill below is what the
+        // file-liveness proof needs; the plain twin folds identically, so the
+        // override changes nothing about the decision.)
+        for mem in ["8(%rdi)", "%gs:8(%rdi)"] {
+            let asm = format!(
+                "{PRO}    movl {mem}, %edx\n    cmpl %edi, %edx\n    movl %ecx, %edx\n{EPI}"
+            );
+            let out = body(&run(&asm, fuse_load_into_alu));
+            assert!(has(&out, &format!("cmpl %edi, {mem}")), "{mem}: {out:?}");
+        }
+        // The shared validator is case-insensitive, exactly like the
+        // integrated assembler.
+        let asm = format!(
+            "{PRO}    movq %GS:8(%rsi), %rax\n    addq %rax, %r8\n    movq %r8, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "addq %GS:8(%rsi), %r8"), "{out:?}");
+    }
+
+    #[test]
+    fn fuses_segment_qualified_immediate_cmp_and_bmi_andn() {
+        // Immediate mirror: `cmpl $I, %T` folds to `cmpl $I, MEM` (the 83/81
+        // /7 encoding), and the segment prefix rides along.
+        let asm = format!(
+            "{PRO}    movl %gs:8(%rdi), %edx\n    cmpl $25, %edx\n    movl %ecx, %edx\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "cmpl $25, %gs:8(%rdi)"), "{out:?}");
+        // BMI three-operand form: `andn %T, %S, %D` takes the memory operand in
+        // its AT&T-first (r/m) slot; the prefix rides along here too.
+        let asm = format!(
+            "{PRO}    movq %gs:8(%rdi), %rbp\n    andnq %rbp, %rax, %rcx\n    movq %r8, %rbp\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "andnq %gs:8(%rdi), %rax, %rcx"), "{out:?}");
+    }
+
+    #[test]
+    fn segment_qualified_fold_requires_adjacency() {
+        // A segment-qualified operand is re-read at the consumer, and any
+        // instruction in between could rebase FS/GS (`wrfsbase`, `wrmsr`,
+        // `swapgs`); it folds only when nothing can sit in between.  The
+        // DS-relative twin keeps its gap tolerance.
+        let asm = format!(
+            "{PRO}    movq %fs:8(%rsi), %rax\n    movl %edx, %edx\n    addq %rax, %r8\n    movq %r8, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movq %fs:8(%rsi), %rax"), "{out:?}");
+        assert!(has(&out, "addq %rax, %r8"), "{out:?}");
+        let asm = format!(
+            "{PRO}    movq 8(%rsi), %rax\n    movl %edx, %edx\n    addq %rax, %r8\n    movq %r8, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "addq 8(%rsi), %r8"), "{out:?}");
+    }
+
+    #[test]
+    fn copy_bridged_segment_fold_requires_adjacency_too() {
+        // The copy-bridged form moves the memory operand to the OP's line, so
+        // with any instruction between the copy and the op the operand would
+        // be re-read at a different distance — the same rebase hazard the
+        // direct form vetoes.  A register-only gap (here a `movl` that writes
+        // no address family and touches no memory) is exactly the case that
+        // would slip through a missing guard.
+        // `xorl %eax, %eax` retires the loaded value so deadness is proven and
+        // the distance guard is the only thing that can refuse the fold.
+        let asm = format!(
+            "{PRO}    movq %gs:8(%rdi), %rax\n    movq %rax, %rbp\n    movl %edx, %edx\n    addq %rsi, %rbp\n    xorl %eax, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movq %gs:8(%rdi), %rax"), "{out:?}");
+        assert!(has(&out, "addq %rsi, %rbp"), "{out:?}");
+        // Adjacent (gap2 == 0): the copy is the only line between the load and
+        // the op, and a register-to-register mov cannot rebase a segment.
+        let asm = format!(
+            "{PRO}    movq %gs:8(%rdi), %rax\n    movq %rax, %rbp\n    addq %rsi, %rbp\n    xorl %eax, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "addq %gs:8(%rdi), %rbp"), "{out:?}");
+    }
+
+    #[test]
+    fn malformed_segment_prefix_still_refused() {
+        // `%gss:` is not one of the six segment registers: the operand stays a
+        // load, and nothing may fold it into the consumer.
+        let asm = format!(
+            "{PRO}    movq %gss:8(%rsi), %rax\n    addq %rax, %r8\n    movq %r8, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movq %gss:8(%rsi), %rax"), "{out:?}");
+        assert!(has(&out, "addq %rax, %r8"), "{out:?}");
     }
 
     #[test]
@@ -2265,5 +2676,142 @@ mod zec_tests {
             "f:\n    movl (%rcx), %r8d\n    movl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    jne .L16\n",
         );
         assert!(has(&out, "cmpl %r9d, %r8d"), "{out:?}");
+    }
+}
+
+/// Focused tests for [`fuse_load_into_lea_add`] (the "lea-inplace" fold):
+/// `mov MEM,%t; leaq (%B,%t,1),%S` -> `add MEM,%B` with the `%S` consumer chain
+/// renamed onto `%B`.
+///
+/// The template is the shape the register allocator really emits for a
+/// loop-carried accumulator it could not keep in place: the sum is built in a
+/// fresh register `%S` and written back to `%B` by the final `leaq`.  That
+/// write-back is what makes `%B` provably dead right after the LEA, which is
+/// the guard the fold needs.  It is also why the fold is worth having: with it
+/// the loop body loses one instruction and one live register —
+/// `tests/benchmark/programs/percpu_ptr_walk.c` and `tw.c` both drop from 9 to
+/// 8 instructions per iteration.
+#[cfg(test)]
+mod lea_fold_tests {
+    use super::*;
+
+    /// The folding template, parameterised by the two lines under test.
+    fn tmpl(load: &str, lea: &str, extra: &str) -> String {
+        format!(
+            "    .text\n    .globl f\n    .type f, @function\nf:\n    .cfi_startproc\n{extra}    xorl %edx, %edx\n.LBB1:\n    testq %rdi, %rdi\n    je .LBB3\n.LBB2:\n    {load}\n    {lea}\n    xorq 16(%rdi), %r11\n    movq (%rdi), %r9\n    andq $7, %r9\n    leaq (%r11,%r9,1), %rdx\n    movq 24(%rdi), %rdi\n    testq %rdi, %rdi\n    jne .LBB2\n.LBB3:\n    movq %rdx, %rax\n    ret\n    .cfi_endproc\n    .size f, .-f\n"
+        )
+    }
+
+    fn run(asm: &str) -> Vec<String> {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        fuse_load_into_lea_add(&mut store, &mut infos);
+        store
+            .build_result(|i| infos[i].is_nop())
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    fn has(out: &[String], needle: &str) -> bool {
+        out.iter().any(|l| l == needle)
+    }
+
+    fn plain() -> String {
+        tmpl("movq 8(%rdi), %r9", "leaq (%rdx,%r9,1), %r11", "")
+    }
+
+    #[test]
+    fn folds_the_lea_inplace_step_and_renames_the_chain() {
+        let out = run(&plain());
+        // The load is gone; the accumulator doubles as the base and the whole
+        // consumer chain is renamed onto it.
+        assert!(has(&out, "addq 8(%rdi), %rdx"), "{out:?}");
+        assert!(has(&out, "xorq 16(%rdi), %rdx"), "{out:?}");
+        assert!(has(&out, "leaq (%rdx,%r9,1), %rdx"), "{out:?}");
+        assert!(!out.iter().any(|l| l.contains("%r11")), "{out:?}");
+    }
+
+    #[test]
+    fn folds_a_segment_qualified_load() {
+        // The per-CPU spelling: the folded ALU op takes the `%gs:` memory
+        // operand whole, so the scratch load disappears entirely.
+        let out = run(&tmpl(
+            "movq %gs:8(%rdi), %r9",
+            "leaq (%rdx,%r9,1), %r11",
+            "",
+        ));
+        assert!(has(&out, "addq %gs:8(%rdi), %rdx"), "{out:?}");
+        assert!(!out.iter().any(|l| l.starts_with("movq %gs:")), "{out:?}");
+    }
+
+    #[test]
+    fn refuses_when_the_next_instruction_cannot_carry_the_flags() {
+        // The inserted `add` clobbers EFLAGS; the instruction that consumes the
+        // renamed value must be a full clobber itself (`leaq` is flag-neutral
+        // and would silently re-read the pre-fold flags).
+        let asm = plain().replace("xorq 16(%rdi), %r11", "leaq 16(%rdi), %r11");
+        let out = run(&asm);
+        assert!(has(&out, "leaq (%rdx,%r9,1), %r11"), "{out:?}");
+        assert!(
+            !out.iter().any(|l| l.starts_with("addq 8(%rdi)")),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn refuses_when_the_load_destination_is_live_after_the_lea() {
+        // `%r8` (the scratch) escapes to the exit block: the load cannot be
+        // folded away because the value is still needed.
+        let asm = plain()
+            .replace("movq 8(%rdi), %r9", "movq 8(%rdi), %r8")
+            .replace("leaq (%rdx,%r9,1), %r11", "leaq (%rdx,%r8,1), %r11")
+            .replace("movq %rdx, %rax", "addq %r8, %rdx\n    movq %rdx, %rax");
+        let out = run(&asm);
+        assert!(has(&out, "leaq (%rdx,%r8,1), %r11"), "{out:?}");
+    }
+
+    #[test]
+    fn refuses_when_the_base_is_not_dead_after_the_lea() {
+        // Drop the write-back: `%rdx` now flows to the exit unmodified, so the
+        // `add` would destroy a live value.
+        let asm = plain().replace("    leaq (%r11,%r9,1), %rdx\n", "");
+        let out = run(&asm);
+        assert!(has(&out, "leaq (%rdx,%r9,1), %r11"), "{out:?}");
+    }
+
+    #[test]
+    fn refuses_frame_register_bases() {
+        // `%rsp` is never a value home: a `leaq (%rsp,%t,1)` builds an address
+        // and folding it would clobber the stack pointer.
+        let sp = tmpl("movq 8(%rdi), %r9", "leaq (%rsp,%r9,1), %r11", "");
+        let out = run(&sp);
+        assert!(has(&out, "leaq (%rsp,%r9,1), %r11"), "{out:?}");
+        // `%rbp` is a value home only in frame-pointer-omitting functions.
+        let bp_fp = tmpl(
+            "movq 8(%rdi), %r9",
+            "leaq (%rbp,%r9,1), %r11",
+            "    movq %rsp, %rbp\n",
+        );
+        let out = run(&bp_fp);
+        assert!(has(&out, "leaq (%rbp,%r9,1), %r11"), "{out:?}");
+        // …and folds when the frame pointer really is absent (the relay has to
+        // write `%rbp` back, exactly as it writes `%rdx` in the template).
+        let bp_fpo = tmpl("movq 8(%rdi), %r9", "leaq (%rbp,%r9,1), %r11", "")
+            .replace("leaq (%r11,%r9,1), %rdx", "leaq (%r11,%r9,1), %rbp")
+            .replace("movq %rdx, %rax", "movq %rbp, %rax");
+        let out = run(&bp_fpo);
+        assert!(has(&out, "addq 8(%rdi), %rbp"), "{out:?}");
+    }
+
+    #[test]
+    fn refuses_a_width_mismatch_between_load_and_lea() {
+        // A 32-bit load with a 64-bit LEA would add a partially-defined value.
+        let asm = tmpl("movl 8(%rdi), %r9d", "leaq (%rdx,%r9,1), %r11", "");
+        let out = run(&asm);
+        assert!(has(&out, "leaq (%rdx,%r9,1), %r11"), "{out:?}");
     }
 }

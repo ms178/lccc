@@ -1232,6 +1232,110 @@ int main(void) {
     return fails;
 }
     ''', [], None),
+
+    # ── Segment address space: base-register retention ──────────────────
+    # Regression (miscompile, -O2 hang): the link-time-constant address map
+    # (backend/generation.rs `const_addr_vals`) treated a LOOP-CARRIED value
+    # as a constant because its preheader definition was `Copy(Const 0)`,
+    # pinning the segment pointer to 0; every field access then emitted the
+    # direct `movq %gs:8` form with the base register DROPPED and the walk
+    # never reached its terminator.  gcc: 526832.
+    ("seg_loop_carried_ptr_base", r'''
+#include <stdio.h>
+#include <stdint.h>
+
+#define CHAIN 16U
+#define END_OFF ((unsigned long)(CHAIN * sizeof (struct node)))
+
+struct node { unsigned long hits, miss, next; };
+
+static struct node nodes[CHAIN] __attribute__((aligned(64)));
+
+static long
+set_gs_base (void *base)
+{
+  register long code __asm__ ("rdi") = 0x1001;   /* ARCH_SET_GS */
+  register void *addr __asm__ ("rsi") = base;
+  register long nr __asm__ ("rax") = 158;        /* SYS_arch_prctl */
+  __asm__ volatile ("syscall" : "+r" (nr) : "r" (code), "r" (addr)
+                    : "rcx", "r11", "memory");
+  return nr;
+}
+
+__attribute__((noinline)) static unsigned long
+walk (unsigned long start_off)
+{
+  unsigned long acc = 0;
+  unsigned long off = start_off;          /* literal 0 at the call site */
+  while (off != END_OFF)
+    {
+      struct node __seg_gs *p = (struct node __seg_gs *)(uintptr_t)off;
+      acc += p->hits;
+      acc ^= p->miss;
+      off = p->next;
+    }
+  return acc;
+}
+
+int
+main (void)
+{
+  if (set_gs_base (nodes) != 0)
+    { printf ("seg-loop-carried-ptr: no-gs\\n"); return 0; }
+  for (unsigned i = 0; i < CHAIN; i++)
+    {
+      nodes[i].hits = (i * 2654435761UL) & 0xffff;
+      nodes[i].miss = (i * 40503UL) & 0xff;
+      nodes[i].next = (i + 1 < CHAIN)
+                        ? (unsigned long)((i + 1) * sizeof (nodes[0]))
+                        : END_OFF;
+    }
+  printf ("seg-loop-carried-ptr: %lu\\n", walk (0));
+  return 0;
+}
+    ''', [], None),
+
+    # ── Segment address space: object storage vs pointee ────────────────
+    # Regression (miscompile): the storage slot was filled from
+    # `decl.address_space` unconditionally, so an array whose POINTER came
+    # from the declarator (`int __seg_gs *arr[4]`) became a segment-relative
+    # OBJECT: every element access read `%gs:arr+8(%rip)` (segment base +
+    # symbol offset) instead of `arr+8(%rip)`.  Both the element load and
+    # the pointee dereference are exercised: gcc prints `deref 90 plain 60`.
+    ("seg_ptr_array_storage", r'''
+#include <stdio.h>
+#include <stdint.h>
+
+/* The GS base sits 4096 bytes INTO this object, so gs-relative offset X and
+   the plain address &gs_storage + X are different addresses: a dropped or
+   spurious %gs: prefix changes the observed value. */
+static unsigned char gs_storage[8192] __attribute__((aligned(64)));
+static int __seg_gs *arr[4];
+
+static long
+set_gs_base (void *base)
+{
+  register long code __asm__ ("rdi") = 0x1001;
+  register void *addr __asm__ ("rsi") = base;
+  register long nr __asm__ ("rax") = 158;
+  __asm__ volatile ("syscall" : "+r" (nr) : "r" (code), "r" (addr)
+                    : "rcx", "r11", "memory");
+  return nr;
+}
+
+int
+main (void)
+{
+  if (set_gs_base (gs_storage + 4096) != 0)
+    { printf ("seg-ptr-array-storage: no-gs\\n"); return 0; }
+  gs_storage[4096 + 64] = 0x5a;   /* gs-relative 64, the real target      */
+  gs_storage[64] = 0x3c;          /* decoy a dropped %gs: prefix reads    */
+  arr[2] = (int __seg_gs *)(uintptr_t)64;
+  printf ("seg-ptr-array-storage: deref %d plain %d\\n", *arr[2],
+          gs_storage[64]);
+  return 0;
+}
+    ''', [], None),
 ]
 
 # Multi-file test (handled specially)

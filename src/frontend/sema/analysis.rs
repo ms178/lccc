@@ -274,6 +274,7 @@ impl SemanticAnalyzer {
             name: func.name.clone(),
             ty: func_ctype,
             explicit_alignment: None,
+            address_space: AddressSpace::Default,
         });
 
         // Analyze the body in its own scope, with its own return type.
@@ -286,6 +287,7 @@ impl SemanticAnalyzer {
                     name: name.clone(),
                     ty,
                     explicit_alignment: None,
+                    address_space: AddressSpace::Default,
                 });
             }
         }
@@ -349,6 +351,7 @@ impl SemanticAnalyzer {
             name: func.name.clone(),
             ty: func_ctype,
             explicit_alignment: None,
+            address_space: AddressSpace::Default,
         });
 
         // Push scope for function body (both symbol table and type context,
@@ -367,6 +370,7 @@ impl SemanticAnalyzer {
                     name: name.clone(),
                     ty,
                     explicit_alignment: None,
+                    address_space: AddressSpace::Default,
                 });
             }
         }
@@ -637,7 +641,24 @@ impl SemanticAnalyzer {
             // Lowering applies the same rule (stmt.rs / global_decl.rs); sema must
             // agree or every expression naming this object is typed generic and
             // a correct call is rejected as an address-space mismatch.
-            type_builder::apply_declaration_address_space(&mut full_type, decl.address_space);
+            // The space belongs to the OBJECT's storage only when no pointer in
+            // the declarator absorbed it; a pointer declarator makes it a
+            // qualifier on the pointee instead (see the function's contract).
+            //
+            // The procedural rule (`apply_declaration_address_space_for_object`):
+            // a pointer from the TYPE SPECIFIER — a typedef or `typeof` name,
+            // the kernel's `DEFINE_PER_CPU(type, name)` spelling — never
+            // absorbs, so `typeof(obj)` stays plain and `&obj` carries the
+            // segment exactly as gcc models it (drivers/base/cacheinfo.c).
+            type_builder::apply_declaration_address_space_for_object(
+                &mut full_type,
+                decl.address_space,
+                &init_decl.derived,
+            );
+            // Storage space: the shared complement of the call above (single
+            // predicate, so sema and lowering can never disagree).
+            let object_address_space =
+                type_builder::object_storage_address_space(decl.address_space, &init_decl.derived);
 
             // Resolve incomplete array sizes from initializers (e.g., int arr[] = {1,2,3})
             // This must happen before storing the symbol so sizeof(arr) works in
@@ -761,6 +782,7 @@ impl SemanticAnalyzer {
                 name: init_decl.name.clone(),
                 ty: full_type,
                 explicit_alignment,
+                address_space: object_address_space,
             });
             if links && !self.symbol_table.at_file_scope() {
                 self.symbol_table.mark_linked(&init_decl.name);
@@ -1016,6 +1038,7 @@ impl SemanticAnalyzer {
                 name: variant.name.clone(),
                 ty: sym_ty,
                 explicit_alignment: None,
+                address_space: AddressSpace::Default,
             });
             self.enum_counter += 1;
         }
@@ -2978,11 +3001,26 @@ fn function_types_compatible(a: &FunctionType, b: &FunctionType) -> bool {
 /// Compatibility of two pointed-to types (C23 6.7.6.1p2). Recurses through
 /// pointer and array chains, which is what makes `struct S **` an error too
 /// rather than only the single-level case.
+/// An enumeration and the integer type it is compatible with (C11 6.7.2.2p4),
+/// in either direction. Pointer-to-enum and pointer-to-that-integer are
+/// pointers to compatible types, which is what makes the kernel's
+/// `lookup_address(addr, &level)` — `unsigned int *` parameter, `enum pg_level`
+/// argument — a valid call for GCC under -Werror=incompatible-pointer-types.
+fn enum_matches_integer(a: &CType, b: &CType) -> bool {
+    match (a, b) {
+        (CType::Enum(e), other) | (other, CType::Enum(e)) => *other == e.compatible_ctype(),
+        _ => false,
+    }
+}
+
 fn pointee_compat(from: &CType, to: &CType) -> PtrCompat {
     if from == to {
         return PtrCompat::Compatible;
     }
     if same_scalar_modulo_sign(from, to) {
+        return PtrCompat::Compatible;
+    }
+    if enum_matches_integer(from, to) {
         return PtrCompat::Compatible;
     }
     match (from, to) {
@@ -3240,7 +3278,7 @@ mod record_layouts_correspond_tests {
 #[cfg(test)]
 mod pointer_argument_compat_tests {
     use super::{PtrCompat, function_types_compatible, pointee_compat, pointer_argument_compat};
-    use crate::common::types::{AddressSpace, CType, FunctionType};
+    use crate::common::types::{AddressSpace, CType, EnumType, FunctionType};
     use std::rc::Rc;
 
     fn ptr(t: CType) -> CType {
@@ -3523,6 +3561,58 @@ mod pointer_argument_compat_tests {
         );
         assert_eq!(
             pointer_argument_compat(&segfs(CType::Int), &segfs(CType::Int)),
+            PtrCompat::Compatible
+        );
+    }
+
+    #[test]
+    fn enum_is_compatible_with_its_underlying_integer_pointer() {
+        // C11 6.7.2.2p4 + GCC's choice: an all-non-negative enum is compatible
+        // with `unsigned int`. The kernel relies on it:
+        // arch/x86/mm/pat/set_memory.c passes `enum pg_level *` where
+        // `unsigned int *` is expected, and GCC accepts that under
+        // -Werror=incompatible-pointer-types.
+        let pg_level_ty = EnumType {
+            name: Some("pg_level".to_string()),
+            variants: vec![
+                ("PG_LEVEL_NONE".to_string(), 0),
+                ("PG_LEVEL_4K".to_string(), 1),
+                ("PG_LEVEL_2M".to_string(), 2),
+                ("PG_LEVEL_1G".to_string(), 3),
+            ],
+            is_packed: false,
+        };
+        assert_eq!(pg_level_ty.compatible_ctype(), CType::UInt);
+        let pg_level = CType::Enum(pg_level_ty);
+        assert_eq!(
+            pointee_compat(&pg_level, &CType::UInt),
+            PtrCompat::Compatible
+        );
+        assert_eq!(
+            pointee_compat(&CType::UInt, &pg_level),
+            PtrCompat::Compatible
+        );
+        // ... and the full argument check follows from that.
+        assert_eq!(
+            pointer_argument_compat(
+                &CType::Pointer(Box::new(pg_level.clone()), AddressSpace::Default),
+                &CType::Pointer(Box::new(CType::UInt), AddressSpace::Default)
+            ),
+            PtrCompat::Compatible
+        );
+        // A negative enumerator makes the compatible type `int`, so the
+        // unsigned form must NOT be accepted for that enum.
+        let signed_enum = CType::Enum(EnumType {
+            name: Some("signed_e".to_string()),
+            variants: vec![("A".to_string(), -1), ("B".to_string(), 0)],
+            is_packed: false,
+        });
+        assert_eq!(
+            pointee_compat(&signed_enum, &CType::UInt),
+            PtrCompat::Incompatible
+        );
+        assert_eq!(
+            pointee_compat(&signed_enum, &CType::Int),
             PtrCompat::Compatible
         );
     }

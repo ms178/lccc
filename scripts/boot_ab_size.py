@@ -90,7 +90,7 @@ def compile_arm(cc: str, cflags: list[str], cppflags: list[str], files: list[str
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--kernel", default=os.environ.get("KERNEL_DIR", "/opt/kwork/linux-6.18.52"))
+    ap.add_argument("--kernel", default=os.environ.get("KERNEL_DIR", "/opt/kwork/linux-6.18.55"))
     ap.add_argument("--a", required=True, help="baseline lccc binary")
     ap.add_argument("--b", required=True, help="candidate lccc binary")
     ap.add_argument("--a-env", default="", help="KEY=V[,KEY=V] for arm A")

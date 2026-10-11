@@ -783,13 +783,17 @@ fn retain_ptr_only_uses(func: &IrFunction, map: &mut FxHashMap<u32, GepFoldInfo>
         for block in &func.blocks {
             for inst in &block.instructions {
                 match inst {
-                    Instruction::Load {
-                        ptr,
-                        ty,
-                        seg_override,
-                        ..
-                    } => {
-                        if !is_foldable_mem_ty(*ty) || *seg_override != AddressSpace::Default {
+                    Instruction::Load { ptr, ty, .. } => {
+                        // A segment-overridden load is a foldable consumer of a
+                        // constant-offset GEP: generate_load folds the offset
+                        // into the `%gs:`/`%fs:` operand when the base is
+                        // register-held and rebuilds the address through
+                        // emit_gep otherwise. Keeping the candidate here is
+                        // what lets `getp()->field` compile to a single
+                        // `movq %gs:8(%rax), %rax` instead of lea + indirect
+                        // load. Stores stay marked below: they have no
+                        // displacement fold yet and still need a real address.
+                        if !is_foldable_mem_ty(*ty) {
                             mark(ptr.0);
                         }
                     }
@@ -4498,6 +4502,35 @@ fn generate_function(
     // glibc's THREAD_SELF/GETMEM/SETMEM all funnel through this shape, and
     // the register-indirect fallback costs 3 instructions per access.
     let const_addr_vals: FxHashMap<u32, i64> = {
+        // SSA-soundness guard (miscompile: per-CPU pointer walk at -O2).  A
+        // value defined MORE THAN ONCE in the function is not a link-time
+        // constant, even when one of its definitions copies a constant.  The
+        // phi-eliminated loop-carried pointer is exactly that shape: the
+        // preheader definition is `Copy(Const 0)` — a segment-relative walk
+        // that starts at offset 0, a NULL-terminated-ish chain, any
+        // accumulation reset — while the latch definition copies the value
+        // loaded from the previous node (`off = p->next`, the `Load` result).
+        // The scan below runs in BLOCK ORDER and only ever grows the map, so
+        // whichever arm it visits first wins for the whole function: with the
+        // preheader first, the pointer was pinned to 0, `generate_load` took
+        // the direct-address arm (`emit_seg_load_const_addr`), and every field
+        // access became `movq %gs:8` / `%gs:16` — the base register dropped
+        // because the address was "constant".  The loop then never reached
+        // its terminator (reduced: `unsigned long walk(unsigned long off)` over
+        // `struct node __seg_gs *p = (struct node __seg_gs *)off;` with the
+        // caller passing a literal 0 hangs at -O2, correct at -O0/-O1 and in
+        // gcc; `tests/benchmark/programs/percpu_ptr_walk.c`).  Counting
+        // definitions first makes the map a genuine per-value constant set.
+        let mut def_counts: FxHashMap<u32, u32> = FxHashMap::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Some(d) = inst.dest() {
+                    *def_counts.entry(d.0).or_insert(0) += 1;
+                }
+            }
+        }
+        let single_def =
+            |v: &Value, def_counts: &FxHashMap<u32, u32>| def_counts.get(&v.0).copied() == Some(1);
         let mut m: FxHashMap<u32, i64> = FxHashMap::default();
         let as_const = |op: &Operand, m: &FxHashMap<u32, i64>| -> Option<i64> {
             match op {
@@ -4509,21 +4542,28 @@ fn generate_function(
             for inst in &block.instructions {
                 match inst {
                     Instruction::Copy { dest, src } => {
-                        if let Some(v) = as_const(src, &m) {
-                            m.insert(dest.0, v);
+                        if single_def(dest, &def_counts) {
+                            if let Some(v) = as_const(src, &m) {
+                                m.insert(dest.0, v);
+                            }
                         }
                     }
                     Instruction::Cast { dest, src, .. } => {
-                        if let Some(v) = as_const(src, &m) {
-                            m.insert(dest.0, v);
+                        if single_def(dest, &def_counts) {
+                            if let Some(v) = as_const(src, &m) {
+                                m.insert(dest.0, v);
+                            }
                         }
                     }
                     Instruction::GetElementPtr {
                         dest, base, offset, ..
                     } => {
-                        if let (Some(b), Some(o)) = (m.get(&base.0).copied(), as_const(offset, &m))
-                        {
-                            m.insert(dest.0, b.wrapping_add(o));
+                        if single_def(dest, &def_counts) {
+                            if let (Some(b), Some(o)) =
+                                (m.get(&base.0).copied(), as_const(offset, &m))
+                            {
+                                m.insert(dest.0, b.wrapping_add(o));
+                            }
                         }
                     }
                     _ => {}
@@ -6364,8 +6404,28 @@ fn generate_load(
                 return;
             }
         }
-        // If the GlobalAddr/GEP was skipped as dead, rematerialize first.
+        // Constant GEP offset on the segment pointer: fold the displacement
+        // into the `%gs:`/`%fs:` operand (`movq %gs:8(%rax), %rax`) instead of
+        // materialising base+offset into %rcx first.
+        //
+        // `can_const_addr_fold` is the same gate the GEP-skip used: it is true
+        // exactly when the producer was dropped and the base's live interval
+        // was extended to this point, which is what makes re-reading the base
+        // register here sound. When it is false the GEP was materialised
+        // normally and `rematerialize_const_addr` below is a no-op.
         if let Some(info) = gep_fold_map.get(&ptr.0) {
+            if !is_wide_int_type(ty)
+                && can_const_addr_fold(cg, info)
+                && cg.emit_seg_load_with_const_offset(
+                    dest,
+                    &info.base,
+                    info.offset,
+                    ty,
+                    seg_override,
+                )
+            {
+                return;
+            }
             rematerialize_const_addr(cg, ptr, info);
         } else if let Some(info) = indexed_gep_map.get(&ptr.0) {
             rematerialize_skipped_indexed(cg, ptr, info);

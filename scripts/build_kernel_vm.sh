@@ -21,7 +21,7 @@
 # ============================================================================
 set -euo pipefail
 
-K=${KERNEL_DIR:-/home/user/target/kernel-work/linux-6.18.52}
+K=${KERNEL_DIR:-/home/user/target/kernel-work/linux-6.18.55}
 LOG=${BUILD_LOG:-/tmp/kernel-build-lccc.log}
 # Resolve the script directory before `cd "$K"`: the fragment and the compiler
 # defaults must be found relative to THIS script, not to an absolute repo path
@@ -155,6 +155,19 @@ preflight_host_tools || exit 1
 # target product on compiler changes, but only link products on linker changes.
 "$SCRIPT_DIR/kernel_tool_identity.sh" "$K" "$LCCC" "$LCCC_LD"
 
+# ---- boot-path ISA contract --------------------------------------------------
+# arch/x86/boot/compressed/Makefile and the EFI-stub Makefile REPLACE
+# KBUILD_CFLAGS (they do not extend it), which discards the `-march=` that
+# arch/x86/Makefile derives from CONFIG_GENERIC_CPU/X86_64_VERSION.  GCC,
+# Clang and ICC default to the x86-64 baseline when `-march` is absent, so for
+# them the replacement is harmless; LCCC's documented default ISA is the
+# integer-v3 profile, so the same Makefile silently produced a BMI2
+# decompressor and the first `shrx` in early 64-bit startup was #UD -> triple
+# fault -> no serial output whatsoever.  That is what scripts/kernel_boot_isa.sh
+# fixes (idempotently, and only where the file already names `-march=i386` for
+# its 32-bit branch: naming the ISA per mode is the kernel's own idiom).
+"$SCRIPT_DIR/kernel_boot_isa.sh" patch "$K"
+
 start=$(date +%s)
 # Refresh include/config/auto.conf SERIALLY before the parallel build.  A
 # -j2 `bzImage` re-runs syncconfig as part of `prepare`, and when auto.conf
@@ -192,6 +205,12 @@ fi
 echo "build: SUCCESS in ${elapsed}s"
 ls -l arch/x86/boot/bzImage vmlinux
 size vmlinux
+
+# Measured half of the ISA contract: `patch` above fixes the FLAGS, this audits
+# the ARTIFACTS.  A per-object objdump scan (not the linked image: the stage-2
+# ELF carries the compressed payload, whose bytes are data, not instructions).
+"$SCRIPT_DIR/kernel_boot_isa.sh" scan \
+    arch/x86/boot arch/x86/boot/startup arch/x86/boot/compressed
 # The 32 KiB setup gate must hold for a bootable bzImage.
 # (mawk has no strtonum — convert via bash arithmetic.)
 while read -r hex; do

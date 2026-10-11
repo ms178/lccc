@@ -2733,14 +2733,28 @@ pub(super) fn fold_load_copy_relay(store: &mut LineStore, infos: &mut [LineInfo]
         let comma = rest.rfind(',')?;
         let mem = rest[..comma].trim();
         let dst = rest[comma + 1..].trim();
-        if !mem.contains('(') || mem.starts_with('%') || mem.contains('%') && !mem.contains('(') {
+        // A validated segment override (`%gs:8(%rsi)`) qualifies the address
+        // space and travels with the operand, so strip it and judge the
+        // address body; `*%gs:…`, `%gss:…` and lock/rep-prefixed spellings
+        // stay refused (the mnemonic table cannot produce the last one
+        // anyway).  This rewrite retargets the load's destination IN PLACE —
+        // it never re-reads memory at a later position — so, unlike the ALU
+        // fusion, it needs no adjacency requirement for segmented operands.
+        // `CCC_NO_SEG_OPERAND_FUSE=1` (shared with load_op_fuse) restores the
+        // pre-fusion refusal for A/B measurement.
+        let (_, body) = if std::env::var_os("CCC_NO_SEG_OPERAND_FUSE").is_some() {
+            ("", mem)
+        } else {
+            super::relay_and_lea::strip_segment_prefix(mem)
+        };
+        if !body.contains('(') || body.starts_with('%') || body.contains('%') && !body.contains('(')
+        {
             return None;
         }
         if !dst.starts_with('%') {
             return None;
         }
-        // Reject segment-prefixed and prefixed forms (lock/rep/bnd).
-        if t.contains('%') && mem.contains(':') {
+        if body.contains(':') {
             return None;
         }
         Some((mnem, mem, dst))
@@ -2891,10 +2905,20 @@ pub(super) fn fold_load_copy_relay(store: &mut LineStore, infos: &mut [LineInfo]
                         break;
                     }
                     if infos[k].reg_refs & (1u16 << load_fam) != 0 {
-                        // A pure write to the register family (dest-only) kills it.
-                        let writes = matches!(infos[k].kind, LineKind::Other { dest_reg } if dest_reg == load_fam);
-                        let reads_src = reg_names_family(load_fam).iter().any(|n| td.contains(n));
-                        if writes && !reads_src {
+                        // A FULL redefinition of the family kills the loaded
+                        // value; anything else (a read, a read-modify-write, a
+                        // store of the register, a byte/word partial write)
+                        // vetoes the fuse.  The authoritative predicate is the
+                        // same one relay elimination and the narrow-copy fold
+                        // use, so the three passes agree by construction.
+                        //
+                        // This replaces a `writes && !reads_src` test whose
+                        // `reads_src` half searched the whole line text for any
+                        // spelling of the family — including the destination —
+                        // and therefore never proved deadness for a line that
+                        // names the family at all; only the `LoadRbp`/`Pop`
+                        // fast paths above could fuse.
+                        if super::relay_and_lea::is_full_write(&infos[k], td, load_fam) {
                             dead = true;
                         }
                         break;
@@ -3024,6 +3048,69 @@ mod fold_load_copy_relay_tests {
             out[0].contains("%rbp"),
             "load retargeted to copy dest: {out:?}"
         );
+    }
+
+    /// A segment-qualified load relays exactly like a DS-relative one: the
+    /// rewrite retargets the load's destination IN PLACE (it never re-reads
+    /// memory at a later position), so the override travels with the operand
+    /// and `movq %gs:8(%rsi), %rax ; movq %rax, %r8` becomes
+    /// `movq %gs:8(%rsi), %r8`.
+    #[test]
+    fn fuses_segment_qualified_load_relay() {
+        let asm = "\
+    movq %gs:8(%rsi), %rax\n\
+    movq %rax, %r8\n\
+    movq 8(%rdi), %rax\n\
+";
+        let (changed, out) = run(asm);
+        assert!(changed, "segment relay should fuse");
+        assert!(
+            out[0].contains("%gs:8(%rsi), %r8"),
+            "load retargeted to the copy destination with the override intact: {out:?}"
+        );
+    }
+
+    /// `%gss:` is not one of the six segment registers — the operand must be
+    /// refused, not relayed with a bogus prefix.
+    #[test]
+    fn refuses_malformed_segment_prefix() {
+        let asm = "\
+    movq %gss:8(%rsi), %rax\n\
+    movq %rax, %r8\n\
+    movq 8(%rdi), %rax\n\
+";
+        let (changed, _) = run(asm);
+        assert!(!changed, "malformed segment prefix must not relay");
+    }
+
+    /// A full 64-bit redefinition of the loaded register through an ordinary
+    /// (non-stack) instruction kills the loaded value just like a stack load
+    /// does, so the relay fuses.
+    #[test]
+    fn fuses_when_family_is_redefined_by_a_plain_move() {
+        let asm = "\
+    movq %gs:8(%rsi), %rax\n\
+    movq %rax, %r8\n\
+    movq 8(%rdi), %rax\n\
+";
+        let (changed, out) = run(asm);
+        assert!(
+            changed,
+            "full redefinition should license the relay: {out:?}"
+        );
+    }
+
+    /// ...but a byte/word partial write leaves the upper bits observable and
+    /// must veto it.
+    #[test]
+    fn refuses_fuse_when_only_part_of_the_family_is_rewritten() {
+        let asm = "\
+    movq %gs:8(%rsi), %rax\n\
+    movq %rax, %r8\n\
+    movb %dl, %al\n\
+";
+        let (changed, _) = run(asm);
+        assert!(!changed, "partial write must not prove deadness");
     }
 
     /// Shifts reading %cl must veto a relay of a %rcx-family load.

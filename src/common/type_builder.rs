@@ -503,16 +503,28 @@ pub fn build_full_ctype_with_base(
 /// dereferences read absolute addresses (glibc TLS: `%fs:16`/`%fs:40`
 /// stack-guard loads compiled to NULL-page loads). Only direct
 /// `*(T __seg_fs *)N` casts survived, via TypeSpecifier::Pointer's own field.
-pub fn apply_declaration_address_space(ty: &mut CType, space: AddressSpace) {
+/// Returns `true` when the space was absorbed by a pointer's POINTEE, `false`
+/// when it was not consumed and therefore belongs to the declared object's own
+/// storage. The distinction is not cosmetic: for `T __seg_gs v;` the object `v`
+/// lives in the segment (`&v` is `__seg_gs T *`), but for `T __seg_gs *p;` the
+/// space qualifies the type *name* — GCC reads a named address space as a type
+/// qualifier, exactly like `const T *p` — so `p` is a pointer INTO the segment
+/// while the object `p` itself has default storage and `&p` is
+/// `__seg_gs T **` with a default-space outer pointer. Sema folds this return
+/// value into `Symbol::address_space`; getting it wrong double-applies the
+/// qualifier (observed as `have '__seg_gs __seg_gs unsigned long **'` on
+/// include/linux/percpu-refcount.h).
+pub fn apply_declaration_address_space(ty: &mut CType, space: AddressSpace) -> bool {
     if space == AddressSpace::Default {
-        return;
+        return false;
     }
     match ty {
         CType::Pointer(inner, sp) => {
             if matches!(inner.as_ref(), CType::Pointer(..)) {
-                apply_declaration_address_space(inner, space);
+                apply_declaration_address_space(inner, space)
             } else {
                 *sp = space;
+                true
             }
         }
         CType::Array(elem, _) => apply_declaration_address_space(elem, space),
@@ -522,6 +534,292 @@ pub fn apply_declaration_address_space(ty: &mut CType, space: AddressSpace) {
         // a plain pointer at every call site, so a correctly qualified argument
         // was rejected as "incompatible pointer type".
         CType::Function(ft) => apply_declaration_address_space(&mut ft.return_type, space),
-        _ => {}
+        // A plain object (or an array of plain objects): the data IS the object,
+        // so the space is the object's own storage and nothing absorbed it.
+        _ => false,
+    }
+}
+
+/// Whether the declarator itself supplies a pointer level (`*` or a
+/// function-pointer `(*f)`), as opposed to the pointer coming from the type
+/// specifier through a typedef or `typeof` name.
+///
+/// Measured against gcc 14.2 (see [`apply_declaration_address_space_for_object`]):
+/// this is the discriminator between the two spellings of a per-CPU object.
+pub fn declarator_supplies_pointer(derived: &[DerivedDeclarator]) -> bool {
+    derived.iter().any(|d| {
+        matches!(
+            d,
+            DerivedDeclarator::Pointer | DerivedDeclarator::FunctionPointer(_, _)
+        )
+    })
+}
+
+/// Declaration-level address space for an OBJECT declaration — the rule that
+/// decides between the pointee and the object's storage.
+///
+/// gcc applies the space to the type *as it stands at that point in the
+/// declaration*:
+///
+/// ```c
+/// typedef int *intp;
+/// static int        __seg_gs *p1;   /* declarator supplies `*`  */
+/// static __seg_gs   intp       p2;   /* specifier supplies `*`  */
+/// ```
+///
+/// * `p1`: the space qualifies the base type, so the declarator's `*` makes it
+///   `__seg_gs int *` — a pointer into the segment.  `typeof(p1)` is
+///   `__seg_gs int *`.  (Absorbed into the pointee: the existing rule.)
+/// * `p2`: the specifier's type is already `int *`; the space cannot qualify
+///   the pointee of a type it never touched, so gcc leaves the VALUE's type
+///   plain (`typeof(p2) == int *`) and the space qualifies the object's
+///   storage — `typeof(&p2) == __seg_gs int **`.
+///
+/// Linux's `DEFINE_PER_CPU(type, name)` is the second spelling
+/// (`__PCPU_ATTRS(sec) __typeof__(type) name`), and `per_cpu(var, cpu)`
+/// dereferences `PERCPU_PTR(&var)` — which is compiled as
+/// `(TYPEOF_UNQUAL(*(&var)) *)(unsigned long)(&var)`.  With the space on the
+/// pointee instead of the storage, that chain yields a `__seg_gs`-qualified
+/// pointer where gcc yields a plain one, and `device_unregister(per_cpu(...))`
+/// is rejected (drivers/base/cacheinfo.c).  Storage placement also makes the
+/// object's own reads/writes segment-relative, which is what the kernel means.
+///
+/// Returns whether the type absorbed the space (pointee placement). Callers
+/// that declare objects must use the result to set the object's storage space
+/// (see sema's `object_address_space` / the lowerer's `var.address_space`).
+pub fn apply_declaration_address_space_for_object(
+    ty: &mut CType,
+    space: AddressSpace,
+    derived: &[DerivedDeclarator],
+) -> bool {
+    if space == AddressSpace::Default {
+        return false;
+    }
+    if !declarator_supplies_pointer(derived) {
+        // The pointer level (if any) came from the specifier: the space is the
+        // object's storage and the value's type is left alone.
+        return false;
+    }
+    apply_declaration_address_space(ty, space)
+}
+
+/// The object's OWN storage space for a declaration — the exact complement of
+/// [`apply_declaration_address_space_for_object`], sharing its predicate so the
+/// two can never drift.
+///
+/// A pointer supplied by the DECLARATOR absorbs the qualifier into its pointee,
+/// so the declared object keeps DEFAULT storage: gcc reads element `a[1]` of
+///
+/// ```c
+/// int __seg_gs *a[4];
+/// ```
+/// as `movq 8+a(%rip), %rdx` and only the pointee dereference carries the
+/// override (`movl %gs:(%rdx), %eax`).  The object rule alone was not enough:
+/// the storage slot (`GlobalInfo::var.address_space` / `LocalInfo::var`) was
+/// filled from `decl.address_space` unconditionally, which turned that array
+/// into a genuinely segment-relative object — every element load became
+/// `movq %gs:a+8(%rip)` (segment base + symbol offset, i.e. a wild address
+/// once a GS base is installed) and the recursive `off = p->next`
+/// segment-pointer walk read the wrong node forever (reduced: `int __seg_gs
+/// *garr[4]; int *loadidx(void){ return garr[1]; }`).  Storage space is
+/// therefore the declaration's qualifier ONLY when no declarator pointer
+/// absorbed it.
+pub fn object_storage_address_space(
+    space: AddressSpace,
+    derived: &[DerivedDeclarator],
+) -> AddressSpace {
+    if space == AddressSpace::Default || declarator_supplies_pointer(derived) {
+        AddressSpace::Default
+    } else {
+        space
+    }
+}
+
+#[cfg(test)]
+mod address_space_tests {
+    use super::*;
+
+    /// The object's own storage space is the declaration space only when no
+    /// pointer in the declarator absorbed it. These four shapes are measured
+    /// against gcc 14.2 (see the function's contract) and are what sema folds
+    /// into `Symbol::address_space`; getting any of them backwards either
+    /// breaks `&percpu_obj` (kernel/softirq.c) or double-qualifies the pointee
+    /// (include/linux/percpu-refcount.h).
+    #[test]
+    fn object_space_is_absorbed_by_pointer_declarators() {
+        // `T __seg_gs v;` — plain object: the object itself lives in the segment.
+        let mut ty = CType::Int;
+        assert!(!apply_declaration_address_space(
+            &mut ty,
+            AddressSpace::SegGs
+        ));
+        assert_eq!(ty, CType::Int);
+
+        // `T __seg_gs *p;` — a pointer: the space qualifies the POINTEE, so the
+        // object `p` keeps default storage and `&p` is `__seg_gs T **`.
+        let mut ty = CType::Pointer(Box::new(CType::Int), AddressSpace::Default);
+        assert!(apply_declaration_address_space(
+            &mut ty,
+            AddressSpace::SegGs
+        ));
+        assert_eq!(
+            ty,
+            CType::Pointer(Box::new(CType::Int), AddressSpace::SegGs)
+        );
+
+        // `T __seg_gs **p;` — outer pointer levels are traversed to the innermost
+        // pointer, so the space still lands on the data pointer.
+        let mut ty = CType::Pointer(
+            Box::new(CType::Pointer(Box::new(CType::Int), AddressSpace::Default)),
+            AddressSpace::Default,
+        );
+        assert!(apply_declaration_address_space(
+            &mut ty,
+            AddressSpace::SegGs
+        ));
+        assert_eq!(
+            ty,
+            CType::Pointer(
+                Box::new(CType::Pointer(Box::new(CType::Int), AddressSpace::SegGs)),
+                AddressSpace::Default
+            )
+        );
+
+        // `T __seg_fs f(void);` — the space belongs to the returned pointer, not
+        // to the function designator (srcu_read_lock_fast call sites).
+        let mut ty = CType::Function(Box::new(FunctionType {
+            return_type: CType::Pointer(Box::new(CType::Int), AddressSpace::Default),
+            params: Vec::new(),
+            variadic: false,
+        }));
+        assert!(apply_declaration_address_space(
+            &mut ty,
+            AddressSpace::SegFs
+        ));
+
+        // Default space is a no-op and always reports "nothing absorbed".
+        let mut ty = CType::Pointer(Box::new(CType::Int), AddressSpace::Default);
+        assert!(!apply_declaration_address_space(
+            &mut ty,
+            AddressSpace::Default
+        ));
+    }
+
+    /// The object rule adds the declarator to the decision (gcc 14.2,
+    /// `spacecases.c`): a pointer supplied by the DECLARATOR absorbs the
+    /// space into its pointee; a pointer supplied by the TYPE SPECIFIER
+    /// (typedef/typeof, i.e. the kernel's `DEFINE_PER_CPU` spelling) leaves
+    /// the value's type plain and the space on the object's storage.
+    #[test]
+    fn object_rule_distinguishes_declarator_from_specifier_pointers() {
+        let ptr = CType::Pointer(Box::new(CType::Int), AddressSpace::Default);
+
+        // `int __percpu *p;` — declarator supplies the `*`: pointee placement,
+        // exactly like the raw function.
+        let mut ty = ptr.clone();
+        assert!(apply_declaration_address_space_for_object(
+            &mut ty,
+            AddressSpace::SegGs,
+            &[DerivedDeclarator::Pointer]
+        ));
+        assert_eq!(
+            ty,
+            CType::Pointer(Box::new(CType::Int), AddressSpace::SegGs)
+        );
+
+        // `__percpu intp p;` (intp = int *) — specifier supplies the pointer:
+        // the type must come back UNCHANGED (plain `int *`) and the space is
+        // the object's storage.
+        let mut ty = ptr.clone();
+        assert!(!apply_declaration_address_space_for_object(
+            &mut ty,
+            AddressSpace::SegGs,
+            &[]
+        ));
+        assert_eq!(ty, ptr);
+
+        // `__percpu int **p;` — pointer levels in the declarator absorb, and
+        // the walk still reaches the innermost pointer: the result is
+        // `Pointer(Pointer(Int, SegGs), Default)`, i.e. `__seg_gs int **`
+        // (gcc 14.2 agrees: `typeof(p) == __seg_gs int **`).
+        let mut ty = CType::Pointer(Box::new(ptr.clone()), AddressSpace::Default);
+        assert!(apply_declaration_address_space_for_object(
+            &mut ty,
+            AddressSpace::SegGs,
+            &[DerivedDeclarator::Pointer, DerivedDeclarator::Pointer]
+        ));
+        assert_eq!(
+            ty,
+            CType::Pointer(
+                Box::new(CType::Pointer(Box::new(CType::Int), AddressSpace::SegGs)),
+                AddressSpace::Default
+            )
+        );
+
+        // `__percpu struct device *f(void);` — a function returning a pointer:
+        // the `*` is in the declarator, so the return type absorbs.
+        let mut ty = CType::Function(Box::new(FunctionType {
+            return_type: ptr.clone(),
+            params: Vec::new(),
+            variadic: false,
+        }));
+        assert!(apply_declaration_address_space_for_object(
+            &mut ty,
+            AddressSpace::SegGs,
+            &[
+                DerivedDeclarator::Pointer,
+                DerivedDeclarator::Function(Vec::new(), false)
+            ]
+        ));
+
+        // `__percpu int arr[4];` — no pointer anywhere: storage placement.
+        let mut ty = CType::Array(Box::new(CType::Int), Some(4));
+        assert!(!apply_declaration_address_space_for_object(
+            &mut ty,
+            AddressSpace::SegGs,
+            &[DerivedDeclarator::Array(None)]
+        ));
+        assert_eq!(ty, CType::Array(Box::new(CType::Int), Some(4)));
+
+        // Storage complement — the SAME predicate, so the object's storage and
+        // its pointee placement can never disagree.  Only a declaration whose
+        // pointer level did NOT come from the declarator puts its storage in
+        // the segment; `int __seg_gs *a[4]` is a NORMAL array of pointers into
+        // the segment (gcc reads `a[1]` as `8+a(%rip)`), while
+        // `__seg_gs intp d[4]` (pointer typedef) stores the array itself in the
+        // segment (gcc: `%gs:8+d(%rip)`).
+        assert_eq!(
+            object_storage_address_space(
+                AddressSpace::SegGs,
+                &[DerivedDeclarator::Pointer, DerivedDeclarator::Array(None)]
+            ),
+            AddressSpace::Default
+        );
+        assert_eq!(
+            object_storage_address_space(AddressSpace::SegGs, &[DerivedDeclarator::Array(None)]),
+            AddressSpace::SegGs
+        );
+        assert_eq!(
+            object_storage_address_space(AddressSpace::SegGs, &[]),
+            AddressSpace::SegGs
+        );
+        assert_eq!(
+            object_storage_address_space(AddressSpace::SegFs, &[DerivedDeclarator::Pointer]),
+            AddressSpace::Default
+        );
+        assert_eq!(
+            object_storage_address_space(AddressSpace::Default, &[]),
+            AddressSpace::Default
+        );
+
+        // Function pointers count as declarator-supplied pointers.
+        assert!(declarator_supplies_pointer(&[
+            DerivedDeclarator::Pointer,
+            DerivedDeclarator::FunctionPointer(Vec::new(), false)
+        ]));
+        assert!(!declarator_supplies_pointer(&[
+            DerivedDeclarator::Array(None),
+            DerivedDeclarator::Function(Vec::new(), false)
+        ]));
     }
 }

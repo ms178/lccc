@@ -189,8 +189,15 @@ impl Lowerer {
         };
 
         match (a_norm, b_norm) {
-            // Pointers: pointee types must be compatible
-            (CType::Pointer(p1, _), CType::Pointer(p2, _)) => Self::ctypes_compatible(p1, p2),
+            // Pointers: pointee types must be compatible AND the named address
+            // spaces must be equal.  The space is part of the pointer type's
+            // identity (gcc: `__builtin_types_compatible_p(int *, __seg_gs int *)`
+            // is 0); treating it as invisible made every space pair compatible
+            // and answered `__same_type(...)` wrongly in the kernel's static
+            // assertions.  See the twin in sema's const_eval.rs.
+            (CType::Pointer(p1, s1), CType::Pointer(p2, s2)) => {
+                s1 == s2 && Self::ctypes_compatible(p1, p2)
+            }
             // Arrays with compatible elements are compatible when both known
             // bounds agree OR either side is incomplete (C17 6.2.7p3).
             // `int[5]` and `int[]` are therefore compatible, while `int[5]`

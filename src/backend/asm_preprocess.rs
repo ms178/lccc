@@ -1327,48 +1327,180 @@ fn expand_macros_with(
 
 // ── .if / .else / .endif conditional assembly ──────────────────────────
 
-/// Map x86-64 register names to unique integer values for use in `.if` expressions.
+/// GNU as's numeric value for one register *spelling* (without the leading `%`).
 ///
-/// GAS assigns internal register encoding numbers to register names, allowing
-/// comparisons like `.if %rsp == %rbp` in conditional assembly. The exact values
-/// match GAS's internal encoding (AT&T register numbers starting at 104 for %rax).
-/// Only the 64-bit GPRs are mapped since those are the only ones used in kernel
-/// `.if` comparisons (UNWIND_HINT_REGS).
-pub fn resolve_x86_registers(expr: &str) -> String {
-    // Replace register names with numeric values, longest first to avoid partial matches.
-    // Values match GAS internal encoding for x86-64 registers.
-    const REGS: &[(&str, &str)] = &[
-        ("%r10", "114"),
-        ("%r11", "115"),
-        ("%r12", "116"),
-        ("%r13", "117"),
-        ("%r14", "118"),
-        ("%r15", "119"),
-        ("%r8", "112"),
-        ("%r9", "113"),
-        ("%rax", "104"),
-        ("%rcx", "105"),
-        ("%rdx", "106"),
-        ("%rbx", "107"),
-        ("%rsp", "108"),
-        ("%rbp", "109"),
-        ("%rsi", "110"),
-        ("%rdi", "111"),
-        // 32-bit registers (used in some kernel macros)
-        ("%eax", "40"),
-        ("%ecx", "41"),
-        ("%edx", "42"),
-        ("%ebx", "43"),
-        ("%esp", "44"),
-        ("%ebp", "45"),
-        ("%esi", "46"),
-        ("%edi", "47"),
-    ];
-    let mut result = expr.to_string();
-    for &(name, val) in REGS {
-        result = result.replace(name, val);
+/// GAS substitutes the index of the register's entry in its internal
+/// `i386_regtab` wherever a register appears in an expression. That is what
+/// makes `.if %rsp == %rbp` a legal *constant* comparison — the comparison runs
+/// over those indices, so equality is identity of the SPELLING, not of the
+/// machine register: `%rsp == %rsp` is true while `%rax == %eax` is false even
+/// though both name the same physical register in different widths. The
+/// kernel's `arch/x86/include/asm/unwind_hints.h` builds its whole
+/// `UNWIND_HINT_REGS base=...` dispatch on exactly that identity, so this table
+/// is load-bearing for the kernel boot path, not a convenience.
+///
+/// Every value below was MEASURED against GNU as, never transcribed from a
+/// header: `as --64` on `.long %<reg>` emits the number (and warns "register
+/// value used as expression" — precisely because the value is a spelling
+/// identity and not an address). `scripts/check_asm_reg_expr_gas_parity.sh`
+/// re-measures the entire table against the host `as`, so a future GAS that
+/// renumbers its table is caught rather than silently mis-branching.
+fn x86_register_number(name: &str) -> Option<i64> {
+    /// Decode `prefix<digits>` into `base + digits` for a numbered bank.
+    fn bank(name: &str, prefix: &str, base: i64, first: i64, count: i64) -> Option<i64> {
+        let digits = name.strip_prefix(prefix)?;
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let index: i64 = digits.parse().ok()?;
+        (first..first + count)
+            .contains(&index)
+            .then_some(base + (index - first))
     }
-    result
+
+    match name {
+        // 8-bit legacy names. GAS's table lists them in ENCODING order
+        // (al,cl,dl,bl,ah,ch,dh,bh), which is why this is not a `bank` call.
+        "al" => return Some(0),
+        "cl" => return Some(1),
+        "dl" => return Some(2),
+        "bl" => return Some(3),
+        "ah" => return Some(4),
+        "ch" => return Some(5),
+        "dh" => return Some(6),
+        "bh" => return Some(7),
+        "spl" => return Some(12),
+        "bpl" => return Some(13),
+        "sil" => return Some(14),
+        "dil" => return Some(15),
+        // 16-bit
+        "ax" => return Some(40),
+        "cx" => return Some(41),
+        "dx" => return Some(42),
+        "bx" => return Some(43),
+        "sp" => return Some(44),
+        "bp" => return Some(45),
+        "si" => return Some(46),
+        "di" => return Some(47),
+        // 32-bit
+        "eax" => return Some(72),
+        "ecx" => return Some(73),
+        "edx" => return Some(74),
+        "ebx" => return Some(75),
+        "esp" => return Some(76),
+        "ebp" => return Some(77),
+        "esi" => return Some(78),
+        "edi" => return Some(79),
+        // 64-bit
+        "rax" => return Some(104),
+        "rcx" => return Some(105),
+        "rdx" => return Some(106),
+        "rbx" => return Some(107),
+        "rsp" => return Some(108),
+        "rbp" => return Some(109),
+        "rsi" => return Some(110),
+        "rdi" => return Some(111),
+        // Segment registers, instruction pointer, x87 top-of-stack.
+        "es" => return Some(144),
+        "cs" => return Some(145),
+        "ss" => return Some(146),
+        "ds" => return Some(147),
+        "fs" => return Some(148),
+        "gs" => return Some(149),
+        "rip" => return Some(323),
+        "st" => return Some(327),
+        _ => {}
+    }
+    // r8b..r15b, r8w..r15w, r8d..r15d and r8..r15. `strip_prefix('r')` also
+    // accepts rax..rdi, so those are matched explicitly above before reaching
+    // here; any other `r<digits>` outside 8..=15 is not a register.
+    if let Some(rest) = name.strip_prefix('r') {
+        let (digits, base) = if let Some(d) = rest.strip_suffix('b') {
+            (d, 16)
+        } else if let Some(d) = rest.strip_suffix('w') {
+            (d, 48)
+        } else if let Some(d) = rest.strip_suffix('d') {
+            (d, 80)
+        } else {
+            (rest, 112)
+        };
+        return bank(digits, "", base, 8, 8);
+    }
+    // Control, debug, MMX and the SIMD banks. Longest prefix first so that
+    // `%xmm0` can never be read as `%mm…`.
+    for (prefix, base, count) in [
+        ("xmm", 215, 32),
+        ("ymm", 247, 32),
+        ("zmm", 279, 32),
+        ("mm", 207, 8),
+        ("cr", 151, 16),
+        ("dr", 183, 8),
+    ] {
+        if let Some(n) = bank(name, prefix, base, 0, count) {
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// Rewrite every register spelling in `expr` to GAS's numeric value.
+///
+/// One left-to-right pass with a longest-name lookup at each `%` — deliberately
+/// NOT a sequence of `str::replace` calls. The previous implementation built a
+/// list of pairs and relied on the author ordering it longest-first, which is a
+/// silent-corruption hazard in both directions: `%r8` rewrites the first three
+/// characters of `%r8d`, and `%st` rewrites the prefix of `%st(1)`. Scanning
+/// once and requiring the WHOLE `%`-name run to be a known spelling removes the
+/// hazard by construction — reordering the table can no longer change the
+/// output.
+///
+/// A `%` that is not followed by a known register name is passed through
+/// verbatim: `%` is also GAS's modulus operator (`10 % 3`, `x%2`), and that
+/// meaning must survive.
+pub fn resolve_x86_registers(expr: &str) -> String {
+    let bytes = expr.as_bytes();
+    let mut out = String::with_capacity(expr.len());
+    let mut k = 0;
+    while k < bytes.len() {
+        if bytes[k] != b'%' {
+            let start = k;
+            while k < bytes.len() && bytes[k] != b'%' {
+                k += 1;
+            }
+            out.push_str(&expr[start..k]);
+            continue;
+        }
+        // The name run after `%`. `%st(3)` ends the run at `(`, handled below.
+        let name_start = k + 1;
+        let mut end = name_start;
+        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+            end += 1;
+        }
+        match x86_register_number(&expr[name_start..end]) {
+            Some(mut value) => {
+                // x87 stack slots: `%st(3)` is a distinct spelling from `%st`
+                // and GAS numbers it `%st` + slot.
+                let mut stop = end;
+                if &expr[name_start..end] == "st" && expr[end..].starts_with('(') {
+                    if let Some(close) = expr[end..].find(')') {
+                        if let Ok(slot) = expr[end + 1..end + close].parse::<i64>() {
+                            if (0..=7).contains(&slot) {
+                                value = 327 + slot;
+                                stop = end + close + 1;
+                            }
+                        }
+                    }
+                }
+                out.push_str(&value.to_string());
+                k = stop;
+            }
+            None => {
+                out.push('%');
+                k += 1;
+            }
+        }
+    }
+    out
 }
 
 /// Evaluate a simple `.if` condition expression.
@@ -1960,8 +2092,112 @@ mod tests {
         assert_eq!(resolve_x86_registers("%rbp"), "109");
         assert_eq!(resolve_x86_registers("%rdi"), "111");
         assert_eq!(resolve_x86_registers("%r10"), "114");
-        // Ordering matters: %r10 must be replaced before %r8/%r9 to avoid partial matches
         assert_eq!(resolve_x86_registers("%r13"), "117");
+    }
+
+    /// The whole GAS register table, pinned to values measured from GNU as
+    /// (`.long %<reg>`). `scripts/check_asm_reg_expr_gas_parity.sh` re-measures
+    /// these against the host assembler; this test keeps the values in the
+    /// compiler's own suite so a refactor cannot drift silently.
+    #[test]
+    fn test_resolve_x86_registers_matches_gas_table() {
+        // High-value spellings across every bank, plus the width-aliasing case
+        // that must stay DISTINCT: %rax and %eax name the same machine register
+        // but are different GAS spellings, so they are different values.
+        let cases: &[(&str, &str)] = &[
+            ("%al", "0"),
+            ("%ah", "4"),
+            ("%spl", "12"),
+            ("%dil", "15"),
+            ("%r8b", "16"),
+            ("%r15b", "23"),
+            ("%ax", "40"),
+            ("%di", "47"),
+            ("%r8w", "48"),
+            ("%r15w", "55"),
+            ("%eax", "72"),
+            ("%edi", "79"),
+            ("%r8d", "80"),
+            ("%r15d", "87"),
+            ("%rax", "104"),
+            ("%r15", "119"),
+            ("%es", "144"),
+            ("%gs", "149"),
+            ("%cr4", "155"),
+            ("%dr7", "190"),
+            ("%mm0", "207"),
+            ("%mm7", "214"),
+            ("%xmm0", "215"),
+            ("%xmm31", "246"),
+            ("%ymm0", "247"),
+            ("%ymm31", "278"),
+            ("%zmm0", "279"),
+            ("%zmm31", "310"),
+            ("%rip", "323"),
+            ("%st", "327"),
+            ("%st(0)", "327"),
+            ("%st(7)", "334"),
+        ];
+        for (reg, value) in cases {
+            assert_eq!(
+                resolve_x86_registers(reg),
+                *value,
+                "GAS value for {reg} drifted"
+            );
+        }
+        assert_ne!(
+            resolve_x86_registers("%rax"),
+            resolve_x86_registers("%eax"),
+            "%rax and %eax are distinct GAS spellings"
+        );
+    }
+
+    /// Regression: the table must not be applied as ordered substitutions.
+    /// `%r8` is a prefix of `%r8d`, `%st` is a prefix of `%st(1)`, and `%mm0`
+    /// sits inside the `%xmm0`/`%ymm0`/`%zmm0` namespaces.
+    #[test]
+    fn test_resolve_x86_registers_has_no_partial_match_corruption() {
+        assert_eq!(resolve_x86_registers("%r8d"), "80");
+        assert_eq!(resolve_x86_registers("%r8w"), "48");
+        assert_eq!(resolve_x86_registers("%r8b"), "16");
+        assert_eq!(resolve_x86_registers("%r9d"), "81");
+        assert_eq!(resolve_x86_registers("%st(1)"), "328");
+        assert_eq!(resolve_x86_registers("%xmm0"), "215");
+        assert_eq!(resolve_x86_registers("%mm0"), "207");
+        // Registers embedded in a real comparison expression.
+        assert_eq!(resolve_x86_registers("%rsp == %rbp"), "108 == 109");
+        assert_eq!(resolve_x86_registers("%r10 != %rdi"), "114 != 111");
+    }
+
+    /// `%` is also GAS's modulus operator; only a `%` that starts a known
+    /// register spelling may be rewritten.
+    #[test]
+    fn test_resolve_x86_registers_leaves_modulus_alone() {
+        assert_eq!(resolve_x86_registers("10 % 3"), "10 % 3");
+        assert_eq!(resolve_x86_registers("10%3"), "10%3");
+        assert_eq!(resolve_x86_registers("%"), "%");
+        assert_eq!(resolve_x86_registers("%nosuchreg"), "%nosuchreg");
+    }
+
+    /// End-to-end shape of the kernel's `UNWIND_HINT_REGS` dispatch: the
+    /// resolver feeds the boolean evaluator, so the whole `base=` chain must
+    /// select exactly one arm.
+    #[test]
+    fn test_unwind_hint_regs_dispatch_shape() {
+        let arms = ["%rsp", "%rbp", "%rdi", "%rdx", "%r10"];
+        for (i, want) in arms.iter().enumerate() {
+            let matched: Vec<&str> = arms
+                .iter()
+                .copied()
+                .filter(|arm| {
+                    eval_if_condition_with_resolver(
+                        &format!("{arm} == {want}"),
+                        resolve_x86_registers,
+                    )
+                })
+                .collect();
+            assert_eq!(matched, vec![*want], "arm {i} must match exactly once");
+        }
     }
 
     #[test]

@@ -4709,6 +4709,18 @@ fn reject_non_constant(expr: &str, directive: &str) -> Result<(), String> {
         }
         if c.is_ascii_alphabetic() || c == b'_' || c == b'$' || c == b'%' {
             let start = k;
+            // `%` is a register PREFIX, not an identifier body character: it
+            // must be consumed before the name run or the run is empty. That
+            // exactly inverted the register exemption below — every `%reg`
+            // scanned as the empty identifier, which is neither `%`-prefixed
+            // nor a resolvable spelling, so `reject_non_constant` rejected
+            // every register comparison in a `.if` and the kernel's
+            // UNWIND_HINT_REGS dispatch (`.if \base == %rsp` …) could not be
+            // assembled at all (`entry_64.S` died with "non-constant
+            // expression in \".if\" statement").
+            if c == b'%' {
+                k += 1;
+            }
             while k < bytes.len()
                 && (bytes[k].is_ascii_alphanumeric() || matches!(bytes[k], b'_' | b'$' | b'@'))
             {

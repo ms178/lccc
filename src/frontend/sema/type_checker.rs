@@ -181,7 +181,13 @@ impl<'a> ExprTypeChecker<'a> {
             // Address-of wraps in Pointer
             Expr::AddressOf(inner, _) => {
                 if let Some(inner_ct) = self.infer_expr_ctype(inner) {
-                    Some(CType::Pointer(Box::new(inner_ct), AddressSpace::Default))
+                    // C11 6.5.3.2p3: `&E` is a pointer to the type of E, and a
+                    // named address space is part of that storage, not a
+                    // property of the value. Without it, `&percpu_var` typed as
+                    // a generic pointer and a call to the `__percpu`-qualified
+                    // function it belongs to was rejected (kernel/softirq.c).
+                    let space = self.lvalue_address_space(inner);
+                    Some(CType::Pointer(Box::new(inner_ct), space))
                 } else {
                     // Even if inner type unknown, result is some pointer
                     Some(CType::Pointer(Box::new(CType::Void), AddressSpace::Default))
@@ -1270,7 +1276,8 @@ impl<'a> ExprTypeChecker<'a> {
                 let inner_ct = self
                     .infer_expr_ctype(inner)
                     .or_else(|| self.infer_expr_ctype_with_scope(inner, scope))?;
-                Some(CType::Pointer(Box::new(inner_ct), AddressSpace::Default))
+                let space = self.lvalue_address_space(inner);
+                Some(CType::Pointer(Box::new(inner_ct), space))
             }
             // Statement expression: thread the current scope down so nested
             // typeof() patterns (kernel xchg/cmpxchg macros) resolve.
@@ -1278,6 +1285,67 @@ impl<'a> ExprTypeChecker<'a> {
                 self.infer_stmt_expr_ctype_with_scope(compound, Some(scope))
             }
             _ => None,
+        }
+    }
+
+    /// Named address space of the storage an lvalue designates — the property
+    /// `&E` must carry into its pointer type (C11 6.5.3.2p3).
+    ///
+    /// This is sema's mirror of the lowerer's `get_addr_space_of_struct_expr`
+    /// (src/ir/lowering/pointer_analysis.rs), deliberately walking the same
+    /// shapes: an identifier gets its space from the declaration record, a
+    /// member or subscript expression from its base object, and `p->m` / `*p`
+    /// from the space of the pointer `p` points with. Sema and lowering must
+    /// agree — lowering already prefixes the load (kernel per-CPU objects read
+    /// through `%gs:`), so a generic sema type is not a cosmetic mismatch: it
+    /// rejects correct kernel code such as `__tasklet_schedule_common(t,
+    /// &tasklet_vec, TASKLET_SOFTIRQ)` whose parameter is `struct tasklet_head
+    /// __percpu *`.
+    fn lvalue_address_space(&self, expr: &Expr) -> AddressSpace {
+        match expr {
+            Expr::Identifier(name, _) => {
+                // `__func__` and enum constants are not objects with storage.
+                self.symbols
+                    .lookup(name)
+                    .map(|sym| sym.address_space)
+                    .unwrap_or(AddressSpace::Default)
+            }
+            // `s.inner.field` / `arr[i]` live in the base object's space.
+            Expr::MemberAccess(base, _, _) | Expr::ArraySubscript(base, _, _) => {
+                self.lvalue_address_space(base)
+            }
+            // `p->field` / `(*p).field`: the member lives in the space p points
+            // into, which may come from p's type rather than its declaration.
+            Expr::PointerMemberAccess(base, _, _) | Expr::Deref(base, _) => {
+                self.pointee_address_space(base)
+            }
+            // `*(__seg_gs T *)n` and friends.
+            Expr::Cast(TypeSpecifier::Pointer(_, space), _, _) => *space,
+            _ => AddressSpace::Default,
+        }
+    }
+
+    /// Named address space of the object a pointer expression designates.
+    /// Prefers the expression's type (a `__seg_gs T *` value carries its space
+    /// there) and otherwise looks through unqualified casts to `&obj`, matching
+    /// `get_addr_space_of_ptr_expr` in the lowerer.
+    fn pointee_address_space(&self, expr: &Expr) -> AddressSpace {
+        if let Some(CType::Pointer(_, space)) = self.infer_expr_ctype(expr) {
+            if space != AddressSpace::Default {
+                return space;
+            }
+        }
+        match expr {
+            Expr::Cast(TypeSpecifier::Pointer(_, space), inner, _) => {
+                if *space != AddressSpace::Default {
+                    *space
+                } else {
+                    self.pointee_address_space(inner)
+                }
+            }
+            Expr::Cast(_, inner, _) => self.pointee_address_space(inner),
+            Expr::AddressOf(inner, _) => self.lvalue_address_space(inner),
+            _ => AddressSpace::Default,
         }
     }
 }

@@ -987,6 +987,17 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
             trace("fuse_load_into_alu", pass_count, c, &store, &infos);
             changed |= c;
         }
+        // Load -> LEA-add in-place (`mov MEM,%t; leaq (%acc,%t,1),%s` ->
+        // `add MEM,%acc` + rename the chain uses). One transform, one switch:
+        // `CCC_PEEPHOLE_SKIP=load_lea_inplace` bisects it independently of the
+        // sibling above AND of `local_patterns::fuse_load_lea_add` (which owns
+        // the pre-existing `load_lea_add` switch; see load_op_fuse.rs for this
+        // transform's soundness argument).
+        if !sk("load_lea_inplace") {
+            let c = load_op_fuse::fuse_load_into_lea_add(&mut store, &mut infos);
+            trace("fuse_load_into_lea_add", pass_count, c, &store, &infos);
+            changed |= c;
+        }
         // `fuse_zero_ext_cmp` has its OWN skip name. It used to share
         // `load_alu_fuse` with `fuse_load_into_alu`, which made the two
         // inseparable in an A/B: `CCC_PEEPHOLE_SKIP=load_alu_fuse` turned off
