@@ -33,22 +33,38 @@ struct DeclContext {
     is_common: bool,
 }
 
-/// Apply a declaration-level named address space to a parsed type: it lands
-/// on the innermost pointer (closest to the base type), matching
-/// `type_builder::apply_declaration_address_space` on the CType side.
+/// Parser-side mirror of `common::type_builder::apply_declaration_address_space`
+/// (the two must stay in step). The named space goes to the innermost pointer:
+/// the walk descends through pointers, arrays and function return types. A
+/// function-pointer node (`FunctionPointer`) is itself a generic pointer, so
+/// the walk continues into its return type, as for `struct c __seg_gs *(*f)(void)`.
+/// Parser mirror of `common::type_builder::pointee_reaches_pointer_level`.
+fn spec_reaches_pointer_level(ts: &TypeSpecifier) -> bool {
+    match ts {
+        TypeSpecifier::Pointer(..)
+        | TypeSpecifier::FunctionPointer(..)
+        | TypeSpecifier::BareFunction(..) => true,
+        TypeSpecifier::Array(elem, _) => spec_reaches_pointer_level(elem),
+        _ => false,
+    }
+}
+
 fn apply_decl_address_space_to_spec(ts: &mut TypeSpecifier, space: AddressSpace) {
     if space == AddressSpace::Default {
         return;
     }
     match ts {
         TypeSpecifier::Pointer(inner, sp) => {
-            if matches!(inner.as_ref(), TypeSpecifier::Pointer(..)) {
+            if spec_reaches_pointer_level(inner) {
                 apply_decl_address_space_to_spec(inner, space);
             } else {
                 *sp = space;
             }
         }
         TypeSpecifier::Array(elem, _) => apply_decl_address_space_to_spec(elem, space),
+        TypeSpecifier::FunctionPointer(ret, _, _) | TypeSpecifier::BareFunction(ret, _, _) => {
+            apply_decl_address_space_to_spec(ret, space)
+        }
         _ => {}
     }
 }
@@ -172,6 +188,7 @@ impl Parser {
 
         let (name, derived, decl_mode, decl_common, decl_aligned, _) =
             self.parse_declarator_with_attrs();
+        let declarator_object_space = self.attrs.declarator_object_space;
         let (post_ctor, post_dtor, post_mode, post_common, post_aligned, first_asm_reg) =
             self.parse_asm_and_attributes();
         let mode_kind = decl_mode.or(post_mode);
@@ -214,6 +231,7 @@ impl Parser {
 
         // Build per-declarator attributes struct from the collected flags
         let mut decl_attrs = DeclAttributes::default();
+        decl_attrs.object_space = declarator_object_space;
         decl_attrs.set_constructor(is_constructor);
         decl_attrs.set_destructor(is_destructor);
         decl_attrs.set_weak(is_weak);
@@ -403,7 +421,7 @@ impl Parser {
                         return_type =
                             TypeSpecifier::Array(Box::new(return_type), size_expr.clone());
                     }
-                    DerivedDeclarator::Pointer => {
+                    DerivedDeclarator::Pointer(_) => {
                         return_type =
                             TypeSpecifier::Pointer(Box::new(return_type), AddressSpace::Default);
                     }
@@ -424,7 +442,7 @@ impl Parser {
             let mut i = 0;
             while i < prefix.len() {
                 match &prefix[i] {
-                    DerivedDeclarator::Pointer => {
+                    DerivedDeclarator::Pointer(_) => {
                         if let Some(DerivedDeclarator::FunctionPointer(params, variadic)) =
                             prefix.get(i + 1)
                         {
@@ -464,7 +482,7 @@ impl Parser {
             // No Function in derived - just apply pointer derivations
             for d in derived {
                 match d {
-                    DerivedDeclarator::Pointer => {
+                    DerivedDeclarator::Pointer(_) => {
                         return_type =
                             TypeSpecifier::Pointer(Box::new(return_type), AddressSpace::Default);
                     }
@@ -497,7 +515,7 @@ impl Parser {
                                     | DerivedDeclarator::Function(_, _) => {
                                         found_fptr = true;
                                     }
-                                    DerivedDeclarator::Pointer if found_fptr => {
+                                    DerivedDeclarator::Pointer(_) if found_fptr => {
                                         ptrs_after += 1;
                                     }
                                     _ => {}
@@ -565,7 +583,7 @@ impl Parser {
             //   First Pointer is return-type pointer, second is syntax marker.
             let ptr_count = pderived
                 .iter()
-                .filter(|d| matches!(d, DerivedDeclarator::Pointer))
+                .filter(|d| matches!(d, DerivedDeclarator::Pointer(_)))
                 .count();
             // Apply all pointers except the syntax marker (last one)
             for _ in 0..ptr_count.saturating_sub(1) {
@@ -579,7 +597,7 @@ impl Parser {
         // Not a function pointer - apply all derivations normally.
         // Apply pointers
         for d in pderived {
-            if let DerivedDeclarator::Pointer = d {
+            if let DerivedDeclarator::Pointer(_) = d {
                 full_type = TypeSpecifier::Pointer(Box::new(full_type), AddressSpace::Default);
             }
         }
@@ -721,6 +739,7 @@ impl Parser {
         // Parse additional declarators separated by commas
         while self.consume_if(&TokenKind::Comma) {
             let (dname, dderived) = self.parse_declarator();
+            let d_object_space = self.attrs.declarator_object_space;
             let (d_ctor, d_dtor, _, d_common, _, d_asm_reg) = self.parse_asm_and_attributes();
             ctx.is_common = ctx.is_common || d_common;
             let d_weak = self.attrs.parsing_weak();
@@ -778,6 +797,7 @@ impl Parser {
                     da.alias_target = d_alias;
                     da.visibility = d_vis;
                     da.section = d_section;
+                    da.object_space = d_object_space;
                     da.asm_register = d_asm_reg;
                     da.cleanup_fn = d_cleanup_fn;
                     da
@@ -892,6 +912,7 @@ impl Parser {
         let mut alignment: Option<usize> = None;
         loop {
             let (name, derived, decl_mode, _, decl_aligned, _) = self.parse_declarator_with_attrs();
+            let l_object_space = self.attrs.declarator_object_space;
             let (skip_mode, skip_aligned, skip_asm_reg) = self.skip_asm_and_attributes();
             let local_cleanup_fn = self.attrs.parsing_cleanup_fn.take();
             let local_section = self.attrs.parsing_section.take();
@@ -911,6 +932,7 @@ impl Parser {
                 init,
                 attrs: {
                     let mut da = DeclAttributes::default();
+                    da.object_space = l_object_space;
                     da.section = local_section;
                     da.asm_register = skip_asm_reg;
                     da.cleanup_fn = local_cleanup_fn;
@@ -1445,7 +1467,7 @@ impl Parser {
     ) -> TypeSpecifier {
         for d in derived {
             match d {
-                DerivedDeclarator::Pointer => {
+                DerivedDeclarator::Pointer(_) => {
                     spec = TypeSpecifier::Pointer(Box::new(spec), AddressSpace::Default);
                 }
                 DerivedDeclarator::Array(n) => {
@@ -1589,5 +1611,98 @@ impl Parser {
         // references (e.g. sizeof, offsetof, compiler builtins), silently accept.
         // This matches real-world behavior where complex expressions may not be
         // evaluable at parse time but are valid constant expressions.
+    }
+}
+
+#[cfg(test)]
+mod seg_placement_tests {
+    //! Mirrors `common::type_builder`'s placement tests on the parser's
+    //! `TypeSpecifier`, so the two placement rules are checked against the same
+    //! declarator shapes. Keep the case lists in step with that module.
+    use super::*;
+
+    fn base() -> TypeSpecifier {
+        TypeSpecifier::Long
+    }
+    fn ptr(inner: TypeSpecifier) -> TypeSpecifier {
+        TypeSpecifier::Pointer(Box::new(inner), AddressSpace::Default)
+    }
+    fn innermost_space(ts: &TypeSpecifier) -> Option<AddressSpace> {
+        match ts {
+            TypeSpecifier::Pointer(inner, sp) => match inner.as_ref() {
+                TypeSpecifier::Pointer(..)
+                | TypeSpecifier::Array(..)
+                | TypeSpecifier::FunctionPointer(..)
+                | TypeSpecifier::BareFunction(..) => innermost_space(inner),
+                _ => Some(*sp),
+            },
+            TypeSpecifier::Array(elem, _) => innermost_space(elem),
+            TypeSpecifier::FunctionPointer(ret, _, _) | TypeSpecifier::BareFunction(ret, _, _) => {
+                innermost_space(ret)
+            }
+            _ => None,
+        }
+    }
+    fn outer_space(ts: &TypeSpecifier) -> Option<AddressSpace> {
+        match ts {
+            TypeSpecifier::Pointer(_, sp) => Some(*sp),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn plain_pointer() {
+        let mut t = ptr(base());
+        apply_decl_address_space_to_spec(&mut t, AddressSpace::SegGs);
+        assert_eq!(outer_space(&t), Some(AddressSpace::SegGs));
+    }
+
+    #[test]
+    fn pointer_to_pointer_qualifies_inner_only() {
+        let mut t = ptr(ptr(base()));
+        apply_decl_address_space_to_spec(&mut t, AddressSpace::SegGs);
+        assert_eq!(outer_space(&t), Some(AddressSpace::Default));
+        assert_eq!(innermost_space(&t), Some(AddressSpace::SegGs));
+    }
+
+    #[test]
+    fn function_pointer_qualifies_return_pointer_not_itself() {
+        // struct c __seg_gs *(*fp)(void)
+        let mut t = TypeSpecifier::FunctionPointer(Box::new(ptr(base())), Vec::new(), false);
+        apply_decl_address_space_to_spec(&mut t, AddressSpace::SegGs);
+        assert_eq!(innermost_space(&t), Some(AddressSpace::SegGs));
+    }
+
+    #[test]
+    fn bare_function_qualifies_return_pointer() {
+        // struct c __seg_gs *f(void)
+        let mut t = TypeSpecifier::BareFunction(Box::new(ptr(base())), Vec::new(), false);
+        apply_decl_address_space_to_spec(&mut t, AddressSpace::SegGs);
+        assert_eq!(innermost_space(&t), Some(AddressSpace::SegGs));
+    }
+
+    #[test]
+    fn array_of_pointers_qualifies_elements() {
+        // struct c __seg_gs *a[4]
+        let mut t = TypeSpecifier::Array(Box::new(ptr(base())), None);
+        apply_decl_address_space_to_spec(&mut t, AddressSpace::SegGs);
+        assert_eq!(innermost_space(&t), Some(AddressSpace::SegGs));
+    }
+
+    #[test]
+    fn pointer_to_array_of_pointers_keeps_outer_generic() {
+        // struct c __seg_gs *(*pa)[4]
+        let mut t = ptr(TypeSpecifier::Array(Box::new(ptr(base())), None));
+        apply_decl_address_space_to_spec(&mut t, AddressSpace::SegGs);
+        assert_eq!(outer_space(&t), Some(AddressSpace::Default));
+        assert_eq!(innermost_space(&t), Some(AddressSpace::SegGs));
+    }
+
+    #[test]
+    fn default_space_is_a_no_op() {
+        let mut t = ptr(ptr(base()));
+        let before = format!("{t:?}");
+        apply_decl_address_space_to_spec(&mut t, AddressSpace::Default);
+        assert_eq!(format!("{t:?}"), before);
     }
 }

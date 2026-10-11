@@ -20,7 +20,97 @@ pub(super) enum ResolvedIndirectCall {
     Direct(String, i64),
 }
 
+/// 32-bit name of a 64-bit general register (`rcx` -> `ecx`, `r8` -> `r8d`).
+fn dword_name(qword: &str) -> String {
+    match qword.strip_prefix('r') {
+        Some(rest) if rest.starts_with(|c: char| c.is_ascii_digit()) => format!("r{rest}d"),
+        Some(rest) => format!("e{rest}"),
+        None => qword.to_string(),
+    }
+}
+
 impl X86Codegen {
+    /// Load the bytes `[eb, struct_size)` of a by-value struct argument into
+    /// the 64-bit register `dst`, zero-extended, reading exactly those bytes.
+    ///
+    /// `%rax` holds the struct's address. `eb` is the eightbyte's byte offset (0
+    /// or 8), and the eightbyte has `r = min(8, struct_size - eb)` bytes:
+    ///
+    /// * `r == 8`: one qword load.
+    /// * `eb >= 8` (a partial high eightbyte, `struct_size >= 9`): load the
+    ///   window `[struct_size - 8, struct_size)`, which ends at the object, and
+    ///   shift out its leading `8 - r` bytes. No byte before the object is read
+    ///   and no scratch register is needed.
+    /// * `eb == 0` and `r < 8`: the struct is smaller than one qword. Compose
+    ///   it from two overlapping narrow loads (see `load_bytes_exact` in the
+    ///   IR lowering); `%rax` is free afterwards because nothing else reads it.
+    ///
+    /// The previous emission loaded a full qword in all three cases, which read
+    /// up to 7 bytes past the end of the struct.
+    /// Load eightbyte `eb` of a by-value struct whose address is in `%rax` into
+    /// `dst`, reading only the bytes that belong to the struct. Full qwords keep
+    /// the `(%rax)` form of the whole-qword load they replace, so the encoding is
+    /// unchanged for the common case. A partial width uses an exact-width load
+    /// (1, 2, 4) or two overlapping loads (3, 5, 6, 7). The 3/5/6/7 form clobbers
+    /// `%rax`: it is only emitted for a single-eightbyte struct, where `%rax` is
+    /// not needed afterwards.
+    pub(super) fn emit_struct_eightbyte_exact(&mut self, struct_size: usize, eb: usize, dst: &str) {
+        // Bytes of this eightbyte that belong to the struct: a full qword for
+        // any eightbyte before the last one, the remainder for the last one.
+        let r = (struct_size - eb).min(8);
+        debug_assert!((1..=8).contains(&r), "eightbyte width {r}");
+        let mem = |off: usize| {
+            if off == 0 {
+                "(%rax)".to_string()
+            } else {
+                format!("{off}(%rax)")
+            }
+        };
+        if r == 8 {
+            self.state
+                .emit_fmt(format_args!("    movq {}, %{}", mem(eb), dst));
+            return;
+        }
+        if eb >= 8 {
+            self.state
+                .emit_fmt(format_args!("    movq {}, %{}", mem(struct_size - 8), dst));
+            self.state
+                .emit_fmt(format_args!("    shrq ${}, %{}", 8 * (8 - r), dst));
+            return;
+        }
+        debug_assert_eq!(eb, 0);
+        let d32 = dword_name(dst);
+        match r {
+            1 => self
+                .state
+                .emit_fmt(format_args!("    movzbl {}, %{d32}", mem(0))),
+            2 => self
+                .state
+                .emit_fmt(format_args!("    movzwl {}, %{d32}", mem(0))),
+            4 => self
+                .state
+                .emit_fmt(format_args!("    movl {}, %{d32}", mem(0))),
+            _ => {
+                // 3, 5, 6, 7: overlapping low and high loads of width w.
+                let w = if r == 3 { 2 } else { 4 };
+                if w == 2 {
+                    self.state
+                        .emit_fmt(format_args!("    movzwl {}, %{d32}", mem(0)));
+                    self.state
+                        .emit_fmt(format_args!("    movzwl {}, %eax", mem(r - w)));
+                } else {
+                    self.state
+                        .emit_fmt(format_args!("    movl {}, %{d32}", mem(0)));
+                    self.state
+                        .emit_fmt(format_args!("    movl {}, %eax", mem(r - w)));
+                }
+                self.state
+                    .emit_fmt(format_args!("    shlq ${}, %rax", 8 * (r - w)));
+                self.state.emit_fmt(format_args!("    orq %rax, %{dst}"));
+            }
+        }
+    }
+
     pub(super) fn call_abi_config_impl(&self) -> CallAbiConfig {
         CallAbiConfig {
             max_int_regs: 6,
@@ -475,12 +565,8 @@ impl X86Codegen {
                             self.state
                                 .emit_fmt(format_args!("    pushq {}(%rax)", offset));
                         } else {
-                            self.state.out.emit_instr_mem_reg(
-                                "    movq",
-                                offset as i64,
-                                "rax",
-                                "rcx",
-                            );
+                            // Partial tail: exact bytes only (see the helper).
+                            self.emit_struct_eightbyte_exact(size, offset, "rcx");
                             self.state.emit("    pushq %rcx");
                         }
                     }
@@ -1000,14 +1086,12 @@ impl X86Codegen {
                 CallArgClass::StructByValReg { base_reg_idx, size } => {
                     self.operand_to_rax(arg);
                     let lo_reg = X86_ARG_REGS[base_reg_idx];
-                    self.state
-                        .out
-                        .emit_instr_mem_reg("    movq", 0, "rax", lo_reg);
+                    // Low eightbyte first: for sizes below 8 it clobbers %rax,
+                    // which is only read again when there is no high eightbyte.
+                    self.emit_struct_eightbyte_exact(size, 0, lo_reg);
                     if size > 8 {
                         let hi_reg = X86_ARG_REGS[base_reg_idx + 1];
-                        self.state
-                            .out
-                            .emit_instr_mem_reg("    movq", 8, "rax", hi_reg);
+                        self.emit_struct_eightbyte_exact(size, 8, hi_reg);
                     }
                 }
                 CallArgClass::StructSseReg {

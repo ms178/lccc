@@ -162,11 +162,7 @@ impl Lowerer {
                 ty: IrType::Ptr,
                 seg_override: AddressSpace::Default,
             });
-            self.emit(Instruction::Memcpy {
-                dest: sret_ptr,
-                src: src_addr,
-                size: struct_size,
-            });
+            self.copy_aggregate_from_expr(sret_ptr, e, src_addr, struct_size);
             return Some(Operand::Value(sret_ptr));
         }
 
@@ -242,6 +238,8 @@ impl Lowerer {
         if expr_ct.is_complex() {
             return None;
         }
+        // Every load below reads the source object; carry its segment (if any).
+        let seg = self.aggregate_lvalue_space(e);
         // Get the struct size. struct_value_size may return Some(0) for expressions
         // where CType::size() returns 0 (Struct/Union types without resolved size).
         // In that case, fall back to the function's own two_reg_ret_size from sig
@@ -332,7 +330,7 @@ impl Lowerer {
                     dest: hi,
                     ptr: hi_ptr,
                     ty: IrType::F64,
-                    seg_override: AddressSpace::Default,
+                    seg_override: seg,
                 });
                 self.emit(Instruction::SetReturnF64Second {
                     src: Operand::Value(hi),
@@ -343,7 +341,7 @@ impl Lowerer {
                     dest: lo,
                     ptr: addr,
                     ty: IrType::F64,
-                    seg_override: AddressSpace::Default,
+                    seg_override: seg,
                 });
                 return Some(Operand::Value(lo));
             }
@@ -356,24 +354,11 @@ impl Lowerer {
             dest: lo,
             ptr: addr,
             ty: IrType::I64,
-            seg_override: AddressSpace::Default,
+            seg_override: seg,
         });
-        // Load high bytes
-        let hi_ptr = self.fresh_value();
-        self.emit(Instruction::GetElementPtr {
-            dest: hi_ptr,
-            base: addr,
-            offset: Operand::Const(IrConst::I64(8)),
-            ty: IrType::I64,
-        });
-        let hi = self.fresh_value();
-        self.emit(Instruction::Load {
-            volatile: false,
-            dest: hi,
-            ptr: hi_ptr,
-            ty: IrType::I64,
-            seg_override: AddressSpace::Default,
-        });
+        // High bytes: exactly `struct_size - 8` of them (1..=7 below 16), so
+        // no load reads past the object.
+        let hi = self.load_bytes_exact(addr, 8, struct_size - 8, seg);
         // Pack into I128: (hi << 64) | lo (zero-extend both halves)
         let hi_wide = self.fresh_value();
         self.emit(Instruction::Cast {
@@ -431,14 +416,11 @@ impl Lowerer {
             return None;
         }
         let addr = self.get_struct_base_addr(e);
-        let dest = self.fresh_value();
-        self.emit(Instruction::Load {
-            volatile: false,
-            dest,
-            ptr: addr,
-            ty: IrType::I64,
-            seg_override: AddressSpace::Default,
-        });
+        // The segment rides on the load itself; no temporary is needed. Read
+        // exactly the object's bytes: a whole-word load would over-read 1..7
+        // bytes past a small struct (see `load_bytes_exact`).
+        let seg = self.aggregate_lvalue_space(e);
+        let dest = self.load_bytes_exact(addr, 0, struct_size, seg);
         Some(Operand::Value(dest))
     }
 

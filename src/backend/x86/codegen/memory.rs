@@ -3785,6 +3785,133 @@ impl X86Codegen {
         self.store_rax_to(dest);
     }
 
+    /// Segment-prefixed load from `offset(base)` with the constant displacement
+    /// folded into the operand: `movq %gs:8(%rdx), %rcx` where the generic path
+    /// needed `leaq 8(%rdx), %r8` followed by `movq %gs:(%r8), %rax`.
+    ///
+    /// The base must have a general-register home (`rax` excluded: the load
+    /// result is staged there). Returns false, emitting nothing, for other bases
+    /// and for widths without a direct form; the caller then uses the generic
+    /// rematerialize-and-load path.
+    pub(super) fn emit_seg_load_with_const_offset_impl(
+        &mut self,
+        dest: &Value,
+        base: &Value,
+        offset: i64,
+        ty: IrType,
+        seg: AddressSpace,
+    ) -> bool {
+        let seg_prefix = match seg {
+            AddressSpace::SegGs => "%gs:",
+            AddressSpace::SegFs => "%fs:",
+            AddressSpace::Default => return false,
+        };
+        if !seg_fold_width_ok(ty) {
+            return false;
+        }
+        let Some(base_reg) = self.seg_base_home(base) else {
+            return false;
+        };
+        let load_instr = Self::mov_load_for_type(ty);
+        if matches!(ty, IrType::I64 | IrType::U64 | IrType::Ptr) {
+            if let Some(&reg) = self.reg_assignments.get(&dest.0) {
+                if !is_xmm_reg(reg) {
+                    self.state.emit_fmt(format_args!(
+                        "    {} {}{}(%{}), %{}",
+                        load_instr,
+                        seg_prefix,
+                        offset,
+                        base_reg,
+                        phys_reg_name(reg)
+                    ));
+                    self.state.reg_cache.invalidate_acc();
+                    return true;
+                }
+            }
+        }
+        self.state.emit_fmt(format_args!(
+            "    {} {}{}(%{}), {}",
+            load_instr,
+            seg_prefix,
+            offset,
+            base_reg,
+            Self::load_dest_reg(ty)
+        ));
+        self.store_rax_to(dest);
+        true
+    }
+
+    /// Segment-prefixed store to `offset(base)` with the displacement folded into
+    /// the operand. The base must have a general-register home other than `rax`,
+    /// so the value can be staged in `%rax` without touching the base, and no
+    /// `push`/`pop` is needed (the generic segment store uses both to survive
+    /// any operand-home assignment). A constant that fits the immediate is stored
+    /// directly. Returns false, emitting nothing, when the form does not apply.
+    pub(super) fn emit_seg_store_with_const_offset_impl(
+        &mut self,
+        val: &Operand,
+        base: &Value,
+        offset: i64,
+        ty: IrType,
+        seg: AddressSpace,
+    ) -> bool {
+        let seg_prefix = match seg {
+            AddressSpace::SegGs => "%gs:",
+            AddressSpace::SegFs => "%fs:",
+            AddressSpace::Default => return false,
+        };
+        if !seg_fold_width_ok(ty) {
+            return false;
+        }
+        let Some(base_reg) = self.seg_base_home(base) else {
+            return false;
+        };
+        let store_instr = Self::mov_store_for_type(ty);
+        if let Some(imm) = seg_store_immediate(val, ty) {
+            self.state.emit_fmt(format_args!(
+                "    {} ${}, {}{}(%{})",
+                store_instr, imm, seg_prefix, offset, base_reg
+            ));
+            self.state.reg_cache.invalidate_acc();
+            return true;
+        }
+        // Value source: its own register home when it has one, else rax.
+        let src = match val {
+            Operand::Value(v) => match self.reg_assignments.get(&v.0) {
+                Some(&r) if !is_xmm_reg(r) && phys_reg_name(r) != "rax" => {
+                    typed_phys_reg_name(r, ty)
+                }
+                _ => {
+                    self.operand_to_rax(val);
+                    Self::reg_for_type("rax", ty)
+                }
+            },
+            Operand::Const(_) => {
+                self.operand_to_rax(val);
+                Self::reg_for_type("rax", ty)
+            }
+        };
+        self.state.emit_fmt(format_args!(
+            "    {} %{}, {}{}(%{})",
+            store_instr, src, seg_prefix, offset, base_reg
+        ));
+        self.state.reg_cache.invalidate_acc();
+        true
+    }
+
+    /// The general-register home of `base` when it can address memory directly
+    /// (never `rax`, which stages values, and never an xmm register).
+    fn seg_base_home(&self, base: &Value) -> Option<&'static str> {
+        let &reg = self.reg_assignments.get(&base.0)?;
+        if is_xmm_reg(reg) {
+            return None;
+        }
+        match phys_reg_name(reg) {
+            "rax" => None,
+            name => Some(name),
+        }
+    }
+
     pub(super) fn emit_seg_load_symbol_impl(
         &mut self,
         dest: &Value,
@@ -3911,7 +4038,9 @@ impl X86Codegen {
         if let Operand::Value(v) = val {
             if let Some(&reg) = self.reg_assignments.get(&v.0) {
                 if !is_xmm_reg(reg) {
-                    let rname = Self::reg_for_type(phys_reg_name(reg), ty);
+                    // typed name: reg_for_type knows only rax..r9, so a value homed in
+                    // rbx/r10..r15 would otherwise be stored from %rax.
+                    let rname = typed_phys_reg_name(reg, ty);
                     self.state.emit_fmt(format_args!(
                         "    {} %{}, {}{}",
                         store_instr, rname, seg_prefix, addr
@@ -4197,6 +4326,40 @@ impl X86Codegen {
             "    {} %{}, {}{}(%rip)",
             store_instr, store_reg, seg_prefix, sym
         ));
+    }
+}
+
+/// Integer widths with a direct segment-prefixed form (no 128-bit or FP).
+fn seg_fold_width_ok(ty: IrType) -> bool {
+    matches!(
+        ty,
+        IrType::I8
+            | IrType::U8
+            | IrType::I16
+            | IrType::U16
+            | IrType::I32
+            | IrType::U32
+            | IrType::I64
+            | IrType::U64
+            | IrType::Ptr
+    )
+}
+
+/// The immediate of a constant store, truncated to the store width and in a
+/// form the assembler accepts. A 64-bit store needs a sign-extendable imm32.
+fn seg_store_immediate(val: &Operand, ty: IrType) -> Option<i64> {
+    let Operand::Const(c) = val else {
+        return None;
+    };
+    let v = c.to_i64()?;
+    match ty {
+        IrType::I64 | IrType::U64 | IrType::Ptr => (i32::MIN as i64..=i32::MAX as i64)
+            .contains(&v)
+            .then_some(v),
+        IrType::I32 | IrType::U32 => Some(v as i32 as i64),
+        IrType::I16 | IrType::U16 => Some(v as i16 as i64),
+        IrType::I8 | IrType::U8 => Some(v as i8 as i64),
+        _ => None,
     }
 }
 

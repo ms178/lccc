@@ -75,13 +75,13 @@ impl Lowerer {
             // Register before evaluating initializer so self-referential
             // initializers (e.g., `struct Node n = {&n}`) can resolve.
             let mut ginfo = GlobalInfo::from_analysis(&da);
-            ginfo.var.address_space = decl.address_space;
-            if let Some(ref mut ct) = ginfo.var.c_type {
-                crate::common::type_builder::apply_declaration_address_space(
-                    ct,
-                    decl.address_space,
-                );
-            }
+            ginfo.var.address_space = crate::common::type_builder::place_declared_space(
+                ginfo.var.c_type.as_mut(),
+                decl.address_space,
+                &decl.type_spec,
+                &declarator.derived,
+                declarator.attrs.object_space,
+            );
             self.globals.insert(declarator.name.clone(), ginfo);
 
             let init = self.lower_declarator_init(decl, declarator, &da);
@@ -230,10 +230,13 @@ impl Lowerer {
         }
         let mut ginfo = GlobalInfo::from_analysis(&da);
         ginfo.asm_register = Some(reg_name.clone());
-        ginfo.var.address_space = decl.address_space;
-        if let Some(ref mut ct) = ginfo.var.c_type {
-            crate::common::type_builder::apply_declaration_address_space(ct, decl.address_space);
-        }
+        ginfo.var.address_space = crate::common::type_builder::place_declared_space(
+            ginfo.var.c_type.as_mut(),
+            decl.address_space,
+            &decl.type_spec,
+            &declarator.derived,
+            declarator.attrs.object_space,
+        );
         self.globals.insert(declarator.name.clone(), ginfo);
         true
     }
@@ -270,13 +273,13 @@ impl Lowerer {
                 da.apply_vector_size(vs);
             }
             let mut ginfo = GlobalInfo::from_analysis(&da);
-            ginfo.var.address_space = decl.address_space;
-            if let Some(ref mut ct) = ginfo.var.c_type {
-                crate::common::type_builder::apply_declaration_address_space(
-                    ct,
-                    decl.address_space,
-                );
-            }
+            ginfo.var.address_space = crate::common::type_builder::place_declared_space(
+                ginfo.var.c_type.as_mut(),
+                decl.address_space,
+                &decl.type_spec,
+                &declarator.derived,
+                declarator.attrs.object_space,
+            );
             self.globals.insert(declarator.name.clone(), ginfo);
         }
         // For extern TLS variables, emit an IrGlobal so codegen uses TLS access patterns.
@@ -653,7 +656,7 @@ impl Lowerer {
         let is_array_of_pointers = is_array && {
             let ptr_pos = derived
                 .iter()
-                .position(|d| matches!(d, DerivedDeclarator::Pointer));
+                .position(|d| matches!(d, DerivedDeclarator::Pointer(_)));
             let last_arr_pos = derived
                 .iter()
                 .rposition(|d| matches!(d, DerivedDeclarator::Array(_)));
@@ -690,7 +693,7 @@ impl Lowerer {
 
         let has_derived_ptr = derived
             .iter()
-            .any(|d| matches!(d, DerivedDeclarator::Pointer));
+            .any(|d| matches!(d, DerivedDeclarator::Pointer(_)));
         let is_bool = self.is_type_bool(type_spec) && !has_derived_ptr && !is_array;
 
         let struct_layout = self.get_struct_layout_for_type(type_spec).or_else(|| {
@@ -763,7 +766,7 @@ impl Lowerer {
                         | DerivedDeclarator::Function(_, _) => {
                             found_fptr = true;
                         }
-                        DerivedDeclarator::Pointer if found_fptr => {
+                        DerivedDeclarator::Pointer(_) if found_fptr => {
                             ptrs_after_fptr += 1;
                         }
                         _ => {}

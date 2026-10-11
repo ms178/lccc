@@ -995,11 +995,11 @@ impl Lowerer {
                 cond,
                 common_ir,
                 |s| {
-                    let v = s.lower_expr(then_expr);
+                    let v = s.lower_aggregate_rvalue(then_expr);
                     s.convert_scalar_ctype(v, s.get_expr_type(then_expr), &then_ct, &common_ct)
                 },
                 |s| {
-                    let v = s.lower_expr(else_expr);
+                    let v = s.lower_aggregate_rvalue(else_expr);
                     s.convert_scalar_ctype(v, s.get_expr_type(else_expr), &else_ct, &common_ct)
                 },
             );
@@ -1015,7 +1015,7 @@ impl Lowerer {
         if let Some(const_val) = self.eval_const_expr(cond) {
             let is_true = const_val.is_nonzero();
             if is_true {
-                let then_val = self.lower_expr(then_expr);
+                let then_val = self.lower_aggregate_rvalue(then_expr);
                 if result_is_complex {
                     // Convert to the common complex type if the branch types differ
                     let common_ct = self.common_complex_type(&then_ct, &else_ct);
@@ -1034,7 +1034,7 @@ impl Lowerer {
                 let common_ty = Self::common_type(then_ty, else_ty);
                 return self.emit_implicit_cast(then_val, then_ty, common_ty);
             } else {
-                let else_val = self.lower_expr(else_expr);
+                let else_val = self.lower_aggregate_rvalue(else_expr);
                 if result_is_complex {
                     // Convert to the common complex type if the branch types differ
                     let common_ct = self.common_complex_type(&then_ct, &else_ct);
@@ -1064,11 +1064,11 @@ impl Lowerer {
                 cond,
                 IrType::Ptr,
                 |s| {
-                    let v = s.lower_expr(then_expr);
+                    let v = s.lower_aggregate_rvalue(then_expr);
                     s.convert_to_complex(v, &then_ct, &common_ct)
                 },
                 |s| {
-                    let v = s.lower_expr(else_expr);
+                    let v = s.lower_aggregate_rvalue(else_expr);
                     s.convert_to_complex(v, &else_ct, &common_ct)
                 },
             );
@@ -1113,7 +1113,7 @@ impl Lowerer {
             cond,
             effective_ty,
             |s| {
-                let then_val = s.lower_expr(then_expr);
+                let then_val = s.lower_aggregate_rvalue(then_expr);
                 if needs_struct_load && !then_produces_packed {
                     // Address-producing branch (compound literal, deref, etc.);
                     // load the packed data to match the other packed-data branch
@@ -1135,7 +1135,7 @@ impl Lowerer {
                 }
             },
             |s| {
-                let else_val = s.lower_expr(else_expr);
+                let else_val = s.lower_aggregate_rvalue(else_expr);
                 if needs_struct_load && then_produces_packed {
                     // Address-producing branch (compound literal, deref, etc.);
                     // load the packed data to match the other packed-data branch
@@ -1183,7 +1183,7 @@ impl Lowerer {
                 IrType::Ptr,
                 |s| s.convert_to_complex(cond_val, &cond_ct, &common_ct),
                 |s| {
-                    let v = s.lower_expr(else_expr);
+                    let v = s.lower_aggregate_rvalue(else_expr);
                     s.convert_to_complex(v, &else_ct, &common_ct)
                 },
             );
@@ -1224,7 +1224,7 @@ impl Lowerer {
                 common_ir,
                 |s| s.convert_scalar_ctype(cond_val, cond_ty, &cond_ct, &common_ct),
                 |s| {
-                    let v = s.lower_expr(else_expr);
+                    let v = s.lower_aggregate_rvalue(else_expr);
                     s.convert_scalar_ctype(v, s.get_expr_type(else_expr), &else_ct, &common_ct)
                 },
             );
@@ -1253,7 +1253,7 @@ impl Lowerer {
             common_ty,
             |s| s.emit_implicit_cast(cond_val, cond_ty, common_ty),
             |s| {
-                let else_val = s.lower_expr(else_expr);
+                let else_val = s.lower_aggregate_rvalue(else_expr);
                 s.emit_implicit_cast(else_val, else_ty, common_ty)
             },
         )
@@ -1835,12 +1835,13 @@ impl Lowerer {
         is_inc: bool,
         return_new: bool,
     ) -> Option<Operand> {
-        let (field_addr, storage_ty, bit_offset, bit_width, sso) =
+        let (field_addr, storage_ty, bit_offset, bit_width, sso, seg) =
             self.resolve_bitfield_lvalue(inner)?;
 
         let is_vol = self.expr_access_is_volatile(inner);
-        let current_val = self
-            .extract_bitfield_from_addr(field_addr, storage_ty, bit_offset, bit_width, sso, is_vol);
+        let current_val = self.extract_bitfield_from_addr(
+            field_addr, storage_ty, bit_offset, bit_width, sso, is_vol, seg,
+        );
         let current_ty = crate::ir::lowering::expr_types::bitfield_promoted_type(
             storage_ty,
             Some((bit_offset, bit_width)),
@@ -1866,6 +1867,7 @@ impl Lowerer {
             store_val,
             self.expr_access_is_volatile(inner),
             sso,
+            seg,
         );
 
         if return_new {

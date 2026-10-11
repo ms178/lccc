@@ -1164,13 +1164,11 @@ impl Lowerer {
                 return Operand::Value(addr);
             }
         }
-        let addr_space = match self.get_addr_space_of_ptr_expr(base) {
-            // Member arrays of segment-qualified structs have Array CType;
-            // fall back to the struct-expression walk (mirrors the lvalue
-            // path — LK-26).
-            AddressSpace::Default => self.get_addr_space_of_struct_expr(base),
-            s => s,
-        };
+        // The element's space is the subscript's own space: the pointee of a
+        // pointer operand, the object of an array operand (member arrays of
+        // segment-qualified structs have Array CType, LK-26), or, for the
+        // reversed form `i[p]`, the pointer operand that is the index.
+        let addr_space = self.get_addr_space_of_struct_expr(expr);
         let elem_ty = self.get_expr_type(expr);
         let addr = self.compute_array_element_addr(base, index);
         let dest = self.fresh_value();
@@ -1277,7 +1275,7 @@ impl Lowerer {
         // (packed bitfields that span storage unit boundaries).
         if let Some((bit_offset, bit_width)) = bitfield {
             return self.extract_bitfield_from_addr(
-                field_addr, storage_ty, bit_offset, bit_width, sso, is_vol,
+                field_addr, storage_ty, bit_offset, bit_width, sso, is_vol, addr_space,
             );
         }
 

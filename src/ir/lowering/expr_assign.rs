@@ -127,17 +127,55 @@ impl Lowerer {
             let rhs_val = self.lower_expr(rhs);
             if let Some(lv) = self.lower_lvalue(lhs) {
                 let dest_addr = self.lvalue_addr(&lv);
-                self.store_packed_data_exact(dest_addr, rhs_val, struct_size);
+                let dest_space = self.aggregate_lvalue_space(lhs);
+                if dest_space == AddressSpace::Default {
+                    self.store_packed_data_exact(dest_addr, rhs_val, struct_size);
+                } else {
+                    // Assemble the value in a generic slot, then copy it into
+                    // the segment object.
+                    let slot = self.emit_entry_alloca(IrType::I64, 8, 8, false);
+                    self.store_packed_data_exact(slot, rhs_val, struct_size);
+                    let vol = self.expr_access_is_volatile(lhs);
+                    self.emit_segment_copy(
+                        dest_addr,
+                        dest_space,
+                        slot,
+                        AddressSpace::Default,
+                        struct_size,
+                        vol,
+                    );
+                }
                 return Operand::Value(dest_addr);
             }
             return rhs_val;
         }
 
-        let rhs_val = self.lower_expr(rhs);
+        let rhs_val = self.lower_aggregate_rvalue(rhs);
         if let Some(lv) = self.lower_lvalue(lhs) {
             let dest_addr = self.lvalue_addr(&lv);
             let src_addr = self.operand_to_value(rhs_val);
-            if let Some(size_val) = dynamic_size {
+            let dest_space = self.aggregate_lvalue_space(lhs);
+            if dest_space != AddressSpace::Default {
+                // Destination object lives in a named address space: write it
+                // through the segment (see seg_copy.rs). A dynamic-size copy
+                // into a segment has no lowering yet, so reject it loudly.
+                if dynamic_size.is_some() {
+                    self.diagnostics.borrow_mut().error(
+                        "assignment to a segment-qualified aggregate with a variable-length member is not supported",
+                        lhs.span(),
+                    );
+                } else {
+                    let vol = self.expr_access_is_volatile(lhs);
+                    self.emit_segment_copy(
+                        dest_addr,
+                        dest_space,
+                        src_addr,
+                        AddressSpace::Default,
+                        struct_size,
+                        vol,
+                    );
+                }
+            } else if let Some(size_val) = dynamic_size {
                 self.emit_dynamic_memcpy(dest_addr, src_addr, size_val);
             } else {
                 self.emit(Instruction::Memcpy {
@@ -160,7 +198,7 @@ impl Lowerer {
     pub(super) fn resolve_bitfield_lvalue(
         &mut self,
         expr: &Expr,
-    ) -> Option<(Value, IrType, u32, u32, SsoMode)> {
+    ) -> Option<(Value, IrType, u32, u32, SsoMode, AddressSpace)> {
         let (base_expr, field_name, is_pointer) = match expr {
             Expr::MemberAccess(base, field, _) => (base.as_ref(), field.as_str(), false),
             Expr::PointerMemberAccess(base, field, _) => (base.as_ref(), field.as_str(), true),
@@ -200,7 +238,11 @@ impl Lowerer {
             ty: storage_ty,
         });
 
-        Some((field_addr, storage_ty, bit_offset, bit_width, sso))
+        // The storage unit lives in the object's address space: `gbf.x` takes
+        // it from `gbf`, `p->x` from the pointee of `p`. Every load and store of
+        // this bitfield must carry it, or a segment object is accessed generically.
+        let seg = self.get_addr_space_of_struct_expr(expr);
+        Some((field_addr, storage_ty, bit_offset, bit_width, sso, seg))
     }
 
     /// Integer-promotion result used by arithmetic on a bit-field. Fields wider
@@ -265,7 +307,7 @@ impl Lowerer {
 
     /// Try to lower assignment to a bitfield member.
     fn try_lower_bitfield_assign(&mut self, lhs: &Expr, rhs: &Expr) -> Option<Operand> {
-        let (field_addr, storage_ty, bit_offset, bit_width, sso) =
+        let (field_addr, storage_ty, bit_offset, bit_width, sso, seg) =
             self.resolve_bitfield_lvalue(lhs)?;
         let is_bool = self.is_bool_lvalue(lhs);
         let rhs_val = self.lower_expr(rhs);
@@ -287,6 +329,7 @@ impl Lowerer {
             store_val,
             self.expr_access_is_volatile(lhs),
             sso,
+            seg,
         );
         Some(self.truncate_to_bitfield_value(
             store_val,
@@ -303,13 +346,14 @@ impl Lowerer {
         lhs: &Expr,
         rhs: &Expr,
     ) -> Option<Operand> {
-        let (field_addr, storage_ty, bit_offset, bit_width, sso) =
+        let (field_addr, storage_ty, bit_offset, bit_width, sso, seg) =
             self.resolve_bitfield_lvalue(lhs)?;
         let is_bool = self.is_bool_lvalue(lhs);
 
         let is_vol = self.expr_access_is_volatile(lhs);
-        let current_val = self
-            .extract_bitfield_from_addr(field_addr, storage_ty, bit_offset, bit_width, sso, is_vol);
+        let current_val = self.extract_bitfield_from_addr(
+            field_addr, storage_ty, bit_offset, bit_width, sso, is_vol, seg,
+        );
         let current_ty = crate::ir::lowering::expr_types::bitfield_promoted_type(
             storage_ty,
             Some((bit_offset, bit_width)),
@@ -342,6 +386,7 @@ impl Lowerer {
             store_val,
             self.expr_access_is_volatile(lhs),
             sso,
+            seg,
         );
         Some(self.truncate_to_bitfield_value(
             store_val,
@@ -364,6 +409,7 @@ impl Lowerer {
         val: Operand,
         volatile: bool,
         sso: SsoMode,
+        seg: AddressSpace,
     ) {
         if bit_width >= 64 && bit_offset == 0 {
             // Full-width field: the store covers the whole storage unit, so
@@ -394,7 +440,7 @@ impl Lowerer {
                 val: stored,
                 ptr: addr,
                 ty: storage_ty,
-                seg_override: AddressSpace::Default,
+                seg_override: seg,
             });
             return;
         }
@@ -412,6 +458,7 @@ impl Lowerer {
                 val,
                 volatile,
                 sso,
+                seg,
             );
             return;
         }
@@ -451,7 +498,7 @@ impl Lowerer {
             dest: old_val,
             ptr: addr,
             ty: storage_ty,
-            seg_override: AddressSpace::Default,
+            seg_override: seg,
         });
         let old_fixed = self.emit_sso_load_fixup(Operand::Value(old_val), storage_ty, sso);
 
@@ -479,7 +526,7 @@ impl Lowerer {
             val: stored,
             ptr: addr,
             ty: storage_ty,
-            seg_override: AddressSpace::Default,
+            seg_override: seg,
         });
     }
 
@@ -495,6 +542,7 @@ impl Lowerer {
         val: Operand,
         volatile: bool,
         sso: SsoMode,
+        seg: AddressSpace,
     ) {
         let low_bits = storage_bits - bit_offset;
         let high_bits = bit_width - low_bits;
@@ -547,7 +595,7 @@ impl Lowerer {
             dest: old_low,
             ptr: addr,
             ty: storage_ty,
-            seg_override: AddressSpace::Default,
+            seg_override: seg,
         });
         let old_low_fixed = self.emit_sso_load_fixup(Operand::Value(old_low), storage_ty, sso);
         let low_clear = !(low_mask << bit_offset);
@@ -569,7 +617,7 @@ impl Lowerer {
             val: new_low_fixed,
             ptr: addr,
             ty: storage_ty,
-            seg_override: AddressSpace::Default,
+            seg_override: seg,
         });
 
         // High part: take remaining bits from masked_val >> low_bits, store at bit 0 of next unit
@@ -600,7 +648,7 @@ impl Lowerer {
             dest: old_high,
             ptr: high_addr,
             ty: storage_ty,
-            seg_override: AddressSpace::Default,
+            seg_override: seg,
         });
         let old_high_fixed = self.emit_sso_load_fixup(Operand::Value(old_high), storage_ty, sso);
         let high_clear = !high_mask;
@@ -622,7 +670,7 @@ impl Lowerer {
             val: new_high_fixed,
             ptr: high_addr,
             ty: storage_ty,
-            seg_override: AddressSpace::Default,
+            seg_override: seg,
         });
     }
 
@@ -725,6 +773,7 @@ impl Lowerer {
         bit_width: u32,
         sso: SsoMode,
         volatile: bool,
+        seg: AddressSpace,
     ) -> Operand {
         let storage_bits = (storage_ty.size() * 8) as u32;
 
@@ -743,7 +792,7 @@ impl Lowerer {
                 dest: low_loaded,
                 ptr: addr,
                 ty: storage_ty,
-                seg_override: AddressSpace::Default,
+                seg_override: seg,
             });
             let low_fixed = self.emit_sso_load_fixup(Operand::Value(low_loaded), storage_ty, sso);
             let low_fixed_v = match &low_fixed {
@@ -780,7 +829,7 @@ impl Lowerer {
                 dest: high_loaded,
                 ptr: high_addr,
                 ty: storage_ty,
-                seg_override: AddressSpace::Default,
+                seg_override: seg,
             });
             let high_fixed = self.emit_sso_load_fixup(Operand::Value(high_loaded), storage_ty, sso);
             let high_mask = if high_bits >= op_bits {
@@ -842,7 +891,7 @@ impl Lowerer {
                 dest: loaded,
                 ptr: addr,
                 ty: storage_ty,
-                seg_override: AddressSpace::Default,
+                seg_override: seg,
             });
             let fixed = self.emit_sso_load_fixup(Operand::Value(loaded), storage_ty, sso);
             self.extract_bitfield(fixed, storage_ty, bit_offset, bit_width)
@@ -893,12 +942,31 @@ impl Lowerer {
 
         let lhs_ptr = self.lower_complex_lvalue(lhs);
 
+        // The LHS object's space: its current value is read from there, and
+        // the result is written back there (a `__seg_gs` complex is %gs-resident).
+        let lhs_space = self.get_addr_space_of_struct_expr(lhs);
+        let lhs_size = Self::complex_component_size(lhs_ct) * 2;
+        let lhs_read_ptr = if lhs_space == AddressSpace::Default {
+            lhs_ptr
+        } else {
+            let tmp = self.emit_entry_alloca(IrType::I8, lhs_size, 8, false);
+            let lhs_vol = self.expr_access_is_volatile(lhs);
+            self.emit_segment_copy(
+                tmp,
+                AddressSpace::Default,
+                lhs_ptr,
+                lhs_space,
+                lhs_size,
+                lhs_vol,
+            );
+            tmp
+        };
         let op_lhs_ptr = if result_ct != *lhs_ct {
             let lhs_converted =
-                self.convert_to_complex(Operand::Value(lhs_ptr), lhs_ct, &result_ct);
+                self.convert_to_complex(Operand::Value(lhs_read_ptr), lhs_ct, &result_ct);
             self.operand_to_value(lhs_converted)
         } else {
-            lhs_ptr
+            lhs_read_ptr
         };
 
         let rhs_val = self.lower_expr(rhs);
@@ -921,12 +989,14 @@ impl Lowerer {
         } else {
             self.operand_to_value(result)
         };
-        let comp_size = Self::complex_component_size(lhs_ct);
-        self.emit(Instruction::Memcpy {
-            dest: lhs_ptr,
-            src: store_ptr,
-            size: comp_size * 2,
-        });
+        self.copy_bytes_across_spaces(
+            lhs_ptr,
+            lhs_space,
+            store_ptr,
+            AddressSpace::Default,
+            lhs_size,
+            self.expr_access_is_volatile(lhs),
+        );
 
         Operand::Value(lhs_ptr)
     }
@@ -1221,7 +1291,7 @@ impl Lowerer {
         // Small vectors (<=8 bytes) are returned as packed I64 values, not pointers.
         let rhs_is_small_vec_call = self.rhs_is_small_vector_call(rhs, total_size);
 
-        let rhs_val = self.lower_expr(rhs);
+        let rhs_val = self.lower_aggregate_rvalue(rhs);
         let rhs_ptr_val = if rhs_is_small_vec_call {
             // The return value is packed vector data in a register.
             // Spill it to an alloca so we can memcpy from it.
@@ -1246,11 +1316,25 @@ impl Lowerer {
         } else {
             self.operand_to_value(rhs_val)
         };
-        self.emit(Instruction::Memcpy {
-            dest: lhs_ptr_val,
-            src: rhs_ptr_val,
-            size: total_size,
-        });
+        // A vector object in a named address space is written through its
+        // segment; the generic Memcpy would store to the wrong memory.
+        let dest_space = self.aggregate_lvalue_space(lhs);
+        if dest_space == AddressSpace::Default {
+            self.emit(Instruction::Memcpy {
+                dest: lhs_ptr_val,
+                src: rhs_ptr_val,
+                size: total_size,
+            });
+        } else {
+            self.emit_segment_copy(
+                lhs_ptr_val,
+                dest_space,
+                rhs_ptr_val,
+                AddressSpace::Default,
+                total_size,
+                self.expr_access_is_volatile(lhs),
+            );
+        }
         Operand::Value(lhs_ptr_val)
     }
 
@@ -1308,13 +1392,17 @@ impl Lowerer {
         // Get the IR binary operation
         let ir_op = Self::binop_to_ir(*op, is_unsigned);
 
-        // LHS is always a vector for compound assignment
+        // LHS is always a vector for compound assignment. Its address is the
+        // object's storage, so its loads and stores use the object's space
+        // (a `__seg_gs` vector is read and written through %gs).
         let lhs_ptr = self.lower_expr(lhs);
         let lhs_ptr_val = self.operand_to_value(lhs_ptr);
+        let lhs_space = self.get_addr_space_of_struct_expr(lhs);
+        let lhs_volatile = self.expr_access_is_volatile(lhs);
 
         // RHS may be a scalar or a vector
         let rhs_is_vector = self.expr_ctype(rhs).is_vector();
-        let rhs_lowered = self.lower_expr(rhs);
+        let rhs_lowered = self.lower_aggregate_rvalue(rhs);
         let rhs_val = self.operand_to_value(rhs_lowered);
 
         // For scalar RHS, cast to element type once (broadcast value)
@@ -1343,11 +1431,11 @@ impl Lowerer {
             // Load LHS element
             let lhs_elem = self.fresh_value();
             self.emit(Instruction::Load {
-                volatile: false,
+                volatile: lhs_volatile,
                 dest: lhs_elem,
                 ptr: lhs_elem_ptr,
                 ty: elem_ir_ty,
-                seg_override: AddressSpace::Default,
+                seg_override: lhs_space,
             });
             // Get RHS element: splatted scalar or loaded from vector
             let rhs_elem_op = if let Some(ref scalar_op) = rhs_scalar {
@@ -1378,11 +1466,11 @@ impl Lowerer {
                 self.emit_binop_val(ir_op, Operand::Value(lhs_elem), rhs_elem_op, elem_ir_ty);
             // Store back to LHS
             self.emit(Instruction::Store {
-                volatile: false,
+                volatile: lhs_volatile,
                 val: Operand::Value(result_elem),
                 ptr: lhs_elem_ptr,
                 ty: elem_ir_ty,
-                seg_override: AddressSpace::Default,
+                seg_override: lhs_space,
             });
         }
 
@@ -1423,9 +1511,9 @@ impl Lowerer {
         let result_alloca = self.emit_entry_alloca(IrType::Ptr, total_size, total_size, false);
 
         // Lower operands. Vectors produce pointers; scalars produce values.
-        let lhs_lowered = self.lower_expr(lhs);
+        let lhs_lowered = self.lower_aggregate_rvalue(lhs);
         let lhs_val = self.operand_to_value(lhs_lowered);
-        let rhs_lowered = self.lower_expr(rhs);
+        let rhs_lowered = self.lower_aggregate_rvalue(rhs);
         let rhs_val = self.operand_to_value(rhs_lowered);
 
         // For scalar operands, cast to the element type once (broadcast value).
@@ -1565,9 +1653,9 @@ impl Lowerer {
         // Allocate the result mask vector on the stack.
         let result_alloca = self.emit_entry_alloca(IrType::Ptr, total_size, total_size, false);
 
-        let lhs_lowered = self.lower_expr(lhs);
+        let lhs_lowered = self.lower_aggregate_rvalue(lhs);
         let lhs_val = self.operand_to_value(lhs_lowered);
-        let rhs_lowered = self.lower_expr(rhs);
+        let rhs_lowered = self.lower_aggregate_rvalue(rhs);
         let rhs_val = self.operand_to_value(rhs_lowered);
 
         // For a scalar operand, cast it to the element type once (the
@@ -1698,7 +1786,7 @@ impl Lowerer {
             ),
         };
         let result_alloca = self.emit_entry_alloca(IrType::Ptr, total_size, total_size, false);
-        let val = self.lower_expr(inner);
+        let val = self.lower_aggregate_rvalue(inner);
         let val = self.operand_to_value(val);
         let ptr_int_ty = crate::common::types::target_int_ir_type();
 

@@ -1,5 +1,5 @@
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::common::types::CType;
+use crate::common::types::{AddressSpace, CType};
 
 /// Information about a declared symbol.
 #[derive(Debug, Clone)]
@@ -9,6 +9,9 @@ pub struct Symbol {
     /// Explicit alignment from _Alignas or __attribute__((aligned(N))).
     /// Used by _Alignof(var) to return the correct alignment per C11 6.2.8p3.
     pub explicit_alignment: Option<usize>,
+    /// Address space the object is stored in (`__seg_gs` objects); `Default`
+    /// for everything else, including functions, parameters and enumerators.
+    pub storage_space: AddressSpace,
 }
 
 /// A scope in the symbol table.

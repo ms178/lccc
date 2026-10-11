@@ -8916,6 +8916,21 @@ impl ArchCodegen for X86Codegen {
         }
     }
 
+    fn seg_const_offset_fold_base_ok(&self, base: &Value) -> bool {
+        // Same liveness contract as the generic fold. The segment forms only
+        // read the base, and the value staging they use (operand_to_rax,
+        // store_rax_to) never writes %rdx or %r11, so those homes are safe here
+        // even though the generic fold excludes them. %rax is excluded because
+        // loads stage their result there.
+        if self.state.ra_config.no_folded_index_liveness {
+            return false;
+        }
+        match self.reg_assignments.get(&base.0) {
+            Some(&phys) if !is_xmm_reg(phys) => phys_reg_name(phys) != "rax",
+            _ => false,
+        }
+    }
+
     fn emit_reg_to_acc(&mut self, reg: PhysReg) {
         // The trait DEFAULT for this hook is a NO-OP ("backends override").
         // Without the override, default emit_gep fallbacks that stage a
@@ -9398,6 +9413,8 @@ impl ArchCodegen for X86Codegen {
         fn emit_seg_load(&mut self, dest: &Value, ptr: &Value, ty: IrType, seg: AddressSpace) => emit_seg_load_impl;
         fn emit_seg_load_const_addr(&mut self, dest: &Value, addr: i64, ty: IrType, seg: AddressSpace) -> bool => emit_seg_load_const_addr_impl;
         fn emit_seg_store_const_addr(&mut self, val: &Operand, addr: i64, ty: IrType, seg: AddressSpace) -> bool => emit_seg_store_const_addr_impl;
+        fn emit_seg_load_with_const_offset(&mut self, dest: &Value, base: &Value, offset: i64, ty: IrType, seg: AddressSpace) -> bool => emit_seg_load_with_const_offset_impl;
+        fn emit_seg_store_with_const_offset(&mut self, val: &Operand, base: &Value, offset: i64, ty: IrType, seg: AddressSpace) -> bool => emit_seg_store_with_const_offset_impl;
         fn emit_seg_load_symbol(&mut self, dest: &Value, sym: &str, ty: IrType, seg: AddressSpace) => emit_seg_load_symbol_impl;
         fn emit_seg_store(&mut self, val: &Operand, ptr: &Value, ty: IrType, seg: AddressSpace) => emit_seg_store_impl;
         fn emit_seg_store_symbol(&mut self, val: &Operand, sym: &str, ty: IrType, seg: AddressSpace) => emit_seg_store_symbol_impl;

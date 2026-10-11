@@ -184,7 +184,11 @@ _tarball_matches_pin() {  # <tarball>: the pinned binutils-2.47 bytes?
 # and the caches are not. What the marker DOES close is every accidental
 # and environmental drift case that previously rode the fast path on a
 # self-reported version string alone.
-PROVENANCE_KEYS=(target tarball_version tarball_sha256 as_sha256 objdump_sha256 objcopy_sha256)
+# sysregs_def_sha256 binds the binutils system-register table that
+# scripts/aarch64_sysreg_table.py checks lccc against. It is installed with the
+# pair (share/lccc/) so a cache hit that restores the prefix also restores the
+# table; a pair provisioned before this key existed has no table and rebuilds.
+PROVENANCE_KEYS=(target tarball_version tarball_sha256 as_sha256 objdump_sha256 objcopy_sha256 sysregs_def_sha256)
 
 _pair_provenance_ok() {  # requires $as/$od/$oc/$provenance/$target set
     [[ -f "$provenance" ]] || return 1
@@ -212,15 +216,17 @@ _pair_provenance_ok() {  # requires $as/$od/$oc/$provenance/$target set
     _sha256_is "$as" "${seen[as_sha256]}" || return 1
     _sha256_is "$od" "${seen[objdump_sha256]}" || return 1
     _sha256_is "$oc" "${seen[objcopy_sha256]}" || return 1
+    _sha256_is "$sysregs_def" "${seen[sysregs_def_sha256]}" || return 1
 }
 
 _write_provenance() {  # after a verified-tarball build passed validation
-    local as_sum od_sum oc_sum
+    local as_sum od_sum oc_sum def_sum
     as_sum=$(sha256sum "$as") && as_sum=${as_sum%% *}
     od_sum=$(sha256sum "$od") && od_sum=${od_sum%% *}
     oc_sum=$(sha256sum "$oc") && oc_sum=${oc_sum%% *}
-    printf 'target=%s\ntarball_version=%s\ntarball_sha256=%s\nas_sha256=%s\nobjdump_sha256=%s\nobjcopy_sha256=%s\n' \
-        "$target" "$ver" "$GAS_TARBALL_SHA256" "$as_sum" "$od_sum" "$oc_sum" \
+    def_sum=$(sha256sum "$sysregs_def") && def_sum=${def_sum%% *}
+    printf 'target=%s\ntarball_version=%s\ntarball_sha256=%s\nas_sha256=%s\nobjdump_sha256=%s\nobjcopy_sha256=%s\nsysregs_def_sha256=%s\n' \
+        "$target" "$ver" "$GAS_TARBALL_SHA256" "$as_sum" "$od_sum" "$oc_sum" "$def_sum" \
         > "$provenance.tmp"
     mv -f "$provenance.tmp" "$provenance"
 }
@@ -442,9 +448,13 @@ EOF
             ok=1
         fi
     }
-    local good_marker no_objdump_marker rot_pin
-    good_marker=$(printf 'target=%s\ntarball_version=%s\ntarball_sha256=%s\nas_sha256=%s\nobjdump_sha256=%s\nobjcopy_sha256=%s\n' \
-        "$target" "$ver" "$GAS_TARBALL_SHA256" "$sum_as" "$sum_od" "$sum_oc")
+    local good_marker no_objdump_marker rot_pin def_fake sum_def
+    def_fake="$tmp/sysregs-prov.def"
+    printf 'DEF(\"prov\", CPENC(3,0,0,0,0,0))\n' >"$def_fake"
+    sysregs_def="$def_fake"
+    sum_def=$(sha256sum "$def_fake"); sum_def=${sum_def%% *}
+    good_marker=$(printf 'target=%s\ntarball_version=%s\ntarball_sha256=%s\nas_sha256=%s\nobjdump_sha256=%s\nobjcopy_sha256=%s\nsysregs_def_sha256=%s\n' \
+        "$target" "$ver" "$GAS_TARBALL_SHA256" "$sum_as" "$sum_od" "$sum_oc" "$sum_def")
     no_objdump_marker=$(printf 'target=%s\ntarball_version=%s\ntarball_sha256=%s\nas_sha256=%s\n' \
         "$target" "$ver" "$GAS_TARBALL_SHA256" "$sum_as")
     # A rotated pin, guaranteed different from the current one (same
@@ -456,6 +466,19 @@ EOF
         *)  rot_pin="00${GAS_TARBALL_SHA256:2}" ;;
     esac
     prov_case "provenance: marker of these exact bytes" 0 "$good_marker"
+    # A pair provisioned before the table was installed (the cache that CI
+    # restored): six keys, no sysregs_def_sha256. The fast path must rebuild.
+    local old_marker
+    old_marker=$(printf 'target=%s\ntarball_version=%s\ntarball_sha256=%s\nas_sha256=%s\nobjdump_sha256=%s\nobjcopy_sha256=%s\n' \
+        "$target" "$ver" "$GAS_TARBALL_SHA256" "$sum_as" "$sum_od" "$sum_oc")
+    prov_case "provenance: pre-table marker (six keys)" 1 "$old_marker"
+    # The table is altered after provisioning: the same marker must now fail.
+    local def_orig="$tmp/sysregs-prov.def.orig"
+    cp "$def_fake" "$def_orig"
+    printf 'tampered\n' >>"$def_fake"
+    prov_case "provenance: sysregs table drifted" 1 "$good_marker"
+    cp "$def_orig" "$def_fake"
+    prov_case "provenance: sysregs table restored" 0 "$good_marker"
     # A pair installed before the marker existed (the current real-world
     # cache): no marker at all — the fast path must rebuild, not trust the
     # bare version+canary layers.
@@ -508,6 +531,7 @@ as="$prefix/bin/as"
 od="$prefix/bin/objdump"
 oc="$prefix/bin/objcopy"
 provenance="$prefix/.lccc-binutils-provenance"
+sysregs_def="$prefix/share/lccc/aarch64-sys-regs.def"
 
 # BOTH binaries, validated as a PAIR (pinned token, one build, functional
 # canary) AND provably the product of the PINNED TARBALL's bytes (the
@@ -628,6 +652,16 @@ cp binutils/objdump "$od"
     exit 1
 }
 cp binutils/objcopy "$oc"
+# The binutils system-register table, from the same pinned tree the pair was
+# built from. scripts/aarch64_sysreg_table.py reads it from here: a cache hit
+# restores this prefix but not ~/dl, so the table must travel with the pair.
+[[ -f "$src/opcodes/aarch64-sys-regs.def" ]] || {
+    echo "FATAL: $src/opcodes/aarch64-sys-regs.def is missing from the pinned tree" >&2
+    exit 1
+}
+mkdir -p "$(dirname "$sysregs_def")"
+cp "$src/opcodes/aarch64-sys-regs.def" "$sysregs_def.tmp"
+mv -f "$sysregs_def.tmp" "$sysregs_def"
 # The freshly installed pair must pass the SAME validation the cache
 # fast path applies — an install that cannot justify itself is a failure,
 # not a print-and-hope.

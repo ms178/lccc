@@ -332,6 +332,30 @@ pub trait ArchCodegen {
     ) -> bool {
         false
     }
+    /// Segment-overridden load of `offset(base)` with the constant displacement
+    /// folded into the addressing mode. Returns false (emitting nothing) when
+    /// the backend has no such form; the caller then materializes the address.
+    fn emit_seg_load_with_const_offset(
+        &mut self,
+        _dest: &Value,
+        _base: &Value,
+        _offset: i64,
+        _ty: IrType,
+        _seg: AddressSpace,
+    ) -> bool {
+        false
+    }
+    /// Store counterpart of `emit_seg_load_with_const_offset`.
+    fn emit_seg_store_with_const_offset(
+        &mut self,
+        _val: &Operand,
+        _base: &Value,
+        _offset: i64,
+        _ty: IrType,
+        _seg: AddressSpace,
+    ) -> bool {
+        false
+    }
     fn emit_seg_load(&mut self, _dest: &Value, _ptr: &Value, _ty: IrType, _seg: AddressSpace) {
         panic!("segment override loads only supported on x86");
     }
@@ -544,6 +568,13 @@ pub trait ArchCodegen {
     /// proven alloca-only contract.
     fn const_offset_fold_reg_base_ok(&self, _base: &Value) -> bool {
         false
+    }
+
+    /// Whether a register-resident base may be folded into a segment-overridden
+    /// access (`%gs:off(%base)`). Defaults to the generic hook; backends whose
+    /// segment forms read only the base may accept more homes.
+    fn seg_const_offset_fold_base_ok(&self, base: &Value) -> bool {
+        self.const_offset_fold_reg_base_ok(base)
     }
 
     /// Emit a RIP-relative load from a global symbol (folded GlobalAddr + Load).

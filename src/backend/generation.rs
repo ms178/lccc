@@ -243,6 +243,28 @@ fn filter_rip_legal_symbols(cg: &dyn ArchCodegen, map: &mut FxHashMap<u32, Strin
 }
 
 fn can_const_addr_fold(cg: &dyn ArchCodegen, info: &GepFoldInfo) -> bool {
+    can_const_addr_fold_for(cg, info, false)
+}
+
+/// `can_const_addr_fold` for segment-overridden accesses. Same liveness
+/// contract; the backend's segment hook may accept bases that the generic
+/// hook refuses because the generic fold stages through their registers.
+/// A symbol or constant-address root is never materialized into a register, so
+/// its home holds no address; only a root that is computed at run time may be
+/// used as a register base.
+fn seg_fold_base_in_register(
+    info: &GepFoldInfo,
+    global_addr_map: &FxHashMap<u32, String>,
+    const_addr_vals: &FxHashMap<u32, i64>,
+) -> bool {
+    !global_addr_map.contains_key(&info.base.0) && !const_addr_vals.contains_key(&info.base.0)
+}
+
+fn can_seg_const_addr_fold(cg: &dyn ArchCodegen, info: &GepFoldInfo) -> bool {
+    can_const_addr_fold_for(cg, info, true)
+}
+
+fn can_const_addr_fold_for(cg: &dyn ArchCodegen, info: &GepFoldInfo, seg: bool) -> bool {
     // A/B gate: force the pre-session-25 alloca-only contract.
     if env_flag_set("CCC_NO_REGBASE_FOLD") {
         return cg.state_ref().is_alloca(info.base.0);
@@ -275,7 +297,11 @@ fn can_const_addr_fold(cg: &dyn ArchCodegen, info: &GepFoldInfo) -> bool {
     // gz_reset `movl %r15d,(%r15)` NULL store); without (b) the access can
     // silently fall through.  The backend hook performs the per-value
     // physical-register sanity check (emitter scratch exclusion).
-    cg.const_offset_fold_reg_base_ok(&info.base)
+    if seg {
+        cg.seg_const_offset_fold_base_ok(&info.base)
+    } else {
+        cg.const_offset_fold_reg_base_ok(&info.base)
+    }
 }
 
 /// Whether a memory access is addressed by a GEP represented in the
@@ -783,27 +809,20 @@ fn retain_ptr_only_uses(func: &IrFunction, map: &mut FxHashMap<u32, GepFoldInfo>
         for block in &func.blocks {
             for inst in &block.instructions {
                 match inst {
-                    Instruction::Load {
-                        ptr,
-                        ty,
-                        seg_override,
-                        ..
-                    } => {
-                        if !is_foldable_mem_ty(*ty) || *seg_override != AddressSpace::Default {
+                    Instruction::Load { ptr, ty, .. } => {
+                        // A segment-overridden access folds the constant displacement
+                        // too (`%gs:off(%base)`); see `emit_seg_load_with_const_offset`.
+                        if !is_foldable_mem_ty(*ty) {
                             mark(ptr.0);
                         }
                     }
-                    Instruction::Store {
-                        val,
-                        ptr,
-                        ty,
-                        seg_override,
-                        ..
-                    } => {
+                    Instruction::Store { val, ptr, ty, .. } => {
                         if let Operand::Value(v) = val {
                             mark(v.0);
                         }
-                        if !is_foldable_mem_ty(*ty) || *seg_override != AddressSpace::Default {
+                        // A segment-overridden access folds the constant displacement
+                        // too (`%gs:off(%base)`); see `emit_seg_load_with_const_offset`.
+                        if !is_foldable_mem_ty(*ty) {
                             mark(ptr.0);
                         }
                     }
@@ -6364,6 +6383,23 @@ fn generate_load(
                 return;
             }
         }
+        // Constant-displacement GEP: fold it into the segment operand. Only
+        // when the generic path would fold it too (same base legality).
+        if let Some(gep_info) = gep_fold_map.get(&ptr.0) {
+            if !is_wide_int_type(ty)
+                && seg_fold_base_in_register(gep_info, global_addr_map, const_addr_vals)
+                && can_seg_const_addr_fold(cg, gep_info)
+                && cg.emit_seg_load_with_const_offset(
+                    dest,
+                    &gep_info.base,
+                    gep_info.offset,
+                    ty,
+                    seg_override,
+                )
+            {
+                return;
+            }
+        }
         // If the GlobalAddr/GEP was skipped as dead, rematerialize first.
         if let Some(info) = gep_fold_map.get(&ptr.0) {
             rematerialize_const_addr(cg, ptr, info);
@@ -6445,6 +6481,21 @@ fn generate_store(
         // Constant offset (glibc THREAD_SETMEM): direct one-instruction form.
         if let Some(&addr) = const_addr_vals.get(&ptr.0) {
             if cg.emit_seg_store_const_addr(val, addr, ty, seg_override) {
+                return;
+            }
+        }
+        if let Some(gep_info) = gep_fold_map.get(&ptr.0) {
+            if !is_wide_int_type(ty)
+                && seg_fold_base_in_register(gep_info, global_addr_map, const_addr_vals)
+                && can_seg_const_addr_fold(cg, gep_info)
+                && cg.emit_seg_store_with_const_offset(
+                    val,
+                    &gep_info.base,
+                    gep_info.offset,
+                    ty,
+                    seg_override,
+                )
+            {
                 return;
             }
         }

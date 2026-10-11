@@ -16,6 +16,24 @@
 #      `struct c __seg_gs *lk2(struct s *ssp)` keeps `ssp` generic, so a
 #      plain `struct s *` argument is accepted (GCC accepts it).
 #   8. negative control — a plain `struct c *` load carries no %gs override.
+#   9. function pointer  `struct c __seg_gs *(*fp)(void)`: the return-type
+#                       pointer is %gs, the function pointer load is not.
+#  10. pointer to ptr   `struct c __seg_gs **pp`: `pp[0]` is generic; only the
+#                       final `->` dereference is %gs (exactly one override).
+#  11. global pointer   `struct c __seg_gs *gp`: the variable `gp` itself is
+#                       generic memory (never `%gs:gp`); `gp->v[0]` is %gs.
+#  12. global pointer array `struct c __seg_gs *garr[4]`: elements are generic
+#                       loads, one %gs override for the dereference.
+#  13. positive control `struct c __seg_gs gobj`: a plain object declared in
+#                       the space is loaded as `%gs:gobj`.
+#  14. constraint: a generic `struct c *` stored into a `__seg_gs` member is
+#                       rejected (GCC 14.2: "assignment from pointer to
+#                       non-enclosed address space"), as are the reverse, an
+#                       initializer, and `void *` in either direction. An
+#                       explicit cast and a same-space store stay accepted.
+#  15. whole-type qualifier `__seg_gs __typeof__(struct c *) gpv;`: the pointer
+#                       object itself is %gs (kernel per-CPU pointer shape).
+#                       The pointee is NOT qualified by this form.
 #
 # GCC is the oracle for the accepted/rejected set and for the %gs prefix on
 # each load; the check is on the emitted assembly, not only the exit status.
@@ -44,10 +62,28 @@ void pass_ret(void) { take(lk()); take(mk()); }
 long rd_typedef(gp_t g) { return g->v[0]; }
 void pass_generic(struct s *s) { lk2(s); }
 long rd_plain(struct c *q) { return q->v[0]; }
+
+struct c __seg_gs *(*fp)(void);
+long rd_fnptr(void) { return fp()->v[0]; }
+struct c __seg_gs **pp;
+long rd_pp(void) { return pp[0]->v[0]; }
+struct c __seg_gs *gp;
+long rd_gp(void) { return gp->v[0]; }
+struct c __seg_gs *garr[4];
+long rd_garr(int i) { return garr[i]->v[0]; }
+struct c __seg_gs gobj;
+long rd_gobj(void) { return gobj.v[0]; }
+extern __seg_gs __typeof__(struct c *) gpv;
+long rd_whole(void) { return (long)gpv; }
 C
 
-"$CCC" -O2 -S -o "$tmp/t.s" "$tmp/t.c"
+cat >"$tmp/divergence.c" <<'C'
+struct c { long v[2]; };
+struct g { struct c __seg_gs *scp; };
+void store_generic(struct g *t, struct c *q) { t->scp = q; }
+C
 
+asm_checks() { # the emitted-assembly checks, on $tmp/t.s for the current -O level
 # Body of one function from the emitted assembly.
 # Ends at the first `ret` (lccc indents with spaces, GCC with tabs).
 body() { awk -v f="$1" '$0 ~ "^"f":" {on=1} on {print} on && /^[ \t]*ret[ \t]*$/ {exit}' "$tmp/t.s"; }
@@ -66,9 +102,47 @@ require_gs() { # require_gs <fn>  — the function must contain a %gs-prefixed a
     fi
 }
 
-for fn in rd_param rd_local rd_proto_ret rd_def_ret rd_typedef; do
+for fn in rd_param rd_local rd_proto_ret rd_def_ret rd_typedef rd_fnptr; do
     require_gs "$fn"
 done
+
+gs_count() { # gs_count <fn> -> number of %gs: overrides in the function body
+    body "$1" | grep -o '%gs:' | wc -l | tr -d ' '
+}
+expect_count() { # expect_count <fn> <n>
+    local got
+    got=$(gs_count "$1")
+    if [[ $got != "$2" ]]; then
+        echo "FAIL: $1: expected $2 %gs override(s), got $got" >&2
+        body "$1" >&2
+        exit 1
+    fi
+}
+expect_no_gs_of() { # expect_no_gs_of <fn> <symbol>
+    if grep -q "%gs:$2\b" <<<"$(body "$1")"; then
+        echo "FAIL: $1: $2 itself is loaded through %gs (object storage, not pointee)" >&2
+        body "$1" >&2
+        exit 1
+    fi
+}
+
+# 9-12: the function-pointer and pointer-level placement cases.
+expect_count rd_fnptr 1
+expect_count rd_pp 1
+expect_no_gs_of rd_pp pp
+expect_count rd_gp 1
+expect_no_gs_of rd_gp gp
+expect_count rd_garr 1
+expect_no_gs_of rd_garr garr
+# 13: a plain object of the declared space keeps its %gs storage.
+# At -O2 the access is the direct `%gs:gobj`; at -O0/-O1 it is `leaq gobj(%rip)`
+# and a %gs access through that address, the same effective address.
+if [[ $opt == -O2 ]]; then want='%gs:gobj'; else want='%gs:'; fi
+grep -q -- "$want" <<<"$(body rd_gobj)" || { echo "FAIL: rd_gobj ($opt): gobj not loaded via $want" >&2; body rd_gobj >&2; exit 1; }
+# 15: the whole-type pointer object is in %gs; reading it is a %gs load.
+grep -q '%gs:gpv' <<<"$(body rd_whole)" || { echo "FAIL: rd_whole: gpv not loaded via %gs:gpv" >&2; body rd_whole >&2; exit 1; }
+# Locals: the pointer slot itself is generic; one deref override.
+expect_count rd_local 1
 
 plain=$(body rd_plain)
 if grep -q '%gs:' <<<"$plain"; then
@@ -77,4 +151,135 @@ if grep -q '%gs:' <<<"$plain"; then
     exit 1
 fi
 
-echo "PASS: __seg_gs declaration qualifier reaches params, locals, returns, typedefs"
+}
+
+for opt in -O0 -O1 -O2; do
+    "$CCC" "$opt" -S -o "$tmp/t.s" "$tmp/t.c"
+    asm_checks
+    echo "  emitted-assembly checks pass at $opt"
+done
+
+# 14: a named-space pointer conversion is a constraint violation. GCC 14.2
+# rejects each of these with "from pointer to non-enclosed address space"; lccc
+# must reject it with its address-space diagnostic (not an unrelated error).
+expect_reject() { # expect_reject <label> <file>
+    if "$CCC" -S -o "$tmp/rej.s" "$2" 2>"$tmp/rej.err"; then
+        echo "FAIL: $1: accepted; GCC 14.2 rejects it" >&2
+        exit 1
+    fi
+    # Assignment and initializer conversions say "incompatible address space";
+    # an argument keeps the existing argument diagnostic (pointer_argument_compat).
+    if ! grep -q -e 'incompatible address space' -e 'incompatible pointer type for argument' "$tmp/rej.err"; then
+        echo "FAIL: $1: rejected, but not for the address space" >&2
+        cat "$tmp/rej.err" >&2
+        exit 1
+    fi
+}
+expect_accept() { # expect_accept <label> <file>
+    if ! "$CCC" -S -o "$tmp/acc.s" "$2" 2>"$tmp/acc.err"; then
+        echo "FAIL: $1: rejected; GCC 14.2 accepts it" >&2
+        cat "$tmp/acc.err" >&2
+        exit 1
+    fi
+}
+cat >"$tmp/void_out.c" <<'C'
+struct c { long v[2]; };
+struct c __seg_gs *gp;
+void *src(void);
+void f(void) { gp = src(); }
+C
+cat >"$tmp/init_in.c" <<'C'
+long n;
+long __seg_gs *g = &n;
+C
+cat >"$tmp/init_out.c" <<'C'
+struct c { long v[2]; };
+struct c __seg_gs *gp;
+struct c *q = gp;
+C
+cat >"$tmp/arg_void.c" <<'C'
+struct c { long v[2]; };
+struct c __seg_gs *gp;
+void sink(void *p);
+void f(void) { sink(gp); }
+C
+expect_reject "14a: generic -> __seg_gs member store" "$tmp/divergence.c"
+expect_reject "14b: __seg_gs -> generic local initializer" "$tmp/init_out.c"
+expect_reject "14c: generic &n -> __seg_gs initializer" "$tmp/init_in.c"
+expect_reject "14d: void * -> __seg_gs assignment" "$tmp/void_out.c"
+expect_reject "14e: __seg_gs -> void * argument" "$tmp/arg_void.c"
+cat >"$tmp/ok_cast.c" <<'C'
+struct c { long v[2]; };
+struct c __seg_gs *gp;
+struct c __seg_gs *same;
+struct c *q;
+void f(void) { q = (struct c *)gp; same = gp; }
+C
+expect_accept "14f: explicit cast and same-space store" "$tmp/ok_cast.c"
+
+# 15: an object with automatic storage cannot live in a named space. GCC 14.2:
+# "'__seg_gs' specified for auto variable" and "... for parameter". Block
+# `static` and block `extern` name static storage and are accepted.
+expect_reject_msg() { # expect_reject_msg <label> <file> <message>
+    if "$CCC" -S -o "$tmp/rej.s" "$2" 2>"$tmp/rej.err"; then
+        echo "FAIL: $1: accepted; GCC 14.2 rejects it" >&2
+        exit 1
+    fi
+    if ! grep -q -F -e "$3" "$tmp/rej.err"; then
+        echo "FAIL: $1: rejected, but without \"$3\"" >&2
+        cat "$tmp/rej.err" >&2
+        exit 1
+    fi
+}
+cat >"$tmp/auto_obj.c" <<'C'
+long f(void) { long __seg_gs x = 1; return x; }
+C
+cat >"$tmp/auto_param.c" <<'C'
+long f(long __seg_gs x) { return x; }
+C
+cat >"$tmp/block_static.c" <<'C'
+void f(void) { static long __seg_gs s; s = 1; extern long __seg_gs e; e = 2; }
+C
+expect_reject_msg "15a: automatic __seg_gs object" "$tmp/auto_obj.c" "'__seg_gs' specified for auto variable 'x'"
+expect_reject_msg "15b: __seg_gs object parameter" "$tmp/auto_param.c" "'__seg_gs' specified for parameter 'x'"
+expect_accept "15c: block static and block extern __seg_gs objects" "$tmp/block_static.c"
+
+# 16: `&object` keeps the object's space: a __seg_gs pointer to a __seg_gs
+# object is accepted (GCC 14.2 accepts it; it was rejected before the fix).
+cat >"$tmp/addrof_obj.c" <<'C'
+struct c { long v[2]; };
+struct c __seg_gs gobj;
+struct c __seg_gs *p = &gobj;
+long f(void) { return p->v[1]; }
+C
+expect_accept "16: &__seg_gs object into __seg_gs pointer" "$tmp/addrof_obj.c"
+
+# 17: the qualifier after `*` places the pointer object in %gs (GCC 14.2:
+# `movq %gs:gq(%rip)`, then a generic dereference).
+cat >"$tmp/post_star.c" <<'C'
+long *__seg_gs gq;
+long rd(void) { return *gq; }
+C
+for opt in -O0 -O2; do
+    "$CCC" "$opt" -S -o "$tmp/post.s" "$tmp/post_star.c"
+    if ! grep -q 'movq	%gs:gq(%rip)' "$tmp/post.s" && ! grep -q '%gs:gq(%rip)' "$tmp/post.s"; then
+        echo "FAIL: 17 post-star qualifier: gq is not loaded through %gs at $opt" >&2
+        exit 1
+    fi
+done
+
+# 18: pointer to array whose elements are __seg_gs: the element access is %gs.
+cat >"$tmp/ptr_array.c" <<'C'
+long __seg_gs arr[4];
+long __seg_gs (*pa)[4];
+long rd(int i) { return (*pa)[i]; }
+C
+for opt in -O0 -O2; do
+    "$CCC" "$opt" -S -o "$tmp/pa.s" "$tmp/ptr_array.c"
+    if ! awk '/^rd:/{p=1} p&&/%gs:/{found=1} /\.size\s+rd,/{p=0} END{exit !found}' "$tmp/pa.s"; then
+        echo "FAIL: 18 pointer-to-array element is not %gs-relative at $opt" >&2
+        exit 1
+    fi
+done
+
+echo "PASS: __seg_gs declaration qualifier reaches params, locals, returns, typedefs; object vs pointee placement"

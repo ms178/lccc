@@ -361,6 +361,21 @@ gate "segfs-declarator-codegen" fast \
 gate "seg-named-decl-qualifier" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_seg_named_decl_qualifier.sh
 
+# Executed __seg_gs runtime contract: segment accesses and aggregate copies
+# run under a real GS base and match gcc -O2 (D2, D4, D7).
+gate "seg-gs-runtime" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_seg_gs_runtime.sh
+
+# Segment qualifier after an earlier `*` (the pointee is in %gs or %fs): the
+# %fs/%gs load sequence is checked at -O0/-O1/-O2 (D1b).
+gate "seg-pointee-chain-asm" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_seg_pointee_chain_asm.sh
+
+# Explicit casts between named address spaces warn as GCC 14.2 does; sizeof and
+# unnamed-parameter pointer-to-segment-pointer values are checked at run time.
+gate "seg-cast-warning" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_seg_cast_warning.sh
+
 gate "tls-model-selection" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_tls_model_selection.sh
 

@@ -217,7 +217,18 @@ impl Lowerer {
         r
     }
 
+    /// Lower an expression to its value. A `__seg_gs` complex object is copied
+    /// into a generic temporary here, so every arithmetic, conversion and call
+    /// consumer reads ordinary memory. Writers use `lower_expr_unmaterialized`
+    /// (via `lower_complex_lvalue`) to get the object's real address.
     pub(super) fn lower_expr(&mut self, expr: &Expr) -> Operand {
+        let result = self.lower_expr_unmaterialized(expr);
+        self.materialize_segment_complex(expr, result)
+    }
+
+    /// `lower_expr` without the segment materialization: the result of a
+    /// `__seg_gs` complex lvalue is its storage address.
+    pub(super) fn lower_expr_unmaterialized(&mut self, expr: &Expr) -> Operand {
         // The discard flag applies only when the expression being lowered IS
         // the top-level post-increment/decrement. Nested occurrences always
         // need their result (e.g. `foo(i++)` reads the old value), so clear

@@ -244,6 +244,7 @@ impl SemanticAnalyzer {
             name: func.name.clone(),
             ty: func_ctype,
             explicit_alignment: None,
+            storage_space: AddressSpace::Default,
         });
 
         // Analyze the body in its own scope, with its own return type.
@@ -256,6 +257,7 @@ impl SemanticAnalyzer {
                     name: name.clone(),
                     ty,
                     explicit_alignment: None,
+                    storage_space: AddressSpace::Default,
                 });
             }
         }
@@ -310,6 +312,7 @@ impl SemanticAnalyzer {
             name: func.name.clone(),
             ty: func_ctype,
             explicit_alignment: None,
+            storage_space: AddressSpace::Default,
         });
 
         // Push scope for function body (both symbol table and type context,
@@ -328,6 +331,7 @@ impl SemanticAnalyzer {
                     name: name.clone(),
                     ty,
                     explicit_alignment: None,
+                    storage_space: AddressSpace::Default,
                 });
             }
         }
@@ -593,12 +597,21 @@ impl SemanticAnalyzer {
                     &init_decl.derived,
                 )
             };
-            // The declaration-level named address space (`struct c __seg_gs *p`,
-            // `struct c __seg_gs *f(void)`) qualifies the pointer it sits on.
-            // Lowering applies the same rule (stmt.rs / global_decl.rs); sema must
-            // agree or every expression naming this object is typed generic and
-            // a correct call is rejected as an address-space mismatch.
-            type_builder::apply_declaration_address_space(&mut full_type, decl.address_space);
+            // The declaration-level named address space is placed by the same
+            // rule lowering uses (stmt.rs / global_decl.rs: place_declared_space).
+            // A whole-type qualifier (`__seg_fs __typeof__(T *) p`) is the object's
+            // own space and leaves the type alone; a base-type qualifier
+            // (`struct c __seg_gs *p`) qualifies the pointee. Applying the space
+            // unconditionally typed `p` itself as `__seg_fs T *`, so a valid
+            // `take(p)` against `T *` was rejected as an address-space mismatch.
+            // The storage space is lowering's concern; sema needs only the type.
+            let storage_space = type_builder::place_declared_space(
+                Some(&mut full_type),
+                decl.address_space,
+                &decl.type_spec,
+                &init_decl.derived,
+                init_decl.attrs.object_space,
+            );
 
             // Resolve incomplete array sizes from initializers (e.g., int arr[] = {1,2,3})
             // This must happen before storing the symbol so sizeof(arr) works in
@@ -716,10 +729,22 @@ impl SemanticAnalyzer {
                 }
             }
 
+            // An automatic object has no segment to live in: GCC 14.2 rejects a
+            // block-scope `__seg_gs` object unless it is static or extern.
+            if storage_space != AddressSpace::Default && !links && !decl.is_static() {
+                self.diagnostics.borrow_mut().error(
+                    format!(
+                        "'{}' specified for auto variable '{}'",
+                        storage_space, init_decl.name
+                    ),
+                    init_decl.span,
+                );
+            }
             self.symbol_table.declare(Symbol {
                 name: init_decl.name.clone(),
                 ty: full_type,
                 explicit_alignment,
+                storage_space,
             });
             if links && !self.symbol_table.at_file_scope() {
                 self.symbol_table.mark_linked(&init_decl.name);
@@ -754,6 +779,12 @@ impl SemanticAnalyzer {
                                 &init_ty,
                                 &var_ty,
                                 init_expr.span(),
+                            );
+                            self.check_address_space_conversion(
+                                &init_ty,
+                                &var_ty,
+                                init_expr.span(),
+                                matches!(init_expr, Expr::Cast(..)),
                             );
                         }
                     }
@@ -975,6 +1006,7 @@ impl SemanticAnalyzer {
                 name: variant.name.clone(),
                 ty: sym_ty,
                 explicit_alignment: None,
+                storage_space: AddressSpace::Default,
             });
             self.enum_counter += 1;
         }
@@ -1796,8 +1828,9 @@ impl SemanticAnalyzer {
                 self.analyze_expr(obj);
                 self.check_member_exists(obj, field_name, *span, true);
             }
-            Expr::Cast(_, inner, _) => {
+            Expr::Cast(_, inner, span) => {
                 self.analyze_expr(inner);
+                self.check_explicit_cast_address_space(expr, inner, *span);
             }
             Expr::Sizeof(arg, span) => {
                 // sizeof is unevaluated context, but identifiers must still be declared
@@ -2196,6 +2229,78 @@ impl SemanticAnalyzer {
         self.diagnostics.borrow_mut().error(message, span);
     }
 
+    /// Implicit conversion between pointers into different named address
+    /// spaces is a constraint violation. GCC 14.2 rejects `struct c __seg_gs
+    /// *p = generic_ptr;` and the reverse, and `long __seg_gs *g = &n;`, each
+    /// with "from pointer to non-enclosed address space"; lccc accepted all of
+    /// them and then loaded or stored through the wrong segment. The argument
+    /// path (`pointer_argument_compat`) already enforces the rule. An explicit
+    /// cast is a deliberate conversion, and GCC only warns on it. `void *` gets
+    /// no exemption: GCC 14.2 rejects `void *` <-> `__seg_gs` in both directions
+    /// (return, argument and assignment alike).
+    fn check_address_space_conversion(
+        &self,
+        from_ty: &CType,
+        to_ty: &CType,
+        span: Span,
+        is_explicit_cast: bool,
+    ) {
+        if is_explicit_cast {
+            return;
+        }
+        if let (CType::Pointer(_, from_space), CType::Pointer(_, to_space)) = (from_ty, to_ty) {
+            if from_space != to_space {
+                self.diagnostics.borrow_mut().error(
+                    format!(
+                        "incompatible address space in pointer conversion: cannot convert pointer to '{}' memory to pointer to '{}' memory ('{}' to '{}')",
+                        from_space, to_space, from_ty, to_ty
+                    ),
+                    span,
+                );
+            }
+        }
+    }
+
+    /// An explicit cast between pointers in different named address spaces is
+    /// accepted (a deliberate conversion) but GCC 14.2 warns about it. The
+    /// rule is applied to the outermost pointer only, as GCC does:
+    /// `long *__seg_gs *` -> `long *__seg_gs *` is silent, `long *` ->
+    /// `long *__seg_gs *` warns. Wording follows GCC's two directions.
+    fn check_explicit_cast_address_space(&self, cast: &Expr, inner: &Expr, span: Span) {
+        let checker = super::type_checker::ExprTypeChecker {
+            symbols: &self.symbol_table,
+            types: &self.result.type_context,
+            functions: &self.result.functions,
+            expr_types: Some(&self.result.expr_types),
+        };
+        let (Some(CType::Pointer(_, from_space)), Some(CType::Pointer(_, to_space))) = (
+            checker.infer_expr_ctype(inner),
+            checker.infer_expr_ctype(cast),
+        ) else {
+            return;
+        };
+        if from_space == to_space {
+            return;
+        }
+        let message = if to_space == AddressSpace::Default {
+            format!(
+                "cast to generic address space pointer from disjoint '{}' address space pointer",
+                from_space
+            )
+        } else if from_space == AddressSpace::Default {
+            format!(
+                "cast to '{}' address space pointer from disjoint generic address space pointer",
+                to_space
+            )
+        } else {
+            format!(
+                "cast to '{}' address space pointer from disjoint '{}' address space pointer",
+                to_space, from_space
+            )
+        };
+        self.diagnostics.borrow_mut().warning(message, span);
+    }
+
     fn check_assignment_compatibility(
         &self,
         from_ty: &CType,
@@ -2223,6 +2328,7 @@ impl SemanticAnalyzer {
                 span,
             );
         }
+        self.check_address_space_conversion(from_ty, to_ty, span, is_explicit_cast);
         // GCC/clang suppress the incompatible-pointer-types diagnostic when the
         // source is an EXPLICIT cast (C-style `(T*)expr`): the cast is an
         // intentional conversion, so emitting a hard error here breaks
@@ -3035,11 +3141,13 @@ fn pointee_compat(from: &CType, to: &CType) -> PtrCompat {
 fn pointer_argument_compat(from: &CType, to: &CType) -> PtrCompat {
     match (from, to) {
         (CType::Pointer(from_inner, from_space), CType::Pointer(to_inner, to_space)) => {
-            if **from_inner == CType::Void || **to_inner == CType::Void {
-                return PtrCompat::Compatible;
-            }
+            // The address space is checked first and for every pointee: GCC 14.2
+            // rejects `void *` <-> `__seg_gs` in both directions too.
             if from_space != to_space {
                 return PtrCompat::Incompatible;
+            }
+            if **from_inner == CType::Void || **to_inner == CType::Void {
+                return PtrCompat::Compatible;
             }
             pointee_compat(from_inner, to_inner)
         }
