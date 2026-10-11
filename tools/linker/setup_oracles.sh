@@ -68,6 +68,9 @@ LINKDIR="${LINKDIR:-$HOME/artifacts/bin}"
 CACHE="${ORACLE_CACHE:-}"              # optional install cache (see above)
 
 BINUTILS_VER=2.47
+# Same release bytes as scripts/ensure_gas_247.sh. This archive stamps its
+# binaries 2.47.20260726; oracle_versions.sh accepts that exact banner.
+BINUTILS_SHA256=154ab23b60070e8f27013c22977f1129425d67d1e8acd6e13010e617811e4cff
 MOLD_VER=2.42.1
 MOLD_TARGETS='X86_64;I386'
 LLD_MAJOR=23
@@ -106,7 +109,7 @@ cache_prefix() {    # <prefix dir>
     mv -f "$CACHE/$1.tar.xz.tmp" "$CACHE/$1.tar.xz"
 }
 
-need curl tar xz
+need curl tar xz sha256sum
 restore_cached "bfd-$BINUTILS_VER" bin/ld || need make gcc g++
 restore_cached "mold-$MOLD_VER" bin/mold || need cmake make g++
 if [ "$WITH_WILD" = 1 ]; then
@@ -122,6 +125,10 @@ else
     TARBALL="$SRC/binutils-$BINUTILS_VER.tar.xz"
     [ -f "$TARBALL" ] || { note "ld    : fetching binutils $BINUTILS_VER"; \
         curl -fsSL -o "$TARBALL" "https://ftp.gnu.org/gnu/binutils/binutils-$BINUTILS_VER.tar.xz"; }
+    printf '%s  %s\n' "$BINUTILS_SHA256" "$TARBALL" | sha256sum -c - || {
+        note "ld    : binutils archive integrity failure; remove $TARBALL to refetch"
+        exit 1
+    }
     BT="$SRC/binutils-$BINUTILS_VER"
     rm -rf "$BT"; tar -xf "$TARBALL" -C "$SRC"
     ( cd "$BT"

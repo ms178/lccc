@@ -406,7 +406,7 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
             };
             let mut tail =
                 crate::backend::asm_expr::parse_align_tail(rest, ".p2align", parse_int_literal)
-                    .map_err(|e| e.replace(".p2align:", ".align:"))?;
+                    .map_err(|e| e.to_message().replace(".p2align:", ".align:"))?;
             // RISC-V has no padding cap. Its `.p2align` handler is
             // `riscv_frag_align_code (int n)` — a single argument — and the
             // generic fall-back it shares with `.balign` never sees the cap
@@ -444,8 +444,12 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
                 parse_int_literal,
             ) {
                 Ok(t) => t.fill,
-                Err(e) if e.contains("fill") || e.contains("too many") => return Err(e),
-                Err(_) => None,
+                // Matched on the variant, not on the message text: this target is
+                // allowed to ignore exactly one verdict, and a reworded error must
+                // not be able to turn that allowance into a silent acceptance of a
+                // bad fill or of a fourth operand.
+                Err(crate::backend::asm_expr::AlignTailError::BadMax { .. }) => None,
+                Err(e) => return Err(e.to_message()),
             };
             Directive::Balign {
                 bytes: if raw == 0 { 1 } else { raw as u64 },
@@ -1332,5 +1336,86 @@ mod tests {
         assert_eq!(mnemonic_list(".if 1\n nop\n.endif\n").len(), 1);
         // A commented-out `.rept` must not be expanded at all.
         assert_eq!(mnemonic_list("# .rept 4\n nop\n# .endr\n").len(), 1);
+    }
+
+    /// The `.p2align` / `.balign` operands this target keeps, as
+    /// `(alignment bytes, fill, max_pad)`.
+    fn align_operands(src: &str) -> (u64, Option<u8>, Option<u64>) {
+        stmts(src)
+            .expect("parse")
+            .into_iter()
+            .find_map(|s| match s {
+                AsmStatement::Directive(Directive::Align { bytes, tail }) => {
+                    Some((bytes, tail.fill, tail.max_pad))
+                }
+                _ => None,
+            })
+            .expect("a .p2align directive")
+    }
+
+    fn balign_operands(src: &str) -> (u64, Option<u8>) {
+        stmts(src)
+            .expect("parse")
+            .into_iter()
+            .find_map(|s| match s {
+                AsmStatement::Directive(Directive::Balign { bytes, fill }) => Some((bytes, fill)),
+                _ => None,
+            })
+            .expect("a .balign directive")
+    }
+
+    /// RISC-V's alignment tail rules, asserted at the entry point that applies
+    /// them.  The shared tail parser is unit-tested for the grammar; what only
+    /// this file can prove is the target-specific *use* of the parsed operands --
+    /// that the cap is read and then dropped, that an explicit fill survives that
+    /// drop, that out-of-range exponents land in the signed-shift bucket, and that
+    /// `.balign` tolerates a junk cap but not a junk fill.  Honouring the cap
+    /// instead -- which is what this parser did before the oracle pass -- skips
+    /// padding GAS emits and moves every later label, and a writer-level test
+    /// cannot see it because the writer only ever receives an already-parsed
+    /// directive.
+    #[test]
+    fn gas247_riscv_align_tail_verdicts_at_the_parser() {
+        // Cap read, validated, dropped: `.p2align E,,M` pads identically for
+        // every M in {0,1,2,3,4,5,8,11,12,20,40,2048,2049} (as 2.47).
+        assert_eq!(align_operands(".p2align 4,,8"), (16, None, None));
+        assert_eq!(align_operands(".p2align 4,,0"), (16, None, None));
+        assert_eq!(align_operands(".p2align 3,,2049"), (8, None, None));
+        // An explicit fill is the operand GAS does read, so it survives.
+        assert_eq!(align_operands(".p2align 4,0xff"), (16, Some(0xff), None));
+        assert_eq!(
+            align_operands(".p2align 4, 300 ,2"),
+            (16, Some(0x2c), None),
+            "the fill is the low byte of any integer, and whitespace around a slot is trimmed"
+        );
+        // An empty slot means "absent", not "zero fill"; two empty slots are
+        // still two operands, and a third comma is a fourth operand -- an error.
+        assert_eq!(align_operands(".p2align 4,,"), (16, None, None));
+        assert_eq!(
+            stmts(".p2align 4,,,").unwrap_err(),
+            "Line 1: .align: too many operands: '.p2align 4,,,'"
+        );
+        // Out-of-range exponents clamp to the signed-shift bucket, never to 0.
+        assert_eq!(align_operands(".p2align 64").0, 1u64 << 63);
+        assert_eq!(align_operands(".p2align -1").0, 1u64 << 63);
+        // `.balign` has no cap slot at all: a junk cap is tolerated (GAS never
+        // reads it), a junk fill and a fourth operand are not.
+        assert_eq!(balign_operands(".balign 8,3"), (8, Some(3)));
+        assert_eq!(balign_operands(".balign 8,,junk"), (8, None));
+        assert_eq!(
+            stmts(".balign 8,,4,9").unwrap_err(),
+            "Line 1: .balign: too many operands: '.balign 8,,4,9'"
+        );
+        assert_eq!(
+            stmts(".balign 8,junk").unwrap_err(),
+            "Line 1: .balign: fill `junk` is not an integer: '.balign 8,junk'"
+        );
+        // A bare `.balign` is the no-op GAS accepts; a non-power-of-two is a
+        // rejection, not a silent rounding.
+        assert_eq!(balign_operands(".balign").0, 1);
+        assert_eq!(
+            stmts(".balign 3").unwrap_err(),
+            "Line 1: .balign: alignment 3 is not a power of 2: '.balign 3'"
+        );
     }
 }

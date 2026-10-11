@@ -1,5 +1,11 @@
 # PR #785 — review adjudication, fixes, and measurements (2026-10-10)
 
+> **Status (2026-10-11): merged.** This note covers the review of PR #785, which was
+> redelivered as #788 and landed on main as `106b7e35`.  The follow-up brief that
+> the merge produced -- nine items, all measured, plus the reading of #781/#777/
+> #776/#725 that the same audit asked for -- continues in
+> [`FOLLOWUP-2026-10-11-review-followups-and-open-prs.md`](FOLLOWUP-2026-10-11-review-followups-and-open-prs.md).
+
 Base: `ms178/lccc` main = `1334bb8a` (merge of PR #782). Verified against the
 GitHub API at the time of writing, i.e. the branch already sits on the
 newest upstream commit — there was nothing to rebase onto, and that claim is
