@@ -3282,6 +3282,10 @@ pub(super) fn promote_loop_invariant_fp_load(
                     if dt.starts_with(".size ")
                         || dt.starts_with(".globl ")
                         || dt.starts_with(".type ")
+                        // The preheader store has to still describe the loop
+                        // entry: a data directive in between can rewrite %rax
+                        // or the stack slot itself.
+                        || super::helpers::directive_emits_data(dt)
                     {
                         break;
                     }
@@ -3325,9 +3329,15 @@ pub(super) fn promote_loop_invariant_fp_load(
                 //     a read on another path) may remain.  Checked on the
                 //     tentatively rewritten text; reverted when it fails.
                 let mut nxt = ph_pos + 1;
+                // A data directive between the store and the header can rewrite
+                // %xmm2 or the slot, so it ends the run instead of being
+                // stepped over (`steps_over_line`).
                 while nxt < header
-                    && (infos[nxt].is_nop()
-                        || matches!(infos[nxt].kind, LineKind::Directive | LineKind::Empty))
+                    && (infos[nxt].kind == LineKind::Empty
+                        || super::helpers::steps_over_line(
+                            &infos[nxt],
+                            infos[nxt].trimmed(store.get(nxt)),
+                        ))
                 {
                     nxt += 1;
                 }
@@ -4743,10 +4753,13 @@ pub(super) fn hoist_loop_invariant_gpr_load(
             let mut place = None;
             while q > func_start + 1 {
                 q -= 1;
-                if infos[q].is_nop()
-                    || matches!(infos[q].kind, LineKind::Directive | LineKind::Empty)
+                if infos[q].kind == LineKind::Empty
+                    || super::helpers::steps_over_line(&infos[q], infos[q].trimmed(store.get(q)))
                 {
                     continue; // the alignment/directive run before the label
+                }
+                if infos[q].kind == LineKind::Directive {
+                    break; // data: the hoisted LEA must not land across hidden code
                 }
                 // The first real instruction above the directive run must
                 // be a control-flow boundary whose fall-through reaches

@@ -1156,7 +1156,7 @@ pub(super) fn fold_load_test_into_cmp(store: &mut LineStore, infos: &mut [LineIn
         let addr_mask = infos[i].reg_refs & !fam_mask;
         let mut j = i + 1;
         while j < len {
-            if infos[j].is_nop() || infos[j].kind == LineKind::Directive {
+            if super::helpers::steps_over_line(&infos[j], infos[j].trimmed(store.get(j))) {
                 j += 1;
                 continue;
             }
@@ -1537,6 +1537,65 @@ mod tests {
 
     fn frame(body: &str) -> String {
         format!("f:\n.cfi_startproc\n{body}    ret\n.cfi_endproc\n")
+    }
+
+    /// Run ONLY `eliminate_dead_flag_writes`, so the assertion is about guard 4
+    /// (`flags_dead_after`) and not about the rest of the pipeline.
+    fn run_dead_flag_writes(body: &str) -> String {
+        let asm = frame(body);
+        let store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        eliminate_dead_flag_writes(&store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// PR #725's hazard, at the pass that actually consumed it.  `.byte 0xf5`
+    /// is `cmc`: it reads and writes EFLAGS, so the flags are NOT dead after it
+    /// and the producer must survive.  Every walker in both backends used to
+    /// answer "no bytes, no effect" for the whole `LineKind::Directive` class,
+    /// which silently made `.byte`/`.long`/`.fill,0xcc` invisible to
+    /// `flags_dead_after`, to the liveness scans, to callee-save elimination and
+    /// to store forwarding.  The positive arm is the other half of the pin: a
+    /// `.cfi_*` line must stay transparent, because a fold blocked by debug
+    /// noise is a lost optimisation nobody writes a test for.
+    #[test]
+    fn dead_flag_write_survives_data_but_not_a_cfi_line() {
+        // A caller-saved scratch register: %rax would be live-out at the
+        // `ret` (it is the return value), so guard 3 would veto for a reason
+        // that has nothing to do with this test.
+        let add = "    addl $1, %ecx\n";
+        for d in [
+            "    .byte 0xf5\n",
+            "    .byte 0xb8,0x00,0x00,0x00,0x00\n",
+            "    .p2align 4,0xcc\n",
+            "    .long .L1-.L2\n",
+            "    .fill 4,1,0xf8\n",
+        ] {
+            let out = run_dead_flag_writes(&format!("{add}{d}"));
+            assert!(
+                out.contains("addl $1, %ecx"),
+                "{d:?}: flags declared dead across {d:?}:\n{out}"
+            );
+        }
+        for d in [
+            "    .cfi_adjust_cfa_offset 16\n",
+            "    .cfi_startproc\n",
+            "    .p2align 4\n",
+            "    .p2align 4,,10\n",
+            "    .loc 1 42 7\n",
+        ] {
+            let out = run_dead_flag_writes(&format!("{add}{d}"));
+            assert!(
+                !out.contains("addl $1, %ecx"),
+                "{d:?}: bookkeeping blocked guard 4:\n{out}"
+            );
+        }
     }
 
     fn slot_refs(out: &str, slot: &str) -> usize {

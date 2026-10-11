@@ -108,7 +108,7 @@ pub(super) fn coalesce_register_copies(store: &mut LineStore, infos: &mut [LineI
         // through a back edge, which is what makes the earlier mentions of
         // either family (the other half of a parameter shuffle) harmless.
         for n in fstart..i {
-            if infos[n].is_nop() || infos[n].kind == LineKind::Directive {
+            if super::helpers::steps_over_line(&infos[n], infos[n].trimmed(store.get(n))) {
                 continue;
             }
             if matches!(

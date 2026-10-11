@@ -310,6 +310,27 @@ gate "differential-correctness-oracle" fast \
 gate "loop-alignment-contract" fast \
     python3 scripts/check_loop_alignment.py --lccc "$LCCC"
 
+# The loop-inversion census is #777's tooling, adopted with the latch its
+# original form lacked: as shipped, `main` returned 0 whatever it counted, so a
+# day on which the pass rotated nothing -- a default flipped off, its debug line
+# renamed away from these regexes -- would have printed "0 rotations" and stayed
+# green.  Three arms now, each with an input that reaches it: 2 when no TU yields
+# a parseable record (the census itself is broken, which is a different claim from
+# the optimiser being wrong), 1 when a corpus TU fails to compile (an enumeration
+# that quietly shrinks is the failure mode, not the metric), and 1 when the pass is
+# live but earns nothing.  6 s against the 91-TU corpus.
+# Documented debt, counted rather than forgotten: a 1-3 byte struct that is a
+# subobject of a larger by-value argument is mis-passed under -mregparm on i386
+# (six configurations, six different wrong answers, -m64 clean). The gate latches
+# the count in both directions -- growth is a regression, a drop means the debt is
+# partly repaid and the budget has to be re-measured -- and refuses to call an
+# empty sweep a pass.
+gate "i386-small-struct-abi-debt" fast \
+    bash tests/regression/check_i386_regparm_small_struct_abi.sh
+
+gate "loop-invert-census" fast \
+    python3 scripts/loop_invert_census.py --lccc "$LCCC" --quiet
+
 gate "fuzz-harness-tests" fast \
     python3 -m unittest discover -s tests/fuzz -p 'test_*.py'
 
@@ -591,6 +612,32 @@ gate "phi-acyclic-copy-order" fast \
 
 gate "doc-link-integrity" fast \
     python3 scripts/check_doc_links.py
+
+# The Expat differential is only a differential if both compilers ran the SAME
+# tests under the SAME feature configuration.  `junit_check.py` compares testcase
+# identity multisets and the CMake cache, and this gate runs its compiler-free
+# contract so the rule is enforced even where no Expat build happens.
+gate "expat-junit-contract" fast \
+    python3 tests/workloads/expat-2.8.5/junit_check.py --self-test
+
+# The AArch64 dispatcher ratchet is enforced twice -- by the committed goldens TSV
+# and by an in-crate test that re-encodes every row -- and both enumerate the
+# dispatcher by scanning Rust *text*.  A text scan that finds nothing prints a
+# satisfied count, so the scanner's rules (region end by brace depth, arm heads
+# invisible to comments, literals unable to fake a brace or a quote) are pinned
+# here, toolchain-free, rather than only by the consumer they feed.  The
+# "# arms:" header in the TSV is the latch between this scan and that consumer:
+# if the two disagree about how many arms exist, both gates fail.
+gate "dispatcher-region-contract" fast \
+    python3 -m unittest discover -s tests/aarch64 -p 'test_*.py'
+
+# A peephole walker may step over a `nop`, or over a directive that emits no
+# data -- never over a bare `.byte`, which is machine code no mnemonic table can
+# see.  48 of these skips existed in the two backends; the law now has one home
+# (peephole_common::directive_emits_data) and this gate fails the build when a
+# pass hand-rolls the old `is_nop() || kind == Directive` test again.
+gate "peephole-directive-step" fast \
+    python3 scripts/check_peephole_directive_step.py
 
 # Needs PyYAML (python3-yaml on Debian/Ubuntu). This gate is the FIRST
 # local consumer: on a box without it the checker fails cleanly (no

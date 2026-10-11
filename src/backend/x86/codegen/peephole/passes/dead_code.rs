@@ -1301,11 +1301,8 @@ fn stack_top_is_consumed_next(
     end: usize,
 ) -> bool {
     while idx < end {
-        if infos[idx].is_nop()
-            || matches!(
-                infos[idx].kind,
-                LineKind::Empty | LineKind::Directive | LineKind::Label
-            )
+        if matches!(infos[idx].kind, LineKind::Empty | LineKind::Label)
+            || super::helpers::steps_over_line(&infos[idx], infos[idx].trimmed(store.get(idx)))
         {
             idx += 1;
             continue;
@@ -1326,7 +1323,7 @@ fn is_epilogue_rsp_shift(store: &LineStore, infos: &[LineInfo], k: usize, func_e
     let mut j = k;
     let limit = (k + 24).min(func_end);
     while j < limit {
-        if infos[j].is_nop() || matches!(infos[j].kind, LineKind::Directive) {
+        if super::helpers::steps_over_line(&infos[j], infos[j].trimmed(store.get(j))) {
             j += 1;
             continue;
         }

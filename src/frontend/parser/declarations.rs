@@ -227,6 +227,7 @@ impl Parser {
         decl_attrs.set_pure(is_pure);
         decl_attrs.set_const_attr(is_const_attr);
         decl_attrs.set_cold(is_cold);
+        decl_attrs.set_nested_fn(self.attrs.parsing_nested_fn());
         decl_attrs.alias_target = alias_target;
         decl_attrs.visibility = visibility;
         decl_attrs.section = section;
@@ -674,6 +675,15 @@ impl Parser {
         if self.attrs.parsing_noreturn() {
             last_decl.attrs.set_noreturn(true);
         }
+        // The declaration-statement funnel covers every block-scope shape
+        // (prototype-only, init-declarator, definition); the nested-function
+        // fact must be carried here as well as in the file-scope and
+        // init-declarator builders, or `auto double f(double);` inside a
+        // function body is indistinguishable from `extern double f(double);`
+        // and retypes the file-scope entity of the same name.
+        if self.attrs.parsing_nested_fn() {
+            last_decl.attrs.set_nested_fn(true);
+        }
         if self.attrs.parsing_fastcall() {
             last_decl.attrs.set_fastcall(true);
         }
@@ -770,6 +780,7 @@ impl Parser {
                     da.set_weak(d_weak);
                     da.set_error_attr(d_error_attr);
                     da.set_noreturn(d_noreturn);
+                    da.set_nested_fn(self.attrs.parsing_nested_fn());
                     da.set_pure(d_pure);
                     da.set_const_attr(d_const_attr);
                     da.set_used(d_used);
@@ -915,6 +926,7 @@ impl Parser {
                     da.asm_register = skip_asm_reg;
                     da.cleanup_fn = local_cleanup_fn;
                     da.set_used(self.attrs.parsing_used());
+                    da.set_nested_fn(self.attrs.parsing_nested_fn());
                     da.set_noreturn(self.attrs.parsing_noreturn());
                     da.set_pure(self.attrs.parsing_pure());
                     da.set_const_attr(self.attrs.parsing_const_attr());
@@ -1378,8 +1390,17 @@ impl Parser {
                     self.advance();
                     self.attrs.set_volatile(true);
                 }
-                TokenKind::Restrict | TokenKind::Inline | TokenKind::Register | TokenKind::Auto => {
+                TokenKind::Restrict | TokenKind::Inline | TokenKind::Register => {
                     self.advance();
+                }
+                TokenKind::Auto => {
+                    self.advance();
+                    // C gives `auto` no meaning for variables, and the tree has
+                    // always ignored it; but at block scope on a *function* it is
+                    // the only spelling that says "this is a GNU nested function,
+                    // not a redeclaration of the external one". Dropping it made
+                    // that distinction unrecoverable in sema.
+                    self.attrs.set_nested_fn(true);
                 }
                 TokenKind::SegGs => {
                     self.advance();

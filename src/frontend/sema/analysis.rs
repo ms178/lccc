@@ -144,8 +144,13 @@ pub struct SemanticAnalyzer {
     /// Stack of enclosing function definition names for nested functions.
     /// Entry i is the name of the function containing the body currently
     /// being analyzed; the LAST entry is the innermost (possibly nested)
-    /// function. Used by the lowerer-side capture analysis via the analyzer
-    /// result (see `nested_function_names`).
+    /// function, which is also the prefix of the mangled `parent.nested` key that
+    /// `analyze_nested_function_def` registers in `result.functions`: it is how a
+    /// block-scope declaration finds the nested entity it belongs to instead of
+    /// writing through the shared basename.
+    ///
+    /// (This comment used to send the reader to a `nested_function_names` member
+    /// of the analyzer result. No such member exists in the tree.)
     function_nesting_stack: Vec<String>,
 }
 
@@ -420,7 +425,7 @@ impl SemanticAnalyzer {
             .map(|v| v as usize)
     }
 
-    fn analyze_declaration(&mut self, decl: &Declaration, _is_global: bool) {
+    fn analyze_declaration(&mut self, decl: &Declaration, is_global: bool) {
         // Register enum constants from this declaration's type specifier.
         // This recursively walks into struct/union fields to find inline
         // enum definitions (e.g., `struct { enum { A, B } mode; }`).
@@ -654,6 +659,59 @@ impl SemanticAnalyzer {
             if let CType::Function(ref ft) = full_type {
                 let is_noreturn = init_decl.attrs.is_noreturn();
                 let prototype = (!ft.params.is_empty()).then(|| ft.as_ref().clone());
+                // A declaration inside a function body describes that body's view of
+                // the name, not the translation unit's. This matters because a GNU
+                // nested function is a *distinct entity* that merely shares a
+                // basename: rewriting the file-scope record's `prototype` from a
+                // nested `auto double f(double);` then retypes the *outer* `f`,
+                // because `lower.rs` prefers `fi.prototype` over `fi.params` for any
+                // non-K&R definition -- an `int f(int)` emitted with a double
+                // argument ABI, on the strength of a declaration that was never about
+                // it. The flag that says which case this is was already threaded in
+                // (`is_global`) and ignored, which is how the hole survived the
+                // scope-aware call lookup: the read side learned about scopes, the
+                // write side did not.
+                //
+                // Type equality cannot be the predicate -- it errs in both
+                // directions. `auto int f(int)` beside a file-scope `int f(int)` has
+                // an *identical* type, so inequality calls it the same entity and lets
+                // the nested declaration retype the outer one (the F01 hole, in the
+                // very path taken when no mangled record exists yet); conversely
+                // `int f(const char *)` beside `int f(char *)` is one entity per
+                // C11 6.7.6.3p15, so inequality wrongly splits it and drops the
+                // prototype merge. Storage class is the fact that separates the two:
+                // C11 6.7.1p5 says every block-scope function declaration *without*
+                // `auto` denotes the externally-visible entity, and `auto` is exactly
+                // the spelling of a nested function of its own.
+                let distinct_entity_here = !is_global && init_decl.attrs.is_nested_fn();
+                if distinct_entity_here {
+                    // Refine the nested entity's own record when it already exists (a
+                    // declaration after the definition); otherwise stop here. The
+                    // scoped symbol declared below carries this type for the calls in
+                    // this block, which is all C11 6.2.1 asks of a block-scope
+                    // prototype.
+                    if prototype.is_some() {
+                        if let Some(parent) = self.function_nesting_stack.last() {
+                            let mangled = format!("{parent}.{}", init_decl.name);
+                            if let Some(existing) = self.result.functions.get_mut(&mangled) {
+                                existing.is_noreturn |= is_noreturn;
+                                existing.prototype = prototype;
+                            }
+                        }
+                    } else if let Some(info) = self.result.functions.get(&init_decl.name) {
+                        // A block-scope declaration *without* a prototype absorbs the
+                        // visible prototype's type (6.2.1p4) -- that much does read
+                        // the shared record; it never writes it.
+                        let merged = info.call_type();
+                        full_type = CType::Function(Box::new(merged));
+                    }
+                    self.symbol_table.declare(Symbol {
+                        name: init_decl.name.clone(),
+                        ty: full_type,
+                        explicit_alignment: None,
+                    });
+                    return;
+                }
                 if let Some(existing) = self.result.functions.get_mut(&init_decl.name) {
                     existing.is_noreturn |= is_noreturn;
                     if prototype.is_some() {
@@ -681,8 +739,12 @@ impl SemanticAnalyzer {
                 }
                 // An unspecified-parameter redeclaration must not erase an
                 // already visible prototype from the scoped callable type.
-                full_type =
-                    CType::Function(Box::new(self.result.functions[&init_decl.name].call_type()));
+                // `call_type()` is read back out of the table rather than kept as
+                // `ft`, because the update above may have merged a prior prototype.
+                // The index cannot fail: the `else` branch just inserted the record
+                // when it was absent.
+                let merged = self.result.functions[&init_decl.name].call_type();
+                full_type = CType::Function(Box::new(merged));
             }
 
             // Check for incomplete struct/union types in variable declarations.
@@ -3664,6 +3726,75 @@ mod kr_prototype_tests {
             analyze("int f(int); int f(); int use(void) { return f(); }")
                 .1
                 .is_err()
+        );
+    }
+
+    /// A block-scope function declaration must describe only that block.
+    ///
+    /// The shape that used to go wrong is a GNU nested function sharing a basename
+    /// with a file-scope one: `int f(int)` at file scope, then inside `g` the
+    /// declaration `auto double f(double);`. That declaration is `g`'s view of a
+    /// *different entity*, yet it wrote the translation-unit record for `f` --
+    /// `prototype` included, since a declaration carrying one overwrites it
+    /// unconditionally -- so the file-scope definition was later lowered with the
+    /// nested function's parameter types. The `is_global` flag that distinguishes
+    /// the two cases was already threaded into `analyze_declaration` and ignored.
+    #[test]
+    fn nested_block_scope_declaration_does_not_retype_the_outer_function() {
+        let (analyzer, result) = analyze(
+            "int f(int x);\n\
+             int g(void) { auto double f(double); double f(double x) { return x * 2; } return (int) f(1.5); }",
+        );
+        result.expect("a nested declaration must not be rejected");
+        let info = analyzer
+            .result
+            .functions
+            .get("f")
+            .expect("file-scope f is recorded");
+        let proto = info
+            .prototype
+            .as_ref()
+            .expect("`int f(int x);` leaves a prototype");
+        assert_eq!(
+            proto.return_type,
+            CType::Int,
+            "a block-scope `auto double f(double);` must not replace the outer return type"
+        );
+        assert_eq!(
+            proto.params.len(),
+            1,
+            "and must not replace the outer parameter list either"
+        );
+        assert!(
+            matches!(proto.params[0].0, CType::Int),
+            "outer parameter type came out as {:?}",
+            proto.params[0].0
+        );
+        assert!(
+            analyzer.result.functions.contains_key("g.f"),
+            "the nested definition registers under its mangled key; got {:?}",
+            analyzer.result.functions.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// …but a block-scope declaration *without* a prototype does read the
+    /// translation-unit record, because C11 6.2.1p4 makes the visible prototype the
+    /// type of the declared identifier. Pinned so the fix above is not widened into
+    /// "block-scope declarations never consult the table", which would drop
+    /// `noreturn` for redeclarations of an external function made inside a body.
+    #[test]
+    fn block_scope_declaration_without_prototype_absorbs_the_visible_one() {
+        let (analyzer, result) =
+            analyze("void die(void) __attribute__((noreturn));\nint g(void) { die(); return 0; }");
+        result.expect("absorbing a visible prototype is valid C");
+        assert!(
+            analyzer
+                .result
+                .functions
+                .get("die")
+                .expect("die is recorded")
+                .is_noreturn,
+            "an attribute set at file scope survives calls made from inside a body"
         );
     }
 

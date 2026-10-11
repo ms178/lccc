@@ -64,7 +64,7 @@ from typing import Sequence
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
-from tools.corpus import process, publication
+from tools.corpus import process, publication, evidence
 
 DEFAULT_LCCC_X86_64 = REPO / "target" / "fastbuild" / "lccc"
 DEFAULT_LCCC_I686 = REPO / "target" / "fastbuild" / "lccc-i686"
@@ -135,7 +135,10 @@ class Case:
 
     @property
     def key(self) -> str:
-        return f"{self.source.name}[{self.opt_flags}]"
+        # The consumer recomputes this exact identity from the report to check
+        # that the run it is summarising contains the cases it claims; see
+        # `tools/corpus/evidence.py`.
+        return evidence.case_key(self.source.name, self.opt_flags)
 
 
 @dataclasses.dataclass
@@ -508,10 +511,31 @@ def valid_object(path: Path, is_32: bool) -> bool:
 
 
 def reference_status(proc: subprocess.CompletedProcess[bytes], phase: str) -> str:
-    """Host rejection is ineligibility; missing tools/resource failures are not."""
-    if (proc.returncode in (124, 125, 126, 127) or
-            (phase == "compile" and (proc.returncode < 0 or
-             b"internal compiler error" in proc.stderr.lower()))):
+    """Host rejection is ineligibility; a reference that DIED is a failure.
+
+    The line that matters is not which phase ran but whether the reference
+    produced a verdict at all.  An ordinary non-zero exit *is* a verdict:
+    `gcc.c-torture` cases that the host cannot run leave the reference exiting
+    non-zero on purpose (an `exit (1)` fixture, a `dg-` requirement the driver
+    does not implement), and skipping those says nothing about LCCC.
+
+    Death by signal produced no verdict.  A negative return code is
+    SIGKILL -- the kernel's OOM killer, which is exactly what a torture matrix
+    with `--jobs` invites -- or SIGSEGV/SIGABRT from a broken toolchain or a
+    corrupted cache; 124/125/126/127 are timeout, invocation and missing-tool
+    failures.  All of those mean the ORACLE could not adjudicate the case, so
+    they count against the run and never into the skipped denominator.
+
+    Until now the negative-code half of that rule was restricted to
+    ``phase == "compile"``, so a reference executable killed while *running*
+    came back as ``reference-run-skip``: the comparison never happened, the
+    case left the denominator, and the row still read "zero reported
+    failures".  Preflight cannot help -- it probes the toolchain before the
+    matrix, not the memory pressure at case 9,000.
+    """
+    if (proc.returncode < 0 or proc.returncode in (124, 125, 126, 127) or
+            (phase == "compile"
+             and b"internal compiler error" in proc.stderr.lower())):
         return "reference-fail"
     return f"reference-{phase}-skip"
 
@@ -563,7 +587,87 @@ def public_environment() -> dict[str, str]:
                 marker in k.upper() for marker in ("TOKEN", "SECRET", "PASSWORD", "KEY", "AUTH"))}
 
 
-def run_identity(args: argparse.Namespace, sources: list[Path]) -> dict:
+_INCLUDE_RE = re.compile(rb'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"', re.M)
+# A torture case pulls in at most a handful of local headers; the bound is
+# there so a pathological (or cyclic) include graph cannot make identity
+# capture unbounded, and `truncated` says out loud when the cap bit.
+DEPENDENCY_FILE_LIMIT = 256
+
+
+def local_dependencies(source: Path, search_dirs: Sequence[Path]) -> tuple[list[Path], bool]:
+    """`#include "..."` files a case depends on, transitively, in stable order.
+
+    Returns the discovered headers and whether the bound truncated the walk.
+    Angle-bracket includes are deliberately not pinned: they are the host
+    toolchain's own surface, which the evidence records through `tools`
+    (sha256 of each binary) and `gcc_checkout_head` instead.
+    """
+    seen: set[Path] = set()
+    ordered: list[Path] = []
+    queue = [source]
+    truncated = False
+    while queue:
+        current = queue.pop(0)
+        try:
+            text = current.read_bytes()
+        except OSError:
+            continue
+        for match in _INCLUDE_RE.findall(text):
+            name = match.decode("utf-8", "replace")
+            for base in (current.parent, *search_dirs):
+                candidate = (base / name).resolve()
+                if candidate.is_file() and candidate not in seen:
+                    seen.add(candidate)
+                    if len(ordered) >= DEPENDENCY_FILE_LIMIT:
+                        truncated = True
+                        break
+                    ordered.append(candidate)
+                    queue.append(candidate)
+            else:
+                continue
+            break
+    return ordered, truncated
+
+
+def dependency_digest(sources: Sequence[Path], search_dirs: Sequence[Path]) -> dict:
+    """A hash over every local file that can change the compiled result.
+
+    `selected_sources_sha256` covers the .c files only, so editing an included
+    `trap.h` from `VALUE 0` to `VALUE 1` left the published identity byte-for-byte
+    identical while changing the program under test.  A digest that ignores an
+    input is not a pin.
+    """
+    digest = hashlib.sha256()
+    files: list[str] = []
+    truncated = False
+    for source in sorted(sources):
+        deps, cut = local_dependencies(source, search_dirs)
+        truncated = truncated or cut
+        for dep in deps:
+            files.append(str(dep))
+            digest.update(dep.name.encode() + b"\0" + dep.read_bytes() + b"\0")
+    return {"files": len(files), "truncated": truncated,
+            "digest": digest.hexdigest() if files or not truncated else None}
+
+
+def identity_drift(args: argparse.Namespace, sources: list[Path],
+                   identity: dict, suite: Path, is_32: bool) -> list[str]:
+    """What changed underneath a run in flight; empty means nothing did.
+
+    Capture stays *before* the matrix -- re-hashing afterwards and calling the
+    result the run's identity would relabel the thousands of cases that already
+    executed under the old inputs.  Drift is reported as drift: the pre-run
+    pin stands, and the run is marked unusable.
+    """
+    now = run_identity(args, sources, suite, is_32)
+    changed = [key for key in ("selected_sources_sha256", "dependency_digest",
+                               "tools", "gcc_checkout_head", "runner_sha256")
+               if now.get(key) != identity.get(key)]
+    return changed
+
+
+def run_identity(args: argparse.Namespace, sources: list[Path],
+                 suite: Path, is_32: bool) -> dict:
     tools = {}
     for name, command in (("lccc", str(args.lccc)), ("lccc_ld", str(args.lccc_ld)),
                           ("gcc", args.gcc)):
@@ -576,6 +680,8 @@ def run_identity(args: argparse.Namespace, sources: list[Path]) -> dict:
     selected = hashlib.sha256()
     for source in sorted(sources):
         selected.update(source.name.encode() + b"\0" + source.read_bytes() + b"\0")
+    search_dirs: list[Path] = [args.suite, *([args.suite / "lib"] if is_32 else [])]
+    dependencies = dependency_digest(sources, search_dirs)
     stamp = args.suite.parents[1] / ".lccc-provisioned"
     return {
         "arch": args.arch, "mode": args.mode, "suite": str(args.suite),
@@ -587,14 +693,23 @@ def run_identity(args: argparse.Namespace, sources: list[Path]) -> dict:
         "corpus_stamp_sha256": file_sha256(stamp), "tools": tools,
         "selection": {"tests": args.tests, "filter": args.filter,
                       "from_list": str(args.from_list) if args.from_list else None,
-                      "sources": len(sources), "selected_sources_sha256": selected.hexdigest()},
+                      "sources": len(sources), "selected_sources_sha256": selected.hexdigest(),
+                      "dependency_files": dependencies["files"],
+                      "dependency_digest_truncated": dependencies["truncated"]},
+        "dependency_digest": dependencies["digest"],
         **({"from_list": str(args.from_list)} if args.from_list else {}),
         "append": args.append, "runner": args.runner, "expensive": args.expensive,
         "compile_timeout": args.compile_timeout, "run_timeout": args.run_timeout,
         "jobs": args.jobs, "host": platform.platform(),
         "environment": public_environment(),
-        "coverage_contract": "top-level C sources; native reference eligibility; "
-                             "not full DejaGnu directive/option coverage",
+        # The boundary is stated, not implied: quoted (project-local) includes
+        # are pinned; system headers reached through <...> are not, because
+        # they belong to the host toolchain that `tools` and `gcc_checkout_head`
+        # already describe.
+        "coverage_contract": "top-level C sources and their quoted local includes "
+                             "(bounded, truncation reported); native reference "
+                             "eligibility; not system-header or full DejaGnu "
+                             "directive/option coverage",
     }
 
 
@@ -730,7 +845,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     counts: Counter[str] = Counter()
     # Identity is captured before the matrix, never inferred later from a
     # possibly rebuilt binary or a rebased checkout. Paths alone are not pins.
-    identity = run_identity(args, sources)
+    is_32 = args.arch in ("i686", "i386")
+    identity = run_identity(args, sources, args.suite, is_32)
     fatal = reference_preflight(args, runner_cmd)
 
     def save(complete: bool) -> None:
@@ -738,6 +854,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             atomic_json(args.json, {
                 "schema": 2, **identity, "complete": complete,
                 "expected_cases": len(cases), "completed_cases": len(results),
+                # The exact set of cases this run *owed*, so a consumer can
+                # tell a report with the right COUNT of results from one with
+                # the right CASES: two copies of a passing case and a missing
+                # one are the same length and a different run.
+                "case_set_sha256": evidence.case_set_digest(c.key for c in cases),
                 "fatal": fatal, "flags": flags,
                 "elapsed_s": round(time.monotonic() - started, 3),
                 "counts": dict(sorted(counts.items())),
@@ -769,7 +890,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             for case in cases
         }
         for index, future in enumerate(concurrent.futures.as_completed(futures), 1):
-            result = future.result()
+            try:
+                result = future.result()
+            except Exception as exc:  # noqa: BLE001 - the point is to classify
+                # An escaping exception used to abort `main` mid-iteration: the
+                # queued cases kept running to completion behind it, the last
+                # checkpoint said `fatal: null` with `complete: false` and zero
+                # completed cases, and the operator got a traceback instead of
+                # a diagnosis.  Record which case and phase faulted, stop
+                # submitting work that cannot be judged, publish the partial
+                # report with the fault in it, and exit 2 like any other
+                # infrastructure failure -- a runner bug is not a compiler bug.
+                case = futures[future]
+                fatal = (f"runner fault in {case.key}: {type(exc).__name__}: {exc}")
+                for other in futures:
+                    other.cancel()
+                save(False)
+                print(f"error: {fatal}", file=sys.stderr)
+                return 2
             results.append(result)
             counts[result.status] += 1
             # At most 24 completed cases can be lost by an external SIGKILL.
@@ -790,6 +928,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     elapsed = time.monotonic() - started
     if not counts["pass"] and all(status in QUIET_STATUSES for status in counts):
         fatal = "no eligible case passed; an all-skipped run is not validation"
+    drifted = identity_drift(args, sources, identity, args.suite, is_32)
+    if drifted:
+        # The pre-run identity stands (it is what the cases actually ran
+        # against); what the drift invalidates is the run's claim to be
+        # reproducible from that identity.
+        fatal = (fatal or "") + ("; " if fatal else "") + (
+            "run inputs changed mid-flight: " + ", ".join(drifted) +
+            " -- the published identity is the pre-run one, and a run whose "
+            "inputs moved is not evidence")
+        save(False)
+        print(f"error: {fatal}", file=sys.stderr)
+        return 2
     save(True)
     if args.failure_log:
         args.failure_log.parent.mkdir(parents=True, exist_ok=True)

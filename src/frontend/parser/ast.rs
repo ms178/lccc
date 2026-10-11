@@ -644,6 +644,10 @@ pub mod decl_attr_flag {
     /// `__attribute__((cold))` — the function is unlikely to execute.
     /// Meaningful on functions only; ignored for variables like GCC.
     pub const COLD: u16 = 1 << 11;
+    /// GNU `auto` at block scope, i.e. a nested function (see
+    /// `parsed_attr_flag::NESTED_FN`). Not an attribute spelling: there is no
+    /// `__attribute__((auto))`, only the storage-class keyword.
+    pub const NESTED_FN: u16 = 1 << 12;
 }
 
 impl DeclAttributes {
@@ -668,6 +672,10 @@ impl DeclAttributes {
     #[inline]
     pub fn is_noreturn(&self) -> bool {
         self.flags & decl_attr_flag::NORETURN != 0
+    }
+    #[inline]
+    pub fn is_nested_fn(&self) -> bool {
+        self.flags & decl_attr_flag::NESTED_FN != 0
     }
     #[inline]
     pub fn is_used(&self) -> bool {
@@ -719,6 +727,10 @@ impl DeclAttributes {
     #[inline]
     pub fn set_noreturn(&mut self, v: bool) {
         self.set_flag(decl_attr_flag::NORETURN, v)
+    }
+    #[inline]
+    pub fn set_nested_fn(&mut self, v: bool) {
+        self.set_flag(decl_attr_flag::NESTED_FN, v)
     }
     #[inline]
     pub fn set_used(&mut self, v: bool) {

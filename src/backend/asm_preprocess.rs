@@ -487,7 +487,13 @@ pub fn expansion_size(lines: &[String]) -> (u64, u64) {
 /// output.  Charging the *total* across frames is what turns that into a
 /// refusal, and it is the same ceiling `.rept` already enforces -- so a macro
 /// and a repeat of the same size cost the same, and neither is a way around
-/// the other.
+/// the other.  "Same size" means the same *charged* size, which at nesting
+/// depth 1 is the materialized text: a macro whose body repeats another macro
+/// is billed for its inner lines twice (`nested_macro_output_is_billed_twice`),
+/// so the same text through a nested frame crosses the ceiling earlier than a
+/// flat repeat of it.  That asymmetry is in the safe direction -- it can only
+/// refuse more, never less -- and `same_size_macro_and_rept_share_the_ceiling`
+/// pins both halves of the sentence rather than leaving it as prose.
 ///
 /// A per-frame budget would be wrong in the obvious way (101 frames each
 /// allowed 4M lines is 400M), which is why the counter is threaded through the
@@ -1645,6 +1651,48 @@ mod tests {
         .expect("flat macro");
         assert_eq!(one.len(), 2);
         assert_eq!(flat.lines, 2, "one frame, one charge");
+    }
+
+    /// One ceiling, three spellings.  `.rept`/`.irp` can predict their size
+    /// from a literal count and refuse before emitting anything; `.macro`
+    /// cannot, which is why all three hand their *totals* to
+    /// `check_expansion_growth` and no per-construct ceiling exists to drift.
+    /// The parity is what stops `.macro` being a way around `.rept` (and vice
+    /// versa), and the second half pins the one place the two do differ: the
+    /// nesting multiplier, which can only make a macro refuse earlier.
+    #[test]
+    fn same_size_macro_and_rept_share_the_ceiling() {
+        let limit = MAX_EXPANSION_LINES as u64;
+        let cap = MAX_EXPANSION_TEXT as u64;
+        let q = (MAX_EXPANSION_LINES / 4) as u64;
+        for kind in ["macro", "rept", "irp"] {
+            // The line ceiling: the last admissible total and the first refusal.
+            assert_eq!(check_expansion_growth(kind, limit, 1), Ok(()));
+            assert_eq!(
+                check_expansion_growth(kind, limit + 1, 1).unwrap_err(),
+                format!("{kind}: expansion exceeds the {limit}-line limit"),
+                "{kind} must be refused one line past the same ceiling"
+            );
+            // And the byte ceiling, which is the half a 4 Mi-line body of
+            // 1-byte lines does NOT reach -- hence two ceilings.
+            assert_eq!(check_expansion_growth(kind, 1, cap), Ok(()));
+            assert_eq!(
+                check_expansion_growth(kind, 1, cap + 1).unwrap_err(),
+                format!("{kind}: expansion exceeds the {cap}-byte limit")
+            );
+        }
+        // Same charged size -> same verdict, whatever the spelling called it.
+        for kind in ["macro", "rept"] {
+            assert_eq!(check_expansion_growth(kind, 3 * q, 3 * q * 5), Ok(()));
+        }
+        // 3q materialized lines reached through one nesting level are charged
+        // 7/4 as much (the 4-materialized : 7-billed ratio above), which is
+        // past the 4q ceiling: the repeat of the same text is still admitted.
+        assert_eq!(
+            check_expansion_growth("macro", 3 * q * 7 / 4, 1).unwrap_err(),
+            format!("macro: expansion exceeds the {limit}-line limit")
+        );
+        assert_eq!(check_expansion_growth("rept", 3 * q, 1), Ok(()));
     }
 
     /// The riscv-facing expander carries the same GAS 2.47 wall as the
