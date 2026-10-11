@@ -398,12 +398,57 @@ impl I686Codegen {
                             // possible at word 0 when base==0) is written last.
                             self.operand_to_eax(&args[arg_i]);
                             for k in (0..words).rev() {
+                                let off = (k * 4) as i64;
+                                let defined = (*size as i64 - off).min(4);
+                                if defined >= 4 {
+                                    emit!(
+                                        self.state,
+                                        "    movl {}(%eax), {}",
+                                        off,
+                                        regparm_regs[base_reg_idx + k]
+                                    );
+                                    continue;
+                                }
+                                // regparm rounds an aggregate up to whole words, and
+                                // the last word can hold as few as one defined byte.
+                                // Loading it with `movl` reads up to 3 bytes past the
+                                // C object: measured on -m32, sizes 1, 7, 9 and 15
+                                // faulted as the caller while 8 and 16 did not -- the
+                                // exact profile of word rounding, with the fixture's
+                                // aggregate placed flush against a PROT_NONE page.
+                                // Padding above the object is unspecified in the
+                                // register, so the fix is to stop reading, not to zero
+                                // what was never defined.  Staging goes through a
+                                // transient word of our own stack because %eax is the
+                                // only free GP here: every other one may already hold a
+                                // staged argument.  The pointer is parked and restored
+                                // so the descending order above (an %eax destination
+                                // must be written last) still holds.
+                                emit!(self.state, "    subl $8, %esp");
+                                emit!(self.state, "    movl %eax, 4(%esp)");
+                                let mut done = 0i64;
+                                while done < defined {
+                                    let (mn, ferry, width) = if defined - done >= 2 {
+                                        ("movw", "%ax", 2i64)
+                                    } else {
+                                        ("movb", "%al", 1i64)
+                                    };
+                                    emit!(self.state, "    movl 4(%esp), %eax");
+                                    self.state.emit_fmt(format_args!(
+                                        "    {mn} {}(%eax), {ferry}",
+                                        off + done
+                                    ));
+                                    self.state
+                                        .emit_fmt(format_args!("    {mn} {ferry}, {}(%esp)", done));
+                                    done += width;
+                                }
                                 emit!(
                                     self.state,
-                                    "    movl {}(%eax), {}",
-                                    k * 4,
+                                    "    movl (%esp), {}",
                                     regparm_regs[base_reg_idx + k]
                                 );
+                                emit!(self.state, "    movl 4(%esp), %eax");
+                                emit!(self.state, "    addl $8, %esp");
                             }
                         }
                     }

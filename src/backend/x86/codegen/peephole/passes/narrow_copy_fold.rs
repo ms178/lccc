@@ -793,7 +793,7 @@ pub(super) fn fold_induction_copyback(store: &mut LineStore, infos: &mut [LineIn
             let mut j = i + 1;
             let mut steps = 0;
             while j < len && steps < 8 {
-                if infos[j].is_nop() || matches!(infos[j].kind, LineKind::Directive) {
+                if super::helpers::steps_over_line(&infos[j], infos[j].trimmed(store.get(j))) {
                     j += 1;
                     continue;
                 }
@@ -862,7 +862,7 @@ pub(super) fn fold_induction_copyback(store: &mut LineStore, infos: &mut [LineIn
         let mut j = i + 1;
         let mut clean = true;
         while j < c {
-            if infos[j].is_nop() || matches!(infos[j].kind, LineKind::Directive) {
+            if super::helpers::steps_over_line(&infos[j], infos[j].trimmed(store.get(j))) {
                 j += 1;
                 continue;
             }

@@ -26,7 +26,7 @@ survive that check.
 
 | # | item | verdict | what the measurement showed |
 |---|---|---|---|
-| 1 | region latch in the dispatcher ratchet | **agree, fixed** | `src[a + 10..].find("\npub fn ")` returns −1 *today*: the counted region ran 104,346 B to EOF instead of the 54,114 B that are the function, and a rough arm scan saw 569 "arms" out there vs 528 inside. Now delimited by the first column-0 `}`, loud if absent, in both copies. |
+| 1 | region latch in the dispatcher ratchet | **agree, fixed** | `src[a + 10..].find("\npub fn ")` returns −1 *today*: the counted region ran 104,346 B to EOF instead of the 54,114 B that are the function, and a rough arm scan saw 569 "arms" out there vs 528 inside. The next round showed that rule to be textual too (see F08 in `FOLLOWUP-2026-10-11-round12-review.md`): both copies now close the region by brace depth over a view where comments and literal contents are blanked, an empty arm set is a hard failure, and the `# arms:` TSV header latches the two enumerations together (`dispatcher-region-contract` gate). |
 | 2 | orphan `///` block + `small_nop` field doc | **agree, fixed** | The block sat between `new()` and `ensure_section()` with a blank line after it. The field doc claimed RVC conditionality that `riscv/assembler/elf_writer.rs:507` (`with_small_nop(RISCV_C_NOP)`, unconditional) contradicts. |
 | 3 | RISC-V `.p2align` cap/fill pins | **agree, fixed** | The parser module had 3 tests and none pinned the cap-drop, the explicit-fill survival, `.p2align 4,,` vs `,,,`, or the exponent clamp. `gas247_riscv_align_tail_verdicts_at_the_parser` now pins all four plus the `.balign` tolerances. |
 | 4 | string-sniffed tail errors | **agree, fixed** | `Err(e) if e.contains("fill") \|\| e.contains("too many")` replaced by `AlignTailError::{BadFill, BadMax, TooMany}` with `to_message()` reproducing the old text byte-for-byte, so no diagnostic pin had to move. |
@@ -187,3 +187,193 @@ Delivery: this branch is `arena/round10-gate-hardening` at `ms178:lccc`, and the
 canonical patch is `git diff 106b7e35`, whose commits are itemised at the head of
 this section.  #781's authorship is preserved via the cherry-pick trailer, so the ABI
 work keeps its own commit rather than being folded into mine.
+
+---
+
+## Round 11 — re-audit of the same review, and the two things it led me to
+
+The review of #788 was re-sent verbatim after round 10, so round 11 was spent
+re-deriving its nine items against the tree rather than against my notes, and
+finishing the sub-clauses round 10 had deferred (mutation proofs, writer-level
+byte pins, docstring qualifiers).  Two of the outcomes are corrections to
+*my own* previous answers, so they come first.
+
+**P3-2 — the review was right and round 10's dismissal was wrong.**  I had
+answered "`check_ensure_gcc_torture.sh` shows no `±1` arithmetic, so the `+1/-1`
+is noise" and stopped there.  `git diff 1334bb8a..106b7e35 --
+tests/regression/check_ensure_gcc_torture.sh` returns one changed *comment*
+line: "every way a harness wipe or an interrupted run can" became "every way an
+interrupted or half-copied provision can".  Verifying a property of a file is
+not verifying a property of the diff, and "the hunk is unexplained" was a fair
+remark about the commit.  The reason is now written into the file at that line,
+which is the only place a future reader looks.
+
+**PR #725's directive law was 1/7 applied on main, and 1/49 applied when the
+walkers are counted across both backends.**  Round 10 recorded "#725 is closed
+except for one walker site"; reading all the sites showed the opposite framing:
+`directive_emits_data` was consulted in one place, while 48 step-over sites in
+15 files tested `is_nop() || kind == LineKind::Directive` and thereby asserted
+that no directive can matter.  That is an overclaim, whatever the reachability.
+Every one now goes through one law: `peephole_common::directive_emits_data`
+(moved there because the x86 and i686 backends have separate `LineInfo` models
+but one assembler), wrapped by `steps_over_line` per backend.
+
+  * Three sites were already right for a *different* reason and are annotated
+    rather than converted: `identical_blocks` classifies through
+    `is_alignment_directive`/`is_debug_marker_directive`, and `store_forwarding`
+    and `local_patterns` *seek* `.cfi_startproc`/`.size` instead of skipping
+    past a directive.  A gate that forced them through the step law would have
+    made them wrong.
+  * Two scans needed more than "do not skip": `flag_peepholes`' narrow-mov
+    liveness walk and `local_patterns`' preheader-store walk classify registers,
+    not flags, so an unclassifiable line has to *end* the search.  Falling
+    through it is not the conservative answer; "no classifier knows" and
+    "nothing happened" are different statements, and only one of them is safe
+    to act on.  Everywhere else the existing `flags_effect` catch-all (unrecognized
+    text answers `Reads`) does the work, which is why the sites read differently.
+  * `scripts/check_peephole_directive_step.py` is new and wired into
+    `ci_local.sh`, `ci.yml` and the gate-parity contract (152 commands).  It
+    found six more sites than my greps did — the `|| matches!(…, Directive |
+    Empty)` spellings split across lines — which is the argument for a gate over
+    a grep.  Its ratchet was verified by mutation: re-inserting the old test at
+    `spill_deref.rs:561` makes it name the file, the line and the text;
+    restoring the file makes it pass again.
+  * Reachability, measured rather than assumed: `lccc -O2 -c` on a `.s` file
+    containing a dead `addl $1, %ecx` keeps the `add` for both space- and
+    tab-indented spellings, so the peepholes do not act on foreign assembler
+    input at all, and `pin_inline_asm_regions` already reclassifies `#APP` text
+    as `InlineAsm` and pins it.  **This is hardening plus a structural gate, not
+    a live miscompile** — and the honest version of the claim is the one in the
+    commit message.  What was wrong was the *reasoning* at 48 sites, and the
+    reasoning is what the next pass inherits.
+
+**The RISC-V alignment cap was the other finding, and it is a real divergence.**
+Round 8/9 recorded "RISC-V has no padding cap: `riscv_frag_align_code (int n)`
+never sees it" and the parser therefore did `tail.max_pad = None`, plus a
+`.balign` arm that swallowed a bad cap "because GAS never looks at it".  Both
+statements are half true, and the halves were used as if they were whole.  From
+`s_align` (read.c) and the measured behaviour of `riscv64-linux-gnu-as`
+2.47.20260726:
+
+| input at offset 1 or 5 | section | fill | cap | GAS 2.47 emits |
+|---|---|---|---|---|
+| `.p2align 4,,2` | `.text` | – | 2 | 15 pad bytes (the hook ignores the cap) |
+| `.p2align 4,,10` | `.text` | – | 10 | 15 pad bytes |
+| `.p2align 4,0x13,2` | `.text` | 0x13 | 2 | **no pad** — a fill routes around the hook |
+| `.p2align 4,0x13,99` | `.text` | 0x13 | 99 | 15 × `0x13` |
+| `.p2align 4,,2` / `,,14` | `.data` | – | < pad | **no pad** |
+| `.p2align 4,,15` / `,,0` | `.data` | – | ≥ pad / none | 15 zero bytes |
+| `.balign 8,,4` | `.text` | – | 4 | 7 pad bytes |
+| `.balign 8,,4` | `.data` | – | 4 | **no pad** |
+| `.balign 8,,junk` | any | – | symbol | **assembler error** |
+
+So the cap is a property of the *section and the fill*, not of the mnemonic; it
+is a **byte** count compared against the padding needed (`0` and a negative,
+which GAS warns about and clears, both mean unlimited); and it is *parsed*
+before any hook can decline it, which makes `.balign 8,,junk` an error on every
+target.  lccc's blanket drop padded inside `.data` where GAS leaves the offset
+alone — moving every later symbol in the section — and the tolerated junk cap
+accepted input GAS rejects.  The parser now keeps the operand, `.balign` carries
+it, the writer decides with the section's flags
+(`code_no_fill → cap dropped`), and `cap_applies_outside_a_code_section` pins
+every row of that table at the byte level (which is also the writer-level
+evidence the review's P2-3 asked for and round 10 had deferred:
+`.byte 1\n.p2align 3,,2` pads 7 bytes, `.p2align 4,0x13` emits 15 fill bytes, in
+`.text` — both re-derived against the real oracle).  Two existing pins recorded
+the wrong expectation and were reversed with the measurement written beside them:
+`.balign 8,,junk` assembles, and "`.balign` has no cap slot".
+
+**`.macro`/`.rept` ceiling parity** is now a test, not a sentence:
+`same_size_macro_and_rept_share_the_ceiling` drives `check_expansion_growth` at
+the boundary for all three construct names and shows the one asymmetry — a
+nested frame charged 7/4 for 4 materialized lines is refused where the
+same-size repeat is admitted, i.e. earlier, never later — and the docstring
+above `ExpansionTotals` now says that "same size" means same *charged* size.
+The `max <= 0 → unlimited` collapse (`.p2align 4,,0` ≡ `.p2align 4`) is pinned
+at both layers with the reason: a `Some(0)` would hand every consumer a value
+that must be re-interpreted, and a consumer reading 0 as "pad nothing" would
+delete padding GAS emits.
+
+**Gate and mutation status.**  The dispatcher ratchet's region latch was
+verified by mutation: a `pub fn` inserted after the dispatcher's closing brace
+leaves the enumeration at 526 (before the fix it widened silently), a new arm
+inside the body raises it to 527, and `check()` reports that as
+`uncovered dispatcher arm` — so the latch is bounded *and* sensitive.  The arm-set
+half of `check()` (including a new `# arms:` cross-check against the TSV header,
+which is the mechanical version of the prose-drift fix) now runs before
+`build_toolchain`, because an arm hole masked by a missing binutils is a gate
+that cannot run its cheap half.  The NEON census was verified the same way:
+deleting `encode_neon_bic`'s `neon_shapes_agree` call fails the census by name;
+restoring it passes.
+
+**Open PRs, final adjudication this round.**  #725: the law is now applied at
+every walker, so the PR is fully absorbed — close.  #776: 61 of its added lines
+have no textual match on main, and they are all re-wordings in files rounds
+8-11 rewrote (`aarch64_doccheck_2026_09.py`, `x86/assembler/parser.rs`, the riscv
+pair, `asm_preprocess.rs`); its content is present — close.  #777: its
+soundness half is already on main and *pinned* there
+(`tests/regression/ivsr_scale_ring_wrap.c`, run by `check_ivsr_domains.sh`), its
+memory licence is off-by-default and §6 of its own document retracts the 15.9 %
+regression it was built on (+0.57 % on the byte-walk kernel, `min`-of-31 shown to
+invent 5-25 % effects on identical code), and the census script #777 adds (not adopted)
+exists only to re-run that experiment — so neither the licence nor the census
+script is adopted, and the switch `CCC_DEBUG_LOOP_INVERT` with its
+read-at-most-once-per-run resolution is already on main.  #781: adopted,
+including the CI `gcc-multilib` provisioning that makes the i686
+empty-aggregate miscompile reproducible (20/20 with the patch, `rc=3` without).
+
+**Not done, with the reason.**  The Arm (32-bit) `md_do_align` was not
+re-measured: no `arm-*` binutils is installed here, and the ARM writer inherits
+the generic cap law from `align_to_capped_ex`, which is what aarch64 was
+measured to do; `as --version` for an Arm triplet in CI is the one command that
+would close it.  `compute_trim_offset` in the x86 line model skips spaces only,
+so a tab-indented line never becomes `LineKind::Directive` (or a `nop`, or most
+folds): harmless today because foreign `.s` does not reach the peepholes, and
+deliberately *not* widened here, because teaching it tabs would change which
+folds fire on every hand-written `.s` and deserves its own measurement.  The
+uniform-but-invalid `pmul v0.8h, v1.8h, v2.8h` acceptance from round 10 is
+still open: `neon_shapes_agree` compares arrangements pairwise, and a legal
+pairwise-uniform triple can still be an illegal form for that mnemonic.
+
+## Open, found while re-checking my own earlier alignment law (highest-priority follow-up)
+
+**lccc's riscv `.text` section alignment follows the wrong target's rule.** Round 8
+established "sections start at `sh_addralign` 1 and the first instruction raises it to the
+target alignment", measured it on x86 and aarch64, and applied it to riscv
+(`ElfWriterBase::new(RISCV_NOP, 2)` plus `note_instruction`); the riscv test
+`gas247_bare_input_default_section_and_align_law` pins `sh_addralign == 1` for a data-only
+`.text`. Re-measuring all three targets against the 2.47 oracles (2026-10-11) shows the law
+fits two of them and not the third:
+
+| target, bare input | `.text` with one `.byte 1` | `.text` with one instruction | rule that fits |
+| --- | --- | --- | --- |
+| x86-64 | `Al=1 size=1` | `Al=1` | created at 1; nothing raises it (markers are the only source of x86 `sh_addralign`) |
+| aarch64 | `Al=1 size=1` | `Al=4 size=4` | **raised by the first instruction** (`record_alignment`) |
+| riscv64 `-march=rv64gc` | **`Al=2 size=2`** | `Al=2 size=2` | **set when the section is created**, from the minimum instruction size; content irrelevant |
+| riscv64 `-march=rv64im` (no C) | **`Al=4 size=4`** | `Al=4 size=4` | same rule, minimum instruction size 4 |
+
+Reproduce with the two oracle toolchains: `as -march=rv64gc -mabi=lp64d -o t.o t.s` on a
+file containing `.byte 1` (and separately `addi x0,x0,0`), then `readelf -SW t.o` -- the
+last column of the `.text` row is `sh_addralign`, column 7 is the size. Repeat with
+`-march=rv64im -mabi=lp64`. `aarch64-linux-gnu-as` and `x86_64-linux-gnu-as` for the others.
+
+Two consequences, both deliberately left unpatched this round:
+
+1. a data-only `.text` gets `sh_addralign` 1 where GAS gives 2 (riscv only);
+2. GAS also *pads the section size up to that alignment* (`size=2` for a one-byte input on
+   riscv; on aarch64 the instruction is already 4 bytes, which is why aarch64 appears to
+   agree with lccc today), so an lccc riscv object can be shorter than the oracle's.
+
+A too-small `sh_addralign` is not cosmetic: the linker may honour it when choosing the
+section's final address, and 2-byte alignment for a 4-byte-only instruction stream is a
+misaligned-fetch hazard on cores that trap on it. The fix is to take the creation-time value
+from the target description (riscv: minimum instruction size -- 2 for the default `rv64gc`,
+4 without `C`; aarch64 and x86 keep today's behaviour) and to pad the section size to it at
+finalize. That touches the shared creation path, flips two pinned expectations, and needs a
+fresh full `ci_local --fast`, so it is recorded here rather than landed at the end of a
+round -- the same standard this file applies to the two reversed pins above.
+
+The lesson is that those two reversals taught again: **a law measured on one target and
+inherited by another is a guess.** The analogy's premise -- a shared creation law -- was
+never tested on the target it was applied to, and the test that would have caught it was
+passing because it asserted the borrowed belief.

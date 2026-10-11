@@ -851,7 +851,7 @@ impl FileLiveness {
             let mut k = n;
             while k > start {
                 k -= 1;
-                if infos[k].is_nop() || infos[k].kind == LineKind::Directive {
+                if super::helpers::steps_over_line(&infos[k], infos[k].trimmed(store.get(k))) {
                     continue;
                 }
                 if matches!(
@@ -1019,7 +1019,7 @@ impl FileLiveness {
         let mut succs: Vec<Vec<usize>> = vec![Vec::new(); end.saturating_sub(start)];
         let mut lines: Vec<usize> = Vec::new();
         for n in start..end {
-            if infos[n].is_nop() || infos[n].kind == LineKind::Directive {
+            if super::helpers::steps_over_line(&infos[n], infos[n].trimmed(store.get(n))) {
                 continue;
             }
             lines.push(n);

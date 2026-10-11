@@ -4,6 +4,9 @@
 # Runs the provisioning script against a synthetic release tarball served
 # from a file:// mirror (no network), then damages the provisioned tree in
 # every way an interrupted or half-copied provision can, and checks that each
+# (the wording used to read "a harness wipe or an interrupted run": a wiped
+#  sandbox is one environment's cause, a half-copied tarball is the failure mode
+#  the script actually has to survive, and the guard is written for that)
 # damage is detected, reported and repaired — and that a stamp is never left
 # behind for a tree that was not validated.
 set -euo pipefail

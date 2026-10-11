@@ -54,14 +54,17 @@ MARKER='FIX''ME'
 #        its debug trace per candidate loop
 #   155  at 2026-10-01 on the hardened tree: the policy is resolved once in
 #        `run_passes`, so three per-loop reads disappeared
-#   153  now (measured 2026-10-07 on the review-hardened tree): IVSR reads
+#   153  at the review-hardening round (measured 2026-10-07): IVSR reads
 #        `CCC_IVSR_DEBUG` once per invocation instead of once per trace site
 #        (5 reads -> 3 in iv_strength_reduce.rs)
+#   151  now: loop_invert's two reads -- the kill switch and the debug trace --
+#        moved out of the pass into the driver's pipeline, which resolves both
+#        once per run instead of twice per function
 #
 # Lower this number whenever a measurement comes in below it; never raise it.
 # The pre-epic baseline is more than restored, which is the property this
 # ratchet exists to protect.
-ENV_READ_BUDGET=153
+ENV_READ_BUDGET=151
 
 fail=0
 report() { # report <label> <offending lines>

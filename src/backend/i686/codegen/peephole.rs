@@ -7390,7 +7390,7 @@ fn fuse_sext_testb(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         };
         // Next code line must be the matching full-width self-test.
         let mut j = i + 1;
-        while j < len && (infos[j].is_nop() || infos[j].kind == LineKind::Directive) {
+        while j < len && steps_over_line(store, infos, j) {
             j += 1;
         }
         if j >= len {
@@ -7406,9 +7406,12 @@ fn fuse_sext_testb(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         let mut k = j + 1;
         let mut reg_dead = false;
         while k < len {
-            if infos[k].is_nop() || infos[k].kind == LineKind::Directive {
+            if steps_over_line(store, infos, k) {
                 k += 1;
                 continue;
+            }
+            if opaque_data_directive(store, infos, k) {
+                break; // a hidden write/read: nothing is provable
             }
             if let LineKind::Pop { reg: popped } = infos[k].kind {
                 if popped == family {
@@ -7851,20 +7854,44 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
 /// collapse is therefore gated on a forward scan proving %eax is not read
 /// before its next pure write.  Any barrier (label/branch/call/ret/push/
 /// pop/esp-arithmetic/directive) stops the scan conservatively.
+/// Next line index that is neither a NOP nor a *benign* directive, or `len`.
+/// The law is the x86 one (`peephole::passes::helpers::steps_over_line`): a
+/// directive that emits data is machine code the text does not spell out, so
+/// it is code for the purposes of an adjacency scan and must not be stepped
+/// over.  `check_peephole_directive_step.py` enforces it in both backends.
+fn next_code_line(store: &LineStore, infos: &[LineInfo], start: usize) -> usize {
+    let mut k = start;
+    while k < infos.len() && steps_over_line(store, infos, k) {
+        k += 1;
+    }
+    k
+}
+
+/// See `next_code_line`.
+fn steps_over_line(store: &LineStore, infos: &[LineInfo], n: usize) -> bool {
+    let info = &infos[n];
+    if info.is_nop() {
+        return true;
+    }
+    info.kind == LineKind::Directive
+        && !crate::backend::peephole_common::directive_emits_data(trimmed(store, info, n))
+}
+
+/// True when `n` is a directive the scan may not step over: a data directive.
+/// A forward liveness scan cannot classify what `.byte 0xb8 0x01` did to the
+/// register it is proving dead, so it has to stop.
+fn opaque_data_directive(store: &LineStore, infos: &[LineInfo], n: usize) -> bool {
+    infos[n].kind == LineKind::Directive
+        && crate::backend::peephole_common::directive_emits_data(trimmed(store, &infos[n], n))
+}
+
 fn collapse_slot_rmw_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     if std::env::var("CCC_NO_SLOT_RMW").is_ok() {
         return false;
     }
-    /// Next line index that is neither a NOP nor a (code-less) directive —
-    /// `-g` interleaves `.loc` markers between instructions, and they must
-    /// not break the load/op/store adjacency.
-    fn next_code_line(infos: &[LineInfo], start: usize) -> usize {
-        let mut k = start;
-        while k < infos.len() && (infos[k].is_nop() || infos[k].kind == LineKind::Directive) {
-            k += 1;
-        }
-        k
-    }
+    // `next_code_line` (module level) is the one that knows about data
+    // directives: `-g` interleaves `.loc` markers between instructions, and
+    // those must not break the load/op/store adjacency, while a `.byte` must.
     /// Parse an op line that reads and writes %REG and has a valid
     /// memory-destination form: returns (mnemonic, optional source operand).
     fn parse_rmw_op<'a>(s: &'a str, reg_name: &str) -> Option<(&'a str, Option<&'a str>)> {
@@ -7931,7 +7958,7 @@ fn collapse_slot_rmw_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool
             }
         };
         // Line i+1: the RMW op on %REG (directives between are skipped)
-        let op_idx = next_code_line(infos, i + 1);
+        let op_idx = next_code_line(store, infos, i + 1);
         if op_idx >= len {
             break;
         }
@@ -7944,7 +7971,7 @@ fn collapse_slot_rmw_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool
             }
         };
         // Line i+2: movl %REG, SAME slot
-        let st_idx = next_code_line(infos, op_idx + 1);
+        let st_idx = next_code_line(store, infos, op_idx + 1);
         if st_idx >= len {
             break;
         }
@@ -7970,9 +7997,12 @@ fn collapse_slot_rmw_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool
         let mut k = st_idx + 1;
         let mut reg_dead = false;
         while k < len {
-            if infos[k].is_nop() || infos[k].kind == LineKind::Directive {
+            if steps_over_line(store, infos, k) {
                 k += 1;
                 continue;
+            }
+            if opaque_data_directive(store, infos, k) {
+                break; // a hidden write/read: nothing is provable
             }
             // `popl %REG` in the epilogue is a pure restore (def) of the
             // register — the stale collapsed value is overwritten, never
@@ -11701,11 +11731,10 @@ fn eliminate_never_read_stores_range(
                 // retpoline/stack-transfer shape `movl %reg,(%esp); ret|pop`.
                 let mut next = i + 1;
                 while next < end
-                    && (infos[next].is_nop()
-                        || matches!(
-                            infos[next].kind,
-                            LineKind::Empty | LineKind::Directive | LineKind::Label
-                        ))
+                    && (matches!(
+                        infos[next].kind,
+                        LineKind::Empty | LineKind::Label | LineKind::Directive
+                    ) && !opaque_data_directive(store, infos, next))
                 {
                     next += 1;
                 }
@@ -11770,11 +11799,10 @@ fn eliminate_never_read_stores_range(
         {
             let mut next = i + 1;
             while next < end
-                && (infos[next].is_nop()
-                    || matches!(
-                        infos[next].kind,
-                        LineKind::Empty | LineKind::Directive | LineKind::Label
-                    ))
+                && (matches!(
+                    infos[next].kind,
+                    LineKind::Empty | LineKind::Label | LineKind::Directive
+                ) && !opaque_data_directive(store, infos, next))
             {
                 next += 1;
             }

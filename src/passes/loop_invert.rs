@@ -110,13 +110,16 @@ pub(crate) struct LoopInvertConfig {
 }
 
 impl LoopInvertConfig {
-    /// The driver's configuration: the documented `CCC_NO_LOOP_INVERT` /
-    /// `CCC_DEBUG_LOOP_INVERT` escape hatches, read at most once per run.
-    pub fn from_env() -> Self {
-        Self {
-            enabled: std::env::var("CCC_NO_LOOP_INVERT").is_err(),
-            debug: std::env::var("CCC_DEBUG_LOOP_INVERT").is_ok(),
-        }
+    /// The driver's constructor.  This module reads **no** environment variable:
+    /// `from_env` used to live here, which left the pass holding an ambient read
+    /// that any caller could reach per function -- and `invert_loops`, the entry
+    /// point the pipeline used, did exactly that, so the "resolved once by the
+    /// driver" claim above was false for as long as it was written.  Taking the
+    /// two booleans as parameters is what makes the claim structural: the ratchet
+    /// in `tests/regression/check_env_test_hygiene.sh` can then fall and stay
+    /// down, instead of counting a read that happens to have no caller today.
+    pub const fn new(enabled: bool, debug: bool) -> Self {
+        Self { enabled, debug }
     }
 
     /// Configuration used by the unit tests: no environment access at all.
@@ -135,12 +138,6 @@ impl LoopInvertConfig {
             debug: false,
         }
     }
-}
-
-/// Invert every eligible top-test loop in `func`. Returns the number rotated.
-pub(crate) fn invert_loops(func: &mut IrFunction) -> usize {
-    let cfg = LoopInvertConfig::from_env();
-    invert_loops_with(func, cfg)
 }
 
 /// The pass itself, parameterised by [`LoopInvertConfig`].
