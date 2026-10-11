@@ -3,7 +3,7 @@
 #
 # Runs the provisioning script against a synthetic release tarball served
 # from a file:// mirror (no network), then damages the provisioned tree in
-# every way a harness wipe or an interrupted run can, and checks that each
+# every way an interrupted or half-copied provision can, and checks that each
 # damage is detected, reported and repaired — and that a stamp is never left
 # behind for a tree that was not validated.
 set -euo pipefail

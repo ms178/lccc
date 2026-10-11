@@ -2015,8 +2015,13 @@ pub(crate) fn encode_neon_pmull(
     operands: &[Operand],
     is_pmull2: bool,
 ) -> Result<EncodeResult, String> {
-    if operands.len() < 3 {
-        return Err("pmull requires 3 operands".to_string());
+    // Exact, not a minimum: GAS's operand table for PMULL has three slots and
+    // a fourth is rejected ("unexpected characters following instruction at
+    // operand 3"), so accepting one here assembled a *different* instruction
+    // sequence than the source describes while reporting success.  This is the
+    // surplus-operand class recorded as F8 in docs/REVIEW_746_ADJUDICATION.md.
+    if operands.len() != 3 {
+        return Err("pmull/pmull2 requires exactly 3 operands".to_string());
     }
     let (rd, arr_d) = get_neon_reg(operands, 0)?;
     let (rn, _) = get_neon_reg(operands, 1)?;
@@ -2260,12 +2265,67 @@ pub(crate) fn encode_neon_rbit(operands: &[Operand]) -> Result<EncodeResult, Str
 /// Encode NEON float three-same: FADD, FSUB, FMUL, FDIV, FMLA, FMLS, etc.
 /// Format: 0 Q U 01110 size 1 Rm opcode 1 Rn Rd
 /// size[1]=size_hi (0 or 1), size[0]=sz (0=single, 1=double)
+/// GAS's `FP_REG_REG_REG`-class tables require every register operand to spell
+/// the *same* shape, and say so with `operand mismatch`: `fcmeq v0.2s, v1.2s,
+/// v2.4s` and `fcmeq s0, d1, #0.0` are both rejected (measured on GNU as 2.47).
+/// Reading the arrangement off operand 0 alone -- which is what these encoders
+/// did -- accepted both, encoding a program whose later operands are silently
+/// reinterpreted at the destination's width.
+///
+/// Scalar registers carry no arrangement suffix, so their shape is the register
+/// letter itself; that is also what makes `s0` and `d0` distinguishable here.
+pub(crate) fn neon_operand_shape(op: &Operand) -> Option<String> {
+    match op {
+        Operand::RegArrangement { arrangement, .. } => Some(arrangement.clone()),
+        Operand::Reg(name) => name
+            .strip_prefix(['v', 's', 'd', 'b', 'h', 'q'])
+            .map_or_else(
+                || Some(name.clone()),
+                |rest| {
+                    // `s0` -> `s`, `v3.4s` -> `4s`; the leading letter *is* the
+                    // shape for the scalar spellings.
+                    let letter = name.chars().next()?.to_lowercase().next()?;
+                    if rest.is_empty() || rest.starts_with(|c: char| c.is_ascii_digit()) {
+                        Some(letter.to_string())
+                    } else {
+                        Some(name[name.find('.')? + 1..].to_string())
+                    }
+                },
+            ),
+        _ => None,
+    }
+}
+
+/// Check the first `n` operands agree, ignoring any operand that is not a
+/// register at all (an immediate slot, a memory operand).
+pub(crate) fn neon_shapes_agree(operands: &[Operand], n: usize, mn: &str) -> Result<(), String> {
+    let mut want: Option<String> = None;
+    for (idx, op) in operands.iter().take(n).enumerate() {
+        let Some(shape) = neon_operand_shape(op) else {
+            continue;
+        };
+        match &want {
+            None => want = Some(shape),
+            Some(first) if first == &shape => {}
+            Some(first) => {
+                return Err(format!(
+                    "{mn}: operand mismatch at operand {}: `{first}` vs `{shape}` \
+                     (GAS requires every register operand to have the same arrangement)",
+                    idx + 1
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn encode_neon_float_three_same(
     operands: &[Operand],
     u_bit: u32,
     size_hi: u32,
     opcode: u32,
 ) -> Result<EncodeResult, String> {
+    neon_shapes_agree(operands, 3, "float three-same")?;
     let (rd, arr_d) = get_neon_reg(operands, 0)?;
     let (rn, _) = get_neon_reg(operands, 1)?;
     let (rm, _) = get_neon_reg(operands, 2)?;
@@ -2273,6 +2333,12 @@ pub(crate) fn encode_neon_float_three_same(
         "2s" => (0u32, 0u32),
         "4s" => (1, 0),
         "2d" => (1, 1),
+        // Deliberately no `s`/`d` here: the scalar spellings of these
+        // mnemonics are not this encoding class with bit 28 set (measured:
+        // `fmax s0, s1, s2` = 0x1e224820, whose fields sit elsewhere), and
+        // they already reach the scalar FP encoder that knows that class --
+        // `fcmeq s0, s1, s2` (GAS: 0x5e22e420) is the one gap left in the
+        // compare family, recorded with the measurement rather than guessed at.
         _ => {
             return Err(format!(
                 "float three-same: unsupported arrangement: {}",
@@ -3040,20 +3106,42 @@ pub(crate) fn encode_neon_float_cmp_zero(
             operands.get(2)
         ));
     }
+    neon_shapes_agree(operands, 2, "float cmp zero")?;
+    // A scalar register operand has no arrangement suffix, so `s0`/`d0` reach
+    // here with an empty one; the register letter is the shape.
     let (rd, arr_d) = get_neon_reg(operands, 0)?;
     let (rn, _) = get_neon_reg(operands, 1)?;
+    let arr_d = match arr_d.as_str() {
+        "" => match operands.first() {
+            Some(Operand::Reg(name)) if name.starts_with('s') || name.starts_with('d') => {
+                name[..1].to_string()
+            }
+            _ => arr_d,
+        },
+        _ => arr_d,
+    };
+    let scalar = matches!(arr_d.as_str(), "s" | "d");
     let (q, sz, x) = match arr_d.as_str() {
         "2s" => (0u32, 0u32, 0u32),
         "4s" => (1, 0, 0),
         "2d" => (1, 1, 0),
         "4h" => (0, 1, 0b110),
         "8h" => (1, 1, 0b110),
+        // `fcmeq s0, s1, #0.0` = 0x5ea0d820, `fcmgt d0, d1, #0.0` =
+        // 0x7ee0c820 (measured): the scalar forms of the same instruction, in
+        // the "floating-point scalar, other" class -- bit 28 set, element
+        // width from the register letter. Before the dispatcher routed the
+        // `#0.0` spelling here at all, no scalar arrangement ever reached this
+        // match, so the scalar forms were unreachable in both senses.
+        "s" => (1, 0, 0),
+        "d" => (1, 1, 0),
         _ => return Err(format!("float cmp zero: unsupported: {}", arr_d)),
     };
     let size = (size_hi << 1) | sz;
+    let group = if scalar { 0b11110 } else { 0b01110 };
     let word = (q << 30)
         | (u_bit << 29)
-        | (0b01110 << 24)
+        | (group << 24)
         | (size << 22)
         | (1 << 21)
         | (x << 18)

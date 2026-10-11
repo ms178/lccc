@@ -707,6 +707,67 @@ pub fn parse_integer_expr(s: &str) -> Result<i64, String> {
     Ok(val)
 }
 
+// ── alignment directive tail ───────────────────────────────────────────────
+
+/// The `[, fill[, max]]` tail of a GAS alignment directive, with the unit of
+/// the leading operand left to the caller (`.p2align` takes an exponent,
+/// `.balign` a byte count, and aarch64 `.align` a byte count again while
+/// RISC-V `.align` is exponent-form — three units, one tail grammar).
+///
+/// This lives here, shared, because the tail is where two backends that each
+/// grew their own parser had already diverged: one honored fill and cap, the
+/// other silently dropped both, so the same `.s` source assembled to different
+/// bytes (and therefore different addresses for every later label) depending on
+/// which target was being built. The rules below are the `read.c` ones,
+/// re-measured against GNU as 2.47.20260726 on aarch64-linux-gnu and
+/// riscv64-linux-gnu:
+///
+/// * `fill` is any integer, stored as its LOW BYTE (`-1` -> `0xff`,
+///   `300` -> `0x2c`, `256` -> `0x00`); an empty slot (`.p2align 3,,5`) means
+///   "no explicit fill", which is what switches on the target's NOP law.
+/// * `max` is a padding cap in bytes: the directive is skipped when honoring
+///   it would insert MORE than `max`. `0` and a negative value mean unlimited
+///   (so `.p2align 4,,0` still pads), and the comparison is against the
+///   boundary padding, before any target-specific growth of that run.
+/// * More operands than that (`.balign 8,,, -1`) is an error, not a suffix to
+///   ignore.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AlignTail {
+    pub fill: Option<u8>,
+    pub max_pad: Option<u64>,
+}
+
+/// Parse the tail after the alignment operand. `integer` is the caller's own
+/// expression evaluator, because each backend resolves symbols and different
+/// radix forms through its own path.
+pub fn parse_align_tail<F>(rest: &str, directive: &str, mut integer: F) -> Result<AlignTail, String>
+where
+    F: FnMut(&str) -> Result<i64, String>,
+{
+    let mut parts = rest.split(',');
+    let fill = match parts.next().map(str::trim) {
+        None | Some("") => None,
+        Some(tok) => {
+            let v =
+                integer(tok).map_err(|_| format!("{directive}: fill `{tok}` is not an integer"))?;
+            // GAS stores the low byte of any integer (see the type docs).
+            Some(v as u8)
+        }
+    };
+    let max_pad = match parts.next().map(str::trim) {
+        None | Some("") => None,
+        Some(tok) => {
+            let v = integer(tok)
+                .map_err(|_| format!("{directive}: max-pad `{tok}` is not an integer"))?;
+            if v <= 0 { None } else { Some(v as u64) }
+        }
+    };
+    if parts.next().is_some() {
+        return Err(format!("{directive}: too many operands"));
+    }
+    Ok(AlignTail { fill, max_pad })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

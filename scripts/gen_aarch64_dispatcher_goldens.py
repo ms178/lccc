@@ -177,15 +177,129 @@ HAND_TEMPLATES: dict[str, list[str]] = {
 }
 
 
+def arm_head_re() -> re.Pattern[str]:
+    r"""One arm head: quoted keys starting at the dispatcher's own indent.
+
+    Inner `match`es live deeper, so anchoring on indentation rather than on
+    `^\s*` is what keeps a leaf's `if mnemonic == "..."` from being read as an
+    arm.  Exported for the generator only -- the Rust ratchet re-implements the
+    same rule, and the `# arms: N` line this script writes into the TSV is the
+    latch that catches the two copies drifting apart.
+    """
+    return re.compile(r'^ {8}"[a-z0-9_.]+"', re.M)
+
+
 def dispatcher_arms() -> list[str]:
-    """Mnemonic arms of `encode_instruction`, mechanically extracted."""
+    """Mnemonic arms of `encode_instruction`, mechanically extracted.
+
+    Every key in an arm's pattern list counts, not just the first: an arm head
+    is a run of `"..." | "..."` groups terminated by `=>`.  The first version
+    matched one name per line, so of the dispatcher's multi-pattern arms --
+    `cas*`, `casp*`, `swp*`, `ldadd*`/`ldclr*`/`ldeor*`/`ldset*`/`ld*max*`/
+    `ld*min*`, `stadd*`/`stclr*`/`steor*`/`stset*`, `crc32*`, `ldrsw`, the
+    rounding `fcvt*` group -- it saw the leading mnemonic and silently dropped
+    the rest: 423 of 526 arms, with 103 names never even attempted.
+
+    That is the exact family where a routing defect hides.  An alias arm
+    forwards to a shared leaf *with the mnemonic string* (`encode_cas(m, ops)`),
+    so the leaf re-reads the decoration: a lost `b`/`h` suffix changes the
+    element size and register width, a mis-read `al` changes the memory order,
+    and a `st*` form that should take `Rt, [Rn]` but reads three operands is
+    invisible to every other test in the tree.  An ratchet that prints a
+    satisfied count over a hole this large is worse than no ratchet, because it
+    certifies the hole.
+    """
     src = DISPATCHER.read_text()
     a = src.find("pub fn encode_instruction(")
     if a < 0:
         raise SystemExit("encode_instruction not found in encoder/mod.rs")
     b = src.find("\npub fn ", a + 10)
     body = src[a:b if b > 0 else len(src)]
-    return sorted(set(re.findall(r'^\s*"([a-z0-9_.]+)"\s*(?:=>|\|)', body, re.M)))
+    lines = body.splitlines()
+    head = arm_head_re()
+    names: set[str] = set()
+    i = 0
+    while i < len(lines):
+        if not head.match(lines[i]):
+            i += 1
+            continue
+        while True:
+            names.update(re.findall(r'"([a-z0-9_.]+)"', lines[i]))
+            if "=>" in lines[i]:
+                break
+            i += 1
+            if i >= len(lines) or not lines[i].strip().startswith("|"):
+                break
+        i += 1
+    return sorted(names)
+
+
+def alias_family_templates(arms: set[str]) -> dict[str, list[str]]:
+    """Candidate texts for alias-family arms no random word reaches.
+
+    The LSE atomics and `crc32` occupy slices of the 32-bit encoding space a
+    uniform sweep of the corpus misses entirely, so their goldens can only come
+    from a template.  Spelling is derived from the mnemonic instead of written
+    out variant by variant: the leading verb fixes the operand shape (atomic
+    stores take `Rt, [Rn]`, the load-compare-swap forms take `Rt, Rt2, [Rn]`),
+    an `a`/`l`/`al` infix is the acquire/release decoration, and a trailing
+    `b`/`h` picks the element size and therefore the register width.
+
+    Where a width rule is not certain (`crc32`'s Rt/Rn pair), every plausible
+    spelling is offered and GNU as decides: the generator keeps the first
+    candidate the oracle accepts, so an over-eager template costs one rejected
+    probe rather than writing a wrong golden.  Letting the oracle pick is the
+    only honest way for this script to invent a spelling at all.
+    """
+    out: dict[str, list[str]] = {}
+    load_form = "{r0}, {r1}, [x2]"
+    store_form = "{r0}, [x2]"
+    # The Armv8.1 LSE set: CAS/CASP/SWP, the eight LD* and eight ST* atomics,
+    # each optionally decorated with A (acquire), L (release) and B/H (width).
+    verbs = {
+        "casp": "x0, x1, x2, x3, [x4]",
+        "cas": load_form, "swp": load_form,
+        "ldadd": load_form, "ldclr": load_form, "ldeor": load_form,
+        "ldset": load_form, "ldsmax": load_form, "ldsmin": load_form,
+        "ldumax": load_form, "ldumin": load_form,
+        "stadd": store_form, "stclr": store_form, "steor": store_form,
+        "stset": store_form, "stsmax": store_form, "stsmin": store_form,
+        "stumax": store_form, "stumin": store_form,
+    }
+    by_len = sorted(verbs, key=len, reverse=True)  # `casp` before `cas`
+    for mn in sorted(arms):
+        if mn in HAND_TEMPLATES:
+            continue
+        for verb in by_len:
+            if not mn.startswith(verb):
+                continue
+            deco = mn[len(verb):]
+            size = ""
+            if deco and deco[-1] in "bh":
+                size, deco = deco[-1], deco[:-1]
+            if deco not in ("", "a", "l", "al"):
+                break  # not this family after all
+            r0, r1 = ("w0", "w1") if size else ("x0", "x1")
+            out.setdefault(mn, []).append(
+                f"{mn} " + verbs[verb].format(r0=r0, r1=r1)
+            )
+            break
+        else:
+            if mn.startswith("crc32"):
+                out.setdefault(mn, []).extend(
+                    f"{mn} {a}, {b}, {c}"
+                    for a, b, c in (("w0", "w1", "w2"), ("x0", "w1", "w2"),
+                                    ("x0", "x1", "w2"), ("w0", "x1", "w2"))
+                )
+            elif mn.startswith(("ldrsw", "ldrw")):
+                out.setdefault(mn, []).extend([f"{mn} x0, [x1]",
+                                               f"{mn} x0, [x1, #8]"])
+            elif mn.startswith("fcvt"):
+                out.setdefault(mn, []).extend(
+                    [f"{mn} w0, s1", f"{mn} x0, d1", f"{mn} v0.4s, v1.4s",
+                     f"{mn} v0.2d, v1.2d"]
+                )
+    return out
 
 
 def build_toolchain(ns: argparse.Namespace) -> D.Toolchain:
@@ -214,6 +328,7 @@ def generate(ns: argparse.Namespace) -> int:
         for ins in corpus:
             by_mnemonic.setdefault(ins.mnemonic, []).append(ins)
 
+        extra = alias_family_templates(set(arms))
         rows: dict[str, tuple[str, str]] = {}
         mismatches: list[str] = []
         for arm in arms:
@@ -224,6 +339,7 @@ def generate(ns: argparse.Namespace) -> int:
                     sorted({i.text for i in by_mnemonic[arm]})
                 )
             candidates.extend(HAND_TEMPLATES.get(arm, []))
+            candidates.extend(extra.get(arm, []))
             if not candidates:
                 problems.append(f"{arm}: no corpus row and no hand template")
                 continue
@@ -285,6 +401,9 @@ def generate(ns: argparse.Namespace) -> int:
             "# re-derives the arm set and re-assembles every row through the full",
             "# parser->dispatcher->leaf path, so a new arm without a row, or a",
             "# drifted word, fails cargo test --lib on a host with no cross tools.",
+            f"# arms: {len(arms)} -- arm count as enumerated by this script;",
+            "# the ratchet test compares its own re-derivation against it, so",
+            "# the two copies of the enumeration rule cannot drift apart.",
             "# mnemonic\tinstruction\tencoding (GNU as 2.47, LE hex)",
         ]
         for arm in sorted(rows):
@@ -345,9 +464,12 @@ def main() -> int:
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--n", type=int, default=200_000)
     ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--gas", default="/home/user/.cache/gas-2.47-aarch64-linux-gnu/bin/as")
-    ap.add_argument("--objcopy", default="/home/user/.cache/gas-2.47-aarch64-linux-gnu/bin/objcopy")
-    ap.add_argument("--objdump", default="/home/user/.cache/gas-2.47-aarch64-linux-gnu/bin/objdump")
+    ap.add_argument("--gas",
+                    default=str(Path.home() / ".cache" / "gas-2.47-aarch64-linux-gnu" / "bin" / "as"))
+    ap.add_argument("--objcopy",
+                    default=str(Path.home() / ".cache" / "gas-2.47-aarch64-linux-gnu" / "bin" / "objcopy"))
+    ap.add_argument("--objdump",
+                    default=str(Path.home() / ".cache" / "gas-2.47-aarch64-linux-gnu" / "bin" / "objdump"))
     ap.add_argument("--lccc", default=str(REPO / "target/fastbuild/lccc"))
     ns = ap.parse_args()
     return check(ns) if ns.check else generate(ns)

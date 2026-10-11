@@ -1473,6 +1473,51 @@ mod branch_range_tests {
         .expect("a short backward branch must assemble");
         assert!(w.base.sections[".text"].relocs.is_empty());
     }
+
+    /// GAS's alignment-fill law, measured on GNU as 2.47.20260726
+    /// (aarch64-linux-gnu): a NOP may only sit on its own alignment grid, so
+    /// the bytes before that grid are zeros and the NOPs land at the *end* of
+    /// the pad. The writer used to emit NOPs first and zeros last, which put a
+    /// 4-byte NOP at offset 1 and left the boundary-straddling tail as zeros.
+    #[test]
+    fn text_padding_follows_gas_nop_alignment_law() {
+        // `.byte 1; .p2align 3` -> 01 | 00 00 00 | 1f 20 03 d5
+        let w = assemble(".text\n.byte 1\n.p2align 3\n").expect("must assemble");
+        assert_eq!(
+            w.base.sections[".text"].data,
+            vec![0x01, 0x00, 0x00, 0x00, 0x1f, 0x20, 0x03, 0xd5],
+            "GAS 2.47 aarch64 pads the unaligned prefix with zeros, then one NOP"
+        );
+    }
+
+    /// A pad with no room for a whole NOP is pure zeros, and a larger
+    /// alignment multiplies the NOP count without changing the 3-byte prefix:
+    /// `.p2align 5` at offset 1 measured as 3 zeros + seven NOPs (31 bytes).
+    #[test]
+    fn text_padding_prefix_is_zeros_whenever_no_nop_fits() {
+        let w = assemble(".text\n.byte 1\n.p2align 2\n").expect("must assemble");
+        assert_eq!(
+            w.base.sections[".text"].data,
+            vec![0x01, 0x00, 0x00, 0x00],
+            "3 bytes of pad cannot host a 4-byte NOP"
+        );
+        let w = assemble(".text\n.byte 1\n.p2align 5\n").expect("must assemble");
+        let mut want: Vec<u8> = vec![0x01, 0x00, 0x00, 0x00];
+        for _ in 0..7 {
+            want.extend_from_slice(&[0x1f, 0x20, 0x03, 0xd5]);
+        }
+        assert_eq!(w.base.sections[".text"].data, want, "3 zeros then 7 NOPs");
+    }
+
+    /// An explicit fill byte overrides the NOP vocabulary entirely:
+    /// `.p2align 3, 0xff` is seven 0xff bytes on both targets, NOPs included.
+    #[test]
+    fn explicit_fill_byte_beats_the_nop_law() {
+        let w = assemble(".text\n.byte 1\n.p2align 3, 0xff\n").expect("must assemble");
+        let mut want = vec![0x01u8];
+        want.extend(std::iter::repeat_n(0xffu8, 7));
+        assert_eq!(w.base.sections[".text"].data, want);
+    }
 }
 
 // =============================================================================

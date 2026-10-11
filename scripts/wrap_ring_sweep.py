@@ -238,46 +238,112 @@ def build_and_run(cc, src, out, flags, arg=None):
     return (r.stdout.strip() or f"rc={r.returncode}"), ""
 
 
-def main():
-    compilers = [a for a in sys.argv[1:] if not a.startswith("--")]
+def main() -> int:
+    """Run the sweep and *fail* when it found something.
+
+    Two defects made this harness decorative rather than diagnostic, both of
+    them about the exit status: `main()` returned nothing, so a run that
+    printed `DIVERGENT(21)` still exited 0 and any caller that checks `$?`
+    (`run_regression.py`, a CI step, a shell `&&`) read a pass; and the verdict
+    file went to a fixed path under $HOME, where a stale artifact from an
+    earlier mode or an earlier tree reads exactly like a fresh one -- the
+    `-fixed2`/`-rebased`/`.bak` zoo next to it is the evidence.  A sweep whose
+    pass/fail lives only in prose on stdout is not a gate.
+
+    So: exit 1 on any divergence, exit 1 on an unusable *reference* (those
+    cells are not agreements, they are comparisons against a compiler that
+    failed to build or crashed -- the silent-pass direction), exit 1 when no
+    case ran at all, exit 2 for a usage error, and 0 only for a real clean
+    sweep.  The verdict artifact defaults to the per-run work directory and
+    carries a header naming its mode, compilers and tally.
+    """
+    argv = sys.argv[1:]
+    compilers = [a for a in argv if not a.startswith("--")]
     opts = ["-O2"]
-    for a in sys.argv[1:]:
-        if a.startswith("--opts"):
+    out = None
+    for a in argv:
+        if not a.startswith("--"):
+            continue  # positional: a compiler, already collected above
+        if a.startswith("--opts="):
             opts = a.split("=", 1)[1].split(",")
+        elif a.startswith("--out="):
+            out = pathlib.Path(a.split("=", 1)[1])
+        elif a == "--opaque":
+            pass
+        else:
+            print(f"wrap_ring_sweep: unknown argument {a!r}", file=sys.stderr)
+            return 2
+    if not compilers:
+        print(__doc__.strip().splitlines()[0], file=sys.stderr)
+        print("usage: wrap_ring_sweep.py [--opts=-O1,-O2] [--opaque] "
+              "[--out=FILE] CC [CC...]", file=sys.stderr)
+        return 2
+
+    if out is None:
+        WORK.mkdir(parents=True, exist_ok=True)
+        out = WORK / f"wrap-sweep-verdicts{'-opaque' if OPAQUE else ''}.txt"
+
     cases = gen()
     mode = "opaque index (runtime, volatile)" if OPAQUE else "constant index"
-    print(f"{len(cases)} cases x {len(opts)} opt levels x {len(compilers)} compilers, {mode}")
+    print(f"{len(cases)} cases x {len(opts)} opt levels x {len(compilers)} "
+          f"compilers, {mode}")
     verdicts = {}
+    unusable_ref = []
     for opt in opts:
         flags = [opt]
         ref = {}
         for name, src, arg in cases:
-            out, err = build_and_run("gcc", src, WORK / f"gcc_{name}_{opt.strip('-')}", flags, arg)
-            ref[name] = out
-            if out == "BUILD-FAIL":
-                print(f"  !! REFERENCE BUILD FAILED {name}: {err}")
-            elif out.startswith(("SIGNAL", "MMAP", "MPROT", "TIMEOUT")):
-                print(f"  !! REFERENCE UNUSABLE {name}: {out}")
+            res, err = build_and_run("gcc", src, WORK / f"gcc_{name}_{opt.strip('-')}",
+                                      flags, arg)
+            ref[name] = res
+            if res == "BUILD-FAIL" or res.startswith(("SIGNAL", "MMAP", "MPROT", "TIMEOUT")):
+                unusable_ref.append(f"{name}@{opt}")
+                print(f"  !! REFERENCE UNUSABLE {name} {opt}: {res} {err}")
         for cc in compilers:
             tag = pathlib.Path(cc).name
             for name, src, arg in cases:
-                out, err = build_and_run(cc, src, WORK / f"{tag}_{name}_{opt.strip('-')}", flags, arg)
-                verdicts[(opt, tag, name)] = (out, ref[name], err)
-                if out != ref[name]:
-                    print(f"  DIFF {opt} {name:26s} gcc={ref[name]!r} {tag}={out!r} {err}")
+                res, err = build_and_run(cc, src, WORK / f"{tag}_{name}_{opt.strip('-')}",
+                                          flags, arg)
+                verdicts[(opt, tag, name)] = (res, ref[name], err)
+                if res != ref[name]:
+                    print(f"  DIFF {opt} {name:26s} gcc={ref[name]!r} {tag}={res!r} {err}")
+
     print("\n=== summary ===")
+    diverged = []
     for cc in compilers:
         tag = pathlib.Path(cc).name
         for opt in opts:
             keys = [k for k in verdicts if k[0] == opt and k[1] == tag]
             bad = [k[2] for k in keys if verdicts[k][0] != verdicts[k][1]]
+            diverged += [f"{tag}@{opt}:{b}" for b in bad]
             print(f"{tag:16s} {opt}: {len(keys) - len(bad)}/{len(keys)} agree"
                   + (f"   DIVERGENT({len(bad)}): {', '.join(sorted(bad))}" if bad else ""))
-    out = pathlib.Path("/home/user/wrap-sweep-verdicts%s.txt" % ("-opaque" if OPAQUE else ""))
-    out.write_text("\n".join(
-        f"{k[0]}\t{k[1]}\t{k[2]}\tgcc={v[1]}\tgot={v[0]}" for k, v in sorted(verdicts.items())) + "\n")
+
+    out.write_text(
+        "# mode=%s compilers=%s opts=%s cases=%d cells=%d divergent=%d "
+        "unusable_reference=%d\n"
+        % ("opaque" if OPAQUE else "const", ",".join(compilers), ",".join(opts),
+           len(cases), len(verdicts), len(diverged), len(unusable_ref))
+        + "\n".join(
+            f"{k[0]}\t{k[1]}\t{k[2]}\tgcc={v[1]}\tgot={v[0]}"
+            for k, v in sorted(verdicts.items())) + "\n")
     print(f"verdicts -> {out}")
+
+    if not verdicts:
+        print("SWEEP INCONCLUSIVE: no case ran", file=sys.stderr)
+        return 1
+    if unusable_ref:
+        print(f"SWEEP INCONCLUSIVE: reference unusable for {len(unusable_ref)} "
+              f"cells ({', '.join(unusable_ref[:6])}); agreeing with a broken "
+              f"reference is not a verdict", file=sys.stderr)
+        return 1
+    if diverged:
+        print(f"SWEEP FAILED: {len(diverged)}/{len(verdicts)} cells diverge",
+              file=sys.stderr)
+        return 1
+    print(f"sweep clean: {len(verdicts)}/{len(verdicts)} cells agree")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

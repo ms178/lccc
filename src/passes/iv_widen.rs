@@ -218,8 +218,9 @@ fn widen_ivs_in_function(func: &mut IrFunction) -> usize {
         sorted.sort_by_key(|lp| lp.body.len());
         let mut did = false;
         for lp in sorted {
-            if try_widen_loop(func, lp, &cfg, &dom, debug) {
-                total += 1;
+            let outcome = try_widen_loop(func, lp, &cfg, &dom, debug);
+            total += outcome.widened;
+            if outcome.changed {
                 did = true;
                 break; // IR changed — rebuild before the next candidate.
             }
@@ -296,11 +297,13 @@ fn type_max_i128(ty: IrType) -> i128 {
 /// bit 31 is set must become `0xFFFFFFFF` (4294967295), **not** `-1` — the
 /// previous revision used `to_i64()` which sign-extends the raw bit pattern
 /// and silently flipped such constants.
-/// Widen an integer constant from `from_ty` to 64 bits with the extension
-/// kind implied by `from_ty`. Critical for unsigned: a `U32` constant whose
-/// bit 31 is set must become `0xFFFFFFFF` (4294967295), **not** `-1` — the
-/// previous revision used `to_i64()` which sign-extends the raw bit pattern
-/// and silently flipped such constants.
+///
+/// This is the *ring-preserving* widening: it answers "what is the value of
+/// this constant in the wide type", which is the right question for bounds,
+/// masks and closure members.  The latch step needs a different question --
+/// see `normalize_step_const`, which for a signed narrow type emits the
+/// sign-extended delta instead and must keep agreeing with this function
+/// (`normalize_step_const_agrees_with_itself` pins that).
 ///
 /// Returns `None` for a non-integer constant. A floating-point constant here
 /// means an *integer* closure member was admitted from a float-typed
@@ -333,6 +336,69 @@ fn widen_const(c: IrConst, from_ty: IrType) -> Option<IrConst> {
         ((raw << shift) as i64 >> shift) as u64
     };
     Some(IrConst::I64(val as i64))
+}
+
+/// Normalize a latch step constant to the ONE value this pass reasons about.
+///
+/// A step constant reaches the pass in whatever carrier the producer chose,
+/// and carriers disagree about sign: `IrConst::to_i64` sign-extends an `I32`
+/// carrier (`I32(-1)` -> `-1`) while the raw bit pattern of that same constant
+/// in a 32-bit ring is `0xFFFFFFFF`.  Reading the delta from one and emitting
+/// the wide step from the other makes the proof and the codegen describe
+/// *different loops* — a proven unit decrement emitted as a `0xFFFFFFFF`
+/// increment — and because widening also retypes the exit test into the wide
+/// domain, that is a loop that never terminates, not a cosmetic mismatch.
+///
+/// So: reduce the step modulo the narrow type's width (the recurrence is exact
+/// in that ring), interpret the reduction in the narrow type's own signedness,
+/// and return that one number twice -- as the `i128` delta the bound proof
+/// reasons about (`.0`) and as the wide `IrConst` the widened latch emits
+/// (`.1`).  Both call sites read the same field pair out of the same call, so
+/// there is no second reduction left to disagree with the first; the unsigned
+/// case is bit-identical to what `widen_const` would have produced, and for
+/// rings of 64 bits or more the two agree modulo 2^64 by construction.
+///
+/// `None` means "not a constant step this pass can normalize" (a float
+/// carrier; a zero step is declined earlier).
+fn normalize_step_const(c: IrConst, phi_ty: IrType) -> Option<(i128, IrConst)> {
+    if !matches!(
+        c,
+        IrConst::I8(_) | IrConst::I16(_) | IrConst::I32(_) | IrConst::I64(_) | IrConst::Zero
+    ) {
+        return None;
+    }
+    let raw = c.to_i64()? as u64;
+    let bits = narrow_bit_width(phi_ty);
+    // Reduce into the narrow ring: for a >= 64-bit phi the carrier already IS
+    // the value; below that, mask to the width the recurrence is exact in.
+    let reduced: u64 = if bits >= 64 {
+        raw
+    } else {
+        raw & ((1u64 << bits) - 1)
+    };
+    // The delta the proof reasons about is the SIGNED interpretation of the
+    // reduced pattern in the narrow ring, widened to i128 so no overflow is
+    // possible at the boundary (e.g. i32::MIN as a magnitude).
+    let signed: i128 = if is_unsigned_ty(phi_ty) {
+        reduced as i128
+    } else {
+        let shift = 64 - bits.min(64);
+        ((reduced << shift) as i64 >> shift) as i128
+    };
+    if signed == 0 {
+        return None;
+    }
+    // Emit the SIGNED delta itself, not the reduced bit pattern.  Congruence
+    // modulo 2^bits is enough for the body's uses, which are truncated back
+    // into the narrow ring, but widening also RETYPES THE EXIT TEST into the
+    // wide domain, and there a proven `-1` emitted as `+4294967295` turns a
+    // proved-terminating countdown into an ascent that never reaches the
+    // bound.  The two readings differ exactly when the narrow type is signed
+    // and the step constant is negative -- i.e. for every descending
+    // `i = i + (-k)` loop this pass widens; for unsigned rings `signed` already
+    // equals `reduced`, so nothing else changes, and for rings of 64 bits or
+    // more the two are the same 64 bits either way.
+    Some((signed, IrConst::I64(signed as i64)))
 }
 
 // ---------------------------------------------------------------------------
@@ -509,6 +575,33 @@ struct PhiCandidate {
     latch_is_sub: bool,
 }
 
+/// Outcome of one `try_widen_loop` attempt, reported on two axes because the
+/// fixpoint needs two different answers.
+///
+/// * `widened` — IVs actually retyped to the wide domain (what the pass
+///   counts and reports).
+/// * `changed` — whether the IR was mutated AT ALL, including a canonicalising
+///   rewrite that performed no widening. Reporting only the first loses the
+///   second: `canonicalise_chained_latch` exists precisely to make a latch the
+///   recognisers can read, so a canonicalisation that found no candidate still
+///   invalidated the analyses taken before it, and the next attempt in the same
+///   fixpoint run would be reasoning about a stale latch. The caller rebuilds on
+///   `changed` and counts `widened`.
+struct LoopOutcome {
+    widened: usize,
+    changed: bool,
+}
+
+impl LoopOutcome {
+    /// An attempt that did not reach any mutation site.
+    fn untouched() -> Self {
+        Self {
+            widened: 0,
+            changed: false,
+        }
+    }
+}
+
 /// Try to widen exactly one IV in `lp`. Returns true if a widening was
 /// applied.
 fn try_widen_loop(
@@ -517,12 +610,12 @@ fn try_widen_loop(
     cfg: &CfgAnalysis,
     dom: &DominanceChecker,
     debug: bool,
-) -> bool {
+) -> LoopOutcome {
     let Some(preheader) = lp.find_preheader(&cfg.preds) else {
-        return false;
+        return LoopOutcome::untouched();
     };
     let Some(latch) = lp.single_latch(&cfg.preds) else {
-        return false;
+        return LoopOutcome::untouched();
     };
     // A self-loop (header == latch) is the rotated shape; still widenable as
     // long as a preheader exists for the hoists.
@@ -550,19 +643,23 @@ fn try_widen_loop(
             _ => None,
         })
         .collect();
+    let mut changed = false;
     for (phi_dest, latch_val) in chained {
-        canonicalise_chained_latch(func, latch, latch_val, phi_dest);
+        changed |= canonicalise_chained_latch(func, latch, latch_val, phi_dest);
         // A duplicated step (`a[(i + 1) & m]` + `while (i++ < n)`) leaves a
         // value-identical twin ahead of the latch value in the same block;
         // redirecting the back edge to it routes the body read through the
         // intercept's bit-exact And arm (see `canonicalise_latch_twin`).
-        canonicalise_latch_twin(func, latch, latch_val, phi_dest);
+        changed |= canonicalise_latch_twin(func, latch, latch_val, phi_dest);
     }
 
     let candidates: Vec<PhiCandidate> =
         collect_widenable_phis(func, lp, preheader_label, latch, latch_label);
     if candidates.is_empty() {
-        return false;
+        return LoopOutcome {
+            widened: 0,
+            changed,
+        };
     }
 
     let uses = build_use_map(func);
@@ -576,6 +673,7 @@ fn try_widen_loop(
             &cfg.succs,
             &uses,
             &hoist,
+            dom,
             cand.phi_dest,
             cand.phi_ty,
             cand.init_op,
@@ -611,10 +709,19 @@ fn try_widen_loop(
             continue;
         }
         if apply_widen(func, &plan, preheader, debug) {
-            return true;
+            return LoopOutcome {
+                widened: 1,
+                changed: true,
+            };
         }
     }
-    false
+    // No IV was widened, but a canonicalisation may still have rewritten the
+    // latch — report it, or the fixpoint skips the very iteration that the
+    // rewrite was meant to enable.
+    LoopOutcome {
+        widened: 0,
+        changed,
+    }
 }
 
 /// Collect narrow phi candidates in the header that have a 2-incoming shape
@@ -1081,6 +1188,7 @@ fn analyze_iv(
     succs: &FlatAdj,
     uses: &UseMap,
     hoist: &PreheaderSite<'_>,
+    dom: &DominanceChecker,
     phi_dest: Value,
     phi_ty: IrType,
     init: Operand,
@@ -1100,6 +1208,7 @@ fn analyze_iv(
             preds,
             succs,
             uses,
+            dom,
             phi_dest,
             phi_ty,
             latch,
@@ -1550,6 +1659,24 @@ fn analyze_iv(
                     // (a value *conversion*). Establish integer-ness first.
                     let to_is_int = to_ty.is_integer();
                     let same_sign = is_unsigned_ty(*to_ty) == is_unsigned_ty(*from_ty);
+                    // The pass reasons about its members by induction on THEIR
+                    // OWN recorded types, and a cast's declared `from_ty` is
+                    // the base case of that induction for the block below it.
+                    // Trusting the declaration while the operand's definer
+                    // disagrees makes the whole chain's typing fictional: an
+                    // `I32` value declared as `U64` at its consumer turns a
+                    // zero-extend into a sign-extend (or vice versa) with no
+                    // diagnostic anywhere. Decline the plan instead — the loop
+                    // stays narrow, which is a missed optimisation, not a
+                    // wrong program. (The IR verifier is structural, so no
+                    // earlier stage catches this.)
+                    if let Operand::Value(v) = src {
+                        if let Some(actual) = defining_type(func, *v) {
+                            if actual != *from_ty {
+                                return None;
+                            }
+                        }
+                    }
                     // Cross-sign widening cast (U32→I64 / I32→U64). Members
                     // are always 32-bit, so these two pairs are the complete
                     // set of cross-sign widening integer casts. The cast's
@@ -1575,7 +1702,23 @@ fn analyze_iv(
                         queue.push((*dest, false, cur_exact));
                         continue;
                     }
-                    if to_is_int && to_ty.size() >= 4 && *to_ty != IrType::Ptr && same_sign {
+                    // The width bound is the plan's own domain, not "any
+                    // integer at least 32 bits wide". `wide_ty_for` returns
+                    // I64/U64 for every narrow phi, so a destination wider
+                    // than that (i64→i128) is NOT an extension the pass can
+                    // drop: step 6 would alias the 128-bit consumers onto a
+                    // 64-bit member and silently halve their value's width.
+                    // Decline instead — this pass has no 128-bit support, and
+                    // `Cast { to_ty: I128 }` producers (`(unsigned __int128)`
+                    // arithmetic) stay in the narrow loop, which is where they
+                    // were lowered and where they are known-correct.
+                    let to_within_wide_domain = to_ty.size() <= wide_ty.size();
+                    if to_is_int
+                        && to_ty.size() >= 4
+                        && to_within_wide_domain
+                        && *to_ty != IrType::Ptr
+                        && same_sign
+                    {
                         // Widening *integer* cast (i8→i32, i32→i64, ...): the
                         // dest becomes wide; drop it and alias its uses to the
                         // underlying member.
@@ -2137,6 +2280,7 @@ fn prove_counted_bound(
     preds: &FlatAdj,
     succs: &FlatAdj,
     uses: &UseMap,
+    dom: &DominanceChecker,
     phi_dest: Value,
     phi_ty: IrType,
     latch: usize,
@@ -2146,15 +2290,14 @@ fn prove_counted_bound(
 ) -> Option<CountedProof> {
     // Constant step only, in either latch spelling (`Add(i, s)` / `Sub(i, s)`),
     // so the true delta carries the latch's sign rather than assuming `s == 1`.
-    let step_val = match step {
-        Operand::Const(c) => c.to_i64()?,
+    // The magnitude comes from `normalize_step_const` — the SAME reduction the
+    // emitter widens — so the proof and the emitted step can never describe
+    // different loops (see that helper for the carrier-sign divergence).
+    let step_mag = match step {
+        Operand::Const(c) => normalize_step_const(c, phi_ty)?.0,
         _ => return None,
     };
-    let delta: i128 = if latch_is_sub {
-        -(step_val as i128)
-    } else {
-        step_val as i128
-    };
+    let delta: i128 = if latch_is_sub { -step_mag } else { step_mag };
     if delta == 0 {
         return None;
     }
@@ -2247,6 +2390,21 @@ fn prove_counted_bound(
         };
         // The bound direction must match the step sign.
         if is_upper != (delta > 0) {
+            return None;
+        }
+        // The guard block must DOMINATE the latch. The counted-range
+        // argument is: every backedge iteration passes the guard, so the
+        // value re-entering the header is confined by it. That premise is a
+        // *dominance* fact, not a reachability one. A CFG whose header
+        // routes either to the guard block or to a bypass block, with both
+        // arms reaching the single latch, satisfies body-entry closure,
+        // single-latch, no-inner-cycle-through-latch and the one-arm-exits
+        // test — yet the backedge iterations taken through the bypass never
+        // execute the guard, so the interval this proof would report is
+        // fictional and every member range derived from it is unsound.
+        // (The strict-range case needs no separate argument: a guard in the
+        // header trivially dominates the latch.)
+        if !dom.dominates(bi, latch) {
             return None;
         }
         // The no-wrap room obligation. A runtime threshold is provable only
@@ -2651,7 +2809,13 @@ fn apply_widen(func: &mut IrFunction, plan: &WidenPlan, preheader_idx: usize, de
 
     // 2. Preheader: wide step (invariant value only — consts fold inline).
     let wide_step: Operand = match plan.step {
-        Operand::Const(c) => Operand::Const(widen_const(c, phi_ty).unwrap_or(c)),
+        // Same normalization the proof used, so the emitted step is congruent
+        // to the proven delta. A step that cannot be normalized falls back to
+        // the historical widening (unreachable for steps the proof accepted).
+        Operand::Const(c) => match normalize_step_const(c, phi_ty) {
+            Some((_, wide)) => Operand::Const(wide),
+            None => Operand::Const(widen_const(c, phi_ty).unwrap_or(c)),
+        },
         Operand::Value(v) => {
             let d = fresh();
             push_inst(
@@ -2752,46 +2916,120 @@ fn apply_widen(func: &mut IrFunction, plan: &WidenPlan, preheader_idx: usize, de
         }
     }
 
-    // 6. Drop widening casts and copies: redirect their uses to the
-    //    underlying member, then remove if dead (liveness re-checked at the
-    //    point of removal so an imprecise analysis can never orphan a value).
+    // 6. Drop widening casts and copies: redirect their uses to the value the
+    //    alias finally reads, then remove if dead.
+    //
+    //    Aliases form a CHAIN (`v11 = cast v10`, `v10 = cast v1`), so two
+    //    properties are required and neither held when this loop read each
+    //    member's recorded operand directly and deleted as it went:
+    //
+    //    * Redirection must target the chain TERMINAL, not the recorded
+    //      operand. Rewriting `v10` first turns `v11`'s source into `v1`, and
+    //      then redirecting `v11` to its recorded operand `v10` would point
+    //      every `v11` consumer at an instruction that is already gone — a
+    //      `use of undefined value` IR the verifier must reject.
+    //    * Deletions must not invalidate positions still to be visited. A
+    //      `Vec::remove(ii)` shifts every later instruction in that block, so
+    //      a forward walk deletes the second alias at a stale index (and can
+    //      delete a *neighbouring* instruction). Resolving every position
+    //      first and deleting in DESCENDING (block, index) order means each
+    //      remaining site is still exactly where it was found.
+    //
+    //    Liveness is evaluated once, after ALL redirections, so a member that
+    //    is dead only because a later alias absorbed its uses is still
+    //    recognised as dead (and a live one is retained as a well-typed
+    //    identity for DCE to collect).
+    let mut alias_of: FxHashMap<u32, Value> = FxHashMap::default();
     for m in &plan.members {
         if let MemberKind::WidenCast { operand } | MemberKind::Copy { operand } = &m.kind {
-            let Some((bi, ii)) = find_def_idx(func, m.value) else {
-                continue;
-            };
-            replace_all_uses_of_value(func, m.value, Operand::Value(*operand));
-            let still_used = value_still_used(func, m.value);
-            let block = &mut func.blocks[bi];
-            if ii < block.instructions.len() {
-                if still_used {
-                    // Keep a well-typed identity so the IR stays consistent;
-                    // DCE will collect it if it becomes dead.
-                    if let Instruction::Cast {
-                        src,
-                        from_ty,
-                        to_ty,
-                        ..
-                    } = &mut block.instructions[ii]
-                    {
-                        *src = Operand::Value(*operand);
-                        *from_ty = wide_ty;
-                        *to_ty = wide_ty;
-                    }
-                    if debug {
-                        eprintln!(
-                            "[IV-WIDEN] retained cast v{} as wide identity (still used)",
-                            m.value.0
-                        );
-                    }
-                } else if matches!(block.instructions[ii], Instruction::Cast { .. })
-                    || matches!(block.instructions[ii], Instruction::Copy { .. })
-                {
-                    remove_inst(block, ii);
-                }
-            }
+            alias_of.insert(m.value.0, *operand);
         }
     }
+    // Path-compress each alias to its terminal, and collect the removal
+    // candidates in one deterministic pass. `None` (a cycle — impossible in
+    // SSA, but this loop must terminate regardless of plan shape) leaves the
+    // whole member alone rather than redirecting it somewhere unproven.
+    let mut redirect: Vec<(Value, Value)> = Vec::new();
+    for m in &plan.members {
+        if !matches!(
+            m.kind,
+            MemberKind::WidenCast { .. } | MemberKind::Copy { .. }
+        ) {
+            continue;
+        }
+        let mut cur = m.value;
+        let mut steps = 0usize;
+        let terminal = loop {
+            let Some(&next) = alias_of.get(&cur.0) else {
+                break cur;
+            };
+            cur = next;
+            steps += 1;
+            if steps > alias_of.len() {
+                break m.value; // cycle: the bail below leaves this member alone
+            }
+        };
+        if terminal != m.value {
+            redirect.push((m.value, terminal));
+        }
+    }
+    for (from, terminal) in &redirect {
+        replace_all_uses_of_value(func, *from, Operand::Value(*terminal));
+    }
+    let mut to_remove: Vec<(usize, usize)> = Vec::new();
+    for (from, terminal) in &redirect {
+        let Some((bi, ii)) = find_def_idx(func, *from) else {
+            continue;
+        };
+        // Every read of `func` (liveness, instruction shape) happens before
+        // the exclusive borrow below mutates it.
+        let still_used = value_still_used(func, *from);
+        let Some(droppable) = func.blocks[bi]
+            .instructions
+            .get(ii)
+            .map(|inst| matches!(inst, Instruction::Cast { .. } | Instruction::Copy { .. }))
+        else {
+            continue;
+        };
+        if still_used {
+            // Keep a well-typed identity so the IR stays consistent; DCE will
+            // collect it if it becomes dead.
+            if let Instruction::Cast {
+                src,
+                from_ty,
+                to_ty,
+                ..
+            } = &mut func.blocks[bi].instructions[ii]
+            {
+                *src = Operand::Value(*terminal);
+                *from_ty = wide_ty;
+                *to_ty = wide_ty;
+            }
+            if debug {
+                eprintln!(
+                    "[IV-WIDEN] retained cast v{} as wide identity (still used)",
+                    from.0
+                );
+            }
+        } else if droppable {
+            to_remove.push((bi, ii));
+        }
+    }
+    to_remove.sort_unstable_by(|a, b| b.cmp(a));
+    for (bi, ii) in to_remove {
+        // `remove_inst` keeps `source_spans` parallel with `instructions`;
+        // descending order is what makes the recorded `ii` still exact here.
+        remove_inst(&mut func.blocks[bi], ii);
+    }
+    // The IR must not name a value this step deleted. The pipeline verifier
+    // enforces this on every run; the assertion documents the invariant at the
+    // mutation site and fires on the first offending plan in tests.
+    debug_assert!(
+        redirect
+            .iter()
+            .all(|(from, _)| !value_still_used(func, *from)),
+        "iv_widen step 6: a dropped alias still has a live use"
+    );
 
     // 7. Cmp rewrites (located by cmp dest — immune to index shifts from the
     //    preheader inserts and the drops above). The member side of a widened
@@ -6367,5 +6605,535 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    // -----------------------------------------------------------------------
+    // Contract regressions for the widening proof and the apply phase.
+    //
+    // Each of these is a counterexample first: it was written against a
+    // specific hole in the proof/apply contract, verified to FAIL on the code
+    // before the repair, and kept as the test that pins the repaired
+    // invariant. They exercise IR shapes the C frontend does not produce
+    // (copy propagation and CSE collapse them upstream), which is exactly why
+    // a hand-built unit fixture, not a .c test, is the right level.
+    // -----------------------------------------------------------------------
+
+    /// the proof interprets the step through `to_i64()` (a signed
+    /// 64-bit carrier) while emission goes through `widen_const` (raw w-bit
+    /// pattern). For `Add(phi, 0xFFFFFFFFu)` written with a signed I32 carrier
+    /// the two disagree: the proof sees delta = -1 (a unit DECREMENT, provable)
+    /// while the emitted wide recurrence keeps opcode Add with the widened
+    /// constant 0xFFFFFFFF (an INCREMENT by 4294967295). The emitted wide phi
+    /// then diverges from `zext(narrow phi)` from the first step, so every
+    /// consumer that trusts the no-wrap proof reads garbage.
+    /// The pass must not reason about one number and emit another.
+    ///
+    /// `normalize_step_const` is the single source of truth for the latch step:
+    /// the bound proof reads `.0` and the widened latch emits `.1`, so the
+    /// invariant is that `.1` *is* `.0`, not merely congruent to it modulo the
+    /// narrow width.  Round 6's §1 routed both sides through this helper but
+    /// still returned the reduced bit pattern for the emitter, which is exactly
+    /// the divergence the helper's own documentation says it exists to remove.
+    #[test]
+    fn normalize_step_const_agrees_with_itself() {
+        for (ty, c) in [
+            (IrType::I32, IrConst::I32(-1)),
+            (IrType::I32, IrConst::I32(-2)),
+            (IrType::I32, IrConst::I32(i32::MIN)),
+            (IrType::I32, IrConst::I32(1)),
+            (IrType::I32, IrConst::I64(-1)),
+            (IrType::I32, IrConst::I64(0xFFFF_FFFF)),
+            (IrType::U32, IrConst::I32(-1)),
+            (IrType::U32, IrConst::I32(1)),
+            (IrType::I8, IrConst::I8(-8)),
+            (IrType::U8, IrConst::I8(-8)),
+            (IrType::I64, IrConst::I64(-1)),
+        ] {
+            let (proof, emitted) =
+                normalize_step_const(c, ty).unwrap_or_else(|| panic!("None for {c:?} {ty:?}"));
+            assert_eq!(
+                emitted.to_i64(),
+                Some(proof as i64),
+                "proof delta {proof} vs emitted wide step {emitted:?} for {ty:?} step {c:?}: \
+                 the wide recurrence would walk a different loop than the one proved"
+            );
+        }
+        // An unsigned ring's reduced pattern IS its value: a u32
+        // `+= 0xFFFFFFFF` really does add 4294967295 in the source language,
+        // and the emitter must keep that.
+        let (proof, emitted) = normalize_step_const(IrConst::I32(-1), IrType::U32).unwrap();
+        assert_eq!((proof, emitted.to_i64()), (4294967295, Some(4294967295)));
+        // And for a signed ring the emitted constant must still equal what
+        // `widen_const` -- the helper every *other* wide constant goes through
+        // -- produces, so the two cannot drift apart again.
+        let (proof, emitted) = normalize_step_const(IrConst::I32(-1), IrType::I32).unwrap();
+        assert_eq!((proof, emitted.to_i64()), (-1, Some(-1)));
+        assert_eq!(
+            emitted,
+            widen_const(IrConst::I32(-1), IrType::I32).unwrap(),
+            "normalize_step_const and widen_const disagree on the widened step"
+        );
+    }
+
+    /// A congruent-but-different wide step is fatal, not cosmetic, because
+    /// widening moves the exit test into the wide domain.
+    ///
+    /// Measured before the fix, for `for (int i = 40; i > 8; i += -1)` spelled
+    /// as `Add(phi, I32(-1))`: the latch became `Add I64(4294967295)` while the
+    /// exit test became `Cmp Sgt phi, I64(8)` with `ty = I64` -- a proven
+    /// countdown emitted as an ascent that never reaches the bound.  All three
+    /// facts are asserted together because the first is only dangerous given
+    /// the second.
+    #[test]
+    fn widened_signed_step_emits_the_proved_delta() {
+        let body = vec![
+            Instruction::Cast {
+                dest: Value(10),
+                src: Operand::Value(Value(1)),
+                from_ty: IrType::I32,
+                to_ty: IrType::U64,
+            },
+            gep_inst(11, 10, IrType::I8),
+        ];
+        let cmp = Instruction::Cmp {
+            dest: Value(99),
+            op: IrCmpOp::Sgt,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I32(8)),
+            ty: IrType::I32,
+        };
+        let mut func = counting_loop("signedstep", IrType::I32, IrBinOp::Add, body, Some(cmp));
+        func.blocks[0].instructions[0] = Instruction::Copy {
+            dest: Value(0),
+            src: Operand::Const(IrConst::I32(40)),
+        };
+        func.blocks[3].instructions[0] = Instruction::BinOp {
+            dest: Value(5),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I32(-1)),
+            ty: IrType::I32,
+        };
+        let n = widen_ivs_in_function(&mut func);
+        assert_eq!(
+            n, 1,
+            "the pass must ACCEPT this shape or the assertions below say nothing; \
+             it accepted it before the fix, so a decline here is a behaviour change \
+             to look at, not a pass"
+        );
+        let mut violations = Vec::new();
+        crate::passes::verify::verify_function(&func, "iv_widen_signed_step", &mut violations);
+        assert!(violations.is_empty(), "verifier: {violations:?}");
+
+        let latch = func.blocks[3]
+            .instructions
+            .iter()
+            .find(|i| matches!(i, Instruction::BinOp { dest: Value(5), .. }))
+            .expect("latch step");
+        match latch {
+            Instruction::BinOp {
+                op: IrBinOp::Add,
+                rhs: Operand::Const(c),
+                ty,
+                ..
+            } => {
+                assert_eq!(c.to_i64(), Some(-1), "emitted wide step {c:?} != -1");
+                assert_eq!(*ty, IrType::I64, "latch not retyped to the wide ring");
+            }
+            other => panic!("unexpected widened latch shape {other:?}"),
+        }
+        let exit = func
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .find(|i| matches!(i, Instruction::Cmp { .. }))
+            .expect("exit compare");
+        match exit {
+            Instruction::Cmp { ty, rhs, .. } => {
+                assert_eq!(
+                    *ty,
+                    IrType::I64,
+                    "the exit test is evaluated in the wide domain: a step whose wide value \
+                     differs from the proved one changes the trip count"
+                );
+                assert_eq!(*rhs, Operand::Const(IrConst::I64(8)));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// The sibling shape the pass refuses, pinned so the test above cannot go
+    /// vacuous if the acceptance rule moves.
+    ///
+    /// `for (u32 i = 40; i > 8; i += 0xFFFFFFFFu)` is a descending u32 loop
+    /// written as an ascent, so its reduced step is `+4294967295` and the
+    /// trajectory analysis declines it.  Sound and intended -- asserted, rather
+    /// than quietly returned from, because the earlier version of this test said
+    /// `if n == 0 { return; }` and therefore verified nothing at all.
+    #[test]
+    fn unsigned_wrap_step_is_declined_not_widened() {
+        let body = vec![
+            Instruction::Cast {
+                dest: Value(10),
+                src: Operand::Value(Value(1)),
+                from_ty: IrType::U32,
+                to_ty: IrType::U64,
+            },
+            gep_inst(11, 10, IrType::I8),
+        ];
+        let cmp = Instruction::Cmp {
+            dest: Value(99),
+            op: IrCmpOp::Ugt,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I32(8)),
+            ty: IrType::U32,
+        };
+        let mut func = counting_loop("wrapstep", IrType::U32, IrBinOp::Add, body, Some(cmp));
+        func.blocks[0].instructions[0] = Instruction::Copy {
+            dest: Value(0),
+            src: Operand::Const(IrConst::I32(40)),
+        };
+        func.blocks[3].instructions[0] = Instruction::BinOp {
+            dest: Value(5),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I32(-1)),
+            ty: IrType::U32,
+        };
+        let n = widen_ivs_in_function(&mut func);
+        assert_eq!(
+            n, 0,
+            "u32 `Add 0xFFFFFFFF` must stay declined; if it is now widened, re-check that the \
+             emitted step still equals the proved delta (see widened_signed_step_emits_the_proved_delta)"
+        );
+    }
+
+    /// the counted-bound proof never requires the guard block to
+    /// dominate the latch. Here the header routes to either the guard block or
+    /// a bypass block; both reach the same latch, which branches back to the
+    /// header. Backedge iterations through the bypass never execute the guard,
+    /// so the exit test confines nothing and the "counted loop" range is
+    /// fictional — yet every gate I added (closed body entry, single latch,
+    /// latch not on an inner cycle, exactly one exiting arm) is satisfied.
+    #[test]
+    fn guard_that_does_not_dominate_latch_declines_proof() {
+        let mut func = IrFunction::new("bypass".to_string(), IrType::I32, vec![], false);
+        // B0 preheader
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I32(0)),
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(50),
+                    name: "arr".to_string(),
+                },
+                Instruction::Copy {
+                    dest: Value(60),
+                    src: Operand::Const(IrConst::I32(1)),
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        // B1 header: phi + a routing test (NOT the bound guard).
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(1),
+                    ty: IrType::U32,
+                    incoming: vec![
+                        (Operand::Value(Value(0)), BlockId(0)),
+                        (Operand::Value(Value(5)), BlockId(4)),
+                    ],
+                },
+                Instruction::Cmp {
+                    dest: Value(98),
+                    op: IrCmpOp::Ult,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Value(Value(60)),
+                    ty: IrType::U32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(98)),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+            source_spans: Vec::new(),
+        });
+        // B2 guard block: the bound test. One arm exits, one reaches the latch.
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![Instruction::Cmp {
+                dest: Value(99),
+                op: IrCmpOp::Ult,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I32(64)),
+                ty: IrType::U32,
+            }],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(99)),
+                true_label: BlockId(4),
+                false_label: BlockId(5),
+            },
+            source_spans: Vec::new(),
+        });
+        // B3 bypass block: reaches the latch WITHOUT executing the guard.
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(4)),
+            source_spans: Vec::new(),
+        });
+        // B4 latch: body read + step, back to the header.
+        func.blocks.push(BasicBlock {
+            label: BlockId(4),
+            instructions: vec![
+                Instruction::Cast {
+                    dest: Value(10),
+                    src: Operand::Value(Value(1)),
+                    from_ty: IrType::U32,
+                    to_ty: IrType::U64,
+                },
+                gep_inst(11, 10, IrType::I8),
+                Instruction::BinOp {
+                    dest: Value(5),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::U32,
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        // B5 exit
+        func.blocks.push(BasicBlock {
+            label: BlockId(5),
+            instructions: vec![],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 100;
+        func.next_label = 6;
+        check(&mut func, 0);
+        assert!(
+            matches!(
+                &func.blocks[1].instructions[0],
+                Instruction::Phi {
+                    ty: IrType::U32,
+                    ..
+                }
+            ),
+            "a guard that does not dominate the latch proves no bound; \
+             the IV must stay narrow"
+        );
+    }
+
+    /// the cast admission test is `to_is_int && to_ty.size() >= 4
+    /// && !Ptr && same_sign`, which admits casts that are NOT value-preserving
+    /// widening of a 32-bit member: a 64-bit source "widened" to 128 bits, and
+    /// a same-width `I64 -> I64` no-op. The pass has no I128 support
+    /// (`wide_ty` is 64-bit), so dropping such a cast aliases its consumers to
+    /// a value of the wrong width.
+    #[test]
+    fn cast_wider_than_the_wide_domain_declines() {
+        // A 64-bit member chain reaching a Cast to I128 inside the loop body.
+        let body = vec![
+            Instruction::Cast {
+                dest: Value(10),
+                src: Operand::Value(Value(1)),
+                from_ty: IrType::I32,
+                to_ty: IrType::I64,
+            },
+            Instruction::Cast {
+                dest: Value(11),
+                src: Operand::Value(Value(10)),
+                from_ty: IrType::I64,
+                to_ty: IrType::I128,
+            },
+            Instruction::GetElementPtr {
+                dest: Value(12),
+                base: Value(50),
+                offset: Operand::Value(Value(11)),
+                ty: IrType::I128,
+            },
+        ];
+        let mut func = counting_loop("cast128", IrType::I32, IrBinOp::Add, body, None);
+        let n = widen_ivs_in_function(&mut func);
+        let mut violations = Vec::new();
+        crate::passes::verify::verify_function(&func, "iv_widen_cast128", &mut violations);
+        assert!(
+            violations.is_empty(),
+            "verifier after widening: {violations:?}"
+        );
+        assert_eq!(
+            n, 0,
+            "an I64->I128 cast is not a value-preserving widening of a 32-bit \
+             member; the pass has no 128-bit support and must decline"
+        );
+    }
+
+    /// a cast whose declared `from_ty` disagrees with
+    /// its operand's defining type. The pass trusts `from_ty`; if the verifier
+    /// does not enforce the agreement, a mistyped cast is admitted on a lie.
+    #[test]
+    fn cast_from_ty_must_match_the_operand_def() {
+        // V10 is defined as an I32 Cast of the phi, but V11 declares its
+        // source type as U64 while really reading the I32 value.
+        let body = vec![
+            Instruction::Cast {
+                dest: Value(10),
+                src: Operand::Value(Value(1)),
+                from_ty: IrType::I32,
+                to_ty: IrType::I64,
+            },
+            Instruction::Cast {
+                dest: Value(11),
+                src: Operand::Value(Value(10)),
+                from_ty: IrType::U64,
+                to_ty: IrType::U32,
+            },
+            gep_inst(12, 11, IrType::I8),
+        ];
+        let mut func = counting_loop("castlie", IrType::I32, IrBinOp::Add, body, None);
+        let mut violations = Vec::new();
+        crate::passes::verify::verify_function(&func, "iv_widen_castlie_pre", &mut violations);
+        let n = widen_ivs_in_function(&mut func);
+        let mut post = Vec::new();
+        crate::passes::verify::verify_function(&func, "iv_widen_castlie", &mut post);
+        assert!(
+            post.is_empty(),
+            "verifier after widening: {post:?} (pre-existing violations: {violations:?})"
+        );
+        // Either the verifier rejects the mistyped cast up front (then the
+        // pass may widen safely), or the pass must not widen on a from_ty it
+        // has not cross-checked against the operand's defining type.
+        assert!(
+            !violations.is_empty() || n == 0,
+            "a cast with a false declared from_ty was accepted by both the \
+             verifier and the widening proof"
+        );
+    }
+
+    /// alias removal rewrites and deletes each widening alias one at
+    /// a time in forward member order, with a "retain a wide identity if still
+    /// used" fallback. A chain of aliases (cast of a cast) plus a second
+    /// consumer of the intermediate must still end with no operand naming a
+    /// removed SSA value, and no retained wide identity that changes semantics.
+    #[test]
+    fn nested_alias_chain_removal_leaves_no_dangling_use() {
+        let body = vec![
+            Instruction::Cast {
+                dest: Value(10),
+                src: Operand::Value(Value(1)),
+                from_ty: IrType::I32,
+                to_ty: IrType::I64,
+            },
+            Instruction::Cast {
+                dest: Value(11),
+                src: Operand::Value(Value(10)),
+                from_ty: IrType::I64,
+                to_ty: IrType::I64,
+            },
+            gep_inst(12, 11, IrType::I8),
+            gep_inst(13, 10, IrType::I8),
+        ];
+        let mut func = counting_loop("aliaschain", IrType::I32, IrBinOp::Add, body, None);
+        check(&mut func, 1);
+        // No operand may name a value that no longer has a definition.
+        let defined: std::collections::HashSet<u32> = func
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter().filter_map(|i| i.dest().map(|v| v.0)))
+            .collect();
+        let mut dangling = Vec::new();
+        for b in &func.blocks {
+            for inst in &b.instructions {
+                inst.for_each_used_value(|id| {
+                    if !defined.contains(&id) {
+                        dangling.push((b.label.0, id));
+                    }
+                });
+            }
+            b.terminator.for_each_used_value(|id| {
+                if !defined.contains(&id) {
+                    dangling.push((b.label.0, id));
+                }
+            });
+        }
+        assert!(
+            dangling.is_empty(),
+            "operands naming removed SSA values: {dangling:?}"
+        );
+    }
+
+    /// A same-width `U32 -> U32` cast of the member is filed as `NarrowCast`
+    /// (not enqueued, so its uses are never rewritten to the wide value) while
+    /// apply retypes the member to `U64`. The retained cast must then declare a
+    /// `from_ty` that matches the width its source operand physically holds —
+    /// `U32` next to a 64-bit value would be a lie the backend cannot see.
+    /// Not a defensive case: a same-width cast of a *retained* member is what
+    /// this pass leaves behind whenever an IV's use is not itself widened, so
+    /// `from_ty` agreeing with the source operand's physical width is a live
+    /// requirement of the mutation, checked here rather than assumed.
+    #[test]
+    fn same_width_cast_of_member_keeps_a_consistent_from_ty() {
+        let body = vec![
+            Instruction::Cast {
+                dest: Value(10),
+                src: Operand::Value(Value(1)),
+                from_ty: IrType::U32,
+                to_ty: IrType::U32,
+            },
+            Instruction::Cast {
+                dest: Value(11),
+                src: Operand::Value(Value(10)),
+                from_ty: IrType::U32,
+                to_ty: IrType::U64,
+            },
+            gep_inst(12, 11, IrType::I8),
+        ];
+        let mut func = counting_loop("samewidth", IrType::U32, IrBinOp::Add, body, None);
+        func.blocks[3].instructions[0] = Instruction::BinOp {
+            dest: Value(5),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I64(1)),
+            ty: IrType::U32,
+        };
+        let n = widen_ivs_in_function(&mut func);
+        let mut violations = Vec::new();
+        crate::passes::verify::verify_function(&func, "iv_widen_samewidth", &mut violations);
+        assert!(
+            violations.is_empty(),
+            "verifier after widening {n} IVs: {violations:?}"
+        );
+        // If it widened, every retained cast on the member must declare a
+        // from_ty that matches the width its source operand now holds.
+        if n > 0 {
+            for b in &func.blocks {
+                for inst in &b.instructions {
+                    if let Instruction::Cast {
+                        src: Operand::Value(v),
+                        from_ty,
+                        ..
+                    } = inst
+                    {
+                        if *v == Value(1) {
+                            assert_eq!(
+                                *from_ty,
+                                IrType::U64,
+                                "retained cast of the widened phi still declares {from_ty:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

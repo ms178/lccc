@@ -72,7 +72,20 @@ REQUIRED_RELEASE = "2026-09"
 # named-field table {name: (field_mask, field_ones, pinned_mask)}.
 Constraint = tuple[int, int, dict[str, tuple[int, int, int]]]
 # A usable variant: mask/value plus `field != literal` predicates.
-Variant = tuple[int, int, list[tuple[int, int]]]
+# A variant is (mask, value, rejects).  `rejects` models a *predicate* over
+# fields rather than the single `!=` it used to hold, because the M.d XML uses
+# three shapes: `imm12 != 0` (reject on one field), `!(L == 0 && imm3 == 011
+# && Rt == 11111)` (hinte.xml: reject only when the conjunction holds), and
+# `!(op1 == 000 && op2 IN {00x, 010})` (msr_imm.xml: a term with alternatives).
+# Reading the second as three separate `!=`s would reject valid encodings --
+# `HINT #1` satisfies L==0 && imm3==011 but not Rt==11111, and a checker that
+# over-rejects reports legal instructions as divergent.
+#   rejects  : list of patterns, any match forbids the word
+#   pattern  : list of terms, all must match to forbid
+#   term     : list of (mask, value) pairs, any match satisfies the term
+Term = list[tuple[int, int]]
+Pattern = list[Term]
+Variant = tuple[int, int, list[Pattern]]
 
 
 # ── cross-mnemonic aliases (explicit, never silent) ──────────────────
@@ -195,71 +208,181 @@ def diagram_constraints(diagram: ET.Element) -> Constraint | None:
     return mask, value, fields
 
 
-def apply_bitdiffs(base: Constraint, encoding: ET.Element) -> Variant | None:
-    """Fold an encoding's `bitdiffs` into (mask, value, !=-predicates).
+def _split_top(spec: str) -> list[str]:
+    """Split on `&&` at depth 0, so `!(a && b)` stays one term.
 
-    Terms: `field == lit` (lit may carry parens and `x` don't-cares) and
-    `field != lit` (becomes a match-time predicate).  Any other operator
-    makes the variant unusable (None) so it is never matched loosely.
+    The first version used `spec.split("&&")`, which cut *through* the
+    negation: `!(L == 0 && imm3 == 011 && Rt == 11111)` became three terms
+    `!(L == 0`, `imm3 == 011`, `Rt == 11111)`, none of them parseable, and the
+    encoding was dropped as unusable -- a silently unchecked instruction.
     """
+    parts: list[str] = []
+    depth = 0
+    cur = ""
+    i = 0
+    while i < len(spec):
+        ch = spec[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if depth == 0 and spec.startswith("&&", i):
+            parts.append(cur)
+            cur = ""
+            i += 2
+            continue
+        if depth == 0 and spec.startswith("||", i):
+            # An or-predicate cannot be folded into (mask, value, rejects).
+            return []
+        cur += ch
+        i += 1
+    parts.append(cur)
+    return [t.strip() for t in parts if t.strip()]
+
+
+def _lit(term: str, fmask: int) -> "list[tuple[int, int]] | None":
+    """(mask, value) pairs for `011`, `(0)`, or `{00x, 010}` against `fmask`."""
+    top = fmask.bit_length() - 1
+    alts: list[str] = []
+    m = re.fullmatch(r"\(\s*([01xX ]+)\s*\)", term)
+    if m:
+        alts = [m.group(1).replace(" ", "")]
+    elif term.startswith("{") and term.endswith("}"):
+        alts = [a.strip() for a in term[1:-1].split(",") if a.strip()]
+    else:
+        alts = [term.replace(" ", "")]
+    out: list[tuple[int, int]] = []
+    for lit in alts:
+        if any(c not in "01xX" for c in lit) or len(lit) != fmask.bit_count():
+            return None
+        vm = 0
+        vv = 0
+        for i, ch in enumerate(lit):
+            bit = top - i
+            if ch in "xX":
+                continue
+            vm |= 1 << bit
+            if ch == "1":
+                vv |= 1 << bit
+        out.append((vm, vv))
+    return out
+
+
+def apply_bitdiffs(
+    base: Constraint, encoding: ET.Element, why: "list[str] | None" = None
+) -> "Variant | None":
+    """Fold an encoding's `bitdiffs` into (mask, value, rejects).
+
+    Understood shapes: `f == lit` (folds into mask/value, and is cross-checked
+    against what the regdiagram pins), `f != lit` (a reject term), and
+    `!( t1 && t2 && ... )` where each `ti` is `f == lit` or `f IN {..}` (one
+    reject *pattern*: the word is only forbidden when the whole conjunction
+    holds).  Anything else is refused with a reason in `why`, because the
+    caller drops the variant and an unchecked encoding must not look like a
+    passing one -- silently folding a parse failure into "0 variants" is how
+    this script used to report 423/423 while three XML forms were simply
+    unread (hinte.xml, msr_imm.xml: `!(A && B && C)`, `op2 IN {00x, 010}`).
+    """
+    def nope(msg: str) -> None:
+        if why is not None:
+            why.append(msg)
+
     spec = (encoding.get("bitdiffs") or "").strip()
     bmask, value, fields = base
     if not spec:
         return bmask, value, []
     mask = bmask
-    preds: list[tuple[int, int]] = []
-    for term in spec.split("&&"):
-        term = term.strip()
-        m = re.fullmatch(
-            r"([A-Za-z_][A-Za-z0-9_]*)\s*(==|!=)\s*\(?\s*([01xX]+)\s*\)?", term
-        )
-        if not m:
+    rejects: list[Pattern] = []
+    terms = _split_top(spec)
+    if not terms:
+        # An empty split means the spec was empty (handled above) or carried a
+        # shape _split_top refuses (`||`): neither may fall through to the
+        # no-constraint return below, because a variant with no rejects matches
+        # every word of the iclass and that is how a checker starts certifying
+        # encodings it never read.
+        nope(f"bitdiff form not understood: {spec[:60]!r}")
+        return None
+    for term in terms:
+        negated = False
+        inner = term
+        m = re.fullmatch(r"!\s*\((.*)\)", term, re.S)
+        if m:
+            negated, inner = True, m.group(1).strip()
+        conjuncts = [inner] if not negated else _split_top(inner)
+        if not conjuncts:
+            nope(f"unsupported bitdiff: {term[:60]!r}")
             return None
-        fname, op, lit = m.group(1), m.group(2), m.group(3)
-        if fname not in fields:
-            return None
-        fmask, fbits, fpinned = fields[fname]
-        if len(lit) != fmask.bit_count():
-            return None
-        top = fmask.bit_length() - 1
-        wanted = 0
-        lit_mask = 0
-        for i, ch in enumerate(lit):
-            bit = top - i
-            if ch == "x" or ch == "X":
+        pattern: Pattern = []
+        for conj in conjuncts:
+            cm = re.fullmatch(
+                r"([A-Za-z_][A-Za-z0-9_]*)\s*(==|!=)\s*(.*)", conj.strip(), re.S
+            )
+            if not cm:
+                im = re.fullmatch(
+                    r"([A-Za-z_][A-Za-z0-9_]*)\s+IN\s+(\{.*\})", conj.strip(), re.S
+                )
+                if not im or negated is False:
+                    nope(f"unsupported bitdiff term: {conj.strip()[:60]!r}")
+                    return None
+                fname, lit = im.group(1), im.group(2)
+                op = "=="
+            else:
+                fname, op, lit = cm.group(1), cm.group(2), cm.group(3).strip()
+            if fname not in fields:
+                nope(f"bitdiff names unknown field {fname!r} ({spec[:40]!r})")
+                return None
+            fmask, fbits, fpinned = fields[fname]
+            alts = _lit(lit, fmask)
+            if not alts:
+                nope(f"bitdiff literal {lit[:24]!r} does not fit {fname} "
+                     f"({fmask.bit_count()} bits)")
+                return None
+            if negated:
+                if op == "!=":
+                    nope(f"`!=` inside a negation is not understood: {conj[:40]!r}")
+                    return None
+                pattern.append(alts)
                 continue
-            lit_mask |= 1 << bit
-            wanted |= (1 if ch == "1" else 0) << bit
-        if op == "==":
-            # Cross-check only the bits the literal actually states, and
-            # only where the diagram pins them too.
-            if (wanted ^ fbits) & fpinned & lit_mask:
+            if op == "!=":
+                if fpinned & fmask:
+                    nope(f"{fname} is pinned by the diagram yet `!=`-constrained")
+                    return None
+                pattern.append(alts)
+                continue
+            # Positive `==`: cross-check against the diagram, then fold in.
+            for vm, vv in alts:
+                if (vv ^ fbits) & fpinned & vm:
+                    nope(f"bitdiff {fname}=={lit[:16]!r} contradicts the regdiagram")
+                    return None
+            if len(alts) != 1:
+                nope(f"`IN` on a positive term is not foldable: {conj[:40]!r}")
                 return None
-            for i, ch in enumerate(lit):
-                bit = top - i
-                if ch in "01":
-                    mask |= 1 << bit
-                    if ch == "1":
-                        value |= 1 << bit
-                    else:
-                        value &= ~(1 << bit)
-        else:  # !=
-            if fpinned & fmask:
-                # A pinned field cannot also be `!=`-constrained.
-                return None
-            preds.append((fmask, wanted & fmask))
-    return mask, value, preds
+            vm, vv = alts[0]
+            mask |= vm
+            value = (value & ~vm) | (vv & vm)
+        if negated or pattern:
+            rejects.append(pattern)
+    return mask, value, rejects
 
 
 def word_matches(word: int, variant: Variant) -> bool:
-    mask, value, preds = variant
+    mask, value, rejects = variant
     if word & mask != value:
         return False
-    return all(word & fm != forbidden for fm, forbidden in preds)
+    for pattern in rejects:
+        # A pattern forbids the word only when EVERY term is satisfied, and a
+        # term is satisfied by ANY of its alternatives (`IN {00x, 010}`).
+        if all(any(word & m == v for m, v in term) for term in pattern):
+            return False
+    return True
 
 
-def encoding_variants(root: ET.Element) -> list[Variant]:
-    """All usable constraints an iform XML provides."""
+def encoding_variants(root: ET.Element, why: "list[str] | None" = None) -> list[Variant]:
+    """All usable constraints an iform XML provides.
+
+    `why` collects every bitdiff form that had to be refused, so a caller can
+    tell "no variant matched" apart from "no variant could be read".
+    """
     out: list[Variant] = []
     for iclass in root.iter("iclass"):
         class_diagram = iclass.find("regdiagram")
@@ -272,7 +395,7 @@ def encoding_variants(root: ET.Element) -> list[Variant]:
             base_c = diagram_constraints(diagram) if diagram is not None else class_c
             if base_c is None:
                 continue
-            folded = apply_bitdiffs(base_c, enc)
+            folded = apply_bitdiffs(base_c, enc, why)
             if folded is not None:
                 out.append(folded)
     return out
@@ -386,6 +509,97 @@ def load_goldens(path: Path) -> "list[tuple[str, str, int]]":
     return rows
 
 
+def selftest() -> int:
+    """The bitdiff parser's contract, without XML or cross tools.
+
+    This parser rotted quietly for a release because nothing pinned it: an
+    unreadable form returned None, `encoding_variants` dropped the variant, and
+    the run still printed a satisfied count.  These cases are the three shapes
+    real M.d XML uses (hinte.xml, msr_imm.xml) plus the refusal paths, so the
+    next time the XML grows a form we cannot read the failure is a red
+    `--selftest`, not a quiet pass.
+    """
+    # fields: L = bit 21, imm3 = bits 20:18, Rt = 4:0, imm12 = 21:10, op1/op2.
+    f_l = (1 << 21, 0, 0)
+    f_imm3 = (0b111 << 18, 0, 0)
+    f_rt = (0b11111, 0, 0)
+    f_imm12 = (0xFFF << 10, 0, 0)
+    f_op1 = (0b111 << 16, 0, 0)
+    f_op2 = (0b111 << 19, 0, 0)
+    fields = {"L": f_l, "imm3": f_imm3, "Rt": f_rt, "imm12": f_imm12,
+              "op1": f_op1, "op2": f_op2}
+    base: Constraint = (0, 0, fields)
+
+    def enc(spec: str, why: "list[str] | None" = None):
+        e = ET.Element("encoding", {"bitdiffs": spec})
+        return apply_bitdiffs(base, e, why)
+
+    bad: "list[str]" = []
+
+    def expect(cond: bool, msg: str) -> None:
+        if not cond:
+            bad.append(msg)
+
+    # !(A && B && C): reject the conjunction, never the individual terms.
+    v = enc("!(L == 0 && imm3 == 011 && Rt == 11111)")
+    expect(v is not None, "negated conjunction must be understood")
+    if v is not None:
+        mask, value, rejects = v
+        expect(mask == 0 and value == 0,
+               f"a negation must not fold into mask/value, got {mask:08x}/{value:08x}")
+        expect(len(rejects) == 1 and len(rejects[0]) == 3,
+               f"want one pattern of three terms, got {rejects}")
+        hint0 = (0b011 << 18) | 0b11111          # L=0, imm3=011, Rt=xzr -> HINT #0
+        hint1 = (hint0 & ~0b11111) | 0b00001     # same, but Rt != xzr
+        expect(not word_matches(hint0, v), "the forbidden conjunction must be rejected")
+        expect(word_matches(hint1, v), "one term differing must stay legal")
+
+    # !(op1 == 000 && op2 IN {00x, 010}): a term with alternatives.
+    v = enc("!(op1 == 000 && op2 IN {00x, 010})")
+    expect(v is not None, "`IN {{...}}` inside a negation must be understood")
+    if v is not None:
+        a = (0b000 << 16) | (0b001 << 19)   # op1=000, op2=00x -> forbidden
+        b = (0b000 << 16) | (0b011 << 19)   # op1=000, op2=011 -> legal
+        c = (0b101 << 16) | (0b000 << 19)   # op1!=000          -> legal
+        expect(not word_matches(a, v), "op2=00x with op1=000 must be forbidden")
+        expect(word_matches(b, v), "op2=011 with op1=000 must be legal")
+        expect(word_matches(c, v), "op1!=000 must be legal whatever op2 is")
+
+    # Positive == folds into mask/value; != stays a one-term reject.
+    v = enc("imm3 == 011")
+    expect(v is not None and v[0] == 0b111 << 18 and v[1] == 0b011 << 18,
+           f"positive == must fold, got {v}")
+    # Literals are field-width: the M.d XML spells `imm3 != 100`, never
+    # `imm12 != 0`, and a short literal is refused as a width mismatch below.
+    v = enc("imm3 != 100")
+    if v is not None:
+        expect(not word_matches(0b100 << 18, v), "imm3 == 100 must be forbidden")
+        expect(word_matches(0b011 << 18, v), "imm3 == 011 must be legal")
+    else:
+        bad.append("`f != lit` must stay understood (it is 62 rows of the corpus)")
+    expect(enc("imm12 != 0") is None,
+           "a literal narrower than its field must be refused, not zero-extended")
+
+    # Refusals must be recorded, not silent.
+    why: "list[str]" = []
+    expect(enc("L == 0 || L == 1", why) is None, "or-predicates must be refused")
+    expect(
+        why and "not understood" in why[-1] and "||" in why[-1],
+        f"a refusal must record a reason naming the spec, got {why}",
+    )
+    why = []
+    expect(enc("nosuchfield == 0", why) is None, "an unknown field must be refused")
+    expect(why and "unknown field" in why[-1], f"reason must name the field, got {why}")
+    why = []
+    expect(enc("imm3 == 0111", why) is None, "a literal wider than the field must be refused")
+    expect(why and "does not fit" in why[-1], f"reason must say why, got {why}")
+
+    for m in bad:
+        print(f"doccheck --selftest: FAIL: {m}", file=sys.stderr)
+    print(f"doccheck --selftest: {len(bad)} failure(s)")
+    return 1 if bad else 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--xml-dir", type=Path, default=DEFAULT_XML_DIR)
@@ -418,6 +632,7 @@ def main() -> int:
 
     validated = 0
     problems: "list[str]" = []
+    unread_total = 0
     for mnem, text, word in rows:
         candidates = index.get(mnem.upper(), [])
         if not candidates:
@@ -430,18 +645,21 @@ def main() -> int:
             continue
         matched = False
         unparsable = 0
+        unparsed: "list[str]" = []
+        # (counted below whether or not this row ends up matching)
         for path in candidates:
             try:
                 root = ET.parse(path).getroot()
             except ET.ParseError:
                 unparsable += 1
                 continue
-            for variant in encoding_variants(root):
+            for variant in encoding_variants(root, unparsed):
                 if word_matches(word, variant):
                     matched = True
                     break
             if matched:
                 break
+        unread_total += len(unparsed)
         if matched:
             validated += 1
         else:
@@ -451,6 +669,11 @@ def main() -> int:
                 print(f"doccheck: note: {note}")
                 continue
             extra = f" ({unparsable} unparsable candidate file(s))" if unparsable else ""
+            if unparsed:
+                uniq = sorted(set(unparsed))
+                extra += (f"; {len(unparsed)} bitdiff form(s) this script could not "
+                          f"read, so those encodings were NOT checked: "
+                          + "; ".join(uniq[:4]))
             problems.append(
                 f"{mnem}: word {word:08x} ({text!r}) matches no encoding "
                 f"variant of {len(candidates)} candidate(s){extra}"
@@ -461,6 +684,18 @@ def main() -> int:
         f"doccheck: {validated}/{total} golden words validated against "
         f"ARM DDI 0487 M.d / ISA A64 {REQUIRED_RELEASE} XML"
     )
+    if unread_total:
+        # Fail closed.  A row can still "validate" through another variant of
+        # the same iclass while the encoding whose bitdiff we could not read is
+        # skipped, and that is a *looser* check that reports a pass.  The only
+        # honest answer is to teach the parser, not to keep the tally quiet.
+        print(
+            f"doccheck: FAIL - {unread_total} bitdiff form(s) on the candidate "
+            f"paths of these goldens could not be read; the affected encodings "
+            f"were not checked at all",
+            file=sys.stderr,
+        )
+        return 1
     if problems:
         print(f"doccheck: {len(problems)} divergence(s):", file=sys.stderr)
         for p in problems[:60]:
@@ -472,4 +707,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(selftest())
     sys.exit(main())

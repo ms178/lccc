@@ -230,6 +230,33 @@ _write_provenance() {  # after a verified-tarball build passed validation
 # land on. The fakes are functional for the canary layer wherever the case
 # is meant to reject at the VERSION layer (and vice versa), so each layer
 # is proven to reject on its own, independently.
+# Both predicates live above `self_test` on purpose: the self-test below must be
+# able to call the very same functions the early return calls, or it would be
+# testing a reimplementation.  (The first version of this block sat below
+# `self_test`, and every new case it added reported "command not found" -- which
+# still *passed* the "rebuild" expectations, the most misleading way for a guard
+# test to be wrong.)
+_gate_inputs_ok() {
+    case "$target" in
+        aarch64*)
+            # `scripts/aarch64_sysreg_table.py` resolves the .def from this prefix
+            # precisely because the download step may never run; a prefix that
+            # predates that install must not be treated as complete.
+            [[ -f "$prefix/share/opcodes/aarch64-sys-regs.def" ]] || return 1
+            ;;
+    esac
+    return 0
+}
+
+_prefix_provisioned() {
+    [[ -x "$as" && -x "$od" && -x "$oc" ]] && validate_pair && _pair_provenance_ok && _gate_inputs_ok
+}
+
+# Ask the same question the fast path asks, without risking a rebuild. A gate
+# that wants to know whether the prefix is usable (or a human debugging why a
+# step fell through to a 3-minute build) gets the answer from ONE predicate, so
+# "USABLE" can never disagree with the early return below.
+
 self_test() {
     local tmp ok=0
     tmp=$(mktemp -d)
@@ -489,6 +516,43 @@ target=other-target
     prov_case "provenance: not key=value at all" 1 "garbage"
     rm -f "$marker"
 
+    # The gate-input guard, in the same style: a prefix with valid, provenanced
+    # tools but without the file a consumer of this prefix resolves is NOT
+    # provisioned. This is the regression pin for main going red at
+    # "AArch64 spelling differ and system-register table" -- the early return
+    # short-circuited past the only step that produced aarch64-sys-regs.def, so
+    # the gate could not see its own input and a warm runner failed where a cold
+    # one passed. Cases run with the validated tool triple in place, so each
+    # verdict below is the .def's doing alone.
+    gate_case() {  # gate_case <label> <want: 0=provisioned, 1=rebuild>
+        local label=$1 want=$2 got
+        if _gate_inputs_ok; then got=0; else got=1; fi
+        if [[ $got == "$want" ]]; then
+            printf '  ok   %-44s -> %s\n' "$label" \
+                "$([[ $want == 0 ]] && echo PROVISIONED || echo REBUILD)"
+        else
+            printf '  FAIL %-44s -> wanted %s, got %s\n' "$label" \
+                "$([[ $want == 0 ]] && echo PROVISIONED || echo REBUILD)" \
+                "$([[ $got == 0 ]] && echo PROVISIONED || echo REBUILD)"
+            ok=1
+        fi
+    }
+    as="$tmp/gas-247"; od="$tmp/od-247"; oc="$tmp/oc-247"
+    prefix="$tmp/prefix-aarch64"
+    target=aarch64-linux-gnu
+    gate_case "aarch64 prefix with no share/opcodes dir" 1
+    mkdir -p "$prefix/share/opcodes"
+    gate_case "aarch64 prefix with an empty share/opcodes" 1
+    : > "$prefix/share/opcodes/aarch64-sys-regs.def"
+    gate_case "aarch64 prefix holding the sysreg .def" 0
+    target=riscv64-linux-gnu
+    rm -rf "$prefix"
+    gate_case "riscv64 prefix needs no .def" 0
+    mkdir -p "$prefix"
+    target=aarch64-linux-gnu
+    gate_case "absent aarch64 prefix is never provisioned" 1
+    rm -rf "$prefix"
+
     if [[ $ok == 0 ]]; then
         echo "ensure_gas_247 self-test: every case lands on its verdict"
     else
@@ -509,20 +573,32 @@ od="$prefix/bin/objdump"
 oc="$prefix/bin/objcopy"
 provenance="$prefix/.lccc-binutils-provenance"
 
-# BOTH binaries, validated as a PAIR (pinned token, one build, functional
-# canary) AND provably the product of the PINNED TARBALL's bytes (the
-# provenance marker: recorded tarball digest equal to the current pin and
-# recorded binary digests equal to the installed bytes), or a full
-# rebuild. Three guards, three failure modes: a cache carrying only one
-# of the pair is an interrupted provision; a pair under the 2.47-NAMED
-# prefix that does not validate is a lie — the prefix name is not the
-# version; and a pair whose provenance marker is missing, stale (a pin
-# rotation) or describes different bytes (a swap, a tamper, a partial
-# overwrite) never rode the pinned tarball at all — it rebuilds. Anything
-# else falls through to the rebuild, which reinstalls from one verified
-# source tree, must itself pass the same validation, and writes a fresh
-# marker.
-if [[ -x "$as" && -x "$od" && -x "$oc" ]] && validate_pair && _pair_provenance_ok; then
+# A prefix counts as provisioned when it holds BOTH binaries, they validate as a
+# PAIR (pinned token, one build, functional canary), they are provably the product
+# of the PINNED TARBALL's bytes (the provenance marker: recorded tarball digest
+# equal to the current pin and recorded binary digests equal to the installed
+# bytes), AND the files this prefix exists to *serve* are next to them. Four
+# guards, four failure modes: a cache carrying only one of the pair is an
+# interrupted provision; a pair under the 2.47-NAMED prefix that does not validate
+# is a lie — the prefix name is not the version; a pair whose provenance marker is
+# missing, stale (a pin rotation) or describes different bytes (a swap, a tamper,
+# a partial overwrite) never rode the pinned tarball at all; and a prefix without
+# the AArch64 sysreg table satisfies the tools but not the consumer, which is how
+# main went red at "AArch64 spelling differ and system-register table": the
+# provisioner's early return skipped the download that step's gate used to need.
+# Anything else falls through to the rebuild, which reinstalls from one verified
+# source tree, must itself pass the same validation, and writes a fresh marker.
+if [[ ${LCCC_ENSURE_GAS_CHECK_ONLY:-0} == 1 ]]; then
+    if _prefix_provisioned; then
+        echo "USABLE: $prefix ($target)"
+    else
+        echo "NOT-USABLE: $prefix ($target) -- a rebuild is required" >&2
+        exit 1
+    fi
+    exit 0
+fi
+
+if _prefix_provisioned; then
     "$as" --version | sed -n '1,1p'
     "$od" --version | sed -n '1,1p'
     exit 0
@@ -628,6 +704,28 @@ cp binutils/objdump "$od"
     exit 1
 }
 cp binutils/objcopy "$oc"
+# Install binutils' OWN system-register table next to the tools, for the
+# aarch64 sysreg gate (scripts/aarch64_sysreg_table.py holds the generated
+# table against this .def, in both directions).
+#
+# It has to travel WITH the prefix because of the fast path above: on a cache
+# hit this script returns before the tarball is ever fetched, so a gate that
+# reaches for $GAS_DL_DIR/binutils-2.47.tar.xz passes on a cold runner and
+# fails on a warm one -- red CI on main (run 38054218876, step
+# "AArch64 spelling differ and system-register table", exit 2) with no code
+# change at all.  A check whose input depends on whether the cache happened to
+# be warm is not a check.
+#
+# These bytes are the ones from the tarball that was just verified against the
+# pinned digest, so the .def is provably the table this very assembler was
+# built from -- which is a stronger claim than re-downloading a tarball and
+# hoping it matches the tools.
+if [[ "$target" == aarch64* ]]; then
+    def_src="$src/opcodes/aarch64-sys-regs.def"
+    [[ -f "$def_src" ]] || { echo "FATAL: $def_src missing from the extracted tree" >&2; exit 1; }
+    mkdir -p "$prefix/share/opcodes"
+    install -m 0644 "$def_src" "$prefix/share/opcodes/aarch64-sys-regs.def"
+fi
 # The freshly installed pair must pass the SAME validation the cache
 # fast path applies — an install that cannot justify itself is a failure,
 # not a print-and-hope.
