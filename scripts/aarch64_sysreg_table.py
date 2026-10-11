@@ -25,6 +25,16 @@ every bad line and keeps going, so the rejects come from the error lines and
 the accepted encodings from a second pass of just those names (object bytes in
 name order).  1619 names therefore cost two assembler runs, not 3238.
 
+The .def is found, in order, by `--def`, `$LCCC_AARCH64_SYSREGS_DEF`, the
+assembler prefix's `share/opcodes/aarch64-sys-regs.def` (what
+`ensure_gas_247.sh` installs next to the tools it builds, derived from `--as`),
+the provisioner's extracted source tree, then the pinned tarball in
+`$GAS_DL_DIR` / `~/dl` / `/var/tmp`.  The prefix entry is not a convenience:
+the provisioner skips its download when the tool prefix is already cached, so a
+gate that could read the .def only from the download cache fails on a warm
+runner and passes on a cold one.  Every source is checked against
+`SYSREGS_DEF_SHA256`, `--def` included.
+
 Usage:
   aarch64_sysreg_table.py --check [--as AS] [--objcopy OBJCOPY]
                                 [--lccc BINARY] [--def FILE] [--tarball FILE]
@@ -52,6 +62,14 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_OUT = REPO / "src/backend/arm/assembler/encoder/sysreg_table.rs"
 DEF_MEMBER = "binutils-2.47/opcodes/aarch64-sys-regs.def"
+# sha256 of that member, measured from the tarball whose own digest is the
+# provisioner's pin (binutils-2.47.tar.xz = 154ab23b...e4cff).  The gate is
+# "does the checked-in table match binutils 2.47's own", and that question only
+# has an answer if the .def it reads is also pinned -- "whichever .def the
+# search happens to find" would let a stale or foreign file certify itself.
+# Moving this number is a re-pin: it belongs with BINUTILS_VERSION, and the
+# refusal text says so.
+SYSREGS_DEF_SHA256 = "7e7a9b2e5abc4299bbb64b1cc90500feb22866b1e53327b2114ce8eabc77d290"
 BINUTILS_VERSION = "2.47"
 # The provisioner that owns the tarball pin (see pinned_tarball_sha256).
 ENSURE_GAS_247 = REPO / "scripts" / "ensure_gas_247.sh"
@@ -121,37 +139,128 @@ def sha256_of(path: Path) -> str:
     return digest.hexdigest()
 
 
-def find_def(explicit_def: str | None, tarball: str | None) -> tuple[list[str], dict[str, int]]:
-    """(names, name -> encoding) from binutils' own system-register table."""
-    text = None
-    if explicit_def:
-        text = Path(explicit_def).read_text()
-    else:
-        candidates = []
-        if tarball:
-            candidates.append(Path(tarball))
-        dl = Path(os.environ.get("GAS_DL_DIR", str(Path.home() / "dl")))
-        candidates.append(dl / f"binutils-{BINUTILS_VERSION}.tar.xz")
-        candidates.append(Path(f"/var/tmp/{BINUTILS_VERSION}.tar.xz"))
-        for cand in candidates:
-            if not cand.is_file():
-                continue
-            want = pinned_tarball_sha256()
-            got = sha256_of(cand)
-            if got != want:
-                die(f"{cand} is not the pinned binutils-{BINUTILS_VERSION} "
-                    f"tarball: sha256 {got}, expected {want}; refusing to "
-                    "extract it", 2)
-            with tarfile.open(cand, "r:xz") as tf:
-                member = tf.extractfile(DEF_MEMBER)
-                if member is None:
-                    die(f"{cand} has no {DEF_MEMBER}", 2)
-                text = member.read().decode()
-            break
-    if text is None:
-        die("no binutils sys-regs.def: pass --def, or keep the pinned "
-            f"binutils-{BINUTILS_VERSION}.tar.xz in GAS_DL_DIR", 2)
+def _prefix_of(tool: str | None) -> "Path | None":
+    """`<prefix>/bin/as` -> `<prefix>`: the layout ensure_gas_247.sh installs."""
+    if not tool:
+        return None
+    p = Path(tool)
+    if p.parent.name != "bin":
+        return None
+    return p.parent.parent
 
+
+def _check_def_text(text: str, label: str) -> str:
+    got = hashlib.sha256(text.encode()).hexdigest()
+    if got != SYSREGS_DEF_SHA256:
+        die(f"{label}: aarch64-sys-regs.def sha256 is {got}, expected the "
+            f"pinned {SYSREGS_DEF_SHA256}. The gate reads binutils "
+            f"{BINUTILS_VERSION}'s table specifically; if this is a deliberate "
+            "re-pin, update SYSREGS_DEF_SHA256 with BINUTILS_VERSION.", 2)
+    return text
+
+
+def _def_result(text: str, label: str) -> "tuple[list[str], dict[str, int], str]":
+    """Parse and pin-check `text`, labelling where it came from.
+
+    A single exit shape for every source: `find_def` returns three values, and
+    `return _parse_def(x), label` would silently return a *pair* whose first
+    element is a tuple -- which is exactly the bug this helper removes (the
+    caller unpacks three and would have died on it, as it did the first time).
+    """
+    names, enc = _parse_def(_check_def_text(text, label))
+    return names, enc, label
+
+
+def find_def(explicit_def: str | None, tarball: str | None,
+             as_bin: str | None = None) -> "tuple[list[str], dict[str, int], str]":
+    """(names, name -> encoding, provenance) from binutils' own sysreg table.
+
+    Discovery order, first hit wins: ``--def``, ``$LCCC_AARCH64_SYSREGS_DEF``,
+    the *assembler prefix's* ``share/opcodes/`` (what ``ensure_gas_247.sh``
+    installs beside the binaries it builds), the provisioner's extracted source
+    tree, then the pinned tarball in ``$GAS_DL_DIR`` / ``~/dl`` / ``/var/tmp``.
+
+    The prefix entry is what was missing.  This gate used to be satisfiable
+    *only* from the tarball, and the provisioner legitimately skips its own
+    download when the tool prefix is already cached -- so on a warm runner the
+    file was simply never there, and main went red at "AArch64 spelling differ
+    and system-register table" (exit 2) with no code change of any kind, while
+    a cold runner passed.  A check whose input depends on whether a cache
+    happens to be warm is not a check; and because the prefix copy is extracted
+    from the tarball that the same run verified against ``GAS_TARBALL_SHA256``,
+    the .def is now provably the one this very assembler was built from, rather
+    than an unrelated download that is merely expected to agree.
+
+    Every source, ``--def`` included, is checked against
+    ``SYSREGS_DEF_SHA256``: an explicit path is a convenience, not a licence to
+    read unpinned bytes.
+    """
+    searched: list[str] = []
+    if explicit_def:
+        path = Path(explicit_def)
+        searched.append(f"--def {path}")
+        if not path.is_file():
+            die(f"--def {path} does not exist", 2)
+        return _def_result(path.read_text(), f"{path} (explicit --def)")
+
+    env = os.environ.get("LCCC_AARCH64_SYSREGS_DEF")
+    if env:
+        searched.append(f"$LCCC_AARCH64_SYSREGS_DEF={env}")
+        path = Path(env)
+        if path.is_file():
+            return _def_result(path.read_text(), f"{path} ($LCCC_AARCH64_SYSREGS_DEF)")
+
+    prefix = _prefix_of(as_bin)
+    if prefix is not None:
+        path = prefix / "share/opcodes/aarch64-sys-regs.def"
+        searched.append(str(path))
+        if path.is_file():
+            return _def_result(path.read_text(), f"{path} (assembler prefix)")
+
+    cache = Path(os.environ.get("GAS_CACHE", str(Path.home() / ".cache")))
+    path = cache / DEF_MEMBER
+    searched.append(str(path))
+    if path.is_file():
+        return _def_result(path.read_text(), f"{path} (provisioner source tree)")
+
+    dl = Path(os.environ.get("GAS_DL_DIR", str(Path.home() / "dl")))
+    for cand in [Path(tarball)] if tarball else []:
+        searched.append(str(cand))
+        text = _def_from_tarball(cand)
+        if text is not None:
+            return _def_result(text, f"{cand} (pinned tarball)")
+    for cand in (dl / f"binutils-{BINUTILS_VERSION}.tar.xz",
+                 Path(f"/var/tmp/{BINUTILS_VERSION}.tar.xz")):
+        searched.append(str(cand))
+        text = _def_from_tarball(cand)
+        if text is not None:
+            return _def_result(text, f"{cand} (pinned tarball)")
+
+    die("no aarch64-sys-regs.def found. Searched, in order:\n  "
+        + "\n  ".join(searched)
+        + f"\nFix: re-run scripts/ensure_gas_247.sh aarch64-linux-gnu (it installs "
+          f"share/opcodes/aarch64-sys-regs.def next to the tools it builds), pass "
+          f"--def, or keep the pinned binutils-{BINUTILS_VERSION}.tar.xz in "
+          f"$GAS_DL_DIR", 2)
+
+
+def _def_from_tarball(cand: Path) -> "str | None":
+    """The .def member out of a tarball, after the tarball proves its digest."""
+    if not cand.is_file():
+        return None
+    want = pinned_tarball_sha256()
+    got = sha256_of(cand)
+    if got != want:
+        die(f"{cand} is not the pinned binutils-{BINUTILS_VERSION} tarball: "
+            f"sha256 {got}, expected {want}; refusing to extract it", 2)
+    with tarfile.open(cand, "r:xz") as tf:
+        member = tf.extractfile(DEF_MEMBER)
+        if member is None:
+            die(f"{cand} has no {DEF_MEMBER}", 2)
+        return _check_def_text(member.read().decode(), f"{DEF_MEMBER} in {cand}")
+
+
+def _parse_def(text: str) -> "tuple[list[str], dict[str, int]]":
     names: list[str] = []
     encodings: dict[str, int] = {}
     for m in DEF_ROW.finditer(text):
@@ -410,7 +519,9 @@ def main() -> int:
 
     as_bin = args.as_bin or shutil.which("aarch64-linux-gnu-as")
     objcopy = args.objcopy or shutil.which("aarch64-linux-gnu-objcopy")
-    names, def_enc = find_def(args.def_file, args.tarball)
+    names, def_enc, def_src = find_def(args.def_file, args.tarball, as_bin)
+    print(f"sysreg gate: .def source = {def_src}, "
+          f"sha256 {SYSREGS_DEF_SHA256[:12]}... (pinned)")
     candidates = names + [n for n in PSTATE_CANDIDATES if n not in def_enc]
 
     if args.regenerate:

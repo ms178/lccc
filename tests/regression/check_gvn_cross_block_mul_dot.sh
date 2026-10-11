@@ -32,7 +32,14 @@ set -euo pipefail
 CCC=${CCC:-./target/fastbuild/lccc}
 dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 src="$dir/gvn_cross_block_mul_dot_product.c"
-tmp=$(mktemp -d "${TMPDIR:-}/tmp/lccc-gvn-xblk-dot.XXXXXX")
+# mktemp needs its parent to exist.  The old template wrote
+# "${TMPDIR:-}/tmp/lccc-...", which silently assumed a `$TMPDIR/tmp`
+# subdirectory: unset TMPDIR lands in /tmp and works, but ci_local sets
+# TMPDIR to a scratch tree with no `tmp` inside it, and then the gate fails in
+# `mktemp` before compiling anything -- an environmental failure that reads as
+# a code failure. The gate therefore depends on $TMPDIR alone.
+tmproot="${TMPDIR:-/tmp}"
+tmp=$(mktemp -d "$tmproot/lccc-gvn-xblk-dot.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 
 "$CCC" -O2 -S "$src" -o "$tmp/out.s"

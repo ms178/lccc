@@ -164,6 +164,29 @@ disassembler proves the two objects decode identically, and both asm-diff
 gates (x86-64 and i686) pin the full 2.47 pair — an unpinned objdump is an
 unpinned verdict authority, whatever binutils the host image ships.
 
+## Evidence producers that are not gates (manual)
+
+Two scripts in this directory exist to *measure* something rather than to decide
+something, and neither runs in CI:
+
+| script | what it produces | how to re-run |
+|---|---|---|
+| `gas_fill_census.py` | per-directive counts of alignment/fill emission inside function bodies, per target, over the compile corpus at several `-O` levels | `GAS247_PREFIX=$HOME/.cache/gas-2.47-<triple> python3 scripts/gas_fill_census.py [target]` (or `GAS247_AUTO_PROVISION=1`); needs the pinned binutils prefix |
+| `wrap_ring_sweep.py` | the pointer-ring / wrap-semantics family sweep (per-family verdict table, exit 0 clean, 1 on any divergence or unusable reference, 2 on usage error) | `python3 scripts/wrap_ring_sweep.py` with `LCCC=<binary>` |
+
+They are deliberately not gates: a full census pass is hundreds of
+`TU x opt x arch` combinations (the recorded number is 636), and both tools
+answer "how often does this shape occur", which is a *cost* question for a design
+decision, not an invariant that can break.  The consequence that matters is
+stated plainly: **numbers quoted from them in comments are historical evidence,
+re-derivable but not enforced** -- so any law that must not regress belongs in a
+gate instead.  `ci_local.sh --fast` and `.github/workflows/ci.yml` are the
+enforcement surface; `check_ci_gate_parity.py` keeps the two in agreement, and it
+does *not* list these two scripts.  When one of their findings becomes a rule (as
+the `.zero`/`.fill` classification did), the rule moves into the classifier plus a
+unit test, and the census citation stays as the measurement of what that rule
+cost.
+
 ## The corpus-gate contracts (encdiff)
 
 The `encdiff-corpus` gate runs `encdiff.py` offline, against the pinned

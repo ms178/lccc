@@ -872,7 +872,8 @@ fn expand_macros(lines: &[&str]) -> Result<Vec<String>, String> {
     use crate::common::fx_hash::FxHashMap;
     let mut macros: FxHashMap<String, MacroDef> = FxHashMap::default();
     let mut counter = 0u64;
-    expand_macros_impl(lines, &mut macros, 0, &mut counter)
+    let mut totals = crate::backend::asm_preprocess::ExpansionTotals::default();
+    expand_macros_impl(lines, &mut macros, 0, &mut counter, &mut totals)
 }
 
 /// Core macro expansion implementation with a shared, mutable macro table.
@@ -883,6 +884,7 @@ fn expand_macros_impl(
     macros: &mut crate::common::fx_hash::FxHashMap<String, MacroDef>,
     depth: usize,
     counter: &mut u64,
+    totals: &mut crate::backend::asm_preprocess::ExpansionTotals,
 ) -> Result<Vec<String>, String> {
     // GAS 2.47's macro-nesting wall, re-measured on the pinned oracle:
     // a 101-frame chain of distinct macros assembles, the 102nd frame
@@ -958,7 +960,9 @@ fn expand_macros_impl(
                     }
                     *counter += 1;
                     let refs: Vec<&str> = expanded_lines.iter().map(|s| s.as_str()).collect();
-                    let re_expanded = expand_macros_impl(&refs, macros, depth + 1, counter)?;
+                    let re_expanded =
+                        expand_macros_impl(&refs, macros, depth + 1, counter, totals)?;
+                    totals.charge(".macro", &re_expanded)?;
                     result.extend(re_expanded);
                 } else {
                     result.push(lines[i].to_string());
@@ -1025,7 +1029,8 @@ fn expand_macros_impl(
                 *counter += 1;
                 // Recursively expand the result (may define new macros, invoke others)
                 let refs: Vec<&str> = expanded_lines.iter().map(|s| s.as_str()).collect();
-                let re_expanded = expand_macros_impl(&refs, macros, depth + 1, counter)?;
+                let re_expanded = expand_macros_impl(&refs, macros, depth + 1, counter, totals)?;
+                totals.charge(".macro", &re_expanded)?;
                 result.extend(re_expanded);
             } else {
                 result.push(lines[i].to_string());

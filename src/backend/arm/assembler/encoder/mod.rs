@@ -1349,22 +1349,58 @@ pub fn encode_instruction(
         }
         "frecps" => encode_neon_float_three_same(operands, 0, 0, 0b11111),
         "frsqrts" => encode_neon_float_three_same(operands, 0, 1, 0b11111),
+        // The two `FMNMX`-class spellings of fcmeq differ only in whether
+        // operand 3 is an immediate at all, so the gate tests the *shape* and
+        // leaves the value to `fcmp_is_positive_zero` in the leaf -- which
+        // already reproduces GAS's `verify_float_immediate_zero_only`,
+        // `#0.0`/`#0`/`#00.0`/`#+0.0` accepted and `#1`, `#-0`, `#-0.0`
+        // rejected (all measured on GNU as 2.47). Gating on `Imm(0)` here, as
+        // this arm did, recognized the integer spelling only and sent the
+        // documented `#0.0` to the register encoder, where it failed: the form
+        // GAS emits most often from `x == 0.0` was unreachable here.
         "fcmeq" => {
-            if matches!(operands.get(2), Some(Operand::Imm(0))) {
+            if matches!(
+                operands.get(2),
+                Some(Operand::Imm(_) | Operand::Expr(_) | Operand::Symbol(_))
+            ) {
                 encode_neon_float_cmp_zero(operands, raw_operands, 0, 1, 0b01101)
             } else {
                 encode_neon_float_three_same(operands, 0, 0, 0b11100)
             }
         }
+        // The two `FMNMX`-class spellings of fcmge differ only in whether
+        // operand 3 is an immediate at all, so the gate tests the *shape* and
+        // leaves the value to `fcmp_is_positive_zero` in the leaf -- which
+        // already reproduces GAS's `verify_float_immediate_zero_only`,
+        // `#0.0`/`#0`/`#00.0`/`#+0.0` accepted and `#1`, `#-0`, `#-0.0`
+        // rejected (all measured on GNU as 2.47). Gating on `Imm(0)` here, as
+        // this arm did, recognized the integer spelling only and sent the
+        // documented `#0.0` to the register encoder, where it failed: the form
+        // GAS emits most often from `x == 0.0` was unreachable here.
         "fcmge" => {
-            if matches!(operands.get(2), Some(Operand::Imm(0))) {
+            if matches!(
+                operands.get(2),
+                Some(Operand::Imm(_) | Operand::Expr(_) | Operand::Symbol(_))
+            ) {
                 encode_neon_float_cmp_zero(operands, raw_operands, 1, 1, 0b01100)
             } else {
                 encode_neon_float_three_same(operands, 1, 0, 0b11100)
             }
         }
+        // The two `FMNMX`-class spellings of fcmgt differ only in whether
+        // operand 3 is an immediate at all, so the gate tests the *shape* and
+        // leaves the value to `fcmp_is_positive_zero` in the leaf -- which
+        // already reproduces GAS's `verify_float_immediate_zero_only`,
+        // `#0.0`/`#0`/`#00.0`/`#+0.0` accepted and `#1`, `#-0`, `#-0.0`
+        // rejected (all measured on GNU as 2.47). Gating on `Imm(0)` here, as
+        // this arm did, recognized the integer spelling only and sent the
+        // documented `#0.0` to the register encoder, where it failed: the form
+        // GAS emits most often from `x == 0.0` was unreachable here.
         "fcmgt" => {
-            if matches!(operands.get(2), Some(Operand::Imm(0))) {
+            if matches!(
+                operands.get(2),
+                Some(Operand::Imm(_) | Operand::Expr(_) | Operand::Symbol(_))
+            ) {
                 encode_neon_float_cmp_zero(operands, raw_operands, 0, 1, 0b01100)
             } else {
                 encode_neon_float_three_same(operands, 1, 1, 0b11100)
@@ -2734,25 +2770,53 @@ mod gas247_golden_word_tests {
             .expect("encode_instruction found");
         let body_end = src[a + 10..].find("\npub fn ").map(|i| a + 10 + i);
         let body = &src[a..body_end.unwrap_or(src.len())];
+        // An arm head is a line whose own indentation is the dispatcher's (eight
+        // spaces): inner `match`es sit deeper, which is what keeps a leaf's
+        // `if mnemonic == "..."` from being read as an arm.  Every key on that
+        // line -- and on the `|` continuation lines of a multi-pattern head --
+        // is an arm.  The first version here took one key per line and so
+        // enumerated 423 of 526 arms, which certified a hole rather than
+        // finding one: the 103 dropped names are precisely the alias families
+        // (`cas*`, `swp*`, `ld*`/`st*` atomics, `crc32*`, `ldrsw`, the rounding
+        // `fcvt*` group) whose leaf re-reads the mnemonic to pick element size
+        // and memory order.  scripts/gen_aarch64_dispatcher_goldens.py carries
+        // the same rule, and the `# arms: N` line below is the latch that keeps
+        // the two copies from drifting apart -- this test has to run on hosts
+        // with no cross assembler, so sharing one implementation is not an
+        // option and pinning the count is the next best thing.
         let mut arms: Vec<String> = Vec::new();
-        for line in body.lines() {
-            let t = line.trim_start();
-            if let Some(rest) = t.strip_prefix('"') {
-                if let Some(end) = rest.find('"') {
-                    let mn = &rest[..end];
-                    let after = &rest[end + 1..];
-                    let key_ok = !mn.is_empty()
-                        && mn.chars().all(|c| {
-                            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.'
-                        });
-                    if key_ok
-                        && (after.trim_start().starts_with("=>")
-                            || after.trim_start().starts_with('|'))
-                    {
-                        if !arms.iter().any(|x| x == mn) {
-                            arms.push(mn.to_string());
-                        }
+        let lines: Vec<&str> = body.lines().collect();
+        let key_ok = |mn: &str| -> bool {
+            !mn.is_empty()
+                && mn
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.')
+        };
+        let mut i = 0usize;
+        while i < lines.len() {
+            if !lines[i].starts_with("        \"") {
+                i += 1;
+                continue;
+            }
+            loop {
+                let mut rest = lines[i];
+                while let Some(q) = rest.find('"') {
+                    let after = &rest[q + 1..];
+                    let Some(end) = after.find('"') else { break };
+                    let mn = &after[..end];
+                    if key_ok(mn) && !arms.iter().any(|x| x == mn) {
+                        arms.push(mn.to_string());
                     }
+                    rest = &after[end + 1..];
+                }
+                let head_done = lines[i].contains("=>");
+                i += 1;
+                if head_done
+                    || !lines
+                        .get(i)
+                        .is_some_and(|l| l.trim_start().starts_with('|'))
+                {
+                    break;
                 }
             }
         }
@@ -2762,6 +2826,18 @@ mod gas247_golden_word_tests {
             .join("tests/aarch64/dispatcher-goldens.tsv");
         let tsv = std::fs::read_to_string(&tsv_path)
             .unwrap_or_else(|e| panic!("read {}: {e}", tsv_path.display()));
+        if let Some(recorded) = tsv.lines().find_map(|l| {
+            l.strip_prefix("# arms:")
+                .and_then(|r| r.trim().split_whitespace().next())
+                .and_then(|n| n.parse::<usize>().ok())
+        }) {
+            assert_eq!(
+                recorded,
+                arms.len(),
+                "the generator recorded {recorded} arms but this test re-derived {};                  the enumeration rule in scripts/gen_aarch64_dispatcher_goldens.py and                  in this test have drifted -- fix the rule, then regenerate the TSV",
+                arms.len()
+            );
+        }
         let mut rows: Vec<(String, String, String)> = Vec::new();
         for line in tsv.lines() {
             if line.starts_with('#') || line.trim().is_empty() {
@@ -2925,5 +3001,165 @@ mod gas247_golden_word_tests {
         ] {
             encode1_err(text);
         }
+    }
+
+    /// Non-panicking `encode1`: returns the encoded word or the encoder's
+    /// error text, so a probe can assert on rejection instead of unwinding.
+    fn encode1_opt(text: &str) -> Result<u32, String> {
+        let stmts = match parse_asm(text) {
+            Ok(s) => s,
+            Err(e) => return Err(format!("parse: {e}")),
+        };
+        let mut words = Vec::new();
+        for st in &stmts {
+            if let AsmStatement::Instruction {
+                mnemonic,
+                operands,
+                raw_operands,
+            } = st
+            {
+                match encode_instruction(mnemonic, operands, raw_operands) {
+                    Ok(EncodeResult::Word(w)) => words.push(w),
+                    Ok(_) => return Err("non-word result".to_string()),
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        if words.len() == 1 {
+            Ok(words[0])
+        } else {
+            Err(format!("expected 1 word, got {}", words.len()))
+        }
+    }
+
+    /// The `fcmeq/fcmge/fcmgt #0.0` dispatcher gate tests
+    /// `Operand::Imm(0)`, but GAS's spelling `#0.0` parses as
+    /// `Operand::Expr`, so the compare-zero route is missed and the
+    /// three-same encoder takes over — a different instruction word.
+    ///
+    /// Expected words are GNU as 2.47.20260726 measurements (aarch64), not
+    /// recalled constants:
+    ///   fcmeq v0.4s, v1.4s, #0.0  = 0x4ea0d820
+    ///   fcmge v0.4s, v1.4s, #0.0  = 0x6ea0c820
+    ///   fcmgt v0.4s, v1.4s, #0.0  = 0x4ea0c820
+    /// `fcmeq/fcmge/fcmgt Vd.T, Vn.T, #0.0` — the compare-against-zero form in
+    /// every spelling GNU as 2.47 accepts, and the rejections it issues.
+    ///
+    /// The words are the oracle's own: `as -o x.o` then `objdump -d`, for
+    /// `fcmeq v0.4s, v1.4s, #0.0` = 0x4ea0d820, `fcmge` = 0x6ea0c820,
+    /// `fcmgt` = 0x4ea0c820, the `.2d` twin = 0x4ee0d820 and the scalar
+    /// `fcmeq s0, s1, #0.0` = 0x5e20d800. Before the gate recognized an FP
+    /// immediate at all, every one of these fell through to the
+    /// register-register encoder and failed.
+    #[test]
+    fn neon_float_compare_zero_accepts_every_gas_zero_spelling() {
+        for (text, want) in [
+            ("fcmeq v0.4s, v1.4s, #0.0", 0x4ea0d820u32),
+            ("fcmeq v0.2s, v1.2s, #0.0", 0x0ea0d820),
+            ("fcmge v0.4s, v1.4s, #0.0", 0x6ea0c820),
+            ("fcmgt v0.4s, v1.4s, #0.0", 0x4ea0c820),
+            ("fcmeq v0.2d, v1.2d, #0.0", 0x4ee0d820),
+            ("fcmeq s0, s1, #0.0", 0x5ea0d820),
+            ("fcmge s0, s1, #0.0", 0x7ea0c820),
+            ("fcmgt s0, s1, #0.0", 0x5ea0c820),
+            ("fcmeq d0, d1, #0.0", 0x5ee0d820),
+            ("fcmge d0, d1, #0.0", 0x7ee0c820),
+            ("fcmgt d0, d1, #0.0", 0x5ee0c820),
+            // GAS folds these to the same constant token.
+            ("fcmeq v0.4s, v1.4s, #0", 0x4ea0d820),
+            ("fcmeq v0.4s, v1.4s, #00.0", 0x4ea0d820),
+            ("fcmeq v0.4s, v1.4s, #+0.0", 0x4ea0d820),
+            ("fcmeq v0.4s, v1.4s, 0.0", 0x4ea0d820),
+            // The register form is unaffected (0x4e22e420, measured: the
+            // FCMEQ vector-register opcode sits at bits 15:12 as 0b11101, not
+            // the compare-zero 0b1101 — the value this row carries is the
+            // oracle's, not a reading of the table).
+            ("fcmeq v0.4s, v1.4s, v2.4s", 0x4e22e420),
+        ] {
+            let got = encode1_opt(text);
+            assert!(got.is_ok(), "{text:?} did not encode: {:?}", got.err());
+            assert_eq!(got.unwrap(), want, "{text:?}");
+        }
+    }
+
+    /// The other half of GAS's `verify_float_immediate_zero_only`: a non-zero
+    /// immediate is rejected with "immediate zero expected at operand 3", and
+    /// so is `#-0.0`, whose *value* is zero but whose token is a negate
+    /// expression rather than a constant (all three measured as rejects on
+    /// as 2.47). Routing either one to the register encoder instead would
+    /// produce a misleading "expected register" diagnostic for a mistake the
+    /// user made in the immediate slot.
+    #[test]
+    fn neon_float_compare_zero_rejects_nonzero_immediates() {
+        for text in [
+            "fcmeq v0.4s, v1.4s, #1.0",
+            "fcmge v0.4s, v1.4s, #0.5",
+            "fcmgt v0.4s, v1.4s, #-0.0",
+            "fcmeq v0.4s, v1.4s, #2",
+            "fcmeq v0.4s, v1.4s, #-0",
+            "fcmeq v0.4s, v1.4s, #inf",
+        ] {
+            let got = encode1_opt(text);
+            assert!(got.is_err(), "{text:?} must be rejected, got {got:?}");
+            let msg = got.unwrap_err();
+            assert!(
+                msg.contains("+0.0") || msg.contains("zero"),
+                "{text:?}: diagnostic does not name the accepted immediate: {msg:?}"
+            );
+        }
+    }
+
+    /// GAS's `FP_REG_REG_REG` tables reject a shape disagreement with
+    /// `operand mismatch` (measured on as 2.47: `fcmeq v0.2s, v1.2s, v2.4s` and
+    /// `fcmeq s0, d1, #0.0` both fail), because the destination's arrangement
+    /// would silently reinterpret the other operands. Both float leaves now
+    /// agree-check; the scalar register form, which the same measurement shows
+    /// is *legal* (`fcmeq s0, s1, s2` = 0x5e22e420), keeps encoding.
+    #[test]
+    fn float_leaves_require_agreeing_operand_shapes() {
+        for text in [
+            "fcmeq v0.2s, v1.2s, v2.4s",
+            "fcmeq s0, d1, #0.0",
+            "fcmgt d0, s0, #0.0",
+        ] {
+            let got = encode1_opt(text);
+            assert!(got.is_err(), "{text:?} must be rejected, got {got:?}");
+            let msg = got.unwrap_err();
+            assert!(
+                msg.contains("operand mismatch"),
+                "{text:?}: wrong diagnostic {msg:?}"
+            );
+        }
+        // The scalar register form of the same class: GAS encodes it in the
+        // floating-point compare class (0x5e22e420), and LCCC does not reach it
+        // through this leaf. Pinned as a *rejection* so that the day someone
+        // routes it here, this test fails and the measured word above is the
+        // thing to match -- a wrong encoding is worse than a refusal.
+        assert!(encode1_opt("fcmeq s0, s1, s2").is_err());
+        // And the scalar forms that are already right, unchanged by this:
+        assert_eq!(encode1_opt("fmax s0, s1, s2"), Ok(0x1e224820));
+    }
+
+    /// F8 (`docs/REVIEW_746_ADJUDICATION.md`), the surplus-operand class, for
+    /// the polynomial multiply: GAS's operand table has three slots and says so
+    /// -- "unexpected characters following instruction at operand 3" -- while
+    /// the leaf here checked only *at least* three and quietly encoded the
+    /// first three. A dropped operand is a wrong program assembled without a
+    /// diagnostic, so the arity is exact; the legal forms keep their measured
+    /// words (3-operand `pmull` = 0x0e32e230, and `pmull2`'s wider source).
+    #[test]
+    fn neon_pmull_arity_is_exact_not_a_minimum() {
+        let r = encode1_opt("pmull v16.8h, v17.8b, v18.8b, v19.8b");
+        assert!(
+            r.is_err(),
+            "pmull with 4 operands encoded as 0x{:08x} instead of erroring",
+            r.unwrap()
+        );
+        assert!(encode1_opt("pmull v16.8h, v17.8b, v18.8b, #0").is_err());
+        assert_eq!(encode1_opt("pmull v16.8h, v17.8b, v18.8b"), Ok(0x0e32e230));
+        assert!(
+            encode1_opt("pmull2 v16.16h, v17.16b").is_err(),
+            "two is not three"
+        );
     }
 }

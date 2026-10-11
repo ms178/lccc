@@ -27,6 +27,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import sys
 import tempfile
@@ -58,6 +59,11 @@ PINNED_DIVERGENCES: dict[str, str] = {
 }
 
 PRE = ".text\n"
+
+# GAS needs the FP16 feature to accept any half-precision FCMP; the value is
+# measured, not assumed (`-march=armv8.2-a+fp16`).
+FP16 = ["-march=armv8.2-a+fp16"]
+FP16_ROW_RE = re.compile(r"^(fcmp|fcmpe)\s+h\d")
 
 
 def gen():
@@ -100,13 +106,35 @@ def gen():
                  "DbgBvr7_El1", "pmevtyper10_el0", "PMEVTYPER10_EL0"):
         out.append(f"mrs x0,{name}")
         out.append(f"msr {name},x0")
+    # 8. FP zero immediates: the value the field can hold is unique (#0.0), so
+    #    the whole question is which *spellings* denote it.  GNU as 2.47 accepts
+    #    every zero-mantissa form and refuses the rest -- including the
+    #    underflow-to-zero spellings a host float parser rounds to 0.0 -- which
+    #    is a rule this assembler used to get wrong in the accepting direction
+    #    (see `fp_zero_spelling` in src/backend/arm/assembler/encoder/fp_scalar.rs).
+    for mn, rn in (("fcmp", "s0"), ("fcmpe", "s0"), ("fcmp", "d0"),
+                   ("fcmpe", "d0"), ("fcmp", "h0"), ("fcmpe", "h0")):
+        for imm in ("#0.0", "#0", "#00.0", "#.0", "#+0.0", "#0e0", "#0e400",
+                    "#0.0e9", "#-0.0", "#1.0", "#1e-400", "#1E-400",
+                    "#4.9e-324", "#1e-323",
+                    "#0.00000000000000000000000000000001", "#0x0p+0", "(0.0)",
+                    "#zero", "#nan"):
+            out.append(f"{mn} {rn},{imm}")
     # 7. pstate immediates: the full immediate domain
     for field in ("daifset", "daifclr", "spsel", "pan", "uao", "ssbs", "dit",
                   "tco", "allint", "svcrsm", "svcrza", "svcrsmza", "nzcv",
                   "daif", "currentel", "spsr_el1"):
         for imm in ("#0", "#1", "#7", "#8", "#15", "#16"):
             out.append(f"msr {field},{imm}")
-    return out
+    # Rows that name a half-precision FP register need GAS to be told the
+    # feature exists: at its default architecture GAS answers
+    # `Error: selected processor does not support `fcmp h0,#0.0'` even though
+    # the encoding is legal, which would show up as WE-ACCEPT-GAS-REJECTS for a
+    # pair that agrees bit for bit (`fcmp h0,#0.0` = 0x1ee02008 in both).  A
+    # verdict that depends on the oracle's own -march is not a divergence, so
+    # these rows are given the flag.  Scoped to fcmp/fcmpe rather than applied
+    # to every `h` register in the corpus, so no existing row's verdict moves.
+    return [(insn, FP16 if FP16_ROW_RE.search(insn) else []) for insn in out]
 
 
 def _direction(gas: str, lc: str) -> str:
@@ -139,9 +167,9 @@ def main() -> int:
         link = tmp / "aarch64-linux-gnu-ccc"
         link.symlink_to(lccc.resolve())
         bad, pinned, n = [], [], 0
-        for insn in gen():
+        for insn, extra in gen():
             n += 1
-            gas = M.assemble(insn, [args.as_bin], args.objcopy, tmp, prologue=PRE)
+            gas = M.assemble(insn, [args.as_bin, *extra], args.objcopy, tmp, prologue=PRE)
             lc = M.assemble(insn, [str(link), "-c"], args.objcopy, tmp, prologue=PRE)
             if gas != lc:
                 # A pinned divergence is keyed on any operand spelling, not on

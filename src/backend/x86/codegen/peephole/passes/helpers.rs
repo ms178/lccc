@@ -7,6 +7,125 @@ use super::super::types::*;
 
 // ── Register helpers ─────────────────────────────────────────────────────────
 
+/// Directives that emit DATA -- bytes into the section being assembled.
+///
+/// A `.byte`/`.long`/`.quad` sequence inside a function body can encode any
+/// instruction -- `adc`, `clc`, a branch, `int3` -- that the textual predicates
+/// above cannot see, exactly like inline asm, so a walker must not step over it
+/// as if it had no effect.  The question this answers is deliberately narrow:
+/// **can this line put bytes into the current section, or change what the lines
+/// around it mean?**  A directive is benign only if it does neither:
+///
+/// * it emits nothing into the current section.  `.cfi_*` writes `.eh_frame`,
+///   `.loc`/`.file` write the line tables, `.globl`/`.type`/`.size` are symbol
+///   bookkeeping, `.comm`/`.lcomm` reserve space in `.bss` rather than here,
+///   `.ident` goes to `.comment`; and
+/// * it does not change how neighbouring lines are assembled.  `.code16`,
+///   `.code32`, `.arch`, `.intel_syntax`, `.att_syntax` re-interpret every
+///   following instruction, and `.text`, `.data`, `.section .rodata`,
+///   `.pushsection`, `.previous` move the *following* lines out of the section
+///   this window was parsed in.  None of them emits a byte here, yet each makes
+///   "the contiguous run of code I analysed" false, which is the assumption
+///   every caller of this predicate rests on.  (`engineering/evidence/
+///   2026-10-08-pr-audit/directive-census.txt` counts `.section` 68 times in
+///   function bodies -- jump-table islands in `.rodata` -- so this is not a
+///   hypothetical shape.)
+///
+/// Anything the classification does not name is data, because "unrecognized" is
+/// not "harmless".  That is also why `.zero`, `.skip`, `.space` and `.fill` are
+/// *not* benign: all four emit bytes, the first three zeros, and `0x00 0x00`
+/// decodes as `add %al,(%rax)` -- a flag writer -- while
+/// `.fill 1,1,0xF8` is a bare `clc`.  Their reach inside function bodies is
+/// measured at 0 across the 106-source corpora, so the caution refuses no fold
+/// this compiler has ever wanted to make.
+///
+/// The alignment family needs a rule rather than a verdict: in a text section
+/// `.p2align 4` fills with nops (harmless), but the fill byte is the
+/// programmer's choice -- `.p2align 4,0xf8` fills with `clc` and
+/// `.p2align 4,0xcc` with `int3`, both of which a flag or control-flow walk must
+/// not step over.  So an explicit fill operand makes an alignment directive data
+/// (`alignment_fill_is_explicit`), while `.p2align 4,,10` -- empty fill, `max`
+/// only -- stays benign.
+pub(super) fn directive_emits_data(text: &str) -> bool {
+    let trimmed = text.trim();
+    let Some(rest) = trimmed.strip_prefix('.') else {
+        return false;
+    };
+    // A local label like `.Ltmp3:` is dotted but not a directive: it emits no
+    // bytes and is not what this predicate is for.  Callers select on
+    // `LineKind::Directive` first (labels are a barrier of their own there), so
+    // this only matters to a caller that hands the classifier raw text -- which
+    // is precisely how a "directive" predicate gets reused by a census script or
+    // a new pass, and an answer of "data" for a label would be silently wrong.
+    if trimmed.ends_with(':') {
+        return false;
+    }
+    let name = rest
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .next()
+        .unwrap_or("");
+    let args = &rest[name.len()..];
+    // CFI never touches the section being assembled.  Prefix-matched on
+    // purpose: the previous version enumerated fifteen `.cfi_*` names, which
+    // silently classified the unlisted `.cfi_adjust_cfa_offset` -- the one in
+    // every prologue -- as data.  That cost no folds (census: 0 in bodies) but
+    // the enumeration was wrong in the over-conservative direction, and a
+    // classifier that is wrong in either direction gets trusted in the other.
+    if name.starts_with("cfi_") {
+        return false;
+    }
+    if matches!(
+        name,
+        "p2align" | "p2alignw" | "p2alignl" | "align" | "balign" | "balignw" | "balignl"
+    ) {
+        return alignment_fill_is_explicit(args);
+    }
+    if matches!(
+        name,
+        // Positional/debug/symbol bookkeeping: no bytes here, no re-reading of
+        // what follows.  Deliberately *no* `.text`/`.data`/`.section` family and
+        // no `.arch`/`.code*`/`._syntax` members -- see the doc comment.
+        // `.end` is absent too: it closes `.macro`/`.if` blocks whose *opener*
+        // is already unrecognised (hence data), and a verdict that is only right
+        // because of what some other line does is not a verdict.
+        "loc"
+            | "file"
+            | "ident"
+            | "globl"
+            | "global"
+            | "weak"
+            | "local"
+            | "type"
+            | "size"
+            | "set"
+            | "equ"
+            | "comm"
+            | "lcomm"
+    ) {
+        return false;
+    }
+    // `.byte`, `.2byte`/`.word`, `.4byte`/`.long`, `.8byte`/`.quad`, `.value`,
+    // `.inst`, `.insn`, `.ascii`, `.asciz`, `.string`, `.uleb128`, `.sleb128`,
+    // `.float`, `.double`, `.zero`, `.skip`, `.space`, `.fill`, `.if`/`.else`,
+    // `.macro`/`.rept`/`.irp` blocks, section and mode switches -- and
+    // anything unrecognized.
+    true
+}
+
+/// True when an alignment directive names its own fill byte.
+///
+/// `args` is everything after the directive name: GAS takes
+/// `.p2align <align>[, <fill>[, <max>]]`, so the second comma-separated field
+/// is the fill -- present and non-empty means the padding is arbitrary data,
+/// present and *empty* (`.p2align 4,,10`) means the default nops/zeros.  Fields
+/// are split on commas, not on a whitespace-or-comma class, because ", " and
+/// ",," must not look alike to a fill test.
+pub(super) fn alignment_fill_is_explicit(args: &str) -> bool {
+    let mut fields = args.split(',');
+    let _ = fields.next(); // <align>
+    matches!(fields.next(), Some(fill) if !fill.trim().is_empty())
+}
+
 /// Check if a register ID refers to a valid general-purpose register (0..=15).
 #[inline]
 pub(super) fn is_valid_gp_reg(reg: RegId) -> bool {
@@ -1249,5 +1368,99 @@ mod writes_family_tests {
         // Out-of-range families (XMM ids, REG_NONE) are never GP kills.
         assert!(!self_zeroing_full_write("xorl %ecx, %ecx", REG_NONE));
         assert!(!self_zeroing_full_write("xorl %ecx, %ecx", REG_GP_MAX + 1));
+    }
+
+    /// The two rules of the classifier, in both directions.  Data-emitting and
+    /// meaning-changing directives must block a window; pure bookkeeping must
+    /// not, because a fold blocked by a `.cfi_*` line is a lost optimisation and
+    /// nobody writes a test for those.
+    #[test]
+    fn directive_classifier_blocks_data_and_mode_changes() {
+        for t in [
+            ".byte 0xf8",
+            ".long .LBB33 - .Ljt_0",
+            ".quad 0",
+            ".zero 16",
+            ".space 8",
+            ".skip 4",
+            ".fill 1,1,0xF8",
+            ".ascii \"x\"",
+            ".inst.n 0xbf00",
+            // Fill bytes are arbitrary data: 0xf8 is `clc`, 0xcc is `int3`.
+            ".p2align 4,0xf8",
+            ".p2align 4, 0xcc",
+            ".align 16,0xcc",
+            ".balign 8, 0x90",
+            // Not data, but they change what the neighbouring lines mean.
+            ".text",
+            ".section .rodata",
+            ".pushsection .note.lccc",
+            ".popsection",
+            ".previous",
+            ".subsection 2",
+            ".code32",
+            ".code16",
+            ".arch i8086",
+            ".intel_syntax noprefix",
+            ".att_syntax prefix",
+            // Conditional assembly can delete or duplicate lines wholesale.
+            ".if 0",
+            ".else",
+            ".endif",
+            ".macro foo",
+            ".endm",
+            ".rept 4",
+            // Unrecognised is not harmless.
+            ".totally_new_directive 1",
+        ] {
+            assert!(
+                directive_emits_data(t),
+                "{t:?} must not be treated as benign"
+            );
+        }
+    }
+
+    #[test]
+    fn directive_classifier_allows_pure_bookkeeping() {
+        for t in [
+            ".cfi_startproc",
+            ".cfi_endproc",
+            ".cfi_def_cfa_offset 32",
+            // The one that used to be missing from the enumeration and is in
+            // every prologue: `.eh_frame` only, so it must never block a fold.
+            ".cfi_adjust_cfa_offset 16",
+            ".cfi_lsda 0x1b,4,.Laset0",
+            ".cfi_escape 0x2a",
+            ".p2align 4",
+            ".p2align 4,,10",
+            ".align 4",
+            ".balign 16",
+            ".loc 1 42 7",
+            ".file 1 \"x.c\"",
+            ".globl f",
+            ".type f,@function",
+            ".size f, .-f",
+            ".ident \"lccc\"",
+            ".comm x,16,16",
+            ".equ K,3",
+        ] {
+            assert!(
+                !directive_emits_data(t),
+                "{t:?} emits nothing into the current section and changes no                  neighbouring line: blocking a fold on it is a lost optimisation"
+            );
+        }
+        // Not a directive at all -> the caller's other predicates decide.
+        assert!(!directive_emits_data("nop"));
+        assert!(!directive_emits_data("  .Ltmp3:"));
+    }
+
+    #[test]
+    fn alignment_fill_lexing_distinguishes_the_two_forms() {
+        assert!(!alignment_fill_is_explicit(" 4"));
+        assert!(!alignment_fill_is_explicit(" 4,,10"));
+        assert!(!alignment_fill_is_explicit(" 4, ,10"));
+        assert!(alignment_fill_is_explicit(" 4,0xf8"));
+        assert!(alignment_fill_is_explicit(" 16, 0xcc"));
+        assert!(alignment_fill_is_explicit(" 8, 0, 16"));
     }
 }
