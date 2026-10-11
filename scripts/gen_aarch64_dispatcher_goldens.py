@@ -6,8 +6,10 @@ WHY
 ``aarch64_encoder_differential.py`` samples the encoding space uniformly at
 random, so a rare form (an indexed element load, an LSE pairing, a system
 op) can hide from it for a long time, and its sweep is a manual offline run.
-The dispatcher in ``encoder/mod.rs`` has ~401 mnemonic arms; a routing bug
-in one of them (wrong leaf, wrong operand transformation — the shape in
+The dispatcher in ``encoder/mod.rs`` has 526 mnemonic arms as this script
+enumerates them today (the ``# arms:`` line it writes into the TSV is the
+authority; this sentence is prose, and was written when the count was 401);
+a routing bug in one of them (wrong leaf, wrong operand transformation — the shape in
 which an ``fmls`` defect once hid) must be caught by the *default* test
 run with no cross binutils and no network.
 
@@ -213,8 +215,17 @@ def dispatcher_arms() -> list[str]:
     a = src.find("pub fn encode_instruction(")
     if a < 0:
         raise SystemExit("encode_instruction not found in encoder/mod.rs")
-    b = src.find("\npub fn ", a + 10)
-    body = src[a:b if b > 0 else len(src)]
+    # Delimit the counted region by the dispatcher's own closing brace, the first
+    # `}` at column 0 after its `fn` head.  Scanning for the next `pub fn` and
+    # falling back to EOF (the earlier rule) let an insertion above the dispatcher
+    # widen the region silently, and the ratchet would then certify whatever it
+    # happened to see.  Both ends of the region must be provable.
+    b = src.find("\n}", a)
+    if b < 0:
+        raise SystemExit("encode_instruction body does not end at a column-0 `}`")
+    body = src[a:b]
+    if "#[test]" in body:
+        raise SystemExit("the counted region ran past the dispatcher into the test module")
     lines = body.splitlines()
     head = arm_head_re()
     names: set[str] = set()
@@ -438,6 +449,33 @@ def check(ns: argparse.Namespace) -> int:
         if mnemonic not in arms:
             print(f"stale row: `{mnemonic}` is no longer a dispatcher arm")
             bad += 1
+    # The arm-set half runs BEFORE any toolchain is touched, and the header is
+    # part of it: `# arms:` is the authority the docs cite, so a dispatcher that
+    # grew an arm without the file being regenerated must fail here -- in an
+    # environment with no binutils at all -- rather than after a `build_toolchain`
+    # that may not return.  An arm hole masked by a missing oracle is the gate
+    # equivalent of a test that cannot run.
+    missing = sorted(arms - {m for m, _, _ in rows})
+    for m in missing:
+        print(f"uncovered dispatcher arm: `{m}`")
+        bad += 1
+    header = next(
+        (
+            int(line.split(":", 1)[1].split()[0])
+            for line in TSV.read_text().splitlines()
+            if line.startswith("# arms:")
+        ),
+        None,
+    )
+    if header is None:
+        print("the TSV has no `# arms:` line to check the enumeration against")
+        bad += 1
+    elif header != len(arms):
+        print(
+            f"arm-count drift: the TSV header says {header}, the dispatcher has "
+            f"{len(arms)} -- re-run without --check"
+        )
+        bad += 1
     tc = build_toolchain(ns)
     try:
         for mnemonic, text, word in rows:
@@ -448,10 +486,6 @@ def check(ns: argparse.Namespace) -> int:
                 bad += 1
     finally:
         tc.close()
-    missing = sorted(arms - {m for m, _, _ in rows})
-    for m in missing:
-        print(f"uncovered dispatcher arm: `{m}`")
-        bad += 1
     if bad:
         print(f"{bad} problem(s)")
         return 1

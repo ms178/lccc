@@ -1527,7 +1527,8 @@ fn is_transparent_for_store_fold(
     reg: RegId,
     base_fam: u8,
 ) -> bool {
-    if infos[k].is_nop() || infos[k].kind == LineKind::Empty || infos[k].kind == LineKind::Directive
+    if infos[k].kind == LineKind::Empty
+        || super::helpers::steps_over_line(&infos[k], infos[k].trimmed(store.get(k)))
     {
         return true;
     }
@@ -1640,9 +1641,8 @@ pub(super) fn fold_store_alu_memop(store: &mut LineStore, infos: &mut [LineInfo]
         let mut advanced = false;
         loop {
             while j < len
-                && (infos[j].is_nop()
-                    || infos[j].kind == LineKind::Empty
-                    || infos[j].kind == LineKind::Directive)
+                && (infos[j].kind == LineKind::Empty
+                    || super::helpers::steps_over_line(&infos[j], infos[j].trimmed(store.get(j))))
             {
                 j += 1;
             }

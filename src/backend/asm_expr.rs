@@ -737,19 +737,71 @@ pub struct AlignTail {
     pub max_pad: Option<u64>,
 }
 
+/// Why a `[, fill[, max]]` tail was rejected.
+///
+/// A type rather than a message string because a target may legitimately ignore
+/// one operand and still have to report the other.  RISC-V's `.balign` forwards
+/// `BadFill`, `BadMax` and `TooMany` are all real rejections: `s_align` reads
+/// the max field with `get_absolute_expression()` before any target hook runs,
+/// so `.balign 8,,junk` is an error on riscv64 and on aarch64 alike (measured on
+/// as 2.47.20260726).  RISC-V used to swallow `BadMax` on the theory that its
+/// `.p2align` handler ignores the cap -- but "ignored when the padding is
+/// emitted" and "never parsed" are different claims, and the second one is
+/// false.  Triage by `e.contains("fill")` would let a reworded message silently
+/// change which inputs the assembler accepts; the variants are the contract and
+/// [`AlignTailError::to_message`] spells them the way GAS does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AlignTailError {
+    /// The fill slot is present but is not an integer.
+    BadFill { directive: String, token: String },
+    /// The max-pad slot is present but is not an integer.
+    BadMax { directive: String, token: String },
+    /// More operands than `fill` and `max`.
+    TooMany { directive: String },
+}
+
+impl AlignTailError {
+    /// The user-facing text.  Byte-identical to the string this parser returned
+    /// before the type existed, so every test of the wording keeps pinning it.
+    pub fn to_message(&self) -> String {
+        match self {
+            Self::BadFill { directive, token } => {
+                format!("{directive}: fill `{token}` is not an integer")
+            }
+            Self::BadMax { directive, token } => {
+                format!("{directive}: max-pad `{token}` is not an integer")
+            }
+            Self::TooMany { directive } => format!("{directive}: too many operands"),
+        }
+    }
+}
+
+impl core::fmt::Display for AlignTailError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.to_message())
+    }
+}
+
 /// Parse the tail after the alignment operand. `integer` is the caller's own
 /// expression evaluator, because each backend resolves symbols and different
 /// radix forms through its own path.
-pub fn parse_align_tail<F>(rest: &str, directive: &str, mut integer: F) -> Result<AlignTail, String>
+pub fn parse_align_tail<F>(
+    rest: &str,
+    directive: &str,
+    mut integer: F,
+) -> Result<AlignTail, AlignTailError>
 where
     F: FnMut(&str) -> Result<i64, String>,
 {
     let mut parts = rest.split(',');
+    let d = || directive.to_string();
     let fill = match parts.next().map(str::trim) {
         None | Some("") => None,
         Some(tok) => {
-            let v =
-                integer(tok).map_err(|_| format!("{directive}: fill `{tok}` is not an integer"))?;
+            let v = integer(tok).map_err(|_| AlignTailError::BadFill {
+                directive: d(),
+                token: tok.to_string(),
+            })?;
             // GAS stores the low byte of any integer (see the type docs).
             Some(v as u8)
         }
@@ -757,13 +809,15 @@ where
     let max_pad = match parts.next().map(str::trim) {
         None | Some("") => None,
         Some(tok) => {
-            let v = integer(tok)
-                .map_err(|_| format!("{directive}: max-pad `{tok}` is not an integer"))?;
+            let v = integer(tok).map_err(|_| AlignTailError::BadMax {
+                directive: d(),
+                token: tok.to_string(),
+            })?;
             if v <= 0 { None } else { Some(v as u64) }
         }
     };
     if parts.next().is_some() {
-        return Err(format!("{directive}: too many operands"));
+        return Err(AlignTailError::TooMany { directive: d() });
     }
     Ok(AlignTail { fill, max_pad })
 }
@@ -952,5 +1006,117 @@ mod tests {
         // Character literals in expressions
         assert_eq!(parse_integer_expr("'A' + 1").unwrap(), 66);
         assert_eq!(parse_integer_expr("'!' | 0x80").unwrap(), 0xA1);
+    }
+
+    /// The `[, fill[, max]]` grammar, measured against GNU as 2.47 on the two
+    /// pinned targets.  These are the rules every front end shares -- low-byte
+    /// fill, empty slot means "absent", `max <= 0` means unlimited, one operand
+    /// too many is an error -- so they belong here rather than being rediscovered
+    /// per target.  The `max <= 0` rule and the low-byte truncation in particular
+    /// are invisible from a codegen diff alone: a target that clamped the fill
+    /// instead of truncating it still assembles, and only the pad *content*
+    /// differs.
+    ///
+    /// `rest` is what the caller's split left after the alignment operand, so the
+    /// first slot here is the fill and the second is the cap: `".p2align 4,3,8"`
+    /// reaches this function as `"3,8"`.
+    #[test]
+    fn gas247_align_tail_grammar() {
+        let tail = |t: &str| parse_align_tail(t, ".p2align", parse_integer_expr);
+        assert_eq!(
+            tail("").unwrap(),
+            AlignTail {
+                fill: None,
+                max_pad: None
+            },
+            "a bare directive has no explicit fill and no cap"
+        );
+        assert_eq!(
+            tail("3").unwrap(),
+            AlignTail {
+                fill: Some(3),
+                max_pad: None
+            }
+        );
+        // The fill is the LOW BYTE of any integer, not a range check.
+        for (src, want) in [
+            ("-1", 0xffu8),
+            ("300", 0x2c),
+            ("256", 0x00),
+            ("0x1ff", 0xff),
+        ] {
+            assert_eq!(
+                tail(src).unwrap().fill,
+                Some(want),
+                "fill {src} is the low byte of the expression"
+            );
+        }
+        // An empty slot is absent, not zero, and does not consume the next field.
+        assert_eq!(
+            tail(",").unwrap(),
+            AlignTail {
+                fill: None,
+                max_pad: None
+            }
+        );
+        assert_eq!(tail("-1,").unwrap().fill, Some(0xff));
+        // `max` is unlimited at 0 and below -- `.p2align 4,,0` still pads.
+        for src in ["0", "-1", "-4096", ""] {
+            assert_eq!(
+                tail(&format!(",{src}")).unwrap().max_pad,
+                None,
+                "max {src:?} must mean unlimited"
+            );
+        }
+        assert_eq!(tail(",2048").unwrap().max_pad, Some(2048));
+        assert_eq!(
+            tail(",18446744073709551615").unwrap().max_pad,
+            None,
+            "u64max is the all-ones pattern, i.e. negative as i64, i.e. unlimited"
+        );
+        // The three verdicts, each with the exact text a target forwards.
+        assert_eq!(
+            tail("junk").unwrap_err().to_message(),
+            ".p2align: fill `junk` is not an integer"
+        );
+        assert_eq!(
+            tail(",junk").unwrap_err().to_message(),
+            ".p2align: max-pad `junk` is not an integer"
+        );
+        assert_eq!(
+            tail(",1,2").unwrap_err().to_message(),
+            ".p2align: too many operands"
+        );
+        assert_eq!(
+            tail(",,1").unwrap_err().to_message(),
+            ".p2align: too many operands",
+            "three slots is a fourth operand on the directive, even when empty"
+        );
+        // The variants, not just the text: a target that ignores one verdict has
+        // to be able to name it.
+        assert!(matches!(
+            tail("junk").unwrap_err(),
+            AlignTailError::BadFill { .. }
+        ));
+        assert!(matches!(
+            tail(",junk").unwrap_err(),
+            AlignTailError::BadMax { .. }
+        ));
+        assert!(matches!(
+            tail(",1,2").unwrap_err(),
+            AlignTailError::TooMany { .. }
+        ));
+        // `Display` and `to_message` are one text, so a target that renames the
+        // directive in its diagnostic cannot diverge between the two paths.
+        let e = tail("junk").unwrap_err();
+        assert_eq!(e.to_string(), e.to_message());
+        // The label follows the caller's directive name: the same tail parsed for
+        // `.balign` blames `.balign`.
+        assert_eq!(
+            parse_align_tail("junk", ".balign", parse_integer_expr)
+                .unwrap_err()
+                .to_message(),
+            ".balign: fill `junk` is not an integer"
+        );
     }
 }

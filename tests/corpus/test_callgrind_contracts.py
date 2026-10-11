@@ -242,7 +242,7 @@ class InterspersedCliRatchetTests(unittest.TestCase):
         'scripts/comdat_registration_bench.py','scripts/distill_evex_opcodes.py','scripts/encdiff.py',
         'scripts/gen_encoding_sweep.py','scripts/i686_alu_redteam.py','scripts/peephole_trace_bisect.py',
         'scripts/perf_ab.py','scripts/ra_quality_census.py','scripts/stack_census.py',
-        'scripts/tight_loop_oracle.py','scripts/x86_gcc_torture.py','tests/stress/reduce_ice.py',
+        'scripts/tight_loop_oracle.py','tests/stress/reduce_ice.py',
     ))
 
     @staticmethod

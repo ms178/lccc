@@ -100,6 +100,14 @@ pub(crate) fn encode_neon_three_same(
     let (rd, arr_d) = get_neon_reg(operands, 0)?;
     let (rn, _arr_n) = get_neon_reg(operands, 1)?;
     let (rm, _arr_m) = get_neon_reg(operands, 2)?;
+    // One `size`/`Q` triple for all three operands: see the note on
+    // [`neon_shapes_agree`].  Before this check a mixed spelling was assembled
+    // successfully from the destination's shape and the sources' numbers, i.e.
+    // the bytes described a different instruction than the source (measured on
+    // this tree before the fix: `add v0.4s, v1.4s, v2.8h`, `mla v0.8h, v1.16b,
+    // v2.16b`, `pmul v0.8h, v1.16b, v2.16b` and `sqdmulh v0.4h, v1.4h, v2.8h`
+    // each assembled, exit status 0).
+    neon_shapes_agree(operands, 3, "NEON three-same")?;
 
     let (q, size) = neon_arr_to_q_size(&arr_d)?;
 
@@ -538,6 +546,9 @@ pub(crate) fn encode_neon_logical(operands: &[Operand], opc: u32) -> Result<Enco
     let (rd, arr_d) = get_neon_reg(operands, 0)?;
     let (rn, _arr_n) = get_neon_reg(operands, 1)?;
     let (rm, _arr_m) = get_neon_reg(operands, 2)?;
+    // Three-same shape law: see [`neon_shapes_agree`].  One `size`/`Q` for all
+    // three operands, so the shapes below cannot disagree.
+    neon_shapes_agree(operands, 3, "NEON logical (and/or/orn/eor)")?;
 
     let q: u32 = if arr_d == "16b" { 1 } else { 0 };
 
@@ -571,6 +582,9 @@ pub(crate) fn encode_neon_mul(operands: &[Operand]) -> Result<EncodeResult, Stri
     let (rd, arr_d) = get_neon_reg(operands, 0)?;
     let (rn, _) = get_neon_reg(operands, 1)?;
     let (rm, _) = get_neon_reg(operands, 2)?;
+    // Three-same shape law: see [`neon_shapes_agree`].  One `size`/`Q` for all
+    // three operands, so the shapes below cannot disagree.
+    neon_shapes_agree(operands, 3, "mul (vector)")?;
     let (q, size) = neon_arr_to_q_size(&arr_d)?;
 
     // MUL (vector): 0 Q 0 01110 size 1 Rm 10011 1 Rn Rd
@@ -590,6 +604,9 @@ pub(crate) fn encode_neon_pmul(operands: &[Operand]) -> Result<EncodeResult, Str
     let (rd, arr_d) = get_neon_reg(operands, 0)?;
     let (rn, _) = get_neon_reg(operands, 1)?;
     let (rm, _) = get_neon_reg(operands, 2)?;
+    // Three-same shape law: see [`neon_shapes_agree`].  One `size`/`Q` for all
+    // three operands, so the shapes below cannot disagree.
+    neon_shapes_agree(operands, 3, "pmul")?;
     let q: u32 = if arr_d == "16b" { 1 } else { 0 };
     // PMUL: 0 Q 1 01110 00 1 Rm 10011 1 Rn Rd (size=00 for bytes, U=1)
     // PMUL encoding: size=00 (bytes) is implicit (zero bits at [23:22])
@@ -609,6 +626,9 @@ pub(crate) fn encode_neon_mla(operands: &[Operand]) -> Result<EncodeResult, Stri
     let (rd, arr_d) = get_neon_reg(operands, 0)?;
     let (rn, _) = get_neon_reg(operands, 1)?;
     let (rm, _) = get_neon_reg(operands, 2)?;
+    // Three-same shape law: see [`neon_shapes_agree`].  One `size`/`Q` for all
+    // three operands, so the shapes below cannot disagree.
+    neon_shapes_agree(operands, 3, "mla")?;
     let (q, size) = neon_arr_to_q_size(&arr_d)?;
     // MLA: 0 Q 0 01110 size 1 Rm 10010 1 Rn Rd
     let word = (q << 30)
@@ -627,6 +647,9 @@ pub(crate) fn encode_neon_mls(operands: &[Operand]) -> Result<EncodeResult, Stri
     let (rd, arr_d) = get_neon_reg(operands, 0)?;
     let (rn, _) = get_neon_reg(operands, 1)?;
     let (rm, _) = get_neon_reg(operands, 2)?;
+    // Three-same shape law: see [`neon_shapes_agree`].  One `size`/`Q` for all
+    // three operands, so the shapes below cannot disagree.
+    neon_shapes_agree(operands, 3, "mls")?;
     let (q, size) = neon_arr_to_q_size(&arr_d)?;
     // MLS: 0 Q 1 01110 size 1 Rm 10010 1 Rn Rd (U=1)
     let word = (q << 30)
@@ -1442,6 +1465,9 @@ pub(crate) fn encode_neon_bic(operands: &[Operand]) -> Result<EncodeResult, Stri
     let (rd, arr_d) = get_neon_reg(operands, 0)?;
     let (rn, _) = get_neon_reg(operands, 1)?;
     let (rm, _) = get_neon_reg(operands, 2)?;
+    // Three-same shape law: see [`neon_shapes_agree`].  One `size`/`Q` for all
+    // three operands, so the shapes below cannot disagree.
+    neon_shapes_agree(operands, 3, "bic")?;
 
     let q: u32 = if arr_d == "16b" { 1 } else { 0 };
 
@@ -1465,6 +1491,9 @@ pub(crate) fn encode_neon_bsl(operands: &[Operand]) -> Result<EncodeResult, Stri
     let (rd, arr_d) = get_neon_reg(operands, 0)?;
     let (rn, _) = get_neon_reg(operands, 1)?;
     let (rm, _) = get_neon_reg(operands, 2)?;
+    // Three-same shape law: see [`neon_shapes_agree`].  One `size`/`Q` for all
+    // three operands, so the shapes below cannot disagree.
+    neon_shapes_agree(operands, 3, "bsl")?;
 
     let q: u32 = if arr_d == "16b" { 1 } else { 0 };
 
@@ -1980,6 +2009,9 @@ pub(crate) fn encode_neon_zip_uzp(
     let (rd, arr_d) = get_neon_reg(operands, 0)?;
     let (rn, _) = get_neon_reg(operands, 1)?;
     let (rm, _) = get_neon_reg(operands, 2)?;
+    // Three-same shape law: see [`neon_shapes_agree`].  One `size`/`Q` for all
+    // three operands, so the shapes below cannot disagree.
+    neon_shapes_agree(operands, 3, "uzp/zip/trn")?;
     let (q, size) = neon_arr_to_q_size(&arr_d)?;
 
     // UZP1: 0 Q 0 01110 size 0 Rm 0 001 10 Rn Rd  (op_bits=001)
@@ -2081,6 +2113,9 @@ pub(crate) fn encode_neon_add_sub(
     let (rd, arr_d) = get_neon_reg(operands, 0)?;
     let (rn, _) = get_neon_reg(operands, 1)?;
     let (rm, _) = get_neon_reg(operands, 2)?;
+    // Three-same shape law: see [`neon_shapes_agree`].  One `size`/`Q` for all
+    // three operands, so the shapes below cannot disagree.
+    neon_shapes_agree(operands, 3, "add/sub (vector)")?;
     let (q, size) = neon_arr_to_q_size(&arr_d)?;
     let u = if is_sub { 1u32 } else { 0u32 };
 
@@ -2298,6 +2333,20 @@ pub(crate) fn neon_operand_shape(op: &Operand) -> Option<String> {
 
 /// Check the first `n` operands agree, ignoring any operand that is not a
 /// register at all (an immediate slot, a memory operand).
+///
+/// Scope: the NEON **three-same** leaves -- float three-same, and the integer
+/// three-same forms behind [`encode_neon_three_same`], [`encode_neon_add_sub`],
+/// [`encode_neon_logical`], [`encode_neon_bic`], [`encode_neon_bsl`],
+/// [`encode_neon_mul`], [`encode_neon_bitwise_insert`], [`encode_neon_zip_uzp`],
+/// [`encode_neon_pmul`], [`encode_neon_mla`] and [`encode_neon_mls`].  Those are
+/// exactly the forms whose encoding carries *one* `size`/`Q` triple shared by all
+/// three register operands, so a differing arrangement is not a variant with a
+/// different word: it has no word.  The families deliberately left alone are the
+/// ones that legitimately widen or narrow (`pmull`/`pmull2`, `saddl` and the rest
+/// of three-different, `ld*`/`st*` multi-register, and every indexed form -- the
+/// dispatcher sends `v2.s[1]` to [`encode_neon_elem`] before any leaf here sees
+/// it).  `three_same_leaves_all_agree_check` enumerates the set mechanically and
+/// fails if a new leaf with this shape dodges the check.
 pub(crate) fn neon_shapes_agree(operands: &[Operand], n: usize, mn: &str) -> Result<(), String> {
     let mut want: Option<String> = None;
     for (idx, op) in operands.iter().take(n).enumerate() {
@@ -3458,6 +3507,9 @@ pub(crate) fn encode_neon_bitwise_insert(
     let (rd, arr_d) = get_neon_reg(operands, 0)?;
     let (rn, _) = get_neon_reg(operands, 1)?;
     let (rm, _) = get_neon_reg(operands, 2)?;
+    // Three-same shape law: see [`neon_shapes_agree`].  One `size`/`Q` for all
+    // three operands, so the shapes below cannot disagree.
+    neon_shapes_agree(operands, 3, "bit/bif")?;
     let q: u32 = if arr_d == "16b" { 1 } else { 0 };
     let word = (q << 30)
         | (1 << 29)

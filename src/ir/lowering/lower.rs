@@ -1247,13 +1247,17 @@ impl Lowerer {
                 Vec::new()
             };
 
-        // Collect parameter types, with K&R default argument promotions.
-        // Use sema's param CTypes when available to avoid re-computing from AST.
+        // A K&R definition needs the declared body types before default
+        // promotions. A prototype declaration instead needs its callable
+        // types: reusing the body's `float` for a later `f(double)` silently
+        // changed the call ABI back to F32 while the body still received F64.
         let sema_param_ctypes = self.sema_functions.get(name).map(|fi| {
-            fi.params
-                .iter()
-                .map(|(ct, _)| ct.clone())
-                .collect::<Vec<_>>()
+            let params = if is_kr {
+                &fi.params
+            } else {
+                fi.prototype.as_ref().map_or(&fi.params, |ft| &ft.params)
+            };
+            params.iter().map(|(ct, _)| ct.clone()).collect::<Vec<_>>()
         });
 
         let param_tys: Vec<IrType> = params

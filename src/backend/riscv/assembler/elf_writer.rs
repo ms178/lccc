@@ -557,9 +557,33 @@ impl ElfWriter {
         // only the shared writer has. Short-cutting made `.byte 1;
         // .p2align 0,,3` emit no padding where GNU as 2.47 pads to 4.
         let offset_before = self.base.current_offset();
-        // `align_to_capped_ex` owns the whole GAS law (explicit fill, the cap
-        // that skips the directive outright, the target's NOP floor) and
-        // returns the bytes it inserted... or none, if it skipped.
+        // Which cap applies is a property of the SECTION, not of the mnemonic.
+        // GAS's `s_align` calls `md_do_align`, and the RISC-V hook fires only
+        // for a code section with no fill operand (`fill == NULL && len == 0`);
+        // there it hands the exponent to `riscv_frag_align_code (int n)`, which
+        // has no `max` argument at all, so the cap is dropped. Every other
+        // combination -- `.data`, or `.text` *with* an explicit fill byte, which
+        // routes into the generic `frag_align (n, *fill, max)` -- compares the
+        // cap against the padding in BYTES and skips the whole directive when
+        // the padding would exceed it. All eight combinations measured on
+        // as 2.47.20260726 riscv64:
+        //   .text  .p2align 4,,2   -> 15 pad bytes (cap ignored)
+        //   .text  .p2align 4,0x13,2  -> no pad   (fill routes around the hook)
+        //   .text  .p2align 4,0x13,99 -> 15 x 0x13
+        //   .data  .p2align 4,,2   -> no pad
+        //   .data  .p2align 4,,15  -> 15 zero bytes   (15 <= 15)
+        //   .data  .p2align 4,,14  -> no pad
+        //   .data  .p2align 4,,-1  -> 15 zero bytes (GAS warns, treats as 0)
+        //   .text  .balign 8,,4    -> 7 pad bytes; in .data -> no pad
+        // `align_to_capped_ex` implements the generic half (and `max <= 0` is
+        // unlimited, as in GAS); the hook half is the `code_no_fill` test below.
+        let code_no_fill = fill.is_none()
+            && self
+                .base
+                .sections
+                .get(&self.base.current_section)
+                .map_or(true, |s| s.sh_flags & SHF_EXECINSTR != 0);
+        let max_pad = if code_no_fill { None } else { max_pad };
         self.base.align_to_capped_ex(align_bytes, max_pad, fill)?;
         let offset_after = self.base.current_offset();
         let padding = offset_after - offset_before;
@@ -757,8 +781,12 @@ impl ElfWriter {
                 Ok(())
             }
 
-            Directive::Balign { bytes, fill } => {
-                self.emit_align_with_reloc(*bytes, *fill, None)?;
+            Directive::Balign {
+                bytes,
+                fill,
+                max_pad,
+            } => {
+                self.emit_align_with_reloc(*bytes, *fill, *max_pad)?;
                 Ok(())
             }
 
@@ -2025,6 +2053,15 @@ mod padding_law_tests {
         w.base.sections[".text"].data.clone()
     }
 
+    /// Same, for a named section: the cap law is section-conditional, so a
+    /// `.data` pin cannot go through a helper hard-wired to `.text`.
+    fn section(name: &str, asm: &str) -> Vec<u8> {
+        let statements = parse_asm(asm).expect("must parse");
+        let mut w = ElfWriter::new();
+        w.process_statements(&statements).expect("must assemble");
+        w.base.sections[name].data.clone()
+    }
+
     const NOP: [u8; 4] = [0x13, 0x00, 0x00, 0x00];
     const C_NOP: [u8; 2] = [0x01, 0x00];
     const DATA: [u8; 5] = [0xa5; 5];
@@ -2080,8 +2117,12 @@ mod padding_law_tests {
     }
 
     /// The `fill` operand was parsed and thrown away by this backend, so
-    /// `.p2align 4, 0xff` assembled as NOPs and `.p2align 4,,3` padded where
-    /// the cap says to skip — both moving every address after the directive
+    /// `.p2align 4, 0xff` assembled as NOPs instead of the asked-for byte,
+    /// moving every address after the directive once the fill made the run a
+    /// different length in a data section.  (`.p2align 4,,3` in `.text` is *not*
+    /// such a case: the RISC-V code hook ignores the cap, so padding is correct
+    /// there -- see `cap_applies_outside_a_code_section`.  The sentence used to
+    /// claim the opposite, which is how a wrong belief survives a green test.)
     /// away from the oracle's. The fill now reaches the writer (measured on
     /// as 2.47: an explicit fill byte replaces the NOP vocabulary completely,
     /// in `.text` as in `.data`).
@@ -2105,8 +2146,9 @@ mod padding_law_tests {
         let got = text(".byte 0xa5\n.p2align 1, 0xff\n");
         assert_eq!(got.len(), 4, "raised to the 4-byte code floor like GAS");
         assert_eq!(&got[1..], &[0xff, 0xff, 0xff], "fill byte throughout");
-        // `.balign` shares the grammar; GAS's balign_directive has a fill slot
-        // and no cap slot at all (measured: `.balign 8,,2` still pads).
+        // `.balign` shares the grammar, including the cap slot -- which is live
+        // outside a code section (see `cap_applies_outside_a_code_section`; in
+        // `.text` the hook ignores it, so `.balign 8,,2` still pads).
         let got = text(".byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.balign 8, 0xff\n");
         assert_eq!(got, [vec![0xa5; 3], vec![0xff; 5]].concat());
     }
@@ -2114,9 +2156,10 @@ mod padding_law_tests {
     /// RISC-V has no padding cap: `riscv_frag_align_code (int n)` receives the
     /// alignment alone, and the generic fall-back it shares with `.balign`
     /// never reads the operand. Measured identical for every cap in
-    /// {0,1,2,3,4,5,8,11,12,20,40,2048,2049} — so the operand is validated and
-    /// dropped, and a `.p2align` that GAS pads, LCCC pads too. (aarch64 is the
-    /// target where the cap really skips: see the ARM writer's tests.)
+    /// {0,1,2,3,4,5,8,11,12,20,40,2048,2049} — but only because the default
+    /// section is code and no fill was given, which is the one combination where
+    /// GAS's hook declines to look at the cap. (aarch64 is the target where the
+    /// cap skips everywhere: see the ARM writer's tests.)
     #[test]
     fn padding_cap_is_validated_then_dropped_as_on_gas() {
         let plain = text(".byte 0xa5\n.p2align 4\n");
@@ -2131,8 +2174,77 @@ mod padding_law_tests {
         assert!(parse_asm(".byte 0xa5\n.p2align 4, junk\n").is_err());
         assert!(parse_asm(".byte 0xa5\n.p2align 4,, 2, 9\n").is_err());
         assert!(
-            parse_asm(".byte 0xa5\n.balign 8,, junk\n").is_ok(),
-            "GAS never reads .balign's cap slot, so a bad one is not an error"
+            parse_asm(".byte 0xa5\n.balign 8,, junk\n").is_err(),
+            "GAS parses .balign's cap slot with get_absolute_expression() before
+             any section logic runs, so a non-integer one is an assembler error"
+        );
+    }
+
+    /// The half of the law a parser test cannot see, and the reason the cap must
+    /// survive parsing: which operand applies depends on the section the
+    /// directive sits in.  Every row is the byte string GNU as 2.47.20260726
+    /// (`riscv64-linux-gnu-as`, the prefix `scripts/ensure_gas_247.sh`
+    /// provisions) put in the section, read back with `objdump -s`; the last
+    /// three are the cases where this backend used to disagree, in both
+    /// directions: it ignored the cap everywhere (so `.data` padded where GAS
+    /// does not) and, before the fill operand reached the writer at all, it had
+    /// no way to express `.text` padding that a cap cancels.
+    #[test]
+    fn cap_applies_outside_a_code_section() {
+        // `.text`, no fill operand: riscv_frag_align_code(n) never sees `max`.
+        let plain = text(".text\n.byte 1\n.p2align 4\n.byte 2\n");
+        for cap in ["2", "0", "14", "99"] {
+            assert_eq!(
+                text(&format!(".text\n.byte 1\n.p2align 4,,{cap}\n.byte 2\n")),
+                plain,
+                "a cap must not change `.text` padding (max={cap})"
+            );
+        }
+        assert_eq!(plain.len(), 17, "01 then 15 pad bytes then 02");
+        // `.data`: the generic frag_align, cap in BYTES against the pad needed.
+        let d = |align: &str| {
+            section(
+                ".data",
+                &format!(".data\n.byte 1\n.p2align {align}\n.byte 2\n"),
+            )
+        };
+        assert_eq!(
+            d("4,,2"),
+            vec![0x01, 0x02],
+            "15 > 2: the directive is skipped"
+        );
+        assert_eq!(d("4,,14"), vec![0x01, 0x02], "15 > 14: skipped");
+        assert_eq!(
+            d("4,,15"),
+            [vec![0x01], vec![0x00; 15], vec![0x02]].concat(),
+            "15 <= 15: pad, and in `.data` the default fill is zero, not NOP"
+        );
+        assert_eq!(
+            d("4,,0"),
+            [vec![0x01], vec![0x00; 15], vec![0x02]].concat(),
+            "`0` means unlimited, exactly as GAS's `if (max && ...)` reads"
+        );
+        // A fill byte routes `.text` around the hook, so the cap is live there.
+        assert_eq!(
+            text(".text\n.byte 1\n.p2align 4,0x13,2\n.byte 2\n"),
+            vec![0x01, 0x02],
+            "fill given -> generic frag_align -> 15 > 2 -> skipped"
+        );
+        assert_eq!(
+            text(".text\n.byte 1\n.p2align 4,0x13,99\n.byte 2\n"),
+            [vec![0x01], vec![0x13; 15], vec![0x02]].concat(),
+            "and padded with the asked-for byte when the cap allows it"
+        );
+        // `.balign` obeys the same rule in both directions.
+        assert_eq!(
+            section(".data", ".data\n.byte 1\n.balign 8,,4\n.byte 2\n"),
+            vec![0x01, 0x02],
+            "7 > 4 in `.data`: skipped, where `.text` pads"
+        );
+        assert_eq!(
+            text(".text\n.byte 1\n.balign 8,,4\n.byte 2\n").len(),
+            9,
+            "the same cap in `.text` pads 7 bytes"
         );
     }
 }

@@ -4,127 +4,45 @@
 //! epilogue detection, and instruction analysis that multiple passes need.
 
 use super::super::types::*;
+// The data/benign classification of an assembler directive is a law for BOTH
+// x86 and i686, so it lives in `peephole_common`; `steps_over_line` below is the
+// x86 line-model wrapper around it (i686 has its own `LineInfo` and calls the
+// shared predicate directly).
+pub(super) use crate::backend::peephole_common::{
+    alignment_fill_is_explicit, directive_emits_data,
+};
+
+/// The single law for stepping over a line while a pass reasons about flags,
+/// register liveness or memory: a `nop`, or a directive that emits **no data**.
+///
+/// Every walker in this directory used to write its own
+/// `is_nop() || kind == LineKind::Directive` test, which silently asserted that
+/// no directive can matter.  `directive_emits_data` says otherwise: a `.byte`
+/// in a function body is arbitrary machine code (`.byte 0xf5` is `cmc`,
+/// `.byte 0xb8` is `mov $imm32,%eax`), so a fold that steps over it can move a
+/// flag write across a hidden flag read, delete a store a hidden instruction
+/// reads, or narrow a `movsq` across a hidden wide read.  The hazard is the
+/// integrated assembler's, not lccc's own codegen: text spliced from `__asm__`
+/// is already opaque to every pass (`pin_inline_asm_regions` pins it with all
+/// registers live and indirect memory clobbered), but a `.s` file handed to
+/// `lccc` directly is not.
+///
+/// A data-emitting directive is therefore NOT steppable.  A walk that is
+/// *searching* for a property (register liveness, a preheader store, the
+/// frame-pointer shape) must additionally stop at one: falling through a line
+/// no classifier knows is not a conservative answer, it is an unclassified one,
+/// so those sites refuse the fold outright rather than `continue`.
+/// `check_peephole_directive_step.py` fails the build if a pass re-introduces
+/// the bare skip test.
+#[inline]
+pub(super) fn steps_over_line(info: &LineInfo, text: &str) -> bool {
+    if info.is_nop() {
+        return true;
+    }
+    info.kind == LineKind::Directive && !directive_emits_data(text)
+}
 
 // ── Register helpers ─────────────────────────────────────────────────────────
-
-/// Directives that emit DATA -- bytes into the section being assembled.
-///
-/// A `.byte`/`.long`/`.quad` sequence inside a function body can encode any
-/// instruction -- `adc`, `clc`, a branch, `int3` -- that the textual predicates
-/// above cannot see, exactly like inline asm, so a walker must not step over it
-/// as if it had no effect.  The question this answers is deliberately narrow:
-/// **can this line put bytes into the current section, or change what the lines
-/// around it mean?**  A directive is benign only if it does neither:
-///
-/// * it emits nothing into the current section.  `.cfi_*` writes `.eh_frame`,
-///   `.loc`/`.file` write the line tables, `.globl`/`.type`/`.size` are symbol
-///   bookkeeping, `.comm`/`.lcomm` reserve space in `.bss` rather than here,
-///   `.ident` goes to `.comment`; and
-/// * it does not change how neighbouring lines are assembled.  `.code16`,
-///   `.code32`, `.arch`, `.intel_syntax`, `.att_syntax` re-interpret every
-///   following instruction, and `.text`, `.data`, `.section .rodata`,
-///   `.pushsection`, `.previous` move the *following* lines out of the section
-///   this window was parsed in.  None of them emits a byte here, yet each makes
-///   "the contiguous run of code I analysed" false, which is the assumption
-///   every caller of this predicate rests on.  (`engineering/evidence/
-///   2026-10-08-pr-audit/directive-census.txt` counts `.section` 68 times in
-///   function bodies -- jump-table islands in `.rodata` -- so this is not a
-///   hypothetical shape.)
-///
-/// Anything the classification does not name is data, because "unrecognized" is
-/// not "harmless".  That is also why `.zero`, `.skip`, `.space` and `.fill` are
-/// *not* benign: all four emit bytes, the first three zeros, and `0x00 0x00`
-/// decodes as `add %al,(%rax)` -- a flag writer -- while
-/// `.fill 1,1,0xF8` is a bare `clc`.  Their reach inside function bodies is
-/// measured at 0 across the 106-source corpora, so the caution refuses no fold
-/// this compiler has ever wanted to make.
-///
-/// The alignment family needs a rule rather than a verdict: in a text section
-/// `.p2align 4` fills with nops (harmless), but the fill byte is the
-/// programmer's choice -- `.p2align 4,0xf8` fills with `clc` and
-/// `.p2align 4,0xcc` with `int3`, both of which a flag or control-flow walk must
-/// not step over.  So an explicit fill operand makes an alignment directive data
-/// (`alignment_fill_is_explicit`), while `.p2align 4,,10` -- empty fill, `max`
-/// only -- stays benign.
-pub(super) fn directive_emits_data(text: &str) -> bool {
-    let trimmed = text.trim();
-    let Some(rest) = trimmed.strip_prefix('.') else {
-        return false;
-    };
-    // A local label like `.Ltmp3:` is dotted but not a directive: it emits no
-    // bytes and is not what this predicate is for.  Callers select on
-    // `LineKind::Directive` first (labels are a barrier of their own there), so
-    // this only matters to a caller that hands the classifier raw text -- which
-    // is precisely how a "directive" predicate gets reused by a census script or
-    // a new pass, and an answer of "data" for a label would be silently wrong.
-    if trimmed.ends_with(':') {
-        return false;
-    }
-    let name = rest
-        .split(|c: char| c.is_whitespace() || c == ',')
-        .next()
-        .unwrap_or("");
-    let args = &rest[name.len()..];
-    // CFI never touches the section being assembled.  Prefix-matched on
-    // purpose: the previous version enumerated fifteen `.cfi_*` names, which
-    // silently classified the unlisted `.cfi_adjust_cfa_offset` -- the one in
-    // every prologue -- as data.  That cost no folds (census: 0 in bodies) but
-    // the enumeration was wrong in the over-conservative direction, and a
-    // classifier that is wrong in either direction gets trusted in the other.
-    if name.starts_with("cfi_") {
-        return false;
-    }
-    if matches!(
-        name,
-        "p2align" | "p2alignw" | "p2alignl" | "align" | "balign" | "balignw" | "balignl"
-    ) {
-        return alignment_fill_is_explicit(args);
-    }
-    if matches!(
-        name,
-        // Positional/debug/symbol bookkeeping: no bytes here, no re-reading of
-        // what follows.  Deliberately *no* `.text`/`.data`/`.section` family and
-        // no `.arch`/`.code*`/`._syntax` members -- see the doc comment.
-        // `.end` is absent too: it closes `.macro`/`.if` blocks whose *opener*
-        // is already unrecognised (hence data), and a verdict that is only right
-        // because of what some other line does is not a verdict.
-        "loc"
-            | "file"
-            | "ident"
-            | "globl"
-            | "global"
-            | "weak"
-            | "local"
-            | "type"
-            | "size"
-            | "set"
-            | "equ"
-            | "comm"
-            | "lcomm"
-    ) {
-        return false;
-    }
-    // `.byte`, `.2byte`/`.word`, `.4byte`/`.long`, `.8byte`/`.quad`, `.value`,
-    // `.inst`, `.insn`, `.ascii`, `.asciz`, `.string`, `.uleb128`, `.sleb128`,
-    // `.float`, `.double`, `.zero`, `.skip`, `.space`, `.fill`, `.if`/`.else`,
-    // `.macro`/`.rept`/`.irp` blocks, section and mode switches -- and
-    // anything unrecognized.
-    true
-}
-
-/// True when an alignment directive names its own fill byte.
-///
-/// `args` is everything after the directive name: GAS takes
-/// `.p2align <align>[, <fill>[, <max>]]`, so the second comma-separated field
-/// is the fill -- present and non-empty means the padding is arbitrary data,
-/// present and *empty* (`.p2align 4,,10`) means the default nops/zeros.  Fields
-/// are split on commas, not on a whitespace-or-comma class, because ", " and
-/// ",," must not look alike to a fill test.
-pub(super) fn alignment_fill_is_explicit(args: &str) -> bool {
-    let mut fields = args.split(',');
-    let _ = fields.next(); // <align>
-    matches!(fields.next(), Some(fill) if !fill.trim().is_empty())
-}
 
 /// Check if a register ID refers to a valid general-purpose register (0..=15).
 #[inline]
@@ -1029,6 +947,85 @@ mod register_rewrite_tests {
         let input = "movq %rax, %rbx # café";
         assert_eq!(replace_reg_name_exact(input, "", "%rcx"), input);
         assert_eq!(replace_reg_name_exact(input, "%rax", "%rax"), input);
+    }
+
+    /// The step law, in both directions and at the line-model level: a walker
+    /// may step over a `nop` and over bookkeeping, never over data.  Pinning
+    /// this here (rather than only at the classifiers) is what keeps the 48
+    /// converted `is_nop() || kind == LineKind::Directive` sites honest: the
+    /// whole list of "things a fold is allowed to ignore" is these two loops.
+    #[test]
+    fn steps_over_line_admits_bookkeeping_and_nops_but_never_data() {
+        let steps = |t: &str| super::steps_over_line(&classify_line(t), t);
+        // Steppable: position, no bytes, no change of meaning.
+        for t in [
+            "    .cfi_adjust_cfa_offset 16",
+            "    .cfi_escape 0x2a",
+            "    .loc 1 42 7",
+            "    .file 1 \"x.c\"",
+            "    .size f, .-f",
+            "    .globl f",
+            "    .type f,@function",
+            "    .p2align 4",
+            "    .p2align 4,,10",
+            "    .align 16",
+            "    .balign 8,,64",
+        ] {
+            assert!(steps(t), "{t:?} must be steppable");
+        }
+        // Not steppable: bytes into the section, or a change of what the
+        // neighbouring lines mean.
+        for t in [
+            "    .byte 0xf5",
+            "    .byte 0xb8,0x00,0x00,0x00,0x00",
+            "    .long .LBB33 - .Ljt_0",
+            "    .quad 0",
+            "    .zero 16",
+            "    .space 8,0x90",
+            "    .ascii \"x\"",
+            "    .incbin \"blob\"",
+            "    .inst.n 0xbf00",
+            "    .p2align 4,0xf8",
+            "    .p2align 4,0xcc",
+            "    .p2align 4,0xf8,10",
+            "    .fill 8,1,0x90",
+            "    .text",
+            "    .code32",
+            "    .if 0",
+            "    .rept 4",
+            "    .totally_new_directive 1",
+        ] {
+            assert!(!steps(t), "{t:?} must not be stepped over");
+        }
+        // Tab indentation is not a directive at all to this line model:
+        // `compute_trim_offset` skips only spaces -- the emitter's own
+        // indentation -- so a tab-led line arrives as `Other`.  That is the
+        // conservative answer for a fold (`Other` is not steppable), and the
+        // reason a tab-indented `.s` gets no peepholes whatsoever; pinned here so
+        // nobody "fixes" the directive law by teaching it tabs and thereby
+        // makes a tab-indented `.byte` look benign.
+        // A 4th operand is not data, it is an assembler *error*: GAS reads
+        // `.p2align abs[,fill[,max-log]]`, so in `.p2align 4,,10,0xcc` the fill
+        // field is empty (default nops) and `0xcc` sits in no field at all.
+        // `parse_align_tail` refuses it (TooMany) long before a walker sees it;
+        // classifying it "benign" here is therefore right, and pinning that
+        // keeps the two layers from disagreeing about who owns the case.
+        assert!(
+            steps("    .p2align 4,,10,0xcc"),
+            "a 4-operand tail is the PARSER's rejection; the step law must not
+             invent a second, different verdict for it"
+        );
+        for t in ["\t.byte 0xf5", "\t.cfi_startproc", "\t.p2align 4"] {
+            assert!(!steps(t), "{t:?} is not a classified directive");
+        }
+        // A pass-marked nop is steppable even though its text is empty-ish:
+        // that is what `is_nop()` is for.
+        let mut marked = classify_line("    addl $1, %ecx");
+        mark_nop(&mut marked);
+        assert!(
+            super::steps_over_line(&marked, "    nop"),
+            "a marked nop must be steppable"
+        );
     }
 }
 

@@ -18,21 +18,23 @@
 # GitHub CI runs the slow gates on every PR, so a full local run is not required.
 #
 #   ./scripts/ci_local.sh              # everything (test + bench + clippy)
-#   ./scripts/ci_local.sh --fast       # skip ONLY the three slow gates:
+#   ./scripts/ci_local.sh --fast       # skip ONLY the five slow gates:
+#                                      #   cargo-test-debug-assertions,
 #                                      #   regression-corpus-ssa,
 #                                      #   benchmark-output-oracle,
-#                                      #   peephole-whitespace-invariance
+#                                      #   peephole-whitespace-invariance,
+#                                      #   regression-corpus-debug-assertions
 #                                      # rustfmt and clippy ALWAYS run — they
 #                                      # are the CI lint jobs, and skipping
 #                                      # them locally is how a red PR ships.
-#   ./scripts/ci_local.sh --slow       # ONLY the three slow gates (plus the
+#   ./scripts/ci_local.sh --slow       # ONLY the five slow gates (plus the
 #                                      # build).  If a --fast stamp for the SAME
 #                                      # tree exists, a green --slow run upgrades
 #                                      # it to mode=full: fast + slow on one tree
 #                                      # is every gate GitHub runs.
 #   ./scripts/ci_local.sh --only NAME  # a single gate, substring match
 #
-# A --fast pass is NOT CI-equivalent: GitHub runs all three slow gates on every
+# A --fast pass is NOT CI-equivalent: GitHub runs all five slow gates on every
 # PR.  PR #638 went red on check_peephole_whitespace.sh after a green
 # --fast run, because the snapshot gate accepted a fast stamp.  lccc-snapshot.sh
 # accepts a mode=fast stamp as its gate (owner decision: GitHub CI runs the
@@ -192,6 +194,14 @@ gate "fp-extract-homes" fast \
     env CCC="$LCCC" bash tests/regression/check_fp_extract_homes.sh
 gate "va-arg-pack-len" fast \
     env CCC="$LCCC" bash tests/regression/check_va_arg_pack_len.sh
+
+# Same-compiler agreement cannot prove an ABI. Check both directions against
+# GCC, including regparm/fastcall/varargs and zero-size holes, on m64 and m32.
+gate "empty-aggregate-abi" fast \
+    env CCC="$LCCC" bash tests/regression/check_empty_aggregate_abi.sh
+
+gate "aggregate-call-abi" fast \
+    env CCC="$LCCC" bash tests/regression/check_aggregate_call_abi.sh
 
 # The unit-test gate is what GitHub's required check runs on every PR, so it
 # belongs in the fast set: a red PR has to be reproducible with --fast.
@@ -578,6 +588,14 @@ gate "phi-acyclic-copy-order" fast \
 
 gate "doc-link-integrity" fast \
     python3 scripts/check_doc_links.py
+
+# A peephole walker may step over a `nop`, or over a directive that emits no
+# data -- never over a bare `.byte`, which is machine code no mnemonic table can
+# see.  48 of these skips existed in the two backends; the law now has one home
+# (peephole_common::directive_emits_data) and this gate fails the build when a
+# pass hand-rolls the old `is_nop() || kind == Directive` test again.
+gate "peephole-directive-step" fast \
+    python3 scripts/check_peephole_directive_step.py
 
 # Needs PyYAML (python3-yaml on Debian/Ubuntu). This gate is the FIRST
 # local consumer: on a box without it the checker fails cleanly (no

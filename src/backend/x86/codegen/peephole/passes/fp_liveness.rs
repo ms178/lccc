@@ -689,7 +689,9 @@ fn call_xmm_reads(store: &LineStore, infos: &[LineInfo], start: usize, n: usize)
     let mut census: Option<u64> = None;
     while k > start && steps < 8 {
         k -= 1;
-        if infos[k].is_nop() || matches!(infos[k].kind, LineKind::Directive | LineKind::Empty) {
+        if infos[k].kind == LineKind::Empty
+            || super::helpers::steps_over_line(&infos[k], infos[k].trimmed(store.get(k)))
+        {
             continue;
         }
         if infos[k].is_barrier() {
@@ -749,7 +751,9 @@ fn call_xmm_reads(store: &LineStore, infos: &[LineInfo], start: usize, n: usize)
     let mut steps = 0;
     while k > start && steps < 24 {
         k -= 1;
-        if infos[k].is_nop() || matches!(infos[k].kind, LineKind::Directive | LineKind::Empty) {
+        if infos[k].kind == LineKind::Empty
+            || super::helpers::steps_over_line(&infos[k], infos[k].trimmed(store.get(k)))
+        {
             continue;
         }
         // Register-file-transparent lines are checked BEFORE the barrier
@@ -879,7 +883,7 @@ fn ret_xmm_reads(store: &LineStore, infos: &[LineInfo], start: usize, end: usize
         let mut k = n;
         while k > start {
             k -= 1;
-            if infos[k].is_nop() || infos[k].kind == LineKind::Directive {
+            if super::helpers::steps_over_line(&infos[k], infos[k].trimmed(store.get(k))) {
                 continue;
             }
             if matches!(
@@ -1005,7 +1009,7 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
             let mut k = n;
             let mut epilogue = false;
             while k < end {
-                if infos[k].is_nop() || matches!(infos[k].kind, LineKind::Directive) {
+                if super::helpers::steps_over_line(&infos[k], infos[k].trimmed(store.get(k))) {
                     k += 1;
                     continue;
                 }
@@ -1075,7 +1079,9 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
     };
     let mut lines: Vec<usize> = Vec::with_capacity(n_lines);
     for n in start..end {
-        if infos[n].is_nop() || matches!(infos[n].kind, LineKind::Directive | LineKind::Empty) {
+        if infos[n].kind == LineKind::Empty
+            || super::helpers::steps_over_line(&infos[n], infos[n].trimmed(store.get(n)))
+        {
             continue;
         }
         lines.push(n);

@@ -498,9 +498,12 @@ pub(super) fn flags_dead_after(store: &LineStore, infos: &[LineInfo], from: usiz
             n += 1;
             continue;
         }
-        // Assembler directives (.cfi_*, .p2align, .size) emit no flag-touching
-        // instruction; alignment padding is `nop`.
-        if infos[n].kind == LineKind::Directive {
+        // `.cfi_*`, `.loc`, `.size` and fill-less alignment emit no flag-touching
+        // instruction (their padding is `nop`), so they are a position.  A DATA
+        // directive is not: `.byte 0xf5` is `cmc`.  It is deliberately left to
+        // the classifier below, which answers `Reads` for text it cannot
+        // identify and therefore reports the flags live (see `steps_over_line`).
+        if super::helpers::steps_over_line(&infos[n], infos[n].trimmed(store.get(n))) {
             n += 1;
             continue;
         }
@@ -1627,7 +1630,7 @@ pub(super) fn eliminate_redundant_self_test(store: &LineStore, infos: &mut [Line
         let mut producer = None;
         while k > 0 {
             k -= 1;
-            if infos[k].is_nop() || infos[k].kind == LineKind::Directive {
+            if super::helpers::steps_over_line(&infos[k], infos[k].trimmed(store.get(k))) {
                 continue;
             }
             if infos[k].pinned || infos[k].is_barrier() {
@@ -1665,7 +1668,7 @@ pub(super) fn eliminate_redundant_self_test(store: &LineStore, infos: &mut [Line
         // already guarantees this run is a straight-line window with no other
         // entry point onto the test.)
         for n in pidx + 1..j {
-            if infos[n].is_nop() || infos[n].kind == LineKind::Directive {
+            if super::helpers::steps_over_line(&infos[n], infos[n].trimmed(store.get(n))) {
                 continue;
             }
             let tn = infos[n].trimmed(store.get(n));
@@ -1739,7 +1742,7 @@ fn flags_are_block_local(
 ) -> bool {
     let mut written = false;
     for n in fstart..fend {
-        if infos[n].is_nop() || infos[n].kind == LineKind::Directive {
+        if super::helpers::steps_over_line(&infos[n], infos[n].trimmed(store.get(n))) {
             continue;
         }
         if infos[n].kind == LineKind::Label {
@@ -2326,7 +2329,7 @@ pub(super) fn narrow_dead_sign_extension(store: &mut LineStore, infos: &mut [Lin
         let mut ok = false;
         let mut j = i + 1;
         while j < len {
-            if infos[j].is_nop() || infos[j].kind == LineKind::Directive {
+            if super::helpers::steps_over_line(&infos[j], infos[j].trimmed(store.get(j))) {
                 j += 1;
                 continue;
             }
@@ -2474,7 +2477,7 @@ pub(super) fn fold_redundant_flags_compare(store: &LineStore, infos: &mut [LineI
         // Walk forward over flag-preserving lines looking for the same compare.
         let mut k = j + 1;
         while k < len {
-            if infos[k].is_nop() || infos[k].kind == LineKind::Directive {
+            if super::helpers::steps_over_line(&infos[k], infos[k].trimmed(store.get(k))) {
                 k += 1;
                 continue;
             }
