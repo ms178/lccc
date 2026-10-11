@@ -33,6 +33,13 @@ pub(super) const EF_RISCV_FLOAT_ABI_QUAD: u32 = 0x6;
 /// RISC-V NOP instruction: `addi x0, x0, 0` = 0x00000013 in little-endian
 const RISCV_NOP: [u8; 4] = [0x13, 0x00, 0x00, 0x00];
 
+/// `c.nop` — the 2-byte RV32C/RV64C `addi` with both rs1 and rd zero. GAS
+/// `2.47` uses it inside alignment padding on an RVC march (`nop`, `c.nop`,
+/// then zeros, each at its own alignment), so filling the odd bytes with
+/// plain zeros instead is a byte-level divergence from the oracle, not only a
+/// cosmetic one.
+const RISCV_C_NOP: [u8; 2] = [0x01, 0x00];
+
 /// The ELF writer for RISC-V.
 ///
 /// Composes with `ElfWriterBase` for shared infrastructure and adds
@@ -491,7 +498,15 @@ fn rewrite_numeric_refs_in_directive(
 impl ElfWriter {
     pub fn new() -> Self {
         Self {
-            base: ElfWriterBase::new(RISCV_NOP, 2),
+            // The padding vocabulary follows the target, not the march: measured
+            // on GNU as 2.47, `-march=rv64im` pads `.p2align` exactly like
+            // `rv64gc` — including the 2-byte `c.nop` — because the fill lands
+            // where control flow never goes and GAS therefore does not gate it
+            // on RVC. Coupling it to `EF_RISCV_RVC` instead was a guess that
+            // the oracle disproves.
+            base: ElfWriterBase::new(RISCV_NOP, 2)
+                .with_small_nop(RISCV_C_NOP)
+                .with_code_align_floor(4),
             pending_branch_relocs: Vec::new(),
             pcrel_hi_counter: 0,
             numeric_labels: FxHashMap::default(),
@@ -504,6 +519,7 @@ impl ElfWriter {
     }
 
     /// Set the ELF e_flags (e.g., to change float ABI from the default double-float).
+    ///
     pub fn set_elf_flags(&mut self, flags: u32) {
         self.elf_flags = flags;
     }
@@ -529,12 +545,22 @@ impl ElfWriter {
     /// sections (when relaxation is enabled). The linker needs these to know
     /// where alignment padding exists so it can re-align after relaxation
     /// changes code sizes.
-    fn emit_align_with_reloc(&mut self, align_bytes: u64) -> Result<(), String> {
-        if align_bytes <= 1 {
-            return Ok(());
-        }
+    fn emit_align_with_reloc(
+        &mut self,
+        align_bytes: u64,
+        fill: Option<u8>,
+        max_pad: Option<u64>,
+    ) -> Result<(), String> {
+        // No `align_bytes <= 1` short cut here: a RISC-V *code* section raises a
+        // sub-instruction alignment to the instruction size before deciding it
+        // has nothing to do, and that decision needs the section's flags, which
+        // only the shared writer has. Short-cutting made `.byte 1;
+        // .p2align 0,,3` emit no padding where GNU as 2.47 pads to 4.
         let offset_before = self.base.current_offset();
-        self.base.align_to(align_bytes)?;
+        // `align_to_capped_ex` owns the whole GAS law (explicit fill, the cap
+        // that skips the directive outright, the target's NOP floor) and
+        // returns the bytes it inserted... or none, if it skipped.
+        self.base.align_to_capped_ex(align_bytes, max_pad, fill)?;
         let offset_after = self.base.current_offset();
         let padding = offset_after - offset_before;
         if padding > 0 && !self.no_relax {
@@ -726,16 +752,13 @@ impl ElfWriter {
                 Ok(())
             }
 
-            Directive::Align(val) => {
-                // RISC-V .align N means 2^N bytes (same as .p2align);
-                // the parser clamps N to 63 (GAS), so the shift is safe.
-                let bytes = 1u64 << val;
-                self.emit_align_with_reloc(bytes)?;
+            Directive::Align { bytes, tail } => {
+                self.emit_align_with_reloc(*bytes, tail.fill, tail.max_pad)?;
                 Ok(())
             }
 
-            Directive::Balign(val) => {
-                self.emit_align_with_reloc(*val)?;
+            Directive::Balign { bytes, fill } => {
+                self.emit_align_with_reloc(*bytes, *fill, None)?;
                 Ok(())
             }
 
@@ -1987,5 +2010,129 @@ mod branch_range_tests {
                 "`{asm}` was rejected but without a diagnostic"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod padding_law_tests {
+    use super::super::parser::parse_asm;
+    use super::*;
+
+    fn text(asm: &str) -> Vec<u8> {
+        let statements = parse_asm(asm).expect("must parse");
+        let mut w = ElfWriter::new();
+        w.process_statements(&statements).expect("must assemble");
+        w.base.sections[".text"].data.clone()
+    }
+
+    const NOP: [u8; 4] = [0x13, 0x00, 0x00, 0x00];
+    const C_NOP: [u8; 2] = [0x01, 0x00];
+    const DATA: [u8; 5] = [0xa5; 5];
+
+    /// The pad content is GNU as 2.47's `riscv_make_nops` (tc-riscv.c:5410),
+    /// measured on the oracle: a run of `p` bytes takes one zero byte when `p`
+    /// is odd, then one `c.nop` when what remains is 2 mod 4, and 4-byte NOPs
+    /// for the rest — so every NOP sits where a hart could fetch it and the
+    /// run ends flush with the boundary. Before this law was shared with
+    /// aarch64 the writer emitted NOPs first and zeros last, putting a 4-byte
+    /// NOP at an odd offset.
+    #[test]
+    fn pad_is_zero_prefix_then_compressed_nop_then_nops() {
+        // Offset 5, `.p2align 3`: 3 bytes of pad = 00 | c.nop.
+        assert_eq!(
+            text(".byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.p2align 3\n"),
+            [DATA.as_slice(), &[0x00], &C_NOP].concat()
+        );
+        // Offset 5, `.p2align 4`: 11 bytes = 00 | c.nop | nop | nop.
+        assert_eq!(
+            text(".byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.p2align 4\n"),
+            [DATA.as_slice(), &[0x00], &C_NOP, &NOP, &NOP].concat()
+        );
+    }
+
+    /// The pad stops at the boundary. GAS does not stop there on RISC-V:
+    /// `riscv_frag_align_code` writes a worst-case `align - insn_alignment`
+    /// NOP run plus a `BFD_RELOC_RISCV_ALIGN` fixup and lets the linker relax
+    /// it (measured at offset 16: `.p2align 5` pads 48 bytes, two quanta more
+    /// than the 16 that reach the boundary). LCCC's linker takes
+    /// `R_RISCV_ALIGN` as a hint it skips, so the inflation would survive into
+    /// the image; padding to the boundary is what a relaxed link leaves. This
+    /// test is the pinned record of that deliberate difference.
+    #[test]
+    fn pad_reaches_the_boundary_and_stops_there() {
+        let got = text(".byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.p2align 5\n");
+        assert_eq!(got.len(), 5 + 27, "27 bytes of pad to the 32-byte boundary");
+        assert_eq!(
+            &got[5..6],
+            &[0x00][..],
+            "odd prefix first, exactly as riscv_make_nops"
+        );
+        assert_eq!(&got[6..8], &C_NOP[..], "then the one allowed c.nop");
+        assert!(
+            got[8..].chunks_exact(4).all(|c| c == NOP),
+            "the remaining 24 bytes are four full NOPs, ending flush at 32"
+        );
+        assert_eq!(
+            text(".byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.p2align 2\n").len(),
+            8,
+            "`.p2align 2` is at or below the instruction size: plain 3-byte pad"
+        );
+    }
+
+    /// The `fill` operand was parsed and thrown away by this backend, so
+    /// `.p2align 4, 0xff` assembled as NOPs and `.p2align 4,,3` padded where
+    /// the cap says to skip — both moving every address after the directive
+    /// away from the oracle's. The fill now reaches the writer (measured on
+    /// as 2.47: an explicit fill byte replaces the NOP vocabulary completely,
+    /// in `.text` as in `.data`).
+    #[test]
+    fn explicit_fill_byte_is_honoured_in_text() {
+        let got =
+            text(".byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.p2align 4, 0xff\n");
+        assert_eq!(got.len(), 16, "same size as the NOP fill");
+        assert!(
+            got[5..].iter().all(|&b| b == 0xff),
+            "11 bytes of 0xff, no NOPs: {got:02x?}"
+        );
+        // The corner LCCC does *not* chase: an explicit fill below the code
+        // alignment floor. `.byte 1; .p2align 1, 0xff` pads GAS `ff 01 00` —
+        // its mapping-state pre-align (`frag_align_code (rvc ? 1 : 2, 0)`,
+        // tc-riscv.c:5463) runs first, so the fill reaches only the byte that
+        // pre-align could not express as a NOP. LCCC fills all three with the
+        // asked-for byte at the same size, which is what the operand means to a
+        // reader of the source. Sizes agree, so no address after the directive
+        // moves; `scripts/gas_fill_census.py` counts these cells separately.
+        let got = text(".byte 0xa5\n.p2align 1, 0xff\n");
+        assert_eq!(got.len(), 4, "raised to the 4-byte code floor like GAS");
+        assert_eq!(&got[1..], &[0xff, 0xff, 0xff], "fill byte throughout");
+        // `.balign` shares the grammar; GAS's balign_directive has a fill slot
+        // and no cap slot at all (measured: `.balign 8,,2` still pads).
+        let got = text(".byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.balign 8, 0xff\n");
+        assert_eq!(got, [vec![0xa5; 3], vec![0xff; 5]].concat());
+    }
+
+    /// RISC-V has no padding cap: `riscv_frag_align_code (int n)` receives the
+    /// alignment alone, and the generic fall-back it shares with `.balign`
+    /// never reads the operand. Measured identical for every cap in
+    /// {0,1,2,3,4,5,8,11,12,20,40,2048,2049} — so the operand is validated and
+    /// dropped, and a `.p2align` that GAS pads, LCCC pads too. (aarch64 is the
+    /// target where the cap really skips: see the ARM writer's tests.)
+    #[test]
+    fn padding_cap_is_validated_then_dropped_as_on_gas() {
+        let plain = text(".byte 0xa5\n.p2align 4\n");
+        let capped = text(".byte 0xa5\n.p2align 4,, 3\n");
+        assert_eq!(
+            plain, capped,
+            "a cap GAS ignores must not change LCCC either"
+        );
+        assert_eq!(plain.len(), 16);
+        // A cap operand that is not an integer is still a syntax error, and so
+        // is a fourth operand — the tail grammar is the shared one.
+        assert!(parse_asm(".byte 0xa5\n.p2align 4, junk\n").is_err());
+        assert!(parse_asm(".byte 0xa5\n.p2align 4,, 2, 9\n").is_err());
+        assert!(
+            parse_asm(".byte 0xa5\n.balign 8,, junk\n").is_ok(),
+            "GAS never reads .balign's cap slot, so a bad one is not an error"
+        );
     }
 }

@@ -471,14 +471,33 @@ fn replace_vec_reads(t: &str, old: u8, new: u8) -> Option<String> {
 }
 
 /// Directives that cannot emit code, and so cannot break a bracket.
+///
+/// This is *not* the same question as
+/// [`super::helpers::directive_emits_data`]'s -- that one guards a flag window,
+/// this one guards a copy relation from being re-formed across a line that
+/// changes what the region means -- so the two sets legitimately differ (`.LFB`
+/// is harmless here and is not named there).  The overlap that does matter is
+/// the alignment family, and it now shares one rule: `.p2align 4` pads with
+/// nops, `.p2align 4,0xcc` pads with `int3`, and a trap in the middle of the
+/// region this predicate just certified as contiguous is exactly a broken
+/// bracket.  Hence the fill check rather than the prefix.
 fn benign_directive(t: &str) -> bool {
-    t.starts_with(".cfi_")
-        || t.starts_with(".p2align")
-        || t.starts_with(".align")
-        || t.starts_with(".balign")
+    let t = t.trim();
+    if t.starts_with(".cfi_")
         || t.starts_with(".LFB")
         || t.starts_with(".loc ")
         || t.starts_with(".file ")
+    {
+        return true;
+    }
+    for prefix in [".p2align", ".balign", ".align"] {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            // Longest prefix first above, so `.p2align`/`.balign` are not
+            // shadowed by `.align` when they share its spelling rules.
+            return !super::helpers::alignment_fill_is_explicit(rest);
+        }
+    }
+    false
 }
 
 /// True when a line ends the region a copy relation or a bracket may span.

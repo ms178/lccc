@@ -3387,37 +3387,35 @@ const MAX_MACRO_FRAMES: u32 = 101;
 /// * `grown_lines` / `grown_bytes` — everything `.irp`, `.irpc` and
 ///   macro invocation materialize *before* any parse can run.  An
 ///   `items x body` product is quadratic in a linear input, so the
-///   shared [`asm_preprocess::check_expansion_growth`] ceilings
-///   (4194304 lines / 256 MiB of line text, each line counted as
-///   `len + 1` exactly like [`asm_preprocess::expansion_size`]) are
-///   charged incrementally and checked *before* the next block is
-///   appended: the same deterministic-stand-in law as
+/// * `totals` — [`asm_preprocess::ExpansionTotals`]: the 4194304-line /
+///   256 MiB-of-text ceilings of [`asm_preprocess::check_expansion_growth`]
+///   (each line counted as `len + 1`, exactly [`asm_preprocess::expansion_size`]),
+///   charged incrementally and checked *before* the next block is appended.
+///   The same deterministic-stand-in law as
 ///   `MAX_DIRECTIVE_FILL`, whose GAS-side verdict degrades into
 ///   machine memory state at these sizes (FOLLOWUP deviation
 ///   register).  One budget spans the whole recursive expansion, so
 ///   nested constructs can never reset the totals.
 struct ExpansionBudget {
-    grown_lines: u64,
-    grown_bytes: u64,
+    totals: asm_preprocess::ExpansionTotals,
     depth: u32,
 }
 
 impl ExpansionBudget {
     fn new() -> Self {
         Self {
-            grown_lines: 0,
-            grown_bytes: 0,
+            totals: asm_preprocess::ExpansionTotals::default(),
             depth: 0,
         }
     }
 
-    /// Charge `lines` freshly materialized lines (with their text) and
-    /// fail closed the moment either ceiling is crossed.
+    /// Charge `lines` freshly materialized lines (with their text) and fail
+    /// closed the moment either ceiling is crossed.  Delegation, not a second
+    /// implementation: the arm and riscv front ends charge the same shared
+    /// totals, so the three expanders cannot grow three different ceilings --
+    /// which is what they had until `.macro` joined the party.
     fn charge(&mut self, lines: &[String], kind: &str) -> Result<(), String> {
-        let (l, b) = asm_preprocess::expansion_size(lines);
-        self.grown_lines = self.grown_lines.saturating_add(l);
-        self.grown_bytes = self.grown_bytes.saturating_add(b);
-        asm_preprocess::check_expansion_growth(kind, self.grown_lines, self.grown_bytes)
+        self.totals.charge(kind, lines)
     }
 }
 
@@ -4810,6 +4808,106 @@ fn collect_conditional_branches(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ExpansionBudget` must stay a *delegation*, not a second accounting.
+    ///
+    /// The end-to-end `.rept`/`.irp` ceiling tests in this module would also
+    /// pass if x86 kept a private copy of the limits -- which is the drift the
+    /// shared type exists to prevent, and the drift a future edit can
+    /// reintroduce.  So the boundary is pinned directly.  It is also cheap by
+    /// design: the two counters *are* the state that decides, so a budget can be
+    /// pre-loaded one line below a ceiling instead of materialising four million
+    /// `String`s (~200 MB) to assert arithmetic that needs one.
+    #[test]
+    fn x86_expansion_budget_delegates_to_the_shared_totals() {
+        use crate::backend::asm_preprocess::{
+            ExpansionTotals, MAX_EXPANSION_LINES, MAX_EXPANSION_TEXT,
+        };
+        let one = vec![String::from("x")]; // 1 line, len+1 = 2 bytes
+
+        // Both ceilings are `>` comparisons, so the last permitted charge and
+        // the first refused one are both worth pinning: a `>=` slip here would
+        // refuse 4 Mi expanded lines that assemble today.
+        let at_ceiling = MAX_EXPANSION_LINES as u64 - 1;
+        let mut shared = ExpansionTotals {
+            lines: at_ceiling,
+            bytes: 0,
+        };
+        let mut mine = ExpansionBudget {
+            totals: ExpansionTotals {
+                lines: at_ceiling,
+                bytes: 0,
+            },
+            depth: 7, // the frame counter is x86's own; the ceilings are not
+        };
+        let last_ok_s = shared.charge(".macro", &one);
+        let last_ok_m = mine.charge(&one, ".macro");
+        assert!(
+            last_ok_s.is_ok() && last_ok_m.is_ok(),
+            "the ceiling must permit exactly MAX_EXPANSION_LINES: {last_ok_s:?} / {last_ok_m:?}"
+        );
+        assert_eq!(
+            (mine.totals.lines, mine.totals.bytes),
+            (shared.lines, shared.bytes),
+            "the delegated charge kept a second, diverging tally"
+        );
+        assert_eq!((mine.totals.lines, mine.totals.bytes), (at_ceiling + 1, 2));
+        assert_eq!(mine.depth, 7, "charge must not touch the frame counter");
+
+        // One line more, and both sides refuse with the same words.
+        let s = shared.charge(".macro", &one);
+        let m = mine.charge(&one, ".macro");
+        assert!(
+            s.is_err() && m.is_err(),
+            "the line ceiling did not fire past its boundary"
+        );
+        assert_eq!(
+            s.err().unwrap(),
+            m.err().unwrap(),
+            "x86 grew its own wording: a reader of the error is told a different rule"
+        );
+
+        // Text ceiling, walked the same way.  The byte check runs first inside
+        // `check_expansion_growth`, so a line count far below its ceiling must
+        // still yield the *byte* diagnostic: if the two limits were merged into
+        // one condition on the x86 side, this is what would catch it.
+        let at_text = MAX_EXPANSION_TEXT as u64 - 2;
+        let mut shared = ExpansionTotals {
+            lines: 0,
+            bytes: at_text,
+        };
+        let mut mine = ExpansionBudget {
+            totals: ExpansionTotals {
+                lines: 0,
+                bytes: at_text,
+            },
+            depth: 0,
+        };
+        assert!(shared.charge(".rept", &one).is_ok());
+        assert!(mine.charge(&one, ".rept").is_ok());
+        let s = shared.charge(".rept", &one);
+        let m = mine.charge(&one, ".rept");
+        assert!(
+            s.as_ref().err().unwrap().contains("byte limit")
+                && m.as_ref().err().unwrap().contains("byte limit"),
+            "shared={s:?} x86={m:?}"
+        );
+        assert_eq!(s.err(), m.err());
+        assert_eq!(
+            mine.totals.lines, 2,
+            "lines must still be counted under a byte refusal, or a later verdict              would be made from an under-charged tally"
+        );
+
+        // A fresh budget is empty: the ceiling is per expansion run, so the
+        // struct must not be sharing a static tally across invocations.
+        let mut fresh = ExpansionBudget::new();
+        assert_eq!(
+            (fresh.totals.lines, fresh.totals.bytes, fresh.depth),
+            (0, 0, 0)
+        );
+        fresh.charge(&one, ".macro").expect("trivial charge");
+        assert_eq!((fresh.totals.lines, fresh.totals.bytes), (1, 2));
+    }
 
     #[test]
     fn gas247_rept_budget_law_x86() {

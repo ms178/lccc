@@ -125,10 +125,22 @@ pub enum Directive {
     Type(String, SymbolType),
     /// `.size sym, expr`
     Size(String, SizeExpr),
-    /// `.align N` or `.p2align N` — power-of-2 alignment
-    Align(u64),
-    /// `.balign N` — byte alignment
-    Balign(u64),
+    /// `.align N` / `.p2align N[, fill[, max]]` — power-of-2 alignment.
+    ///
+    /// `bytes` is the resolved alignment (1 << exponent) and `tail` the fill
+    /// byte / padding cap. Both used to be dropped on the floor here: the same
+    /// source assembled to different bytes than GAS (`.p2align 4, 0xff` filled
+    /// with NOPs, `.p2align 4,,3` padded where GAS skips), which moves the
+    /// address of every label after the directive.
+    Align {
+        bytes: u64,
+        tail: crate::backend::asm_expr::AlignTail,
+    },
+    /// `.balign N[, fill]` — byte alignment, and deliberately no cap field:
+    /// GAS's `balign_directive` hands the backend an unlimited cap, so
+    /// `.balign 8,,2` pads 5 bytes where `.p2align 3,,2` skips (both measured
+    /// on as 2.47.20260726). A stray third operand is tolerated, not applied.
+    Balign { bytes: u64, fill: Option<u8> },
     /// `.byte val, val, ...`
     Byte(Vec<DataValue>),
     /// `.short val, ...` / `.hword` / `.2byte` / `.half`
@@ -380,36 +392,65 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
             // (the old `unwrap_or(0)` silently assembled `.align junk`
             // as align-1) and out-of-range exponents clamp to 63 into
             // the writer's signed-shift bucket.
-            let raw = args
-                .trim()
-                .split(',')
-                .next()
-                .and_then(|s| parse_int_literal(s.trim()).ok())
-                .ok_or_else(|| format!(".align: bad operand: {args}"))?;
+            let (first, rest) = split_align_args(args);
+            let raw =
+                parse_int_literal(first).map_err(|_| format!(".align: bad operand: {args}"))?;
             // Out-of-range exponents (negative or > 63) clamp to 63 —
             // NOT to 0: measured `.p2align -1` behaves like `.p2align 63`
             // (read.c's `address16 = ...` — same rule on every GAS
             // target), landing in the writer's signed-shift bucket.
-            Directive::Align(if (0..=63).contains(&raw) {
+            let exp = if (0..=63).contains(&raw) {
                 raw as u64
             } else {
                 63
-            })
+            };
+            let mut tail =
+                crate::backend::asm_expr::parse_align_tail(rest, ".p2align", parse_int_literal)
+                    .map_err(|e| e.replace(".p2align:", ".align:"))?;
+            // RISC-V has no padding cap. Its `.p2align` handler is
+            // `riscv_frag_align_code (int n)` — a single argument — and the
+            // generic fall-back it shares with `.balign` never sees the cap
+            // either, so the operand is read, validated, and dropped. Measured:
+            // `.p2align E,,M` pads identically for every M in {0,1,2,3,4,5,8,
+            // 11,12,20,40,2048,2049}. Silently honouring the cap instead — as
+            // this parser did until now — skips padding that GAS emits, moving
+            // every later address by up to the whole alignment quantum.
+            tail.max_pad = None;
+            Directive::Align {
+                bytes: 1u64 << exp,
+                tail,
+            }
         }
         ".balign" => {
             // Byte-count form: bare is a no-op (GAS-accepted), anything
             // else must be a non-negative power of two or it is an error
             // ("alignment not a power of 2"), never a silent default.
-            let tok = args.trim().split(',').next().unwrap_or("").trim();
-            let raw: i64 = if tok.is_empty() {
+            let (first, rest) = split_align_args(args);
+            let raw: i64 = if first.is_empty() {
                 1
             } else {
-                parse_int_literal(tok).map_err(|_| format!(".balign: bad operand: {args}"))?
+                parse_int_literal(first).map_err(|_| format!(".balign: bad operand: {args}"))?
             };
             if raw < 0 || (raw != 0 && !(raw as u64).is_power_of_two()) {
                 return Err(format!(".balign: alignment {raw} is not a power of 2"));
             }
-            Directive::Balign(if raw == 0 { 1 } else { raw as u64 })
+            // Read the tail for its fill byte and *only* that: `too many
+            // operands` still has to be reported (GAS rejects 4 operands), but
+            // a cap that is not an integer is not either, because GAS never
+            // looks at it (measured: `.balign 8,,junk` assembles).
+            let fill = match crate::backend::asm_expr::parse_align_tail(
+                rest,
+                ".balign",
+                parse_int_literal,
+            ) {
+                Ok(t) => t.fill,
+                Err(e) if e.contains("fill") || e.contains("too many") => return Err(e),
+                Err(_) => None,
+            };
+            Directive::Balign {
+                bytes: if raw == 0 { 1 } else { raw as u64 },
+                fill,
+            }
         }
 
         ".byte" => {
@@ -1175,6 +1216,18 @@ pub fn is_register(s: &str) -> bool {
     })
 }
 
+/// Split an alignment directive's operands into the alignment itself and the
+/// raw text after the first comma (`""` when there is none), so the shared
+/// [`crate::backend::asm_expr::parse_align_tail`] can read `[, fill[, max]]`
+/// with exactly the grammar every other GAS target applies.
+fn split_align_args(args: &str) -> (&str, &str) {
+    let args = args.trim();
+    match args.find(',') {
+        Some(i) => (&args[..i], args[i + 1..].trim()),
+        None => (args, ""),
+    }
+}
+
 pub fn parse_int_literal(s: &str) -> Result<i64, String> {
     let s = s.trim();
     if s.is_empty() {
@@ -1184,4 +1237,100 @@ pub fn parse_int_literal(s: &str) -> Result<i64, String> {
     // Use the shared expression evaluator which handles parentheses,
     // operator precedence, bitwise ops (|, &, ^, <<, >>), and arithmetic.
     asm_expr::parse_integer_expr(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stmts(src: &str) -> Result<Vec<AsmStatement>, String> {
+        parse_asm(src)
+    }
+
+    fn mnemonic_list(src: &str) -> Vec<String> {
+        stmts(src)
+            .expect("parse")
+            .into_iter()
+            .filter_map(|s| match s {
+                AsmStatement::Instruction { mnemonic, .. } => Some(mnemonic),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn count_directives(src: &str) -> usize {
+        stmts(src)
+            .expect("parse")
+            .into_iter()
+            .filter(|s| matches!(s, AsmStatement::Directive(_)))
+            .count()
+    }
+
+    /// The RISC-V front end reaches the shared expansion ceilings.
+    ///
+    /// `.macro`/`.endm`, `.rept`/`.endr` and `.irp`/`.irpc` are expanded here by
+    /// `asm_preprocess::expand_macros` / `expand_rept_blocks` -- the same code
+    /// that carries the growth ceilings and the nesting wall added for GAS
+    /// parity.  Those limits are unit-tested in `asm_preprocess` and the x86
+    /// front end has its own parity tests, but this target had neither, so a
+    /// RISC-V path that expanded *around* the budget (a wrapper that pre-expanded
+    /// and handed the expander a flat list, say) would have been invisible: the
+    /// failure mode is a compiler that eats memory on a 41 KiB `.s` file rather
+    /// than an error.  Asserted through `parse_asm`, i.e. through whatever wiring
+    /// this target actually has, not through the shared module directly.
+    #[test]
+    fn gas247_expansion_ceilings_reach_the_riscv_entry_point() {
+        // Legal expansions stay exact -- the guard is not achieved by refusing
+        // everything, which is the easy way for a ceiling test to go green.
+        assert_eq!(
+            mnemonic_list(".macro two\n nop\n nop\n.endm\n two\n"),
+            ["nop", "nop"]
+        );
+        assert_eq!(mnemonic_list(".rept 3\n nop\n.endr\n").len(), 3);
+        // `.irp` amplifies items x body-lines out of a linear input.
+        assert_eq!(count_directives(".irp v,1,2,3\n .byte \\v\n.endr\n"), 3);
+        // The line-growth ceiling fires as an Err, in the shared wording.
+        let err = stmts(".rept 5000000\n nop\n.endr\n").unwrap_err();
+        assert!(err.contains("line limit"), "got: {err}");
+        // GAS's `size_t` cast for a negative count, pinned at this entry point
+        // too: this is the path that used to wrap to u64::MAX.
+        let err = stmts(".rept -1\n nop\n.endr\n").unwrap_err();
+        assert!(
+            err.contains("excessive count 18446744073709551615 for REPT - ignored"),
+            "got: {err}"
+        );
+        // The nesting wall: 101 chained frames assemble, the 102nd errors.
+        let chain = |n: usize| {
+            let mut s = String::new();
+            for i in 0..n {
+                let nxt = if i + 1 < n {
+                    format!(" m{}", i + 1)
+                } else {
+                    " nop".to_string()
+                };
+                s.push_str(&format!(".macro m{i}\n{nxt}\n.endm\n"));
+            }
+            s.push_str(" m0\n");
+            s
+        };
+        assert_eq!(mnemonic_list(&chain(101)).len(), 1);
+        let err = stmts(&chain(102)).unwrap_err();
+        assert!(err.contains("macros nested too deeply"), "got: {err}");
+        // Direct recursion hits the same wall rather than the native stack.
+        let err = stmts(".macro m\n m\n.endm\n m\n").unwrap_err();
+        assert!(err.contains("macros nested too deeply"), "got: {err}");
+    }
+
+    /// Comment styles and `.if` evaluation go through the same shared helpers,
+    /// so a target-level pin of each keeps a `CommentStyle` mix-up (which would
+    /// leave `#`-commented `.rept` blocks unexpanded, and thus blow the budget on
+    /// innocent input) from being caught only by a codegen diff.
+    #[test]
+    fn riscv_comment_and_conditional_paths_are_wired() {
+        assert_eq!(mnemonic_list("# a comment\n nop // trailing\n").len(), 1);
+        assert_eq!(mnemonic_list(".if 0\n nop\n.else\n nop\n.endif\n").len(), 1);
+        assert_eq!(mnemonic_list(".if 1\n nop\n.endif\n").len(), 1);
+        // A commented-out `.rept` must not be expanded at all.
+        assert_eq!(mnemonic_list("# .rept 4\n nop\n# .endr\n").len(), 1);
+    }
 }

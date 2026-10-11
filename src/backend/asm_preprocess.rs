@@ -470,6 +470,47 @@ pub fn expansion_size(lines: &[String]) -> (u64, u64) {
     (lines.len() as u64, bytes)
 }
 
+/// Text materialized by one expansion run, summed over every frame.
+///
+/// This is the single home of the law.  The x86 front end's `ExpansionBudget`
+/// is a thin wrapper over it (it additionally carries the frame counter its
+/// recursion needs): three copies of "saturate, then compare against
+/// `check_expansion_growth`" is how one of them ends up forgetting a ceiling,
+/// and the `.macro` path arriving at this ceiling at all is the reason the
+/// wrapper delegates instead of reimplementing.
+///
+/// `.rept` and `.irp` can predict their size from a literal count and refuse
+/// before emitting anything; a `.macro` body that invokes macros has no such
+/// handle, and depth alone does not bound it either: GAS allows 101 live
+/// frames, and a body that invokes macros twice per frame doubles at each
+/// level, so the legal recursion ceiling admits an astronomically large
+/// output.  Charging the *total* across frames is what turns that into a
+/// refusal, and it is the same ceiling `.rept` already enforces -- so a macro
+/// and a repeat of the same size cost the same, and neither is a way around
+/// the other.
+///
+/// A per-frame budget would be wrong in the obvious way (101 frames each
+/// allowed 4M lines is 400M), which is why the counter is threaded through the
+/// recursion rather than created inside it.
+#[derive(Clone, Copy, Default)]
+pub struct ExpansionTotals {
+    pub lines: u64,
+    pub bytes: u64,
+}
+
+impl ExpansionTotals {
+    /// Charge one expansion's output against the run, refusing once the
+    /// ceiling is crossed.  Saturating on purpose: a run that would overflow
+    /// `u64` is far past every ceiling already, and an arithmetic panic would
+    /// replace a diagnostic with a crash.
+    pub fn charge(&mut self, kind: &str, lines: &[String]) -> Result<(), String> {
+        let (added_lines, added_bytes) = expansion_size(lines);
+        self.lines = self.lines.saturating_add(added_lines);
+        self.bytes = self.bytes.saturating_add(added_bytes);
+        check_expansion_growth(kind, self.lines, self.bytes)
+    }
+}
+
 /// Expand `.rept`/`.endr` and `.irp`/`.endr` blocks by repeating or
 /// substituting contained lines.
 ///
@@ -1049,7 +1090,7 @@ fn merge_expression_tokens(tokens: &[String]) -> Vec<String> {
 ///
 /// Handles nested macro definitions and recursive expansion.
 pub fn expand_macros(lines: &[&str], comment_style: &CommentStyle) -> Result<Vec<String>, String> {
-    expand_macros_at(lines, comment_style, 0)
+    expand_macros_at(lines, comment_style, 0, &mut ExpansionTotals::default())
 }
 
 /// Depth-carrying core of [`expand_macros`].  `depth` counts live macro
@@ -1061,6 +1102,7 @@ fn expand_macros_at(
     lines: &[&str],
     comment_style: &CommentStyle,
     depth: u32,
+    totals: &mut ExpansionTotals,
 ) -> Result<Vec<String>, String> {
     use crate::common::fx_hash::FxHashMap;
     let mut macros: FxHashMap<String, MacroDef> = FxHashMap::default();
@@ -1146,7 +1188,9 @@ fn expand_macros_at(
                     expanded_lines.push(expanded);
                 }
                 let refs: Vec<&str> = expanded_lines.iter().map(|s| s.as_str()).collect();
-                let re_expanded = expand_macros_with(&refs, &macros, comment_style, depth + 1)?;
+                let re_expanded =
+                    expand_macros_with(&refs, &macros, comment_style, depth + 1, totals)?;
+                totals.charge(".macro", &re_expanded)?;
                 result.extend(re_expanded);
             } else {
                 result.push(lines[i].to_string());
@@ -1202,6 +1246,7 @@ fn expand_macros_with(
     macros: &crate::common::fx_hash::FxHashMap<String, MacroDef>,
     comment_style: &CommentStyle,
     depth: u32,
+    totals: &mut ExpansionTotals,
 ) -> Result<Vec<String>, String> {
     // Frame entry: the GAS 2.47 nesting wall (see `expand_macros_at`).
     if depth > 101 {
@@ -1239,7 +1284,8 @@ fn expand_macros_with(
                 expanded_lines.push(expanded);
             }
             let refs: Vec<&str> = expanded_lines.iter().map(|s| s.as_str()).collect();
-            let re_expanded = expand_macros_with(&refs, macros, comment_style, depth + 1)?;
+            let re_expanded = expand_macros_with(&refs, macros, comment_style, depth + 1, totals)?;
+            totals.charge(".macro", &re_expanded)?;
             result.extend(re_expanded);
         } else {
             result.push(line.to_string());
@@ -1536,6 +1582,124 @@ mod tests {
         let err = run(&chain(102)).unwrap_err();
         assert!(err.contains("macros nested too deeply"), "got: {err}");
         let err = run(".macro m\n m\n.endm\n m\n").unwrap_err();
+        assert!(err.contains("macros nested too deeply"), "got: {err}");
+    }
+
+    /// The `.macro` path's half of the budget that `.rept` already enforced:
+    /// a *run* total, charged across every invocation of every frame, not a
+    /// per-frame allowance (101 frames each granted 4M lines would be 400M).
+    ///
+    /// Why the refusal is tested on the accumulator rather than end to end:
+    /// the ceiling is 4 Mi lines, so an end-to-end crossing must materialize
+    /// 4 Mi `String`s (~150 MB) before the budget can fire.  A unit suite has
+    /// no business paying for that to exercise a constant.  What it must pin is
+    /// the two things that are actually new here -- that charges accumulate
+    /// across calls, and that a charge which is legal on its own is still
+    /// refused once the run passes the ceiling.
+    #[test]
+    fn expansion_growth_budget_accumulates_across_expansions() {
+        let chunk: Vec<String> = vec!["nop".to_string(); MAX_EXPANSION_LINES / 64];
+        assert!(
+            check_expansion_growth(".macro", chunk.len() as u64, 4 * chunk.len() as u64).is_ok(),
+            "each charge alone must be inside the ceiling, or the test proves nothing"
+        );
+        let mut totals = ExpansionTotals::default();
+        let mut refused = None;
+        for frame in 1..=128u64 {
+            if let Err(e) = totals.charge(".macro", &chunk) {
+                refused = Some((frame, e));
+                break;
+            }
+        }
+        let (frame, err) = refused.expect("128 frames of 1/64 the ceiling must cross it");
+        assert_eq!(
+            totals.lines as usize,
+            frame as usize * (MAX_EXPANSION_LINES / 64),
+            "the total must be the sum of every charge, with none dropped"
+        );
+        assert!(
+            err.contains("line limit") && err.contains(".macro"),
+            "got: {err}"
+        );
+    }
+
+    /// Saturating, not `+`: a run that would overflow `u64` is long past every
+    /// ceiling, and an arithmetic panic would answer a resource question with a
+    /// crash instead of a diagnostic.
+    #[test]
+    fn expansion_growth_charge_saturates_instead_of_panicking() {
+        let mut totals = ExpansionTotals {
+            lines: u64::MAX,
+            bytes: u64::MAX,
+        };
+        let err = totals
+            .charge(".macro", &["nop".to_string()])
+            .expect_err("u64::MAX is past every ceiling");
+        assert_eq!(totals.lines, u64::MAX);
+        assert_eq!(totals.bytes, u64::MAX);
+        // Both ceilings refuse, and the byte one is consulted first -- pinning
+        // the precedence as well, because a run can be over one and under the
+        // other and the message is the only thing the user sees.
+        assert!(err.contains("byte limit"), "got: {err}");
+        let mut by_lines = ExpansionTotals {
+            lines: MAX_EXPANSION_LINES as u64,
+            bytes: 0,
+        };
+        let err = by_lines
+            .charge(".macro", &["nop".to_string()])
+            .expect_err("one line past the ceiling must refuse");
+        assert!(err.contains("line limit"), "got: {err}");
+        assert_eq!(by_lines.lines, MAX_EXPANSION_LINES as u64 + 1);
+        let exactly_at = ExpansionTotals {
+            lines: MAX_EXPANSION_LINES as u64,
+            bytes: 0,
+        };
+        assert!(
+            check_expansion_growth(".macro", exactly_at.lines, exactly_at.bytes).is_ok(),
+            "the ceiling is inclusive: 4 Mi lines is the permitted maximum, not a rejection"
+        );
+    }
+
+    /// Legal work must not start failing: a 101-frame chain is at the wall and
+    /// still fine, and 500 invocations of a 200-line body -- 100k lines
+    /// accumulated inside a single frame, the shape the old depth-only accounting
+    /// left unbounded -- expands in full.
+    #[test]
+    fn expansion_growth_budget_leaves_legal_expansions_alone() {
+        let run = |src: &str| expand_macros(&src.lines().collect::<Vec<_>>(), &CommentStyle::Hash);
+        let mut src = String::new();
+        for i in 0..101 {
+            let nxt = if i + 1 < 101 {
+                format!("m{}", i + 1)
+            } else {
+                ".byte 7".into()
+            };
+            src.push_str(&format!(".macro m{i}\n{nxt}\n.endm\n"));
+        }
+        src.push_str("m0\n");
+        run(&src).expect("the wall is 101 frames, not a budget problem");
+
+        let mut bulk = String::from(".macro B\n");
+        for _ in 0..200 {
+            bulk.push_str("nop\n");
+        }
+        bulk.push_str(".endm\n");
+        for _ in 0..500 {
+            bulk.push_str("B\n");
+        }
+        let out = run(&bulk).expect("100k lines is a quarter of the ceiling");
+        assert_eq!(out.iter().filter(|l| l.trim() == "nop").count(), 200 * 500);
+    }
+
+    /// A macro that calls itself twice per frame is the exponential shape.  It
+    /// must answer with the depth diagnostic in bounded time -- the error
+    /// propagates out of the first over-deep frame, so nothing is materialized
+    /// along the way.
+    #[test]
+    fn self_doubling_macro_is_refused_not_materialized() {
+        let src = ".macro d\n d d\n.endm\nd\n";
+        let err = expand_macros(&src.lines().collect::<Vec<_>>(), &CommentStyle::Hash)
+            .expect_err("must not expand");
         assert!(err.contains("macros nested too deeply"), "got: {err}");
     }
 

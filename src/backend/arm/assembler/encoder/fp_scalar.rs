@@ -528,11 +528,70 @@ pub(crate) fn fcmp_is_positive_zero(op: Option<&Operand>, raw_operand: &str) -> 
             let after_paren = after_hash.strip_prefix('(').unwrap_or(after_hash);
             !after_paren.starts_with('-')
         }
-        Some(Operand::Expr(e)) => {
-            matches!(e.trim().parse::<f64>(), Ok(v) if v == 0.0 && !v.is_sign_negative())
-        }
+        Some(Operand::Expr(e)) | Some(Operand::Symbol(e)) => fp_zero_spelling(e),
         _ => false,
     }
+}
+
+/// Is this operand *spelling* the constant zero that GAS's
+/// `verify_float_immediate_zero_only` demands?
+///
+/// The `#` is optional to GAS and this lexer files an unprefixed token under
+/// [`Operand::Symbol`] unless it happens to look like a plain decimal, so both
+/// variants have to be consulted. Measured on GNU as 2.47: `#0.0`, `#0`, `#0x0`,
+/// `#+0.0` and `0.0` all encode `fcmeq v0.4s, v1.4s, <op>` (and `fcmp s0, 0.0` =
+/// 0x1e202008), while `(0.0)`, `#-0.0` and a symbol named `zero` are rejected --
+/// the first because a parenthesized token is not a bare constant to GAS's
+/// reader, the second because a unary minus leaves a negate expression behind,
+/// the third because the symbol never resolves inside an assembler operand.
+///
+/// A `.equ`-defined zero does fold to a constant for GAS and is refused here:
+/// True when a decimal float literal's mantissa is written entirely of zeros,
+/// i.e. the spelling denotes an exact zero rather than a value that merely
+/// rounds to one.  See `fp_zero_spelling` for why the distinction is required.
+fn mantissa_is_exact_zero(body: &str) -> bool {
+    let mant = body
+        .split(['e', 'E'])
+        .next()
+        .unwrap_or(body)
+        .chars()
+        .filter(|c| *c != '.' && *c != '_');
+    let mut digits = mant.peekable();
+    let any = digits.peek().is_some();
+    any && digits.all(|c| c == '0')
+}
+
+/// this pass classifies operands before any symbol table is in reach, and a
+/// refusal is a diagnostic while a guessed encoding would be a wrong program.
+fn fp_zero_spelling(text: &str) -> bool {
+    let text = text.trim();
+    let body = text.strip_prefix('#').unwrap_or(text);
+    let body = body.strip_prefix('+').unwrap_or(body);
+    if body.is_empty() || body.starts_with('-') || body.starts_with('(') {
+        return false;
+    }
+    if let Ok(value) = body.parse::<f64>() {
+        // `inf`/`nan` land here too and fail the comparison, as they should.
+        // A `-0.0` that reached this point without its sign (`-` was stripped
+        // by the lexer) would be `0.0` and `+0.0`, both of which GAS accepts.
+        //
+        // The value test alone is not enough: Rust flushes a subnormal
+        // underflow to `+0.0`, so `1e-400` and `0.000000000000000000000000000000001`
+        // pass it while the source constant is not zero at all.  Accepting them
+        // would encode the FCMP `#0.0` field for a nonzero literal -- a silent
+        // substitution of a different number, which is the one thing an
+        // assembler must not do to an operand.  GNU as 2.47 refuses them
+        // (`Error: cannot create floating-point number` for the underflowing
+        // ones, `Error: immediate zero expected` for the representable
+        // denormals), and the mantissa test reproduces that split exactly:
+        // measured over `fcmpe s0,<spelling>` for
+        //   accept: #0.0 #0 #00.0 #+0.0 #0e0 #0e400 #0.0e9 0 0x0
+        //   refuse: #-0.0 #1.0 #1e-400 #1e-323 #4.9e-324 #0.00000000000000000000000000000001
+        //           #0x0p+0 (0.0) #zero
+        // `scripts/aarch64_legality_probe_differ.py` re-measures it in CI.
+        return value == 0.0 && !value.is_sign_negative() && mantissa_is_exact_zero(body);
+    }
+    crate::backend::asm_expr::parse_integer_expr(body).is_ok_and(|v| v == 0)
 }
 
 /// `FCMP`/`FCMPE` share one encoding; `fcmpe` sets bit 4 of Rt in both the
@@ -1216,6 +1275,44 @@ mod fcvt_precision_tests {
                 Ok(v) => panic!("fcvt {w}0, {w}1 must be refused, got {v:?}"),
             };
             assert!(e.contains("same floating-point width"), "{w}: {e}");
+        }
+    }
+
+    /// The `#0.0` operand of FCMP/FCMPE has one legal *value*, but several legal
+    /// *spellings*, and GNU as draws the line by what the literal denotes rather
+    /// than by what it rounds to.  Measured with
+    /// `gas247-aarch64-linux-gnu/bin/as` on `fcmpe s0,<spelling>`; the same set
+    /// is re-measured in CI by `scripts/aarch64_legality_probe_differ.py`.
+    #[test]
+    fn fp_zero_spelling_matches_gas_on_exact_and_rounded_zeros() {
+        for good in [
+            "#0.0", "#0", "#00.0", "#.0", "#+0.0", "#0e0", "#0e400", "#0.0e9", "0.0", "0", "0x0",
+            "#0.0000",
+        ] {
+            assert!(fp_zero_spelling(good), "{good:?} is an exact zero");
+        }
+        for bad in [
+            "#-0.0",
+            "#-0",
+            "#1.0",
+            "#2",
+            "#inf",
+            "#nan",
+            "(0.0)",
+            "#zero",
+            "#0x0p+0",
+            // Underflow-to-zero: `1e-400` parses as `0.0` in f64, so a value
+            // test alone accepted these and encoded a nonzero literal as the
+            // zero field.  GNU as refuses all four.
+            "#1e-400",
+            "#1E-400",
+            "#0.00000000000000000000000000000001",
+            "#4.9e-324",
+            "#1e-323",
+            "",
+            "#",
+        ] {
+            assert!(!fp_zero_spelling(bad), "{bad:?} is not a +0.0 spelling");
         }
     }
 }
