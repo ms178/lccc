@@ -1,5 +1,5 @@
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::common::types::CType;
+use crate::common::types::{AddressSpace, CType};
 
 /// Information about a declared symbol.
 #[derive(Debug, Clone)]
@@ -9,6 +9,21 @@ pub struct Symbol {
     /// Explicit alignment from _Alignas or __attribute__((aligned(N))).
     /// Used by _Alignof(var) to return the correct alignment per C11 6.2.8p3.
     pub explicit_alignment: Option<usize>,
+    /// Named address space of the *object* this symbol designates
+    /// (`__seg_gs`/`__seg_fs`, the kernel's `__percpu`).
+    ///
+    /// The space is a property of the storage, not of the declared type, so a
+    /// non-pointer object has nowhere to carry it in `ty` (and for a pointer
+    /// object it would be ambiguous with the pointee's space). GCC keeps it on
+    /// the object: for `static __seg_gs T v;` the type of `&v` is
+    /// `__seg_gs T *`, and for `static __seg_gs T *p;` the type of `&p` is
+    /// `__seg_gs T **` (measured with gcc 14.2: `T **b = &p;` is rejected
+    /// while `T __seg_gs **c = &p;` is accepted). `&v` must reproduce that, or
+    /// a per-CPU object cannot be passed to the `__percpu`-qualified
+    /// parameter it belongs to (kernel/softirq.c: `&tasklet_vec`). Lowering
+    /// already records the same fact (`VarInfo::address_space`); this field
+    /// is what lets sema agree with it.
+    pub address_space: AddressSpace,
 }
 
 /// A scope in the symbol table.

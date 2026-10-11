@@ -39,7 +39,7 @@
 # ============================================================================
 set -uo pipefail
 
-K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.52}
+K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.55}
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 LCCC=${LCCC:-$REPO_ROOT/target/fastbuild/lccc}

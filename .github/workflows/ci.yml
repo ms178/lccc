@@ -457,6 +457,47 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_seg_named_decl_qualifier.sh
 
+      # A per-CPU access with a constant displacement must fold the
+      # displacement into the segment operand (`movq %gs:8(%rax), %rax`) —
+      # the shape GCC and Clang emit for every per-CPU `base->field`. The
+      # behavioural half (real GS base via arch_prctl) lives in the
+      # correctness suite.
+      - name: Verify segment-override constant-displacement fold
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_seg_const_offset_fold.sh
+
+      # The loaded value of a segment access must land in its own GPR home:
+      # `p = p->next` on a per-CPU pointer must be `movq %gs:24(%rdi), %rdi`,
+      # not a `%rax` round trip (one instruction and one register per access).
+      - name: Verify segment loads land in their home register
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_seg_direct_home.sh
+
+      # An explicit `-march=` is a ceiling, including for Makefiles that
+      # REPLACE KBUILD_CFLAGS (the kernel decompressor has no -march on
+      # x86-64): no BMI/BMI2/AVX-class instruction may appear in a
+      # baseline/v2 TU, with a positive control so the check cannot go
+      # vacuous. A 64-bit-startup #UD is a triple fault with no serial
+      # output — this gate is what keeps that from shipping again.
+      - name: Verify ISA ceilings (no BMI/AVX escape at x86-64/v2)
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_isa_gate_escape.sh
+
+      # The flag-only gate above cannot see the kernel's own flag-wiping
+      # Makefiles, which is where the v3 default actually leaked into the
+      # boot path.  This one tests scripts/kernel_boot_isa.sh end to end:
+      # the idempotent ISA-explicitness patch, its loud refusal when the
+      # files are refactored, and the per-object scan of built boot objects
+      # (positive controls: a v3 object and a -mavx2 object must both be
+      # rejected; baseline objects must pass).
+      - name: Verify kernel boot-path ISA contract (patch + artifact scan)
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_kernel_boot_isa.sh
+
       # BB-SLP red-team battery: the 2026-09-16 semantic audit closed three
       # P0 soundness holes (dangling lane uses via Call/Phi/InlineAsm/
       # atomics; the store->load forwarding hazard; cross-seed reordering

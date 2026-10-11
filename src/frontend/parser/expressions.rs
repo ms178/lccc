@@ -14,8 +14,29 @@
 
 use super::ast::*;
 use super::parse::Parser;
+use crate::common::source::Span;
 use crate::common::types::AddressSpace;
 use crate::frontend::lexer::token::TokenKind;
+
+/// Build the AST node for an `L"..."` literal, honouring `-fshort-wchar`.
+///
+/// Under `-fshort-wchar` the C type of `L"..."` is `unsigned short[]` — GCC's
+/// `__WCHAR_TYPE__` is `short unsigned int` and its code units are UTF-16 —
+/// which is *exactly* the type and encoding this compiler already implements
+/// for `u"..."`. Rewriting the node here therefore reuses one existing, tested
+/// 16-bit wide-literal path (sema types, `sizeof`, array initialisation, the
+/// backend's `.short` emission) instead of adding a second parallel one that
+/// would have to be kept in step at every one of those sites.
+///
+/// Doing it at parse time is the only place where a single edit covers them
+/// all: the AST node alone decides the element width from here on.
+fn wide_string_expr(text: String, span: Span) -> Expr {
+    if crate::common::types::short_wchar() {
+        Expr::Char16StringLiteral(text, span)
+    } else {
+        Expr::WideStringLiteral(text, span)
+    }
+}
 
 /// C operator precedence levels (loosest to tightest binding).
 /// Used by the table-driven binary expression parser.
@@ -650,7 +671,7 @@ impl Parser {
                     }
                 }
                 if is_wide {
-                    Expr::WideStringLiteral(result, span)
+                    wide_string_expr(result, span)
                 } else if is_char16 {
                     Expr::Char16StringLiteral(result, span)
                 } else {
@@ -670,7 +691,7 @@ impl Parser {
                     result.push_str(s2);
                     self.advance();
                 }
-                Expr::WideStringLiteral(result, span)
+                wide_string_expr(result, span)
             }
             TokenKind::Char16StringLiteral(s) => {
                 let mut result = s.clone();
@@ -693,7 +714,7 @@ impl Parser {
                     }
                 }
                 if is_wide {
-                    Expr::WideStringLiteral(result, span)
+                    wide_string_expr(result, span)
                 } else {
                     Expr::Char16StringLiteral(result, span)
                 }

@@ -382,13 +382,23 @@ impl Lowerer {
         vla_size: Option<Value>,
     ) {
         let mut local_info = LocalInfo::from_analysis(da, alloca, decl.is_const());
-        local_info.var.address_space = decl.address_space;
+        local_info.var.address_space = crate::common::type_builder::object_storage_address_space(
+            decl.address_space,
+            &declarator.derived,
+        );
         // `T __seg_fs *p`: the qualifier lives on the pointer's CType (the
         // space the pointer points into), not just on the variable slot.
         // Without this, `*p` resolves AddressSpace::Default through
         // get_expr_ctype and the segment prefix is silently dropped.
+        // Object rule: a pointer supplied by the DECLARATOR absorbs the space
+        // into its pointee; one supplied by the type specifier leaves the value
+        // plain (see apply_declaration_address_space_for_object).
         if let Some(ref mut ct) = local_info.var.c_type {
-            crate::common::type_builder::apply_declaration_address_space(ct, decl.address_space);
+            crate::common::type_builder::apply_declaration_address_space_for_object(
+                ct,
+                decl.address_space,
+                &declarator.derived,
+            );
         }
         if explicit_align > 0 {
             local_info.var.explicit_alignment = Some(explicit_align);

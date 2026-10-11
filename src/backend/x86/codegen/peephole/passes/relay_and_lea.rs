@@ -1088,6 +1088,78 @@ fn is_plain_symbol(sym: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$' | '@'))
 }
 
+/// Byte length of a leading segment-override prefix (`%gs:`, `%fs:`, `%es:`,
+/// `%ds:`, `%cs:`, `%ss:`) in operand text, if one is present.
+///
+/// AT&T spells a segment override as `%<seg>:` between the operand boundary
+/// and the displacement.  `parse_disp` deliberately refuses that spelling —
+/// `is_plain_symbol` would otherwise print `%gs:` back out as a displacement
+/// symbol — so every composition path used to fail closed on
+/// `movq %gs:(%r9), %rax`.  That also refused the fold GCC and Clang always
+/// perform (`leaq 8(%rax), %rcx; movq %gs:(%rcx), %rax` ->
+/// `movq %gs:8(%rax), %rax`: one instruction and one GPR less per per-CPU
+/// access, which is what every `this_cpu_ptr(p)->field` in the kernel pays).
+/// Callers strip the validated prefix, compose the address behind it, and
+/// re-attach the prefix verbatim; anything that is not exactly one of the six
+/// segment registers, or that carries trailing text inside the prefix, stays
+/// refused.
+///
+/// This is the *authoritative* segment-override validator for the peephole
+/// layer: every pass that is willing to carry a `%gs:` operand through a
+/// rewrite calls either this or [`strip_segment_prefix`], so the accepted
+/// spelling is defined in exactly one place.
+pub(super) fn segment_prefix_len(text: &str) -> Option<usize> {
+    let b = text.as_bytes();
+    if b.len() < 4 || b[0] != b'%' || b[3] != b':' {
+        return None;
+    }
+    // Case-insensitive: the integrated assembler accepts `%GS:` too, and the
+    // prefix must be exactly two letters — `%gsx:` or `%g:` is not a prefix.
+    let seg = (b[1] | 0x20, b[2] | 0x20);
+    matches!(
+        seg,
+        (b'c', b's') | (b'd', b's') | (b'e', b's') | (b'f', b's') | (b'g', b's') | (b's', b's')
+    )
+    .then_some(4)
+}
+
+/// Split a validated segment override off `op`: `("%gs:", "8(%rsi)")`, or
+/// `("", op)` when there is none.  The pair form of [`segment_prefix_len`]
+/// for the call sites whose rewrite carries the operand verbatim and only
+/// needs to judge the address *body* (`(disp(base[,index,scale]))`) — the
+/// prefix itself is re-emitted untouched, so validating it is all it takes.
+pub(super) fn strip_segment_prefix(op: &str) -> (&str, &str) {
+    match segment_prefix_len(op) {
+        Some(n) => op.split_at(n),
+        None => ("", op),
+    }
+}
+
+/// Whether `pos` in `t` starts a memory operand, allowing the segment-override
+/// spellings `%gs:(%T)` / `%fs:8(%T)` the window scan must recognise.
+///
+/// The bare and indexed matchers look for `(%T)` / `(%T,` and require the
+/// preceding byte to be an operand boundary.  Without this, a segment override
+/// puts `:` before the `(` and the consumer is invisible to the fold — the
+/// exact reason `fold_after_call` in tests/regression/
+/// check_seg_const_offset_fold.sh saw `leaq` where GCC emits the folded form.
+/// A four-byte validated prefix ending at `pos` moves the boundary to the byte
+/// before it, so `movq %gs:(%T), %rax` is recognised while `foo:(%T)`,
+/// `*%gs:(%T)` and `0x64::(%T)` are not.
+fn at_mem_operand_boundary(t: &str, pos: usize) -> bool {
+    if pos == 0 {
+        return true;
+    }
+    let b = t.as_bytes();
+    if matches!(b[pos - 1], b' ' | b',' | b'\t') {
+        return true;
+    }
+    if pos >= 4 && t.get(pos - 4..pos).and_then(segment_prefix_len).is_some() {
+        return pos == 4 || matches!(b[pos - 5], b' ' | b',' | b'\t');
+    }
+    false
+}
+
 impl SibAddr {
     /// Parse `[disp][(][%base][, %index[, scale]][)]`.  Returns `None` for
     /// anything whose composition cannot be reasoned about (RIP-relative
@@ -1340,6 +1412,15 @@ fn compose_indexed_relay(
     let producer = SibAddr::parse(producer_text)?;
     let op_start = operand_start(line, pos);
     let cons_text = format!("{}{}", &line[op_start..pos], &line[pos..=close]);
+    // The consumer may carry a segment override (`movq %gs:(%T, %idx, 4), %rax`).
+    // It sits between the operand boundary and the displacement, and the caller
+    // keeps `line[..pos]` in the rewritten line — so it is stripped here and
+    // never becomes part of the composed operand.
+    let trimmed = cons_text.trim_start();
+    let cons_text = match segment_prefix_len(trimmed) {
+        Some(n) => trimmed[n..].to_string(),
+        None => cons_text,
+    };
     let cons = SibAddr::parse(&cons_text)?;
     // The base slot must be exactly %T.  Comparing the parsed field rather
     // than a text prefix also closes the `%r1` vs `%r10` prefix hazard.
@@ -1371,10 +1452,14 @@ fn compose_indexed_relay(
 /// Fails closed (`None`) when:
 ///   * `%T` is not the base of exactly one memory operand -- two such operands
 ///     are not rewritten half-way;
-///   * the consumer operand is not a plain `[disp](%T[, %idx[, s]])`: segment
-///     overrides (`%fs:8(%T)`) and indirect-branch operands (`*8(%T)`) put a
-///     prefix in the displacement slot that `parse_disp` would otherwise treat
-///     as a symbol;
+///   * the consumer operand is not a plain `[disp](%T[, %idx[, s]])`: an
+///     indirect-branch operand (`*8(%T)`) or any other prefix keeps its text in
+///     the displacement slot, where `parse_disp` would otherwise treat it as a
+///     symbol.  A validated segment override (`%gs:8(%T)`) is the one prefix
+///     that is composed *through*: it is stripped for the parse and re-attached
+///     in front of the composed address, which is what makes the per-CPU
+///     `leaq 8(%rax), %rcx; movq %gs:(%rcx), %rax` fold into GCC's
+///     `movq %gs:8(%rax), %rax`;
 ///   * the sum needs more registers than one SIB byte encodes, two symbols, or
 ///     a numeric displacement outside disp32.
 ///
@@ -1397,7 +1482,15 @@ pub(super) fn splice_lea_into_mem_operand(
     }
     let close = pos + line[pos..].find(')')?;
     let op_start = operand_start(line, pos);
-    let disp_text = line[op_start..pos].trim();
+    let raw_disp = line[op_start..pos].trim();
+    // `%gs:(%T)` / `%fs:8(%T)`: keep the validated override (it belongs to the
+    // same memory operand and the fold does not move it) and compose only the
+    // address text behind it.  Anything else in the displacement slot is still
+    // refused — `*%gs:(%T)` keeps its `*` here and falls out below.
+    let (seg, disp_text) = match segment_prefix_len(raw_disp) {
+        Some(n) => (&raw_disp[..n], &raw_disp[n..]),
+        None => ("", raw_disp),
+    };
     if disp_text.contains(['%', ':', '*', '(', ')', '$', ' ', '\t']) {
         return None;
     }
@@ -1418,8 +1511,9 @@ pub(super) fn splice_lea_into_mem_operand(
     let lead = line[op_start..pos].len() - line[op_start..pos].trim_start().len();
     let start = op_start + lead;
     Some(format!(
-        "{}{}{}",
+        "{}{}{}{}",
         &line[..start],
+        seg,
         composed,
         &line[close + 1..]
     ))
@@ -1521,13 +1615,15 @@ pub(super) fn fold_lea_into_load(store: &mut LineStore, infos: &mut [LineInfo]) 
                 // `(%T, …)` can absorb the LEA. `8(%T)` must not match:
                 // splicing would produce `8DISP(%base)`.
                 let mut matched: Option<(usize, usize, String)> = None;
-                if let Some((pos, _)) = t.match_indices(&addr_pat).find(|(pos, _)| {
-                    *pos == 0 || matches!(t.as_bytes()[pos - 1] as char, ' ' | ',' | '\t')
-                }) {
+                if let Some((pos, _)) = t
+                    .match_indices(&addr_pat)
+                    .find(|(pos, _)| at_mem_operand_boundary(t, *pos))
+                {
                     matched = Some((pos, pos + addr_pat.len() - 1, folded_addr.clone()));
-                } else if let Some((pos, _)) = t.match_indices(&idx_pat).find(|(pos, _)| {
-                    *pos == 0 || matches!(t.as_bytes()[pos - 1] as char, ' ' | ',' | '\t')
-                }) {
+                } else if let Some((pos, _)) = t
+                    .match_indices(&idx_pat)
+                    .find(|(pos, _)| at_mem_operand_boundary(t, *pos))
+                {
                     if let Some(cl) = t[pos..].find(')').map(|c| pos + c)
                         && let Some(new_operand) =
                             compose_indexed_relay(t, pos, cl, dst_text, &folded_addr)
@@ -5989,9 +6085,17 @@ mod tests {
             splice_lea_into_mem_operand("cmpsb (%rdx), (%rdx)", "%rdx", "8(%rdi)"),
             None
         );
-        // Operand prefixes are not displacements.
+        // A *segment override* is the one operand prefix that IS composed
+        // through: it is stripped for the address parse and re-attached in
+        // front of the composed displacement (GCC's per-CPU shape,
+        // `leaq 8(%rdi), %rdx; movq %fs:(%rdx), %rax` -> `movq %fs:8(%rdi), %rax`).
+        // A prefix that is not one of the six segment registers stays refused.
         assert_eq!(
-            splice_lea_into_mem_operand("movq %fs:8(%rdx), %rax", "%rdx", "8(%rdi)"),
+            splice_lea_into_mem_operand("movq %fs:8(%rdx), %rax", "%rdx", "8(%rdi)").as_deref(),
+            Some("movq %fs:16(%rdi), %rax")
+        );
+        assert_eq!(
+            splice_lea_into_mem_operand("movq %gss:8(%rdx), %rax", "%rdx", "8(%rdi)"),
             None
         );
         assert_eq!(
@@ -6027,5 +6131,143 @@ mod tests {
         assert_eq!(parse_disp("lock addq 8"), None);
         assert_eq!(parse_disp(".LC0+8"), Some((Some(".LC0".to_string()), 8)));
         assert_eq!(parse_disp("x.1"), Some((Some("x.1".to_string()), 0)));
+    }
+
+    /// The segment-override spelling is recognised as a prefix and nothing
+    /// else: exactly two letters from the segment set, one colon, no trailing
+    /// text inside the prefix.
+    #[test]
+    fn segment_prefix_validation_is_exact() {
+        use super::segment_prefix_len;
+        for ok in ["%gs:", "%fs:", "%es:", "%ds:", "%cs:", "%ss:", "%GS:"] {
+            assert_eq!(segment_prefix_len(ok), Some(4), "{ok} is a prefix");
+        }
+        // The detector answers for the PREFIX only; the residual text after it
+        // belongs to the caller (`%gs:8` is a four-byte prefix plus `8`, which
+        // is exactly the shape the splice parses).
+        assert_eq!(segment_prefix_len("%gs:8"), Some(4));
+        assert_eq!(segment_prefix_len("%gs:"), Some(4));
+        for bad in [
+            "", "%", "%g:", "%gss:", "%gx:", "%xyz:", "%gs8:", "%gs", "gs:", "%%gs:", " %gs:",
+            "%$s:", "*%gs:",
+        ] {
+            assert_eq!(segment_prefix_len(bad), None, "{bad} is not a prefix");
+        }
+    }
+
+    /// The operand-boundary test the window scan uses: the bare and indexed
+    /// matchers must see a consumer behind a segment override, and must still
+    /// refuse anything else that puts text before the operand.
+    #[test]
+    fn segment_override_is_an_operand_boundary_for_the_window_scan() {
+        use super::{at_mem_operand_boundary, segment_prefix_len};
+        assert!(at_mem_operand_boundary("movq %gs:(%rcx), %rax", 9));
+        assert!(at_mem_operand_boundary("movq %gs:(%rcx, %rdx, 8), %rax", 9));
+        assert!(at_mem_operand_boundary("movq (%rcx), %rax", 5));
+        assert!(at_mem_operand_boundary("(%rcx)", 0));
+        // `*8(%rcx)` / `foo:(%rcx)` / `%gsx:(%rcx)` are not operand starts.
+        assert!(!at_mem_operand_boundary("jmp *%gs:(%rcx)", 9));
+        assert!(!at_mem_operand_boundary("movq 0x64:(%rcx), %rax", 10));
+        assert!(!at_mem_operand_boundary("movq %gss:(%rcx), %rax", 10));
+        assert_eq!(segment_prefix_len("%gsx:"), None);
+    }
+
+    /// GCC and Clang fold a per-CPU load whose base arrives in the accumulator
+    /// — `movq %gs:8(%rax), %rax` — and the segment override is the only reason
+    /// lccc's window scan used to miss it (the `:` before the `(` was not an
+    /// operand boundary).  Reproducer: `long f(void){ return base()->b; }`
+    /// (tests/regression/check_seg_const_offset_fold.sh, `fold_after_call`).
+    #[test]
+    fn lea_folds_into_segment_prefixed_load() {
+        let out = run(concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    call base@PLT\n",
+            "    leaq 8(%rax), %rcx\n",
+            "    movq %gs:(%rcx), %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.contains("movq %gs:8(%rax), %rax"),
+            "the segment consumer must fold:\n{out}"
+        );
+        assert!(
+            !out.contains("leaq 8(%rax), %rcx"),
+            "the lea must be gone:\n{out}"
+        );
+    }
+
+    /// Same for the indexed consumer (`p[i].field` through a per-CPU array),
+    /// which goes through `compose_indexed_relay` — the prefix must survive the
+    /// composition and the index/scale must survive with it.
+    #[test]
+    fn lea_folds_into_indexed_segment_prefixed_load() {
+        let out = run(concat!(
+            "g:\n",
+            ".cfi_startproc\n",
+            "    leaq 8(%rax), %rcx\n",
+            "    movq %gs:(%rcx, %rdx, 8), %rsi\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.contains("movq %gs:8(%rax, %rdx, 8), %rsi"),
+            "the indexed segment consumer must fold:\n{out}"
+        );
+        assert!(
+            !out.contains("leaq 8(%rax), %rcx"),
+            "the lea must be gone:\n{out}"
+        );
+    }
+
+    /// A segment-prefixed *store* destination folds the same way, through the
+    /// shared splice: `leaq 8(%rdi), %rcx; movq %rax, %gs:(%rcx)`.
+    #[test]
+    fn lea_folds_into_segment_prefixed_store() {
+        let out = run(concat!(
+            "h:\n",
+            ".cfi_startproc\n",
+            "    leaq 8(%rdi), %rcx\n",
+            "    movq %rax, %gs:(%rcx)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.contains("movq %rax, %gs:8(%rdi)"),
+            "the segment store must fold:\n{out}"
+        );
+    }
+
+    /// The fold composes displacements *through* a segment override: both the
+    /// producer's and the consumer's displacements survive the rewrite.
+    #[test]
+    fn segment_prefixed_consumer_composes_displacements() {
+        assert_eq!(
+            splice_lea_into_mem_operand("movq %gs:(%r9), %rax", "%r9", "8(%r13, %r10)").as_deref(),
+            Some("movq %gs:8(%r13, %r10), %rax")
+        );
+        assert_eq!(
+            splice_lea_into_mem_operand("movq %fs:8(%rcx), %rax", "%rcx", "8(%rdi)").as_deref(),
+            Some("movq %fs:16(%rdi), %rax")
+        );
+        assert_eq!(
+            splice_lea_into_mem_operand("movl %eax, %gs:(%rdx)", "%rdx", "0x10(%rsi)").as_deref(),
+            Some("movl %eax, %gs:16(%rsi)")
+        );
+        // A prefix that is not a segment register, an indirect branch operand
+        // and a doubled prefix all stay refused.
+        assert_eq!(
+            splice_lea_into_mem_operand("movq %gss:(%r9), %rax", "%r9", "8(%rdi)"),
+            None
+        );
+        assert_eq!(
+            splice_lea_into_mem_operand("jmp *%gs:(%r9)", "%r9", "8(%rdi)"),
+            None
+        );
+        assert_eq!(
+            splice_lea_into_mem_operand("movq %gs:%fs:(%r9), %rax", "%r9", "8(%rdi)"),
+            None
+        );
     }
 }

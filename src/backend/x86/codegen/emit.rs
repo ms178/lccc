@@ -9396,6 +9396,7 @@ impl ArchCodegen for X86Codegen {
         fn emit_inline_memmove_call(&mut self, dest: &Operand, src: &Operand, size: usize) => emit_inline_memmove_call_impl;
         fn emit_inline_memset_call(&mut self, dest: &Operand, value: &Operand, size: usize, result: Option<&Value>) => emit_inline_memset_call_impl;
         fn emit_seg_load(&mut self, dest: &Value, ptr: &Value, ty: IrType, seg: AddressSpace) => emit_seg_load_impl;
+        fn emit_seg_load_with_const_offset(&mut self, dest: &Value, base: &Value, offset: i64, ty: IrType, seg: AddressSpace) -> bool => emit_seg_load_with_const_offset_impl;
         fn emit_seg_load_const_addr(&mut self, dest: &Value, addr: i64, ty: IrType, seg: AddressSpace) -> bool => emit_seg_load_const_addr_impl;
         fn emit_seg_store_const_addr(&mut self, val: &Operand, addr: i64, ty: IrType, seg: AddressSpace) -> bool => emit_seg_store_const_addr_impl;
         fn emit_seg_load_symbol(&mut self, dest: &Value, sym: &str, ty: IrType, seg: AddressSpace) => emit_seg_load_symbol_impl;

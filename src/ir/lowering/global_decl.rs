@@ -75,11 +75,22 @@ impl Lowerer {
             // Register before evaluating initializer so self-referential
             // initializers (e.g., `struct Node n = {&n}`) can resolve.
             let mut ginfo = GlobalInfo::from_analysis(&da);
-            ginfo.var.address_space = decl.address_space;
+            ginfo.var.address_space = crate::common::type_builder::object_storage_address_space(
+                decl.address_space,
+                &declarator.derived,
+            );
             if let Some(ref mut ct) = ginfo.var.c_type {
-                crate::common::type_builder::apply_declaration_address_space(
+                // OBJECT declaration: the space lands on the pointee only when
+                // the DECLARATOR supplies the pointer.  A pointer from the type
+                // specifier (typedef/typeof — the kernel's DEFINE_PER_CPU
+                // spelling) keeps its plain value type while the object's
+                // storage (`var.address_space` above, exactly as gcc models
+                // `&obj`) stays in the segment.  See
+                // apply_declaration_address_space_for_object.
+                crate::common::type_builder::apply_declaration_address_space_for_object(
                     ct,
                     decl.address_space,
+                    &declarator.derived,
                 );
             }
             self.globals.insert(declarator.name.clone(), ginfo);
@@ -230,9 +241,16 @@ impl Lowerer {
         }
         let mut ginfo = GlobalInfo::from_analysis(&da);
         ginfo.asm_register = Some(reg_name.clone());
-        ginfo.var.address_space = decl.address_space;
+        ginfo.var.address_space = crate::common::type_builder::object_storage_address_space(
+            decl.address_space,
+            &declarator.derived,
+        );
         if let Some(ref mut ct) = ginfo.var.c_type {
-            crate::common::type_builder::apply_declaration_address_space(ct, decl.address_space);
+            crate::common::type_builder::apply_declaration_address_space_for_object(
+                ct,
+                decl.address_space,
+                &declarator.derived,
+            );
         }
         self.globals.insert(declarator.name.clone(), ginfo);
         true
@@ -270,11 +288,15 @@ impl Lowerer {
                 da.apply_vector_size(vs);
             }
             let mut ginfo = GlobalInfo::from_analysis(&da);
-            ginfo.var.address_space = decl.address_space;
+            ginfo.var.address_space = crate::common::type_builder::object_storage_address_space(
+                decl.address_space,
+                &declarator.derived,
+            );
             if let Some(ref mut ct) = ginfo.var.c_type {
-                crate::common::type_builder::apply_declaration_address_space(
+                crate::common::type_builder::apply_declaration_address_space_for_object(
                     ct,
                     decl.address_space,
+                    &declarator.derived,
                 );
             }
             self.globals.insert(declarator.name.clone(), ginfo);

@@ -3776,6 +3776,12 @@ impl X86Codegen {
         };
         self.operand_to_rax(&Operand::Value(*ptr));
         self.state.emit("    movq %rax, %rcx");
+        // Scalar FP: load straight into the destination's XMM home rather than
+        // moving the bit pattern through %rax.
+        if matches!(ty, IrType::F64 | IrType::F32 | IrType::D64 | IrType::D32) {
+            self.emit_seg_load_xmm(dest, ty, seg_prefix, "", Some("rcx"));
+            return;
+        }
         let load_instr = Self::mov_load_for_type(ty);
         let dest_reg = Self::load_dest_reg(ty);
         self.state.emit_fmt(format_args!(
@@ -3783,6 +3789,161 @@ impl X86Codegen {
             load_instr, seg_prefix, dest_reg
         ));
         self.store_rax_to(dest);
+    }
+
+    /// Finish a segment-prefixed scalar FP load in the SSE domain:
+    /// `movsd %gs:8(%rdi), %xmm0` / `movss %gs:16, %xmm3`.
+    ///
+    /// `disp` is the displacement text (`""`, `"8"`, `"sym"`) and `base` the
+    /// addressing register without its `%` (`None` for a direct segment
+    /// address).  Landing the value in the destination's own XMM home is what
+    /// keeps an FP per-CPU access one instruction: the GPR path loads the bit
+    /// pattern into %rax and then shuttles it across domains
+    /// (`movq %gs:8(%rdi), %rax; movq %rax, %xmm0`), and the default-space
+    /// twin (`emit_load_with_const_offset_impl`) already made this choice for
+    /// everything except segment operands.  Measured: `double f(struct F
+    /// __seg_gs *p){ return p->d; }` — lccc 3 instructions, GCC 1
+    /// (`movsd %gs:8(%rdi), %xmm0`).
+    fn emit_seg_load_xmm(
+        &mut self,
+        dest: &Value,
+        ty: IrType,
+        seg_prefix: &str,
+        disp: &str,
+        base: Option<&str>,
+    ) {
+        let load_instr = if matches!(ty, IrType::F64 | IrType::D64) {
+            "movsd"
+        } else {
+            "movss"
+        };
+        let dest_xmm_reg = self
+            .reg_assignments
+            .get(&dest.0)
+            .copied()
+            .filter(|&r| is_xmm_reg(r));
+        let target = dest_xmm_reg.map(phys_reg_name).unwrap_or("xmm0");
+        match base {
+            Some(reg) => self.state.emit_fmt(format_args!(
+                "    {} {}{}(%{}), %{}",
+                load_instr, seg_prefix, disp, reg, target
+            )),
+            None => self.state.emit_fmt(format_args!(
+                "    {} {}{}, %{}",
+                load_instr, seg_prefix, disp, target
+            )),
+        }
+        if dest_xmm_reg.is_none() {
+            self.store_xmm_to(dest, "xmm0", ty);
+        } else {
+            // Definition-writes-home accounting: the load wrote the dest's
+            // XMM home, exactly like the default-space FP branch.
+            self.note_inplace_compute(
+                dest_xmm_reg.expect("dest_xmm_reg is Some in this arm"),
+                dest.0,
+            );
+        }
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    /// Segment-overridden load at a constant displacement from a base that is
+    /// already live in a GPR: `movq %gs:8(%rax), %rax`. GCC and Clang fold
+    /// this displacement; the generic [`Self::emit_seg_load_impl`] instead
+    /// materialises `base + offset` into %rcx first, so every per-CPU
+    /// `base->field` access in the kernel cost `leaq 8(%rax), %rcx` plus a
+    /// second live GPR. Measured on `struct S __seg_gs *` (work/repros/
+    /// seg_fold.c): lccc 2 instructions vs GCC/Clang 1 for `getp()->b`.
+    ///
+    /// Returns false whenever the shape is not expressible here (base not in a
+    /// register, 128-bit type, oversized displacement, default address space),
+    /// in which case the caller keeps the existing base-materialisation path.
+    pub(super) fn emit_seg_load_with_const_offset_impl(
+        &mut self,
+        dest: &Value,
+        base: &Value,
+        offset: i64,
+        ty: IrType,
+        seg: AddressSpace,
+    ) -> bool {
+        let seg_prefix = match seg {
+            AddressSpace::SegGs => "%gs:",
+            AddressSpace::SegFs => "%fs:",
+            AddressSpace::Default => return false,
+        };
+        // Same legality predicate as the default-space fast path
+        // (`is_foldable_mem_ty`): 128-bit values have no single
+        // memory-operand load.
+        if crate::backend::generation::is_wide_int_type(ty) || ty == IrType::F128 {
+            return false;
+        }
+        // x86 displacements are sign-extended 32-bit.
+        if i32::try_from(offset).is_err() {
+            return false;
+        }
+        let Some(&base_reg) = self.reg_assignments.get(&base.0) else {
+            return false;
+        };
+        if is_xmm_reg(base_reg) {
+            return false;
+        }
+        let base_name = phys_reg_name(base_reg);
+        // Scalar FP stays in the SSE domain, like the default-space twin:
+        // `movsd %gs:8(%rax), %xmm0` instead of a GPR round trip.
+        if matches!(ty, IrType::F64 | IrType::F32 | IrType::D64 | IrType::D32) {
+            let disp = if offset == 0 {
+                String::new()
+            } else {
+                offset.to_string()
+            };
+            self.emit_seg_load_xmm(dest, ty, seg_prefix, &disp, Some(base_name));
+            return true;
+        }
+        let load_instr = Self::mov_load_for_type(ty);
+        // 64-bit loads go straight into the value's GPR home when it has one,
+        // exactly like the const-ADDRESS twin (`emit_seg_load_const_addr`).
+        // The `%rax` round trip costs one instruction per access and shows up on
+        // the kernel's hottest shape, the per-CPU field read: `p = p->next`
+        // emitted `movq %gs:24(%r8), %rax; movq %rax, %r8` (2 insns) where gcc
+        // and clang emit `movq %gs:24(%rdi), %rdi` (1).  Measured on the
+        // pointer-base per-CPU walk (tests/benchmark/programs/percpu_ptr_walk.c,
+        // 4 segment loads per iteration): inner loop 9 -> 8 instructions and
+        // byte-identical output.  `invalidate_acc` is the same accumulator
+        // bookkeeping the const-address twin applies: the value now lives in
+        // its home and nothing may claim it in %rax.
+        if matches!(ty, IrType::I64 | IrType::U64 | IrType::Ptr) {
+            if let Some(&reg) = self.reg_assignments.get(&dest.0) {
+                if !is_xmm_reg(reg) {
+                    let dest_name = phys_reg_name(reg);
+                    if offset == 0 {
+                        self.state.emit_fmt(format_args!(
+                            "    {} {}(%{}), %{}",
+                            load_instr, seg_prefix, base_name, dest_name
+                        ));
+                    } else {
+                        self.state.emit_fmt(format_args!(
+                            "    {} {}{}(%{}), %{}",
+                            load_instr, seg_prefix, offset, base_name, dest_name
+                        ));
+                    }
+                    self.state.reg_cache.invalidate_acc();
+                    return true;
+                }
+            }
+        }
+        let dest_reg = Self::load_dest_reg(ty);
+        if offset == 0 {
+            self.state.emit_fmt(format_args!(
+                "    {} {}(%{}), {}",
+                load_instr, seg_prefix, base_name, dest_reg
+            ));
+        } else {
+            self.state.emit_fmt(format_args!(
+                "    {} {}{}(%{}), {}",
+                load_instr, seg_prefix, offset, base_name, dest_reg
+            ));
+        }
+        self.store_rax_to(dest);
+        true
     }
 
     pub(super) fn emit_seg_load_symbol_impl(
@@ -3799,6 +3960,12 @@ impl X86Codegen {
                 unreachable!("segment-prefixed op called with default address space")
             }
         };
+        // Scalar FP per-CPU objects (`this_cpu_read(fp_field)`) stay in the SSE
+        // domain: `movsd %gs:sym(%rip), %xmm0`.
+        if matches!(ty, IrType::F64 | IrType::F32 | IrType::D64 | IrType::D32) {
+            self.emit_seg_load_xmm(dest, ty, seg_prefix, sym, Some("rip"));
+            return;
+        }
         let load_instr = Self::mov_load_for_type(ty);
         let dest_reg = Self::load_dest_reg(ty);
         self.state.emit_fmt(format_args!(
@@ -3813,11 +3980,6 @@ impl X86Codegen {
     /// address materialization) replaces movq $16,%r; movq %r,%rcx;
     /// movq %fs:(%rcx),... The offset is printed signed decimal exactly
     /// like GAS 2.47 disassembles it.
-    /// Direct segment-relative access at constant offset: the GCC/Clang
-    /// form for every glibc TLS macro. `movq %fs:16, %rax` (no address
-    /// materialization) replaces movq $16,%r; movq %r,%rcx;
-    /// movq %fs:(%rcx),... The offset prints signed decimal, exactly the
-    /// operand GAS 2.47 accepts and objdump prints.
     pub(super) fn emit_seg_load_const_addr_impl(
         &mut self,
         dest: &Value,

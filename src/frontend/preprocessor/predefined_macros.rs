@@ -365,6 +365,19 @@ impl Preprocessor {
             self.define_simple_macro(name, body);
         }
 
+        // `-fshort-wchar` rewrites exactly the five `wchar_t` macros below and
+        // nothing else (`__WINT_*` stay 32-bit, verified against GCC 14.2's
+        // `-dM -E` output for both flag settings). The table above holds the
+        // default spellings; re-defining here keeps the flag override in one
+        // place instead of threading a runtime value through a `const` table.
+        if crate::common::types::short_wchar() {
+            self.define_simple_macro("__SIZEOF_WCHAR_T__", "2");
+            self.define_simple_macro("__WCHAR_MAX__", "0xffff");
+            self.define_simple_macro("__WCHAR_MIN__", "0");
+            self.define_simple_macro("__WCHAR_WIDTH__", "16");
+            self.define_simple_macro("__WCHAR_TYPE__", "short unsigned int");
+        }
+
         let (date_macro, time_macro) = Self::current_date_time_macros();
         self.define_simple_macro("__DATE__", &date_macro);
         self.define_simple_macro("__TIME__", &time_macro);

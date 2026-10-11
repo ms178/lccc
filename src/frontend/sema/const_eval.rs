@@ -561,9 +561,18 @@ impl<'a> SemaConstEval<'a> {
 
     /// Check if two CTypes are compatible (for __builtin_types_compatible_p).
     fn ctypes_compatible(&self, t1: &CType, t2: &CType) -> bool {
-        // Strip qualifiers (CType doesn't carry them) and compare
+        // Strip qualifiers (CType doesn't carry them) and compare.  The named
+        // ADDRESS SPACE is part of the pointer type's identity, not a
+        // qualifier: gcc reports `__builtin_types_compatible_p(T *,
+        // __seg_gs T *) == 0`, and the kernel leans on that answer in
+        // `__same_type`-shaped static assertions.  Ignoring the space here made
+        // every space pair compatible, so `__same_type(gs_ptr, plain_ptr)`
+        // answered 1 where gcc answers 0 — a silently wrong constant in code
+        // that is *specified* by the compiler's answer.
         match (t1, t2) {
-            (CType::Pointer(a, _), CType::Pointer(b, _)) => self.ctypes_compatible(a, b),
+            (CType::Pointer(a, sa), CType::Pointer(b, sb)) => {
+                sa == sb && self.ctypes_compatible(a, b)
+            }
             (CType::Array(a, sa), CType::Array(b, sb)) => {
                 self.ctypes_compatible(a, b) && (sa == sb || sa.is_none() || sb.is_none())
             }

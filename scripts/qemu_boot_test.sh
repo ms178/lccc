@@ -22,9 +22,17 @@
 # ============================================================================
 set -euo pipefail
 
-K=${KERNEL_DIR:-/home/user/target/kernel-work/linux-6.18.52}
+K=${KERNEL_DIR:-/home/user/target/kernel-work/linux-6.18.55}
 BZIMAGE=${1:-$K/arch/x86/boot/bzImage}
 QEMU=${QEMU:-qemu-system-x86_64}
+# Explicit CPU model.  The default QEMU model for x86_64 is `qemu64`, whose
+# feature set is the x86-64 baseline plus a few SSE-era extras — exactly what
+# the VM kernel is built for (kernel-vm.fragment: CONFIG_GENERIC_CPU=y,
+# CONFIG_X86_NATIVE_CPU=n).  Naming it explicitly keeps the boot gate
+# reproducible across QEMU versions and host CPUs and makes the ISA contract
+# visible: a kernel built with `-march=native` #UDs here, loudly, instead of
+# passing on one host and failing on another.
+QEMU_CPU=${QEMU_CPU:-qemu64}
 WORK=${BOOT_WORK:-/tmp/boottest}
 BUSYBOX=${BUSYBOX:-/usr/bin/busybox}
 LOG=${BOOT_LOG:-/tmp/qemu-boot.log}
@@ -182,7 +190,7 @@ echo "boot: $QEMU ${qemu_l[*]} -kernel $BZIMAGE (log: $LOG)"
 # dedicated file chardev has no stdio semantics to deadlock on: the same
 # image powers down and QEMU exits within ~1 s (measured). QEMU diagnostics
 # go to a separate file so the serial log stays grep-clean.
-timeout 600 "$QEMU" -m 512 -smp 2 \
+timeout 600 "$QEMU" -m 512 -smp 2 -cpu "$QEMU_CPU" \
     "${qemu_l[@]}" \
     -kernel "$BZIMAGE" -initrd "$WORK/initramfs.cpio.gz" \
     -display none -serial file:"$LOG" \

@@ -377,6 +377,40 @@ gate "segfs-declarator-codegen" fast \
 gate "seg-named-decl-qualifier" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_seg_named_decl_qualifier.sh
 
+# `%gs:`/`%fs:` loads whose base is a register plus a constant displacement must
+# fold into the memory operand (`movq %gs:8(%rax), %rax`) — the shape GCC and
+# Clang emit for every per-CPU `base->field` access — including when the base
+# arrives in the accumulator from a call. The behavioural half is
+# seg_gs_const_offset_fold.c (real GS base installed via arch_prctl).
+gate "seg-const-offset-fold" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_seg_const_offset_fold.sh
+
+# The result of a segment load must land in its own GPR home: `p = p->next` on
+# a per-CPU pointer emits `movq %gs:24(%rdi), %rdi`, not the two-instruction
+# `movq %gs:24(%rdi), %rax; movq %rax, %rdi` relay. One instruction per access
+# on the kernel's hottest per-CPU shape; GCC and Clang emit the single form.
+# The gate also caps the walk loop at the oracle's eight instructions.
+gate "seg-direct-home" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_seg_direct_home.sh
+
+# An explicit `-march=` is a ceiling: a TU compiled for x86-64/v2 contains no
+# BMI/BMI2/AVX-class instruction, `-mno-bmi2` wins over `-mavx2`, and a
+# positive control proves the check is not vacuous. The kernel decompressor's
+# Makefile REPLACES KBUILD_CFLAGS (no -march on x86-64), so this is the gate
+# that keeps `make`-driven builds baseline-clean: a 64-bit-startup #UD is a
+# triple fault with no serial output at all — measured on QEMU, and
+# indistinguishable from "the compiler miscompiled everything".
+gate "isa-gate-escape" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_isa_gate_escape.sh
+
+# The flag-only half above is necessary but not sufficient: the kernel's own
+# flag-wiping Makefiles are what leaked v3 into the boot path in the first
+# place.  This gate tests the patch that makes them name their ISA, refuses to
+# guess when they are refactored, and the per-object artifact scan that proves
+# the built boot/decompressor objects are baseline-clean.
+gate "kernel-boot-isa" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_kernel_boot_isa.sh
+
 gate "tls-model-selection" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_tls_model_selection.sh
 

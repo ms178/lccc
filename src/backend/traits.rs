@@ -332,6 +332,25 @@ pub trait ArchCodegen {
     ) -> bool {
         false
     }
+    /// Segment-overridden load at a constant displacement from `base`
+    /// (`movq %gs:8(%rax), %rax`) — the per-CPU address shape whose base is
+    /// already live in a register. Folding the displacement here is what GCC
+    /// and Clang do; without it every `base->field` access through a
+    /// `__seg_gs` pointer pays an extra `leaq` plus a second GPR. Returns
+    /// false when the shape is not expressible, which leaves the caller's
+    /// base-materialisation ladder exactly as it was. Default false on every
+    /// non-x86 backend.
+    fn emit_seg_load_with_const_offset(
+        &mut self,
+        _dest: &Value,
+        _base: &Value,
+        _offset: i64,
+        _ty: IrType,
+        _seg: AddressSpace,
+    ) -> bool {
+        false
+    }
+
     fn emit_seg_load(&mut self, _dest: &Value, _ptr: &Value, _ty: IrType, _seg: AddressSpace) {
         panic!("segment override loads only supported on x86");
     }

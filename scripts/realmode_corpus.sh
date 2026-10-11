@@ -13,7 +13,7 @@ set -euo pipefail
 
 LCCC=$(realpath "${1:?usage: realmode_corpus.sh <lccc-binary> [outdir]}")
 OUT=${2:-/tmp/realmode}
-K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.52}
+K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.55}
 # Resolve the script directory before `cd "$K"`: the shared ELF section helper
 # has to be found relative to THIS script, not inside the kernel tree.
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)

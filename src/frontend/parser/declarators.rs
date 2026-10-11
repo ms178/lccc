@@ -569,6 +569,7 @@ impl Parser {
                     fptr_variadic,
                     inner_ptr_depth,
                     param_is_restrict,
+                    paren_ptr_total,
                 ) = self.parse_param_declarator_full();
                 // Post-name GCC attributes: `int x __attribute__((aligned(32)))`.
                 // The parameter declarator parser does not consume them; parse
@@ -596,7 +597,29 @@ impl Parser {
                 // makes only `*pp` a %gs access), so it lands on the first level
                 // built, exactly as `apply_declaration_address_space` places it
                 // for declarations. The outer levels stay ordinary memory.
-                for level in 0..pointer_depth {
+                //
+                // The pointer levels split around a pointee ARRAY suffix.  A
+                // parenthesized pointer-to-array declarator binds its stars from
+                // the OUTSIDE (`(*p)[N]` is `Pointer(Array(T, N))`, and
+                // `(**p)[N]` — the kernel's `const char (**names)[ETH_GSTRING_LEN]`
+                // in net/ethtool/privflags.c — is `Pointer(Pointer(Array(T, N)))`),
+                // while the leading stars bind to the base type from the inside
+                // (`int *(*p)[N]` is `Pointer(Array(Pointer(int), N))`).  Applying
+                // every pointer level first built the first shape as
+                // `Pointer(Array(Pointer(T), N))` — one pointer level attached to
+                // the wrong side of the array — so the kernel rejected a correct
+                // argument to `ethnl_get_priv_flags_info`.
+                let leading_depth = if paren_ptr_total > 0 {
+                    pointer_depth + 1 - paren_ptr_total
+                } else {
+                    pointer_depth
+                };
+                let trailing_depth = if paren_ptr_total > 0 {
+                    paren_ptr_total
+                } else {
+                    0
+                };
+                for level in 0..leading_depth {
                     let space = if level == 0 {
                         param_addr_space
                     } else {
@@ -604,12 +627,13 @@ impl Parser {
                     };
                     type_spec = TypeSpecifier::Pointer(Box::new(type_spec), space);
                 }
-
-                // Pointer-to-array: int (*p)[N][M]
+                // Pointer-to-array: int (*p)[N][M], int (**p)[N][M]
                 if !ptr_to_array_dims.is_empty() {
                     for dim in ptr_to_array_dims.iter().rev() {
                         type_spec = TypeSpecifier::Array(Box::new(type_spec), dim.clone());
                     }
+                }
+                for _ in 0..trailing_depth {
                     type_spec = TypeSpecifier::Pointer(Box::new(type_spec), AddressSpace::Default);
                 }
 
@@ -705,6 +729,12 @@ impl Parser {
         bool,
         u32,
         bool,
+        // Pointer levels contributed by a parenthesized pointer-to-array
+        // declarator (`(*p)[N]` → 1, `(**p)[N]` → 2), 0 otherwise.  The
+        // CALLER needs the split: these bind to the array suffix from the
+        // OUTSIDE, while the leading stars bind to the base type from the
+        // inside (see the construction in parse_param_list).
+        u32,
     ) {
         let mut pointer_depth: u32 = 0;
         let mut is_restrict = false;
@@ -737,6 +767,7 @@ impl Parser {
         let mut fptr_params: Option<Vec<ParamDecl>> = None;
         let mut fptr_variadic = false;
         let mut fptr_inner_ptr_depth: u32 = 0;
+        let mut paren_ptr_total: u32 = 0;
 
         let name = if matches!(self.peek(), TokenKind::LParen) && self.is_paren_declarator() {
             self.parse_paren_param_declarator(
@@ -747,6 +778,7 @@ impl Parser {
                 &mut fptr_params,
                 &mut fptr_variadic,
                 &mut fptr_inner_ptr_depth,
+                &mut paren_ptr_total,
             )
         } else if let TokenKind::Identifier(n) = self.peek() {
             let n = n.clone();
@@ -800,10 +832,12 @@ impl Parser {
             fptr_variadic,
             fptr_inner_ptr_depth,
             is_restrict,
+            paren_ptr_total,
         )
     }
 
     /// Parse a parenthesized parameter declarator: (*name)(params), (name), etc.
+    #[allow(clippy::too_many_arguments)]
     fn parse_paren_param_declarator(
         &mut self,
         pointer_depth: &mut u32,
@@ -813,6 +847,7 @@ impl Parser {
         fptr_params: &mut Option<Vec<ParamDecl>>,
         fptr_variadic: &mut bool,
         fptr_inner_ptr_depth: &mut u32,
+        paren_ptr_total: &mut u32,
     ) -> Option<String> {
         let save = self.pos;
         self.advance(); // consume '('
@@ -898,7 +933,16 @@ impl Parser {
                 *fptr_params = Some(fp_params);
                 *fptr_variadic = variadic;
             } else if matches!(self.peek(), TokenKind::LBracket) {
-                // Pointer-to-array: (*p)[N]
+                // Pointer-to-array: (*p)[N], (**p)[N]
+                //
+                // Every star counts: `(*p)[N]` has the syntax-marker star and
+                // `(**p)[N]` has the marker plus one indirection level, and
+                // BOTH bind to the array from the outside.  The caller builds
+                // `Pointer^paren_ptr_total(Array^dims(base))`, which is why the
+                // count is reported separately from `pointer_depth` (that one
+                // keeps the leading stars, which bind to the base from the
+                // inside).
+                *paren_ptr_total = inner_ptr_depth;
                 while matches!(self.peek(), TokenKind::LBracket) {
                     self.advance();
                     self.skip_array_qualifiers();

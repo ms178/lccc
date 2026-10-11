@@ -365,7 +365,7 @@ fn define_type_traits_macros(macros: &mut MacroTable) {
     def(macros, "__LONG_LONG_MAX__", "9223372036854775807LL");
     def(macros, "__SHRT_MAX__", "32767");
     def(macros, "__SCHAR_MAX__", "127");
-    def(macros, "__WCHAR_MAX__", "2147483647");
+    def(macros, "__WCHAR_MAX__", crate::common::types::wchar_max());
     def(macros, "__SIZE_MAX__", "18446744073709551615UL");
 
     // Type width macros (GCC/Clang extension)
@@ -377,7 +377,11 @@ fn define_type_traits_macros(macros: &mut MacroTable) {
     def(macros, "__LONG_LONG_WIDTH__", "64");
     def(macros, "__PTRDIFF_WIDTH__", "64");
     def(macros, "__SIZE_WIDTH__", "64");
-    def(macros, "__WCHAR_WIDTH__", "32");
+    def(
+        macros,
+        "__WCHAR_WIDTH__",
+        crate::common::types::wchar_width(),
+    );
     def(macros, "__WINT_WIDTH__", "32");
     def(macros, "__INTMAX_WIDTH__", "64");
     def(macros, "__INTPTR_WIDTH__", "64");
@@ -391,7 +395,11 @@ fn define_type_traits_macros(macros: &mut MacroTable) {
     def(macros, "__INT_FAST16_WIDTH__", "64");
     def(macros, "__INT_FAST32_WIDTH__", "64");
     def(macros, "__INT_FAST64_WIDTH__", "64");
-    def(macros, "__SIZEOF_WCHAR_T__", "4");
+    def(
+        macros,
+        "__SIZEOF_WCHAR_T__",
+        crate::common::types::wchar_sizeof(),
+    );
 
     // Byte order
     def(macros, "__BYTE_ORDER__", "1234");

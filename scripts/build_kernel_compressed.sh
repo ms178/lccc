@@ -9,6 +9,18 @@
 # arch/x86/boot/compressed/Makefile:
 #   -O2 -fPIE -mcmodel=small -mno-sse -mno-mmx -ffreestanding
 #
+# `-march=x86-64` is passed EXPLICITLY, and that is load-bearing:
+# arch/x86/boot/compressed/Makefile line 27 REPLACES KBUILD_CFLAGS
+# (`KBUILD_CFLAGS := -m$(BITS) -O2 $(CLANG_FLAGS)`), so on x86-64 the
+# decompressor is built with NO `-march` unless CONFIG_X86_NATIVE_CPU leaks
+# `-march=native` in through arch/x86/Makefile.  "No -march" means
+# `-march=x86-64` (the baseline) for GCC — but lccc's absent-flag default is
+# the integer-v3 profile, so omitting the flag here silently produced a
+# BMI2/AVX2 decompressor that triple-faults on any pre-Haswell CPU.  Measured
+# on QEMU's default `qemu64` model: `andn` at kernel_ident_mapping_init
+# (#UD -> triple fault, no serial output at all).  The explicit baseline
+# makes lccc's effective flag set identical to GCC's for this Makefile.
+#
 # Payload: INTACT_VMLINUX (default kernel-work/intact/vmlinux). Do not relink
 # that ELF. Piggy is `zstd -6 --ultra` plus a 4-byte LE uncompressed size.
 #
@@ -18,7 +30,7 @@
 # ============================================================================
 set -euo pipefail
 
-K=${KERNEL_DIR:-/home/user/target/kernel-work/linux-6.18.52}
+K=${KERNEL_DIR:-/home/user/target/kernel-work/linux-6.18.55}
 INTACT=${INTACT_VMLINUX:-/home/user/target/kernel-work/intact/vmlinux}
 C=$K/arch/x86/boot/compressed
 B=$K/arch/x86/boot
@@ -107,6 +119,7 @@ INC=(
 )
 CF=(
   -std=gnu18 -m64 -O2 -fno-strict-aliasing -fPIE -fno-jump-tables
+  -march=x86-64                 # GCC parity: the Makefile replaces KBUILD_CFLAGS
   -Wundef -DDISABLE_BRANCH_PROFILING -mcmodel=small -mno-red-zone
   -mno-mmx -ffreestanding -fshort-wchar -fno-stack-protector
   -Wno-pointer-sign -fno-asynchronous-unwind-tables -D__DISABLE_EXPORTS
@@ -132,6 +145,7 @@ as() { # as <stem> [src]
 echo "CC   startup"
 ST_CF=(
   -std=gnu11 -m64 -Os -fPIC -mcmodel=small -fno-stack-protector
+  -march=x86-64                 # baseline, as for the compressed TUs above
   -fno-jump-tables -ffreestanding -fno-asynchronous-unwind-tables
   -D__DISABLE_EXPORTS -DDISABLE_BRANCH_PROFILING -D__NO_FORTIFY -D__KERNEL__
   -mno-mmx -mno-sse
@@ -238,4 +252,11 @@ echo "BUILD bzImage"
 (dd if="$B/setup.bin" bs=4k conv=sync status=none; cat "$B/vmlinux.bin") > "$B/bzImage"
 ls -l "$B/bzImage" "$C/vmlinux" "$B/setup.bin"
 sha256sum "$B/bzImage"
+# ISA audit of the decompressor and startup objects (per object, not on the
+# linked image: the stage-2 ELF carries the compressed payload as data).  The
+# CF/ST_CF arrays above name `-march=x86-64` explicitly for exactly the reason
+# scripts/kernel_boot_isa.sh documents: compressed/Makefile-style targets
+# REPLACE KBUILD_CFLAGS, and LCCC's absent-`-march` default is integer-v3.
+"$SCRIPT_DIR/kernel_boot_isa.sh" scan "$C" "$S" "$OUT/setup"
+
 echo "build_kernel_compressed: SUCCESS"

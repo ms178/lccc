@@ -16,6 +16,26 @@
 # ~5000), then `make olddefconfig` resolves the remaining dependencies.
 #
 # Boot validation targets: QEMU (TCG), serial console, busybox initramfs.
+#
+# ISA PORTABILITY IS PART OF THE GATE.  The package config enables
+# CONFIG_X86_NATIVE_CPU, which makes arch/x86/Makefile append `-march=native`
+# for the KERNEL and (through arch/x86/Makefile, read before the compressed
+# Makefile replaces KBUILD_CFLAGS) for the decompressor too.  A kernel built
+# that way only runs on the build host's CPU class: on QEMU's default
+# `qemu64` model the FIRST BMI2/AVX2 instruction raises #UD, which in early
+# 64-bit startup is a triple fault with no serial output at all — measured,
+# and indistinguishable from "lccc miscompiles everything".  (GCC behaves the
+# same way; this is a build-target choice, not a compiler defect.)
+#
+# The VM kernel is therefore built for the generic x86-64 baseline.  That is
+# the configuration that makes the boot gate reproducible on any host and on
+# any QEMU CPU model, and it is also the configuration that exercises LCCC's
+# ISA gating end to end: a baseline build that contains a single BMI2/AVX
+# instruction fails the boot, so `check_isa_gate_escape.sh` and this gate
+# cover the two directions.
+# CONFIG_X86_NATIVE_CPU is not set
+# CONFIG_MZEN4 is not set
+CONFIG_GENERIC_CPU=y
 # ============================================================================
 CONFIG_64BIT=y
 
