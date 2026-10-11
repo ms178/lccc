@@ -8,7 +8,9 @@ cc=${CC:-gcc}
 td=$(mktemp -d)
 trap 'rm -rf "$td"' EXIT
 python3 scripts/test_audit_levkropp_since.py
-for name in swar_intermediate_casts count_zero_intermediate_casts clz_safe_guards cmp_select_fusion_stale_cond loop_memory_promote_alias_load; do
+python3 scripts/test_oracle_delta_gate.py
+python3 scripts/test_bench_rank.py
+for name in nested_select_same_condition exact_product_half swar_intermediate_casts count_zero_intermediate_casts clz_safe_guards cmp_select_fusion_stale_cond loop_memory_promote_alias_load; do
     src=tests/regression/$name.c
     timeout 60 "$cc" -O2 "$src" -o "$td/ref"
     timeout 10 "$td/ref" > "$td/expected"
@@ -60,13 +62,19 @@ for name in count_zero_intermediate_casts clz_safe_guards; do
 done
 # The i686 backend uses paired registers for the 64-bit input. Exercise zero,
 # every single bit (including bit 63), and guard/cast boundaries there too.
-for name in count_zero_intermediate_casts clz_safe_guards; do
-    timeout 60 "$cc" -m32 -O2 "tests/regression/$name.c" -o "$td/ref32"
-    timeout 10 "$td/ref32" > "$td/expected32"
-    for opt in -O1 -O2 -O3; do
-        timeout 60 "$ccc" -m32 "$opt" "tests/regression/$name.c" -o "$td/check32"
-        timeout 10 "$td/check32" > "$td/actual32"
-        diff -u "$td/expected32" "$td/actual32"
+source tests/regression/i386_exec.sh
+if i386_run_or_skip "$cc"; then
+    for name in count_zero_intermediate_casts clz_safe_guards exact_product_half nested_select_same_condition; do
+        timeout 60 "$cc" -m32 -O2 "tests/regression/$name.c" -o "$td/ref32"
+        timeout 10 "$td/ref32" > "$td/expected32"
+        for opt in -O1 -O2 -O3; do
+            timeout 60 "$ccc" -m32 "$opt" "tests/regression/$name.c" -o "$td/check32"
+            timeout 10 "$td/check32" > "$td/actual32"
+            diff -u "$td/expected32" "$td/actual32"
+        done
+        echo "PASS: $name (i686 -O1/-O2/-O3; GCC stdout)"
     done
-    echo "PASS: $name (i686 -O1/-O2/-O3; GCC stdout)"
-done
+else
+    rc=$?
+    [[ $rc == 77 ]] || exit "$rc"
+fi

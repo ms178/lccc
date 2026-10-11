@@ -116,12 +116,12 @@ def evidence(r):
                 stdout_sha256=r['stdout_sha256'],stderr_sha256=r['stderr_sha256'],stderr_excerpt=r['stderr'].decode('utf-8',errors='replace')[-400:])
 
 
-def callgrind(binary,outdir,*,cache_geometry=None,expected_stdout=None):
+def callgrind(binary,outdir,*,cache_geometry=None,expected_stdout=None,timeout=1200):
     cg=Path(outdir)/(Path(binary).name+'.cg');cg.unlink(missing_ok=True)
     model=cache_geometry or geometry()[0]
     cmd=['valgrind','--tool=callgrind','--cache-sim=yes','--branch-sim=yes','--quiet',
          f'--I1={model["I1"]}',f'--D1={model["D1"]}',f'--LL={model["LL"]}',f'--callgrind-out-file={cg}',str(binary)]
-    try:r=_run(cmd,1200)
+    try:r=_run(cmd,timeout)
     except (OSError,ValueError) as exc:return None,'Callgrind infrastructure: '+str(exc),dict(command=cmd)
     info=dict(command=cmd,process=evidence(r))
     if r['failure'] or r['returncode']!=0:return None,f"Callgrind rc={r['returncode']} failure={r['failure']}",info
@@ -171,8 +171,8 @@ def _measure(args,benches,outroot,manifest,cache):
         entry['correctness']=dict(mine=evidence(pm),ref=evidence(pr))
         err=same_output(pm,pr)
         if err:entry['detail']=err;failures[bench]=err;continue
-        m_events,me,mi=callgrind(mbin,mdir,cache_geometry=cache,expected_stdout=pm['stdout'])
-        r_events,re,ri=callgrind(rbin,rdir,cache_geometry=cache,expected_stdout=pr['stdout'])
+        m_events,me,mi=callgrind(mbin,mdir,cache_geometry=cache,expected_stdout=pm['stdout'],timeout=args.instrument_timeout)
+        r_events,re,ri=callgrind(rbin,rdir,cache_geometry=cache,expected_stdout=pr['stdout'],timeout=args.instrument_timeout)
         entry['instrumentation']=dict(mine=mi,ref=ri)
         if me or re:entry['detail']=me or re;failures[bench]=me or re;continue
         try:metrics=compare_events(r_events,m_events)
@@ -198,6 +198,7 @@ def build_parser():
     ap=argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('mine');ap.add_argument('ref')
     ap.add_argument('--opt',required=True);ap.add_argument('bench',nargs='*')
+    ap.add_argument('--instrument-timeout',type=int,default=1200,help='seconds per instrumented arm')
     ap.add_argument('--heavy',action='store_true')
     ap.add_argument('--out-root',type=Path)
     ap.add_argument('--gcc-include-command',default='gcc')
@@ -246,13 +247,14 @@ def main(argv=None):
     # the runner.  parse_intermixed_args is the stdlib answer to exactly this,
     # and unlike hand-rolled argv reordering it keeps a bare `--` meaningful.
     args=ap.parse_intermixed_args(argv);benches=args.bench or DEFAULT_FAST+(sorted(HEAVY) if args.heavy else [])
+    if args.instrument_timeout < 1:ap.error('instrumentation timeout must be positive')
     if len(set(benches))!=len(benches) or any(not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*',b) for b in benches):
         ap.error('duplicate/unsafe benchmark name')
     # A unique common prefix avoids stale/concurrent default outputs. Explicit
     # out-root runs serialize the entire measurement under a same-root flock.
     outroot=args.out_root or Path(tempfile.mkdtemp(prefix='cg-ab-'));outroot.mkdir(parents=True,exist_ok=True)
     manifest=dict(schema='lccc-callgrind-ab-v2',model='simulated instructions/I1/D1/LL/branch predictor; not PMU/uops/cycles/speedup',
-                  opt=args.opt,opt_tokens=shlex.split(args.opt),heavy_opt_in=bool(set(benches)&HEAVY),
+                  opt=args.opt,opt_tokens=shlex.split(args.opt),instrument_timeout_s=args.instrument_timeout,heavy_opt_in=bool(set(benches)&HEAVY),
                   host=dict(platform=platform.platform(),machine=platform.machine(),libc=platform.libc_ver()),
                   compiler_environment={k:v for k,v in sorted(os.environ.items()) if k.startswith(('CCC_','LCCC_')) and not any(s in k.upper() for s in ('TOKEN','SECRET','PASSWORD','KEY'))},
                   failures={},results={},comparable=0,selected=len(benches))

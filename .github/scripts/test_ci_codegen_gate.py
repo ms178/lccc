@@ -10,6 +10,9 @@ frame-pointer function (so it cannot mask a real spill).
 
 import importlib.util
 import sys
+import json
+import tempfile
+from unittest.mock import patch
 import unittest
 from pathlib import Path
 
@@ -123,6 +126,23 @@ class RbpAccountingTests(unittest.TestCase):
         )
         m = gate.function_body_metrics(asm)
         self.assertEqual(m["stackmem"], 1)
+
+
+class BaselinePublicationTests(unittest.TestCase):
+    def test_incomplete_refresh_preserves_baseline(self):
+        with tempfile.TemporaryDirectory() as td, patch.object(gate, "WORKLOADS", [("a.c", "a"), ("b.c", "b")]):
+            path = Path(td) / "baseline.json"
+            path.write_text("old baseline\n")
+            for rows in [[], [{"label": "a", "metrics": {}}],
+                         [{"label": "a", "metrics": {}}, {"label": "b", "skip": "missing"}],
+                         [{"label": "a", "metrics": {}}, {"label": "b", "error": "compile"}],
+                         [{"label": "a", "metrics": {}}, {"label": "a", "metrics": {}}]]:
+                with self.assertRaises(ValueError): gate.publish_baseline(rows, path)
+                self.assertEqual(path.read_text(), "old baseline\n")
+            gate.publish_baseline([{"label": "a", "metrics": {"insns": 1}},
+                                   {"label": "b", "metrics": {"insns": 2}}], path)
+            self.assertEqual(set(json.loads(path.read_text())), {"a", "b"})
+            self.assertFalse(list(Path(td).glob("*.tmp.*")))
 
 
 if __name__ == "__main__":

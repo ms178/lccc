@@ -1,3 +1,7 @@
+/* Optional bounded instrumentation size; default workload is unchanged. */
+#ifndef SELECT_ITERS
+#define SELECT_ITERS 50000000u
+#endif
 /* Branchless integer selection corpus distilled from code-generation defects.
    Header-free declarations keep it usable with cross-target Compiler Explorer. */
 extern int printf(const char *, ...);
@@ -26,7 +30,7 @@ int main(void) {
     u32 state = 1;
     u32 count = 0;
     u32 checksum = 0;
-    for (u32 i = 0; i < 50000000u; ++i) {
+    for (u32 i = 0; i < SELECT_ITERS; ++i) {
         state = state * 1664525u + 1013904223u;
         count = conditional_increment(count, state & 1u);
         checksum += select_pressure(state & 8u, state, i, count, state >> 3,

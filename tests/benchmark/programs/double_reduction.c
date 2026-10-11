@@ -1,3 +1,7 @@
+/* Optional bounded instrumentation size; default workload is unchanged. */
+#ifndef REDUCTION_PASSES
+#define REDUCTION_PASSES 128
+#endif
 // Deterministic two-accumulator reduction benchmark (statistical-moments /
 // complex-correlation shape).
 //
@@ -9,7 +13,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
-enum { N = 1 << 20, PASSES = 128 };
+enum { N = 1 << 20, PASSES = REDUCTION_PASSES };
 
 static int a[N], b[N], c[N];
 

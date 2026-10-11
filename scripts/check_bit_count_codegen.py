@@ -46,12 +46,21 @@ def check(directory: Path) -> None:
         require(count(guarded_ctz, trailing) == 1, f"{arch} guarded CTZ: missing native count")
         require(count(guarded_ctz, r"or\w*") == 0,
                 f"{arch} guarded CTZ: redundant high-bit safety OR")
-        for name in ["clz_guard32", "clz_guard_live", "clz_guard_same_width",
+        # This is a shape contract, not proof of Select→Copy: CVP can remove
+        # the same OR. The 72-case simplify IR matrix asserts the Copy itself.
+        for name in ["clz_guard31", "clz_guard32", "clz_guard_live", "clz_guard_same_width",
                      "clz_guard_signed_widen", "clz_guard_zero_widen"]:
             text = body(guards, name)
             require(count(text, leading) == 1, f"{arch} {name}: missing native CLZ")
             require(not re.search(r"^\s*or\w*\s+\$1\s*,", text, re.M),
                     f"{arch} {name}: redundant OR1 under nonzero guard")
+        for name in ["clz_guard_narrow", "clz_guard_wide"]:
+            text = body(guards, name)
+            require(count(text, leading) == 1, f"{arch} {name}: missing native CLZ")
+            require(count(text, r"j(?!mp)\w+|cmov\w+") >= 1,
+                    f"{arch} {name}: guard disappeared; inspect proof and executable witnesses")
+            require(re.search(r"\$32\b", text) is not None,
+                    f"{arch} {name}: lost distinct zero fallback")
     print("PASS: typed CLZ32/CTZ64, safe-zero branch elimination, guarded OR1 removal, truncated near-misses")
 
 

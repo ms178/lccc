@@ -726,6 +726,11 @@ fn safe_clz_guard_replacement(
     unary_defs: &[Option<UnaryDef>],
     binop_defs: &[Option<BinOpDef>],
 ) -> Option<Instruction> {
+    // Result casts, unlike INPUT casts, are transparent here: safe CLZ's
+    // range is 0..=W-1 (at most 63), representable even in I8/U8. Thus every
+    // integer narrowing/widening/sign change preserves the count. Copy keeps
+    // the original result cast chain; the W fallback still requires a
+    // width-matched result before constructing a new Clz with that type.
     let Operand::Value(root) = peel_int_cast_chain(true_val, cast_defs, false) else {
         return None;
     };
@@ -1912,6 +1917,67 @@ fn try_mul_power_of_two(
     }
 }
 
+/// Remove the rounding-toward-zero bias from an exact signed division by 2.
+/// div_by_const runs before GVN, so related product operands often become
+/// identical only AFTER division has expanded. Recognize that expanded form.
+/// For an even two's-complement p, (p + signbit(p)) >>s 1 == p >>s 1,
+/// including wrapped products and MIN. No positivity or no-overflow assumption
+/// is needed. x and x +/- odd (also x XOR odd) have opposite low bits, hence
+/// their product is even in EVERY integer ring. Do not cross width changes.
+fn unbiased_even_product_half(
+    biased: Operand,
+    ty: IrType,
+    casts: &[Option<CastDef>],
+    bins: &[Option<BinOpDef>],
+) -> Option<Operand> {
+    if !matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64) {
+        return None;
+    }
+    let width = ty.size() * 8;
+    let literal = |o: Operand, n: i128| matches!(o, Operand::Const(c) if c.to_i128() == Some(n));
+    let bin =
+        |o: Operand, op: IrBinOp| get_binop_def(&o, bins).filter(|d| d.op == op && d.ty == ty);
+    let add = bin(biased, IrBinOp::Add)?;
+    for (product, correction) in [(add.lhs, add.rhs), (add.rhs, add.lhs)] {
+        let Some(bias) = bin(correction, IrBinOp::LShr) else {
+            continue;
+        };
+        if !literal(bias.rhs, (width - 1) as i128) {
+            continue;
+        }
+        let Some(sign) = bin(bias.lhs, IrBinOp::AShr) else {
+            continue;
+        };
+        if !literal(sign.rhs, (width - 1) as i128) || sign.lhs != product {
+            continue;
+        }
+        let root = peel_int_cast_chain(product, casts, true);
+        let Some(mul) = get_binop_def(&root, bins) else {
+            continue;
+        };
+        if mul.op != IrBinOp::Mul || !mul.ty.is_integer() || mul.ty.size() != ty.size() {
+            continue;
+        }
+        for (x, adjacent) in [(mul.lhs, mul.rhs), (mul.rhs, mul.lhs)] {
+            let Some(pair) = get_binop_def(&adjacent, bins) else {
+                continue;
+            };
+            if pair.ty != mul.ty || !matches!(pair.op, IrBinOp::Add | IrBinOp::Sub | IrBinOp::Xor) {
+                continue;
+            }
+            // Sub is symmetric modulo 2 too: odd-x and x-odd both flip x's LSB.
+            for (base, odd) in [(pair.lhs, pair.rhs), (pair.rhs, pair.lhs)] {
+                if base == x
+                    && matches!(odd, Operand::Const(c) if c.to_i128().is_some_and(|n| n & 1 != 0))
+                {
+                    return Some(product);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn simplify_binop(
     dest: Value,
     op: IrBinOp,
@@ -2283,6 +2349,17 @@ fn simplify_binop(
             }
         }
         IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr => {
+            if op == IrBinOp::AShr && rhs_one {
+                if let Some(product) = unbiased_even_product_half(*lhs, ty, cast_defs, binop_defs) {
+                    return Some(Instruction::BinOp {
+                        dest,
+                        op,
+                        lhs: product,
+                        rhs: *rhs,
+                        ty,
+                    });
+                }
+            }
             if rhs_zero {
                 // x << 0 or x >> 0 => x
                 return Some(Instruction::Copy { dest, src: *lhs });
@@ -6022,5 +6099,147 @@ mod safe_clz_review_tests {
             unary[3].as_mut().unwrap().src = v(1); // bare NonZero has no safe-zero proof
             assert!(call(v(1), width, ty, &casts, &unary, &bins).is_none());
         }
+    }
+    #[test]
+    fn safe_clz_result_cast_matrix_preserves_copy_and_count_width() {
+        let v = |n| Operand::Value(Value(n));
+        let mut cases = 0;
+        for carrier in [IrType::I32, IrType::U32, IrType::I64, IrType::U64] {
+            let width = (carrier.size() * 8) as i64;
+            let same_size = if carrier == IrType::I32 {
+                IrType::U32
+            } else if carrier == IrType::U32 {
+                IrType::I32
+            } else if carrier == IrType::I64 {
+                IrType::U64
+            } else {
+                IrType::I64
+            };
+            let wide = if width == 32 {
+                IrType::I64
+            } else {
+                IrType::I128
+            };
+            for result_type in [
+                None,
+                Some(same_size),
+                Some(IrType::U16),
+                Some(wide),
+                Some(IrType::I8),
+                Some(IrType::U8),
+            ] {
+                for fallback in [width - 1, width, width - 2] {
+                    let mut casts = vec![None; 8];
+                    let mut unaries = vec![None; 8];
+                    let mut binaries = vec![None; 8];
+                    binaries[2] = Some(BinOpDef {
+                        op: IrBinOp::Or,
+                        lhs: v(1),
+                        rhs: Operand::Const(IrConst::I32(1)),
+                        ty: carrier,
+                    });
+                    unaries[3] = Some(UnaryDef {
+                        op: IrUnaryOp::ClzNonZero,
+                        src: v(2),
+                        ty: carrier,
+                    });
+                    let result = if let Some(to_ty) = result_type {
+                        casts[4] = Some(CastDef {
+                            src: v(3),
+                            from_ty: carrier,
+                            to_ty,
+                        });
+                        v(4)
+                    } else {
+                        v(3)
+                    };
+                    let select_ty = result_type.unwrap_or(carrier);
+                    let got = safe_clz_guard_replacement(
+                        Value(7),
+                        v(1),
+                        result,
+                        Operand::Const(IrConst::I64(fallback)),
+                        select_ty,
+                        &casts,
+                        &unaries,
+                        &binaries,
+                    );
+                    if fallback == width - 1 {
+                        assert!(
+                            matches!(got, Some(Instruction::Copy { dest: Value(7), src }) if src == result),
+                            "Copy must retain the result cast: {carrier:?}, {result_type:?}, {got:?}"
+                        );
+                    } else if fallback == width && select_ty.size() == carrier.size() {
+                        assert!(
+                            matches!(got, Some(Instruction::UnaryOp { op: IrUnaryOp::Clz, src, ty, .. })
+                            if src == v(1) && ty == select_ty)
+                        );
+                    } else {
+                        assert!(got.is_none(), "must not change count width: {got:?}");
+                    }
+                    cases += 1;
+                }
+            }
+        }
+        // Requested 48-case matrix plus 24 signed/unsigned byte-result cases.
+        assert_eq!(cases, 72);
+    }
+}
+
+#[cfg(test)]
+mod exact_product_half_tests {
+    use super::*;
+
+    #[test]
+    fn even_product_bias_proof_checks_every_operation_and_width() {
+        let v = |n| Operand::Value(Value(n));
+        let c = |n| Operand::Const(IrConst::I64(n));
+        for ty in [IrType::I32, IrType::U32, IrType::I64, IrType::U64] {
+            for pair_op in [IrBinOp::Add, IrBinOp::Sub, IrBinOp::Xor] {
+                for odd in [-3, -1, 1, 3] {
+                    let w = (ty.size() * 8) as i64;
+                    let mut bins = vec![None; 7];
+                    for (id, op, lhs, rhs) in [
+                        (1, pair_op, v(0), c(odd)),
+                        (2, IrBinOp::Mul, v(0), v(1)),
+                        (3, IrBinOp::AShr, v(2), c(w - 1)),
+                        (4, IrBinOp::LShr, v(3), c(w - 1)),
+                        (5, IrBinOp::Add, v(2), v(4)),
+                    ] {
+                        bins[id] = Some(BinOpDef { op, lhs, rhs, ty });
+                    }
+                    assert_eq!(unbiased_even_product_half(v(5), ty, &[], &bins), Some(v(2)));
+                    for id in 1..=5 {
+                        let mut bad = bins.clone();
+                        bad[id].as_mut().unwrap().ty = IrType::U16;
+                        assert!(
+                            unbiased_even_product_half(v(5), ty, &[], &bad).is_none(),
+                            "node {id}"
+                        );
+                    }
+                    bins[1].as_mut().unwrap().rhs = c(2);
+                    assert!(unbiased_even_product_half(v(5), ty, &[], &bins).is_none());
+                    bins[1].as_mut().unwrap().rhs = c(odd);
+                    bins[3].as_mut().unwrap().lhs = v(0);
+                    assert!(unbiased_even_product_half(v(5), ty, &[], &bins).is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_half_identity_includes_negative_wrapped_products() {
+        let mut state = 0xa5a5_0123u64;
+        for i in 0..10000 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let x = if i == 0 { i64::MIN } else { state as i64 };
+            for delta in [-3i64, -1, 1, 3] {
+                let p = x.wrapping_mul(x.wrapping_add(delta));
+                assert_eq!(p / 2, p >> 1);
+                let p32 = (x as i32).wrapping_mul((x as i32).wrapping_add(delta as i32));
+                assert_eq!(p32 / 2, p32 >> 1);
+            }
+        }
+        assert_ne!(-1i64 / 2, -1i64 >> 1); // odd negative near-miss
     }
 }

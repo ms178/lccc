@@ -1,3 +1,7 @@
+/* Optional bounded instrumentation size; default workload is unchanged. */
+#ifndef ACK_N
+#define ACK_N 11
+#endif
 // Ackermann function - deep recursion stress test (stack, call overhead)
 #include <stdio.h>
 
@@ -9,7 +13,7 @@ static int ackermann(int m, int n) {
 
 int main(void) {
     // ack(3,11) = 16381 - deep enough to stress call overhead
-    int result = ackermann(3, 11);
-    printf("ackermann(3,11) = %d\n", result);
+    int result = ackermann(3, ACK_N);
+    printf("ackermann(3,%d) = %d\n", ACK_N, result);
     return 0;
 }

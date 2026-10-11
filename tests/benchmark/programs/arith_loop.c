@@ -1,3 +1,7 @@
+/* Optional bounded instrumentation size; default workload is unchanged. */
+#ifndef ARITH_ITERS
+#define ARITH_ITERS 10000000
+#endif
 // Benchmark 1: Arithmetic-heavy loop with many local variables
 // This stresses register allocation — 32 local ints
 #include <stdio.h>
@@ -24,7 +28,7 @@ int arith_loop(int n) {
 }
 
 int main(void) {
-    volatile int result = arith_loop(10000000);
+    volatile int result = arith_loop(ARITH_ITERS);
     printf("arith_loop result: %d\n", result);
     return 0;
 }

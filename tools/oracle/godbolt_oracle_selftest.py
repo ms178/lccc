@@ -14,6 +14,7 @@ harness, each of which silently reported success:
   * asking for `asm` and execution in one request yields execution with no
     assembly, i.e. zero size data with no error.
 
+The export contract uses the host C compiler and nm (no linking).
 No network: the stream shapes are the ones the API actually returns, and the
 cases are checked directly.  Run: tools/oracle/godbolt_oracle_selftest.py
 """
@@ -21,6 +22,9 @@ cases are checked directly.  Run: tools/oracle/godbolt_oracle_selftest.py
 import json
 import os
 import re
+import shlex
+import subprocess
+import tempfile
 import sys
 import unittest
 from unittest import mock
@@ -38,6 +42,44 @@ import godbolt_cache as GC  # noqa: E402
 # bearing: the body handed to this pattern starts at `int main`, so without it
 # `^` can match only at offset 0 and the assertion never fires.
 FILE_SCOPE_STORAGE_RE = re.compile(r"(?m)^\s*static\s+\w+[^;]*\[")
+
+
+def exported_functions(source: Path) -> set[str]:
+    """Check real definitions, including macros/attributes, without networking.
+
+    Source regexes confused macro-generated exports with missing functions and
+    could mistake a prototype for a definition. Compile only: a delta source
+    need not have main(), and undefined external references need not link.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        obj = Path(directory) / "kernel.o"
+        command = shlex.split(os.environ.get("CC", "cc"))
+        result = subprocess.run(command + ["-O0", "-fno-lto", "-c", str(source), "-o", str(obj)],
+                                capture_output=True, text=True, timeout=30)
+        if result.returncode:
+            raise RuntimeError(f"host compilation failed for {source}: {result.stderr}")
+        command = shlex.split(os.environ.get("NM", "nm"))
+        result = subprocess.run(command + ["-g", "--defined-only", str(obj)],
+                                capture_output=True, text=True, timeout=30, check=True)
+        return {parts[-1] for line in result.stdout.splitlines()
+                if len(parts := line.split()) >= 2 and parts[-2] in {"T", "W"}}
+
+
+class TestExportedFunctions(unittest.TestCase):
+    def test_macros_attributes_and_non_definitions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "exports.c"
+            source.write_text("""
+#define EXPORT(name) __attribute__((noinline)) unsigned long name(void) { return 1; }
+#define HIDDEN(name) static int name(void) { return 2; }
+EXPORT(real)
+HIDDEN(hidden)
+extern int declaration_only(void);
+int data_only;
+/* int comment_only(void) { return 0; } */
+int caller(void) { return declaration_only() + hidden(); }
+""")
+            self.assertEqual(exported_functions(source), {"real", "caller"})
 
 
 class TestAllCompetition(unittest.TestCase):
@@ -249,16 +291,8 @@ class TestDirectoryPartition(unittest.TestCase):
             path = os.path.join(G.REPO, entry["source"])
             self.assertTrue(os.path.isfile(path),
                             f"{entry['id']}: corpus claims a missing source {path}")
-            src = Path(path).read_text()
-            fn = re.escape(entry["function"])
-            # Both house styles: `unsigned global_match_probe(` on one line,
-            # and the return type on its own line above a column-0 name.
-            self.assertRegex(
-                src, rf"(?m)^(?:[A-Za-z_][A-Za-z0-9_]*[ \t*]+)?{fn}[ \t]*\(",
-                f"{entry['id']}: {entry['function']} is not defined at file scope")
-            self.assertNotRegex(
-                src, rf"(?m)^\s*static\b[^;{{}}]*\b{fn}\s*\(",
-                f"{entry['id']}: measured function {entry['function']} is static")
+            self.assertIn(entry["function"], exported_functions(Path(path)),
+                          f"{entry['id']}: {entry['function']} is not an exported function definition")
             if os.path.dirname(path) == G.PROGRAMS:
                 claimed += 1
         self.assertGreater(claimed, 0, "no kernel lives in tests/oracle/programs")

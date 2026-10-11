@@ -2,6 +2,30 @@
   "schema": 1,
   "flags": "-O2 -march=x86-64-v3",
   "entries": {
+    "clz_full": {
+      "insns": 4,
+      "stack": 0,
+      "got": 0,
+      "push": 0
+    },
+    "clz_guard32": {
+      "insns": 7,
+      "stack": 0,
+      "got": 0,
+      "push": 0
+    },
+    "ctz_full": {
+      "insns": 6,
+      "stack": 0,
+      "got": 0,
+      "push": 0
+    },
+    "ctz_guard64": {
+      "insns": 7,
+      "stack": 0,
+      "got": 0,
+      "push": 0
+    },
     "expat_name_length": {
       "insns": 70,
       "stack": 0,
@@ -21,13 +45,13 @@
       "push": 0
     },
     "ra01_global_match_probe": {
-      "insns": 92,
+      "insns": 89,
       "stack": 2,
       "got": 0,
       "push": 6
     },
     "zlib_ng_adler32_c": {
-      "insns": 270,
+      "insns": 269,
       "stack": 14,
       "got": 0,
       "push": 6

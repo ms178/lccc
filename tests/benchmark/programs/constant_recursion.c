@@ -1,3 +1,7 @@
+/* Optional bounded instrumentation size; default workload is unchanged. */
+#ifndef ACK_N
+#define ACK_N 11
+#endif
 // Compile-time recursive specialization benchmark.
 #include <stdio.h>
 
@@ -8,7 +12,7 @@ static int ackermann(int m, int n) {
 }
 
 int main(void) {
-    volatile int result = ackermann(3, 11);
+    volatile int result = ackermann(3, ACK_N);
     printf("constant ackermann: %d\n", result);
     return 0;
 }

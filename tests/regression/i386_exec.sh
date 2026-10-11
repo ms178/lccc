@@ -69,3 +69,15 @@ i386_link_ok() { # $1 = compiler command: the -m32 LINK works (exec may not)
     _i386_ensure_memo "$1"
     [[ "${_I386_CAP_MEMO[$1]}" != none ]]
 }
+
+# Policy for gates whose i686 leg requires execution. Return 77 only for an
+# optional host-capability skip, never for a failure of the compiler under test.
+i386_run_or_skip() { # $1 = HOST compiler, not LCCC
+    if i386_exec_ok "$1"; then return 0; fi
+    if [[ ${LCCC_REQUIRE_I686:-0} == 1 ]]; then
+        echo "FAIL: required i686 execution unavailable (host compiler: $1)" >&2
+        return 1
+    fi
+    echo "SKIP-RUN: i686 execution unavailable (host compiler: $1)"
+    return 77
+}

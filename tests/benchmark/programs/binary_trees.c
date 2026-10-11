@@ -1,3 +1,7 @@
+/* Optional bounded instrumentation size; default workload is unchanged. */
+#ifndef TREE_DEPTH
+#define TREE_DEPTH 18
+#endif
 // Binary trees benchmark (malloc/free heavy, recursion, pointer chasing)
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,7 +31,7 @@ static void destroy(Node *n) {
 
 int main(void) {
     int min_depth = 4;
-    int max_depth = 18;
+    int max_depth = TREE_DEPTH;
     if (max_depth < min_depth + 2) max_depth = min_depth + 2;
 
     // stretch tree

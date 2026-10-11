@@ -10,8 +10,9 @@ single spectacular win while a dozen workloads quietly regress.
 This tool therefore:
 
   * sorts every correct benchmark pair by median ratio (worst first);
-  * marks each gap as SIGNIFICANT / NOISE using the runner's own paired
-    bootstrap CI on the ratio (a CI excluding 1.0 is a real difference);
+  * reports the runner's paired bootstrap interval, but withholds a significance
+    verdict below seven pairs (or when the sample count is unknown); an interval
+    excluding parity is not itself a guarantee of reliable coverage;
   * reports the geometric mean **and** the top-improvement / top-regression /
     unchanged split, so no aggregate can conceal a catastrophic regression
     (project policy: "a global geomean must not hide a regression");
@@ -71,6 +72,14 @@ def load_rows(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
             # not, and must never be reported as a win or a regression.
             significant = not (float(ci[0]) <= 1.0 <= float(ci[1]))
 
+        # A three-pair screening interval can exclude parity yet have very
+        # poor coverage. Honour the producer's minimum sample policy rather
+        # than printing an unqualified YES while hiding its warning.
+        bootstrap_excludes_parity = significant
+        sample_count = ratios.get("n")
+        if not isinstance(sample_count, int) or sample_count < 7:
+            significant = None
+
         compile_info = bench.get("compile", {})
         correctness = bench.get("correctness", {})
         warnings = sorted({
@@ -84,6 +93,8 @@ def load_rows(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
             "description": bench.get("description", ""),
             "ratio": ratio,
             "significant": significant,
+            "bootstrap_excludes_parity": bootstrap_excludes_parity,
+            "sample_count": sample_count,
             "ci": ci,
             "cv": ratios.get("cv"),
             "lccc_s": lccc_wall,
@@ -123,7 +134,9 @@ def classify(rows: list[dict[str, Any]], threshold: float) -> dict[str, list[dic
         if not ratio or not row.get("correct"):
             unknown.append(row)
             continue
-        if row.get("significant") is not True:
+        if row.get("significant") is None:
+            unknown.append(row)
+        elif row.get("significant") is not True:
             unchanged.append(row)
         elif ratio > 1.0 + threshold:
             regressed.append(row)
@@ -168,6 +181,8 @@ def render_table(rows: list[dict[str, Any]], *, show_size: bool, reference: str)
         if not row.get("correct"):
             line += "   <-- INCORRECT/FAILED"
         lines.append(line)
+        if row.get("warnings"):
+            lines.append("    WARNING: " + "; ".join(row["warnings"]))
     return "\n".join(lines)
 
 
@@ -194,6 +209,10 @@ def render_markdown(rows: list[dict[str, Any]], document: dict[str, Any],
                    f"{format_ms(row.get('ref_s'))} | "
                    f"{ratio:.3f} | {sig} | {ci_text} |" if ratio else
                    f"| {index} | `{row['name']}` | — | — | — | {sig} | {ci_text} |")
+    warnings = [(row["name"], row.get("warnings", [])) for row in rows if row.get("warnings")]
+    if warnings:
+        out += ["", "## Measurement limitations", ""]
+        out += [f"- `{name}`: " + "; ".join(items) for name, items in warnings]
     return "\n".join(out) + "\n"
 
 

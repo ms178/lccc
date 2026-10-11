@@ -437,7 +437,12 @@ def bytes_per_trip(insns: list[str]) -> tuple[int, str]:
 
 
 def steady_state_loop(loops: list[LoopInfo]) -> tuple[LoopInfo | None, str | None]:
-    """The innermost loop that dominates run time for a unit-stride kernel.
+    """Heuristic steady-state candidate for a unit-stride kernel.
+
+    Largest step is useful for a packed loop plus its scalar remainder, but
+    does not prove which phase is hot in a multi-phase function. In particular
+    two compilers' `main` symbols can select entirely different computations.
+    A cross-compiler performance claim needs independent loop/work matching.
 
     NOT the tightest cycle: a vectorized kernel contains at least two
     backedges -- the packed body and the scalar remainder -- and the

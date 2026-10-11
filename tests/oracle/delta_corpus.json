@@ -31,6 +31,26 @@
       "id": "expat_scan_document",
       "source": "tests/oracle/programs/expat_name_scan_kernel.c",
       "function": "expat_scan_document"
+    },
+    {
+      "id": "clz_full",
+      "function": "clz_full",
+      "source": "tests/regression/count_zero_intermediate_casts.c"
+    },
+    {
+      "id": "ctz_full",
+      "function": "ctz_full",
+      "source": "tests/regression/count_zero_intermediate_casts.c"
+    },
+    {
+      "id": "clz_guard32",
+      "function": "clz_guard32",
+      "source": "tests/regression/clz_safe_guards.c"
+    },
+    {
+      "id": "ctz_guard64",
+      "function": "ctz_guard64",
+      "source": "tests/regression/clz_safe_guards.c"
     }
   ]
 }
