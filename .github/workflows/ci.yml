@@ -99,6 +99,9 @@ jobs:
       - name: Build
         run: ./scripts/build_lccc_fast.sh
 
+      - name: a9987 salvage and SWAR cast soundness
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_a9987_salvage.sh
+
       - name: Audit loop branch and must-execute contracts
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_audit_loop_contracts.sh
 

@@ -11,6 +11,7 @@ standalone `LCCC-RECOVER.py` survives a worktree reset. See the
 
 | Script | Purpose |
 |---|---|
+| `audit_levkropp_since.py` | Historical marker scan, plus exact `--commit SHA --against REF` JSON inventory for consolidation audits: compares all changed Git entries without pretending filename/subject matches prove semantic adoption. Offline fixture: `test_audit_levkropp_since.py`. |
 | `rust_toolchain.sh` | Shared selector: resolves the current channel from `rust-toolchain.toml` (currently stable Rust 1.98.1), while honoring an explicit bisection/reproduction override. Its behavior is covered by `tests/regression/check_rust_toolchain_selector.sh`. |
 | `build_lccc_fast.sh` | Incremental `fastbuild` profile (target compiler opt-level 1, no LTO), using the manifest-selected current Rust/Cargo release, exactly two Cargo jobs, and warnings denied by default. Use for RA/codegen loops. |
 | `build_lccc_o1_j2.sh` | Ship-quality release: Rust opt-level 1, two Cargo jobs, thin LTO, swap active, manifest-selected current Rust/Cargo release, and warnings denied by default. |

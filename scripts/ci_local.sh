@@ -177,6 +177,9 @@ gate "rust-toolchain-selector" fast \
 gate "linker-oracle-versions" fast \
     bash tests/regression/check_linker_oracle_versions.sh
 
+gate "a9987-salvage" fast \
+    env CCC="$LCCC" bash tests/regression/check_a9987_salvage.sh
+
 gate "audit-loop-contracts" fast \
     env CCC="$LCCC" bash tests/regression/check_audit_loop_contracts.sh
 

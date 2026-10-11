@@ -1,0 +1,38 @@
+[
+  {
+    "workload": "expat_xml_scan",
+    "before_sha256": "4e43b97ab75fbd4185e5210e8d9f3980e730cc337960d7c9be64b3650314b7ad",
+    "after_sha256": "4e43b97ab75fbd4185e5210e8d9f3980e730cc337960d7c9be64b3650314b7ad",
+    "identical": true
+  },
+  {
+    "workload": "glibc_memcmp",
+    "before_sha256": "a3cf9b51198ab8abcd5aaaeaf7e723408b672e05cd0336d73bd236cc80ba9a61",
+    "after_sha256": "a3cf9b51198ab8abcd5aaaeaf7e723408b672e05cd0336d73bd236cc80ba9a61",
+    "identical": true
+  },
+  {
+    "workload": "gzip_crc32",
+    "before_sha256": "7d8b7e95a3f9d6983ac395cb12e8cad91a699bfa7c5d62f8cf19b84b292af295",
+    "after_sha256": "7d8b7e95a3f9d6983ac395cb12e8cad91a699bfa7c5d62f8cf19b84b292af295",
+    "identical": true
+  },
+  {
+    "workload": "linux_find_bit",
+    "before_sha256": "a9809a10dbf27ba3917da27acc8019a758d4028e4f70936298ebe6ad849f1c55",
+    "after_sha256": "a9809a10dbf27ba3917da27acc8019a758d4028e4f70936298ebe6ad849f1c55",
+    "identical": true
+  },
+  {
+    "workload": "sqlite_varint",
+    "before_sha256": "74b534f292c6ce339109b6639cc625cd272ac53bf4f09000b6ba626cb10b7ce4",
+    "after_sha256": "74b534f292c6ce339109b6639cc625cd272ac53bf4f09000b6ba626cb10b7ce4",
+    "identical": true
+  },
+  {
+    "workload": "zlib_ng_adler32",
+    "before_sha256": "a3ed427a35dc657092d5905cdb1361898d687c7251793af30a359814137ec388",
+    "after_sha256": "a3ed427a35dc657092d5905cdb1361898d687c7251793af30a359814137ec388",
+    "identical": true
+  }
+]
