@@ -11,10 +11,16 @@ change plausibly adopted.
 Usage:
   git fetch levkropp main --shallow-since=2026-08-19T00:00:00Z
   scripts/audit_levkropp_since.py --since 2026-08-19 --out engineering/evidence/levkropp-audit.md
+  scripts/audit_levkropp_since.py --commit COMMIT --against origin/main --out inventory.json
+
+The --commit mode inventories EVERY changed path using exact Git tree entries
+(mode, object type, object id), including deletions. It never infers adoption
+from a filename or a substring match. It needs the commit's first parent.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,12 +69,69 @@ def tree_contains(marker: str, root: Path) -> bool:
         return False
 
 
+def commit_inventory(commit: str, against: str) -> dict:
+    """Compare exact tree entries, not subjects/markers or checkout contents.
+
+    Status is provenance evidence ONLY, never semantic approval. Rename
+    detection is disabled: both the old and new path must be accounted for.
+    Resolve refs first so a moving branch cannot mix revisions in one report.
+    Missing parents (shallow fetch) and invalid refs fail closed.
+    """
+    def resolve(ref: str) -> str:
+        return run(["git", "rev-parse", "--verify", "--end-of-options",
+                    ref + "^{commit}"]).strip()
+
+    tip = resolve(commit)
+    base = resolve(tip + "^")
+    local = resolve(against)
+
+    def tree(ref: str) -> dict[str, tuple[str, str, str]]:
+        entries = {}
+        for entry in run(["git", "ls-tree", "-r", "-z", ref]).split("\0"):
+            if entry:
+                meta, path = entry.split("\t", 1)
+                entries[path] = tuple(meta.split())
+        return entries
+
+    before, incoming, current = tree(base), tree(tip), tree(local)
+    rows = []
+    for path in sorted(before.keys() | incoming.keys()):
+        old, new, here = before.get(path), incoming.get(path), current.get(path)
+        if old == new:
+            continue
+        if here == new:
+            status = "identical-entry" if new is not None else "deletion-already-present"
+        elif here == old:
+            status = "parent-entry" if old is not None else "addition-absent"
+        elif here is None:
+            status = "absent-locally"
+        else:
+            status = "diverged-review-required"
+        rows.append({"path": path, "status": status,
+                     "parent": old, "incoming": new, "local": here})
+    counts = {}
+    for row in rows:
+        counts[row["status"]] = counts.get(row["status"], 0) + 1
+    return {"schema": 1, "commit": tip, "parent": base, "against": local,
+            "warning": "Exact entry comparison is not semantic approval or ancestry proof.",
+            "counts": counts, "paths": rows}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--since", default="2026-08-19")
     ap.add_argument("--ref", default="levkropp/main")
     ap.add_argument("--out", default="-")
+    ap.add_argument("--commit", help="exact single-commit inventory (JSON), not marker scan")
+    ap.add_argument("--against", default="HEAD", help="committed local baseline for --commit")
     ns = ap.parse_args()
+    if ns.commit:
+        text = json.dumps(commit_inventory(ns.commit, ns.against), indent=2) + "\n"
+        if ns.out == "-":
+            print(text, end="")
+        else:
+            Path(ns.out).write_text(text)
+        return 0
     root = Path.cwd()
     log = run([
         "git", "log", "--reverse", f"--since={ns.since}T00:00:00Z",

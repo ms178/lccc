@@ -712,12 +712,15 @@ pub(super) fn match_bool_mux_algebra(
     None
 }
 
+// A cast is not a structural alias of an arithmetic node. In particular,
+// traversing trunc/zext can drop significant bits inside SWAR/swap networks.
+// Count-only canonicalization uses `peel` separately; values do not.
 fn binop(
     opnd: Operand,
     wanted: IrBinOp,
     defs: &[Option<Instruction>],
 ) -> Option<(Operand, Operand, IrType)> {
-    let Operand::Value(v) = peel(opnd, defs) else {
+    let Operand::Value(v) = peel_copies(opnd, defs) else {
         return None;
     };
     match defs.get(v.0 as usize).and_then(Option::as_ref) {
@@ -1076,11 +1079,13 @@ fn match_narrow_rotate(
     Some((value, amount, is_left))
 }
 
+// Selected data is also width-sensitive: a truncation between CLZ/CTZ
+// stages changes the next stage's input, even when the predicates still match.
 fn select(
     opnd: Operand,
     defs: &[Option<Instruction>],
 ) -> Option<(Operand, Operand, Operand, IrType)> {
-    let Operand::Value(v) = peel(opnd, defs) else {
+    let Operand::Value(v) = peel_copies(opnd, defs) else {
         return None;
     };
     match defs.get(v.0 as usize).and_then(Option::as_ref) {
@@ -1158,37 +1163,55 @@ fn is_incremented(
 ///
 /// `x -= (x >> 1) & 0x55555555; ...; (x * 0x01010101) >> 24`
 fn match_popcount32(result: Operand, defs: &[Option<Instruction>]) -> Option<Operand> {
-    let multiplied = shift(result, IrBinOp::LShr, 24, defs)?;
-    let stage3 = commutative_const(multiplied, IrBinOp::Mul, 0x0101_0101, defs)?;
-    let stage3_add = commutative_const(stage3, IrBinOp::And, 0x0f0f_0f0f, defs)?;
-    let (a, b, _) = binop(stage3_add, IrBinOp::Add, defs)?;
-    let stage2 = if shift(a, IrBinOp::LShr, 4, defs).is_some_and(|base| same(base, b, defs)) {
+    // Every arithmetic node must run in the 32-bit ring. The masks do NOT
+    // make intervening truncations harmless: trunc16 before the final mask
+    // counts only the low two bytes (16, not 32, for UINT32_MAX). Likewise,
+    // a widened multiply followed by a widened shift is not a 32-bit count.
+    // Structural matching is Copy-only, and shared values retain cast identity.
+    let bin = |value, op| {
+        let (lhs, rhs, ty) = binop(value, op, defs)?;
+        matches!(ty, IrType::U32 | IrType::I32).then_some((lhs, rhs))
+    };
+    let with_const = |value, op, constant| {
+        let (lhs, rhs) = bin(value, op)?;
+        if const_u64(rhs) == Some(constant) {
+            Some(lhs)
+        } else if const_u64(lhs) == Some(constant) {
+            Some(rhs)
+        } else {
+            None
+        }
+    };
+    let shifted_by = |value, amount| {
+        let (lhs, rhs) = bin(value, IrBinOp::LShr)?;
+        (const_u64(rhs) == Some(amount)).then_some(lhs)
+    };
+    let multiplied = shifted_by(result, 24)?;
+    let stage3 = with_const(multiplied, IrBinOp::Mul, 0x0101_0101)?;
+    let stage3_add = with_const(stage3, IrBinOp::And, 0x0f0f_0f0f)?;
+    let (a, b) = bin(stage3_add, IrBinOp::Add)?;
+    let stage2 = if shifted_by(a, 4).is_some_and(|base| same_value(base, b, defs)) {
         b
-    } else if shift(b, IrBinOp::LShr, 4, defs).is_some_and(|base| same(base, a, defs)) {
+    } else if shifted_by(b, 4).is_some_and(|base| same_value(base, a, defs)) {
         a
     } else {
         return None;
     };
 
-    let (a, b, _) = binop(stage2, IrBinOp::Add, defs)?;
-    let a_base = commutative_const(a, IrBinOp::And, 0x3333_3333, defs)?;
-    let b_base = commutative_const(b, IrBinOp::And, 0x3333_3333, defs)?;
-    let stage1 = if shift(a_base, IrBinOp::LShr, 2, defs)
-        .is_some_and(|base| same(base, b_base, defs))
-    {
+    let (a, b) = bin(stage2, IrBinOp::Add)?;
+    let a_base = with_const(a, IrBinOp::And, 0x3333_3333)?;
+    let b_base = with_const(b, IrBinOp::And, 0x3333_3333)?;
+    let stage1 = if shifted_by(a_base, 2).is_some_and(|base| same_value(base, b_base, defs)) {
         b_base
-    } else if shift(b_base, IrBinOp::LShr, 2, defs).is_some_and(|base| same(base, a_base, defs)) {
+    } else if shifted_by(b_base, 2).is_some_and(|base| same_value(base, a_base, defs)) {
         a_base
     } else {
         return None;
     };
 
-    let (original, subtracted, ty) = binop(stage1, IrBinOp::Sub, defs)?;
-    if ty != IrType::U32 && ty != IrType::I32 {
-        return None;
-    }
-    let shifted = commutative_const(subtracted, IrBinOp::And, 0x5555_5555, defs)?;
-    let shifted_base = shift(shifted, IrBinOp::LShr, 1, defs)?;
+    let (original, subtracted) = bin(stage1, IrBinOp::Sub)?;
+    let shifted = with_const(subtracted, IrBinOp::And, 0x5555_5555)?;
+    let shifted_base = shifted_by(shifted, 1)?;
     same_value(original, shifted_base, defs).then_some(peel_copies(original, defs))
 }
 
@@ -1984,6 +2007,9 @@ pub(crate) fn recognize_function(
     // instruction, consumer block, consumer index, new consumer
     // instruction).
     let mut pending_masks: Vec<(usize, usize, Instruction, usize, usize, Instruction)> = Vec::new();
+    // CLZ needs an extra nonzero-input node. Insert only after index-based
+    // rewrites have finished; reverse order preserves earlier match locations.
+    let mut pending_clz = Vec::new();
     for (block_bi, block) in func.blocks.iter_mut().enumerate() {
         let mut index = 0;
         while index < block.instructions.len() {
@@ -2384,12 +2410,14 @@ pub(crate) fn recognize_function(
                         && match_clz32(Operand::Value(dest), &defs).is_some()
                     {
                         let src = match_clz32(Operand::Value(dest), &defs).unwrap();
-                        block.instructions[index] = Instruction::UnaryOp {
-                            dest,
-                            op: IrUnaryOp::Clz,
-                            src,
-                            ty: IrType::U32,
-                        };
+                        // The portable tree returns 31 for zero, not 32.
+                        // clz(x | 1) is exact: the low bit cannot change the
+                        // highest set bit of any nonzero x, and zero becomes
+                        // one. This also avoids an undefined zero-input BSR
+                        // on targets without LZCNT, with no compare/select.
+                        let safe = crate::ir::reexports::Value(next_value_id);
+                        next_value_id = next_value_id.saturating_add(1);
+                        pending_clz.push((block_bi, index, dest, safe, src));
                         changes += 1;
                     }
                 }
@@ -2478,6 +2506,36 @@ pub(crate) fn recognize_function(
             }
         }
     }
+    for (bi, ii, dest, safe, src) in pending_clz.into_iter().rev() {
+        let block = &mut func.blocks[bi];
+        block.instructions[ii] = Instruction::BinOp {
+            dest: safe,
+            op: IrBinOp::Or,
+            lhs: src,
+            rhs: Operand::Const(IrConst::I32(1)),
+            ty: IrType::U32,
+        };
+        block.instructions.insert(
+            ii + 1,
+            Instruction::UnaryOp {
+                dest,
+                op: IrUnaryOp::Clz,
+                src: Operand::Value(safe),
+                ty: IrType::U32,
+            },
+        );
+        if !block.source_spans.is_empty() {
+            let span = block
+                .source_spans
+                .get(ii)
+                .copied()
+                .unwrap_or_else(crate::common::source::Span::dummy);
+            block
+                .source_spans
+                .resize(block.instructions.len() - 1, span);
+            block.source_spans.insert(ii + 1, span);
+        }
+    }
     changes
 }
 
@@ -2529,6 +2587,200 @@ mod tests {
     fn rejects_near_miss_swar_popcount32() {
         let defs = swar_defs(0x3333_3331);
         assert!(match_popcount32(Operand::Value(Value(12)), &defs).is_none());
+    }
+
+    #[test]
+    fn clz_zero_guard_preserves_two_networks_and_spans() {
+        use crate::common::source::Span;
+        let mut insts = Vec::new();
+        let mut next = 1;
+        let input = Operand::Value(Value(0));
+        insts.push(Instruction::Copy {
+            dest: Value(0),
+            src: Operand::Const(IrConst::I32(0)),
+        });
+        let mut outputs = Vec::new();
+        for _ in 0..2 {
+            let mut working = input;
+            let mut count = Operand::Const(IrConst::I32(0));
+            for amount in [16, 8, 4, 2, 1] {
+                let cond = Value(next);
+                let added = Value(next + 1);
+                let shifted = Value(next + 2);
+                let selected = Value(next + 3);
+                let counted = Value(next + 4);
+                next += 5;
+                insts.push(Instruction::Cmp {
+                    dest: cond,
+                    op: IrCmpOp::Ule,
+                    lhs: working,
+                    rhs: Operand::Const(IrConst::I32((u32::MAX >> amount) as i32)),
+                    ty: IrType::U32,
+                });
+                insts.push(Instruction::BinOp {
+                    dest: added,
+                    op: IrBinOp::Add,
+                    lhs: count,
+                    rhs: Operand::Const(IrConst::I32(amount)),
+                    ty: IrType::U32,
+                });
+                if amount != 1 {
+                    insts.push(Instruction::BinOp {
+                        dest: shifted,
+                        op: IrBinOp::Shl,
+                        lhs: working,
+                        rhs: Operand::Const(IrConst::I32(amount)),
+                        ty: IrType::U32,
+                    });
+                    insts.push(Instruction::Select {
+                        dest: selected,
+                        cond: Operand::Value(cond),
+                        true_val: Operand::Value(shifted),
+                        false_val: working,
+                        ty: IrType::U32,
+                    });
+                    working = Operand::Value(selected);
+                }
+                insts.push(Instruction::Select {
+                    dest: counted,
+                    cond: Operand::Value(cond),
+                    true_val: Operand::Value(added),
+                    false_val: count,
+                    ty: IrType::U32,
+                });
+                count = Operand::Value(counted);
+            }
+            outputs.push(count);
+        }
+        let old_len = insts.len();
+        let spans: Vec<_> = (0..old_len)
+            .map(|i| Span::new(i as u32, i as u32 + 1, 1))
+            .collect();
+        let mut func = IrFunction::new("clz_guard".into(), IrType::U32, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: insts,
+            source_spans: spans,
+            terminator: Terminator::Return(Some(outputs[1])),
+        });
+        assert_eq!(recognize_function(&mut func, false, 64, 8, false), 2);
+        let b = &func.blocks[0];
+        assert_eq!(b.instructions.len(), old_len + 2);
+        assert_eq!(b.source_spans.len(), b.instructions.len());
+        let mut seen = Vec::new();
+        for (i, inst) in b.instructions.iter().enumerate() {
+            if let Instruction::UnaryOp {
+                dest,
+                op: IrUnaryOp::Clz,
+                src: Operand::Value(safe),
+                ..
+            } = inst
+            {
+                assert!(matches!(&b.instructions[i-1], Instruction::BinOp {
+                    dest: d, op: IrBinOp::Or, rhs: Operand::Const(IrConst::I32(1)), .. } if d == safe));
+                assert_eq!(b.source_spans[i - 1], b.source_spans[i]);
+                seen.push(Operand::Value(*dest));
+            }
+        }
+        assert_eq!(seen, outputs);
+        assert_eq!(recognize_function(&mut func, false, 64, 8, false), 0);
+    }
+
+    #[test]
+    fn select_structure_preserves_intermediate_casts() {
+        for wide in [IrType::U32, IrType::U64] {
+            let defs = vec![
+                None,
+                Some(Instruction::Select {
+                    dest: Value(1),
+                    cond: Operand::Value(Value(0)),
+                    true_val: Operand::Const(IrConst::I64(0x10000)),
+                    false_val: Operand::Const(IrConst::I64(2)),
+                    ty: wide,
+                }),
+                Some(Instruction::Copy {
+                    dest: Value(2),
+                    src: Operand::Value(Value(1)),
+                }),
+                Some(Instruction::Cast {
+                    dest: Value(3),
+                    src: Operand::Value(Value(1)),
+                    from_ty: wide,
+                    to_ty: IrType::U16,
+                }),
+                Some(Instruction::Cast {
+                    dest: Value(4),
+                    src: Operand::Value(Value(3)),
+                    from_ty: IrType::U16,
+                    to_ty: wide,
+                }),
+            ];
+            assert!(select(Operand::Value(Value(1)), &defs).is_some());
+            assert!(select(Operand::Value(Value(2)), &defs).is_some());
+            assert!(select(Operand::Value(Value(3)), &defs).is_none());
+            assert!(select(Operand::Value(Value(4)), &defs).is_none());
+        }
+    }
+
+    #[test]
+    fn swar_intermediate_casts_are_not_structural_aliases() {
+        // Attack every internal edge, including both readers of shared nodes.
+        // Copy aliases remain legal; truncation followed by extension does not.
+        for id in 1..12 {
+            for narrow in [None, Some(IrType::U8), Some(IrType::U16), Some(IrType::I16)] {
+                let mut defs = swar_defs(0x3333_3333);
+                let replacement = Value(if narrow.is_some() { 14 } else { 13 });
+                for inst in defs.iter_mut().flatten() {
+                    if let Instruction::BinOp { lhs, rhs, .. } = inst {
+                        for op in [lhs, rhs] {
+                            if *op == Operand::Value(Value(id)) {
+                                *op = Operand::Value(replacement);
+                            }
+                        }
+                    }
+                }
+                if let Some(ty) = narrow {
+                    defs.push(Some(Instruction::Cast {
+                        dest: Value(13),
+                        src: Operand::Value(Value(id)),
+                        from_ty: IrType::U32,
+                        to_ty: ty,
+                    }));
+                    defs.push(Some(Instruction::Cast {
+                        dest: Value(14),
+                        src: Operand::Value(Value(13)),
+                        from_ty: ty,
+                        to_ty: IrType::U32,
+                    }));
+                } else {
+                    defs.push(Some(Instruction::Copy {
+                        dest: Value(13),
+                        src: Operand::Value(Value(id)),
+                    }));
+                }
+                assert_eq!(
+                    match_popcount32(Operand::Value(Value(12)), &defs).is_some(),
+                    narrow.is_none(),
+                    "edge {id}, cast {narrow:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn swar_requires_32_bit_arithmetic_at_every_node() {
+        for id in 1..=12 {
+            for ty in [IrType::U8, IrType::U16, IrType::U64, IrType::I64] {
+                let mut defs = swar_defs(0x3333_3333);
+                if let Some(Instruction::BinOp { ty: node_ty, .. }) = &mut defs[id] {
+                    *node_ty = ty;
+                }
+                assert!(
+                    match_popcount32(Operand::Value(Value(12)), &defs).is_none(),
+                    "node {id}, width {ty:?}"
+                );
+            }
+        }
     }
 
     /// Build `Or(Shl(shl_src, c1), LShr(lshr_src, c2))` at `ty`; ids 1..4.

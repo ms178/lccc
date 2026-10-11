@@ -8,6 +8,12 @@ period file — no new per-session markdown files), root causes and
 measured negatives in [`DECISIONS.md`](DECISIONS.md), raw numbers in
 [`evidence/`](evidence/README.md).
 
+## a9987d0 consolidation audit (2026-10-11)
+
+[Audit and evidence](AUDIT-a9987d0-2026-10-11.md): no wholesale import; fix
+intermediate-cast bit-idiom miscompiles and salvage two SQLite regressions.
+[Continuity and prioritized follow-up](FOLLOWUP-a9987d0-2026-10-11.md).
+
 ## Read order for an implementation agent
 
 1. [`STATE.md`](STATE.md) — the compiler as it is on `main` right now.
