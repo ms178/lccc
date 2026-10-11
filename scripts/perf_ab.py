@@ -217,6 +217,20 @@ PRESETS: dict[str, dict[str, Any]] = {
 }
 
 
+def matched_link_flags(flags: list[str], *compilers: str) -> list[str]:
+    """Put automatic libm linkage in BOTH arms and in the reported flags.
+
+    Vendor drivers may leave math calls where LCCC uses instructions. Adding
+    -lm privately to only the vendor arm also changes layout/library loading;
+    that is not a matched-flags comparison. Unrecognised wrappers can supply
+    --cflag=-lm explicitly. LCCC-only screens retain their existing defaults.
+    """
+    needs_math = any(any(name in Path(cc).name.lower()
+                        for name in ("gcc", "clang", "icx", "icc"))
+                     for cc in compilers)
+    return [*flags, *(["-lm"] if needs_math and "-lm" not in flags else [])]
+
+
 def build_binary(
     compiler: str,
     src: Path,
@@ -242,8 +256,6 @@ def build_binary(
     }
     env.update(extra_env)
     cmd = [compiler, *flags, str(src), "-o", out]
-    if "gcc" in compiler or "clang" in compiler or "icx" in compiler:
-        cmd.append("-lm")
     try:
         p = subprocess.run(
             cmd,
@@ -716,7 +728,7 @@ def main() -> int:
             "error: either --preset, --env KEY=VALUE, --skip PASS, or --vs <compiler> is required"
         )
 
-    flags = [args.opt, *args.cflag]
+    flags = matched_link_flags([args.opt, *args.cflag], compiler_a, compiler_b)
     only_set = {s.strip() for s in args.only.split(",") if s.strip()}
     if not only_set and preset_data and preset_data.get("only"):
         only_set = set(preset_data["only"])

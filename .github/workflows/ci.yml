@@ -105,6 +105,9 @@ jobs:
       - name: a9987 salvage and SWAR cast soundness
         run: env LCCC_REQUIRE_I686=1 CCC=target/fastbuild/lccc bash tests/regression/check_a9987_salvage.sh
 
+      - name: Memory value forwarding and predicate effect contracts
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_memory_value_contracts.sh
+
       - name: Audit loop branch and must-execute contracts
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_audit_loop_contracts.sh
 

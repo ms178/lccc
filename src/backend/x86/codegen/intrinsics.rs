@@ -1563,6 +1563,39 @@ impl X86Codegen {
             .unwrap_or(0)
     }
 
+    /// Checked constant-index composition: both inputs fitting individually
+    /// does not imply that their sum is an encodable signed disp32.
+    fn vec_constant_displacement(offset: &Operand, disp: i64) -> Option<i64> {
+        let Operand::Const(c) = offset else {
+            return None;
+        };
+        let index = i64::try_from(c.to_i128()?).ok()?;
+        let sum = disp.checked_add(index)?;
+        i32::try_from(sum).ok().map(i64::from)
+    }
+
+    /// A normal alloca's slot IS the object, unlike a spilled pointer or a
+    /// vector payload slot. Runtime-overaligned allocas must keep their
+    /// computed address. Respect the active RBP/RSP frame addressing policy.
+    fn vec_direct_stack_operand(&self, base: &Operand, displacement: i64) -> Option<String> {
+        let Operand::Value(v) = base else { return None };
+        if !self.state.is_alloca(v.0) {
+            return None;
+        }
+        let crate::backend::state::SlotAddr::Direct(slot) = self.state.resolve_slot_addr(v.0)?
+        else {
+            return None;
+        };
+        let offset = slot.0.checked_add(displacement)?;
+        let encoded = if self.state.out.use_rsp_addressing {
+            self.state.out.rsp_frame_size.checked_add(offset)?
+        } else {
+            offset
+        };
+        i32::try_from(encoded).ok()?;
+        Some(self.slot_ref(offset))
+    }
+
     /// Full x86 memory operand for a vector access: `disp(%base,%index)`.
     /// A zero displacement omits the field, keeping the encoding
     /// byte-identical to the two-argument (map) form.
@@ -1574,20 +1607,17 @@ impl X86Codegen {
         // (`vmovdqu 16(%rax)`) is one instruction. Only offsets that fit
         // the i32 disp field take this path; a huge constant still stages
         // through a register.
-        if let Operand::Const(c) = off_arg {
-            if let Some(v) = c.to_i64() {
-                if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
-                    let (base, _) =
-                        self.vec_load_addr_regs(base_arg, &Operand::Const(IrConst::I64(0)));
-                    let d = disp + v;
-                    let disp_str = if d == 0 {
-                        String::new()
-                    } else {
-                        format!("{}", d)
-                    };
-                    return format!("{}(%{})", disp_str, base);
-                }
+        if let Some(d) = Self::vec_constant_displacement(off_arg, disp) {
+            if let Some(mem) = self.vec_direct_stack_operand(base_arg, d) {
+                return mem;
             }
+            let (base, _) = self.vec_load_addr_regs(base_arg, &Operand::Const(IrConst::I64(0)));
+            let disp_str = if d == 0 {
+                String::new()
+            } else {
+                format!("{}", d)
+            };
+            return format!("{}(%{})", disp_str, base);
         }
         let (base, index) = self.vec_load_addr_regs(base_arg, off_arg);
         let disp_str = if disp == 0 {
@@ -10433,5 +10463,67 @@ mod fma_form_reencode_tests {
             assert!(r213.is_err(), "{m} must not re-encode to 213");
             assert!(r231.is_err(), "{m} must not re-encode to 231");
         }
+    }
+}
+
+#[cfg(test)]
+mod vector_address_contract_tests {
+    use super::*;
+
+    #[test]
+    fn constant_index_sum_must_fit_the_encoding_without_truncation() {
+        let c = |v| Operand::Const(IrConst::I64(v));
+        assert_eq!(X86Codegen::vec_constant_displacement(&c(8), -16), Some(-8));
+        assert_eq!(
+            X86Codegen::vec_constant_displacement(&c(1), i32::MAX as i64),
+            None
+        );
+        assert_eq!(
+            X86Codegen::vec_constant_displacement(&c(-1), i32::MIN as i64),
+            None
+        );
+        assert_eq!(X86Codegen::vec_constant_displacement(&c(1), i64::MAX), None);
+        assert_eq!(
+            X86Codegen::vec_constant_displacement(&Operand::Const(IrConst::I128(1i128 << 80)), 0),
+            None
+        );
+        assert_eq!(
+            X86Codegen::vec_constant_displacement(&Operand::Value(Value(0)), 0),
+            None
+        );
+    }
+
+    #[test]
+    fn direct_object_slots_follow_frame_addressing_policy() {
+        let mut cg = X86Codegen::new();
+        cg.state.alloca_values.insert(0);
+        cg.state.value_locations.insert(0, StackSlot(-64));
+        let base = Operand::Value(Value(0));
+        assert_eq!(
+            cg.vec_direct_stack_operand(&base, 16).as_deref(),
+            Some("-48(%rbp)")
+        );
+        cg.state.out.use_rsp_addressing = true;
+        cg.state.out.rsp_frame_size = 128;
+        assert_eq!(
+            cg.vec_direct_stack_operand(&base, 16).as_deref(),
+            Some("80(%rsp)")
+        );
+        assert_eq!(cg.vec_direct_stack_operand(&base, i64::MAX), None);
+        cg.state.out.rsp_frame_size = i64::MAX;
+        assert_eq!(cg.vec_direct_stack_operand(&base, 128), None);
+    }
+
+    #[test]
+    fn payload_pointer_and_overaligned_slots_are_not_direct_objects() {
+        let mut cg = X86Codegen::new();
+        cg.state.value_locations.insert(0, StackSlot(-64));
+        let base = Operand::Value(Value(0));
+        assert_eq!(cg.vec_direct_stack_operand(&base, 16), None);
+        cg.state.vector_values.insert(0);
+        assert_eq!(cg.vec_direct_stack_operand(&base, 16), None);
+        cg.state.alloca_values.insert(0);
+        cg.state.alloca_alignments.insert(0, 32);
+        assert_eq!(cg.vec_direct_stack_operand(&base, 16), None);
     }
 }

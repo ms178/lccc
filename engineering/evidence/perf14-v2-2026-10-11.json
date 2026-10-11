@@ -1,0 +1,2326 @@
+{
+  "compiler_sha256": "1816bd685480833570ecab67c44584653cc4c0b40edc31e897ab31c5a99c206a",
+  "scope": "V2; before vector-address canonicalization. Native timing after CI exited, no concurrent build. Ir is simulated, not cycles. Binary census covers the exact flags recorded for each source.",
+  "native": {
+    "header": "A: baseline-pr795-lccc vs B: memory-range-v2-lccc",
+    "flags": [
+      "-O2",
+      "-march=x86-64-v3",
+      "-fwrapv"
+    ],
+    "reps": 11,
+    "floor_ms": 1.2342259997240035,
+    "geomean_b_over_a": 0.93920945634498,
+    "benchmarks": [
+      {
+        "benchmark": "expat_siphash24",
+        "a_min_ms": 471.27907300000516,
+        "b_min_ms": 373.8589009999487,
+        "ratio_b_over_a": 0.7932855974700675,
+        "ratio_low3": 0.7931742667013458,
+        "samples_a": [
+          477.5163029999021,
+          476.43874200002756,
+          473.58976900022753,
+          475.100497999847,
+          476.20270300012635,
+          475.99966899997526,
+          473.87161799997557,
+          505.8388899997226,
+          558.9705739998863,
+          471.27907300000516,
+          474.4991590000609
+        ],
+        "samples_b": [
+          379.913925999972,
+          379.96027300005153,
+          377.93358199996874,
+          382.91107599980023,
+          379.20476200042685,
+          376.74949600022956,
+          374.70002700001714,
+          389.48484100001224,
+          380.52805300003456,
+          379.75402000029135,
+          373.8589009999487
+        ],
+        "excluded": false
+      },
+      {
+        "benchmark": "expat_xml_scan",
+        "a_min_ms": 48.53142399997523,
+        "b_min_ms": 48.348806999911176,
+        "ratio_b_over_a": 0.9962371390531597,
+        "ratio_low3": 0.999893217772198,
+        "samples_a": [
+          48.563395000201126,
+          48.53142399997523,
+          49.01358799997979,
+          48.93961599964314,
+          48.584859000129654,
+          48.63433899981828,
+          49.19644400024481,
+          49.597107999943546,
+          48.904030000358034,
+          49.408217999825865,
+          48.90403300032631
+        ],
+        "samples_b": [
+          48.348806999911176,
+          49.15875699998651,
+          48.92365699970469,
+          48.56658999960928,
+          48.82593899992571,
+          49.20387499987555,
+          49.22061500019481,
+          49.188136000339,
+          48.7487250002232,
+          49.10216999996919,
+          57.02979499983485
+        ],
+        "excluded": false
+      },
+      {
+        "benchmark": "struct_copy",
+        "a_min_ms": 20.648645000164834,
+        "b_min_ms": 20.646044999921287,
+        "ratio_b_over_a": 0.9998740837355901,
+        "ratio_low3": 1.0010426220930337,
+        "samples_a": [
+          21.76783200002319,
+          21.70958700025949,
+          21.730923999712104,
+          21.68764399993961,
+          21.76274600014949,
+          21.738736999850516,
+          21.606991000226117,
+          20.799029000045266,
+          20.833628000218596,
+          20.648645000164834,
+          20.702361000076053
+        ],
+        "samples_b": [
+          21.62979099966833,
+          21.783316999972158,
+          21.8163760000607,
+          21.61186000012094,
+          22.567022000202996,
+          21.63819399993372,
+          23.204667999834783,
+          21.507603999907587,
+          20.857645999967644,
+          20.646044999921287,
+          20.711142999971344
+        ],
+        "excluded": false
+      },
+      {
+        "benchmark": "tls_seg_access",
+        "a_min_ms": 10.144668999600981,
+        "b_min_ms": 9.989645999667118,
+        "ratio_b_over_a": 0.9847187720033093,
+        "ratio_low3": 0.9846286816553668,
+        "samples_a": [
+          10.360886999933427,
+          10.220250000202213,
+          10.18014100009168,
+          10.29195000000982,
+          10.151876999771048,
+          10.20568900003127,
+          10.144668999600981,
+          10.263435000069876,
+          10.199106000072788,
+          10.170651999942493,
+          10.266227000101935
+        ],
+        "samples_b": [
+          10.102325999923778,
+          10.113842000009754,
+          10.118328999851656,
+          10.17082999987906,
+          10.04712699977972,
+          9.99868000008064,
+          10.099071000240656,
+          10.010551000050327,
+          9.989645999667118,
+          10.080283000206691,
+          10.097604999828036
+        ],
+        "excluded": false
+      }
+    ],
+    "failures": []
+  },
+  "binary_identity": [
+    {
+      "name": "arith_loop",
+      "source_sha256": "154a39b6e98cf506bf0d62ed4ab44dad88f7d75923a4eb797b4c41e9339f662c",
+      "baseline_sha256": "2e7ac9d474ed1969b0c935ea214d4c245cd32391a264d3ffdbb3a33efc9a5644",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/arith_loop.c"
+      ],
+      "v2_sha256": "2e7ac9d474ed1969b0c935ea214d4c245cd32391a264d3ffdbb3a33efc9a5644"
+    },
+    {
+      "name": "fib",
+      "source_sha256": "983660d7782bcce1d90c389a5869452a6b055a399654ad63f34491245ed41379",
+      "baseline_sha256": "6e1f16327746afc5be3b65f5cf6147e4e13532b3ab6342fcb4f9f71ac5141928",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/fib.c"
+      ],
+      "v2_sha256": "6e1f16327746afc5be3b65f5cf6147e4e13532b3ab6342fcb4f9f71ac5141928"
+    },
+    {
+      "name": "matmul",
+      "source_sha256": "927478b18ee0aa0d118eea4d2a9d6bb1251fdf3c64c2619ab578463beba99560",
+      "baseline_sha256": "671fc88a955cb05e79b84ba0da47de3d6150e7a9497c43633a9f1920f3f6ae1a",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/matmul.c"
+      ],
+      "v2_sha256": "671fc88a955cb05e79b84ba0da47de3d6150e7a9497c43633a9f1920f3f6ae1a"
+    },
+    {
+      "name": "qsort",
+      "source_sha256": "4b7916c27962da3a9cf71ce75b09910467449ce727a1fb2d3dbf75f5f011641a",
+      "baseline_sha256": "5608ed570afa2a748624bf396d1c56f6a55cddb68da9bf0071333371b5bb2c28",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/qsort.c"
+      ],
+      "v2_sha256": "5608ed570afa2a748624bf396d1c56f6a55cddb68da9bf0071333371b5bb2c28"
+    },
+    {
+      "name": "sieve",
+      "source_sha256": "2fd99e297a95711800c1bf4b2facd7e5e09efa740b113c86837e3d0cd22f069b",
+      "baseline_sha256": "05112e1ed422f14a810e1e6b6bb4de8ab106a46c0e56192fa2ecd568ea8b3300",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/sieve.c"
+      ],
+      "v2_sha256": "05112e1ed422f14a810e1e6b6bb4de8ab106a46c0e56192fa2ecd568ea8b3300"
+    },
+    {
+      "name": "tce_sum",
+      "source_sha256": "57ddb14e5fd945998d614fbe2bba64a9861b8a0f5153ce4fcd84a15348991eee",
+      "baseline_sha256": "3cebc48e97d86f603f0960318915091aecc907275c06dd70560839770ae1e5c9",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/tce_sum.c"
+      ],
+      "v2_sha256": "3cebc48e97d86f603f0960318915091aecc907275c06dd70560839770ae1e5c9"
+    },
+    {
+      "name": "nbody",
+      "source_sha256": "45db2f21add3645a945f1a6635d642f1aad5caecfa4c7b47da4943331a321837",
+      "baseline_sha256": "c21e4e0a0d3f9202cc8bea1c18f465922500a6c3815aa40839d8826be469605e",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/nbody.c",
+        "-lm"
+      ],
+      "v2_sha256": "c21e4e0a0d3f9202cc8bea1c18f465922500a6c3815aa40839d8826be469605e"
+    },
+    {
+      "name": "binary_trees",
+      "source_sha256": "0a19ef11ab58e32a6ef0ecb8703a856347ba295d2bca67bbe20dfa5243251dc0",
+      "baseline_sha256": "6b359b914c5a29ad90563891af025c312c372ab4cd25264ba087ee680e91b3f9",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/binary_trees.c"
+      ],
+      "v2_sha256": "6b359b914c5a29ad90563891af025c312c372ab4cd25264ba087ee680e91b3f9"
+    },
+    {
+      "name": "spectral_norm",
+      "source_sha256": "21a48dccebcbc3b9496263f62df260d278051c3cd1a528ed99c8b66bef481e6a",
+      "baseline_sha256": "e4130560ae231f98a5d8c8ac6bec4e9d03262ef6ea20344ef9911f3eff618d19",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/spectral_norm.c",
+        "-lm"
+      ],
+      "v2_sha256": "e4130560ae231f98a5d8c8ac6bec4e9d03262ef6ea20344ef9911f3eff618d19"
+    },
+    {
+      "name": "mandelbrot",
+      "source_sha256": "3f9d3a3e0da962e5a1840790ebf46fa09f38cd5e758645c8c65625fa9882555c",
+      "baseline_sha256": "81f98df9f328f1f25830f9644c4c9301fa014c1f9567d4164821460aa96f4fb6",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/mandelbrot.c"
+      ],
+      "v2_sha256": "81f98df9f328f1f25830f9644c4c9301fa014c1f9567d4164821460aa96f4fb6"
+    },
+    {
+      "name": "hash_table",
+      "source_sha256": "1c742684a0ea694fbeb95d249748488e89f9033c64d518cd1fafe27da24a2e5a",
+      "baseline_sha256": "649fceb09bb6c0726656f0947a20a9056c32bb0b8d13562daf918a222c31f26a",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/hash_table.c"
+      ],
+      "v2_sha256": "649fceb09bb6c0726656f0947a20a9056c32bb0b8d13562daf918a222c31f26a"
+    },
+    {
+      "name": "strlen_bench",
+      "source_sha256": "175202f59218fa62a3120f9f5202a005f5e234f2cbabd453048d933082e0dd44",
+      "baseline_sha256": "5bcda07cd5b236d9b4be1021d8eba7eaf532d6ad27cfe4cfa8c43da5de2c840e",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/strlen_bench.c"
+      ],
+      "v2_sha256": "5bcda07cd5b236d9b4be1021d8eba7eaf532d6ad27cfe4cfa8c43da5de2c840e"
+    },
+    {
+      "name": "switch_dispatch",
+      "source_sha256": "6a044523272024b733f4af8e5101d5bf2d72ba9d6e9362798f6149cd9265117a",
+      "baseline_sha256": "19739ea5c59732ddc27327cfe19e18baae6bec18a93344e88160773c202feae0",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/switch_dispatch.c"
+      ],
+      "v2_sha256": "19739ea5c59732ddc27327cfe19e18baae6bec18a93344e88160773c202feae0"
+    },
+    {
+      "name": "struct_copy",
+      "source_sha256": "b0ca8943fcfed56f7ae9bbd49e7e52a98f9780b4be8151c494fc12b05dcb2bfa",
+      "baseline_sha256": "5f99d19bc0fb98cbf9b158c8207c3e57f8344d54c88eefb046f68af1b090e275",
+      "identical": false,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/struct_copy.c"
+      ],
+      "v2_sha256": "e227904bbaa1800fbbccefa8e806f990024f79f3331b8084fa345463d4d4488c"
+    },
+    {
+      "name": "loop_patterns",
+      "source_sha256": "e56488201b8d9e8fc7ad17ec521f395232d4c66edcaf880876d2adccba28df88",
+      "baseline_sha256": "dd457e623477fff20bff68ca16d8b864aadf02b32a8537cb1527c7013f9fc7ad",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/loop_patterns.c"
+      ],
+      "v2_sha256": "dd457e623477fff20bff68ca16d8b864aadf02b32a8537cb1527c7013f9fc7ad"
+    },
+    {
+      "name": "fannkuch",
+      "source_sha256": "2a78d670ab985384a3008ac031e7a478fdc790b627d011177dd528b7282d11e5",
+      "baseline_sha256": "1ca6b863c9c9784ba6ae4e9766a2921464fa1d9200b47ddf874758641a63585f",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/fannkuch.c"
+      ],
+      "v2_sha256": "1ca6b863c9c9784ba6ae4e9766a2921464fa1d9200b47ddf874758641a63585f"
+    },
+    {
+      "name": "ackermann",
+      "source_sha256": "8f4443c46516743ca68886d1e882b9431d42ea812df71bf58236013193b790b9",
+      "baseline_sha256": "2d022192e3f74390834bd68ccaf8dfa7bf625d72d76aaa9cb42a8f0d810a960c",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/ackermann.c"
+      ],
+      "v2_sha256": "2d022192e3f74390834bd68ccaf8dfa7bf625d72d76aaa9cb42a8f0d810a960c"
+    },
+    {
+      "name": "constant_recursion",
+      "source_sha256": "86d59c961c6c10e03a75dbb42b3c73f01d448bf6296c401bb960f6120dd985c9",
+      "baseline_sha256": "95405ec18b108fcbc71729142d3364266d419ec894f73fe7c06a0da4d2a51a82",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/constant_recursion.c"
+      ],
+      "v2_sha256": "95405ec18b108fcbc71729142d3364266d419ec894f73fe7c06a0da4d2a51a82"
+    },
+    {
+      "name": "bitops",
+      "source_sha256": "e1e97ac28dabf06df8859e6812a288f639c7f6f070478ebd6fe834a64ed9f7ea",
+      "baseline_sha256": "2cec762329a1a3e69e43712484b6274f240fb74f158f09d23f0b5b92ea1331c8",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/bitops.c"
+      ],
+      "v2_sha256": "2cec762329a1a3e69e43712484b6274f240fb74f158f09d23f0b5b92ea1331c8"
+    },
+    {
+      "name": "double_reduction",
+      "source_sha256": "cad8a08bc76c767ac184e222570f4311d2e1ddab072f59119d737c87fbc1eaf7",
+      "baseline_sha256": "2cdff16cef9965615adadf43af90fb03fc9b9d5dff260ee5e1b16c2586255f8c",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/double_reduction.c"
+      ],
+      "v2_sha256": "2cdff16cef9965615adadf43af90fb03fc9b9d5dff260ee5e1b16c2586255f8c"
+    },
+    {
+      "name": "ascii_case_fold",
+      "source_sha256": "7a97d5091e4e166a63cb4d6dd80bb35014c4f9ccd77848b60bac357f3211a5dd",
+      "baseline_sha256": "514d7429c7ea8189ae11329285283ca2d601678d670b5da4b9153a7d70c79e75",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/ascii_case_fold.c"
+      ],
+      "v2_sha256": "514d7429c7ea8189ae11329285283ca2d601678d670b5da4b9153a7d70c79e75"
+    },
+    {
+      "name": "binary_search",
+      "source_sha256": "e53295433fcba1e277011bd4ae6860e38a1dc27934c36dc9b2de9c6d3d533422",
+      "baseline_sha256": "513ec0c8457adbf98d87dbe173c680c544e0db6f9cdf8ff8ce72fa6dd25514d7",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/binary_search.c"
+      ],
+      "v2_sha256": "513ec0c8457adbf98d87dbe173c680c544e0db6f9cdf8ff8ce72fa6dd25514d7"
+    },
+    {
+      "name": "ring_fifo",
+      "source_sha256": "e5c01f13f9472d27106f37b76e0076f2d3e4cb71109c38344688e4e8f6e6db03",
+      "baseline_sha256": "bc3fe1db840133428dd78f4d2dc11a0719037720c42451d0bb2b1ba2cfd2fdcf",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/ring_fifo.c"
+      ],
+      "v2_sha256": "bc3fe1db840133428dd78f4d2dc11a0719037720c42451d0bb2b1ba2cfd2fdcf"
+    },
+    {
+      "name": "aarch64_select_patterns",
+      "source_sha256": "22b7e42c9de227a1b815878d95f3dc2e97630addaf6e3c19e77d2ce38c09c0b1",
+      "baseline_sha256": "4b3b8e4f2f7c387ec43c80ce5e70f72f72f57bf3387e4a1e673e0e0fcb79eafb",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/aarch64_select_patterns.c"
+      ],
+      "v2_sha256": "4b3b8e4f2f7c387ec43c80ce5e70f72f72f57bf3387e4a1e673e0e0fcb79eafb"
+    },
+    {
+      "name": "histogram",
+      "source_sha256": "67bef36e96b93d37b36e85f02e991eda19cd759393ec104684edfde54c6a3806",
+      "baseline_sha256": "407c539552ad27296ec0de786378f27244885b9009ae42518fda337234ad2612",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/histogram.c"
+      ],
+      "v2_sha256": "407c539552ad27296ec0de786378f27244885b9009ae42518fda337234ad2612"
+    },
+    {
+      "name": "gzip_crc32",
+      "source_sha256": "9f9acac042ab580ce2137a9fb653a5b3db5e7015dbb49254944195ef5eb98f6a",
+      "baseline_sha256": "7d8b7e95a3f9d6983ac395cb12e8cad91a699bfa7c5d62f8cf19b84b292af295",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/gzip_crc32.c"
+      ],
+      "v2_sha256": "7d8b7e95a3f9d6983ac395cb12e8cad91a699bfa7c5d62f8cf19b84b292af295"
+    },
+    {
+      "name": "libm_round_family",
+      "source_sha256": "b70c5bacd90081c28ea74dc1142f9eacc64278d539f258da5bd1614ebc503668",
+      "baseline_sha256": "83c27c1b8e9ca07522fece54f5e54f1f78abfa35deb20f90692fc32c40110aa3",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/libm_round_family.c"
+      ],
+      "v2_sha256": "83c27c1b8e9ca07522fece54f5e54f1f78abfa35deb20f90692fc32c40110aa3"
+    },
+    {
+      "name": "tls_seg_access",
+      "source_sha256": "02e6d2bcd07b2e1fc253b53d316d522e7b3d912ae634b6fad2c10dc93a1d4835",
+      "baseline_sha256": "ef3adad795d5c7096ae854491e973e58d9228c86c9c8de138b01c1b395e57e00",
+      "identical": false,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/tls_seg_access.c"
+      ],
+      "v2_sha256": "09326030da587b552e63eac29383b99183e25596956dce51bc3e6737a09d5d14"
+    },
+    {
+      "name": "zlib_ng_adler32",
+      "source_sha256": "bca7938ef542270a06d734bf814b3f1806ab1796e8f53d5c53d1b5ccd6b08486",
+      "baseline_sha256": "a3ed427a35dc657092d5905cdb1361898d687c7251793af30a359814137ec388",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/zlib_ng_adler32.c"
+      ],
+      "v2_sha256": "a3ed427a35dc657092d5905cdb1361898d687c7251793af30a359814137ec388"
+    },
+    {
+      "name": "zlib_ng_adler32_combine",
+      "source_sha256": "5d9a2ade64019e993686dab352d67dbdc4a009e2e33dd8568beff5c9ac423940",
+      "baseline_sha256": "881b01876d5b7b01a53ad32957f81e1102a12fff88c75f2992d1a2964b598d48",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/zlib_ng_adler32_combine.c"
+      ],
+      "v2_sha256": "881b01876d5b7b01a53ad32957f81e1102a12fff88c75f2992d1a2964b598d48"
+    },
+    {
+      "name": "expat_xml_scan",
+      "source_sha256": "a076b1823869765011658d56ec090b22102e2ba7a5bbdf4cd0b6bdd0d774cf35",
+      "baseline_sha256": "4e43b97ab75fbd4185e5210e8d9f3980e730cc337960d7c9be64b3650314b7ad",
+      "identical": false,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/expat_xml_scan.c"
+      ],
+      "v2_sha256": "a62dab242c391fee0fec06501a9bab16d8b9e31f49c74aa65cead99f0c9aefb9"
+    },
+    {
+      "name": "expat_siphash24",
+      "source_sha256": "59c5dfbdf3f0d2e149a3681925c46b7b0aeb195f179c285f3b64a2daaf1fb663",
+      "baseline_sha256": "f52374126e16d1d4e97390ca84d45c77f1b619b900890ea6281ee9e2deabd060",
+      "identical": false,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/expat_siphash24.c"
+      ],
+      "v2_sha256": "d02eb95d965113b43ae16b698c7ebb0931f07be9152b0faf58d5b3734f3b6447"
+    },
+    {
+      "name": "sqlite_varint",
+      "source_sha256": "11c7e09b1507659fe44e678848c5e489268e4dd4aa385d3a542453caa400e1af",
+      "baseline_sha256": "74b534f292c6ce339109b6639cc625cd272ac53bf4f09000b6ba626cb10b7ce4",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/sqlite_varint.c"
+      ],
+      "v2_sha256": "74b534f292c6ce339109b6639cc625cd272ac53bf4f09000b6ba626cb10b7ce4"
+    },
+    {
+      "name": "linux_find_bit",
+      "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a",
+      "baseline_sha256": "a9809a10dbf27ba3917da27acc8019a758d4028e4f70936298ebe6ad849f1c55",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/linux_find_bit.c"
+      ],
+      "v2_sha256": "a9809a10dbf27ba3917da27acc8019a758d4028e4f70936298ebe6ad849f1c55"
+    },
+    {
+      "name": "linux_find_bit_scaled",
+      "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a",
+      "baseline_sha256": "d4a6684668abb1265a8d74224322f8ba6332efdb4a98ba82a5a46172487ad58a",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/linux_find_bit.c",
+        "-DPASSES=65536"
+      ],
+      "v2_sha256": "d4a6684668abb1265a8d74224322f8ba6332efdb4a98ba82a5a46172487ad58a"
+    },
+    {
+      "name": "glibc_memcmp",
+      "source_sha256": "6fcec75ff20c60106d78db2013a646579ab4262750fe64eee99387f3c16b0870",
+      "baseline_sha256": "a3cf9b51198ab8abcd5aaaeaf7e723408b672e05cd0336d73bd236cc80ba9a61",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/glibc_memcmp.c"
+      ],
+      "v2_sha256": "a3cf9b51198ab8abcd5aaaeaf7e723408b672e05cd0336d73bd236cc80ba9a61"
+    },
+    {
+      "name": "chacha20_block",
+      "source_sha256": "7f0b876dc4bbea778d85e2a30d55046207eb60abe8c5388857bb1207efdac85c",
+      "baseline_sha256": "ddd16c4dc934ca52707312261a9acb58084b69f87eecac65ab15524456156559",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/chacha20_block.c"
+      ],
+      "v2_sha256": "ddd16c4dc934ca52707312261a9acb58084b69f87eecac65ab15524456156559"
+    },
+    {
+      "name": "sha256_transform",
+      "source_sha256": "6f55a89cfd9d59eb9a8e115eef968295ec775fa63d0545dd33517c2fdf06bf5e",
+      "baseline_sha256": "bc206ffa96abae21803b3c12f535dbfcfc2d26c89159612127a49d4602afef36",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/sha256_transform.c"
+      ],
+      "v2_sha256": "bc206ffa96abae21803b3c12f535dbfcfc2d26c89159612127a49d4602afef36"
+    },
+    {
+      "name": "linux_rbtree",
+      "source_sha256": "7c9c5ada20d8e32116ccbc1ca68690e92470ef7348b51842e49ffa2fa0480253",
+      "baseline_sha256": "8d8b345205e3d6ed2c3bc79db0799d7f72be4cd225426ce6040e59bd36d8ce33",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/linux_rbtree.c"
+      ],
+      "v2_sha256": "8d8b345205e3d6ed2c3bc79db0799d7f72be4cd225426ce6040e59bd36d8ce33"
+    },
+    {
+      "name": "zstd_count",
+      "source_sha256": "cf01953477eadbebe46b07ede170a62ff41b62cf947dd12222a04ad93c985be6",
+      "baseline_sha256": "890c670d2e687705f1559a1f073ea06c6c21353e3287d4259827947ee6a7164e",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/zstd_count.c"
+      ],
+      "v2_sha256": "890c670d2e687705f1559a1f073ea06c6c21353e3287d4259827947ee6a7164e"
+    },
+    {
+      "name": "lz4_compress",
+      "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4",
+      "baseline_sha256": "8e3712abf7e36c054db3aa250df44d2b0793764a5f0c45aef6f80e1dc4afb08e",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/lz4_compress.c"
+      ],
+      "v2_sha256": "8e3712abf7e36c054db3aa250df44d2b0793764a5f0c45aef6f80e1dc4afb08e"
+    },
+    {
+      "name": "lz4_match_extend",
+      "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4",
+      "baseline_sha256": "494fc8efa8ddafa9a92f8c7d867e21acb2309dc202cc3bcdbd0c58a69f70cf01",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/lz4_compress.c",
+        "-DMATCH_RICH=1",
+        "-DPASSES=2048"
+      ],
+      "v2_sha256": "494fc8efa8ddafa9a92f8c7d867e21acb2309dc202cc3bcdbd0c58a69f70cf01"
+    },
+    {
+      "name": "glibc_strstr",
+      "source_sha256": "17dcd48414c9eb254cc910905113b7ed8a3cedac3c0d41216305484a5a7cd344",
+      "baseline_sha256": "bf86eff0305f9bf2081bab0afd01d4e06e4ed2504c0e2b71436f0ad02a9e80a6",
+      "identical": true,
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "/home/lccc-work/lccc/tests/benchmark/programs/glibc_strstr.c"
+      ],
+      "v2_sha256": "bf86eff0305f9bf2081bab0afd01d4e06e4ed2504c0e2b71436f0ad02a9e80a6"
+    }
+  ],
+  "callgrind": {
+    "complete": true,
+    "metric": "bounded whole-program simulated Ir; not runtime",
+    "selected": [
+      "aarch64_select_patterns",
+      "ackermann",
+      "arith_loop",
+      "ascii_case_fold",
+      "binary_search",
+      "binary_trees",
+      "bitops",
+      "chacha20_block",
+      "constant_recursion",
+      "double_reduction",
+      "expat_siphash24",
+      "expat_xml_scan",
+      "fannkuch",
+      "fib",
+      "glibc_memcmp",
+      "glibc_strstr",
+      "gzip_crc32",
+      "hash_table",
+      "histogram",
+      "libm_round_family",
+      "linux_find_bit",
+      "linux_find_bit_scaled",
+      "linux_rbtree",
+      "loop_patterns",
+      "lz4_compress",
+      "lz4_match_extend",
+      "mandelbrot",
+      "matmul",
+      "nbody",
+      "qsort",
+      "ring_fifo",
+      "sha256_transform",
+      "sieve",
+      "spectral_norm",
+      "sqlite_varint",
+      "strlen_bench",
+      "struct_copy",
+      "switch_dispatch",
+      "tce_sum",
+      "tls_seg_access",
+      "zlib_ng_adler32",
+      "zlib_ng_adler32_combine",
+      "zstd_count"
+    ],
+    "results": {
+      "arith_loop": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DARITH_ITERS=20000",
+        "metrics": {
+          "conditional_mispredicts": [
+            3297,
+            3297
+          ],
+          "d1_misses": [
+            1879,
+            1879
+          ],
+          "i1_misses": [
+            1371,
+            1371
+          ],
+          "indirect_mispredicts": [
+            232,
+            232
+          ],
+          "ir_mine": 2185613,
+          "ir_ratio": 1.0,
+          "ir_ref": 2185613,
+          "ll_misses": [
+            2910,
+            2910
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/arith_loop/manifest.json"
+      },
+      "fib": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DFIB_N=25",
+        "metrics": {
+          "conditional_mispredicts": [
+            3321,
+            3321
+          ],
+          "d1_misses": [
+            1878,
+            1878
+          ],
+          "i1_misses": [
+            1353,
+            1353
+          ],
+          "indirect_mispredicts": [
+            233,
+            233
+          ],
+          "ir_mine": 146034,
+          "ir_ratio": 1.0,
+          "ir_ref": 146034,
+          "ll_misses": [
+            2895,
+            2895
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/fib/manifest.json"
+      },
+      "matmul": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=48",
+        "metrics": {
+          "conditional_mispredicts": [
+            3506,
+            3506
+          ],
+          "d1_misses": [
+            3232,
+            3232
+          ],
+          "i1_misses": [
+            1444,
+            1444
+          ],
+          "indirect_mispredicts": [
+            234,
+            234
+          ],
+          "ir_mine": 307241,
+          "ir_ratio": 1.0,
+          "ir_ref": 307241,
+          "ll_misses": [
+            3860,
+            3860
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/matmul/manifest.json"
+      },
+      "qsort": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=10000",
+        "metrics": {
+          "conditional_mispredicts": [
+            78756,
+            78756
+          ],
+          "d1_misses": [
+            7637,
+            7637
+          ],
+          "i1_misses": [
+            1402,
+            1402
+          ],
+          "indirect_mispredicts": [
+            243,
+            243
+          ],
+          "ir_mine": 3391409,
+          "ir_ratio": 1.0,
+          "ir_ref": 3391409,
+          "ll_misses": [
+            4192,
+            4192
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/qsort/manifest.json"
+      },
+      "sieve": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=100000",
+        "metrics": {
+          "conditional_mispredicts": [
+            3530,
+            3530
+          ],
+          "d1_misses": [
+            51855,
+            51855
+          ],
+          "i1_misses": [
+            1360,
+            1360
+          ],
+          "indirect_mispredicts": [
+            242,
+            242
+          ],
+          "ir_mine": 1622464,
+          "ir_ratio": 1.0,
+          "ir_ref": 1622464,
+          "ll_misses": [
+            4467,
+            4467
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/sieve/manifest.json"
+      },
+      "tce_sum": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+        "metrics": {
+          "conditional_mispredicts": [
+            3287,
+            3287
+          ],
+          "d1_misses": [
+            1876,
+            1876
+          ],
+          "i1_misses": [
+            1353,
+            1353
+          ],
+          "indirect_mispredicts": [
+            233,
+            233
+          ],
+          "ir_mine": 145619,
+          "ir_ratio": 1.0,
+          "ir_ref": 145619,
+          "ll_misses": [
+            2892,
+            2892
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/tce_sum/manifest.json"
+      },
+      "nbody": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSTEPS=1000",
+        "metrics": {
+          "conditional_mispredicts": [
+            3458,
+            3458
+          ],
+          "d1_misses": [
+            1915,
+            1915
+          ],
+          "i1_misses": [
+            1446,
+            1446
+          ],
+          "indirect_mispredicts": [
+            234,
+            234
+          ],
+          "ir_mine": 689042,
+          "ir_ratio": 1.0,
+          "ir_ref": 689042,
+          "ll_misses": [
+            3001,
+            3001
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/nbody/manifest.json"
+      },
+      "binary_trees": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DTREE_DEPTH=10",
+        "metrics": {
+          "conditional_mispredicts": [
+            207631,
+            207631
+          ],
+          "d1_misses": [
+            54353,
+            54353
+          ],
+          "i1_misses": [
+            1378,
+            1378
+          ],
+          "indirect_mispredicts": [
+            238,
+            238
+          ],
+          "ir_mine": 31600299,
+          "ir_ratio": 1.0,
+          "ir_ref": 31600299,
+          "ll_misses": [
+            4968,
+            4968
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/binary_trees/manifest.json"
+      },
+      "spectral_norm": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=128",
+        "metrics": {
+          "conditional_mispredicts": [
+            8569,
+            8569
+          ],
+          "d1_misses": [
+            1936,
+            1936
+          ],
+          "i1_misses": [
+            1423,
+            1423
+          ],
+          "indirect_mispredicts": [
+            233,
+            233
+          ],
+          "ir_mine": 8673460,
+          "ir_ratio": 1.0,
+          "ir_ref": 8673460,
+          "ll_misses": [
+            2969,
+            2969
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/spectral_norm/manifest.json"
+      },
+      "mandelbrot": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DWIDTH=128 -DHEIGHT=128",
+        "metrics": {
+          "conditional_mispredicts": [
+            15483,
+            15483
+          ],
+          "d1_misses": [
+            1877,
+            1877
+          ],
+          "i1_misses": [
+            1355,
+            1355
+          ],
+          "indirect_mispredicts": [
+            232,
+            232
+          ],
+          "ir_mine": 5599382,
+          "ir_ratio": 1.0,
+          "ir_ref": 5599382,
+          "ll_misses": [
+            2894,
+            2894
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/mandelbrot/manifest.json"
+      },
+      "hash_table": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DNUM_OPS=20000",
+        "metrics": {
+          "conditional_mispredicts": [
+            19462,
+            19462
+          ],
+          "d1_misses": [
+            98420,
+            98420
+          ],
+          "i1_misses": [
+            1362,
+            1362
+          ],
+          "indirect_mispredicts": [
+            242,
+            242
+          ],
+          "ir_mine": 8433901,
+          "ir_ratio": 1.0,
+          "ir_ref": 8433901,
+          "ll_misses": [
+            26038,
+            26038
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/hash_table/manifest.json"
+      },
+      "strlen_bench": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DNSTRINGS=1000",
+        "metrics": {
+          "conditional_mispredicts": [
+            132017,
+            132017
+          ],
+          "d1_misses": [
+            221290,
+            221290
+          ],
+          "i1_misses": [
+            1385,
+            1385
+          ],
+          "indirect_mispredicts": [
+            251,
+            251
+          ],
+          "ir_mine": 9285507,
+          "ir_ratio": 1.0,
+          "ir_ref": 9285507,
+          "ll_misses": [
+            5362,
+            5362
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/strlen_bench/manifest.json"
+      },
+      "switch_dispatch": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=20000",
+        "metrics": {
+          "conditional_mispredicts": [
+            3288,
+            3288
+          ],
+          "d1_misses": [
+            1876,
+            1876
+          ],
+          "i1_misses": [
+            1356,
+            1356
+          ],
+          "indirect_mispredicts": [
+            18994,
+            18994
+          ],
+          "ir_mine": 593093,
+          "ir_ratio": 1.0,
+          "ir_ref": 593093,
+          "ll_misses": [
+            2898,
+            2898
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/switch_dispatch/manifest.json"
+      },
+      "struct_copy": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=2000",
+        "metrics": {
+          "conditional_mispredicts": [
+            3380,
+            3380
+          ],
+          "d1_misses": [
+            1916,
+            1917
+          ],
+          "i1_misses": [
+            1448,
+            1448
+          ],
+          "indirect_mispredicts": [
+            234,
+            234
+          ],
+          "ir_mine": 371084,
+          "ir_ratio": 0.9946392769456744,
+          "ir_ref": 373084,
+          "ll_misses": [
+            3000,
+            3000
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/struct_copy/manifest.json"
+      },
+      "loop_patterns": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSIZE=16384",
+        "metrics": {
+          "conditional_mispredicts": [
+            3443,
+            3443
+          ],
+          "d1_misses": [
+            10537,
+            10537
+          ],
+          "i1_misses": [
+            1376,
+            1376
+          ],
+          "indirect_mispredicts": [
+            236,
+            236
+          ],
+          "ir_mine": 719419,
+          "ir_ratio": 1.0,
+          "ir_ref": 719419,
+          "ll_misses": [
+            4965,
+            4965
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/loop_patterns/manifest.json"
+      },
+      "fannkuch": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DFANNKUCH_N=7",
+        "metrics": {
+          "conditional_mispredicts": [
+            22514,
+            22514
+          ],
+          "d1_misses": [
+            1885,
+            1885
+          ],
+          "i1_misses": [
+            1361,
+            1361
+          ],
+          "indirect_mispredicts": [
+            232,
+            232
+          ],
+          "ir_mine": 1237742,
+          "ir_ratio": 1.0,
+          "ir_ref": 1237742,
+          "ll_misses": [
+            2904,
+            2904
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/fannkuch/manifest.json"
+      },
+      "ackermann": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DACK_N=6",
+        "metrics": {
+          "conditional_mispredicts": [
+            3300,
+            3300
+          ],
+          "d1_misses": [
+            1878,
+            1878
+          ],
+          "i1_misses": [
+            1352,
+            1352
+          ],
+          "indirect_mispredicts": [
+            232,
+            232
+          ],
+          "ir_mine": 145755,
+          "ir_ratio": 1.0,
+          "ir_ref": 145755,
+          "ll_misses": [
+            2892,
+            2892
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/ackermann/manifest.json"
+      },
+      "constant_recursion": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DACK_N=6",
+        "metrics": {
+          "conditional_mispredicts": [
+            3282,
+            3282
+          ],
+          "d1_misses": [
+            1879,
+            1879
+          ],
+          "i1_misses": [
+            1351,
+            1351
+          ],
+          "indirect_mispredicts": [
+            232,
+            232
+          ],
+          "ir_mine": 145456,
+          "ir_ratio": 1.0,
+          "ir_ref": 145456,
+          "ll_misses": [
+            2894,
+            2894
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/constant_recursion/manifest.json"
+      },
+      "bitops": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=20000",
+        "metrics": {
+          "conditional_mispredicts": [
+            3325,
+            3325
+          ],
+          "d1_misses": [
+            1876,
+            1876
+          ],
+          "i1_misses": [
+            1357,
+            1357
+          ],
+          "indirect_mispredicts": [
+            233,
+            233
+          ],
+          "ir_mine": 1286708,
+          "ir_ratio": 1.0,
+          "ir_ref": 1286708,
+          "ll_misses": [
+            2897,
+            2897
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/bitops/manifest.json"
+      },
+      "double_reduction": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DREDUCTION_PASSES=1",
+        "metrics": {
+          "conditional_mispredicts": [
+            3317,
+            3317
+          ],
+          "d1_misses": [
+            526296,
+            526296
+          ],
+          "i1_misses": [
+            1360,
+            1360
+          ],
+          "indirect_mispredicts": [
+            233,
+            233
+          ],
+          "ir_mine": 30423242,
+          "ir_ratio": 1.0,
+          "ir_ref": 30423242,
+          "ll_misses": [
+            199511,
+            199511
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/double_reduction/manifest.json"
+      },
+      "ascii_case_fold": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+        "metrics": {
+          "conditional_mispredicts": [
+            3163,
+            3163
+          ],
+          "d1_misses": [
+            4919,
+            4919
+          ],
+          "i1_misses": [
+            1167,
+            1167
+          ],
+          "indirect_mispredicts": [
+            216,
+            216
+          ],
+          "ir_mine": 2238897,
+          "ir_ratio": 1.0,
+          "ir_ref": 2238897,
+          "ll_misses": [
+            4683,
+            4683
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/ascii_case_fold/manifest.json"
+      },
+      "binary_search": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+        "metrics": {
+          "conditional_mispredicts": [
+            5816,
+            5816
+          ],
+          "d1_misses": [
+            2041,
+            2041
+          ],
+          "i1_misses": [
+            1165,
+            1165
+          ],
+          "indirect_mispredicts": [
+            216,
+            216
+          ],
+          "ir_mine": 601907,
+          "ir_ratio": 1.0,
+          "ir_ref": 601907,
+          "ll_misses": [
+            2887,
+            2887
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/binary_search/manifest.json"
+      },
+      "ring_fifo": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+        "metrics": {
+          "conditional_mispredicts": [
+            3158,
+            3158
+          ],
+          "d1_misses": [
+            1839,
+            1839
+          ],
+          "i1_misses": [
+            1164,
+            1164
+          ],
+          "indirect_mispredicts": [
+            216,
+            216
+          ],
+          "ir_mine": 621735,
+          "ir_ratio": 1.0,
+          "ir_ref": 621735,
+          "ll_misses": [
+            2693,
+            2693
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/ring_fifo/manifest.json"
+      },
+      "aarch64_select_patterns": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSELECT_ITERS=20000",
+        "metrics": {
+          "conditional_mispredicts": [
+            3322,
+            3322
+          ],
+          "d1_misses": [
+            1873,
+            1873
+          ],
+          "i1_misses": [
+            1359,
+            1359
+          ],
+          "indirect_mispredicts": [
+            231,
+            231
+          ],
+          "ir_mine": 865980,
+          "ir_ratio": 1.0,
+          "ir_ref": 865980,
+          "ll_misses": [
+            2898,
+            2898
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/aarch64_select_patterns/manifest.json"
+      },
+      "histogram": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+        "metrics": {
+          "conditional_mispredicts": [
+            3170,
+            3170
+          ],
+          "d1_misses": [
+            10063,
+            10063
+          ],
+          "i1_misses": [
+            1166,
+            1166
+          ],
+          "indirect_mispredicts": [
+            216,
+            216
+          ],
+          "ir_mine": 3485868,
+          "ir_ratio": 1.0,
+          "ir_ref": 3485868,
+          "ll_misses": [
+            6756,
+            6756
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/histogram/manifest.json"
+      },
+      "gzip_crc32": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DDATA_SIZE=16384 -DPASSES=4",
+        "metrics": {
+          "conditional_mispredicts": [
+            3342,
+            3342
+          ],
+          "d1_misses": [
+            2211,
+            2211
+          ],
+          "i1_misses": [
+            1365,
+            1365
+          ],
+          "indirect_mispredicts": [
+            233,
+            233
+          ],
+          "ir_mine": 801085,
+          "ir_ratio": 1.0,
+          "ir_ref": 801085,
+          "ll_misses": [
+            3180,
+            3180
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/gzip_crc32/manifest.json"
+      },
+      "libm_round_family": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=256 -DPASSES=4",
+        "metrics": {
+          "conditional_mispredicts": [
+            3424,
+            3424
+          ],
+          "d1_misses": [
+            1952,
+            1952
+          ],
+          "i1_misses": [
+            1447,
+            1447
+          ],
+          "indirect_mispredicts": [
+            233,
+            233
+          ],
+          "ir_mine": 171370,
+          "ir_ratio": 1.0,
+          "ir_ref": 171370,
+          "ll_misses": [
+            3035,
+            3035
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/libm_round_family/manifest.json"
+      },
+      "tls_seg_access": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=100",
+        "metrics": {
+          "conditional_mispredicts": [
+            3423,
+            3423
+          ],
+          "d1_misses": [
+            1885,
+            1885
+          ],
+          "i1_misses": [
+            1356,
+            1356
+          ],
+          "indirect_mispredicts": [
+            233,
+            233
+          ],
+          "ir_mine": 218453,
+          "ir_ratio": 1.0,
+          "ir_ref": 218453,
+          "ll_misses": [
+            2910,
+            2910
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/tls_seg_access/manifest.json"
+      },
+      "zlib_ng_adler32": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DDATA_SIZE=16384 -DPASSES=4",
+        "metrics": {
+          "conditional_mispredicts": [
+            3378,
+            3378
+          ],
+          "d1_misses": [
+            2191,
+            2191
+          ],
+          "i1_misses": [
+            1377,
+            1377
+          ],
+          "indirect_mispredicts": [
+            233,
+            233
+          ],
+          "ir_mine": 463928,
+          "ir_ratio": 1.0,
+          "ir_ref": 463928,
+          "ll_misses": [
+            3176,
+            3176
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/zlib_ng_adler32/manifest.json"
+      },
+      "zlib_ng_adler32_combine": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=10000",
+        "metrics": {
+          "conditional_mispredicts": [
+            5513,
+            5513
+          ],
+          "d1_misses": [
+            1910,
+            1910
+          ],
+          "i1_misses": [
+            1382,
+            1382
+          ],
+          "indirect_mispredicts": [
+            234,
+            234
+          ],
+          "ir_mine": 22937456,
+          "ir_ratio": 1.0,
+          "ir_ref": 22937456,
+          "ll_misses": [
+            2947,
+            2947
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/zlib_ng_adler32_combine/manifest.json"
+      },
+      "expat_xml_scan": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DXML_SIZE=16384 -DPASSES=4",
+        "metrics": {
+          "conditional_mispredicts": [
+            25497,
+            26581
+          ],
+          "d1_misses": [
+            2183,
+            2183
+          ],
+          "i1_misses": [
+            1364,
+            1364
+          ],
+          "indirect_mispredicts": [
+            232,
+            232
+          ],
+          "ir_mine": 1696292,
+          "ir_ratio": 0.9961529042900608,
+          "ir_ref": 1702843,
+          "ll_misses": [
+            3162,
+            3162
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/expat_xml_scan/manifest.json"
+      },
+      "expat_siphash24": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=1000",
+        "metrics": {
+          "conditional_mispredicts": [
+            123390,
+            123382
+          ],
+          "d1_misses": [
+            1897,
+            1894
+          ],
+          "i1_misses": [
+            1407,
+            1408
+          ],
+          "indirect_mispredicts": [
+            1429,
+            1429
+          ],
+          "ir_mine": 21961756,
+          "ir_ratio": 0.8670457332818148,
+          "ir_ref": 25329409,
+          "ll_misses": [
+            2959,
+            2959
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/expat_siphash24/manifest.json"
+      },
+      "sqlite_varint": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DVALUE_COUNT=2048 -DPASSES=4",
+        "metrics": {
+          "conditional_mispredicts": [
+            12569,
+            12569
+          ],
+          "d1_misses": [
+            2229,
+            2229
+          ],
+          "i1_misses": [
+            1375,
+            1375
+          ],
+          "indirect_mispredicts": [
+            2054,
+            2054
+          ],
+          "ir_mine": 833190,
+          "ir_ratio": 1.0,
+          "ir_ref": 833190,
+          "ll_misses": [
+            3205,
+            3205
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/sqlite_varint/manifest.json"
+      },
+      "linux_find_bit": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=32",
+        "metrics": {
+          "conditional_mispredicts": [
+            11858,
+            11858
+          ],
+          "d1_misses": [
+            137234,
+            137234
+          ],
+          "i1_misses": [
+            1358,
+            1358
+          ],
+          "indirect_mispredicts": [
+            232,
+            232
+          ],
+          "ir_mine": 5957838,
+          "ir_ratio": 1.0,
+          "ir_ref": 5957838,
+          "ll_misses": [
+            6998,
+            6998
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/linux_find_bit/manifest.json"
+      },
+      "linux_find_bit_scaled": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=128",
+        "metrics": {
+          "conditional_mispredicts": [
+            36568,
+            36568
+          ],
+          "d1_misses": [
+            530618,
+            530618
+          ],
+          "i1_misses": [
+            1362,
+            1362
+          ],
+          "indirect_mispredicts": [
+            232,
+            232
+          ],
+          "ir_mine": 22941700,
+          "ir_ratio": 1.0,
+          "ir_ref": 22941700,
+          "ll_misses": [
+            7003,
+            7003
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/linux_find_bit_scaled/manifest.json"
+      },
+      "glibc_memcmp": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=16",
+        "metrics": {
+          "conditional_mispredicts": [
+            3371,
+            3371
+          ],
+          "d1_misses": [
+            25348,
+            25348
+          ],
+          "i1_misses": [
+            1362,
+            1362
+          ],
+          "indirect_mispredicts": [
+            232,
+            232
+          ],
+          "ir_mine": 722972,
+          "ir_ratio": 1.0,
+          "ir_ref": 722972,
+          "ll_misses": [
+            4951,
+            4951
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/glibc_memcmp/manifest.json"
+      },
+      "chacha20_block": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DBLOCK_COUNT=256 -DPASSES=2",
+        "metrics": {
+          "conditional_mispredicts": [
+            3850,
+            3850
+          ],
+          "d1_misses": [
+            1887,
+            1887
+          ],
+          "i1_misses": [
+            1375,
+            1375
+          ],
+          "indirect_mispredicts": [
+            235,
+            235
+          ],
+          "ir_mine": 419153,
+          "ir_ratio": 1.0,
+          "ir_ref": 419153,
+          "ll_misses": [
+            2919,
+            2919
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/chacha20_block/manifest.json"
+      },
+      "sha256_transform": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DBLOCK_COUNT=256 -DPASSES=2",
+        "metrics": {
+          "conditional_mispredicts": [
+            4368,
+            4368
+          ],
+          "d1_misses": [
+            1898,
+            1898
+          ],
+          "i1_misses": [
+            1383,
+            1383
+          ],
+          "indirect_mispredicts": [
+            235,
+            235
+          ],
+          "ir_mine": 1801712,
+          "ir_ratio": 1.0,
+          "ir_ref": 1801712,
+          "ll_misses": [
+            2933,
+            2933
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/sha256_transform/manifest.json"
+      },
+      "linux_rbtree": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DNODE_COUNT=1024 -DLOOKUP_ROUNDS=2",
+        "metrics": {
+          "conditional_mispredicts": [
+            17992,
+            17992
+          ],
+          "d1_misses": [
+            2531,
+            2531
+          ],
+          "i1_misses": [
+            1380,
+            1380
+          ],
+          "indirect_mispredicts": [
+            236,
+            236
+          ],
+          "ir_mine": 515148,
+          "ir_ratio": 1.0,
+          "ir_ref": 515148,
+          "ll_misses": [
+            3436,
+            3436
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/linux_rbtree/manifest.json"
+      },
+      "zstd_count": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DBUFFER_SIZE=16384 -DQUERY_COUNT=1024 -DPASSES=2",
+        "metrics": {
+          "conditional_mispredicts": [
+            5407,
+            5407
+          ],
+          "d1_misses": [
+            2190,
+            2190
+          ],
+          "i1_misses": [
+            1377,
+            1377
+          ],
+          "indirect_mispredicts": [
+            236,
+            236
+          ],
+          "ir_mine": 463188,
+          "ir_ratio": 1.0,
+          "ir_ref": 463188,
+          "ll_misses": [
+            3177,
+            3177
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/zstd_count/manifest.json"
+      },
+      "lz4_compress": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSRC_SIZE=16384 -DPASSES=2",
+        "metrics": {
+          "conditional_mispredicts": [
+            10603,
+            10603
+          ],
+          "d1_misses": [
+            5913,
+            5913
+          ],
+          "i1_misses": [
+            1393,
+            1393
+          ],
+          "indirect_mispredicts": [
+            243,
+            243
+          ],
+          "ir_mine": 635174,
+          "ir_ratio": 1.0,
+          "ir_ref": 635174,
+          "ll_misses": [
+            4483,
+            4483
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/lz4_compress/manifest.json"
+      },
+      "lz4_match_extend": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSRC_SIZE=16384 -DPASSES=2 -DMATCH_RICH=1",
+        "metrics": {
+          "conditional_mispredicts": [
+            8263,
+            8263
+          ],
+          "d1_misses": [
+            14198,
+            14198
+          ],
+          "i1_misses": [
+            1407,
+            1407
+          ],
+          "indirect_mispredicts": [
+            244,
+            244
+          ],
+          "ir_mine": 1167652,
+          "ir_ratio": 1.0,
+          "ir_ref": 1167652,
+          "ll_misses": [
+            4410,
+            4410
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/lz4_match_extend/manifest.json"
+      },
+      "glibc_strstr": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DHAYSTACK_LEN=16384 -DQUERY_COUNT=32 -DPASSES=2",
+        "metrics": {
+          "conditional_mispredicts": [
+            9432,
+            9432
+          ],
+          "d1_misses": [
+            2194,
+            2194
+          ],
+          "i1_misses": [
+            1381,
+            1381
+          ],
+          "indirect_mispredicts": [
+            236,
+            236
+          ],
+          "ir_mine": 3644894,
+          "ir_ratio": 1.0,
+          "ir_ref": 3644894,
+          "ll_misses": [
+            3181,
+            3181
+          ]
+        },
+        "manifest": "/home/lccc-work/cg-memory-range-v2/glibc_strstr/manifest.json"
+      }
+    },
+    "failures": [],
+    "worst_first": [
+      "arith_loop",
+      "fib",
+      "matmul",
+      "qsort",
+      "sieve",
+      "tce_sum",
+      "nbody",
+      "binary_trees",
+      "spectral_norm",
+      "mandelbrot",
+      "hash_table",
+      "strlen_bench",
+      "switch_dispatch",
+      "loop_patterns",
+      "fannkuch",
+      "ackermann",
+      "constant_recursion",
+      "bitops",
+      "double_reduction",
+      "ascii_case_fold",
+      "binary_search",
+      "ring_fifo",
+      "aarch64_select_patterns",
+      "histogram",
+      "gzip_crc32",
+      "libm_round_family",
+      "tls_seg_access",
+      "zlib_ng_adler32",
+      "zlib_ng_adler32_combine",
+      "sqlite_varint",
+      "linux_find_bit",
+      "linux_find_bit_scaled",
+      "glibc_memcmp",
+      "chacha20_block",
+      "sha256_transform",
+      "linux_rbtree",
+      "zstd_count",
+      "lz4_compress",
+      "lz4_match_extend",
+      "glibc_strstr",
+      "expat_xml_scan",
+      "struct_copy",
+      "expat_siphash24"
+    ]
+  },
+  "oracle_execution": {
+    "complete": true,
+    "rows": [
+      {
+        "source": "tests/regression/memory_value_forwarding.c",
+        "source_sha256": "93e183c475b2749dcc05147492c777d3c2ee3acef306b8b2f8f5262707513bbc",
+        "flags": "-O2 -march=x86-64-v3 -fwrapv",
+        "compiler": {
+          "id": "cg162",
+          "name": "x86-64 gcc 16.2",
+          "semver": "16.2",
+          "compilerType": ""
+        },
+        "local": {
+          "id": "lccc",
+          "vendor": "local",
+          "ok": true,
+          "asm_insns": 309,
+          "stdout": "memory-value 31600ed331510cd2\n",
+          "exit": 0,
+          "reason": null
+        },
+        "remote": {
+          "id": "cg162",
+          "vendor": "GNU",
+          "ok": true,
+          "asm_insns": 218,
+          "stdout": "memory-value 31600ed331510cd2",
+          "exit": 0,
+          "reason": null,
+          "ce_semver": null,
+          "cached_at": 1791757586.0564163
+        },
+        "pass": true
+      },
+      {
+        "source": "tests/regression/memory_value_forwarding.c",
+        "source_sha256": "93e183c475b2749dcc05147492c777d3c2ee3acef306b8b2f8f5262707513bbc",
+        "flags": "-O2 -march=x86-64-v3 -fwrapv",
+        "compiler": {
+          "id": "cclang2310",
+          "name": "x86-64 clang 23.1.0",
+          "semver": "23.1.0",
+          "compilerType": "clang"
+        },
+        "local": {
+          "id": "lccc",
+          "vendor": "local",
+          "ok": true,
+          "asm_insns": 309,
+          "stdout": "memory-value 31600ed331510cd2\n",
+          "exit": 0,
+          "reason": null
+        },
+        "remote": {
+          "id": "cclang2310",
+          "vendor": "LLVM",
+          "ok": true,
+          "asm_insns": 231,
+          "stdout": "memory-value 31600ed331510cd2",
+          "exit": 0,
+          "reason": null,
+          "ce_semver": null,
+          "cached_at": 1791757587.649952
+        },
+        "pass": true
+      },
+      {
+        "source": "tests/regression/memory_value_forwarding.c",
+        "source_sha256": "93e183c475b2749dcc05147492c777d3c2ee3acef306b8b2f8f5262707513bbc",
+        "flags": "-O2 -march=x86-64-v3 -fwrapv",
+        "compiler": {
+          "id": "cicc2021100",
+          "name": "x86-64 icc 2021.10.0",
+          "semver": "2021.10.0",
+          "compilerType": ""
+        },
+        "local": {
+          "id": "lccc",
+          "vendor": "local",
+          "ok": true,
+          "asm_insns": 309,
+          "stdout": "memory-value 31600ed331510cd2\n",
+          "exit": 0,
+          "reason": null
+        },
+        "remote": {
+          "id": "cicc2021100",
+          "vendor": "Intel (classic)",
+          "ok": true,
+          "asm_insns": 320,
+          "stdout": "memory-value 31600ed331510cd2",
+          "exit": 0,
+          "reason": null,
+          "ce_semver": null,
+          "cached_at": 1791757588.7688377
+        },
+        "pass": true
+      },
+      {
+        "source": "tests/regression/memory_value_forwarding.c",
+        "source_sha256": "93e183c475b2749dcc05147492c777d3c2ee3acef306b8b2f8f5262707513bbc",
+        "flags": "-O2 -march=x86-64-v3 -fwrapv",
+        "compiler": {
+          "id": "cicxlatest",
+          "name": "x86-64 icx (latest)",
+          "semver": "(latest)",
+          "compilerType": "clang-intel"
+        },
+        "local": {
+          "id": "lccc",
+          "vendor": "local",
+          "ok": true,
+          "asm_insns": 309,
+          "stdout": "memory-value 31600ed331510cd2\n",
+          "exit": 0,
+          "reason": null
+        },
+        "remote": {
+          "id": "cicxlatest",
+          "vendor": "Intel",
+          "ok": true,
+          "asm_insns": 275,
+          "stdout": "memory-value 31600ed331510cd2",
+          "exit": 0,
+          "reason": null,
+          "ce_semver": null,
+          "cached_at": 1791757590.3106654
+        },
+        "pass": true
+      },
+      {
+        "source": "tests/regression/adjacent_membership.c",
+        "source_sha256": "c6d31d3d1609b24b0538c7621e251d733dd1015e9b4198a0dd9db94a42f350e6",
+        "flags": "-O2 -march=x86-64-v3 -fwrapv",
+        "compiler": {
+          "id": "cg162",
+          "name": "x86-64 gcc 16.2",
+          "semver": "16.2",
+          "compilerType": ""
+        },
+        "local": {
+          "id": "lccc",
+          "vendor": "local",
+          "ok": true,
+          "asm_insns": 187,
+          "stdout": "adjacent membership: PASS\n",
+          "exit": 0,
+          "reason": null
+        },
+        "remote": {
+          "id": "cg162",
+          "vendor": "GNU",
+          "ok": true,
+          "asm_insns": 186,
+          "stdout": "adjacent membership: PASS",
+          "exit": 0,
+          "reason": null,
+          "ce_semver": null,
+          "cached_at": 1791757592.1646502
+        },
+        "pass": true
+      },
+      {
+        "source": "tests/regression/adjacent_membership.c",
+        "source_sha256": "c6d31d3d1609b24b0538c7621e251d733dd1015e9b4198a0dd9db94a42f350e6",
+        "flags": "-O2 -march=x86-64-v3 -fwrapv",
+        "compiler": {
+          "id": "cclang2310",
+          "name": "x86-64 clang 23.1.0",
+          "semver": "23.1.0",
+          "compilerType": "clang"
+        },
+        "local": {
+          "id": "lccc",
+          "vendor": "local",
+          "ok": true,
+          "asm_insns": 187,
+          "stdout": "adjacent membership: PASS\n",
+          "exit": 0,
+          "reason": null
+        },
+        "remote": {
+          "id": "cclang2310",
+          "vendor": "LLVM",
+          "ok": true,
+          "asm_insns": 203,
+          "stdout": "adjacent membership: PASS",
+          "exit": 0,
+          "reason": null,
+          "ce_semver": null,
+          "cached_at": 1791757593.3766851
+        },
+        "pass": true
+      },
+      {
+        "source": "tests/regression/adjacent_membership.c",
+        "source_sha256": "c6d31d3d1609b24b0538c7621e251d733dd1015e9b4198a0dd9db94a42f350e6",
+        "flags": "-O2 -march=x86-64-v3 -fwrapv",
+        "compiler": {
+          "id": "cicc2021100",
+          "name": "x86-64 icc 2021.10.0",
+          "semver": "2021.10.0",
+          "compilerType": ""
+        },
+        "local": {
+          "id": "lccc",
+          "vendor": "local",
+          "ok": true,
+          "asm_insns": 187,
+          "stdout": "adjacent membership: PASS\n",
+          "exit": 0,
+          "reason": null
+        },
+        "remote": {
+          "id": "cicc2021100",
+          "vendor": "Intel (classic)",
+          "ok": true,
+          "asm_insns": 243,
+          "stdout": "adjacent membership: PASS",
+          "exit": 0,
+          "reason": null,
+          "ce_semver": null,
+          "cached_at": 1791757594.510056
+        },
+        "pass": true
+      },
+      {
+        "source": "tests/regression/adjacent_membership.c",
+        "source_sha256": "c6d31d3d1609b24b0538c7621e251d733dd1015e9b4198a0dd9db94a42f350e6",
+        "flags": "-O2 -march=x86-64-v3 -fwrapv",
+        "compiler": {
+          "id": "cicxlatest",
+          "name": "x86-64 icx (latest)",
+          "semver": "(latest)",
+          "compilerType": "clang-intel"
+        },
+        "local": {
+          "id": "lccc",
+          "vendor": "local",
+          "ok": true,
+          "asm_insns": 187,
+          "stdout": "adjacent membership: PASS\n",
+          "exit": 0,
+          "reason": null
+        },
+        "remote": {
+          "id": "cicxlatest",
+          "vendor": "Intel",
+          "ok": true,
+          "asm_insns": 208,
+          "stdout": "adjacent membership: PASS",
+          "exit": 0,
+          "reason": null,
+          "ce_semver": null,
+          "cached_at": 1791757597.2637348
+        },
+        "pass": true
+      }
+    ],
+    "errors": []
+  }
+}

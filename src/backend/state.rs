@@ -401,6 +401,9 @@ pub struct CodegenState {
     /// Total use count for each value ID across the entire function.
     /// Used by MachInst flush to determine if a buffer-defined vreg is live-out.
     pub value_use_counts: Vec<u32>,
+    /// Width-qualified selector bounds, recomputed after phi lowering for
+    /// each function. They never license dropping width normalization.
+    pub switch_unsigned_bounds: FxHashMap<u32, (u32, u64)>,
     /// Use counts within the current block (set before block codegen).
     /// Compared with value_use_counts to detect live-out values.
     pub block_use_counts: FxHashMap<u32, u32>,
@@ -729,6 +732,7 @@ impl CodegenState {
             promoted_global_addr_homes: FxHashSet::default(),
             current_func_name: String::new(),
             value_use_counts: Vec::new(),
+            switch_unsigned_bounds: FxHashMap::default(),
             block_use_counts: FxHashMap::default(),
             pending_load_cmp: FxHashMap::default(),
             function_return_thunk: false,
@@ -968,6 +972,7 @@ impl CodegenState {
         self.wide_values.clear();
         self.never_materialized_values.clear();
         self.promoted_global_addr_homes.clear();
+        self.switch_unsigned_bounds.clear();
         self.has_dyn_alloca = false;
         self.omit_frame_pointer = false;
         self.pending_classic_mcount_label = None;

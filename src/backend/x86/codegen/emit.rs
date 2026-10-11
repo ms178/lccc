@@ -8711,17 +8711,30 @@ impl ArchCodegen for X86Codegen {
                 self.state.emit("    subq %rcx, %rax");
             }
         }
-        if (range as i64) >= i32::MIN as i64 && (range as i64) <= i32::MAX as i64 {
-            self.state
-                .out
-                .emit_instr_imm_reg("    cmpq", range as i64, "rax");
-        } else {
-            self.state
-                .out
-                .emit_instr_imm_reg("    movabsq", range as i64, "rcx");
-            self.state.emit("    cmpq %rcx, %rax");
+        let in_range = match val {
+            Operand::Value(v) => {
+                self.state
+                    .switch_unsigned_bounds
+                    .get(&v.0)
+                    .is_some_and(|&bound| {
+                        crate::passes::integer_bounds::covers_switch(bound, ty, min_val, range)
+                    })
+            }
+            _ => false,
+        };
+        if !in_range {
+            if (range as i64) >= i32::MIN as i64 && (range as i64) <= i32::MAX as i64 {
+                self.state
+                    .out
+                    .emit_instr_imm_reg("    cmpq", range as i64, "rax");
+            } else {
+                self.state
+                    .out
+                    .emit_instr_imm_reg("    movabsq", range as i64, "rcx");
+                self.state.emit("    cmpq %rcx, %rax");
+            }
+            self.state.out.emit_jcc_label("    jae", &default_label);
         }
-        self.state.out.emit_jcc_label("    jae", &default_label);
 
         // Kernel / non-PIC code model: emit the GCC-canonical ABSOLUTE jump
         // table — `jmp *jt_table(,%rax,8)` (R_X86_64_32S against .rodata)

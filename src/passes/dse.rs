@@ -35,8 +35,8 @@
 //!   translation units can hold their address).
 //! * Volatile stores are never eliminated but may overwrite (kill) earlier
 //!   stores; volatile loads read memory and kill like ordinary loads.
-//!   Segment-overridden accesses target a different address space: they can
-//!   neither alias default-space cells nor be eliminated here.
+//!   Segment-relative accesses are not eliminated here and are opaque
+//!   barriers: their offsets cannot be compared to default-space offsets.
 //!
 //! Scope is deliberately same-block. Cross-block DSE needs post-dominator
 //! plus read-between proofs — that is the `segments`-based OP-33 follow-up.
@@ -131,10 +131,15 @@ impl DseContext {
                         dest, base, offset, ..
                     } => {
                         let d = match offset {
-                            Operand::Const(c) => PtrDef::GepConst {
-                                base: base.0,
-                                delta: c.to_i64().unwrap_or(i64::MAX),
-                            },
+                            Operand::Const(c) => {
+                                match c.to_i128().and_then(|n| i64::try_from(n).ok()) {
+                                    Some(delta) => PtrDef::GepConst {
+                                        base: base.0,
+                                        delta,
+                                    },
+                                    None => PtrDef::GepVar { base: base.0 },
+                                }
+                            }
                             Operand::Value(_) => PtrDef::GepVar { base: base.0 },
                         };
                         defs.insert(dest.0, d);
@@ -166,53 +171,51 @@ impl DseContext {
     /// instruction (params) are opaque roots by value id.
     fn resolve(&self, v: Value) -> Option<CellAddr> {
         let mut cur = v;
-        let mut offset: i64 = 0;
+        let mut offset = Some(0i64);
+        let mut seen = FxHashSet::default();
         loop {
+            if !seen.insert(cur.0) {
+                return None;
+            }
             let def = match self.defs.get(&cur.0) {
                 Some(d) => d,
                 None => {
                     return Some(CellAddr {
                         root: CellRoot::Other(cur.0),
-                        offset: Some(offset),
+                        offset,
                     });
                 }
             };
             match def {
                 PtrDef::CopyOf(src) => cur = Value(*src),
                 PtrDef::GepConst { base, delta } => {
-                    offset = offset.saturating_add(*delta);
+                    offset = offset.and_then(|off| off.checked_add(*delta));
                     cur = Value(*base);
                 }
                 PtrDef::GepVar { base } => {
-                    return Some(CellAddr {
-                        root: self.root_of(Value(*base))?,
-                        offset: None,
-                    });
+                    offset = None;
+                    cur = Value(*base);
                 }
                 PtrDef::Alloca => {
                     return Some(CellAddr {
                         root: CellRoot::Alloca(cur.0),
-                        offset: Some(offset),
+                        offset,
                     });
                 }
                 PtrDef::Global(name) => {
                     return Some(CellAddr {
                         root: CellRoot::Global(name.clone()),
-                        offset: Some(offset),
+                        offset,
                     });
                 }
                 PtrDef::Opaque => {
                     return Some(CellAddr {
                         root: CellRoot::Other(cur.0),
-                        offset: Some(offset),
+                        offset,
                     });
                 }
             }
         }
-    }
-
-    fn root_of(&self, v: Value) -> Option<CellRoot> {
-        self.resolve(v).map(|c| c.root)
     }
 }
 
@@ -331,7 +334,10 @@ fn roots_may_alias(a: &CellRoot, b: &CellRoot) -> bool {
 }
 
 fn overlaps(a_off: i64, a_sz: i64, b_off: i64, b_sz: i64) -> bool {
-    a_off < b_off + b_sz && b_off < a_off + a_sz
+    match (a_off.checked_add(a_sz), b_off.checked_add(b_sz)) {
+        (Some(a_end), Some(b_end)) => a_off < b_end && b_off < a_end,
+        _ => true, // an unrepresentable range is not a disjointness proof
+    }
 }
 
 /// Kill every pending entry that `root` (at unknown offset) may overwrite.
@@ -423,6 +429,7 @@ fn dse_block(block: &crate::ir::reexports::BasicBlock, ctx: &DseContext) -> Vec<
                 ..
             } => {
                 if *seg_override != AddressSpace::Default {
+                    kill_opaque(&mut pending, ctx);
                     continue;
                 }
                 match ctx.resolve(*ptr) {
@@ -435,7 +442,11 @@ fn dse_block(block: &crate::ir::reexports::BasicBlock, ctx: &DseContext) -> Vec<
                             if roots_may_alias(&p.root, &root) {
                                 // Same object (or unknown overlap): kill on
                                 // byte-range intersection.
-                                !overlaps(p.offset, p.size, off, sz)
+                                // Offsets are relative to their roots. Offsets
+                                // 0 and 8 do not prove p and q+8 disjoint when
+                                // q may equal p-8. Only a shared root permits
+                                // comparing these coordinate systems.
+                                p.root == root && !overlaps(p.offset, p.size, off, sz)
                             } else {
                                 true
                             }
@@ -487,6 +498,11 @@ fn dse_block(block: &crate::ir::reexports::BasicBlock, ctx: &DseContext) -> Vec<
 /// Run same-block dead store elimination on one function.
 pub(crate) fn eliminate_dead_stores(func: &mut IrFunction) -> usize {
     if func.blocks.is_empty() || std::env::var_os("CCC_NO_DSE").is_some() {
+        return 0;
+    }
+    // This pass's pointer-def map describes SSA, not mutable copy webs.
+    // Never use a position-independent path for a redefined pointer.
+    if !super::gvn::find_multi_def_values(func).is_empty() {
         return 0;
     }
     let ctx = DseContext::build(func);
@@ -848,6 +864,124 @@ mod tests {
                 .instructions
                 .iter()
                 .any(|i| matches!(i, Instruction::Store { volatile: true, .. }))
+        );
+    }
+}
+
+#[cfg(test)]
+mod displaced_alias_tests {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, IrConst, Terminator};
+
+    fn gep(dest: u32, base: u32, offset: i64) -> Instruction {
+        Instruction::GetElementPtr {
+            dest: Value(dest),
+            base: Value(base),
+            offset: Operand::Const(IrConst::I64(offset)),
+            ty: IrType::Ptr,
+        }
+    }
+    fn store(ptr: u32) -> Instruction {
+        Instruction::Store {
+            ptr: Value(ptr),
+            val: Operand::Const(IrConst::I32(1)),
+            ty: IrType::I32,
+            volatile: false,
+            seg_override: AddressSpace::Default,
+        }
+    }
+    fn function(instructions: Vec<Instruction>) -> IrFunction {
+        let mut f = IrFunction::new("displaced".into(), IrType::Void, vec![], false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        });
+        f
+    }
+
+    #[test]
+    fn read_offsets_are_comparable_only_for_the_same_root() {
+        for same_root in [false, true] {
+            for offset in -12..=12 {
+                let mut f = function(vec![
+                    gep(2, if same_root { 0 } else { 1 }, offset),
+                    store(0),
+                    Instruction::Load {
+                        dest: Value(3),
+                        ptr: Value(2),
+                        ty: IrType::I32,
+                        volatile: false,
+                        seg_override: AddressSpace::Default,
+                    },
+                    store(0),
+                ]);
+                let expected = usize::from(same_root && !(-3..=3).contains(&offset));
+                assert_eq!(
+                    eliminate_dead_stores(&mut f),
+                    expected,
+                    "same={same_root}, off={offset}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn segment_relative_read_is_not_a_default_space_offset_proof() {
+        let mut f = function(vec![
+            store(0),
+            Instruction::Load {
+                dest: Value(3),
+                ptr: Value(1),
+                ty: IrType::I32,
+                volatile: false,
+                seg_override: AddressSpace::SegFs,
+            },
+            store(0),
+        ]);
+        assert_eq!(eliminate_dead_stores(&mut f), 0);
+    }
+
+    #[test]
+    fn redefined_pointer_is_not_a_function_wide_ssa_fact() {
+        let mut f = function(vec![
+            Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Value(Value(1)),
+            },
+            store(0),
+            Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Value(Value(2)),
+            },
+            store(0),
+        ]);
+        assert_eq!(eliminate_dead_stores(&mut f), 0);
+    }
+
+    #[test]
+    fn overflowing_and_cyclic_paths_fail_closed_without_recursion() {
+        let f = function(vec![gep(2, 0, i64::MAX), gep(3, 2, 1)]);
+        let ctx = DseContext::build(&f);
+        assert_eq!(ctx.resolve(Value(3)).unwrap().offset, None);
+        assert!(overlaps(i64::MAX, 4, 0, 4));
+        assert!(!overlaps(i64::MIN, 4, i64::MAX - 4, 4));
+        let mut f = function(vec![gep(1, 2, 0), gep(2, 1, 0)]);
+        assert!(DseContext::build(&f).resolve(Value(1)).is_none());
+        if let Instruction::GetElementPtr { offset, .. } = &mut f.blocks[0].instructions[0] {
+            *offset = Operand::Value(Value(9));
+        }
+        assert!(DseContext::build(&f).resolve(Value(1)).is_none());
+        let f = function(vec![Instruction::GetElementPtr {
+            dest: Value(2),
+            base: Value(0),
+            offset: Operand::Const(IrConst::I128(i128::MAX)),
+            ty: IrType::Ptr,
+        }]);
+        assert_eq!(
+            DseContext::build(&f).resolve(Value(2)).unwrap().offset,
+            None
         );
     }
 }
