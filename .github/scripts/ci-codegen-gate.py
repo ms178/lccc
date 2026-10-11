@@ -32,6 +32,7 @@ Usage:
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -60,6 +61,10 @@ WORKLOADS = [
     # Tracked so the gap-closure project measures against a pinned floor and
     # no change regresses it silently while the gap is open.
     ("chacha20_block.c", "chacha20_block"),
+    # Whole-TU sentinel; per-function baseline/v3 contracts live in
+    # check_bit_count_codegen.py, executable/IR witnesses in the salvage gate.
+    ("../../regression/count_zero_intermediate_casts.c", "portable_bit_counts"),
+    ("../../regression/clz_safe_guards.c", "safe_count_guards"),
 ]
 
 # Metric -> default max regression (fraction). A metric that got BETTER
@@ -181,6 +186,18 @@ def detect_gcc_inc() -> str:
     return r.stdout.strip()
 
 
+def publish_baseline(results, path=BASELINE):
+    """Never bless missing sources or failed compiles, even in update mode."""
+    expected = {label for _, label in WORKLOADS}
+    if (not expected or len(results) != len(expected)
+            or {r["label"] for r in results} != expected
+            or any("metrics" not in r for r in results)):
+        raise ValueError("refusing incomplete codegen baseline refresh")
+    tmp = path.with_suffix(f".tmp.{os.getpid()}")
+    tmp.write_text(json.dumps({r["label"]: r["metrics"] for r in results}, indent=2) + "\n")
+    tmp.replace(path)
+
+
 def main():
     p = argparse.ArgumentParser(description="LCCC codegen quality gate")
     p.add_argument("--lccc", required=True, help="Path to LCCC binary")
@@ -205,6 +222,7 @@ def main():
     for src_name, label in WORKLOADS:
         src = PROGRAMS / src_name
         if not src.exists():
+            failures.append(f"{label}: required source missing")
             results.append({"label": label, "skip": str(src)})
             continue
         got = compile_metrics(args.lccc, gcc_inc, src)
@@ -237,12 +255,11 @@ def main():
         results.append(entry)
 
     if args.update_baseline:
-        new_base = {}
-        for r in results:
-            if "metrics" in r:
-                new_base[r["label"]] = r["metrics"]
-        BASELINE.write_text(json.dumps(new_base, indent=2) + "\n")
-        print(f"Baseline updated: {BASELINE}", file=sys.stderr)
+        try:
+            publish_baseline(results)
+            print(f"Baseline updated: {BASELINE}", file=sys.stderr)
+        except ValueError as exc:
+            failures.append(str(exc))
 
     if args.json:
         Path(args.json).write_text(json.dumps(results, indent=2))
@@ -255,6 +272,9 @@ def main():
         for r in results:
             if "skip" in r:
                 print(f"| {r['label']} | — | — | — | — | — | SKIPPED |")
+                continue
+            if "error" in r:
+                print(f"| {r['label']} | — | — | — | — | — | ERROR |")
                 continue
             m = r["metrics"]
             verdict = "PASS" if not r.get("regressions") else (

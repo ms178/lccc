@@ -40,7 +40,7 @@
     "fma": 0
   },
   "hash_table": {
-    "insns": 125,
+    "insns": 124,
     "stackmem": 0,
     "pushes": 8,
     "moves": 29,
@@ -48,7 +48,7 @@
     "fma": 0
   },
   "zstd_count": {
-    "insns": 147,
+    "insns": 146,
     "stackmem": 8,
     "pushes": 6,
     "moves": 34,
@@ -69,6 +69,22 @@
     "pushes": 8,
     "moves": 9,
     "ymm": 5,
+    "fma": 0
+  },
+  "portable_bit_counts": {
+    "insns": 228,
+    "stackmem": 7,
+    "pushes": 8,
+    "moves": 82,
+    "ymm": 0,
+    "fma": 0
+  },
+  "safe_count_guards": {
+    "insns": 174,
+    "stackmem": 0,
+    "pushes": 6,
+    "moves": 65,
+    "ymm": 0,
     "fma": 0
   }
 }

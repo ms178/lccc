@@ -23,8 +23,12 @@ the density rank disagree in SIGN, not just magnitude:
     density (this tool):             lccc 0.1172 insn/B vs gcc 0.1875
                                      -> lccc 1.60x AHEAD
 
-Comparability rules (no silent apples-to-oranges)
+Heuristic comparability limits (manual loop/work matching still required)
 -------------------------------------------------
+* Matching function names does NOT prove matching loop phases. The selected
+  largest-step loop may be initialization, a reduction, or another phase.
+  These are screening candidates, not certified performance ratios. Confirm
+  the same work with assembly and Callgrind before acting on a ranking.
 * A function is compared only when LCCC and at least `--min-oracles` oracles
   emit it as a standalone symbol with a measurable innermost loop.  Different
   inlining decisions otherwise compare a whole inlined kernel against an
@@ -164,6 +168,7 @@ def main(argv: list[str] | None = None) -> int:
     unranked = [r for r in rows if r.ratio is None or r.note]
     ranked.sort(key=lambda r: (-(r.ratio or 0), r.benchmark, r.symbol))
 
+    print("WARNING: heuristic loop selection; same-work/hot-loop equivalence is NOT verified.")
     width = max((len(r.benchmark) for r in rows), default=9)
     print(f"{'ratio':>6}  {'benchmark':<{width}}  {'function':<22} "
           f"{'lccc insn/B':>11}  {'best':>11}  oracle")
@@ -189,6 +194,7 @@ def main(argv: list[str] | None = None) -> int:
         tmp = args.json.with_suffix(f".tmp.{os.getpid()}")
         tmp.write_text(json.dumps({
             "schema": 1,
+            "semantic_loop_equivalence_verified": False,
             "flags": args.flags,
             "local_flags": args.local_flags or args.flags,
             "oracles": oracle_names,
@@ -202,7 +208,9 @@ def main(argv: list[str] | None = None) -> int:
         lines = [
             f"# Loop-density survey ({args.flags})",
             "",
-            "Ratio = LCCC steady-state instructions per byte / best oracle's. "
+            "WARNING: loop/work equivalence is not verified; this is a heuristic screen, not performance evidence.",
+            "",
+            "Ratio = LCCC candidate-loop instructions per byte / best oracle's. "
             "**< 1.0 means LCCC does less work per byte.**",
             "",
             "| ratio | benchmark | function | LCCC insn/B | best insn/B | best oracle | LCCC loop |",

@@ -1,0 +1,3206 @@
+{
+  "base": "636289180fe6b05e6b2c19c8c7a4cf11d922a2e2",
+  "compiler_before_sha256": "912aa91e7f495dd909d8e37e868b78f59c2e086d0f28452986d9d1036e6b04ee",
+  "compiler_after_sha256": "f4f2f30e6892529c0809ead06e72ace33e56e079e3b8eadc7a3428b92a05baba",
+  "runtime_reference": "gcc (Debian 14.2.0-19) 14.2.0",
+  "instrumentation": "Valgrind 3.24.0 Callgrind, pinned I1=32768,8,64 D1=32768,8,64 LL=33554432,16,64; simulated Ir/cache/branch model, not PMU/uops/cycles/speedup",
+  "callgrind_selected": 43,
+  "callgrind_correct_before": 43,
+  "callgrind_correct_after": 43,
+  "callgrind_failures": [],
+  "callgrind_rows_worst_before_first": [
+    {
+      "name": "ring_fifo",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+      "source_sha256": "e5c01f13f9472d27106f37b76e0076f2d3e4cb71109c38344688e4e8f6e6db03",
+      "before": {
+        "conditional_mispredicts": [
+          3159,
+          3227
+        ],
+        "d1_misses": [
+          1839,
+          1782
+        ],
+        "i1_misses": [
+          1164,
+          1162
+        ],
+        "indirect_mispredicts": [
+          216,
+          222
+        ],
+        "ir_mine": 621819,
+        "ir_ratio": 2.497796719783729,
+        "ir_ref": 248947,
+        "ll_misses": [
+          2693,
+          2643
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          3158,
+          3226
+        ],
+        "d1_misses": [
+          1839,
+          1782
+        ],
+        "i1_misses": [
+          1164,
+          1162
+        ],
+        "indirect_mispredicts": [
+          216,
+          222
+        ],
+        "ir_mine": 621819,
+        "ir_ratio": 2.497796719783729,
+        "ir_ref": 248947,
+        "ll_misses": [
+          2693,
+          2643
+        ]
+      },
+      "before_binary_sha256": "2cdb66c05d25688eb2129518ebcbf4a34b727757d0e799556fa8ba4720110d98",
+      "after_binary_sha256": "2cdb66c05d25688eb2129518ebcbf4a34b727757d0e799556fa8ba4720110d98",
+      "reference_binary_sha256": "3b8197cce4488a97d08dd7fe4ac71a6d0a2c9c2475f5a524b50da2d8140eec08",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "histogram",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+      "source_sha256": "67bef36e96b93d37b36e85f02e991eda19cd759393ec104684edfde54c6a3806",
+      "before": {
+        "conditional_mispredicts": [
+          3171,
+          3246
+        ],
+        "d1_misses": [
+          10063,
+          10077
+        ],
+        "i1_misses": [
+          1166,
+          1168
+        ],
+        "indirect_mispredicts": [
+          216,
+          222
+        ],
+        "ir_mine": 3485952,
+        "ir_ratio": 2.050762663604403,
+        "ir_ref": 1699832,
+        "ll_misses": [
+          6756,
+          6778
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          3170,
+          3245
+        ],
+        "d1_misses": [
+          10063,
+          10077
+        ],
+        "i1_misses": [
+          1166,
+          1168
+        ],
+        "indirect_mispredicts": [
+          216,
+          222
+        ],
+        "ir_mine": 3485952,
+        "ir_ratio": 2.050762663604403,
+        "ir_ref": 1699832,
+        "ll_misses": [
+          6756,
+          6778
+        ]
+      },
+      "before_binary_sha256": "2bc29e8b50a742334ed9931a54f384b67f3030872050d70f46beb6a5c5ad92a1",
+      "after_binary_sha256": "2bc29e8b50a742334ed9931a54f384b67f3030872050d70f46beb6a5c5ad92a1",
+      "reference_binary_sha256": "1fd560829a52f0cf521f5bf8cbb941e9134eabf69aa349683779dc5b028543ec",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "ascii_case_fold",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+      "source_sha256": "7a97d5091e4e166a63cb4d6dd80bb35014c4f9ccd77848b60bac357f3211a5dd",
+      "before": {
+        "conditional_mispredicts": [
+          3164,
+          18860
+        ],
+        "d1_misses": [
+          4920,
+          4930
+        ],
+        "i1_misses": [
+          1167,
+          1173
+        ],
+        "indirect_mispredicts": [
+          216,
+          222
+        ],
+        "ir_mine": 2238981,
+        "ir_ratio": 1.8334765023948403,
+        "ir_ref": 1221167,
+        "ll_misses": [
+          4680,
+          4704
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          3163,
+          18859
+        ],
+        "d1_misses": [
+          4920,
+          4930
+        ],
+        "i1_misses": [
+          1167,
+          1173
+        ],
+        "indirect_mispredicts": [
+          216,
+          222
+        ],
+        "ir_mine": 2238981,
+        "ir_ratio": 1.8334765023948403,
+        "ir_ref": 1221167,
+        "ll_misses": [
+          4680,
+          4704
+        ]
+      },
+      "before_binary_sha256": "db8dfa20def25159ea84f2b63a4200a4146a9b2082bd698f5f1d97be56b3d0d9",
+      "after_binary_sha256": "db8dfa20def25159ea84f2b63a4200a4146a9b2082bd698f5f1d97be56b3d0d9",
+      "reference_binary_sha256": "6877fd5e0fb549f55a11b94efbbc43e96f7433610672ab440ff4d3573ad4e282",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "glibc_strstr",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DHAYSTACK_LEN=16384 -DQUERY_COUNT=32 -DPASSES=2",
+      "source_sha256": "17dcd48414c9eb254cc910905113b7ed8a3cedac3c0d41216305484a5a7cd344",
+      "before": {
+        "conditional_mispredicts": [
+          9432,
+          9522
+        ],
+        "d1_misses": [
+          2190,
+          2198
+        ],
+        "i1_misses": [
+          1382,
+          1382
+        ],
+        "indirect_mispredicts": [
+          236,
+          243
+        ],
+        "ir_mine": 3644983,
+        "ir_ratio": 1.7724912931125871,
+        "ir_ref": 2056418,
+        "ll_misses": [
+          3180,
+          3199
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          9433,
+          9522
+        ],
+        "d1_misses": [
+          2190,
+          2198
+        ],
+        "i1_misses": [
+          1382,
+          1382
+        ],
+        "indirect_mispredicts": [
+          236,
+          243
+        ],
+        "ir_mine": 3644959,
+        "ir_ratio": 1.7725003087929647,
+        "ir_ref": 2056394,
+        "ll_misses": [
+          3180,
+          3199
+        ]
+      },
+      "before_binary_sha256": "31326cdb5225b7bd0efedc5d76df92215ff786cc3cd51b88e597d2020d62a78f",
+      "after_binary_sha256": "31326cdb5225b7bd0efedc5d76df92215ff786cc3cd51b88e597d2020d62a78f",
+      "reference_binary_sha256": "37dcc2e5401200d510741be9ef0c1746b93765ae62da6fd23426cdcd302f041f",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "expat_siphash24",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=1000",
+      "source_sha256": "59c5dfbdf3f0d2e149a3681925c46b7b0aeb195f179c285f3b64a2daaf1fb663",
+      "before": {
+        "conditional_mispredicts": [
+          123383,
+          116528
+        ],
+        "d1_misses": [
+          1895,
+          1906
+        ],
+        "i1_misses": [
+          1408,
+          1383
+        ],
+        "indirect_mispredicts": [
+          1429,
+          1307
+        ],
+        "ir_mine": 25329493,
+        "ir_ratio": 1.6502961568830423,
+        "ir_ref": 15348453,
+        "ll_misses": [
+          2957,
+          2955
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          123382,
+          116527
+        ],
+        "d1_misses": [
+          1895,
+          1906
+        ],
+        "i1_misses": [
+          1408,
+          1383
+        ],
+        "indirect_mispredicts": [
+          1429,
+          1307
+        ],
+        "ir_mine": 25329493,
+        "ir_ratio": 1.6502961568830423,
+        "ir_ref": 15348453,
+        "ll_misses": [
+          2957,
+          2955
+        ]
+      },
+      "before_binary_sha256": "b78c747b10a5d6ce38b97758a273cdc06d1621be62f81f6d0c5ea9f2e4038f89",
+      "after_binary_sha256": "b78c747b10a5d6ce38b97758a273cdc06d1621be62f81f6d0c5ea9f2e4038f89",
+      "reference_binary_sha256": "352f5b01221030ba827c3eaa7fe363623cb430bbf4a6005bc50d7918c4f2063b",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "spectral_norm",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=128",
+      "source_sha256": "21a48dccebcbc3b9496263f62df260d278051c3cd1a528ed99c8b66bef481e6a",
+      "before": {
+        "conditional_mispredicts": [
+          8556,
+          8640
+        ],
+        "d1_misses": [
+          1935,
+          1958
+        ],
+        "i1_misses": [
+          1424,
+          1415
+        ],
+        "indirect_mispredicts": [
+          233,
+          241
+        ],
+        "ir_mine": 11302656,
+        "ir_ratio": 1.4004787272664643,
+        "ir_ref": 8070566,
+        "ll_misses": [
+          2969,
+          2979
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          8570,
+          8639
+        ],
+        "d1_misses": [
+          1935,
+          1958
+        ],
+        "i1_misses": [
+          1424,
+          1415
+        ],
+        "indirect_mispredicts": [
+          233,
+          241
+        ],
+        "ir_mine": 8673539,
+        "ir_ratio": 1.074712603800031,
+        "ir_ref": 8070566,
+        "ll_misses": [
+          2969,
+          2979
+        ]
+      },
+      "before_binary_sha256": "31504db8c4ae323aa06cbddcb3a6795af5cf073e23c5808c41afddd2978ca206",
+      "after_binary_sha256": "97948f9b83caa21744dbd1e43afd59962d0236764ae619aad0c289271e5b88f4",
+      "reference_binary_sha256": "0c11bcbdfcf9ee8368fd1160570f6340064840e3737cc296b990e01c0877e182",
+      "identical_lccc_binaries": false,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "binary_search",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+      "source_sha256": "e53295433fcba1e277011bd4ae6860e38a1dc27934c36dc9b2de9c6d3d533422",
+      "before": {
+        "conditional_mispredicts": [
+          5818,
+          12168
+        ],
+        "d1_misses": [
+          2042,
+          2049
+        ],
+        "i1_misses": [
+          1166,
+          1165
+        ],
+        "indirect_mispredicts": [
+          216,
+          222
+        ],
+        "ir_mine": 601986,
+        "ir_ratio": 1.4002800625255871,
+        "ir_ref": 429904,
+        "ll_misses": [
+          2887,
+          2904
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          5817,
+          12167
+        ],
+        "d1_misses": [
+          2042,
+          2049
+        ],
+        "i1_misses": [
+          1166,
+          1165
+        ],
+        "indirect_mispredicts": [
+          216,
+          222
+        ],
+        "ir_mine": 601986,
+        "ir_ratio": 1.4002800625255871,
+        "ir_ref": 429904,
+        "ll_misses": [
+          2887,
+          2904
+        ]
+      },
+      "before_binary_sha256": "ab1fcff8ec3af2977f6ae28dbb0ec0e89740c5b18ca550b5ddca05868fe59555",
+      "after_binary_sha256": "ab1fcff8ec3af2977f6ae28dbb0ec0e89740c5b18ca550b5ddca05868fe59555",
+      "reference_binary_sha256": "a878154602a415f822b8d0b6b0b7615bb4563c5fbb13c28d1e44c7481a91a988",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "aarch64_select_patterns",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSELECT_ITERS=20000",
+      "source_sha256": "22b7e42c9de227a1b815878d95f3dc2e97630addaf6e3c19e77d2ce38c09c0b1",
+      "before": {
+        "conditional_mispredicts": [
+          3326,
+          10970
+        ],
+        "d1_misses": [
+          1878,
+          1885
+        ],
+        "i1_misses": [
+          1360,
+          1359
+        ],
+        "indirect_mispredicts": [
+          231,
+          238
+        ],
+        "ir_mine": 966064,
+        "ir_ratio": 1.3543510200419457,
+        "ir_ref": 713304,
+        "ll_misses": [
+          2901,
+          2917
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          3322,
+          10969
+        ],
+        "d1_misses": [
+          1875,
+          1885
+        ],
+        "i1_misses": [
+          1359,
+          1359
+        ],
+        "indirect_mispredicts": [
+          231,
+          238
+        ],
+        "ir_mine": 866064,
+        "ir_ratio": 1.214158339221426,
+        "ir_ref": 713304,
+        "ll_misses": [
+          2898,
+          2917
+        ]
+      },
+      "before_binary_sha256": "6831a36f6694129f19c9a319751a57908ddedaea59152ffbd5e5a30dcfd2a0a7",
+      "after_binary_sha256": "a6566b711e72bb93e9bf63a176ed562ba1b4b8c0078227ee9cf4de2a51419831",
+      "reference_binary_sha256": "9f5bf1c853247371554fdd26a9d3959ce12a6f499aff57d95bdcd25c9932f1ea",
+      "identical_lccc_binaries": false,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "nbody",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSTEPS=1000",
+      "source_sha256": "45db2f21add3645a945f1a6635d642f1aad5caecfa4c7b47da4943331a321837",
+      "before": {
+        "conditional_mispredicts": [
+          3460,
+          4571
+        ],
+        "d1_misses": [
+          1915,
+          1920
+        ],
+        "i1_misses": [
+          1447,
+          1431
+        ],
+        "indirect_mispredicts": [
+          234,
+          241
+        ],
+        "ir_mine": 689121,
+        "ir_ratio": 1.2853186060565367,
+        "ir_ref": 536148,
+        "ll_misses": [
+          3001,
+          3002
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          3459,
+          4570
+        ],
+        "d1_misses": [
+          1915,
+          1920
+        ],
+        "i1_misses": [
+          1447,
+          1431
+        ],
+        "indirect_mispredicts": [
+          234,
+          241
+        ],
+        "ir_mine": 689121,
+        "ir_ratio": 1.2853186060565367,
+        "ir_ref": 536148,
+        "ll_misses": [
+          3001,
+          3002
+        ]
+      },
+      "before_binary_sha256": "eb88206c798dd9ad0e266f5e5b66126245fc775a96fa6b98a64001cf4e263629",
+      "after_binary_sha256": "eb88206c798dd9ad0e266f5e5b66126245fc775a96fa6b98a64001cf4e263629",
+      "reference_binary_sha256": "5707e9437525e1c514ebc68d310cbea657966338bc61f468c1a1a77ac6aead22",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "lz4_match_extend",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSRC_SIZE=16384 -DPASSES=2 -DMATCH_RICH=1",
+      "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4",
+      "before": {
+        "conditional_mispredicts": [
+          8262,
+          8382
+        ],
+        "d1_misses": [
+          14196,
+          14139
+        ],
+        "i1_misses": [
+          1407,
+          1394
+        ],
+        "indirect_mispredicts": [
+          244,
+          265
+        ],
+        "ir_mine": 1167736,
+        "ir_ratio": 1.2551415470537275,
+        "ir_ref": 930362,
+        "ll_misses": [
+          4408,
+          4416
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          8263,
+          8382
+        ],
+        "d1_misses": [
+          14196,
+          14139
+        ],
+        "i1_misses": [
+          1407,
+          1394
+        ],
+        "indirect_mispredicts": [
+          244,
+          265
+        ],
+        "ir_mine": 1167722,
+        "ir_ratio": 1.2551453864575406,
+        "ir_ref": 930348,
+        "ll_misses": [
+          4408,
+          4416
+        ]
+      },
+      "before_binary_sha256": "c4a7661e92408fb8200ec87455ef1cc504a2175b32bd7096c78504028ce68aa4",
+      "after_binary_sha256": "c4a7661e92408fb8200ec87455ef1cc504a2175b32bd7096c78504028ce68aa4",
+      "reference_binary_sha256": "f0b778c468baaeebf2e6dcf73956bdf7e3233137f7bb47c7ff3f6e2702f0a2b6",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "linux_rbtree",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DNODE_COUNT=1024 -DLOOKUP_ROUNDS=2",
+      "source_sha256": "7c9c5ada20d8e32116ccbc1ca68690e92470ef7348b51842e49ffa2fa0480253",
+      "before": {
+        "conditional_mispredicts": [
+          17992,
+          22071
+        ],
+        "d1_misses": [
+          2528,
+          2525
+        ],
+        "i1_misses": [
+          1381,
+          1380
+        ],
+        "indirect_mispredicts": [
+          236,
+          243
+        ],
+        "ir_mine": 515237,
+        "ir_ratio": 1.2521921510299707,
+        "ir_ref": 411468,
+        "ll_misses": [
+          3435,
+          3452
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          17993,
+          22071
+        ],
+        "d1_misses": [
+          2528,
+          2525
+        ],
+        "i1_misses": [
+          1381,
+          1380
+        ],
+        "indirect_mispredicts": [
+          236,
+          243
+        ],
+        "ir_mine": 515213,
+        "ir_ratio": 1.2522068616871311,
+        "ir_ref": 411444,
+        "ll_misses": [
+          3435,
+          3452
+        ]
+      },
+      "before_binary_sha256": "003c47d231b2153f30759d707b8cd36777fdc44a4f278fb0f32dbbb93c604d25",
+      "after_binary_sha256": "003c47d231b2153f30759d707b8cd36777fdc44a4f278fb0f32dbbb93c604d25",
+      "reference_binary_sha256": "93f5500890daf78c18e15f5258829f17ef8cc0c16291edc1a6dbb851759fad4b",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "expat_xml_scan",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DXML_SIZE=16384 -DPASSES=4",
+      "source_sha256": "a076b1823869765011658d56ec090b22102e2ba7a5bbdf4cd0b6bdd0d774cf35",
+      "before": {
+        "conditional_mispredicts": [
+          26580,
+          28572
+        ],
+        "d1_misses": [
+          2182,
+          2195
+        ],
+        "i1_misses": [
+          1364,
+          1359
+        ],
+        "indirect_mispredicts": [
+          232,
+          239
+        ],
+        "ir_mine": 1702927,
+        "ir_ratio": 1.1807604756248835,
+        "ir_ref": 1442229,
+        "ll_misses": [
+          3160,
+          3174
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          26581,
+          28573
+        ],
+        "d1_misses": [
+          2182,
+          2195
+        ],
+        "i1_misses": [
+          1364,
+          1359
+        ],
+        "indirect_mispredicts": [
+          232,
+          239
+        ],
+        "ir_mine": 1702913,
+        "ir_ratio": 1.1807622303193352,
+        "ir_ref": 1442215,
+        "ll_misses": [
+          3160,
+          3174
+        ]
+      },
+      "before_binary_sha256": "2ae7ba3691a60a11bf73cffa921b537993071bf96e1da09b084ba841bb93e0b8",
+      "after_binary_sha256": "2ae7ba3691a60a11bf73cffa921b537993071bf96e1da09b084ba841bb93e0b8",
+      "reference_binary_sha256": "574f71533edeaa4e43b554fe46f1d5e624975614564aa53707572545f9195d41",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "switch_dispatch",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=20000",
+      "source_sha256": "6a044523272024b733f4af8e5101d5bf2d72ba9d6e9362798f6149cd9265117a",
+      "before": {
+        "conditional_mispredicts": [
+          3289,
+          3406
+        ],
+        "d1_misses": [
+          1877,
+          1890
+        ],
+        "i1_misses": [
+          1356,
+          1358
+        ],
+        "indirect_mispredicts": [
+          18994,
+          18851
+        ],
+        "ir_mine": 593177,
+        "ir_ratio": 1.1594614511031143,
+        "ir_ref": 511597,
+        "ll_misses": [
+          2896,
+          2918
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          3288,
+          3405
+        ],
+        "d1_misses": [
+          1877,
+          1890
+        ],
+        "i1_misses": [
+          1356,
+          1358
+        ],
+        "indirect_mispredicts": [
+          18994,
+          18851
+        ],
+        "ir_mine": 593177,
+        "ir_ratio": 1.1594614511031143,
+        "ir_ref": 511597,
+        "ll_misses": [
+          2896,
+          2918
+        ]
+      },
+      "before_binary_sha256": "a45f2b1fb575ff1978e85f350cef1bd5bc9a85725f9eefbab389418828491375",
+      "after_binary_sha256": "a45f2b1fb575ff1978e85f350cef1bd5bc9a85725f9eefbab389418828491375",
+      "reference_binary_sha256": "5da104dcd1e5fc148dcc29a7df292e681fe285c4462e6182533b786df743884a",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "loop_patterns",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSIZE=16384",
+      "source_sha256": "e56488201b8d9e8fc7ad17ec521f395232d4c66edcaf880876d2adccba28df88",
+      "before": {
+        "conditional_mispredicts": [
+          3445,
+          3552
+        ],
+        "d1_misses": [
+          10536,
+          10539
+        ],
+        "i1_misses": [
+          1377,
+          1376
+        ],
+        "indirect_mispredicts": [
+          236,
+          243
+        ],
+        "ir_mine": 719498,
+        "ir_ratio": 1.155192843082792,
+        "ir_ref": 622838,
+        "ll_misses": [
+          4965,
+          4984
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          3444,
+          3551
+        ],
+        "d1_misses": [
+          10536,
+          10539
+        ],
+        "i1_misses": [
+          1377,
+          1376
+        ],
+        "indirect_mispredicts": [
+          236,
+          243
+        ],
+        "ir_mine": 719498,
+        "ir_ratio": 1.155192843082792,
+        "ir_ref": 622838,
+        "ll_misses": [
+          4965,
+          4984
+        ]
+      },
+      "before_binary_sha256": "30c966b78603832954be81d6629cd278a00cb8779c8ff2c78c139077a16773ff",
+      "after_binary_sha256": "30c966b78603832954be81d6629cd278a00cb8779c8ff2c78c139077a16773ff",
+      "reference_binary_sha256": "e8c5f7fc5277a14a4746f8daa85143131ca81518ebdf713cff046c970c4f1503",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "double_reduction",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DREDUCTION_PASSES=1",
+      "source_sha256": "cad8a08bc76c767ac184e222570f4311d2e1ddab072f59119d737c87fbc1eaf7",
+      "before": {
+        "conditional_mispredicts": [
+          3316,
+          3431
+        ],
+        "d1_misses": [
+          526295,
+          526301
+        ],
+        "i1_misses": [
+          1360,
+          1359
+        ],
+        "indirect_mispredicts": [
+          233,
+          240
+        ],
+        "ir_mine": 30423326,
+        "ir_ratio": 1.1258441427719235,
+        "ir_ref": 27022680,
+        "ll_misses": [
+          199509,
+          199526
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          3317,
+          3432
+        ],
+        "d1_misses": [
+          526295,
+          526301
+        ],
+        "i1_misses": [
+          1360,
+          1359
+        ],
+        "indirect_mispredicts": [
+          233,
+          240
+        ],
+        "ir_mine": 30423312,
+        "ir_ratio": 1.1258442079697095,
+        "ir_ref": 27022666,
+        "ll_misses": [
+          199509,
+          199526
+        ]
+      },
+      "before_binary_sha256": "31194f3111fa89fa07b5ddd38fc26481a13d5ff9e4adf0915636bd31460dde29",
+      "after_binary_sha256": "31194f3111fa89fa07b5ddd38fc26481a13d5ff9e4adf0915636bd31460dde29",
+      "reference_binary_sha256": "a29ecd0c8e10e455543550d71916f4218ecacd458892d1f2cf6f0ec62424abdc",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "lz4_compress",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSRC_SIZE=16384 -DPASSES=2",
+      "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4",
+      "before": {
+        "conditional_mispredicts": [
+          10603,
+          10704
+        ],
+        "d1_misses": [
+          5911,
+          5942
+        ],
+        "i1_misses": [
+          1394,
+          1387
+        ],
+        "indirect_mispredicts": [
+          243,
+          265
+        ],
+        "ir_mine": 635263,
+        "ir_ratio": 1.1217742476629078,
+        "ir_ref": 566302,
+        "ll_misses": [
+          4482,
+          4495
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          10604,
+          10704
+        ],
+        "d1_misses": [
+          5911,
+          5942
+        ],
+        "i1_misses": [
+          1394,
+          1387
+        ],
+        "indirect_mispredicts": [
+          243,
+          265
+        ],
+        "ir_mine": 635239,
+        "ir_ratio": 1.1217794087003203,
+        "ir_ref": 566278,
+        "ll_misses": [
+          4482,
+          4495
+        ]
+      },
+      "before_binary_sha256": "c0481c41cdb30e9b7f715b82146664fa695116aaea282e5dfc244308152d273f",
+      "after_binary_sha256": "c0481c41cdb30e9b7f715b82146664fa695116aaea282e5dfc244308152d273f",
+      "reference_binary_sha256": "cf109676225d73d0beeb88e6c963a43e871b6eb4cdac4d2178a0d358ed89b402",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "zstd_count",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DBUFFER_SIZE=16384 -DQUERY_COUNT=1024 -DPASSES=2",
+      "source_sha256": "cf01953477eadbebe46b07ede170a62ff41b62cf947dd12222a04ad93c985be6",
+      "before": {
+        "conditional_mispredicts": [
+          5406,
+          5489
+        ],
+        "d1_misses": [
+          2188,
+          2196
+        ],
+        "i1_misses": [
+          1377,
+          1374
+        ],
+        "indirect_mispredicts": [
+          236,
+          243
+        ],
+        "ir_mine": 463282,
+        "ir_ratio": 1.1212676407447655,
+        "ir_ref": 413177,
+        "ll_misses": [
+          3176,
+          3191
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          5407,
+          5490
+        ],
+        "d1_misses": [
+          2187,
+          2195
+        ],
+        "i1_misses": [
+          1377,
+          1374
+        ],
+        "indirect_mispredicts": [
+          236,
+          243
+        ],
+        "ir_mine": 463268,
+        "ir_ratio": 1.121271749890479,
+        "ir_ref": 413163,
+        "ll_misses": [
+          3175,
+          3190
+        ]
+      },
+      "before_binary_sha256": "f933308686d88d5591fc01669a00c8aa9b4bf593b7ec820e60347788f8496204",
+      "after_binary_sha256": "f933308686d88d5591fc01669a00c8aa9b4bf593b7ec820e60347788f8496204",
+      "reference_binary_sha256": "375d2d779702509c0f57fec43e4047363187ee44c428fe8119beca15fc3bcf2c",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "binary_trees",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DTREE_DEPTH=10",
+      "source_sha256": "0a19ef11ab58e32a6ef0ecb8703a856347ba295d2bca67bbe20dfa5243251dc0",
+      "before": {
+        "conditional_mispredicts": [
+          207631,
+          60572
+        ],
+        "d1_misses": [
+          54316,
+          54196
+        ],
+        "i1_misses": [
+          1379,
+          1463
+        ],
+        "indirect_mispredicts": [
+          238,
+          249
+        ],
+        "ir_mine": 31600388,
+        "ir_ratio": 1.1191715738727221,
+        "ir_ref": 28235517,
+        "ll_misses": [
+          4967,
+          5068
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          207632,
+          60573
+        ],
+        "d1_misses": [
+          54316,
+          54196
+        ],
+        "i1_misses": [
+          1379,
+          1463
+        ],
+        "indirect_mispredicts": [
+          238,
+          249
+        ],
+        "ir_mine": 31600364,
+        "ir_ratio": 1.1191716751678464,
+        "ir_ref": 28235493,
+        "ll_misses": [
+          4967,
+          5068
+        ]
+      },
+      "before_binary_sha256": "e6566a24102b8828dd9c2f2d50e95c4d5763f1c4c16008d519dece79db72af48",
+      "after_binary_sha256": "e6566a24102b8828dd9c2f2d50e95c4d5763f1c4c16008d519dece79db72af48",
+      "reference_binary_sha256": "63704810074586a95779d753e55ac92e0373c249747538ce2cc20d1697b4ed2b",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "linux_find_bit_scaled",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=128",
+      "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a",
+      "before": {
+        "conditional_mispredicts": [
+          36567,
+          36540
+        ],
+        "d1_misses": [
+          530614,
+          530495
+        ],
+        "i1_misses": [
+          1361,
+          1361
+        ],
+        "indirect_mispredicts": [
+          232,
+          239
+        ],
+        "ir_mine": 22941765,
+        "ir_ratio": 1.1083153877993817,
+        "ir_ref": 20699672,
+        "ll_misses": [
+          7000,
+          7016
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          36567,
+          36540
+        ],
+        "d1_misses": [
+          530614,
+          530495
+        ],
+        "i1_misses": [
+          1361,
+          1361
+        ],
+        "indirect_mispredicts": [
+          232,
+          239
+        ],
+        "ir_mine": 22941779,
+        "ir_ratio": 1.1083153145414864,
+        "ir_ref": 20699686,
+        "ll_misses": [
+          7000,
+          7016
+        ]
+      },
+      "before_binary_sha256": "40d082ddd33c3ac1fbb4d60e6b6c3ec13dc50acc63ff997e91e6477711138ad9",
+      "after_binary_sha256": "40d082ddd33c3ac1fbb4d60e6b6c3ec13dc50acc63ff997e91e6477711138ad9",
+      "reference_binary_sha256": "46999c44f0fe04de810debc568d034ac6d0b4133c2ae7e56dc24acad4608d2f2",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "linux_find_bit",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=32",
+      "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a",
+      "before": {
+        "conditional_mispredicts": [
+          11858,
+          11926
+        ],
+        "d1_misses": [
+          137230,
+          137208
+        ],
+        "i1_misses": [
+          1358,
+          1358
+        ],
+        "indirect_mispredicts": [
+          232,
+          239
+        ],
+        "ir_mine": 5957922,
+        "ir_ratio": 1.1004924574273962,
+        "ir_ref": 5413869,
+        "ll_misses": [
+          6996,
+          7012
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          11858,
+          11927
+        ],
+        "d1_misses": [
+          137230,
+          137208
+        ],
+        "i1_misses": [
+          1358,
+          1358
+        ],
+        "indirect_mispredicts": [
+          232,
+          239
+        ],
+        "ir_mine": 5957908,
+        "ir_ratio": 1.1004927172966399,
+        "ir_ref": 5413855,
+        "ll_misses": [
+          6996,
+          7012
+        ]
+      },
+      "before_binary_sha256": "e9852e5443ec97a09e34d7f52f169a4c688d59804cfb00a1b7c0cb3fe91f488c",
+      "after_binary_sha256": "e9852e5443ec97a09e34d7f52f169a4c688d59804cfb00a1b7c0cb3fe91f488c",
+      "reference_binary_sha256": "09483837f0523aeb7f821e60adb3b4b5af6cafc816b53fb1edce2f1cde196510",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "strlen_bench",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DNSTRINGS=1000",
+      "source_sha256": "175202f59218fa62a3120f9f5202a005f5e234f2cbabd453048d933082e0dd44",
+      "before": {
+        "conditional_mispredicts": [
+          132017,
+          131746
+        ],
+        "d1_misses": [
+          221240,
+          221579
+        ],
+        "i1_misses": [
+          1386,
+          1390
+        ],
+        "indirect_mispredicts": [
+          251,
+          255
+        ],
+        "ir_mine": 9285596,
+        "ir_ratio": 1.0983834040602682,
+        "ir_ref": 8453875,
+        "ll_misses": [
+          5361,
+          5387
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          132018,
+          131747
+        ],
+        "d1_misses": [
+          221240,
+          221579
+        ],
+        "i1_misses": [
+          1386,
+          1390
+        ],
+        "indirect_mispredicts": [
+          251,
+          255
+        ],
+        "ir_mine": 9285572,
+        "ir_ratio": 1.0983836833651315,
+        "ir_ref": 8453851,
+        "ll_misses": [
+          5361,
+          5387
+        ]
+      },
+      "before_binary_sha256": "6b8234b5605da5cf3d3ec30e9a2b0ee8653c6a51d457bf654bd1ea87c351de52",
+      "after_binary_sha256": "6b8234b5605da5cf3d3ec30e9a2b0ee8653c6a51d457bf654bd1ea87c351de52",
+      "reference_binary_sha256": "3074629eae0f8efc22cac7d4f77462bfb26911b2e6cbd72194096fbe38457e07",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "zlib_ng_adler32_combine",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=10000",
+      "source_sha256": "5d9a2ade64019e993686dab352d67dbdc4a009e2e33dd8568beff5c9ac423940",
+      "before": {
+        "conditional_mispredicts": [
+          5514,
+          5617
+        ],
+        "d1_misses": [
+          1909,
+          1915
+        ],
+        "i1_misses": [
+          1382,
+          1386
+        ],
+        "indirect_mispredicts": [
+          234,
+          241
+        ],
+        "ir_mine": 22937540,
+        "ir_ratio": 1.0728547432749023,
+        "ir_ref": 21379912,
+        "ll_misses": [
+          2947,
+          2970
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          5513,
+          5616
+        ],
+        "d1_misses": [
+          1909,
+          1915
+        ],
+        "i1_misses": [
+          1382,
+          1386
+        ],
+        "indirect_mispredicts": [
+          234,
+          241
+        ],
+        "ir_mine": 22937540,
+        "ir_ratio": 1.0728547432749023,
+        "ir_ref": 21379912,
+        "ll_misses": [
+          2947,
+          2970
+        ]
+      },
+      "before_binary_sha256": "9acfbed58f63b50f96ca3aa58357437113ae7e48faf49e56c355b0cb265f284d",
+      "after_binary_sha256": "9acfbed58f63b50f96ca3aa58357437113ae7e48faf49e56c355b0cb265f284d",
+      "reference_binary_sha256": "db7bb9d503a0bab4ad9d2c20b920c28f6202745275cee7b442311dd688a62043",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "sqlite_varint",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DVALUE_COUNT=2048 -DPASSES=4",
+      "source_sha256": "11c7e09b1507659fe44e678848c5e489268e4dd4aa385d3a542453caa400e1af",
+      "before": {
+        "conditional_mispredicts": [
+          12571,
+          10606
+        ],
+        "d1_misses": [
+          2229,
+          2244
+        ],
+        "i1_misses": [
+          1376,
+          1374
+        ],
+        "indirect_mispredicts": [
+          2054,
+          2061
+        ],
+        "ir_mine": 833269,
+        "ir_ratio": 1.067845915878856,
+        "ir_ref": 780327,
+        "ll_misses": [
+          3205,
+          3224
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          12570,
+          10605
+        ],
+        "d1_misses": [
+          2229,
+          2244
+        ],
+        "i1_misses": [
+          1376,
+          1374
+        ],
+        "indirect_mispredicts": [
+          2054,
+          2061
+        ],
+        "ir_mine": 833269,
+        "ir_ratio": 1.067845915878856,
+        "ir_ref": 780327,
+        "ll_misses": [
+          3205,
+          3224
+        ]
+      },
+      "before_binary_sha256": "5409fcf959dd1f1750ceb19661a182c1a4e31a4bfbb1b800f112529d2853d365",
+      "after_binary_sha256": "5409fcf959dd1f1750ceb19661a182c1a4e31a4bfbb1b800f112529d2853d365",
+      "reference_binary_sha256": "9a53983d6a25cd472e4986d998e4410f18f9a3343aa94b0638d03b2fa21a56b3",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "glibc_memcmp",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=16",
+      "source_sha256": "6fcec75ff20c60106d78db2013a646579ab4262750fe64eee99387f3c16b0870",
+      "before": {
+        "conditional_mispredicts": [
+          3371,
+          3471
+        ],
+        "d1_misses": [
+          25329,
+          25317
+        ],
+        "i1_misses": [
+          1363,
+          1365
+        ],
+        "indirect_mispredicts": [
+          232,
+          239
+        ],
+        "ir_mine": 723061,
+        "ir_ratio": 1.0443349967141609,
+        "ir_ref": 692365,
+        "ll_misses": [
+          4950,
+          4969
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          3372,
+          3471
+        ],
+        "d1_misses": [
+          25329,
+          25317
+        ],
+        "i1_misses": [
+          1363,
+          1365
+        ],
+        "indirect_mispredicts": [
+          232,
+          239
+        ],
+        "ir_mine": 723037,
+        "ir_ratio": 1.044336533586773,
+        "ir_ref": 692341,
+        "ll_misses": [
+          4950,
+          4969
+        ]
+      },
+      "before_binary_sha256": "bfdc256be00a95211e1a57548bd495bbb04133199b6b41445747cee4512f8a97",
+      "after_binary_sha256": "bfdc256be00a95211e1a57548bd495bbb04133199b6b41445747cee4512f8a97",
+      "reference_binary_sha256": "474a939b63b36f31707357b1601453d33de169e7335751c8039306482f76aead",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "hash_table",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DNUM_OPS=20000",
+      "source_sha256": "1c742684a0ea694fbeb95d249748488e89f9033c64d518cd1fafe27da24a2e5a",
+      "before": {
+        "conditional_mispredicts": [
+          19461,
+          19548
+        ],
+        "d1_misses": [
+          98417,
+          98274
+        ],
+        "i1_misses": [
+          1362,
+          1362
+        ],
+        "indirect_mispredicts": [
+          242,
+          242
+        ],
+        "ir_mine": 8433995,
+        "ir_ratio": 1.0385111282924018,
+        "ir_ref": 8121237,
+        "ll_misses": [
+          26037,
+          26055
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          19462,
+          19549
+        ],
+        "d1_misses": [
+          98416,
+          98273
+        ],
+        "i1_misses": [
+          1362,
+          1362
+        ],
+        "indirect_mispredicts": [
+          242,
+          242
+        ],
+        "ir_mine": 8433981,
+        "ir_ratio": 1.0385111946808996,
+        "ir_ref": 8121223,
+        "ll_misses": [
+          26036,
+          26054
+        ]
+      },
+      "before_binary_sha256": "73eda8bd81a3df36b607898efb658779020c9ae5f499dea375879793d3607e5d",
+      "after_binary_sha256": "73eda8bd81a3df36b607898efb658779020c9ae5f499dea375879793d3607e5d",
+      "reference_binary_sha256": "a9e6e700b03690904cc437c74eebbffe6a0effe9a1f7dd85e96a4aa218389fe2",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "qsort",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=10000",
+      "source_sha256": "4b7916c27962da3a9cf71ce75b09910467449ce727a1fb2d3dbf75f5f011641a",
+      "before": {
+        "conditional_mispredicts": [
+          78758,
+          78833
+        ],
+        "d1_misses": [
+          7635,
+          7679
+        ],
+        "i1_misses": [
+          1403,
+          1407
+        ],
+        "indirect_mispredicts": [
+          243,
+          245
+        ],
+        "ir_mine": 3391488,
+        "ir_ratio": 1.0346520426785182,
+        "ir_ref": 3277902,
+        "ll_misses": [
+          4192,
+          4211
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          78757,
+          78832
+        ],
+        "d1_misses": [
+          7635,
+          7679
+        ],
+        "i1_misses": [
+          1403,
+          1407
+        ],
+        "indirect_mispredicts": [
+          243,
+          245
+        ],
+        "ir_mine": 3391488,
+        "ir_ratio": 1.0346520426785182,
+        "ir_ref": 3277902,
+        "ll_misses": [
+          4192,
+          4211
+        ]
+      },
+      "before_binary_sha256": "5c2213c4e54fda28c57681566c5880a6ee1415e8ea8e00dff0126eb55c31136b",
+      "after_binary_sha256": "5c2213c4e54fda28c57681566c5880a6ee1415e8ea8e00dff0126eb55c31136b",
+      "reference_binary_sha256": "c1493fa70371e27c80e39fb662815a33503534037846b7ed487c21a88d348380",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "mandelbrot",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DWIDTH=128 -DHEIGHT=128",
+      "source_sha256": "3f9d3a3e0da962e5a1840790ebf46fa09f38cd5e758645c8c65625fa9882555c",
+      "before": {
+        "conditional_mispredicts": [
+          15482,
+          15589
+        ],
+        "d1_misses": [
+          1878,
+          1887
+        ],
+        "i1_misses": [
+          1355,
+          1355
+        ],
+        "indirect_mispredicts": [
+          232,
+          239
+        ],
+        "ir_mine": 5599476,
+        "ir_ratio": 1.0148311516348556,
+        "ir_ref": 5517643,
+        "ll_misses": [
+          2893,
+          2913
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          15483,
+          15590
+        ],
+        "d1_misses": [
+          1877,
+          1886
+        ],
+        "i1_misses": [
+          1355,
+          1355
+        ],
+        "indirect_mispredicts": [
+          232,
+          239
+        ],
+        "ir_mine": 5599462,
+        "ir_ratio": 1.0148311892662591,
+        "ir_ref": 5517629,
+        "ll_misses": [
+          2892,
+          2912
+        ]
+      },
+      "before_binary_sha256": "84891c6b7887104aa502b539e2b86a395464028f92d1b9e43d7ac1836deea715",
+      "after_binary_sha256": "84891c6b7887104aa502b539e2b86a395464028f92d1b9e43d7ac1836deea715",
+      "reference_binary_sha256": "cf37bf92ad7aacb2c5fb0f6721c7b39e1b3bcc0b54f1351d46340849229e01dc",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "gzip_crc32",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DDATA_SIZE=16384 -DPASSES=4",
+      "source_sha256": "9f9acac042ab580ce2137a9fb653a5b3db5e7015dbb49254944195ef5eb98f6a",
+      "before": {
+        "conditional_mispredicts": [
+          3341,
+          3442
+        ],
+        "d1_misses": [
+          2209,
+          2217
+        ],
+        "i1_misses": [
+          1365,
+          1364
+        ],
+        "indirect_mispredicts": [
+          233,
+          240
+        ],
+        "ir_mine": 801179,
+        "ir_ratio": 0.9911386517093013,
+        "ir_ref": 808342,
+        "ll_misses": [
+          3179,
+          3195
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          3342,
+          3443
+        ],
+        "d1_misses": [
+          2208,
+          2216
+        ],
+        "i1_misses": [
+          1365,
+          1364
+        ],
+        "indirect_mispredicts": [
+          233,
+          240
+        ],
+        "ir_mine": 801165,
+        "ir_ratio": 0.9911384982333904,
+        "ir_ref": 808328,
+        "ll_misses": [
+          3178,
+          3194
+        ]
+      },
+      "before_binary_sha256": "1f71579b8e4dd81df21f2e3595eddcbd6d90b1e0ecfb94f1d32f3f6580dd80a0",
+      "after_binary_sha256": "1f71579b8e4dd81df21f2e3595eddcbd6d90b1e0ecfb94f1d32f3f6580dd80a0",
+      "reference_binary_sha256": "0e2ebf1a9a8405dce4654d051919d8ec5b7b5e580126a61b3d8724f2009adaf8",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "libm_round_family",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=256 -DPASSES=4",
+      "source_sha256": "b70c5bacd90081c28ea74dc1142f9eacc64278d539f258da5bd1614ebc503668",
+      "before": {
+        "conditional_mispredicts": [
+          3424,
+          3481
+        ],
+        "d1_misses": [
+          1954,
+          1955
+        ],
+        "i1_misses": [
+          1446,
+          1448
+        ],
+        "indirect_mispredicts": [
+          233,
+          241
+        ],
+        "ir_mine": 171449,
+        "ir_ratio": 0.9749452674078075,
+        "ir_ref": 175855,
+        "ll_misses": [
+          3033,
+          3053
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          3423,
+          3480
+        ],
+        "d1_misses": [
+          1954,
+          1955
+        ],
+        "i1_misses": [
+          1446,
+          1448
+        ],
+        "indirect_mispredicts": [
+          233,
+          241
+        ],
+        "ir_mine": 171449,
+        "ir_ratio": 0.9749452674078075,
+        "ir_ref": 175855,
+        "ll_misses": [
+          3033,
+          3053
+        ]
+      },
+      "before_binary_sha256": "5a4433cc61fe4a727132c78eb4432504f5f71b112b5bc68c1e1bc242f6416f50",
+      "after_binary_sha256": "5a4433cc61fe4a727132c78eb4432504f5f71b112b5bc68c1e1bc242f6416f50",
+      "reference_binary_sha256": "8aff20a825b87a2455e8e667c6833b5ed9dbf97e1e2e87c26b10577a3d0b26d5",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "tls_seg_access",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=100",
+      "source_sha256": "02e6d2bcd07b2e1fc253b53d316d522e7b3d912ae634b6fad2c10dc93a1d4835",
+      "before": {
+        "conditional_mispredicts": [
+          3422,
+          3498
+        ],
+        "d1_misses": [
+          1884,
+          1899
+        ],
+        "i1_misses": [
+          1356,
+          1357
+        ],
+        "indirect_mispredicts": [
+          233,
+          241
+        ],
+        "ir_mine": 218537,
+        "ir_ratio": 0.9747586932862317,
+        "ir_ref": 224196,
+        "ll_misses": [
+          2908,
+          2925
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          3423,
+          3499
+        ],
+        "d1_misses": [
+          1884,
+          1899
+        ],
+        "i1_misses": [
+          1356,
+          1357
+        ],
+        "indirect_mispredicts": [
+          233,
+          241
+        ],
+        "ir_mine": 218523,
+        "ir_ratio": 0.9747571169853065,
+        "ir_ref": 224182,
+        "ll_misses": [
+          2908,
+          2925
+        ]
+      },
+      "before_binary_sha256": "988706c30b19343f1cbf1f3a0996a2a9881f449f359b4263f8d987790e8962a5",
+      "after_binary_sha256": "988706c30b19343f1cbf1f3a0996a2a9881f449f359b4263f8d987790e8962a5",
+      "reference_binary_sha256": "2b630f1abab5e084df8879445407511836b075d4942619273a378e3b6f9829c7",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "tce_sum",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+      "source_sha256": "57ddb14e5fd945998d614fbe2bba64a9861b8a0f5153ce4fcd84a15348991eee",
+      "before": {
+        "conditional_mispredicts": [
+          3287,
+          3401
+        ],
+        "d1_misses": [
+          1876,
+          1889
+        ],
+        "i1_misses": [
+          1352,
+          1352
+        ],
+        "indirect_mispredicts": [
+          233,
+          240
+        ],
+        "ir_mine": 145698,
+        "ir_ratio": 0.9526044969826148,
+        "ir_ref": 152947,
+        "ll_misses": [
+          2891,
+          2910
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          3286,
+          3400
+        ],
+        "d1_misses": [
+          1876,
+          1889
+        ],
+        "i1_misses": [
+          1352,
+          1352
+        ],
+        "indirect_mispredicts": [
+          233,
+          240
+        ],
+        "ir_mine": 145698,
+        "ir_ratio": 0.9526044969826148,
+        "ir_ref": 152947,
+        "ll_misses": [
+          2891,
+          2910
+        ]
+      },
+      "before_binary_sha256": "7ec5911e34b49b0391296f53de640ff2a14c0f46e5ebf601a0b8944d0195f0fb",
+      "after_binary_sha256": "7ec5911e34b49b0391296f53de640ff2a14c0f46e5ebf601a0b8944d0195f0fb",
+      "reference_binary_sha256": "1385ae79d88861f1c562cfe77c273438759d3cada8303f58b203d2d458ab8355",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "sha256_transform",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DBLOCK_COUNT=256 -DPASSES=2",
+      "source_sha256": "6f55a89cfd9d59eb9a8e115eef968295ec775fa63d0545dd33517c2fdf06bf5e",
+      "before": {
+        "conditional_mispredicts": [
+          4367,
+          5012
+        ],
+        "d1_misses": [
+          1898,
+          1898
+        ],
+        "i1_misses": [
+          1383,
+          1373
+        ],
+        "indirect_mispredicts": [
+          235,
+          242
+        ],
+        "ir_mine": 1801796,
+        "ir_ratio": 0.9525933351097351,
+        "ir_ref": 1891464,
+        "ll_misses": [
+          2931,
+          2939
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          4368,
+          5013
+        ],
+        "d1_misses": [
+          1898,
+          1898
+        ],
+        "i1_misses": [
+          1383,
+          1373
+        ],
+        "indirect_mispredicts": [
+          235,
+          242
+        ],
+        "ir_mine": 1801782,
+        "ir_ratio": 0.9525929842184567,
+        "ir_ref": 1891450,
+        "ll_misses": [
+          2931,
+          2939
+        ]
+      },
+      "before_binary_sha256": "7b8c334a7b7661bda9aa1e064ca170999e99693c803a178ccedf31df2ecc09ac",
+      "after_binary_sha256": "7b8c334a7b7661bda9aa1e064ca170999e99693c803a178ccedf31df2ecc09ac",
+      "reference_binary_sha256": "2c69b45299417e9c8bd19131447d5d72b601c49b99f8016006bb6a967447840f",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "sieve",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=100000",
+      "source_sha256": "2fd99e297a95711800c1bf4b2facd7e5e09efa740b113c86837e3d0cd22f069b",
+      "before": {
+        "conditional_mispredicts": [
+          3532,
+          3594
+        ],
+        "d1_misses": [
+          51852,
+          51870
+        ],
+        "i1_misses": [
+          1361,
+          1361
+        ],
+        "indirect_mispredicts": [
+          242,
+          243
+        ],
+        "ir_mine": 1622543,
+        "ir_ratio": 0.9423604327134731,
+        "ir_ref": 1721786,
+        "ll_misses": [
+          4467,
+          4485
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          3531,
+          3593
+        ],
+        "d1_misses": [
+          51852,
+          51870
+        ],
+        "i1_misses": [
+          1361,
+          1361
+        ],
+        "indirect_mispredicts": [
+          242,
+          243
+        ],
+        "ir_mine": 1622543,
+        "ir_ratio": 0.9423604327134731,
+        "ir_ref": 1721786,
+        "ll_misses": [
+          4467,
+          4485
+        ]
+      },
+      "before_binary_sha256": "108ee7a4c5f965946bfefdf41879cb78e12508bce164cc658b737409450217a6",
+      "after_binary_sha256": "108ee7a4c5f965946bfefdf41879cb78e12508bce164cc658b737409450217a6",
+      "reference_binary_sha256": "5d3ec56b4aebe90151e437806bb44b82aebf6fc82024a136a4b0aadd5874c273",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "fannkuch",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DFANNKUCH_N=7",
+      "source_sha256": "2a78d670ab985384a3008ac031e7a478fdc790b627d011177dd528b7282d11e5",
+      "before": {
+        "conditional_mispredicts": [
+          22513,
+          28494
+        ],
+        "d1_misses": [
+          1886,
+          1899
+        ],
+        "i1_misses": [
+          1361,
+          1361
+        ],
+        "indirect_mispredicts": [
+          232,
+          241
+        ],
+        "ir_mine": 1237826,
+        "ir_ratio": 0.9376084593563829,
+        "ir_ref": 1320195,
+        "ll_misses": [
+          2905,
+          2926
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          22514,
+          28495
+        ],
+        "d1_misses": [
+          1886,
+          1899
+        ],
+        "i1_misses": [
+          1361,
+          1361
+        ],
+        "indirect_mispredicts": [
+          232,
+          241
+        ],
+        "ir_mine": 1237812,
+        "ir_ratio": 0.9376077977186461,
+        "ir_ref": 1320181,
+        "ll_misses": [
+          2905,
+          2926
+        ]
+      },
+      "before_binary_sha256": "d2e695aa8a2c26d54690f80d80d5d2085ef7c14ae11d88ce28a5b50ba3b729ce",
+      "after_binary_sha256": "d2e695aa8a2c26d54690f80d80d5d2085ef7c14ae11d88ce28a5b50ba3b729ce",
+      "reference_binary_sha256": "76c5bdbad0bdcffa4d3e43baaa36145b7fce8d7ce150fc6f3d61bb1ef7a338b9",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "zlib_ng_adler32",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DDATA_SIZE=16384 -DPASSES=4",
+      "source_sha256": "bca7938ef542270a06d734bf814b3f1806ab1796e8f53d5c53d1b5ccd6b08486",
+      "before": {
+        "conditional_mispredicts": [
+          3379,
+          3473
+        ],
+        "d1_misses": [
+          2190,
+          2200
+        ],
+        "i1_misses": [
+          1377,
+          1369
+        ],
+        "indirect_mispredicts": [
+          233,
+          240
+        ],
+        "ir_mine": 464012,
+        "ir_ratio": 0.9079510188747177,
+        "ir_ref": 511054,
+        "ll_misses": [
+          3174,
+          3185
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          3378,
+          3472
+        ],
+        "d1_misses": [
+          2190,
+          2200
+        ],
+        "i1_misses": [
+          1377,
+          1369
+        ],
+        "indirect_mispredicts": [
+          233,
+          240
+        ],
+        "ir_mine": 464012,
+        "ir_ratio": 0.9079510188747177,
+        "ir_ref": 511054,
+        "ll_misses": [
+          3174,
+          3185
+        ]
+      },
+      "before_binary_sha256": "aedc8c315bc276c97250c7794dca35f3263e3bb9d777cb7c1308fcfb38b4ef77",
+      "after_binary_sha256": "aedc8c315bc276c97250c7794dca35f3263e3bb9d777cb7c1308fcfb38b4ef77",
+      "reference_binary_sha256": "41c46fa966c91d1097954058c9737612d14b394de69132aa558236056950d9f7",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "struct_copy",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=2000",
+      "source_sha256": "b0ca8943fcfed56f7ae9bbd49e7e52a98f9780b4be8151c494fc12b05dcb2bfa",
+      "before": {
+        "conditional_mispredicts": [
+          3382,
+          3504
+        ],
+        "d1_misses": [
+          1912,
+          1923
+        ],
+        "i1_misses": [
+          1449,
+          1444
+        ],
+        "indirect_mispredicts": [
+          234,
+          241
+        ],
+        "ir_mine": 373173,
+        "ir_ratio": 0.9004596730409604,
+        "ir_ref": 414425,
+        "ll_misses": [
+          2999,
+          3011
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          3381,
+          3503
+        ],
+        "d1_misses": [
+          1912,
+          1923
+        ],
+        "i1_misses": [
+          1449,
+          1444
+        ],
+        "indirect_mispredicts": [
+          234,
+          241
+        ],
+        "ir_mine": 373173,
+        "ir_ratio": 0.9004596730409604,
+        "ir_ref": 414425,
+        "ll_misses": [
+          2999,
+          3011
+        ]
+      },
+      "before_binary_sha256": "2d7e28a7201a2842370da062d461436c93784d720c931862972eedbce8f40b05",
+      "after_binary_sha256": "2d7e28a7201a2842370da062d461436c93784d720c931862972eedbce8f40b05",
+      "reference_binary_sha256": "a84a64442ac172601a45bcdbf6cb94be18280024c12f321a2356d49949585558",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "matmul",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=48",
+      "source_sha256": "927478b18ee0aa0d118eea4d2a9d6bb1251fdf3c64c2619ab578463beba99560",
+      "before": {
+        "conditional_mispredicts": [
+          3504,
+          5880
+        ],
+        "d1_misses": [
+          3236,
+          3246
+        ],
+        "i1_misses": [
+          1443,
+          1443
+        ],
+        "indirect_mispredicts": [
+          234,
+          241
+        ],
+        "ir_mine": 307320,
+        "ir_ratio": 0.8939880091807437,
+        "ir_ref": 343763,
+        "ll_misses": [
+          3859,
+          3876
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          3505,
+          5881
+        ],
+        "d1_misses": [
+          3236,
+          3246
+        ],
+        "i1_misses": [
+          1443,
+          1443
+        ],
+        "indirect_mispredicts": [
+          234,
+          241
+        ],
+        "ir_mine": 307306,
+        "ir_ratio": 0.893983691588921,
+        "ir_ref": 343749,
+        "ll_misses": [
+          3859,
+          3876
+        ]
+      },
+      "before_binary_sha256": "90da9191e39fcdebac45d2cb2ec1a173f94346da2ca056417363834df7473c4b",
+      "after_binary_sha256": "90da9191e39fcdebac45d2cb2ec1a173f94346da2ca056417363834df7473c4b",
+      "reference_binary_sha256": "d387f5d0dbae8ac3f41291a59b750e17d8c9d5c8931df52c46d8e1a4f0b6d35a",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "bitops",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=20000",
+      "source_sha256": "e1e97ac28dabf06df8859e6812a288f639c7f6f070478ebd6fe834a64ed9f7ea",
+      "before": {
+        "conditional_mispredicts": [
+          3323,
+          9546
+        ],
+        "d1_misses": [
+          1877,
+          1890
+        ],
+        "i1_misses": [
+          1356,
+          1357
+        ],
+        "indirect_mispredicts": [
+          233,
+          240
+        ],
+        "ir_mine": 1286787,
+        "ir_ratio": 0.8668302711937023,
+        "ir_ref": 1484474,
+        "ll_misses": [
+          2896,
+          2917
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          3324,
+          9547
+        ],
+        "d1_misses": [
+          1877,
+          1890
+        ],
+        "i1_misses": [
+          1356,
+          1357
+        ],
+        "indirect_mispredicts": [
+          233,
+          240
+        ],
+        "ir_mine": 1286773,
+        "ir_ratio": 0.8668290152648102,
+        "ir_ref": 1484460,
+        "ll_misses": [
+          2896,
+          2917
+        ]
+      },
+      "before_binary_sha256": "200fe1e0655c5f9c760f1670e0dcd572527a44d216b3b4ee565d420bc568326f",
+      "after_binary_sha256": "200fe1e0655c5f9c760f1670e0dcd572527a44d216b3b4ee565d420bc568326f",
+      "reference_binary_sha256": "cc239cc59eef9fa130177d69330f1910f067185b6d2a718b7e66735c945b9b3c",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "arith_loop",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DARITH_ITERS=20000",
+      "source_sha256": "154a39b6e98cf506bf0d62ed4ab44dad88f7d75923a4eb797b4c41e9339f662c",
+      "before": {
+        "conditional_mispredicts": [
+          3296,
+          3410
+        ],
+        "d1_misses": [
+          1880,
+          1885
+        ],
+        "i1_misses": [
+          1371,
+          1367
+        ],
+        "indirect_mispredicts": [
+          232,
+          239
+        ],
+        "ir_mine": 2185707,
+        "ir_ratio": 0.7882179162941724,
+        "ir_ref": 2772973,
+        "ll_misses": [
+          2909,
+          2923
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          3297,
+          3411
+        ],
+        "d1_misses": [
+          1879,
+          1884
+        ],
+        "i1_misses": [
+          1371,
+          1367
+        ],
+        "indirect_mispredicts": [
+          232,
+          239
+        ],
+        "ir_mine": 2185693,
+        "ir_ratio": 0.7882168470576016,
+        "ir_ref": 2772959,
+        "ll_misses": [
+          2908,
+          2922
+        ]
+      },
+      "before_binary_sha256": "c3091cdff9574d12ed671bac90c4730010f32b42e211091df862e0750b2ac784",
+      "after_binary_sha256": "c3091cdff9574d12ed671bac90c4730010f32b42e211091df862e0750b2ac784",
+      "reference_binary_sha256": "fba8501e6736dae7f7c1880a52e97173a486aab670b95585f900fdf6d02614ee",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "chacha20_block",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DBLOCK_COUNT=256 -DPASSES=2",
+      "source_sha256": "7f0b876dc4bbea778d85e2a30d55046207eb60abe8c5388857bb1207efdac85c",
+      "before": {
+        "conditional_mispredicts": [
+          3849,
+          4486
+        ],
+        "d1_misses": [
+          1887,
+          1896
+        ],
+        "i1_misses": [
+          1375,
+          1377
+        ],
+        "indirect_mispredicts": [
+          235,
+          242
+        ],
+        "ir_mine": 419237,
+        "ir_ratio": 0.5135518185871711,
+        "ir_ref": 816348,
+        "ll_misses": [
+          2917,
+          2941
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          3850,
+          4487
+        ],
+        "d1_misses": [
+          1887,
+          1896
+        ],
+        "i1_misses": [
+          1375,
+          1377
+        ],
+        "indirect_mispredicts": [
+          235,
+          242
+        ],
+        "ir_mine": 419223,
+        "ir_ratio": 0.5135434760771939,
+        "ir_ref": 816334,
+        "ll_misses": [
+          2917,
+          2941
+        ]
+      },
+      "before_binary_sha256": "84ec0f80fcf59b689c03945460c6b44a43655b22d727a5c2cc3e39fb040d98b8",
+      "after_binary_sha256": "84ec0f80fcf59b689c03945460c6b44a43655b22d727a5c2cc3e39fb040d98b8",
+      "reference_binary_sha256": "dfe90cc30d54e0821cbc6778a2cbd555a10a4176c72a853c882dc80bf94f694f",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "ackermann",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DACK_N=6",
+      "source_sha256": "8f4443c46516743ca68886d1e882b9431d42ea812df71bf58236013193b790b9",
+      "before": {
+        "conditional_mispredicts": [
+          3301,
+          4549
+        ],
+        "d1_misses": [
+          1878,
+          1930
+        ],
+        "i1_misses": [
+          1352,
+          1358
+        ],
+        "indirect_mispredicts": [
+          232,
+          239
+        ],
+        "ir_mine": 145839,
+        "ir_ratio": 0.1258976875723524,
+        "ir_ref": 1158393,
+        "ll_misses": [
+          2892,
+          2914
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          3300,
+          4548
+        ],
+        "d1_misses": [
+          1878,
+          1930
+        ],
+        "i1_misses": [
+          1352,
+          1358
+        ],
+        "indirect_mispredicts": [
+          232,
+          239
+        ],
+        "ir_mine": 145839,
+        "ir_ratio": 0.1258976875723524,
+        "ir_ref": 1158393,
+        "ll_misses": [
+          2892,
+          2914
+        ]
+      },
+      "before_binary_sha256": "09118b55935a07dbaa4b45596ccb0989a89ec9c2b95d7fb738d88e19104757d2",
+      "after_binary_sha256": "09118b55935a07dbaa4b45596ccb0989a89ec9c2b95d7fb738d88e19104757d2",
+      "reference_binary_sha256": "f0821f9e6d30f55b37e1bcaed66862fc597b9d9bbb3d602587de15588a6b381a",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "constant_recursion",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DACK_N=6",
+      "source_sha256": "86d59c961c6c10e03a75dbb42b3c73f01d448bf6296c401bb960f6120dd985c9",
+      "before": {
+        "conditional_mispredicts": [
+          3280,
+          4527
+        ],
+        "d1_misses": [
+          1879,
+          1931
+        ],
+        "i1_misses": [
+          1350,
+          1356
+        ],
+        "indirect_mispredicts": [
+          232,
+          239
+        ],
+        "ir_mine": 145535,
+        "ir_ratio": 0.12566834299293317,
+        "ir_ref": 1158088,
+        "ll_misses": [
+          2891,
+          2914
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          3281,
+          4528
+        ],
+        "d1_misses": [
+          1879,
+          1931
+        ],
+        "i1_misses": [
+          1350,
+          1356
+        ],
+        "indirect_mispredicts": [
+          232,
+          239
+        ],
+        "ir_mine": 145521,
+        "ir_ratio": 0.12565777316475457,
+        "ir_ref": 1158074,
+        "ll_misses": [
+          2891,
+          2914
+        ]
+      },
+      "before_binary_sha256": "6bf503d2d3c9804563e4a3161a7ea5a0fcb2f9920d2c1d0944c21b6504c474dd",
+      "after_binary_sha256": "6bf503d2d3c9804563e4a3161a7ea5a0fcb2f9920d2c1d0944c21b6504c474dd",
+      "reference_binary_sha256": "c446126ab321f53c1d0c6ae6e38419af4de3f62aa9fbd5da293be6038d16a283",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    },
+    {
+      "name": "fib",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DFIB_N=25",
+      "source_sha256": "983660d7782bcce1d90c389a5869452a6b055a399654ad63f34491245ed41379",
+      "before": {
+        "conditional_mispredicts": [
+          3323,
+          22378
+        ],
+        "d1_misses": [
+          1876,
+          1887
+        ],
+        "i1_misses": [
+          1354,
+          1368
+        ],
+        "indirect_mispredicts": [
+          233,
+          240
+        ],
+        "ir_mine": 146113,
+        "ir_ratio": 0.05905364147888525,
+        "ir_ref": 2474242,
+        "ll_misses": [
+          2895,
+          2927
+        ]
+      },
+      "after": {
+        "conditional_mispredicts": [
+          3322,
+          22377
+        ],
+        "d1_misses": [
+          1876,
+          1887
+        ],
+        "i1_misses": [
+          1354,
+          1368
+        ],
+        "indirect_mispredicts": [
+          233,
+          240
+        ],
+        "ir_mine": 146113,
+        "ir_ratio": 0.05905364147888525,
+        "ir_ref": 2474242,
+        "ll_misses": [
+          2895,
+          2927
+        ]
+      },
+      "before_binary_sha256": "aa30fd92b1725f29b725d7bac6abb570a79fd8f371a308d0897c2f8ba6eb897f",
+      "after_binary_sha256": "aa30fd92b1725f29b725d7bac6abb570a79fd8f371a308d0897c2f8ba6eb897f",
+      "reference_binary_sha256": "25f5c3d20a1f048a3a0ac157a753d17b60b90b20c34694e60ca48bf0683e5e5f",
+      "identical_lccc_binaries": true,
+      "correctness": "native and instrumented stdout/exit match GCC in both phases"
+    }
+  ],
+  "identical_binaries": 41,
+  "native_screen_flags": "-O2 -march=x86-64-v3 -fwrapv",
+  "native_screen_correct_pairs": 43,
+  "native_screen_worst_first": [
+    {
+      "name": "nbody",
+      "ratio": 1.7210144857500091,
+      "ci95_bootstrap": [
+        1.6296606429852685,
+        1.7351967213994337
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "expat_siphash24",
+      "ratio": 1.5848665273288418,
+      "ci95_bootstrap": [
+        1.5840995316507895,
+        1.5979356099693156
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "expat_xml_scan",
+      "ratio": 1.3069195336055104,
+      "ci95_bootstrap": [
+        1.1310369021014166,
+        1.4273867818502226
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "matmul",
+      "ratio": 1.2347571260142611,
+      "ci95_bootstrap": [
+        1.1923904386236277,
+        1.2399855774935873
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "mandelbrot",
+      "ratio": 1.2025301626620513,
+      "ci95_bootstrap": [
+        1.197843537958015,
+        1.2083706274030963
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "hash_table",
+      "ratio": 1.2015714827388821,
+      "ci95_bootstrap": [
+        1.122917000143494,
+        1.227060175859053
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "zstd_count",
+      "ratio": 1.125930172407432,
+      "ci95_bootstrap": [
+        1.1109142217069885,
+        1.1504089717922865
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "spectral_norm",
+      "ratio": 1.1188625984295526,
+      "ci95_bootstrap": [
+        1.0803313809090023,
+        1.1317318472477715
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "sqlite_varint",
+      "ratio": 1.1130845775726004,
+      "ci95_bootstrap": [
+        1.065617840587815,
+        1.1184373457785812
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "tls_seg_access",
+      "ratio": 1.107197114079482,
+      "ci95_bootstrap": [
+        1.0324055985988871,
+        1.110452912757842
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "strlen_bench",
+      "ratio": 1.1059230732431833,
+      "ci95_bootstrap": [
+        1.035597934951296,
+        1.1449314087017162
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "glibc_memcmp",
+      "ratio": 1.1006204000503315,
+      "ci95_bootstrap": [
+        1.0929202263888986,
+        1.1247976489821205
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "switch_dispatch",
+      "ratio": 1.0935471591279693,
+      "ci95_bootstrap": [
+        1.0701203191950541,
+        1.10416116755781
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "sha256_transform",
+      "ratio": 1.0913841066253351,
+      "ci95_bootstrap": [
+        1.0878871045892033,
+        1.1049746923639152
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "fannkuch",
+      "ratio": 1.084721295112587,
+      "ci95_bootstrap": [
+        1.0792202396770532,
+        1.115136804989626
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "arith_loop",
+      "ratio": 1.078831720617822,
+      "ci95_bootstrap": [
+        1.0717678783079843,
+        1.0857100134082038
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "binary_trees",
+      "ratio": 1.0596911787646133,
+      "ci95_bootstrap": [
+        1.0574477430017823,
+        1.0758411029735748
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "binary_search",
+      "ratio": 1.0594574103333827,
+      "ci95_bootstrap": [
+        0.97507414515912,
+        1.0692221101603931
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "zlib_ng_adler32_combine",
+      "ratio": 1.0463381368002223,
+      "ci95_bootstrap": [
+        1.044537213267415,
+        1.048866128257512
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "loop_patterns",
+      "ratio": 1.0419742412068316,
+      "ci95_bootstrap": [
+        1.0068196125190263,
+        1.1128723537255685
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "ascii_case_fold",
+      "ratio": 1.0392352252996118,
+      "ci95_bootstrap": [
+        0.9256432294689244,
+        1.0501766143983804
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "lz4_match_extend",
+      "ratio": 1.0226072082770878,
+      "ci95_bootstrap": [
+        0.9929722598224023,
+        1.0867593870358516
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "linux_rbtree",
+      "ratio": 1.0197952626440236,
+      "ci95_bootstrap": [
+        0.8948455529837239,
+        1.0362235810384695
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "zlib_ng_adler32",
+      "ratio": 1.017216416464361,
+      "ci95_bootstrap": [
+        1.0032771173153339,
+        1.0591563938345465
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "sieve",
+      "ratio": 1.0155262269072614,
+      "ci95_bootstrap": [
+        1.0149565453522407,
+        1.0266266964650501
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "lz4_compress",
+      "ratio": 1.009871826715523,
+      "ci95_bootstrap": [
+        1.0050491959697718,
+        1.155672986755704
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "glibc_strstr",
+      "ratio": 1.0068122393865728,
+      "ci95_bootstrap": [
+        1.002467969792898,
+        1.0159865778851283
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "libm_round_family",
+      "ratio": 1.0047803481075515,
+      "ci95_bootstrap": [
+        1.0007839295662269,
+        1.028946655973276
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "histogram",
+      "ratio": 0.9983464769258552,
+      "ci95_bootstrap": [
+        0.9677428223335726,
+        1.0937126541079907
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "double_reduction",
+      "ratio": 0.9904694644754694,
+      "ci95_bootstrap": [
+        0.9868584978601457,
+        1.0183397171619208
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "qsort",
+      "ratio": 0.9848608462124788,
+      "ci95_bootstrap": [
+        0.9778204910537057,
+        0.9861137612640062
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "tce_sum",
+      "ratio": 0.9468114047206186,
+      "ci95_bootstrap": [
+        0.941595151727651,
+        1.0347238438596862
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "ring_fifo",
+      "ratio": 0.9293519950093265,
+      "ci95_bootstrap": [
+        0.8877667384333787,
+        0.9693462676827083
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "aarch64_select_patterns",
+      "ratio": 0.9233659309924276,
+      "ci95_bootstrap": [
+        0.8825206129321114,
+        0.9421196350080177
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "gzip_crc32",
+      "ratio": 0.902934853264246,
+      "ci95_bootstrap": [
+        0.8959061105330429,
+        0.908043993057518
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "struct_copy",
+      "ratio": 0.8925451224790537,
+      "ci95_bootstrap": [
+        0.8462069236359422,
+        0.9905240039953308
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "linux_find_bit",
+      "ratio": 0.8857810319314378,
+      "ci95_bootstrap": [
+        0.8793362723193319,
+        0.9351899905490539
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "linux_find_bit_scaled",
+      "ratio": 0.875045185053295,
+      "ci95_bootstrap": [
+        0.8729479081299346,
+        0.88146704207856
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "chacha20_block",
+      "ratio": 0.8279671430425206,
+      "ci95_bootstrap": [
+        0.8239116975414378,
+        0.8299221816056516
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "bitops",
+      "ratio": 0.6363347456678203,
+      "ci95_bootstrap": [
+        0.5922083811812611,
+        0.6423272566733708
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "constant_recursion",
+      "ratio": 0.015429605622968086,
+      "ci95_bootstrap": [
+        0.01517889919287069,
+        0.015665913611626007
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "ackermann",
+      "ratio": 0.015268759964133242,
+      "ci95_bootstrap": [
+        0.015203354560330534,
+        0.018028736165997674
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    },
+    {
+      "name": "fib",
+      "ratio": 0.011934206420265082,
+      "ci95_bootstrap": [
+        0.011879991105009815,
+        0.013810931178775993
+      ],
+      "rounds": 3,
+      "quality": "screening only: insufficient samples for a confident performance verdict"
+    }
+  ],
+  "native_paired_ab": {
+    "spectral_norm": {
+      "candidate": {
+        "arm": "candidate",
+        "n": 11,
+        "min_ms": 208.435,
+        "median_ms": 216.031,
+        "mean_ms": 215.417,
+        "stdev_ms": 4.724,
+        "samples_ms": [
+          216.778,
+          220.627,
+          221.382,
+          217.11,
+          208.435,
+          212.031,
+          216.031,
+          211.12,
+          222.826,
+          214.393,
+          208.858
+        ]
+      },
+      "baseline": {
+        "arm": "baseline",
+        "n": 11,
+        "min_ms": 263.334,
+        "median_ms": 269.304,
+        "mean_ms": 272.116,
+        "stdev_ms": 9.953,
+        "samples_ms": [
+          274.498,
+          273.975,
+          280.312,
+          271.008,
+          263.538,
+          267.245,
+          263.334,
+          263.555,
+          267.312,
+          269.304,
+          299.199
+        ]
+      },
+      "binary_a": "e4130560ae231f98a5d8c8ac6bec4e9d03262ef6ea20344ef9911f3eff618d19",
+      "binary_b": "42c11c246e24cf00eacc32e71cc4a273ab63851ebd637ed159169476a9dc8287",
+      "median_time_reduction_pct": 19.781733654160348,
+      "paired_signs_candidate_faster": 11,
+      "paired_signs_candidate_slower": 0,
+      "exact_two_sided_sign_p_from_saved_pairs": 0.0009765625,
+      "note": "The harness printed a normal approximation; this summary uses the exact Binomial(n,1/2) two-sided tail. Same pinned CPU; 2 warmups; 11 alternating pairs."
+    },
+    "aarch64_select_patterns": {
+      "candidate": {
+        "arm": "candidate",
+        "n": 11,
+        "min_ms": 116.478,
+        "median_ms": 123.235,
+        "mean_ms": 125.223,
+        "stdev_ms": 7.528,
+        "samples_ms": [
+          123.235,
+          124.454,
+          126.76,
+          122.203,
+          138.187,
+          116.513,
+          121.933,
+          131.55,
+          138.557,
+          117.584,
+          116.478
+        ]
+      },
+      "baseline": {
+        "arm": "baseline",
+        "n": 11,
+        "min_ms": 132.466,
+        "median_ms": 135.352,
+        "mean_ms": 137.201,
+        "stdev_ms": 3.917,
+        "samples_ms": [
+          135.352,
+          139.994,
+          142.933,
+          139.718,
+          144.903,
+          136.774,
+          133.168,
+          134.946,
+          132.466,
+          134.841,
+          134.12
+        ]
+      },
+      "binary_a": "450681e28fa891d4aefedab9c70304ec1cbf291c7dacb840a1f89b7cfd657c81",
+      "binary_b": "2bc093da609893cfe2601b68e3945b1d5240914eb3a7d412ede12dc313261727",
+      "median_time_reduction_pct": 8.952213487794792,
+      "paired_signs_candidate_faster": 10,
+      "paired_signs_candidate_slower": 1,
+      "exact_two_sided_sign_p_from_saved_pairs": 0.01171875,
+      "note": "The harness printed a normal approximation; this summary uses the exact Binomial(n,1/2) two-sided tail. Same pinned CPU; 2 warmups; 11 alternating pairs."
+    }
+  },
+  "half_static_ab": {
+    "before": {
+      "binary_sha256": "912aa91e7f495dd909d8e37e868b78f59c2e086d0f28452986d9d1036e6b04ee",
+      "functions": {
+        "half32": 10,
+        "half64": 10,
+        "odd32": 10,
+        "xor64": 11,
+        "different": 9
+      }
+    },
+    "after": {
+      "binary_sha256": "f4f2f30e6892529c0809ead06e72ace33e56e079e3b8eadc7a3428b92a05baba",
+      "functions": {
+        "half32": 5,
+        "half64": 5,
+        "odd32": 10,
+        "xor64": 6,
+        "different": 9
+      }
+    }
+  },
+  "external_half32_insns": {
+    "gcc16.2": 7,
+    "clang23.1.0": 7,
+    "icc2021.10.0": 8,
+    "icx_latest": 7
+  },
+  "external_select_pressure_insns": {
+    "gcc16.2": 6,
+    "clang23.1.0": 6,
+    "icc2021.10.0": 7,
+    "icx_latest": 6
+  },
+  "limitations": [
+    "No claim that all Worst15 losses are fixed; only two compiler optimization changes earned.",
+    "Low-power native corpus ranks are provisional; do not treat three-sample bootstrap intervals as reliable coverage.",
+    "Callgrind uses bounded sizes, including startup and libraries; it is a different ranking from full-size native runtime.",
+    "Loop-density auto-selection compares potentially different phases; its ratios are not accepted as performance evidence.",
+    "The result-cast and promoted-literal cases include IR proof-boundary witnesses, not newly observed frontend-C miscompilations."
+  ],
+  "final_oracle_survey": {
+    "requested_flags": "-O2 -march=x86-64-v3 -fwrapv",
+    "unique_sources": 41,
+    "first_pass_failed_comparisons": 7,
+    "retry_failed_comparisons": 6,
+    "failure_reason": "HTTP 429 rate limiting, not a compiler/codegen rejection",
+    "resolved_compilers": {
+      "gcc16.2": {
+        "id": "cg162",
+        "name": "x86-64 gcc 16.2",
+        "semver": "16.2"
+      },
+      "clang": {
+        "id": "cclang2310",
+        "name": "x86-64 clang 23.1.0",
+        "semver": "23.1.0"
+      },
+      "icc": {
+        "id": "cicc2021100",
+        "name": "x86-64 icc 2021.10.0",
+        "semver": "2021.10.0"
+      },
+      "icx": {
+        "id": "cicxlatest",
+        "name": "x86-64 icx (latest)",
+        "semver": "(latest)"
+      }
+    },
+    "note": "Final common-fwrapv coverage is complete: 157 first pass, one immediate retry, six after a cooldown. All 41 unique sources now have all four vendors. Original failure reports are retained separately.",
+    "recovery_pass_failed_comparisons": 0,
+    "final_successful_comparisons": 164,
+    "strict_delta_revalidation": "PASS after cooldown; original HTTP 429 failures retained"
+  }
+}

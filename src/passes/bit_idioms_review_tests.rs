@@ -653,3 +653,140 @@ fn review_literal_carriers_are_not_arithmetic_masks() {
         Some(u32::MAX as u64)
     );
 }
+
+#[test]
+fn review_increments_use_the_requested_ring_and_do_not_peel_casts() {
+    let mut g = Graph::new();
+    let base = g.param(0, IrType::U64);
+    let added = g.bin(IrBinOp::Add, base, c(1), IrType::U64);
+    let truncated = g.cast(c(256), IrType::U32, IrType::U8);
+    let widened = g.cast(truncated, IrType::U8, IrType::U32);
+    let defs = definitions(&g.insts);
+    assert!(is_incremented(added, base, 1, 64, &defs));
+    assert!(!is_incremented(added, base, 1, 32, &defs));
+    assert!(is_incremented(c(0), c(u32::MAX as u64), 1, 32, &defs));
+    assert!(!is_incremented(c(0), c(u32::MAX as u64), 1, 64, &defs));
+    assert!(is_incremented(
+        c(1u64 << 32),
+        c(u32::MAX as u64),
+        1,
+        32,
+        &defs
+    ));
+    assert!(!is_incremented(widened, c(255), 1, 32, &defs));
+}
+
+#[test]
+fn review_count_literals_accept_ring_equivalent_carriers() {
+    for family in [0, 1] {
+        let (mut g, result) = fixture(family);
+        // Count constants have U32 consumers. Add a full modulus to their
+        // storage carrier, not to shifts or the U64 mask's comparison.
+        for i in &mut g.insts {
+            if let Instruction::BinOp {
+                op: IrBinOp::Add,
+                lhs,
+                rhs,
+                ..
+            } = i
+            {
+                for operand in [lhs, rhs] {
+                    if let Operand::Const(value) = operand {
+                        *value = IrConst::I64((value.to_i128().unwrap() + (1i128 << 32)) as i64);
+                    }
+                }
+            }
+            if let Instruction::Select {
+                false_val: Operand::Const(value),
+                ty: IrType::U32,
+                ..
+            } = i
+            {
+                if value.to_i128() == Some(0) {
+                    *value = IrConst::I64(1i64 << 32);
+                }
+            }
+        }
+        assert!(matches(family, result, &definitions(&g.insts)));
+        let mut f = g.function(result);
+        let original = f.clone();
+        assert_eq!(recognize_function(&mut f, false, 64, 8, false), 1);
+        for x in [0, 1, 0x100, 1u64 << 31, 1u64 << 32, 1u64 << 63, u64::MAX] {
+            assert_eq!(evaluate(&f, &[x]), evaluate(&original, &[x]));
+        }
+    }
+}
+
+#[test]
+fn review_narrow_rotate_range_proof_uses_promoted_ring() {
+    // I8(-128) in an I32 operation is 0xffffff80, NOT 0x80.
+    // The old carrier-view range check admitted a 16-bit rotate and changed
+    // this expression from 0xffff to 0x80ff. This is an IR witness, not a
+    // claim that the C frontend currently emits this literal spelling.
+    let mut g = Graph::new();
+    let x = Operand::Const(IrConst::I8(-128));
+    let left = g.bin(IrBinOp::Shl, x, c(8), IrType::U32);
+    let right = g.bin(IrBinOp::LShr, x, c(8), IrType::U32);
+    let combined = g.bin(IrBinOp::Or, left, right, IrType::U32);
+    let result = g.cast(combined, IrType::U32, IrType::U16);
+    assert!(!high_bits_zero(x, 16, &definitions(&g.insts)));
+    assert!(match_narrow_rotate(combined, 16, &definitions(&g.insts)).is_none());
+    let mut f = g.function(result);
+    assert_eq!(evaluate(&f, &[]), 0xffff);
+    recognize_function(&mut f, false, 64, 8, false);
+    assert_eq!(evaluate(&f, &[]), 0xffff);
+}
+
+#[test]
+fn review_mask_range_proofs_preserve_constant_casts_and_signs() {
+    let mut g = Graph::new();
+    let x = g.param(0, IrType::U32);
+    let fake_mask = Operand::Const(IrConst::I8(-1));
+    let and = g.bin(IrBinOp::And, x, fake_mask, IrType::U32);
+    let narrow = g.cast(c(255), IrType::U32, IrType::I8);
+    let extended = g.cast(narrow, IrType::I8, IrType::U32);
+    let cast_mask = g.bin(IrBinOp::And, x, extended, IrType::U32);
+    let defs = definitions(&g.insts);
+    assert!(!high_bits_zero(and, 8, &defs));
+    assert!(!high_bits_zero(cast_mask, 8, &defs));
+    assert!(!fits_low_bits(fake_mask, 8, 32, &defs));
+    assert!(fits_low_bits(fake_mask, 8, 8, &defs));
+    assert_eq!(const_in_ring(c(0), 128), None);
+}
+
+#[test]
+fn review_same_condition_selects_preserve_polarity_widths_and_spans() {
+    for ty in [IrType::I8, IrType::U16, IrType::I32, IrType::U64] {
+        for unrelated in [false, true] {
+            let mut g = Graph::new();
+            let cond = g.param(0, IrType::U64);
+            let other = g.param(1, IrType::U64);
+            let inner_cond = if unrelated { other } else { cond };
+            let yes = g.sel(inner_cond, c(7), c(8), ty);
+            let no = g.sel(inner_cond, c(9), c(10), ty);
+            let result = g.sel(cond, yes, no, ty);
+            let mut f = g.function(result);
+            let original = f.clone();
+            assert_eq!(
+                recognize_function(&mut f, false, 64, 8, false),
+                usize::from(!unrelated)
+            );
+            for a in [0, 1, 1u64 << 32, u64::MAX] {
+                for b in [0, 1] {
+                    assert_eq!(evaluate(&f, &[a, b]), evaluate(&original, &[a, b]));
+                }
+            }
+            assert_eq!(f.blocks[0].source_spans, original.blocks[0].source_spans);
+            assert_eq!(recognize_function(&mut f, false, 64, 8, false), 0);
+        }
+    }
+    // A low-byte predicate cannot inherit a full-width nonzero proof.
+    let mut g = Graph::new();
+    let cond = g.param(0, IrType::U64);
+    let truncated = g.cast(cond, IrType::U64, IrType::U8);
+    let yes = g.sel(truncated, c(7), c(8), IrType::U32);
+    let result = g.sel(cond, yes, c(10), IrType::U32);
+    let mut f = g.function(result);
+    assert_eq!(recognize_function(&mut f, false, 64, 8, false), 0);
+    assert_eq!(evaluate(&f, &[256]), 8);
+}

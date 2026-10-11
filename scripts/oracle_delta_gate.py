@@ -19,7 +19,8 @@ Metrics (AT&T, function body only): ``insns`` (labels/directives excluded),
 
 Network policy: an unreachable Compiler Explorer is a *skip* (exit 0) unless
 ``--strict``; a gate that cannot run must not block unrelated work, but the
-skip is loud and recorded in the report.
+skip is loud and recorded in the report. Baseline refresh is always fail-closed:
+missing functions/oracles, empty selections and outages never publish a baseline.
 
     scripts/oracle_delta_gate.py                       # gate
     scripts/oracle_delta_gate.py --update-baseline     # refresh after a win
@@ -164,15 +165,34 @@ def main(argv: list[str] | None = None) -> int:
     entries = corpus["entries"]
     if args.only:
         wanted = set(args.only.split(","))
+        unknown = wanted - {e["id"] for e in entries}
+        if unknown:
+            print(f"error: unknown entry ids: {sorted(unknown)}", file=sys.stderr)
+            return 2
         entries = [e for e in entries if e["id"] in wanted]
+    if not entries or len({e["id"] for e in entries}) != len(entries):
+        print("error: corpus selection must be nonempty with unique ids", file=sys.stderr)
+        return 2
     if not Path(args.local).exists():
         print(f"error: local compiler {args.local} not built", file=sys.stderr)
         return 2
     try:
         rows, errors = measure(entries, corpus["flags"], corpus["oracles"], args.local)
     except Exception as exc:  # noqa: BLE001 - network/CE outage classification
-        print(f"oracle gate SKIPPED: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return 1 if args.strict else 0
+        message = f"{type(exc).__name__}: {exc}"
+        if args.report:
+            args.report.parent.mkdir(parents=True, exist_ok=True)
+            args.report.write_text(json.dumps({"schema": 1, "rows": [],
+                                              "errors": [message], "skipped": True}, indent=2) + "\n")
+        print(f"oracle gate {'FAILED' if args.update_baseline or args.strict else 'SKIPPED'}: {message}",
+              file=sys.stderr)
+        return 1 if args.strict or args.update_baseline else 0
+    # Do not trust a measurement implementation to report every missing row.
+    if sorted(r["id"] for r in rows) != sorted(e["id"] for e in entries):
+        errors.append("incomplete/duplicate measured entry coverage")
+    for row in rows:
+        if set(row["oracles"]) != set(corpus["oracles"]):
+            errors.append(f"{row['id']}: incomplete oracle coverage")
     tol = dict(TOLERANCE, insns_pct=args.insns_pct)
     baseline = json.loads(args.baseline.read_text()) if args.baseline.exists() else {}
     failures, notes = evaluate(rows, baseline, tol)
@@ -186,7 +206,13 @@ def main(argv: list[str] | None = None) -> int:
     for line in errors:
         print(f"error: {line}", file=sys.stderr)
     if args.update_baseline:
-        merged = baseline.get("entries", {})
+        if errors:
+            print("error: refusing incomplete baseline refresh", file=sys.stderr)
+            return 1
+        if args.only and baseline and baseline.get("flags") != corpus["flags"]:
+            print("error: partial refresh cannot change baseline flags", file=sys.stderr)
+            return 1
+        merged = dict(baseline.get("entries", {})) if args.only else {}
         merged.update({r["id"]: r["lccc"] for r in rows})
         tmp = args.baseline.with_suffix(f".tmp.{os.getpid()}")
         tmp.write_text(json.dumps({"schema": 1, "flags": corpus["flags"],

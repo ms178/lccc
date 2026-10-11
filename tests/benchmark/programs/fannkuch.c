@@ -1,3 +1,7 @@
+/* Optional bounded instrumentation size; default workload is unchanged. */
+#ifndef FANNKUCH_N
+#define FANNKUCH_N 11
+#endif
 // Fannkuch-Redux benchmark (array permutations, integer-heavy)
 #include <stdio.h>
 
@@ -46,7 +50,7 @@ static void fannkuch(int n) {
 }
 
 int main(void) {
-    int n = 11;
+    int n = FANNKUCH_N;
     fannkuch(n);
     printf("%d\nPfannkuchen(%d) = %d\n", checksum, n, maxflips);
     return 0;
