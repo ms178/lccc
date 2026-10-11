@@ -2005,8 +2005,10 @@ pub fn encode_instruction(
 /// caller therefore had no way to say "GP slot" and no way to be told it had
 /// been handed a floating-point register: `mul d0, x1, x2` parsed `d0` as
 /// register 0 within the *GP* multiply and emitted `mul x0, x1, x2`. The
-/// 1,624-row `sweep register class` group in the operand-legality matrix
-/// exists to pin every such slot, and it found 401 of them.
+/// `sweep register class` group of the operand-legality matrix pins every such
+/// slot against GNU as -- the TSV is the authority for how many rows that is
+/// today, so this note does not quote a number that goes stale on the next
+/// `--regenerate`.
 ///
 /// The GP grammar is now exactly [`GpReg::by_name`]'s -- `x0`-`x30`,
 /// `w0`-`w30`, `lr`, `sp`/`wsp`, `xzr`/`wzr` -- so a floating-point or vector
@@ -2768,8 +2770,26 @@ mod gas247_golden_word_tests {
         let a = src
             .find("pub fn encode_instruction(")
             .expect("encode_instruction found");
-        let body_end = src[a + 10..].find("\npub fn ").map(|i| a + 10 + i);
-        let body = &src[a..body_end.unwrap_or(src.len())];
+        // Delimit the counted region with the dispatcher's own closing brace:
+        // `encode_instruction` is a top-level `fn`, so the first `}` at column 0
+        // after it ends the body.  The earlier version scanned for the next
+        // `\npub fn ` and fell back to `src.len()`, which let the region run to
+        // EOF as soon as any `pub fn` was inserted above the dispatcher -- and the
+        // ratchet would then certify whatever it happened to see (423 names, 526,
+        // or a number that merely matched) without saying so.  A latch with no way
+        // to fail is not a latch, so both ends of the region must be provable.
+        let close = src[a..]
+            .find("\n}")
+            .map(|i| a + i)
+            .expect("encode_instruction body must end at a column-0 `}`");
+        let body = &src[a..close];
+        assert!(
+            close < src.len() && !body.contains("#[test]"),
+            "the counted region must stop at the dispatcher's closing brace, not at \
+             EOF (close={close} of {} bytes, body={} bytes)",
+            src.len(),
+            body.len()
+        );
         // An arm head is a line whose own indentation is the dispatcher's (eight
         // spaces): inner `match`es sit deeper, which is what keeps a leaf's
         // `if mnemonic == "..."` from being read as an arm.  Every key on that
@@ -3138,6 +3158,203 @@ mod gas247_golden_word_tests {
         assert!(encode1_opt("fcmeq s0, s1, s2").is_err());
         // And the scalar forms that are already right, unchanged by this:
         assert_eq!(encode1_opt("fmax s0, s1, s2"), Ok(0x1e224820));
+    }
+
+    /// The integer side of the same law, which the float sweep had already
+    /// pinned and the integer leaves had not: `add`/`sub`/`mul`/`sqdmulh` and
+    /// friends, `pmul`, `mla`, `mls` all encode from a *single* `size`/`Q` triple
+    /// shared by the three register operands, so a differing arrangement has no
+    /// word -- and before this check LCCC handed back the destination's shape with
+    /// the sources' register numbers, i.e. bytes for a different instruction, with
+    /// exit status 0.  Measured on this tree before the fix: `add v0.4s, v1.4s,
+    /// v2.8h`, `mla v0.8h, v1.16b, v2.16b`, `pmul v0.8h, v1.16b, v2.16b` and
+    /// `sqdmulh v0.4h, v1.4h, v2.8h` all assembled.
+    ///
+    /// The second half of the test is the scope: the families that *legitimately*
+    /// mix shapes -- indexed forms, three-different widening, `pmull` -- must keep
+    /// encoding, which is why the check sits in the three-same leaves and not in a
+    /// shared prologue.
+    /// The census behind the test above, run against the file rather than
+    /// against a hand-kept list.
+    ///
+    /// Every `encode_neon_*` leaf that reads exactly three vector registers and
+    /// derives its `size`/`Q` from the destination arrangement alone is a
+    /// three-same form, and every one of those must call `neon_shapes_agree`.
+    /// Enumerating the set from `neon.rs` is what makes this a gate: the check was
+    /// originally pinned per call site, and call sites are addable -- seven of
+    /// these eleven leaves stayed un-checked for exactly that reason, and the
+    /// float family was already fixed beside them without anyone noticing the
+    /// asymmetry.  A new leaf of this shape cannot dodge the law, and neither can
+    /// a rename of the helper or of the pattern, because the expected set below is
+    /// asserted non-empty and each name is looked for by name.
+    #[test]
+    fn three_same_leaves_all_agree_check() {
+        let src = include_str!("neon.rs");
+        // Leaves that *legitimately* mix arrangements, exempted by name so the
+        // exemption is a decision someone has to make here.  Each must still
+        // exist, so an entry cannot outlive the function it excuses.
+        const EXEMPT: &[&str] = &["encode_neon_pmull"];
+        for name in EXEMPT {
+            assert!(
+                src.contains(&format!("fn {name}(")),
+                "exemption {name} no longer names a function in neon.rs -- drop it \
+                 from EXEMPT (a stale exemption is how a gate starts forgiving \
+                 things it was never meant to forgive)"
+            );
+        }
+        // The names the census must find.  If the scan below stops matching --
+        // because a helper was renamed or the arrangement read reworded -- the
+        // gate has to fail loudly rather than certify an empty set.
+        const EXPECT: &[&str] = &[
+            "encode_neon_three_same",
+            "encode_neon_logical",
+            "encode_neon_mul",
+            "encode_neon_pmul",
+            "encode_neon_mla",
+            "encode_neon_mls",
+            "encode_neon_bic",
+            "encode_neon_bsl",
+            "encode_neon_zip_uzp",
+            "encode_neon_add_sub",
+            "encode_neon_bitwise_insert",
+        ];
+        // Every function start, at any visibility -- not just `pub(crate)`.  The
+        // first version split the file on `pub(crate) fn ` alone, so a leaf that
+        // is followed by a private `fn` swallowed that function's body and was read
+        // as a three-operand leaf (`encode_neon_not`, which takes two, was the
+        // innocent casualty).  Boundaries must be complete or the census is wrong
+        // in both directions.
+        let starts: Vec<(usize, &str)> = {
+            let mut v = Vec::new();
+            let mut off = 0usize;
+            for line in src.split_inclusive('\n') {
+                let body = line.trim_start();
+                for prefix in ["pub(crate) fn ", "pub fn ", "fn "] {
+                    if let Some(rest) = body.strip_prefix(prefix) {
+                        let name_len = rest.find(['(', '<']).unwrap_or(0);
+                        // Byte offset of the line itself, then of the `fn` keyword
+                        // within it, so slices of `src` stay valid.
+                        let s0 = off + (line.len() - body.len());
+                        v.push((s0, &rest[..name_len]));
+                        break;
+                    }
+                }
+                off += line.len();
+            }
+            v
+        };
+        let mut found: Vec<&str> = Vec::new();
+        let mut missing: Vec<(&str, usize)> = Vec::new();
+        for (idx, &(start, name)) in starts.iter().enumerate() {
+            let end = starts.get(idx + 1).map(|(s, _)| *s).unwrap_or(src.len());
+            let chunk = &src[start..end];
+            let regs = chunk.matches("get_neon_reg(operands, ").count();
+            let derived_from_dest =
+                chunk.contains("neon_arr_to_q_size(&arr_d)") || chunk.contains(r#"arr_d == "16b""#);
+            if !(regs == 3 && derived_from_dest) || EXEMPT.contains(&name) {
+                continue;
+            }
+            found.push(name);
+            if !chunk.contains("neon_shapes_agree(operands, 3") {
+                missing.push((name, chunk.matches('\n').count()));
+            }
+        }
+        for name in EXPECT {
+            assert!(
+                found.contains(name),
+                "the census no longer sees {name} as a three-same leaf: the rule it is \
+                 matched by has changed, and a gate whose predicate stopped firing \
+                 is worse than no gate"
+            );
+        }
+        assert!(
+            missing.is_empty(),
+            "three-same leaves without an arrangement-agreement check: {missing:?} \
+             (name, lines of leaf) -- one `size`/`Q` covers all three operands, so a \
+             disagreeing spelling has no encoding and must be refused"
+        );
+    }
+
+    #[test]
+    fn integer_three_same_leaves_require_agreeing_operand_shapes() {
+        for text in [
+            "add v0.4s, v1.4s, v2.8h",
+            "sub v0.16b, v1.16b, v2.8h",
+            "mul v0.4s, v1.4s, v2.8h",
+            "sqdmulh v0.4h, v1.4h, v2.8h",
+            "mla v0.8h, v1.16b, v2.16b",
+            // A narrower destination is the same disagreement, seen from the other
+            // side; the word would otherwise be built from `.16b` alone.
+            "mla v0.16b, v1.8h, v2.8h",
+            "mls v0.4s, v1.4s, v2.2d",
+            "pmul v0.8h, v1.16b, v2.16b",
+            "and v0.16b, v1.16b, v2.8h",
+            "bic v0.8h, v1.8h, v2.16b",
+            "bsl v0.16b, v1.8h, v2.16b",
+            "bit v0.16b, v1.16b, v2.8h",
+            "zip1 v0.4s, v1.4s, v2.8h",
+        ] {
+            let got = encode1_opt(text);
+            assert!(got.is_err(), "{text:?} must be rejected, got {got:?}");
+            let msg = got.unwrap_err();
+            assert!(
+                msg.contains("operand mismatch"),
+                "{text:?}: wrong diagnostic {msg:?}"
+            );
+        }
+        // Rejected, but by the operand parser rather than by the shape check: a
+        // `.4d` third operand on `mul`/`mls` never reaches an arrangement, so the
+        // diagnostic names the register class.  That wording is worse than GAS's
+        // (`operand mismatch` / `invalid arrangement for instruction`), and it is a
+        // diagnostic-only gap -- the verdict (refuse) is right -- so it is pinned
+        // here as *an* error rather than as *this* error, and recorded as follow-up
+        // work in the round note rather than silently upgraded.
+        for text in ["mul v0.4s, v1.4s, v2.4d", "mls v0.4s, v1.4s, v2.4d"] {
+            assert!(
+                encode1_opt(text).is_err(),
+                "{text:?} must not assemble into a word built from the destination alone"
+            );
+        }
+        // Uniform spellings still encode, including the two GAS rows the ratchet
+        // file carries for this family.
+        for text in [
+            "add v0.4s, v1.4s, v2.4s",
+            "add d10, d7, d17",
+            "mul v0.16b, v1.16b, v2.16b",
+            "pmul v17.16b, v1.16b, v18.16b",
+            "mla v0.8h, v7.8h, v15.8h",
+        ] {
+            assert!(encode1_opt(text).is_ok(), "{text:?} must still encode");
+        }
+        // The two GAS rows this family has in the ratchet file, read the way the
+        // ratchet reads them: the TSV stores the `.text` byte string, so the word
+        // is those bytes little-endian, not the hex parsed as a number.
+        assert_eq!(
+            encode1_base("pmul v17.16b, v1.16b, v18.16b"),
+            u32::from_le_bytes([0x31, 0x9c, 0x32, 0x6e])
+        );
+        assert_eq!(
+            encode1_base("add d10, d7, d17"),
+            u32::from_le_bytes([0xea, 0x84, 0xf1, 0x5e])
+        );
+        // Out of scope, by design: indexed forms, widening forms and `pmull`
+        // carry different shapes on purpose, and each routes to its own leaf.
+        for text in [
+            "mla v0.4s, v1.4s, v2.s[1]",
+            "sqdmulh v10.4h, v6.4h, v3.h[2]",
+            "saddl v0.8h, v0.8b, v8.8b",
+            "pmull v1.8h, v1.8b, v2.8b",
+        ] {
+            assert!(
+                encode1_opt(text).is_ok(),
+                "{text:?} is a legal mixed-shape form and must not be refused \
+                 by the three-same check"
+            );
+        }
+        assert_eq!(
+            encode1_base("pmull v1.1q, v13.1d, v21.1d"),
+            u32::from_le_bytes([0xa1, 0xe1, 0xf5, 0x0e])
+        );
     }
 
     /// F8 (`docs/REVIEW_746_ADJUDICATION.md`), the surplus-operand class, for

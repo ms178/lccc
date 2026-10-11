@@ -65,6 +65,12 @@ impl SymbolTable {
         None
     }
 
+    /// Look up a declaration in this scope only. A nested function definition
+    /// may refine its own forward declaration, not an outer function it hides.
+    pub fn lookup_current(&self, name: &str) -> Option<&Symbol> {
+        self.scopes.last()?.symbols.get(name)
+    }
+
     /// Whether declarations are currently at file scope.
     pub fn at_file_scope(&self) -> bool {
         self.scopes.len() <= 1

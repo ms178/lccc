@@ -163,11 +163,7 @@ impl<'a> ExprTypeChecker<'a> {
                 }
                 // Check function signatures for implicitly declared functions
                 if let Some(func_info) = self.functions.get(name) {
-                    return Some(CType::Function(Box::new(FunctionType {
-                        return_type: func_info.return_type.clone(),
-                        params: func_info.params.clone(),
-                        variadic: func_info.variadic,
-                    })));
+                    return Some(CType::Function(Box::new(func_info.call_type())));
                 }
                 None
             }

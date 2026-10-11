@@ -34,10 +34,12 @@ standalone `LCCC-RECOVER.py` survives a worktree reset. See the
 | `x86_gcc_torture.py` | Full native x86-64 **and i686** GCC `gcc.c-torture/execute` matrix (`--arch=i686`), plus the `gcc.c-torture/compile` leg with `--mode=compile`. That leg follows compile.exp's contract: every source must compile and assemble to an ELF object. gcc gates eligibility the same way, and there is no link or run. Splits compilation and linking so every PASS covers LCCC object generation **and standalone `lccc-ld`** (`-m elf_x86_64` / `-m elf_i386`, driven through `gcc [-m32] -no-pie -B<shim>`; `--link-mode=driver` keeps the legacy one-step `lccc-i686` compile+link), defaults to the corpus `ensure_gcc_torture.sh` provisions (the JSON records it as `gcc_testsuite`), uses GCC only as eligibility/CRT oracle, understands unconditional `dg-options`, scales timeouts by `dg-timeout-factor`, reports `run_expensive_tests` sources (memclr/memcpy-a*) as `unsupported` unless `--expensive`/`GCC_TEST_RUN_EXPENSIVE` is set (gcc's own harness rule), enforces timeouts, and writes deterministic JSON/failure logs. `--from-list FILE` re-runs only the tests named in a previous report (one JSON `test` value per line, blank/`#` lines ignored, unknown names warn+skip, intersects positional tests and `--filter`); the partial-run JSON gains a `from_list` field so evidence tooling can see the filtering. |
 | `lccc-snapshot.sh` | Harness-wipe-resistant autosave: commits then atomically publishes a verified squashed `ms178-1.patch`, series, tarball, bundle, and ledger with SHA-256 records. Set `LCCC_BASE_REF` when re-anchoring a new session after an upstream rebase. Accepts a matching `ci_local.sh --fast` (or `mode=full`) stamp for the same tree. Owner policy: no full local CI run; GitHub CI runs the slow gates on every PR. `LCCC_SNAPSHOT_ALLOW_PARTIAL=1` still labels a `--slow`-only autosave `PARTIAL-NOT-DELIVERABLE`. |
 | `ci_ubuntu_chroot.sh` | Runs a command -- normally `ci_local.sh --fast` -- in an Ubuntu 24.04 debootstrap (the GitHub runner's userland: GCC 13.2, glibc, binutils) with `$HOME` bound at the same path. The system GCC is an oracle for several gates; PR #638 passed ci_local on Debian's GCC 14.2 and failed CI on Ubuntu's 13.2. `--setup-only` builds the chroot; `LCCC_CI_CHROOT`/`LCCC_CI_MIRROR` override its path and mirror. |
+| `torture_evidence.py` | Summarizes native torture reports without conflating compile and execute legs. Schema-2 incomplete/fatal/cardinality-mismatched reports are refused; filtered selections are labelled explicitly. |
 | `check_ci_gate_parity.py` | Both directions of the ci_local.sh / workflow mirror: every local gate runs in hosted CI, every hosted script, cargo subcommand and `--config` build mode runs locally (comments do not count on either side), and no `tests/regression/check_*.sh` is wired into nothing. Exceptions: `ci_gate_allowlist.txt` (orphans) and `ci_hosted_only.txt` (hosted-only measurements); both may only shrink. Self-test: `test_ci_gate_parity.py`. |
 | `bench_kernels.py` | Separate-TU kernel timing harness. Supports a CPU-pinned, AB/BA-balanced `lccc-alt` compiler arm via `--lccc-alt-env NAME=VALUE`, verifies checksums, and hashes only the timed function. |
 | `fuzz_diff.py` | Unified differential-testing harness and single entry point for every differential engine (`synthetic`, `csmith`, `yarpgen`, `stress_suite` + the nine absorbed `tests/fuzz` engines `differential`, `phi_cfg`, `intcmp_thread`, `m32`, `regparm`, `slot_rmw`, `alias_m32`, `alu_torture`, `aarch64`). Compiles every generated program with LCCC **and all selected references** across the requested `-O` levels, compares stdout/stderr/exit status, and saves miscompile reproducers. The `stress_suite` engine sweeps `--count` seeds per generator and evaluates every case under the cartesian product of repeatable `--config-env KEY=VALUE` axes; a case where the reference AND lccc die by the same signal is a GEN-BUG failure (generator bug, never a silent skip). The generator-config engines import the historical `tests/fuzz` generators (historical flags, seeds, and gcc oracle preserved; `Oz` maps to `-Os` on references); the standalone-pipeline engines (nostdlib int80 or cross-compilation) are forwarded to their `tests/fuzz` script and adopt its exit code, SKIPping cleanly when the host lacks ELF32/int80 or the cross toolchain (int80-blocked hosts fall back to compile-only validation). `--check-engines` is the CI wiring guard against stub engines. |
 | `ensure_gcc_torture.sh` | Idempotently (re)provisions `gcc.c-torture/{execute,compile}` + `gcc.dg` from the GCC release tarball (default **16.2.0**, `GCC_TORTURE_VERSION`) into the snapshot-excluded `~/.cache` zone — the ~22k-file corpus and the 107 MB tarball would each blow the workspace snapshot cap. The tarball must match a sha512 pin (cross-checked against the GNU release signature when added; `GCC_TORTURE_SHA512` for unpinned versions). The stamp is trusted only after the manifest hash, the required directories (`gcc.c-torture/{execute,compile}`, `gcc.dg`), the exact file set and every file's sha256 check out; any failure auto-repairs. Re-provisioning drops the stamp first and writes it only after the new tree validates. `--force` re-extracts; `tests/regression/check_ensure_gcc_torture.sh` is the contract test. |
+| `ensure_gcc_torture_git.py` | GCC **17-git** companion to the release provisioner: resolves master once (or accepts `--ref <full SHA>`), sparsely fetches the torture, gcc.dg and harness-support trees, checks the complete selected file set and every Git blob, repairs a damaged cache by atomic directory exchange, and writes a revision-bearing corpus stamp. Offline repair/failure tests: `python3 -m unittest discover -s tests/corpus -p test_gcc_git_provision.py`. Default checkout: `~/.cache/lccc-gcc17`; point the runner's `--suite` at its `gcc/testsuite/gcc.c-torture/{execute,compile}`. |
 | `x86_gcc_torture_i686.py` | Compatibility wrapper: forwards to `scripts/x86_gcc_torture.py --arch=i686` (all flags, including `--from-list`, pass through unchanged). |
 | `csmith_diff.py`, `yarpgen_diff.py` | Compatibility wrappers: translate the historical flag spellings (`--ccc`, `--clang`, `--gcc`, `--jobs`, `--tests`, `--seed-start`, ...) and forward to `scripts/fuzz_diff.py --engine csmith|yarpgen`. |
 | `run_gep_chain_stress.sh` | Compatibility wrapper (bash): forwards to `scripts/fuzz_diff.py --engine stress_suite` over seeds `first..last` (`LCCC_BIN`→`--lccc`, `GCC_BIN`→`--refs`, trailing args→`--opts`), driving `gen_gep_chain_stress.py` for folded-address (chained-GEP) liveness. A seed where GCC and lccc both die by the same signal is reported GEN-BUG and fails the run. |
@@ -164,6 +166,21 @@ disassembler proves the two objects decode identically, and both asm-diff
 gates (x86-64 and i686) pin the full 2.47 pair — an unpinned objdump is an
 unpinned verdict authority, whatever binutils the host image ships.
 
+## AArch64 instruments: gate mode, manual mode, and what proves what
+
+Five scripts measure the AArch64 back end.  Each separates the mode that
+*decides* (runs in CI, fails the build) from the mode that *rewrites* (manual:
+it needs the pinned binutils prefix, and a generated golden belongs in a
+reviewed diff, not in a gate that can silently refresh its own input).
+
+| script | gate mode (where it runs) | manual mode (what only a human runs) |
+|---|---|---|
+| `aarch64_operand_legality_matrix.py` | `--check`, and `--check-lccc` for the encoder half: `ci.yml` step "AArch64 operand-legality matrix", `ci_local.sh` gates `aarch64-operand-legality` and `aarch64-operand-legality-encoder` (both SKIP without cross-binutils, which is why `ci_local.sh --fast` is not the whole story) | `--regenerate` rewrites `tests/aarch64/operand-legality.tsv` from GNU as; `--print` dumps it |
+| `aarch64_legality_probe_differ.py` | no flag, i.e. the pinned-row diff: `ci.yml` step "AArch64 spelling differ and system-register table" | `--json`, the per-spelling dump a new pinned row is argued from |
+| `aarch64_sysreg_table.py` | `--check`, same CI step: holds the generated table against the `.def` it came from and against `SYSREGS_DEF_SHA256`, in both directions | `--regenerate` re-emits the table; `--def` picks the source explicitly (prefix, `$LCCC_AARCH64_SYSREGS_DEF`, cache, tarball) |
+| `aarch64_doccheck_2026_09.py` | `--xml-dir ... --goldens ...`: `ci.yml` step "Arm A64 documentation cross-check (2026-09)" | the same invocation with the cached-XML defaults, on a dev box |
+| `gen_aarch64_dispatcher_goldens.py` | **not run in CI at all**: the generator needs GNU as.  What CI runs is its *output*, via `dispatcher_goldens_ratchet_one_row_per_arm` in `encoder/mod.rs`, which re-derives the arm set with the same rule and re-assembles every row through LCCC's own parser to leaf path -- no cross binutils, no network | the generation itself, on a host with a provisioned `$HOME/.cache/gas-2.47-aarch64-linux-gnu` |
+
 ## Evidence producers that are not gates (manual)
 
 Two scripts in this directory exist to *measure* something rather than to decide
@@ -248,6 +265,18 @@ python3 scripts/codegen_oracle.py test.c --function hot_loop \
     --arch aarch64 --local target/fastbuild/lccc-arm \
     --local-flags '-O2' --flags '-O2' \
     --artifact-dir /tmp/aarch64-oracle
+
+# For current GCC 17 development sources (pin the printed full commit on reruns):
+python3 scripts/ensure_gcc_torture_git.py
+# --suite ~/.cache/lccc-gcc17/gcc/testsuite/gcc.c-torture/execute
+# uses that checkout instead of the GCC 16.2 release corpus.
+# The native runner is NOT DejaGnu: conditional target directives, expected
+# diagnostics, LTO option matrices, and nested suites are not fully interpreted.
+# JSON schema 2 records selection, flags, binary/source hashes, and host identity.
+# It checkpoints atomically every 25 cases and immediately on failures; only
+# complete=true without fatal errors is a finished run. Reference multilib/tool
+# preflight failures and all-skipped runs exit 2, never green. Resource failures
+# retain a reference-fail verdict rather than disappearing into skips.
 
 # Native x86-64: compile with LCCC, link through standalone lccc-ld, execute.
 # The default is the full -O0/-O1/-O2/-O3/-Os matrix; use -j2 on constrained VMs.

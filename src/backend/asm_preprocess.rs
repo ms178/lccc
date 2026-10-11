@@ -503,6 +503,23 @@ impl ExpansionTotals {
     /// ceiling is crossed.  Saturating on purpose: a run that would overflow
     /// `u64` is far past every ceiling already, and an arithmetic panic would
     /// replace a diagnostic with a crash.
+    ///
+    /// **Billing law.** One charge is the output of one expansion, so the output
+    /// of a *nested* `.macro` expansion is billed twice: the inner frame charges
+    /// its own result, and the outer frame then charges the text it received --
+    /// which already contains those lines.  `.rept`/`.irp` need no such doubling
+    /// because a parent's growth is `count x expanded_size`, i.e. the child's
+    /// repetition is already inside the number the parent multiplies, and
+    /// `.rept` checks it in its own frame rather than in a threaded accumulator.
+    /// The asymmetry is deliberate: both rules charge at least what the pass
+    /// materializes, which is the direction a ceiling must err in (measured in
+    /// the round-8 oracle run, a legal 4.0 M-line `.macro` file costs LCCC 8.2 s
+    /// and GAS 0 s, so there is nothing to win by counting *less*).  Unifying the
+    /// two passes to a single shared total would also be wrong, not merely
+    /// different: the `.rept` pass runs before the `.macro` pass on the same
+    /// input, so its growth is legitimately charged twice in wall-clock terms
+    /// (once per pass) and a shared counter would refuse files both passes can
+    /// handle.  `nested_macro_output_is_billed_twice` pins the arithmetic.
     pub fn charge(&mut self, kind: &str, lines: &[String]) -> Result<(), String> {
         let (added_lines, added_bytes) = expansion_size(lines);
         self.lines = self.lines.saturating_add(added_lines);
@@ -1093,6 +1110,20 @@ pub fn expand_macros(lines: &[&str], comment_style: &CommentStyle) -> Result<Vec
     expand_macros_at(lines, comment_style, 0, &mut ExpansionTotals::default())
 }
 
+/// Test-only view of the depth-carrying core below, with the caller's own
+/// accumulator.  [`expand_macros`] owns its [`ExpansionTotals`] internally, and
+/// the nested-billing law is a statement about that accumulator, not about the
+/// returned lines -- without this seam the only way to observe it is to expand
+/// several megabytes of text and watch which side of the ceiling refuses.
+#[cfg(test)]
+pub(crate) fn expand_macros_counted(
+    lines: &[&str],
+    comment_style: &CommentStyle,
+    totals: &mut ExpansionTotals,
+) -> Result<Vec<String>, String> {
+    expand_macros_at(lines, comment_style, 0, totals)
+}
+
 /// Depth-carrying core of [`expand_macros`].  `depth` counts live macro
 /// frames; GAS 2.47 fatals the 102nd with `macros nested too deeply`
 /// (101-frame chains assemble — measured on the pinned oracle), and
@@ -1558,6 +1589,63 @@ pub fn find_symbol_diff_minus(expr: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The billing law on [`ExpansionTotals::charge`], read off a two-level
+    /// expansion: `outer`'s body is one `inner` invocation plus one line, and
+    /// `inner`'s body is three lines, so four lines are materialized and seven
+    /// are billed -- the inner frame's three, and the parent's four that already
+    /// contain them.
+    ///
+    /// Pinned because the double charge is the only thing making the ceiling
+    /// conservative for nested input, and a future "unification" that removes it
+    /// would halve the bound on exactly the input class that costs the most
+    /// (each nested level multiplies, so the top level's number is the one that
+    /// matters).  The per-front-end wiring that lets each target reach this
+    /// accounting is pinned where it lives: `gas247_expansion_ceilings_reach_the_
+    /// riscv_entry_point` (RISC-V), the `ExpansionBudget` delegation test in
+    /// `backend/x86/assembler/parser.rs`, and the `.macro`/`.rept` growth checks
+    /// in `backend/arm/assembler/parser.rs`.
+    #[test]
+    fn nested_macro_output_is_billed_twice() {
+        let src = ".macro inner\n nop\n nop\n nop\n.endm\n\
+                   .macro outer\n inner\n ld x0\n.endm\n\
+                   outer\n";
+        let mut totals = ExpansionTotals::default();
+        let out = expand_macros_counted(
+            &src.lines().collect::<Vec<_>>(),
+            &CommentStyle::Hash,
+            &mut totals,
+        )
+        .expect("four lines is nowhere near the ceiling");
+        assert_eq!(out.len(), 4, "the file materializes body(inner)+1 line");
+        assert_eq!(
+            totals.lines, 7,
+            "3 (inner's own charge) + 4 (outer's charge, which repeats them)"
+        );
+        // The bytes follow the same rule, so the two counters cannot disagree
+        // about which expansions were seen.
+        // `expansion_size` bills `len + 1` per line, so the byte total is the
+        // same doubling seen from the other counter: the inner frame's three
+        // 4-char lines, then those three again inside the parent's four.
+        assert_eq!(
+            totals.bytes,
+            3 * 5 + (3 * 5 + 7),
+            "inner's 3 lines, then the same 3 plus the parent's own line"
+        );
+        // A single-level expansion is charged exactly once: the doubling is a
+        // property of nesting, not a factor of two on every macro.
+        let mut flat = ExpansionTotals::default();
+        let one = expand_macros_counted(
+            &".macro m\n nop\n nop\n.endm\n m\n"
+                .lines()
+                .collect::<Vec<_>>(),
+            &CommentStyle::Hash,
+            &mut flat,
+        )
+        .expect("flat macro");
+        assert_eq!(one.len(), 2);
+        assert_eq!(flat.lines, 2, "one frame, one charge");
+    }
 
     /// The riscv-facing expander carries the same GAS 2.47 wall as the
     /// other two front ends (it used to recurse until the native stack

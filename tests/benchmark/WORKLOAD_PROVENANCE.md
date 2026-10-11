@@ -173,3 +173,45 @@ checksums selected by a carried checksum (no dead loop or fixed constant output)
 `-DPASSES=N` scales runtime; default 50 million. This exercises division by
 65521, multiply, carry-free modular corrections and branch/CMOV decisions,
 which the existing byte-accumulator kernel does not isolate.
+
+
+## 2026-10-10 addition: Expat 2.8.5 SipHash-2-4
+
+`expat_siphash24` is selected from `packages/expat/PKGBUILD` at archpkgbuilds
+commit `39fcd576582ee3320379882965a549a1fe6120e1`. Source: Expat 2.8.5
+`lib/siphash.h`, SHA-256
+`12ecc9915bccb793ea8bb543cc7d002e226f4e4d6b97ec9839dca41cbe4e2e27`.
+Upstream's file-specific license is **CC0-1.0**, not Expat's package-level MIT
+license; attribution remains in the source and the CC0 text is bundled in
+`third_party_licenses/CC0-1.0.txt`.
+
+The SipHash implementation and all 64 known-answer vectors are unchanged.
+Changes are confined to replacing fallthrough annotations with portable no-ops,
+removing the upstream header guard/main, and adding a noinline wrapper plus a
+harness. It checks every streaming split for lengths 0 through 128. Workload
+iterations vary message length, alignment, key and bytes through the carried
+hash to prevent invariant-loop elimination. No XML parser or package-level
+speed claim follows from this keyed-name-hashing kernel.
+
+The release archive's SHA-256 is
+`952c03c33a6b337f12dae7a9b0f9dee86f867550d35c994d6bdaaddd37dc8454`.
+The recipe SHA-512 mismatch was reproduced; the upstream asset digest and the
+detached signature were independently checked against the recipe's pinned key.
+Details and full-project reproduction are in
+`tests/workloads/expat-2.8.5/README.md`. This 2.8.5 evidence does not overwrite
+or reclassify the older 2.8.2 extraction / mismatch recorded above.
+
+Initial evidence: the full default workload agrees under native LCCC/GCC/Clang
+at O2. The reduced-iteration matrix also agrees at O0/O1/O2/O3/Os on
+both x86-64 and i686: 30 compiler executions, with all built-in self-checks
+retained. A matched x86-64-v3 Callgrind screen (`-DPASSES=200000`) records
+442,526,918 LCCC versus 267,107,196 GCC14.2 simulated instructions, a ratio of
+1.656739. This is an instruction-count **deficit**, not a measured speed ratio
+or a Raptor Lake PMU result. Whole-TU static counts at O2/v3 are 707 LCCC,
+308 GCC16.2, 496 Clang23.1, 745 ICC2021.10, 515 ICXlatest and 307 GCCtrunk;
+these include cold self-tests and retained helper bodies, so dynamic counts
+are the stronger attribution signal. LCCC retains a memory-heavy `sip_round`
+loop (ten loads / ten stores) and assembles eight-byte words with separate
+byte loads/shifts/ORs where the GCC oracle uses a word load. Adjacent-byte load
+combining and conservative aggregate promotion are research candidates, not
+implemented optimizations or promised wins.
