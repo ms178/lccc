@@ -104,8 +104,15 @@ pub struct ElfWriterBase {
     nop_bytes: [u8; 4],
     /// A half-width NOP the target may use for the bytes a full NOP cannot
     /// cover at its own alignment, as `Some((bytes, size))`: RISC-V `c.nop`
-    /// (`0x0001`, 2 bytes) when the march carries `c`. `None` for every target
-    /// without a compressed encoding, where the prefix is zeros.
+    /// (`0x0001`, 2 bytes), and `None` for every target without a 2-byte
+    /// instruction encoding, where the prefix stays zeros.
+    ///
+    /// A target that has one offers it *unconditionally*; it is not gated on the
+    /// march.  Measured on GNU as 2.47, `-march=rv64im` pads `.p2align` exactly
+    /// like `rv64gc` — including the 2-byte `c.nop` — because the fill lands
+    /// where control flow never goes, so GAS does not gate it on RVC.  Coupling
+    /// it to `EF_RISCV_RVC` was a guess the oracle disproves (see the call site
+    /// in `backend/riscv/assembler/elf_writer.rs`).
     ///
     /// This exists because GAS's fill is *not* "zeros then NOPs" or "NOPs then
     /// zeros" but "each NOP at its own alignment, largest last", so a 7-byte
@@ -163,12 +170,6 @@ impl ElfWriterBase {
             fill_budget_used: 0,
         }
     }
-
-    /// Offer the target's half-width NOP (RISC-V `c.nop`) for the bytes a full
-    /// NOP cannot cover at its own alignment. Only a target with a 2-byte
-    /// instruction encoding has one to offer; the notes on
-    /// [`Self::small_nop`] record that
-    /// GNU as 2.47 uses it for padding regardless of `-march=`.
 
     /// Ensure a section exists. If it doesn't, create it with the given properties.
     pub fn ensure_section(&mut self, name: &str, sh_type: u32, sh_flags: u64, align: u64) {

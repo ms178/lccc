@@ -6,8 +6,10 @@ WHY
 ``aarch64_encoder_differential.py`` samples the encoding space uniformly at
 random, so a rare form (an indexed element load, an LSE pairing, a system
 op) can hide from it for a long time, and its sweep is a manual offline run.
-The dispatcher in ``encoder/mod.rs`` has ~401 mnemonic arms; a routing bug
-in one of them (wrong leaf, wrong operand transformation — the shape in
+The dispatcher in ``encoder/mod.rs`` has 526 mnemonic arms as this script
+enumerates them today (the ``# arms:`` line it writes into the TSV is the
+authority; this sentence is prose, and was written when the count was 401);
+a routing bug in one of them (wrong leaf, wrong operand transformation — the shape in
 which an ``fmls`` defect once hid) must be caught by the *default* test
 run with no cross binutils and no network.
 
@@ -213,8 +215,17 @@ def dispatcher_arms() -> list[str]:
     a = src.find("pub fn encode_instruction(")
     if a < 0:
         raise SystemExit("encode_instruction not found in encoder/mod.rs")
-    b = src.find("\npub fn ", a + 10)
-    body = src[a:b if b > 0 else len(src)]
+    # Delimit the counted region by the dispatcher's own closing brace, the first
+    # `}` at column 0 after its `fn` head.  Scanning for the next `pub fn` and
+    # falling back to EOF (the earlier rule) let an insertion above the dispatcher
+    # widen the region silently, and the ratchet would then certify whatever it
+    # happened to see.  Both ends of the region must be provable.
+    b = src.find("\n}", a)
+    if b < 0:
+        raise SystemExit("encode_instruction body does not end at a column-0 `}`")
+    body = src[a:b]
+    if "#[test]" in body:
+        raise SystemExit("the counted region ran past the dispatcher into the test module")
     lines = body.splitlines()
     head = arm_head_re()
     names: set[str] = set()
