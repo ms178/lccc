@@ -1,38 +1,45 @@
 #!/usr/bin/env bash
-# Documented debt, gated: a by-value subobject struct smaller than 4 bytes is
-# mis-passed under -mregparm (i386), and silently so.
-#
-# Found while answering "is the aggregate over-read fix complete?" (round 13).
-# The answer is no, and this file is why the question stays answered: the class
-# is reproduced, attributed to a call convention, and counted.
+# Regparm small-struct gate: a 1-3 byte struct that is a subobject of a larger
+# by-value argument must survive every i386 -mregparm convention, and it now
+# does.  The class was found while answering "is the aggregate over-read fix
+# complete?" (round 13), back when the answer was no:
 #
 #   struct S { unsigned char b[1]; };
 #   struct T { unsigned long long pad; struct S s; };
 #   eat(s) + eat(t.s)          /* eat: noinline, folds the 1 byte it was given */
 #
-# `eat(t.s)` must return 8 in every ABI, because that is the byte. gcc returns
-# 16 for the sum. lccc returns 16 with -mregparm=0 and the i386 default, and
-# 72 / 232 / 40 / 8 for -mregparm=2,3 at -O0,-O2 -- a different wrong answer per
-# configuration, which is what reading past the end of the one-byte member looks
-# like. -m64 agrees everywhere (measured: 10 configurations, all ok), so the
-# x86-64 backend is not in this class; the shared *classifier* was the thing
-# fixed in round 12, and the regparm staging path is a different consumer of it.
+# `eat(t.s)` must return 8 in every ABI, because that is the byte, and gcc
+# returns 16 for the sum.  The regression was in the i686 call-site staging: the
+# parked subobject pointer was reloaded into %eax *after* the loop had written
+# the word whose destination is %eax, so the first regparm register received the
+# source address instead of the byte -- a different wrong answer per
+# configuration, and not even stable between runs of one binary, which is what
+# reading memory the program never wrote looks like.  Reloading the parked
+# pointer only while the descending word loop continues fixed it: all six
+# suspect configurations now agree with gcc deterministically (re-measured on
+# CI: 0 divergent, 12 executed, 0 skipped).  -m64 agreed throughout, including
+# while the bug was live, so the x86-64 backend was never in this class; the
+# shared *classifier* was fixed in round 12 and the regparm staging path was the
+# other consumer of it.
 #
-# Attribution note: "lccc is wrong" rests on gcc + the program's own text (the
-# value of a 1-byte object is not ABI-dependent). The mechanism is NOT
-# established -- the leading suspect is the call-site aggregate copy using the
-# parameter slot's address instead of the subobject's, which would explain both
-# the offset and the garbage -- and a fix must not be written from this comment.
+# The oracle is gcc plus the program's own text: the value of a 1-byte object is
+# not ABI-dependent, so agreement is a fact about the emitted code rather than a
+# preference for another compiler's convention.
 #
-# Budget semantics: == KNOWN passes; MORE fails as a regression; FEWER fails as
-# "debt repaid, delete this gate".  An exact-count latch was chosen over
-# "<= KNOWN" because a partial fix here (say regparm=1 only) would otherwise be
-# invisible, and this project has already paid for gates that accept "better".
+# Budget semantics: KNOWN is the measured count of divergent suspect
+# configurations, latched exactly in both directions -- MORE is a regression,
+# FEWER means the measurement moved and must be written down.  The debt is
+# repaid, so it defaults to 0.  A "<= KNOWN" latch was rejected from the start
+# because a gate that accepts "better" has already cost this project, and the
+# vacuity arms below are what keep "0 divergences" from meaning "measured
+# nothing".
 set -uo pipefail
 cd "$(dirname "$0")/../.." || exit 2
 
 LCCC=${LCCC:-target/fastbuild/lccc}
-KNOWN=${KNOWN:-6}
+# Re-measured after the staging fix: 0 of 6 suspect configurations diverge.
+# Raise this only together with a new measurement.
+KNOWN=${KNOWN:-0}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -125,13 +132,13 @@ if [ "$executed" -eq 0 ]; then
 fi
 # All-or-nothing on the suspect class, because a hosted runner without a 32-bit
 # toolchain cannot measure it at all, and "0 divergences" there would be a
-# licence to believe the debt is gone.  Either every suspect configuration ran
+# licence to believe the class is clean.  Either every suspect configuration ran
 # (compare against the budget), or none could (say so, and keep the controls
 # honest), or the harness is looking at a half-populated host -- which is a
-# failure, since a partial count matches neither a fixed bug nor a known one.
+# failure, since a partial count matches neither a clean pass nor a measured one.
 if [ "$sus_exec" -eq 0 ]; then
     echo "SKIP: no i386 configuration was executable here (32-bit toolchain absent);" \
-         " $ctrl_exec control configuration(s) agreed, debt unmeasured on this host"
+         " $ctrl_exec control configuration(s) agreed, class unmeasured on this host"
     if [ "$ctrl_exec" -eq 0 ]; then
         echo "FAIL: not even a control ran -- the harness is broken, not the toolchain"
         exit 1
@@ -140,7 +147,7 @@ if [ "$sus_exec" -eq 0 ]; then
 fi
 if [ "$sus_exec" -ne "${#SUSPECT[@]}" ]; then
     echo "FAIL: $sus_exec of ${#SUSPECT[@]} suspect configurations ran -- a partial sweep" \
-         " matches neither a fixed pass nor the documented debt"
+         " matches neither a clean pass nor a host that cannot run the class"
     exit 1
 fi
 if [ "$ctrl_div" -ne 0 ]; then
@@ -148,11 +155,11 @@ if [ "$ctrl_div" -ne 0 ]; then
     rc=1
 fi
 if [ "$div" -gt "$KNOWN" ]; then
-    echo "FAIL: $div > $KNOWN -- more mis-passed configurations than documented"
+    echo "FAIL: $div > $KNOWN -- the class is back: a small subobject aggregate is mis-passed under -mregparm again"
     rc=1
 elif [ "$div" -lt "$KNOWN" ]; then
-    echo "FAIL: $div < $KNOWN -- some of this debt is repaid; re-measure and lower the budget, or delete this gate at 0"
+    echo "FAIL: $div < $KNOWN -- fewer divergences than the latch records; re-measure and lower the budget"
     rc=1
 fi
-[ "$rc" -eq 0 ] && echo "check_i386_regparm_small_struct_abi: PASS (documented debt, exactly as counted)"
+[ "$rc" -eq 0 ] && echo "check_i386_regparm_small_struct_abi: PASS ($div == $KNOWN divergences, class exercised)"
 exit $rc

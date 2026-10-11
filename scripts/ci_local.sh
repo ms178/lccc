@@ -319,12 +319,11 @@ gate "loop-alignment-contract" fast \
 # the optimiser being wrong), 1 when a corpus TU fails to compile (an enumeration
 # that quietly shrinks is the failure mode, not the metric), and 1 when the pass is
 # live but earns nothing.  6 s against the 91-TU corpus.
-# Documented debt, counted rather than forgotten: a 1-3 byte struct that is a
-# subobject of a larger by-value argument is mis-passed under -mregparm on i386
-# (six configurations, six different wrong answers, -m64 clean). The gate latches
-# the count in both directions -- growth is a regression, a drop means the debt is
-# partly repaid and the budget has to be re-measured -- and refuses to call an
-# empty sweep a pass.
+# Regparm small-struct class, counted rather than trusted: a 1-3 byte struct
+# that is a subobject of a larger by-value argument must survive -mregparm on
+# i386 (six suspect configurations, -m64 clean). The round-13 debt here is
+# repaid, so the latch sits at 0 and a divergence is a regression.  A partial
+# sweep still fails, and an empty one is refused rather than called a pass.
 gate "i386-small-struct-abi-debt" fast \
     bash tests/regression/check_i386_regparm_small_struct_abi.sh
 

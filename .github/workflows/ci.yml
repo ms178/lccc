@@ -235,9 +235,9 @@ jobs:
       - name: Loop-alignment contract gate (emitted assembly)
         run: python3 scripts/check_loop_alignment.py --lccc target/fastbuild/lccc
       # i386 only: a 1-3 byte struct that is a subobject of a larger by-value
-      # argument is mis-passed under every non-zero -mregparm. Documented debt,
-      # counted in both directions -- growth is a regression, a drop means part of
-      # it is repaid and the number must be re-measured -- and a host without a
+      # argument must survive every non-zero -mregparm. The round-13 debt in this
+      # class is repaid (re-measured: 0 of 6 configurations diverge, 12 executed),
+      # so the latch sits at 0 and a divergence is a regression. A host without a
       # 32-bit toolchain SKIPs after proving its controls ran, so "0 divergences"
       # here always means the class was actually exercised.
       - name: i386 small-struct regparm ABI debt gate

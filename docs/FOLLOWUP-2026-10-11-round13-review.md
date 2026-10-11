@@ -205,8 +205,18 @@ returns 16 with the i386 default, `-mregparm=0` and `-freg-struct-return`, and
 wrong answer per configuration, which is what reading past the end of a one-byte
 member looks like. All ten `-m64` configurations agree, so the x86-64 backend is
 genuinely out of this class; the round-12 fix is correct where it was applied and
-applied to the classifier rather than to every consumer of it. The mechanism is
-deliberately not asserted.
+applied to the classifier rather than to every consumer of it. The mechanism was
+deliberately not asserted here.
+
+**Repaid in this revision.** The mechanism turned out to be the i686 call-site
+staging: the parked subobject pointer was reloaded into `%eax` after the loop had
+already written the word whose destination is `%eax`, so the argument register
+received the source address instead of the byte. Reloading the parked pointer only
+while the descending word loop continues makes all six configurations agree with
+gcc deterministically, so the gate's budget was lowered from 6 to 0 to record the
+re-measurement; it now fails only if the class comes back. The refusal arms are
+unchanged -- they are about measurement validity (no 32-bit host, a partial sweep,
+an empty sweep, a widening control), not about the count.
 
 The class is **non-deterministic**: `-m32 -mregparm=3 -O2` returned 120 in one
 run of this gate and 88 in the next, same binary, same source. A by-value 1-byte
@@ -266,7 +276,7 @@ no re-fetch of upstream this round. Both are marked as carried, not confirmed.
 | `cargo test --profile fastbuild --lib` | 4288 passed, 0 failed, 7 ignored |
 | `tests/regression/check_env_test_hygiene.sh` | PASS, measured 151 == budget 151 |
 | `scripts/loop_invert_census.py` (new gate) | 91 TUs, 0 failures, 285 rotations, rc 0 |
-| `tests/regression/check_i386_regparm_small_struct_abi.sh` (new gate) | PASS, 6 == budget, 12 executed |
+| `tests/regression/check_i386_regparm_small_struct_abi.sh` (new gate) | PASS, 0 == budget, 12 executed (re-measured after the staging fix; budget was 6) |
 | `riscv_align_cap_matrix_matches_the_hook` | PASS with 4 new rows |
 | `scripts/check_doc_links.py` | rc 0 |
 | `tests/regression/check_i386_regparm_small_struct_abi.sh`, all four arms | PASS at 6 == 6; SKIP mode rc 0 (simulated no-`-m32` host); partial sweep rc 1 (4 of 6); 0 executed rc 1 |
