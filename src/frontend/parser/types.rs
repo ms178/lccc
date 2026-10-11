@@ -65,9 +65,23 @@ impl Parser {
                 TokenKind::Restrict => {
                     self.advance();
                 }
-                TokenKind::Register | TokenKind::Auto => {
+                TokenKind::Register => {
                     self.advance();
                     any_storage_class = true;
+                }
+                // `auto` is not interchangeable with `register` here: on a
+                // block-scope function declaration it is the spelling that
+                // separates a GNU nested function from a redeclaration of the
+                // visible external entity, and Sema sees only the recorded
+                // bit, never the keyword itself. It must be recorded wherever
+                // the keyword is consumed -- as the `static`/`extern` arms
+                // around this one record their own -- or which entity a
+                // declaration names silently depends on where `auto` was
+                // written.
+                TokenKind::Auto => {
+                    self.advance();
+                    any_storage_class = true;
+                    self.attrs.set_nested_fn(true);
                 }
                 TokenKind::Noreturn => {
                     self.advance();
@@ -457,7 +471,11 @@ impl Parser {
                         self.advance();
                         self.attrs.set_extern(true);
                     }
-                    TokenKind::Auto | TokenKind::Register => {
+                    TokenKind::Auto => {
+                        self.advance();
+                        self.attrs.set_nested_fn(true);
+                    }
+                    TokenKind::Register => {
                         self.advance();
                     }
                     TokenKind::ThreadLocal => {
@@ -513,7 +531,11 @@ impl Parser {
                         self.advance();
                         self.attrs.set_extern(true);
                     }
-                    TokenKind::Auto | TokenKind::Register => {
+                    TokenKind::Auto => {
+                        self.advance();
+                        self.attrs.set_nested_fn(true);
+                    }
+                    TokenKind::Register => {
                         self.advance();
                     }
                     TokenKind::ThreadLocal => {
@@ -565,7 +587,11 @@ impl Parser {
                         self.advance();
                         self.attrs.set_extern(true);
                     }
-                    TokenKind::Auto | TokenKind::Register => {
+                    TokenKind::Auto => {
+                        self.advance();
+                        self.attrs.set_nested_fn(true);
+                    }
+                    TokenKind::Register => {
                         self.advance();
                     }
                     TokenKind::ThreadLocal => {
@@ -885,7 +911,11 @@ impl Parser {
                     self.advance();
                     self.attrs.set_extern(true);
                 }
-                TokenKind::Auto | TokenKind::Register => {
+                TokenKind::Auto => {
+                    self.advance();
+                    self.attrs.set_nested_fn(true);
+                }
+                TokenKind::Register => {
                     self.advance();
                 }
                 TokenKind::ThreadLocal => {

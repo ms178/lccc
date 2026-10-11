@@ -850,6 +850,11 @@ impl Parser {
         self.attrs.set_static(false);
         self.attrs.set_extern(false);
         self.attrs.set_thread_local(false);
+        // `auto` is this declaration's own storage class like the three above,
+        // and the only spelling that makes a block-scope function declaration
+        // name a nested entity. It must not survive into the next declaration,
+        // which -- without `auto` -- names the externally visible one.
+        self.attrs.set_nested_fn(false);
         self.attrs.set_typedef(false);
         self.attrs.set_inline(false);
         self.attrs.set_const(false);

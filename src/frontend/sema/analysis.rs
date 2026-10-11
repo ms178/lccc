@@ -3777,6 +3777,48 @@ mod kr_prototype_tests {
         );
     }
 
+    /// The keyword's position among the declaration specifiers is not part of
+    /// the distinction: `double auto f(double);` is the same nested declaration
+    /// as `auto double f(double);`, and must not retype the file-scope `f`
+    /// either. Both spellings reach Sema through the same recorded bit.
+    #[test]
+    fn nested_block_scope_declaration_with_trailing_auto_does_not_retype_the_outer_function() {
+        let (analyzer, result) = analyze(
+            "int f(int x);\n\
+             int g(void) { double auto f(double); double f(double x) { return x * 2; } return (int) f(1.5); }",
+        );
+        result.expect("a nested declaration must not be rejected");
+        let info = analyzer
+            .result
+            .functions
+            .get("f")
+            .expect("file-scope f is recorded");
+        let proto = info
+            .prototype
+            .as_ref()
+            .expect("`int f(int x);` leaves a prototype");
+        assert_eq!(
+            proto.return_type,
+            CType::Int,
+            "a block-scope `double auto f(double);` must not replace the outer return type"
+        );
+        assert_eq!(
+            proto.params.len(),
+            1,
+            "and must not replace the outer parameter list either"
+        );
+        assert!(
+            matches!(proto.params[0].0, CType::Int),
+            "outer parameter type came out as {:?}",
+            proto.params[0].0
+        );
+        assert!(
+            analyzer.result.functions.contains_key("g.f"),
+            "the nested definition registers under its mangled key; got {:?}",
+            analyzer.result.functions.keys().collect::<Vec<_>>()
+        );
+    }
+
     /// …but a block-scope declaration *without* a prototype does read the
     /// translation-unit record, because C11 6.2.1p4 makes the visible prototype the
     /// type of the declared identifier. Pinned so the fix above is not widened into
