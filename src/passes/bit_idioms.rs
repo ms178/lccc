@@ -6,7 +6,7 @@
 
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::reexports::{
-    Instruction, IntrinsicOp, IrBinOp, IrCmpOp, IrConst, IrFunction, IrUnaryOp, Operand,
+    Instruction, IntrinsicOp, IrBinOp, IrCmpOp, IrConst, IrFunction, IrUnaryOp, Operand, Value,
 };
 
 fn const_u64(op: Operand) -> Option<u64> {
@@ -731,16 +731,31 @@ fn binop(
     }
 }
 
+/// Interpret a literal in the arithmetic node's ring, not its storage
+/// carrier. For example I16(-1) used by a 64-bit AND is all 64 bits set,
+/// NOT the low-16 mask. `const_u64` alone would confuse these two cases.
+fn const_in_ring(op: Operand, bits: usize) -> Option<u64> {
+    let Operand::Const(c) = op else {
+        return None;
+    };
+    let mask = u64::MAX >> (64 - bits);
+    c.to_i128().map(|n| n as u64 & mask)
+}
+
 fn commutative_const(
     opnd: Operand,
     wanted: IrBinOp,
     constant: u64,
+    bits: usize,
     defs: &[Option<Instruction>],
 ) -> Option<Operand> {
-    let (lhs, rhs, _) = binop(opnd, wanted, defs)?;
-    if const_u64(rhs) == Some(constant) {
+    let (lhs, rhs, ty) = binop(opnd, wanted, defs)?;
+    if !ty.is_integer() || ty.size() * 8 != bits {
+        return None;
+    }
+    if const_in_ring(rhs, bits) == Some(constant) {
         Some(lhs)
-    } else if const_u64(lhs) == Some(constant) {
+    } else if const_in_ring(lhs, bits) == Some(constant) {
         Some(rhs)
     } else {
         None
@@ -751,9 +766,13 @@ fn shift(
     opnd: Operand,
     wanted: IrBinOp,
     amount: u64,
+    bits: usize,
     defs: &[Option<Instruction>],
 ) -> Option<Operand> {
-    let (lhs, rhs, _) = binop(opnd, wanted, defs)?;
+    let (lhs, rhs, ty) = binop(opnd, wanted, defs)?;
+    if !ty.is_integer() || ty.size() * 8 != bits {
+        return None;
+    }
     (const_u64(rhs) == Some(amount)).then_some(lhs)
 }
 
@@ -1113,32 +1132,63 @@ fn unsigned_le_const(
             op: IrCmpOp::Ule,
             lhs,
             rhs,
+            ty,
             ..
-        }) if const_u64(*rhs) == Some(constant) => Some(*lhs),
+        }) if matches!(ty, IrType::U32 | IrType::I32)
+            && const_in_ring(*rhs, 32) == Some(constant) =>
+        {
+            Some(*lhs)
+        }
         _ => None,
     }
 }
 
 fn add_const(opnd: Operand, amount: u64, defs: &[Option<Instruction>]) -> Option<Operand> {
-    commutative_const(opnd, IrBinOp::Add, amount, defs)
+    commutative_const(opnd, IrBinOp::Add, amount, 32, defs)
 }
 
-/// Match `((value & mask) == 0)` in either operand order and return `value`.
-/// This is the condition form produced by lowering Linux's portable `__ffs`
-/// tree. It is intentionally stricter than a generic equality simplifier: the
-/// mask is part of the idiom's proof and each stage is checked independently.
-fn equal_zero_mask(condition: Operand, mask: u64, defs: &[Option<Instruction>]) -> Option<Operand> {
-    let Operand::Value(v) = peel(condition, defs) else {
+/// Normalize one CTZ select into (tested value, zero arm, nonzero arm, type).
+/// If-conversion often uses the mask itself as its condition, reversing the
+/// arms. Explicit Eq/Ne comparisons are accepted only at the 64-bit value
+/// width. Casts are NOT aliases: truncating a mask can change its zero-ness.
+fn zero_mask_select(
+    result: Operand,
+    mask: u64,
+    defs: &[Option<Instruction>],
+) -> Option<(Operand, Operand, Operand, IrType)> {
+    let (cond, yes, no, ty) = select(result, defs)?;
+    if let Some(x) = commutative_const(cond, IrBinOp::And, mask, 64, defs) {
+        return Some((x, no, yes, ty));
+    }
+    let Operand::Value(v) = peel_copies(cond, defs) else {
         return None;
     };
-    let Instruction::Cmp { op, lhs, rhs, .. } = defs.get(v.0 as usize).and_then(Option::as_ref)?
+    let Instruction::Cmp {
+        op,
+        lhs,
+        rhs,
+        ty: cmp_ty,
+        ..
+    } = defs.get(v.0 as usize).and_then(Option::as_ref)?
     else {
         return None;
     };
-    if *op != IrCmpOp::Eq || const_u64(*rhs) != Some(0) {
+    if !matches!(cmp_ty, IrType::U64 | IrType::I64) {
         return None;
     }
-    commutative_const(*lhs, IrBinOp::And, mask, defs)
+    let tested = if const_u64(*rhs) == Some(0) {
+        *lhs
+    } else if const_u64(*lhs) == Some(0) {
+        *rhs
+    } else {
+        return None;
+    };
+    let x = commutative_const(tested, IrBinOp::And, mask, 64, defs)?;
+    match op {
+        IrCmpOp::Eq => Some((x, yes, no, ty)),
+        IrCmpOp::Ne => Some((x, no, yes, ty)),
+        _ => None,
+    }
 }
 
 fn is_incremented(
@@ -1236,7 +1286,10 @@ fn match_clz32(result: Operand, defs: &[Option<Instruction>]) -> Option<Operand>
         (8, 0x00ff_ffff),
         (16, 0x0000_ffff),
     ] {
-        let (count_cond, count_true, count_false, _) = select(count, defs)?;
+        let (count_cond, count_true, count_false, count_ty) = select(count, defs)?;
+        if !matches!(count_ty, IrType::U32 | IrType::I32) {
+            return None;
+        }
         if !is_incremented(count_true, count_false, amount, defs) {
             return None;
         }
@@ -1247,7 +1300,7 @@ fn match_clz32(result: Operand, defs: &[Option<Instruction>]) -> Option<Operand>
         if !same_value(count_cond, value_cond, defs) {
             return None;
         }
-        if !shift(value_true, IrBinOp::Shl, amount, defs)
+        if !shift(value_true, IrBinOp::Shl, amount, 32, defs)
             .is_some_and(|base| same_value(base, value_false, defs))
         {
             return None;
@@ -1274,67 +1327,51 @@ fn match_clz32(result: Operand, defs: &[Option<Instruction>]) -> Option<Operand>
 /// for `n`. Requiring every condition, shift, mask and increment to agree is
 /// what makes this safe. The zero case is preserved explicitly: the Linux tree
 /// returns 63 for zero, while native `tzcnt` returns the operand width. The
-/// rewrite materializes a nonzero Ctz operand and selects 63 for zero.
+/// rewrite sets bit 63 before CtzNonZero, mapping zero to 63 without a guard.
 fn match_ctz64(result: Operand, defs: &[Option<Instruction>]) -> Option<Operand> {
-    let (final_cond, final_true, final_false, final_ty) = select(result, defs)?;
-    if final_ty != IrType::I32 && final_ty != IrType::U32 {
+    let (mut working, final_true, mut count, final_ty) = zero_mask_select(result, 1, defs)?;
+    if !matches!(final_ty, IrType::I32 | IrType::U32) || !is_incremented(final_true, count, 1, defs)
+    {
         return None;
     }
-    if !is_incremented(final_true, final_false, 1, defs) {
-        return None;
-    }
-
-    // The final one-bit test selects only the count; its working-value input
-    // is the operand of the final mask test.
-    let mut working = equal_zero_mask(final_cond, 1, defs)?;
-    let mut count = final_false;
-
     for (amount, mask) in [(2, 3), (4, 15), (8, 255), (16, 65535), (32, 0xffff_ffff)] {
-        let (count_cond, count_true, count_false, count_ty) = select(count, defs)?;
-        if count_ty != IrType::I32 && count_ty != IrType::U32 {
-            return None;
-        }
-        if !is_incremented(count_true, count_false, amount, defs) {
-            return None;
-        }
-
-        let (value_cond, value_true, value_false, value_ty) = select(working, defs)?;
-        if value_ty != IrType::I64 && value_ty != IrType::U64 {
-            return None;
-        }
-        if !same_value(count_cond, value_cond, defs) {
-            return None;
-        }
-        if !shift(value_true, IrBinOp::LShr, amount, defs)
-            .is_some_and(|base| same_value(base, value_false, defs))
+        let (count_x, count_true, count_false, count_ty) = zero_mask_select(count, mask, defs)?;
+        if !matches!(count_ty, IrType::I32 | IrType::U32)
+            || !is_incremented(count_true, count_false, amount, defs)
         {
             return None;
         }
-        if !equal_zero_mask(count_cond, mask, defs)
-            .is_some_and(|base| same_value(base, value_false, defs))
+        let (value_x, value_true, value_false, value_ty) = zero_mask_select(working, mask, defs)?;
+        if !matches!(value_ty, IrType::I64 | IrType::U64)
+            || !same_value(count_x, value_x, defs)
+            || !same_value(value_x, value_false, defs)
+            || !shift(value_true, IrBinOp::LShr, amount, 64, defs)
+                .is_some_and(|base| same_value(base, value_false, defs))
         {
             return None;
         }
         working = value_false;
         count = count_false;
     }
-
     (const_u64(peel(count, defs)) == Some(0)).then_some(peel_copies(working, defs))
 }
 
 fn match_shift_pair(opnd: Operand, amount: u64, defs: &[Option<Instruction>]) -> Option<Operand> {
-    let (a, b, _) = binop(opnd, IrBinOp::Or, defs)?;
+    let (a, b, ty) = binop(opnd, IrBinOp::Or, defs)?;
+    if !matches!(ty, IrType::U32 | IrType::I32) {
+        return None;
+    }
     if let (Some(x), Some(y)) = (
-        shift(a, IrBinOp::LShr, amount, defs),
-        shift(b, IrBinOp::Shl, amount, defs),
+        shift(a, IrBinOp::LShr, amount, 32, defs),
+        shift(b, IrBinOp::Shl, amount, 32, defs),
     ) {
         if same_value(x, y, defs) {
             return Some(x);
         }
     }
     if let (Some(x), Some(y)) = (
-        shift(b, IrBinOp::LShr, amount, defs),
-        shift(a, IrBinOp::Shl, amount, defs),
+        shift(b, IrBinOp::LShr, amount, 32, defs),
+        shift(a, IrBinOp::Shl, amount, 32, defs),
     ) {
         if same_value(x, y, defs) {
             return Some(x);
@@ -1355,10 +1392,10 @@ fn match_bswap32_network(result: Operand, defs: &[Option<Instruction>]) -> Optio
     }
 
     let match_halves = |right: Operand, left: Operand| -> Option<Operand> {
-        let right_shifted = commutative_const(right, IrBinOp::And, 0x00ff_00ff, defs)?;
-        let original = shift(right_shifted, IrBinOp::LShr, 8, defs)?;
-        let left_masked = shift(left, IrBinOp::Shl, 8, defs)?;
-        let left_original = commutative_const(left_masked, IrBinOp::And, 0x00ff_00ff, defs)?;
+        let right_shifted = commutative_const(right, IrBinOp::And, 0x00ff_00ff, 32, defs)?;
+        let original = shift(right_shifted, IrBinOp::LShr, 8, 32, defs)?;
+        let left_masked = shift(left, IrBinOp::Shl, 8, 32, defs)?;
+        let left_original = commutative_const(left_masked, IrBinOp::And, 0x00ff_00ff, 32, defs)?;
         same_value(original, left_original, defs).then_some(peel_copies(original, defs))
     };
     match_halves(a, b).or_else(|| match_halves(b, a))
@@ -1375,10 +1412,10 @@ fn match_masked_swap_stage(
         return None;
     }
     let match_halves = |right: Operand, left: Operand| -> Option<Operand> {
-        let shifted = commutative_const(right, IrBinOp::And, mask, defs)?;
-        let original = shift(shifted, IrBinOp::LShr, amount, defs)?;
-        let masked = shift(left, IrBinOp::Shl, amount, defs)?;
-        let left_original = commutative_const(masked, IrBinOp::And, mask, defs)?;
+        let shifted = commutative_const(right, IrBinOp::And, mask, 32, defs)?;
+        let original = shift(shifted, IrBinOp::LShr, amount, 32, defs)?;
+        let masked = shift(left, IrBinOp::Shl, amount, 32, defs)?;
+        let left_original = commutative_const(masked, IrBinOp::And, mask, 32, defs)?;
         same_value(original, left_original, defs).then_some(peel_copies(original, defs))
     };
     match_halves(a, b).or_else(|| match_halves(b, a))
@@ -2007,14 +2044,14 @@ pub(crate) fn recognize_function(
     // instruction, consumer block, consumer index, new consumer
     // instruction).
     let mut pending_masks: Vec<(usize, usize, Instruction, usize, usize, Instruction)> = Vec::new();
-    // CLZ needs an extra nonzero-input node. Insert only after index-based
-    // rewrites have finished; reverse order preserves earlier match locations.
-    let mut pending_clz = Vec::new();
+    // No insertion is allowed during the scan: def_loc and pending mask
+    // coordinates refer to the original layout. Boolean producer rewrites
+    // remain immediate (with coherent defs/use_counts); every expanding
+    // rewrite is applied after the atomic mask pairs, in reverse order.
+    let mut expansions: Vec<(usize, usize, Value, Vec<Instruction>)> = Vec::new();
     for (block_bi, block) in func.blocks.iter_mut().enumerate() {
         let mut index = 0;
         while index < block.instructions.len() {
-            let mut consumed = 1;
-
             // Shift/rotate count canonicalization: forward integer casts and
             // Copies on the COUNT operand. Every backend consumes a variable
             // count masked at the shift's own width (x86 `%cl` with
@@ -2299,7 +2336,7 @@ pub(crate) fn recognize_function(
                                 ty: IrType::U32,
                             };
                             changes += 1;
-                            index += consumed;
+                            index += 1;
                             continue;
                         }
                         if let Some(src) = match_bswap32_network(Operand::Value(dest), &defs) {
@@ -2310,7 +2347,7 @@ pub(crate) fn recognize_function(
                                 ty: IrType::U32,
                             };
                             changes += 1;
-                            index += consumed;
+                            index += 1;
                             continue;
                         }
                     }
@@ -2332,92 +2369,70 @@ pub(crate) fn recognize_function(
                         changes += 1;
                     }
                 }
-                Instruction::Select { dest, ty, .. }
-                    if *ty == IrType::U32 || *ty == IrType::I32 || *ty == IrType::U64 =>
-                {
+                Instruction::Select { dest, ty, .. } if matches!(ty, IrType::U32 | IrType::I32) => {
                     let dest = *dest;
                     let ty = *ty;
                     if let Some(src) = match_ctz64(Operand::Value(dest), &defs) {
-                        if ty == IrType::U64 {
-                            block.instructions[index] = Instruction::UnaryOp {
-                                dest,
-                                op: IrUnaryOp::Ctz,
-                                src,
-                                ty: IrType::U64,
-                            };
-                        } else {
-                            // The source tree returns 63 for zero (it is
-                            // normally called only after a nonzero guard, but
-                            // the standalone C function is still defined).
-                            // Make the Ctz operand nonzero before evaluating
-                            // it, then select the exact zero result. This is
-                            // required on targets where the native Ctz
-                            // instruction is undefined for zero.
-                            let zero = crate::ir::reexports::Value(next_value_id);
-                            let safe_src = crate::ir::reexports::Value(next_value_id + 1);
-                            let ctz = crate::ir::reexports::Value(next_value_id + 2);
-                            let narrowed = crate::ir::reexports::Value(next_value_id + 3);
-                            next_value_id = next_value_id.saturating_add(4);
-                            block.instructions[index] = Instruction::Cmp {
-                                dest: zero,
-                                op: IrCmpOp::Eq,
-                                lhs: src,
-                                rhs: Operand::Const(IrConst::I64(0)),
-                                ty: IrType::U64,
-                            };
-                            block.instructions.insert(
-                                index + 1,
-                                Instruction::Select {
-                                    dest: safe_src,
-                                    cond: Operand::Value(zero),
-                                    true_val: Operand::Const(IrConst::I64(1)),
-                                    false_val: src,
+                        // The portable tree returns 63 at zero. Setting bit
+                        // 63 preserves every nonzero input's trailing count,
+                        // maps zero to 63, and proves the intrinsic nonzero.
+                        // This replaces the old compare/two-select expansion.
+                        let safe = Value(next_value_id);
+                        let count = Value(next_value_id + 1);
+                        next_value_id = next_value_id.saturating_add(2);
+                        expansions.push((
+                            block_bi,
+                            index,
+                            dest,
+                            vec![
+                                Instruction::BinOp {
+                                    dest: safe,
+                                    op: IrBinOp::Or,
+                                    lhs: src,
+                                    rhs: Operand::Const(IrConst::I64(i64::MIN)),
                                     ty: IrType::U64,
                                 },
-                            );
-                            block.instructions.insert(
-                                index + 2,
                                 Instruction::UnaryOp {
-                                    dest: ctz,
-                                    op: IrUnaryOp::Ctz,
-                                    src: Operand::Value(safe_src),
+                                    dest: count,
+                                    op: IrUnaryOp::CtzNonZero,
+                                    src: Operand::Value(safe),
                                     ty: IrType::U64,
                                 },
-                            );
-                            block.instructions.insert(
-                                index + 3,
                                 Instruction::Cast {
-                                    dest: narrowed,
-                                    src: Operand::Value(ctz),
+                                    dest,
+                                    src: Operand::Value(count),
                                     from_ty: IrType::U64,
                                     to_ty: ty,
                                 },
-                            );
-                            block.instructions.insert(
-                                index + 4,
-                                Instruction::Select {
-                                    dest,
-                                    cond: Operand::Value(zero),
-                                    true_val: Operand::Const(IrConst::I64(63)),
-                                    false_val: Operand::Value(narrowed),
+                            ],
+                        ));
+                        changes += 1;
+                    } else if let Some(src) = match_clz32(Operand::Value(dest), &defs) {
+                        // clz(x | 1) is exact, including the tree's zero -> 31.
+                        // Record its nonzero proof in the IR, otherwise the
+                        // baseline x86 lowering emits an unnecessary diamond.
+                        let safe = Value(next_value_id);
+                        next_value_id = next_value_id.saturating_add(1);
+                        expansions.push((
+                            block_bi,
+                            index,
+                            dest,
+                            vec![
+                                Instruction::BinOp {
+                                    dest: safe,
+                                    op: IrBinOp::Or,
+                                    lhs: src,
+                                    rhs: Operand::Const(IrConst::I32(1)),
                                     ty,
                                 },
-                            );
-                            consumed = 5;
-                        }
-                        changes += 1;
-                    } else if (ty == IrType::U32 || ty == IrType::I32)
-                        && match_clz32(Operand::Value(dest), &defs).is_some()
-                    {
-                        let src = match_clz32(Operand::Value(dest), &defs).unwrap();
-                        // The portable tree returns 31 for zero, not 32.
-                        // clz(x | 1) is exact: the low bit cannot change the
-                        // highest set bit of any nonzero x, and zero becomes
-                        // one. This also avoids an undefined zero-input BSR
-                        // on targets without LZCNT, with no compare/select.
-                        let safe = crate::ir::reexports::Value(next_value_id);
-                        next_value_id = next_value_id.saturating_add(1);
-                        pending_clz.push((block_bi, index, dest, safe, src));
+                                Instruction::UnaryOp {
+                                    dest,
+                                    op: IrUnaryOp::ClzNonZero,
+                                    src: Operand::Value(safe),
+                                    ty,
+                                },
+                            ],
+                        ));
                         changes += 1;
                     }
                 }
@@ -2450,33 +2465,36 @@ pub(crate) fn recognize_function(
                         // chain — the rewrite never touches it).
                         let trunc = crate::ir::reexports::Value(next_value_id);
                         next_value_id = next_value_id.saturating_add(1);
-                        block.instructions[index] = Instruction::Cast {
-                            dest: trunc,
-                            src: value,
-                            from_ty,
-                            to_ty,
-                        };
-                        block.instructions.insert(
-                            index + 1,
-                            Instruction::BinOp {
-                                dest,
-                                op: if is_left {
-                                    IrBinOp::RotateLeft
-                                } else {
-                                    IrBinOp::RotateRight
+                        expansions.push((
+                            block_bi,
+                            index,
+                            dest,
+                            vec![
+                                Instruction::Cast {
+                                    dest: trunc,
+                                    src: value,
+                                    from_ty,
+                                    to_ty,
                                 },
-                                lhs: Operand::Value(trunc),
-                                rhs: amount,
-                                ty: to_ty,
-                            },
-                        );
+                                Instruction::BinOp {
+                                    dest,
+                                    op: if is_left {
+                                        IrBinOp::RotateLeft
+                                    } else {
+                                        IrBinOp::RotateRight
+                                    },
+                                    lhs: Operand::Value(trunc),
+                                    rhs: amount,
+                                    ty: to_ty,
+                                },
+                            ],
+                        ));
                         changes += 1;
-                        consumed = 2;
                     }
                 }
                 _ => {}
             }
-            index += consumed;
+            index += 1;
         }
     }
     func.next_value_id = next_value_id.max(func.next_value_id);
@@ -2489,52 +2507,37 @@ pub(crate) fn recognize_function(
             Instruction::BinOp { dest, .. } => *dest,
             _ => unreachable!("mask distribution consumer is always a BinOp"),
         };
-        if let Some(pb) = func.blocks.get_mut(pbi) {
-            if matches!(
-                pb.instructions.get(pii),
-                Some(Instruction::BinOp { dest: d, .. }) if *d == x_dest
-            ) {
-                pb.instructions[pii] = new_prod;
-            }
-        }
-        if let Some(cb) = func.blocks.get_mut(cbi) {
-            if matches!(
-                cb.instructions.get(cii),
-                Some(Instruction::BinOp { dest: d, .. }) if *d == c_dest
-            ) {
-                cb.instructions[cii] = new_cons;
-            }
+        // Validate BOTH destinations before writing either half. A rejected
+        // pair must not leave a producer/consumer with mismatched semantics.
+        let valid = |bi: usize, ii: usize, dest: Value| {
+            matches!(func.blocks.get(bi).and_then(|b| b.instructions.get(ii)),
+                Some(Instruction::BinOp { dest: d, .. }) if *d == dest)
+        };
+        if valid(pbi, pii, x_dest) && valid(cbi, cii, c_dest) {
+            func.blocks[pbi].instructions[pii] = new_prod;
+            func.blocks[cbi].instructions[cii] = new_cons;
         }
     }
-    for (bi, ii, dest, safe, src) in pending_clz.into_iter().rev() {
+    // Scan order is lexicographic (block, instruction); reverse application
+    // leaves every remaining coordinate intact. Preserve each replaced
+    // instruction's source span on ALL nodes, including the original dest.
+    for (bi, ii, dest, replacement) in expansions.into_iter().rev() {
         let block = &mut func.blocks[bi];
-        block.instructions[ii] = Instruction::BinOp {
-            dest: safe,
-            op: IrBinOp::Or,
-            lhs: src,
-            rhs: Operand::Const(IrConst::I32(1)),
-            ty: IrType::U32,
-        };
-        block.instructions.insert(
-            ii + 1,
-            Instruction::UnaryOp {
-                dest,
-                op: IrUnaryOp::Clz,
-                src: Operand::Value(safe),
-                ty: IrType::U32,
-            },
-        );
+        if block.instructions.get(ii).and_then(Instruction::dest) != Some(dest) {
+            continue;
+        }
         if !block.source_spans.is_empty() {
             let span = block
                 .source_spans
                 .get(ii)
                 .copied()
                 .unwrap_or_else(crate::common::source::Span::dummy);
+            block.source_spans.resize(block.instructions.len(), span);
             block
                 .source_spans
-                .resize(block.instructions.len() - 1, span);
-            block.source_spans.insert(ii + 1, span);
+                .splice(ii..=ii, std::iter::repeat_n(span, replacement.len()));
         }
+        block.instructions.splice(ii..=ii, replacement);
     }
     changes
 }
@@ -2671,7 +2674,7 @@ mod tests {
         for (i, inst) in b.instructions.iter().enumerate() {
             if let Instruction::UnaryOp {
                 dest,
-                op: IrUnaryOp::Clz,
+                op: IrUnaryOp::ClzNonZero,
                 src: Operand::Value(safe),
                 ..
             } = inst
@@ -4819,3 +4822,7 @@ mod tests {
         assert_eq!(recognize_copysign_mem(&mut f), 4);
     }
 }
+
+#[cfg(test)]
+#[path = "bit_idioms_review_tests.rs"]
+mod review_tests;

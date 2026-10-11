@@ -567,6 +567,7 @@ fn peel_int_cast_chain(
 pub(crate) fn remove_redundant_bitop_guards(func: &mut IrFunction) -> usize {
     let max = func.max_value_id() as usize + 1;
     let mut cast_defs: Vec<Option<CastDef>> = vec![None; max];
+    let mut binop_defs: Vec<Option<BinOpDef>> = vec![None; max];
     let mut unary_defs: Vec<Option<UnaryDef>> = vec![None; max];
     for block in &func.blocks {
         for inst in &block.instructions {
@@ -584,6 +585,20 @@ pub(crate) fn remove_redundant_bitop_guards(func: &mut IrFunction) -> usize {
                             to_ty: *to_ty,
                         });
                     }
+                }
+                Instruction::BinOp {
+                    dest,
+                    op,
+                    lhs,
+                    rhs,
+                    ty,
+                } => {
+                    binop_defs[dest.0 as usize] = Some(BinOpDef {
+                        op: *op,
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        ty: *ty,
+                    });
                 }
                 Instruction::UnaryOp { dest, op, src, ty }
                     if matches!(
@@ -615,9 +630,21 @@ pub(crate) fn remove_redundant_bitop_guards(func: &mut IrFunction) -> usize {
                     cond,
                     true_val,
                     false_val,
-                    ..
+                    ty,
                 } => {
-                    if let Some(t) = clz_ctz_zero_guard_replacement(
+                    if let Some(replacement) = safe_clz_guard_replacement(
+                        *dest,
+                        *cond,
+                        *true_val,
+                        *false_val,
+                        *ty,
+                        &cast_defs,
+                        &unary_defs,
+                        &binop_defs,
+                    ) {
+                        *inst = replacement;
+                        changes += 1;
+                    } else if let Some(t) = clz_ctz_zero_guard_replacement(
                         cond,
                         true_val,
                         false_val,
@@ -681,6 +708,76 @@ pub(crate) fn remove_redundant_bitop_guards(func: &mut IrFunction) -> usize {
         }
     }
     changes
+}
+
+/// Fold a guard around the *safe* portable CLZ, not a speculated bare
+/// NonZero intrinsic. At x=0 the OR arm produces W-1: fallback W-1 selects
+/// that existing arm, whereas fallback W requires a new DEFINED-zero Clz(x).
+/// The new unary keeps the operand width; a wider/narrower result carrier is
+/// deliberately rejected instead of accidentally changing the count width.
+#[allow(clippy::too_many_arguments)]
+fn safe_clz_guard_replacement(
+    dest: Value,
+    cond: Operand,
+    true_val: Operand,
+    false_val: Operand,
+    select_ty: IrType,
+    cast_defs: &[Option<CastDef>],
+    unary_defs: &[Option<UnaryDef>],
+    binop_defs: &[Option<BinOpDef>],
+) -> Option<Instruction> {
+    let Operand::Value(root) = peel_int_cast_chain(true_val, cast_defs, false) else {
+        return None;
+    };
+    let unary = unary_defs.get(root.0 as usize)?.as_ref()?;
+    if !matches!(unary.op, IrUnaryOp::Clz | IrUnaryOp::ClzNonZero)
+        || !matches!(
+            unary.ty,
+            IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64
+        )
+    {
+        return None;
+    }
+    let Operand::Value(safe) = peel_int_cast_chain(unary.src, cast_defs, true) else {
+        return None;
+    };
+    let or = binop_defs.get(safe.0 as usize)?.as_ref()?;
+    if or.op != IrBinOp::Or || !or.ty.is_integer() || or.ty.size() != unary.ty.size() {
+        return None;
+    }
+    let one = |o: Operand| matches!(o, Operand::Const(c) if c.to_i128() == Some(1));
+    let x = if one(or.rhs) {
+        or.lhs
+    } else if one(or.lhs) {
+        or.rhs
+    } else {
+        return None;
+    };
+    if peel_int_cast_chain(cond, cast_defs, true) != peel_int_cast_chain(x, cast_defs, true) {
+        return None;
+    }
+    let Operand::Const(zero) = false_val else {
+        return None;
+    };
+    let width = (unary.ty.size() * 8) as i128;
+    if zero.to_i128() == Some(width - 1) {
+        Some(Instruction::Copy {
+            dest,
+            src: true_val,
+        })
+    } else if zero.to_i128() == Some(width)
+        && select_ty.is_integer()
+        && select_ty.size() == unary.ty.size()
+    {
+        Some(Instruction::UnaryOp {
+            dest,
+            op: IrUnaryOp::Clz,
+            src: x,
+            ty: select_ty,
+        })
+    } else {
+        None
+    }
 }
 
 /// Core predicate + rewrite of the redundant zero-guard pattern. Returns the
@@ -883,7 +980,7 @@ fn try_simplify_with_types(
             cond,
             true_val,
             false_val,
-            ..
+            ty,
         } => {
             // select cond, x, x => x (both arms are the same)
             if same_operand(true_val, false_val) {
@@ -910,6 +1007,11 @@ fn try_simplify_with_types(
             // select(cond != 0 -> clz/ctz(x), else W) => clz/ctz(x): the IR
             // defines Clz(0)/Ctz(0) == width, so the intrinsic arm already
             // produces W for zero and the guarded ternary is redundant.
+            if let Some(replacement) = safe_clz_guard_replacement(
+                *dest, *cond, *true_val, *false_val, *ty, cast_defs, unary_defs, binop_defs,
+            ) {
+                return Some(replacement);
+            }
             if let Some(t) =
                 clz_ctz_zero_guard_replacement(cond, true_val, false_val, cast_defs, unary_defs)
             {
@@ -5851,6 +5953,74 @@ mod tests {
                 }
                 other => panic!("expected an AND fold for 2^{k}, got {other:?}"),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod safe_clz_review_tests {
+    use super::*;
+    #[test]
+    fn safe_clz_guards_require_matching_width_and_zero_equivalent_input() {
+        let v = |n| Operand::Value(Value(n));
+        for ty in [IrType::U32, IrType::I32, IrType::U64, IrType::I64] {
+            let width = (ty.size() * 8) as i64;
+            let mut casts = vec![None; 8];
+            let mut unary = vec![None; 8];
+            let mut bins = vec![None; 8];
+            bins[2] = Some(BinOpDef {
+                op: IrBinOp::Or,
+                lhs: v(1),
+                rhs: Operand::Const(IrConst::I64(1)),
+                ty,
+            });
+            unary[3] = Some(UnaryDef {
+                op: IrUnaryOp::ClzNonZero,
+                src: v(2),
+                ty,
+            });
+            let call = |cond, zero, out, casts: &[_], unary: &[_], bins: &[_]| {
+                safe_clz_guard_replacement(
+                    Value(7),
+                    cond,
+                    v(3),
+                    Operand::Const(IrConst::I64(zero)),
+                    out,
+                    casts,
+                    unary,
+                    bins,
+                )
+            };
+            assert!(
+                matches!(call(v(1),width,ty,&casts,&unary,&bins),Some(Instruction::UnaryOp {op:IrUnaryOp::Clz,src,..}) if src==v(1))
+            );
+            assert!(
+                matches!(call(v(1),width-1,ty,&casts,&unary,&bins),Some(Instruction::Copy {src,..}) if src==v(3))
+            );
+            assert!(call(v(1), width - 2, ty, &casts, &unary, &bins).is_none());
+            assert!(call(v(6), width, ty, &casts, &unary, &bins).is_none());
+            casts[4] = Some(CastDef {
+                src: v(1),
+                from_ty: ty,
+                to_ty: IrType::U8,
+            });
+            assert!(call(v(4), width, ty, &casts, &unary, &bins).is_none());
+            casts[5] = Some(CastDef {
+                src: v(4),
+                from_ty: IrType::U8,
+                to_ty: ty,
+            });
+            assert!(call(v(5), width, ty, &casts, &unary, &bins).is_none());
+            let other = if ty.size() == 4 {
+                IrType::U64
+            } else {
+                IrType::U32
+            };
+            assert!(call(v(1), width, other, &casts, &unary, &bins).is_none());
+            bins[2].as_mut().unwrap().ty = other;
+            assert!(call(v(1), width, ty, &casts, &unary, &bins).is_none());
+            unary[3].as_mut().unwrap().src = v(1); // bare NonZero has no safe-zero proof
+            assert!(call(v(1), width, ty, &casts, &unary, &bins).is_none());
         }
     }
 }

@@ -184,6 +184,76 @@ fn proves_nonzero(
     })
 }
 
+/// Portable count recognizers preserve zero -> W-1 by setting an extremal
+/// bit: bit 0 for CLZ, bit W-1 for CTZ. Under a dominating nonzero fact about
+/// x that bit cannot change its count, so the OR can go. Its arithmetic
+/// width must equal the intrinsic width; casts of the OR are transparent only
+/// when they preserve that width. Never use a fact about a pre-truncation root.
+fn guarded_bitcount_input(
+    func: &IrFunction,
+    defs: &FxHashMap<Value, (usize, usize)>,
+    casts: &FxHashMap<Value, (Operand, IrType, IrType)>,
+    facts: &[Fact],
+    mut src: Operand,
+    op: crate::ir::reexports::IrUnaryOp,
+    ty: IrType,
+) -> Option<Operand> {
+    if !matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64) {
+        return None;
+    }
+    let bit = if matches!(
+        op,
+        crate::ir::reexports::IrUnaryOp::Ctz | crate::ir::reexports::IrUnaryOp::CtzNonZero
+    ) {
+        1u64 << (ty.size() * 8 - 1)
+    } else {
+        1
+    };
+    for _ in 0..32 {
+        let Operand::Value(v) = src else {
+            return None;
+        };
+        let &(bi, ii) = defs.get(&v)?;
+        match &func.blocks[bi].instructions[ii] {
+            Instruction::Copy { src: next, .. } => src = *next,
+            Instruction::Cast {
+                src: next,
+                from_ty,
+                to_ty,
+                ..
+            } if from_ty.is_integer()
+                && to_ty.is_integer()
+                && from_ty.size() == ty.size()
+                && to_ty.size() == ty.size() =>
+            {
+                src = *next
+            }
+            Instruction::BinOp {
+                op: crate::ir::reexports::IrBinOp::Or,
+                lhs,
+                rhs,
+                ty: or_ty,
+                ..
+            } if or_ty.is_integer() && or_ty.size() == ty.size() => {
+                let is_bit = |o: Operand| matches!(o, Operand::Const(c) if c.to_i128().map(|n| n as u64) == Some(bit));
+                let x = if is_bit(*rhs) {
+                    *lhs
+                } else if is_bit(*lhs) {
+                    *rhs
+                } else {
+                    return None;
+                };
+                return match x {
+                    Operand::Value(v) if proves_nonzero(facts, v, casts) => Some(x),
+                    _ => None,
+                };
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 fn is_subset(sub: &Set, sup: &Set) -> bool {
     // Both normalised: every `sub` interval must sit inside one `sup` interval.
     let mut j = 0;
@@ -893,6 +963,33 @@ pub fn run_function_with_symbols(func: &mut IrFunction, defined_syms: &FxHashSet
                             src: if t { *true_val } else { *false_val },
                         }
                     }),
+                    Instruction::UnaryOp {
+                        dest,
+                        op:
+                            op @ (crate::ir::reexports::IrUnaryOp::Clz
+                            | crate::ir::reexports::IrUnaryOp::ClzNonZero
+                            | crate::ir::reexports::IrUnaryOp::Ctz
+                            | crate::ir::reexports::IrUnaryOp::CtzNonZero),
+                        src,
+                        ty,
+                    } if let Some(src) =
+                        guarded_bitcount_input(func, &defs, &casts, &stack, *src, *op, *ty) =>
+                    {
+                        Some(Instruction::UnaryOp {
+                            dest: *dest,
+                            op: if matches!(
+                                op,
+                                crate::ir::reexports::IrUnaryOp::Clz
+                                    | crate::ir::reexports::IrUnaryOp::ClzNonZero
+                            ) {
+                                crate::ir::reexports::IrUnaryOp::ClzNonZero
+                            } else {
+                                crate::ir::reexports::IrUnaryOp::CtzNonZero
+                            },
+                            src,
+                            ty: *ty,
+                        })
+                    }
                     Instruction::UnaryOp {
                         dest,
                         op:
@@ -1876,5 +1973,79 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         };
         assert_eq!((val(1), val(2), val(3)), (1, 0, 0));
+    }
+}
+
+#[cfg(test)]
+mod safe_clz_review_tests {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, IrBinOp, IrUnaryOp};
+    #[test]
+    fn nonzero_or_bypass_is_dominance_and_width_scoped() {
+        for (op, bit) in [
+            (IrUnaryOp::ClzNonZero, 1),
+            (IrUnaryOp::CtzNonZero, 1i64 << 31),
+        ] {
+            for truncate in [false, true] {
+                let v = |n| Operand::Value(Value(n));
+                let mut f = IrFunction::new("guarded_safe_clz".into(), IrType::U32, vec![], false);
+                let mut entry = vec![Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::U64,
+                }];
+                entry.push(Instruction::Cast {
+                    dest: Value(1),
+                    src: v(0),
+                    from_ty: IrType::U64,
+                    to_ty: IrType::U32,
+                });
+                let block = |n, ins, term| BasicBlock {
+                    label: BlockId(n),
+                    instructions: ins,
+                    source_spans: vec![],
+                    terminator: term,
+                };
+                let body = |base| {
+                    vec![
+                        Instruction::BinOp {
+                            dest: Value(base),
+                            op: IrBinOp::Or,
+                            lhs: v(1),
+                            rhs: Operand::Const(IrConst::I64(bit)),
+                            ty: IrType::U32,
+                        },
+                        Instruction::UnaryOp {
+                            dest: Value(base + 1),
+                            op,
+                            src: v(base),
+                            ty: IrType::U32,
+                        },
+                    ]
+                };
+                f.blocks = vec![
+                    block(
+                        0,
+                        entry,
+                        Terminator::CondBranch {
+                            cond: v(if truncate { 0 } else { 1 }),
+                            true_label: BlockId(1),
+                            false_label: BlockId(2),
+                        },
+                    ),
+                    block(1, body(2), Terminator::Return(Some(v(3)))),
+                    block(2, body(4), Terminator::Return(Some(v(5)))),
+                ];
+                assert_eq!(run_function(&mut f), usize::from(!truncate));
+                let expected = if truncate { v(2) } else { v(1) };
+                assert!(
+                    matches!(f.blocks[1].instructions[1],Instruction::UnaryOp {src,..} if src==expected)
+                );
+                assert!(
+                    matches!(f.blocks[2].instructions[1],Instruction::UnaryOp {src,..} if src==v(4))
+                );
+                assert_eq!(run_function(&mut f), 0);
+            }
+        }
     }
 }
