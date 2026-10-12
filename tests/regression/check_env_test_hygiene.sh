@@ -61,7 +61,11 @@ MARKER='FIX''ME'
 # Lower this number whenever a measurement comes in below it; never raise it.
 # The pre-epic baseline is more than restored, which is the property this
 # ratchet exists to protect.
-ENV_READ_BUDGET=153
+#
+# The budget is the count, not the count rounded up: a ratchet with slack in it
+# silently permits growth: a budget of 153 over 151 reads passes while allowing
+# two more env reads than the code has, with nothing to stop a third.
+ENV_READ_BUDGET=151
 
 fail=0
 report() { # report <label> <offending lines>

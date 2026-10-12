@@ -2182,9 +2182,17 @@ impl Driver {
         // changes the CFG (the back edge moves from the latch to the body
         // entry), and the layout pass recomputes loops from scratch, so it
         // sees and lays out the rotated shape.
+        // Both switches are resolved once for the whole run, here.  Reading them
+        // inside the pass made this loop do two `environ` scans per function, and
+        // left the module's own documentation ("resolved once, by the driver")
+        // describing an intention the call site had not implemented.
+        let loop_invert_cfg = crate::passes::loop_invert::LoopInvertConfig::new(
+            std::env::var("CCC_NO_LOOP_INVERT").is_err(),
+            std::env::var("CCC_DEBUG_LOOP_INVERT").is_ok(),
+        );
         for func in &mut module.functions {
             if !func.is_declaration {
-                crate::passes::loop_invert::invert_loops(func);
+                crate::passes::loop_invert::invert_loops_with(func, loop_invert_cfg);
             }
         }
 

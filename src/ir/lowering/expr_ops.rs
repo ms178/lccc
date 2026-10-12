@@ -1543,6 +1543,27 @@ impl Lowerer {
                 // home and leaves the upper bits undefined.
                 slf.emit_implicit_cast(val, IrType::U8, int_ty)
             } else {
+                // The compare below reads at `int_ty`, which is the machine
+                // word -- I64 on LP64. An operand defined narrower (a call
+                // returning `int`, a `short` load, a `char`) may not simply be
+                // re-read at 64 bits: the backend spills the 4 bytes the value
+                // actually has and reloads 8, so the branch keys on whatever
+                // the stack held above it. Measured on x86-64 at -O0 before
+                // this clamp: `int main(void) { return 1 != 1 || h(); }` with
+                // `int h(void) { return 0; }` returned 1, gcc returned 0.
+                // Widen explicitly instead -- sign- or zero-extended by the
+                // operand's own type, so zero-ness is exactly preserved and no
+                // stack round trip is involved. Float operands are left alone:
+                // their truthiness is not an int truncation of the value.
+                let narrow_int = matches!(
+                    slf.infer_expr_type(last),
+                    IrType::I8 | IrType::I16 | IrType::I32 | IrType::U8 | IrType::U16 | IrType::U32
+                ) && int_ty == IrType::I64;
+                let val = if narrow_int {
+                    slf.emit_implicit_cast(val, slf.infer_expr_type(last), int_ty)
+                } else {
+                    val
+                };
                 Operand::Value(slf.emit_cmp_val(
                     IrCmpOp::Ne,
                     val,

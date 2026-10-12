@@ -65,9 +65,22 @@ impl Parser {
                 TokenKind::Restrict => {
                     self.advance();
                 }
-                TokenKind::Register | TokenKind::Auto => {
+                TokenKind::Register => {
                     self.advance();
                     any_storage_class = true;
+                }
+                // `auto` shares `register`'s token position, and for a variable
+                // both are type-irrelevant -- but at block scope on a *function*
+                // `auto` is load-bearing: C11 6.7.1p5 makes every block-scope
+                // function declaration *without* `auto` denote the
+                // externally-visible entity, and GNU C uses `auto` to spell a
+                // nested function, i.e. a distinct entity whose prototype must
+                // never retype the outer one. Dropping the fact here is what
+                // forced sema to guess with type inequality instead (F01).
+                TokenKind::Auto => {
+                    self.advance();
+                    any_storage_class = true;
+                    self.attrs.set_nested_fn(true);
                 }
                 TokenKind::Noreturn => {
                     self.advance();
@@ -457,8 +470,19 @@ impl Parser {
                         self.advance();
                         self.attrs.set_extern(true);
                     }
-                    TokenKind::Auto | TokenKind::Register => {
+                    TokenKind::Register => {
                         self.advance();
+                    }
+                    // `auto` shares `register`'s token position, and for a variable both are
+                    // type-irrelevant -- but at block scope on a *function* `auto` is load-bearing:
+                    // C11 6.7.1p5 makes every block-scope function declaration *without* `auto`
+                    // denote the externally-visible entity, and GNU C uses `auto` to spell a
+                    // nested function, i.e. a distinct entity whose prototype must never retype
+                    // the outer one. Dropping the fact here is what forced sema to guess with type
+                    // inequality instead (F01), and guessing is how the miscompile survived.
+                    TokenKind::Auto => {
+                        self.advance();
+                        self.attrs.set_nested_fn(true);
                     }
                     TokenKind::ThreadLocal => {
                         self.advance();
@@ -513,8 +537,19 @@ impl Parser {
                         self.advance();
                         self.attrs.set_extern(true);
                     }
-                    TokenKind::Auto | TokenKind::Register => {
+                    TokenKind::Register => {
                         self.advance();
+                    }
+                    // `auto` shares `register`'s token position, and for a variable both are
+                    // type-irrelevant -- but at block scope on a *function* `auto` is load-bearing:
+                    // C11 6.7.1p5 makes every block-scope function declaration *without* `auto`
+                    // denote the externally-visible entity, and GNU C uses `auto` to spell a
+                    // nested function, i.e. a distinct entity whose prototype must never retype
+                    // the outer one. Dropping the fact here is what forced sema to guess with type
+                    // inequality instead (F01), and guessing is how the miscompile survived.
+                    TokenKind::Auto => {
+                        self.advance();
+                        self.attrs.set_nested_fn(true);
                     }
                     TokenKind::ThreadLocal => {
                         self.advance();
@@ -565,8 +600,19 @@ impl Parser {
                         self.advance();
                         self.attrs.set_extern(true);
                     }
-                    TokenKind::Auto | TokenKind::Register => {
+                    TokenKind::Register => {
                         self.advance();
+                    }
+                    // `auto` shares `register`'s token position, and for a variable both are
+                    // type-irrelevant -- but at block scope on a *function* `auto` is load-bearing:
+                    // C11 6.7.1p5 makes every block-scope function declaration *without* `auto`
+                    // denote the externally-visible entity, and GNU C uses `auto` to spell a
+                    // nested function, i.e. a distinct entity whose prototype must never retype
+                    // the outer one. Dropping the fact here is what forced sema to guess with type
+                    // inequality instead (F01), and guessing is how the miscompile survived.
+                    TokenKind::Auto => {
+                        self.advance();
+                        self.attrs.set_nested_fn(true);
                     }
                     TokenKind::ThreadLocal => {
                         self.advance();
@@ -885,8 +931,19 @@ impl Parser {
                     self.advance();
                     self.attrs.set_extern(true);
                 }
-                TokenKind::Auto | TokenKind::Register => {
+                TokenKind::Register => {
                     self.advance();
+                }
+                // `auto` shares `register`'s token position, and for a variable both are
+                // type-irrelevant -- but at block scope on a *function* `auto` is load-bearing:
+                // C11 6.7.1p5 makes every block-scope function declaration *without* `auto`
+                // denote the externally-visible entity, and GNU C uses `auto` to spell a
+                // nested function, i.e. a distinct entity whose prototype must never retype
+                // the outer one. Dropping the fact here is what forced sema to guess with type
+                // inequality instead (F01), and guessing is how the miscompile survived.
+                TokenKind::Auto => {
+                    self.advance();
+                    self.attrs.set_nested_fn(true);
                 }
                 TokenKind::ThreadLocal => {
                     self.advance();

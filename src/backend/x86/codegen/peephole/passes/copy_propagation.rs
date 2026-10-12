@@ -625,6 +625,7 @@ mod tests {
                     rbp_offset: RBP_OFFSET_NONE,
                     reg_refs: u16::MAX,
                     pinned: true,
+                    inert_dir: false,
                 };
             }
         }

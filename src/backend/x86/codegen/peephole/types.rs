@@ -58,6 +58,11 @@ pub(super) struct LineInfo {
     /// peephole pass. Used for parameter pre-stores (movq %arg_reg, %callee_saved)
     /// that must survive across function calls.
     pub(super) pinned: bool,
+    /// For `LineKind::Directive` only: whether a window may step over this line
+    /// (see [`crate::backend::peephole_common::inert_directive`]). Computed once
+    /// at classification so the barrier test in the hot loop stays integer-only
+    /// and no pass can re-derive the law -- or mis-derive it.
+    pub(super) inert_dir: bool,
 }
 
 /// What kind of assembly line this is, with pre-extracted fields for the
@@ -215,12 +220,27 @@ impl LineInfo {
     pub(super) fn is_nop(self) -> bool {
         self.kind == LineKind::Nop
     }
+    /// True when a locality window may step over this line entirely: a nop or an
+    /// inert directive. The "next real instruction" walkers use it, so a line a
+    /// window may not span is also a line they may not skip on the way to the
+    /// one after it -- the two laws cannot drift again.
+    #[inline]
+    pub(super) fn is_steppable(self) -> bool {
+        self.is_nop() || (self.kind == LineKind::Directive && self.inert_dir)
+    }
+
     #[inline]
     pub(super) fn is_barrier(self) -> bool {
-        matches!(
-            self.kind,
-            LineKind::Label | LineKind::Call | LineKind::Jmp | LineKind::JmpIndirect |
-            LineKind::CondJmp | LineKind::Ret | LineKind::Directive |
+        // A directive blocks a window unless it emits and references nothing
+        // (see `is_steppable`). An unconditional arm would be sound, but it would
+        // cost every `-g` window its locality at the first `.loc`. The reciprocal
+        // error (no directive blocks at all) is unsound across `.long .L1-.` jump
+        // tables and `.p2align ,0xcc`.
+        (self.kind == LineKind::Directive && !self.inert_dir)
+            || matches!(
+                self.kind,
+                LineKind::Label | LineKind::Call | LineKind::Jmp | LineKind::JmpIndirect |
+            LineKind::CondJmp | LineKind::Ret |
             // ms178: push/pop (incl. pushfq/popfq with REG_NONE) read/write the
             // stack and adjust %rsp. Treating them as barriers keeps every
             // offset-tracking pass sound in their presence. The codegen keeps
@@ -234,7 +254,7 @@ impl LineInfo {
             // having to know the kind (three of them did not: store_forwarding,
             // copy_propagation and `writes_family`).
             LineKind::InlineAsm
-        )
+            )
     }
     #[inline]
     pub(super) fn is_push(self) -> bool {
@@ -313,6 +333,7 @@ pub(super) fn line_info(kind: LineKind, ts: u16) -> LineInfo {
         rbp_offset: RBP_OFFSET_NONE,
         reg_refs: 0,
         pinned: false,
+        inert_dir: false,
     }
 }
 
@@ -338,6 +359,7 @@ pub(super) fn cmp_line_info(ts: u16, s: &str, sb: &[u8]) -> LineInfo {
         rbp_offset: rbp_off,
         reg_refs,
         pinned: false,
+        inert_dir: false,
     }
 }
 
@@ -375,6 +397,7 @@ pub(super) fn xmm_slot_line_info(kind: LineKind, ts: u16, s: &str, sb: &[u8]) ->
         rbp_offset: rbp_off,
         reg_refs: scan_register_refs(sb),
         pinned: false,
+        inert_dir: false,
     }
 }
 
@@ -389,6 +412,7 @@ pub(super) fn line_info_with_regs(kind: LineKind, ts: u16, reg_refs: u16) -> Lin
         rbp_offset: RBP_OFFSET_NONE,
         reg_refs,
         pinned: false,
+        inert_dir: false,
     }
 }
 
@@ -403,7 +427,15 @@ pub(super) fn line_info_ext(kind: LineKind, ext: ExtKind, ts: u16) -> LineInfo {
         rbp_offset: RBP_OFFSET_NONE,
         reg_refs: 0,
         pinned: false,
+        inert_dir: false,
     }
+}
+
+/// A directive line, with the shared steppability verdict cached.
+fn directive_line_info(text: &str, ts: u16) -> LineInfo {
+    let mut info = line_info(LineKind::Directive, ts);
+    info.inert_dir = crate::backend::peephole_common::inert_directive(text);
+    info
 }
 
 /// Parse one assembly line into a `LineInfo`.
@@ -426,15 +458,22 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
     let lead = &raw[trim_start..];
     let s =
         &lead[..crate::backend::peephole_common::line_len_without_trailing_blanks(lead.as_bytes())];
+    let ts = trim_start as u16;
+
+    // A trailing comment is not part of the line's syntax, but the decisions
+    // below read the last byte: without cutting it, `.long 4  # note:` ends in
+    // ':' and is classified as a *label* -- wrong for every pass that keys off
+    // `LineKind`, and wrong in the other direction too (labels always block a
+    // window, inert directives need not).
+    let s = &s[..crate::backend::peephole_common::line_len_without_trailing_comment(s.as_bytes())];
     let sb = s.as_bytes();
 
     if sb.is_empty() {
-        return line_info(LineKind::Empty, trim_start as u16);
+        return line_info(LineKind::Empty, ts);
     }
 
     let first = sb[0];
     let last = sb[sb.len() - 1];
-    let ts = trim_start as u16;
 
     // Label: ends with ':'
     if last == b':' {
@@ -443,7 +482,7 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
 
     // Directive: starts with '.'
     if first == b'.' {
-        return line_info(LineKind::Directive, ts);
+        return directive_line_info(s, ts);
     }
 
     // Scalar-FP / SSE XMM stack moves: classified precisely (offset + byte
@@ -544,6 +583,7 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
                 rbp_offset: rbp_off,
                 reg_refs,
                 pinned: false,
+                inert_dir: false,
             };
         }
     }
@@ -696,6 +736,7 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
         rbp_offset: rbp_off,
         reg_refs,
         pinned: false,
+        inert_dir: false,
     }
 }
 
@@ -1127,6 +1168,7 @@ pub(super) fn mark_nop(info: &mut LineInfo) {
         rbp_offset: RBP_OFFSET_NONE,
         reg_refs: 0,
         pinned: false,
+        inert_dir: false,
     };
 }
 
@@ -3014,5 +3056,70 @@ mod thunk_comment_tests {
         // The family oracle itself is unaffected by comment text.
         assert_eq!(indirect_thunk_family("rax"), Some(0));
         assert_eq!(indirect_thunk_family("r10"), Some(10));
+    }
+}
+
+#[cfg(test)]
+mod classify_directive_tests {
+    use super::*;
+
+    #[test]
+    fn a_trailing_comment_cannot_turn_data_into_a_label() {
+        // `.long 4  # note:` must not end in ':' and classify as a *label*, so the
+        // data stopped being opaque to a window and every pass that keys off
+        // `LineKind` read the wrong kind.
+        let i = classify_line("    .long 4  # note:");
+        assert_eq!(i.kind, LineKind::Directive);
+        assert!(!i.inert_dir, "a data directive must stay opaque");
+        // A label keeps its meaning with a comment, a blank or a CRLF after it,
+        // and a local label is still a label although it starts with '.'.
+        assert_eq!(classify_line("foo:  # c").kind, LineKind::Label);
+        assert_eq!(classify_line("  .LBB3: ").kind, LineKind::Label);
+        assert_eq!(classify_line("bar:\r").kind, LineKind::Label);
+        // `#` inside quotes is data, not a comment.
+        assert_eq!(
+            classify_line("    .string \"a#b:\"").kind,
+            LineKind::Directive
+        );
+    }
+
+    #[test]
+    fn only_opacity_free_directives_are_steppable() {
+        for (text, want) in [
+            ("    .cfi_startproc", true),
+            ("    .cfi_def_cfa_offset 16", true),
+            ("    .cfi_sections .debug_frame", false),
+            ("    .loc 1 12 4", true),
+            ("    .p2align 4", true),
+            ("    .p2align 4,0xcc", false),
+            ("    .long .L1-.", false),
+            ("    .section .rodata", false),
+        ] {
+            let i = classify_line(text);
+            assert_eq!(i.kind, LineKind::Directive, "{text}");
+            assert_eq!(i.inert_dir, want, "inert flag for {text}");
+            assert_eq!(i.is_steppable(), want, "steppable for {text}");
+            assert_eq!(i.is_barrier(), !want, "barrier for {text}");
+        }
+    }
+
+    #[test]
+    fn vector_copy_shares_the_law_instead_of_keeping_its_own() {
+        // The predicate this module's `is_barrier` uses is the one
+        // `vector_copy` was first written against; the two must not drift.
+        for text in [
+            "    .cfi_startproc",
+            "    .loc 1 12 4",
+            "    .p2align 4",
+            "    .p2align 4,0xcc",
+            "    .long .L1-.",
+        ] {
+            let i = classify_line(text);
+            assert_eq!(
+                i.is_steppable(),
+                crate::backend::peephole_common::inert_directive(text.trim()),
+                "{text}"
+            );
+        }
     }
 }

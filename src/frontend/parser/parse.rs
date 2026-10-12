@@ -98,6 +98,14 @@ pub(super) mod parsed_attr_flag {
     pub const THREAD_LOCAL: u32 = 1 << 3;
     /// `inline` keyword encountered.
     pub const INLINE: u32 = 1 << 4;
+    /// GNU `auto` at block scope: introduces a *nested function*, a distinct
+    /// entity that shares only a basename with any file-scope symbol. Carried as
+    /// a flag because the distinction is a storage-class fact, and the two cases
+    /// need opposite handling in sema (merge into the translation-unit record
+    /// versus do not touch it). Nothing else in the tree can recover it later:
+    /// the type may be identical, which is exactly what a basename collision looks
+    /// like before any name lookup.
+    pub const NESTED_FN: u32 = 1 << 24;
 
     // --- Type qualifiers ---
     /// `const` qualifier encountered.
@@ -228,6 +236,10 @@ impl ParsedDeclAttrs {
         self.flags & parsed_attr_flag::EXTERN != 0
     }
     #[inline]
+    pub fn parsing_nested_fn(&self) -> bool {
+        self.flags & parsed_attr_flag::NESTED_FN != 0
+    }
+    #[inline]
     pub fn parsing_thread_local(&self) -> bool {
         self.flags & parsed_attr_flag::THREAD_LOCAL != 0
     }
@@ -325,6 +337,10 @@ impl ParsedDeclAttrs {
     #[inline]
     pub fn set_extern(&mut self, v: bool) {
         self.set_flag(parsed_attr_flag::EXTERN, v)
+    }
+    #[inline]
+    pub fn set_nested_fn(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::NESTED_FN, v)
     }
     #[inline]
     pub fn set_thread_local(&mut self, v: bool) {

@@ -114,6 +114,23 @@ impl SymbolTable {
         None
     }
 
+    /// The depth of the scope that binds `name`, or `None` when nothing does.
+    /// Depth 0 is file scope.
+    ///
+    /// `lookup` reports *what* the name means but not *where* it was bound, and
+    /// C11 6.2.1p4 makes those two different questions: a block-scope
+    /// declaration of the same basename denotes a different entity, so a caller
+    /// that must not answer a scoped query from the file-scope record needs the
+    /// depth.  Keep it a distinct query rather than folding it into `lookup`:
+    /// every other consumer wants the symbol, not its scope.
+    pub fn lookup_depth(&self, name: &str) -> Option<usize> {
+        self.scopes
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(depth, scope)| scope.symbols.contains_key(name).then_some(depth))
+    }
+
     /// Look up only file-scope storage. Constant-expression queries need to
     /// distinguish a global object (which cannot become a compile-time value
     /// through caller specialization) from a parameter/local that may become
@@ -126,5 +143,56 @@ impl SymbolTable {
 impl Default for SymbolTable {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod binding_depth_tests {
+    use super::{Symbol, SymbolTable};
+    use crate::common::types::{AddressSpace, CType, FunctionType};
+
+    fn fn_sym(name: &str) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            ty: CType::Function(Box::new(FunctionType {
+                return_type: CType::Int,
+                params: Vec::new(),
+                variadic: false,
+            })),
+            explicit_alignment: None,
+            // A test that builds a `Symbol` by literal has to spell every field, and that is
+            // the point: this fixture is about *bindings*, so the address space
+            // it names is `Default`, written rather than defaulted-with-`..`.
+            address_space: AddressSpace::Default,
+        }
+    }
+
+    /// `lookup_depth` is what lets a scoped query refuse the file-scope record.
+    /// Depth 0 is file scope; a shadowed name reports a positive depth even
+    /// though `lookup` returns the same *shape* of symbol either way.
+    #[test]
+    fn depth_distinguishes_the_file_binding_from_a_shadow() {
+        let mut table = SymbolTable::new();
+        assert_eq!(table.lookup_depth("f"), None, "nothing declared yet");
+        table.declare(fn_sym("f"));
+        assert_eq!(table.lookup_depth("f"), Some(0), "file scope is depth 0");
+        table.push_scope();
+        assert_eq!(
+            table.lookup_depth("f"),
+            Some(0),
+            "an inner scope that binds nothing keeps the file binding"
+        );
+        table.declare(fn_sym("f"));
+        assert_eq!(
+            table.lookup_depth("f"),
+            Some(1),
+            "a block-scope declaration of the same basename is a distinct entity"
+        );
+        table.pop_scope();
+        assert_eq!(
+            table.lookup_depth("f"),
+            Some(0),
+            "and it stops at the scope end"
+        );
     }
 }

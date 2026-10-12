@@ -25,6 +25,7 @@ pub(crate) mod x86_common; // Shared x86/i686 register names, condition codes, a
 pub(crate) mod live_range; // Linear scan data structures (LiveRange, LinearScanAllocator)
 pub(crate) mod liveness; // Live interval computation
 pub(crate) mod location_alloc;
+pub(crate) mod narrow_copy; // Bounded aggregate tail copy, shared by both x86 backends
 pub(crate) mod regalloc; // Linear scan register allocator
 pub(crate) mod split_ranges; // Live range splitting for call-spanning values // P0-A global location allocation (cross-block GLA)
 

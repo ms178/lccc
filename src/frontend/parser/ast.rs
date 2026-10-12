@@ -85,10 +85,66 @@ pub mod func_attr_flag {
     pub const COLD: u32 = 1 << 16;
 }
 
+/// The declaration *specifiers* of a function definition: the part of its
+/// attribute set that a `__attribute__` list cannot spell.  Grouped so that
+/// assembling `FunctionAttributes` is one call whose signature is complete,
+/// instead of a list of setters each caller keeps by hand.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct DefSpecifiers {
+    pub static_: bool,
+    pub inline_: bool,
+    pub extern_: bool,
+    pub gnu_inline: bool,
+    pub always_inline: bool,
+    pub noinline: bool,
+}
+
 impl FunctionAttributes {
     /// Create a new `FunctionAttributes` with all flags cleared.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The attributes of a function *definition*, assembled from the parser's
+    /// collected declaration state in one place.
+    ///
+    /// The file-scope path and the nested-function path each enumerated the flags
+    /// they happened to copy, and the lists drifted: the nested one carried six
+    /// of these twenty-one, so `auto void f(void) __attribute__((noreturn))
+    /// { for (;;) {} }` defined a function that analysis did not consider
+    /// noreturn -- with `pure`, `const` and `cold` dropped the same way, which is
+    /// both a wrong diagnostic answer and a lost optimization.  Sharing the
+    /// assembly is what stops the next attribute from being forgotten; a second
+    /// hand-kept list would only re-open it.
+    ///
+    /// `no_instrument` is an argument rather than a read of `decl` because the
+    /// file-scope caller merges the attribute with a prior declaration's (`S13`),
+    /// and that merge needs state `decl` does not have.
+    pub fn for_definition(decl: &DeclAttributes, spec: DefSpecifiers, no_instrument: bool) -> Self {
+        let mut attrs = Self::new();
+        attrs.set_static(spec.static_);
+        attrs.set_inline(spec.inline_);
+        attrs.set_extern(spec.extern_);
+        attrs.set_gnu_inline(spec.gnu_inline);
+        attrs.set_always_inline(spec.always_inline);
+        attrs.set_noinline(spec.noinline);
+        attrs.set_constructor(decl.is_constructor());
+        attrs.set_destructor(decl.is_destructor());
+        attrs.set_weak(decl.is_weak());
+        attrs.set_used(decl.is_used());
+        attrs.set_fastcall(decl.is_fastcall());
+        attrs.regparm = decl.regparm;
+        attrs.set_naked(decl.is_naked());
+        attrs.set_no_instrument(no_instrument);
+        attrs.set_noreturn(decl.is_noreturn());
+        attrs.set_pure(decl.is_pure());
+        attrs.set_const_attr(decl.is_const_attr());
+        attrs.set_cold(decl.is_cold());
+        attrs.section = decl.section.clone();
+        attrs.visibility = decl.visibility.clone();
+        attrs.symver = decl.symver.clone();
+        attrs.diagnose_as = decl.diagnose_as.clone();
+        attrs
     }
 
     // --- flag getters ---
@@ -644,6 +700,10 @@ pub mod decl_attr_flag {
     /// `__attribute__((cold))` — the function is unlikely to execute.
     /// Meaningful on functions only; ignored for variables like GCC.
     pub const COLD: u16 = 1 << 11;
+    /// GNU `auto` at block scope, i.e. a nested function (see
+    /// `parsed_attr_flag::NESTED_FN`). Not an attribute spelling: there is no
+    /// `__attribute__((auto))`, only the storage-class keyword.
+    pub const NESTED_FN: u16 = 1 << 12;
 }
 
 impl DeclAttributes {
@@ -668,6 +728,10 @@ impl DeclAttributes {
     #[inline]
     pub fn is_noreturn(&self) -> bool {
         self.flags & decl_attr_flag::NORETURN != 0
+    }
+    #[inline]
+    pub fn is_nested_fn(&self) -> bool {
+        self.flags & decl_attr_flag::NESTED_FN != 0
     }
     #[inline]
     pub fn is_used(&self) -> bool {
@@ -719,6 +783,10 @@ impl DeclAttributes {
     #[inline]
     pub fn set_noreturn(&mut self, v: bool) {
         self.set_flag(decl_attr_flag::NORETURN, v)
+    }
+    #[inline]
+    pub fn set_nested_fn(&mut self, v: bool) {
+        self.set_flag(decl_attr_flag::NESTED_FN, v)
     }
     #[inline]
     pub fn set_used(&mut self, v: bool) {

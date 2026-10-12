@@ -25,6 +25,15 @@ jobs:
       # binaries link but enter libc with a malformed startup image and die
       # with SIGSEGV.  Install the complete multilib contract before building
       # so the i686 tests exercise compiler codegen rather than host setup.
+      #
+      # This is the ONE provisioning step for the 32-bit runtime: the ABI
+      # cross-checks later in this same job compile, link and *run* `-m32`
+      # caller/callee pairs against it, and each treats a missing runtime as an
+      # infrastructure failure rather than a skip (a skipped ABI gate is how a
+      # miscompile ships).  The runtime is provisioned here, once.  Installing
+      # it in a second step with a narrower package set (no `g++-multilib`)
+      # would let one consumer silently depend on a weaker environment than
+      # the other, so there is exactly one provisioning step.
       - name: Install i686 C runtime and development files
         run: |
           sudo dpkg --add-architecture i386
@@ -124,15 +133,6 @@ jobs:
       - name: Variadic pack count inlining contracts
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_va_arg_pack_len.sh
 
-      # Both checks below compile, link and *run* `-m32` caller/callee pairs, and
-      # each treats a missing 32-bit runtime as an infrastructure failure rather
-      # than a skip -- that refusal is the point (a skipped ABI gate is how a
-      # miscompile ships).  So the packages are installed here rather than trusted
-      # to the runner image, which is how `mold`/`lld` and `gcc-14` are handled in
-      # this same job.
-      - name: Install the 32-bit runtime the ABI cross-checks link against
-        run: sudo apt-get install -y --no-install-recommends gcc-multilib libc6-dev-i386
-
       - name: Empty-aggregate cross-compiler ABI contracts
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_empty_aggregate_abi.sh
 
@@ -188,7 +188,7 @@ jobs:
             gcc --version | head -1
             as --version | head -1
             ld --version | head -1
-            dpkg-query -W -f='${Package} ${Version}\n' gcc-multilib libc6-dev-i386 2>/dev/null || true
+            dpkg-query -W -f='${Package} ${Version}\n' gcc-multilib libc6-dev-i386 2>/dev/null || echo 'gcc-multilib libc6-dev-i386: ABSENT (every -m32 gate on this runner will SKIP, and this record is the only place that says so)'
             echo '== CPU flags =='
             grep -m1 -E '^flags[[:space:]]*:' /proc/cpuinfo || true
             echo '== tested compiler =='
@@ -237,6 +237,43 @@ jobs:
       # missing tier fails and so does an unexpected one.
       - name: Loop-alignment contract gate (emitted assembly)
         run: python3 scripts/check_loop_alignment.py --lccc target/fastbuild/lccc
+      # i386 only: a 1-3 byte struct that is a subobject of a larger by-value
+      # argument is mis-passed under every non-zero -mregparm. Documented debt,
+      # counted in both directions -- growth is a regression, a drop means part of
+      # it is repaid and the number must be re-measured -- and a host without a
+      # 32-bit toolchain SKIPs after proving its controls ran, so "0 divergences"
+      # here always means the class was actually exercised.
+      - name: i386 small-struct regparm ABI debt gate
+        run: bash tests/regression/check_i386_regparm_small_struct_abi.sh
+
+      # Scoped-entity noreturn: a nested `auto` function is a distinct entity
+      # that shares a basename (C11 6.2.1p4), so resolving the noreturn question
+      # by bare name mis-answers -Wreturn-type, switch fallthrough and statement
+      # expressions in both directions.  Asserted absolutely (a compiler with the
+      # diagnostics off fails) and differentially against gcc where gcc accepts the
+      # spelling; the one row without an oracle pins our documented superset.  The
+      # gate also asserts the *emitted* control flow for the same-signature case,
+      # where no warning distinguishes the two answers.
+      - name: Scoped-noreturn diagnostic gate
+        run: bash tests/regression/check_scoped_noreturn_diagnostics.sh
+
+      # i386 register-argument staging: the clobber-before-last-read law on the
+      # emitted asm, the no-16-byte-move law for a 12-byte packed argument, and the
+      # cross-compiler boundary (caller from one compiler, callee from the other) that
+      # a single-compiler test cannot see.  The asm legs need no 32-bit runtime; the
+      # boundary leg reports unmeasured cells instead of passing on a host without
+      # multilib.
+      - name: i386 call-staging assembly gate
+        run: bash tests/regression/check_i386_call_staging_asm.sh
+
+      # Census of the loop-inversion pass across the corpus.  The gate has three
+      # failure arms, each with an input that reaches it: 2 when no TU yields a
+      # parseable [INV] record, 1 when a corpus TU fails to compile, and 1 when
+      # the pass is live but rotates nothing.  A census that exits 0 whatever it
+      # counts is a gate that cannot fail, so the exit codes are part of the
+      # contract.
+      - name: Loop-inversion census
+        run: python3 scripts/loop_invert_census.py --lccc target/fastbuild/lccc --quiet
 
       # Nested same-tag record identity, differential against the host GCC.
       # The runtime corpus cannot cover this: GCC rejects the offending program
@@ -354,6 +391,20 @@ jobs:
 
       - name: Verify differential-fuzz engine wiring
         run: python3 scripts/fuzz_diff.py --check-engines
+
+      # The Expat workload's differential rule (identical testcase identity +
+      # identical feature configuration, not equal counts) is a compiler-free
+      # contract, so it runs here even though no CI job builds Expat; the
+      # workload itself stays manual and its summary says so.
+      - name: Expat JUnit comparison contract
+        run: python3 tests/workloads/expat-2.8.5/junit_check.py --self-test
+
+      # Same reasoning as the gate above: the AArch64 dispatcher goldens ratchet and
+      # its in-crate twin both enumerate the dispatcher by scanning Rust text, and a
+      # scan that finds nothing passes. These fixtures pin the scanner's rules and
+      # the "# arms:" latch between the two consumers, without a toolchain.
+      - name: AArch64 dispatcher region contract
+        run: python3 -m unittest discover -s tests/aarch64 -p 'test_*.py'
 
       # Dependency-free differential smoke: a handful of synthetic programs
       # compiled with LCCC and the host GCC across -O0/-O2 must agree.  This
@@ -1145,6 +1196,8 @@ jobs:
           bash tests/regression/check_redundant_test_elimination.sh
           python3 tests/regression/verify_pr713_audit.py --quiet
           python3 scripts/check_doc_links.py
+          python3 scripts/check_peephole_directive_step.py
+          python3 scripts/check_pr_claim_fidelity.py
           bash tests/regression/check_ra_web_inloop_use.sh
           bash tests/regression/check_store_alu_cross_join.sh
           bash tests/regression/check_gla_remat_policy.sh

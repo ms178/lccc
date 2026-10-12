@@ -74,7 +74,7 @@ pub(super) fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [
         // First, collect pushq callee-saved registers (new prologue style).
         // Skip .cfi directives interspersed between pushes.
         while j < len {
-            if infos[j].is_nop() || infos[j].kind == LineKind::Directive {
+            if super::helpers::steps_over_line(&infos[j], infos[j].trimmed(store.get(j))) {
                 j += 1;
                 continue;
             }
@@ -99,7 +99,8 @@ pub(super) fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [
         // plain subq exists to rewrite, so push elimination must refuse there
         // (handled by the gate below via prologue_subq == None).
         let mut prologue_subq: Option<(usize, i64)> = None;
-        while j < len && (infos[j].is_nop() || infos[j].kind == LineKind::Directive) {
+        while j < len && super::helpers::steps_over_line(&infos[j], infos[j].trimmed(store.get(j)))
+        {
             j += 1;
         }
         if j < len {
@@ -378,7 +379,7 @@ pub(super) fn eliminate_unused_callee_saves_fpo(store: &mut LineStore, infos: &m
         let mut saves: Vec<(RegId, usize)> = Vec::new();
         let mut j = i + 1;
         while j < func_end {
-            if infos[j].is_nop() || infos[j].kind == LineKind::Directive {
+            if super::helpers::steps_over_line(&infos[j], infos[j].trimmed(store.get(j))) {
                 j += 1;
                 continue;
             }

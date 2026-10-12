@@ -1156,7 +1156,7 @@ pub(super) fn fold_load_test_into_cmp(store: &mut LineStore, infos: &mut [LineIn
         let addr_mask = infos[i].reg_refs & !fam_mask;
         let mut j = i + 1;
         while j < len {
-            if infos[j].is_nop() || infos[j].kind == LineKind::Directive {
+            if super::helpers::steps_over_line(&infos[j], infos[j].trimmed(store.get(j))) {
                 j += 1;
                 continue;
             }
@@ -1335,7 +1335,7 @@ pub(super) fn fold_accumulator_roundtrip(store: &mut LineStore, infos: &mut [Lin
         let next_real = |from: usize| -> Option<usize> {
             let mut k = from;
             while k < len {
-                if !infos[k].is_nop() && infos[k].kind != LineKind::Directive {
+                if !infos[k].is_steppable() {
                     return Some(k);
                 }
                 k += 1;
@@ -1537,6 +1537,65 @@ mod tests {
 
     fn frame(body: &str) -> String {
         format!("f:\n.cfi_startproc\n{body}    ret\n.cfi_endproc\n")
+    }
+
+    /// Run ONLY `eliminate_dead_flag_writes`, so the assertion is about guard 4
+    /// (`flags_dead_after`) and not about the rest of the pipeline.
+    fn run_dead_flag_writes(body: &str) -> String {
+        let asm = frame(body);
+        let store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        eliminate_dead_flag_writes(&store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The hazard at the pass that actually consumes it.  `.byte 0xf5`
+    /// is `cmc`: it reads and writes EFLAGS, so the flags are NOT dead after it
+    /// and the producer must survive.  Before the fix, every walker in both
+    /// backends answered "no bytes, no effect" for the whole `LineKind::Directive` class,
+    /// which silently made `.byte`/`.long`/`.fill,0xcc` invisible to
+    /// `flags_dead_after`, to the liveness scans, to callee-save elimination and
+    /// to store forwarding.  The positive arm is the other half of the pin: a
+    /// `.cfi_*` line must stay transparent, because a fold blocked by debug
+    /// noise is a lost optimisation nobody writes a test for.
+    #[test]
+    fn dead_flag_write_survives_data_but_not_a_cfi_line() {
+        // A caller-saved scratch register: %rax would be live-out at the
+        // `ret` (it is the return value), so guard 3 would veto for a reason
+        // that has nothing to do with this test.
+        let add = "    addl $1, %ecx\n";
+        for d in [
+            "    .byte 0xf5\n",
+            "    .byte 0xb8,0x00,0x00,0x00,0x00\n",
+            "    .p2align 4,0xcc\n",
+            "    .long .L1-.L2\n",
+            "    .fill 4,1,0xf8\n",
+        ] {
+            let out = run_dead_flag_writes(&format!("{add}{d}"));
+            assert!(
+                out.contains("addl $1, %ecx"),
+                "{d:?}: flags declared dead across {d:?}:\n{out}"
+            );
+        }
+        for d in [
+            "    .cfi_adjust_cfa_offset 16\n",
+            "    .cfi_startproc\n",
+            "    .p2align 4\n",
+            "    .p2align 4,,10\n",
+            "    .loc 1 42 7\n",
+        ] {
+            let out = run_dead_flag_writes(&format!("{add}{d}"));
+            assert!(
+                !out.contains("addl $1, %ecx"),
+                "{d:?}: bookkeeping blocked guard 4:\n{out}"
+            );
+        }
     }
 
     fn slot_refs(out: &str, slot: &str) -> usize {
@@ -2931,6 +2990,61 @@ mod tests {
             assert!(
                 !out.contains("cmpb $0"),
                 "fold must refuse address-write staging: {out}"
+            );
+        }
+
+        /// The step law at the pass that the directive-step guard exists for.
+        /// `fold_accumulator_roundtrip` looks from the staging copy to the RMW
+        /// through a `next_real` walk; when that walk tested `kind
+        /// != LineKind::Directive` it stepped over *any* directive, and a `.byte`
+        /// in a function body is machine code -- here a `cmc`, which the folded
+        /// `addq` would jump over and change the flags the data depends on.
+        /// Asserted in both directions so neither a permissive nor a paranoid
+        /// rewrite of the walk can pass by accident: an inert directive must not
+        /// veto the fold either.
+        /// The step law at the pass the directive-step guard exists for.
+        /// `fold_accumulator_roundtrip` finds the RMW with a `next_real` walk; a
+        /// walk that tests `kind != LineKind::Directive` steps over *any*
+        /// directive -- but a `.byte` in a function body is machine code, here a
+        /// `cmc`, whose flags the folded `xorq` would jump over.  Asserted in both
+        /// directions: an opacity-free directive must not veto the fold either,
+        /// which is what keeps this from being a test of paranoia.
+        #[test]
+        fn fold_accumulator_roundtrip_neither_crosses_data_nor_balks_at_bookkeeping() {
+            let body = |directive: &str| {
+                run(&format!(
+                    "foo:\n\
+                     .cfi_startproc\n\
+                     .LBB2:\n\
+                     \x20   movq %r8, %rax\n\
+                     \x20   {directive}\n\
+                     \x20   xorq %r10, %rax\n\
+                     \x20   movq %rax, %r8\n\
+                     \x20   addl $1, %ebx\n\
+                     \x20   cmpl $4, %ebx\n\
+                     \x20   jne .LBB2\n\
+                     \x20   movq %r8, %rax\n\
+                     \x20   ret\n\
+                     .cfi_endproc\n"
+                ))
+            };
+            let data = body("    .byte 0xf5");
+            assert!(
+                !data.contains("xorq %r10, %r8"),
+                "the fold must not step over emitted data:\n{data}"
+            );
+            assert!(
+                data.contains("movq %rax, %r8"),
+                "the round trip survives intact when data is in the way:\n{data}"
+            );
+            assert!(
+                data.contains(".byte 0xf5"),
+                "and the data itself must not be moved or deleted:\n{data}"
+            );
+            let bookkeeping = body("    .cfi_adjust_cfa_offset 8");
+            assert!(
+                bookkeeping.contains("xorq %r10, %r8"),
+                "an opacity-free directive must not veto the fold:\n{bookkeeping}"
             );
         }
 

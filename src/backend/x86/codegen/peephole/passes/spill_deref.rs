@@ -558,9 +558,8 @@ fn is_epilogue_tail(store: &LineStore, infos: &[LineInfo], k: usize, func_end: u
     let mut j = k;
     let limit = (k + 24).min(func_end);
     while j < limit {
-        if infos[j].is_nop()
-            || infos[j].kind == LineKind::Empty
-            || matches!(infos[j].kind, LineKind::Directive)
+        if infos[j].kind == LineKind::Empty
+            || super::helpers::steps_over_line(&infos[j], infos[j].trimmed(store.get(j)))
         {
             j += 1;
             continue;

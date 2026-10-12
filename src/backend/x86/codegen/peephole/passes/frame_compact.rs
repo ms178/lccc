@@ -17,10 +17,16 @@
 use super::super::types::*;
 use super::helpers::*;
 
-/// Skip NOP and Directive lines (CFI directives appear between prologue instructions).
-fn next_non_nop_or_directive(infos: &[LineInfo], start: usize, limit: usize) -> usize {
+/// Skip NOP and *benign* Directive lines (CFI directives appear between
+/// prologue instructions; a data directive does not, and stops the scan).
+fn next_non_nop_or_directive(
+    store: &LineStore,
+    infos: &[LineInfo],
+    start: usize,
+    limit: usize,
+) -> usize {
     let mut j = start;
-    while j < limit && (infos[j].is_nop() || matches!(infos[j].kind, LineKind::Directive)) {
+    while j < limit && super::helpers::steps_over_line(&infos[j], infos[j].trimmed(store.get(j))) {
         j += 1;
     }
     j
@@ -45,7 +51,7 @@ pub(super) fn compact_frame(store: &mut LineStore, infos: &mut [LineInfo]) {
         }
 
         // Next non-nop/directive should be "movq %rsp, %rbp"
-        let mut j = next_non_nop_or_directive(infos, i + 1, len);
+        let mut j = next_non_nop_or_directive(store, infos, i + 1, len);
         if j >= len {
             i = j;
             continue;
@@ -58,7 +64,7 @@ pub(super) fn compact_frame(store: &mut LineStore, infos: &mut [LineInfo]) {
         j += 1;
 
         // Next non-nop/directive should be "subq $N, %rsp"
-        j = next_non_nop_or_directive(infos, j, len);
+        j = next_non_nop_or_directive(store, infos, j, len);
         if j >= len {
             i = j;
             continue;
@@ -92,7 +98,7 @@ pub(super) fn compact_frame(store: &mut LineStore, infos: &mut [LineInfo]) {
             alive: bool, // not NOP'd
         }
         let mut saves: Vec<CalleeSave> = Vec::new();
-        j = next_non_nop_or_directive(infos, j, len);
+        j = next_non_nop_or_directive(store, infos, j, len);
         let mut scan = j;
         while scan < len {
             if infos[scan].is_nop() {
@@ -419,7 +425,7 @@ pub(super) fn remove_dead_leaf_frame(store: &mut LineStore, infos: &mut [LineInf
         let mut func_end = len;
         let mut j = i + 1;
         while j < len {
-            if infos[j].is_nop() || matches!(infos[j].kind, LineKind::Directive) {
+            if super::helpers::steps_over_line(&infos[j], infos[j].trimmed(store.get(j))) {
                 let dj = infos[j].trimmed(store.get(j));
                 if dj.starts_with(".size ") {
                     func_end = j + 1;
@@ -454,7 +460,7 @@ pub(super) fn remove_dead_leaf_frame(store: &mut LineStore, infos: &mut [LineInf
                 let mut q = j + 1;
                 let mut ret_paired = false;
                 while q < len {
-                    if infos[q].is_nop() || matches!(infos[q].kind, LineKind::Directive) {
+                    if super::helpers::steps_over_line(&infos[q], infos[q].trimmed(store.get(q))) {
                         q += 1;
                         continue;
                     }
@@ -483,7 +489,10 @@ pub(super) fn remove_dead_leaf_frame(store: &mut LineStore, infos: &mut [LineInf
                     let mut paired = false;
                     while p > i {
                         p -= 1;
-                        if infos[p].is_nop() || matches!(infos[p].kind, LineKind::Directive) {
+                        if super::helpers::steps_over_line(
+                            &infos[p],
+                            infos[p].trimmed(store.get(p)),
+                        ) {
                             continue;
                         }
                         paired = epilogues.contains(&p);
@@ -545,6 +554,9 @@ pub(super) fn remove_dead_leaf_frame(store: &mut LineStore, infos: &mut [LineInf
 fn rewrite_cfa_after(store: &mut LineStore, infos: &mut [LineInfo], at: usize, new_offset: i64) {
     let len = store.len();
     let mut d = at + 1;
+    // DIRECTIVE-LAW: selecting -- the walk is hunting the `.cfi_def_cfa_offset`
+    // lines of one prologue to rewrite them in place; it neither deletes nor moves
+    // a line, so the opacity rule for fold windows does not apply.
     while d < len && matches!(infos[d].kind, LineKind::Directive) {
         let dl = infos[d].trimmed(store.get(d));
         if dl.starts_with(".cfi_def_cfa_offset ") {
@@ -570,7 +582,7 @@ fn prologue_precedes_label(store: &LineStore, infos: &[LineInfo], at: usize) -> 
     let mut p = at;
     while p > 0 {
         p -= 1;
-        if infos[p].is_nop() || matches!(infos[p].kind, LineKind::Directive) {
+        if super::helpers::steps_over_line(&infos[p], infos[p].trimmed(store.get(p))) {
             if infos[p].trimmed(store.get(p)).starts_with(".cfi_startproc") {
                 return true;
             }

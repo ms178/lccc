@@ -461,6 +461,499 @@ impl LineStore {
     }
 }
 
+// ── Assembler-directive effects ────────────────────────────────────────────────
+
+/// Directives that emit DATA -- bytes into the section being assembled.
+///
+/// A `.byte`/`.long`/`.quad` sequence inside a function body can encode any
+/// instruction -- `adc`, `clc`, a branch, `int3` -- that no mnemonic table can
+/// see, exactly like inline asm, so a walker must not step over it
+/// as if it had no effect.  The question this answers is deliberately narrow:
+/// **can this line put bytes into the current section, or change what the lines
+/// around it mean?**  A directive is benign only if it does neither:
+///
+/// * it emits nothing into the current section.  `.cfi_*` writes `.eh_frame`,
+///   `.loc`/`.file` write the line tables, `.globl`/`.type`/`.size` are symbol
+///   bookkeeping, `.comm`/`.lcomm` reserve space in `.bss` rather than here,
+///   `.ident` goes to `.comment`; and
+/// * it does not change how neighbouring lines are assembled.  `.code16`,
+///   `.code32`, `.arch`, `.intel_syntax`, `.att_syntax` re-interpret every
+///   following instruction, and `.text`, `.data`, `.section .rodata`,
+///   `.pushsection`, `.previous` move the *following* lines out of the section
+///   this window was parsed in.  None of them emits a byte here, yet each makes
+///   "the contiguous run of code I analysed" false, which is the assumption
+///   every caller of this predicate rests on.  (`engineering/evidence/
+///   2026-10-08-pr-audit/directive-census.txt` counts `.section` 68 times in
+///   function bodies -- jump-table islands in `.rodata` -- so this is not a
+///   hypothetical shape.)
+///
+/// Anything the classification does not name is data, because "unrecognized" is
+/// not "harmless".  That is also why `.zero`, `.skip`, `.space` and `.fill` are
+/// *not* benign: all four emit bytes, the first three zeros, and `0x00 0x00`
+/// decodes as `add %al,(%rax)` -- a flag writer -- while
+/// `.fill 1,1,0xF8` is a bare `clc`.  Their reach inside function bodies is
+/// measured at 0 across the 106-source corpora, so the caution refuses no fold
+/// this compiler has ever wanted to make.
+///
+/// The alignment family needs a rule rather than a verdict: in a text section
+/// `.p2align 4` fills with nops (harmless), but the fill byte is the
+/// programmer's choice -- `.p2align 4,0xf8` fills with `clc` and
+/// `.p2align 4,0xcc` with `int3`, both of which a flag or control-flow walk must
+/// not step over.  So an explicit fill operand makes an alignment directive data
+/// (`alignment_fill_is_explicit`), while `.p2align 4,,10` -- empty fill, `max`
+/// only -- stays benign.
+pub(crate) fn directive_emits_data(text: &str) -> bool {
+    let trimmed = text.trim();
+    let Some(rest) = trimmed.strip_prefix('.') else {
+        return false;
+    };
+    // A local label like `.Ltmp3:` is dotted but not a directive: it emits no
+    // bytes and is not what this predicate is for.  Callers select on
+    // `LineKind::Directive` first (labels are a barrier of their own there), so
+    // this only matters to a caller that hands the classifier raw text -- which
+    // is precisely how a "directive" predicate gets reused by a census script or
+    // a new pass, and an answer of "data" for a label would be silently wrong.
+    if trimmed.ends_with(':') {
+        return false;
+    }
+    let name = rest
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .next()
+        .unwrap_or("");
+    let args = &rest[name.len()..];
+    // CFI never touches the section being assembled.  Prefix-matched on
+    // purpose: the previous version enumerated fifteen `.cfi_*` names, which
+    // silently classified the unlisted `.cfi_adjust_cfa_offset` -- the one in
+    // every prologue -- as data.  That cost no folds (census: 0 in bodies) but
+    // the enumeration was wrong in the over-conservative direction, and a
+    // classifier that is wrong in either direction gets trusted in the other.
+    if name.starts_with("cfi_") {
+        return false;
+    }
+    if matches!(
+        name,
+        "p2align" | "p2alignw" | "p2alignl" | "align" | "balign" | "balignw" | "balignl"
+    ) {
+        return alignment_fill_is_explicit(args);
+    }
+    if matches!(
+        name,
+        // Positional/debug/symbol bookkeeping: no bytes here, no re-reading of
+        // what follows.  Deliberately *no* `.text`/`.data`/`.section` family and
+        // no `.arch`/`.code*`/`._syntax` members -- see the doc comment.
+        // `.end` is absent too: it closes `.macro`/`.if` blocks whose *opener*
+        // is already unrecognised (hence data), and a verdict that is only right
+        // because of what some other line does is not a verdict.
+        "loc"
+            | "file"
+            | "ident"
+            | "globl"
+            | "global"
+            | "weak"
+            | "local"
+            | "type"
+            | "size"
+            | "set"
+            | "equ"
+            | "comm"
+            | "lcomm"
+    ) {
+        return false;
+    }
+    // `.byte`, `.2byte`/`.word`, `.4byte`/`.long`, `.8byte`/`.quad`, `.value`,
+    // `.inst`, `.insn`, `.ascii`, `.asciz`, `.string`, `.uleb128`, `.sleb128`,
+    // `.float`, `.double`, `.zero`, `.skip`, `.space`, `.fill`, `.if`/`.else`,
+    // `.macro`/`.rept`/`.irp` blocks, section and mode switches -- and
+    // anything unrecognized.
+    true
+}
+
+/// True when an alignment directive names its own fill byte.
+///
+/// `args` is everything after the directive name: GAS takes
+/// `.p2align <align>[, <fill>[, <max>]]`, so the second comma-separated field
+/// is the fill -- present and non-empty means the padding is arbitrary data,
+/// present and *empty* (`.p2align 4,,10`) means the default nops/zeros.  Fields
+/// are split on commas, not on a whitespace-or-comma class, because ", " and
+/// ",," must not look alike to a fill test.
+pub(crate) fn alignment_fill_is_explicit(args: &str) -> bool {
+    let mut fields = args.split(',');
+    let _ = fields.next(); // <align>
+    matches!(fields.next(), Some(fill) if !fill.trim().is_empty())
+}
+
+/// Byte length of `b` with a trailing, unquoted `#` comment removed.
+///
+/// GAS treats an unquoted `#` as start-of-comment, so the *syntax* of a line
+/// ends there -- but the comment is only invisible to the parser, not to the
+/// line classifiers, which must not look at the last byte of the line (that
+/// reads `.long 4  # note:` as a *label*).  Quoting is honoured because `#` is an
+/// ordinary character inside `"..."` and `'...'`: cutting `.string "a#b:"` at
+/// the `#` would turn a data directive into the string `a`.
+///
+/// A line that *begins* with `#` is returned unchanged: `#APP`, `#NO_APP` and
+/// the `# LCCC_*` markers are whole-line directives whose text is meaningful to
+/// this compiler, and stripping them would erase the inline-asm quarantine.
+pub(crate) fn line_len_without_trailing_comment(b: &[u8]) -> usize {
+    // A line that *begins* with `#` is a comment line, not an instruction with
+    // a comment: `#APP`, `#NO_APP` and the `# LCCC_*` return/ABI markers are
+    // read from the line text by other passes, so cutting at the `#` would
+    // delete them and silently disable the inline-asm quarantine.
+    if b.first() == Some(&b'#') {
+        return b.len();
+    }
+    let mut i = 0;
+    let mut in_str: Option<u8> = None;
+    while i < b.len() {
+        match in_str {
+            Some(q) => {
+                if b[i] == b'\\' {
+                    i += 1; // escaped byte inside the quote
+                } else if b[i] == q {
+                    in_str = None;
+                }
+            }
+            None => match b[i] {
+                b'"' | b'\'' => in_str = Some(b[i]),
+                // Cut here, then drop the blanks the comment left behind: a
+                // classifier that reads the END of the line (the label colon)
+                // must not see a space where the instruction text ended.
+                b'#' => {
+                    let mut end = i;
+                    while end > 0 && matches!(b[end - 1], b' ' | b'\t' | b'\r') {
+                        end -= 1;
+                    }
+                    return end;
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    b.len()
+}
+
+/// Directives a peephole window may step over: they emit no bytes, reference no
+/// data whose value depends on code layout, and cannot switch section.
+///
+/// This is *the* directive law for both x86-64 and i686, in one place, because
+/// the two backends had drifted apart on it: x86-64 treated every directive as
+/// a barrier (sound, but it blinded every locality window at the first `.loc`
+/// on a `-g` command line), while i686 treated *none* of them as one and
+/// justified it with "a directive emits no instruction" -- which is true of
+/// `.cfi_startproc` and false of everything that puts bytes in the section:
+///
+/// * `.long .L1-.`, `.quad sym`, `.string "x"`, `.byte` -- these *are* content.
+///   A jump table lowered into `.text` is one of them: it holds label
+///   differences, so a pass that rewrites or moves lines across it changes what
+///   the table means.
+/// * `.p2align 4,0xcc` -- alignment with an explicit fill emits a trap (or any
+///   byte the author chose) into the middle of the region a window just
+///   certified as contiguous. Without a fill the padding is nops, which is why
+///   the check is on the fill and not on the mnemonic.
+/// * `.section`, `.text`, `.data`, `.bss` -- subsequent lines belong to another
+///   section; position here is meaning, not layout.
+/// * `.ifdef`/`.if`/`.else`/`.endif` -- crossing them changes whether a line is
+///   assembled at all.
+///
+/// Everything else on the allowlist below emits nothing *and* says nothing about
+/// the rest of the file: ordinary unwind info (`.cfi_*`, but see the
+/// `.cfi_sections` exception in the body -- it emits no bytes yet moves every
+/// following FDE between sections), line tables (`.loc`, `.file`),
+/// function-boundary symbols (`.LFB`), symbol metadata (`.size`, `.type`,
+/// `.globl`, `.weak`, `.hidden`, `.set`, `.equ`).
+/// Unknown directives are opaque: the cost of a missed fold is a few bytes, the
+/// cost of a wrong one is a miscompiled object.
+pub(crate) fn inert_directive(text: &str) -> bool {
+    let t = text.trim();
+    if t.starts_with(".cfi_") {
+        // Unwind records put nothing into the section being assembled, so they are
+        // steppable -- except the one that chooses *which section* they go into.
+        // `.cfi_sections <list>` redirects every following FDE, so its position is
+        // meaning exactly as `.section`'s is.  Measured with GNU as 2.44 on a
+        // two-instruction function: with `.cfi_sections .debug_frame` before
+        // `.cfi_startproc` the object has `.debug_frame` (0x38) and no `.eh_frame`
+        // at all; delete the line and the object has `.eh_frame` (0x30) and no
+        // `.debug_frame`; `.text` is 0xb bytes either way -- which is why
+        // `directive_emits_data` may answer "no bytes" for it while this predicate
+        // must not answer "steppable".
+        return !t.starts_with(".cfi_sections");
+    }
+    if t.starts_with(".LFB")
+        || t.starts_with(".loc ")
+        || t.starts_with(".file ")
+        || t.starts_with(".size ")
+        || t.starts_with(".type ")
+        || t.starts_with(".globl ")
+        || t.starts_with(".weak ")
+        || t.starts_with(".hidden ")
+        || t.starts_with(".set ")
+        || t.starts_with(".equ ")
+    {
+        return true;
+    }
+    for prefix in [".p2align", ".balign", ".align"] {
+        // Longest prefix first, so `.p2align`/`.balign` are not shadowed by the
+        // `.align` spelling rules.
+        if let Some(rest) = t.strip_prefix(prefix) {
+            return !alignment_fill_is_explicit(rest);
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod inert_directive_tests {
+    use super::*;
+
+    #[test]
+    fn inert_directives_are_the_ones_that_emit_and_reference_nothing() {
+        for t in [
+            ".cfi_startproc",
+            ".cfi_adjust_cfa_offset 16",
+            ".cfi_def_cfa_register 6",
+            ".loc 1 12 4",
+            ".file 1 \"k.c\"",
+            ".LFB0:",
+            ".size f, .-f",
+            ".type f, @function",
+            ".globl main",
+            ".hidden f",
+            ".p2align 4",
+            ".balign 16",
+            ".align 16",
+        ] {
+            assert!(inert_directive(t), "{t} must be steppable");
+        }
+    }
+
+    #[test]
+    fn content_and_layout_directives_are_opaque() {
+        for t in [
+            // Data: a jump table in .text holds label differences.
+            ".long .L1-.",
+            ".quad f",
+            ".string \"x\"",
+            ".byte 3, 4",
+            ".value 0x1234",
+            // Explicit fill puts a byte (here int3) in the window.
+            ".p2align 4,0xcc",
+            ".p2align 4, 0x90",
+            ".balign 16, 0xcc",
+            // Section switches and conditionals make position meaningful -- and
+            // `.cfi_sections` is a section switch for the unwind stream: it is
+            // what decides whether `.eh_frame` exists in the object at all.
+            ".cfi_sections .debug_frame",
+            ".section .rodata",
+            ".text",
+            ".data",
+            ".bss",
+            ".ifdef FOO",
+            ".endif",
+            // Unknown: fail closed.
+            ".unhandled_pseudo 1",
+        ] {
+            assert!(!inert_directive(t), "{t} must block a window");
+        }
+    }
+
+    #[test]
+    fn trailing_comments_are_cut_unless_they_are_the_whole_line() {
+        // Compare the surviving prefix, not an index: the point is that the
+        // comment is gone and the instruction text is not.
+        let cut = |s: &[u8]| -> Vec<u8> {
+            let n = line_len_without_trailing_comment(s);
+            s[..n].to_vec()
+        };
+        assert_eq!(cut(b".long 4  # note:"), b".long 4");
+        assert_eq!(cut(b"foo:  # c"), b"foo:");
+        // Trailing blanks the comment *covered* must go too, or a classifier
+        // that reads the end of the line (the label colon) sees a space instead
+        // of the label.
+        assert_eq!(cut(b".LBB3:   # note"), b".LBB3:");
+        // `#` inside quotes is data, not a comment.
+        assert_eq!(cut(b".string \"a#b:\""), b".string \"a#b:\"");
+        assert_eq!(cut(b".string \"a\\\"#b\""), b".string \"a\\\"#b\"");
+        // Whole-line `#` markers keep their text: the inline-asm quarantine and
+        // the `# LCCC_*` hints are read from it.
+        assert_eq!(cut(b"#APP"), b"#APP");
+        assert_eq!(cut(b"# NO_APP"), b"# NO_APP");
+        // No comment at all.
+        assert_eq!(cut(b"movl %eax, %ecx"), b"movl %eax, %ecx");
+    }
+}
+
+#[cfg(test)]
+mod directive_law_enforcement {
+    //! The directive law must be *enforced*, not only documented.
+    //!
+    //! Every bug in this family had the same shape: a window walker decided for
+    //! itself that "a directive is not a real instruction" and stepped over it.
+    //! That is right for `.loc` and wrong for `.long .L1-.` (a jump-table entry
+    //! whose value is a code distance), `.p2align 4,0xcc` (an inserted trap) and
+    //! `.section` (position is meaning). `inert_directive` is the one answer;
+    //! this test is what keeps a new pass from inventing a second one by
+    //! grep-forbidding the local decision.
+
+    use std::fs;
+    use std::path::Path;
+
+    /// Lines in the peephole walkers that decide directive opacity by hand.
+    ///
+    /// `kind != LineKind::Directive` is the skipping idiom (the unsound one: it
+    /// steps over data, fill and section-switch directives too). Blocking with
+    /// `kind == LineKind::Directive` is safe, so it is not policed here -- only
+    /// the loosening direction is.
+    fn violations(root: &Path, dir: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.join(dir)];
+        while let Some(p) = stack.pop() {
+            let rd = match fs::read_dir(&p) {
+                Ok(rd) => rd,
+                Err(_) => continue,
+            };
+            for e in rd.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|x| x.to_str()) != Some("rs") {
+                    continue;
+                }
+                let Ok(text) = fs::read_to_string(&path) else {
+                    continue;
+                };
+                let lines: Vec<&str> = text.lines().collect();
+                for (i, raw) in lines.iter().enumerate() {
+                    // Judge the code, not the prose.  Several tests and doc
+                    // comments in these backends *describe* the forbidden pattern
+                    // in order to explain why it is forbidden; matching that text
+                    // made the guard fire on explanation, which trains people to
+                    // reword comments instead of fixing code.
+                    let line = code_part(raw);
+                    if !line.contains("!= LineKind::Directive") {
+                        continue;
+                    }
+                    // An exemption has to be *written down* next to the use, so
+                    // a reviewer sees a decision rather than a drift.
+                    // A marker on the same line or on the line just above both
+                    // count: rustfmt keeps a comment above, and it is adjacent
+                    // either way, which is all a reviewer needs to see.
+                    // A marker anywhere in the comment block directly above also
+                    // counts: the explanation belongs to the statement, and
+                    // rustfmt decides how many lines it takes.
+                    let marked = raw.contains("DIRECTIVE-LAW:")
+                        || lines[..i]
+                            .iter()
+                            .rev()
+                            .take_while(|l| l.trim_start().starts_with("//"))
+                            .any(|l| l.contains("DIRECTIVE-LAW:"));
+                    if marked {
+                        continue;
+                    }
+                    out.push(format!(
+                        "{}:{}: {}",
+                        path.strip_prefix(root).unwrap_or(&path).display(),
+                        i + 1,
+                        line.trim()
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn no_x86_or_i686_walker_skips_directives_by_hand() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("backend");
+        let mut bad = violations(&root, "x86/codegen/peephole");
+        bad.extend(violations(&root, "i686/codegen"));
+        assert!(
+            bad.is_empty(),
+            "directive opacity must come from `inert_directive`/`is_steppable`, \
+             not a local `!= LineKind::Directive` test (mark a deliberate \
+             exception with `DIRECTIVE-LAW:` on the line):\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// Everything before an unquoted `//`.
+    fn code_part(line: &str) -> &str {
+        let bytes = line.as_bytes();
+        let mut in_string = false;
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' if in_string => i += 1,
+                b'"' => in_string = !in_string,
+                b'/' if !in_string && bytes.get(i + 1) == Some(&b'/') => return &line[..i],
+                _ => {}
+            }
+            i += 1;
+        }
+        line
+    }
+
+    #[test]
+    fn the_detector_actually_detects() {
+        // A guard that cannot fail is the failure mode this repository has been
+        // burned by before, so the detector is tested against its own pattern.
+        let tmp = std::env::temp_dir().join("lccc-directive-guard-self-test");
+        let _ = fs::remove_dir_all(&tmp);
+        let dir = tmp.join("x86/codegen/peephole/passes");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("bad.rs"),
+            "fn w(i: &[LineInfo]) {\n    if i[0].kind != LineKind::Directive { }\n}\n",
+        )
+        .unwrap();
+        // Explaining the pattern is not using it: a doc comment and a trailing
+        // comment both have to be ignored, or the guard gets reworded away.
+        fs::write(
+            dir.join("prose.rs"),
+            "/// A walker once tested `kind != LineKind::Directive` and was wrong.\n\
+             fn w(i: &[LineInfo]) {\n    let _ = i; // != LineKind::Directive is the old bug\n}\n",
+        )
+        .unwrap();
+        // And a written-down exemption next to a real use is honoured, in both of
+        // the places rustfmt can leave it.
+        fs::write(
+            dir.join("exempt.rs"),
+            "fn w(i: &[LineInfo]) {\n    // DIRECTIVE-LAW: selecting\n    if i[0].kind != LineKind::Directive { }\n}\n",
+        )
+        .unwrap();
+        let v = violations(&tmp, "x86/codegen/peephole");
+        fs::remove_dir_all(&tmp).unwrap();
+        assert_eq!(
+            v.len(),
+            1,
+            "the fixture must be reported, prose must not: {v:?}"
+        );
+        assert!(v[0].contains("bad.rs:2"), "line number: {}", v[0]);
+    }
+
+    #[test]
+    fn the_steppable_predicate_is_wired_into_every_loose_walker() {
+        // The two walkers that once skipped every directive must go through
+        // the shared predicate; if a refactor drops the call, the fix is gone
+        // even though the law still reads fine.
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/backend/x86/codegen/peephole/passes");
+        let mut users = 0usize;
+        for f in ["dead_writes.rs", "liveness.rs"] {
+            let t = std::fs::read_to_string(root.join(f)).expect(f);
+            users += t.matches("is_steppable()").count();
+        }
+        assert!(
+            users >= 2,
+            "expected both walkers to call `is_steppable`, saw {users}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
