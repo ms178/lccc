@@ -70,6 +70,32 @@ const MAX_STATIC_LOOP_INLINE_BLOCKS: usize = 16;
 /// body keeps the outlined copy, so `inst*(sites-1)` undercounts by `inst`),
 /// and a corpus census proving the 3rd site fires nowhere it loses.
 const MAX_STATIC_LOOP_INLINE_CALLS: usize = 2;
+/// Constant-trip loop helper tier. A plain static helper whose loop exit is
+/// compared against a parameter may be cloned at every call site that passes
+/// a constant in `MIN_CONST_TRIP_COUNT..=MAX_CONST_TRIP_COUNT` for that
+/// parameter, provided the body fits the tier's own size window below. Every
+/// other call keeps the general limits above, and `always_inline` or gnu_inline
+/// bodies never enter the tier.
+///
+/// Measured shape: expat's `sip_round(H, 2|4)` (139 IR instructions, 7 sites,
+/// two of them inside the `sip24_update` loop). GCC 16.2, Clang 23.1 and ICX
+/// all inline every site. LCCC kept four SipHash state words in memory across
+/// rounds and ran 25% more Callgrind instructions (198.9M vs 159.3M) than the
+/// inlined form.
+///
+/// The lower bound: with zero or one iteration no state crosses an iteration
+/// boundary, so the clone only adds setup code. `reference(1)` in
+/// tests/regression/loop_rotate_pressure_gate.c measured +146 Callgrind
+/// instructions when it was cloned at its single-iteration site.
+///
+/// The upper bound covers the measured SipHash counts (2 and 4) with one
+/// doubling of headroom. It was not tuned beyond that. Raising it needs a
+/// Callgrind screen with scripts/callgrind_corpus.py first.
+const MIN_CONST_TRIP_COUNT: i64 = 2;
+const MAX_CONST_TRIP_COUNT: i64 = 8;
+/// Size window for a constant-trip clone, per copy.
+const MAX_CONST_TRIP_INLINE_INSTRUCTIONS: usize = 160;
+const MAX_CONST_TRIP_INLINE_BLOCKS: usize = 16;
 /// At -Os, larger loop bodies stay out of enclosing loops even when inlining
 /// their final call site would remove the standalone copy. LCCC's current
 /// register allocator spills the merged nest heavily (zlib-ng Adler-32).
@@ -386,6 +412,18 @@ fn select_inline_site(
     let budget_exhausted = always_inline_budget_remaining == 0;
     for site in call_sites {
         let callee_data = &callee_map[&site.callee_name];
+        // Constant-trip-only bodies are restricted to qualifying sites in
+        // both passes (see the second pass for the size_optimized rationale).
+        let const_trip_admitted = callee_data.const_trip_only
+            && !size_optimized
+            && const_trip_site_arg(
+                callee_data.loop_bound_params,
+                &callee_data.param_struct_sizes,
+                &site.args,
+            );
+        if callee_data.const_trip_only && !const_trip_admitted {
+            continue;
+        }
         // Never use ordinary inlining for a recursive callee. A clone still
         // contains the recursive call, so fixed-point cloning only inflates
         // the caller and does not remove call overhead. Dedicated recursion
@@ -417,14 +455,15 @@ fn select_inline_site(
                 site.pgo_force,
                 size_optimized,
             )
-            || nested_loop_multisite_static_should_stay_outlined(
-                callee_data,
-                callee_inst_count,
-                loop_blocks.contains(&site.block_idx),
-                caller_has_section,
-                site.pgo_force,
-                size_optimized,
-            )
+            || (!const_trip_admitted
+                && nested_loop_multisite_static_should_stay_outlined(
+                    callee_data,
+                    callee_inst_count,
+                    loop_blocks.contains(&site.block_idx),
+                    caller_has_section,
+                    site.pgo_force,
+                    size_optimized,
+                ))
             || repeated_small_loop_clone_should_stay_outlined(
                 callee_data,
                 callee_inst_count,
@@ -498,6 +537,21 @@ fn select_inline_site(
     for site in call_sites {
         let callee_data = &callee_map[&site.callee_name];
         let call_is_in_loop = loop_blocks.contains(&site.block_idx);
+        // Constant-trip tier: a body admitted only by that tier is cloned only
+        // at a site that passes a small constant for a loop-bound parameter.
+        // The tier is disabled at -Os, where a loop-body clone is a size cost
+        // with no measured benefit. The multi-site loop guard below is
+        // exempted only for this admitted case; every other callee keeps it.
+        let const_trip_admitted = callee_data.const_trip_only
+            && !size_optimized
+            && const_trip_site_arg(
+                callee_data.loop_bound_params,
+                &callee_data.param_struct_sizes,
+                &site.args,
+            );
+        if callee_data.const_trip_only && !const_trip_admitted {
+            continue;
+        }
         let callee_inst_count: usize = callee_data
             .blocks
             .iter()
@@ -511,14 +565,15 @@ fn select_inline_site(
                 site.pgo_force,
                 size_optimized,
             )
-            || nested_loop_multisite_static_should_stay_outlined(
-                callee_data,
-                callee_inst_count,
-                loop_blocks.contains(&site.block_idx),
-                caller_has_section,
-                site.pgo_force,
-                size_optimized,
-            )
+            || (!const_trip_admitted
+                && nested_loop_multisite_static_should_stay_outlined(
+                    callee_data,
+                    callee_inst_count,
+                    loop_blocks.contains(&site.block_idx),
+                    caller_has_section,
+                    site.pgo_force,
+                    size_optimized,
+                ))
             || repeated_small_loop_clone_should_stay_outlined(
                 callee_data,
                 callee_inst_count,
@@ -605,9 +660,15 @@ fn select_inline_site(
             let in_loop = loop_blocks.contains(&site.block_idx);
             let size_cap_exempt = callee_data.is_single_call_site_static
                 && callee_data.size_inline_cost <= MAX_SINGLE_SITE_LOOP_NEST_EXEMPTION_COST;
+            // A constant-trip clone (see MAX_CONST_TRIP_COUNT) is bounded by
+            // the per-caller budget and the hard/absolute caps below. The soft
+            // cap would otherwise veto the second clone in a caller, as in
+            // expat's sip24_final, where the 4-round site follows a 2-round
+            // clone and needs the caller to grow past 200 instructions.
             if caller_too_large
                 && !callee_data.is_always_inline
                 && !size_cap_exempt
+                && !const_trip_admitted
                 && !(in_loop
                     && !callee_data.has_loops
                     && callee_inst_count <= MAX_INLINE_INSTRUCTIONS)
@@ -1973,6 +2034,12 @@ struct CalleeData {
     /// Module-wide direct calls (including a redirected asm label) observed
     /// before inlining.  Multi-site wrappers duplicate their descendants.
     direct_call_count: usize,
+    /// Parameters that bound a loop exit (see `loop_bound_param_mask`).
+    loop_bound_params: u64,
+    /// Admitted only by the constant-trip tier: the body fails the general
+    /// static-loop limits, so ordinary sites must not clone it. Such a callee
+    /// is selected only at a call site with a qualifying constant argument.
+    const_trip_only: bool,
     /// Whether recursively expanding ordinary eligible callees reaches a loop.
     /// A tiny wrapper can otherwise conceal a large loop nest from the raw
     /// tiny/small threshold used by the fixed-point inliner.
@@ -2099,6 +2166,124 @@ fn fits_static_loop_inline_limits(
         && inst_count <= MAX_STATIC_LOOP_INLINE_INSTRUCTIONS
         && block_count <= MAX_STATIC_LOOP_INLINE_BLOCKS;
     small || bounded_clone
+}
+
+/// Bit mask of parameters (index < 64) that bound the exit test of a natural
+/// loop: the parameter's entry value, through plain copies, is an operand of
+/// the compare feeding a loop-exiting conditional branch. A parameter that is
+/// reassigned inside the loop reaches the compare through a phi, so it is not
+/// counted and the tier cannot admit it.
+fn loop_bound_param_mask(func: &IrFunction) -> u64 {
+    if func.blocks.is_empty() {
+        return 0;
+    }
+    let mut param_of: FxHashMap<Value, usize> = FxHashMap::default();
+    let mut copy_src: FxHashMap<Value, Value> = FxHashMap::default();
+    let mut cmp_operands: FxHashMap<Value, (Operand, Operand)> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::ParamRef {
+                    dest, param_idx, ..
+                } => {
+                    param_of.insert(*dest, *param_idx);
+                }
+                Instruction::Copy {
+                    dest,
+                    src: Operand::Value(src),
+                } => {
+                    copy_src.insert(*dest, *src);
+                }
+                Instruction::Cmp { dest, lhs, rhs, .. } => {
+                    cmp_operands.insert(*dest, (lhs.clone(), rhs.clone()));
+                }
+                _ => {}
+            }
+        }
+    }
+    // Follow copy chains to their root, bounded so a cyclic copy (not expected
+    // in SSA, but cheap to defend against) cannot loop forever.
+    let root = |mut v: Value| -> Value {
+        for _ in 0..8 {
+            match copy_src.get(&v) {
+                Some(&s) => v = s,
+                None => break,
+            }
+        }
+        v
+    };
+    let param_of_operand = |op: &Operand| -> Option<usize> {
+        match op {
+            Operand::Value(v) => param_of.get(&root(*v)).copied(),
+            Operand::Const(_) => None,
+        }
+    };
+
+    let label_index: FxHashMap<BlockId, usize> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.label, i))
+        .collect();
+    let cfg = crate::ir::analysis::CfgAnalysis::build(func);
+    let loops =
+        loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
+
+    let mut mask = 0u64;
+    for lp in &loops {
+        for &bi in &lp.body {
+            let Terminator::CondBranch {
+                cond: Operand::Value(cond),
+                true_label,
+                false_label,
+            } = &func.blocks[bi].terminator
+            else {
+                continue;
+            };
+            let exits = [true_label, false_label]
+                .iter()
+                .any(|l| label_index.get(l).is_some_and(|&j| !lp.body.contains(&j)));
+            if !exits {
+                continue;
+            }
+            let Some((lhs, rhs)) = cmp_operands.get(&root(*cond)) else {
+                continue;
+            };
+            for idx in [param_of_operand(lhs), param_of_operand(rhs)]
+                .into_iter()
+                .flatten()
+            {
+                if idx < 64 {
+                    mask |= 1u64 << idx;
+                }
+            }
+        }
+    }
+    mask
+}
+
+/// True when a call passes a small compile-time constant for a parameter that
+/// bounds a loop exit of `callee`. Such a site is a constant-trip clone
+/// candidate; the constant bounds the loop regardless of the other arguments.
+/// Struct-by-value parameters are never scalar constants and are excluded.
+fn const_trip_site_arg(
+    loop_bound_params: u64,
+    param_struct_sizes: &[Option<usize>],
+    args: &[Operand],
+) -> bool {
+    if loop_bound_params == 0 {
+        return false;
+    }
+    args.iter().take(64).enumerate().any(|(i, arg)| {
+        loop_bound_params & (1u64 << i) != 0
+            && param_struct_sizes.get(i).is_some_and(Option::is_none)
+            && match arg {
+                Operand::Const(c) => c
+                    .to_i64()
+                    .is_some_and(|v| (MIN_CONST_TRIP_COUNT..=MAX_CONST_TRIP_COUNT).contains(&v)),
+                Operand::Value(_) => false,
+            }
+    })
 }
 
 fn direct_call_counts(module: &IrModule) -> FxHashMap<String, usize> {
@@ -2326,6 +2511,27 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
         } else {
             MAX_INLINE_BLOCKS_NO_LOOPS
         };
+        // Constant-trip tier (see MAX_CONST_TRIP_COUNT): a plain static loop
+        // helper whose loop exit is bounded by a parameter may be cloned at a
+        // site that passes a small constant for that parameter. The mask is
+        // computed only for candidates inside the size window, so the common
+        // path pays no analysis cost.
+        // `always_inline` and gnu_inline bodies keep their own admission path:
+        // they must be inlined at every site, so they never become
+        // constant-trip-only.
+        let loop_bound_params = if func.is_static
+            && !func.is_inline
+            && !func.is_always_inline
+            && !func.is_gnu_inline_def
+            && has_loops
+            && inst_count_for_static <= MAX_CONST_TRIP_INLINE_INSTRUCTIONS
+            && func.blocks.len() <= MAX_CONST_TRIP_INLINE_BLOCKS
+        {
+            loop_bound_param_mask(func)
+        } else {
+            0
+        };
+        let const_trip_candidate = loop_bound_params != 0;
         // Medium static callees up to MAX_MEDIUM_STATIC_INLINE_INSTRUCTIONS
         // instructions are admitted, including small loop CFGs. This exposes
         // aggregate-return helpers such as make_group to scalar cleanup. The
@@ -2379,6 +2585,7 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
             && !is_trivially_empty
             && !is_small_static
             && !is_medium_static
+            && !const_trip_candidate
             && !fits_single_call_site_static
             // An external-linkage `inline` definition is still an inlining
             // candidate; linkage controls out-of-line emission, not whether
@@ -2463,7 +2670,7 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
         // sip_round (~85 instr, one loop) are otherwise marked
         // exceeds_normal_limits and excluded from ordinary callers, leaving
         // their state in memory. The per-caller budget bounds the growth.
-        let fits_normal = fits_normal_inline_limits(
+        let fits_general_normal = fits_normal_inline_limits(
             inst_count,
             func.blocks.len(),
             func.is_static,
@@ -2480,6 +2687,16 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
             // not exist (glibc rtld __bsearch). Dedicated caps: big enough
             // for glibc's header bodies, still bounded.
             || (func.is_gnu_inline_def && inst_count <= 128 && func.blocks.len() <= 16);
+        // A body admitted only by the constant-trip tier is not a general
+        // normal-limit callee: selection restricts it to qualifying sites.
+        // Its general admission must be ignored here. The medium-static path
+        // in `fits_normal_inline_limits` would otherwise admit it at every
+        // site, which the early skip gate never intended for loop helpers.
+        let const_trip_only = const_trip_candidate
+            && !is_medium_static
+            && !is_small_static
+            && !fits_single_call_site_static;
+        let fits_normal = const_trip_only || fits_general_normal;
         let fits_relaxed = inst_count <= MAX_ALWAYS_INLINE_INSTRUCTIONS
             && func.blocks.len() <= MAX_ALWAYS_INLINE_BLOCKS;
         // Single-call-site statics were already size-checked above against
@@ -2588,6 +2805,8 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
                     && !is_always_inline
                     && !func.is_gnu_inline_def,
                 direct_call_count: total_calls,
+                loop_bound_params,
+                const_trip_only,
                 has_inlineable_loop_descendant: false,
                 has_inlined_calls: func.has_inlined_calls,
                 // Any static callee with a single call site is dead after
@@ -4603,6 +4822,8 @@ mod inline_limit_tests {
             is_gnu_inline_def: false,
             is_plain_static: true,
             direct_call_count: 2,
+            loop_bound_params: 0,
+            const_trip_only: false,
             has_inlineable_loop_descendant: false,
             has_inlined_calls: false,
             is_single_call_site_static: false,
@@ -5185,5 +5406,237 @@ mod phase0_drain_tests {
             fresh_inbound, 0,
             "nothing may branch to the pre-call block's fresh label"
         );
+    }
+}
+
+#[cfg(test)]
+mod const_trip_tests {
+    use super::*;
+    use crate::common::types::IrType;
+    use crate::ir::ops::IrCmpOp;
+    use crate::ir::reexports::{BasicBlock, Instruction, Terminator};
+
+    fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions,
+            terminator,
+            source_spans: Vec::new(),
+        }
+    }
+
+    fn function(blocks: Vec<BasicBlock>) -> IrFunction {
+        IrFunction {
+            name: "callee".into(),
+            return_type: IrType::Void,
+            params: vec![],
+            blocks,
+            is_variadic: false,
+            is_declaration: false,
+            is_static: true,
+            is_inline: false,
+            is_always_inline: false,
+            is_noinline: false,
+            next_value_id: 16,
+            fp_expr_tags: Default::default(),
+            next_label: 8,
+            section: None,
+            visibility: None,
+            is_weak: false,
+            is_used: false,
+            has_inlined_calls: false,
+            param_alloca_values: vec![],
+            uses_sret: false,
+            is_fastcall: false,
+            regparm: None,
+            is_naked: false,
+            no_instrument: false,
+            global_init_label_blocks: vec![],
+            ret_eightbyte_classes: vec![],
+            ret_is_f128_sse: false,
+            is_gnu_inline_def: false,
+            loop_promoted_f64_values: Vec::new(),
+        }
+    }
+
+    fn param_ref(dest: u32, param_idx: usize) -> Instruction {
+        Instruction::ParamRef {
+            dest: Value(dest),
+            param_idx,
+            ty: IrType::I32,
+        }
+    }
+
+    /// `i < bound` with a constant lhs, so only `bound` can be a parameter.
+    fn compare_const_lt(dest: u32, bound: Value) -> Instruction {
+        Instruction::Cmp {
+            dest: Value(dest),
+            op: IrCmpOp::Slt,
+            lhs: Operand::Const(IrConst::I32(0)),
+            rhs: Operand::Value(bound),
+            ty: IrType::I32,
+        }
+    }
+
+    /// entry(0) reads the parameter, header(1) exits to block 3 on
+    /// `0 < bound`, and the body(2) branches back to the header.
+    fn counted_loop(header_bound: Value, entry: Vec<Instruction>) -> IrFunction {
+        function(vec![
+            block(0, entry, Terminator::Branch(BlockId(1))),
+            block(
+                1,
+                vec![compare_const_lt(3, header_bound)],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(3)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(2, vec![], Terminator::Branch(BlockId(1))),
+            block(3, vec![], Terminator::Return(None)),
+        ])
+    }
+
+    #[test]
+    fn mask_marks_parameter_bounding_a_loop_exit() {
+        let f = counted_loop(Value(1), vec![param_ref(1, 1)]);
+        assert_eq!(loop_bound_param_mask(&f), 0b10);
+    }
+
+    #[test]
+    fn mask_follows_copies_to_the_parameter() {
+        let f = counted_loop(
+            Value(5),
+            vec![
+                param_ref(1, 1),
+                Instruction::Copy {
+                    dest: Value(4),
+                    src: Operand::Value(Value(1)),
+                },
+                Instruction::Copy {
+                    dest: Value(5),
+                    src: Operand::Value(Value(4)),
+                },
+            ],
+        );
+        assert_eq!(loop_bound_param_mask(&f), 0b10);
+    }
+
+    #[test]
+    fn mask_ignores_comparisons_outside_any_loop() {
+        let f = function(vec![
+            block(
+                0,
+                vec![param_ref(1, 0), compare_const_lt(2, Value(1))],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(2)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            block(1, vec![], Terminator::Return(None)),
+            block(2, vec![], Terminator::Return(None)),
+        ]);
+        assert_eq!(loop_bound_param_mask(&f), 0);
+    }
+
+    #[test]
+    fn mask_ignores_loops_without_an_exit_edge() {
+        // header(1) branches to block 2 or back to itself; both successors
+        // stay inside the loop body, so no compare is a loop exit.
+        let f = function(vec![
+            block(0, vec![param_ref(1, 1)], Terminator::Branch(BlockId(1))),
+            block(
+                1,
+                vec![compare_const_lt(3, Value(1))],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(3)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(2),
+                },
+            ),
+            block(2, vec![], Terminator::Branch(BlockId(1))),
+        ]);
+        assert_eq!(loop_bound_param_mask(&f), 0);
+    }
+
+    #[test]
+    fn mask_ignores_bounds_that_are_not_a_parameter() {
+        // The bound is an undefined value here, standing in for a phi or an
+        // arithmetic result. Such a bound is not proven to be the parameter.
+        let f = counted_loop(Value(9), vec![param_ref(1, 1)]);
+        assert_eq!(loop_bound_param_mask(&f), 0);
+    }
+
+    fn c32(v: i32) -> Operand {
+        Operand::Const(IrConst::I32(v))
+    }
+
+    #[test]
+    fn site_accepts_constant_trip_counts_from_two_to_eight() {
+        let sizes = [None, None];
+        for v in 2..=8 {
+            assert!(const_trip_site_arg(
+                0b10,
+                &sizes,
+                &[Operand::Value(Value(1)), c32(v)]
+            ));
+        }
+    }
+
+    #[test]
+    fn site_rejects_trip_counts_outside_the_range() {
+        let sizes = [None, None];
+        for v in [-1, 0, 1, 9, 4096] {
+            assert!(
+                !const_trip_site_arg(0b10, &sizes, &[Operand::Value(Value(1)), c32(v)]),
+                "trip {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn site_rejects_non_constant_and_unmarked_arguments() {
+        let sizes = [None, None];
+        // A value argument is never a known constant, even if it is one in practice.
+        assert!(!const_trip_site_arg(
+            0b10,
+            &sizes,
+            &[Operand::Value(Value(1)), Operand::Value(Value(2))]
+        ));
+        // The constant is at index 0, but only index 1 bounds a loop.
+        assert!(!const_trip_site_arg(
+            0b10,
+            &sizes,
+            &[c32(4), Operand::Value(Value(2))]
+        ));
+        // No loop-bound parameter at all.
+        assert!(!const_trip_site_arg(
+            0,
+            &sizes,
+            &[Operand::Value(Value(1)), c32(4)]
+        ));
+    }
+
+    #[test]
+    fn site_rejects_struct_by_value_bound_parameter() {
+        // A struct-by-value parameter is never passed as a scalar constant.
+        let sizes = [None, Some(8)];
+        assert!(!const_trip_site_arg(
+            0b10,
+            &sizes,
+            &[Operand::Value(Value(1)), c32(4)]
+        ));
+    }
+
+    #[test]
+    fn site_accepts_wide_integer_constants_in_range() {
+        let sizes = [None, None];
+        let arg = Operand::Const(IrConst::I64(4));
+        assert!(const_trip_site_arg(
+            0b10,
+            &sizes,
+            &[Operand::Value(Value(1)), arg]
+        ));
     }
 }
