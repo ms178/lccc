@@ -391,6 +391,58 @@ mod memory_read_tests {
     }
 
     #[test]
+    fn legacy_source_reading_stores_are_not_pure_or_const() {
+        use crate::ir::reexports::Value;
+
+        for op in [O::StoreuPs256, O::StoreuPd256] {
+            for source in [Value(0), Value(1)] {
+                let params = (0..2)
+                    .map(|_| crate::ir::reexports::IrParam {
+                        ty: IrType::Ptr,
+                        noalias: false,
+                        struct_size: None,
+                        struct_align: None,
+                        param_align: None,
+                        struct_eightbyte_classes: vec![],
+                        is_f128_sse: false,
+                        riscv_float_class: None,
+                    })
+                    .collect();
+                let mut f = IrFunction::new("legacy_store".into(), IrType::Void, params, false);
+                f.blocks.push(BasicBlock {
+                    label: BlockId(0),
+                    instructions: vec![
+                        Instruction::ParamRef {
+                            dest: Value(0),
+                            param_idx: 0,
+                            ty: IrType::Ptr,
+                        },
+                        Instruction::ParamRef {
+                            dest: Value(1),
+                            param_idx: 1,
+                            ty: IrType::Ptr,
+                        },
+                        Instruction::Intrinsic {
+                            dest: None,
+                            op,
+                            dest_ptr: Some(Value(0)),
+                            args: vec![Operand::Value(source)],
+                        },
+                    ],
+                    terminator: Terminator::Return(None),
+                    source_spans: vec![crate::common::source::Span::dummy(); 3],
+                });
+                f.next_value_id = 2;
+                assert_eq!(
+                    analyze_function_purity(&f, &FxHashSet::default(), &FxHashSet::default()),
+                    (false, false),
+                    "{op:?}, source={source:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn vector_readers_are_not_constant_functions() {
         for op in [
             O::VecLoadF64x2,

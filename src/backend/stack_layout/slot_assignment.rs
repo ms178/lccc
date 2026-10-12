@@ -776,10 +776,11 @@ fn classify_value(
         }
     }
 
-    // Vector values (both the auto-vectorizer's Vec* ops and user-level
-    // SSE/AVX intrinsic results, see IntrinsicOp::vector_result_width) need
-    // protected stack slots to prevent slot reuse from corrupting vector data
-    // during reduction vectorization and real intrinsic chains.
+    // SIMD home metadata comes from IntrinsicOp::vector_home_width in the
+    // stack-layout pre-scan, then propagates through value copies and PHIs.
+    // These homes need protected slots to prevent reuse from corrupting data.
+    // vector_result_width describes actual results instead; a store's source
+    // home metadata is neither a produced value nor a memory-effect proof.
     if is_vector || is_vector128 {
         state.protected_slot_values.insert(dest.0);
     }
