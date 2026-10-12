@@ -1,0 +1,12 @@
+{
+  "scope": "Historical payload retention, not verification of the producing compilers or corrective validation.",
+  "retained_from_commit": "52064a7ad563744e2653faca4b50ec697e304e5a",
+  "retained_git_blob": "5f57a58c54f709ea339187a75fa68da820cfb2e8",
+  "retained_sha256": "e6a08d40318b3413dc3a2ae2203ba0c34166c7fe0a2bacf25e9b915bae79a238",
+  "payload": "review-diagnostics.json",
+  "recorded_producer_head": "cdbb0ef759001d62ab00b6572fac99ba5a97893c",
+  "producer_head_status": "Not available in the fetched main history during this audit; not reconstructed or validated.",
+  "recorded_upstream_base": "e7483ac7608cd63b517ee6b117ecbccb03d9c6fd",
+  "upstream_base_status": "Available in fetched main history. Availability does not verify historical compiler binaries.",
+  "verification": "Payload bytes are hash-anchored in retained-evidence-sha256.json and test_retained_perf_evidence.py. Historical embedded compiler hashes are claims of that payload, not independently reproduced hashes."
+}

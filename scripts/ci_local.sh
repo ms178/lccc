@@ -486,6 +486,9 @@ gate "seg-declarator-space" fast \
 gate "seg-conv-diagnostics" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_seg_conv_diagnostics.sh
 
+gate "seg-target-diagnostics" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_seg_target_diagnostics.sh
+
 gate "chroot-bind" fast bash tests/regression/check_chroot_bind.sh
 
 gate "kernel-tree-clear" fast bash tests/regression/check_kernel_tree_clear.sh

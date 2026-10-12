@@ -392,6 +392,58 @@ mod tests {
         assert_eq!(arguments(&f)[1], Operand::Value(Value(0)));
     }
     #[test]
+    fn store_effect_contract_fold_then_dce() {
+        for op in crate::ir::intrinsics::VECTOR_STORES {
+            for pointer in [None, Some(Value(1))] {
+                let mut f = fixture(vec![
+                    gep(1, 0, IrConst::I64(56)),
+                    Instruction::Intrinsic {
+                        dest: None,
+                        op,
+                        dest_ptr: pointer,
+                        args: vec![
+                            Operand::Value(Value(50)),
+                            Operand::Value(Value(1)),
+                            Operand::Const(IrConst::I64(0)),
+                        ],
+                    },
+                ]);
+                assert_eq!(run(&mut f), 1, "{op:?}: missed folding");
+                assert!(matches!(
+                    f.blocks[0].instructions[1],
+                    Instruction::Intrinsic { dest_ptr: None, .. }
+                ));
+                assert_eq!(run(&mut f), 0, "{op:?}: not idempotent");
+                super::super::dce::eliminate_dead_code(&mut f);
+                assert_eq!(f.blocks[0].instructions.len(), 1, "{op:?}: store deleted");
+                assert_eq!(arguments(&f)[1], Operand::Value(Value(0)));
+                assert_eq!(arguments(&f)[3], Operand::Const(IrConst::I64(56)));
+            }
+        }
+    }
+
+    #[test]
+    fn store_effect_contract_args_form_is_a_dce_root() {
+        for op in crate::ir::intrinsics::VECTOR_STORES {
+            let store = Instruction::Intrinsic {
+                dest: None,
+                op,
+                dest_ptr: None,
+                args: vec![
+                    Operand::Value(Value(50)),
+                    Operand::Value(Value(0)),
+                    Operand::Const(IrConst::I64(0)),
+                ],
+            };
+            // The unused GEP must disappear while the dest-less store survives.
+            // DCE also roots dest-less instructions independently of purity.
+            let mut f = fixture(vec![gep(1, 0, IrConst::I64(0)), store]);
+            super::super::dce::eliminate_dead_code(&mut f);
+            assert_eq!(f.blocks[0].instructions.len(), 1, "{op:?}: store deleted");
+        }
+    }
+
+    #[test]
     fn malformed_arity_and_variable_displacement_fail_closed() {
         for extra in [Operand::Value(Value(20)), Operand::Const(IrConst::I64(0))] {
             let mut f = fixture(vec![

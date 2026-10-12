@@ -30,15 +30,15 @@ use crate::ir::reexports::{
 };
 
 /// Largest transfer emitted as straight-line code. The counted loop's counter
-/// is an entry alloca: at -O0 it lives in memory (a load and a store per 8-byte
-/// word); at -O2 mem2reg promotes it to a register (checked on a 1500-byte copy,
+/// is an entry alloca: at -O0 it lives in memory (a load and a store per 32-byte
+/// block); at -O2 mem2reg promotes it to a register (checked on a 1500-byte copy,
 /// where the loop counter is %rdx). The 2.8x to 3.5x gap quoted for a 320-byte
-/// copy came from an earlier bench/bench_seg.c, which is not in the tree and
-/// whose optimisation level is not recorded, so that figure is not reproduced
-/// here.
+/// copy came from an unretained fixture whose optimisation level and compiler
+/// identity were not recorded, so that figure is not reproduced here.
 ///
-/// Measured with Callgrind (lccc -O2, 20000 calls per size, __seg_gs source and
-/// destination): a 512-byte straight-line copy is 129 instructions and 961 bytes
+/// Historical Callgrind observations (compiler identity not recorded here;
+/// not current-tree validation): lccc -O2, 20000 calls per size, __seg_gs source and
+/// destination. A 512-byte straight-line copy is 129 instructions and 961 bytes
 /// of code; a 520-byte copy through the loop is 248 instructions and the loop is
 /// 99 bytes of code, shared by every size above the limit. A 320-byte
 /// straight-line copy is 81 instructions and 601 bytes of code. Straight-line code

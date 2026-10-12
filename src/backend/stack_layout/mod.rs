@@ -206,7 +206,7 @@ pub fn calculate_stack_space_common(
     }
 
     // Pass 1: Mark all vector intrinsic destinations as vector values.
-    // Uses the single authority `IntrinsicOp::vector_result_width()` so that
+    // Uses the single authority `IntrinsicOp::vector_home_width()` so that
     // USER-level SSE/AVX intrinsics (sad_epu8, maddubs, add_epi32, mul_ps,
     // loadu_si256, ...) are protected exactly like the auto-vectorizer's
     // internal Vec* ops. Previously only the Vec* ops were recognized, so
@@ -220,7 +220,7 @@ pub fn calculate_stack_space_common(
                 dest: Some(d), op, ..
             } = inst
             {
-                match op.vector_result_width() {
+                match op.vector_home_width() {
                     Some(32) => {
                         state.vector_values.insert(d.0);
                         state.protected_slot_values.insert(d.0);

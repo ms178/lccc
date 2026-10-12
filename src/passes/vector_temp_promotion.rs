@@ -1506,15 +1506,9 @@ fn invalidate_for_memory_effects(
         Instruction::Intrinsic {
             op, dest_ptr: None, ..
         } => {
-            // An intrinsic with no destination pointer either only reads
-            // memory (pure) or produces a register-resident vector result and
-            // touches no memory.  VecStoreI64x2 is the exception: it appears in
-            // produces_vector_value for slot sizing but is the memory-form
-            // vector store that writes through args[1] — it must be a full
-            // barrier here.
-            if !op.is_pure()
-                && (!op.produces_vector_value() || matches!(op, IntrinsicOp::VecStoreI64x2))
-            {
+            // Purity is the side-effect contract, not SIMD home shape.
+            // Loads may be pure; every args-form vector store is a barrier.
+            if !op.is_pure() {
                 available.clear();
             }
         }
@@ -2614,50 +2608,51 @@ mod tests {
     }
 
     #[test]
-    fn vec_store_memory_form_is_a_forwarding_barrier() {
-        // VecStoreI64x2 (memory form, dest_ptr: None) writes through args[1].
-        // It must not inherit the register-result exemption of
-        // produces_vector_value.
-        let mut function = function(
-            "vec_store",
-            vec![block(
-                0,
-                vec![
-                    alloca(1, 32, 32),
-                    alloca(6, 32, 32),
-                    intrinsic(
-                        Some(3),
-                        IntrinsicOp::Loadu256,
-                        Some(1),
-                        vec![Operand::Value(Value(2))],
-                    ),
-                    intrinsic(
-                        None,
-                        IntrinsicOp::VecStoreI64x2,
-                        None,
-                        vec![
-                            Operand::Value(Value(7)),
-                            Operand::Value(Value(2)),
-                            Operand::Value(Value(8)),
-                        ],
-                    ),
-                    intrinsic(
-                        Some(5),
-                        IntrinsicOp::Paddb256,
-                        Some(6),
-                        vec![Operand::Value(Value(1)), Operand::Value(Value(9))],
-                    ),
-                ],
-            )],
-        );
-        fuse_in_function(&mut function);
-        let Instruction::Intrinsic { args, .. } = function.blocks[0].instructions.last().unwrap()
-        else {
-            panic!("expected consumer");
-        };
-        // The VecStore wrote through Value(2), the load's source: the forward
-        // must have been killed.
-        assert!(matches!(args[0], Operand::Value(Value(1))));
+    fn store_effect_contract_temp_forwarding_barrier() {
+        // Test all args-form writers, including the half-wide pair store.
+        for op in crate::ir::intrinsics::VECTOR_STORES {
+            let mut function = function(
+                "vec_store",
+                vec![block(
+                    0,
+                    vec![
+                        alloca(1, 32, 32),
+                        alloca(6, 32, 32),
+                        intrinsic(
+                            Some(3),
+                            IntrinsicOp::Loadu256,
+                            Some(1),
+                            vec![Operand::Value(Value(2))],
+                        ),
+                        intrinsic(
+                            None,
+                            op,
+                            None,
+                            vec![
+                                Operand::Value(Value(7)),
+                                Operand::Value(Value(2)),
+                                Operand::Value(Value(8)),
+                            ],
+                        ),
+                        intrinsic(
+                            Some(5),
+                            IntrinsicOp::Paddb256,
+                            Some(6),
+                            vec![Operand::Value(Value(1)), Operand::Value(Value(9))],
+                        ),
+                    ],
+                )],
+            );
+            fuse_in_function(&mut function);
+            let Instruction::Intrinsic { args, .. } =
+                function.blocks[0].instructions.last().unwrap()
+            else {
+                panic!("expected consumer");
+            };
+            // The VecStore wrote through Value(2), the load's source: the forward
+            // must have been killed.
+            assert!(matches!(args[0], Operand::Value(Value(1))));
+        }
     }
 
     #[test]

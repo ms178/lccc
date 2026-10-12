@@ -586,7 +586,13 @@ jobs:
       - name: Run __seg_gs conversion diagnostics check
         env:
           CCC: target/fastbuild/lccc
+          GCC: gcc-14
         run: bash tests/regression/check_seg_conv_diagnostics.sh
+
+      - name: Reject named address spaces on unsupported targets without an ICE
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_seg_target_diagnostics.sh
 
       # Chroot bind() creates a file target for a file source.
       - name: Run chroot bind regression

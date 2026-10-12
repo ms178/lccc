@@ -925,6 +925,19 @@ impl Parser {
     }
 
     pub fn parse(&mut self) -> TranslationUnit {
+        // Named FS/GS spaces are x86 extensions. Diagnose even declaration-only
+        // uses, which otherwise survive optimization without reaching the
+        // backend's fail-closed panic. Tokens are already preprocessed, so a
+        // qualifier in an inactive #if branch is not rejected. Keep this scan
+        // off the x86 hot path (ELF EM_386=3, EM_X86_64=62).
+        if !matches!(crate::common::types::target_elf_machine(), 3 | 62)
+            && let Some(span) = self.tokens.iter().find_map(|token| {
+                matches!(token.kind, TokenKind::SegGs | TokenKind::SegFs).then_some(token.span)
+            })
+        {
+            self.emit_error("named address spaces require an x86 target", span);
+            return TranslationUnit { decls: Vec::new() };
+        }
         let mut decls = Vec::with_capacity(16);
         while !self.at_eof() {
             // The expression frame-budget error is fatal for the TU; stop
@@ -2433,6 +2446,42 @@ impl Parser {
             TypeSpecifier::ComplexDouble => 8,
             TypeSpecifier::Array(elem, _) => Self::preferred_alignof_type_spec(elem, tag_aligns),
             _ => Self::alignof_type_spec(ts, tag_aligns),
+        }
+    }
+}
+
+#[cfg(test)]
+mod named_space_target_tests {
+    use super::*;
+    use crate::common::types::{set_target_elf_machine, target_elf_machine};
+    use crate::frontend::lexer::Lexer;
+
+    #[test]
+    fn named_space_target_contract() {
+        struct RestoreTarget(u16);
+        impl Drop for RestoreTarget {
+            fn drop(&mut self) {
+                set_target_elf_machine(self.0);
+            }
+        }
+        let _restore = RestoreTarget(target_elf_machine());
+        for machine in [3, 62, 183, 243] {
+            set_target_elf_machine(machine);
+            for qualifier in ["__seg_gs", "__seg_fs", ""] {
+                for source in [
+                    format!("extern long {qualifier} value;"),
+                    format!("long f(long {qualifier} *p) {{ return *p; }}"),
+                    format!("void f(long {qualifier} *p) {{ *p = 7; }}"),
+                ] {
+                    let mut parser = Parser::new(Lexer::new(&source, 0).tokenize());
+                    parser.parse();
+                    assert_eq!(
+                        parser.error_count != 0,
+                        !qualifier.is_empty() && !matches!(machine, 3 | 62),
+                        "machine={machine}, source={source}"
+                    );
+                }
+            }
         }
     }
 }

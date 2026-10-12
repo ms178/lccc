@@ -325,8 +325,9 @@ fn analyze_function_purity(
                 // neutral, so a function whose memory writes all went
                 // through vectorizer intrinsics (e.g. a loop-vectorized
                 // `void fill(int*)`, or the BB-SLP 4×u64 copy) was marked
-                // pure and its calls deleted — a miscompile
-                // (tests/regression/bb_slp_pure_store_fn.c).
+                // pure and its calls could be deleted. The runtime contract is
+                // tests/regression/bb_slp_pure_store_fn.c; direct IR tests below
+                // additionally exercise the args-only store form.
                 Instruction::Intrinsic { op, dest_ptr, .. } => {
                     if !op.is_pure() || dest_ptr.is_some() {
                         return (false, false);
@@ -359,6 +360,35 @@ mod memory_read_tests {
     use crate::common::types::IrType;
     use crate::ir::intrinsics::IntrinsicOp as O;
     use crate::ir::reexports::{BasicBlock, BlockId};
+
+    #[test]
+    fn store_effect_contract_function_is_neither_pure_nor_const() {
+        for op in crate::ir::intrinsics::VECTOR_STORES {
+            for pointer in [None, Some(crate::ir::reexports::Value(0))] {
+                let mut f = IrFunction::new("writer".into(), IrType::Void, vec![], false);
+                f.blocks.push(BasicBlock {
+                    label: BlockId(0),
+                    instructions: vec![Instruction::Intrinsic {
+                        dest: None,
+                        op,
+                        dest_ptr: pointer,
+                        args: vec![
+                            Operand::Value(crate::ir::reexports::Value(1)),
+                            Operand::Value(crate::ir::reexports::Value(0)),
+                            Operand::Const(crate::ir::reexports::IrConst::I64(0)),
+                        ],
+                    }],
+                    terminator: Terminator::Return(None),
+                    source_spans: vec![],
+                });
+                assert_eq!(
+                    analyze_function_purity(&f, &FxHashSet::default(), &FxHashSet::default()),
+                    (false, false),
+                    "{op:?}, {pointer:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn vector_readers_are_not_constant_functions() {

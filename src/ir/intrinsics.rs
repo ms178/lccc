@@ -1666,27 +1666,51 @@ pub enum IntrinsicOp {
     FmaPd231v512,
 }
 
+/// Independent test matrix: do not derive this from the predicates under test.
+#[cfg(test)]
+pub(crate) const VECTOR_STORES: [IntrinsicOp; 13] = [
+    IntrinsicOp::VecStoreI32x4Pair,
+    IntrinsicOp::VecStoreI32x4,
+    IntrinsicOp::VecStoreI32x8,
+    IntrinsicOp::VecStoreF32x4,
+    IntrinsicOp::VecStoreF32x8,
+    IntrinsicOp::VecStoreF64x2,
+    IntrinsicOp::VecStoreF64x4,
+    IntrinsicOp::VecStoreI64x2,
+    IntrinsicOp::VecStoreI64x4,
+    IntrinsicOp::VecStoreI16x8,
+    IntrinsicOp::VecStoreI8x16,
+    IntrinsicOp::VecStoreI8x32,
+    IntrinsicOp::VecStoreI16x16,
+];
+
 impl IntrinsicOp {
-    /// Width in bytes of the vector/XMM result produced by this intrinsic:
-    /// 128-bit SSE results → Some(16), 256-bit AVX/AVX2 results → Some(32).
-    /// Returns None for ops whose `dest` is scalar (GPR/x87), that produce no
-    /// value (fences, stores, control), or that are handled by the F128 path.
-    ///
-    /// NOTE: ops whose result is a SCALAR must never be listed here even if
-    /// their name sounds vector-ish (HorizontalAdd*/VecHorizontalAdd* return
-    /// I32/F64 scalars; Pmovmskb*/Cvtsi128Si*/Pextr*/Crc32* are scalar too).
-    /// Misclassifying them as vectors corrupts scalar values (volatile_access
-    /// regression: sum reloaded via leaq instead of movq).
-    ///
-    /// This is the single authority for "does this intrinsic write a vector
-    /// home slot" — used by the stack-layout pre-scan to protect user-level
-    /// SSE/AVX intrinsic results from block-local slot reuse. Previously only
-    /// the auto-vectorizer's internal Vec* ops were recognized, so real code
-    /// (zlib-ng adler32_ssse3, _mm256_mul_ps chains, ...) got 8-byte slots
-    /// with 16/32-byte stores overflowing into neighbours and reusable slots
-    /// being read back after corruption (vector_defer_multidef_slot and
-    /// simd_avx2_256 regressions).
+    /// Width of an actual SIMD result (including explicit-SIMD result homes).
+    /// An opcode property, not a claim that an instruction has a live `dest`:
+    /// callers must check the instruction's destination separately. Stores
+    /// consume vector values but produce none, even when their source has a
+    /// SIMD home. Modern register-valued producers are classified separately
+    /// by `produces_vector_value` (explicit-SIMD ops can use memory homes).
     pub fn vector_result_width(&self) -> Option<u32> {
+        if self.writes_memory_via_args()
+            || matches!(self, IntrinsicOp::StoreuPs256 | IntrinsicOp::StoreuPd256)
+        {
+            None
+        } else {
+            self.vector_home_width()
+        }
+    }
+
+    /// SIMD home width used by the backend's homing metadata. Normally this
+    /// is the result width; for the historical register-shaped stores it is
+    /// the SOURCE home width, not a result or memory effect. In particular,
+    /// VecStoreI32x4Pair consumes 16 register bytes but writes only 8 bytes.
+    /// Never infer purity or a read-only argument from this method alone.
+    ///
+    /// Keeping this metadata separate preserves explicit-SIMD and vectorizer
+    /// slot protection without pretending that stores return vector values.
+    /// Scalar reductions/extracts are excluded even if their inputs are SIMD.
+    pub fn vector_home_width(&self) -> Option<u32> {
         use IntrinsicOp::*;
         match self {
             // ---- 256-bit AVX/AVX2 results ----
@@ -1930,13 +1954,12 @@ impl IntrinsicOp {
         // VecBroadcast left behind by a vectorizer bailout was DCE-rooted
         // as "side-effecting", reached codegen with no register or slot
         // home, and ICEd the intrinsic emitter (`gd[i] = gd[i]*k + c` over
-        // a global array). VecStoreI64x2 is the one memory-writing op that
-        // produces_vector_value() also lists (kept there for slot sizing);
-        // it is excluded here -- stores are never pure. Lane extracts read
+        // a global array). Stores are excluded from the result predicate;
+        // their source-home metadata lives in vector_home_width. Lane extracts read
         // a vector and produce a scalar; they are pure reads (an orphaned
         // extract left by an SLP bailout must be DCE-eligible, not rooted
         // as a side effect).
-        (self.produces_vector_value() && !matches!(self, IntrinsicOp::VecStoreI64x2))
+        self.produces_vector_value()
             || matches!(
                 self,
                 IntrinsicOp::VecExtractLaneI32x4
@@ -1958,11 +1981,9 @@ impl IntrinsicOp {
     /// alignment pass uses this to give vector-loop headers the stronger
     /// 32-byte treatment.
     pub fn is_vector_op(&self) -> bool {
-        // `VecStore*` write memory and produce no value, so neither
-        // produces_vector_value() nor vector_result_width() covers them;
-        // they are listed explicitly.
+        // SIMD participation is not a purity or result classification.
         self.produces_vector_value()
-            || self.vector_result_width().is_some()
+            || self.vector_home_width().is_some()
             || self.writes_memory_via_args()
     }
 
@@ -1981,9 +2002,10 @@ impl IntrinsicOp {
     /// argument; a pointer there is address observation, not a memory
     /// operand.)
     pub fn reads_pointer_arg(&self) -> bool {
-        self.may_read_memory()
-            || self.produces_vector_value()
-            || self.vector_result_width().is_some()
+        !self.writes_memory_via_args()
+            && (self.may_read_memory()
+                || self.produces_vector_value()
+                || self.vector_home_width().is_some())
     }
 
     /// True when this intrinsic writes memory through its `args` rather
@@ -2187,8 +2209,6 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecLoadI32x4Pair
                 | IntrinsicOp::VecAddI64x2
                 | IntrinsicOp::VecMulI64x2
-                | IntrinsicOp::VecStoreI64x2
-                | IntrinsicOp::VecStoreI32x4Pair
                 | IntrinsicOp::VecBroadcastI64x2
                 | IntrinsicOp::VecZeroI64x2
                 | IntrinsicOp::VecLoadI64x4
@@ -2387,7 +2407,7 @@ mod vector_result_width_tests {
             let op: IntrinsicOp = names_to_op(name)
                 .unwrap_or_else(|| panic!("unhandled Vec* variant {name}: add it to names_to_op"));
             assert_eq!(
-                op.vector_result_width(),
+                op.vector_home_width(),
                 expected,
                 "{name} ends in {tok}: name promises {expected:?}"
             );
@@ -2644,6 +2664,36 @@ mod memory_classification_tests {
     /// non-reading likewise. Both lists must stay complete for every family
     /// the vectorizers emit.
     #[test]
+    fn store_effect_contract_classification() {
+        for op in super::VECTOR_STORES {
+            assert!(!op.is_pure(), "{op:?} must not be classified as pure");
+            assert!(!op.produces_vector_value(), "{op:?} has no result");
+            assert_eq!(op.vector_result_width(), None, "{op:?} has no result home");
+            assert!(
+                !op.reads_pointer_arg(),
+                "{op:?} is not a read-only argument consumer"
+            );
+            assert!(op.is_vector_op(), "{op:?} still consumes SIMD data");
+        }
+    }
+
+    #[test]
+    fn store_source_homes_are_not_results_or_purity_proofs() {
+        for (op, width) in [
+            (O::VecStoreI64x2, 16),
+            (O::VecStoreI32x4Pair, 16),
+            (O::StoreuPs256, 32),
+            (O::StoreuPd256, 32),
+        ] {
+            assert_eq!(op.vector_home_width(), Some(width));
+            assert_eq!(op.vector_result_width(), None);
+            assert!(!op.produces_vector_value());
+            assert!(!op.is_pure());
+            assert!(op.is_vector_op());
+        }
+    }
+
+    #[test]
     fn every_vec_store_family_writes_memory_via_args() {
         for op in [
             O::VecStoreI32x4,
@@ -2690,7 +2740,15 @@ mod memory_classification_tests {
             O::VecLoadWidenI32ToI64x2,
             O::Loadu256,
             O::Load256,
+            O::LoadF64x4,
+            O::LoadF64x2,
+            O::LoadI32x8,
+            O::LoadI32x4,
+            O::LoaduPs256,
+            O::LoaduPd256,
+            O::Loadu512,
         ] {
+            assert!(op.reads_pointer_arg(), "{op:?} allows a read-only pointer");
             assert!(op.may_read_memory(), "{op:?} must classify as a read");
             assert!(
                 !op.writes_memory_via_args(),
