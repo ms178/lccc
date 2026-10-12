@@ -483,12 +483,13 @@ def remote(cid: str, source: str, flags: str, execute: bool, timeout: int) -> di
     return finish(True)
 
 
-def local(binary: str, source: str, flags: str, execute: bool, tmp: str) -> dict:
-    """Compile+run with the tree's lccc, on exactly the same source and flags."""
+def local(binary: str | None, source: str, flags: str, execute: bool, tmp: str) -> dict:
+    """Compile+run with the requested binary; None selects the configured LCCC."""
+    binary = LCCC if binary is None else binary
     rec = {"id": "lccc", "vendor": "local", "ok": False,
            "asm_insns": None, "stdout": None, "exit": None, "reason": None}
     s = os.path.join(tmp, "p.s")
-    r = subprocess.run([LCCC, *flags.split(), "-S", "-o", s, source],
+    r = subprocess.run([binary, *flags.split(), "-S", "-o", s, source],
                        capture_output=True, text=True)
     if r.returncode != 0:
         rec["reason"] = (r.stderr or r.stdout).strip().splitlines()[0][:160] if (
@@ -499,7 +500,7 @@ def local(binary: str, source: str, flags: str, execute: bool, tmp: str) -> dict
 
     if execute:
         exe = os.path.join(tmp, "p.bin")
-        r = subprocess.run([LCCC, *flags.split(), "-o", exe, source],
+        r = subprocess.run([binary, *flags.split(), "-o", exe, source],
                            capture_output=True, text=True)
         if r.returncode != 0:
             rec["reason"] = (r.stderr or r.stdout).strip().splitlines()[0][:160] if (

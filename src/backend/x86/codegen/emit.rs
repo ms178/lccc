@@ -7322,6 +7322,10 @@ impl X86Codegen {
 }
 
 impl ArchCodegen for X86Codegen {
+    fn supports_switch_bounds(&self) -> bool {
+        true
+    }
+
     fn is_value_reg_assigned(&self, vid: u32) -> bool {
         self.reg_assignments.contains_key(&vid)
     }
@@ -8711,17 +8715,30 @@ impl ArchCodegen for X86Codegen {
                 self.state.emit("    subq %rcx, %rax");
             }
         }
-        if (range as i64) >= i32::MIN as i64 && (range as i64) <= i32::MAX as i64 {
-            self.state
-                .out
-                .emit_instr_imm_reg("    cmpq", range as i64, "rax");
-        } else {
-            self.state
-                .out
-                .emit_instr_imm_reg("    movabsq", range as i64, "rcx");
-            self.state.emit("    cmpq %rcx, %rax");
+        let in_range = match val {
+            Operand::Value(v) => {
+                self.state
+                    .switch_unsigned_bounds
+                    .get(&v.0)
+                    .is_some_and(|&bound| {
+                        crate::passes::integer_bounds::covers_switch(bound, ty, min_val, range)
+                    })
+            }
+            _ => false,
+        };
+        if !in_range {
+            if (range as i64) >= i32::MIN as i64 && (range as i64) <= i32::MAX as i64 {
+                self.state
+                    .out
+                    .emit_instr_imm_reg("    cmpq", range as i64, "rax");
+            } else {
+                self.state
+                    .out
+                    .emit_instr_imm_reg("    movabsq", range as i64, "rcx");
+                self.state.emit("    cmpq %rcx, %rax");
+            }
+            self.state.out.emit_jcc_label("    jae", &default_label);
         }
-        self.state.out.emit_jcc_label("    jae", &default_label);
 
         // Kernel / non-PIC code model: emit the GCC-canonical ABSOLUTE jump
         // table — `jmp *jt_table(,%rax,8)` (R_X86_64_32S against .rodata)
@@ -10682,5 +10699,91 @@ mod def_matcher_tests {
         // Single-def values (the global, the latch increment) stay visible.
         assert!(X86Codegen::find_defining_instruction(&func, 0).is_some());
         assert!(X86Codegen::find_defining_instruction(&func, 2).is_some());
+    }
+}
+
+#[cfg(test)]
+mod switch_bound_emitter_tests {
+    use super::*;
+
+    fn emit(
+        bound: Option<(u32, u64)>,
+        ty: IrType,
+        minimum: i64,
+        pic: bool,
+        kernel: bool,
+    ) -> String {
+        let mut cg = X86Codegen::new();
+        cg.state.value_locations.insert(0, StackSlot(-8));
+        cg.state.pic_mode = pic;
+        cg.state.code_model_kernel = kernel;
+        if let Some(bound) = bound {
+            cg.state.switch_unsigned_bounds.insert(0, bound);
+        }
+        // A dense table with a real hole: omitting the outer guard must not
+        // omit or redirect the default entry for selector 7.
+        let cases: Vec<_> = (0..16)
+            .filter(|&i| i != 7)
+            .map(|i| (minimum + i, BlockId(100 + i as u32)))
+            .collect();
+        cg.emit_switch_jump_table(&Operand::Value(Value(0)), &cases, &BlockId(99), ty);
+        cg.state.out.buf.clone()
+    }
+
+    #[test]
+    fn proved_tables_keep_normalization_holes_and_code_model() {
+        for (pic, kernel) in [(false, false), (true, false), (true, true)] {
+            for ty in [IrType::I32, IrType::U32] {
+                let out = emit(Some((32, 15)), ty, 0, pic, kernel);
+                assert!(!out.contains("cmpq") && !out.contains("jae"), "{out}");
+                assert!(
+                    out.contains(if ty.is_unsigned() {
+                        "movl %eax, %eax"
+                    } else {
+                        "cltq"
+                    }),
+                    "{out}"
+                );
+                let entry = if pic && !kernel { ".long" } else { ".quad" };
+                assert_eq!(
+                    out.lines()
+                        .filter(|l| l.trim_start().starts_with(entry))
+                        .count(),
+                    16,
+                    "{out}"
+                );
+                assert!(
+                    out.contains(&format!("{entry} .LBB99")),
+                    "hole lost its default: {out}"
+                );
+                if pic && !kernel {
+                    assert!(out.contains("movslq (%rcx,%rax,4), %rdx"), "{out}");
+                } else {
+                    assert!(out.contains("(,%rax,8)"), "{out}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unproved_tables_keep_the_default_bounds_branch() {
+        for (bound, ty, minimum) in [
+            (None, IrType::I32, 0),
+            (Some((32, 16)), IrType::I32, 0),
+            (Some((32, 0x8000_0000)), IrType::I32, 0),
+            (Some((8, 15)), IrType::I32, 0),
+            (Some((32, 15)), IrType::I64, 0),
+            (Some((64, u64::MAX)), IrType::U64, 0),
+            (Some((32, 15)), IrType::I32, 1),
+        ] {
+            for pic in [false, true] {
+                let out = emit(bound, ty, minimum, pic, false);
+                assert!(out.contains("cmpq $16, %rax"), "{out}");
+                assert!(out.contains("jae .LBB99"), "{out}");
+                if minimum != 0 {
+                    assert!(out.contains("subq $1, %rax"), "{out}");
+                }
+            }
+        }
     }
 }

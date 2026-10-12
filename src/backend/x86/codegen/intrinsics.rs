@@ -447,6 +447,12 @@ impl X86Codegen {
             },
         };
         let disp = Self::vec_disp_arg(args, 2);
+        // Deferred operands must use stable allocated homes, never scratch
+        // registers whose contents can change before the consumer. Refuse
+        // an unencodable displacement; the ordinary load stages it safely.
+        if i32::try_from(disp).is_err() {
+            return false;
+        }
         let disp_str = if disp == 0 {
             String::new()
         } else {
@@ -1563,6 +1569,39 @@ impl X86Codegen {
             .unwrap_or(0)
     }
 
+    /// Checked constant-index composition: both inputs fitting individually
+    /// does not imply that their sum is an encodable signed disp32.
+    fn vec_constant_displacement(offset: &Operand, disp: i64) -> Option<i64> {
+        let Operand::Const(c) = offset else {
+            return None;
+        };
+        let index = i64::try_from(c.to_i128()?).ok()?;
+        let sum = disp.checked_add(index)?;
+        i32::try_from(sum).ok().map(i64::from)
+    }
+
+    /// A normal alloca's slot IS the object, unlike a spilled pointer or a
+    /// vector payload slot. Runtime-overaligned allocas must keep their
+    /// computed address. Respect the active RBP/RSP frame addressing policy.
+    fn vec_direct_stack_operand(&self, base: &Operand, displacement: i64) -> Option<String> {
+        let Operand::Value(v) = base else { return None };
+        if !self.state.is_alloca(v.0) {
+            return None;
+        }
+        let crate::backend::state::SlotAddr::Direct(slot) = self.state.resolve_slot_addr(v.0)?
+        else {
+            return None;
+        };
+        let offset = slot.0.checked_add(displacement)?;
+        let encoded = if self.state.out.use_rsp_addressing {
+            self.state.out.rsp_frame_size.checked_add(offset)?
+        } else {
+            offset
+        };
+        i32::try_from(encoded).ok()?;
+        Some(self.slot_ref(offset))
+    }
+
     /// Full x86 memory operand for a vector access: `disp(%base,%index)`.
     /// A zero displacement omits the field, keeping the encoding
     /// byte-identical to the two-argument (map) form.
@@ -1574,22 +1613,35 @@ impl X86Codegen {
         // (`vmovdqu 16(%rax)`) is one instruction. Only offsets that fit
         // the i32 disp field take this path; a huge constant still stages
         // through a register.
-        if let Operand::Const(c) = off_arg {
-            if let Some(v) = c.to_i64() {
-                if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
-                    let (base, _) =
-                        self.vec_load_addr_regs(base_arg, &Operand::Const(IrConst::I64(0)));
-                    let d = disp + v;
-                    let disp_str = if d == 0 {
-                        String::new()
-                    } else {
-                        format!("{}", d)
-                    };
-                    return format!("{}(%{})", disp_str, base);
-                }
+        if let Some(d) = Self::vec_constant_displacement(off_arg, disp) {
+            if let Some(mem) = self.vec_direct_stack_operand(base_arg, d) {
+                return mem;
             }
+            let (base, _) = self.vec_load_addr_regs(base_arg, &Operand::Const(IrConst::I64(0)));
+            let disp_str = if d == 0 {
+                String::new()
+            } else {
+                format!("{}", d)
+            };
+            return format!("{}(%{})", disp_str, base);
         }
         let (base, index) = self.vec_load_addr_regs(base_arg, off_arg);
+        if i32::try_from(disp).is_err() {
+            // A SIB displacement is signed disp32, not an arbitrary i64.
+            // Collapse base+index BEFORE reusing reserved scratch RCX, which
+            // may currently hold the index. LEA/MOV preserve flags and the
+            // allocated input homes; the address sum wraps at pointer width.
+            // Normal disp32 accesses keep the existing zero-instruction path.
+            let address = match index {
+                Some(ix) => format!("(%{},%{})", base, ix),
+                None => format!("(%{})", base),
+            };
+            self.state
+                .emit_fmt(format_args!("    leaq {}, %rax", address));
+            self.state
+                .emit_fmt(format_args!("    movabsq ${}, %rcx", disp));
+            return "(%rax,%rcx)".into();
+        }
         let disp_str = if disp == 0 {
             String::new()
         } else {
@@ -3651,74 +3703,12 @@ impl X86Codegen {
                 //   vmovupd 96(%rbx,%r10), %ymm0 / ...
                 // Total: 1 movslq + 12 FMA + loop control = ~15 insns vs GCC 25 total func.
 
-                // Extract displacement from 4th arg if present
-                let mut disp: i64 = 0;
-                if args.len() >= 4 {
-                    if let Operand::Const(c) = &args[3] {
-                        if let Some(d) = c.to_i64() {
-                            disp = d;
-                        }
-                    }
-                } else {
-                    // Backward compat: try to fold offset = base + const
-                    if let Operand::Value(v) = &args[2] {
-                        if let Some(inst) = self.get_defining_instruction(v.0) {
-                            if let crate::ir::reexports::Instruction::BinOp {
-                                op: crate::ir::reexports::IrBinOp::Add,
-                                lhs,
-                                rhs,
-                                ..
-                            } = inst
-                            {
-                                let try_extract =
-                                    |a: &Operand, b: &Operand| -> Option<(Operand, i64)> {
-                                        match (a, b) {
-                                            (Operand::Value(_), Operand::Const(c)) => {
-                                                c.to_i64().map(|d| (a.clone(), d))
-                                            }
-                                            (Operand::Const(c), Operand::Value(_)) => {
-                                                c.to_i64().map(|d| (b.clone(), d))
-                                            }
-                                            _ => None,
-                                        }
-                                    };
-                                if let Some((_, d)) = try_extract(lhs, rhs) {
-                                    disp = d;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // If we folded from Add, we need base offset Value, not the Add result.
-                // For 4-arg form, base is args[2]; for 3-arg folded form, base is lhs of Add.
-                let off_operand: Operand = if args.len() >= 4 {
-                    args[2].clone()
-                } else if disp != 0 {
-                    // Extract base from Add
-                    if let Operand::Value(v) = &args[2] {
-                        if let Some(crate::ir::reexports::Instruction::BinOp { lhs, rhs, .. }) =
-                            self.get_defining_instruction(v.0)
-                        {
-                            if matches!(lhs, Operand::Value(_)) && matches!(rhs, Operand::Const(_))
-                            {
-                                lhs.clone()
-                            } else if matches!(rhs, Operand::Value(_))
-                                && matches!(lhs, Operand::Const(_))
-                            {
-                                rhs.clone()
-                            } else {
-                                args[2].clone()
-                            }
-                        } else {
-                            args[2].clone()
-                        }
-                    } else {
-                        args[2].clone()
-                    }
-                } else {
-                    args[2].clone()
-                };
+                // Address canonicalization belongs before allocation. Peeling
+                // an Add here creates hidden uses of possibly dead/reused
+                // homes and also loses narrow-add wrap semantics. The IR
+                // vecaddr pass encodes safe I64/U64 additions as args[3].
+                let mut disp = Self::vec_disp_arg(args, 3);
+                let off_operand = args[2];
 
                 // Intrinsic-scratch pool (the caller-saved GP registers
                 // the emitter may clobber around intrinsics; see the
@@ -3762,7 +3752,7 @@ impl X86Codegen {
                         r
                     }
                 };
-                let off_name = match off_home {
+                let mut off_name = match off_home {
                     Some(name) => name,
                     None => {
                         let r = pool
@@ -3774,6 +3764,24 @@ impl X86Codegen {
                         r
                     }
                 };
+
+                if i32::try_from(disp).is_err() {
+                    // Share a normalized index across both streams and the
+                    // store, without mutating any allocated operand home.
+                    let scratch = pool
+                        .iter()
+                        .copied()
+                        .find(|r| !home_taken(r) && *r != c_name && *r != b_name && *r != off_name)
+                        .expect("five scratch registers, at most three live address operands");
+                    self.state
+                        .emit_fmt(format_args!("    movabsq ${}, %{}", disp, scratch));
+                    self.state.emit_fmt(format_args!(
+                        "    leaq (%{},%{}), %{}",
+                        off_name, scratch, scratch
+                    ));
+                    off_name = scratch;
+                    disp = 0;
+                }
 
                 if disp == 0 {
                     self.state.emit_fmt(format_args!(
@@ -10433,5 +10441,265 @@ mod fma_form_reencode_tests {
             assert!(r213.is_err(), "{m} must not re-encode to 213");
             assert!(r231.is_err(), "{m} must not re-encode to 231");
         }
+    }
+}
+
+#[cfg(test)]
+mod vector_address_contract_tests {
+    use super::*;
+
+    #[test]
+    fn constant_index_sum_must_fit_the_encoding_without_truncation() {
+        let c = |v| Operand::Const(IrConst::I64(v));
+        assert_eq!(X86Codegen::vec_constant_displacement(&c(8), -16), Some(-8));
+        assert_eq!(
+            X86Codegen::vec_constant_displacement(&c(1), i32::MAX as i64),
+            None
+        );
+        assert_eq!(
+            X86Codegen::vec_constant_displacement(&c(-1), i32::MIN as i64),
+            None
+        );
+        assert_eq!(X86Codegen::vec_constant_displacement(&c(1), i64::MAX), None);
+        assert_eq!(
+            X86Codegen::vec_constant_displacement(&Operand::Const(IrConst::I128(1i128 << 80)), 0),
+            None
+        );
+        assert_eq!(
+            X86Codegen::vec_constant_displacement(&Operand::Value(Value(0)), 0),
+            None
+        );
+    }
+
+    #[test]
+    fn deferred_vector_loads_refuse_unencodable_displacements() {
+        for disp in [
+            i64::MIN,
+            i64::MAX,
+            i64::from(i32::MIN) - 1,
+            i64::from(i32::MAX) + 1,
+            i64::from(i32::MIN),
+            0,
+            i64::from(i32::MAX),
+        ] {
+            let mut cg = X86Codegen::new();
+            cg.reg_assignments.insert(0, super::super::machinst::R12);
+            cg.reg_assignments.insert(1, super::super::machinst::R13);
+            cg.state.vector_memfold_values.insert(2);
+            let accepted = cg.try_elide_vec_load(
+                &Some(Value(2)),
+                &IntrinsicOp::VecLoadI32x8,
+                &[
+                    Operand::Value(Value(0)),
+                    Operand::Value(Value(1)),
+                    Operand::Const(IrConst::I64(disp)),
+                ],
+            );
+            assert_eq!(accepted, i32::try_from(disp).is_ok());
+            assert_eq!(cg.state.pending_vec_memfold.is_some(), accepted);
+            assert!(
+                cg.state.out.buf.is_empty(),
+                "deferred addressing may not depend on scratch"
+            );
+        }
+    }
+
+    #[test]
+    fn fma_three_operand_form_never_rebuilds_an_allocated_offset() {
+        use crate::ir::reexports::{
+            BasicBlock, BlockId, Instruction, IrBinOp, IrFunction, Terminator,
+        };
+        for ty in [IrType::I32, IrType::U32, IrType::I64, IrType::U64] {
+            let mut f = IrFunction::new("offset".into(), IrType::Void, vec![], false);
+            f.blocks.push(BasicBlock {
+                label: BlockId(0),
+                source_spans: vec![],
+                instructions: vec![Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(3)),
+                    rhs: Operand::Const(IrConst::I64(32)),
+                    ty,
+                }],
+                terminator: Terminator::Return(None),
+            });
+            let mut cg = X86Codegen::new();
+            cg.current_func = Some(&f as *const _);
+            for (id, reg) in [
+                (0, super::super::machinst::R12),
+                (1, super::super::machinst::R13),
+                (2, super::super::machinst::R14),
+                (3, super::super::machinst::R15),
+            ] {
+                cg.reg_assignments.insert(id, reg);
+            }
+            cg.emit_intrinsic_impl(
+                &None,
+                &IntrinsicOp::FmaF64x4HoistedSIB,
+                &None,
+                &[
+                    Operand::Value(Value(0)),
+                    Operand::Value(Value(1)),
+                    Operand::Value(Value(2)),
+                ],
+            );
+            let out = &cg.state.out.buf;
+            assert!(
+                out.contains("(%r12,%r14)") && out.contains("(%r13,%r14)"),
+                "{out}"
+            );
+            assert!(
+                !out.contains("%r15"),
+                "the Add's hidden input is no longer live: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn large_fma_displacement_is_shared_without_clobbering_inputs() {
+        for disp in [
+            i64::MIN,
+            i64::MAX,
+            i64::from(i32::MIN) - 1,
+            i64::from(i32::MAX) + 1,
+        ] {
+            for allocated in [false, true] {
+                let mut cg = X86Codegen::new();
+                if allocated {
+                    for (id, reg) in [
+                        (0, super::super::machinst::R12),
+                        (1, super::super::machinst::R13),
+                        (2, super::super::machinst::R14),
+                    ] {
+                        cg.reg_assignments.insert(id, reg);
+                    }
+                } else {
+                    for id in 0..3 {
+                        cg.state
+                            .value_locations
+                            .insert(id, StackSlot(-8 * (i64::from(id) + 1)));
+                    }
+                }
+                cg.emit_intrinsic_impl(
+                    &None,
+                    &IntrinsicOp::FmaF64x4HoistedSIB,
+                    &None,
+                    &[
+                        Operand::Value(Value(0)),
+                        Operand::Value(Value(1)),
+                        Operand::Value(Value(2)),
+                        Operand::Const(IrConst::I64(disp)),
+                    ],
+                );
+                let out = &cg.state.out.buf;
+                assert_eq!(out.matches("movabsq").count(), 1, "{out}");
+                assert_eq!(out.matches("leaq").count(), 1, "{out}");
+                assert!(
+                    out.contains(&format!("${disp},")) && !out.contains(&format!("{disp}(%")),
+                    "{out}"
+                );
+                assert!(
+                    !out.contains("addq")
+                        && !out.contains(", %r12")
+                        && !out.contains(", %r13")
+                        && !out.contains(", %r14"),
+                    "{out}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn large_vector_displacements_use_flag_neutral_scratch_addressing() {
+        for disp in [
+            i64::MIN,
+            i64::MAX,
+            i64::from(i32::MIN) - 1,
+            i64::from(i32::MAX) + 1,
+        ] {
+            // Allocated index, staged index (RCX), and no index. In every
+            // case RCX must only be reused AFTER the effective base is read.
+            for offset in [
+                Operand::Value(Value(1)),
+                Operand::Const(IrConst::I64(if disp < 0 { -7 } else { 7 })),
+                Operand::Const(IrConst::I64(0)),
+            ] {
+                let mut cg = X86Codegen::new();
+                cg.reg_assignments.insert(0, super::super::machinst::R12);
+                cg.reg_assignments.insert(1, super::super::machinst::R13);
+                let mem = cg.vec_mem_operand(&Operand::Value(Value(0)), &offset, disp);
+                assert_eq!(mem, "(%rax,%rcx)");
+                let out = &cg.state.out.buf;
+                let lea = out.find("leaq ").expect("collapse base/index first");
+                let imm = out.find(&format!("movabsq ${disp}, %rcx")).unwrap();
+                assert!(lea < imm, "{out}");
+                assert!(
+                    !out.contains("addq") && !out.contains("push") && !out.contains("pop"),
+                    "{out}"
+                );
+                assert!(
+                    !out.contains(", %r12") && !out.contains(", %r13"),
+                    "allocated homes must survive: {out}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn encodable_vector_displacement_boundaries_need_no_staging() {
+        for disp in [i32::MIN, -1, 0, 1, i32::MAX] {
+            let mut cg = X86Codegen::new();
+            cg.reg_assignments.insert(0, super::super::machinst::R12);
+            cg.reg_assignments.insert(1, super::super::machinst::R13);
+            let mem = cg.vec_mem_operand(
+                &Operand::Value(Value(0)),
+                &Operand::Value(Value(1)),
+                i64::from(disp),
+            );
+            let prefix = if disp == 0 {
+                String::new()
+            } else {
+                disp.to_string()
+            };
+            assert_eq!(mem, format!("{prefix}(%r12,%r13)"));
+            assert!(
+                cg.state.out.buf.is_empty(),
+                "the common path must not gain instructions"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_object_slots_follow_frame_addressing_policy() {
+        let mut cg = X86Codegen::new();
+        cg.state.alloca_values.insert(0);
+        cg.state.value_locations.insert(0, StackSlot(-64));
+        let base = Operand::Value(Value(0));
+        assert_eq!(
+            cg.vec_direct_stack_operand(&base, 16).as_deref(),
+            Some("-48(%rbp)")
+        );
+        cg.state.out.use_rsp_addressing = true;
+        cg.state.out.rsp_frame_size = 128;
+        assert_eq!(
+            cg.vec_direct_stack_operand(&base, 16).as_deref(),
+            Some("80(%rsp)")
+        );
+        assert_eq!(cg.vec_direct_stack_operand(&base, i64::MAX), None);
+        cg.state.out.rsp_frame_size = i64::MAX;
+        assert_eq!(cg.vec_direct_stack_operand(&base, 128), None);
+    }
+
+    #[test]
+    fn payload_pointer_and_overaligned_slots_are_not_direct_objects() {
+        let mut cg = X86Codegen::new();
+        cg.state.value_locations.insert(0, StackSlot(-64));
+        let base = Operand::Value(Value(0));
+        assert_eq!(cg.vec_direct_stack_operand(&base, 16), None);
+        cg.state.vector_values.insert(0);
+        assert_eq!(cg.vec_direct_stack_operand(&base, 16), None);
+        cg.state.alloca_values.insert(0);
+        cg.state.alloca_alignments.insert(0, 32);
+        assert_eq!(cg.vec_direct_stack_operand(&base, 16), None);
     }
 }

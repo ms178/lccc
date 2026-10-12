@@ -1,0 +1,3743 @@
+{
+  "scope": "14 previous native worst15 excluding spectral; v1 screening, not final gates",
+  "base": "0a3d09c05fe11c0c8968b4e72c1f02989ae5a3c0",
+  "flags": [
+    "-O2",
+    "-march=x86-64-v3",
+    "-fwrapv"
+  ],
+  "baseline_compiler_sha256": "f4f2f30e6892529c0809ead06e72ace33e56e079e3b8eadc7a3428b92a05baba",
+  "v1_compiler_sha256": "429f98606f2d39f0770703caf9972c7777905f641420d36a2deebba336e53c4f",
+  "oracle14": [
+    {
+      "source": "tests/benchmark/programs/nbody.c",
+      "sha256": "45db2f21add3645a945f1a6635d642f1aad5caecfa4c7b47da4943331a321837",
+      "records": [
+        {
+          "key": "lccc",
+          "id": "/home/lccc-work/baseline-pr795-lccc",
+          "name": "local LCCC",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 302,
+          "loads": 91,
+          "stores": 32,
+          "spills": 30,
+          "stack_refs": 30,
+          "xmm_reg_moves": 7,
+          "branches": 17,
+          "vectors": 29,
+          "calls": 2,
+          "ratio_vs_best": 1.4046511627906977
+        },
+        {
+          "key": "gcc",
+          "id": "cg162",
+          "name": "x86-64 gcc 16.2",
+          "semver": "16.2",
+          "compilerType": "",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 215,
+          "loads": 59,
+          "stores": 12,
+          "spills": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 4,
+          "branches": 18,
+          "vectors": 78,
+          "calls": 4,
+          "ratio_vs_best": 1.0
+        },
+        {
+          "key": "clang",
+          "id": "cclang2310",
+          "name": "x86-64 clang 23.1.0",
+          "semver": "23.1.0",
+          "compilerType": "clang",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 266,
+          "loads": 93,
+          "stores": 20,
+          "spills": 8,
+          "stack_refs": 8,
+          "xmm_reg_moves": 2,
+          "branches": 28,
+          "vectors": 50,
+          "calls": 2,
+          "ratio_vs_best": 1.2372093023255815
+        },
+        {
+          "key": "icc",
+          "id": "cicc2021100",
+          "name": "x86-64 icc 2021.10.0",
+          "semver": "2021.10.0",
+          "compilerType": "",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 1192,
+          "loads": 301,
+          "stores": 116,
+          "spills": 240,
+          "stack_refs": 240,
+          "xmm_reg_moves": 0,
+          "branches": 5,
+          "vectors": 0,
+          "calls": 3,
+          "ratio_vs_best": 5.544186046511628
+        },
+        {
+          "key": "icx",
+          "id": "cicxlatest",
+          "name": "x86-64 icx (latest)",
+          "semver": "(latest)",
+          "compilerType": "clang-intel",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 531,
+          "loads": 144,
+          "stores": 83,
+          "spills": 139,
+          "stack_refs": 139,
+          "xmm_reg_moves": 12,
+          "branches": 16,
+          "vectors": 401,
+          "calls": 4,
+          "ratio_vs_best": 2.469767441860465
+        }
+      ],
+      "errors": []
+    },
+    {
+      "source": "tests/benchmark/programs/expat_siphash24.c",
+      "sha256": "59c5dfbdf3f0d2e149a3681925c46b7b0aeb195f179c285f3b64a2daaf1fb663",
+      "records": [
+        {
+          "key": "lccc",
+          "id": "/home/lccc-work/baseline-pr795-lccc",
+          "name": "local LCCC",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 707,
+          "loads": 122,
+          "stores": 74,
+          "spills": 54,
+          "stack_refs": 54,
+          "xmm_reg_moves": 0,
+          "branches": 77,
+          "vectors": 16,
+          "calls": 17,
+          "ratio_vs_best": 2.2954545454545454
+        },
+        {
+          "key": "gcc",
+          "id": "cg162",
+          "name": "x86-64 gcc 16.2",
+          "semver": "16.2",
+          "compilerType": "",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 308,
+          "loads": 36,
+          "stores": 30,
+          "spills": 17,
+          "stack_refs": 17,
+          "xmm_reg_moves": 0,
+          "branches": 35,
+          "vectors": 18,
+          "calls": 10,
+          "ratio_vs_best": 1.0
+        },
+        {
+          "key": "clang",
+          "id": "cclang2310",
+          "name": "x86-64 clang 23.1.0",
+          "semver": "23.1.0",
+          "compilerType": "clang",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 496,
+          "loads": 52,
+          "stores": 54,
+          "spills": 72,
+          "stack_refs": 72,
+          "xmm_reg_moves": 0,
+          "branches": 43,
+          "vectors": 9,
+          "calls": 6,
+          "ratio_vs_best": 1.6103896103896105
+        },
+        {
+          "key": "icc",
+          "id": "cicc2021100",
+          "name": "x86-64 icc 2021.10.0",
+          "semver": "2021.10.0",
+          "compilerType": "",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 745,
+          "loads": 133,
+          "stores": 79,
+          "spills": 127,
+          "stack_refs": 127,
+          "xmm_reg_moves": 0,
+          "branches": 56,
+          "vectors": 0,
+          "calls": 8,
+          "ratio_vs_best": 2.418831168831169
+        },
+        {
+          "key": "icx",
+          "id": "cicxlatest",
+          "name": "x86-64 icx (latest)",
+          "semver": "(latest)",
+          "compilerType": "clang-intel",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 515,
+          "loads": 56,
+          "stores": 50,
+          "spills": 65,
+          "stack_refs": 65,
+          "xmm_reg_moves": 0,
+          "branches": 47,
+          "vectors": 27,
+          "calls": 6,
+          "ratio_vs_best": 1.672077922077922
+        }
+      ],
+      "errors": []
+    },
+    {
+      "source": "tests/benchmark/programs/expat_xml_scan.c",
+      "sha256": "a076b1823869765011658d56ec090b22102e2ba7a5bbdf4cd0b6bdd0d774cf35",
+      "records": [
+        {
+          "key": "lccc",
+          "id": "/home/lccc-work/baseline-pr795-lccc",
+          "name": "local LCCC",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 222,
+          "loads": 18,
+          "stores": 10,
+          "spills": 17,
+          "stack_refs": 17,
+          "xmm_reg_moves": 0,
+          "branches": 58,
+          "vectors": 0,
+          "calls": 4,
+          "ratio_vs_best": 1.2906976744186047
+        },
+        {
+          "key": "gcc",
+          "id": "cg162",
+          "name": "x86-64 gcc 16.2",
+          "semver": "16.2",
+          "compilerType": "",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 172,
+          "loads": 15,
+          "stores": 6,
+          "spills": 4,
+          "stack_refs": 4,
+          "xmm_reg_moves": 0,
+          "branches": 50,
+          "vectors": 7,
+          "calls": 4,
+          "ratio_vs_best": 1.0
+        },
+        {
+          "key": "clang",
+          "id": "cclang2310",
+          "name": "x86-64 clang 23.1.0",
+          "semver": "23.1.0",
+          "compilerType": "clang",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 222,
+          "loads": 15,
+          "stores": 10,
+          "spills": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "branches": 59,
+          "vectors": 12,
+          "calls": 1,
+          "ratio_vs_best": 1.2906976744186047
+        },
+        {
+          "key": "icc",
+          "id": "cicc2021100",
+          "name": "x86-64 icc 2021.10.0",
+          "semver": "2021.10.0",
+          "compilerType": "",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 319,
+          "loads": 21,
+          "stores": 7,
+          "spills": 3,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "branches": 95,
+          "vectors": 0,
+          "calls": 3,
+          "ratio_vs_best": 1.8546511627906976
+        },
+        {
+          "key": "icx",
+          "id": "cicxlatest",
+          "name": "x86-64 icx (latest)",
+          "semver": "(latest)",
+          "compilerType": "clang-intel",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 327,
+          "loads": 21,
+          "stores": 29,
+          "spills": 3,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "branches": 107,
+          "vectors": 30,
+          "calls": 1,
+          "ratio_vs_best": 1.9011627906976745
+        }
+      ],
+      "errors": []
+    },
+    {
+      "source": "tests/benchmark/programs/matmul.c",
+      "sha256": "927478b18ee0aa0d118eea4d2a9d6bb1251fdf3c64c2619ab578463beba99560",
+      "records": [
+        {
+          "key": "lccc",
+          "id": "/home/lccc-work/baseline-pr795-lccc",
+          "name": "local LCCC",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 85,
+          "loads": 12,
+          "stores": 7,
+          "spills": 2,
+          "stack_refs": 2,
+          "xmm_reg_moves": 1,
+          "branches": 14,
+          "vectors": 12,
+          "calls": 2,
+          "ratio_vs_best": 1.0365853658536586
+        },
+        {
+          "key": "gcc",
+          "id": "cg162",
+          "name": "x86-64 gcc 16.2",
+          "semver": "16.2",
+          "compilerType": "",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 82,
+          "loads": 8,
+          "stores": 6,
+          "spills": 2,
+          "stack_refs": 2,
+          "xmm_reg_moves": 0,
+          "branches": 9,
+          "vectors": 31,
+          "calls": 2,
+          "ratio_vs_best": 1.0
+        },
+        {
+          "key": "clang",
+          "id": "cclang2310",
+          "name": "x86-64 clang 23.1.0",
+          "semver": "23.1.0",
+          "compilerType": "clang",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 164,
+          "loads": 46,
+          "stores": 22,
+          "spills": 4,
+          "stack_refs": 4,
+          "xmm_reg_moves": 0,
+          "branches": 11,
+          "vectors": 94,
+          "calls": 1,
+          "ratio_vs_best": 2.0
+        },
+        {
+          "key": "icc",
+          "id": "cicc2021100",
+          "name": "x86-64 icc 2021.10.0",
+          "semver": "2021.10.0",
+          "compilerType": "",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 162,
+          "loads": 28,
+          "stores": 16,
+          "spills": 5,
+          "stack_refs": 5,
+          "xmm_reg_moves": 0,
+          "branches": 12,
+          "vectors": 16,
+          "calls": 2,
+          "ratio_vs_best": 1.975609756097561
+        },
+        {
+          "key": "icx",
+          "id": "cicxlatest",
+          "name": "x86-64 icx (latest)",
+          "semver": "(latest)",
+          "compilerType": "clang-intel",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 131,
+          "loads": 24,
+          "stores": 16,
+          "spills": 5,
+          "stack_refs": 5,
+          "xmm_reg_moves": 0,
+          "branches": 11,
+          "vectors": 60,
+          "calls": 1,
+          "ratio_vs_best": 1.5975609756097562
+        }
+      ],
+      "errors": []
+    },
+    {
+      "source": "tests/benchmark/programs/mandelbrot.c",
+      "sha256": "3f9d3a3e0da962e5a1840790ebf46fa09f38cd5e758645c8c65625fa9882555c",
+      "records": [
+        {
+          "key": "lccc",
+          "id": "/home/lccc-work/baseline-pr795-lccc",
+          "name": "local LCCC",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 55,
+          "loads": 5,
+          "stores": 0,
+          "spills": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 1,
+          "branches": 9,
+          "vectors": 1,
+          "calls": 1,
+          "ratio_vs_best": 1.1702127659574468
+        },
+        {
+          "key": "gcc",
+          "id": "cg162",
+          "name": "x86-64 gcc 16.2",
+          "semver": "16.2",
+          "compilerType": "",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 47,
+          "loads": 4,
+          "stores": 0,
+          "spills": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 4,
+          "branches": 7,
+          "vectors": 6,
+          "calls": 1,
+          "ratio_vs_best": 1.0
+        },
+        {
+          "key": "clang",
+          "id": "cclang2310",
+          "name": "x86-64 clang 23.1.0",
+          "semver": "23.1.0",
+          "compilerType": "clang",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 59,
+          "loads": 4,
+          "stores": 0,
+          "spills": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 2,
+          "branches": 10,
+          "vectors": 4,
+          "calls": 1,
+          "ratio_vs_best": 1.2553191489361701
+        },
+        {
+          "key": "icc",
+          "id": "cicc2021100",
+          "name": "x86-64 icc 2021.10.0",
+          "semver": "2021.10.0",
+          "compilerType": "",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 64,
+          "loads": 7,
+          "stores": 3,
+          "spills": 3,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "branches": 7,
+          "vectors": 3,
+          "calls": 2,
+          "ratio_vs_best": 1.3617021276595744
+        },
+        {
+          "key": "icx",
+          "id": "cicxlatest",
+          "name": "x86-64 icx (latest)",
+          "semver": "(latest)",
+          "compilerType": "clang-intel",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 64,
+          "loads": 7,
+          "stores": 3,
+          "spills": 3,
+          "stack_refs": 3,
+          "xmm_reg_moves": 3,
+          "branches": 10,
+          "vectors": 9,
+          "calls": 1,
+          "ratio_vs_best": 1.3617021276595744
+        }
+      ],
+      "errors": []
+    },
+    {
+      "source": "tests/benchmark/programs/hash_table.c",
+      "sha256": "1c742684a0ea694fbeb95d249748488e89f9033c64d518cd1fafe27da24a2e5a",
+      "records": [
+        {
+          "key": "lccc",
+          "id": "/home/lccc-work/baseline-pr795-lccc",
+          "name": "local LCCC",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 141,
+          "loads": 8,
+          "stores": 5,
+          "spills": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "branches": 26,
+          "vectors": 0,
+          "calls": 6,
+          "ratio_vs_best": 1.2155172413793103
+        },
+        {
+          "key": "gcc",
+          "id": "cg162",
+          "name": "x86-64 gcc 16.2",
+          "semver": "16.2",
+          "compilerType": "",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 116,
+          "loads": 11,
+          "stores": 9,
+          "spills": 8,
+          "stack_refs": 8,
+          "xmm_reg_moves": 0,
+          "branches": 24,
+          "vectors": 0,
+          "calls": 6,
+          "ratio_vs_best": 1.0
+        },
+        {
+          "key": "clang",
+          "id": "cclang2310",
+          "name": "x86-64 clang 23.1.0",
+          "semver": "23.1.0",
+          "compilerType": "clang",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 140,
+          "loads": 13,
+          "stores": 10,
+          "spills": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "branches": 30,
+          "vectors": 0,
+          "calls": 3,
+          "ratio_vs_best": 1.206896551724138
+        },
+        {
+          "key": "icc",
+          "id": "cicc2021100",
+          "name": "x86-64 icc 2021.10.0",
+          "semver": "2021.10.0",
+          "compilerType": "",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 158,
+          "loads": 17,
+          "stores": 13,
+          "spills": 3,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "branches": 26,
+          "vectors": 0,
+          "calls": 4,
+          "ratio_vs_best": 1.3620689655172413
+        },
+        {
+          "key": "icx",
+          "id": "cicxlatest",
+          "name": "x86-64 icx (latest)",
+          "semver": "(latest)",
+          "compilerType": "clang-intel",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 142,
+          "loads": 15,
+          "stores": 13,
+          "spills": 3,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "branches": 30,
+          "vectors": 2,
+          "calls": 3,
+          "ratio_vs_best": 1.2241379310344827
+        }
+      ],
+      "errors": []
+    },
+    {
+      "source": "tests/benchmark/programs/zstd_count.c",
+      "sha256": "cf01953477eadbebe46b07ede170a62ff41b62cf947dd12222a04ad93c985be6",
+      "records": [
+        {
+          "key": "lccc",
+          "id": "/home/lccc-work/baseline-pr795-lccc",
+          "name": "local LCCC",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 166,
+          "loads": 12,
+          "stores": 4,
+          "spills": 8,
+          "stack_refs": 8,
+          "xmm_reg_moves": 0,
+          "branches": 30,
+          "vectors": 4,
+          "calls": 1,
+          "ratio_vs_best": 1.8241758241758241
+        },
+        {
+          "key": "gcc",
+          "id": "cg162",
+          "name": "x86-64 gcc 16.2",
+          "semver": "16.2",
+          "compilerType": "",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 91,
+          "loads": 5,
+          "stores": 1,
+          "spills": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "branches": 18,
+          "vectors": 0,
+          "calls": 1,
+          "ratio_vs_best": 1.0
+        },
+        {
+          "key": "clang",
+          "id": "cclang2310",
+          "name": "x86-64 clang 23.1.0",
+          "semver": "23.1.0",
+          "compilerType": "clang",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 121,
+          "loads": 7,
+          "stores": 3,
+          "spills": 2,
+          "stack_refs": 2,
+          "xmm_reg_moves": 0,
+          "branches": 20,
+          "vectors": 0,
+          "calls": 1,
+          "ratio_vs_best": 1.3296703296703296
+        },
+        {
+          "key": "icc",
+          "id": "cicc2021100",
+          "name": "x86-64 icc 2021.10.0",
+          "semver": "2021.10.0",
+          "compilerType": "",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 106,
+          "loads": 8,
+          "stores": 5,
+          "spills": 3,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "branches": 17,
+          "vectors": 0,
+          "calls": 2,
+          "ratio_vs_best": 1.164835164835165
+        },
+        {
+          "key": "icx",
+          "id": "cicxlatest",
+          "name": "x86-64 icx (latest)",
+          "semver": "(latest)",
+          "compilerType": "clang-intel",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 152,
+          "loads": 10,
+          "stores": 7,
+          "spills": 3,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "branches": 29,
+          "vectors": 2,
+          "calls": 1,
+          "ratio_vs_best": 1.6703296703296704
+        }
+      ],
+      "errors": []
+    },
+    {
+      "source": "tests/benchmark/programs/sqlite_varint.c",
+      "sha256": "11c7e09b1507659fe44e678848c5e489268e4dd4aa385d3a542453caa400e1af",
+      "records": [
+        {
+          "key": "lccc",
+          "id": "/home/lccc-work/baseline-pr795-lccc",
+          "name": "local LCCC",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 397,
+          "loads": 32,
+          "stores": 32,
+          "spills": 22,
+          "stack_refs": 22,
+          "xmm_reg_moves": 0,
+          "branches": 59,
+          "vectors": 0,
+          "calls": 5,
+          "ratio_vs_best": 1.2329192546583851
+        },
+        {
+          "key": "gcc",
+          "id": "cg162",
+          "name": "x86-64 gcc 16.2",
+          "semver": "16.2",
+          "compilerType": "",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 322,
+          "loads": 26,
+          "stores": 23,
+          "spills": 18,
+          "stack_refs": 18,
+          "xmm_reg_moves": 0,
+          "branches": 55,
+          "vectors": 3,
+          "calls": 5,
+          "ratio_vs_best": 1.0
+        },
+        {
+          "key": "clang",
+          "id": "cclang2310",
+          "name": "x86-64 clang 23.1.0",
+          "semver": "23.1.0",
+          "compilerType": "clang",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 373,
+          "loads": 24,
+          "stores": 22,
+          "spills": 7,
+          "stack_refs": 7,
+          "xmm_reg_moves": 0,
+          "branches": 61,
+          "vectors": 20,
+          "calls": 5,
+          "ratio_vs_best": 1.1583850931677018
+        },
+        {
+          "key": "icc",
+          "id": "cicc2021100",
+          "name": "x86-64 icc 2021.10.0",
+          "semver": "2021.10.0",
+          "compilerType": "",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 470,
+          "loads": 33,
+          "stores": 52,
+          "spills": 33,
+          "stack_refs": 33,
+          "xmm_reg_moves": 0,
+          "branches": 63,
+          "vectors": 0,
+          "calls": 4,
+          "ratio_vs_best": 1.4596273291925466
+        },
+        {
+          "key": "icx",
+          "id": "cicxlatest",
+          "name": "x86-64 icx (latest)",
+          "semver": "(latest)",
+          "compilerType": "clang-intel",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 428,
+          "loads": 35,
+          "stores": 40,
+          "spills": 21,
+          "stack_refs": 21,
+          "xmm_reg_moves": 0,
+          "branches": 61,
+          "vectors": 50,
+          "calls": 3,
+          "ratio_vs_best": 1.329192546583851
+        }
+      ],
+      "errors": []
+    },
+    {
+      "source": "tests/benchmark/programs/tls_seg_access.c",
+      "sha256": "02e6d2bcd07b2e1fc253b53d316d522e7b3d912ae634b6fad2c10dc93a1d4835",
+      "records": [
+        {
+          "key": "lccc",
+          "id": "/home/lccc-work/baseline-pr795-lccc",
+          "name": "local LCCC",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 56,
+          "loads": 2,
+          "stores": 1,
+          "spills": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "branches": 8,
+          "vectors": 0,
+          "calls": 2,
+          "ratio_vs_best": 1.5555555555555556
+        },
+        {
+          "key": "gcc",
+          "id": "cg162",
+          "name": "x86-64 gcc 16.2",
+          "semver": "16.2",
+          "compilerType": "",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 36,
+          "loads": 1,
+          "stores": 1,
+          "spills": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "branches": 6,
+          "vectors": 0,
+          "calls": 2,
+          "ratio_vs_best": 1.0
+        },
+        {
+          "key": "clang",
+          "id": "cclang2310",
+          "name": "x86-64 clang 23.1.0",
+          "semver": "23.1.0",
+          "compilerType": "clang",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 55,
+          "loads": 6,
+          "stores": 3,
+          "spills": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "branches": 6,
+          "vectors": 0,
+          "calls": 2,
+          "ratio_vs_best": 1.5277777777777777
+        },
+        {
+          "key": "icc",
+          "id": "cicc2021100",
+          "name": "x86-64 icc 2021.10.0",
+          "semver": "2021.10.0",
+          "compilerType": "",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 62,
+          "loads": 6,
+          "stores": 6,
+          "spills": 3,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "branches": 7,
+          "vectors": 0,
+          "calls": 3,
+          "ratio_vs_best": 1.7222222222222223
+        },
+        {
+          "key": "icx",
+          "id": "cicxlatest",
+          "name": "x86-64 icx (latest)",
+          "semver": "(latest)",
+          "compilerType": "clang-intel",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 64,
+          "loads": 6,
+          "stores": 6,
+          "spills": 3,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "branches": 6,
+          "vectors": 2,
+          "calls": 2,
+          "ratio_vs_best": 1.7777777777777777
+        }
+      ],
+      "errors": []
+    },
+    {
+      "source": "tests/benchmark/programs/strlen_bench.c",
+      "sha256": "175202f59218fa62a3120f9f5202a005f5e234f2cbabd453048d933082e0dd44",
+      "records": [
+        {
+          "key": "lccc",
+          "id": "/home/lccc-work/baseline-pr795-lccc",
+          "name": "local LCCC",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 196,
+          "loads": 11,
+          "stores": 10,
+          "spills": 13,
+          "stack_refs": 13,
+          "xmm_reg_moves": 0,
+          "branches": 37,
+          "vectors": 0,
+          "calls": 5,
+          "ratio_vs_best": 1.410071942446043
+        },
+        {
+          "key": "gcc",
+          "id": "cg162",
+          "name": "x86-64 gcc 16.2",
+          "semver": "16.2",
+          "compilerType": "",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 139,
+          "loads": 8,
+          "stores": 5,
+          "spills": 4,
+          "stack_refs": 4,
+          "xmm_reg_moves": 0,
+          "branches": 23,
+          "vectors": 0,
+          "calls": 5,
+          "ratio_vs_best": 1.0
+        },
+        {
+          "key": "clang",
+          "id": "cclang2310",
+          "name": "x86-64 clang 23.1.0",
+          "semver": "23.1.0",
+          "compilerType": "clang",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 226,
+          "loads": 14,
+          "stores": 10,
+          "spills": 12,
+          "stack_refs": 12,
+          "xmm_reg_moves": 0,
+          "branches": 32,
+          "vectors": 0,
+          "calls": 5,
+          "ratio_vs_best": 1.6258992805755397
+        },
+        {
+          "key": "icc",
+          "id": "cicc2021100",
+          "name": "x86-64 icc 2021.10.0",
+          "semver": "2021.10.0",
+          "compilerType": "",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 204,
+          "loads": 22,
+          "stores": 11,
+          "spills": 11,
+          "stack_refs": 11,
+          "xmm_reg_moves": 0,
+          "branches": 29,
+          "vectors": 4,
+          "calls": 5,
+          "ratio_vs_best": 1.4676258992805755
+        },
+        {
+          "key": "icx",
+          "id": "cicxlatest",
+          "name": "x86-64 icx (latest)",
+          "semver": "(latest)",
+          "compilerType": "clang-intel",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 481,
+          "loads": 37,
+          "stores": 24,
+          "spills": 48,
+          "stack_refs": 48,
+          "xmm_reg_moves": 0,
+          "branches": 61,
+          "vectors": 54,
+          "calls": 40,
+          "ratio_vs_best": 3.460431654676259
+        }
+      ],
+      "errors": []
+    },
+    {
+      "source": "tests/benchmark/programs/glibc_memcmp.c",
+      "sha256": "6fcec75ff20c60106d78db2013a646579ab4262750fe64eee99387f3c16b0870",
+      "records": [
+        {
+          "key": "lccc",
+          "id": "/home/lccc-work/baseline-pr795-lccc",
+          "name": "local LCCC",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 203,
+          "loads": 17,
+          "stores": 15,
+          "spills": 15,
+          "stack_refs": 15,
+          "xmm_reg_moves": 0,
+          "branches": 37,
+          "vectors": 4,
+          "calls": 9,
+          "ratio_vs_best": 1.2929936305732483
+        },
+        {
+          "key": "gcc",
+          "id": "cg162",
+          "name": "x86-64 gcc 16.2",
+          "semver": "16.2",
+          "compilerType": "",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 157,
+          "loads": 18,
+          "stores": 15,
+          "spills": 11,
+          "stack_refs": 11,
+          "xmm_reg_moves": 0,
+          "branches": 29,
+          "vectors": 5,
+          "calls": 4,
+          "ratio_vs_best": 1.0
+        },
+        {
+          "key": "clang",
+          "id": "cclang2310",
+          "name": "x86-64 clang 23.1.0",
+          "semver": "23.1.0",
+          "compilerType": "clang",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 227,
+          "loads": 14,
+          "stores": 11,
+          "spills": 7,
+          "stack_refs": 7,
+          "xmm_reg_moves": 0,
+          "branches": 37,
+          "vectors": 4,
+          "calls": 4,
+          "ratio_vs_best": 1.4458598726114649
+        },
+        {
+          "key": "icc",
+          "id": "cicc2021100",
+          "name": "x86-64 icc 2021.10.0",
+          "semver": "2021.10.0",
+          "compilerType": "",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 322,
+          "loads": 72,
+          "stores": 40,
+          "spills": 76,
+          "stack_refs": 76,
+          "xmm_reg_moves": 0,
+          "branches": 61,
+          "vectors": 1,
+          "calls": 5,
+          "ratio_vs_best": 2.050955414012739
+        },
+        {
+          "key": "icx",
+          "id": "cicxlatest",
+          "name": "x86-64 icx (latest)",
+          "semver": "(latest)",
+          "compilerType": "clang-intel",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 311,
+          "loads": 18,
+          "stores": 24,
+          "spills": 6,
+          "stack_refs": 6,
+          "xmm_reg_moves": 0,
+          "branches": 42,
+          "vectors": 6,
+          "calls": 4,
+          "ratio_vs_best": 1.980891719745223
+        }
+      ],
+      "errors": []
+    },
+    {
+      "source": "tests/benchmark/programs/switch_dispatch.c",
+      "sha256": "6a044523272024b733f4af8e5101d5bf2d72ba9d6e9362798f6149cd9265117a",
+      "records": [
+        {
+          "key": "lccc",
+          "id": "/home/lccc-work/baseline-pr795-lccc",
+          "name": "local LCCC",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 88,
+          "loads": 1,
+          "stores": 0,
+          "spills": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "branches": 22,
+          "vectors": 0,
+          "calls": 1,
+          "ratio_vs_best": 1.2941176470588236
+        },
+        {
+          "key": "gcc",
+          "id": "cg162",
+          "name": "x86-64 gcc 16.2",
+          "semver": "16.2",
+          "compilerType": "",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 68,
+          "loads": 1,
+          "stores": 0,
+          "spills": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "branches": 18,
+          "vectors": 0,
+          "calls": 1,
+          "ratio_vs_best": 1.0
+        },
+        {
+          "key": "clang",
+          "id": "cclang2310",
+          "name": "x86-64 clang 23.1.0",
+          "semver": "23.1.0",
+          "compilerType": "clang",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 80,
+          "loads": 2,
+          "stores": 0,
+          "spills": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "branches": 19,
+          "vectors": 0,
+          "calls": 1,
+          "ratio_vs_best": 1.1764705882352942
+        },
+        {
+          "key": "icc",
+          "id": "cicc2021100",
+          "name": "x86-64 icc 2021.10.0",
+          "semver": "2021.10.0",
+          "compilerType": "",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 80,
+          "loads": 4,
+          "stores": 3,
+          "spills": 3,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "branches": 20,
+          "vectors": 0,
+          "calls": 2,
+          "ratio_vs_best": 1.1764705882352942
+        },
+        {
+          "key": "icx",
+          "id": "cicxlatest",
+          "name": "x86-64 icx (latest)",
+          "semver": "(latest)",
+          "compilerType": "clang-intel",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 87,
+          "loads": 4,
+          "stores": 3,
+          "spills": 3,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "branches": 21,
+          "vectors": 2,
+          "calls": 1,
+          "ratio_vs_best": 1.2794117647058822
+        }
+      ],
+      "errors": []
+    },
+    {
+      "source": "tests/benchmark/programs/sha256_transform.c",
+      "sha256": "6f55a89cfd9d59eb9a8e115eef968295ec775fa63d0545dd33517c2fdf06bf5e",
+      "records": [
+        {
+          "key": "lccc",
+          "id": "/home/lccc-work/baseline-pr795-lccc",
+          "name": "local LCCC",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 279,
+          "loads": 43,
+          "stores": 41,
+          "spills": 60,
+          "stack_refs": 60,
+          "xmm_reg_moves": 0,
+          "branches": 23,
+          "vectors": 64,
+          "calls": 3,
+          "ratio_vs_best": 1.2077922077922079
+        },
+        {
+          "key": "gcc",
+          "id": "cg162",
+          "name": "x86-64 gcc 16.2",
+          "semver": "16.2",
+          "compilerType": "",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 231,
+          "loads": 32,
+          "stores": 31,
+          "spills": 37,
+          "stack_refs": 37,
+          "xmm_reg_moves": 0,
+          "branches": 15,
+          "vectors": 37,
+          "calls": 3,
+          "ratio_vs_best": 1.0
+        },
+        {
+          "key": "clang",
+          "id": "cclang2310",
+          "name": "x86-64 clang 23.1.0",
+          "semver": "23.1.0",
+          "compilerType": "clang",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 232,
+          "loads": 38,
+          "stores": 24,
+          "spills": 40,
+          "stack_refs": 40,
+          "xmm_reg_moves": 0,
+          "branches": 12,
+          "vectors": 48,
+          "calls": 3,
+          "ratio_vs_best": 1.0043290043290043
+        },
+        {
+          "key": "icc",
+          "id": "cicc2021100",
+          "name": "x86-64 icc 2021.10.0",
+          "semver": "2021.10.0",
+          "compilerType": "",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 462,
+          "loads": 67,
+          "stores": 48,
+          "spills": 90,
+          "stack_refs": 90,
+          "xmm_reg_moves": 0,
+          "branches": 13,
+          "vectors": 42,
+          "calls": 2,
+          "ratio_vs_best": 2.0
+        },
+        {
+          "key": "icx",
+          "id": "cicxlatest",
+          "name": "x86-64 icx (latest)",
+          "semver": "(latest)",
+          "compilerType": "clang-intel",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 862,
+          "loads": 93,
+          "stores": 45,
+          "spills": 103,
+          "stack_refs": 103,
+          "xmm_reg_moves": 0,
+          "branches": 12,
+          "vectors": 724,
+          "calls": 3,
+          "ratio_vs_best": 3.7316017316017316
+        }
+      ],
+      "errors": []
+    },
+    {
+      "source": "tests/benchmark/programs/fannkuch.c",
+      "sha256": "2a78d670ab985384a3008ac031e7a478fdc790b627d011177dd528b7282d11e5",
+      "records": [
+        {
+          "key": "lccc",
+          "id": "/home/lccc-work/baseline-pr795-lccc",
+          "name": "local LCCC",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 152,
+          "loads": 15,
+          "stores": 27,
+          "spills": 7,
+          "stack_refs": 7,
+          "xmm_reg_moves": 0,
+          "branches": 22,
+          "vectors": 3,
+          "calls": 1,
+          "ratio_vs_best": 1.0704225352112675
+        },
+        {
+          "key": "gcc",
+          "id": "cg162",
+          "name": "x86-64 gcc 16.2",
+          "semver": "16.2",
+          "compilerType": "",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 142,
+          "loads": 20,
+          "stores": 27,
+          "spills": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "branches": 23,
+          "vectors": 13,
+          "calls": 1,
+          "ratio_vs_best": 1.0
+        },
+        {
+          "key": "clang",
+          "id": "cclang2310",
+          "name": "x86-64 clang 23.1.0",
+          "semver": "23.1.0",
+          "compilerType": "clang",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 227,
+          "loads": 35,
+          "stores": 33,
+          "spills": 19,
+          "stack_refs": 19,
+          "xmm_reg_moves": 0,
+          "branches": 27,
+          "vectors": 40,
+          "calls": 2,
+          "ratio_vs_best": 1.5985915492957747
+        },
+        {
+          "key": "icc",
+          "id": "cicc2021100",
+          "name": "x86-64 icc 2021.10.0",
+          "semver": "2021.10.0",
+          "compilerType": "",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 216,
+          "loads": 24,
+          "stores": 28,
+          "spills": 3,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "branches": 31,
+          "vectors": 1,
+          "calls": 3,
+          "ratio_vs_best": 1.5211267605633803
+        },
+        {
+          "key": "icx",
+          "id": "cicxlatest",
+          "name": "x86-64 icx (latest)",
+          "semver": "(latest)",
+          "compilerType": "clang-intel",
+          "flags": "-O2 -march=x86-64-v3 -fwrapv",
+          "instructions": 268,
+          "loads": 38,
+          "stores": 35,
+          "spills": 12,
+          "stack_refs": 12,
+          "xmm_reg_moves": 0,
+          "branches": 38,
+          "vectors": 26,
+          "calls": 4,
+          "ratio_vs_best": 1.8873239436619718
+        }
+      ],
+      "errors": []
+    }
+  ],
+  "native_v1": {
+    "header": "A: baseline-pr795-lccc vs B: memory-range-v1-lccc",
+    "flags": [
+      "-O2",
+      "-march=x86-64-v3",
+      "-fwrapv"
+    ],
+    "reps": 11,
+    "floor_ms": 2.3432200000570447,
+    "geomean_b_over_a": 0.9810004217497533,
+    "benchmarks": [
+      {
+        "benchmark": "expat_siphash24",
+        "a_min_ms": 474.8734110000896,
+        "b_min_ms": 374.32085700015705,
+        "ratio_b_over_a": 0.7882539816491987,
+        "ratio_low3": 0.7882442348485884,
+        "samples_a": [
+          480.717150999908,
+          476.66818399989097,
+          476.2482329999784,
+          499.79150900003333,
+          493.44516499991187,
+          479.11633800003983,
+          475.45304100003705,
+          476.14068000007137,
+          481.94391599986375,
+          474.8734110000896,
+          478.46296100010477
+        ],
+        "samples_b": [
+          378.2878819999951,
+          375.9701930000574,
+          375.9912949999489,
+          383.56376900014766,
+          403.67844200000036,
+          374.32085700015705,
+          377.96660499998325,
+          382.66437800007225,
+          379.5735410001271,
+          375.1109899999392,
+          374.9726460000602
+        ],
+        "excluded": false
+      },
+      {
+        "benchmark": "expat_xml_scan",
+        "a_min_ms": 49.778981999907046,
+        "b_min_ms": 49.55401500001244,
+        "ratio_b_over_a": 0.9954806829939787,
+        "ratio_low3": 0.9967755690183199,
+        "samples_a": [
+          49.93250600000465,
+          49.98419100002138,
+          49.778981999907046,
+          50.141777999897386,
+          50.3132949997962,
+          49.900342999990244,
+          50.267625000060434,
+          49.858220000032816,
+          49.886191000041435,
+          49.795120999988285,
+          49.81070400003773
+        ],
+        "samples_b": [
+          50.029926999968666,
+          50.53794500008735,
+          49.89419300000009,
+          50.10295399983988,
+          49.97026400019422,
+          49.66761300011058,
+          49.68149799992716,
+          50.00213999983316,
+          49.88427200009937,
+          49.55401500001244,
+          49.77699799997026
+        ],
+        "excluded": false
+      },
+      {
+        "benchmark": "fannkuch",
+        "a_min_ms": 2774.555300999964,
+        "b_min_ms": 2770.3489699999864,
+        "ratio_b_over_a": 0.998483962097111,
+        "ratio_low3": 0.9999200478381416,
+        "samples_a": [
+          2799.394353000025,
+          3013.701342000104,
+          2891.98747599994,
+          2784.4568839998374,
+          2815.2909689999888,
+          2778.683757999943,
+          2785.309189999907,
+          2826.087113000085,
+          2783.9213690001543,
+          2774.555300999964,
+          2823.363898000025
+        ],
+        "samples_b": [
+          2830.3012809999473,
+          2806.5892120000626,
+          2835.5191870000453,
+          2781.1138220001794,
+          2785.0310619999163,
+          2770.3489699999864,
+          2797.4429039998085,
+          2811.087096000165,
+          2903.7904490000983,
+          2875.3928400001314,
+          2821.388387999832
+        ],
+        "excluded": false
+      },
+      {
+        "benchmark": "glibc_memcmp",
+        "a_min_ms": 10.120528000015838,
+        "b_min_ms": 10.087844000054247,
+        "ratio_b_over_a": 0.9967705242294137,
+        "ratio_low3": 0.9979989044841145,
+        "samples_a": [
+          10.357865000059974,
+          10.179249999964668,
+          10.178838000001633,
+          10.144280000076833,
+          10.120528000015838,
+          10.310551999964446,
+          10.174019000032786,
+          10.451636999960101,
+          10.541916999954992,
+          10.1782109998112,
+          10.40149699997528
+        ],
+        "samples_b": [
+          10.214100999974107,
+          10.183272999938708,
+          10.119875999862415,
+          10.170195999990028,
+          10.087844000054247,
+          10.179465999954118,
+          10.185376999970686,
+          10.171333000016602,
+          10.265974000049027,
+          10.19724299999325,
+          10.380557999951634
+        ],
+        "excluded": false
+      },
+      {
+        "benchmark": "hash_table",
+        "a_min_ms": 10279.873786000053,
+        "b_min_ms": 10181.369645999894,
+        "ratio_b_over_a": 0.9904177675669219,
+        "ratio_low3": 1.0422620811269026,
+        "samples_a": [
+          11622.501607999993,
+          10279.873786000053,
+          10849.282096000024,
+          10660.151842000005,
+          10875.547036999933,
+          13768.620058999886,
+          13946.766262999972,
+          13228.545663999967,
+          14072.88563100019,
+          14112.422628000104,
+          13872.001747000013
+        ],
+        "samples_b": [
+          11599.82323500003,
+          10181.369645999894,
+          12860.896795000144,
+          12004.693275999898,
+          11351.597144999914,
+          12482.993165999915,
+          11880.359569999882,
+          13269.984423999858,
+          13868.498865999982,
+          13060.92450899996,
+          14765.348083999925
+        ],
+        "excluded": false
+      },
+      {
+        "benchmark": "mandelbrot",
+        "a_min_ms": 1382.9399530000046,
+        "b_min_ms": 1374.5438989999457,
+        "ratio_b_over_a": 0.993928836908757,
+        "ratio_low3": 0.9955545428206081,
+        "samples_a": [
+          1387.0601060000354,
+          1411.1621949998607,
+          1382.9399530000046,
+          1429.6272589999717,
+          1395.1625009999589,
+          1454.889145999914,
+          1454.632674000095,
+          1395.44485600004,
+          1383.0355579998468,
+          1404.69016499992,
+          1421.7534490001071
+        ],
+        "samples_b": [
+          1420.270832999904,
+          1381.1459430000923,
+          1374.5438989999457,
+          1412.951461000148,
+          1452.3398579999593,
+          1545.5135800000335,
+          1378.8836329999867,
+          1388.2646550000572,
+          1381.228419000081,
+          1382.3408790001395,
+          1396.9278299998678
+        ],
+        "excluded": false
+      },
+      {
+        "benchmark": "matmul",
+        "a_min_ms": 6.666135999921607,
+        "b_min_ms": 6.699801999957344,
+        "ratio_b_over_a": 1.0050503020094599,
+        "ratio_low3": 1.004627243745952,
+        "samples_a": [
+          7.066671999837126,
+          6.937719000006837,
+          6.898976999991646,
+          7.465308000064397,
+          6.788020999920263,
+          7.581544999993639,
+          6.794115000047896,
+          6.666135999921607,
+          6.740216000025612,
+          6.70231800017973,
+          6.720826999981
+        ],
+        "samples_b": [
+          6.976079999958529,
+          6.875716999957149,
+          6.768115000113539,
+          7.731171999921571,
+          6.886750999910873,
+          6.838281999989704,
+          6.780438000077993,
+          7.0781510000870185,
+          7.166800000049989,
+          6.699801999957344,
+          6.714321999879758
+        ],
+        "excluded": false
+      },
+      {
+        "benchmark": "nbody",
+        "a_min_ms": 324.8847580000529,
+        "b_min_ms": 325.8404260000134,
+        "ratio_b_over_a": 1.0029415599729685,
+        "ratio_low3": 0.9914426289011264,
+        "samples_a": [
+          341.7324590000135,
+          342.47895500016057,
+          347.80292800019197,
+          341.86021499999697,
+          345.8370829998785,
+          340.58543600008306,
+          349.33954899997843,
+          339.70462399997814,
+          324.8847580000529,
+          338.42344200002117,
+          327.8024930000356
+        ],
+        "samples_b": [
+          356.47659999995085,
+          338.0264489999263,
+          333.77133299995876,
+          339.48096200015243,
+          342.50108299988824,
+          343.6632190000637,
+          334.7184350000134,
+          359.2572130000917,
+          325.8404260000134,
+          327.0066559998668,
+          329.7823090001657
+        ],
+        "excluded": false
+      },
+      {
+        "benchmark": "sha256_transform",
+        "a_min_ms": 293.94367399982,
+        "b_min_ms": 294.37872999983483,
+        "ratio_b_over_a": 1.0014800658714467,
+        "ratio_low3": 0.9945095161624532,
+        "samples_a": [
+          301.01819800006524,
+          303.8034929998048,
+          308.09018199988714,
+          320.294112000056,
+          307.7392919999511,
+          318.7120640000103,
+          317.1204450000005,
+          296.2899589999779,
+          301.8024099999366,
+          298.763610999913,
+          293.94367399982
+        ],
+        "samples_b": [
+          297.3110190000625,
+          294.7910990001219,
+          308.2803600000261,
+          322.62206299992613,
+          297.91574399996534,
+          300.0195749998511,
+          326.3591819998055,
+          294.94638999995004,
+          301.8416900001739,
+          306.17852099999254,
+          294.37872999983483
+        ],
+        "excluded": false
+      },
+      {
+        "benchmark": "sqlite_varint",
+        "a_min_ms": 27.640515000030064,
+        "b_min_ms": 27.59853500015197,
+        "ratio_b_over_a": 0.9984812149890099,
+        "ratio_low3": 0.9980380589233223,
+        "samples_a": [
+          28.071980000049734,
+          27.9640000001109,
+          28.082692999987557,
+          27.774620999934996,
+          27.80028099982701,
+          27.859288999934506,
+          27.790217000074335,
+          27.996518999998443,
+          27.855585999986943,
+          27.640515000030064,
+          28.0396620000829
+        ],
+        "samples_b": [
+          27.85790200005067,
+          28.032831000018632,
+          27.788342999883753,
+          27.852735999886136,
+          27.59853500015197,
+          27.725340999950276,
+          27.78105999982472,
+          27.892014999906678,
+          28.029328999991776,
+          27.71823300008691,
+          28.505747000053816
+        ],
+        "excluded": false
+      },
+      {
+        "benchmark": "strlen_bench",
+        "a_min_ms": 237.63914099981776,
+        "b_min_ms": 233.6143349998565,
+        "ratio_b_over_a": 0.9830633708612659,
+        "ratio_low3": 0.982560704792302,
+        "samples_a": [
+          237.63914099981776,
+          243.06944499994643,
+          246.54064399987874,
+          245.30375699987417,
+          247.49347300007685,
+          241.77617099985582,
+          249.86878400000023,
+          246.1082649999753,
+          249.5658119999007,
+          252.53438999993705,
+          240.37518699992688
+        ],
+        "samples_b": [
+          234.48182900006032,
+          239.6313189999546,
+          273.9086070000667,
+          274.3368080000437,
+          305.03588400006265,
+          239.1416959999333,
+          247.16856500003814,
+          247.9337760000817,
+          239.25716999997348,
+          233.6143349998565,
+          254.4114320000972
+        ],
+        "excluded": false
+      },
+      {
+        "benchmark": "switch_dispatch",
+        "a_min_ms": 535.631715999898,
+        "b_min_ms": 535.1915419998932,
+        "ratio_b_over_a": 0.9991782152048574,
+        "ratio_low3": 0.9998244227102984,
+        "samples_a": [
+          536.4691350000612,
+          536.2707849999424,
+          538.1028470001183,
+          535.8225110001058,
+          535.631715999898,
+          540.3437919999305,
+          570.6455720001031,
+          562.8420600000936,
+          540.7778049998342,
+          537.3539919999075,
+          540.2129960000366
+        ],
+        "samples_b": [
+          536.4865869998994,
+          536.495326000022,
+          536.040746000026,
+          535.1915419998932,
+          536.2520399999084,
+          537.2304899999563,
+          539.9135699999533,
+          542.8748659999201,
+          538.0345060000309,
+          536.2104439998348,
+          541.4990489998672
+        ],
+        "excluded": false
+      },
+      {
+        "benchmark": "tls_seg_access",
+        "a_min_ms": 11.342125000055603,
+        "b_min_ms": 11.31659399993623,
+        "ratio_b_over_a": 0.9977490108670777,
+        "ratio_low3": 0.9915738039566874,
+        "samples_a": [
+          11.484092000046076,
+          11.509765000027983,
+          11.559826999928191,
+          11.686757999996189,
+          11.925002999987555,
+          11.49425199992038,
+          11.342125000055603,
+          11.756015000173647,
+          11.621522000041296,
+          12.024225999994087,
+          12.877644000127475
+        ],
+        "samples_b": [
+          11.473792000060712,
+          12.506730000040989,
+          11.734710999917297,
+          13.766393999958382,
+          11.360745000047245,
+          11.428417999923113,
+          11.31659399993623,
+          11.353938999945967,
+          12.268865999885747,
+          12.33787699993627,
+          11.729325000032986
+        ],
+        "excluded": false
+      },
+      {
+        "benchmark": "zstd_count",
+        "a_min_ms": 13.115634999849135,
+        "b_min_ms": 13.202544000023408,
+        "ratio_b_over_a": 1.0066263661786312,
+        "ratio_low3": 1.0039647678952508,
+        "samples_a": [
+          13.956471000028614,
+          18.614793999859103,
+          13.592736999953559,
+          13.362797000127102,
+          14.209650000111651,
+          13.202707000118608,
+          13.330385000017486,
+          13.508006999927602,
+          13.4211540000706,
+          13.115634999849135,
+          13.779956999997012
+        ],
+        "samples_b": [
+          13.512791000039215,
+          13.493062000179634,
+          14.440786000022854,
+          13.868361000049845,
+          13.931116000094335,
+          13.507052000022668,
+          13.322618999836777,
+          13.410044000011112,
+          13.315664999936416,
+          13.287715999922511,
+          13.202544000023408
+        ],
+        "excluded": false
+      }
+    ],
+    "failures": []
+  },
+  "callgrind_v1": {
+    "complete": true,
+    "failures": [],
+    "results": {
+      "arith_loop": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DARITH_ITERS=20000",
+        "metrics": {
+          "conditional_mispredicts": [
+            3297,
+            3297
+          ],
+          "d1_misses": [
+            1880,
+            1880
+          ],
+          "i1_misses": [
+            1371,
+            1371
+          ],
+          "indirect_mispredicts": [
+            232,
+            232
+          ],
+          "ir_mine": 2185599,
+          "ir_ratio": 1.0,
+          "ir_ref": 2185599,
+          "ll_misses": [
+            2909,
+            2909
+          ]
+        }
+      },
+      "fib": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DFIB_N=25",
+        "metrics": {
+          "conditional_mispredicts": [
+            3322,
+            3322
+          ],
+          "d1_misses": [
+            1877,
+            1877
+          ],
+          "i1_misses": [
+            1354,
+            1354
+          ],
+          "indirect_mispredicts": [
+            233,
+            233
+          ],
+          "ir_mine": 146029,
+          "ir_ratio": 1.0,
+          "ir_ref": 146029,
+          "ll_misses": [
+            2896,
+            2896
+          ]
+        }
+      },
+      "matmul": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=48",
+        "metrics": {
+          "conditional_mispredicts": [
+            3505,
+            3505
+          ],
+          "d1_misses": [
+            3237,
+            3237
+          ],
+          "i1_misses": [
+            1443,
+            1443
+          ],
+          "indirect_mispredicts": [
+            234,
+            234
+          ],
+          "ir_mine": 307222,
+          "ir_ratio": 1.0,
+          "ir_ref": 307222,
+          "ll_misses": [
+            3860,
+            3860
+          ]
+        }
+      },
+      "qsort": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=10000",
+        "metrics": {
+          "conditional_mispredicts": [
+            78756,
+            78756
+          ],
+          "d1_misses": [
+            7637,
+            7637
+          ],
+          "i1_misses": [
+            1402,
+            1402
+          ],
+          "indirect_mispredicts": [
+            243,
+            243
+          ],
+          "ir_mine": 3391409,
+          "ir_ratio": 1.0,
+          "ir_ref": 3391409,
+          "ll_misses": [
+            4192,
+            4192
+          ]
+        }
+      },
+      "sieve": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=100000",
+        "metrics": {
+          "conditional_mispredicts": [
+            3530,
+            3530
+          ],
+          "d1_misses": [
+            51855,
+            51855
+          ],
+          "i1_misses": [
+            1360,
+            1360
+          ],
+          "indirect_mispredicts": [
+            242,
+            242
+          ],
+          "ir_mine": 1622464,
+          "ir_ratio": 1.0,
+          "ir_ref": 1622464,
+          "ll_misses": [
+            4467,
+            4467
+          ]
+        }
+      },
+      "tce_sum": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+        "metrics": {
+          "conditional_mispredicts": [
+            3287,
+            3287
+          ],
+          "d1_misses": [
+            1876,
+            1876
+          ],
+          "i1_misses": [
+            1353,
+            1353
+          ],
+          "indirect_mispredicts": [
+            233,
+            233
+          ],
+          "ir_mine": 145619,
+          "ir_ratio": 1.0,
+          "ir_ref": 145619,
+          "ll_misses": [
+            2892,
+            2892
+          ]
+        }
+      },
+      "nbody": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSTEPS=1000",
+        "metrics": {
+          "conditional_mispredicts": [
+            3458,
+            3458
+          ],
+          "d1_misses": [
+            1915,
+            1915
+          ],
+          "i1_misses": [
+            1446,
+            1446
+          ],
+          "indirect_mispredicts": [
+            234,
+            234
+          ],
+          "ir_mine": 689042,
+          "ir_ratio": 1.0,
+          "ir_ref": 689042,
+          "ll_misses": [
+            3001,
+            3001
+          ]
+        }
+      },
+      "binary_trees": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DTREE_DEPTH=10",
+        "metrics": {
+          "conditional_mispredicts": [
+            207631,
+            207631
+          ],
+          "d1_misses": [
+            54353,
+            54353
+          ],
+          "i1_misses": [
+            1378,
+            1378
+          ],
+          "indirect_mispredicts": [
+            238,
+            238
+          ],
+          "ir_mine": 31600285,
+          "ir_ratio": 1.0,
+          "ir_ref": 31600285,
+          "ll_misses": [
+            4968,
+            4968
+          ]
+        }
+      },
+      "spectral_norm": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=128",
+        "metrics": {
+          "conditional_mispredicts": [
+            8569,
+            8569
+          ],
+          "d1_misses": [
+            1936,
+            1936
+          ],
+          "i1_misses": [
+            1423,
+            1423
+          ],
+          "indirect_mispredicts": [
+            233,
+            233
+          ],
+          "ir_mine": 8673460,
+          "ir_ratio": 1.0,
+          "ir_ref": 8673460,
+          "ll_misses": [
+            2969,
+            2969
+          ]
+        }
+      },
+      "mandelbrot": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DWIDTH=128 -DHEIGHT=128",
+        "metrics": {
+          "conditional_mispredicts": [
+            15483,
+            15483
+          ],
+          "d1_misses": [
+            1878,
+            1878
+          ],
+          "i1_misses": [
+            1355,
+            1355
+          ],
+          "indirect_mispredicts": [
+            232,
+            232
+          ],
+          "ir_mine": 5599368,
+          "ir_ratio": 1.0,
+          "ir_ref": 5599368,
+          "ll_misses": [
+            2893,
+            2893
+          ]
+        }
+      },
+      "hash_table": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DNUM_OPS=20000",
+        "metrics": {
+          "conditional_mispredicts": [
+            19462,
+            19462
+          ],
+          "d1_misses": [
+            98419,
+            98419
+          ],
+          "i1_misses": [
+            1362,
+            1362
+          ],
+          "indirect_mispredicts": [
+            242,
+            242
+          ],
+          "ir_mine": 8433887,
+          "ir_ratio": 1.0,
+          "ir_ref": 8433887,
+          "ll_misses": [
+            26037,
+            26037
+          ]
+        }
+      },
+      "strlen_bench": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DNSTRINGS=1000",
+        "metrics": {
+          "conditional_mispredicts": [
+            132017,
+            132017
+          ],
+          "d1_misses": [
+            221290,
+            221290
+          ],
+          "i1_misses": [
+            1385,
+            1385
+          ],
+          "indirect_mispredicts": [
+            251,
+            251
+          ],
+          "ir_mine": 9285493,
+          "ir_ratio": 1.0,
+          "ir_ref": 9285493,
+          "ll_misses": [
+            5362,
+            5362
+          ]
+        }
+      },
+      "switch_dispatch": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=20000",
+        "metrics": {
+          "conditional_mispredicts": [
+            3288,
+            3288
+          ],
+          "d1_misses": [
+            1876,
+            1876
+          ],
+          "i1_misses": [
+            1356,
+            1356
+          ],
+          "indirect_mispredicts": [
+            18994,
+            18994
+          ],
+          "ir_mine": 593093,
+          "ir_ratio": 1.0,
+          "ir_ref": 593093,
+          "ll_misses": [
+            2898,
+            2898
+          ]
+        }
+      },
+      "struct_copy": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=2000",
+        "metrics": {
+          "conditional_mispredicts": [
+            3381,
+            3381
+          ],
+          "d1_misses": [
+            1915,
+            1916
+          ],
+          "i1_misses": [
+            1449,
+            1449
+          ],
+          "indirect_mispredicts": [
+            234,
+            234
+          ],
+          "ir_mine": 371079,
+          "ir_ratio": 0.9946392051013324,
+          "ir_ref": 373079,
+          "ll_misses": [
+            3001,
+            3001
+          ]
+        }
+      },
+      "loop_patterns": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSIZE=16384",
+        "metrics": {
+          "conditional_mispredicts": [
+            3443,
+            3443
+          ],
+          "d1_misses": [
+            10537,
+            10537
+          ],
+          "i1_misses": [
+            1376,
+            1376
+          ],
+          "indirect_mispredicts": [
+            236,
+            236
+          ],
+          "ir_mine": 719419,
+          "ir_ratio": 1.0,
+          "ir_ref": 719419,
+          "ll_misses": [
+            4965,
+            4965
+          ]
+        }
+      },
+      "fannkuch": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DFANNKUCH_N=7",
+        "metrics": {
+          "conditional_mispredicts": [
+            22514,
+            22514
+          ],
+          "d1_misses": [
+            1885,
+            1885
+          ],
+          "i1_misses": [
+            1361,
+            1361
+          ],
+          "indirect_mispredicts": [
+            232,
+            232
+          ],
+          "ir_mine": 1237728,
+          "ir_ratio": 1.0,
+          "ir_ref": 1237728,
+          "ll_misses": [
+            2904,
+            2904
+          ]
+        }
+      },
+      "ackermann": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DACK_N=6",
+        "metrics": {
+          "conditional_mispredicts": [
+            3300,
+            3300
+          ],
+          "d1_misses": [
+            1878,
+            1878
+          ],
+          "i1_misses": [
+            1352,
+            1352
+          ],
+          "indirect_mispredicts": [
+            232,
+            232
+          ],
+          "ir_mine": 145755,
+          "ir_ratio": 1.0,
+          "ir_ref": 145755,
+          "ll_misses": [
+            2892,
+            2892
+          ]
+        }
+      },
+      "constant_recursion": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DACK_N=6",
+        "metrics": {
+          "conditional_mispredicts": [
+            3282,
+            3282
+          ],
+          "d1_misses": [
+            1878,
+            1878
+          ],
+          "i1_misses": [
+            1351,
+            1351
+          ],
+          "indirect_mispredicts": [
+            232,
+            232
+          ],
+          "ir_mine": 145442,
+          "ir_ratio": 1.0,
+          "ir_ref": 145442,
+          "ll_misses": [
+            2893,
+            2893
+          ]
+        }
+      },
+      "bitops": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=20000",
+        "metrics": {
+          "conditional_mispredicts": [
+            3324,
+            3324
+          ],
+          "d1_misses": [
+            1878,
+            1878
+          ],
+          "i1_misses": [
+            1356,
+            1356
+          ],
+          "indirect_mispredicts": [
+            233,
+            233
+          ],
+          "ir_mine": 1286689,
+          "ir_ratio": 1.0,
+          "ir_ref": 1286689,
+          "ll_misses": [
+            2897,
+            2897
+          ]
+        }
+      },
+      "double_reduction": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DREDUCTION_PASSES=1",
+        "metrics": {
+          "conditional_mispredicts": [
+            3317,
+            3317
+          ],
+          "d1_misses": [
+            526296,
+            526296
+          ],
+          "i1_misses": [
+            1360,
+            1360
+          ],
+          "indirect_mispredicts": [
+            233,
+            233
+          ],
+          "ir_mine": 30423228,
+          "ir_ratio": 1.0,
+          "ir_ref": 30423228,
+          "ll_misses": [
+            199511,
+            199511
+          ]
+        }
+      },
+      "ascii_case_fold": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+        "metrics": {
+          "conditional_mispredicts": [
+            3163,
+            3163
+          ],
+          "d1_misses": [
+            4919,
+            4919
+          ],
+          "i1_misses": [
+            1167,
+            1167
+          ],
+          "indirect_mispredicts": [
+            216,
+            216
+          ],
+          "ir_mine": 2238897,
+          "ir_ratio": 1.0,
+          "ir_ref": 2238897,
+          "ll_misses": [
+            4683,
+            4683
+          ]
+        }
+      },
+      "binary_search": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+        "metrics": {
+          "conditional_mispredicts": [
+            5816,
+            5816
+          ],
+          "d1_misses": [
+            2041,
+            2041
+          ],
+          "i1_misses": [
+            1165,
+            1165
+          ],
+          "indirect_mispredicts": [
+            216,
+            216
+          ],
+          "ir_mine": 601907,
+          "ir_ratio": 1.0,
+          "ir_ref": 601907,
+          "ll_misses": [
+            2887,
+            2887
+          ]
+        }
+      },
+      "ring_fifo": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+        "metrics": {
+          "conditional_mispredicts": [
+            3158,
+            3158
+          ],
+          "d1_misses": [
+            1839,
+            1839
+          ],
+          "i1_misses": [
+            1164,
+            1164
+          ],
+          "indirect_mispredicts": [
+            216,
+            216
+          ],
+          "ir_mine": 621735,
+          "ir_ratio": 1.0,
+          "ir_ref": 621735,
+          "ll_misses": [
+            2693,
+            2693
+          ]
+        }
+      },
+      "aarch64_select_patterns": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSELECT_ITERS=20000",
+        "metrics": {
+          "conditional_mispredicts": [
+            3322,
+            3322
+          ],
+          "d1_misses": [
+            1873,
+            1873
+          ],
+          "i1_misses": [
+            1359,
+            1359
+          ],
+          "indirect_mispredicts": [
+            231,
+            231
+          ],
+          "ir_mine": 865980,
+          "ir_ratio": 1.0,
+          "ir_ref": 865980,
+          "ll_misses": [
+            2898,
+            2898
+          ]
+        }
+      },
+      "histogram": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+        "metrics": {
+          "conditional_mispredicts": [
+            3170,
+            3170
+          ],
+          "d1_misses": [
+            10063,
+            10063
+          ],
+          "i1_misses": [
+            1166,
+            1166
+          ],
+          "indirect_mispredicts": [
+            216,
+            216
+          ],
+          "ir_mine": 3485868,
+          "ir_ratio": 1.0,
+          "ir_ref": 3485868,
+          "ll_misses": [
+            6756,
+            6756
+          ]
+        }
+      },
+      "gzip_crc32": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DDATA_SIZE=16384 -DPASSES=4",
+        "metrics": {
+          "conditional_mispredicts": [
+            3342,
+            3342
+          ],
+          "d1_misses": [
+            2210,
+            2210
+          ],
+          "i1_misses": [
+            1365,
+            1365
+          ],
+          "indirect_mispredicts": [
+            233,
+            233
+          ],
+          "ir_mine": 801071,
+          "ir_ratio": 1.0,
+          "ir_ref": 801071,
+          "ll_misses": [
+            3179,
+            3179
+          ]
+        }
+      },
+      "libm_round_family": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=256 -DPASSES=4",
+        "metrics": {
+          "conditional_mispredicts": [
+            3424,
+            3424
+          ],
+          "d1_misses": [
+            1952,
+            1952
+          ],
+          "i1_misses": [
+            1447,
+            1447
+          ],
+          "indirect_mispredicts": [
+            233,
+            233
+          ],
+          "ir_mine": 171370,
+          "ir_ratio": 1.0,
+          "ir_ref": 171370,
+          "ll_misses": [
+            3035,
+            3035
+          ]
+        }
+      },
+      "tls_seg_access": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=100",
+        "metrics": {
+          "conditional_mispredicts": [
+            3423,
+            3423
+          ],
+          "d1_misses": [
+            1884,
+            1884
+          ],
+          "i1_misses": [
+            1356,
+            1356
+          ],
+          "indirect_mispredicts": [
+            233,
+            233
+          ],
+          "ir_mine": 218439,
+          "ir_ratio": 1.0,
+          "ir_ref": 218439,
+          "ll_misses": [
+            2909,
+            2909
+          ]
+        }
+      },
+      "zlib_ng_adler32": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DDATA_SIZE=16384 -DPASSES=4",
+        "metrics": {
+          "conditional_mispredicts": [
+            3378,
+            3378
+          ],
+          "d1_misses": [
+            2191,
+            2191
+          ],
+          "i1_misses": [
+            1377,
+            1377
+          ],
+          "indirect_mispredicts": [
+            233,
+            233
+          ],
+          "ir_mine": 463928,
+          "ir_ratio": 1.0,
+          "ir_ref": 463928,
+          "ll_misses": [
+            3176,
+            3176
+          ]
+        }
+      },
+      "zlib_ng_adler32_combine": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=10000",
+        "metrics": {
+          "conditional_mispredicts": [
+            5513,
+            5513
+          ],
+          "d1_misses": [
+            1910,
+            1910
+          ],
+          "i1_misses": [
+            1382,
+            1382
+          ],
+          "indirect_mispredicts": [
+            234,
+            234
+          ],
+          "ir_mine": 22937456,
+          "ir_ratio": 1.0,
+          "ir_ref": 22937456,
+          "ll_misses": [
+            2947,
+            2947
+          ]
+        }
+      },
+      "expat_xml_scan": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DXML_SIZE=16384 -DPASSES=4",
+        "metrics": {
+          "conditional_mispredicts": [
+            26581,
+            26581
+          ],
+          "d1_misses": [
+            2182,
+            2182
+          ],
+          "i1_misses": [
+            1364,
+            1364
+          ],
+          "indirect_mispredicts": [
+            232,
+            232
+          ],
+          "ir_mine": 1702829,
+          "ir_ratio": 1.0,
+          "ir_ref": 1702829,
+          "ll_misses": [
+            3161,
+            3161
+          ]
+        }
+      },
+      "expat_siphash24": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=1000",
+        "metrics": {
+          "conditional_mispredicts": [
+            123386,
+            123382
+          ],
+          "d1_misses": [
+            1897,
+            1894
+          ],
+          "i1_misses": [
+            1408,
+            1408
+          ],
+          "indirect_mispredicts": [
+            1429,
+            1429
+          ],
+          "ir_mine": 21676433,
+          "ir_ratio": 0.8557812383226154,
+          "ir_ref": 25329409,
+          "ll_misses": [
+            2961,
+            2959
+          ]
+        }
+      },
+      "sqlite_varint": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DVALUE_COUNT=2048 -DPASSES=4",
+        "metrics": {
+          "conditional_mispredicts": [
+            12569,
+            12569
+          ],
+          "d1_misses": [
+            2229,
+            2229
+          ],
+          "i1_misses": [
+            1375,
+            1375
+          ],
+          "indirect_mispredicts": [
+            2054,
+            2054
+          ],
+          "ir_mine": 833190,
+          "ir_ratio": 1.0,
+          "ir_ref": 833190,
+          "ll_misses": [
+            3205,
+            3205
+          ]
+        }
+      },
+      "linux_find_bit": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=32",
+        "metrics": {
+          "conditional_mispredicts": [
+            11858,
+            11858
+          ],
+          "d1_misses": [
+            137233,
+            137233
+          ],
+          "i1_misses": [
+            1358,
+            1358
+          ],
+          "indirect_mispredicts": [
+            232,
+            232
+          ],
+          "ir_mine": 5957824,
+          "ir_ratio": 1.0,
+          "ir_ref": 5957824,
+          "ll_misses": [
+            6997,
+            6997
+          ]
+        }
+      },
+      "linux_find_bit_scaled": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=128",
+        "metrics": {
+          "conditional_mispredicts": [
+            36567,
+            36567
+          ],
+          "d1_misses": [
+            530617,
+            530617
+          ],
+          "i1_misses": [
+            1361,
+            1361
+          ],
+          "indirect_mispredicts": [
+            232,
+            232
+          ],
+          "ir_mine": 22941695,
+          "ir_ratio": 1.0,
+          "ir_ref": 22941695,
+          "ll_misses": [
+            7001,
+            7001
+          ]
+        }
+      },
+      "glibc_memcmp": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=16",
+        "metrics": {
+          "conditional_mispredicts": [
+            3371,
+            3371
+          ],
+          "d1_misses": [
+            25348,
+            25348
+          ],
+          "i1_misses": [
+            1362,
+            1362
+          ],
+          "indirect_mispredicts": [
+            232,
+            232
+          ],
+          "ir_mine": 722958,
+          "ir_ratio": 1.0,
+          "ir_ref": 722958,
+          "ll_misses": [
+            4951,
+            4951
+          ]
+        }
+      },
+      "chacha20_block": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DBLOCK_COUNT=256 -DPASSES=2",
+        "metrics": {
+          "conditional_mispredicts": [
+            3850,
+            3850
+          ],
+          "d1_misses": [
+            1887,
+            1887
+          ],
+          "i1_misses": [
+            1375,
+            1375
+          ],
+          "indirect_mispredicts": [
+            235,
+            235
+          ],
+          "ir_mine": 419139,
+          "ir_ratio": 1.0,
+          "ir_ref": 419139,
+          "ll_misses": [
+            2918,
+            2918
+          ]
+        }
+      },
+      "sha256_transform": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DBLOCK_COUNT=256 -DPASSES=2",
+        "metrics": {
+          "conditional_mispredicts": [
+            4368,
+            4368
+          ],
+          "d1_misses": [
+            1898,
+            1898
+          ],
+          "i1_misses": [
+            1383,
+            1383
+          ],
+          "indirect_mispredicts": [
+            235,
+            235
+          ],
+          "ir_mine": 1801698,
+          "ir_ratio": 1.0,
+          "ir_ref": 1801698,
+          "ll_misses": [
+            2933,
+            2933
+          ]
+        }
+      },
+      "linux_rbtree": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DNODE_COUNT=1024 -DLOOKUP_ROUNDS=2",
+        "metrics": {
+          "conditional_mispredicts": [
+            17992,
+            17992
+          ],
+          "d1_misses": [
+            2531,
+            2531
+          ],
+          "i1_misses": [
+            1380,
+            1380
+          ],
+          "indirect_mispredicts": [
+            236,
+            236
+          ],
+          "ir_mine": 515134,
+          "ir_ratio": 1.0,
+          "ir_ref": 515134,
+          "ll_misses": [
+            3436,
+            3436
+          ]
+        }
+      },
+      "zstd_count": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DBUFFER_SIZE=16384 -DQUERY_COUNT=1024 -DPASSES=2",
+        "metrics": {
+          "conditional_mispredicts": [
+            5407,
+            5407
+          ],
+          "d1_misses": [
+            2190,
+            2190
+          ],
+          "i1_misses": [
+            1377,
+            1377
+          ],
+          "indirect_mispredicts": [
+            236,
+            236
+          ],
+          "ir_mine": 463174,
+          "ir_ratio": 1.0,
+          "ir_ref": 463174,
+          "ll_misses": [
+            3176,
+            3176
+          ]
+        }
+      },
+      "lz4_compress": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSRC_SIZE=16384 -DPASSES=2",
+        "metrics": {
+          "conditional_mispredicts": [
+            10603,
+            10603
+          ],
+          "d1_misses": [
+            5913,
+            5913
+          ],
+          "i1_misses": [
+            1393,
+            1393
+          ],
+          "indirect_mispredicts": [
+            243,
+            243
+          ],
+          "ir_mine": 635160,
+          "ir_ratio": 1.0,
+          "ir_ref": 635160,
+          "ll_misses": [
+            4483,
+            4483
+          ]
+        }
+      },
+      "lz4_match_extend": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSRC_SIZE=16384 -DPASSES=2 -DMATCH_RICH=1",
+        "metrics": {
+          "conditional_mispredicts": [
+            8263,
+            8263
+          ],
+          "d1_misses": [
+            14195,
+            14195
+          ],
+          "i1_misses": [
+            1407,
+            1407
+          ],
+          "indirect_mispredicts": [
+            244,
+            244
+          ],
+          "ir_mine": 1167638,
+          "ir_ratio": 1.0,
+          "ir_ref": 1167638,
+          "ll_misses": [
+            4409,
+            4409
+          ]
+        }
+      },
+      "glibc_strstr": {
+        "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DHAYSTACK_LEN=16384 -DQUERY_COUNT=32 -DPASSES=2",
+        "metrics": {
+          "conditional_mispredicts": [
+            9432,
+            9432
+          ],
+          "d1_misses": [
+            2194,
+            2194
+          ],
+          "i1_misses": [
+            1381,
+            1381
+          ],
+          "indirect_mispredicts": [
+            236,
+            236
+          ],
+          "ir_mine": 3644880,
+          "ir_ratio": 1.0,
+          "ir_ref": 3644880,
+          "ll_misses": [
+            3181,
+            3181
+          ]
+        }
+      }
+    }
+  },
+  "fp_home_rejection": [
+    {
+      "name": "no-lm",
+      "flags": [],
+      "symbols": {
+        "off": [
+          "0000000000404f40 d bodies"
+        ],
+        "on": [
+          "0000000000404f00 d bodies"
+        ]
+      },
+      "samples_ms": [
+        {
+          "round": 2,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 399.903226,
+          "off": 323.717134
+        },
+        {
+          "round": 3,
+          "order": [
+            "off",
+            "on"
+          ],
+          "off": 332.146316,
+          "on": 408.251879
+        },
+        {
+          "round": 4,
+          "order": [
+            "off",
+            "on"
+          ],
+          "off": 341.227131,
+          "on": 399.452218
+        },
+        {
+          "round": 5,
+          "order": [
+            "off",
+            "on"
+          ],
+          "off": 325.456846,
+          "on": 400.198303
+        },
+        {
+          "round": 6,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 398.925223,
+          "off": 326.246651
+        },
+        {
+          "round": 7,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 401.538527,
+          "off": 320.909525
+        },
+        {
+          "round": 8,
+          "order": [
+            "off",
+            "on"
+          ],
+          "off": 324.938306,
+          "on": 428.438319
+        },
+        {
+          "round": 9,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 412.853591,
+          "off": 368.920446
+        },
+        {
+          "round": 10,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 405.462963,
+          "off": 332.856313
+        }
+      ],
+      "on_over_off_medians": 1.230782065560575
+    },
+    {
+      "name": "lm",
+      "flags": [
+        "-lm"
+      ],
+      "symbols": {
+        "off": [
+          "0000000000404f50 d bodies"
+        ],
+        "on": [
+          "0000000000404f10 d bodies"
+        ]
+      },
+      "samples_ms": [
+        {
+          "round": 2,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 293.698197,
+          "off": 391.083261
+        },
+        {
+          "round": 3,
+          "order": [
+            "off",
+            "on"
+          ],
+          "off": 394.982518,
+          "on": 330.270838
+        },
+        {
+          "round": 4,
+          "order": [
+            "off",
+            "on"
+          ],
+          "off": 389.108203,
+          "on": 288.139048
+        },
+        {
+          "round": 5,
+          "order": [
+            "off",
+            "on"
+          ],
+          "off": 387.82914,
+          "on": 283.86326
+        },
+        {
+          "round": 6,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 297.306895,
+          "off": 387.815987
+        },
+        {
+          "round": 7,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 287.041447,
+          "off": 385.377047
+        },
+        {
+          "round": 8,
+          "order": [
+            "off",
+            "on"
+          ],
+          "off": 387.08301,
+          "on": 286.853467
+        },
+        {
+          "round": 9,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 287.627191,
+          "off": 383.782837
+        },
+        {
+          "round": 10,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 275.222637,
+          "off": 401.137306
+        }
+      ],
+      "on_over_off_medians": 0.7416337797618817
+    },
+    {
+      "name": "0x406000",
+      "flags": [
+        "-lm",
+        "-Wl,--section-start=.data=0x406000"
+      ],
+      "symbols": {
+        "off": [
+          "0000000000404f50 d bodies"
+        ],
+        "on": [
+          "0000000000404f10 d bodies"
+        ]
+      },
+      "samples_ms": [
+        {
+          "round": 2,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 303.337317,
+          "off": 402.489599
+        },
+        {
+          "round": 3,
+          "order": [
+            "off",
+            "on"
+          ],
+          "off": 384.706399,
+          "on": 288.813028
+        },
+        {
+          "round": 4,
+          "order": [
+            "off",
+            "on"
+          ],
+          "off": 389.217337,
+          "on": 288.083155
+        },
+        {
+          "round": 5,
+          "order": [
+            "off",
+            "on"
+          ],
+          "off": 388.658225,
+          "on": 282.11602
+        },
+        {
+          "round": 6,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 302.179789,
+          "off": 428.692095
+        },
+        {
+          "round": 7,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 273.508309,
+          "off": 388.429786
+        },
+        {
+          "round": 8,
+          "order": [
+            "off",
+            "on"
+          ],
+          "off": 389.932446,
+          "on": 272.941069
+        },
+        {
+          "round": 9,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 279.585009,
+          "off": 392.811741
+        },
+        {
+          "round": 10,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 310.741932,
+          "off": 414.506352
+        }
+      ],
+      "on_over_off_medians": 0.7388027284090125
+    },
+    {
+      "name": "0x406ef0",
+      "flags": [
+        "-lm",
+        "-Wl,--section-start=.data=0x406ef0"
+      ],
+      "symbols": {
+        "off": [
+          "0000000000404f50 d bodies"
+        ],
+        "on": [
+          "0000000000404f10 d bodies"
+        ]
+      },
+      "samples_ms": [
+        {
+          "round": 2,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 289.676442,
+          "off": 406.911538
+        },
+        {
+          "round": 3,
+          "order": [
+            "off",
+            "on"
+          ],
+          "off": 409.245612,
+          "on": 314.706023
+        },
+        {
+          "round": 4,
+          "order": [
+            "off",
+            "on"
+          ],
+          "off": 396.404091,
+          "on": 291.767787
+        },
+        {
+          "round": 5,
+          "order": [
+            "off",
+            "on"
+          ],
+          "off": 386.470886,
+          "on": 276.356801
+        },
+        {
+          "round": 6,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 287.41139,
+          "off": 378.387484
+        },
+        {
+          "round": 7,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 273.917015,
+          "off": 386.783381
+        },
+        {
+          "round": 8,
+          "order": [
+            "off",
+            "on"
+          ],
+          "off": 386.847059,
+          "on": 286.84293
+        },
+        {
+          "round": 9,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 287.29404,
+          "off": 399.579645
+        },
+        {
+          "round": 10,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 287.412258,
+          "off": 419.021142
+        }
+      ],
+      "on_over_off_medians": 0.7250464778881406
+    },
+    {
+      "name": "0x406f00",
+      "flags": [
+        "-lm",
+        "-Wl,--section-start=.data=0x406f00"
+      ],
+      "symbols": {
+        "off": [
+          "0000000000404f50 d bodies"
+        ],
+        "on": [
+          "0000000000404f10 d bodies"
+        ]
+      },
+      "samples_ms": [
+        {
+          "round": 2,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 287.042536,
+          "off": 397.488578
+        },
+        {
+          "round": 3,
+          "order": [
+            "off",
+            "on"
+          ],
+          "off": 387.810415,
+          "on": 287.698609
+        },
+        {
+          "round": 4,
+          "order": [
+            "off",
+            "on"
+          ],
+          "off": 397.03788,
+          "on": 275.349342
+        },
+        {
+          "round": 5,
+          "order": [
+            "off",
+            "on"
+          ],
+          "off": 382.132589,
+          "on": 273.667204
+        },
+        {
+          "round": 6,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 285.263827,
+          "off": 382.249033
+        },
+        {
+          "round": 7,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 281.914319,
+          "off": 401.570088
+        },
+        {
+          "round": 8,
+          "order": [
+            "off",
+            "on"
+          ],
+          "off": 393.721511,
+          "on": 293.409118
+        },
+        {
+          "round": 9,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 275.74293,
+          "off": 397.88609
+        },
+        {
+          "round": 10,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 285.565561,
+          "off": 391.628072
+        }
+      ],
+      "on_over_off_medians": 0.724531982708966
+    },
+    {
+      "name": "0x406f30",
+      "flags": [
+        "-lm",
+        "-Wl,--section-start=.data=0x406f30"
+      ],
+      "symbols": {
+        "off": [
+          "0000000000404f50 d bodies"
+        ],
+        "on": [
+          "0000000000404f10 d bodies"
+        ]
+      },
+      "samples_ms": [
+        {
+          "round": 2,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 286.848775,
+          "off": 395.93751
+        },
+        {
+          "round": 3,
+          "order": [
+            "off",
+            "on"
+          ],
+          "off": 387.750339,
+          "on": 287.04964
+        },
+        {
+          "round": 4,
+          "order": [
+            "off",
+            "on"
+          ],
+          "off": 393.908064,
+          "on": 290.94358
+        },
+        {
+          "round": 5,
+          "order": [
+            "off",
+            "on"
+          ],
+          "off": 383.201117,
+          "on": 288.919027
+        },
+        {
+          "round": 6,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 338.366425,
+          "off": 383.501272
+        },
+        {
+          "round": 7,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 289.071096,
+          "off": 402.04545
+        },
+        {
+          "round": 8,
+          "order": [
+            "off",
+            "on"
+          ],
+          "off": 395.741114,
+          "on": 305.823531
+        },
+        {
+          "round": 9,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 320.410338,
+          "off": 444.062442
+        },
+        {
+          "round": 10,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 288.56603,
+          "off": 411.844751
+        }
+      ],
+      "on_over_off_medians": 0.7304550519863348
+    },
+    {
+      "name": "0x406f40",
+      "flags": [
+        "-lm",
+        "-Wl,--section-start=.data=0x406f40"
+      ],
+      "symbols": {
+        "off": [
+          "0000000000404f50 d bodies"
+        ],
+        "on": [
+          "0000000000404f10 d bodies"
+        ]
+      },
+      "samples_ms": [
+        {
+          "round": 2,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 288.006716,
+          "off": 396.748676
+        },
+        {
+          "round": 3,
+          "order": [
+            "off",
+            "on"
+          ],
+          "off": 389.175491,
+          "on": 288.122134
+        },
+        {
+          "round": 4,
+          "order": [
+            "off",
+            "on"
+          ],
+          "off": 395.513396,
+          "on": 287.043814
+        },
+        {
+          "round": 5,
+          "order": [
+            "off",
+            "on"
+          ],
+          "off": 382.163575,
+          "on": 283.781351
+        },
+        {
+          "round": 6,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 304.314839,
+          "off": 384.138192
+        },
+        {
+          "round": 7,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 287.265266,
+          "off": 388.943291
+        },
+        {
+          "round": 8,
+          "order": [
+            "off",
+            "on"
+          ],
+          "off": 380.91984,
+          "on": 287.08764
+        },
+        {
+          "round": 9,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 286.545187,
+          "off": 395.414432
+        },
+        {
+          "round": 10,
+          "order": [
+            "on",
+            "off"
+          ],
+          "on": 287.222973,
+          "off": 387.249888
+        }
+      ],
+      "on_over_off_medians": 0.7384700537230762
+    }
+  ],
+  "limitations": [
+    "v1 predates the phi-effect fix and early forwarding; do not present as final validation",
+    "Native screen included a formatter during early samples; rerun changed finalists alone before final claims",
+    "Native reporter highlights minimums, not medians; unchanged binaries cannot earn speedups from timing noise",
+    "FP fixed-data requests through LCCC were ignored: symbol addresses did not move; these are not matched-layout experiments",
+    "FP homes no-lm regressed: remain opt-in",
+    "Callgrind counters are simulation, not cycles or PMU",
+    "ICX uses CE moving cicxlatest channel, not a claimed pinned version"
+  ]
+}

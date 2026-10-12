@@ -123,6 +123,8 @@ BENCHMARKS: tuple[Benchmark, ...] = (
               ("libm_round_family.c",), ("workload", "glibc", "fp", "libm")),
     Benchmark("tls_seg_access", "glibc TLS access shapes (THREAD_SELF/SETMEM, %fs segment)",
               ("tls_seg_access.c",), ("workload", "glibc", "tls", "memory")),
+    Benchmark("percpu_ptr_walk", "computed GS-base per-CPU pointer walk",
+              ("percpu_ptr_walk.c",), ("synthetic", "kernel", "percpu", "memory")),
     Benchmark("zlib_ng_adler32", "zlib-ng Adler-32 NMAX accumulator",
               ("zlib_ng_adler32.c",), ("workload", "zlib-ng", "checksum", "loop")),
     Benchmark("zlib_ng_adler32_combine", "zlib-ng checksum composition / modular arithmetic",

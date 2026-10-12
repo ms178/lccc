@@ -27,6 +27,7 @@ import tempfile
 
 REPO=Path(__file__).resolve().parents[1];sys.path.insert(0,str(REPO))
 from tools.corpus import process,publication,schema
+from scripts.perf_ab import split_driver_flags
 
 CG_I1='32768,8,64';CG_D1='32768,8,64';CG_LL='33554432,16,64'
 REQUIRED_EVENTS={'Ir','I1mr','D1mr','D1mw','ILmr','DLmr','DLmw','Bcm','Bim'}
@@ -97,7 +98,10 @@ def compile_program(compiler,opt,source,out,*,include=None):
     opts=shlex.split(opt) if isinstance(opt,str) else list(opt)
     try:
         include=include or gcc_include()
-        r=_run(shlex.split(str(compiler))+[include]+opts+['-o',str(out),str(source)],180)
+        frontend,linker=split_driver_flags(opts)
+        # Use the native harness's ordering authority: --as-needed must see
+        # the object before its libraries, in both measurement arms.
+        r=_run(shlex.split(str(compiler))+[include]+frontend+[str(source)]+linker+['-o',str(out)],180)
     except (OSError,ValueError) as exc:return 'compile infrastructure: '+str(exc)
     if r['failure'] or r['returncode']!=0:return f"compile rc={r['returncode']} failure={r['failure']}: "+r['stderr'].decode('utf-8',errors='replace')[-400:]
     if not out.is_file() or not os.access(out,os.X_OK):return 'compiler reported success but produced no executable'

@@ -1,0 +1,2690 @@
+{
+  "date": "2026-10-12",
+  "decision": "Keep late memory cleanup as normal policy; require CCC_ENABLE_PREINLINE_MEMORY for the additional early placement. Explicit disable controls dominate.",
+  "measurement_source_commit": "c5a72c065f79845ab90bfb21c5c586fdc8a290db",
+  "measurement_source_subtree": "5836426d4a6cbf49b731ae2fdf57ab93b7cdcce6",
+  "compiler_sha256": "5d725232af8b1e45d40ec83629ee74871048f7bff98bf99d6cc7b7e2a07aa199",
+  "host": "2-vCPU KVM, Intel Xeon family 6 model 106; not a 14700KF",
+  "native_control_direction": "A=early enabled, B=early disabled; eleven alternating AB/BA rounds; default problem size",
+  "native_control": {
+    "header": "A: default vs B: CCC_DISABLE_PASSES=preinline_memory",
+    "flags": [
+      "-O2",
+      "-march=x86-64-v3",
+      "-fwrapv"
+    ],
+    "reps": 11,
+    "floor_ms": 1.078694000170799,
+    "geomean_b_over_a": 0.9865303356706556,
+    "benchmarks": [
+      {
+        "benchmark": "expat_siphash24",
+        "a_min_ms": 378.63289500000974,
+        "b_min_ms": 373.5328370003117,
+        "ratio_b_over_a": 0.9865303356706556,
+        "ratio_low3": 0.9880460425244328,
+        "samples_a": [
+          381.71826699999656,
+          383.9679430002434,
+          378.63289500000974,
+          408.0239490003805,
+          404.75027700085775,
+          379.6184440006982,
+          378.703188000145,
+          378.79720399996586,
+          381.62918600028206,
+          393.3821430000535,
+          385.82642799974565
+        ],
+        "samples_b": [
+          376.7371620006088,
+          373.8786070007336,
+          404.1987139999037,
+          406.23559600044246,
+          490.0024439994013,
+          431.04923899954883,
+          375.1405539996995,
+          376.32230700000946,
+          381.14678999954776,
+          373.5328370003117,
+          381.8184539995855
+        ],
+        "excluded": false
+      }
+    ],
+    "failures": []
+  },
+  "native_enabled_over_disabled": 1.0136535733796646,
+  "callgrind_direction": "mine=early enabled, ref=early disabled; bounded workload, not cycles",
+  "callgrind_flags": "-O2 -march=x86-64-v3 -fwrapv -DPASSES=1000",
+  "callgrind": {
+    "conditional_mispredicts": [
+      122897,
+      122892
+    ],
+    "d1_misses": [
+      1603,
+      1603
+    ],
+    "i1_misses": [
+      1344,
+      1345
+    ],
+    "indirect_mispredicts": [
+      1374,
+      1374
+    ],
+    "ir_mine": 21934900,
+    "ir_ratio": 1.0131791489505777,
+    "ir_ref": 21649577,
+    "ll_misses": [
+      2693,
+      2695
+    ]
+  },
+  "stage_cost_repetitions_per_arm": 7,
+  "stage_cost_and_codegen": [
+    {
+      "program": "nbody",
+      "samples": [
+        {
+          "iteration": 0,
+          "arm": "on",
+          "wall_seconds": 0.13839552199988248,
+          "stages": [
+            [
+              0.000151,
+              41
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000151s, 41 rewrites\n",
+          "asm_sha256": "e40053c29aacea1acefc6a197fa062bb6540078832305085daf74d675e870eb3"
+        },
+        {
+          "iteration": 0,
+          "arm": "off",
+          "wall_seconds": 0.14049654600057693,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "e40053c29aacea1acefc6a197fa062bb6540078832305085daf74d675e870eb3"
+        },
+        {
+          "iteration": 1,
+          "arm": "off",
+          "wall_seconds": 0.14304156199978024,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "e40053c29aacea1acefc6a197fa062bb6540078832305085daf74d675e870eb3"
+        },
+        {
+          "iteration": 1,
+          "arm": "on",
+          "wall_seconds": 0.1402347130006092,
+          "stages": [
+            [
+              0.000174,
+              41
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000174s, 41 rewrites\n",
+          "asm_sha256": "e40053c29aacea1acefc6a197fa062bb6540078832305085daf74d675e870eb3"
+        },
+        {
+          "iteration": 2,
+          "arm": "on",
+          "wall_seconds": 0.15280107499984297,
+          "stages": [
+            [
+              0.000147,
+              41
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000147s, 41 rewrites\n",
+          "asm_sha256": "e40053c29aacea1acefc6a197fa062bb6540078832305085daf74d675e870eb3"
+        },
+        {
+          "iteration": 2,
+          "arm": "off",
+          "wall_seconds": 0.155868054000166,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "e40053c29aacea1acefc6a197fa062bb6540078832305085daf74d675e870eb3"
+        },
+        {
+          "iteration": 3,
+          "arm": "off",
+          "wall_seconds": 0.15080945800036716,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "e40053c29aacea1acefc6a197fa062bb6540078832305085daf74d675e870eb3"
+        },
+        {
+          "iteration": 3,
+          "arm": "on",
+          "wall_seconds": 0.14790594599980977,
+          "stages": [
+            [
+              0.00015,
+              41
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000150s, 41 rewrites\n",
+          "asm_sha256": "e40053c29aacea1acefc6a197fa062bb6540078832305085daf74d675e870eb3"
+        },
+        {
+          "iteration": 4,
+          "arm": "on",
+          "wall_seconds": 0.14487260000078095,
+          "stages": [
+            [
+              0.000151,
+              41
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000151s, 41 rewrites\n",
+          "asm_sha256": "e40053c29aacea1acefc6a197fa062bb6540078832305085daf74d675e870eb3"
+        },
+        {
+          "iteration": 4,
+          "arm": "off",
+          "wall_seconds": 0.1458938939995278,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "e40053c29aacea1acefc6a197fa062bb6540078832305085daf74d675e870eb3"
+        },
+        {
+          "iteration": 5,
+          "arm": "off",
+          "wall_seconds": 0.13959390799936955,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "e40053c29aacea1acefc6a197fa062bb6540078832305085daf74d675e870eb3"
+        },
+        {
+          "iteration": 5,
+          "arm": "on",
+          "wall_seconds": 0.14064071200027684,
+          "stages": [
+            [
+              0.000151,
+              41
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000151s, 41 rewrites\n",
+          "asm_sha256": "e40053c29aacea1acefc6a197fa062bb6540078832305085daf74d675e870eb3"
+        },
+        {
+          "iteration": 6,
+          "arm": "on",
+          "wall_seconds": 0.14779920799992396,
+          "stages": [
+            [
+              0.000147,
+              41
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000147s, 41 rewrites\n",
+          "asm_sha256": "e40053c29aacea1acefc6a197fa062bb6540078832305085daf74d675e870eb3"
+        },
+        {
+          "iteration": 6,
+          "arm": "off",
+          "wall_seconds": 0.15428709700063337,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "e40053c29aacea1acefc6a197fa062bb6540078832305085daf74d675e870eb3"
+        }
+      ],
+      "median_stage_ms": 0.15100000000000002,
+      "median_wall_on_ms": 144.87260000078095,
+      "median_wall_off_ms": 145.8938939995278,
+      "median_wall_on_over_off": 0.9929997481680066,
+      "asm_identical_on_off": true,
+      "asm_bytes_on": 11906,
+      "asm_bytes_off": 11906
+    },
+    {
+      "program": "expat_siphash24",
+      "samples": [
+        {
+          "iteration": 0,
+          "arm": "on",
+          "wall_seconds": 0.22903832599968155,
+          "stages": [
+            [
+              0.00035,
+              102
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000350s, 102 rewrites\n",
+          "asm_sha256": "78e6807a16296f7b49bda3da559025ffba8c222ad89800d635145b04c9a6c463"
+        },
+        {
+          "iteration": 0,
+          "arm": "off",
+          "wall_seconds": 0.2560551950000445,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "dbe275e417652e8cc9ccba26800525e9f61acf4ed2592ef8c01fbba67b9cc93d"
+        },
+        {
+          "iteration": 1,
+          "arm": "off",
+          "wall_seconds": 0.19459650199951284,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "dbe275e417652e8cc9ccba26800525e9f61acf4ed2592ef8c01fbba67b9cc93d"
+        },
+        {
+          "iteration": 1,
+          "arm": "on",
+          "wall_seconds": 0.19580550200043945,
+          "stages": [
+            [
+              0.000339,
+              102
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000339s, 102 rewrites\n",
+          "asm_sha256": "78e6807a16296f7b49bda3da559025ffba8c222ad89800d635145b04c9a6c463"
+        },
+        {
+          "iteration": 2,
+          "arm": "on",
+          "wall_seconds": 0.2012900100007755,
+          "stages": [
+            [
+              0.000342,
+              102
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000342s, 102 rewrites\n",
+          "asm_sha256": "78e6807a16296f7b49bda3da559025ffba8c222ad89800d635145b04c9a6c463"
+        },
+        {
+          "iteration": 2,
+          "arm": "off",
+          "wall_seconds": 0.2065885480005818,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "dbe275e417652e8cc9ccba26800525e9f61acf4ed2592ef8c01fbba67b9cc93d"
+        },
+        {
+          "iteration": 3,
+          "arm": "off",
+          "wall_seconds": 0.19191990500075917,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "dbe275e417652e8cc9ccba26800525e9f61acf4ed2592ef8c01fbba67b9cc93d"
+        },
+        {
+          "iteration": 3,
+          "arm": "on",
+          "wall_seconds": 0.2010452049999003,
+          "stages": [
+            [
+              0.000348,
+              102
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000348s, 102 rewrites\n",
+          "asm_sha256": "78e6807a16296f7b49bda3da559025ffba8c222ad89800d635145b04c9a6c463"
+        },
+        {
+          "iteration": 4,
+          "arm": "on",
+          "wall_seconds": 0.30225193300066167,
+          "stages": [
+            [
+              0.000377,
+              102
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000377s, 102 rewrites\n",
+          "asm_sha256": "78e6807a16296f7b49bda3da559025ffba8c222ad89800d635145b04c9a6c463"
+        },
+        {
+          "iteration": 4,
+          "arm": "off",
+          "wall_seconds": 0.2757157059995734,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "dbe275e417652e8cc9ccba26800525e9f61acf4ed2592ef8c01fbba67b9cc93d"
+        },
+        {
+          "iteration": 5,
+          "arm": "off",
+          "wall_seconds": 0.19683542900020257,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "dbe275e417652e8cc9ccba26800525e9f61acf4ed2592ef8c01fbba67b9cc93d"
+        },
+        {
+          "iteration": 5,
+          "arm": "on",
+          "wall_seconds": 0.19701942799929384,
+          "stages": [
+            [
+              0.000375,
+              102
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000375s, 102 rewrites\n",
+          "asm_sha256": "78e6807a16296f7b49bda3da559025ffba8c222ad89800d635145b04c9a6c463"
+        },
+        {
+          "iteration": 6,
+          "arm": "on",
+          "wall_seconds": 0.1962169480002558,
+          "stages": [
+            [
+              0.000341,
+              102
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000341s, 102 rewrites\n",
+          "asm_sha256": "78e6807a16296f7b49bda3da559025ffba8c222ad89800d635145b04c9a6c463"
+        },
+        {
+          "iteration": 6,
+          "arm": "off",
+          "wall_seconds": 0.19190929300020798,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "dbe275e417652e8cc9ccba26800525e9f61acf4ed2592ef8c01fbba67b9cc93d"
+        }
+      ],
+      "median_stage_ms": 0.348,
+      "median_wall_on_ms": 201.0452049999003,
+      "median_wall_off_ms": 196.83542900020257,
+      "median_wall_on_over_off": 1.0213872879546162,
+      "asm_identical_on_off": false,
+      "asm_bytes_on": 27126,
+      "asm_bytes_off": 27806,
+      "text_bytes_on": 2896,
+      "instructions_on": 678,
+      "text_bytes_off": 2999,
+      "instructions_off": 698
+    },
+    {
+      "program": "expat_xml_scan",
+      "samples": [
+        {
+          "iteration": 0,
+          "arm": "on",
+          "wall_seconds": 0.09939930699965771,
+          "stages": [
+            [
+              0.000197,
+              18
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000197s, 18 rewrites\n",
+          "asm_sha256": "3202c6a24febc341c1972e840787fd770d9c1b29b45592e52e37df1ab051d566"
+        },
+        {
+          "iteration": 0,
+          "arm": "off",
+          "wall_seconds": 0.09931116600000678,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "3202c6a24febc341c1972e840787fd770d9c1b29b45592e52e37df1ab051d566"
+        },
+        {
+          "iteration": 1,
+          "arm": "off",
+          "wall_seconds": 0.10920484300004318,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "3202c6a24febc341c1972e840787fd770d9c1b29b45592e52e37df1ab051d566"
+        },
+        {
+          "iteration": 1,
+          "arm": "on",
+          "wall_seconds": 0.10804605899920716,
+          "stages": [
+            [
+              0.000181,
+              18
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000181s, 18 rewrites\n",
+          "asm_sha256": "3202c6a24febc341c1972e840787fd770d9c1b29b45592e52e37df1ab051d566"
+        },
+        {
+          "iteration": 2,
+          "arm": "on",
+          "wall_seconds": 0.10908264400040935,
+          "stages": [
+            [
+              0.00021,
+              18
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000210s, 18 rewrites\n",
+          "asm_sha256": "3202c6a24febc341c1972e840787fd770d9c1b29b45592e52e37df1ab051d566"
+        },
+        {
+          "iteration": 2,
+          "arm": "off",
+          "wall_seconds": 0.10092598299979727,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "3202c6a24febc341c1972e840787fd770d9c1b29b45592e52e37df1ab051d566"
+        },
+        {
+          "iteration": 3,
+          "arm": "off",
+          "wall_seconds": 0.09871090300021024,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "3202c6a24febc341c1972e840787fd770d9c1b29b45592e52e37df1ab051d566"
+        },
+        {
+          "iteration": 3,
+          "arm": "on",
+          "wall_seconds": 0.10171528500086424,
+          "stages": [
+            [
+              0.000167,
+              18
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000167s, 18 rewrites\n",
+          "asm_sha256": "3202c6a24febc341c1972e840787fd770d9c1b29b45592e52e37df1ab051d566"
+        },
+        {
+          "iteration": 4,
+          "arm": "on",
+          "wall_seconds": 0.09917819900056202,
+          "stages": [
+            [
+              0.000169,
+              18
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000169s, 18 rewrites\n",
+          "asm_sha256": "3202c6a24febc341c1972e840787fd770d9c1b29b45592e52e37df1ab051d566"
+        },
+        {
+          "iteration": 4,
+          "arm": "off",
+          "wall_seconds": 0.10096394899937877,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "3202c6a24febc341c1972e840787fd770d9c1b29b45592e52e37df1ab051d566"
+        },
+        {
+          "iteration": 5,
+          "arm": "off",
+          "wall_seconds": 0.09953184400001192,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "3202c6a24febc341c1972e840787fd770d9c1b29b45592e52e37df1ab051d566"
+        },
+        {
+          "iteration": 5,
+          "arm": "on",
+          "wall_seconds": 0.09943012900021131,
+          "stages": [
+            [
+              0.000164,
+              18
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000164s, 18 rewrites\n",
+          "asm_sha256": "3202c6a24febc341c1972e840787fd770d9c1b29b45592e52e37df1ab051d566"
+        },
+        {
+          "iteration": 6,
+          "arm": "on",
+          "wall_seconds": 0.11107248600001185,
+          "stages": [
+            [
+              0.00019,
+              18
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000190s, 18 rewrites\n",
+          "asm_sha256": "3202c6a24febc341c1972e840787fd770d9c1b29b45592e52e37df1ab051d566"
+        },
+        {
+          "iteration": 6,
+          "arm": "off",
+          "wall_seconds": 0.10094612699958816,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "3202c6a24febc341c1972e840787fd770d9c1b29b45592e52e37df1ab051d566"
+        }
+      ],
+      "median_stage_ms": 0.18100000000000002,
+      "median_wall_on_ms": 101.71528500086424,
+      "median_wall_off_ms": 100.92598299979727,
+      "median_wall_on_over_off": 1.007820602560478,
+      "asm_identical_on_off": true,
+      "asm_bytes_on": 6981,
+      "asm_bytes_off": 6981
+    },
+    {
+      "program": "matmul",
+      "samples": [
+        {
+          "iteration": 0,
+          "arm": "on",
+          "wall_seconds": 0.02563544299937348,
+          "stages": [
+            [
+              7.3e-05,
+              5
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000073s, 5 rewrites\n",
+          "asm_sha256": "de181194f1dd78344dae2fe69f548c4e8cc21a459001b5fa3350fb75f437c765"
+        },
+        {
+          "iteration": 0,
+          "arm": "off",
+          "wall_seconds": 0.025891657000101986,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "de181194f1dd78344dae2fe69f548c4e8cc21a459001b5fa3350fb75f437c765"
+        },
+        {
+          "iteration": 1,
+          "arm": "off",
+          "wall_seconds": 0.026160856999922544,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "de181194f1dd78344dae2fe69f548c4e8cc21a459001b5fa3350fb75f437c765"
+        },
+        {
+          "iteration": 1,
+          "arm": "on",
+          "wall_seconds": 0.025199994999638875,
+          "stages": [
+            [
+              0.000116,
+              5
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000116s, 5 rewrites\n",
+          "asm_sha256": "de181194f1dd78344dae2fe69f548c4e8cc21a459001b5fa3350fb75f437c765"
+        },
+        {
+          "iteration": 2,
+          "arm": "on",
+          "wall_seconds": 0.029814505000103964,
+          "stages": [
+            [
+              6.9e-05,
+              5
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000069s, 5 rewrites\n",
+          "asm_sha256": "de181194f1dd78344dae2fe69f548c4e8cc21a459001b5fa3350fb75f437c765"
+        },
+        {
+          "iteration": 2,
+          "arm": "off",
+          "wall_seconds": 0.035921532999964256,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "de181194f1dd78344dae2fe69f548c4e8cc21a459001b5fa3350fb75f437c765"
+        },
+        {
+          "iteration": 3,
+          "arm": "off",
+          "wall_seconds": 0.028083979999792064,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "de181194f1dd78344dae2fe69f548c4e8cc21a459001b5fa3350fb75f437c765"
+        },
+        {
+          "iteration": 3,
+          "arm": "on",
+          "wall_seconds": 0.026820124000551004,
+          "stages": [
+            [
+              6.7e-05,
+              5
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000067s, 5 rewrites\n",
+          "asm_sha256": "de181194f1dd78344dae2fe69f548c4e8cc21a459001b5fa3350fb75f437c765"
+        },
+        {
+          "iteration": 4,
+          "arm": "on",
+          "wall_seconds": 0.02862678400015284,
+          "stages": [
+            [
+              8.2e-05,
+              5
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000082s, 5 rewrites\n",
+          "asm_sha256": "de181194f1dd78344dae2fe69f548c4e8cc21a459001b5fa3350fb75f437c765"
+        },
+        {
+          "iteration": 4,
+          "arm": "off",
+          "wall_seconds": 0.03120932299952983,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "de181194f1dd78344dae2fe69f548c4e8cc21a459001b5fa3350fb75f437c765"
+        },
+        {
+          "iteration": 5,
+          "arm": "off",
+          "wall_seconds": 0.02984070000002248,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "de181194f1dd78344dae2fe69f548c4e8cc21a459001b5fa3350fb75f437c765"
+        },
+        {
+          "iteration": 5,
+          "arm": "on",
+          "wall_seconds": 0.025825682000686356,
+          "stages": [
+            [
+              9.1e-05,
+              5
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000091s, 5 rewrites\n",
+          "asm_sha256": "de181194f1dd78344dae2fe69f548c4e8cc21a459001b5fa3350fb75f437c765"
+        },
+        {
+          "iteration": 6,
+          "arm": "on",
+          "wall_seconds": 0.02501885699984996,
+          "stages": [
+            [
+              6.6e-05,
+              5
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000066s, 5 rewrites\n",
+          "asm_sha256": "de181194f1dd78344dae2fe69f548c4e8cc21a459001b5fa3350fb75f437c765"
+        },
+        {
+          "iteration": 6,
+          "arm": "off",
+          "wall_seconds": 0.025358697000228858,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "de181194f1dd78344dae2fe69f548c4e8cc21a459001b5fa3350fb75f437c765"
+        }
+      ],
+      "median_stage_ms": 0.073,
+      "median_wall_on_ms": 25.825682000686356,
+      "median_wall_off_ms": 28.083979999792064,
+      "median_wall_on_over_off": 0.9195876795553042,
+      "asm_identical_on_off": true,
+      "asm_bytes_on": 3304,
+      "asm_bytes_off": 3304
+    },
+    {
+      "program": "mandelbrot",
+      "samples": [
+        {
+          "iteration": 0,
+          "arm": "on",
+          "wall_seconds": 0.020644725999773073,
+          "stages": [
+            [
+              4.1e-05,
+              0
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000041s, 0 rewrites\n",
+          "asm_sha256": "f2263b85f69539c5bd5f662ac3b45895b351ae589527749ab1575c23c7c1fd69"
+        },
+        {
+          "iteration": 0,
+          "arm": "off",
+          "wall_seconds": 0.021017752999796357,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "f2263b85f69539c5bd5f662ac3b45895b351ae589527749ab1575c23c7c1fd69"
+        },
+        {
+          "iteration": 1,
+          "arm": "off",
+          "wall_seconds": 0.021020242999838956,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "f2263b85f69539c5bd5f662ac3b45895b351ae589527749ab1575c23c7c1fd69"
+        },
+        {
+          "iteration": 1,
+          "arm": "on",
+          "wall_seconds": 0.020109966999370954,
+          "stages": [
+            [
+              3.6e-05,
+              0
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000036s, 0 rewrites\n",
+          "asm_sha256": "f2263b85f69539c5bd5f662ac3b45895b351ae589527749ab1575c23c7c1fd69"
+        },
+        {
+          "iteration": 2,
+          "arm": "on",
+          "wall_seconds": 0.019774975000473205,
+          "stages": [
+            [
+              3.5e-05,
+              0
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000035s, 0 rewrites\n",
+          "asm_sha256": "f2263b85f69539c5bd5f662ac3b45895b351ae589527749ab1575c23c7c1fd69"
+        },
+        {
+          "iteration": 2,
+          "arm": "off",
+          "wall_seconds": 0.01946200700058398,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "f2263b85f69539c5bd5f662ac3b45895b351ae589527749ab1575c23c7c1fd69"
+        },
+        {
+          "iteration": 3,
+          "arm": "off",
+          "wall_seconds": 0.019547696999325126,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "f2263b85f69539c5bd5f662ac3b45895b351ae589527749ab1575c23c7c1fd69"
+        },
+        {
+          "iteration": 3,
+          "arm": "on",
+          "wall_seconds": 0.019617713000116055,
+          "stages": [
+            [
+              3.7e-05,
+              0
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000037s, 0 rewrites\n",
+          "asm_sha256": "f2263b85f69539c5bd5f662ac3b45895b351ae589527749ab1575c23c7c1fd69"
+        },
+        {
+          "iteration": 4,
+          "arm": "on",
+          "wall_seconds": 0.019949683000049845,
+          "stages": [
+            [
+              3.6e-05,
+              0
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000036s, 0 rewrites\n",
+          "asm_sha256": "f2263b85f69539c5bd5f662ac3b45895b351ae589527749ab1575c23c7c1fd69"
+        },
+        {
+          "iteration": 4,
+          "arm": "off",
+          "wall_seconds": 0.01986987600048451,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "f2263b85f69539c5bd5f662ac3b45895b351ae589527749ab1575c23c7c1fd69"
+        },
+        {
+          "iteration": 5,
+          "arm": "off",
+          "wall_seconds": 0.019571992000237515,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "f2263b85f69539c5bd5f662ac3b45895b351ae589527749ab1575c23c7c1fd69"
+        },
+        {
+          "iteration": 5,
+          "arm": "on",
+          "wall_seconds": 0.019211885999538936,
+          "stages": [
+            [
+              3.6e-05,
+              0
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000036s, 0 rewrites\n",
+          "asm_sha256": "f2263b85f69539c5bd5f662ac3b45895b351ae589527749ab1575c23c7c1fd69"
+        },
+        {
+          "iteration": 6,
+          "arm": "on",
+          "wall_seconds": 0.019680405000144674,
+          "stages": [
+            [
+              3.6e-05,
+              0
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000036s, 0 rewrites\n",
+          "asm_sha256": "f2263b85f69539c5bd5f662ac3b45895b351ae589527749ab1575c23c7c1fd69"
+        },
+        {
+          "iteration": 6,
+          "arm": "off",
+          "wall_seconds": 0.01969593800004077,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "f2263b85f69539c5bd5f662ac3b45895b351ae589527749ab1575c23c7c1fd69"
+        }
+      ],
+      "median_stage_ms": 0.036000000000000004,
+      "median_wall_on_ms": 19.774975000473205,
+      "median_wall_off_ms": 19.69593800004077,
+      "median_wall_on_over_off": 1.004012857901577,
+      "asm_identical_on_off": true,
+      "asm_bytes_on": 2292,
+      "asm_bytes_off": 2292
+    },
+    {
+      "program": "hash_table",
+      "samples": [
+        {
+          "iteration": 0,
+          "arm": "on",
+          "wall_seconds": 0.06868133799980569,
+          "stages": [
+            [
+              0.000111,
+              27
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000111s, 27 rewrites\n",
+          "asm_sha256": "2de6de73811adebdce16dec7c1a8dabe128b7a6cfe3fd4983c1cbf697f274df3"
+        },
+        {
+          "iteration": 0,
+          "arm": "off",
+          "wall_seconds": 0.07075860800068767,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "2de6de73811adebdce16dec7c1a8dabe128b7a6cfe3fd4983c1cbf697f274df3"
+        },
+        {
+          "iteration": 1,
+          "arm": "off",
+          "wall_seconds": 0.08239918900017074,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "2de6de73811adebdce16dec7c1a8dabe128b7a6cfe3fd4983c1cbf697f274df3"
+        },
+        {
+          "iteration": 1,
+          "arm": "on",
+          "wall_seconds": 0.08340769400001591,
+          "stages": [
+            [
+              0.000159,
+              27
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000159s, 27 rewrites\n",
+          "asm_sha256": "2de6de73811adebdce16dec7c1a8dabe128b7a6cfe3fd4983c1cbf697f274df3"
+        },
+        {
+          "iteration": 2,
+          "arm": "on",
+          "wall_seconds": 0.0797666600001321,
+          "stages": [
+            [
+              0.000157,
+              27
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000157s, 27 rewrites\n",
+          "asm_sha256": "2de6de73811adebdce16dec7c1a8dabe128b7a6cfe3fd4983c1cbf697f274df3"
+        },
+        {
+          "iteration": 2,
+          "arm": "off",
+          "wall_seconds": 0.11015512599988142,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "2de6de73811adebdce16dec7c1a8dabe128b7a6cfe3fd4983c1cbf697f274df3"
+        },
+        {
+          "iteration": 3,
+          "arm": "off",
+          "wall_seconds": 0.07691381400036335,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "2de6de73811adebdce16dec7c1a8dabe128b7a6cfe3fd4983c1cbf697f274df3"
+        },
+        {
+          "iteration": 3,
+          "arm": "on",
+          "wall_seconds": 0.0711769399995319,
+          "stages": [
+            [
+              0.000102,
+              27
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000102s, 27 rewrites\n",
+          "asm_sha256": "2de6de73811adebdce16dec7c1a8dabe128b7a6cfe3fd4983c1cbf697f274df3"
+        },
+        {
+          "iteration": 4,
+          "arm": "on",
+          "wall_seconds": 0.07373072900008992,
+          "stages": [
+            [
+              0.000105,
+              27
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000105s, 27 rewrites\n",
+          "asm_sha256": "2de6de73811adebdce16dec7c1a8dabe128b7a6cfe3fd4983c1cbf697f274df3"
+        },
+        {
+          "iteration": 4,
+          "arm": "off",
+          "wall_seconds": 0.09540394600026048,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "2de6de73811adebdce16dec7c1a8dabe128b7a6cfe3fd4983c1cbf697f274df3"
+        },
+        {
+          "iteration": 5,
+          "arm": "off",
+          "wall_seconds": 0.1539895500000057,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "2de6de73811adebdce16dec7c1a8dabe128b7a6cfe3fd4983c1cbf697f274df3"
+        },
+        {
+          "iteration": 5,
+          "arm": "on",
+          "wall_seconds": 0.09728009300033591,
+          "stages": [
+            [
+              0.000163,
+              27
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000163s, 27 rewrites\n",
+          "asm_sha256": "2de6de73811adebdce16dec7c1a8dabe128b7a6cfe3fd4983c1cbf697f274df3"
+        },
+        {
+          "iteration": 6,
+          "arm": "on",
+          "wall_seconds": 0.093850537000435,
+          "stages": [
+            [
+              0.000132,
+              27
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000132s, 27 rewrites\n",
+          "asm_sha256": "2de6de73811adebdce16dec7c1a8dabe128b7a6cfe3fd4983c1cbf697f274df3"
+        },
+        {
+          "iteration": 6,
+          "arm": "off",
+          "wall_seconds": 0.0936342209997747,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "2de6de73811adebdce16dec7c1a8dabe128b7a6cfe3fd4983c1cbf697f274df3"
+        }
+      ],
+      "median_stage_ms": 0.132,
+      "median_wall_on_ms": 79.7666600001321,
+      "median_wall_off_ms": 93.6342209997747,
+      "median_wall_on_over_off": 0.8518964450008512,
+      "asm_identical_on_off": true,
+      "asm_bytes_on": 4782,
+      "asm_bytes_off": 4782
+    },
+    {
+      "program": "zstd_count",
+      "samples": [
+        {
+          "iteration": 0,
+          "arm": "on",
+          "wall_seconds": 0.1204563320006855,
+          "stages": [
+            [
+              0.000157,
+              20
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000157s, 20 rewrites\n",
+          "asm_sha256": "89719e1783298d0599a12c69a82ae6bdf9fa6443b74dd41167ba8212354876d0"
+        },
+        {
+          "iteration": 0,
+          "arm": "off",
+          "wall_seconds": 0.11152176899940969,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "89719e1783298d0599a12c69a82ae6bdf9fa6443b74dd41167ba8212354876d0"
+        },
+        {
+          "iteration": 1,
+          "arm": "off",
+          "wall_seconds": 0.12023232200044731,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "89719e1783298d0599a12c69a82ae6bdf9fa6443b74dd41167ba8212354876d0"
+        },
+        {
+          "iteration": 1,
+          "arm": "on",
+          "wall_seconds": 0.10829825900054857,
+          "stages": [
+            [
+              0.000131,
+              20
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000131s, 20 rewrites\n",
+          "asm_sha256": "89719e1783298d0599a12c69a82ae6bdf9fa6443b74dd41167ba8212354876d0"
+        },
+        {
+          "iteration": 2,
+          "arm": "on",
+          "wall_seconds": 0.08635040599983768,
+          "stages": [
+            [
+              0.000145,
+              20
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000145s, 20 rewrites\n",
+          "asm_sha256": "89719e1783298d0599a12c69a82ae6bdf9fa6443b74dd41167ba8212354876d0"
+        },
+        {
+          "iteration": 2,
+          "arm": "off",
+          "wall_seconds": 0.08275254000000132,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "89719e1783298d0599a12c69a82ae6bdf9fa6443b74dd41167ba8212354876d0"
+        },
+        {
+          "iteration": 3,
+          "arm": "off",
+          "wall_seconds": 0.08594992300004378,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "89719e1783298d0599a12c69a82ae6bdf9fa6443b74dd41167ba8212354876d0"
+        },
+        {
+          "iteration": 3,
+          "arm": "on",
+          "wall_seconds": 0.09229387000050338,
+          "stages": [
+            [
+              0.000104,
+              20
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000104s, 20 rewrites\n",
+          "asm_sha256": "89719e1783298d0599a12c69a82ae6bdf9fa6443b74dd41167ba8212354876d0"
+        },
+        {
+          "iteration": 4,
+          "arm": "on",
+          "wall_seconds": 0.09153914499984239,
+          "stages": [
+            [
+              0.000117,
+              20
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000117s, 20 rewrites\n",
+          "asm_sha256": "89719e1783298d0599a12c69a82ae6bdf9fa6443b74dd41167ba8212354876d0"
+        },
+        {
+          "iteration": 4,
+          "arm": "off",
+          "wall_seconds": 0.10553888800041022,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "89719e1783298d0599a12c69a82ae6bdf9fa6443b74dd41167ba8212354876d0"
+        },
+        {
+          "iteration": 5,
+          "arm": "off",
+          "wall_seconds": 0.08155814900055702,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "89719e1783298d0599a12c69a82ae6bdf9fa6443b74dd41167ba8212354876d0"
+        },
+        {
+          "iteration": 5,
+          "arm": "on",
+          "wall_seconds": 0.0835037110000485,
+          "stages": [
+            [
+              0.000101,
+              20
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000101s, 20 rewrites\n",
+          "asm_sha256": "89719e1783298d0599a12c69a82ae6bdf9fa6443b74dd41167ba8212354876d0"
+        },
+        {
+          "iteration": 6,
+          "arm": "on",
+          "wall_seconds": 0.08485451100023056,
+          "stages": [
+            [
+              0.000139,
+              20
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000139s, 20 rewrites\n",
+          "asm_sha256": "89719e1783298d0599a12c69a82ae6bdf9fa6443b74dd41167ba8212354876d0"
+        },
+        {
+          "iteration": 6,
+          "arm": "off",
+          "wall_seconds": 0.08598873100072524,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "89719e1783298d0599a12c69a82ae6bdf9fa6443b74dd41167ba8212354876d0"
+        }
+      ],
+      "median_stage_ms": 0.131,
+      "median_wall_on_ms": 91.53914499984239,
+      "median_wall_off_ms": 85.98873100072524,
+      "median_wall_on_over_off": 1.0645481557236882,
+      "asm_identical_on_off": true,
+      "asm_bytes_on": 4549,
+      "asm_bytes_off": 4549
+    },
+    {
+      "program": "sqlite_varint",
+      "samples": [
+        {
+          "iteration": 0,
+          "arm": "on",
+          "wall_seconds": 0.12326220899922191,
+          "stages": [
+            [
+              0.000262,
+              29
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000262s, 29 rewrites\n",
+          "asm_sha256": "545a27523a8eca7e1130f265011d8713646cf877cb0c20733ef692a72f25aa11"
+        },
+        {
+          "iteration": 0,
+          "arm": "off",
+          "wall_seconds": 0.11935320900010993,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "545a27523a8eca7e1130f265011d8713646cf877cb0c20733ef692a72f25aa11"
+        },
+        {
+          "iteration": 1,
+          "arm": "off",
+          "wall_seconds": 0.12390967000010278,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "545a27523a8eca7e1130f265011d8713646cf877cb0c20733ef692a72f25aa11"
+        },
+        {
+          "iteration": 1,
+          "arm": "on",
+          "wall_seconds": 0.1312177249992601,
+          "stages": [
+            [
+              0.000382,
+              29
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000382s, 29 rewrites\n",
+          "asm_sha256": "545a27523a8eca7e1130f265011d8713646cf877cb0c20733ef692a72f25aa11"
+        },
+        {
+          "iteration": 2,
+          "arm": "on",
+          "wall_seconds": 0.1198289570002089,
+          "stages": [
+            [
+              0.000212,
+              29
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000212s, 29 rewrites\n",
+          "asm_sha256": "545a27523a8eca7e1130f265011d8713646cf877cb0c20733ef692a72f25aa11"
+        },
+        {
+          "iteration": 2,
+          "arm": "off",
+          "wall_seconds": 0.116690639000808,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "545a27523a8eca7e1130f265011d8713646cf877cb0c20733ef692a72f25aa11"
+        },
+        {
+          "iteration": 3,
+          "arm": "off",
+          "wall_seconds": 0.11556728799951088,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "545a27523a8eca7e1130f265011d8713646cf877cb0c20733ef692a72f25aa11"
+        },
+        {
+          "iteration": 3,
+          "arm": "on",
+          "wall_seconds": 0.11729755900068994,
+          "stages": [
+            [
+              0.000216,
+              29
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000216s, 29 rewrites\n",
+          "asm_sha256": "545a27523a8eca7e1130f265011d8713646cf877cb0c20733ef692a72f25aa11"
+        },
+        {
+          "iteration": 4,
+          "arm": "on",
+          "wall_seconds": 0.11709122299998853,
+          "stages": [
+            [
+              0.000219,
+              29
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000219s, 29 rewrites\n",
+          "asm_sha256": "545a27523a8eca7e1130f265011d8713646cf877cb0c20733ef692a72f25aa11"
+        },
+        {
+          "iteration": 4,
+          "arm": "off",
+          "wall_seconds": 0.1297620260002077,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "545a27523a8eca7e1130f265011d8713646cf877cb0c20733ef692a72f25aa11"
+        },
+        {
+          "iteration": 5,
+          "arm": "off",
+          "wall_seconds": 0.12013611200018204,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "545a27523a8eca7e1130f265011d8713646cf877cb0c20733ef692a72f25aa11"
+        },
+        {
+          "iteration": 5,
+          "arm": "on",
+          "wall_seconds": 0.11803982899982657,
+          "stages": [
+            [
+              0.000457,
+              29
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000457s, 29 rewrites\n",
+          "asm_sha256": "545a27523a8eca7e1130f265011d8713646cf877cb0c20733ef692a72f25aa11"
+        },
+        {
+          "iteration": 6,
+          "arm": "on",
+          "wall_seconds": 0.1178184729997156,
+          "stages": [
+            [
+              0.000246,
+              29
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000246s, 29 rewrites\n",
+          "asm_sha256": "545a27523a8eca7e1130f265011d8713646cf877cb0c20733ef692a72f25aa11"
+        },
+        {
+          "iteration": 6,
+          "arm": "off",
+          "wall_seconds": 0.117146337000122,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "545a27523a8eca7e1130f265011d8713646cf877cb0c20733ef692a72f25aa11"
+        }
+      ],
+      "median_stage_ms": 0.24600000000000002,
+      "median_wall_on_ms": 118.03982899982657,
+      "median_wall_off_ms": 119.35320900010993,
+      "median_wall_on_over_off": 0.9889958551488788,
+      "asm_identical_on_off": true,
+      "asm_bytes_on": 11122,
+      "asm_bytes_off": 11122
+    },
+    {
+      "program": "tls_seg_access",
+      "samples": [
+        {
+          "iteration": 0,
+          "arm": "on",
+          "wall_seconds": 0.024050351999903796,
+          "stages": [
+            [
+              5.1e-05,
+              4
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000051s, 4 rewrites\n",
+          "asm_sha256": "e074ea16217405c9c2dc6e5b2d2e80217aefaab2a15fa79330661651429e5823"
+        },
+        {
+          "iteration": 0,
+          "arm": "off",
+          "wall_seconds": 0.024994786999741336,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "e074ea16217405c9c2dc6e5b2d2e80217aefaab2a15fa79330661651429e5823"
+        },
+        {
+          "iteration": 1,
+          "arm": "off",
+          "wall_seconds": 0.024985539999761386,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "e074ea16217405c9c2dc6e5b2d2e80217aefaab2a15fa79330661651429e5823"
+        },
+        {
+          "iteration": 1,
+          "arm": "on",
+          "wall_seconds": 0.02388115500070853,
+          "stages": [
+            [
+              4.6e-05,
+              4
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000046s, 4 rewrites\n",
+          "asm_sha256": "e074ea16217405c9c2dc6e5b2d2e80217aefaab2a15fa79330661651429e5823"
+        },
+        {
+          "iteration": 2,
+          "arm": "on",
+          "wall_seconds": 0.023998480000045674,
+          "stages": [
+            [
+              4.7e-05,
+              4
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000047s, 4 rewrites\n",
+          "asm_sha256": "e074ea16217405c9c2dc6e5b2d2e80217aefaab2a15fa79330661651429e5823"
+        },
+        {
+          "iteration": 2,
+          "arm": "off",
+          "wall_seconds": 0.024049462000220956,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "e074ea16217405c9c2dc6e5b2d2e80217aefaab2a15fa79330661651429e5823"
+        },
+        {
+          "iteration": 3,
+          "arm": "off",
+          "wall_seconds": 0.02793610000026092,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "e074ea16217405c9c2dc6e5b2d2e80217aefaab2a15fa79330661651429e5823"
+        },
+        {
+          "iteration": 3,
+          "arm": "on",
+          "wall_seconds": 0.024531100999411137,
+          "stages": [
+            [
+              0.000187,
+              4
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000187s, 4 rewrites\n",
+          "asm_sha256": "e074ea16217405c9c2dc6e5b2d2e80217aefaab2a15fa79330661651429e5823"
+        },
+        {
+          "iteration": 4,
+          "arm": "on",
+          "wall_seconds": 0.02391859899944393,
+          "stages": [
+            [
+              4.8e-05,
+              4
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000048s, 4 rewrites\n",
+          "asm_sha256": "e074ea16217405c9c2dc6e5b2d2e80217aefaab2a15fa79330661651429e5823"
+        },
+        {
+          "iteration": 4,
+          "arm": "off",
+          "wall_seconds": 0.024308405999363458,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "e074ea16217405c9c2dc6e5b2d2e80217aefaab2a15fa79330661651429e5823"
+        },
+        {
+          "iteration": 5,
+          "arm": "off",
+          "wall_seconds": 0.024843918999977177,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "e074ea16217405c9c2dc6e5b2d2e80217aefaab2a15fa79330661651429e5823"
+        },
+        {
+          "iteration": 5,
+          "arm": "on",
+          "wall_seconds": 0.02588779699999577,
+          "stages": [
+            [
+              5.3e-05,
+              4
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000053s, 4 rewrites\n",
+          "asm_sha256": "e074ea16217405c9c2dc6e5b2d2e80217aefaab2a15fa79330661651429e5823"
+        },
+        {
+          "iteration": 6,
+          "arm": "on",
+          "wall_seconds": 0.02562603299975308,
+          "stages": [
+            [
+              5.2e-05,
+              4
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000052s, 4 rewrites\n",
+          "asm_sha256": "e074ea16217405c9c2dc6e5b2d2e80217aefaab2a15fa79330661651429e5823"
+        },
+        {
+          "iteration": 6,
+          "arm": "off",
+          "wall_seconds": 0.025244413999644166,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "e074ea16217405c9c2dc6e5b2d2e80217aefaab2a15fa79330661651429e5823"
+        }
+      ],
+      "median_stage_ms": 0.051,
+      "median_wall_on_ms": 24.050351999903796,
+      "median_wall_off_ms": 24.985539999761386,
+      "median_wall_on_over_off": 0.9625708309739746,
+      "asm_identical_on_off": true,
+      "asm_bytes_on": 2325,
+      "asm_bytes_off": 2325
+    },
+    {
+      "program": "strlen_bench",
+      "samples": [
+        {
+          "iteration": 0,
+          "arm": "on",
+          "wall_seconds": 0.11903250999966986,
+          "stages": [
+            [
+              0.000179,
+              11
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000179s, 11 rewrites\n",
+          "asm_sha256": "6a51f68e8494a070c27428229ee647459a4b4af7418d393502ceb48f8c027012"
+        },
+        {
+          "iteration": 0,
+          "arm": "off",
+          "wall_seconds": 0.09805944799973076,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "6a51f68e8494a070c27428229ee647459a4b4af7418d393502ceb48f8c027012"
+        },
+        {
+          "iteration": 1,
+          "arm": "off",
+          "wall_seconds": 0.09956435299955047,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "6a51f68e8494a070c27428229ee647459a4b4af7418d393502ceb48f8c027012"
+        },
+        {
+          "iteration": 1,
+          "arm": "on",
+          "wall_seconds": 0.10258335999969859,
+          "stages": [
+            [
+              0.000137,
+              11
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000137s, 11 rewrites\n",
+          "asm_sha256": "6a51f68e8494a070c27428229ee647459a4b4af7418d393502ceb48f8c027012"
+        },
+        {
+          "iteration": 2,
+          "arm": "on",
+          "wall_seconds": 0.10030113800075924,
+          "stages": [
+            [
+              0.000142,
+              11
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000142s, 11 rewrites\n",
+          "asm_sha256": "6a51f68e8494a070c27428229ee647459a4b4af7418d393502ceb48f8c027012"
+        },
+        {
+          "iteration": 2,
+          "arm": "off",
+          "wall_seconds": 0.11005359199953091,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "6a51f68e8494a070c27428229ee647459a4b4af7418d393502ceb48f8c027012"
+        },
+        {
+          "iteration": 3,
+          "arm": "off",
+          "wall_seconds": 0.1035018479997234,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "6a51f68e8494a070c27428229ee647459a4b4af7418d393502ceb48f8c027012"
+        },
+        {
+          "iteration": 3,
+          "arm": "on",
+          "wall_seconds": 0.09919000499940012,
+          "stages": [
+            [
+              0.000126,
+              11
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000126s, 11 rewrites\n",
+          "asm_sha256": "6a51f68e8494a070c27428229ee647459a4b4af7418d393502ceb48f8c027012"
+        },
+        {
+          "iteration": 4,
+          "arm": "on",
+          "wall_seconds": 0.0998050250000233,
+          "stages": [
+            [
+              0.000166,
+              11
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000166s, 11 rewrites\n",
+          "asm_sha256": "6a51f68e8494a070c27428229ee647459a4b4af7418d393502ceb48f8c027012"
+        },
+        {
+          "iteration": 4,
+          "arm": "off",
+          "wall_seconds": 0.09925429000031727,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "6a51f68e8494a070c27428229ee647459a4b4af7418d393502ceb48f8c027012"
+        },
+        {
+          "iteration": 5,
+          "arm": "off",
+          "wall_seconds": 0.11058659899936174,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "6a51f68e8494a070c27428229ee647459a4b4af7418d393502ceb48f8c027012"
+        },
+        {
+          "iteration": 5,
+          "arm": "on",
+          "wall_seconds": 0.0979104809994169,
+          "stages": [
+            [
+              0.000123,
+              11
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000123s, 11 rewrites\n",
+          "asm_sha256": "6a51f68e8494a070c27428229ee647459a4b4af7418d393502ceb48f8c027012"
+        },
+        {
+          "iteration": 6,
+          "arm": "on",
+          "wall_seconds": 0.09931459100062057,
+          "stages": [
+            [
+              0.000126,
+              11
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000126s, 11 rewrites\n",
+          "asm_sha256": "6a51f68e8494a070c27428229ee647459a4b4af7418d393502ceb48f8c027012"
+        },
+        {
+          "iteration": 6,
+          "arm": "off",
+          "wall_seconds": 0.12734598200040637,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "6a51f68e8494a070c27428229ee647459a4b4af7418d393502ceb48f8c027012"
+        }
+      ],
+      "median_stage_ms": 0.13699999999999998,
+      "median_wall_on_ms": 99.8050250000233,
+      "median_wall_off_ms": 103.5018479997234,
+      "median_wall_on_over_off": 0.9642825411222612,
+      "asm_identical_on_off": true,
+      "asm_bytes_on": 5785,
+      "asm_bytes_off": 5785
+    },
+    {
+      "program": "glibc_memcmp",
+      "samples": [
+        {
+          "iteration": 0,
+          "arm": "on",
+          "wall_seconds": 0.09075997400032065,
+          "stages": [
+            [
+              0.000131,
+              18
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000131s, 18 rewrites\n",
+          "asm_sha256": "fa489049c877956bb8876c8ed00c68cc05967d60252c29244980f805a28d8472"
+        },
+        {
+          "iteration": 0,
+          "arm": "off",
+          "wall_seconds": 0.085673155999757,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "fa489049c877956bb8876c8ed00c68cc05967d60252c29244980f805a28d8472"
+        },
+        {
+          "iteration": 1,
+          "arm": "off",
+          "wall_seconds": 0.08315626999956294,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "fa489049c877956bb8876c8ed00c68cc05967d60252c29244980f805a28d8472"
+        },
+        {
+          "iteration": 1,
+          "arm": "on",
+          "wall_seconds": 0.08261855700038723,
+          "stages": [
+            [
+              0.000137,
+              18
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000137s, 18 rewrites\n",
+          "asm_sha256": "fa489049c877956bb8876c8ed00c68cc05967d60252c29244980f805a28d8472"
+        },
+        {
+          "iteration": 2,
+          "arm": "on",
+          "wall_seconds": 0.08388314799958607,
+          "stages": [
+            [
+              0.000132,
+              18
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000132s, 18 rewrites\n",
+          "asm_sha256": "fa489049c877956bb8876c8ed00c68cc05967d60252c29244980f805a28d8472"
+        },
+        {
+          "iteration": 2,
+          "arm": "off",
+          "wall_seconds": 0.08413657799974317,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "fa489049c877956bb8876c8ed00c68cc05967d60252c29244980f805a28d8472"
+        },
+        {
+          "iteration": 3,
+          "arm": "off",
+          "wall_seconds": 0.09078245500040794,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "fa489049c877956bb8876c8ed00c68cc05967d60252c29244980f805a28d8472"
+        },
+        {
+          "iteration": 3,
+          "arm": "on",
+          "wall_seconds": 0.09088869799961685,
+          "stages": [
+            [
+              0.000135,
+              18
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000135s, 18 rewrites\n",
+          "asm_sha256": "fa489049c877956bb8876c8ed00c68cc05967d60252c29244980f805a28d8472"
+        },
+        {
+          "iteration": 4,
+          "arm": "on",
+          "wall_seconds": 0.08728753000013967,
+          "stages": [
+            [
+              0.000603,
+              18
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000603s, 18 rewrites\n",
+          "asm_sha256": "fa489049c877956bb8876c8ed00c68cc05967d60252c29244980f805a28d8472"
+        },
+        {
+          "iteration": 4,
+          "arm": "off",
+          "wall_seconds": 0.09371070900033374,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "fa489049c877956bb8876c8ed00c68cc05967d60252c29244980f805a28d8472"
+        },
+        {
+          "iteration": 5,
+          "arm": "off",
+          "wall_seconds": 0.08670508199975302,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "fa489049c877956bb8876c8ed00c68cc05967d60252c29244980f805a28d8472"
+        },
+        {
+          "iteration": 5,
+          "arm": "on",
+          "wall_seconds": 0.08700870400025451,
+          "stages": [
+            [
+              0.000188,
+              18
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000188s, 18 rewrites\n",
+          "asm_sha256": "fa489049c877956bb8876c8ed00c68cc05967d60252c29244980f805a28d8472"
+        },
+        {
+          "iteration": 6,
+          "arm": "on",
+          "wall_seconds": 0.09405686399986735,
+          "stages": [
+            [
+              0.000138,
+              18
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000138s, 18 rewrites\n",
+          "asm_sha256": "fa489049c877956bb8876c8ed00c68cc05967d60252c29244980f805a28d8472"
+        },
+        {
+          "iteration": 6,
+          "arm": "off",
+          "wall_seconds": 0.08412982800018654,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "fa489049c877956bb8876c8ed00c68cc05967d60252c29244980f805a28d8472"
+        }
+      ],
+      "median_stage_ms": 0.13699999999999998,
+      "median_wall_on_ms": 87.28753000013967,
+      "median_wall_off_ms": 85.673155999757,
+      "median_wall_on_over_off": 1.018843405283065,
+      "asm_identical_on_off": true,
+      "asm_bytes_on": 6720,
+      "asm_bytes_off": 6720
+    },
+    {
+      "program": "switch_dispatch",
+      "samples": [
+        {
+          "iteration": 0,
+          "arm": "on",
+          "wall_seconds": 0.029743490000328165,
+          "stages": [
+            [
+              6.2e-05,
+              4
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000062s, 4 rewrites\n",
+          "asm_sha256": "34c72e8da870b830a99ed044fdaadcdb99725dace378a5e484be411f75ba4c97"
+        },
+        {
+          "iteration": 0,
+          "arm": "off",
+          "wall_seconds": 0.029474335000486462,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "34c72e8da870b830a99ed044fdaadcdb99725dace378a5e484be411f75ba4c97"
+        },
+        {
+          "iteration": 1,
+          "arm": "off",
+          "wall_seconds": 0.038102243000139424,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "34c72e8da870b830a99ed044fdaadcdb99725dace378a5e484be411f75ba4c97"
+        },
+        {
+          "iteration": 1,
+          "arm": "on",
+          "wall_seconds": 0.03121505899980548,
+          "stages": [
+            [
+              6e-05,
+              4
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000060s, 4 rewrites\n",
+          "asm_sha256": "34c72e8da870b830a99ed044fdaadcdb99725dace378a5e484be411f75ba4c97"
+        },
+        {
+          "iteration": 2,
+          "arm": "on",
+          "wall_seconds": 0.029082538999318785,
+          "stages": [
+            [
+              6e-05,
+              4
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000060s, 4 rewrites\n",
+          "asm_sha256": "34c72e8da870b830a99ed044fdaadcdb99725dace378a5e484be411f75ba4c97"
+        },
+        {
+          "iteration": 2,
+          "arm": "off",
+          "wall_seconds": 0.028881180999633216,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "34c72e8da870b830a99ed044fdaadcdb99725dace378a5e484be411f75ba4c97"
+        },
+        {
+          "iteration": 3,
+          "arm": "off",
+          "wall_seconds": 0.029517284999201365,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "34c72e8da870b830a99ed044fdaadcdb99725dace378a5e484be411f75ba4c97"
+        },
+        {
+          "iteration": 3,
+          "arm": "on",
+          "wall_seconds": 0.029692011999941315,
+          "stages": [
+            [
+              6e-05,
+              4
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000060s, 4 rewrites\n",
+          "asm_sha256": "34c72e8da870b830a99ed044fdaadcdb99725dace378a5e484be411f75ba4c97"
+        },
+        {
+          "iteration": 4,
+          "arm": "on",
+          "wall_seconds": 0.028962514999875566,
+          "stages": [
+            [
+              6e-05,
+              4
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000060s, 4 rewrites\n",
+          "asm_sha256": "34c72e8da870b830a99ed044fdaadcdb99725dace378a5e484be411f75ba4c97"
+        },
+        {
+          "iteration": 4,
+          "arm": "off",
+          "wall_seconds": 0.02905123500022455,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "34c72e8da870b830a99ed044fdaadcdb99725dace378a5e484be411f75ba4c97"
+        },
+        {
+          "iteration": 5,
+          "arm": "off",
+          "wall_seconds": 0.029202028999861795,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "34c72e8da870b830a99ed044fdaadcdb99725dace378a5e484be411f75ba4c97"
+        },
+        {
+          "iteration": 5,
+          "arm": "on",
+          "wall_seconds": 0.03184474199952092,
+          "stages": [
+            [
+              7.6e-05,
+              4
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000076s, 4 rewrites\n",
+          "asm_sha256": "34c72e8da870b830a99ed044fdaadcdb99725dace378a5e484be411f75ba4c97"
+        },
+        {
+          "iteration": 6,
+          "arm": "on",
+          "wall_seconds": 0.029620827000144345,
+          "stages": [
+            [
+              6.3e-05,
+              4
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000063s, 4 rewrites\n",
+          "asm_sha256": "34c72e8da870b830a99ed044fdaadcdb99725dace378a5e484be411f75ba4c97"
+        },
+        {
+          "iteration": 6,
+          "arm": "off",
+          "wall_seconds": 0.03197919800004456,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "34c72e8da870b830a99ed044fdaadcdb99725dace378a5e484be411f75ba4c97"
+        }
+      ],
+      "median_stage_ms": 0.060000000000000005,
+      "median_wall_on_ms": 29.692011999941315,
+      "median_wall_off_ms": 29.474335000486462,
+      "median_wall_on_over_off": 1.0073853065540328,
+      "asm_identical_on_off": true,
+      "asm_bytes_on": 2866,
+      "asm_bytes_off": 2866
+    },
+    {
+      "program": "sha256_transform",
+      "samples": [
+        {
+          "iteration": 0,
+          "arm": "on",
+          "wall_seconds": 0.15267088000018703,
+          "stages": [
+            [
+              0.000181,
+              101
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000181s, 101 rewrites\n",
+          "asm_sha256": "db2bda36b4c0216a4400fa8fa9df8471e8a9bdc8257b3c6a8e12a7af385904c5"
+        },
+        {
+          "iteration": 0,
+          "arm": "off",
+          "wall_seconds": 0.1536210949998349,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "db2bda36b4c0216a4400fa8fa9df8471e8a9bdc8257b3c6a8e12a7af385904c5"
+        },
+        {
+          "iteration": 1,
+          "arm": "off",
+          "wall_seconds": 0.13783968400002777,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "db2bda36b4c0216a4400fa8fa9df8471e8a9bdc8257b3c6a8e12a7af385904c5"
+        },
+        {
+          "iteration": 1,
+          "arm": "on",
+          "wall_seconds": 0.12413151800046762,
+          "stages": [
+            [
+              0.000192,
+              101
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000192s, 101 rewrites\n",
+          "asm_sha256": "db2bda36b4c0216a4400fa8fa9df8471e8a9bdc8257b3c6a8e12a7af385904c5"
+        },
+        {
+          "iteration": 2,
+          "arm": "on",
+          "wall_seconds": 0.11924362099944119,
+          "stages": [
+            [
+              0.000189,
+              101
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000189s, 101 rewrites\n",
+          "asm_sha256": "db2bda36b4c0216a4400fa8fa9df8471e8a9bdc8257b3c6a8e12a7af385904c5"
+        },
+        {
+          "iteration": 2,
+          "arm": "off",
+          "wall_seconds": 0.14836382900011813,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "db2bda36b4c0216a4400fa8fa9df8471e8a9bdc8257b3c6a8e12a7af385904c5"
+        },
+        {
+          "iteration": 3,
+          "arm": "off",
+          "wall_seconds": 0.12194763200022862,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "db2bda36b4c0216a4400fa8fa9df8471e8a9bdc8257b3c6a8e12a7af385904c5"
+        },
+        {
+          "iteration": 3,
+          "arm": "on",
+          "wall_seconds": 0.11910653000086313,
+          "stages": [
+            [
+              0.000184,
+              101
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000184s, 101 rewrites\n",
+          "asm_sha256": "db2bda36b4c0216a4400fa8fa9df8471e8a9bdc8257b3c6a8e12a7af385904c5"
+        },
+        {
+          "iteration": 4,
+          "arm": "on",
+          "wall_seconds": 0.15433469800063904,
+          "stages": [
+            [
+              0.000292,
+              101
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000292s, 101 rewrites\n",
+          "asm_sha256": "db2bda36b4c0216a4400fa8fa9df8471e8a9bdc8257b3c6a8e12a7af385904c5"
+        },
+        {
+          "iteration": 4,
+          "arm": "off",
+          "wall_seconds": 0.1175147450003351,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "db2bda36b4c0216a4400fa8fa9df8471e8a9bdc8257b3c6a8e12a7af385904c5"
+        },
+        {
+          "iteration": 5,
+          "arm": "off",
+          "wall_seconds": 0.1261909820004803,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "db2bda36b4c0216a4400fa8fa9df8471e8a9bdc8257b3c6a8e12a7af385904c5"
+        },
+        {
+          "iteration": 5,
+          "arm": "on",
+          "wall_seconds": 0.12980878000053053,
+          "stages": [
+            [
+              0.000215,
+              101
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000215s, 101 rewrites\n",
+          "asm_sha256": "db2bda36b4c0216a4400fa8fa9df8471e8a9bdc8257b3c6a8e12a7af385904c5"
+        },
+        {
+          "iteration": 6,
+          "arm": "on",
+          "wall_seconds": 0.11997108300056425,
+          "stages": [
+            [
+              0.000181,
+              101
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000181s, 101 rewrites\n",
+          "asm_sha256": "db2bda36b4c0216a4400fa8fa9df8471e8a9bdc8257b3c6a8e12a7af385904c5"
+        },
+        {
+          "iteration": 6,
+          "arm": "off",
+          "wall_seconds": 0.1198741770003835,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "db2bda36b4c0216a4400fa8fa9df8471e8a9bdc8257b3c6a8e12a7af385904c5"
+        }
+      ],
+      "median_stage_ms": 0.189,
+      "median_wall_on_ms": 124.13151800046762,
+      "median_wall_off_ms": 126.19098200048029,
+      "median_wall_on_over_off": 0.9836797846615947,
+      "asm_identical_on_off": true,
+      "asm_bytes_on": 10255,
+      "asm_bytes_off": 10255
+    },
+    {
+      "program": "fannkuch",
+      "samples": [
+        {
+          "iteration": 0,
+          "arm": "on",
+          "wall_seconds": 0.10062199300045904,
+          "stages": [
+            [
+              0.000122,
+              7
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000122s, 7 rewrites\n",
+          "asm_sha256": "9c3252a7c6b2868d2b2dda4351fef197cdbd8883bcf475322431855ec94aee03"
+        },
+        {
+          "iteration": 0,
+          "arm": "off",
+          "wall_seconds": 0.09732416599945282,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "9c3252a7c6b2868d2b2dda4351fef197cdbd8883bcf475322431855ec94aee03"
+        },
+        {
+          "iteration": 1,
+          "arm": "off",
+          "wall_seconds": 0.09539529999983642,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "9c3252a7c6b2868d2b2dda4351fef197cdbd8883bcf475322431855ec94aee03"
+        },
+        {
+          "iteration": 1,
+          "arm": "on",
+          "wall_seconds": 0.1020967450003809,
+          "stages": [
+            [
+              0.0001,
+              7
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000100s, 7 rewrites\n",
+          "asm_sha256": "9c3252a7c6b2868d2b2dda4351fef197cdbd8883bcf475322431855ec94aee03"
+        },
+        {
+          "iteration": 2,
+          "arm": "on",
+          "wall_seconds": 0.11104996799986111,
+          "stages": [
+            [
+              0.000123,
+              7
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000123s, 7 rewrites\n",
+          "asm_sha256": "9c3252a7c6b2868d2b2dda4351fef197cdbd8883bcf475322431855ec94aee03"
+        },
+        {
+          "iteration": 2,
+          "arm": "off",
+          "wall_seconds": 0.0953755659993476,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "9c3252a7c6b2868d2b2dda4351fef197cdbd8883bcf475322431855ec94aee03"
+        },
+        {
+          "iteration": 3,
+          "arm": "off",
+          "wall_seconds": 0.0954176710001775,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "9c3252a7c6b2868d2b2dda4351fef197cdbd8883bcf475322431855ec94aee03"
+        },
+        {
+          "iteration": 3,
+          "arm": "on",
+          "wall_seconds": 0.0944858769998973,
+          "stages": [
+            [
+              9.8e-05,
+              7
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000098s, 7 rewrites\n",
+          "asm_sha256": "9c3252a7c6b2868d2b2dda4351fef197cdbd8883bcf475322431855ec94aee03"
+        },
+        {
+          "iteration": 4,
+          "arm": "on",
+          "wall_seconds": 0.10298663300000044,
+          "stages": [
+            [
+              0.000108,
+              7
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000108s, 7 rewrites\n",
+          "asm_sha256": "9c3252a7c6b2868d2b2dda4351fef197cdbd8883bcf475322431855ec94aee03"
+        },
+        {
+          "iteration": 4,
+          "arm": "off",
+          "wall_seconds": 0.10559279800054355,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "9c3252a7c6b2868d2b2dda4351fef197cdbd8883bcf475322431855ec94aee03"
+        },
+        {
+          "iteration": 5,
+          "arm": "off",
+          "wall_seconds": 0.0991725129997576,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "9c3252a7c6b2868d2b2dda4351fef197cdbd8883bcf475322431855ec94aee03"
+        },
+        {
+          "iteration": 5,
+          "arm": "on",
+          "wall_seconds": 0.09385921900047833,
+          "stages": [
+            [
+              0.000122,
+              7
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000122s, 7 rewrites\n",
+          "asm_sha256": "9c3252a7c6b2868d2b2dda4351fef197cdbd8883bcf475322431855ec94aee03"
+        },
+        {
+          "iteration": 6,
+          "arm": "on",
+          "wall_seconds": 0.09309764600038761,
+          "stages": [
+            [
+              0.00012,
+              7
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000120s, 7 rewrites\n",
+          "asm_sha256": "9c3252a7c6b2868d2b2dda4351fef197cdbd8883bcf475322431855ec94aee03"
+        },
+        {
+          "iteration": 6,
+          "arm": "off",
+          "wall_seconds": 0.09797433499988983,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "9c3252a7c6b2868d2b2dda4351fef197cdbd8883bcf475322431855ec94aee03"
+        }
+      ],
+      "median_stage_ms": 0.12000000000000001,
+      "median_wall_on_ms": 100.62199300045904,
+      "median_wall_off_ms": 97.32416599945282,
+      "median_wall_on_over_off": 1.0338849757112203,
+      "asm_identical_on_off": true,
+      "asm_bytes_on": 4875,
+      "asm_bytes_off": 4875
+    },
+    {
+      "program": "struct_copy",
+      "samples": [
+        {
+          "iteration": 0,
+          "arm": "on",
+          "wall_seconds": 0.04613663800046197,
+          "stages": [
+            [
+              9.9e-05,
+              4
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000099s, 4 rewrites\n",
+          "asm_sha256": "8ffaeb3fe827c2abefff44ea991dd2e0fa8427a76329c1c46ad46f11ff910198"
+        },
+        {
+          "iteration": 0,
+          "arm": "off",
+          "wall_seconds": 0.046412327000325604,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "8ffaeb3fe827c2abefff44ea991dd2e0fa8427a76329c1c46ad46f11ff910198"
+        },
+        {
+          "iteration": 1,
+          "arm": "off",
+          "wall_seconds": 0.04499705000034737,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "8ffaeb3fe827c2abefff44ea991dd2e0fa8427a76329c1c46ad46f11ff910198"
+        },
+        {
+          "iteration": 1,
+          "arm": "on",
+          "wall_seconds": 0.04496370999913779,
+          "stages": [
+            [
+              9.4e-05,
+              4
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000094s, 4 rewrites\n",
+          "asm_sha256": "8ffaeb3fe827c2abefff44ea991dd2e0fa8427a76329c1c46ad46f11ff910198"
+        },
+        {
+          "iteration": 2,
+          "arm": "on",
+          "wall_seconds": 0.044658325999989756,
+          "stages": [
+            [
+              0.000101,
+              4
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000101s, 4 rewrites\n",
+          "asm_sha256": "8ffaeb3fe827c2abefff44ea991dd2e0fa8427a76329c1c46ad46f11ff910198"
+        },
+        {
+          "iteration": 2,
+          "arm": "off",
+          "wall_seconds": 0.04373312899951998,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "8ffaeb3fe827c2abefff44ea991dd2e0fa8427a76329c1c46ad46f11ff910198"
+        },
+        {
+          "iteration": 3,
+          "arm": "off",
+          "wall_seconds": 0.046270170999378024,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "8ffaeb3fe827c2abefff44ea991dd2e0fa8427a76329c1c46ad46f11ff910198"
+        },
+        {
+          "iteration": 3,
+          "arm": "on",
+          "wall_seconds": 0.06553194899970549,
+          "stages": [
+            [
+              0.000141,
+              4
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000141s, 4 rewrites\n",
+          "asm_sha256": "8ffaeb3fe827c2abefff44ea991dd2e0fa8427a76329c1c46ad46f11ff910198"
+        },
+        {
+          "iteration": 4,
+          "arm": "on",
+          "wall_seconds": 0.06021253400012938,
+          "stages": [
+            [
+              0.000144,
+              4
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000144s, 4 rewrites\n",
+          "asm_sha256": "8ffaeb3fe827c2abefff44ea991dd2e0fa8427a76329c1c46ad46f11ff910198"
+        },
+        {
+          "iteration": 4,
+          "arm": "off",
+          "wall_seconds": 0.04455100599989237,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "8ffaeb3fe827c2abefff44ea991dd2e0fa8427a76329c1c46ad46f11ff910198"
+        },
+        {
+          "iteration": 5,
+          "arm": "off",
+          "wall_seconds": 0.04451061899999331,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "8ffaeb3fe827c2abefff44ea991dd2e0fa8427a76329c1c46ad46f11ff910198"
+        },
+        {
+          "iteration": 5,
+          "arm": "on",
+          "wall_seconds": 0.0653801239996028,
+          "stages": [
+            [
+              0.00019,
+              4
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000190s, 4 rewrites\n",
+          "asm_sha256": "8ffaeb3fe827c2abefff44ea991dd2e0fa8427a76329c1c46ad46f11ff910198"
+        },
+        {
+          "iteration": 6,
+          "arm": "on",
+          "wall_seconds": 0.052156175000163785,
+          "stages": [
+            [
+              0.000184,
+              4
+            ]
+          ],
+          "stderr": "[TIME] preinline memory: 0.000184s, 4 rewrites\n",
+          "asm_sha256": "8ffaeb3fe827c2abefff44ea991dd2e0fa8427a76329c1c46ad46f11ff910198"
+        },
+        {
+          "iteration": 6,
+          "arm": "off",
+          "wall_seconds": 0.053093442999852414,
+          "stages": [],
+          "stderr": "",
+          "asm_sha256": "8ffaeb3fe827c2abefff44ea991dd2e0fa8427a76329c1c46ad46f11ff910198"
+        }
+      ],
+      "median_stage_ms": 0.14100000000000001,
+      "median_wall_on_ms": 52.156175000163785,
+      "median_wall_off_ms": 44.99705000034737,
+      "median_wall_on_over_off": 1.1591020966876973,
+      "asm_identical_on_off": true,
+      "asm_bytes_on": 4557,
+      "asm_bytes_off": 4557
+    }
+  ],
+  "size_modes": [
+    {
+      "program": "nbody",
+      "opt": "-Os",
+      "text_on": 1167,
+      "text_off": 1167
+    },
+    {
+      "program": "expat_siphash24",
+      "opt": "-Os",
+      "text_on": 1949,
+      "text_off": 1949
+    },
+    {
+      "program": "expat_xml_scan",
+      "opt": "-Os",
+      "text_on": 850,
+      "text_off": 850
+    },
+    {
+      "program": "matmul",
+      "opt": "-Os",
+      "text_on": 364,
+      "text_off": 364
+    },
+    {
+      "program": "mandelbrot",
+      "opt": "-Os",
+      "text_on": 243,
+      "text_off": 243
+    },
+    {
+      "program": "hash_table",
+      "opt": "-Os",
+      "text_on": 702,
+      "text_off": 702
+    },
+    {
+      "program": "zstd_count",
+      "opt": "-Os",
+      "text_on": 457,
+      "text_off": 457
+    },
+    {
+      "program": "sqlite_varint",
+      "opt": "-Os",
+      "text_on": 1460,
+      "text_off": 1460
+    },
+    {
+      "program": "tls_seg_access",
+      "opt": "-Os",
+      "text_on": 204,
+      "text_off": 204
+    },
+    {
+      "program": "strlen_bench",
+      "opt": "-Os",
+      "text_on": 784,
+      "text_off": 784
+    },
+    {
+      "program": "glibc_memcmp",
+      "opt": "-Os",
+      "text_on": 1062,
+      "text_off": 1062
+    },
+    {
+      "program": "switch_dispatch",
+      "opt": "-Os",
+      "text_on": 299,
+      "text_off": 299
+    },
+    {
+      "program": "sha256_transform",
+      "opt": "-Os",
+      "text_on": 924,
+      "text_off": 924
+    },
+    {
+      "program": "fannkuch",
+      "opt": "-Os",
+      "text_on": 445,
+      "text_off": 445
+    },
+    {
+      "program": "struct_copy",
+      "opt": "-Os",
+      "text_on": 552,
+      "text_off": 552
+    },
+    {
+      "program": "nbody",
+      "opt": "-Oz",
+      "text_on": 1167,
+      "text_off": 1167
+    },
+    {
+      "program": "expat_siphash24",
+      "opt": "-Oz",
+      "text_on": 1949,
+      "text_off": 1949
+    },
+    {
+      "program": "expat_xml_scan",
+      "opt": "-Oz",
+      "text_on": 850,
+      "text_off": 850
+    },
+    {
+      "program": "matmul",
+      "opt": "-Oz",
+      "text_on": 364,
+      "text_off": 364
+    },
+    {
+      "program": "mandelbrot",
+      "opt": "-Oz",
+      "text_on": 243,
+      "text_off": 243
+    },
+    {
+      "program": "hash_table",
+      "opt": "-Oz",
+      "text_on": 702,
+      "text_off": 702
+    },
+    {
+      "program": "zstd_count",
+      "opt": "-Oz",
+      "text_on": 457,
+      "text_off": 457
+    },
+    {
+      "program": "sqlite_varint",
+      "opt": "-Oz",
+      "text_on": 1460,
+      "text_off": 1460
+    },
+    {
+      "program": "tls_seg_access",
+      "opt": "-Oz",
+      "text_on": 204,
+      "text_off": 204
+    },
+    {
+      "program": "strlen_bench",
+      "opt": "-Oz",
+      "text_on": 784,
+      "text_off": 784
+    },
+    {
+      "program": "glibc_memcmp",
+      "opt": "-Oz",
+      "text_on": 1062,
+      "text_off": 1062
+    },
+    {
+      "program": "switch_dispatch",
+      "opt": "-Oz",
+      "text_on": 299,
+      "text_off": 299
+    },
+    {
+      "program": "sha256_transform",
+      "opt": "-Oz",
+      "text_on": 924,
+      "text_off": 924
+    },
+    {
+      "program": "fannkuch",
+      "opt": "-Oz",
+      "text_on": 445,
+      "text_off": 445
+    },
+    {
+      "program": "struct_copy",
+      "opt": "-Oz",
+      "text_on": 552,
+      "text_off": 552
+    }
+  ],
+  "code_size_unit": "GNU assembler/objdump 2.47 .text bytes, not assembly text length",
+  "code_size_siphash": {
+    "enabled": 2896,
+    "disabled": 2999,
+    "instructions_enabled": 678,
+    "instructions_disabled": 698
+  },
+  "limits": [
+    "Microbenchmarks, not full applications.",
+    "Native and compile-wall samples are from a shared VM, not the target CPU.",
+    "Fourteen of fifteen O2 assembly files were identical with and without early placement.",
+    "All thirty Os/Oz text-size comparisons were equal.",
+    "Smaller static code is not evidence of faster execution."
+  ],
+  "sources": {
+    "tests/benchmark/programs/nbody.c": "45db2f21add3645a945f1a6635d642f1aad5caecfa4c7b47da4943331a321837",
+    "tests/benchmark/programs/expat_siphash24.c": "59c5dfbdf3f0d2e149a3681925c46b7b0aeb195f179c285f3b64a2daaf1fb663",
+    "tests/benchmark/programs/expat_xml_scan.c": "a076b1823869765011658d56ec090b22102e2ba7a5bbdf4cd0b6bdd0d774cf35",
+    "tests/benchmark/programs/matmul.c": "927478b18ee0aa0d118eea4d2a9d6bb1251fdf3c64c2619ab578463beba99560",
+    "tests/benchmark/programs/mandelbrot.c": "3f9d3a3e0da962e5a1840790ebf46fa09f38cd5e758645c8c65625fa9882555c",
+    "tests/benchmark/programs/hash_table.c": "1c742684a0ea694fbeb95d249748488e89f9033c64d518cd1fafe27da24a2e5a",
+    "tests/benchmark/programs/zstd_count.c": "cf01953477eadbebe46b07ede170a62ff41b62cf947dd12222a04ad93c985be6",
+    "tests/benchmark/programs/sqlite_varint.c": "11c7e09b1507659fe44e678848c5e489268e4dd4aa385d3a542453caa400e1af",
+    "tests/benchmark/programs/tls_seg_access.c": "02e6d2bcd07b2e1fc253b53d316d522e7b3d912ae634b6fad2c10dc93a1d4835",
+    "tests/benchmark/programs/strlen_bench.c": "175202f59218fa62a3120f9f5202a005f5e234f2cbabd453048d933082e0dd44",
+    "tests/benchmark/programs/glibc_memcmp.c": "6fcec75ff20c60106d78db2013a646579ab4262750fe64eee99387f3c16b0870",
+    "tests/benchmark/programs/switch_dispatch.c": "6a044523272024b733f4af8e5101d5bf2d72ba9d6e9362798f6149cd9265117a",
+    "tests/benchmark/programs/sha256_transform.c": "6f55a89cfd9d59eb9a8e115eef968295ec775fa63d0545dd33517c2fdf06bf5e",
+    "tests/benchmark/programs/fannkuch.c": "2a78d670ab985384a3008ac031e7a478fdc790b627d011177dd528b7282d11e5",
+    "tests/benchmark/programs/struct_copy.c": "b0ca8943fcfed56f7ae9bbd49e7e52a98f9780b4be8151c494fc12b05dcb2bfa"
+  }
+}

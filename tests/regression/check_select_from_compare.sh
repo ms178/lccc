@@ -45,12 +45,12 @@ note "contract 1: oracle parity across opt levels and the kill switch"
 expected=$(timeout 300 "$work/ref") || bad "gcc oracle exited non-zero"
 
 for opt in -O1 -O2 -O3; do
-    for envs in "" "CCC_NO_FLAG_PEEPHOLES=1"; do
+    for envs in "" "CCC_PEEPHOLE_SKIP=setcc_cmov"; do
         name="$(echo "opt$opt${envs:+killed}" | tr -d ' -')"
-        if ! "$CCC" "$opt" "$corpus" -o "$work/$name" > "$work/$name.build" 2>&1; then
+        if ! env $envs "$CCC" "$opt" "$corpus" -o "$work/$name" > "$work/$name.build" 2>&1; then
             bad "$opt ${envs:+killed}: lccc failed to build"; continue
         fi
-        local_out=$(timeout 300 env $envs "$work/$name") || { bad "$opt ${envs:+killed}: non-zero exit"; continue; }
+        local_out=$(timeout 300 "$work/$name") || { bad "$opt ${envs:+killed}: non-zero exit"; continue; }
         [[ $local_out == "$expected" ]] || bad "$opt ${envs:+killed}: stdout differs from the oracle"
     done
 done
@@ -66,6 +66,15 @@ grep -qE "^[[:space:]]+setbe[[:space:]]" <<< "$bench_body" \
     && bad "a \`setbe\` relay survived: the comparison is still materialised as a byte"
 grep -qE "^[[:space:]]+testl[[:space:]]" <<< "$bench_body" \
     && bad "a \`testl\` self-test relay survived in the fused loop"
+
+# The control must change COMPILER behavior, not the generated program's
+# environment. Pin the unfused shape too, so a misspelled/no-op knob fails.
+CCC_PEEPHOLE_SKIP=setcc_cmov "$CCC" -O2 -march=x86-64-v3 -S "$bench" -o "$work/killed.s" || bad "disabled -S build failed"
+killed_body=$(body "$work/killed.s")
+grep -qE "^[[:space:]]+setbe[[:space:]]" <<< "$killed_body" \
+    || bad "disabled fusion did not retain the boolean definition"
+grep -qE "^[[:space:]]+cmovbe" <<< "$killed_body" \
+    && bad "disabled fusion still emitted the fused cmov"
 
 "$CCC" -O2 -march=x86-64-v3 -S "$corpus" -o "$work/corpus.s" || bad "-S build failed (corpus)"
 kept=$(awk '/^bool_kept:/ { inside=1 } inside { print } inside && /\.size/ { exit }' "$work/corpus.s")

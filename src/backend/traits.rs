@@ -2281,6 +2281,11 @@ pub trait ArchCodegen {
         unreachable!("backend advertised fused bit-test branches but did not implement the hook");
     }
 
+    /// Opt in only after the switch emitter consumes width-qualified facts.
+    fn supports_switch_bounds(&self) -> bool {
+        false
+    }
+
     /// Whether the backend can fuse an integer compare feeding a Select into
     /// compare + conditional-select, skipping the boolean materialization.
     fn supports_fused_cmp_select(&self) -> bool {

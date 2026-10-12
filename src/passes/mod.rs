@@ -38,6 +38,7 @@ pub(crate) mod if_convert;
 pub(crate) mod inline;
 pub(crate) mod instrument;
 pub(crate) mod int_const_hoist;
+pub(crate) mod integer_bounds;
 pub(crate) mod ip_purity;
 pub(crate) mod ipcp;
 pub(crate) mod iv_strength_reduce;
@@ -71,6 +72,7 @@ pub(crate) mod store_load_forward;
 pub(crate) mod tail_call_elim;
 pub(crate) mod univsr;
 pub(crate) mod use_def;
+pub(crate) mod vec_addr_fold;
 pub(crate) mod vec_arx;
 pub(crate) mod vec_interleave;
 pub(crate) mod vec_load_sink;
@@ -812,6 +814,31 @@ fn run_inline_phase(
     }
     constant_fold::run(module);
     copy_prop::run(module);
+    // Early cleanup changes the inliner's cost input. A smaller emitted body
+    // need not execute less work: the measured SipHash control shrank code but
+    // increased dynamic Ir. Keep the established late cleanup unconditional on
+    // this opt-in; evaluate early placement separately from its shared proofs.
+    if preinline_memory_enabled(
+        std::env::var_os("CCC_ENABLE_PREINLINE_MEMORY").is_some(),
+        disabled,
+    ) {
+        let started =
+            std::env::var_os("CCC_TIME_PREINLINE_MEMORY").map(|_| std::time::Instant::now());
+        let mut rewrites = module.for_each_function(redundant_loads::run);
+        if !pass_disabled(&disabled, "dse") {
+            rewrites += module.for_each_function(dse::eliminate_dead_stores);
+        }
+        if !pass_disabled(&disabled, "dce") {
+            rewrites += module.for_each_function(dce::eliminate_dead_code);
+        }
+        if let Some(started) = started {
+            eprintln!(
+                "[TIME] preinline memory: {:.6}s, {rewrites} rewrites",
+                started.elapsed().as_secs_f64()
+            );
+        }
+    }
+    iphase_dump!("memory-values-before-inline");
 
     if !pass_disabled(&disabled, "inline") {
         if size_profile {
@@ -949,6 +976,34 @@ pub(crate) fn pass_disabled(disabled: impl AsRef<str>, pass: &str) -> bool {
         let tok = tok.trim();
         tok == "all" || tok == pass
     })
+}
+
+fn preinline_memory_enabled(requested: bool, disabled: &str) -> bool {
+    requested
+        && !pass_disabled(disabled, "preinline_memory")
+        && !pass_disabled(disabled, "redundantloads")
+}
+
+#[cfg(test)]
+mod preinline_memory_policy_tests {
+    use super::preinline_memory_enabled;
+
+    #[test]
+    fn early_cleanup_requires_opt_in_and_disable_controls_dominate() {
+        for disabled in ["", "dse", "dce", "notpreinline_memory"] {
+            assert!(!preinline_memory_enabled(false, disabled));
+            assert!(preinline_memory_enabled(true, disabled));
+        }
+        for disabled in [
+            "all",
+            "preinline_memory",
+            "redundantloads",
+            "gvn, preinline_memory ",
+        ] {
+            assert!(!preinline_memory_enabled(false, disabled));
+            assert!(!preinline_memory_enabled(true, disabled));
+        }
+    }
 }
 
 /// Scalar ANDN (BMI1) fusion permission as the middle end sees it — the
@@ -2922,6 +2977,11 @@ pub(crate) fn run_passes(
     // provably non-aliasing (volatile loads are exempt by construction).
     if !pass_disabled(&disabled, "redundantloads") {
         module.for_each_function(redundant_loads::run);
+        // Forwarded field reads expose overwritten stores. Reuse the same
+        // audited DSE proof rather than inventing a second store-kill engine.
+        if !pass_disabled(&disabled, "dse") {
+            module.for_each_function(dse::eliminate_dead_stores);
+        }
         // Merged loads orphan their (now dead) address computations.
         module.for_each_function(dce::eliminate_dead_code);
     }
@@ -3132,6 +3192,27 @@ pub(crate) fn run_passes(
     if !pass_disabled(&disabled, "reassoc_lat") {
         module.for_each_function(reassoc_latency::run_function);
         verify::verify_after_pass(module, "reassoc_lat");
+    }
+
+    // Producer ranges survive copies/casts without conflating carrier widths.
+    // Run after transformations that reason about signed integer domains.
+    if !pass_disabled(&disabled, "intbounds") {
+        module.for_each_function(integer_bounds::run);
+        verify::verify_after_pass(module, "intbounds");
+    }
+
+    // Expose the addresses the x86 vector emitter actually consumes before
+    // register allocation. Constant GEP pointer homes otherwise survive SLP
+    // even when the ISA can encode their displacement directly.
+    if target == crate::backend::Target::X86_64 && !pass_disabled(&disabled, "vecaddr") {
+        module.for_each_function(|f| {
+            let changed = vec_addr_fold::run(f);
+            if changed != 0 && !pass_disabled(&disabled, "dce") {
+                dce::eliminate_dead_code(f);
+            }
+            changed
+        });
+        verify::verify_after_pass(module, "vecaddr");
     }
 
     // Phase 11f: FMA operand-negation peel. LAST IR transform: after every

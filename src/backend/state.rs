@@ -401,6 +401,12 @@ pub struct CodegenState {
     /// Total use count for each value ID across the entire function.
     /// Used by MachInst flush to determine if a buffer-defined vreg is live-out.
     pub value_use_counts: Vec<u32>,
+    /// Width-qualified selector bounds, recomputed after phi lowering for
+    /// each function. They never license dropping width normalization.
+    pub switch_unsigned_bounds: FxHashMap<u32, (u32, u64)>,
+    /// Module-scoped permission, resolved once before function generation.
+    /// Preserved across function resets; facts themselves are always cleared.
+    pub switch_bounds_enabled: bool,
     /// Use counts within the current block (set before block codegen).
     /// Compared with value_use_counts to detect live-out values.
     pub block_use_counts: FxHashMap<u32, u32>,
@@ -729,6 +735,8 @@ impl CodegenState {
             promoted_global_addr_homes: FxHashSet::default(),
             current_func_name: String::new(),
             value_use_counts: Vec::new(),
+            switch_unsigned_bounds: FxHashMap::default(),
+            switch_bounds_enabled: false,
             block_use_counts: FxHashMap::default(),
             pending_load_cmp: FxHashMap::default(),
             function_return_thunk: false,
@@ -968,6 +976,7 @@ impl CodegenState {
         self.wide_values.clear();
         self.never_materialized_values.clear();
         self.promoted_global_addr_homes.clear();
+        self.switch_unsigned_bounds.clear();
         self.has_dyn_alloca = false;
         self.omit_frame_pointer = false;
         self.pending_classic_mcount_label = None;
@@ -1776,5 +1785,20 @@ mod call_pop_tests {
         state.record_call_pop(None, Some(8));
         state.record_call_pop(None, None);
         assert_eq!(state.callee_pops_indirect["caller"], vec![Some(8), None]);
+    }
+}
+
+#[cfg(test)]
+mod switch_bounds_state_tests {
+    use super::*;
+    #[test]
+    fn function_reset_clears_facts_but_preserves_module_permission() {
+        let mut state = CodegenState::new();
+        assert!(!state.switch_bounds_enabled);
+        state.switch_bounds_enabled = true;
+        state.switch_unsigned_bounds.insert(7, (32, 15));
+        state.reset_for_function();
+        assert!(state.switch_bounds_enabled);
+        assert!(state.switch_unsigned_bounds.is_empty());
     }
 }
