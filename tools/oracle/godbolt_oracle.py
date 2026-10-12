@@ -61,6 +61,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -160,6 +161,8 @@ INSN = re.compile(r"^\s+[a-z][a-z0-9.]*\b")
 # not be re-run offline to reproduce a table it had already published.
 sys.path.insert(0, os.path.join(REPO, "scripts"))
 import godbolt_cache  # noqa: E402
+from godbolt import compilation_error  # noqa: E402
+from perf_ab import binary_command, split_driver_flags  # noqa: E402
 
 # Failures are not all alike, and caching them all is how an oracle disappears
 # from every future sweep with no way back. A transport failure -- rate limit,
@@ -236,7 +239,7 @@ def _ce_call(cid: str, source: str, flags: str, execute: bool, timeout: int) -> 
         # skipped with an "operand size mismatch" that is really just
         # "you handed me the wrong dialect".
         "filters": {"intel": False, "demangle": True, "directives": False},
-        "tools": [{"id": "execute", "args": flags.split()}] if execute else [],
+        "tools": [{"id": "execute", "args": shlex.split(flags)}] if execute else [],
         "executeParameters": {"args": [], "stdin": ""},
     }
     # `executorRequest` makes CE run the binary INSTEAD of returning
@@ -438,26 +441,36 @@ def remote(cid: str, source: str, flags: str, execute: bool, timeout: int) -> di
 
     r, err, transport = safe(False)            # asm pass (no execution)
     if r is None:
-        rec["reason"] = err
+        rec["reason"] = err or "malformed compiler response"
         return finish(not transport)
+    error = compilation_error(r)
+    if error:
+        rec["reason"] = error
+        return finish(False)
     asm = _join(r.get("asm"), "\n")
-    if r.get("code") not in (0, None) and not asm:
-        rec["reason"] = (r.get("stderr") or "compile failed").strip().splitlines()[0][:160]
-        return finish(True)     # the oracle rejected the program: same next time
     rec["ok"] = True
     rec["asm_insns"] = sum(1 for l in asm.splitlines() if INSN.match(l)) if asm else 0
 
     if execute:
         x, err, transport = safe(True)         # execute pass
         if x is None:
-            rec["reason"] = err
+            rec["reason"] = err or "malformed compiler response"
             rec["ok"] = False
             return finish(not transport)
+        if not isinstance(x, dict):
+            rec["reason"] = "malformed execution response"
+            rec["ok"] = False
+            return finish(False)
         if not x.get("didExecute"):
             rec["reason"] = "CE compiled but did not execute"
             rec["ok"] = False
             return finish(True)     # CE's refusal is a property of the program
-        build = x.get("buildResult") or {}
+        build = x.get("buildResult")
+        error = compilation_error(build)
+        if error:
+            rec["reason"] = error
+            rec["ok"] = False
+            return finish(False)
         execution = x.get("execResult")
         # CE's CURRENT flattened execution response stores the PROGRAM code
         # at the top level. buildResult.code is the compiler's success, never
@@ -483,27 +496,34 @@ def remote(cid: str, source: str, flags: str, execute: bool, timeout: int) -> di
     return finish(True)
 
 
-def local(binary: str, source: str, flags: str, execute: bool, tmp: str) -> dict:
-    """Compile+run with the tree's lccc, on exactly the same source and flags."""
+def local(binary: str | None, source: str, flags: str, execute: bool, tmp: str) -> dict:
+    """Compile+run with the requested binary; None selects the configured LCCC."""
+    binary = LCCC if binary is None else binary
     rec = {"id": "lccc", "vendor": "local", "ok": False,
            "asm_insns": None, "stdout": None, "exit": None, "reason": None}
     s = os.path.join(tmp, "p.s")
-    r = subprocess.run([LCCC, *flags.split(), "-S", "-o", s, source],
+    try:
+        argv = shlex.split(flags)
+        compile_flags, _ = split_driver_flags(argv)
+    except ValueError as error:
+        rec["reason"] = f"invalid driver flags: {error}"
+        return rec
+    r = subprocess.run([binary, *compile_flags, "-S", "-o", s, source],
                        capture_output=True, text=True)
-    if r.returncode != 0:
-        rec["reason"] = (r.stderr or r.stdout).strip().splitlines()[0][:160] if (
-            r.stderr or r.stdout) else "compile failed"
+    error = compilation_error({"code": r.returncode, "stderr": r.stderr, "stdout": r.stdout})
+    if error:
+        rec["reason"] = error
         return rec
     with open(s, errors="replace") as fh:
         rec["asm_insns"] = sum(1 for l in fh if INSN.match(l))
 
     if execute:
         exe = os.path.join(tmp, "p.bin")
-        r = subprocess.run([LCCC, *flags.split(), "-o", exe, source],
+        r = subprocess.run(binary_command(binary, Path(source), exe, argv),
                            capture_output=True, text=True)
-        if r.returncode != 0:
-            rec["reason"] = (r.stderr or r.stdout).strip().splitlines()[0][:160] if (
-                r.stderr or r.stdout) else "link failed"
+        error = compilation_error({"code": r.returncode, "stderr": r.stderr, "stdout": r.stdout})
+        if error:
+            rec["reason"] = error
             rec["ok"] = False
             return rec
         try:

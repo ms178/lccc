@@ -1066,8 +1066,9 @@ fn parse_cmov(t: &str) -> Option<(&'static str, char, &str, &str)> {
 ///   instead of the boolean -- measured on the ASCII case-fold kernel, where
 ///   insisting on the boolean's own register left `setbe; movzbl; movsbq;
 ///   test; cmovne` (9 instructions per byte) in place.  Both copies are
-///   accepted; sign/zero extension of a 0/1 value is 0 iff the boolean is 0,
-///   so the `test` still means "the original condition holds";
+///   accepted; sign/zero extension of a 0/1 value is 0 iff the boolean is 0.
+///   After that normalization, full 32/64-bit register copies are accepted
+///   too. Before it, only the exact low-byte test is valid;
 /// * the `cmov` condition is `ne` (boolean true) or `e` (boolean false), which
 ///   maps to the original condition or its negation.
 pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
@@ -1096,7 +1097,13 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
             continue;
         };
         let bool_fam = register_family_fast(breg);
-        if bool_fam == REG_NONE || bool_fam > REG_GP_MAX {
+        // Only a low byte carries this proof. Extending AH into EAX would
+        // overwrite AH itself, invalidating a subsequent read of that byte.
+        if bool_fam == REG_NONE
+            || bool_fam > REG_GP_MAX
+            || bool_fam == 4
+            || breg != REG_NAMES[3][bool_fam as usize]
+        {
             i += 1;
             continue;
         }
@@ -1150,11 +1157,47 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
                     // condition.  Family equality is what makes the accepted
                     // 8-bit reads sound; text equality is what makes the wider
                     // ones impossible.
-                    if sfam == bool_fam && src == breg && dfam != REG_NONE && dfam <= REG_GP_MAX {
+                    if sfam == bool_fam
+                        && src == breg
+                        && dfam != REG_NONE
+                        && dfam <= REG_GP_MAX
+                        && dfam != 4
+                    {
                         tested_fam = dfam;
                         widened_mask |= 1u16 << dfam;
                         owned.push(n);
                         continue;
+                    }
+                }
+            }
+            // Once an extension has defined ALL bits as 0/1, ordinary
+            // full-register copies preserve the condition too. Do not infer
+            // this from setcc alone: its untouched upper bits may be nonzero.
+            // Keep every deleted destination in widened_mask for the later
+            // operand/deadness proofs, not just the final test register.
+            if test_idx.is_none() {
+                let copy = tn
+                    .strip_prefix("movl ")
+                    .map(|args| (args, 1))
+                    .or_else(|| tn.strip_prefix("movq ").map(|args| (args, 0)));
+                if let Some((args, size)) = copy {
+                    if let Some((src, dst)) = split_two_operands(args) {
+                        if let (Some(sfam), Some(dfam)) =
+                            (plain_gp_operand(src), plain_gp_operand(dst))
+                        {
+                            if sfam <= REG_GP_MAX
+                                && dfam <= REG_GP_MAX
+                                && dfam != 4
+                                && src == REG_NAMES[size][sfam as usize]
+                                && dst == REG_NAMES[size][dfam as usize]
+                                && widened_mask & (1u16 << sfam) != 0
+                            {
+                                tested_fam = dfam;
+                                widened_mask |= 1u16 << dfam;
+                                owned.push(n);
+                                continue;
+                            }
+                        }
                     }
                 }
             }
@@ -1165,7 +1208,18 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
                     .or_else(|| tn.strip_prefix("testb "))
                 {
                     if let Some((a, b)) = split_two_operands(args) {
-                        if a == b && register_family_fast(a) == tested_fam {
+                        let size = if tn.starts_with("testq ") {
+                            0
+                        } else if tn.starts_with("testl ") {
+                            1
+                        } else {
+                            3
+                        };
+                        let normalized = widened_mask & (1u16 << tested_fam) != 0;
+                        if a == b
+                            && a == REG_NAMES[size][tested_fam as usize]
+                            && (normalized || (size == 3 && a == breg))
+                        {
                             owned.push(n);
                             test_idx = Some(n);
                             continue;
@@ -3041,6 +3095,69 @@ mod tests {
             ".cfi_endproc\n",
         ));
         assert!(out.contains("shlq $2, %r12"), "{out}");
+    }
+
+    fn fuse_boolean_only(body: &str) -> (bool, String) {
+        let asm = format!("f:\n.cfi_startproc\n{body}.cfi_endproc\n");
+        let (mut store, mut infos) = build(&asm);
+        let changed = super::fold_setcc_test_cmov(&mut store, &mut infos);
+        (changed, store.build_result(|i| infos[i].is_nop()))
+    }
+
+    #[test]
+    fn normalized_boolean_copy_chains_feed_the_original_flags() {
+        for copy in ["movl %r10d, %r11d", "movq %r10, %r11"] {
+            for (cmov, expected) in [("cmovnel", "cmovbel"), ("cmovel", "cmoval")] {
+                let (changed, out) = fuse_boolean_only(&format!(
+                    "    cmpb $25, %dil\n    setbe %r9b\n    movzbl %r9b, %r10d\n    {copy}\n    movl %r11d, %ecx\n    leal 32(%rsi), %edx\n    testl %ecx, %ecx\n    movl %esi, %eax\n    {cmov} %edx, %eax\n    ret\n"
+                ));
+                assert!(changed, "{out}");
+                assert!(out.contains(expected), "{out}");
+                assert!(!out.contains("setbe") && !out.contains("testl"), "{out}");
+                assert!(!out.contains("movzbl") && !out.contains(copy), "{out}");
+            }
+        }
+    }
+
+    #[test]
+    fn boolean_fusion_rejects_unknown_bits_and_high_bytes() {
+        for body in [
+            "    setbe %r9b\n    movl %r9d, %ecx\n    testl %ecx, %ecx\n",
+            "    setbe %r9b\n    testq %r9, %r9\n",
+            "    setbe %r9b\n    movw %r9w, %cx\n    testl %ecx, %ecx\n",
+            "    setbe %ah\n    movzbl %ah, %eax\n    movzbl %ah, %ecx\n    testl %ecx, %ecx\n",
+            "    setbe %al\n    movzbl %al, %ecx\n    testb %ch, %ch\n",
+        ] {
+            let (changed, _) = fuse_boolean_only(&format!(
+                "    cmpb $25, %dil\n{body}    cmovnel %edx, %esi\n    movl %esi, %eax\n    ret\n"
+            ));
+            assert!(!changed, "must refuse unknown or different bits: {body}");
+        }
+    }
+
+    #[test]
+    fn boolean_copy_fusion_preserves_all_live_destinations_and_flags() {
+        for (middle, cmov, tail) in [
+            (
+                "",
+                "cmovnel %edx, %eax",
+                "    movl %r10d, (%rdi)\n    ret\n",
+            ),
+            ("", "cmovnel %r10d, %eax", "    ret\n"),
+            ("    addl $1, %esi\n", "cmovnel %edx, %eax", "    ret\n"),
+            ("    movb $2, %r10b\n", "cmovnel %edx, %eax", "    ret\n"),
+            (
+                "",
+                "cmovnel %edx, %eax",
+                "    jne .Lother\n    ret\n.Lother:\n    ret\n",
+            ),
+            (".Lentry:\n", "cmovnel %edx, %eax", "    ret\n"),
+        ] {
+            let (changed, _) = fuse_boolean_only(&format!(
+                "    cmpb $25, %dil\n    setbe %r9b\n    movzbl %r9b, %r10d\n    movl %r10d, %ecx\n{middle}    testl %ecx, %ecx\n    {cmov}\n{tail}"
+            ));
+            assert!(!changed, "must preserve {middle} / {cmov} / {tail}");
+        }
     }
 
     #[test]

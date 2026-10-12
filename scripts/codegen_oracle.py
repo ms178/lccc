@@ -351,7 +351,7 @@ def _compile_remote(name: str, source: str, flags: str) -> list[str]:
     fp = godbolt.compiler_fingerprint(cid)
     # One remote-compile path for every report mode, through the cache shared
     # with tools/oracle/godbolt_oracle.py and scripts/encdiff.py
-    # (scripts/godbolt_cache.py). The `att-v3` namespace pins the syntax
+    # (scripts/godbolt_cache.py). The `att-v4` namespace pins the syntax
     # contract -- a pre-v2 cache stored Intel syntax, which made AT&T
     # load/store metrics silently read as zero in a table that then looked
     # like a triumph -- and bumping it is how a change to what a key *means*

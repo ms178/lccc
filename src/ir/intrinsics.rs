@@ -1924,8 +1924,9 @@ impl IntrinsicOp {
             | IntrinsicOp::VecHorizontalMinI32x8
         ) ||
         // The modern vectorizer's value-producing families (splats, zeros,
-        // non-volatile vector loads, packed arithmetic) are pure: they read
-        // no state beyond their operands. Without this, an orphaned
+        // non-volatile vector loads, packed arithmetic) are pure: they have
+        // no observable effects. Loads still read memory; purity is NOT a
+        // read-none proof (see may_read_memory). Without this, an orphaned
         // VecBroadcast left behind by a vectorizer bailout was DCE-rooted
         // as "side-effecting", reached codegen with no register or slot
         // home, and ICEd the intrinsic emitter (`gd[i] = gd[i]*k + c` over

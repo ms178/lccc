@@ -25,6 +25,16 @@ def result(rc=0,stdout=b'ok\n',failure=None):
 class CallgrindContract(unittest.TestCase):
     def test_import_no_discovery(self):
         with mock.patch.object(process,'run',side_effect=AssertionError('eager discovery')):load()
+    def test_linker_order_matches_native_harness(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(cg,'_run',return_value=result()) as run:
+            out=Path(td)/'binary'
+            cg.compile_program('wrapper cc','-O2 -Wl,--as-needed -lm -Xlinker --no-as-needed','source.c',out,include='-Ifake')
+            self.assertEqual(run.call_args.args[0],['wrapper','cc','-Ifake','-O2','source.c','-Wl,--as-needed','-lm','-Xlinker','--no-as-needed','-o',str(out)])
+    def test_missing_linker_operand_never_runs_compiler(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(cg,'_run') as run:
+            error=cg.compile_program('cc','-O2 -Xlinker','source.c',Path(td)/'binary',include='-Ifake')
+            self.assertIn('compile infrastructure',error)
+            run.assert_not_called()
     def test_no_builtin_shadow(self):self.assertFalse(hasattr(cg,'compile'));self.assertTrue(callable(cg.compile_program))
     def test_lazy_gcc_include(self):
         cg.gcc_include.cache_clear()
@@ -59,7 +69,7 @@ class CallgrindContract(unittest.TestCase):
                 with self.assertRaises(ValueError):cg.parse_summary(p)
     def test_correctness_exit_AND_stdout(self):
         self.assertIsNone(cg.same_output(result(),result()))
-        for other in (result(rc=-11),result(rc=127),result(stdout=b'different'),result(failure='timeout')):
+        for other in (result(rc=-11),result(rc=77),result(rc=127),result(stdout=b'different'),result(failure='timeout')):
             self.assertIsNotNone(cg.same_output(result(),other))
     def test_compile_quoted_options_and_no_stale_binary(self):
         with tempfile.TemporaryDirectory() as td:
@@ -172,6 +182,13 @@ class ArgumentVectorContract(unittest.TestCase):
         doc=self.manifest_for(['mock-mine','mock-ref','--opt=-O3','fib'])
         self.assertEqual(doc['opt'],'-O3')
         self.assertEqual(sorted(doc['results']),['fib'])
+
+    def test_benchmark_before_explicit_opt_is_not_swallowed(self):
+        for opt in [['--opt=-O2'], ['--opt', '-O2 -fwrapv']]:
+            with self.subTest(opt=opt):
+                doc=self.manifest_for(['mock-mine','mock-ref','nbody',*opt,'--heavy'])
+                self.assertEqual(sorted(doc['results']),['nbody'])
+                self.assertEqual(doc['selected'],1)
 
     def test_bare_double_dash_keeps_its_meaning(self):
         # Hand-rolled argv reordering hoists the `--` away and argparse then

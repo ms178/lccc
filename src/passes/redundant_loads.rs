@@ -1,4 +1,8 @@
-//! Late redundant-load elimination within basic blocks.
+//! Late memory-value forwarding within basic blocks.
+//!
+//! Representation-compatible stores also establish available values. This makes repeated
+//! aggregate field updates register dataflow without speculating any access
+//! or pretending that two unrelated pointer roots are disjoint.
 //!
 //! After strength reduction, array/struct field accesses appear as
 //! `Load(GEP(base, const_off))` with plain constant offsets. When the
@@ -37,6 +41,17 @@ use super::alias;
 use crate::common::fx_hash::FxHashMap;
 use crate::ir::reexports::{Instruction, IrFunction, Operand, Terminator, Value};
 
+/// Full-width integer carriers have identical bits for signed/unsigned
+/// loads. Narrow carriers may require different extension/normalization, and
+/// equal-sized floats/pointers are not interchangeable untyped SSA values.
+fn same_memory_value_type(
+    a: crate::common::types::IrType,
+    b: crate::common::types::IrType,
+) -> bool {
+    use crate::common::types::IrType::{I64, U64};
+    a == b || matches!((a, b), (I64, U64) | (U64, I64))
+}
+
 pub(crate) fn run(func: &mut IrFunction) -> usize {
     if std::env::var("CCC_NO_REDUNDANT_LOADS").is_ok() {
         return 0;
@@ -55,7 +70,9 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         let mut defs: FxHashMap<u32, &Instruction> = FxHashMap::default();
         for block in func.blocks.iter() {
             for inst in &block.instructions {
-                if let Some(dest) = inst.dest() {
+                if let Some(dest) = inst.dest()
+                    && !multi_def.contains(&dest.0)
+                {
                     defs.insert(dest.0, inst);
                 }
             }
@@ -103,8 +120,9 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                         else {
                             continue;
                         };
-                        if let Some((_, _, canon)) =
-                            available.iter().find(|(f, t, _)| *f == form && *t == *ty)
+                        if let Some((_, _, canon)) = available
+                            .iter()
+                            .find(|(f, t, _)| *f == form && same_memory_value_type(*t, *ty))
                         {
                             // MULTI-DEF GUARD: see the module doc. A multi-def
                             // canonical's content is not position-stable, and a
@@ -118,8 +136,15 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                         }
                         available.push((form, *ty, *dest));
                     }
-                    Instruction::Store { ptr, ty, .. } => {
-                        if available.is_empty() {
+                    Instruction::Store {
+                        ptr,
+                        ty,
+                        val,
+                        volatile,
+                        seg_override,
+                    } => {
+                        if *seg_override != crate::common::types::AddressSpace::Default {
+                            available.clear();
                             continue;
                         }
                         match alias::resolve_in_frame(func, &defs, &frames, frame, *ptr) {
@@ -148,6 +173,22 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                                     }
                                 };
                                 available.retain(keep);
+                                // Copy is not a truncating or bit-reinterpreting load.
+                                // Only a representation-compatible, single-definition value may be
+                                // forwarded; narrow stores of wider operands stay real.
+                                if !*volatile
+                                    && ssz.is_some()
+                                    && let Operand::Value(value) = val
+                                    && !multi_def.contains(&value.0)
+                                    && defs
+                                        .get(&value.0)
+                                        .and_then(|i| i.result_type())
+                                        .is_some_and(|source_ty| {
+                                            same_memory_value_type(source_ty, *ty)
+                                        })
+                                {
+                                    available.push((sform, *ty, *value));
+                                }
                             }
                             None => available.clear(),
                         }
@@ -191,7 +232,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                                 }
                                 None => available.clear(),
                             }
-                        } else if dest_ptr.is_some() {
+                        } else if dest_ptr.is_some() || inst.may_write_memory() {
                             available.clear();
                         }
                         // Read-only / pure intrinsics: no memory effect.
@@ -216,6 +257,10 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                         // Atomics are fenced memory effects: conservative kill.
                         available.clear();
                     }
+                    Instruction::StackRestore { .. } | Instruction::DynAlloca { .. } => {
+                        available.clear();
+                    }
+                    other if other.may_write_memory() => available.clear(),
                     _ => {}
                 }
             }
@@ -261,6 +306,19 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     }
 
     if !all_rewrites.is_empty() {
+        // Store operands can themselves be forwarded loads, including defs
+        // in dominators appearing later in layout. Flatten once before the
+        // one-step canonical operand visitor, so no use names a removed load.
+        let rewrites = all_rewrites.clone();
+        for replacement in all_rewrites.values_mut() {
+            for _ in 0..rewrites.len() {
+                let Some(next) = rewrites.get(replacement) else {
+                    break;
+                };
+                *replacement = *next;
+            }
+            debug_assert!(!rewrites.contains_key(replacement), "cyclic SSA forwarding");
+        }
         for block in func.blocks.iter_mut() {
             for inst in block.instructions.iter_mut() {
                 crate::ir::instruction::replace_values_in_inst_map(inst, &all_rewrites);
@@ -437,5 +495,197 @@ mod tests {
             "terminator target v{} names a value the pass removed (live defs: {live:?})",
             t.0
         );
+    }
+}
+
+#[cfg(test)]
+mod stored_value_tests {
+    use super::*;
+    use crate::common::types::{AddressSpace, IrType};
+    use crate::ir::reexports::{BasicBlock, BlockId, IrConst};
+
+    fn store(ptr: u32, value: u32, ty: IrType) -> Instruction {
+        Instruction::Store {
+            ptr: Value(ptr),
+            val: Operand::Value(Value(value)),
+            ty,
+            volatile: false,
+            seg_override: AddressSpace::Default,
+        }
+    }
+    fn load(dest: u32, ptr: u32, ty: IrType) -> Instruction {
+        Instruction::Load {
+            dest: Value(dest),
+            ptr: Value(ptr),
+            ty,
+            volatile: false,
+            seg_override: AddressSpace::Default,
+        }
+    }
+    fn base() -> IrFunction {
+        let mut f = IrFunction::new("forward".into(), IrType::U64, vec![], false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            source_spans: vec![],
+            instructions: vec![
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                Instruction::ParamRef {
+                    dest: Value(1),
+                    param_idx: 1,
+                    ty: IrType::Ptr,
+                },
+                Instruction::ParamRef {
+                    dest: Value(2),
+                    param_idx: 2,
+                    ty: IrType::U64,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(3),
+                    base: Value(0),
+                    offset: Operand::Const(IrConst::I64(8)),
+                    ty: IrType::Ptr,
+                },
+            ],
+            terminator: Terminator::Return(None),
+        });
+        f
+    }
+
+    #[test]
+    fn store_load_store_load_chain_rewrites_to_a_live_definition() {
+        let mut f = base();
+        f.blocks[0].instructions.extend([
+            store(0, 2, IrType::U64),
+            load(4, 0, IrType::U64),
+            store(3, 4, IrType::U64),
+            load(5, 3, IrType::U64),
+        ]);
+        f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(5))));
+        f.blocks[0].source_spans =
+            vec![crate::common::source::Span::dummy(); f.blocks[0].instructions.len()];
+        assert_eq!(run(&mut f), 2);
+        assert!(matches!(
+            f.blocks[0].terminator,
+            Terminator::Return(Some(Operand::Value(Value(2))))
+        ));
+        for inst in &f.blocks[0].instructions {
+            inst.for_each_used_value(|v| assert!(v != 4 && v != 5, "dangling forwarded value"));
+        }
+        assert_eq!(
+            f.blocks[0].instructions.len(),
+            f.blocks[0].source_spans.len()
+        );
+    }
+
+    #[test]
+    fn only_compatible_producer_store_load_types_forward() {
+        for ty in [IrType::U8, IrType::I64, IrType::F64, IrType::U64] {
+            let mut f = base();
+            f.blocks[0]
+                .instructions
+                .extend([store(0, 2, ty), load(4, 0, ty)]);
+            assert_eq!(
+                run(&mut f),
+                usize::from(matches!(ty, IrType::U64 | IrType::I64)),
+                "{ty:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_unsigned_forwarding_requires_full_width_carriers() {
+        for (signed, unsigned) in [
+            (IrType::I8, IrType::U8),
+            (IrType::I16, IrType::U16),
+            (IrType::I32, IrType::U32),
+            (IrType::I64, IrType::U64),
+        ] {
+            for (source, target) in [(signed, unsigned), (unsigned, signed)] {
+                let mut f = base();
+                if let Instruction::ParamRef { ty, .. } = &mut f.blocks[0].instructions[2] {
+                    *ty = source;
+                }
+                f.blocks[0]
+                    .instructions
+                    .extend([store(0, 2, source), load(4, 0, target)]);
+                f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(4))));
+                let full = source == IrType::I64 || source == IrType::U64;
+                assert_eq!(run(&mut f), usize::from(full), "{source:?} -> {target:?}");
+                assert!(
+                    matches!(f.blocks[0].terminator, Terminator::Return(Some(Operand::Value(v)))
+                    if v == Value(if full { 2 } else { 4 }))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_alias_kills_but_same_root_disjoint_store_preserves() {
+        for ptr in [1, 3] {
+            let mut f = base();
+            f.blocks[0].instructions.extend([
+                store(0, 2, IrType::U64),
+                store(ptr, 2, IrType::U64),
+                load(4, 0, IrType::U64),
+            ]);
+            assert_eq!(run(&mut f), usize::from(ptr == 3));
+        }
+    }
+
+    #[test]
+    fn volatile_segment_and_multidef_sources_do_not_forward() {
+        for case in 0..4 {
+            let mut f = base();
+            let mut s = store(0, 2, IrType::U64);
+            if let Instruction::Store {
+                volatile,
+                seg_override,
+                ..
+            } = &mut s
+            {
+                *volatile = case == 0;
+                if case == 1 {
+                    *seg_override = AddressSpace::SegFs;
+                }
+            }
+            f.blocks[0].instructions.push(s);
+            if case == 2 {
+                f.blocks[0].instructions.push(Instruction::ParamRef {
+                    dest: Value(2),
+                    param_idx: 3,
+                    ty: IrType::U64,
+                });
+            }
+            let mut l = load(4, 0, IrType::U64);
+            if case == 3
+                && let Instruction::Load { volatile, .. } = &mut l
+            {
+                *volatile = true;
+            }
+            f.blocks[0].instructions.push(l);
+            assert_eq!(run(&mut f), 0, "case {case}");
+        }
+    }
+
+    #[test]
+    fn redefined_base_copy_does_not_resolve_through_its_last_definition() {
+        let mut f = base();
+        f.blocks[0].instructions.extend([
+            Instruction::Copy {
+                dest: Value(6),
+                src: Operand::Value(Value(0)),
+            },
+            store(6, 2, IrType::U64),
+            Instruction::Copy {
+                dest: Value(6),
+                src: Operand::Value(Value(1)),
+            },
+            load(7, 6, IrType::U64),
+        ]);
+        assert_eq!(run(&mut f), 0);
     }
 }

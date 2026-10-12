@@ -217,6 +217,54 @@ PRESETS: dict[str, dict[str, Any]] = {
 }
 
 
+def matched_link_flags(flags: list[str], *compilers: str) -> list[str]:
+    """Put automatic libm linkage in BOTH arms and in the reported flags.
+
+    Vendor drivers may leave math calls where LCCC uses instructions. Adding
+    -lm privately to only the vendor arm also changes layout/library loading;
+    that is not a matched-flags comparison. Unrecognised wrappers can supply
+    --cflag=-lm explicitly. LCCC-only screens retain their existing defaults.
+    """
+    needs_math = any(any(name in Path(cc).name.lower()
+                        for name in ("gcc", "clang", "icx", "icc"))
+                     for cc in compilers)
+    return [*flags, *(["-lm"] if needs_math and "-lm" not in flags else [])]
+
+
+
+def split_driver_flags(flags: list[str]) -> tuple[list[str], list[str]]:
+    """Separate compile/link options without reordering either subsequence.
+
+    Putting a shared -lm in CFLAGS before the source can silently drop it
+    under --as-needed (or fail with a static archive). Pair-taking driver
+    options must retain their operands; do not mistake -Xclang's -load for
+    a library. This harness compiles one source, not an arbitrary link graph.
+    """
+    compile_flags, link_flags = [], []
+    pairs = {"-x", "-I", "-D", "-U", "-include", "-imacros", "-isystem",
+             "-iquote", "-idirafter", "-isysroot", "--sysroot", "-Xclang",
+             "-Xassembler", "-Xpreprocessor", "-B", "-MF", "-MT", "-MQ"}
+    i = 0
+    while i < len(flags):
+        flag = flags[i]
+        linked = flag.startswith(("-Wl,", "-l", "-L")) or flag == "-Xlinker"
+        target = link_flags if linked else compile_flags
+        target.append(flag)
+        if flag in pairs or flag in {"-l", "-L", "-Xlinker"}:
+            if i + 1 >= len(flags):
+                raise ValueError(f"missing operand for {flag}")
+            i += 1
+            target.append(flags[i])
+        i += 1
+    return compile_flags, link_flags
+
+
+def binary_command(compiler: str, src: Path, out: str, flags: list[str]) -> list[str]:
+    """Libraries must follow the source/object even under --as-needed."""
+    compile_flags, link_flags = split_driver_flags(flags)
+    return [compiler, *compile_flags, str(src), *link_flags, "-o", out]
+
+
 def build_binary(
     compiler: str,
     src: Path,
@@ -241,10 +289,8 @@ def build_binary(
         if not (k.startswith("CCC_") or k.startswith("LCCC_"))
     }
     env.update(extra_env)
-    cmd = [compiler, *flags, str(src), "-o", out]
-    if "gcc" in compiler or "clang" in compiler or "icx" in compiler:
-        cmd.append("-lm")
     try:
+        cmd = binary_command(compiler, src, out, flags)
         p = subprocess.run(
             cmd,
             capture_output=True,
@@ -295,8 +341,11 @@ def build_asm(
         if not (k.startswith("CCC_") or k.startswith("LCCC_"))
     }
     env.update(extra_env)
-    cmd = [compiler, *flags, "-S", str(src), "-o", out]
     try:
+        # Link-only options do not belong in the compile-only arm. Clang's
+        # unused-linker-input diagnostic can become fatal under -Werror.
+        compile_flags, _ = split_driver_flags(flags)
+        cmd = [compiler, *compile_flags, "-S", str(src), "-o", out]
         p = subprocess.run(cmd, capture_output=True, env=env, timeout=900)
         diagnostic = (p.stdout + p.stderr).decode(errors="replace").strip()
         return p.returncode == 0, diagnostic
@@ -716,7 +765,7 @@ def main() -> int:
             "error: either --preset, --env KEY=VALUE, --skip PASS, or --vs <compiler> is required"
         )
 
-    flags = [args.opt, *args.cflag]
+    flags = matched_link_flags([args.opt, *args.cflag], compiler_a, compiler_b)
     only_set = {s.strip() for s in args.only.split(",") if s.strip()}
     if not only_set and preset_data and preset_data.get("only"):
         only_set = set(preset_data["only"])

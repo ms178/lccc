@@ -302,7 +302,9 @@ fn is_opaque_memory_write(inst: &Instruction) -> bool {
         | Instruction::VaArg { .. }
         | Instruction::VaArgStruct { .. }
         | Instruction::StackRestore { .. } => true,
-        Instruction::Intrinsic { op, .. } => !op.is_pure(),
+        Instruction::Intrinsic { op, dest_ptr, .. } => {
+            !op.is_pure() || dest_ptr.is_some() || op.writes_memory_via_args()
+        }
         _ => false,
     }
 }
@@ -1395,5 +1397,30 @@ mod tests {
                 ..
             }
         )));
+    }
+}
+
+#[cfg(test)]
+mod intrinsic_write_contract {
+    use super::*;
+    use crate::ir::intrinsics::IntrinsicOp;
+
+    #[test]
+    fn pure_opcode_with_memory_result_is_a_write_barrier() {
+        for dest_ptr in [None, Some(Value(0))] {
+            let inst = Instruction::Intrinsic {
+                dest: Some(Value(1)),
+                op: IntrinsicOp::Paddw128,
+                dest_ptr,
+                args: vec![],
+            };
+            assert_eq!(is_opaque_memory_write(&inst), dest_ptr.is_some());
+        }
+        assert!(!is_opaque_memory_write(&Instruction::Intrinsic {
+            dest: Some(Value(1)),
+            op: IntrinsicOp::VecLoadI8x16,
+            dest_ptr: None,
+            args: vec![Operand::Value(Value(0))],
+        }));
     }
 }

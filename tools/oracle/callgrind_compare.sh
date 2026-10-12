@@ -1,103 +1,111 @@
 #!/usr/bin/env bash
-# Dynamic cross-compiler comparison for tests/oracle/programs/*.c.
-#
-# The Godbolt oracle (tools/oracle/godbolt_oracle.py) compares *static*
-# instruction counts against GCC 16 / Clang 23 / ICX through the Compiler
-# Explorer API.  Static counts say nothing about how often each instruction
-# runs, so this harness measures *executed* instructions with Callgrind:
-#
-#   * Ir restricted to the program's own object (loader/libc excluded) via
-#     tools/oracle/callgrind_own_ir.py -- the number to optimize,
-#   * D1 read misses and LL read misses for the same object,
-#   * stdout comparison across compilers, so a "faster" number can never come
-#     from a program that computes something else.
-#
-# Usage:
-#   tools/oracle/callgrind_compare.sh [--opt -O2] [--ref gcc[,clang,...]]
-#                                     [--only prog] [--json out.json]
-#
-# Reference compilers default to whatever is installed locally (gcc, then
-# clang); lccc is always target/fastbuild/lccc unless $LCCC says otherwise.
-set -u
-
+# Dynamic own-object Callgrind comparison for standalone oracle programs.
+# Ir is simulated instruction work, NOT cycles or a native speedup.
+# Usage: callgrind_compare.sh [--opt -O2] [--ref gcc,clang]
+#                            [--only program] [--json output.json]
+# Fail closed on build/execution/instrumentation/counter/parity failures.
+set -euo pipefail
+export LC_ALL=C
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 LCCC=${LCCC:-$ROOT/target/fastbuild/lccc}
 OPT=-O2
 REFS=""
 ONLY=""
 JSON=""
+die() { echo "FAIL: $*" >&2; exit 1; }
 while [ $# -gt 0 ]; do
   case "$1" in
-    --opt) OPT=$2; shift 2;;
-    --ref) REFS=$2; shift 2;;
-    --only) ONLY=$2; shift 2;;
-    --json) JSON=$2; shift 2;;
-    *) echo "unknown option: $1" >&2; exit 2;;
+    --opt|--ref|--only|--json)
+      [ $# -ge 2 ] || die "missing operand for $1"
+      case "$1" in
+        --opt) OPT=$2;; --ref) REFS=$2;; --only) ONLY=$2;; --json) JSON=$2;;
+      esac
+      shift 2;;
+    *) die "unknown option: $1";;
   esac
 done
-[ -x "$LCCC" ] || { echo "lccc not built at $LCCC" >&2; exit 1; }
+[ -x "$LCCC" ] || die "lccc not built at $LCCC"
 if [ -z "$REFS" ]; then
-  REFS=""
   command -v gcc >/dev/null && REFS=gcc
-  command -v clang >/dev/null && REFS="${REFS:+$REFS,}clang"
+  if command -v clang >/dev/null; then REFS="${REFS:+$REFS,}clang"; fi
 fi
-[ -n "$REFS" ] || { echo "no reference compiler found" >&2; exit 1; }
-
-OUT=$(mktemp -d /tmp/cgcmp.XXXXXX)
+[ -n "$REFS" ] || die "no reference compiler found"
+OUT=$(mktemp -d "${TMPDIR:-/tmp}/cgcmp.XXXXXX")
 trap 'rm -rf "$OUT"' EXIT
 IR_TOOL=$ROOT/tools/oracle/callgrind_own_ir.py
-
-cc_of() { case "$1" in lccc) echo "$LCCC";; *) command -v "$1" || return 1;; esac; }
-
-printf '%-22s %10s' program lccc
+cc_of() { case "$1" in lccc) echo "$LCCC";; *) command -v "$1";; esac; }
 IFS=, read -r -a refarr <<< "$REFS"
+for r in "${refarr[@]}"; do
+  [ -n "$r" ] && [ "$r" != lccc ] || die "invalid reference: $r"
+  cc_of "$r" >/dev/null || die "compiler $r missing"
+done
+printf '%-22s %10s' program lccc
 for r in "${refarr[@]}"; do printf ' %10s' "$r"; done
-printf ' %9s' "lccc/ref"; printf ' %8s %8s\n' D1mr LLmr
-
-json_rows=""
+printf ' %9s %8s %8s\n' lccc/ref D1mr LLmr
+: > "$OUT/rows.jsonl"
+matched=0
 for src in "$ROOT"/tests/oracle/programs/*.c; do
   p=$(basename "$src" .c)
   case "$p" in *_kernel) continue;; esac
-  [ -n "$ONLY" ] && [ "$ONLY" != "$p" ] && continue
-  declare -A IR MISS JSONROW OUTS
-  ok=1; refsum=0; failed=""
+  [ -z "$ONLY" ] || [ "$ONLY" = "$p" ] || continue
+  matched=$((matched+1))
+  declare -A IR=() MISS=() JSONROW=()
   for tool in lccc "${refarr[@]}"; do
-    cc=$(cc_of "$tool") || { failed="$p: compiler $tool missing"; break; }
-    bin="$OUT/${p}.$tool"
-    "$cc" "$OPT" -g "$src" -o "$bin" 2>"$OUT/${p}.$tool.err" || {
-      failed="$p: $tool build failed (see $OUT/${p}.$tool.err)"; break; }
-    "$bin" > "$OUT/${p}.$tool.stdout" 2>/dev/null
-    cg="$OUT/${p}.$tool.cg"
-    valgrind --tool=callgrind --cache-sim=yes --callgrind-out-file="$cg" \
-             "$bin" >/dev/null 2>"$OUT/${p}.$tool.vg"
-    row=$(python3 "$IR_TOOL" --json --show Ir,D1mr,DLmr "$cg") || {
-      failed="$p: callgrind_own_ir.py failed on $cg"; break; }
-    IR[$tool]=$(printf '%s' "$row" | python3 -c 'import json,sys;print(json.load(sys.stdin)["totals"]["Ir"])')
-    MISS[$tool]="$(printf '%s' "$row" | python3 -c 'import json,sys;t=json.load(sys.stdin)["totals"];print(t["D1mr"],t["DLmr"])')"
-    JSONROW[$tool]=$row
-    OUTS[$tool]=$(md5sum < "$OUT/${p}.$tool.stdout" | cut -d' ' -f1)
-  done
-  [ "$ok" = 1 ] || { echo "FAIL: $failed" >&2; rm -rf "$OUT"; exit 1; }
-  # Every compiler must produce the same stdout before any ratio is reported.
-  for tool in "${refarr[@]}"; do
-    if [ "${OUTS[$tool]}" != "${OUTS[lccc]}" ]; then
-      echo "MISMATCH: $p stdout differs between lccc and $tool" >&2
-      diff <("$OUT/${p}.lccc" 2>/dev/null) <("$OUT/${p}.${tool}" 2>/dev/null) | head -5 >&2
+    cc=$(cc_of "$tool") || die "compiler $tool missing"
+    # Numbered paths also work for reference executable names containing '/'.
+    bin="$OUT/program"
+    "$cc" "$OPT" -g "$src" -o "$bin" 2>"$OUT/build.err" || {
+      cat "$OUT/build.err" >&2; die "$p: $tool build failed"; }
+    timeout 300 "$bin" > "$OUT/native.stdout" || die "$p: $tool execution failed"
+    cg="$OUT/counters"
+    # A successful process may still fail to write its profile. Never consume
+    # the preceding compiler's counters when that happens.
+    rm -f "$cg"
+    timeout 300 valgrind --tool=callgrind --cache-sim=yes --error-exitcode=97 \
+      --callgrind-out-file="$cg" "$bin" > "$OUT/instrumented.stdout" 2>"$OUT/valgrind.err" || {
+      cat "$OUT/valgrind.err" >&2; die "$p: $tool instrumentation failed"; }
+    cmp -s "$OUT/native.stdout" "$OUT/instrumented.stdout" || die "$p: $tool instrumented output differs"
+    row=$(python3 "$IR_TOOL" --json --show Ir,D1mr,DLmr "$cg") || die "$p: counter parser failed"
+    metrics=$(python3 - "$row" <<'PY'
+import json,sys
+t=json.loads(sys.argv[1])["totals"]
+v=[t[k] for k in ("Ir","D1mr","DLmr")]
+if not all(type(n) is int and n >= 0 for n in v) or v[0] == 0:
+    raise SystemExit("missing/invalid/empty own-object counters")
+print(*v)
+PY
+    ) || die "$p: invalid counters"
+    read -r ir d1 ll <<< "$metrics"
+    IR[$tool]=$ir; MISS[$tool]="$d1 $ll"; JSONROW[$tool]=$row
+    if [ "$tool" = lccc ]; then
+      cp "$OUT/native.stdout" "$OUT/expected.stdout"
+    else
+      cmp -s "$OUT/expected.stdout" "$OUT/native.stdout" || die "$p: $tool stdout mismatch"
     fi
   done
   first=${refarr[0]}
-  ratio=$(awk -v a="${IR[lccc]}" -v b="${IR[$first]}" 'BEGIN{printf "%.4f", a/b}')
+  ratio=$(awk -v a="${IR[lccc]}" -v b="${IR[$first]}" 'BEGIN{printf "%.6f", a/b}')
   printf '%-22s %10s' "$p" "${IR[lccc]}"
   for r in "${refarr[@]}"; do printf ' %10s' "${IR[$r]}"; done
-  printf ' %9s' "$ratio"
-  set -- ${MISS[lccc]}; printf ' %8s %8s\n' "$1" "$2"
-  json_rows="$json_rows$(printf '{"program":"%s","ir":%s,"ratio_vs_%s":%s,"own":%s},' \
-      "$p" "${IR[lccc]}" "$first" "$ratio" "${JSONROW[lccc]}")"
+  read -r d1 ll <<< "${MISS[lccc]}"
+  printf ' %9s %8s %8s\n' "$ratio" "$d1" "$ll"
+  python3 - "$p" "$first" "$ratio" "${JSONROW[lccc]}" >> "$OUT/rows.jsonl" <<'PY'
+import json,sys
+p,ref,ratio,raw=sys.argv[1:]
+row=json.loads(raw)
+print(json.dumps({"program":p,"ir":row["totals"]["Ir"],"ratio_vs_"+ref:float(ratio),"own":row}))
+PY
 done
-
+[ "$matched" -gt 0 ] || die "selection matched no standalone programs"
 if [ -n "$JSON" ]; then
-  { printf '{"opt":"%s","reference":"%s","rows":[' "$OPT" "$REFS"
-    printf '%s' "$json_rows" | sed 's/,$//'
-    printf ']}\n'; } > "$JSON"
+  python3 - "$ROOT" "$JSON" "$OPT" "$REFS" "$OUT/rows.jsonl" <<'PY'
+import json,sys
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+from tools.corpus import publication
+_,dest,opt,refs,rows=sys.argv[1:]
+data={"opt":opt,"reference":refs,"rows":[json.loads(s) for s in Path(rows).read_text().splitlines()]}
+publication.atomic_bytes(Path(dest),(json.dumps(data,indent=2)+"\n").encode())
+PY
   echo "wrote $JSON"
 fi
