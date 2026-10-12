@@ -1305,7 +1305,10 @@ impl Lowerer {
                                 }
                             }
                         }
-                        return Some(CType::Pointer(elem.clone(), AddressSpace::Default));
+                        // The decayed array keeps the space of its object:
+                        // `*(arr + i)` on a __seg_gs array reads %gs.
+                        let space = self.get_addr_space_of_struct_expr(lhs);
+                        return Some(CType::Pointer(elem.clone(), space));
                     }
                     _ => {}
                 }
@@ -1316,7 +1319,8 @@ impl Lowerer {
                     match rct {
                         CType::Pointer(_, _) => return Some(rct),
                         CType::Array(elem, _) => {
-                            return Some(CType::Pointer(elem, AddressSpace::Default));
+                            let space = self.get_addr_space_of_struct_expr(rhs);
+                            return Some(CType::Pointer(elem, space));
                         }
                         _ => {}
                     }

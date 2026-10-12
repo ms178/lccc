@@ -777,15 +777,20 @@ impl Lowerer {
         // Get LHS pointer
         let lhs_ptr = self.lower_complex_lvalue(lhs);
 
-        // Copy real and imag parts from rhs to lhs
+        // Copy real and imag parts from rhs to lhs, into the LHS object's space
+        let lhs_space = self.get_addr_space_of_struct_expr(lhs);
         let rhs_ptr = self.operand_to_value(rhs_complex);
         let comp_size = Self::complex_component_size(lhs_ct);
         let total_size = comp_size * 2;
-        self.emit(Instruction::Memcpy {
-            dest: lhs_ptr,
-            src: rhs_ptr,
-            size: total_size,
-        });
+        let lhs_volatile = self.expr_access_is_volatile(lhs);
+        self.copy_bytes_across_spaces(
+            lhs_ptr,
+            lhs_space,
+            rhs_ptr,
+            AddressSpace::Default,
+            total_size,
+            lhs_volatile,
+        );
 
         // Return the lhs pointer
         Operand::Value(lhs_ptr)
@@ -825,12 +830,12 @@ impl Lowerer {
                 addr
             }
             Expr::Deref(inner, _) => {
-                let ptr = self.lower_expr(inner);
+                let ptr = self.lower_expr_unmaterialized(inner);
                 self.operand_to_value(ptr)
             }
             Expr::ArraySubscript(base, index, _) => {
-                let base_val = self.lower_expr(base);
-                let idx_val = self.lower_expr(index);
+                let base_val = self.lower_expr_unmaterialized(base);
+                let idx_val = self.lower_expr_unmaterialized(index);
                 let ct = self.expr_ctype(expr);
                 let elem_size = self.resolve_ctype_size(&ct);
                 let scaled = self.scale_index(idx_val, elem_size);
@@ -869,11 +874,11 @@ impl Lowerer {
                     }
                 }
                 // Fallback
-                let val = self.lower_expr(expr);
+                let val = self.lower_expr_unmaterialized(expr);
                 self.operand_to_value(val)
             }
             Expr::PointerMemberAccess(base, field, _) => {
-                let base_val = self.lower_expr(base);
+                let base_val = self.lower_expr_unmaterialized(base);
                 let base_ptr = self.operand_to_value(base_val);
                 let base_ct = self.expr_ctype(base);
                 if let CType::Pointer(ref inner, _) = base_ct {
@@ -904,7 +909,7 @@ impl Lowerer {
             }
             _ => {
                 // Fallback: treat expression result as pointer
-                let val = self.lower_expr(expr);
+                let val = self.lower_expr_unmaterialized(expr);
                 self.operand_to_value(val)
             }
         }

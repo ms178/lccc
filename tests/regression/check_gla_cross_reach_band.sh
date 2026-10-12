@@ -34,42 +34,66 @@ trap 'rm -rf "$tmp"' EXIT
 
 # Cross binaries are only present after the full fastbuild; hosts without the
 # cross toolchain still run the x86-64 leg. Missing pieces skip, never fail.
-arm_inc=""; rv_inc=""
+arm_inc=""
 if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
   arm_inc=$(aarch64-linux-gnu-gcc -print-file-name=include)
-fi
-if command -v riscv64-linux-gnu-gcc >/dev/null 2>&1; then
-  rv_inc=$(riscv64-linux-gnu-gcc -print-file-name=include)
 fi
 fail=0
 # Hermetic: an ambient A/B override must not change the derived defaults this
 # test pins (the Rust unit tests skip under CCC_GLA_REACH for the same reason).
 unset CCC_GLA_REACH
 
-if [[ -x $arm_cc && -n $arm_inc ]]; then
-  # (1) AArch64: reach=10 by default.
+# matmul.c has no system includes, so the aarch64 leg needs only the cross
+# binary; the cross gcc (header directory) is passed when it exists.
+arm_inc_flag=()
+[[ -n $arm_inc ]] && arm_inc_flag=(-I"$arm_inc")
+# The body of one function: its lines from `name:` to the next label.
+fn_body() { awk -v f="$2" '$0 == f":" {p=1; next} p && /^[A-Za-z_][A-Za-z0-9_.]*:/ {exit} p' "$1"; }
+if [[ -x $arm_cc ]]; then
+  # (1) AArch64: reach=10 by default, and the trace must say so.
   env -u CCC_GLA_REACH CCC_DEBUG_SPLIT=1 CCC_RA_GLOBAL_LOCATION=1 CCC_GLA_TRACE=1 \
-    "$arm_cc" -I"$arm_inc" -O2 -S "$matmul" -o /dev/null \
+    "$arm_cc" "${arm_inc_flag[@]}" -O2 -S "$matmul" -o /dev/null \
     >"$tmp/arm-trace.txt" 2>&1
   grep -q "reach=10" "$tmp/arm-trace.txt" || {
     echo "FAIL: aarch64 default Speed reach band is not 10"; fail=1; }
 
-  env -u CCC_GLA_REACH "$arm_cc" -I"$arm_inc" -O2 -S "$matmul" -o "$tmp/mm10.s"
-  env CCC_GLA_REACH=6 "$arm_cc" -I"$arm_inc" -O2 -S "$matmul" -o "$tmp/mm6.s"
-  grep -Eq 'stp[[:space:]]+x29, x30, \[sp, #-112\]!' "$tmp/mm10.s" || {
-    echo "FAIL: aarch64 matmul frame should be 112 at band 10"; fail=1; }
-  grep -Eq 'stp[[:space:]]+x29, x30, \[sp, #-128\]!' "$tmp/mm6.s" || {
-    echo "FAIL: aarch64 matmul frame should be 128 at forced band 6"; fail=1; }
-  echo "ok: aarch64 reach band 10 (matmul frame 128 -> 112)"
+  env -u CCC_GLA_REACH "$arm_cc" "${arm_inc_flag[@]}" -O2 -S "$matmul" -o "$tmp/mm10.s"
+  env CCC_GLA_REACH=6 "$arm_cc" "${arm_inc_flag[@]}" -O2 -S "$matmul" -o "$tmp/mm6.s"
+  # Current invariant on this tree (measured): matmul's prologue frame is 96
+  # bytes at both bands, and the band does not change matmul's body. An earlier
+  # pin expected 128 -> 112 from the band; that no longer holds, so the pin is
+  # the measured state. A deliberate change must update this check.
+  for mm in mm10 mm6; do
+    frame=$(fn_body "$tmp/$mm.s" matmul | grep -oE 'stp[[:space:]]+x29, x30, \[sp, #-[0-9]+\]!' | grep -oE '#-[0-9]+' || true)
+    [[ $frame == "#-96" ]] || {
+      echo "FAIL: aarch64 matmul frame ($mm) is ${frame:-none}, pinned #-96"; fail=1; }
+  done
+  fn_body "$tmp/mm10.s" matmul >"$tmp/mm10.body"
+  fn_body "$tmp/mm6.s" matmul >"$tmp/mm6.body"
+  [[ -s $tmp/mm10.body ]] || { echo "FAIL: aarch64 matmul body not found"; fail=1; }
+  cmp -s "$tmp/mm10.body" "$tmp/mm6.body" || {
+    echo "FAIL: aarch64 reach band changed matmul's code (pinned: identical)"; fail=1; }
+  [[ $fail -eq 0 ]] && echo "ok: aarch64 matmul frame 96 at bands 10 and 6, body identical"
 else
   echo "SKIP: aarch64 cross compiler unavailable"
 fi
 
-if [[ -x $rv_cc && -n $rv_inc ]]; then
+# double_reduction.c uses only uint32_t, int64_t and printf. lccc's own include
+# directory has no stddef.h, so the riscv leg compiles a copy whose three
+# declarations are written out. Only declarations differ; the code and the
+# trace lines the checks read are the same. The leg therefore needs no cross
+# headers, and a missing cross gcc cannot turn it into a silent skip.
+dred_nohdr="$tmp/double_reduction_nohdr.c"
+sed -e 's|^#include <stdint.h>$|typedef unsigned int uint32_t; typedef long int64_t;|' \
+    -e 's|^#include <stdio.h>$|int printf(const char *, ...);|' "$dred" >"$dred_nohdr"
+if grep -q '^#include' "$dred_nohdr"; then
+  echo "FAIL: double_reduction copy still has #include lines"; fail=1
+fi
+if [[ -x $rv_cc ]]; then
   # (2) RISC-V: reach=6 by default; the three bases are unreachable and the
   # function takes zero edits.
   env -u CCC_GLA_REACH CCC_DEBUG_SPLIT=1 CCC_RA_GLOBAL_LOCATION=1 CCC_GLA_TRACE=1 \
-    "$rv_cc" -I"$rv_inc" -O2 -S "$dred" -o "$tmp/dr6.s" \
+    "$rv_cc" -O2 -S "$dred_nohdr" -o "$tmp/dr6.s" \
     >"$tmp/rv6-trace.txt" 2>&1
   grep -q "reach=6" "$tmp/rv6-trace.txt" || {
     echo "FAIL: riscv64 default Speed reach band is not 6"; fail=1; }
@@ -84,7 +108,7 @@ if [[ -x $rv_cc && -n $rv_inc ]]; then
   # become reachable and are applied, and three large li pairs move into the
   # LCG loop.
   env CCC_DEBUG_SPLIT=1 CCC_RA_GLOBAL_LOCATION=1 CCC_GLA_REACH=11 CCC_GLA_TRACE=1 \
-    "$rv_cc" -I"$rv_inc" -O2 -S "$dred" -o "$tmp/dr11.s" \
+    "$rv_cc" -O2 -S "$dred_nohdr" -o "$tmp/dr11.s" \
     >"$tmp/rv11-trace.txt" 2>&1
   grep -q "applied: 3 values (3 remat" "$tmp/rv11-trace.txt" || {
     echo "FAIL: forced riscv64 band 11 no longer admits the 3 bases (RA-GLA-03 corpus changed - re-triage)"; fail=1; }

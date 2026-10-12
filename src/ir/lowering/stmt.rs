@@ -382,10 +382,12 @@ impl Lowerer {
         vla_size: Option<Value>,
     ) {
         let mut local_info = LocalInfo::from_analysis(da, alloca, decl.is_const());
-        local_info.var.address_space = crate::common::type_builder::object_storage_address_space(
-            decl.address_space,
-            &declarator.derived,
-        );
+        local_info.var.address_space =
+            crate::common::type_builder::object_storage_address_space_with_object(
+                decl.address_space,
+                &declarator.derived,
+                declarator.attrs.object_space,
+            );
         // `T __seg_fs *p`: the qualifier lives on the pointer's CType (the
         // space the pointer points into), not just on the variable slot.
         // Without this, `*p` resolves AddressSpace::Default through
@@ -432,7 +434,10 @@ impl Lowerer {
                 let ptr_count_before = declarator.derived[..i]
                     .iter()
                     .filter(|d| {
-                        matches!(d, DerivedDeclarator::Pointer | DerivedDeclarator::Array(_))
+                        matches!(
+                            d,
+                            DerivedDeclarator::Pointer(_) | DerivedDeclarator::Array(_)
+                        )
                     })
                     .count();
                 // Subtract 1 for the syntax marker pointer
@@ -676,7 +681,10 @@ impl Lowerer {
                 let ptr_count_before = declarator.derived[..i]
                     .iter()
                     .filter(|d| {
-                        matches!(d, DerivedDeclarator::Pointer | DerivedDeclarator::Array(_))
+                        matches!(
+                            d,
+                            DerivedDeclarator::Pointer(_) | DerivedDeclarator::Array(_)
+                        )
                     })
                     .count();
                 let return_type_ptrs = ptr_count_before.saturating_sub(1);
@@ -1107,7 +1115,14 @@ impl Lowerer {
                             (field.bit_offset, field.bit_width)
                         {
                             self.store_bitfield(
-                                field_addr, field_ty, bit_offset, bit_width, val, false, field.sso,
+                                field_addr,
+                                field_ty,
+                                bit_offset,
+                                bit_width,
+                                val,
+                                false,
+                                field.sso,
+                                AddressSpace::Default,
                             );
                         } else {
                             let val = self.emit_sso_store_fixup(val, field_ty, field.sso);
@@ -1959,7 +1974,7 @@ impl Lowerer {
     ) -> usize {
         let has_pointer = derived
             .iter()
-            .any(|d| matches!(d, DerivedDeclarator::Pointer));
+            .any(|d| matches!(d, DerivedDeclarator::Pointer(_)));
         let has_func_ptr = derived.iter().any(|d| {
             matches!(
                 d,

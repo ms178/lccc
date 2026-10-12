@@ -418,6 +418,23 @@ pub(crate) fn vectorize_with_analysis(func: &mut IrFunction, cfg: &CfgAnalysis) 
     vectorize_with_analysis_mode(func, cfg, false, false, false, FpContract::default())
 }
 
+/// True when some block of the loop accesses memory through a named address
+/// space (`__seg_gs`/`__seg_fs`). Such an access is a segment-relative load or
+/// store, which no vector form built by this pass can express.
+fn loop_touches_named_space(func: &IrFunction, loop_info: &loop_analysis::NaturalLoop) -> bool {
+    loop_info.body.iter().any(|&bi| {
+        func.blocks.get(bi).is_some_and(|b| {
+            b.instructions.iter().any(|inst| match inst {
+                Instruction::Load { seg_override, .. }
+                | Instruction::Store { seg_override, .. } => {
+                    !matches!(seg_override, AddressSpace::Default)
+                }
+                _ => false,
+            })
+        })
+    })
+}
+
 fn vectorize_with_analysis_mode(
     func: &mut IrFunction,
     cfg: &CfgAnalysis,
@@ -431,6 +448,7 @@ fn vectorize_with_analysis_mode(
     // `vec_interleave`'s gate on these same two variables): `var` additionally
     // UTF-8-validates the value and allocates a `String` that nobody reads.
     let debug = std::env::var_os("LCCC_DEBUG_VECTORIZE").is_some();
+    let why_not = std::env::var_os("LCCC_WHY_NOT_VECTORIZE").is_some();
 
     // ISA gate: the x86 vector lowerings require the SIMD register file. Under
     // `-mno-sse` / `-mno-sse2` / `-mgeneral-regs-only` the target has no xmm
@@ -456,7 +474,7 @@ fn vectorize_with_analysis_mode(
     // tests/regression/check_vectorize_isa_gate.sh.
     let simd_ok = neon || x86_simd_available();
     if !simd_ok && !debug {
-        if std::env::var_os("LCCC_WHY_NOT_VECTORIZE").is_some() {
+        if why_not {
             report_simd_disabled(&func.name);
         }
         return 0;
@@ -503,6 +521,21 @@ fn vectorize_with_analysis_mode(
         }
 
         if !is_innermost {
+            continue;
+        }
+
+        // A loop with a load or store through a named address space is not
+        // vectorized. The vector loads and stores built below carry the default
+        // address space, so a `__seg_gs` access inside a vectorized body would
+        // be emitted as a generic one and read the wrong memory. Measured: a
+        // -O3 reduction over a `__seg_gs` array returned a wrong checksum.
+        if loop_touches_named_space(func, loop_info) {
+            if debug || why_not {
+                eprintln!(
+                    "[VEC] Loop {} (header block {}) not vectorized: named address space access",
+                    idx, loop_info.header
+                );
+            }
             continue;
         }
 

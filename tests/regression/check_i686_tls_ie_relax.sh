@@ -31,6 +31,12 @@ trap 'rm -rf "$td"' EXIT
 # root) cannot compile even `#include <stdio.h>` at -m32, and a hard
 # failure there reports the ENVIRONMENT, not the code. Skip loudly.
 if ! printf '#include <stdio.h>\n' | "$ccc" -m32 -x c - -fsyntax-only >/dev/null 2>&1; then
+    # A host whose own gcc -m32 parses the headers must not skip: the probe
+    # failing there is a compiler defect, not a missing sysroot.
+    if printf '#include <stdio.h>\n' | gcc -m32 -x c - -fsyntax-only >/dev/null 2>&1; then
+        echo "FAIL: i686-tls-ie-relax probe cannot parse <stdio.h> though gcc -m32 can" >&2
+        exit 1
+    fi
     echo "SKIP: i686-tls-ie-relax - no i386 libc headers on this host (CI installs gcc-multilib)"
     exit 0
 fi

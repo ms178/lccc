@@ -652,6 +652,9 @@ impl std::fmt::Debug for Declaration {
 pub struct DeclAttributes {
     /// Packed boolean flags — see `decl_attr_flag` constants.
     flags: u16,
+    /// Named address space written after the declarator's last `*`
+    /// (`long *__seg_gs p`): the space of the object itself, not its pointee.
+    pub object_space: AddressSpace,
     /// __attribute__((alias("target"))) - this symbol is an alias for target
     pub alias_target: Option<String>,
     /// __attribute__((visibility("hidden"))) etc.
@@ -860,7 +863,12 @@ pub struct InitDeclarator {
 /// Derived parts of a declarator (pointers, arrays, function params).
 #[derive(Debug, Clone)]
 pub enum DerivedDeclarator {
-    Pointer,
+    /// A `*`. The address space is the qualifier written immediately after this
+    /// `*` (`long *__seg_gs *p`: the first star carries `__seg_gs`). It qualifies
+    /// the storage of the pointer that the NEXT pointer level points to, so
+    /// `p` points at a segment pointer. The last star's space is the declared
+    /// object's own space and is carried separately (`DeclAttributes::object_space`).
+    Pointer(AddressSpace),
     Array(Option<Box<Expr>>),
     Function(Vec<ParamDecl>, bool), // params, variadic
     /// Function pointer: (*name)(params) - distinguishes from pointer-to-return-type
@@ -916,7 +924,7 @@ impl DerivedDeclarator {
         };
         slice
             .iter()
-            .filter(|d| matches!(d, DerivedDeclarator::Pointer))
+            .filter(|d| matches!(d, DerivedDeclarator::Pointer(_)))
             .count()
     }
 }
@@ -965,27 +973,76 @@ mod declarator_law_tests {
             // int f(void) — plain function.
             (vec![func(0)], true, 0),
             // int *f(int) — pointer return.
-            (vec![Pointer, func(1)], true, 1),
+            (
+                vec![
+                    Pointer(crate::common::types::AddressSpace::Default),
+                    func(1),
+                ],
+                true,
+                1,
+            ),
             // int **f(int) — two indirections.
-            (vec![Pointer, Pointer, func(1)], true, 2),
+            (
+                vec![
+                    Pointer(crate::common::types::AddressSpace::Default),
+                    Pointer(crate::common::types::AddressSpace::Default),
+                    func(1),
+                ],
+                true,
+                2,
+            ),
             // void (*f(int))(void) — function RETURNING a function pointer
             // (SQLite's sqlite3OsDlSym shape): the prefix has ONE Pointer.
-            (vec![Pointer, fnp(0), func(1)], true, 1),
+            (
+                vec![
+                    Pointer(crate::common::types::AddressSpace::Default),
+                    fnp(0),
+                    func(1),
+                ],
+                true,
+                1,
+            ),
             // void (*(*f(int))(void))(int) — function returning a POINTER
             // TO a function pointer: the prefix interleaves a
             // FunctionPointer between two Pointers, exactly the shape a
             // leading-run count undercounts (1 instead of 2).
-            (vec![Pointer, fnp(0), Pointer, fnp(1), func(1)], true, 2),
+            (
+                vec![
+                    Pointer(crate::common::types::AddressSpace::Default),
+                    fnp(0),
+                    Pointer(crate::common::types::AddressSpace::Default),
+                    fnp(1),
+                    func(1),
+                ],
+                true,
+                2,
+            ),
             // int (*fp)(int) — function-pointer OBJECT: not a function,
             // whole-list depth 1 (the typedef return is depth-1 = 0: int).
-            (vec![Pointer, fnp(1)], false, 1),
+            (
+                vec![Pointer(crate::common::types::AddressSpace::Default), fnp(1)],
+                false,
+                1,
+            ),
             // int *(*fp)(int) — fn-ptr object returning int*: depth 2,
             // typedef return depth 1.
-            (vec![Pointer, Pointer, fnp(1)], false, 2),
+            (
+                vec![
+                    Pointer(crate::common::types::AddressSpace::Default),
+                    Pointer(crate::common::types::AddressSpace::Default),
+                    fnp(1),
+                ],
+                false,
+                2,
+            ),
             // int (*fps[3])(int) — array of fn-ptrs: not a function.
             (vec![Array(None), fnp(1)], false, 0),
             // Plain pointer object.
-            (vec![Pointer], false, 1),
+            (
+                vec![Pointer(crate::common::types::AddressSpace::Default)],
+                false,
+                1,
+            ),
             // Empty declarator (abstract params of a bare type).
             (vec![], false, 0),
         ];

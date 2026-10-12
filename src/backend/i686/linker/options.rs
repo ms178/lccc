@@ -215,14 +215,6 @@ fn rejected_option(t: &str) -> Option<&'static str> {
         .map(|(_, what)| *what)
 }
 
-fn is_optimisation_only(t: &str) -> bool {
-    matches!(t, "--gc-sections" | "--sort-common" | "--sort-section")
-        || t.starts_with("--icf")
-        || t.starts_with("--sort-common=")
-        || t.starts_with("--sort-section=")
-        || (t.len() == 3 && t.starts_with("-O") && t.as_bytes()[2].is_ascii_digit())
-}
-
 /// Validate the parsed arguments for an i686 userspace link and produce the
 /// emitter options.  `is_shared` selects the `-shared` rules.
 pub(super) fn check_capabilities(
@@ -249,11 +241,11 @@ pub(super) fn check_capabilities(
     if let Some(what) = toks.iter().find_map(|t| rejected_option(t)) {
         return unsupported(what);
     }
-    for t in toks.iter().filter(|t| is_optimisation_only(t)) {
-        eprintln!(
-            "lccc-ld: warning: {t} ignored by the elf_i386 userspace linker (optimisation only; the output is still correct)"
-        );
-    }
+    // Optimisation-only options (--gc-sections, --icf, --sort-*, -O<n>) are
+    // accepted and ignored without a diagnostic, as GNU ld accepts them. The
+    // output is correct without them. Trade-off: the i686 userspace link keeps
+    // the sections that --gc-sections would discard, so the binary is larger
+    // than GNU ld's output for the same input.
 
     if let Some(style) = args.build_id_style.as_deref() {
         if !matches!(style, "sha1" | "tree" | "none" | "0") {

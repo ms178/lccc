@@ -1529,6 +1529,7 @@ impl X86Codegen {
         // named "r11" and PhysReg(11) is named "r10". The indirect target is
         // the literal "%r10", i.e. PhysReg(11).
         let indirect_target_regs = vec![crate::backend::regalloc::PhysReg(11)];
+        let seg_indexed_fold = crate::backend::traits::ArchCodegen::supports_seg_indexed_fold(self);
         let (
             reg_assigned,
             cached_liveness,
@@ -1572,7 +1573,10 @@ impl X86Codegen {
                 // their normal adjacency-synchronized ranges) — a
                 // retained link for a pruned entry only over-constrains
                 // the allocator, never under-constrains.
-                let mut links = crate::backend::generation::collect_folded_gep_links_all(func);
+                let mut links = crate::backend::generation::collect_folded_gep_links_all(
+                    func,
+                    seg_indexed_fold,
+                );
                 for (operand, dests) in &self.cmp_replay_operand_links {
                     links
                         .entry(*operand)

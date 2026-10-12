@@ -390,6 +390,9 @@ gate "comdat-signature-identity" fast \
 gate "loop-memset-decisions" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_loop_memset.sh
 
+gate "loop-store-motion" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_loop_store_motion.sh
+
 gate "bool-pair-tail-jmp-contract" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_bool_pair_tail_jmp.sh
 
@@ -447,6 +450,44 @@ gate "isa-gate-escape" fast \
 # the built boot/decompressor objects are baseline-clean.
 gate "kernel-boot-isa" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_kernel_boot_isa.sh
+# Executed __seg_gs runtime contract: segment accesses and aggregate copies
+# run under a real GS base and match gcc -O2.
+gate "seg-gs-runtime" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_seg_gs_runtime.sh
+
+# Size sweep of __seg_gs aggregate copies: 170 sizes across the 512-byte unroll
+# limit and the loop tails, each checked against gcc -O0 output at -O0 and -O2.
+gate "seg-copy-size-sweep" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_seg_copy_sweep.sh
+
+# Segment qualifier after an earlier `*` (the pointee is in %gs or %fs): the
+# %fs/%gs load sequence is checked at -O0/-O1/-O2.
+gate "seg-pointee-chain-asm" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_seg_pointee_chain_asm.sh
+
+# Explicit casts between named address spaces warn as GCC 14.2 does; sizeof and
+# unnamed-parameter pointer-to-segment-pointer values are checked at run time.
+gate "seg-cast-warning" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_seg_cast_warning.sh
+
+# Named-space declarator placement: each fixture's verdict must match
+# its name and gcc. A parameter cannot carry a named space on its own object,
+# and an array in a named space does not decay to a generic pointer.
+gate "seg-declarator-space" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_seg_declarator_space.sh
+
+# Named-space conversions: a decayed array in a named space (through an
+# identifier, a member of a named object, a subscript of a named array, or
+# pointer arithmetic on any of these) must be rejected where gcc 14.2 rejects
+# it, and accepted where it accepts.
+gate "seg-conv-diagnostics" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_seg_conv_diagnostics.sh
+
+gate "chroot-bind" fast bash tests/regression/check_chroot_bind.sh
+
+gate "kernel-tree-clear" fast bash tests/regression/check_kernel_tree_clear.sh
+# The shared mount-table helper and the chroot/kernel-tree root guards.
+gate "destructive-path-guards" fast bash tests/regression/check_destructive_guards.sh
 
 gate "tls-model-selection" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_tls_model_selection.sh

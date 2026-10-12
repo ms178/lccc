@@ -427,7 +427,7 @@ impl I686Codegen {
             // const-offset folds plus base AND index intervals of indexed
             // folds to their consumers, so the address registers survive
             // intervening calls and accumulator staging.
-            crate::backend::generation::collect_folded_gep_links_all(func),
+            crate::backend::generation::collect_folded_gep_links_all(func, false),
             &self.state.ra_config,
             // Not alias-aware yet: ignored scratch map keeps the pre-alias freshness behavior.
             &mut crate::common::fx_hash::FxHashMap::default(),

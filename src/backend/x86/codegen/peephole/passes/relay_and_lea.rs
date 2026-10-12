@@ -1417,9 +1417,9 @@ fn compose_indexed_relay(
     // keeps `line[..pos]` in the rewritten line — so it is stripped here and
     // never becomes part of the composed operand.
     let trimmed = cons_text.trim_start();
-    let cons_text = match segment_prefix_len(trimmed) {
-        Some(n) => trimmed[n..].to_string(),
-        None => cons_text,
+    let (cons_text, has_seg) = match segment_prefix_len(trimmed) {
+        Some(n) => (trimmed[n..].to_string(), true),
+        None => (cons_text, false),
     };
     let cons = SibAddr::parse(&cons_text)?;
     // The base slot must be exactly %T.  Comparing the parsed field rather
@@ -1435,7 +1435,13 @@ fn compose_indexed_relay(
         base: None,
         index: cons.index,
     };
-    compose_sib(&producer, &cons_rest)
+    let composed = compose_sib(&producer, &cons_rest)?;
+    // The caller keeps the segment override, so an indexed result under a
+    // segment prefix is a segment SIB: refuse it when the kill switch is set.
+    if has_seg && composed.contains(',') && !seg_sib_enabled() {
+        return None;
+    }
+    Some(composed)
 }
 
 /// Substitute the address computed by `leaq PRODUCER, %T` into the single
@@ -1465,6 +1471,13 @@ fn compose_indexed_relay(
 ///
 /// The caller still owns the liveness proof and must reject the result when it
 /// mentions `%T` anywhere else (a remaining read of the deleted LEA's value).
+/// `CCC_NO_SEG_SIB` kill switch, read once per process.  Shared by the
+/// peephole folds below and the codegen emitters (`supports_seg_indexed_fold`).
+pub(super) fn seg_sib_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("CCC_NO_SEG_SIB").is_none())
+}
+
 pub(super) fn splice_lea_into_mem_operand(
     line: &str,
     dst_text: &str,
@@ -1506,6 +1519,14 @@ pub(super) fn splice_lea_into_mem_operand(
         index: cons.index,
     };
     let composed = compose_sib(&producer, &cons_rest)?;
+    // A segment-prefixed operand that gains an index register is a segment SIB
+    // (`%gs:(%base, %idx, scale)`).  Honour the `CCC_NO_SEG_SIB` kill switch
+    // here as well: the emitters are gated, but this peephole composes the
+    // LEA into the operand on its own, so without this check the switch would
+    // leave segment SIB operands behind.
+    if !seg.is_empty() && composed.contains(',') && !seg_sib_enabled() {
+        return None;
+    }
     // Keep the whitespace that separated the operand from the mnemonic or the
     // previous comma; replace exactly `disp(...)`.
     let lead = line[op_start..pos].len() - line[op_start..pos].trim_start().len();
@@ -1615,9 +1636,17 @@ pub(super) fn fold_lea_into_load(store: &mut LineStore, infos: &mut [LineInfo]) 
                 // `(%T, …)` can absorb the LEA. `8(%T)` must not match:
                 // splicing would produce `8DISP(%base)`.
                 let mut matched: Option<(usize, usize, String)> = None;
+                // Plain relay: `%gs:(%T)` takes the folded address verbatim.
+                // An indexed address under a segment override is a segment
+                // SIB, which the `CCC_NO_SEG_SIB` kill switch must refuse.
+                let seg_sib_blocked = |pos: usize| {
+                    !seg_sib_enabled()
+                        && folded_addr.contains(',')
+                        && segment_prefix_len(t[operand_start(t, pos)..pos].trim()).is_some()
+                };
                 if let Some((pos, _)) = t
                     .match_indices(&addr_pat)
-                    .find(|(pos, _)| at_mem_operand_boundary(t, *pos))
+                    .find(|(pos, _)| at_mem_operand_boundary(t, *pos) && !seg_sib_blocked(*pos))
                 {
                     matched = Some((pos, pos + addr_pat.len() - 1, folded_addr.clone()));
                 } else if let Some((pos, _)) = t

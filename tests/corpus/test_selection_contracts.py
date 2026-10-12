@@ -26,10 +26,14 @@ class SelectionContracts(unittest.TestCase):
     def test_real_whitespace_list_excludes_imported_sources(self):
         actual=self.listing(REPO/'tests/regression/check_peephole_whitespace.sh',REPO/'tests',15)
         self.assertFalse(any('/tests/corpus/' in p for p in actual))
-        # Current contaminated sample: 55 regression + 6 benchmarks. Do not
+        # The stride-15 sample must keep its fair share of each first-party
+        # category, derived from the enumeration itself: a fixed count goes
+        # stale whenever a test is added and shifts the stride phase. Do not
         # merely make the sample empty to satisfy exclusion.
-        self.assertGreaterEqual(sum('/tests/regression/' in p for p in actual),55)
-        self.assertGreaterEqual(sum('/tests/benchmark/' in p for p in actual),6)
+        full=[str(p) for p in s.source_paths(REPO/'tests')]
+        for category in ('regression','benchmark'):
+            share=sum(f'/tests/{category}/' in p for p in full)//15
+            self.assertGreaterEqual(sum(f'/tests/{category}/' in p for p in actual),share)
         self.assertEqual(actual,[str(p) for p in s.source_paths(REPO/'tests')[::15]])
 
     def test_whitespace_and_differential_share_same_full_selection(self):

@@ -53,6 +53,35 @@ fi
 
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 ROOT=${LCCC_CI_CHROOT:-/srv/lccc-ci-$SUITE}
+# shellcheck source=mountinfo.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/mountinfo.sh"
+# The bootstrap below deletes $ROOT (`sudo rm -rf`). Validate it before anything
+# runs under sudo: a mistyped LCCC_CI_CHROOT such as $HOME, /var/tmp or a path
+# containing the repository must never reach that deletion.
+# Refuses (exit 2) unless ROOT is a plain absolute directory path that cannot
+# contain the user's data. It normalises ROOT in place: it must not run in a
+# command substitution, where `exit` would only leave the subshell.
+check_root_path() {
+    local n
+    [[ $ROOT == /* ]] || { echo "[ci-chroot] refusing LCCC_CI_CHROOT=$ROOT (must be absolute)" >&2; exit 2; }
+    while [[ $ROOT == */ ]]; do ROOT=${ROOT%/}; done
+    case "$ROOT/" in
+        */../* | */./* | *//*) echo "[ci-chroot] refusing LCCC_CI_CHROOT=$ROOT ('.', '..' or empty component)" >&2; exit 2 ;;
+    esac
+    # At least two components: /srv/x is acceptable, /srv or /home is not.
+    n=$(awk -F/ '{ print NF - 1 }' <<<"$ROOT")
+    (( n >= 2 )) || { echo "[ci-chroot] refusing LCCC_CI_CHROOT=$ROOT (too shallow to be a chroot)" >&2; exit 2; }
+    if [[ $ROOT == "$HOME" || $HOME == "$ROOT"/* ]]; then
+        echo "[ci-chroot] refusing LCCC_CI_CHROOT=$ROOT (it is or contains \$HOME)" >&2; exit 2
+    fi
+    if [[ $REPO == "$ROOT" || $REPO == "$ROOT"/* ]]; then
+        echo "[ci-chroot] refusing LCCC_CI_CHROOT=$ROOT (it contains the repository)" >&2; exit 2
+    fi
+    if [[ -L $ROOT ]]; then
+        echo "[ci-chroot] refusing LCCC_CI_CHROOT=$ROOT (a symlink)" >&2; exit 2
+    fi
+}
+check_root_path
 MIRROR=${LCCC_CI_MIRROR:-http://archive.ubuntu.com/ubuntu}
 case $REPO in
     "$HOME"/*) ;;
@@ -61,7 +90,11 @@ case $REPO in
 esac
 # What the runner image provides that the gates use (compiler, binutils, make,
 # python3, git, file), plus what ci.yml's "Install i686 C runtime" step adds.
-PACKAGES=build-essential,gcc-multilib,libc6-dev-i386,python3,python3-yaml,git,file,binutils,make,bc,xz-utils,ca-certificates,perl
+PACKAGES=build-essential,gcc-multilib,libc6-dev-i386,python3,python3-yaml,git,file,binutils,make,bc,xz-utils,ca-certificates,perl,curl
+# The runner image also carries GCC 14 with its C++ runtime development files:
+# the lccc driver picks the newest /usr/lib/gcc/<triple>/<ver> and links -lstdc++
+# from it, so gcc-14 without libstdc++-14-dev fails the C++ linker tests.
+PACKAGES=$PACKAGES,gcc-14,g++-14,libstdc++-14-dev
 
 stamp=$ROOT/.lccc-ci-ready
 if [[ ! -e $stamp ]]; then
@@ -74,6 +107,15 @@ if [[ ! -e $stamp ]]; then
     # root cannot be resumed reliably, so each attempt starts clean.  No
     # mount exists yet (the binds are made below, after the stamp).
     ok=0
+    # --one-file-system does not stop at a bind mount of the same filesystem, so
+    # a leftover mount of $HOME under $ROOT (an interrupted run) would let this
+    # deletion reach the home directory. Refuse while any mount is below $ROOT.
+    if has_mount_under "$ROOT"; then
+        echo "[ci-chroot] refusing to delete $ROOT: mount points lie below it:" >&2
+        list_mounts_under "$ROOT" | sed 's/^/[ci-chroot]   /' >&2 || true
+        echo "[ci-chroot] unmount them (sudo umount -l MOUNTPOINT) and rerun" >&2
+        exit 1
+    fi
     for attempt in 1 2 3; do
         sudo rm -rf --one-file-system "$ROOT"
         sudo mkdir -p "$ROOT"
@@ -93,6 +135,17 @@ if [[ ! -e $stamp ]]; then
         getent passwd $uid >/dev/null || useradd -m -u $uid -g $gid -s /bin/bash $name"
     sudo touch "$stamp"
 fi
+# A chroot bootstrapped before a package was added to PACKAGES keeps the stamp,
+# so any package it lacks is installed here instead of being silently absent.
+missing=()
+for pkg in ${PACKAGES//,/ }; do
+    sudo chroot "$ROOT" dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
+done
+if ((${#missing[@]})); then
+    echo "[ci-chroot] installing into the existing chroot: ${missing[*]}"
+    # The indexes of an old chroot may predate the packages: refresh them first.
+    sudo chroot "$ROOT" sh -c "apt-get update -qq >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends ${missing[*]} >/dev/null"
+fi
 [[ $SETUP_ONLY == 1 ]] && { echo "[ci-chroot] ready: $ROOT"; exit 0; }
 
 # Bind mounts are torn down on every exit path; a leaked /proc mount would
@@ -106,15 +159,51 @@ cleanup() {
 }
 trap cleanup EXIT
 bind() { # bind SRC DST-inside-root
-    sudo mkdir -p "$ROOT$2"
+    # A target already bound is not bound again: a second mount would stack a
+    # redundant layer and a second cleanup unmount.
+    local m
+    for m in ${mounts[@]+"${mounts[@]}"}; do
+        [[ $m == "$ROOT$2" ]] && return 0
+    done
+    # A file source needs a file target: a directory target makes the bind
+    # fail with a file-type mismatch (a home symlink can point at a file).
+    if [[ -d $1 ]]; then
+        sudo mkdir -p "$ROOT$2"
+    else
+        sudo mkdir -p "$(dirname -- "$ROOT$2")"
+        sudo touch "$ROOT$2"
+    fi
     sudo mount --bind "$1" "$ROOT$2"
     mounts+=("$ROOT$2")
 }
 bind /proc /proc
 bind /dev /dev
+bind /dev/pts /dev/pts
 bind /sys /sys
 bind /dev/shm /dev/shm
 bind "$HOME" "$HOME"
+# Symlinks directly under $HOME may point outside it: a workstation can keep the
+# repository, cargo and rustup in a bulk store (`~/lccc -> /var/tmp/...`). The
+# link resolves on the host but dangles inside the chroot, so every such target
+# is bound at its own path. Bound paths are unmounted by the cleanup trap.
+bind_home_links() {
+    local link target
+    while IFS= read -r -d '' link; do
+        target=$(readlink -f -- "$link")
+        # A dangling link has no source to bind; mount --bind would fail and
+        # set -e would abort the run.
+        [[ -e $target ]] || continue
+        case $target in
+            "$HOME" | "$HOME"/*) continue ;;
+            /) continue ;;  # binding the host root would mount the whole host inside the chroot
+        esac
+        # A target that contains $ROOT would be bound into the chroot that it
+        # holds: the chroot would then contain itself.
+        case "$ROOT/" in "$target"/*) continue ;; esac
+        bind "$target" "$target"
+    done < <(find "$HOME" -mindepth 1 -maxdepth 1 -type l -print0)
+}
+bind_home_links
 sudo mkdir -p "$ROOT/tmp" && sudo chmod 1777 "$ROOT/tmp"
 
 cmd=$(printf '%q ' "$@")

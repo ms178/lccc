@@ -2129,6 +2129,13 @@ fn try_fold_mem_op_with_sib(
     if !instr.contains(addr_pat) {
         return None;
     }
+    // A segment-prefixed operand that gains an index is a segment SIB; the
+    // `CCC_NO_SEG_SIB` kill switch must cover this fold as well.
+    if !super::relay_and_lea::seg_sib_enabled()
+        && (instr.contains("%gs:") || instr.contains("%fs:"))
+    {
+        return None;
+    }
     let sib = format!("(%{}, %{})", &base_reg[1..], &idx_reg[1..]);
     let folded = instr.replace(addr_pat, &sib);
     // Judge the text OUTSIDE the substituted operands: `%base` may itself be

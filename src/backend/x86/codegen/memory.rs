@@ -2284,6 +2284,50 @@ impl X86Codegen {
         }
     }
 
+    /// Memory operand of an indexed access `[base + (index << shift) + disp]`
+    /// through a register base or a frame slot. `seg` is the segment prefix
+    /// (`"%gs:"`/`"%fs:"`) or empty for a generic access. `None` when no legal
+    /// form exists, which the caller reports as a refusal.
+    fn indexed_access_operand(
+        &mut self,
+        base: &Value,
+        index: &Value,
+        shift: u8,
+        disp: i64,
+        seg: &str,
+    ) -> Option<String> {
+        let Some(&b) = self.reg_assignments.get(&base.0) else {
+            // Alloca-base indexed addressing: `disp(%rbp/%rsp,%idx,scale)`.
+            if !self.ensure_sib_index_form(index) {
+                return None;
+            }
+            return self
+                .frame_sib_for_alloca_base(base, index, shift, disp)
+                .map(|mem| format!("{seg}{mem}"));
+        };
+        if is_xmm_reg(b)
+            || self
+                .reg_assignments
+                .get(&index.0)
+                .copied()
+                .is_none_or(is_xmm_reg)
+        {
+            return None;
+        }
+        if !self.ensure_sib_index_form(index) {
+            return None;
+        }
+        Some(format!(
+            "{seg}{}",
+            Self::sib_mem64(
+                phys_reg_name(b),
+                phys_reg_name(self.reg_assignments[&index.0]),
+                shift,
+                disp,
+            )
+        ))
+    }
+
     pub(super) fn emit_load_indexed_impl(
         &mut self,
         dest: &Value,
@@ -2293,34 +2337,9 @@ impl X86Codegen {
         disp: i64,
         ty: IrType,
     ) -> bool {
-        let Some(&b) = self.reg_assignments.get(&base.0) else {
-            // Alloca-base indexed addressing: `disp(%rbp/%rsp,%idx,scale)`.
-            if !self.ensure_sib_index_form(index) {
-                return false;
-            }
-            if let Some(mem) = self.frame_sib_for_alloca_base(base, index, shift, disp) {
-                return self.emit_load_indexed_common(dest, index, shift, ty, mem);
-            }
+        let Some(mem) = self.indexed_access_operand(base, index, shift, disp, "") else {
             return false;
         };
-        if is_xmm_reg(b)
-            || self
-                .reg_assignments
-                .get(&index.0)
-                .copied()
-                .is_none_or(is_xmm_reg)
-        {
-            return false;
-        }
-        if !self.ensure_sib_index_form(index) {
-            return false;
-        }
-        let mem = Self::sib_mem64(
-            phys_reg_name(b),
-            phys_reg_name(self.reg_assignments[&index.0]),
-            shift,
-            disp,
-        );
         self.emit_load_indexed_common(dest, index, shift, ty, mem)
     }
 
@@ -2333,46 +2352,23 @@ impl X86Codegen {
         disp: i64,
         ty: IrType,
     ) -> bool {
-        let Some(&b) = self.reg_assignments.get(&base.0) else {
-            // Alloca-base indexed addressing: `disp(%rbp/%rsp,%idx,scale)`.
-            if !self.ensure_sib_index_form(index) {
-                return false;
-            }
-            if let Some(mem) = self.frame_sib_for_alloca_base(base, index, shift, disp) {
-                return self.emit_store_indexed_common(val, index, shift, ty, mem);
-            }
+        let Some(mem) = self.indexed_access_operand(base, index, shift, disp, "") else {
             return false;
         };
-        if is_xmm_reg(b)
-            || self
-                .reg_assignments
-                .get(&index.0)
-                .copied()
-                .is_none_or(is_xmm_reg)
-        {
-            return false;
-        }
-        if !self.ensure_sib_index_form(index) {
-            return false;
-        }
-        let mem = Self::sib_mem64(
-            phys_reg_name(b),
-            phys_reg_name(self.reg_assignments[&index.0]),
-            shift,
-            disp,
-        );
         self.emit_store_indexed_common(val, index, shift, ty, mem)
     }
 
-    pub(super) fn emit_load_indexed_sym_impl(
+    /// Memory operand of an indexed access through a global symbol base
+    /// `sym(,%idx,scale)`; PIC materialises the symbol in the reserved %rcx.
+    /// `seg` is the segment prefix or empty. `None` when refused.
+    fn indexed_sym_operand(
         &mut self,
-        dest: &Value,
         sym: &str,
         index: &Value,
         shift: u8,
         disp: i64,
-        ty: IrType,
-    ) -> bool {
+        seg: &str,
+    ) -> Option<String> {
         // `sym` may carry a composed constant displacement ("gh+2"). The GOT
         // verdict must be computed on the base symbol, exactly like
         // `rip_rel_blocked` does on the deciding side (`can_indexed_addr_fold`).
@@ -2385,16 +2381,16 @@ impl X86Codegen {
         // displacement suffix.
         let base_sym = sym.split(['+', '-']).next().unwrap_or(sym);
         if self.state.needs_got_for_addr(base_sym) {
-            return false;
+            return None;
         }
         let Some(&x) = self.reg_assignments.get(&index.0) else {
-            return false;
+            return None;
         };
         if is_xmm_reg(x) {
-            return false;
+            return None;
         }
         if !self.ensure_sib_index_form(index) {
-            return false;
+            return None;
         }
         let index_name = phys_reg_name(x);
         let mem = if self.state.pic_mode {
@@ -2409,6 +2405,21 @@ impl X86Codegen {
         } else {
             Self::sib_mem64_sym(sym, index_name, shift, disp)
         };
+        Some(format!("{seg}{mem}"))
+    }
+
+    pub(super) fn emit_load_indexed_sym_impl(
+        &mut self,
+        dest: &Value,
+        sym: &str,
+        index: &Value,
+        shift: u8,
+        disp: i64,
+        ty: IrType,
+    ) -> bool {
+        let Some(mem) = self.indexed_sym_operand(sym, index, shift, disp, "") else {
+            return false;
+        };
         self.emit_load_indexed_common(dest, index, shift, ty, mem)
     }
 
@@ -2421,32 +2432,98 @@ impl X86Codegen {
         disp: i64,
         ty: IrType,
     ) -> bool {
-        // Same basename rule as emit_load_indexed_sym_impl (see comment there):
-        // the GOT check must match the deciding side or the fold is refused
-        // after the allocator committed to it.
-        let base_sym = sym.split(['+', '-']).next().unwrap_or(sym);
-        if self.state.needs_got_for_addr(base_sym) {
+        let Some(mem) = self.indexed_sym_operand(sym, index, shift, disp, "") else {
             return false;
-        }
-        let Some(&x) = self.reg_assignments.get(&index.0) else {
-            return false;
-        };
-        if is_xmm_reg(x) {
-            return false;
-        }
-        if !self.ensure_sib_index_form(index) {
-            return false;
-        }
-        let index_name = phys_reg_name(x);
-        let mem = if self.state.pic_mode {
-            self.state
-                .out
-                .emit_instr_sym_base_reg("    leaq", sym, "rip", "rcx");
-            Self::sib_mem64("rcx", index_name, shift, disp)
-        } else {
-            Self::sib_mem64_sym(sym, index_name, shift, disp)
         };
         self.emit_store_indexed_common(val, index, shift, ty, mem)
+    }
+
+    // Segment-qualified indexed folds. Each takes the same operand
+    // builder as its generic twin with the `%gs:`/`%fs:` prefix, so the
+    // refusal set is identical and the dead-producer contract holds.
+
+    pub(super) fn emit_seg_load_indexed_impl(
+        &mut self,
+        dest: &Value,
+        info: &crate::backend::generation::IndexedGepInfo,
+        ty: IrType,
+        seg: AddressSpace,
+    ) -> bool {
+        let Some(prefix) = seg_operand_prefix(seg) else {
+            return false;
+        };
+        if !crate::backend::generation::seg_indexed_fold_ty(ty) {
+            return false;
+        }
+        let Some(mem) =
+            self.indexed_access_operand(&info.base, &info.index, info.shift, info.disp, prefix)
+        else {
+            return false;
+        };
+        self.emit_load_indexed_common(dest, &info.index, info.shift, ty, mem)
+    }
+
+    pub(super) fn emit_seg_store_indexed_impl(
+        &mut self,
+        val: &Operand,
+        info: &crate::backend::generation::IndexedGepInfo,
+        ty: IrType,
+        seg: AddressSpace,
+    ) -> bool {
+        let Some(prefix) = seg_operand_prefix(seg) else {
+            return false;
+        };
+        if !crate::backend::generation::seg_indexed_fold_ty(ty) {
+            return false;
+        }
+        let Some(mem) =
+            self.indexed_access_operand(&info.base, &info.index, info.shift, info.disp, prefix)
+        else {
+            return false;
+        };
+        self.emit_store_indexed_common(val, &info.index, info.shift, ty, mem)
+    }
+
+    pub(super) fn emit_seg_load_indexed_sym_impl(
+        &mut self,
+        dest: &Value,
+        sym: &str,
+        info: &crate::backend::generation::IndexedGepInfo,
+        ty: IrType,
+        seg: AddressSpace,
+    ) -> bool {
+        let Some(prefix) = seg_operand_prefix(seg) else {
+            return false;
+        };
+        if !crate::backend::generation::seg_indexed_fold_ty(ty) {
+            return false;
+        }
+        let Some(mem) = self.indexed_sym_operand(sym, &info.index, info.shift, info.disp, prefix)
+        else {
+            return false;
+        };
+        self.emit_load_indexed_common(dest, &info.index, info.shift, ty, mem)
+    }
+
+    pub(super) fn emit_seg_store_indexed_sym_impl(
+        &mut self,
+        val: &Operand,
+        sym: &str,
+        info: &crate::backend::generation::IndexedGepInfo,
+        ty: IrType,
+        seg: AddressSpace,
+    ) -> bool {
+        let Some(prefix) = seg_operand_prefix(seg) else {
+            return false;
+        };
+        if !crate::backend::generation::seg_indexed_fold_ty(ty) {
+            return false;
+        }
+        let Some(mem) = self.indexed_sym_operand(sym, &info.index, info.shift, info.disp, prefix)
+        else {
+            return false;
+        };
+        self.emit_store_indexed_common(val, &info.index, info.shift, ty, mem)
     }
 
     pub(super) fn emit_typed_store_to_slot_impl(
@@ -3946,6 +4023,77 @@ impl X86Codegen {
         true
     }
 
+    /// Segment-prefixed store to `offset(base)` with the displacement folded into
+    /// the operand. The base must have a general-register home other than `rax`,
+    /// so the value can be staged in `%rax` without touching the base, and no
+    /// `push`/`pop` is needed (the generic segment store uses both to survive
+    /// any operand-home assignment). A constant that fits the immediate is stored
+    /// directly. Returns false, emitting nothing, when the form does not apply.
+    pub(super) fn emit_seg_store_with_const_offset_impl(
+        &mut self,
+        val: &Operand,
+        base: &Value,
+        offset: i64,
+        ty: IrType,
+        seg: AddressSpace,
+    ) -> bool {
+        let seg_prefix = match seg {
+            AddressSpace::SegGs => "%gs:",
+            AddressSpace::SegFs => "%fs:",
+            AddressSpace::Default => return false,
+        };
+        if !crate::backend::generation::seg_indexed_fold_ty(ty) {
+            return false;
+        }
+        let Some(base_reg) = self.seg_base_home(base) else {
+            return false;
+        };
+        let store_instr = Self::mov_store_for_type(ty);
+        if let Some(imm) = seg_store_immediate(val, ty) {
+            self.state.emit_fmt(format_args!(
+                "    {} ${}, {}{}(%{})",
+                store_instr, imm, seg_prefix, offset, base_reg
+            ));
+            self.state.reg_cache.invalidate_acc();
+            return true;
+        }
+        // Value source: its own register home when it has one, else rax.
+        let src = match val {
+            Operand::Value(v) => match self.reg_assignments.get(&v.0) {
+                Some(&r) if !is_xmm_reg(r) && phys_reg_name(r) != "rax" => {
+                    typed_phys_reg_name(r, ty)
+                }
+                _ => {
+                    self.operand_to_rax(val);
+                    Self::reg_for_type("rax", ty)
+                }
+            },
+            Operand::Const(_) => {
+                self.operand_to_rax(val);
+                Self::reg_for_type("rax", ty)
+            }
+        };
+        self.state.emit_fmt(format_args!(
+            "    {} %{}, {}{}(%{})",
+            store_instr, src, seg_prefix, offset, base_reg
+        ));
+        self.state.reg_cache.invalidate_acc();
+        true
+    }
+
+    /// The general-register home of `base` when it can address memory directly
+    /// (never `rax`, which stages values, and never an xmm register).
+    fn seg_base_home(&self, base: &Value) -> Option<&'static str> {
+        let &reg = self.reg_assignments.get(&base.0)?;
+        if is_xmm_reg(reg) {
+            return None;
+        }
+        match phys_reg_name(reg) {
+            "rax" => None,
+            name => Some(name),
+        }
+    }
+
     pub(super) fn emit_seg_load_symbol_impl(
         &mut self,
         dest: &Value,
@@ -4073,7 +4221,9 @@ impl X86Codegen {
         if let Operand::Value(v) = val {
             if let Some(&reg) = self.reg_assignments.get(&v.0) {
                 if !is_xmm_reg(reg) {
-                    let rname = Self::reg_for_type(phys_reg_name(reg), ty);
+                    // typed name: reg_for_type knows only rax..r9, so a value homed in
+                    // rbx/r10..r15 would otherwise be stored from %rax.
+                    let rname = typed_phys_reg_name(reg, ty);
                     self.state.emit_fmt(format_args!(
                         "    {} %{}, {}{}",
                         store_instr, rname, seg_prefix, addr
@@ -4326,7 +4476,18 @@ impl X86Codegen {
         // home assignment of val and ptr, including rax/rcx/rdx themselves.
         self.operand_to_rax(val);
         self.state.emit("    pushq %rax");
+        // The push moves %rsp by 8 until the pop. A pointer slot addressed
+        // from %rsp (`use_rsp_addressing`) must be computed with that offset,
+        // or it reads the pushed value instead of its own slot. This is the
+        // same adjustment `calls.rs` makes around its pushes.
+        let rsp_adjust = self.state.out.use_rsp_addressing;
+        if rsp_adjust {
+            self.state.out.rsp_frame_size += 8;
+        }
         self.operand_to_rax(&Operand::Value(*ptr));
+        if rsp_adjust {
+            self.state.out.rsp_frame_size -= 8;
+        }
         self.state.emit("    movq %rax, %rcx");
         self.state.emit("    popq %rax");
         let store_instr = Self::mov_store_for_type(ty);
@@ -4359,6 +4520,33 @@ impl X86Codegen {
             "    {} %{}, {}{}(%rip)",
             store_instr, store_reg, seg_prefix, sym
         ));
+    }
+}
+
+/// Assembler segment prefix for a named address space; `None` for generic.
+fn seg_operand_prefix(seg: AddressSpace) -> Option<&'static str> {
+    match seg {
+        AddressSpace::SegGs => Some("%gs:"),
+        AddressSpace::SegFs => Some("%fs:"),
+        AddressSpace::Default => None,
+    }
+}
+
+/// The immediate of a constant store, truncated to the store width and in a
+/// form the assembler accepts. A 64-bit store needs a sign-extendable imm32.
+fn seg_store_immediate(val: &Operand, ty: IrType) -> Option<i64> {
+    let Operand::Const(c) = val else {
+        return None;
+    };
+    let v = c.to_i64()?;
+    match ty {
+        IrType::I64 | IrType::U64 | IrType::Ptr => (i32::MIN as i64..=i32::MAX as i64)
+            .contains(&v)
+            .then_some(v),
+        IrType::I32 | IrType::U32 => Some(v as i32 as i64),
+        IrType::I16 | IrType::U16 => Some(v as i16 as i64),
+        IrType::I8 | IrType::U8 => Some(v as i8 as i64),
+        _ => None,
     }
 }
 
@@ -4645,5 +4833,63 @@ mod indexed_fold_contract_tests {
                 "{ty:?} store-fed folds must be guaranteed"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod seg_store_rsp_tests {
+    use super::*;
+    use crate::backend::state::StackSlot;
+    use crate::common::types::IrType;
+    use crate::ir::reexports::{IrConst, Operand, Value};
+
+    /// A segment store whose pointer is in a stack slot, in a function that
+    /// addresses its slots from %rsp. The value is pushed while the pointer is
+    /// loaded, so %rsp is 8 bytes lower there and the slot must be addressed 8
+    /// bytes higher. Before the fix the pointer was read from the pushed value.
+    #[test]
+    fn seg_store_pointer_slot_accounts_for_the_value_push() {
+        let mut cg = X86Codegen::new();
+        cg.state.out.use_rsp_addressing = true;
+        cg.state.out.rsp_frame_size = 48;
+        // rbp-relative slot -40 is rsp-relative 48 - 40 = 8 outside the push.
+        cg.state.value_locations.insert(5, StackSlot(-40));
+        cg.emit_seg_store_impl(
+            &Operand::Const(IrConst::I64(7)),
+            &Value(5),
+            IrType::I64,
+            AddressSpace::SegGs,
+        );
+        let asm = cg.state.out.buf.clone();
+        assert!(
+            asm.contains("    movq 16(%rsp), %rax\n"),
+            "pointer must be reloaded from 16(%rsp) past the pushed value, got: {asm:?}"
+        );
+        assert!(
+            !asm.contains("8(%rsp)"),
+            "the unadjusted offset reads the pushed value, got: {asm:?}"
+        );
+        assert_eq!(
+            cg.state.out.rsp_frame_size, 48,
+            "the push adjustment must be undone after the pointer load"
+        );
+    }
+
+    /// Without rsp-relative addressing there is no %rsp offset to correct.
+    #[test]
+    fn seg_store_pointer_slot_is_rbp_relative_without_rsp_addressing() {
+        let mut cg = X86Codegen::new();
+        cg.state.value_locations.insert(5, StackSlot(-40));
+        cg.emit_seg_store_impl(
+            &Operand::Const(IrConst::I64(7)),
+            &Value(5),
+            IrType::I64,
+            AddressSpace::SegGs,
+        );
+        assert!(
+            cg.state.out.buf.contains("    movq -40(%rbp), %rax\n"),
+            "rbp-relative reload expected, got: {:?}",
+            cg.state.out.buf
+        );
     }
 }

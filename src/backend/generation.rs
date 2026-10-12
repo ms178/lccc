@@ -227,6 +227,33 @@ fn is_foldable_mem_ty(ty: IrType) -> bool {
     !is_wide_int_type(ty) && ty != IrType::F128
 }
 
+/// Access types a segment-qualified indexed fold covers, and the only width
+/// set the segment emitters accept: integers and pointers. Floats and wide
+/// integers keep their GEP materialised. Every segment emitter and both
+/// allocator/emitter map builders use this one definition.
+pub(crate) fn seg_indexed_fold_ty(ty: IrType) -> bool {
+    matches!(
+        ty,
+        IrType::I8
+            | IrType::U8
+            | IrType::I16
+            | IrType::U16
+            | IrType::I32
+            | IrType::U32
+            | IrType::I64
+            | IrType::U64
+            | IrType::Ptr
+    )
+}
+
+/// Whether a Load/Store access may keep its pointer GEP in the indexed map.
+/// Generic accesses always may (type rule only). A segment access may only
+/// when the backend folds segment indexed accesses and the type is in the
+/// segment width set; otherwise the GEP is dropped from the map, as before.
+fn indexed_access_admissible(seg_indexed: bool, ty: IrType, seg: AddressSpace) -> bool {
+    seg == AddressSpace::Default || (seg_indexed && seg_indexed_fold_ty(ty))
+}
+
 /// True iff `sym` (possibly `name+off`) must not be a RIP/PC-relative mem op.
 fn rip_rel_blocked(cg: &dyn ArchCodegen, sym: &str) -> bool {
     let base = asm_symbol_basename(sym);
@@ -243,6 +270,28 @@ fn filter_rip_legal_symbols(cg: &dyn ArchCodegen, map: &mut FxHashMap<u32, Strin
 }
 
 fn can_const_addr_fold(cg: &dyn ArchCodegen, info: &GepFoldInfo) -> bool {
+    can_const_addr_fold_for(cg, info, false)
+}
+
+/// `can_const_addr_fold` for segment-overridden accesses. Same liveness
+/// contract; the backend's segment hook may accept bases that the generic
+/// hook refuses because the generic fold stages through their registers.
+/// A symbol or constant-address root is never materialized into a register, so
+/// its home holds no address; only a root that is computed at run time may be
+/// used as a register base.
+fn seg_fold_base_in_register(
+    info: &GepFoldInfo,
+    global_addr_map: &FxHashMap<u32, String>,
+    const_addr_vals: &FxHashMap<u32, i64>,
+) -> bool {
+    !global_addr_map.contains_key(&info.base.0) && !const_addr_vals.contains_key(&info.base.0)
+}
+
+fn can_seg_const_addr_fold(cg: &dyn ArchCodegen, info: &GepFoldInfo) -> bool {
+    can_const_addr_fold_for(cg, info, true)
+}
+
+fn can_const_addr_fold_for(cg: &dyn ArchCodegen, info: &GepFoldInfo, seg: bool) -> bool {
     // A/B gate: force the pre-session-25 alloca-only contract.
     if env_flag_set("CCC_NO_REGBASE_FOLD") {
         return cg.state_ref().is_alloca(info.base.0);
@@ -275,7 +324,11 @@ fn can_const_addr_fold(cg: &dyn ArchCodegen, info: &GepFoldInfo) -> bool {
     // gz_reset `movl %r15d,(%r15)` NULL store); without (b) the access can
     // silently fall through.  The backend hook performs the per-value
     // physical-register sanity check (emitter scratch exclusion).
-    cg.const_offset_fold_reg_base_ok(&info.base)
+    if seg {
+        cg.seg_const_offset_fold_base_ok(&info.base)
+    } else {
+        cg.const_offset_fold_reg_base_ok(&info.base)
+    }
 }
 
 /// Whether a memory access is addressed by a GEP represented in the
@@ -784,30 +837,22 @@ fn retain_ptr_only_uses(func: &IrFunction, map: &mut FxHashMap<u32, GepFoldInfo>
             for inst in &block.instructions {
                 match inst {
                     Instruction::Load { ptr, ty, .. } => {
-                        // A segment-overridden load is a foldable consumer of a
-                        // constant-offset GEP: generate_load folds the offset
-                        // into the `%gs:`/`%fs:` operand when the base is
-                        // register-held and rebuilds the address through
-                        // emit_gep otherwise. Keeping the candidate here is
-                        // what lets `getp()->field` compile to a single
-                        // `movq %gs:8(%rax), %rax` instead of lea + indirect
-                        // load. Stores stay marked below: they have no
-                        // displacement fold yet and still need a real address.
+                        // A segment-overridden access folds the constant displacement
+                        // into the `%gs:`/`%fs:` operand (`movq %gs:8(%rax), %rax`) when
+                        // the base is register-held; generate_load/generate_store rebuild
+                        // the address through emit_gep otherwise. Keeping the candidate
+                        // here is what lets `getp()->field` compile to one instruction.
                         if !is_foldable_mem_ty(*ty) {
                             mark(ptr.0);
                         }
                     }
-                    Instruction::Store {
-                        val,
-                        ptr,
-                        ty,
-                        seg_override,
-                        ..
-                    } => {
+                    Instruction::Store { val, ptr, ty, .. } => {
                         if let Operand::Value(v) = val {
                             mark(v.0);
                         }
-                        if !is_foldable_mem_ty(*ty) || *seg_override != AddressSpace::Default {
+                        // A segment-overridden access folds the constant displacement
+                        // too (`%gs:off(%base)`); see `emit_seg_load_with_const_offset`.
+                        if !is_foldable_mem_ty(*ty) {
                             mark(ptr.0);
                         }
                     }
@@ -865,7 +910,11 @@ fn retain_ptr_only_uses(func: &IrFunction, map: &mut FxHashMap<u32, GepFoldInfo>
     }
 }
 
-fn retain_indexed_ptr_only_uses(func: &IrFunction, map: &mut FxHashMap<u32, IndexedGepInfo>) {
+fn retain_indexed_ptr_only_uses(
+    func: &IrFunction,
+    map: &mut FxHashMap<u32, IndexedGepInfo>,
+    seg_indexed: bool,
+) {
     let mut bad: FxHashSet<u32> = FxHashSet::default();
     let mut mark = |id: u32| {
         if map.contains_key(&id) {
@@ -881,7 +930,9 @@ fn retain_indexed_ptr_only_uses(func: &IrFunction, map: &mut FxHashMap<u32, Inde
                     seg_override,
                     ..
                 } => {
-                    if !is_foldable_mem_ty(*ty) || *seg_override != AddressSpace::Default {
+                    if !is_foldable_mem_ty(*ty)
+                        || !indexed_access_admissible(seg_indexed, *ty, *seg_override)
+                    {
                         mark(ptr.0);
                     }
                 }
@@ -895,7 +946,9 @@ fn retain_indexed_ptr_only_uses(func: &IrFunction, map: &mut FxHashMap<u32, Inde
                     if let Operand::Value(v) = val {
                         mark(v.0);
                     }
-                    if !is_foldable_mem_ty(*ty) || *seg_override != AddressSpace::Default {
+                    if !is_foldable_mem_ty(*ty)
+                        || !indexed_access_admissible(seg_indexed, *ty, *seg_override)
+                    {
                         mark(ptr.0);
                     }
                 }
@@ -941,10 +994,13 @@ fn retain_used(map: &mut FxHashMap<u32, impl Sized>, use_counts: &[u32]) {
 /// (see RegAllocConfig::folded_index_uses). Derived from the SAME
 /// build_indexed_gep_map the emitter uses, so allocator and emitter can
 /// never disagree about which indices are consumed where.
-pub(crate) fn collect_folded_index_links(func: &IrFunction) -> FxHashMap<u32, Vec<u32>> {
+pub(crate) fn collect_folded_index_links(
+    func: &IrFunction,
+    seg_indexed: bool,
+) -> FxHashMap<u32, Vec<u32>> {
     let use_counts = count_value_uses(func);
     let stab = analyze_base_stability(func);
-    let m = build_indexed_gep_map(func, &use_counts, &stab);
+    let m = build_indexed_gep_map(func, &use_counts, &stab, seg_indexed);
     let mut out: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     for (dest, info) in &m {
         out.entry(info.index.0).or_default().push(*dest);
@@ -1004,7 +1060,8 @@ pub(crate) fn collect_gep_fold_base_links(func: &IrFunction) -> FxHashMap<u32, V
 pub(crate) fn collect_i686_scratch_denials(func: &IrFunction) -> FxHashSet<u32> {
     let use_counts = count_value_uses(func);
     let stab = analyze_base_stability(func);
-    let m = build_indexed_gep_map(func, &use_counts, &stab);
+    // i686 has no segment indexed emitters: the generic map is its map.
+    let m = build_indexed_gep_map(func, &use_counts, &stab, false);
     let mut out: FxHashSet<u32> = m.keys().copied().collect();
     let mut global_addrs: FxHashSet<u32> = FxHashSet::default();
     for block in &func.blocks {
@@ -1074,7 +1131,10 @@ pub(crate) fn collect_i686_scratch_denials(func: &IrFunction) -> FxHashSet<u32> 
 /// extending intervals for a form the emitter re-materialises only adds
 /// register pressure (x86-64 `check_gpr_leaf_param_codegen::pointer_mix`
 /// regressed +2 callee-saves when the INDEX extension was applied blindly).
-pub(crate) fn collect_folded_gep_links_all(func: &IrFunction) -> FxHashMap<u32, Vec<u32>> {
+pub(crate) fn collect_folded_gep_links_all(
+    func: &IrFunction,
+    seg_indexed: bool,
+) -> FxHashMap<u32, Vec<u32>> {
     let mut out = collect_gep_fold_base_links(func);
     // Indexed folds consume BOTH the base and the index at the Load/Store
     // access position (the IR records their last uses at the folded-away
@@ -1083,7 +1143,7 @@ pub(crate) fn collect_folded_gep_links_all(func: &IrFunction) -> FxHashMap<u32, 
     // indexed memory operand directly (arm, i686 SIB).
     let use_counts = count_value_uses(func);
     let stab = analyze_base_stability(func);
-    let m = build_indexed_gep_map(func, &use_counts, &stab);
+    let m = build_indexed_gep_map(func, &use_counts, &stab, seg_indexed);
     for (dest, info) in &m {
         out.entry(info.base.0).or_default().push(*dest);
         out.entry(info.index.0).or_default().push(*dest);
@@ -1108,6 +1168,7 @@ fn build_indexed_gep_map(
     func: &IrFunction,
     use_counts: &[u32],
     stab: &BaseStability,
+    seg_indexed: bool,
 ) -> FxHashMap<u32, IndexedGepInfo> {
     if env_flag_set("CCC_NO_GEP_FOLD") {
         return FxHashMap::default();
@@ -1591,10 +1652,10 @@ fn build_indexed_gep_map(
         return map;
     }
 
-    retain_indexed_ptr_only_uses(func, &mut map);
+    retain_indexed_ptr_only_uses(func, &mut map, seg_indexed);
     retain_stable_indexed(func, use_counts, stab, &mut map);
     propagate_stable_aliases(func, stab, &mut map);
-    retain_indexed_ptr_only_uses(func, &mut map);
+    retain_indexed_ptr_only_uses(func, &mut map, seg_indexed);
     retain_used(&mut map, use_counts);
 
     // Consumer-access profile: every surviving entry is consumed exclusively
@@ -4492,7 +4553,12 @@ fn generate_function(
     let stab = analyze_base_stability(func);
     let gep_fold_map = build_gep_fold_map(func, &value_use_counts, &stab);
     let indexed_gep_map = if cg.supports_indexed_addr() {
-        build_indexed_gep_map(func, &value_use_counts, &stab)
+        build_indexed_gep_map(
+            func,
+            &value_use_counts,
+            &stab,
+            cg.supports_seg_indexed_fold(),
+        )
     } else {
         FxHashMap::default()
     };
@@ -4501,6 +4567,11 @@ fn generate_function(
     // loads/stores through them use the direct `movq %fs:OFF` form —
     // glibc's THREAD_SELF/GETMEM/SETMEM all funnel through this shape, and
     // the register-indirect fallback costs 3 instructions per access.
+    //
+    // Only single-definition values are recorded. The IR is not SSA for every
+    // value: a multi-def destination (a copy-propagated temporary reassigned
+    // on another path) has no one constant. Recording its first definition
+    // made a `__seg_gs` copy above 512 bytes read the wrong %gs offset.
     let const_addr_vals: FxHashMap<u32, i64> = {
         // SSA-soundness guard (miscompile: per-CPU pointer walk at -O2).  A
         // value defined MORE THAN ONCE in the function is not a link-time
@@ -6404,6 +6475,23 @@ fn generate_load(
                 return;
             }
         }
+        // Segment indexed fold: `seg:disp(base,idx,scale)` / `seg:sym(,idx,scale)`.
+        // Same guard as the generic fold so the skip and emit decisions agree.
+        if let Some(info) = indexed_gep_map.get(&ptr.0) {
+            if seg_indexed_fold_ty(ty) && can_indexed_addr_fold(cg, info, global_addr_map, ptr.0) {
+                if cg.emit_seg_load_indexed(dest, info, ty, seg_override) {
+                    return;
+                }
+                if let Some(sym) = global_addr_map.get(&info.base.0) {
+                    if !rip_rel_blocked(cg, sym)
+                        && cg.emit_seg_load_indexed_sym(dest, sym, info, ty, seg_override)
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+        // If the GlobalAddr/GEP was skipped as dead, rematerialize first.
         // Constant GEP offset on the segment pointer: fold the displacement
         // into the `%gs:`/`%fs:` operand (`movq %gs:8(%rax), %rax`) instead of
         // materialising base+offset into %rcx first.
@@ -6506,6 +6594,35 @@ fn generate_store(
         if let Some(&addr) = const_addr_vals.get(&ptr.0) {
             if cg.emit_seg_store_const_addr(val, addr, ty, seg_override) {
                 return;
+            }
+        }
+        if let Some(gep_info) = gep_fold_map.get(&ptr.0) {
+            if !is_wide_int_type(ty)
+                && seg_fold_base_in_register(gep_info, global_addr_map, const_addr_vals)
+                && can_seg_const_addr_fold(cg, gep_info)
+                && cg.emit_seg_store_with_const_offset(
+                    val,
+                    &gep_info.base,
+                    gep_info.offset,
+                    ty,
+                    seg_override,
+                )
+            {
+                return;
+            }
+        }
+        if let Some(info) = indexed_gep_map.get(&ptr.0) {
+            if seg_indexed_fold_ty(ty) && can_indexed_addr_fold(cg, info, global_addr_map, ptr.0) {
+                if cg.emit_seg_store_indexed(val, info, ty, seg_override) {
+                    return;
+                }
+                if let Some(sym) = global_addr_map.get(&info.base.0) {
+                    if !rip_rel_blocked(cg, sym)
+                        && cg.emit_seg_store_indexed_sym(val, sym, info, ty, seg_override)
+                    {
+                        return;
+                    }
+                }
             }
         }
         if let Some(info) = gep_fold_map.get(&ptr.0) {
@@ -6912,7 +7029,7 @@ mod indexed_gep_machinst_gate_tests {
         let function = late_gep_function();
         let use_counts = count_value_uses(&function);
         let stability = analyze_base_stability(&function);
-        let indexed_gep_map = build_indexed_gep_map(&function, &use_counts, &stability);
+        let indexed_gep_map = build_indexed_gep_map(&function, &use_counts, &stability, false);
         assert!(indexed_gep_map.contains_key(&3));
 
         let consumer_block = &function.blocks[1];
