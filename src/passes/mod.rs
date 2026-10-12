@@ -32,6 +32,7 @@ pub(crate) mod expr_sink;
 pub(crate) mod fma_neg_peel;
 pub(crate) mod fortify_fold;
 pub(crate) mod fp_const_hoist;
+pub(crate) mod fp_double;
 pub(crate) mod global_addr_cse;
 pub(crate) mod gvn;
 pub(crate) mod if_convert;
@@ -54,6 +55,7 @@ pub(crate) mod loop_memory_promote;
 pub(crate) mod loop_memset;
 pub(crate) mod loop_preheader;
 pub(crate) mod loop_rotate;
+pub(crate) mod loop_square;
 pub(crate) mod loop_unroll;
 pub(crate) mod narrow;
 pub(crate) mod outline_switch;
@@ -2117,6 +2119,27 @@ pub(crate) fn run_passes(
             total_changes_excl_dce += n;
         }
 
+        // Predictive commoning of an existing floating-point square. Before
+        // rotation/copy propagation, while the recurrence is explicit SSA.
+        // Never speculate arithmetic on entry; x87 is deliberately excluded.
+        if iter == 0
+            && opt_level >= 2
+            && !optimize_for_size
+            && target == crate::backend::Target::X86_64
+            && x86_isa.simd
+            && !pass_disabled(&disabled, "loop_square")
+        {
+            let n = timed_pass!(
+                "loop_square",
+                run_on_visited(module, &dirty, &mut changed, loop_square::run)
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+            if n > 0 {
+                verify::verify_after_pass(module, "loop_square");
+            }
+        }
+
         // Phase 2b-rot: Loop rotation — iter 0, AFTER iv_widen (so the
         // widened phi flows through the rotated form and emits `addq`
         // directly). Transforms "guard-at-top" loops into "test-at-bottom"
@@ -2984,6 +3007,16 @@ pub(crate) fn run_passes(
     if !pass_disabled(&disabled, "quadsr") {
         module.for_each_function(quadratic_sr::run);
         module.for_each_function(dce::eliminate_dead_code);
+    }
+
+    // Run after the algebraic simplifiers and before constant hoisting,
+    // so neither x+x canonicalization nor a hoisted 2.0 hides the fold.
+    if target == crate::backend::Target::X86_64
+        && x86_isa.simd
+        && !pass_disabled(&disabled, "fp_double")
+    {
+        module.for_each_function(fp_double::run);
+        verify::verify_after_pass(module, "fp_double");
     }
 
     // Hoist FP constants used in loop bodies into preheader Copies so they can
