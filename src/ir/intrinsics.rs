@@ -1667,6 +1667,8 @@ pub enum IntrinsicOp {
 }
 
 /// Independent test matrix: do not derive this from the predicates under test.
+/// test_intrinsic_store_inventory.py checks completeness against the enum and
+/// write-effect classification, including variants without a lane-shape suffix.
 #[cfg(test)]
 pub(crate) const VECTOR_STORES: [IntrinsicOp; 13] = [
     IntrinsicOp::VecStoreI32x4Pair,
@@ -1701,11 +1703,16 @@ impl IntrinsicOp {
         }
     }
 
-    /// SIMD home width used by the backend's homing metadata. Normally this
-    /// is the result width; for the historical register-shaped stores it is
-    /// the SOURCE home width, not a result or memory effect. In particular,
-    /// VecStoreI32x4Pair consumes 16 register bytes but writes only 8 bytes.
-    /// Never infer purity or a read-only argument from this method alone.
+    /// SIMD home width used by the backend's homing metadata, not the
+    /// actual-result contract (`vector_result_width`). Normally the widths
+    /// agree. Store exceptions describe SOURCE homes: VecStoreI64x2 and
+    /// VecStoreI32x4Pair have 16-byte homes; StoreuPs256 and StoreuPd256 have
+    /// 32-byte homes. None of these stores produces a result. The Pair store
+    /// writes only 8 bytes despite its 16-byte SIMD home.
+    ///
+    /// Backend destination homing still requires an instruction destination;
+    /// this metadata alone does not register a store's source as a new value.
+    /// Never infer purity, a read-only argument or access size from it alone.
     ///
     /// Keeping this metadata separate preserves explicit-SIMD and vectorizer
     /// slot protection without pretending that stores return vector values.
@@ -1993,14 +2000,23 @@ impl IntrinsicOp {
     /// memory-folded (the backend's VLFOLD / explicit-SIMD conventions —
     /// an operand that is a pointer is only ever READ).
     ///
+    /// This is an operand-role allowlist, NOT a whole-instruction read-only
+    /// or purity claim. In particular, StoreuPs256/StoreuPd256 return true:
+    /// args[0] can be a memory-folded source, while dest_ptr is a separate
+    /// write. Their reads need not appear in the explicit-load-only
+    /// may_read_memory list. Consumers must check dest_ptr and args-side writes
+    /// independently, including derived aliases of the pointer being proved.
+    /// This opcode query does not validate arity or identify operand indices;
+    /// width/position-sensitive forwarding uses pointer_vector_arg_width.
+    ///
     /// This is the read-side counterpart of the write classification and
     /// the ONLY allowlist through which a pointer may reach an intrinsic
-    /// argument in a callee-read-only proof: anything not listed here
-    /// defaults to rejection, so a future opcode cannot silently widen the
-    /// pointer positions a promoted array's address may observe. (Scalar
-    /// pure intrinsics — Crc32*, shifts, math — have no legitimate pointer
-    /// argument; a pointer there is address observation, not a memory
-    /// operand.)
+    /// argument in a callee-read-only proof. Unclassified opcodes default to
+    /// rejection, but SIMD home/result membership also admits families here:
+    /// adding an opcode to those families requires auditing its operand roles.
+    /// This is not an exhaustive per-position effect schema. Scalar pure
+    /// intrinsics (Crc32*, shifts, math) have no legitimate pointer argument;
+    /// a pointer there is address observation, not a memory operand.
     pub fn reads_pointer_arg(&self) -> bool {
         !self.writes_memory_via_args()
             && (self.may_read_memory()
@@ -2273,11 +2289,12 @@ impl IntrinsicOp {
 }
 
 #[cfg(test)]
-mod vector_result_width_tests {
+mod vector_width_tests {
     use super::IntrinsicOp;
 
-    /// `vector_result_width` is the single authority that decides a vector
-    /// value's slot size AND the width of every copy the backend emits for it
+    /// `vector_home_width` governs backend SIMD home sizing/copy metadata;
+    /// `vector_result_width` describes actual results. For these accumulator
+    /// producers both must agree with the width of the emitted copies
     /// (`vmovdqa %ymm` vs legacy `movdqa %xmm`). A too-narrow answer is a
     /// silent miscompile, not merely a missed optimisation: a legacy
     /// `movdqa %xmm` PRESERVES bits 255:128 of the destination, so a
@@ -2285,25 +2302,20 @@ mod vector_result_width_tests {
     ///
     /// `VecMaskedAddI32x8` (I32x8 accumulator, `vpaddd %ymm`) was grouped with
     /// its 128-bit widening sibling `VecWidenMaskedAddI32x4ToI64x2` (I64x2
-    /// accumulator) and reported 16. `tests/regression/vector_guard_sum.c`
-    /// summed 279 instead of 651 — exactly the low four lanes plus the scalar
-    /// remainder.
+    /// accumulator) and reported 16. A historical report recorded
+    /// `tests/regression/vector_guard_sum.c` summing 279 instead of 651
+    /// (low four lanes plus scalar remainder). That runtime observation is
+    /// not independently reproduced by this metadata test.
     #[test]
     fn masked_reduction_steps_report_their_real_accumulator_width() {
-        assert_eq!(
-            IntrinsicOp::VecMaskedAddI32x8.vector_result_width(),
-            Some(32),
-            "I32x8 accumulator is 256-bit"
-        );
-        assert_eq!(
-            IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2.vector_result_width(),
-            Some(16),
-            "I64x2 accumulator is 128-bit"
-        );
-        assert_eq!(
-            IntrinsicOp::VecWidenAddI32x4ToI64x2.vector_result_width(),
-            Some(16)
-        );
+        for (op, width) in [
+            (IntrinsicOp::VecMaskedAddI32x8, 32),
+            (IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2, 16),
+            (IntrinsicOp::VecWidenAddI32x4ToI64x2, 16),
+        ] {
+            assert_eq!(op.vector_home_width(), Some(width), "{op:?} home");
+            assert_eq!(op.vector_result_width(), Some(width), "{op:?} result");
+        }
     }
 
     /// Every `Vec*` op whose identifier ends in a `<Type><Lanes>` shape token
@@ -2324,11 +2336,14 @@ mod vector_result_width_tests {
     /// Name grammar: take the LAST `<Type>x<Lanes>` token in the identifier
     /// (`VecWiden*ToI64x2` results are the final shape) and expect
     /// lanes * sizeof(Type) bytes. Documented divergences between name and
-    /// result, all asserted as `None`:
-    /// - `VecHorizontal*` reduce pairwise to a narrower shape or a scalar.
-    /// - `VecStore*` write memory and produce no value — except
-    ///   `VecStoreI64x2`, which is deliberately listed (slot sizing) and
-    ///   agrees with its name.
+    /// home metadata (this test calls vector_home_width, not result width):
+    /// - `VecHorizontal*` reduce pairwise to a narrower shape or a scalar;
+    ///   their home metadata is None.
+    /// - ALL `VecStore*` produce no result. Only VecStoreI64x2 and
+    ///   VecStoreI32x4Pair retain 16-byte SOURCE-home metadata; other VecStore*
+    ///   home entries are None. The Pair's memory write is only 8 bytes.
+    /// - StoreuPs256/StoreuPd256 also retain source homes (32 bytes), but are
+    ///   outside this Vec* name grammar and tested separately.
     /// - `VecSadalpI32x4` / `VecSmlal{Hi,Lo}I32x4` are unlowered NEON-shaped
     ///   variants with no registered result; exempt until a lowering lands.
     #[test]
@@ -2382,7 +2397,7 @@ mod vector_result_width_tests {
         ];
         let mut checked = 0usize;
         for name in names {
-            // Divergence classes: name sounds shaped but the result is not.
+            // Home-metadata exceptions; none of these grants a store a result.
             let exempt_none = name.contains("Horizontal")
                 || (name.starts_with("VecStore")
                     && name != "VecStoreI64x2"
@@ -2666,6 +2681,7 @@ mod memory_classification_tests {
     #[test]
     fn store_effect_contract_classification() {
         for op in super::VECTOR_STORES {
+            assert!(op.writes_memory_via_args(), "{op:?} writes through args");
             assert!(!op.is_pure(), "{op:?} must not be classified as pure");
             assert!(!op.produces_vector_value(), "{op:?} has no result");
             assert_eq!(op.vector_result_width(), None, "{op:?} has no result home");
@@ -2694,22 +2710,31 @@ mod memory_classification_tests {
     }
 
     #[test]
+    fn legacy_store_source_read_does_not_cancel_destination_write() {
+        use crate::ir::reexports::{Instruction, Operand, Value};
+
+        for op in [O::StoreuPs256, O::StoreuPd256] {
+            assert!(op.reads_pointer_arg(), "args[0] is a readable SIMD source");
+            assert!(!op.writes_memory_via_args(), "the write is in dest_ptr");
+            assert!(!op.is_pure());
+            assert!(!op.produces_vector_value());
+            assert_eq!(op.vector_home_width(), Some(32));
+            assert_eq!(op.vector_result_width(), None);
+            for source in [Value(0), Value(1)] {
+                let store = Instruction::Intrinsic {
+                    dest: None,
+                    op,
+                    dest_ptr: Some(Value(0)),
+                    args: vec![Operand::Value(source)],
+                };
+                assert!(store.may_write_memory(), "{op:?}, source={source:?}");
+            }
+        }
+    }
+
+    #[test]
     fn every_vec_store_family_writes_memory_via_args() {
-        for op in [
-            O::VecStoreI32x4,
-            O::VecStoreI32x8,
-            O::VecStoreF32x4,
-            O::VecStoreF32x8,
-            O::VecStoreF64x2,
-            O::VecStoreF64x4,
-            O::VecStoreI64x2,
-            O::VecStoreI64x4,
-            O::VecStoreI16x8,
-            O::VecStoreI8x16,
-            O::VecStoreI8x32,
-            O::VecStoreI16x16,
-            O::VecStoreI32x4Pair,
-        ] {
+        for op in super::VECTOR_STORES {
             assert!(
                 op.writes_memory_via_args(),
                 "{op:?} must classify as a memory write in the args form"

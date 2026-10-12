@@ -2358,6 +2358,88 @@ mod tests {
     }
 
     #[test]
+    fn legacy_store_folds_source_read_before_its_destination_write() {
+        for op in [IntrinsicOp::StoreuPs256, IntrinsicOp::StoreuPd256] {
+            assert_eq!(pointer_vector_arg_width(op, 0), Some(32));
+            assert_eq!(pointer_vector_arg_width(op, 1), None);
+            // Even an overlapping destination is written AFTER this source
+            // read. Do not lose safe forwarding by treating the entire op as
+            // args-writing; do not treat it as pure either.
+            for destination in [10, 20] {
+                let mut f = function(
+                    "legacy_source_fold",
+                    vec![block(
+                        0,
+                        vec![
+                            alloca(0, 32, 32),
+                            alloca(10, 32, 32),
+                            alloca(20, 32, 32),
+                            intrinsic(
+                                Some(1),
+                                IntrinsicOp::Loadu256,
+                                Some(0),
+                                vec![Operand::Value(Value(10))],
+                            ),
+                            intrinsic(None, op, Some(destination), vec![Operand::Value(Value(0))]),
+                        ],
+                    )],
+                );
+                f.return_type = IrType::Void;
+                f.next_value_id = 21;
+                assert_eq!(fuse_in_function(&mut f), 1, "{op:?}, dst={destination}");
+                let Instruction::Intrinsic {
+                    dest,
+                    dest_ptr,
+                    args,
+                    ..
+                } = f.blocks[0].instructions.last().unwrap()
+                else {
+                    panic!("expected legacy store");
+                };
+                assert_eq!(*dest, None);
+                assert_eq!(*dest_ptr, Some(Value(destination)));
+                assert!(matches!(args[0], Operand::Value(Value(10))));
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_store_destination_write_blocks_later_source_forwarding() {
+        for op in [IntrinsicOp::StoreuPs256, IntrinsicOp::StoreuPd256] {
+            let mut f = function(
+                "legacy_source_clobber",
+                vec![block(
+                    0,
+                    vec![
+                        alloca(0, 32, 32),
+                        alloca(10, 32, 32),
+                        alloca(20, 32, 32),
+                        alloca(30, 32, 32),
+                        intrinsic(
+                            Some(1),
+                            IntrinsicOp::Loadu256,
+                            Some(0),
+                            vec![Operand::Value(Value(10))],
+                        ),
+                        intrinsic(None, op, Some(10), vec![Operand::Value(Value(30))]),
+                        intrinsic(None, op, Some(20), vec![Operand::Value(Value(0))]),
+                    ],
+                )],
+            );
+            f.return_type = IrType::Void;
+            f.next_value_id = 31;
+            assert_eq!(fuse_in_function(&mut f), 0, "{op:?}");
+            let Instruction::Intrinsic { dest_ptr, args, .. } =
+                f.blocks[0].instructions.last().unwrap()
+            else {
+                panic!("expected legacy store");
+            };
+            assert_eq!(*dest_ptr, Some(Value(20)));
+            assert!(matches!(args[0], Operand::Value(Value(0))));
+        }
+    }
+
+    #[test]
     fn load_forwarding_rejects_aliasing_source_write() {
         let mut function = function(
             "clobber",

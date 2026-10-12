@@ -1210,6 +1210,81 @@ mod tests {
     }
 
     #[test]
+    fn legacy_store_readonly_proof_distinguishes_source_and_destination() {
+        for op in [IntrinsicOp::StoreuPs256, IntrinsicOp::StoreuPd256] {
+            // Separate destination, same pointer, copied alias, overlapping GEP.
+            // Distinct SSA parameters are NOT a no-alias assertion: this helper
+            // proves use through one parameter, not global function purity.
+            for alias in 0..4 {
+                let params = (0..2)
+                    .map(|_| crate::ir::reexports::IrParam {
+                        ty: IrType::Ptr,
+                        noalias: false,
+                        struct_size: None,
+                        struct_align: None,
+                        param_align: None,
+                        struct_eightbyte_classes: vec![],
+                        is_f128_sse: false,
+                        riscv_float_class: None,
+                    })
+                    .collect();
+                let mut f = IrFunction::new("legacy_store".into(), IrType::Void, params, false);
+                let mut insts = vec![
+                    Instruction::ParamRef {
+                        dest: Value(0),
+                        param_idx: 0,
+                        ty: IrType::Ptr,
+                    },
+                    Instruction::ParamRef {
+                        dest: Value(1),
+                        param_idx: 1,
+                        ty: IrType::Ptr,
+                    },
+                ];
+                let destination = match alias {
+                    0 => Value(0),
+                    1 => Value(1),
+                    2 => {
+                        insts.push(Instruction::Copy {
+                            dest: Value(2),
+                            src: Operand::Value(Value(1)),
+                        });
+                        Value(2)
+                    }
+                    _ => {
+                        insts.push(Instruction::GetElementPtr {
+                            dest: Value(2),
+                            base: Value(1),
+                            offset: Operand::Const(IrConst::I64(16)),
+                            ty: IrType::I8,
+                        });
+                        Value(2)
+                    }
+                };
+                insts.push(Instruction::Intrinsic {
+                    dest: None,
+                    op,
+                    dest_ptr: Some(destination),
+                    args: vec![Operand::Value(Value(1))],
+                });
+                f.blocks = vec![block(0, insts, Terminator::Return(None))];
+                f.next_value_id = 3;
+                let fns = [f];
+                assert_eq!(
+                    callee_readonly_through_impl(&fns, "legacy_store", 1),
+                    alias == 0,
+                    "{op:?}, source parameter, alias={alias}"
+                );
+                assert_eq!(
+                    callee_readonly_through_impl(&fns, "legacy_store", 0),
+                    alias != 0,
+                    "{op:?}, destination parameter, alias={alias}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn store_effect_contract_callee_is_not_readonly() {
         for op in crate::ir::intrinsics::VECTOR_STORES {
             let mut writer = IrFunction::new("writer".into(), IrType::Void, vec![], false);

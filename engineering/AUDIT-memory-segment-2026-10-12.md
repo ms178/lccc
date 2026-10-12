@@ -1,5 +1,17 @@
 # Segment diagnostics and vector-store effects audit
 
+## Evidence status
+
+This document records the preceding correction, now merged upstream. Its
+red/green and runtime statements are recorded observations of that earlier
+session, not independently rerun results of the current quality follow-up.
+The retained segment-store verification archive contains logs, source deltas,
+profiles and hashes, but not the producing compiler executables. Hash integrity
+and inspection of those records are not compiler reproduction. The older
+review-diagnostics payload has the further provenance limitations stated below.
+No compiler, compile-based tests or performance measurements are run locally
+for the current follow-up; new Rust tests await hosted validation.
+
 ## Scope and upstream
 
 This correction is based on main `52064a7ad563744e2653faca4b50ec697e304e5a`,
@@ -127,7 +139,7 @@ fewer machine instructions or a runtime speedup. Measure emitted code, not the
 predicate change. Intel SDM 325383-093US and AMD APM 24594 revision 3.38 describe
 MOVQ's memory width; register home width must not be substituted for that width.
 
-The local acceptance recipe remains fastbuild O1, no LTO, incremental, jobs=2,
+The earlier local acceptance recipe was fastbuild O1, no LTO, incremental, jobs=2,
 active swap; `ci_local.sh --fast` includes formatting, Clippy, Rust/Python tests
 and runtime gates. The five slow gates remain hosted-only. Native performance
 claims require controlled measurements; Callgrind Ir is not cycles. Neither

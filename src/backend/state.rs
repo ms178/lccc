@@ -204,8 +204,10 @@ pub struct CodegenState {
     /// 128-bit (SSE-class) vector values. Same addressing rules as
     /// `vector_values`, but their home slots are 16 bytes wide rather than 32.
     /// Populated together with `vector_values` by the stack-layout pre-scan for
-    /// every user-level SSE/AVX intrinsic result (see
-    /// `IntrinsicOp::vector_result_width`).
+    /// SIMD homes selected by `IntrinsicOp::vector_home_width` on instructions
+    /// with an actual destination. `vector_result_width` instead describes
+    /// actual result widths; source-home metadata on stores does not create
+    /// a result or make a store pure.
     pub vector128_values: FxHashSet<u32>,
     /// Vector-register peephole: the stack slot offset that the last
     /// `avx_store_dest`/`sse_store_dest` wrote from %ymm0/%xmm0, and whether
