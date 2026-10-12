@@ -211,38 +211,266 @@ def dispatcher_arms() -> list[str]:
     satisfied count over a hole this large is worse than no ratchet, because it
     certifies the hole.
     """
-    src = DISPATCHER.read_text()
-    a = src.find("pub fn encode_instruction(")
-    if a < 0:
-        raise SystemExit("encode_instruction not found in encoder/mod.rs")
-    # Delimit the counted region by the dispatcher's own closing brace, the first
-    # `}` at column 0 after its `fn` head.  Scanning for the next `pub fn` and
-    # falling back to EOF (the earlier rule) let an insertion above the dispatcher
-    # widen the region silently, and the ratchet would then certify whatever it
-    # happened to see.  Both ends of the region must be provable.
-    b = src.find("\n}", a)
-    if b < 0:
-        raise SystemExit("encode_instruction body does not end at a column-0 `}`")
-    body = src[a:b]
+    source = DISPATCHER.read_text()
+    code_view, text_view, spans = lexical_views(source)
+    a = find_fn_head(code_view, "encode_instruction")
+    # The counted region is the dispatcher's own brace-balanced body.  The first
+    # rule scanned for the next `\npub fn ` and fell back to EOF (an insertion
+    # above the dispatcher widened the region silently); the second, better rule
+    # took the first `}` in column 0 -- but that is a *textual* fact about the
+    # file, not a structural one: a raw string containing a line that starts with
+    # `}` (an embedded template, a doc sample, a multi-line `r#"` literal) ends
+    # the region inside the string, and the ratchet then enumerates zero arms and
+    # certifies nothing while printing a satisfied count.  Braces are matched by
+    # depth over a view where comments and char literals are blanked and string
+    # contents are preserved, so the region can only end where the function ends.
+    b = match_block_end(code_view, a)
+    body = text_view[a:b]
     if "#[test]" in body:
         raise SystemExit("the counted region ran past the dispatcher into the test module")
-    lines = body.splitlines()
+    lines = body.splitlines()          # text_view: arm heads need their quotes
+    raw_lines = source[a:b].splitlines()  # source: the key text itself
     head = arm_head_re()
     names: set[str] = set()
+
+    def keys_from(line_index: int) -> None:
+        """Quoted lowercase tokens on this line that are real literals.
+
+        `lines` is the blanked view (so a commented-out head never matches) and
+        `raw_lines` carries the text; a quoted token whose start sits inside
+        another literal's content is data, not an arm key.
+        """
+        raw = raw_lines[line_index]
+        base = a + sum(len(raw_lines[k]) + 1 for k in range(line_index))
+        for match in re.finditer(r'"([a-z0-9_.]+)"', raw):
+            if not in_span(base + match.start(), spans):
+                names.add(match.group(1))
+
     i = 0
     while i < len(lines):
         if not head.match(lines[i]):
             i += 1
             continue
-        while True:
-            names.update(re.findall(r'"([a-z0-9_.]+)"', lines[i]))
-            if "=>" in lines[i]:
-                break
+        keys_from(i)
+        # A multi-pattern head (`"adcs" | "sbc"\n        | "sbcs" =>`) continues
+        # onto lines that start with `|`; the 103 arms the first version of this
+        # scan dropped were exactly those continuations.
+        while "=>" not in lines[i]:
             i += 1
             if i >= len(lines) or not lines[i].strip().startswith("|"):
                 break
+            keys_from(i)
         i += 1
+    if not names:
+        # An empty arm set is not "nothing to check"; it is the scan failing, and
+        # the difference is the whole point.  `check()` refuses it too, so the
+        # producer cannot write and the consumer cannot accept a ratchet over an
+        # empty region.
+        raise SystemExit("the dispatcher region yielded no arms: the region or the "
+                         "arm-head rule is broken, and a ratchet over nothing "
+                         "certifies nothing")
     return sorted(names)
+
+
+def lexical_views(src: str) -> tuple[str, str, list[tuple[int, int]]]:
+    """`(blanked, string_spans)` for a brace- and line-sensitive scan of Rust.
+
+    Returns three aligned views of the same bytes:
+
+    * `code_view` -- comments blanked *and* every string/char literal's content
+      blanked.  Brace depth and the `fn` head must be judged on this, because a
+      `format!("{} {{", m)` is two unbalanced braces as text and none as code,
+      and a `}` at column 0 inside a raw literal must not end a function.
+    * `text_view` -- only comments blanked; string contents preserved.  The arm
+      head pattern `^ {8}"..."` needs the quoted text to be *visible*, which is
+      exactly what `code_view` removes.
+    * `spans` -- the `(content_start, content_end)` ranges of literal contents.
+      A quoted token that sits inside another literal's content is data, not an
+      arm, so the key extraction filters on it instead of trusting the line.
+
+    Offsets, line breaks and lengths are preserved in all three.
+
+    Blank string contents rather than keeping them is the part that matters: a
+    `format!("{} {{", m)` in the dispatcher body is two unbalanced braces as
+    *text* and none as *code*, and either view alone is wrong for one of the two
+    questions being asked.  Raw literals honour their `#` count (`r#"}}}"#` is
+    one token), `/* */` nests as Rust defines it, and a `}` at column 0 inside a
+    literal cannot end a function.
+    """
+    out = list(src)
+    text_out = list(src)
+    n = len(src)
+    spans: list[tuple[int, int]] = []
+
+    def blank(start: int, end: int) -> None:
+        """Blank in `out` only: comments vanish from both views, so they are
+        blanked in `text_out` at the same time by the caller that needs it."""
+        for k in range(start, min(end, n)):
+            if out[k] != "\n":
+                out[k] = " "
+
+    i = 0
+    while i < n:
+        c = src[i]
+        if c == "/" and src.startswith("//", i):
+            j = src.find("\n", i)
+            j = n if j < 0 else j
+            blank(i, j)
+            for k in range(i, min(j, n)):
+                if text_out[k] != "\n":
+                    text_out[k] = " "
+            i = j
+            continue
+        if c == "/" and src.startswith("/*", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if src.startswith("/*", j):
+                    depth += 1
+                    j += 2
+                elif src.startswith("*/", j):
+                    depth -= 1
+                    j += 2
+                else:
+                    j += 1
+            blank(i, j)
+            for k in range(i, min(j, n)):
+                if text_out[k] != "\n":
+                    text_out[k] = " "
+            i = j
+            continue
+        if (c == '"' or c == "'"
+                or (c in "rb" and _opens_literal(src, i))):
+            if c == "'":
+                j = i + 1
+                if src.startswith("\\", j):
+                    j += 2
+                else:
+                    j += 1
+                if j < n and src[j] == "'":
+                    blank(i, j + 1)
+                    for k in range(i, j + 1):
+                        text_out[k] = " "
+                    i = j + 1
+                    continue
+                # Not a char literal (`'a`, `'deq` are lifetimes); leave it.
+                i += 1
+                continue
+            body, content_end, end = _literal_bounds(src, i)
+            if body < 0 or end <= i:
+                i += 1
+                continue
+            if content_end > body:
+                blank(body, content_end)
+                spans.append((body, content_end))
+            i = end
+            continue
+        i += 1
+    return "".join(out), "".join(text_out), spans
+
+
+def _opens_literal(src: str, index: int) -> bool:
+    """Does the `b`/`r` at `index` begin a byte-string or raw-string literal?
+
+    The prefix rule is not decoration: without the "not preceded by an
+    identifier character" test, the `r` at the end of the *content* of `"xzr"`,
+    sitting immediately before that literal's closing quote, is read as the
+    start of a new literal -- and the masking then runs from the closing quote
+    through the *next* opening one, blanking real code (a `} else {`) and
+    unbalancing every brace depth downstream.  That is how the region scan lost
+    403 of the dispatcher's 526 arms on the first attempt at this function; the
+    fixture in tests/aarch64/test_dispatcher_region_contract.py keeps it fixed.
+    """
+    if index and (src[index - 1].isalnum() or src[index - 1] == "_"):
+        return False
+    k = index + 1
+    if src[k:k + 1] == "r":
+        k += 1
+    while src[k:k + 1] == "#":
+        k += 1
+    return src[k:k + 1] == '"'
+
+
+def _literal_bounds(src: str, index: int) -> tuple[int, int, int]:
+    """`(content_start, content_end, end)` for the literal at `index`.
+
+    `end` is just past the closing delimiter; `(-1, -1, -1)` means "this `b` or
+    `r` is not a literal".
+
+    `end` is just past the closing delimiter.  An unterminated non-raw literal
+    stops at the newline, because a stray quote must not swallow the rest of the
+    file and report a phantom balance.
+    """
+    k = index
+    if src[k:k + 1] == "b":
+        k += 1
+    raw = src[k:k + 1] == "r"
+    if raw:
+        k += 1
+        hashes = 0
+        while src[k:k + 1] == "#":
+            hashes += 1
+            k += 1
+    if src[k:k + 1] != '"':
+        return -1, -1, -1
+    body = k + 1
+    if raw:
+        closer = '"' + "#" * hashes
+        j = src.find(closer, body)
+        if j < 0:
+            return body, len(src), len(src)
+        return body, j, j + len(closer)
+    k = body
+    while k < len(src):
+        if src[k] == "\\":
+            k += 2
+            continue
+        if src[k] == '"':
+            return body, k, k + 1
+        if src[k] == "\n":
+            return body, k, k
+        k += 1
+    return body, k, k
+
+
+def find_fn_head(blanked: str, name: str) -> int:
+    """Offset of the *definition* line for `fn name(`, not a call or a mention.
+
+    The item header must start its own line, so a doc comment saying
+    `pub fn encode_instruction(` (already blanked) or a call site indented
+    inside another body cannot anchor the region.
+    """
+    pattern = re.compile(
+        r"^[ \t]*(?:pub(?:\([^)]*\))?\s+)?(?:default\s+)?(?:const\s+)?(?:async\s+)?"
+        r"(?:unsafe\s+)?(?:extern[^{]*?\s+)?fn\s+" + re.escape(name) + r"\s*[<(]",
+        re.M,
+    )
+    match = pattern.search(blanked)
+    if not match:
+        raise SystemExit(f"{name}: no `fn` definition line found in {DISPATCHER}")
+    return match.start()
+
+
+def match_block_end(blanked: str, fn_head: int) -> int:
+    """Index just past the `}` that closes the body opened after `fn_head`."""
+    brace = blanked.find("{", fn_head)
+    if brace < 0:
+        raise SystemExit("encode_instruction: no opening brace after the fn head")
+    depth = 0
+    for index in range(brace, len(blanked)):
+        char = blanked[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    raise SystemExit("encode_instruction: the body's braces do not balance in the "
+                     "blanked view -- the scan is wrong, not the dispatcher")
+
+
+def in_span(offset: int, spans: list[tuple[int, int]]) -> bool:
+    """Is this offset inside literal *content* (where text is data, not code)?"""
+    return any(start <= offset < end for start, end in spans)
 
 
 def alias_family_templates(arms: set[str]) -> dict[str, list[str]]:
@@ -449,6 +677,39 @@ def check(ns: argparse.Namespace) -> int:
         if mnemonic not in arms:
             print(f"stale row: `{mnemonic}` is no longer a dispatcher arm")
             bad += 1
+    # The arm-set half runs BEFORE any toolchain is touched, and the header is
+    # part of it: `# arms:` is the authority the docs cite, so a dispatcher that
+    # grew an arm without the file being regenerated must fail here -- in an
+    # environment with no binutils at all.
+    missing = sorted(arms - {m for m, _, _ in rows})
+    for m in missing:
+        print(f"uncovered dispatcher arm: `{m}`")
+        bad += 1
+    header = next(
+        (
+            int(line.split(":", 1)[1].split()[0])
+            for line in TSV.read_text().splitlines()
+            if line.startswith("# arms:")
+        ),
+        None,
+    )
+    if header is None:
+        print("the TSV has no `# arms:` line to check the enumeration against")
+        bad += 1
+    elif header != len(arms):
+        print(
+            f"arm-count drift: the TSV header says {header}, the dispatcher has "
+            f"{len(arms)} -- re-run without --check"
+        )
+        bad += 1
+    # ... and so does its verdict.  Checking the enumeration first and *deciding*
+    # after the oracle ran meant a structural finding could be swallowed by a
+    # toolchain that fails to start: on a host without the pinned binutils this
+    # script died in a FileNotFoundError and never printed the drift it had
+    # already seen, which is the same class of silence as a test that cannot run.
+    if bad:
+        print(f"{bad} structural problem(s); the oracle was not consulted")
+        return 1
     tc = build_toolchain(ns)
     try:
         for mnemonic, text, word in rows:
@@ -459,10 +720,6 @@ def check(ns: argparse.Namespace) -> int:
                 bad += 1
     finally:
         tc.close()
-    missing = sorted(arms - {m for m, _, _ in rows})
-    for m in missing:
-        print(f"uncovered dispatcher arm: `{m}`")
-        bad += 1
     if bad:
         print(f"{bad} problem(s)")
         return 1

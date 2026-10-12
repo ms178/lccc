@@ -2762,29 +2762,237 @@ mod gas247_golden_word_tests {
     /// parse -> dispatcher -> leaf path here, on a host with no cross
     /// tools.  Regenerate with `scripts/gen_aarch64_dispatcher_goldens.py`
     /// (exit 0 requires full coverage) and verify with `--check`.
+    /// A view of `src` in which only *code* remains: `//` and `/* */` comments
+    /// (block comments nest, as Rust defines) and the contents of string,
+    /// byte-string and char literals are replaced by spaces.  Length, offsets
+    /// and line breaks are preserved, so any slice of this view is addressable
+    /// with the same indices as `src`.
+    ///
+    /// This exists because both ratchets below delimit a region and count arm
+    /// heads textually.  Textual rules over a language with block comments,
+    /// raw strings and char literals are forgeable: the first version ended the
+    /// counted region at the first `}` in column 0, and a `}` at the start of a
+    /// line inside an `r#"…"#` literal truncates the region to nothing -- the
+    /// ratchet then enumerates zero arms and prints a satisfied count over the
+    /// hole.  Blanking non-code is the smallest thing that makes "brace depth"
+    /// mean brace depth.
+    fn code_view(src: &str) -> String {
+        let b = src.as_bytes();
+        let mut out: Vec<u8> = Vec::with_capacity(b.len());
+        let mut i = 0usize;
+        let ident = |k: usize| k < b.len() && (b[k].is_ascii_alphanumeric() || b[k] == b'_');
+        while i < b.len() {
+            match b[i] {
+                b'/' if i + 1 < b.len() && b[i + 1] == b'/' => {
+                    while i < b.len() && b[i] != b'\n' {
+                        out.push(b' ');
+                        i += 1;
+                    }
+                }
+                b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
+                    let mut depth = 1usize;
+                    out.push(b' ');
+                    out.push(b' ');
+                    i += 2;
+                    while i < b.len() && depth > 0 {
+                        if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+                            depth += 1;
+                            out.push(b' ');
+                            out.push(b' ');
+                            i += 2;
+                        } else if b[i] == b'*' && i + 1 < b.len() && b[i + 1] == b'/' {
+                            depth -= 1;
+                            out.push(b' ');
+                            out.push(b' ');
+                            i += 2;
+                        } else {
+                            out.push(if b[i] == b'\n' { b'\n' } else { b' ' });
+                            i += 1;
+                        }
+                    }
+                }
+                b'"' | b'r' | b'b' | b'\'' => {
+                    // A literal prefix only counts as one at a token boundary:
+                    // the `r` at the end of `"xzr"` sitting just before that
+                    // literal's closing quote is not the start of a raw string,
+                    // and reading it as one blanks real code between two
+                    // literals -- which unbalances every brace downstream.
+                    let starts_literal = b[i] == b'"'
+                        || (b[i] != b'\''
+                            && !ident(i.wrapping_sub(1).min(b.len() - 1))
+                            && (i + 1 < b.len())
+                            && (b[i + 1] == b'"'
+                                || (b[i + 1] == b'r' && i + 2 < b.len() && b[i + 2] == b'"')
+                                || (b[i + 1] == b'r' && i + 2 < b.len() && b[i + 2] == b'#')));
+                    if b[i] == b'\'' {
+                        // char literal, or a lifetime: only blank the former.
+                        let mut j = i + 1;
+                        if j < b.len() && b[j] == b'\\' {
+                            j += 2;
+                        } else {
+                            j += 1;
+                        }
+                        if j < b.len() && b[j] == b'\'' {
+                            out.extend(std::iter::repeat_n(b' ', j - i + 1));
+                            i = j + 1;
+                            continue;
+                        }
+                        out.push(b[i]);
+                        i += 1;
+                        continue;
+                    }
+                    if !starts_literal {
+                        out.push(b[i]);
+                        i += 1;
+                        continue;
+                    }
+                    let mut k = i;
+                    if b[k] == b'b' {
+                        k += 1;
+                    }
+                    let raw = b[k] == b'r';
+                    if raw {
+                        k += 1;
+                    }
+                    let mut hashes = 0usize;
+                    while raw && k < b.len() && b[k] == b'#' {
+                        hashes += 1;
+                        k += 1;
+                    }
+                    if k >= b.len() || b[k] != b'"' {
+                        out.push(b[i]);
+                        i += 1;
+                        continue;
+                    }
+                    // Copy the opening delimiter, blank the contents, then let
+                    // the closing delimiter be read as code again.
+                    for _ in i..k + 1 {
+                        out.push(
+                            if b[i] == b'b' || b[i] == b'r' || b[i] == b'#' || b[i] == b'"' {
+                                b[i]
+                            } else {
+                                b' '
+                            },
+                        );
+                    }
+                    // `out` must stay index-aligned with `src`, so emit exactly
+                    // (k + 1 - i) bytes and then blank content bytes one for one.
+                    let body = k + 1;
+                    if raw {
+                        let closer: Vec<u8> = std::iter::once(b'"')
+                            .chain(std::iter::repeat_n(b'#', hashes))
+                            .collect();
+                        let mut j = body;
+                        while j < b.len() {
+                            if b[j] == b'\n' {
+                                out.push(b'\n');
+                                j += 1;
+                                continue;
+                            }
+                            if b[j..].starts_with(&closer) {
+                                for c in &closer {
+                                    out.push(*c);
+                                }
+                                j += closer.len();
+                                break;
+                            }
+                            out.push(b' ');
+                            j += 1;
+                        }
+                        i = j;
+                    } else {
+                        let mut j = body;
+                        while j < b.len() && b[j] != b'"' && b[j] != b'\n' {
+                            if b[j] == b'\\' {
+                                out.push(b' ');
+                                if j + 1 < b.len() && b[j + 1] == b'\n' {
+                                    out.push(b'\n');
+                                } else {
+                                    out.push(b' ');
+                                }
+                                j += 2;
+                                continue;
+                            }
+                            out.push(b' ');
+                            j += 1;
+                        }
+                        // The closing quote is code again, and must be consumed
+                        // as such: leaving `i` on it makes the next iteration read
+                        // that quote as the OPENING quote of another literal and
+                        // blank the real code between the two literals -- the
+                        // exact misfire that cost the generator 403 arms.
+                        if j < b.len() {
+                            out.push(b[j]);
+                            j += 1;
+                        }
+                        i = j;
+                    }
+                }
+                _ => {
+                    out.push(b[i]);
+                    i += 1;
+                }
+            }
+        }
+        assert_eq!(
+            out.len(),
+            src.len(),
+            "code_view must stay offset-aligned with its input; a view of the wrong \
+             length silently shifts every offset the ratchets depend on"
+        );
+        String::from_utf8(out).expect("blanking only replaces bytes with spaces")
+    }
+
+    /// The first `}` that closes the `{` opened at or after `from`, by depth over
+    /// an already-blanked view.  Refuses to lie: an unbalanced or missing brace is
+    /// an error in the *scan*, and the caller must not fall back to a wider region.
+    fn block_end(view: &str, from: usize) -> usize {
+        let bytes = view.as_bytes();
+        let open = match bytes[from..].iter().position(|c| *c == b'{') {
+            Some(p) => from + p,
+            None => panic!("no opening brace after the item head at offset {from}"),
+        };
+        let mut depth = 0i64;
+        for idx in open..bytes.len() {
+            match bytes[idx] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return idx + 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!(
+            "braces do not balance from offset {open} in the blanked view -- the \
+                scan is wrong, not the dispatcher"
+        )
+    }
+
     #[test]
     fn dispatcher_goldens_ratchet_one_row_per_arm() {
         // Arm set: same mechanical rule as the generator -- mnemonic keys
         // at line start inside the `encode_instruction` body.
         let src = include_str!("mod.rs");
+        // Comments and literal contents blanked, offsets preserved: `a` and
+        // `close` index `src` itself, while the region *end* is decided by brace
+        // depth over the view where only code remains.  The previous rule took
+        // the first `}` in column 0, which is a fact about layout, not about the
+        // function: the dispatcher's body spans several `match`es and ends at an
+        // indented `}`, so the column-0 rule actually ran to the end of the
+        // enclosing item -- and on the generator's copy of the rule a raw string
+        // containing a line-initial `}` truncates the region to zero arms while
+        // still printing a satisfied count.  Both ends must be structural.
+        let view = code_view(src);
         let a = src
             .find("pub fn encode_instruction(")
             .expect("encode_instruction found");
-        // Delimit the counted region with the dispatcher's own closing brace:
-        // `encode_instruction` is a top-level `fn`, so the first `}` at column 0
-        // after it ends the body.  The earlier version scanned for the next
-        // `\npub fn ` and fell back to `src.len()`, which let the region run to
-        // EOF as soon as any `pub fn` was inserted above the dispatcher -- and the
-        // ratchet would then certify whatever it happened to see (423 names, 526,
-        // or a number that merely matched) without saying so.  A latch with no way
-        // to fail is not a latch, so both ends of the region must be provable.
-        let close = src[a..]
-            .find("\n}")
-            .map(|i| a + i)
-            .expect("encode_instruction body must end at a column-0 `}`");
+        let close = block_end(&view, a);
         let body = &src[a..close];
         assert!(
-            close < src.len() && !body.contains("#[test]"),
+            close <= src.len() && !body.contains("#[test]"),
             "the counted region must stop at the dispatcher's closing brace, not at \
              EOF (close={close} of {} bytes, body={} bytes)",
             src.len(),
@@ -2805,7 +3013,12 @@ mod gas247_golden_word_tests {
         // with no cross assembler, so sharing one implementation is not an
         // option and pinning the count is the next best thing.
         let mut arms: Vec<String> = Vec::new();
+        // Head matching runs on the comment-blanked view of the same lines, so a
+        // commented-out `"cas" =>` cannot be counted as an arm; key text still
+        // comes from `body`, because an arm key *is* a string literal.
+        let head_view = code_view(body);
         let lines: Vec<&str> = body.lines().collect();
+        let head_lines: Vec<&str> = head_view.lines().collect();
         let key_ok = |mn: &str| -> bool {
             !mn.is_empty()
                 && mn
@@ -2814,7 +3027,10 @@ mod gas247_golden_word_tests {
         };
         let mut i = 0usize;
         while i < lines.len() {
-            if !lines[i].starts_with("        \"") {
+            if !head_lines
+                .get(i)
+                .is_some_and(|l| l.starts_with("        \""))
+            {
                 i += 1;
                 continue;
             }
@@ -2829,10 +3045,10 @@ mod gas247_golden_word_tests {
                     }
                     rest = &after[end + 1..];
                 }
-                let head_done = lines[i].contains("=>");
+                let head_done = head_lines[i].contains("=>");
                 i += 1;
                 if head_done
-                    || !lines
+                    || !head_lines
                         .get(i)
                         .is_some_and(|l| l.trim_start().starts_with('|'))
                 {
@@ -2841,6 +3057,12 @@ mod gas247_golden_word_tests {
             }
         }
         arms.sort();
+        assert!(
+            !arms.is_empty(),
+            "the dispatcher region yielded no arms: the region or the arm-head rule \
+             is broken. An empty arm set must never be read as 'nothing to check' -- \
+             that is how a ratchet certifies a hole."
+        );
 
         let tsv_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/aarch64/dispatcher-goldens.tsv");
@@ -3255,8 +3477,19 @@ mod gas247_golden_word_tests {
                 continue;
             }
             found.push(name);
-            if !chunk.contains("neon_shapes_agree(operands, 3") {
-                missing.push((name, chunk.matches('\n').count()));
+            // Not `chunk.contains(..)`: a call that only exists in a comment, or
+            // one that runs *after* the encoding word has already been built, is
+            // not the check the law requires.  `code_view` removes comments, and
+            // the call must precede the leaf's first `Ok(` -- the point where the
+            // word exists and refusing is no longer possible.  This is still a
+            // source-level proxy (no macro expansion), which is why the
+            // behavioral latch below is the other half of the gate.
+            let code = code_view(chunk);
+            let call = code.find("neon_shapes_agree(operands, 3");
+            let first_ok = code.find("Ok(");
+            match (call, first_ok) {
+                (Some(at), Some(ok)) if at < ok => {}
+                _ => missing.push((name, chunk.matches('\n').count())),
             }
         }
         for name in EXPECT {
@@ -3267,6 +3500,15 @@ mod gas247_golden_word_tests {
                  is worse than no gate"
             );
         }
+        // A behavioural-per-leaf latch (every leaf the census finds must have a
+        // mismatched-spelling case of its own) was the obvious next step and is
+        // deliberately NOT faked here: these leaves are reached indirectly
+        // (`"and" => encode_logical(..)`, and friends), so binding a mnemonic to a
+        // leaf needs whole-crate reachability, not a table this file cannot check.
+        // A hand-maintained table with per-leaf exemptions would be the
+        // "carve-out that can absorb anything" this audit is about -- see the
+        // `syn`-based census that would make it sound.
+
         assert!(
             missing.is_empty(),
             "three-same leaves without an arrangement-agreement check: {missing:?} \

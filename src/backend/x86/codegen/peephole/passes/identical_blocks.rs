@@ -324,6 +324,9 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
                         if infos[end].kind == LineKind::Label {
                             break;
                         }
+                        // DIRECTIVE-LAW: bails -- the class test opens a branch that
+                        // reads the directive's text; the window below never advances
+                        // past a directive it has not classified.
                         if infos[end].kind == LineKind::Directive {
                             // .loc/.file debug directives are INERT text markers
                             // (parsed but carry no semantics): they must not
@@ -498,8 +501,13 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
                 if infos[k].is_nop() || infos[k].kind == LineKind::Label {
                     continue;
                 }
-                if infos[k].kind == LineKind::Directive {
-                    // .cfi_*/.loc/.file/alignment lines carry no code.
+                // The law, not the class: `.cfi_*`/.loc/.file/alignment lines carry
+                // no code and are stepped over, and a data directive -- which *is*
+                // code the text does not spell out -- ends the backward walk like
+                // any other opaque line.  Testing `kind == Directive` here skipped
+                // `.long .L1-.L2` and then read the instruction before it as the
+                // last one, which is how `flows_in` was decided.
+                if infos[k].is_steppable() {
                     continue;
                 }
                 last_insn = Some(infos[k].kind);

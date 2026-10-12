@@ -896,19 +896,22 @@ impl Lowerer {
                     return sig.return_type;
                 }
             } else {
+                // Nested-function scoping: the signature of the entity being
+                // called, not of the same-named file-scope symbol.
+                let sig_key = self.callee_signature_key(name.as_str());
                 if let Some(ret_ty) = self
                     .func_meta
                     .sigs
-                    .get(name.as_str())
+                    .get(sig_key.as_str())
                     .map(|s| s.return_type)
                 {
                     return ret_ty;
                 }
-                if let Some(ret_ty) = self.builtin_return_type(name) {
+                if let Some(ret_ty) = self.builtin_return_type(&sig_key) {
                     return ret_ty;
                 }
                 // Fall back to sema's function signatures for IrType derivation
-                if let Some(func_info) = self.sema_functions.get(name.as_str()) {
+                if let Some(func_info) = self.sema_functions.get(sig_key.as_str()) {
                     return IrType::from_ctype(&func_info.return_type);
                 }
             }
@@ -1734,17 +1737,20 @@ impl Lowerer {
                             }
                         }
                     }
+                    // Same rule as the IrType path above: a call to a visible
+                    // nested function is typed by the nested entity's record.
+                    let sig_key = self.callee_signature_key(name.as_str());
                     // First check lowerer's own func_meta (has ABI-adjusted return_ctype)
                     if let Some(ctype) = self
                         .func_meta
                         .sigs
-                        .get(name.as_str())
+                        .get(sig_key.as_str())
                         .and_then(|s| s.return_ctype.as_ref())
                     {
                         return Some(ctype.clone());
                     }
                     // Fall back to sema's authoritative function signatures
-                    if let Some(func_info) = self.sema_functions.get(name.as_str()) {
+                    if let Some(func_info) = self.sema_functions.get(sig_key.as_str()) {
                         return Some(func_info.return_type.clone());
                     }
                 }

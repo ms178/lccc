@@ -3,6 +3,7 @@
 use super::emit::{X86_ARG_REGS, X86Codegen};
 use crate::backend::call_abi::{CallAbiConfig, CallArgClass, compute_stack_push_bytes};
 use crate::backend::generation::is_i128_type;
+use crate::backend::narrow_copy::{NarrowCopy, eax_ferry, narrow_copy_plan, narrow_move_mnemonic};
 use crate::common::types::IrType;
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, Operand, Value};
 
@@ -502,23 +503,25 @@ impl X86Codegen {
                                 // In particular a packed object can end at a
                                 // guard page. Copy only its 1..7 actual bytes.
                                 self.state.emit("    pushq $0");
-                                let mut copied = 0usize;
-                                for (width, mnemonic, reg) in
-                                    [(4, "movl", "ecx"), (2, "movw", "cx"), (1, "movb", "cl")]
+                                for NarrowCopy { offset: at, width } in
+                                    narrow_copy_plan(size - offset, 4)
                                 {
-                                    if copied + width <= size - offset {
-                                        self.state.emit_fmt(format_args!(
-                                            "    {} {}(%rax), %{}",
-                                            mnemonic,
-                                            offset + copied,
-                                            reg
-                                        ));
-                                        self.state.emit_fmt(format_args!(
-                                            "    {} %{}, {}(%rsp)",
-                                            mnemonic, reg, copied
-                                        ));
-                                        copied += width;
-                                    }
+                                    let mnemonic = narrow_move_mnemonic(width);
+                                    let reg = match width {
+                                        4 => "ecx",
+                                        2 => "cx",
+                                        _ => "cl",
+                                    };
+                                    self.state.emit_fmt(format_args!(
+                                        "    {} {}(%rax), %{}",
+                                        mnemonic,
+                                        offset + at,
+                                        reg
+                                    ));
+                                    self.state.emit_fmt(format_args!(
+                                        "    {} %{}, {}(%rsp)",
+                                        mnemonic, reg, at
+                                    ));
                                 }
                             }
                         }
@@ -703,6 +706,68 @@ impl X86Codegen {
         self.state.reg_cache.invalidate_all();
         self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();
+    }
+
+    /// Load `len` (1..=8) bytes at `off` of the object addressed by %rax into
+    /// `dest`, guaranteeing no access outside `[off, off + len)`.
+    ///
+    /// A register-classified aggregate is loaded per eightbyte, and the psABI
+    /// says nothing about the bytes of the *last* eightbyte beyond the object's
+    /// end -- so an unconditional `movq 8(%rax)` for a 9-byte struct reads 7
+    /// bytes the C program does not own.  That is not a cosmetic over-read: an
+    /// object can end at a page boundary, and `tests/regression/
+    /// large_aggregate_call_copy.c` places its aggregate exactly there, where the
+    /// over-read is a SIGSEGV (measured: sizes 1, 7, 9 and 15 faulted with lccc as
+    /// the caller, 8 did not -- the exact profile of qword rounding).  The stack
+    /// path in `emit_call_stack_args_impl` already refuses to do this, with the
+    /// comment that ABI rounding "does not license a read past the C object"; this
+    /// is the same rule on the register side.
+    ///
+    /// The bytes are staged through a 16-byte transient in the outgoing area
+    /// (balanced before returning, like the `_Float128` constant path below), so
+    /// the sequence needs no register besides %rax -- every other GP is either an
+    /// argument register for a call site we cannot see from here or already
+    /// staged.  `dest`'s unspecified bytes keep whatever the temp held, which the
+    /// psABI allows and `rep movsb`-style copies never promised either.
+    fn emit_small_aggregate_eightbyte_load(&mut self, off: usize, len: usize, dest: &str) {
+        if len >= 8 {
+            // Whole eightbyte: in bounds by construction, and one instruction.
+            self.state
+                .out
+                .emit_instr_mem_reg("    movq", off as i64, "rax", dest);
+            return;
+        }
+        debug_assert!(
+            off + len <= 16,
+            "small aggregates span at most two eightbytes"
+        );
+        // %rax carries the source address through the whole sequence, so it is
+        // parked in the transient frame: every ferry load goes through it and
+        // destroys the previous value.  Restoring it afterwards keeps whatever the
+        // surrounding staging assumed about %rax intact, and the pair is balanced
+        // before returning, exactly like the `_Float128` constant staging below.
+        self.state.emit("    subq $16, %rsp");
+        self.state.emit("    movq %rax, 8(%rsp)");
+        debug_assert!(
+            len >= 1,
+            "a zero-length ferry load copies nothing; the caller must not call that success"
+        );
+        for NarrowCopy { offset, width } in narrow_copy_plan(len, 4) {
+            let mn = narrow_move_mnemonic(width);
+            let ferry = eax_ferry(width);
+            self.state.emit("    movq 8(%rsp), %rax");
+            self.state.emit_fmt(format_args!(
+                "    {mn} {}(%rax), {ferry}",
+                (off + offset) as i64
+            ));
+            self.state
+                .emit_fmt(format_args!("    {mn} {ferry}, {}(%rsp)", offset as i64));
+        }
+        self.state
+            .out
+            .emit_instr_mem_reg("    movq", 0, "rsp", dest);
+        self.state.emit("    movq 8(%rsp), %rax");
+        self.state.emit("    addq $16, %rsp");
     }
 
     pub(super) fn emit_call_reg_args_impl(
@@ -1039,30 +1104,26 @@ impl X86Codegen {
                 CallArgClass::StructByValReg { base_reg_idx, size } => {
                     self.operand_to_rax(arg);
                     let lo_reg = X86_ARG_REGS[base_reg_idx];
-                    self.state
-                        .out
-                        .emit_instr_mem_reg("    movq", 0, "rax", lo_reg);
+                    self.emit_small_aggregate_eightbyte_load(0, size.min(8), lo_reg);
                     if size > 8 {
                         let hi_reg = X86_ARG_REGS[base_reg_idx + 1];
-                        self.state
-                            .out
-                            .emit_instr_mem_reg("    movq", 8, "rax", hi_reg);
+                        self.emit_small_aggregate_eightbyte_load(8, size - 8, hi_reg);
                     }
                 }
                 CallArgClass::StructSseReg {
                     lo_fp_idx,
                     hi_fp_idx,
-                    ..
+                    size,
                 } => {
                     self.operand_to_rax(arg);
-                    self.state
-                        .out
-                        .emit_instr_mem_reg("    movq", 0, "rax", xmm_regs[lo_fp_idx]);
+                    self.emit_small_aggregate_eightbyte_load(0, size.min(8), xmm_regs[lo_fp_idx]);
                     float_count += 1;
                     if let Some(hi) = hi_fp_idx {
-                        self.state
-                            .out
-                            .emit_instr_mem_reg("    movq", 8, "rax", xmm_regs[hi]);
+                        self.emit_small_aggregate_eightbyte_load(
+                            8,
+                            size.saturating_sub(8).min(8),
+                            xmm_regs[hi],
+                        );
                         float_count += 1;
                     }
                 }
@@ -1146,35 +1207,33 @@ impl X86Codegen {
                 CallArgClass::StructMixedIntSseReg {
                     int_reg_idx,
                     fp_reg_idx,
-                    ..
+                    size,
                 } => {
                     self.operand_to_rax(arg);
-                    self.state
-                        .out
-                        .emit_instr_mem_reg("    movq", 8, "rax", xmm_regs[fp_reg_idx]);
+                    self.emit_small_aggregate_eightbyte_load(
+                        8,
+                        size.saturating_sub(8).min(8),
+                        xmm_regs[fp_reg_idx],
+                    );
                     float_count += 1;
-                    self.state.out.emit_instr_mem_reg(
-                        "    movq",
+                    self.emit_small_aggregate_eightbyte_load(
                         0,
-                        "rax",
+                        size.min(8),
                         X86_ARG_REGS[int_reg_idx],
                     );
                 }
                 CallArgClass::StructMixedSseIntReg {
                     fp_reg_idx,
                     int_reg_idx,
-                    ..
+                    size,
                 } => {
                     self.operand_to_rax(arg);
-                    self.state.out.emit_instr_mem_reg(
-                        "    movq",
+                    self.emit_small_aggregate_eightbyte_load(
                         8,
-                        "rax",
+                        size.saturating_sub(8).min(8),
                         X86_ARG_REGS[int_reg_idx],
                     );
-                    self.state
-                        .out
-                        .emit_instr_mem_reg("    movq", 0, "rax", xmm_regs[fp_reg_idx]);
+                    self.emit_small_aggregate_eightbyte_load(0, size.min(8), xmm_regs[fp_reg_idx]);
                     float_count += 1;
                 }
                 CallArgClass::FloatReg { reg_idx } => {

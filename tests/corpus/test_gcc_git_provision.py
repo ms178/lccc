@@ -45,6 +45,34 @@ class ProvisionContract(unittest.TestCase):
     def provision(self, ref="refs/heads/master"):
         return provisioner.provision(str(self.upstream), ref, self.destination)
 
+    def test_option_shaped_ref_never_reaches_git(self):
+        # `--ref` is threaded into `git ls-remote ... <ref>`, so a value that starts
+        # with a dash is an *option* to git, not a name: `--upload-pack=<cmd>` is the
+        # classic way a "ref" becomes a subprocess.  The guard has to reject it
+        # before anything is spawned, and it must not merely fail -- a run that
+        # crashed after invoking git would leave the marker below behind.
+        marker = self.root / "spawned"
+        real = subprocess.check_output
+
+        def spy(cmd, *args, **kwargs):
+            if cmd and cmd[0] == "git":
+                marker.write_text("git was invoked")
+            return real(cmd, *args, **kwargs)
+
+        with mock.patch.object(subprocess, "check_output", side_effect=spy):
+            for hostile in ("--upload-pack=touch /tmp/nope", "-x", "", "refs/heads/m ast"):
+                with self.subTest(ref=hostile):
+                    with self.assertRaises(ValueError) as ctx:
+                        provisioner.resolve(str(self.upstream), hostile)
+                    self.assertIn("--ref", str(ctx.exception))
+            # A repository spelled as an option is refused for the same reason.
+            with self.assertRaises(ValueError):
+                provisioner.resolve("--upload-pack=echo", "refs/heads/master")
+        self.assertFalse(marker.exists(), "a refused value still reached git")
+        # Positive control: the shapes the guard must accept still resolve.
+        self.assertEqual(provisioner.resolve(str(self.upstream), "refs/heads/master"), self.commit)
+        self.assertEqual(provisioner.resolve(str(self.upstream), self.commit.upper()), self.commit)
+
     def test_pinned_checkout_stamp_and_idempotence(self):
         first = self.provision()
         self.assertEqual(first["commit"], self.commit)

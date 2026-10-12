@@ -943,6 +943,9 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                 if infos[k].is_nop() || matches!(infos[k].kind, LineKind::Push { .. }) {
                     continue;
                 }
+                // DIRECTIVE-LAW: bails -- this test opens the branch that *ends* the
+                // backward walk; the CFI strings below only decide whether the walk
+                // found a prologue before it ended, and nothing is stepped over.
                 if matches!(infos[k].kind, LineKind::Directive) {
                     let dl = infos[k].trimmed(store.get(k));
                     if dl.contains("cfi_startproc") || dl.contains("cfi_def_cfa_offset") {
@@ -959,8 +962,14 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
 
             // Skip callee-saved register saves after the subq
             let mut j = next_non_nop(infos, i + 1, len);
-            // Skip .cfi_def_cfa_offset directive if present
-            if j < len && matches!(infos[j].kind, LineKind::Directive) {
+            // Skip .cfi_def_cfa_offset directive if present.  By *text*: matching the
+            // class would step the prologue walk over any directive, including a
+            // `.long` that emits instructions, and the callee-save scan below would
+            // then start inside data.  // DIRECTIVE-LAW: selecting
+            if j < len
+                && infos[j].kind == LineKind::Directive
+                && infos[j].trimmed(store.get(j)).starts_with(".cfi_")
+            {
                 j = next_non_nop(infos, j + 1, len);
             }
             let mut callee_save_end = j;
@@ -1301,11 +1310,8 @@ fn stack_top_is_consumed_next(
     end: usize,
 ) -> bool {
     while idx < end {
-        if infos[idx].is_nop()
-            || matches!(
-                infos[idx].kind,
-                LineKind::Empty | LineKind::Directive | LineKind::Label
-            )
+        if matches!(infos[idx].kind, LineKind::Empty | LineKind::Label)
+            || super::helpers::steps_over_line(&infos[idx], infos[idx].trimmed(store.get(idx)))
         {
             idx += 1;
             continue;
@@ -1326,7 +1332,7 @@ fn is_epilogue_rsp_shift(store: &LineStore, infos: &[LineInfo], k: usize, func_e
     let mut j = k;
     let limit = (k + 24).min(func_end);
     while j < limit {
-        if infos[j].is_nop() || matches!(infos[j].kind, LineKind::Directive) {
+        if super::helpers::steps_over_line(&infos[j], infos[j].trimmed(store.get(j))) {
             j += 1;
             continue;
         }

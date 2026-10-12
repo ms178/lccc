@@ -4319,6 +4319,25 @@ def _dso_emit_semantics_i386_test(args, oracles):
         cxx = shutil.which(CXX)
         if not cxx:
             return Result(name, "SKIP", f"C part passed; C++ part needs {CXX}")
+        # "`g++` exists" and "`g++ -m32` works" are two capabilities: the 32-bit
+        # libstdc++ headers (the `bits/c++config.h` under the `32/` tuple
+        # directory) ship separately from gcc-multilib's C parts, so a host with
+        # C-only multilib fails the C++ leg below on a *compiler* diagnostic that
+        # says nothing about the linker under test.  Probe the same include chain
+        # the library translation unit uses, name the package to install, and let
+        # LCCC_REQUIRE_I386=1 -- which CI sets -- keep that a failure.
+        with open(os.path.join(td, "cxxprobe.cc"), "w") as f:
+            f.write("#include <stdexcept>\n"
+                    "int probe() { throw std::runtime_error(\"x\"); }\n")
+        probe = sh([cxx, "-m32", "-c", "cxxprobe.cc", "-o", "cxxprobe.o"], cwd=td)
+        if probe.returncode != 0:
+            status = "FAIL" if os.environ.get("LCCC_REQUIRE_I386") == "1" else "SKIP"
+            return Result(
+                name,
+                status,
+                "C part passed; 32-bit libstdc++ unusable here (install g++-multilib "
+                f"and lib32stdc++-14-dev): {probe.stderr.decode()[:150]}",
+            )
         r = sh([cxx, "-m32", "-B" + shim, "-shared", "-fPIC", "-O1", "cxxlib.cc",
                 "-o", "libcx.so"], cwd=td)
         if r.returncode != 0:

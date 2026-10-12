@@ -750,7 +750,7 @@ impl FileLiveness {
         if (lo..=hi).any(|p| self.structural[p] || is_structural(store, infos, p)) {
             return false;
         }
-        let real = |n: usize| !infos[n].is_nop() && infos[n].kind != LineKind::Directive;
+        let real = |n: usize| !infos[n].is_steppable();
         // A call's read set comes from the marker window after it
         // (`call_site_reads` looks at most 4 lines ahead).
         if (lo.saturating_sub(5).max(start)..lo)
@@ -851,7 +851,7 @@ impl FileLiveness {
             let mut k = n;
             while k > start {
                 k -= 1;
-                if infos[k].is_nop() || infos[k].kind == LineKind::Directive {
+                if super::helpers::steps_over_line(&infos[k], infos[k].trimmed(store.get(k))) {
                     continue;
                 }
                 if matches!(
@@ -1019,7 +1019,7 @@ impl FileLiveness {
         let mut succs: Vec<Vec<usize>> = vec![Vec::new(); end.saturating_sub(start)];
         let mut lines: Vec<usize> = Vec::new();
         for n in start..end {
-            if infos[n].is_nop() || infos[n].kind == LineKind::Directive {
+            if super::helpers::steps_over_line(&infos[n], infos[n].trimmed(store.get(n))) {
                 continue;
             }
             lines.push(n);

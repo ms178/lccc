@@ -472,7 +472,31 @@ impl<'a> ExprTypeChecker<'a> {
         }
 
         if let Expr::Identifier(name, _) = stripped {
-            // Check function signatures first
+            // The lexical binding first, the translation-unit record second.
+            //
+            // A block-scope declaration of a function -- a GNU nested function, or
+            // a function-pointer variable -- shadows the file-scope entity of that
+            // basename (C11 6.2.1p4), and this tree lowers the *call* to the
+            // shadowing entity. Reading `functions[name]` first therefore typed the
+            // call with the wrong entity's signature while emitting the call to the
+            // right symbol: for `int f(int)` at file scope and a nested
+            // `double f(double)` inside `g`, `g`'s `f(1.5)` was lowered as a
+            // double-returning chain call and then converted `%xmm0`'s FP result
+            // through `vcvtsi2sd` because the *expression type* said `int`. The ABI
+            // and the value disagreed silently.
+            //
+            // The ordering is safe for the ordinary case: a file-scope function
+            // declared `int f(int)` is in the scope table with exactly that type, so
+            // preferring the scope cannot change its answer; where the scope holds
+            // something else, that something else is what the name means.
+            if let Some(sym) = self.symbols.lookup(name) {
+                if matches!(sym.ty, CType::Function(_)) {
+                    if let Some(ct) = Self::extract_return_ctype_from_type(&sym.ty) {
+                        return Some(ct);
+                    }
+                }
+            }
+            // Check function signatures (external entities and implicit decls)
             if let Some(func_info) = self.functions.get(name.as_str()) {
                 return Some(func_info.return_type.clone());
             }

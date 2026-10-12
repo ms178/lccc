@@ -97,7 +97,10 @@ impl Lowerer {
         };
         let ptr_count = DerivedDeclarator::return_pointer_depth(&declarator.derived);
         if let Some((params, variadic)) = func_info {
+            let entity =
+                self.block_scope_entity_key(&declarator.name, declarator.attrs.is_nested_fn());
             self.register_block_func_meta(
+                entity.as_deref(),
                 &declarator.name,
                 &decl.type_spec,
                 ptr_count,
@@ -110,21 +113,46 @@ impl Lowerer {
             // macro (which uses block-scope `extern void __compiletime_assert_NNN(void)
             // __attribute__((error(...)))`) would emit real calls to undefined symbols
             // instead of replacing them with Unreachable.
-            if declarator.attrs.is_error_attr() && !declarator.name.is_empty() {
-                self.error_functions.insert(declarator.name.clone());
+            // Same scoping law as the signature table above: these sets are
+            // keyed by symbol, so an `auto` declaration must not attach its
+            // attributes to the file-scope entity of the same basename -- an
+            // `error` would reject a legal call elsewhere in the TU, and a
+            // `noreturn` would let code after an unrelated call be dropped as
+            // unreachable. When the entity is a nested one (mangled key
+            // available) the fact is recorded there; when it is a nested
+            // prototype with no definition in this TU, nothing can call it, so
+            // the fact has no carrier and is dropped.
+            let attr_key =
+                self.block_scope_entity_key(&declarator.name, declarator.attrs.is_nested_fn());
+            let attr_key = attr_key.filter(|_| !declarator.name.is_empty());
+            if declarator.attrs.is_error_attr() {
+                if let Some(k) = &attr_key {
+                    self.error_functions.insert(k.clone());
+                }
             }
-            if declarator.attrs.is_noreturn() && !declarator.name.is_empty() {
-                self.noreturn_functions.insert(declarator.name.clone());
+            if declarator.attrs.is_noreturn() {
+                if let Some(k) = &attr_key {
+                    self.noreturn_functions.insert(k.clone());
+                }
             }
-            if declarator.attrs.is_pure() && !declarator.name.is_empty() {
-                self.pure_functions.insert(declarator.name.clone());
+            if declarator.attrs.is_pure() {
+                if let Some(k) = &attr_key {
+                    self.pure_functions.insert(k.clone());
+                }
             }
-            if declarator.attrs.is_const_attr() && !declarator.name.is_empty() {
-                self.const_functions.insert(declarator.name.clone());
+            if declarator.attrs.is_const_attr() {
+                if let Some(k) = &attr_key {
+                    self.const_functions.insert(k.clone());
+                }
             }
             // Propagate __attribute__((weak)) and __attribute__((visibility(...)))
             // from block-scope extern function declarations.
-            if !declarator.name.is_empty()
+            // `weak`/`visibility` are properties of the *linker symbol*: a
+            // nested function is not the file-scope symbol of that basename, so
+            // an `auto` declaration must not retag it. The nested definition
+            // carries its own attributes for its own symbol.
+            if !declarator.attrs.is_nested_fn()
+                && !declarator.name.is_empty()
                 && (declarator.attrs.is_weak() || declarator.attrs.visibility.is_some())
             {
                 self.module.symbol_attrs.push((
@@ -141,7 +169,10 @@ impl Lowerer {
         if declarator.derived.is_empty() && declarator.init.is_none() {
             if let TypeSpecifier::TypedefName(tname) = &decl.type_spec {
                 if let Some(fti) = self.types.function_typedefs.get(tname).cloned() {
+                    let entity = self
+                        .block_scope_entity_key(&declarator.name, declarator.attrs.is_nested_fn());
                     self.register_block_func_meta(
+                        entity.as_deref(),
                         &declarator.name,
                         &fti.return_type,
                         0,
@@ -174,8 +205,47 @@ impl Lowerer {
     /// Must compute the same ABI metadata as `register_function_meta` so that
     /// member access on struct return values (e.g., `stfunc1().field`) works
     /// correctly even when the function is only forward-declared at block scope.
+    /// The symbol under which a block-scope function declaration's module-level
+    /// facts (signature, `error`/`noreturn`/`pure`/`const`, weak/visibility) are
+    /// recorded -- or `None` when there is no module-level fact to record.
+    ///
+    /// C11 6.7.1p5: a block-scope declaration of a function *without* `auto`
+    /// declares the externally-visible identifier, so its facts belong to that
+    /// symbol and any function in the translation unit may legitimately read
+    /// them. GNU `auto` is the one spelling that says otherwise -- it names a
+    /// nested function, a distinct entity that merely shares a basename, is
+    /// registered as `parent.name`, and is visible only in that parent's scope.
+    /// Writing its facts under the plain basename reaches functions that never
+    /// see the declaration: measured on
+    ///
+    /// ```c
+    /// int f(int x) { return x + 1; }
+    /// int g(void) { auto double f(double); return 0; }
+    /// int main(void) { return f(41) != 42; }
+    /// ```
+    ///
+    /// `main`'s call was emitted as a *double* call with `vcvtsi2sd` on the
+    /// argument (lccc exited 1, gcc 0) because the signature table is keyed per
+    /// module. The same mechanism through `__attribute__((noreturn))` would
+    /// delete `main`'s code after the call as unreachable, and through
+    /// `__attribute__((error("...")))` would reject a call that is perfectly
+    /// legal. A nested entity gets its facts from its own definition, which is
+    /// emitted under the mangled symbol; a nested *prototype* with no definition
+    /// in this translation unit cannot be called at all (GCC rejects it), so
+    /// dropping the entry loses nothing.
+    fn block_scope_entity_key(&self, name: &str, is_auto: bool) -> Option<String> {
+        if !is_auto {
+            return Some(name.to_string());
+        }
+        self.func()
+            .nested_functions
+            .get(name)
+            .map(|e| e.mangled.clone())
+    }
+
     fn register_block_func_meta(
         &mut self,
+        entity_key: Option<&str>,
         name: &str,
         ret_type_spec: &TypeSpecifier,
         ptr_count: usize,
@@ -183,6 +253,14 @@ impl Lowerer {
         variadic: bool,
     ) {
         self.known_functions.insert(name.to_string());
+        // The signature table is per-module, so a nested declaration is
+        // recorded under its mangled entity name -- the same key
+        // `callee_signature_key` resolves a call through -- and not at all when
+        // no nested entity of that name is visible here.
+        let Some(entity_key) = entity_key else {
+            return;
+        };
+        let name = entity_key;
         let mut ret_ty = self.type_spec_to_ir(ret_type_spec);
         if ptr_count > 0 {
             ret_ty = IrType::Ptr;

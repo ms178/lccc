@@ -128,7 +128,13 @@ pub struct ElfWriterBase {
     /// addralign 2**1), and AArch64 has no floor at all — `.p2align 1` there
     /// aligns to 2 exactly.
     code_align_floor: u64,
-    /// Default text section alignment (4 for ARM, 2 for RISC-V with compressed instructions)
+    /// The alignment an *instruction* raises the current section to, not the
+    /// alignment `.text` is created with: 4 for ARM/AArch64, 2 for RISC-V (the
+    /// width of the narrowest instruction the target's law admits -- with the C
+    /// extension GAS gives `.text` 2 even for `.byte 1` alone, and 4 at
+    /// `-march=rv64im`, measured on riscv64-linux-gnu-as; lccc's own creation
+    /// value stays 1 until `note_instruction` runs; this is a deliberate
+    /// divergence for instruction-free `.text`).
     text_align: u64,
     /// Bytes of directive-generated fill materialized so far by this
     /// writer — bounded by [`MAX_TOTAL_DIRECTIVE_FILL`] (see there).

@@ -227,6 +227,7 @@ impl Parser {
         decl_attrs.set_pure(is_pure);
         decl_attrs.set_const_attr(is_const_attr);
         decl_attrs.set_cold(is_cold);
+        decl_attrs.set_nested_fn(self.attrs.parsing_nested_fn());
         decl_attrs.alias_target = alias_target;
         decl_attrs.visibility = visibility;
         decl_attrs.section = section;
@@ -352,32 +353,18 @@ impl Parser {
             params: final_params,
             variadic,
             body,
-            attrs: {
-                let mut attrs = FunctionAttributes::new();
-                attrs.set_static(is_static);
-                attrs.set_inline(is_inline);
-                attrs.set_extern(is_extern);
-                attrs.set_gnu_inline(is_gnu_inline);
-                attrs.set_always_inline(is_always_inline);
-                attrs.set_noinline(is_noinline);
-                attrs.set_constructor(decl_attrs.is_constructor());
-                attrs.set_destructor(decl_attrs.is_destructor());
-                attrs.set_weak(decl_attrs.is_weak());
-                attrs.set_used(decl_attrs.is_used());
-                attrs.set_fastcall(decl_attrs.is_fastcall());
-                attrs.regparm = decl_attrs.regparm;
-                attrs.set_naked(decl_attrs.is_naked());
-                attrs.set_no_instrument(no_instrument_merged);
-                attrs.set_noreturn(decl_attrs.is_noreturn());
-                attrs.set_pure(decl_attrs.is_pure());
-                attrs.set_const_attr(decl_attrs.is_const_attr());
-                attrs.set_cold(decl_attrs.is_cold());
-                attrs.section = decl_attrs.section;
-                attrs.visibility = decl_attrs.visibility;
-                attrs.symver = decl_attrs.symver;
-                attrs.diagnose_as = decl_attrs.diagnose_as;
-                attrs
-            },
+            attrs: FunctionAttributes::for_definition(
+                &decl_attrs,
+                DefSpecifiers {
+                    static_: is_static,
+                    inline_: is_inline,
+                    extern_: is_extern,
+                    gnu_inline: is_gnu_inline,
+                    always_inline: is_always_inline,
+                    noinline: is_noinline,
+                },
+                no_instrument_merged,
+            ),
             is_kr: is_kr_style,
             span: start,
         }))
@@ -642,6 +629,12 @@ impl Parser {
             self.parse_asm_and_attributes();
         // Merge post-declarator attributes into the most recently pushed declarator.
         // last_mut() is safe because we just pushed above.
+        // Captured here because `last_decl` below borrows `declarators`
+        // mutably, and the fan-out to every declarator has to wait until that
+        // borrow ends. `auto` is a declaration-specifier, so it applies to each
+        // declarator of the statement (`auto double f(double), h(double);`), not
+        // just the last one.
+        let nested_fn_decl_level = self.attrs.parsing_nested_fn();
         let last_decl = declarators.last_mut().expect("declarator just pushed");
         if let Some(reg) = extra_asm_reg {
             last_decl.attrs.asm_register = Some(reg);
@@ -674,6 +667,15 @@ impl Parser {
         if self.attrs.parsing_noreturn() {
             last_decl.attrs.set_noreturn(true);
         }
+        // The declaration-statement funnel covers every block-scope shape
+        // (prototype-only, init-declarator, definition); the nested-function
+        // fact must be carried here as well as in the file-scope and
+        // init-declarator builders, or `auto double f(double);` inside a
+        // function body is indistinguishable from `extern double f(double);`
+        // and retypes the file-scope entity of the same name.
+        if self.attrs.parsing_nested_fn() {
+            last_decl.attrs.set_nested_fn(true);
+        }
         if self.attrs.parsing_fastcall() {
             last_decl.attrs.set_fastcall(true);
         }
@@ -698,12 +700,18 @@ impl Parser {
         if self.attrs.parsing_error_attr() {
             last_decl.attrs.set_error_attr(true);
         }
+        if nested_fn_decl_level {
+            for d in &mut declarators {
+                d.attrs.set_nested_fn(true);
+            }
+        }
         self.attrs.set_weak(false);
         self.attrs.parsing_alias_target = None;
         self.attrs.parsing_visibility = None;
         self.attrs.parsing_section = None;
         self.attrs.set_error_attr(false);
         self.attrs.set_noreturn(false);
+        self.attrs.set_nested_fn(false);
         self.attrs.set_pure(false);
         self.attrs.set_const_attr(false);
         self.attrs.set_cold(false);
@@ -770,6 +778,7 @@ impl Parser {
                     da.set_weak(d_weak);
                     da.set_error_attr(d_error_attr);
                     da.set_noreturn(d_noreturn);
+                    da.set_nested_fn(self.attrs.parsing_nested_fn());
                     da.set_pure(d_pure);
                     da.set_const_attr(d_const_attr);
                     da.set_used(d_used);
@@ -915,6 +924,7 @@ impl Parser {
                     da.asm_register = skip_asm_reg;
                     da.cleanup_fn = local_cleanup_fn;
                     da.set_used(self.attrs.parsing_used());
+                    da.set_nested_fn(self.attrs.parsing_nested_fn());
                     da.set_noreturn(self.attrs.parsing_noreturn());
                     da.set_pure(self.attrs.parsing_pure());
                     da.set_const_attr(self.attrs.parsing_const_attr());
@@ -1378,8 +1388,17 @@ impl Parser {
                     self.advance();
                     self.attrs.set_volatile(true);
                 }
-                TokenKind::Restrict | TokenKind::Inline | TokenKind::Register | TokenKind::Auto => {
+                TokenKind::Restrict | TokenKind::Inline | TokenKind::Register => {
                     self.advance();
+                }
+                TokenKind::Auto => {
+                    self.advance();
+                    // C gives `auto` no meaning for variables, and the tree has
+                    // always ignored it; but at block scope on a *function* it is
+                    // the only spelling that says "this is a GNU nested function,
+                    // not a redeclaration of the external one". Dropping it made
+                    // that distinction unrecoverable in sema.
+                    self.attrs.set_nested_fn(true);
                 }
                 TokenKind::SegGs => {
                     self.advance();

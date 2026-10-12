@@ -93,6 +93,19 @@ for key in gcc lccc; do
         > "$ARTIFACT_DIR/ctest-$key.log" 2>&1
     cp "$WORK/$key/xmlwf/xmlwf" "$ARTIFACT_DIR/xmlwf-$key"
 done
+# The differential is only a differential if both runs executed the SAME tests
+# under the SAME feature configuration.  Comparing the two CTest JUnit reports
+# by length is not that check (a candidate that dropped `runtests` and gained a
+# duplicate still counts the same), so the identity multiset, each test's status
+# and the CMake feature cache are compared by an importable module -- the same
+# module `ci_local.sh` exercises compiler-free via --self-test.
+python3 "$ROOT/tests/workloads/expat-2.8.5/junit_check.py" \
+    --reference "$ARTIFACT_DIR/ctest-gcc.xml" \
+    --candidate "$ARTIFACT_DIR/ctest-lccc.xml" \
+    --reference-config "$ARTIFACT_DIR/cmake-cache-gcc.txt" \
+    --candidate-config "$ARTIFACT_DIR/cmake-cache-lccc.txt" \
+    --out "$ARTIFACT_DIR/junit-comparison.json" \
+    > "$ARTIFACT_DIR/junit-comparison.log"
 python3 - "$ARTIFACT_DIR" "$WORK" "$SHA256" <<'PY'
 import hashlib, json, subprocess, sys, xml.etree.ElementTree as ET
 from pathlib import Path
@@ -105,6 +118,16 @@ for key in ('gcc', 'lccc'):
                         or c.find('skipped') is not None for c in cases):
         raise SystemExit('empty, failed or skipped CTest result: ' + key)
     reports[key] = len(cases)
+# The identity comparison above is the authoritative one; it ran as its own step
+# (junit-comparison.json) and `set -e` means this script would not be here if the
+# suites differed.  Cross-check that the two counts agree with what that step saw,
+# so a report rewritten between the steps cannot pass unnoticed.
+comparison = json.loads((art / 'junit-comparison.json').read_text())
+if not comparison.get('comparable'):
+    raise SystemExit('junit comparison is not comparable: ' + str(comparison['problems']))
+for key, want in (('gcc', comparison['reference_tests']), ('lccc', comparison['candidate_tests'])):
+    if reports[key] != want:
+        raise SystemExit(f'{key}: {reports[key]} testcases here but {want} in the comparison step')
 fixtures = {
     'attributes.xml': '<root z="7" a="x&amp;y"><empty/>text&#65;</root>',
     'namespaces.xml': '<r xmlns="urn:root" xmlns:p="urn:p"><p:x p:a="v">ok</p:x></r>',
@@ -142,6 +165,12 @@ for name, content in {**fixtures, **invalid}.items():
 summary = {'complete': True, 'status': 'pass', 'version': '2.8.5', 'archive_sha256': sys.argv[3],
            'measurement': 'correctness only, not a timing or PMU result',
            'flags': '-O2 -DNDEBUG', 'jobs': 2, 'ctest_pass': reports, 'xml_cases': checks,
+           'junit_comparison': 'junit-comparison.json (identity multiset + CMake '
+                               'feature configuration, compared by junit_check.py)',
+           'invocation': 'manual: no CI job builds Expat; run '
+                         'tests/workloads/expat-2.8.5/run.sh with LCCC/ARTIFACT_DIR set. '
+                         'Only the compiler-free junit_check.py --self-test contract is '
+                         'gated in CI (ci_local.sh expat-junit-contract).',
            'scope': 'static C library, examples, xmlwf and upstream C tests; no C++ code in this configuration'}
 tmp = art / 'summary.json.tmp'
 tmp.write_text(json.dumps(summary, indent=2) + '\n')

@@ -132,6 +132,11 @@ struct LineInfo {
     trim_start: u16,
     has_indirect_mem: bool,
     ebp_offset: i32,
+    /// For `LineKind::Directive` only: whether a window may step over this line
+    /// (see [`crate::backend::peephole_common::inert_directive`]). Computed once
+    /// at classification so the barrier test in the hot loop stays
+    /// integer-only and no pass re-derives -- or mis-derives -- the law.
+    inert_dir: bool,
 }
 
 impl LineInfo {
@@ -139,27 +144,42 @@ impl LineInfo {
     fn is_nop(self) -> bool {
         self.kind == LineKind::Nop
     }
+    /// True when a window may step over this line entirely: a nop or an inert
+    /// directive. The "next real instruction" walkers must agree with
+    /// `is_barrier`, so both laws share one predicate and cannot drift.
+    #[inline]
+    fn is_steppable(self) -> bool {
+        self.is_nop() || (self.kind == LineKind::Directive && self.inert_dir)
+    }
+
     #[inline]
     fn is_barrier(self) -> bool {
-        // NOTE: LineKind::Directive is deliberately NOT a barrier.  A
-        // directive (`.loc`, `.cfi_*`, `.p2align`, `.type`, …) emits no
-        // instruction — it writes no register, no memory, and no flags —
-        // so it is transparent to every locality window this peephole
-        // keeps.  Treating it as a barrier (the old law) blinded the
-        // whole-function narrow-fact dataflow at every `.loc` the `-g`
-        // command lines emit, and with it every fact-based fold behind
-        // those windows.  Inline-asm regions, labels, calls, jumps and
-        // returns remain barriers: those are real control/data fences.
-        matches!(
-            self.kind,
-            LineKind::Label | LineKind::Call | LineKind::Jmp | LineKind::JmpIndirect |
+        // NOTE: a directive blocks a window only when it is not *inert*. The
+        // reason to step over directives at all is real -- `.loc` and `.cfi_*`
+        // emit no instruction, and treating them as barriers blinded the
+        // whole-function narrow-fact dataflow at every `.loc` a `-g` command
+        // line emits, and with it every fact-based fold behind those windows.
+        // But "a directive emits no instruction" is false of the ones that put
+        // *bytes* in the section: `.long .L1-.` is a jump-table entry whose
+        // value is a code distance, `.string`/`.byte` are data,
+        // `.p2align 4,0xcc` inserts a trap in the middle of the region a window
+        // just certified as contiguous, and `.section` moves subsequent lines
+        // elsewhere -- there, position is meaning, not layout. Those are opaque
+        // again, via `peephole_common::inert_directive`, which x86-64 shares so
+        // the two backends cannot disagree. Inline-asm regions, labels, calls,
+        // jumps and returns remain barriers: real control and data fences.
+        (self.kind == LineKind::Directive && !self.inert_dir)
+            || matches!(
+                self.kind,
+                LineKind::Label | LineKind::Call | LineKind::Jmp | LineKind::JmpIndirect |
             LineKind::CondJmp | LineKind::Ret | LineKind::RetN | LineKind::InlineAsm |
             // ESP changes renumber every (%esp) slot: push/pop and explicit
             // %esp arithmetic fence all slot windows now that ESP-relative
             // slots participate in the peepholes. Pushes/pops only appear
             // in prologue/epilogue and around calls, so the cost is nil.
             LineKind::Push { .. } | LineKind::Pop { .. }
-        ) || matches!(self.kind, LineKind::Other { dest_reg } if dest_reg == REG_ESP)
+            )
+            || matches!(self.kind, LineKind::Other { dest_reg } if dest_reg == REG_ESP)
     }
 }
 
@@ -170,7 +190,17 @@ fn line_info(kind: LineKind, ts: u16) -> LineInfo {
         trim_start: ts,
         has_indirect_mem: false,
         ebp_offset: EBP_OFFSET_NONE,
+        inert_dir: false,
     }
+}
+
+/// A directive line, with the shared steppability verdict cached. Unknown
+/// directives are opaque (fail closed): a missed fold costs bytes, a wrong one
+/// miscompiles the object.
+fn directive_line_info(text: &str, ts: u16) -> LineInfo {
+    let mut info = line_info(LineKind::Directive, ts);
+    info.inert_dir = crate::backend::peephole_common::inert_directive(text);
+    info
 }
 
 /// Classify a `cmpX`/`testX` line.
@@ -203,6 +233,7 @@ fn cmp_line_info(ts: u16, s: &str) -> LineInfo {
         trim_start: ts,
         has_indirect_mem: has_indirect,
         ebp_offset,
+        inert_dir: false,
     }
 }
 
@@ -795,7 +826,16 @@ fn is_known_string_mnemonic(m: &str) -> bool {
 
 fn classify_line(raw: &str) -> LineInfo {
     let trim_start = raw.len() - raw.trim_start().len();
-    let s = &raw[trim_start..];
+    let lead = &raw[trim_start..];
+    // Trailing blanks and a trailing comment are not part of the line's syntax,
+    // yet the tests below read the LAST BYTE. Without both cuts a label
+    // written with a trailing space or a CRLF line ending is not seen as a
+    // label at all -- so text can be moved across it, which is unsound rather
+    // than merely imprecise -- and `.long 4  # note:` ends in ':' and is seen
+    // as a label, so its data stops being opaque to windows.
+    let s =
+        &lead[..crate::backend::peephole_common::line_len_without_trailing_blanks(lead.as_bytes())];
+    let s = &s[..crate::backend::peephole_common::line_len_without_trailing_comment(s.as_bytes())];
 
     if s.is_empty() {
         return line_info(LineKind::Empty, trim_start as u16);
@@ -806,14 +846,15 @@ fn classify_line(raw: &str) -> LineInfo {
     let last = bytes[bytes.len() - 1];
     let ts = trim_start as u16;
 
-    // Label
+    // Label -- also the spelling of a local label (`.LBB3:`), which is why this
+    // test stays ahead of the '.'-is-a-directive one on purpose.
     if last == b':' {
         return line_info(LineKind::Label, ts);
     }
 
     // Directive
     if first == b'.' {
-        return line_info(LineKind::Directive, ts);
+        return directive_line_info(s, ts);
     }
 
     // Comment
@@ -962,6 +1003,7 @@ fn classify_line(raw: &str) -> LineInfo {
         trim_start: ts,
         has_indirect_mem: has_indirect,
         ebp_offset: ebp_off,
+        inert_dir: false,
     }
 }
 
@@ -1144,6 +1186,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                         trim_start: 4,
                         has_indirect_mem: false,
                         ebp_offset: EBP_OFFSET_NONE,
+                        inert_dir: false,
                     };
                     changed = true;
                     i += 1;
@@ -1161,6 +1204,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                         trim_start: 4,
                         has_indirect_mem: false,
                         ebp_offset: EBP_OFFSET_NONE,
+                        inert_dir: false,
                     };
                     changed = true;
                     i += 1;
@@ -1178,6 +1222,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                         trim_start: 4,
                         has_indirect_mem: false,
                         ebp_offset: EBP_OFFSET_NONE,
+                        inert_dir: false,
                     };
                     changed = true;
                     i += 1;
@@ -1195,6 +1240,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                         trim_start: 4,
                         has_indirect_mem: false,
                         ebp_offset: EBP_OFFSET_NONE,
+                        inert_dir: false,
                     };
                     changed = true;
                     i += 1;
@@ -1218,6 +1264,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                         trim_start: 4,
                         has_indirect_mem: false,
                         ebp_offset: EBP_OFFSET_NONE,
+                        inert_dir: false,
                     };
                     changed = true;
                     i += 1;
@@ -1961,6 +2008,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                             trim_start: 4,
                             has_indirect_mem: false,
                             ebp_offset: EBP_OFFSET_NONE,
+                            inert_dir: false,
                         };
                         changed = true;
                         i += 1;
@@ -4917,12 +4965,13 @@ fn slot_pair_dead_on_all_paths(
 /// the `.cfi_*` unwind annotations this backend writes after every %esp
 /// adjustment, debug location markers, and alignment padding.
 fn is_code_free_directive(t: &str) -> bool {
-    let t = t.trim();
-    [
-        ".cfi", ".loc", ".p2align", ".align", ".balign", ".file", ".LFB", ".LFE",
-    ]
-    .iter()
-    .any(|p| t.starts_with(p))
+    // Shared with the barrier law. A bare prefix list has no fill check:
+    // `.p2align 4,0xcc` puts an `int3` in the
+    // middle of the region an %esp-shift proof is walking, and every alignment
+    // directive counted as code-free. `inert_directive` admits the same
+    // families (unwind info, line tables, boundary symbols, nop-fill
+    // alignment) and nothing else.
+    crate::backend::peephole_common::inert_directive(t)
 }
 
 /// The constant `%esp` adjustment of a single instruction, expressed as the
@@ -6828,6 +6877,7 @@ fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
             trim_start: 4,
             has_indirect_mem: false,
             ebp_offset: EBP_OFFSET_NONE,
+            inert_dir: false,
         };
 
         changed = true;
@@ -7212,6 +7262,7 @@ fn fuse_setcc_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             trim_start: 4,
             has_indirect_mem: false,
             ebp_offset: EBP_OFFSET_NONE,
+            inert_dir: false,
         };
         changed = true;
         i = t + 1;
@@ -7390,7 +7441,7 @@ fn fuse_sext_testb(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         };
         // Next code line must be the matching full-width self-test.
         let mut j = i + 1;
-        while j < len && (infos[j].is_nop() || infos[j].kind == LineKind::Directive) {
+        while j < len && steps_over_line(store, infos, j) {
             j += 1;
         }
         if j >= len {
@@ -7406,9 +7457,12 @@ fn fuse_sext_testb(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         let mut k = j + 1;
         let mut reg_dead = false;
         while k < len {
-            if infos[k].is_nop() || infos[k].kind == LineKind::Directive {
+            if steps_over_line(store, infos, k) {
                 k += 1;
                 continue;
+            }
+            if opaque_data_directive(store, infos, k) {
+                break; // a hidden write/read: nothing is provable
             }
             if let LineKind::Pop { reg: popped } = infos[k].kind {
                 if popped == family {
@@ -7851,20 +7905,44 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
 /// collapse is therefore gated on a forward scan proving %eax is not read
 /// before its next pure write.  Any barrier (label/branch/call/ret/push/
 /// pop/esp-arithmetic/directive) stops the scan conservatively.
+/// Next line index that is neither a NOP nor a *benign* directive, or `len`.
+/// The law is the x86 one (`peephole::passes::helpers::steps_over_line`): a
+/// directive that emits data is machine code the text does not spell out, so
+/// it is code for the purposes of an adjacency scan and must not be stepped
+/// over.  `check_peephole_directive_step.py` enforces it in both backends.
+fn next_code_line(store: &LineStore, infos: &[LineInfo], start: usize) -> usize {
+    let mut k = start;
+    while k < infos.len() && steps_over_line(store, infos, k) {
+        k += 1;
+    }
+    k
+}
+
+/// See `next_code_line`.
+fn steps_over_line(store: &LineStore, infos: &[LineInfo], n: usize) -> bool {
+    let info = &infos[n];
+    if info.is_nop() {
+        return true;
+    }
+    info.kind == LineKind::Directive
+        && !crate::backend::peephole_common::directive_emits_data(trimmed(store, info, n))
+}
+
+/// True when `n` is a directive the scan may not step over: a data directive.
+/// A forward liveness scan cannot classify what `.byte 0xb8 0x01` did to the
+/// register it is proving dead, so it has to stop.
+fn opaque_data_directive(store: &LineStore, infos: &[LineInfo], n: usize) -> bool {
+    infos[n].kind == LineKind::Directive
+        && crate::backend::peephole_common::directive_emits_data(trimmed(store, &infos[n], n))
+}
+
 fn collapse_slot_rmw_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     if std::env::var("CCC_NO_SLOT_RMW").is_ok() {
         return false;
     }
-    /// Next line index that is neither a NOP nor a (code-less) directive —
-    /// `-g` interleaves `.loc` markers between instructions, and they must
-    /// not break the load/op/store adjacency.
-    fn next_code_line(infos: &[LineInfo], start: usize) -> usize {
-        let mut k = start;
-        while k < infos.len() && (infos[k].is_nop() || infos[k].kind == LineKind::Directive) {
-            k += 1;
-        }
-        k
-    }
+    // `next_code_line` (module level) is the one that knows about data
+    // directives: `-g` interleaves `.loc` markers between instructions, and
+    // those must not break the load/op/store adjacency, while a `.byte` must.
     /// Parse an op line that reads and writes %REG and has a valid
     /// memory-destination form: returns (mnemonic, optional source operand).
     fn parse_rmw_op<'a>(s: &'a str, reg_name: &str) -> Option<(&'a str, Option<&'a str>)> {
@@ -7931,7 +8009,7 @@ fn collapse_slot_rmw_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool
             }
         };
         // Line i+1: the RMW op on %REG (directives between are skipped)
-        let op_idx = next_code_line(infos, i + 1);
+        let op_idx = next_code_line(store, infos, i + 1);
         if op_idx >= len {
             break;
         }
@@ -7944,7 +8022,7 @@ fn collapse_slot_rmw_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool
             }
         };
         // Line i+2: movl %REG, SAME slot
-        let st_idx = next_code_line(infos, op_idx + 1);
+        let st_idx = next_code_line(store, infos, op_idx + 1);
         if st_idx >= len {
             break;
         }
@@ -7970,9 +8048,12 @@ fn collapse_slot_rmw_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool
         let mut k = st_idx + 1;
         let mut reg_dead = false;
         while k < len {
-            if infos[k].is_nop() || infos[k].kind == LineKind::Directive {
+            if steps_over_line(store, infos, k) {
                 k += 1;
                 continue;
+            }
+            if opaque_data_directive(store, infos, k) {
+                break; // a hidden write/read: nothing is provable
             }
             // `popl %REG` in the epilogue is a pure restore (def) of the
             // register — the stale collapsed value is overwritten, never
@@ -8124,6 +8205,7 @@ fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     trim_start: 4,
                     has_indirect_mem: false,
                     ebp_offset: offset,
+                    inert_dir: false,
                 };
                 infos[i].kind = LineKind::Nop; // Remove the load
                 changed = true;
@@ -10017,6 +10099,8 @@ fn retarget_label_refs(
         if infos[i].is_nop() {
             continue;
         }
+        // DIRECTIVE-LAW: selecting -- this pass rewrites the label tokens *inside*
+        // jump-table data; it reads every directive it touches and moves nothing.
         if matches!(infos[i].kind, LineKind::Directive) {
             // Jump-table data references: `.long LABEL - BASE` /
             // `.long BASE - LABEL`.  Replace whole-word label tokens only
@@ -11701,11 +11785,10 @@ fn eliminate_never_read_stores_range(
                 // retpoline/stack-transfer shape `movl %reg,(%esp); ret|pop`.
                 let mut next = i + 1;
                 while next < end
-                    && (infos[next].is_nop()
-                        || matches!(
-                            infos[next].kind,
-                            LineKind::Empty | LineKind::Directive | LineKind::Label
-                        ))
+                    && (matches!(
+                        infos[next].kind,
+                        LineKind::Empty | LineKind::Label | LineKind::Directive
+                    ) && !opaque_data_directive(store, infos, next))
                 {
                     next += 1;
                 }
@@ -11770,11 +11853,10 @@ fn eliminate_never_read_stores_range(
         {
             let mut next = i + 1;
             while next < end
-                && (infos[next].is_nop()
-                    || matches!(
-                        infos[next].kind,
-                        LineKind::Empty | LineKind::Directive | LineKind::Label
-                    ))
+                && (matches!(
+                    infos[next].kind,
+                    LineKind::Empty | LineKind::Label | LineKind::Directive
+                ) && !opaque_data_directive(store, infos, next))
             {
                 next += 1;
             }
@@ -12334,7 +12416,9 @@ fn eliminate_dead_frame_allocation(store: &mut LineStore, infos: &mut [LineInfo]
                         addls.push((i, v));
                     } else if infos[i].kind != LineKind::Ret
                         && infos[i].kind != LineKind::Label
-                        && infos[i].kind != LineKind::Directive
+                        && infos[i].kind != LineKind::Directive // DIRECTIVE-LAW: selecting
+                        // instructions that touch %esp; directives cannot, and the
+                        // window rules for them are enforced by `is_barrier`.
                         && infos[i].kind != LineKind::Jmp
                         && infos[i].kind != LineKind::CondJmp
                         && infos[i].kind != LineKind::JmpIndirect
@@ -12825,6 +12909,7 @@ fn pin_inline_asm_regions(store: &LineStore, infos: &mut [LineInfo]) {
                 trim_start: infos[i].trim_start,
                 has_indirect_mem: true,
                 ebp_offset: EBP_OFFSET_NONE,
+                inert_dir: false,
             };
         }
     }
@@ -13276,10 +13361,11 @@ fn eliminate_redundant_zext_i686(store: &mut LineStore, infos: &mut [LineInfo]) 
         // reach neither the fact-updating arms nor the REG_NONE fail-closed
         // invalidation, which would otherwise wipe the facts at every
         // `-g`-emitted `.loc`.
-        if matches!(
-            infos[i].kind,
-            LineKind::Directive | LineKind::Empty | LineKind::Nop
-        ) {
+        // Stated through the law so it is visible at the site: `is_barrier()` above
+        // already rejects an opaque directive, and this line must only ever pass the
+        // ones the law calls steppable -- a class test here would silently include a
+        // data directive if `is_barrier`'s rule ever narrowed.
+        if infos[i].kind == LineKind::Empty || infos[i].is_steppable() {
             i += 1;
             continue;
         }
@@ -21773,6 +21859,39 @@ mod tests {
         assert!(
             out.contains("movzbl %al, %eax"),
             "setCC merge keeps the extend:\n{out}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod classify_law_tests {
+    //! The line-model order laws, mirrored from the x86 backend's
+    //! `classify_directive_tests::a_trailing_comment_cannot_turn_data_into_a_label`.
+    //! i686 has its own classifier, and a law enforced in one backend's
+    //! classifier but not the other's is half a law: the directive-step guard
+    //! scans both trees, so the semantics has to agree here too.
+
+    use super::{LineKind, classify_line};
+
+    #[test]
+    fn comment_label_and_directive_precedence_is_the_same_law_as_x86() {
+        // A trailing comment is not part of the line's syntax: without cutting it,
+        // `.long 4  # note:` ends in ':' and is read as a *label*, which makes
+        // emitted data look steppable to every window in this backend.
+        let i = classify_line("    .long 4  # note:");
+        assert_eq!(i.kind, LineKind::Directive);
+        assert!(!i.is_steppable(), "a data directive must stay opaque");
+        // The colon test runs before the '.' test on purpose: lccc's own local
+        // labels are `.LBB3:`, which starts with a dot, and classifying those as
+        // directives would let a fold cross a branch target.
+        assert_eq!(classify_line("  .LBB3: ").kind, LineKind::Label);
+        assert_eq!(classify_line("foo:  # c").kind, LineKind::Label);
+        assert_eq!(classify_line("bar:\r").kind, LineKind::Label, "CRLF");
+        // `#` inside quotes is data, not a comment.
+        assert_eq!(
+            classify_line("    .string \"a#b:\"").kind,
+            LineKind::Directive,
+            "a quoted '#' is not a comment"
         );
     }
 }
