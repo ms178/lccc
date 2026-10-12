@@ -22,7 +22,7 @@
  * `CHAIN * sizeof (struct node)` — one past the array — never NULL.
  *
  * The GS base is installed with arch_prctl(ARCH_SET_GS) on private storage, so
- * the program runs anywhere and the accesses really are segment-relative; the
+ * the program requires Linux x86-64 GS support; accesses are segment-relative; the
  * output is pure arithmetic over that storage.
  */
 #include <stdio.h>
@@ -86,7 +86,8 @@ main (void)
   if (set_gs_base (nodes) != 0)
     {
       printf ("percpu-ptr-walk: no-gs\n");
-      return 0;
+      /* Do not publish a successful timing for an unexecuted workload. */
+      return 77;
     }
   for (unsigned i = 0; i < CHAIN; i++)
     {

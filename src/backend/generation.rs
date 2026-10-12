@@ -4435,6 +4435,7 @@ fn generate_function(
     // consults them to skip dead destinations.
     let value_use_counts = count_value_uses(func);
     cg.state().value_use_counts = value_use_counts.clone();
+    cg.state().switch_unsigned_bounds = crate::passes::integer_bounds::switch_bounds(func);
     cg.emit_store_params(func);
 
     let entry_label = func.blocks.first().map(|b| b.label);

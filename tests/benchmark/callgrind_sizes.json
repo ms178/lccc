@@ -26,6 +26,7 @@
   "histogram": "",
   "gzip_crc32": "-DDATA_SIZE=16384 -DPASSES=4",
   "libm_round_family": "-DN=256 -DPASSES=4",
+  "percpu_ptr_walk": "-DPASSES=1000",
   "tls_seg_access": "-DPASSES=100",
   "zlib_ng_adler32": "-DDATA_SIZE=16384 -DPASSES=4",
   "zlib_ng_adler32_combine": "-DPASSES=10000",

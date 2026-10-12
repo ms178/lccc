@@ -185,6 +185,9 @@ gate "i686-run-policy" fast \
 gate "a9987-salvage" fast \
     env CCC="$LCCC" bash tests/regression/check_a9987_salvage.sh
 
+gate "memory-value-contracts" fast \
+    env CCC="$LCCC" bash tests/regression/check_memory_value_contracts.sh
+
 gate "audit-loop-contracts" fast \
     env CCC="$LCCC" bash tests/regression/check_audit_loop_contracts.sh
 

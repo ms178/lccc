@@ -35,8 +35,9 @@
 //!   translation units can hold their address).
 //! * Volatile stores are never eliminated but may overwrite (kill) earlier
 //!   stores; volatile loads read memory and kill like ordinary loads.
-//!   Segment-overridden accesses target a different address space: they can
-//!   neither alias default-space cells nor be eliminated here.
+//!   Segment-relative reads are opaque barriers: their offsets cannot be
+//!   compared to default-space offsets. Segment stores supply no coverage
+//!   proof and are never eliminated here.
 //!
 //! Scope is deliberately same-block. Cross-block DSE needs post-dominator
 //! plus read-between proofs — that is the `segments`-based OP-33 follow-up.
@@ -60,7 +61,7 @@ fn access_extent(ty: IrType) -> Option<(i64, i64)> {
 enum CellRoot {
     /// A stack object (alloca value id). Distinct allocas never alias.
     Alloca(u32),
-    /// A global symbol (by name). Distinct symbols never alias.
+    /// A global symbol (by name). Distinct names may be GNU aliases.
     Global(Box<str>),
     /// Any other pointer SSA value (param, phi, computed pointer). Equal ids
     /// are the same pointer; distinct ids may still denote one address.
@@ -105,6 +106,8 @@ struct Pending {
 
 struct DseContext {
     defs: FxHashMap<u32, PtrDef>,
+    /// Mutable copy-web values cannot be resolved with a function-wide map.
+    multi_defs: FxHashSet<u32>,
     /// Alloca value ids whose address provably never escapes.
     closed_allocas: FxHashSet<u32>,
     /// This function IS a non-local-goto target (it holds a
@@ -117,9 +120,13 @@ struct DseContext {
 
 impl DseContext {
     fn build(func: &IrFunction) -> Self {
+        let multi_defs = super::gvn::find_multi_def_values(func);
         let mut defs: FxHashMap<u32, PtrDef> = FxHashMap::default();
         for block in &func.blocks {
             for inst in &block.instructions {
+                if inst.dest().is_some_and(|v| multi_defs.contains(&v.0)) {
+                    continue;
+                }
                 match inst {
                     Instruction::Alloca { dest, .. } => {
                         defs.insert(dest.0, PtrDef::Alloca);
@@ -131,10 +138,15 @@ impl DseContext {
                         dest, base, offset, ..
                     } => {
                         let d = match offset {
-                            Operand::Const(c) => PtrDef::GepConst {
-                                base: base.0,
-                                delta: c.to_i64().unwrap_or(i64::MAX),
-                            },
+                            Operand::Const(c) => {
+                                match c.to_i128().and_then(|n| i64::try_from(n).ok()) {
+                                    Some(delta) => PtrDef::GepConst {
+                                        base: base.0,
+                                        delta,
+                                    },
+                                    None => PtrDef::GepVar { base: base.0 },
+                                }
+                            }
                             Operand::Value(_) => PtrDef::GepVar { base: base.0 },
                         };
                         defs.insert(dest.0, d);
@@ -148,7 +160,7 @@ impl DseContext {
                 }
             }
         }
-        let closed_allocas = compute_closed_allocas(func, &defs);
+        let closed_allocas = compute_closed_allocas(func, &multi_defs);
         let has_nonlocal_targets = func.blocks.iter().any(|block| {
             block
                 .instructions
@@ -157,6 +169,7 @@ impl DseContext {
         });
         DseContext {
             defs,
+            multi_defs,
             closed_allocas,
             has_nonlocal_targets,
         }
@@ -166,76 +179,75 @@ impl DseContext {
     /// instruction (params) are opaque roots by value id.
     fn resolve(&self, v: Value) -> Option<CellAddr> {
         let mut cur = v;
-        let mut offset: i64 = 0;
+        let mut offset = Some(0i64);
+        let mut seen = FxHashSet::default();
         loop {
+            if self.multi_defs.contains(&cur.0) || !seen.insert(cur.0) {
+                return None;
+            }
             let def = match self.defs.get(&cur.0) {
                 Some(d) => d,
                 None => {
                     return Some(CellAddr {
                         root: CellRoot::Other(cur.0),
-                        offset: Some(offset),
+                        offset,
                     });
                 }
             };
             match def {
                 PtrDef::CopyOf(src) => cur = Value(*src),
                 PtrDef::GepConst { base, delta } => {
-                    offset = offset.saturating_add(*delta);
+                    offset = offset.and_then(|off| off.checked_add(*delta));
                     cur = Value(*base);
                 }
                 PtrDef::GepVar { base } => {
-                    return Some(CellAddr {
-                        root: self.root_of(Value(*base))?,
-                        offset: None,
-                    });
+                    offset = None;
+                    cur = Value(*base);
                 }
                 PtrDef::Alloca => {
                     return Some(CellAddr {
                         root: CellRoot::Alloca(cur.0),
-                        offset: Some(offset),
+                        offset,
                     });
                 }
                 PtrDef::Global(name) => {
                     return Some(CellAddr {
                         root: CellRoot::Global(name.clone()),
-                        offset: Some(offset),
+                        offset,
                     });
                 }
                 PtrDef::Opaque => {
                     return Some(CellAddr {
                         root: CellRoot::Other(cur.0),
-                        offset: Some(offset),
+                        offset,
                     });
                 }
             }
         }
     }
-
-    fn root_of(&self, v: Value) -> Option<CellRoot> {
-        self.resolve(v).map(|c| c.root)
-    }
 }
 
 /// Alloca roots whose derived pointers are only ever used as `Load.ptr`,
 /// `Store.ptr`, or the base of a pointer chain that ends in such uses.
-/// `derived[v] = root` maps every SSA value that is a const-offset-derived
-/// pointer of an alloca.
-fn compute_closed_allocas(func: &IrFunction, _defs: &FxHashMap<u32, PtrDef>) -> FxHashSet<u32> {
-    let mut derived: FxHashMap<u32, u32> = FxHashMap::default();
-    let mut closed: FxHashSet<u32> = FxHashSet::default();
+/// Escape reachability is independent of block storage order and retains
+/// every defining edge of mutable copy webs.
+fn compute_closed_allocas(func: &IrFunction, multi_defs: &FxHashSet<u32>) -> FxHashSet<u32> {
+    // Trace escape seeds BACKWARDS through all defining edges. A forward
+    // single scan depends on block storage order and loses one of the roots
+    // of a multi-defined Copy. Both can falsely call an escaping alloca closed.
+    let mut parents: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    let mut closed = FxHashSet::default();
     for block in &func.blocks {
         for inst in &block.instructions {
             match inst {
                 Instruction::Alloca { dest, .. } => {
-                    derived.insert(dest.0, dest.0);
                     closed.insert(dest.0);
                 }
-                Instruction::Copy { dest, src } => {
-                    if let Operand::Value(s) = src {
-                        if let Some(&root) = derived.get(&s.0) {
-                            derived.insert(dest.0, root);
-                        }
-                    }
+                Instruction::Copy {
+                    dest,
+                    src: Operand::Value(src),
+                } => {
+                    parents.entry(dest.0).or_default().push(src.0);
                 }
                 Instruction::GetElementPtr {
                     dest,
@@ -243,75 +255,62 @@ fn compute_closed_allocas(func: &IrFunction, _defs: &FxHashMap<u32, PtrDef>) -> 
                     offset: Operand::Const(_),
                     ..
                 } => {
-                    if let Some(&root) = derived.get(&base.0) {
-                        derived.insert(dest.0, root);
-                    }
+                    parents.entry(dest.0).or_default().push(base.0);
                 }
                 _ => {}
             }
         }
     }
-    let open = |v: u32, derived: &FxHashMap<u32, u32>, closed: &mut FxHashSet<u32>| {
-        if let Some(&root) = derived.get(&v) {
-            closed.remove(&root);
+    let mut seeds = FxHashSet::default();
+    let mut open = |id: u32| {
+        if parents.contains_key(&id) || closed.contains(&id) {
+            seeds.insert(id);
         }
     };
+    // An unresolved mutable pointer may itself read an alloca. Such roots
+    // must not survive kill_opaque merely because its uses look nonescaping.
+    for &id in multi_defs {
+        open(id);
+    }
     for block in &func.blocks {
         for inst in &block.instructions {
             match inst {
-                // Blessed positions: reading/writing through the pointer.
-                Instruction::Load { ptr, .. } => {
-                    let _ = ptr;
-                }
-                Instruction::Store { val, ptr, .. } => {
-                    // Storing a derived pointer VALUE takes its address.
-                    if let Operand::Value(pv) = val {
-                        open(pv.0, &derived, &mut closed);
-                    }
-                    let _ = ptr;
-                }
-                // Deriving positions (already in `derived`).
-                Instruction::Copy { .. } | Instruction::Alloca { .. } => {}
-                Instruction::GetElementPtr {
-                    base, offset, dest, ..
-                } => {
-                    if !matches!(offset, Operand::Const(_)) {
-                        // Variable-offset GEP on an alloca chain: the result
-                        // is an inspected pointer — the root may escape via
-                        // this value even if unused, be conservative.
-                        open(base.0, &derived, &mut closed);
-                        open(dest.0, &derived, &mut closed);
-                    }
-                }
-                // Everything else: any derived pointer referenced anywhere
-                // (call args, phi inputs, selects, atomics, asm inputs AND
-                // outputs, memcpy endpoints, intrinsic args/dest_ptr, stored
-                // values, casts...) opens it. The operand visitor covers
-                // value positions; the value-use visitor covers the pointer
-                // positions the operand visitor deliberately skips (memcpy
-                // dest/src, inline-asm outputs, intrinsic dest_ptr, va_list
-                // pointers, stack-restore pointers).
+                Instruction::Alloca { .. }
+                | Instruction::Copy { .. }
+                | Instruction::Load { .. }
+                | Instruction::GetElementPtr {
+                    offset: Operand::Const(_),
+                    ..
+                } => {}
+                Instruction::Store {
+                    val: Operand::Value(v),
+                    ..
+                } => open(v.0),
+                Instruction::Store { .. } => {}
                 _ => {
-                    crate::backend::liveness::for_each_operand_in_instruction(
-                        inst,
-                        &mut |op: &Operand| {
-                            if let Operand::Value(v) = op {
-                                open(v.0, &derived, &mut closed);
-                            }
-                        },
-                    );
-                    crate::backend::liveness::for_each_value_use_in_instruction(
-                        inst,
-                        &mut |v: &Value| open(v.0, &derived, &mut closed),
-                    );
+                    crate::backend::liveness::for_each_operand_in_instruction(inst, &mut |op| {
+                        if let Operand::Value(v) = op {
+                            open(v.0);
+                        }
+                    });
+                    crate::backend::liveness::for_each_value_use_in_instruction(inst, &mut |v| {
+                        open(v.0)
+                    });
                 }
             }
         }
+        block.terminator.for_each_used_value(&mut open);
     }
-    for block in &func.blocks {
-        block
-            .terminator
-            .for_each_used_value(|id| open(id, &derived, &mut closed));
+    let mut work: Vec<u32> = seeds.iter().copied().collect();
+    while let Some(id) = work.pop() {
+        closed.remove(&id);
+        if let Some(sources) = parents.get(&id) {
+            for &src in sources {
+                if seeds.insert(src) {
+                    work.push(src);
+                }
+            }
+        }
     }
     closed
 }
@@ -320,8 +319,10 @@ fn compute_closed_allocas(func: &IrFunction, _defs: &FxHashMap<u32, PtrDef>) -> 
 fn roots_may_alias(a: &CellRoot, b: &CellRoot) -> bool {
     match (a, b) {
         (CellRoot::Alloca(x), CellRoot::Alloca(y)) => x == y,
-        (CellRoot::Global(x), CellRoot::Global(y)) => x == y,
-        // Distinct allocas / distinct globals are provably disjoint.
+        // Function-local analysis has no module alias/interposition proof.
+        // GNU aliases can bind distinct symbol names to the SAME storage.
+        (CellRoot::Global(_), CellRoot::Global(_)) => true,
+        // Stack allocations are disjoint from each other and global storage.
         (CellRoot::Alloca(_), CellRoot::Global(_)) | (CellRoot::Global(_), CellRoot::Alloca(_)) => {
             false
         }
@@ -331,7 +332,10 @@ fn roots_may_alias(a: &CellRoot, b: &CellRoot) -> bool {
 }
 
 fn overlaps(a_off: i64, a_sz: i64, b_off: i64, b_sz: i64) -> bool {
-    a_off < b_off + b_sz && b_off < a_off + a_sz
+    match (a_off.checked_add(a_sz), b_off.checked_add(b_sz)) {
+        (Some(a_end), Some(b_end)) => a_off < b_end && b_off < a_end,
+        _ => true, // an unrepresentable range is not a disjointness proof
+    }
 }
 
 /// Kill every pending entry that `root` (at unknown offset) may overwrite.
@@ -373,7 +377,7 @@ fn dse_block(block: &crate::ir::reexports::BasicBlock, ctx: &DseContext) -> Vec<
                 ..
             } => {
                 if *seg_override != AddressSpace::Default {
-                    continue; // other address space: isolated
+                    continue; // no coverage proof; a write alone observes no earlier store
                 }
                 let extent = access_extent(*ty);
                 let addr = match ctx.resolve(*ptr) {
@@ -423,6 +427,7 @@ fn dse_block(block: &crate::ir::reexports::BasicBlock, ctx: &DseContext) -> Vec<
                 ..
             } => {
                 if *seg_override != AddressSpace::Default {
+                    kill_opaque(&mut pending, ctx);
                     continue;
                 }
                 match ctx.resolve(*ptr) {
@@ -435,7 +440,11 @@ fn dse_block(block: &crate::ir::reexports::BasicBlock, ctx: &DseContext) -> Vec<
                             if roots_may_alias(&p.root, &root) {
                                 // Same object (or unknown overlap): kill on
                                 // byte-range intersection.
-                                !overlaps(p.offset, p.size, off, sz)
+                                // Offsets are relative to their roots. Offsets
+                                // 0 and 8 do not prove p and q+8 disjoint when
+                                // q may equal p-8. Only a shared root permits
+                                // comparing these coordinate systems.
+                                p.root == root && !overlaps(p.offset, p.size, off, sz)
                             } else {
                                 true
                             }
@@ -848,6 +857,306 @@ mod tests {
                 .instructions
                 .iter()
                 .any(|i| matches!(i, Instruction::Store { volatile: true, .. }))
+        );
+    }
+}
+
+#[cfg(test)]
+mod displaced_alias_tests {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, IrConst, Terminator};
+
+    fn gep(dest: u32, base: u32, offset: i64) -> Instruction {
+        Instruction::GetElementPtr {
+            dest: Value(dest),
+            base: Value(base),
+            offset: Operand::Const(IrConst::I64(offset)),
+            ty: IrType::Ptr,
+        }
+    }
+    fn store(ptr: u32) -> Instruction {
+        Instruction::Store {
+            ptr: Value(ptr),
+            val: Operand::Const(IrConst::I32(1)),
+            ty: IrType::I32,
+            volatile: false,
+            seg_override: AddressSpace::Default,
+        }
+    }
+    fn function(instructions: Vec<Instruction>) -> IrFunction {
+        let mut f = IrFunction::new("displaced".into(), IrType::Void, vec![], false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        });
+        f
+    }
+
+    #[test]
+    fn distinct_global_names_are_not_a_disjointness_proof() {
+        let mut f = function(vec![
+            Instruction::GlobalAddr {
+                dest: Value(0),
+                name: "object".into(),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: "alias_object".into(),
+            },
+            store(0),
+            Instruction::Load {
+                dest: Value(2),
+                ptr: Value(1),
+                ty: IrType::I32,
+                volatile: false,
+                seg_override: AddressSpace::Default,
+            },
+            store(0),
+        ]);
+        assert_eq!(eliminate_dead_stores(&mut f), 0);
+    }
+
+    #[test]
+    fn read_offsets_are_comparable_only_for_the_same_root() {
+        for same_root in [false, true] {
+            for offset in -12..=12 {
+                let mut f = function(vec![
+                    gep(2, if same_root { 0 } else { 1 }, offset),
+                    store(0),
+                    Instruction::Load {
+                        dest: Value(3),
+                        ptr: Value(2),
+                        ty: IrType::I32,
+                        volatile: false,
+                        seg_override: AddressSpace::Default,
+                    },
+                    store(0),
+                ]);
+                let expected = usize::from(same_root && !(-3..=3).contains(&offset));
+                assert_eq!(
+                    eliminate_dead_stores(&mut f),
+                    expected,
+                    "same={same_root}, off={offset}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn segment_relative_read_is_not_a_default_space_offset_proof() {
+        let mut f = function(vec![
+            store(0),
+            Instruction::Load {
+                dest: Value(3),
+                ptr: Value(1),
+                ty: IrType::I32,
+                volatile: false,
+                seg_override: AddressSpace::SegFs,
+            },
+            store(0),
+        ]);
+        assert_eq!(eliminate_dead_stores(&mut f), 0);
+    }
+
+    #[test]
+    fn redefined_pointer_is_not_a_function_wide_ssa_fact() {
+        let mut f = function(vec![
+            Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Value(Value(1)),
+            },
+            store(0),
+            Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Value(Value(2)),
+            },
+            store(0),
+        ]);
+        assert_eq!(eliminate_dead_stores(&mut f), 0);
+    }
+
+    #[test]
+    fn unrelated_multidef_values_do_not_disable_independent_stores() {
+        let mut f = function(vec![
+            Instruction::Copy {
+                dest: Value(9),
+                src: Operand::Value(Value(1)),
+            },
+            store(0),
+            Instruction::Copy {
+                dest: Value(9),
+                src: Operand::Value(Value(2)),
+            },
+            store(0),
+        ]);
+        assert_eq!(eliminate_dead_stores(&mut f), 1);
+    }
+
+    #[test]
+    fn mutable_pointer_and_its_derived_chain_are_unresolvable() {
+        let f = function(vec![
+            Instruction::Copy {
+                dest: Value(9),
+                src: Operand::Value(Value(1)),
+            },
+            gep(10, 9, 4),
+            Instruction::Copy {
+                dest: Value(9),
+                src: Operand::Value(Value(2)),
+            },
+        ]);
+        let ctx = DseContext::build(&f);
+        assert!(ctx.resolve(Value(9)).is_none());
+        assert!(ctx.resolve(Value(10)).is_none());
+        assert!(ctx.resolve(Value(1)).is_some());
+    }
+
+    #[test]
+    fn escape_graph_is_order_independent_and_keeps_every_mutable_root() {
+        let f = function(vec![
+            Instruction::Alloca {
+                dest: Value(0),
+                size: 4,
+                align: 4,
+                ty: IrType::I32,
+                volatile: false,
+                semantic_volatile: false,
+            },
+            Instruction::Alloca {
+                dest: Value(1),
+                size: 4,
+                align: 4,
+                ty: IrType::I32,
+                volatile: false,
+                semantic_volatile: false,
+            },
+            Instruction::Alloca {
+                dest: Value(2),
+                size: 4,
+                align: 4,
+                ty: IrType::I32,
+                volatile: false,
+                semantic_volatile: false,
+            },
+            Instruction::Copy {
+                dest: Value(9),
+                src: Operand::Value(Value(0)),
+            },
+            Instruction::Copy {
+                dest: Value(9),
+                src: Operand::Value(Value(1)),
+            },
+        ]);
+        let ctx = DseContext::build(&f);
+        assert!(!ctx.closed_allocas.contains(&0));
+        assert!(!ctx.closed_allocas.contains(&1));
+        assert!(ctx.closed_allocas.contains(&2));
+        // Valid dominance, deliberately non-topological block storage:
+        // entry -> definition -> use, stored as entry/use/definition.
+        let mut escaped = function(vec![Instruction::Alloca {
+            dest: Value(0),
+            size: 4,
+            align: 4,
+            ty: IrType::I32,
+            volatile: false,
+            semantic_volatile: false,
+        }]);
+        escaped.return_type = IrType::Ptr;
+        escaped.blocks[0].terminator = Terminator::Branch(BlockId(2));
+        escaped.blocks.push(BasicBlock {
+            label: BlockId(1),
+            source_spans: vec![],
+            instructions: vec![Instruction::Copy {
+                dest: Value(8),
+                src: Operand::Value(Value(9)),
+            }],
+            terminator: Terminator::Return(Some(Operand::Value(Value(8)))),
+        });
+        escaped.blocks.push(BasicBlock {
+            label: BlockId(2),
+            source_spans: vec![],
+            instructions: vec![Instruction::Copy {
+                dest: Value(9),
+                src: Operand::Value(Value(0)),
+            }],
+            terminator: Terminator::Branch(BlockId(1)),
+        });
+        assert!(!DseContext::build(&escaped).closed_allocas.contains(&0));
+    }
+
+    #[test]
+    fn unresolved_mutable_read_opens_its_objects_but_not_an_independent_alloca() {
+        let mut instructions = Vec::new();
+        for id in 0..3 {
+            instructions.push(Instruction::Alloca {
+                dest: Value(id),
+                size: 4,
+                align: 4,
+                ty: IrType::I32,
+                volatile: false,
+                semantic_volatile: false,
+            });
+        }
+        instructions.extend([
+            Instruction::Copy {
+                dest: Value(9),
+                src: Operand::Value(Value(0)),
+            },
+            store(0),
+            store(2),
+            Instruction::Load {
+                dest: Value(10),
+                ptr: Value(9),
+                ty: IrType::I32,
+                volatile: false,
+                seg_override: AddressSpace::Default,
+            },
+            Instruction::Copy {
+                dest: Value(9),
+                src: Operand::Value(Value(1)),
+            },
+            store(0),
+            store(2),
+        ]);
+        let mut f = function(instructions);
+        f.return_type = IrType::I32;
+        f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(10))));
+        assert_eq!(eliminate_dead_stores(&mut f), 1);
+        let stores = |id| {
+            f.blocks[0]
+                .instructions
+                .iter()
+                .filter(|i| matches!(i, Instruction::Store { ptr, .. } if ptr.0 == id))
+                .count()
+        };
+        assert_eq!(stores(0), 2, "mutable read observes the first store");
+        assert_eq!(stores(2), 1, "unrelated closed object still benefits");
+    }
+
+    #[test]
+    fn overflowing_and_cyclic_paths_fail_closed_without_recursion() {
+        let f = function(vec![gep(2, 0, i64::MAX), gep(3, 2, 1)]);
+        let ctx = DseContext::build(&f);
+        assert_eq!(ctx.resolve(Value(3)).unwrap().offset, None);
+        assert!(overlaps(i64::MAX, 4, 0, 4));
+        assert!(!overlaps(i64::MIN, 4, i64::MAX - 4, 4));
+        let mut f = function(vec![gep(1, 2, 0), gep(2, 1, 0)]);
+        assert!(DseContext::build(&f).resolve(Value(1)).is_none());
+        if let Instruction::GetElementPtr { offset, .. } = &mut f.blocks[0].instructions[0] {
+            *offset = Operand::Value(Value(9));
+        }
+        assert!(DseContext::build(&f).resolve(Value(1)).is_none());
+        let f = function(vec![Instruction::GetElementPtr {
+            dest: Value(2),
+            base: Value(0),
+            offset: Operand::Const(IrConst::I128(i128::MAX)),
+            ty: IrType::Ptr,
+        }]);
+        assert_eq!(
+            DseContext::build(&f).resolve(Value(2)).unwrap().offset,
+            None
         );
     }
 }
