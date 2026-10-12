@@ -317,7 +317,7 @@ fn analyze_function_purity(
                 | Instruction::SetReturnF128Second { .. }
                 | Instruction::GetStaticChain { .. }
                 | Instruction::SetStaticChain { .. } => {}
-                // Intrinsics: `is_pure()` is the single source of truth.
+                // Intrinsics: purity excludes effects; constness also excludes reads.
                 // A memory-writing intrinsic (Vec* stores, movnti, memcpy-
                 // shaped helpers) or an observable one (fences, rdtsc,
                 // clflush, vzeroupper) makes the function impure. The old
@@ -330,6 +330,9 @@ fn analyze_function_purity(
                 Instruction::Intrinsic { op, dest_ptr, .. } => {
                     if !op.is_pure() || dest_ptr.is_some() {
                         return (false, false);
+                    }
+                    if op.may_read_memory() {
+                        is_const = false;
                     }
                 }
             }
@@ -348,4 +351,79 @@ fn analyze_function_purity(
     }
 
     (is_pure, is_const)
+}
+
+#[cfg(test)]
+mod memory_read_tests {
+    use super::*;
+    use crate::common::types::IrType;
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    use crate::ir::reexports::{BasicBlock, BlockId};
+
+    #[test]
+    fn vector_readers_are_not_constant_functions() {
+        for op in [
+            O::VecLoadF64x2,
+            O::VecLoadF64x4,
+            O::VecLoadF32x4,
+            O::VecLoadF32x8,
+            O::VecLoadI32x4,
+            O::VecLoadI32x8,
+            O::VecLoadI64x2,
+            O::VecLoadI64x4,
+            O::VecLoadI16x8,
+            O::VecLoadI8x16,
+            O::VecLoadI8x32,
+            O::VecLoadI16x16,
+            O::VecLoadI32x4Pair,
+            O::VecLoadWidenI32ToI64x2,
+            O::SqrtF64,
+        ] {
+            let param_ty = if op.may_read_memory() {
+                IrType::Ptr
+            } else {
+                IrType::F64
+            };
+            let mut f = IrFunction::new(
+                "reader".into(),
+                IrType::Void,
+                vec![crate::ir::reexports::IrParam {
+                    ty: param_ty,
+                    noalias: false,
+                    struct_size: None,
+                    struct_align: None,
+                    param_align: None,
+                    struct_eightbyte_classes: vec![],
+                    is_f128_sse: false,
+                    riscv_float_class: None,
+                }],
+                false,
+            );
+            f.blocks.push(BasicBlock {
+                label: BlockId(0),
+                instructions: vec![
+                    Instruction::ParamRef {
+                        dest: crate::ir::reexports::Value(0),
+                        param_idx: 0,
+                        ty: param_ty,
+                    },
+                    Instruction::Intrinsic {
+                        dest: Some(crate::ir::reexports::Value(1)),
+                        op,
+                        dest_ptr: None,
+                        args: vec![Operand::Value(crate::ir::reexports::Value(0))],
+                    },
+                ],
+                terminator: Terminator::Return(None),
+                source_spans: vec![],
+            });
+            // Analyze the pre-DCE IR; an unused nonvolatile reader may later
+            // disappear, but it must not be classified as read-none while present.
+            assert_eq!(
+                analyze_function_purity(&f, &FxHashSet::default(), &FxHashSet::default()),
+                (true, !op.may_read_memory()),
+                "{op:?}"
+            );
+        }
+    }
 }

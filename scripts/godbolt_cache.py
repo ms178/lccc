@@ -102,9 +102,11 @@ CACHE = Path(os.environ.get(
 # build's name. Bumping moves every pre-fingerprint record out of the reachable
 # key space in one explicit step instead of leaving it to be mistaken for a
 # current result. Bump these again on any future change to a key's meaning.
-NS_ASM = "att-v3"          # AT&T-syntax assembly, text, one file per tuple
-NS_ORACLE = "oracle-v2"    # execution-oracle records, JSON
-NS_ENCDIFF = "encdiff-v2"  # raw CE /compile replies incl. binary opcodes, JSON
+# Reject pre-validation caches that could contain ignored target flags or
+# partial assembly from failed compilations. Historical files are retained.
+NS_ASM = "att-v4"          # AT&T-syntax assembly, text, one file per tuple
+NS_ORACLE = "oracle-v3"    # execution-oracle records, JSON
+NS_ENCDIFF = "encdiff-v3"  # raw CE /compile replies incl. binary opcodes, JSON
 
 
 def key(namespace: str, *parts: Any) -> str:

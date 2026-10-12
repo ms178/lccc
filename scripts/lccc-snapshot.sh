@@ -69,8 +69,16 @@ mkdir -p "$ART" "$(dirname "$DELIVERABLE")"
 # generate a checkpoint with the same tag or overwrite each other's ledger.
 exec 9>"$ART/.snapshot.lock"
 flock -n 9 || { echo "another snapshot writer is active" >&2; exit 4; }
-KEEP=${LCCC_SNAPSHOT_KEEP:-2}
-[[ $KEEP =~ ^[1-9][0-9]*$ ]] || { echo "LCCC_SNAPSHOT_KEEP must be positive" >&2; exit 2; }
+# Named checkpoints are recovery history, not a disposable cache. Checkpoints
+# anchored to different upstream commits cannot reconstruct one another.
+# Zero retains every compressed checkpoint. Pruning requires two explicit
+# controls so an inherited old KEEP=2 cannot silently repeat the data loss.
+KEEP=${LCCC_SNAPSHOT_KEEP:-0}
+[[ $KEEP =~ ^(0|[1-9][0-9]*)$ ]] || { echo "LCCC_SNAPSHOT_KEEP must be nonnegative" >&2; exit 2; }
+if [[ $KEEP != 0 && ${LCCC_SNAPSHOT_ALLOW_PRUNE:-0} != 1 ]]; then
+  echo "checkpoint pruning requires LCCC_SNAPSHOT_ALLOW_PRUNE=1; KEEP=0 retains all history" >&2
+  exit 2
+fi
 cd "$REPO"
 
 atomic_write() {  # atomic_write <destination>; content arrives on stdin
@@ -302,7 +310,8 @@ fi
 # ---- 2. One visible patch, compressed checkpoint history --------------------
 # Full uncompressed copies grow as O(checkpoints * patch size) and exhausted
 # Arena's ~128 MiB snapshot cap for the EDG import. Only the canonical patch is
-# uncompressed. Checkpoints are bounded, gzip -n deterministic and verified.
+# uncompressed. Checkpoints are gzip -n deterministic and verified. History
+# is retained by default; a budget failure is NOT permission to erase it.
 atomic_copy "$patch_tmp" "$DELIVERABLE"
 patch_sha=$(sha256sum "$patch_tmp" | awk '{print $1}')
 checkpoint_tmp=$(mktemp "$ART/.checkpoint.tmp.XXXXXX")
@@ -377,15 +386,17 @@ if [[ -f "$REPO/scripts/lccc_recover.py" ]]; then
   atomic_copy "$REPO/scripts/lccc_recover.py" "$(dirname "$DELIVERABLE")/LCCC-RECOVER.py"
 fi
 
-# Prune owned compressed checkpoints BEFORE the final-output budget check.
-# Each removed checkpoint is superseded by a newer full cumulative patch.
+# Optional, explicitly authorized pruning BEFORE the budget check. It is
+# destructive: newer cumulative patches do NOT supersede historical trees.
+# Default KEEP=0 leaves all named downloads intact, including across rebases.
 python3 - "$ART" "$KEEP" <<'PYKEEP'
 from pathlib import Path
 import re, sys
 root, keep = Path(sys.argv[1]), int(sys.argv[2])
 items = sorted(root.glob('ms178-1.S*.patch.gz'),
                key=lambda p: int(re.search(r'\.S(\d+)-', p.name)[1]))
-for p in items[:-keep]: p.unlink()
+if keep:
+    for p in items[:-keep]: p.unlink()
 PYKEEP
 
 # ---- 6. User-facing, verified compact download -----------------------------
@@ -430,16 +441,6 @@ mv -f "$ledger_tmp" "$LEDGER"
 # Advance the sequence only once every independently recoverable artifact and
 # the ledger have been published successfully.
 printf '%s\n' "$seq" | atomic_write "$seq_file"
-# Keep the latest compressed checkpoints. Ledger hashes remain permanent.
-python3 - "$ART" "$KEEP" <<'PYKEEP'
-from pathlib import Path
-import re, sys
-root, keep = Path(sys.argv[1]), int(sys.argv[2])
-items = sorted(root.glob('ms178-1.S*.patch.gz'),
-               key=lambda p: int(re.search(r'\.S(\d+)-', p.name)[1]))
-for p in items[:-keep]:
-    p.unlink()
-PYKEEP
 sync 2>/dev/null || true
 
 echo "SNAPSHOT $tag"

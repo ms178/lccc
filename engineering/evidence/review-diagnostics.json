@@ -1,0 +1,157 @@
+{
+  "reviewed_head": "cdbb0ef759001d62ab00b6572fac99ba5a97893c",
+  "upstream_base": "e7483ac7608cd63b517ee6b117ecbccb03d9c6fd",
+  "scope": "Diagnostics from previously built compilers, not validation of the corrective source; assembly only, no new local compiler or executable builds.",
+  "compiler_sha256": {
+    "main": "8e6d3e43c8f91c5f3d0dff6e618739246c70999e97934376832646051de97137",
+    "reviewed": "0fb281b41e168b3fe43b1c0a01cdf1b2736812c72210fe98ef36143e3fe7a088"
+  },
+  "select": {
+    "source": "tests/benchmark/programs/ascii_case_fold.c",
+    "source_sha256": "7a97d5091e4e166a63cb4d6dd80bb35014c4f9ccd77848b60bac357f3211a5dd",
+    "flags": [
+      "-O2",
+      "-march=x86-64-v3"
+    ],
+    "main": {
+      "sha256": "0bfa90086ae2460a11456366d15b2f430b36fc8c16c8291dacffbd9f5a3bc408",
+      "stats": {
+        "instructions": 111,
+        "loads": 7,
+        "stores": 5,
+        "spills": 0,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "branches": 9,
+        "vectors": 0,
+        "calls": 0
+      },
+      "text": ".section .bss\n.align 16\n.type data, @object\n.size data, 65536\ndata:\n    .zero 65536\n.align 16\n.type folded, @object\n.size folded, 65536\nfolded:\n    .zero 65536\n\n.text\n.globl main\n.p2align 4\n.type main, @function\nmain:\n.cfi_startproc\n    pushq %rbx\n    .cfi_def_cfa_offset 16\n    .cfi_offset %rbx, -16\n    pushq %r12\n    .cfi_def_cfa_offset 24\n    .cfi_offset %r12, -24\n    pushq %r13\n    .cfi_def_cfa_offset 32\n    .cfi_offset %r13, -32\n    pushq %r14\n    .cfi_def_cfa_offset 40\n    .cfi_offset %r14, -40\n    pushq %r15\n    .cfi_def_cfa_offset 48\n    .cfi_offset %r15, -48\n    pushq %rbp\n    .cfi_def_cfa_offset 56\n    .cfi_offset %rbp, -56\n    subq $24, %rsp\n    .cfi_def_cfa_offset 80\n    # LCCC_RET_XMM 0\n    # LCCC_RET_RDX 0\n    # LCCC_RET_RAX 1\n    leaq data(%rip), %rdi\n    leaq folded(%rip), %rsi\n    xorl %edx, %edx\n.LBB1:\n    cmpl $65536, %edx\njae .LBB3\n.p2align 4,,10\n.p2align 3\n.LBB2:\n    imull $1103515245, %edx, %r8d\n    addl $12345, %r8d\n    shrl $16, %r8d\n    movl %edx, %ebx\n    movl %r8d, %r10d\n    imulq $1491936009, %r10, %r12\n    shrq $32, %r12\n    subq %r12, %r10\n    shrq $1, %r10\n    addq %r12, %r10\n    shrq $6, %r10\n    movl %r10d, %r9d\n    imull $95, %r9d, %r9d\n    subl %r9d, %r8d\n    addl $32, %r8d\n    movb %r8b, (%rdi, %rbx)\n    addl $1, %edx\n    cmpl $65536, %edx\njb .LBB2\n.LBB3:\n    xorl %edx, %edx\n    xorl %r8d, %r8d\n.LBB4:\n    cmpq $65536, %r8\njae .LBB6\n.p2align 4,,10\n.p2align 3\n.LBB5:\n    leaq 1(%r8), %r13\n    leaq 2(%r8), %r14\n    leaq 3(%r8), %r15\n    movzbl (%rdi, %r8), %r11d\n    movl %r11d, %r9d\n    subq $65, %r11\n    cmpb $25, %r11b\n    leal 32(%r9), %r12d\n    movq %r9, %rbp\n    cmovbel %r12d, %ebp\n    movzbl %bpl, %r11d\n    movb %r11b, (%rsi, %r8)\n    leal (%rbp, %rdx), %r10d\n    movl %edx, %r9d\n    shll $5, %r9d\n    addl %r10d, %r9d\n    movzbl (%rdi, %r13), %ebx\n    movl %ebx, %r10d\n    subq $65, %rbx\n    cmpb $25, %bl\n    leal 32(%r10), %ebp\n    movl %r10d, %ebx\n    cmovbel %ebp, %ebx\n    movb %bl, (%rsi, %r13)\n    leal (%rbx, %r9), %r11d\n    shll $5, %r9d\n    addl %r11d, %r9d\n    movzbl (%rdi, %r14), %r13d\n    movl %r13d, %r11d\n    subq $65, %r13\n    cmpb $25, %r13b\n    leal 32(%r11), %ebx\n    movl %r11d, %r12d\n    cmovbel %ebx, %r12d\n    movb %r12b, (%rsi, %r14)\n    leal (%r12, %r9), %r10d\n    shll $5, %r9d\n    addl %r10d, %r9d\n    movzbl (%rdi, %r15), %r14d\n    movl %r14d, %r10d\n    subq $65, %r14\n    cmpb $25, %r14b\n    leal 32(%r10), %ebx\n    movl %r10d, %r12d\n    cmovbel %ebx, %r12d\n    movb %r12b, (%rsi, %r15)\n    leal (%r12, %r9), %r11d\n    shll $5, %r9d\n    leal (%r9, %r11), %edx\n    addq $4, %r8\n    cmpq $65536, %r8\njb .LBB5\n.LBB6:\n    movzbl folded(%rip), %r10d\n    cmpb $32, %r10b\njne .LBB9\n.LBB7:\n    movzbl folded+1(%rip), %edi\n    cmpb $55, %dil\njne .LBB9\n.LBB8:\n    movzbl folded+2(%rip), %esi\n    cmpb $110, %sil\nje .LBB10\n.LBB9:\n    movl $1, %eax\n.L__lccc_epilogue_1:\n    addq $24, %rsp\n    .cfi_def_cfa_offset 56\n    popq %rbp\n    .cfi_def_cfa_offset 48\n    popq %r15\n    .cfi_def_cfa_offset 40\n    popq %r14\n    .cfi_def_cfa_offset 32\n    popq %r13\n    .cfi_def_cfa_offset 24\n    popq %r12\n    .cfi_def_cfa_offset 16\n    popq %rbx\n    .cfi_def_cfa_offset 8\n    ret\n.LBB10:\n    .cfi_def_cfa_offset 80\n    cmpl $2571300113, %edx\n    movl $0, %ecx\n    movl $2, %edx\n    cmovel %ecx, %edx\n    movl %edx, %eax\n    jmp .L__lccc_epilogue_1\n.cfi_endproc\n.size main, .-main\n\n\n.section .note.GNU-stack,\"\",@progbits\n"
+    },
+    "reviewed": {
+      "sha256": "fcedf595268db1281ef21b45abba4e06fb9587d05fa0ecfcbb643a12a64d5458",
+      "stats": {
+        "instructions": 128,
+        "loads": 7,
+        "stores": 5,
+        "spills": 0,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "branches": 9,
+        "vectors": 0,
+        "calls": 0
+      },
+      "text": ".section .bss\n.align 16\n.type data, @object\n.size data, 65536\ndata:\n    .zero 65536\n.align 16\n.type folded, @object\n.size folded, 65536\nfolded:\n    .zero 65536\n\n.text\n.globl main\n.p2align 4\n.type main, @function\nmain:\n.cfi_startproc\n    pushq %rbx\n    .cfi_def_cfa_offset 16\n    .cfi_offset %rbx, -16\n    pushq %r12\n    .cfi_def_cfa_offset 24\n    .cfi_offset %r12, -24\n    pushq %r13\n    .cfi_def_cfa_offset 32\n    .cfi_offset %r13, -32\n    pushq %r14\n    .cfi_def_cfa_offset 40\n    .cfi_offset %r14, -40\n    pushq %r15\n    .cfi_def_cfa_offset 48\n    .cfi_offset %r15, -48\n    pushq %rbp\n    .cfi_def_cfa_offset 56\n    .cfi_offset %rbp, -56\n    subq $24, %rsp\n    .cfi_def_cfa_offset 80\n    # LCCC_RET_XMM 0\n    # LCCC_RET_RDX 0\n    # LCCC_RET_RAX 1\n    leaq data(%rip), %rdi\n    leaq folded(%rip), %rsi\n    xorl %edx, %edx\n.LBB1:\n    cmpl $65536, %edx\njae .LBB3\n.p2align 4,,10\n.p2align 3\n.LBB2:\n    imull $1103515245, %edx, %r8d\n    addl $12345, %r8d\n    shrl $16, %r8d\n    movl %edx, %ebx\n    movl %r8d, %r10d\n    imulq $1491936009, %r10, %r12\n    shrq $32, %r12\n    subq %r12, %r10\n    shrq $1, %r10\n    addq %r12, %r10\n    shrq $6, %r10\n    movl %r10d, %r9d\n    imull $95, %r9d, %r9d\n    subl %r9d, %r8d\n    addl $32, %r8d\n    movb %r8b, (%rdi, %rbx)\n    addl $1, %edx\n    cmpl $65536, %edx\njb .LBB2\n.LBB3:\n    xorl %edx, %edx\n    xorl %r8d, %r8d\n.LBB4:\n    cmpq $65536, %r8\njae .LBB6\n.p2align 4,,10\n.p2align 3\n.LBB5:\n    leaq 1(%r8), %r13\n    leaq 2(%r8), %r14\n    leaq 3(%r8), %r15\n    movzbl (%rdi, %r8), %r11d\n    movl %r11d, %r9d\n    subq $65, %r11\n    cmpb $25, %r11b\n    setbe %bl\n    movzbl %bl, %ebx\n    leal 32(%r9), %r12d\n    testl %ebx, %ebx\n    movq %r9, %rbp\n    cmovnel %r12d, %ebp\n    movzbl %bpl, %r11d\n    movb %r11b, (%rsi, %r8)\n    leal (%rbp, %rdx), %r10d\n    movl %edx, %r9d\n    shll $5, %r9d\n    addl %r10d, %r9d\n    movq %r13, %r11\n    movzbl (%rdi, %r11), %ebx\n    movl %ebx, %r10d\n    subq $65, %rbx\n    cmpb $25, %bl\n    setbe %r12b\n    movzbl %r12b, %r12d\n    leal 32(%r10), %ebp\n    testl %r12d, %r12d\n    movl %r10d, %ebx\n    cmovnel %ebp, %ebx\n    movb %bl, (%rsi, %r11)\n    leal (%rbx, %r9), %r11d\n    shll $5, %r9d\n    addl %r11d, %r9d\n    movq %r14, %r10\n    movzbl (%rdi, %r10), %r13d\n    movl %r13d, %r11d\n    subq $65, %r13\n    cmpb $25, %r13b\n    setbe %r14b\n    movzbl %r14b, %r14d\n    movl %r14d, %ebp\n    leal 32(%r11), %ebx\n    testl %ebp, %ebp\n    movl %r11d, %r12d\n    cmovnel %ebx, %r12d\n    movb %r12b, (%rsi, %r10)\n    leal (%r12, %r9), %r10d\n    shll $5, %r9d\n    addl %r10d, %r9d\n    movq %r15, %r11\n    movzbl (%rdi, %r11), %r14d\n    movl %r14d, %r10d\n    subq $65, %r14\n    cmpb $25, %r14b\n    setbe %r15b\n    movzbl %r15b, %r15d\n    movl %r15d, %ebp\n    leal 32(%r10), %ebx\n    testl %ebp, %ebp\n    movl %r10d, %r12d\n    cmovnel %ebx, %r12d\n    movb %r12b, (%rsi, %r11)\n    leal (%r12, %r9), %r11d\n    shll $5, %r9d\n    leal (%r9, %r11), %edx\n    addq $4, %r8\n    cmpq $65536, %r8\njb .LBB5\n.LBB6:\n    movzbl folded(%rip), %r10d\n    cmpb $32, %r10b\njne .LBB9\n.LBB7:\n    movzbl folded+1(%rip), %edi\n    cmpb $55, %dil\njne .LBB9\n.LBB8:\n    movzbl folded+2(%rip), %esi\n    cmpb $110, %sil\nje .LBB10\n.LBB9:\n    movl $1, %eax\n.L__lccc_epilogue_1:\n    addq $24, %rsp\n    .cfi_def_cfa_offset 56\n    popq %rbp\n    .cfi_def_cfa_offset 48\n    popq %r15\n    .cfi_def_cfa_offset 40\n    popq %r14\n    .cfi_def_cfa_offset 32\n    popq %r13\n    .cfi_def_cfa_offset 24\n    popq %r12\n    .cfi_def_cfa_offset 16\n    popq %rbx\n    .cfi_def_cfa_offset 8\n    ret\n.LBB10:\n    .cfi_def_cfa_offset 80\n    cmpl $2571300113, %edx\n    movl $0, %ecx\n    movl $2, %edx\n    cmovel %ecx, %edx\n    movl %edx, %eax\n    jmp .L__lccc_epilogue_1\n.cfi_endproc\n.size main, .-main\n\n\n.section .note.GNU-stack,\"\",@progbits\n"
+    },
+    "disabled_intbounds": {
+      "sha256": "0bfa90086ae2460a11456366d15b2f430b36fc8c16c8291dacffbd9f5a3bc408",
+      "stats": {
+        "instructions": 111,
+        "loads": 7,
+        "stores": 5,
+        "spills": 0,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "branches": 9,
+        "vectors": 0,
+        "calls": 0
+      },
+      "text": ".section .bss\n.align 16\n.type data, @object\n.size data, 65536\ndata:\n    .zero 65536\n.align 16\n.type folded, @object\n.size folded, 65536\nfolded:\n    .zero 65536\n\n.text\n.globl main\n.p2align 4\n.type main, @function\nmain:\n.cfi_startproc\n    pushq %rbx\n    .cfi_def_cfa_offset 16\n    .cfi_offset %rbx, -16\n    pushq %r12\n    .cfi_def_cfa_offset 24\n    .cfi_offset %r12, -24\n    pushq %r13\n    .cfi_def_cfa_offset 32\n    .cfi_offset %r13, -32\n    pushq %r14\n    .cfi_def_cfa_offset 40\n    .cfi_offset %r14, -40\n    pushq %r15\n    .cfi_def_cfa_offset 48\n    .cfi_offset %r15, -48\n    pushq %rbp\n    .cfi_def_cfa_offset 56\n    .cfi_offset %rbp, -56\n    subq $24, %rsp\n    .cfi_def_cfa_offset 80\n    # LCCC_RET_XMM 0\n    # LCCC_RET_RDX 0\n    # LCCC_RET_RAX 1\n    leaq data(%rip), %rdi\n    leaq folded(%rip), %rsi\n    xorl %edx, %edx\n.LBB1:\n    cmpl $65536, %edx\njae .LBB3\n.p2align 4,,10\n.p2align 3\n.LBB2:\n    imull $1103515245, %edx, %r8d\n    addl $12345, %r8d\n    shrl $16, %r8d\n    movl %edx, %ebx\n    movl %r8d, %r10d\n    imulq $1491936009, %r10, %r12\n    shrq $32, %r12\n    subq %r12, %r10\n    shrq $1, %r10\n    addq %r12, %r10\n    shrq $6, %r10\n    movl %r10d, %r9d\n    imull $95, %r9d, %r9d\n    subl %r9d, %r8d\n    addl $32, %r8d\n    movb %r8b, (%rdi, %rbx)\n    addl $1, %edx\n    cmpl $65536, %edx\njb .LBB2\n.LBB3:\n    xorl %edx, %edx\n    xorl %r8d, %r8d\n.LBB4:\n    cmpq $65536, %r8\njae .LBB6\n.p2align 4,,10\n.p2align 3\n.LBB5:\n    leaq 1(%r8), %r13\n    leaq 2(%r8), %r14\n    leaq 3(%r8), %r15\n    movzbl (%rdi, %r8), %r11d\n    movl %r11d, %r9d\n    subq $65, %r11\n    cmpb $25, %r11b\n    leal 32(%r9), %r12d\n    movq %r9, %rbp\n    cmovbel %r12d, %ebp\n    movzbl %bpl, %r11d\n    movb %r11b, (%rsi, %r8)\n    leal (%rbp, %rdx), %r10d\n    movl %edx, %r9d\n    shll $5, %r9d\n    addl %r10d, %r9d\n    movzbl (%rdi, %r13), %ebx\n    movl %ebx, %r10d\n    subq $65, %rbx\n    cmpb $25, %bl\n    leal 32(%r10), %ebp\n    movl %r10d, %ebx\n    cmovbel %ebp, %ebx\n    movb %bl, (%rsi, %r13)\n    leal (%rbx, %r9), %r11d\n    shll $5, %r9d\n    addl %r11d, %r9d\n    movzbl (%rdi, %r14), %r13d\n    movl %r13d, %r11d\n    subq $65, %r13\n    cmpb $25, %r13b\n    leal 32(%r11), %ebx\n    movl %r11d, %r12d\n    cmovbel %ebx, %r12d\n    movb %r12b, (%rsi, %r14)\n    leal (%r12, %r9), %r10d\n    shll $5, %r9d\n    addl %r10d, %r9d\n    movzbl (%rdi, %r15), %r14d\n    movl %r14d, %r10d\n    subq $65, %r14\n    cmpb $25, %r14b\n    leal 32(%r10), %ebx\n    movl %r10d, %r12d\n    cmovbel %ebx, %r12d\n    movb %r12b, (%rsi, %r15)\n    leal (%r12, %r9), %r11d\n    shll $5, %r9d\n    leal (%r9, %r11), %edx\n    addq $4, %r8\n    cmpq $65536, %r8\njb .LBB5\n.LBB6:\n    movzbl folded(%rip), %r10d\n    cmpb $32, %r10b\njne .LBB9\n.LBB7:\n    movzbl folded+1(%rip), %edi\n    cmpb $55, %dil\njne .LBB9\n.LBB8:\n    movzbl folded+2(%rip), %esi\n    cmpb $110, %sil\nje .LBB10\n.LBB9:\n    movl $1, %eax\n.L__lccc_epilogue_1:\n    addq $24, %rsp\n    .cfi_def_cfa_offset 56\n    popq %rbp\n    .cfi_def_cfa_offset 48\n    popq %r15\n    .cfi_def_cfa_offset 40\n    popq %r14\n    .cfi_def_cfa_offset 32\n    popq %r13\n    .cfi_def_cfa_offset 24\n    popq %r12\n    .cfi_def_cfa_offset 16\n    popq %rbx\n    .cfi_def_cfa_offset 8\n    ret\n.LBB10:\n    .cfi_def_cfa_offset 80\n    cmpl $2571300113, %edx\n    movl $0, %ecx\n    movl $2, %edx\n    cmovel %ecx, %edx\n    movl %edx, %eax\n    jmp .L__lccc_epilogue_1\n.cfi_endproc\n.size main, .-main\n\n\n.section .note.GNU-stack,\"\",@progbits\n"
+    },
+    "control_equals_main": true
+  },
+  "switch": {
+    "source": "tests/benchmark/programs/switch_dispatch.c",
+    "source_sha256": "6a044523272024b733f4af8e5101d5bf2d72ba9d6e9362798f6149cd9265117a",
+    "flags": [
+      "-O2",
+      "-march=x86-64-v3"
+    ],
+    "enabled": {
+      "sha256": "34c72e8da870b830a99ed044fdaadcdb99725dace378a5e484be411f75ba4c97",
+      "stats": {
+        "instructions": 86,
+        "loads": 1,
+        "stores": 0,
+        "spills": 0,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "branches": 21,
+        "vectors": 0,
+        "calls": 1
+      },
+      "text": ".section .rodata\n.Lstr0:\n    .byte 115, 119, 105, 116, 99, 104, 95, 100, 105, 115, 112, 97, 116, 99, 104, 32, 115, 117, 109, 58, 32, 37, 108, 100, 10, 0\n\n.text\n.globl main\n.p2align 4\n.type main, @function\nmain:\n.cfi_startproc\n    subq $8, %rsp\n    .cfi_def_cfa_offset 16\n    # LCCC_RET_XMM 0\n    # LCCC_RET_RDX 0\n    # LCCC_RET_RAX 1\n    xorl %r11d, %r11d\n    xorl %r10d, %r10d\n    movl $777, %r8d\n.LBB1:\n    cmpl $50000000, %r10d\njge .LBB21\n.p2align 4,,10\n.p2align 3\n.LBB2:\n    imull $1664525, %r8d, %r8d\n    leal 1013904223(%r8), %r9d\n    movl %r9d, %edi\n    shrl $16, %edi\n    andq $15, %rdi\n    movzwl %r9w, %r8d\n    movslq %edi, %rax\n    leaq .Ljt_0(%rip), %rcx\n    movslq (%rcx,%rax,4), %rdx\n    addq %rcx, %rdx\n    jmpq *%rdx\n.section .rodata\n.align 4\n.Ljt_0:\n    .long .LBB4 - .Ljt_0\n    .long .LBB5 - .Ljt_0\n    .long .LBB6 - .Ljt_0\n    .long .LBB7 - .Ljt_0\n    .long .LBB8 - .Ljt_0\n    .long .LBB9 - .Ljt_0\n    .long .LBB10 - .Ljt_0\n    .long .LBB11 - .Ljt_0\n    .long .LBB12 - .Ljt_0\n    .long .LBB13 - .Ljt_0\n    .long .LBB14 - .Ljt_0\n    .long .LBB15 - .Ljt_0\n    .long .LBB16 - .Ljt_0\n    .long .LBB17 - .Ljt_0\n    .long .LBB18 - .Ljt_0\n    .long .LBB19 - .Ljt_0\n.section .text,\"ax\",@progbits\n.LBB3:\n    xorl %edi, %edi\n    jmp .LBB20\n.LBB4:\n    leal (%r10, %r8), %edi\n    jmp .LBB20\n.LBB5:\n    movl %r10d, %edi\n    subl %r8d, %edi\n    jmp .LBB20\n.LBB6:\n    movl %r10d, %edi\n    imull %r8d, %edi\n    jmp .LBB20\n.LBB7:\n    movl %r10d, %edi\n    xorl %r8d, %edi\n    jmp .LBB20\n.LBB8:\n    movl %r10d, %edi\n    orl %r8d, %edi\n    jmp .LBB20\n.LBB9:\n    movl %r10d, %edi\n    andl %r8d, %edi\n    jmp .LBB20\n.LBB10:\n    movl %r8d, %esi\n    andl $7, %esi\n    shlxl %esi, %r10d, %edi\n    jmp .LBB20\n.LBB11:\n    movl %r8d, %esi\n    andl $7, %esi\n    sarxl %esi, %r10d, %edi\n    jmp .LBB20\n.LBB12:\n    movl %r10d, %esi\n    notl %esi\n    leal (%rsi, %r8), %edi\n    jmp .LBB20\n.LBB13:\n    movl %r8d, %esi\n    notl %esi\n    movl %r10d, %edi\n    subl %esi, %edi\n    jmp .LBB20\n.LBB14:\n    leal (%r10, %r8), %edi\n    leaq (%rdi, %rdi, 2), %rdi\n    jmp .LBB20\n.LBB15:\n    movl %r10d, %esi\n    subl %r8d, %esi\n    movl %esi, %edi\n    leaq (%rdi, %rdi, 4), %rdi\n    jmp .LBB20\n.LBB16:\n    xorl %r10d, %r8d\n    leal 1(%r8), %edi\n    jmp .LBB20\n.LBB17:\n    orl %r10d, %r8d\n    movl %r8d, %edi\n    subl $1, %edi\n    jmp .LBB20\n.LBB18:\n    andl %r10d, %r8d\n    leal 2(%r8), %edi\n    jmp .LBB20\n.LBB19:\n    leal 1(%r10), %esi\n    leal (%rsi, %r8), %edi\n.LBB20:\n    movslq %edi, %rsi\n    addq %rsi, %r11\n    addl $1, %r10d\n    movq %r9, %r8\n    cmpl $50000000, %r10d\njl .LBB2\n.LBB21:\n    leaq .Lstr0(%rip), %rdi\n    movq %r11, %rsi\n    xorl %eax, %eax\n    call printf@PLT\n    # LCCC_VA_CALL\n    # LCCC_CALL_ARGS 2\n    # LCCC_CALL_FP 0\n    xorl %eax, %eax\n    addq $8, %rsp\n    .cfi_def_cfa_offset 8\n    ret\n.cfi_endproc\n.size main, .-main\n\n\n.section .note.GNU-stack,\"\",@progbits\n"
+    },
+    "disabled_intbounds": {
+      "sha256": "8010d9081dab88dfe5c81974e1e4837bc3cb74cc7de112f4ac70c58e049b74fc",
+      "stats": {
+        "instructions": 88,
+        "loads": 1,
+        "stores": 0,
+        "spills": 0,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "branches": 22,
+        "vectors": 0,
+        "calls": 1
+      },
+      "text": ".section .rodata\n.Lstr0:\n    .byte 115, 119, 105, 116, 99, 104, 95, 100, 105, 115, 112, 97, 116, 99, 104, 32, 115, 117, 109, 58, 32, 37, 108, 100, 10, 0\n\n.text\n.globl main\n.p2align 4\n.type main, @function\nmain:\n.cfi_startproc\n    subq $8, %rsp\n    .cfi_def_cfa_offset 16\n    # LCCC_RET_XMM 0\n    # LCCC_RET_RDX 0\n    # LCCC_RET_RAX 1\n    xorl %r11d, %r11d\n    xorl %r10d, %r10d\n    movl $777, %r8d\n.LBB1:\n    cmpl $50000000, %r10d\njge .LBB21\n.p2align 4,,10\n.p2align 3\n.LBB2:\n    imull $1664525, %r8d, %r8d\n    leal 1013904223(%r8), %r9d\n    movl %r9d, %edi\n    shrl $16, %edi\n    andq $15, %rdi\n    movzwl %r9w, %r8d\n    movslq %edi, %rax\n    cmpq $16, %rax\n    jae .LBB3\n    leaq .Ljt_0(%rip), %rcx\n    movslq (%rcx,%rax,4), %rdx\n    addq %rcx, %rdx\n    jmpq *%rdx\n.section .rodata\n.align 4\n.Ljt_0:\n    .long .LBB4 - .Ljt_0\n    .long .LBB5 - .Ljt_0\n    .long .LBB6 - .Ljt_0\n    .long .LBB7 - .Ljt_0\n    .long .LBB8 - .Ljt_0\n    .long .LBB9 - .Ljt_0\n    .long .LBB10 - .Ljt_0\n    .long .LBB11 - .Ljt_0\n    .long .LBB12 - .Ljt_0\n    .long .LBB13 - .Ljt_0\n    .long .LBB14 - .Ljt_0\n    .long .LBB15 - .Ljt_0\n    .long .LBB16 - .Ljt_0\n    .long .LBB17 - .Ljt_0\n    .long .LBB18 - .Ljt_0\n    .long .LBB19 - .Ljt_0\n.section .text,\"ax\",@progbits\n.LBB3:\n    xorl %edi, %edi\n    jmp .LBB20\n.LBB4:\n    leal (%r10, %r8), %edi\n    jmp .LBB20\n.LBB5:\n    movl %r10d, %edi\n    subl %r8d, %edi\n    jmp .LBB20\n.LBB6:\n    movl %r10d, %edi\n    imull %r8d, %edi\n    jmp .LBB20\n.LBB7:\n    movl %r10d, %edi\n    xorl %r8d, %edi\n    jmp .LBB20\n.LBB8:\n    movl %r10d, %edi\n    orl %r8d, %edi\n    jmp .LBB20\n.LBB9:\n    movl %r10d, %edi\n    andl %r8d, %edi\n    jmp .LBB20\n.LBB10:\n    movl %r8d, %esi\n    andl $7, %esi\n    shlxl %esi, %r10d, %edi\n    jmp .LBB20\n.LBB11:\n    movl %r8d, %esi\n    andl $7, %esi\n    sarxl %esi, %r10d, %edi\n    jmp .LBB20\n.LBB12:\n    movl %r10d, %esi\n    notl %esi\n    leal (%rsi, %r8), %edi\n    jmp .LBB20\n.LBB13:\n    movl %r8d, %esi\n    notl %esi\n    movl %r10d, %edi\n    subl %esi, %edi\n    jmp .LBB20\n.LBB14:\n    leal (%r10, %r8), %edi\n    leaq (%rdi, %rdi, 2), %rdi\n    jmp .LBB20\n.LBB15:\n    movl %r10d, %esi\n    subl %r8d, %esi\n    movl %esi, %edi\n    leaq (%rdi, %rdi, 4), %rdi\n    jmp .LBB20\n.LBB16:\n    xorl %r10d, %r8d\n    leal 1(%r8), %edi\n    jmp .LBB20\n.LBB17:\n    orl %r10d, %r8d\n    movl %r8d, %edi\n    subl $1, %edi\n    jmp .LBB20\n.LBB18:\n    andl %r10d, %r8d\n    leal 2(%r8), %edi\n    jmp .LBB20\n.LBB19:\n    leal 1(%r10), %esi\n    leal (%rsi, %r8), %edi\n.LBB20:\n    movslq %edi, %rsi\n    addq %rsi, %r11\n    addl $1, %r10d\n    movq %r9, %r8\n    cmpl $50000000, %r10d\njl .LBB2\n.LBB21:\n    leaq .Lstr0(%rip), %rdi\n    movq %r11, %rsi\n    xorl %eax, %eax\n    call printf@PLT\n    # LCCC_VA_CALL\n    # LCCC_CALL_ARGS 2\n    # LCCC_CALL_FP 0\n    xorl %eax, %eax\n    addq $8, %rsp\n    .cfi_def_cfa_offset 8\n    ret\n.cfi_endproc\n.size main, .-main\n\n\n.section .note.GNU-stack,\"\",@progbits\n"
+    }
+  },
+  "global_alias": {
+    "source": "int object;\nextern int alias_object __attribute__((alias(\"object\")));\n__attribute__((noinline)) int read_alias(void) {\n    object = 17;\n    int observed = alias_object;\n    object = 29;\n    return observed;\n}\n",
+    "flags": [
+      "-O2"
+    ],
+    "disabled_passes": [
+      "gaddrcse",
+      "gvn",
+      "redundantloads"
+    ],
+    "main": {
+      "sha256": "665d8157b5a6d33de6e64dd94bfd8c65b69f091e4d94dbfc6cd0886dd3986d87",
+      "stats": {
+        "instructions": 4,
+        "loads": 1,
+        "stores": 1,
+        "spills": 0,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "branches": 1,
+        "vectors": 0,
+        "calls": 0
+      },
+      "text": ".section .bss\n.globl object\n.align 4\n.type object, @object\n.size object, 4\nobject:\n    .zero 4\n\n.text\n.globl read_alias\n.p2align 4\n.type read_alias, @function\nread_alias:\n.cfi_startproc\n    # LCCC_RET_XMM 0\n    # LCCC_RET_RDX 0\n    # LCCC_RET_RAX 1\n    movslq alias_object(%rip), %rdi\n    movl $29, object(%rip)\n    movl %edi, %eax\n    ret\n.cfi_endproc\n.size read_alias, .-read_alias\n\n\n.globl alias_object\n.set alias_object,object\n\n.section .note.GNU-stack,\"\",@progbits\n"
+    },
+    "reviewed": {
+      "sha256": "665d8157b5a6d33de6e64dd94bfd8c65b69f091e4d94dbfc6cd0886dd3986d87",
+      "stats": {
+        "instructions": 4,
+        "loads": 1,
+        "stores": 1,
+        "spills": 0,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "branches": 1,
+        "vectors": 0,
+        "calls": 0
+      },
+      "text": ".section .bss\n.globl object\n.align 4\n.type object, @object\n.size object, 4\nobject:\n    .zero 4\n\n.text\n.globl read_alias\n.p2align 4\n.type read_alias, @function\nread_alias:\n.cfi_startproc\n    # LCCC_RET_XMM 0\n    # LCCC_RET_RDX 0\n    # LCCC_RET_RAX 1\n    movslq alias_object(%rip), %rdi\n    movl $29, object(%rip)\n    movl %edi, %eax\n    ret\n.cfi_endproc\n.size read_alias, .-read_alias\n\n\n.globl alias_object\n.set alias_object,object\n\n.section .note.GNU-stack,\"\",@progbits\n"
+    },
+    "also_disabled_dse": {
+      "sha256": "5e95fba371c9c48adc5f5181ea01630f698046318b5df812398cc9cb2a637f1c",
+      "stats": {
+        "instructions": 5,
+        "loads": 1,
+        "stores": 2,
+        "spills": 0,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "branches": 1,
+        "vectors": 0,
+        "calls": 0
+      },
+      "text": ".section .bss\n.globl object\n.align 4\n.type object, @object\n.size object, 4\nobject:\n    .zero 4\n\n.text\n.globl read_alias\n.p2align 4\n.type read_alias, @function\nread_alias:\n.cfi_startproc\n    # LCCC_RET_XMM 0\n    # LCCC_RET_RDX 0\n    # LCCC_RET_RAX 1\n    movl $17, object(%rip)\n    movslq alias_object(%rip), %rdi\n    movl $29, object(%rip)\n    movl %edi, %eax\n    ret\n.cfi_endproc\n.size read_alias, .-read_alias\n\n\n.globl alias_object\n.set alias_object,object\n\n.section .note.GNU-stack,\"\",@progbits\n"
+    }
+  }
+}

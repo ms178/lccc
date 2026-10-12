@@ -227,6 +227,43 @@ def compiler_fingerprint(compiler_id: str, *, now: float | None = None) -> str:
     return "|".join(parts)
 
 
+def compilation_error(data: Any) -> str | None:
+    """Validate a compiler response, never the executed program's exit status.
+
+    Partial assembly and an exit-zero driver that ignored target options are
+    not matched-target evidence. Ordinary source warnings remain admissible.
+    """
+    if not isinstance(data, dict):
+        return "malformed compiler response"
+    code = data.get("code")
+    if type(code) is not int or code != 0:
+        diagnostics = data.get("stderr") or data.get("stdout") or ""
+        if isinstance(diagnostics, list):
+            diagnostics = "\n".join(str(x.get("text", "")) if isinstance(x, dict) else str(x)
+                                    for x in diagnostics)
+        return f"compilation exit missing or unsuccessful: {code!r}: {str(diagnostics)[:500]}"
+    if data.get("timedOut") or data.get("truncated"):
+        return "compiler resource evidence incomplete"
+    for stream in (data.get("stderr"), data.get("stdout")):
+        if isinstance(stream, str):
+            lines = stream.splitlines()
+        elif isinstance(stream, list):
+            lines = [str(item.get("text", "")) if isinstance(item, dict) else str(item)
+                     for item in stream]
+        else:
+            lines = []
+        for line in lines:
+            if re.search(r"\b(?:warning|error)\b", line, re.I) and re.search(
+                r"(?:ignoring (?:unknown )?(?:option|argument)|"
+                r"(?:unknown|unsupported) (?:command.line )?(?:option|argument|architecture)|"
+                r"argument unused during compilation|"
+                r"(?:option|argument|flag|architecture).*?(?:ignored|not supported|unsupported))",
+                line, re.I,
+            ):
+                return f"requested compiler options not honored: {line[:240]}"
+    return None
+
+
 def compile_on_godbolt(compiler_id: str, source: str, flags: str,
                         *, intel: bool = False, timeout: int = 120,
                         keep_directives: bool = False,
@@ -282,16 +319,11 @@ def compile_on_godbolt(compiler_id: str, source: str, flags: str,
     except GodboltError as error:
         print(f"godbolt: {cid}: {error}", file=sys.stderr)
         return None
-    if not isinstance(data, dict):
-        print(f"godbolt: {cid}: malformed response", file=sys.stderr)
-        return None
-    if data.get("code") != 0:
-        diagnostics = data.get("stderr") or data.get("stdout") or []
-        rendered = "\n".join(
-            item.get("text", str(item)) if isinstance(item, dict) else str(item)
-            for item in diagnostics
-        )
-        print(f"godbolt: {cid}: compilation failed\n{rendered}", file=sys.stderr)
+    # Executor responses may put the PROGRAM status at the top level.
+    build = data.get("buildResult", data) if isinstance(data, dict) else data
+    error = compilation_error(build)
+    if error:
+        print(f"godbolt: {cid}: {error}", file=sys.stderr)
         return None
     return data
 

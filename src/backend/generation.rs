@@ -3510,6 +3510,13 @@ pub fn generate_module(
     module: &IrModule,
     source_mgr: Option<&crate::common::source::SourceManager>,
 ) -> String {
+    // Freeze this module's control once, not once per function, and avoid
+    // running the analysis on backends whose switch emitters do not use it.
+    cg.state().switch_bounds_enabled = cg.supports_switch_bounds()
+        && !crate::passes::pass_disabled(
+            std::env::var("CCC_DISABLE_PASSES").unwrap_or_default(),
+            "intbounds",
+        );
     pre_size_output_buffer(cg, module);
     collect_symbol_sets(cg, module);
     let file_table = build_and_emit_dwarf_file_table(cg, module, source_mgr);
@@ -4496,6 +4503,9 @@ fn generate_function(
     // consults them to skip dead destinations.
     let value_use_counts = count_value_uses(func);
     cg.state().value_use_counts = value_use_counts.clone();
+    if cg.state_ref().switch_bounds_enabled {
+        cg.state().switch_unsigned_bounds = crate::passes::integer_bounds::switch_bounds(func);
+    }
     cg.emit_store_params(func);
 
     let entry_label = func.blocks.first().map(|b| b.label);

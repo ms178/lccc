@@ -752,6 +752,98 @@ fn try_fold_bool_op(
     Some(out)
 }
 
+/// Prove that deleting one comparison arm removes neither effects nor uses.
+/// Only its designated phi incoming edge may reference its local definitions.
+fn removable_phi_arm(
+    func: &IrFunction,
+    bcheck_idx: usize,
+    c2_id: u32,
+    range_value: Value,
+    phi_dest: Value,
+    val_arm: &(Operand, crate::ir::reexports::BlockId),
+) -> bool {
+    let mut local_defs = crate::common::fx_hash::FxHashSet::default();
+    let pure = func.blocks[bcheck_idx]
+        .instructions
+        .iter()
+        .all(|inst| match inst {
+            Instruction::Cmp { dest, .. } if dest.0 == c2_id => {
+                local_defs.insert(dest.0);
+                true
+            }
+            Instruction::Cast {
+                dest,
+                from_ty,
+                to_ty,
+                ..
+            } if from_ty.is_integer() && to_ty.is_integer() => {
+                local_defs.insert(dest.0);
+                true
+            }
+            _ => false,
+        });
+    if !pure || !local_defs.contains(&c2_id) || local_defs.contains(&range_value.0) {
+        return false;
+    }
+    let mut arm_ok = true;
+    for block in &func.blocks {
+        if block.label == func.blocks[bcheck_idx].label {
+            continue;
+        }
+        for inst in &block.instructions {
+            if let Instruction::Phi { dest, incoming, .. } = inst
+                && *dest == phi_dest
+            {
+                for (op, from) in incoming {
+                    if *from == val_arm.1 && *op == val_arm.0 {
+                        continue;
+                    }
+                    if let Operand::Value(v) = op
+                        && local_defs.contains(&v.0)
+                    {
+                        arm_ok = false;
+                    }
+                }
+            } else {
+                inst.for_each_used_value(|id| {
+                    if local_defs.contains(&id) {
+                        arm_ok = false;
+                    }
+                });
+            }
+        }
+        block.terminator.for_each_used_value(|id| {
+            if local_defs.contains(&id) {
+                arm_ok = false;
+            }
+        });
+    }
+    arm_ok
+}
+
+/// Collapsing two edges may not change any sibling phi's selected value.
+fn sibling_phi_edges_agree(
+    merge: &crate::ir::reexports::BasicBlock,
+    selected: usize,
+    cond: u32,
+    check: u32,
+) -> bool {
+    for (index, inst) in merge.instructions.iter().enumerate() {
+        let Instruction::Phi { incoming, .. } = inst else {
+            break;
+        };
+        if index == selected {
+            continue;
+        }
+        let a = incoming.iter().find(|(_, from)| from.0 == cond);
+        let b = incoming.iter().find(|(_, from)| from.0 == check);
+        if !matches!((a, b), (Some(a), Some(b)) if a.0 == b.0) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Fold the PHI form of a short-circuit `&&`/`||` range predicate.
 ///
 /// if_convert is disabled on the m16 size profile (measured: it grows the
@@ -775,12 +867,14 @@ fn try_fold_bool_op(
 ///   %d = Sub(x, K1); %u = Cmp(Ule, %d, K2-K1); [Cast %u -> T]
 ///   Branch(Bmerge)                               // unconditional
 ///
-/// with every use of %p replaced by %u. Bcheck becomes unreachable and is
-/// dropped. All structural requirements are checked fail-closed: the Phi has
-/// exactly the two diamond arms, Bcheck has Bcond as its only predecessor
-/// (canonical CFG: computed-goto and asm-goto edges count) and branches
-/// straight to Bmerge, Bmerge has no other predecessors, the second
-/// comparison (and its widening cast) has no uses besides the Phi arm, the
+/// with every use of %p replaced by %u when these are the only two arms.
+/// For a tail pair in a larger join, retain the Phi and replace just the
+/// Bcond arm by %u; unrelated incoming values must remain unchanged.
+/// Bcheck becomes unreachable and is dropped. All requirements fail closed:
+/// Bcheck has Bcond as its only predecessor (canonical CFG: computed-goto
+/// and asm-goto edges count), contains only the comparison and integer
+/// casts, and branches straight to Bmerge. EVERY local definition has no
+/// external use besides the selected Phi arm (terminators count too), the
 /// cast chain of both comparison operands matches, and every OTHER leading
 /// phi of Bmerge carries the SAME value on its Bcond and Bcheck arms (they
 /// collapse onto one edge; differing values would need a merge that no
@@ -824,6 +918,7 @@ fn fold_phi_diamonds(
         phi_dest: Value,
         merge_label: u32,
         bcheck_label: u32,
+        partial: bool,
     }
     /// What replaces the folded phi's value.
     enum DiamondReplacement {
@@ -844,241 +939,209 @@ fn fold_phi_diamonds(
             else {
                 break; // phis lead the block
             };
-            if incoming.len() != 2 {
-                break;
-            }
-            let a = &incoming[0];
-            let b = &incoming[1];
-            let (const_arm, val_arm) = match (&a.0, &b.0) {
-                (Operand::Const(_), Operand::Value(_)) => (a, b),
-                (Operand::Value(_), Operand::Const(_)) => (b, a),
-                _ => break,
-            };
-            // Constant arm must be 0 (&&) or 1 (||).
-            let and_form = match const_arm.0 {
-                Operand::Const(c) if c.to_i64() == Some(0) => true,
-                Operand::Const(c) if c.to_i64() == Some(1) => false,
-                _ => break,
-            };
-
-            let bcond_idx = match idx_of.get(&const_arm.1.0) {
-                Some(&i) => i,
-                None => continue,
-            };
-            let bcheck_idx = match idx_of.get(&val_arm.1.0) {
-                Some(&i) => i,
-                None => continue,
-            };
-            if bcond_idx == jm || bcheck_idx == jm || bcond_idx == bcheck_idx {
+            if incoming.len() < 2 || incoming.len() != preds.len(jm) {
                 continue;
             }
-
-            // Bcheck: single predecessor (Bcond), branches straight to Bmerge.
-            let bcond_label = func.blocks[bcond_idx].label.0;
-            let bcheck_label = func.blocks[bcheck_idx].label.0;
-            let merge_label = func.blocks[jm].label.0;
-            if preds.len(jm) != 2
-                || !preds.row(jm).contains(&(bcond_idx as u32))
-                || !preds.row(jm).contains(&(bcheck_idx as u32))
+            let incoming_labels: FxHashSet<u32> = incoming.iter().map(|(_, b)| b.0).collect();
+            if incoming_labels.len() != incoming.len()
+                || !preds
+                    .row(jm)
+                    .iter()
+                    .all(|&p| incoming_labels.contains(&func.blocks[p as usize].label.0))
             {
                 continue;
             }
-            if preds.len(bcheck_idx) != 1 || preds.row(bcheck_idx)[0] as usize != bcond_idx {
-                continue;
-            }
-            if !matches!(func.blocks[bcheck_idx].terminator, Terminator::Branch(l) if l.0 == merge_label)
+            // A short-circuit pair can be the tail of a larger membership
+            // chain. Derive its constant arm from the check block's actual
+            // predecessor instead of requiring the entire join to have two
+            // arms. Other incoming values remain in the join unchanged.
+            'arms: for val_arm in incoming
+                .iter()
+                .filter(|(op, _)| matches!(op, Operand::Value(_)))
             {
-                continue;
-            }
-
-            // Bcond must end in a CondBranch whose two targets are exactly
-            // {Bcheck, Bmerge}; remember which side Bmerge is on so the first
-            // comparison can be normalized to its "contributes to the phi"
-            // sense.
-            let (cond_val, merge_on_true) = {
-                let bcond = &func.blocks[bcond_idx];
-                let Terminator::CondBranch {
-                    cond: Operand::Value(cv),
-                    true_label,
-                    false_label,
-                } = &bcond.terminator
+                let Some(&bcheck_idx) = idx_of.get(&val_arm.1.0) else {
+                    continue;
+                };
+                if preds.len(bcheck_idx) != 1 {
+                    continue;
+                }
+                let bcond_idx = preds.row(bcheck_idx)[0] as usize;
+                let Some(const_arm) = incoming
+                    .iter()
+                    .find(|(_, b)| *b == func.blocks[bcond_idx].label)
                 else {
                     continue;
                 };
-                let t_ok = true_label.0 == bcheck_label || true_label.0 == merge_label;
-                let f_ok = false_label.0 == bcheck_label || false_label.0 == merge_label;
-                if !(t_ok && f_ok) || true_label == false_label {
+                // Constant arm must be 0 (&&) or 1 (||).
+                let and_form = match const_arm.0 {
+                    Operand::Const(c) if c.to_i64() == Some(0) => true,
+                    Operand::Const(c) if c.to_i64() == Some(1) => false,
+                    _ => continue,
+                };
+
+                if bcond_idx == jm || bcheck_idx == jm || bcond_idx == bcheck_idx {
                     continue;
                 }
-                (*cv, true_label.0 == merge_label)
-            };
 
-            // Resolve both comparisons (through boolean widenings).
-            let Some(c1_id) = resolve_bool_cmp(cond_val.0, cmp_defs, cast_defs) else {
-                continue;
-            };
-            let Some(c1) = cmp_defs.get(c1_id as usize).and_then(|d| d.as_ref()) else {
-                continue;
-            };
-            // Normalize the first comparison to the sense that contributes to
-            // the phi: the Bmerge edge carries the constant arm. For `&&` the
-            // constant is 0 and the merge edge means "first test failed", so
-            // the contributing sense is the branch edge to Bcheck; when Bmerge
-            // is the TRUE target the comparison is inverted. For `||` (constant
-            // 1 on the merge edge) it is the opposite.
-            let negate = if and_form {
-                merge_on_true
-            } else {
-                !merge_on_true
-            };
-            let c1_op = if negate {
-                match c1.0 {
-                    IrCmpOp::Slt => IrCmpOp::Sge,
-                    IrCmpOp::Sle => IrCmpOp::Sgt,
-                    IrCmpOp::Sgt => IrCmpOp::Sle,
-                    IrCmpOp::Sge => IrCmpOp::Slt,
-                    IrCmpOp::Ult => IrCmpOp::Uge,
-                    IrCmpOp::Ule => IrCmpOp::Ugt,
-                    IrCmpOp::Ugt => IrCmpOp::Ule,
-                    IrCmpOp::Uge => IrCmpOp::Ult,
-                    IrCmpOp::Eq => IrCmpOp::Ne,
-                    IrCmpOp::Ne => IrCmpOp::Eq,
-                }
-            } else {
-                c1.0
-            };
-            let val_id = match val_arm.0 {
-                Operand::Value(v) => v.0,
-                _ => continue,
-            };
-            let Some(c2_id) = resolve_bool_cmp(val_id, cmp_defs, cast_defs) else {
-                continue;
-            };
-            let Some(c2) = cmp_defs.get(c2_id as usize).and_then(|d| d.as_ref()) else {
-                continue;
-            };
-            let Some(bound1) = canonicalize(c1_op, &c1.1, &c1.2, c1.3) else {
-                continue;
-            };
-            let Some(bound2) = canonicalize(c2.0, &c2.1, &c2.2, c2.3) else {
-                continue;
-            };
-
-            let Some(range) = extract_range(&bound1, &bound2, and_form, cast_defs) else {
-                continue;
-            };
-            let Some(plan) = plan_range(&range, cast_defs) else {
-                continue;
-            };
-
-            // The second comparison (and its widening cast, when the phi arm
-            // carries one) must have no uses OUTSIDE Bcheck and the phi arm:
-            // Bcheck dies with the fold, taking its Cmp/Cast definitions along,
-            // so any other live consumer would reference a dead value. Uses
-            // inside Bcheck itself are exactly the instructions being deleted.
-            // (Phi arms count as uses — verified against
-            // `Instruction::for_each_used_value`.)
-            let mut arm_ok = true;
-            'outer: for block in &func.blocks {
-                if block.label.0 == bcheck_label {
+                // Bcheck: single predecessor (Bcond), branches straight to Bmerge.
+                let bcond_label = func.blocks[bcond_idx].label.0;
+                let bcheck_label = func.blocks[bcheck_idx].label.0;
+                let merge_label = func.blocks[jm].label.0;
+                if !preds.row(jm).contains(&(bcond_idx as u32))
+                    || !preds.row(jm).contains(&(bcheck_idx as u32))
+                {
                     continue;
                 }
-                for inst in &block.instructions {
-                    if let Instruction::Phi { dest, incoming, .. } = inst {
-                        if dest.0 == phi_dest.0 {
-                            continue;
-                        }
-                        if incoming.iter().any(
-                            |(op, _)| matches!(op, Operand::Value(v) if v.0 == val_id || v.0 == c2_id),
-                        ) {
-                            arm_ok = false;
-                            break 'outer;
-                        }
+                if preds.len(bcheck_idx) != 1 || preds.row(bcheck_idx)[0] as usize != bcond_idx {
+                    continue;
+                }
+                if !matches!(func.blocks[bcheck_idx].terminator, Terminator::Branch(l) if l.0 == merge_label)
+                {
+                    continue;
+                }
+
+                // Bcond must end in a CondBranch whose two targets are exactly
+                // {Bcheck, Bmerge}; remember which side Bmerge is on so the first
+                // comparison can be normalized to its "contributes to the phi"
+                // sense.
+                let (cond_val, merge_on_true) = {
+                    let bcond = &func.blocks[bcond_idx];
+                    let Terminator::CondBranch {
+                        cond: Operand::Value(cv),
+                        true_label,
+                        false_label,
+                    } = &bcond.terminator
+                    else {
+                        continue;
+                    };
+                    let t_ok = true_label.0 == bcheck_label || true_label.0 == merge_label;
+                    let f_ok = false_label.0 == bcheck_label || false_label.0 == merge_label;
+                    if !(t_ok && f_ok) || true_label == false_label {
+                        continue;
                     }
-                    let mut bad = false;
-                    inst.for_each_used_value(|id| {
-                        if id == val_id || id == c2_id {
-                            bad = true;
-                        }
-                    });
-                    if bad {
-                        arm_ok = false;
-                        break 'outer;
-                    }
-                }
-            }
-            if !arm_ok {
-                continue;
-            }
+                    (*cv, true_label.0 == merge_label)
+                };
 
-            // EVERY other leading phi of Bmerge must carry the same value on
-            // its Bcond and Bcheck arms: the fold collapses the two edges
-            // into one Bcond edge, so a differing pair would silently select
-            // the Bcond value on the old-Bcheck path. Equal arms collapse to
-            // the single Bcond arm (the Bcheck arm is dropped below).
-            for (opi, other) in merge.instructions.iter().enumerate() {
-                if opi == pi {
+                // Resolve both comparisons (through boolean widenings).
+                let Some(c1_id) = resolve_bool_cmp(cond_val.0, cmp_defs, cast_defs) else {
                     continue;
-                }
-                let Instruction::Phi { incoming, .. } = other else {
-                    break; // phis lead the block
                 };
-                let Some(bc_arm) = incoming.iter().find(|(_, f)| f.0 == bcond_label) else {
-                    continue 'cands; // malformed: missing pred arm — reject
+                let Some(c1) = cmp_defs.get(c1_id as usize).and_then(|d| d.as_ref()) else {
+                    continue;
                 };
-                let Some(bk_arm) = incoming.iter().find(|(_, f)| f.0 == bcheck_label) else {
-                    continue 'cands; // malformed: missing pred arm — reject
-                };
-                if bc_arm.0 != bk_arm.0 {
-                    continue 'cands; // differing merge values — reject
-                }
-            }
-
-            // Build the replacement: sub + unsigned compare (+ widening cast
-            // to the phi's type when it is not the boolean type itself) — or,
-            // for a full-domain range, the constant itself.
-            let (new_insts, replacement) = if matches!(plan, RangePlan::FullDomain) {
-                // The inside form is constant TRUE (outside: FALSE). The
-                // phi is rewritten IN PLACE into a Copy of the constant —
-                // every use keeps referencing phi_dest (Operand and
-                // bare-Value positions alike), so no use-rewrite is needed
-                // and no dangling reference is possible.
-                let Some(c) = int_const(*phi_ty, if and_form { 1 } else { 0 }) else {
-                    continue 'cands;
-                };
-                (Vec::new(), DiamondReplacement::Const(c))
-            } else {
-                let (mut new_insts, cmp_dest) = range_test_core(&plan, and_form, next_id);
-                // Replacement value for the phi's uses.
-                let replacement: Operand = if *phi_ty == IrType::I8 || *phi_ty == IrType::U8 {
-                    Operand::Value(cmp_dest)
+                // Normalize the first comparison to the sense that contributes to
+                // the phi: the Bmerge edge carries the constant arm. For `&&` the
+                // constant is 0 and the merge edge means "first test failed", so
+                // the contributing sense is the branch edge to Bcheck; when Bmerge
+                // is the TRUE target the comparison is inverted. For `||` (constant
+                // 1 on the merge edge) it is the opposite.
+                let negate = if and_form {
+                    merge_on_true
                 } else {
-                    let cast_dest = Value(*next_id);
-                    *next_id += 1;
-                    new_insts.push(Instruction::Cast {
-                        dest: cast_dest,
-                        src: Operand::Value(cmp_dest),
-                        from_ty: IrType::I8,
-                        to_ty: *phi_ty,
-                    });
-                    Operand::Value(cast_dest)
+                    !merge_on_true
                 };
-                (new_insts, DiamondReplacement::Value(replacement))
-            };
+                let c1_op = if negate {
+                    match c1.0 {
+                        IrCmpOp::Slt => IrCmpOp::Sge,
+                        IrCmpOp::Sle => IrCmpOp::Sgt,
+                        IrCmpOp::Sgt => IrCmpOp::Sle,
+                        IrCmpOp::Sge => IrCmpOp::Slt,
+                        IrCmpOp::Ult => IrCmpOp::Uge,
+                        IrCmpOp::Ule => IrCmpOp::Ugt,
+                        IrCmpOp::Ugt => IrCmpOp::Ule,
+                        IrCmpOp::Uge => IrCmpOp::Ult,
+                        IrCmpOp::Eq => IrCmpOp::Ne,
+                        IrCmpOp::Ne => IrCmpOp::Eq,
+                    }
+                } else {
+                    c1.0
+                };
+                let val_id = match val_arm.0 {
+                    Operand::Value(v) => v.0,
+                    _ => continue,
+                };
+                let Some(c2_id) = resolve_bool_cmp(val_id, cmp_defs, cast_defs) else {
+                    continue;
+                };
+                let Some(c2) = cmp_defs.get(c2_id as usize).and_then(|d| d.as_ref()) else {
+                    continue;
+                };
+                let (range, test_inside) = if let Some(range) =
+                    adjacent_equality_range((c1_op, c1.1, c1.2, c1.3), *c2, and_form)
+                {
+                    (range, !and_form)
+                } else {
+                    let Some(bound1) = canonicalize(c1_op, &c1.1, &c1.2, c1.3) else {
+                        continue;
+                    };
+                    let Some(bound2) = canonicalize(c2.0, &c2.1, &c2.2, c2.3) else {
+                        continue;
+                    };
+                    let Some(range) = extract_range(&bound1, &bound2, and_form, cast_defs) else {
+                        continue;
+                    };
+                    (range, and_form)
+                };
+                let Some(plan) = plan_range(&range, cast_defs) else {
+                    continue;
+                };
 
-            // Approved. Everything below mutates, so the descriptor is
-            // handed to the apply phase AFTER the immutable scan ends.
-            approved = Some(ApprovedDiamond {
-                bcond_idx,
-                jm,
-                pi,
-                new_insts,
-                replacement,
-                phi_dest: *phi_dest,
-                merge_label,
-                bcheck_label,
-            });
-            break 'cands;
+                if !removable_phi_arm(func, bcheck_idx, c2_id, range.value, *phi_dest, val_arm) {
+                    continue;
+                }
+
+                if !sibling_phi_edges_agree(merge, pi, bcond_label, bcheck_label) {
+                    continue;
+                }
+
+                // Build the replacement: sub + unsigned compare (+ widening cast
+                // to the phi's type when it is not the boolean type itself) — or,
+                // for a full-domain range, the constant itself.
+                let (new_insts, replacement) = if matches!(plan, RangePlan::FullDomain) {
+                    // The inside form is constant TRUE (outside: FALSE). The
+                    // phi is rewritten IN PLACE into a Copy of the constant —
+                    // every use keeps referencing phi_dest (Operand and
+                    // bare-Value positions alike), so no use-rewrite is needed
+                    // and no dangling reference is possible.
+                    let Some(c) = int_const(*phi_ty, i64::from(full_domain_outcome(test_inside)))
+                    else {
+                        continue 'arms;
+                    };
+                    (Vec::new(), DiamondReplacement::Const(c))
+                } else {
+                    let (mut new_insts, cmp_dest) = range_test_core(&plan, test_inside, next_id);
+                    // Replacement value for the phi's uses.
+                    let replacement: Operand = if *phi_ty == IrType::I8 || *phi_ty == IrType::U8 {
+                        Operand::Value(cmp_dest)
+                    } else {
+                        let cast_dest = Value(*next_id);
+                        *next_id += 1;
+                        new_insts.push(Instruction::Cast {
+                            dest: cast_dest,
+                            src: Operand::Value(cmp_dest),
+                            from_ty: IrType::I8,
+                            to_ty: *phi_ty,
+                        });
+                        Operand::Value(cast_dest)
+                    };
+                    (new_insts, DiamondReplacement::Value(replacement))
+                };
+
+                // Approved. Everything below mutates, so the descriptor is
+                // handed to the apply phase AFTER the immutable scan ends.
+                approved = Some(ApprovedDiamond {
+                    bcond_idx,
+                    jm,
+                    pi,
+                    new_insts,
+                    replacement,
+                    phi_dest: *phi_dest,
+                    merge_label,
+                    bcheck_label,
+                    partial: incoming.len() > 2,
+                });
+                break 'cands;
+            }
         }
     }
     let Some(a) = approved else { return changes };
@@ -1097,67 +1160,92 @@ fn fold_phi_diamonds(
             phi_dest,
             merge_label,
             bcheck_label,
+            partial,
         } = a;
-        let _ = merge_label;
         {
             let bcond = &mut func.blocks[bcond_idx];
             bcond.instructions.extend(new_insts);
             bcond.terminator = Terminator::Branch(crate::ir::reexports::BlockId(merge_label));
         }
-        match replacement {
-            DiamondReplacement::Value(replacement) => {
-                // Replace every use of phi_dest with the replacement, through the
-                // canonical pair: operand slots AND the bare-Value slots (Store ptr,
-                // GEP base, ...), because the phi is deleted below and anything naming
-                // it here has to be redirected with it (the contract the long-form
-                // comment spelled out; the helper enforces it for every IR shape).
-                for block in &mut func.blocks {
-                    for inst in &mut block.instructions {
-                        replace_operand_value(inst, phi_dest, replacement.clone());
-                    }
-                    replace_terminator_value(&mut block.terminator, phi_dest, replacement.clone());
+        if partial {
+            let operand = match replacement {
+                DiamondReplacement::Value(value) => value,
+                DiamondReplacement::Const(c) => Operand::Const(c),
+            };
+            let bcond_label = func.blocks[bcond_idx].label;
+            for inst in &mut func.blocks[jm].instructions {
+                let Instruction::Phi { dest, incoming, .. } = inst else {
+                    break;
+                };
+                incoming.retain(|(_, from)| from.0 != bcheck_label);
+                if *dest == phi_dest {
+                    let arm = incoming
+                        .iter_mut()
+                        .find(|(_, from)| *from == bcond_label)
+                        .expect("validated constant predecessor arm");
+                    arm.0 = operand;
                 }
-                // Drop the phi from Bmerge; collapse every other phi's
-                // duplicate Bcheck arm (proven equal above).
-                {
+            }
+        } else {
+            match replacement {
+                DiamondReplacement::Value(replacement) => {
+                    // Replace every use of phi_dest with the replacement, through the
+                    // canonical pair: operand slots AND the bare-Value slots (Store ptr,
+                    // GEP base, ...), because the phi is deleted below and anything naming
+                    // it here has to be redirected with it (the contract the long-form
+                    // comment spelled out; the helper enforces it for every IR shape).
+                    for block in &mut func.blocks {
+                        for inst in &mut block.instructions {
+                            replace_operand_value(inst, phi_dest, replacement.clone());
+                        }
+                        replace_terminator_value(
+                            &mut block.terminator,
+                            phi_dest,
+                            replacement.clone(),
+                        );
+                    }
+                    // Drop the phi from Bmerge; collapse every other phi's
+                    // duplicate Bcheck arm (proven equal above).
+                    {
+                        let merge = &mut func.blocks[jm];
+                        merge.instructions.remove(pi);
+                        for inst in &mut merge.instructions {
+                            let Instruction::Phi { incoming, .. } = inst else {
+                                break;
+                            };
+                            incoming.retain(|(_, f)| f.0 != bcheck_label);
+                        }
+                    }
+                }
+                DiamondReplacement::Const(c) => {
+                    // Full domain: the phi IS the constant on every edge.
+                    // Rewrite it in place (after the block's remaining leading
+                    // phis, which must stay block-leading) so every use —
+                    // Operand or bare-Value — keeps its reference; no rewrite
+                    // walk, no dangling position.
                     let merge = &mut func.blocks[jm];
                     merge.instructions.remove(pi);
+                    let mut insert_at = 0;
+                    for (i, inst) in merge.instructions.iter().enumerate() {
+                        if matches!(inst, Instruction::Phi { .. }) {
+                            insert_at = i + 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    merge.instructions.insert(
+                        insert_at,
+                        Instruction::Copy {
+                            dest: phi_dest,
+                            src: Operand::Const(c),
+                        },
+                    );
                     for inst in &mut merge.instructions {
                         let Instruction::Phi { incoming, .. } = inst else {
                             break;
                         };
                         incoming.retain(|(_, f)| f.0 != bcheck_label);
                     }
-                }
-            }
-            DiamondReplacement::Const(c) => {
-                // Full domain: the phi IS the constant on every edge.
-                // Rewrite it in place (after the block's remaining leading
-                // phis, which must stay block-leading) so every use —
-                // Operand or bare-Value — keeps its reference; no rewrite
-                // walk, no dangling position.
-                let merge = &mut func.blocks[jm];
-                merge.instructions.remove(pi);
-                let mut insert_at = 0;
-                for (i, inst) in merge.instructions.iter().enumerate() {
-                    if matches!(inst, Instruction::Phi { .. }) {
-                        insert_at = i + 1;
-                    } else {
-                        break;
-                    }
-                }
-                merge.instructions.insert(
-                    insert_at,
-                    Instruction::Copy {
-                        dest: phi_dest,
-                        src: Operand::Const(c),
-                    },
-                );
-                for inst in &mut merge.instructions {
-                    let Instruction::Phi { incoming, .. } = inst else {
-                        break;
-                    };
-                    incoming.retain(|(_, f)| f.0 != bcheck_label);
                 }
             }
         }
@@ -1513,6 +1601,47 @@ fn drop_dead_block(func: &mut IrFunction, dead_label: u32) {
     func.blocks.retain(|b| b.label.0 != dead_label);
 }
 
+/// A two-member equality set is a range too, but has the opposite polarity
+/// from two bound checks: equality OR is inside; inequality AND is outside.
+/// Require the very same SSA operand and comparison type. In particular, do
+/// not equate narrowed casts with their sources to manufacture adjacency.
+fn adjacent_equality_range(
+    first: (IrCmpOp, Operand, Operand, IrType),
+    second: (IrCmpOp, Operand, Operand, IrType),
+    and_form: bool,
+) -> Option<Range> {
+    let wanted = if and_form { IrCmpOp::Ne } else { IrCmpOp::Eq };
+    let (op1, l1, r1, ty) = first;
+    let (op2, l2, r2, ty2) = second;
+    if op1 != wanted || op2 != wanted || ty != ty2 {
+        return None;
+    }
+    let (bits, signed) = domain_of(ty)?;
+    let member = |lhs, rhs| match (lhs, rhs) {
+        (Operand::Value(v), Operand::Const(c)) | (Operand::Const(c), Operand::Value(v)) => {
+            c.to_i64().map(|c| (v, c))
+        }
+        _ => None,
+    };
+    let (v1, c1) = member(l1, r1)?;
+    let (v2, c2) = member(l2, r2)?;
+    if v1 != v2 {
+        return None;
+    }
+    let a = dom_value(c1, bits, signed);
+    let b = dom_value(c2, bits, signed);
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    if hi - lo != 1 {
+        return None;
+    }
+    Some(Range {
+        lo: lo as i64,
+        hi: hi as i64,
+        value: v1,
+        ty,
+    })
+}
+
 /// Validate and apply one branch-chain candidate. Every structural fact is
 /// re-derived from the CURRENT IR (never from the scan's snapshot), so a
 /// candidate whose blocks were touched by an earlier fold in the same pass
@@ -1577,15 +1706,23 @@ fn try_fold_one_branch_chain(
     else {
         return None;
     };
-    let (Some(bound1), Some(bound2)) = (
-        canonicalize(op1, &l1, &r1, ty1),
-        canonicalize(op2, &l2, &r2, ty2),
-    ) else {
-        return None;
+    let (range, test_inside) = if let Some(range) =
+        adjacent_equality_range((op1, l1, r1, ty1), (op2, l2, r2, ty2), and_form)
+    {
+        (range, !and_form)
+    } else {
+        let bound1 = canonicalize(op1, &l1, &r1, ty1)?;
+        let bound2 = canonicalize(op2, &l2, &r2, ty2)?;
+        (
+            extract_range(&bound1, &bound2, and_form, cast_defs)?,
+            and_form,
+        )
     };
-    let range = extract_range(&bound1, &bound2, and_form, cast_defs)?;
     let plan = plan_range(&range, cast_defs)?;
     let full = matches!(plan, RangePlan::FullDomain);
+    if full && !full_domain_reaches_body(and_form, test_inside) {
+        return None;
+    }
 
     // --- full-domain structural guards -------------------------------------
     // The dead side (Bexit, in both forms — the inside test is constant
@@ -1689,7 +1826,7 @@ fn try_fold_one_branch_chain(
             Terminator::Branch(crate::ir::reexports::BlockId(bbody_label)),
         )
     } else {
-        let (new_insts, cmp_dest) = range_test_core(&plan, and_form, next_id);
+        let (new_insts, cmp_dest) = range_test_core(&plan, test_inside, next_id);
         let (new_true, new_false) = if and_form {
             (
                 crate::ir::reexports::BlockId(bbody_label),
@@ -1849,6 +1986,18 @@ fn build_def_maps(func: &IrFunction) -> DefMaps {
         }
     }
     maps
+}
+
+/// A full-domain inside test is true; its outside complement is false.
+fn full_domain_outcome(test_inside: bool) -> bool {
+    test_inside
+}
+
+/// The existing full-domain CFG surgery preserves Bbody and removes Bexit.
+/// Opposite-polarity plans need different phi-edge handling, not just a
+/// flipped branch; reject them before mutation until that surgery is modeled.
+fn full_domain_reaches_body(and_form: bool, test_inside: bool) -> bool {
+    full_domain_outcome(test_inside) == and_form
 }
 
 /// Run the range-check fold over one function. Returns the number of folds.
@@ -2067,6 +2216,20 @@ mod tests {
     /// excluding the `U8 -> I64` widening the frontend actually emits for
     /// `char c; c >= 'a' && c <= 'z'` -- so the pass never fired on its own
     /// headline idiom, and `set_membership` downstream was starved with it.
+    #[test]
+    fn full_domain_polarity_is_explicit_and_unsupported_cfg_senses_refuse() {
+        assert!(full_domain_outcome(true));
+        assert!(!full_domain_outcome(false));
+        for and_form in [false, true] {
+            for test_inside in [false, true] {
+                assert_eq!(
+                    full_domain_reaches_body(and_form, test_inside),
+                    and_form == test_inside
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_boolean_widening_cast_is_transparent_at_every_width() {
         let mut cmp_defs: Vec<Option<(IrCmpOp, Operand, Operand, IrType)>> = vec![None; 4];
@@ -3709,5 +3872,415 @@ mod tests {
             }
             other => panic!("expected the exit phi, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn adjacent_equality_branch_sets_fold_with_the_correct_polarity() {
+        for and_form in [false, true] {
+            for swapped in [false, true] {
+                let op = if and_form { IrCmpOp::Ne } else { IrCmpOp::Eq };
+                let cmp = |dest, c| {
+                    let (v, k) = (Operand::Value(Value(0)), Operand::Const(IrConst::I32(c)));
+                    Instruction::Cmp {
+                        dest: Value(dest),
+                        op,
+                        lhs: if swapped { k } else { v },
+                        rhs: if swapped { v } else { k },
+                        ty: IrType::I32,
+                    }
+                };
+                let mut f = IrFunction::new("adjacent".into(), IrType::I32, vec![], false);
+                f.blocks = vec![
+                    block(
+                        0,
+                        vec![
+                            Instruction::ParamRef {
+                                dest: Value(0),
+                                param_idx: 0,
+                                ty: IrType::I32,
+                            },
+                            cmp(1, 45),
+                        ],
+                        Terminator::CondBranch {
+                            cond: Operand::Value(Value(1)),
+                            true_label: BlockId(if and_form { 1 } else { 3 }),
+                            false_label: BlockId(if and_form { 3 } else { 1 }),
+                        },
+                    ),
+                    block(
+                        1,
+                        vec![cmp(2, 46)],
+                        Terminator::CondBranch {
+                            cond: Operand::Value(Value(2)),
+                            true_label: BlockId(if and_form { 2 } else { 3 }),
+                            false_label: BlockId(if and_form { 3 } else { 2 }),
+                        },
+                    ),
+                    block(
+                        2,
+                        vec![],
+                        Terminator::Return(Some(Operand::Const(IrConst::I32(2)))),
+                    ),
+                    block(
+                        3,
+                        vec![],
+                        Terminator::Return(Some(Operand::Const(IrConst::I32(3)))),
+                    ),
+                ];
+                assert!(run_function(&mut f) > 0);
+                assert_verified(&f, "adjacent-equality");
+                assert_eq!(f.blocks.len(), 3);
+                assert!(f.blocks[0].instructions.iter().any(|i| matches!(i,
+                    Instruction::Cmp { op: cmp_op, .. } if *cmp_op == if and_form { IrCmpOp::Ugt } else { IrCmpOp::Ule })));
+                assert!(matches!(f.blocks[0].terminator,
+                    Terminator::CondBranch { true_label: BlockId(t), false_label: BlockId(f), .. }
+                    if (t, f) == if and_form { (2, 3) } else { (3, 2) }));
+            }
+        }
+    }
+
+    #[test]
+    fn adjacent_membership_algebra_exhaustive_bytes_and_domain_boundaries() {
+        for ty in [
+            IrType::I8,
+            IrType::U8,
+            IrType::I16,
+            IrType::U16,
+            IrType::I32,
+            IrType::U32,
+            IrType::I64,
+            IrType::U64,
+        ] {
+            let (bits, signed) = domain_of(ty).unwrap();
+            let min = if signed { -(1i128 << (bits - 1)) } else { 0 };
+            let max = if signed {
+                (1i128 << (bits - 1)) - 1
+            } else {
+                (1i128 << bits) - 1
+            };
+            for lo in [min, min + 1, 0, 45, max - 1] {
+                for and_form in [false, true] {
+                    let op = if and_form { IrCmpOp::Ne } else { IrCmpOp::Eq };
+                    let cmp = |c: i128| {
+                        (
+                            op,
+                            Operand::Value(Value(0)),
+                            Operand::Const(IrConst::I64(c as i64)),
+                            ty,
+                        )
+                    };
+                    let r = adjacent_equality_range(cmp(lo), cmp(lo + 1), and_form).unwrap();
+                    assert!(plan_range(&r, &[]).is_some());
+                    let samples: Vec<i128> = if bits == 8 {
+                        (min..=max).collect()
+                    } else {
+                        vec![min, max, lo - 1, lo, lo + 1, lo + 2]
+                    };
+                    for x in samples.into_iter().filter(|x| *x >= min && *x <= max) {
+                        let inside = ((x - lo) & ((1i128 << bits) - 1)) <= 1;
+                        assert_eq!(
+                            if and_form { !inside } else { inside },
+                            if and_form {
+                                x != lo && x != lo + 1
+                            } else {
+                                x == lo || x == lo + 1
+                            }
+                        );
+                    }
+                    assert!(adjacent_equality_range(cmp(lo), cmp(lo), and_form).is_none());
+                    assert!(adjacent_equality_range(cmp(min), cmp(max), and_form).is_none());
+                    assert!(adjacent_equality_range(cmp(lo), cmp(lo + 2), and_form).is_none());
+                    assert!(adjacent_equality_range(cmp(lo), cmp(lo + 1), !and_form).is_none());
+                }
+            }
+        }
+    }
+
+    fn membership_tail_fixture(effect: bool) -> IrFunction {
+        let mut f = IrFunction::new("membership_tail".into(), IrType::I64, vec![], false);
+        f.blocks = vec![
+            block(
+                0,
+                vec![
+                    Instruction::ParamRef {
+                        dest: Value(0),
+                        param_idx: 0,
+                        ty: IrType::I32,
+                    },
+                    Instruction::ParamRef {
+                        dest: Value(8),
+                        param_idx: 1,
+                        ty: IrType::Ptr,
+                    },
+                    Instruction::ParamRef {
+                        dest: Value(9),
+                        param_idx: 2,
+                        ty: IrType::I32,
+                    },
+                ],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(9)),
+                    true_label: BlockId(4),
+                    false_label: BlockId(1),
+                },
+            ),
+            block(
+                1,
+                vec![Instruction::Cmp {
+                    dest: Value(1),
+                    op: IrCmpOp::Eq,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(45)),
+                    ty: IrType::I32,
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(1)),
+                    true_label: BlockId(3),
+                    false_label: BlockId(2),
+                },
+            ),
+            block(
+                2,
+                vec![
+                    Instruction::Cmp {
+                        dest: Value(2),
+                        op: IrCmpOp::Eq,
+                        lhs: Operand::Value(Value(0)),
+                        rhs: Operand::Const(IrConst::I32(46)),
+                        ty: IrType::I32,
+                    },
+                    Instruction::Cast {
+                        dest: Value(3),
+                        src: Operand::Value(Value(2)),
+                        from_ty: IrType::I8,
+                        to_ty: IrType::I64,
+                    },
+                ],
+                Terminator::Branch(BlockId(3)),
+            ),
+            block(
+                3,
+                vec![Instruction::Phi {
+                    dest: Value(4),
+                    ty: IrType::I64,
+                    incoming: vec![
+                        (Operand::Const(IrConst::I64(1)), BlockId(1)),
+                        (Operand::Value(Value(3)), BlockId(2)),
+                        (Operand::Const(IrConst::I64(9)), BlockId(4)),
+                    ],
+                }],
+                Terminator::Return(Some(Operand::Value(Value(4)))),
+            ),
+            block(4, vec![], Terminator::Branch(BlockId(3))),
+        ];
+        if effect {
+            f.blocks[2].instructions.insert(
+                0,
+                Instruction::Store {
+                    ptr: Value(8),
+                    val: Operand::Const(IrConst::I32(17)),
+                    ty: IrType::I32,
+                    volatile: true,
+                    seg_override: crate::common::types::AddressSpace::Default,
+                },
+            );
+        }
+        f
+    }
+
+    #[test]
+    fn partial_phi_candidates_do_not_depend_on_incoming_order() {
+        // B4 is an ineligible candidate: its predecessor B0 contributes 9,
+        // not a short-circuit boolean. It must not hide the B1/B2 tail pair.
+        let mut original = membership_tail_fixture(false);
+        original.blocks[0].instructions.push(Instruction::Cast {
+            dest: Value(10),
+            src: Operand::Value(Value(9)),
+            from_ty: IrType::I32,
+            to_ty: IrType::I64,
+        });
+        original.blocks[0].terminator = Terminator::CondBranch {
+            cond: Operand::Value(Value(9)),
+            true_label: BlockId(4),
+            false_label: BlockId(3),
+        };
+        original.blocks[4].terminator = Terminator::CondBranch {
+            cond: Operand::Value(Value(0)),
+            true_label: BlockId(1),
+            false_label: BlockId(3),
+        };
+        let arms = [
+            (Operand::Const(IrConst::I64(9)), BlockId(0)),
+            (Operand::Value(Value(10)), BlockId(4)),
+            (Operand::Const(IrConst::I64(1)), BlockId(1)),
+            (Operand::Value(Value(3)), BlockId(2)),
+        ];
+        for a in 0..4 {
+            for b in 0..4 {
+                for c in 0..4 {
+                    for d in 0..4 {
+                        let order = [a, b, c, d];
+                        if order.iter().copied().collect::<FxHashSet<_>>().len() != 4 {
+                            continue;
+                        }
+                        let mut f = original.clone();
+                        let Instruction::Phi { incoming, .. } = &mut f.blocks[3].instructions[0]
+                        else {
+                            unreachable!()
+                        };
+                        *incoming = order.map(|i| arms[i]).to_vec();
+                        assert_verified(&f, "candidate-order-before");
+                        assert_eq!(run_function(&mut f), 1, "incoming order {order:?}");
+                        assert_verified(&f, "candidate-order-after");
+                        assert!(!f.blocks.iter().any(|b| b.label == BlockId(2)));
+                        let merge = f.blocks.iter().find(|b| b.label == BlockId(3)).unwrap();
+                        let Instruction::Phi { incoming, .. } = &merge.instructions[0] else {
+                            panic!("unrelated join arms must survive")
+                        };
+                        assert_eq!(incoming.len(), 3);
+                        assert!(incoming.contains(&arms[0]));
+                        assert!(incoming.contains(&arms[1]));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_sibling_pair_does_not_hide_an_independent_pair() {
+        let mut original = membership_tail_fixture(false);
+        original.blocks[4] = block(
+            4,
+            vec![Instruction::Cmp {
+                dest: Value(11),
+                op: IrCmpOp::Eq,
+                lhs: Operand::Value(Value(0)),
+                rhs: Operand::Const(IrConst::I32(55)),
+                ty: IrType::I32,
+            }],
+            Terminator::CondBranch {
+                cond: Operand::Value(Value(11)),
+                true_label: BlockId(3),
+                false_label: BlockId(5),
+            },
+        );
+        original.blocks.push(block(
+            5,
+            vec![
+                Instruction::Cmp {
+                    dest: Value(12),
+                    op: IrCmpOp::Eq,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(56)),
+                    ty: IrType::I32,
+                },
+                Instruction::Cast {
+                    dest: Value(13),
+                    src: Operand::Value(Value(12)),
+                    from_ty: IrType::I8,
+                    to_ty: IrType::I64,
+                },
+            ],
+            Terminator::Branch(BlockId(3)),
+        ));
+        let Instruction::Phi { incoming, .. } = &mut original.blocks[3].instructions[0] else {
+            unreachable!()
+        };
+        incoming[2].0 = Operand::Const(IrConst::I64(1));
+        incoming.push((Operand::Value(Value(13)), BlockId(5)));
+        original.blocks[3].instructions.push(Instruction::Phi {
+            dest: Value(14),
+            ty: IrType::I64,
+            incoming: vec![
+                (Operand::Const(IrConst::I64(7)), BlockId(1)),
+                (Operand::Const(IrConst::I64(8)), BlockId(2)),
+                (Operand::Const(IrConst::I64(9)), BlockId(4)),
+                (Operand::Const(IrConst::I64(9)), BlockId(5)),
+            ],
+        });
+        for reverse in [false, true] {
+            let mut f = original.clone();
+            if reverse {
+                for inst in &mut f.blocks[3].instructions {
+                    if let Instruction::Phi { incoming, .. } = inst {
+                        incoming.reverse();
+                    }
+                }
+            }
+            assert_verified(&f, "sibling-candidate-before");
+            assert_eq!(run_function(&mut f), 1, "reverse={reverse}");
+            assert_verified(&f, "sibling-candidate-after");
+            assert!(f.blocks.iter().any(|b| b.label == BlockId(2)));
+            assert!(!f.blocks.iter().any(|b| b.label == BlockId(5)));
+            let merge = f.blocks.iter().find(|b| b.label == BlockId(3)).unwrap();
+            let Instruction::Phi { incoming, .. } = &merge.instructions[1] else {
+                panic!("sibling phi must remain")
+            };
+            assert_eq!(incoming.len(), 3);
+            for (value, label) in [(7, 1), (8, 2), (9, 4)] {
+                assert!(incoming.contains(&(Operand::Const(IrConst::I64(value)), BlockId(label))));
+            }
+        }
+    }
+
+    #[test]
+    fn partial_phi_fold_preserves_unrelated_incoming_values() {
+        let mut f = membership_tail_fixture(false);
+        assert_eq!(run_function(&mut f), 1);
+        assert_verified(&f, "membership-tail");
+        assert_eq!(f.blocks.len(), 4);
+        let merge = f.blocks.iter().find(|b| b.label == BlockId(3)).unwrap();
+        let Instruction::Phi { dest, incoming, .. } = &merge.instructions[0] else {
+            panic!("join phi must remain")
+        };
+        assert_eq!(*dest, Value(4));
+        assert_eq!(incoming.len(), 2);
+        assert!(incoming.contains(&(Operand::Const(IrConst::I64(9)), BlockId(4))));
+        assert!(
+            incoming
+                .iter()
+                .any(|(v, from)| *from == BlockId(1) && matches!(v, Operand::Value(_)))
+        );
+        assert!(matches!(
+            merge.terminator,
+            Terminator::Return(Some(Operand::Value(Value(4))))
+        ));
+    }
+
+    #[test]
+    fn phi_folding_keeps_side_effects_in_the_short_circuit_arm() {
+        for partial in [false, true] {
+            let mut f = membership_tail_fixture(true);
+            if !partial {
+                f.blocks[0].terminator = Terminator::Branch(BlockId(1));
+                f.blocks.pop();
+                if let Instruction::Phi { incoming, .. } = &mut f.blocks[3].instructions[0] {
+                    incoming.pop();
+                }
+            }
+            assert_eq!(run_function(&mut f), 0);
+            assert_verified(&f, "effectful-membership-tail");
+            assert!(f.blocks.iter().any(|b| {
+                b.instructions
+                    .iter()
+                    .any(|i| matches!(i, Instruction::Store { volatile: true, .. }))
+            }));
+        }
+    }
+
+    #[test]
+    fn partial_phi_fold_rejects_differing_sibling_arms() {
+        let mut f = membership_tail_fixture(false);
+        f.blocks[3].instructions.push(Instruction::Phi {
+            dest: Value(5),
+            ty: IrType::I64,
+            incoming: vec![
+                (Operand::Const(IrConst::I64(7)), BlockId(1)),
+                (Operand::Const(IrConst::I64(8)), BlockId(2)),
+                (Operand::Const(IrConst::I64(9)), BlockId(4)),
+            ],
+        });
+        assert_eq!(run_function(&mut f), 0);
+        assert_verified(&f, "sibling-membership-tail");
     }
 }

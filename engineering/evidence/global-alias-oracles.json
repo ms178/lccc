@@ -1,0 +1,90 @@
+{
+  "scope": "Independent remote reference execution only; corrective LCCC source has not been built or executed",
+  "source": "tests/regression/dse_global_alias.c",
+  "source_sha256": "ed60f502320b0c3658205ee95b4e4c1c1e74c9b3c3e9863620e2e6768a71653f",
+  "flags": "-O2 -march=x86-64-v3 -fwrapv",
+  "live_semvers": {
+    "cclang2310": "23.1.0",
+    "cg162": "16.2",
+    "cicc2021100": "2021.10.0",
+    "cicxlatest": "(latest)"
+  },
+  "expected_stdout": "dse-alias 17 29",
+  "rows": [
+    {
+      "id": "cg162",
+      "vendor": "GNU",
+      "ok": true,
+      "asm_insns": 21,
+      "stdout": "dse-alias 0 29",
+      "exit": 1,
+      "reason": null,
+      "ce_semver": null,
+      "cached_at": 1791765110.823544
+    },
+    {
+      "id": "cclang2310",
+      "vendor": "LLVM",
+      "ok": true,
+      "asm_insns": 19,
+      "stdout": "dse-alias 17 29",
+      "exit": 0,
+      "reason": null,
+      "ce_semver": null,
+      "cached_at": 1791765110.8239958
+    },
+    {
+      "id": "cicc2021100",
+      "vendor": "Intel (classic)",
+      "ok": true,
+      "asm_insns": 34,
+      "stdout": "dse-alias 0 29",
+      "exit": 1,
+      "reason": null,
+      "ce_semver": null,
+      "cached_at": 1791765112.3204885
+    },
+    {
+      "id": "cicxlatest",
+      "vendor": "Intel",
+      "ok": true,
+      "asm_insns": 26,
+      "stdout": "dse-alias 17 29",
+      "exit": 0,
+      "reason": null,
+      "ce_semver": null,
+      "cached_at": 1791765112.6550632
+    }
+  ],
+  "all_agree": false,
+  "unoptimized_controls": {
+    "flags": "-O0 -march=x86-64-v3 -fwrapv",
+    "rows": [
+      {
+        "id": "cg162",
+        "vendor": "GNU",
+        "ok": true,
+        "asm_insns": 31,
+        "stdout": "dse-alias 17 29",
+        "exit": 0,
+        "reason": null,
+        "ce_semver": null,
+        "cached_at": 1791765357.9321773
+      },
+      {
+        "id": "cicc2021100",
+        "vendor": "Intel (classic)",
+        "ok": true,
+        "asm_insns": 36,
+        "stdout": "dse-alias 17 29",
+        "exit": 0,
+        "reason": null,
+        "ce_semver": null,
+        "cached_at": 1791765357.9331343
+      }
+    ],
+    "all_agree": true
+  },
+  "semantic_contract": "GNU alias attribute is present in the same translation unit; alias/target types, sizes and alignments match.",
+  "contract_url": "https://gcc.gnu.org/onlinedocs/gcc/Common-Attributes.html#index-alias"
+}

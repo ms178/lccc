@@ -52,6 +52,23 @@ class SnapshotPolicyTests(unittest.TestCase):
             policy.inspect(b'not a git record\0')
 
     def test_real_snapshot_compact_recoverable(self):
+        self.snapshot_roundtrip(keep=2)
+
+    def test_default_keeps_every_named_recovery_checkpoint(self):
+        self.snapshot_roundtrip(keep=None)
+
+    def test_inherited_rolling_retention_cannot_silently_prune(self):
+        with tempfile.TemporaryDirectory() as td:
+            env = dict(os.environ, LCCC_REPO=str(REPO), LCCC_ARTIFACTS=td,
+                       LCCC_BULK_ARTIFACTS=td, LCCC_DELIVERABLE=str(Path(td) / 'p.patch'),
+                       LCCC_SNAPSHOT_KEEP='2')
+            env.pop('LCCC_SNAPSHOT_ALLOW_PRUNE', None)
+            p = subprocess.run(['bash', str(REPO / 'scripts/lccc-snapshot.sh'), 'retention-test'],
+                               env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertIn('LCCC_SNAPSHOT_ALLOW_PRUNE=1', p.stderr)
+
+    def snapshot_roundtrip(self, keep):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td); repo = root / 'repo'; repo.mkdir()
             def git(*args):
@@ -64,8 +81,12 @@ class SnapshotPolicyTests(unittest.TestCase):
             git('add', '.'); git('commit', '-qm', 'base'); base = git('rev-parse', 'HEAD')
             env = dict(os.environ, LCCC_REPO=str(repo), LCCC_ARTIFACTS=str(root/'art'),
                        LCCC_DELIVERABLE=str(root/'ms178-1.patch'), LCCC_SNAPSHOT_UNGATED='1',
-                       LCCC_BASE_REF=base, LCCC_SNAPSHOT_KEEP='2')
+                       LCCC_BASE_REF=base)
             env.pop('LCCC_BULK_ARTIFACTS', None)
+            env.pop('LCCC_SNAPSHOT_KEEP', None)
+            env.pop('LCCC_SNAPSHOT_ALLOW_PRUNE', None)
+            if keep is not None:
+                env.update(LCCC_SNAPSHOT_KEEP=str(keep), LCCC_SNAPSHOT_ALLOW_PRUNE='1')
             for i in range(3):
                 (repo / 'a.txt').write_text(f'change {i}\n')
                 p = subprocess.run(['bash', str(repo/'scripts/lccc-snapshot.sh'), f'fix{i}', 'tested'],
@@ -75,7 +96,7 @@ class SnapshotPolicyTests(unittest.TestCase):
             self.assertFalse((art / 'ms178-1.patch').exists())
             self.assertFalse((art / 'series').exists())
             snapshots = sorted(art.glob('ms178-1.S*.patch.gz'))
-            self.assertEqual(len(snapshots), 2)
+            self.assertEqual(len(snapshots), 3 if keep is None else keep)
             self.assertEqual(gzip.decompress(snapshots[-1].read_bytes()), (root/'ms178-1.patch').read_bytes())
             self.assertIn(b'change 2', gzip.decompress((art/'lccc-src.tar.gz').read_bytes()))
             recovered = root/'recovered'
