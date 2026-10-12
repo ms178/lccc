@@ -142,6 +142,16 @@ jobs:
       - name: Aggregate-call byte boundaries and cross-compiler ABI
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_aggregate_call_abi.sh
 
+      # AUD-TMP-1: temp files must be symlink-proof (pre-placed symlink and
+      # pre-placed directory reproducers; victim file must stay untouched).
+      - name: Temp-file symlink hardening
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_temp_symlink.sh
+
+      # AUD-DRV-1: `-o -` streams to stdout for -S/-E/-M and is rejected for
+      # -c / multiple inputs, exactly like GCC.
+      - name: Standard-output contract for -o -
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_o_stdout.sh
+
       - name: Run tests
         env:
           CARGO_BUILD_JOBS: "2"

@@ -1,7 +1,19 @@
 [package]
 name = "lccc"
 version = "0.1.0"
-rust-version = "1.98.1"
+# Minimum supported Rust version.
+#
+# AUD-TOOLCHAIN-1: this said 1.98.1, a version no host in this project ever
+# built the tree with — an *assertion*, not a measurement, and one that made
+# `cargo build` refuse to start on the 1.97.0 toolchain the research sandbox
+# provisions (and on every host that has not caught up with `stable`). The
+# floor is now the version the tree is verified against:
+#   * verified locally: `cargo build --profile fastbuild --locked`
+#     with rustc 1.97.0 (2d8144b78), warnings denied (-D warnings) — clean;
+#   * the GitHub workflow's `msrv` job re-runs `cargo +<this> check --locked`
+#     so the number stays a measurement (see .github/workflows/ci.yml).
+# Raise it only together with the job that tests the new floor.
+rust-version = "1.97.0"
 edition = "2024"
 description = "LCCC (Lev's C Compiler) — a high-performance C compiler fork targeting x86-64, i686, ARM64, and RISC-V"
 

@@ -212,6 +212,18 @@ gate "empty-aggregate-abi" fast \
 gate "aggregate-call-abi" fast \
     env CCC="$LCCC" bash tests/regression/check_aggregate_call_abi.sh
 
+# AUD-TMP-1: temp files must be symlink-proof. Drives the pre-placed-symlink
+# reproducer (and its pre-placed-directory variant) against the built compiler
+# and asserts the victim file is untouched, the compile still succeeds and
+# nothing is written directly into $TMPDIR.
+gate "temp-symlink-hardening" fast \
+    env CCC="$LCCC" bash tests/regression/check_temp_symlink.sh
+
+# AUD-DRV-1: `-o -` is stdout for -S/-E/-M (and rejected for -c / multi-input),
+# never a file named `-`. Build systems pipe through this.
+gate "o-stdout" fast \
+    env CCC="$LCCC" bash tests/regression/check_o_stdout.sh
+
 # The unit-test gate is what GitHub's required check runs on every PR, so it
 # belongs in the fast set: a red PR has to be reproducible with --fast.
 #

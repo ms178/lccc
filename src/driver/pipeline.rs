@@ -647,11 +647,74 @@ impl Driver {
         !self.input_files.is_empty()
     }
 
+    /// True when `-o -` asks for standard output.
+    ///
+    /// GCC treats `-o -` as "write to stdout" for the modes that stream text
+    /// (`-S`, `-E`, and the `-M*` dependency printers) and rejects it for `-c`
+    /// (its assembler fails with "can't open a bfd on stdout") — either way it
+    /// never creates a file called `-`. lccc used to create that file for
+    /// every mode, which silently swallowed the output of
+    ///   `lccc -S -o - t.c | ...`   and `lccc -E -o - t.c | ...`.
+    pub(crate) fn output_is_stdout(&self) -> bool {
+        self.output_path_set && self.output_path == "-"
+    }
+
+    /// Write textual output (assembly, preprocessed source, dependency rules)
+    /// to `-o`'s destination, honouring `-o -` == stdout.
+    ///
+    /// Every text producer in the driver funnels through here so the `-` rule
+    /// exists exactly once; binary producers (objects, executables) must not
+    /// come near it, because a streamed ELF is not a thing any consumer can
+    /// use and GCC errors out instead.
+    fn write_text_output(&self, text: &str) -> Result<(), String> {
+        if self.output_is_stdout() {
+            use std::io::Write;
+            let stdout = std::io::stdout();
+            let mut lock = stdout.lock();
+            lock.write_all(text.as_bytes())
+                .and_then(|()| lock.flush())
+                .map_err(|e| format!("Cannot write to standard output: {}", e))
+        } else {
+            std::fs::write(&self.output_path, text)
+                .map_err(|e| format!("Cannot write {}: {}", self.output_path, e))
+        }
+    }
+
+    /// Reject `-o -` where GCC rejects it, before any work is done.
+    ///
+    /// * `-c`: the object is a binary; `as` cannot emit one on stdout, so GCC
+    ///   aborts — we say so once, up front, instead of letting the assembler
+    ///   write a file called `-` (the pre-fix behaviour) or fail obscurely.
+    /// * several inputs: GCC refuses `-o` outright because one output cannot
+    ///   hold several translation units, and for `-S -o -` concatenating them
+    ///   on stdout would produce unusable output.
+    fn validate_output_destination(&self) -> Result<(), String> {
+        if !self.output_is_stdout() {
+            return Ok(());
+        }
+        match self.mode {
+            CompileMode::ObjectOnly => Err(
+                "Cannot write an object file to standard output ('-o -'); \
+                 use -S -o - for assembly or -E -o - for preprocessed source"
+                    .to_string(),
+            ),
+            CompileMode::AssemblyOnly | CompileMode::PreprocessOnly
+                if self.input_files.len() > 1 =>
+            {
+                Err(
+                    "cannot specify '-o' with '-c', '-S' or '-E' with multiple files".to_string(),
+                )
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Run the compiler pipeline.
     pub fn run(&self) -> Result<(), String> {
         if self.input_files.is_empty() {
             return Err("No input files".to_string());
         }
+        self.validate_output_destination()?;
 
         // Set the thread-local target pointer size for type system queries.
         // Must be done before any CType/IrType size computations.
@@ -758,8 +821,9 @@ impl Driver {
                 }
 
                 if self.output_path_set {
-                    std::fs::write(&self.output_path, &dep_text)
-                        .map_err(|e| format!("Cannot write {}: {}", self.output_path, e))?;
+                    // `-M -o -` prints the rules (GCC does; see the oracle in
+                    // tests/regression/check_o_stdout.sh).
+                    self.write_text_output(&dep_text)?;
                 } else {
                     print!("{}", dep_text);
                 }
@@ -801,8 +865,7 @@ impl Driver {
 
                 let output = preprocessor.dump_defines();
                 if self.output_path_set {
-                    std::fs::write(&self.output_path, format!("{}\n", output))
-                        .map_err(|e| format!("Cannot write {}: {}", self.output_path, e))?;
+                    self.write_text_output(&format!("{}\n", output))?;
                 } else {
                     println!("{}", output);
                 }
@@ -822,11 +885,12 @@ impl Driver {
                 };
 
                 if self.output_path_set {
-                    std::fs::write(&self.output_path, &output)
-                        .map_err(|e| format!("Cannot write {}: {}", self.output_path, e))?;
+                    self.write_text_output(&output)?;
                     // Write dependency file if requested (e.g., -Wp,-MMD,<depfile>).
                     // The kernel build uses this when preprocessing linker scripts
                     // (.lds.S -> .lds) and fixdep expects the .d file to exist.
+                    // With `-o -` the derived name is `-.d`, exactly as GCC
+                    // derives it (verified against gcc 12.2: -MD -E -o -).
                     self.write_dep_file(input_file, &self.output_path)?;
                 } else {
                     print!("{}", output);
@@ -1032,8 +1096,7 @@ impl Driver {
             };
 
             if self.output_path_set {
-                std::fs::write(&self.output_path, &output)
-                    .map_err(|e| format!("Cannot write {}: {}", self.output_path, e))?;
+                self.write_text_output(&output)?;
                 self.write_dep_file(input_file, &self.output_path)?;
             } else {
                 print!("{}", output);
@@ -1126,8 +1189,15 @@ impl Driver {
             }
             // Default path: compile with internal codegen (handles .code16gcc prepend)
             let asm = self.compile_to_assembly(input_file)?;
-            std::fs::write(&out_path, &asm)
-                .map_err(|e| format!("Cannot write {}: {}", out_path, e))?;
+            if self.output_path_set {
+                // `-o -` streams the assembly (write_text_output is the single
+                // place that knows the convention); a real path is written
+                // exactly as before.
+                self.write_text_output(&asm)?;
+            } else {
+                std::fs::write(&out_path, &asm)
+                    .map_err(|e| format!("Cannot write {}: {}", out_path, e))?;
+            }
             self.write_dep_file(input_file, &out_path)?;
             if self.verbose {
                 eprintln!("Assembly output: {}", out_path);
