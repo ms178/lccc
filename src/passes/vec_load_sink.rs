@@ -433,6 +433,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn store_effect_contract_load_cannot_sink_across_args_store() {
+        for op in crate::ir::intrinsics::VECTOR_STORES {
+            let mut f = mkfunc();
+            f.blocks.push(block(
+                0,
+                vec![
+                    vload(37, 4, 35),
+                    Instruction::Intrinsic {
+                        dest: None,
+                        op,
+                        dest_ptr: None,
+                        args: vec![
+                            Operand::Value(Value(30)),
+                            Operand::Value(Value(4)),
+                            Operand::Value(Value(35)),
+                        ],
+                    },
+                    vbin(O::VecMulF32x8, 40, 38, 38),
+                    vbin(O::VecAddF32x8, 41, 37, 40),
+                ],
+            ));
+            assert_eq!(sink_vector_loads(&mut f), 0, "{op:?}");
+            assert_eq!(ops(&f, 0)[0], "VecLoadF32x8:37");
+        }
+    }
+
     /// A scalar store between the load and its use blocks the sink.
     #[test]
     fn intervening_store_blocks_sink() {

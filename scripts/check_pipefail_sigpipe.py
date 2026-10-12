@@ -73,8 +73,9 @@ from check_ci_gate_parity import COMMAND, LOCAL, WORKFLOWS  # noqa: E402
 # word -- including end-of-line, `)`, `;` and a trailing backslash, all of which
 # appear in real gate scripts (`x=$(cmd | head -5)` is the shape that a
 # space-or-EOL boundary misses).
+# A shell OR list (||) is not a pipeline; |& is a real stderr pipeline.
 EARLY_EXIT = re.compile(
-    r"\|[ ]*(?:head[ ]+-n?[ ]*[0-9]+|grep[ ]+-[a-zA-Z]*q[a-zA-Z]*|"
+    r"(?<!\|)\|(?!\|)&?[ ]*(?:head[ ]+-n?[ ]*[0-9]+|grep[ ]+-[a-zA-Z]*q[a-zA-Z]*|"
     r"grep[ ]+-[a-zA-Z]*m[0-9]+|grep[ ]+-[a-zA-Z]*l)(?![A-Za-z0-9_-])"
 )
 PIPEFAIL = re.compile(r"set[ ]+-[a-zA-Z]*o[ ]+pipefail|set[ ]+-[a-zA-Z]*[a-z]+[ ]*$|pipefail")
@@ -126,6 +127,10 @@ SELF_TEST_CASES = [
     ("grep -c with discarded count", "set -euo pipefail\nif a | grep -c p >/dev/null; then :; fi\n", False),
     ("here-string", "set -euo pipefail\nif grep -qE p <<<\"$v\"; then :; fi\n", False),
     ("grep -q on a file", "set -euo pipefail\nif grep -q p file; then :; fi\n", False),
+    ("logical OR is not a pipe", "set -euo pipefail\nif probe || grep -q p file; then :; fi\n", False),
+    ("compact logical OR", "set -euo pipefail\nprobe||grep -qE p file\n", False),
+    ("pipe after logical OR", "set -euo pipefail\nprobe || producer | grep -q p\n", True),
+    ("stderr pipe", "set -euo pipefail\nproducer |& grep -q p\n", True),
     ("process substitution", "set -euo pipefail\nif grep -q p <(cmd); then :; fi\n", False),
     ("no pipefail at all", "set -euo pipefail\n".replace("pipefail", "e") + "x=$(cmd | head -5)\n", False),
     ("comment only", "set -euo pipefail\n# cmd | head -5 is fine to mention\n", False),

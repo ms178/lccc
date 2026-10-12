@@ -123,7 +123,7 @@ fn collect_scalar_values(func: &IrFunction) -> FxHashMap<u32, CoalesceClass> {
                 }
                 Instruction::Intrinsic {
                     dest: Some(d), op, ..
-                } if op.vector_result_width().is_some() => {
+                } if op.vector_home_width().is_some() => {
                     classes.insert(d.0, CoalesceClass::Vector);
                 }
                 Instruction::Phi { dest, ty, .. } if scalar_type(*ty) => {

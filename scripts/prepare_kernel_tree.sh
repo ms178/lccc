@@ -98,7 +98,13 @@ PKGDIR=${PKGDIR:-$PKG_ROOT/packages/linux-cachymod-6.18}
 # shellcheck source=mountinfo.sh
 source "$(dirname -- "${BASH_SOURCE[0]}")/mountinfo.sh"
 # mounts_under DIR: 0 if a mount point is DIR or lies below it (or unknown).
-mounts_under() { has_mount_under "$1"; }
+mounts_under() {
+  # Mountinfo uses physical absolute names. Normalize only the query: changing
+  # PKG_ROOT itself would break prefix checks for explicit relative PKGDIRs.
+  local physical
+  physical=$(realpath -m -- "$1") || return 0
+  has_mount_under "$physical"
+}
 ensure_pkgdir() {
   [[ -d $PKGDIR ]] && return 0
   command -v git >/dev/null 2>&1 || return 1

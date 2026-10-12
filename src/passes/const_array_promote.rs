@@ -1209,6 +1209,38 @@ mod tests {
         assert!(!callee_readonly_through(&fns, "reader", 0, &mut cache));
     }
 
+    #[test]
+    fn store_effect_contract_callee_is_not_readonly() {
+        for op in crate::ir::intrinsics::VECTOR_STORES {
+            let mut writer = IrFunction::new("writer".into(), IrType::Void, vec![], false);
+            writer.blocks = vec![block(
+                0,
+                vec![
+                    Instruction::ParamRef {
+                        dest: Value(1),
+                        param_idx: 0,
+                        ty: IrType::Ptr,
+                    },
+                    Instruction::Intrinsic {
+                        dest: None,
+                        op,
+                        dest_ptr: None,
+                        args: vec![
+                            Operand::Value(Value(2)),
+                            Operand::Value(Value(1)),
+                            Operand::Const(IrConst::I64(0)),
+                        ],
+                    },
+                ],
+                Terminator::Return(None),
+            )];
+            assert!(
+                !callee_readonly_through_impl(&[writer], "writer", 0),
+                "{op:?}"
+            );
+        }
+    }
+
     /// `BuiltinSetjmp` writes its jump buffer through `args[0]` with no
     /// `dest_ptr` and no `writes_memory_via_args` membership: the callee
     /// proof must reject a pointer that reaches it.

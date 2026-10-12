@@ -9,7 +9,7 @@ test=setup opt=none isa=native disabled=none phase=setup
 trap 'printf "FAIL test=%s opt=%s isa=%s disabled=%s phase=%s line=%s command=%s\n" "$test" "$opt" "${isa:-x86-64}" "$disabled" "$phase" "$LINENO" "$BASH_COMMAND" >&2' ERR
 grep -Eq '^[[:space:]]*LCCC_NO_COMPARE=1[[:space:]]*$' tests/regression/dse_global_alias.env
 gcc_include=$("$ref" -print-file-name=include)
-for test in memory_value_forwarding adjacent_membership vector_address_folding integer_bounds dse_global_alias; do
+for test in memory_value_forwarding adjacent_membership vector_address_folding integer_bounds dse_global_alias bb_slp_pure_store_fn; do
     src="tests/regression/$test.c"
     oracle_opt=-O2
     # Optimized GCC/ICC disagree on this declared GNU alias (recorded in
@@ -45,6 +45,14 @@ for test in memory_value_forwarding adjacent_membership vector_address_folding i
         "$ccc" -O2 -m32 -mno-sse -mno-sse2 -I"$gcc_include" "$src" -o "$td/x87"
         "$td/x87" > "$td/x87.actual"
         cmp "$td/expected32" "$td/x87.actual"
+    fi
+    if [[ $test == bb_slp_pure_store_fn ]]; then
+        isa=x86-64-v3 opt=-O2 phase=store-effect-controls
+        for disabled in slp ipcp vecaddr; do
+            CCC_DISABLE_PASSES="$disabled" "$ccc" -O2 -march=x86-64-v3 "$src" -o "$td/check"
+            "$td/check" > "$td/actual"
+            cmp "$td/expected" "$td/actual"
+        done
     fi
     isa=x86-64-v3 opt=-O2 phase=placement-controls
     # Early placement remains available, but is no longer the runtime default.

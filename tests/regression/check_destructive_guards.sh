@@ -104,6 +104,59 @@ if [[ $rc -ne 0 ]] && grep -q 'a mount point lies below it' <<<"$out" && [[ -f $
     pass "escaped mount below KDIR refused, file survives"
 else bad "escaped mount below KDIR not refused (rc=$rc): $out"; fi
 
+# A symlink in a parent component used to hide this mount from the literal
+# path comparison. Force preflight failure if the guard is bypassed: the red
+# control cannot download a kernel or delete a real directory.
+ln -s "$tmp" "$tmp/path-alias"
+set +e
+out=$(HOME="$tmp/home" PKG_ROOT="$tmp/pkgroot" PKGDIR="$pkg" \
+    LCCC_MOUNTINFO="$tmp/mi-sp" HOSTCC=/does-not-exist/host-cc \
+    bash "$prep" "$tmp/path-alias/linux sp" 2>&1)
+rc=$?
+set -e
+if [[ $rc -ne 0 ]] && grep -q 'a mount point lies below it' <<<"$out" && [[ -f $stamped/notes.txt ]]; then
+    pass "parent symlink cannot hide a KDIR mount"
+else bad "parent symlink bypassed KDIR mount guard (rc=$rc): $out"; fi
+
+# Keep relative PKG_ROOT/PKGDIR prefixes intact while canonicalizing mount
+# queries. A fake git records sparse selection, then fails before checkout;
+# this positive compatibility control cannot access the network or a kernel.
+mkdir -p "$tmp/pkg-probe-bin"
+cat >"$tmp/pkg-probe-bin/git" <<'GIT'
+#!/usr/bin/env bash
+if [[ ${3:-} == remote ]]; then printf '%s\n' "$PKG_REPO"; exit 0; fi
+if [[ ${3:-} == sparse-checkout && ${4:-} == set ]]; then
+    printf '%s\n' "$5" >"$PKG_SELECTION_LOG"
+    exit 77
+fi
+exit 0
+GIT
+chmod +x "$tmp/pkg-probe-bin/git"
+set +e
+out=$(cd "$tmp" && PATH="$tmp/pkg-probe-bin:$PATH" HOME="$tmp/home" \
+    PKG_REPO=https://example.invalid/fixture.git PKG_ROOT=pkg-relative \
+    PKGDIR=pkg-relative/packages/not-fetched PKG_SELECTION_LOG="$tmp/pkg-selection" \
+    LCCC_MOUNTINFO="$tmp/empty-mountinfo" bash "$repo/$prep" "$tmp/linux-unused" 2>&1)
+rc=$?
+set -e
+if [[ $rc -ne 0 && $(cat "$tmp/pkg-selection" 2>/dev/null) == packages/not-fetched ]]; then
+    pass "relative package overrides retain the correct sparse prefix"
+else bad "relative package prefix changed (rc=$rc): $out"; fi
+
+mkdir -p "$tmp/pkg-relative/.git"
+printf 'precious\n' >"$tmp/pkg-relative/keep"
+printf '%s\n' "43 35 0:35 / $tmp/pkg-relative/sub rw - tmpfs tmpfs rw" >"$tmp/mi-pkg"
+set +e
+out=$(cd "$tmp" && PATH="$tmp/pkg-probe-bin:$PATH" HOME="$tmp/home" \
+    PKG_REPO=https://example.invalid/fixture.git PKG_ROOT=path-alias/pkg-relative \
+    PKGDIR=path-alias/pkg-relative/packages/not-fetched PKG_SELECTION_LOG="$tmp/pkg-selection" \
+    LCCC_MOUNTINFO="$tmp/mi-pkg" bash "$repo/$prep" "$tmp/linux-unused" 2>&1)
+rc=$?
+set -e
+if [[ $rc -ne 0 && -f $tmp/pkg-relative/keep ]] && grep -q 'a mount is below it' <<<"$out"; then
+    pass "relative package alias cannot hide a mounted checkout"
+else bad "package mount identity not protected (rc=$rc): $out"; fi
+
 # ---- C. ci_ubuntu_chroot.sh root validation --------------------------------
 # The script refuses a repository outside $HOME, so the copy under test lives in
 # a fixture $HOME. $HOME is set to the fixture for every run.
@@ -115,13 +168,18 @@ sudo_log="$tmp/sudo.log"
 cat >"$tmp/bin/sudo" <<SUDO
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >>"$sudo_log"
+if [[ \${TEST_FAIL_BOOTSTRAP:-0} == 1 && \$1 == debootstrap ]]; then
+    printf '%s\n' "41 35 0:36 / \$LCCC_CI_CHROOT/proc rw - proc proc rw" > "\$LCCC_MOUNTINFO"
+    exit 1
+fi
 exit 0
 SUDO
 cat >"$tmp/bin/debootstrap" <<'DEBOOTSTRAP'
 #!/usr/bin/env bash
 exit 0
 DEBOOTSTRAP
-chmod +x "$tmp/bin/sudo" "$tmp/bin/debootstrap"
+printf '#!/bin/sh\nexit 0\n' > "$tmp/bin/sleep"
+chmod +x "$tmp/bin/sudo" "$tmp/bin/debootstrap" "$tmp/bin/sleep"
 chroot_run() {  # chroot_run <ROOT> [MOUNTINFO] -> sets out, rc; sudo calls logged
     : >"$sudo_log"
     set +e
@@ -153,6 +211,32 @@ mkdir -p "$tmp/real-root"
 ln -s "$tmp/real-root" "$tmp/root-link"
 chroot_refused "symlink root refused" "$tmp/root-link" 'a symlink'
 chroot_refused "root equal to the repository refused" "$fake_home/lccc" 'contains the repository'
+
+chroot_refused "symlink parent refused before sudo" "$tmp/root-link/child" 'symlink component'
+
+# Resolve protected identities too, not just the deletion target.
+mkdir -p "$tmp/physical-repo"
+mv "$fake_home/lccc" "$tmp/physical-repo/lccc"
+ln -s "$tmp/physical-repo/lccc" "$fake_home/lccc"
+chroot_refused "physical repository ancestor refused" "$tmp/physical-repo" 'physical repository'
+rm "$fake_home/lccc"
+mv "$tmp/physical-repo/lccc" "$fake_home/lccc"
+mv "$fake_home" "$tmp/physical-home"
+ln -s "$tmp/physical-home" "$fake_home"
+chroot_refused "physical HOME refused" "$tmp/physical-home" 'physical $HOME'
+rm "$fake_home"
+mv "$tmp/physical-home" "$fake_home"
+
+# A failed bootstrap may leave mounts of its own. Recheck before every retry,
+# not only before entering the retry loop. sudo remains a non-executing stub.
+: > "$tmp/retry-mountinfo"
+export TEST_FAIL_BOOTSTRAP=1
+chroot_run "$tmp/retry-root" "$tmp/retry-mountinfo"
+unset TEST_FAIL_BOOTSTRAP
+if [[ $rc -eq 1 ]] && grep -q 'mount points lie below it' <<<"$out" \
+    && [[ $(grep -c '^rm ' "$sudo_log") -eq 1 ]]; then
+    pass "failed bootstrap's new mount blocks the next deletion"
+else bad "bootstrap retry did not recheck mounts (rc=$rc): $out sudo=$(cat "$sudo_log")"; fi
 
 # ---- D. a leftover mount below the root blocks the bootstrap rm -------------
 root="$tmp/root"

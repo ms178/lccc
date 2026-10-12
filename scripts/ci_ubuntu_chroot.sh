@@ -62,7 +62,7 @@ source "$(dirname -- "${BASH_SOURCE[0]}")/mountinfo.sh"
 # contain the user's data. It normalises ROOT in place: it must not run in a
 # command substitution, where `exit` would only leave the subshell.
 check_root_path() {
-    local n
+    local n physical physical_home physical_repo
     [[ $ROOT == /* ]] || { echo "[ci-chroot] refusing LCCC_CI_CHROOT=$ROOT (must be absolute)" >&2; exit 2; }
     while [[ $ROOT == */ ]]; do ROOT=${ROOT%/}; done
     case "$ROOT/" in
@@ -79,6 +79,20 @@ check_root_path() {
     fi
     if [[ -L $ROOT ]]; then
         echo "[ci-chroot] refusing LCCC_CI_CHROOT=$ROOT (a symlink)" >&2; exit 2
+    fi
+    # Checking only the final component misses /srv/link/child. Resolve
+    # existing ancestors before comparing paths or consulting mountinfo.
+    physical=$(realpath -m -- "$ROOT") || exit 2
+    if [[ $physical != "$ROOT" ]]; then
+        echo "[ci-chroot] refusing LCCC_CI_CHROOT=$ROOT (a symlink component)" >&2; exit 2
+    fi
+    physical_home=$(realpath -m -- "$HOME") || exit 2
+    physical_repo=$(realpath -e -- "$REPO") || exit 2
+    if [[ $physical_home == "$ROOT" || $physical_home == "$ROOT"/* ]]; then
+        echo "[ci-chroot] refusing LCCC_CI_CHROOT=$ROOT (it is or contains physical \$HOME)" >&2; exit 2
+    fi
+    if [[ $physical_repo == "$ROOT" || $physical_repo == "$ROOT"/* ]]; then
+        echo "[ci-chroot] refusing LCCC_CI_CHROOT=$ROOT (it contains the physical repository)" >&2; exit 2
     fi
 }
 check_root_path
@@ -107,16 +121,18 @@ if [[ ! -e $stamp ]]; then
     # root cannot be resumed reliably, so each attempt starts clean.  No
     # mount exists yet (the binds are made below, after the stamp).
     ok=0
-    # --one-file-system does not stop at a bind mount of the same filesystem, so
-    # a leftover mount of $HOME under $ROOT (an interrupted run) would let this
-    # deletion reach the home directory. Refuse while any mount is below $ROOT.
-    if has_mount_under "$ROOT"; then
-        echo "[ci-chroot] refusing to delete $ROOT: mount points lie below it:" >&2
-        list_mounts_under "$ROOT" | sed 's/^/[ci-chroot]   /' >&2 || true
-        echo "[ci-chroot] unmount them (sudo umount -l MOUNTPOINT) and rerun" >&2
-        exit 1
-    fi
     for attempt in 1 2 3; do
+        # A failed debootstrap can leave new mounts behind. Recheck on EVERY
+        # attempt, immediately before deletion, not only before the loop.
+        # --one-file-system does not stop at a bind mount of the same filesystem, so
+        # a leftover mount of $HOME under $ROOT (an interrupted run) would let this
+        # deletion reach the home directory. Refuse while any mount is below $ROOT.
+        if has_mount_under "$ROOT"; then
+            echo "[ci-chroot] refusing to delete $ROOT: mount points lie below it:" >&2
+            list_mounts_under "$ROOT" | sed 's/^/[ci-chroot]   /' >&2 || true
+            echo "[ci-chroot] unmount them (sudo umount -l MOUNTPOINT) and rerun" >&2
+            exit 1
+        fi
         sudo rm -rf --one-file-system "$ROOT"
         sudo mkdir -p "$ROOT"
         if sudo debootstrap --variant=minbase --components=main,universe \
