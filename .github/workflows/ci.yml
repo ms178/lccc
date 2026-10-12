@@ -1163,6 +1163,7 @@ jobs:
           bash tests/regression/check_loop_memset.sh
           bash tests/regression/check_loop_store_motion.sh
           bash tests/regression/check_const_trip_loop_inline.sh
+          bash tests/regression/check_fp_recurrence.sh
           bash tests/regression/check_bool_pair_tail_jmp.sh
           bash tests/regression/check_bool_pair_prune.sh
           bash tests/regression/check_demorgan_branch_split.sh

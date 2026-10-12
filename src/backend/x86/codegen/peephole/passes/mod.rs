@@ -35,6 +35,7 @@ mod fp_liveness;
 mod frame_compact;
 mod helpers;
 mod identical_blocks;
+mod jump_thread;
 mod liveness;
 mod load_op_fuse;
 mod local_patterns;
@@ -1752,6 +1753,13 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
     // Must run after all other transformations to catch final identical patterns.
     if !sk("identical_blocks") {
         identical_blocks::merge_identical_blocks(&mut store, &mut infos);
+    }
+
+    // Dead copies can leave branch-only blocks after the IR CFG cleanup.
+    // Retarget their direct edges while lines are still individually parsed.
+    // Never delete labels: computed gotos and address identity stay intact.
+    if !sk("jump_thread") {
+        jump_thread::run(&mut store, &mut infos);
     }
 
     if let Some(s) = peephole_total {

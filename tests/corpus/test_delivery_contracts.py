@@ -46,6 +46,18 @@ class DeliveryContracts(unittest.TestCase):
         self.assertEqual(result['zip_sha256'], d.digest(self.old))
         self.assertEqual(stat.S_IMODE(self.old.stat().st_mode), 0o644)
 
+    def test_readme_never_upgrades_an_ungated_or_partial_status(self):
+        for status in ('UNGATED', 'ci_local-fast-PARTIAL-NOT-DELIVERABLE',
+                       'ci_local-fast-PASS@debian-13'):
+            d.publish(self.patch, self.root, dict(META, ci_gate=status))
+            with zipfile.ZipFile(self.old) as z:
+                text = z.read('README.md').decode('utf-8')
+                self.assertIn(status, text)
+                self.assertIn('ausschließlich', text)
+                self.assertNotIn('Der Stand wurde lokal', text)
+                self.assertEqual(z.read('README.md'),
+                                 (self.root/'LCCC-DELIVERY.md').read_bytes())
+
     def test_deterministic_archive_for_identical_metadata(self):
         self.publish(); first=self.old.read_bytes()
         self.publish(); self.assertEqual(self.old.read_bytes(), first)

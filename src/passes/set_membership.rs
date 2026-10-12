@@ -27,7 +27,7 @@
 //!    consuming the Cmp value — `Eq` tails are maskable, others act as
 //!    skip terminators.
 //!
-//! Transformations (one per call; the driver's fixpoint loop iterates):
+//! Transformations (one per analysis round; a bounded local fixpoint):
 //!
 //! 1. CASE-FOLD PAIR MERGE: two `Range` members `[a,b]` and `[a+32,b+32]`
 //!    with `(a & 32) == 0` and `a >> 5 == b >> 5` (so bit 5 is clear across
@@ -418,6 +418,23 @@ fn parse_member(
 }
 
 pub(crate) fn run_function(func: &mut IrFunction) -> usize {
+    // Finish independent clusters before the driver's CFG/boolean cleanup
+    // destroys their shared phi. A case-fold used to return immediately,
+    // leaving the rest of an Expat-style classifier as separate branches.
+    // Each round rebuilds predecessor/use maps after its single rewrite.
+    // The cap bounds compile time; hitting it only misses optimizations.
+    let mut total = 0;
+    for _ in 0..32 {
+        let n = fold_round(func);
+        total += n;
+        if n == 0 {
+            break;
+        }
+    }
+    total
+}
+
+fn fold_round(func: &mut IrFunction) -> usize {
     if func.blocks.len() < 3 {
         return 0;
     }
@@ -714,7 +731,7 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
                 changes += 1;
                 // One transformation per call: edges were rewired, so the
                 // predecessor counts computed at entry are stale. The
-                // driver's fixpoint loop re-enters for the cluster step.
+                // local fixpoint re-enters for the cluster step.
                 return changes;
             }
         }
@@ -993,7 +1010,7 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
         func.next_value_id = next_id;
         changes += 1;
         // One transformation per call: the appended block invalidated the
-        // label map. The driver's fixpoint loop re-enters for more chains.
+        // label map. The local fixpoint re-enters for more chains.
         return changes;
     }
 
@@ -1287,6 +1304,31 @@ mod tests {
             || (c >= b'0' && c <= b'9')
             || c == b'-'
             || c == b'.') as i64
+    }
+
+    #[test]
+    fn one_pipeline_visit_finishes_case_fold_and_membership_cluster() {
+        let mut f = expat_chain();
+        assert_eq!(run_function(&mut f), 2);
+        assert_eq!(run_function(&mut f), 0);
+        let masks = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .filter(|i| {
+                matches!(
+                    i,
+                    Instruction::BinOp {
+                        op: IrBinOp::BitTest,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(masks, 1);
+        for x in 0..=255u8 {
+            assert_eq!(eval(&f, x), reference(x), "byte {x}");
+        }
     }
 
     #[test]

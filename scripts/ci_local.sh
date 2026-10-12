@@ -399,6 +399,9 @@ gate "loop-store-motion" fast \
 gate "const-trip-loop-inline" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_const_trip_loop_inline.sh
 
+gate "fp-recurrence-and-jump-thread" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_fp_recurrence.sh
+
 gate "bool-pair-tail-jmp-contract" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_bool_pair_tail_jmp.sh
 
