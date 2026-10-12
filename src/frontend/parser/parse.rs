@@ -177,6 +177,11 @@ pub(super) struct ParsedDeclAttrs {
     /// `__seg_gs` or `__seg_fs` qualifier encountered.
     pub parsing_address_space: AddressSpace,
 
+    /// Named space of the object the last declarator names, from the qualifier
+    /// after its last `*` (see `DeclAttributes::object_space`). Set by
+    /// `parse_declarator_with_attrs`, read right after it.
+    pub(super) declarator_object_space: AddressSpace,
+
     /// Named address space of the declaration being parsed, moved out of
     /// `parsing_address_space` right after its type specifier. Parameter
     /// lists and initializers reuse that slot, so the declaration's own
@@ -462,6 +467,7 @@ impl std::fmt::Debug for ParsedDeclAttrs {
             .field("parsing_const", &self.parsing_const())
             .field("parsing_volatile", &self.parsing_volatile())
             .field("parsing_address_space", &self.parsing_address_space)
+            .field("decl_address_space", &self.decl_address_space)
             .field("parsing_constructor", &self.parsing_constructor())
             .field("parsing_destructor", &self.parsing_destructor())
             .field("parsing_weak", &self.parsing_weak())

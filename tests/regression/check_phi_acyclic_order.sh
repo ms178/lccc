@@ -45,6 +45,12 @@ set -euo pipefail
 # failure there reports the ENVIRONMENT, not the code.
 i386_headers_ok() {
     if ! printf '#include <stdio.h>\n' | "$1" -x c - -fsyntax-only >/dev/null 2>&1; then
+        # A host whose own gcc -m32 parses the headers must not skip: the
+        # probe failing there is a compiler defect, not a missing sysroot.
+        if printf '#include <stdio.h>\n' | gcc -m32 -x c - -fsyntax-only >/dev/null 2>&1; then
+            echo "FAIL: i686 probe ($1) cannot parse <stdio.h> though gcc -m32 can" >&2
+            exit 1
+        fi
         echo "SKIP: i686 leg ($1) — no i386 libc headers on this host (CI installs gcc-multilib)"
         return 1
     fi

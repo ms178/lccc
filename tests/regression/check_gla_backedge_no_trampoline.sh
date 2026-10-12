@@ -33,7 +33,13 @@ i386_headers_ok() {
     # preprocess + parse + semantic analysis for ANY input kind, so the
     # probe checks that the headers actually PARSE — strictly stronger
     # than the -E workaround it replaces (which only expanded them).
-    if ! printf '#include <stdio.h>\n' | "$1" -x c -fsyntax-only 2>/dev/null; then
+    if ! printf '#include <stdio.h>\n' | "$1" -x c - -fsyntax-only 2>/dev/null; then
+        # A host whose own gcc -m32 parses the headers must not skip: the
+        # probe failing there is a compiler defect, not a missing sysroot.
+        if printf '#include <stdio.h>\n' | gcc -m32 -x c - -fsyntax-only >/dev/null 2>&1; then
+            echo "FAIL: i686 probe ($1) cannot parse <stdio.h> though gcc -m32 can" >&2
+            exit 1
+        fi
         echo "SKIP: i686 leg ($1) - no i386 libc headers on this host (CI installs gcc-multilib)"
         return 1
     fi

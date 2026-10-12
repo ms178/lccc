@@ -58,8 +58,18 @@ impl Lowerer {
             if let Some(vs) = decl.resolve_vector_size(elem_size) {
                 ext_da.apply_vector_size(vs);
             }
-            self.globals
-                .insert(declarator.name.clone(), GlobalInfo::from_analysis(&ext_da));
+            // A block-scope `extern` names an object with linkage, so it is
+            // placed exactly like its file-scope declaration (global_decl.rs).
+            // Skipping this left `extern long __seg_gs x;` in generic memory.
+            let mut ginfo = GlobalInfo::from_analysis(&ext_da);
+            ginfo.var.address_space = crate::common::type_builder::place_declared_space(
+                ginfo.var.c_type.as_mut(),
+                decl.address_space,
+                &decl.type_spec,
+                &declarator.derived,
+                declarator.attrs.object_space,
+            );
+            self.globals.insert(declarator.name.clone(), ginfo);
         }
         true // Handled, caller should continue to next declarator
     }
@@ -526,7 +536,7 @@ impl Lowerer {
                 // We must spill it to an alloca before memcpy.
                 let total_size = ct.size();
                 let is_small_vec_call = self.rhs_is_small_vector_call(expr, total_size);
-                let src = self.lower_expr(expr);
+                let src = self.lower_aggregate_rvalue(expr);
                 let src_val = self.operand_to_value(src);
                 if is_small_vec_call {
                     // Packed register value: store to alloca, then memcpy from alloca
@@ -659,11 +669,7 @@ impl Lowerer {
             });
         } else {
             let src_addr = self.get_struct_base_addr(expr);
-            self.emit(Instruction::Memcpy {
-                dest: alloca,
-                src: src_addr,
-                size: da.actual_alloc_size,
-            });
+            self.copy_aggregate_from_expr(alloca, expr, src_addr, da.actual_alloc_size);
         }
     }
 

@@ -68,7 +68,7 @@ impl Lowerer {
         // Count pointer and array levels
         let ptr_count = derived
             .iter()
-            .filter(|d| matches!(d, DerivedDeclarator::Pointer))
+            .filter(|d| matches!(d, DerivedDeclarator::Pointer(_)))
             .count();
         let has_array = derived
             .iter()
@@ -508,6 +508,25 @@ impl Lowerer {
         }
     }
 
+    /// Aggregate with its own storage (struct, union, vector or complex): the
+    /// only expression kinds whose value is an address into an object.
+    fn is_storage_aggregate(&self, expr: &Expr) -> bool {
+        let ct = self.expr_ctype(expr);
+        matches!(ct, CType::Struct(_) | CType::Union(_)) || ct.is_vector() || ct.is_complex()
+    }
+
+    /// Space that a subscript operand contributes to `operand[...]`: the
+    /// pointee space of a pointer, or the object space of an array. `None` for
+    /// an operand that is neither (an integer index), so the caller can take
+    /// the other operand of the reversed form `i[p]`.
+    fn subscript_operand_space(&self, operand: &Expr) -> Option<AddressSpace> {
+        match self.get_expr_ctype(operand) {
+            Some(CType::Pointer(_, pointee_space)) => Some(pointee_space),
+            Some(CType::Array(_, _)) => Some(self.get_addr_space_of_struct_expr(operand)),
+            _ => None,
+        }
+    }
+
     /// Get the address space of a struct/union variable expression (for `.` member access).
     /// Walks through the expression to find the underlying variable and returns its
     /// address space qualifier (e.g., SegGs for `__seg_gs` per-CPU variables).
@@ -521,16 +540,47 @@ impl Lowerer {
             }
             // Nested member access: s.inner.field — propagate from outermost base
             Expr::MemberAccess(base, _, _) => self.get_addr_space_of_struct_expr(base),
-            // Array element access: arr[i] (and a[i][j], i[a]) live in the
-            // base object's address space. Without this arm, the kernel's
-            // `__this_cpu_read(vector_irq[vector])` — which lowers through
-            // `&(vector_irq[vector])` — walked into the catch-all and lost
-            // `__seg_gs`, so common_interrupt looked the handler up in the
-            // STATIC percpu image instead of the per-CPU area and every
-            // timer interrupt hit "No irq handler for 0.48" (vector 0x30,
-            // the legacy timer IRQ whose desc binding lives precisely in
-            // that array) until "IO-APIC + timer doesn't work!" panicked.
-            Expr::ArraySubscript(base, _, _) => self.get_addr_space_of_struct_expr(base),
+            // Array element access: arr[i] (and a[i][j], i[a]) lives in the
+            // space of the memory the subscript walks into.
+            //  * Array base (`__seg_gs T arr[N]`): the array object's own
+            //    space. Without this arm, the kernel's
+            //    `__this_cpu_read(vector_irq[vector])` — which lowers through
+            //    `&(vector_irq[vector])` — walked into the catch-all and lost
+            //    `__seg_gs`, so common_interrupt looked the handler up in the
+            //    STATIC percpu image instead of the per-CPU area and every
+            //    timer interrupt hit "No irq handler for 0.48" (vector 0x30,
+            //    the legacy timer IRQ whose desc binding lives precisely in
+            //    that array) until "IO-APIC + timer doesn't work!" panicked.
+            //  * Pointer base (`gp[i]`, `gp` of type `T __seg_gs *`): the
+            //    elements live in the pointee space of gp's type, NOT in the
+            //    space of the variable gp itself. Walking the variable's
+            //    space made `gp[1].v[0]` load from generic memory, a silent
+            //    wrong-memory access (oracle: GCC 14.2 emits `%gs:` there).
+            //  * Reversed form (`i[gp]`, `2[arr]`): C defines `a[b]` as
+            //    `*(a + b)`, so the pointer or array operand may be the index.
+            //    The base is then the integer and the walk must go into the
+            //    index. Without this arm `i[gp]` lost its `%gs` entirely
+            //    (oracle: GCC 14.2 emits `%gs:(%rdi)`).
+            Expr::ArraySubscript(base, index, _) => {
+                if let Some(space) = self.subscript_operand_space(base) {
+                    space
+                } else if let Some(space) = self.subscript_operand_space(index) {
+                    space
+                } else {
+                    self.get_addr_space_of_struct_expr(base)
+                }
+            }
+            // Comma and assignment yield the storage of their operand, so
+            // `(f(), a).v[0]` and `(x = y).v[0]` read the segment object. Only
+            // aggregates have storage; a scalar comma or assignment is a value.
+            Expr::Comma(_, rhs, _) if self.is_storage_aggregate(expr) => {
+                self.get_addr_space_of_struct_expr(rhs)
+            }
+            Expr::Assign(lhs, _, _) | Expr::CompoundAssign(_, lhs, _, _)
+                if self.is_storage_aggregate(expr) =>
+            {
+                self.get_addr_space_of_struct_expr(lhs)
+            }
             // p->field where p is a segment-qualified pointer: the member
             // (including member ARRAYS, whose CType is Array not Pointer and
             // therefore invisible to get_addr_space_of_ptr_expr) lives in

@@ -548,6 +548,56 @@ jobs:
         env:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_kernel_boot_isa.sh
+      # Executed __seg_gs regression: GS base points at a buffer, every
+      # segment load/store/aggregate copy/typedef pointer is self-checked at
+      # -O0/-O1/-O2 and compared with gcc -O2 output for the __seg_gs runtime contract.
+      - name: Run __seg_gs runtime regression
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_seg_gs_runtime.sh
+
+      - name: Run __seg_gs aggregate copy size sweep
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_seg_copy_sweep.sh
+
+      - name: Run __seg_gs pointee-chain assembly contract
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_seg_pointee_chain_asm.sh
+
+      - name: Run __seg_gs explicit-cast warning and abstract-declarator check
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_seg_cast_warning.sh
+
+      # Named-space declarator placement: parameter
+      # object spaces are rejected, array decay across spaces is rejected, and
+      # the accepted pointee/typedef/grouped forms match gcc's verdicts.
+      - name: Run __seg_gs declarator-space placement check
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_seg_declarator_space.sh
+
+      # Named-space array decay through identifiers, members, subscripts and arithmetic.
+      - name: Run __seg_gs conversion diagnostics check
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_seg_conv_diagnostics.sh
+
+      # Chroot bind() creates a file target for a file source.
+      - name: Run chroot bind regression
+        run: bash tests/regression/check_chroot_bind.sh
+
+      # prepare_kernel_tree.sh never removes user data through a KDIR or PKG_ROOT
+      # it should refuse.
+      - name: Run kernel-tree deletion-safety regression
+        run: bash tests/regression/check_kernel_tree_clear.sh
+
+      # The shared mount-table helper (escape decoding, fail-closed) and the
+      # chroot/kernel-tree root guards: each refusal is checked before any sudo.
+      - name: Run destructive-path guard regression
+        run: bash tests/regression/check_destructive_guards.sh
 
       # BB-SLP red-team battery: the 2026-09-16 semantic audit closed three
       # P0 soundness holes (dangling lane uses via Call/Phi/InlineAsm/
@@ -1102,6 +1152,7 @@ jobs:
           python3 scripts/check_deep_nesting_robustness.py
           python3 scripts/test_differential_corpus_paths.py
           bash tests/regression/check_loop_memset.sh
+          bash tests/regression/check_loop_store_motion.sh
           bash tests/regression/check_bool_pair_tail_jmp.sh
           bash tests/regression/check_bool_pair_prune.sh
           bash tests/regression/check_demorgan_branch_split.sh

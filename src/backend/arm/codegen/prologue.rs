@@ -341,7 +341,8 @@ impl ArmCodegen {
             // ARM emits indexed addressing [base, index, lsl #N] directly at
             // the Load/Store with no IR-visible use of the index there; the
             // allocator must keep the index live to the consumer's end.
-            crate::backend::generation::collect_folded_index_links(func),
+            // AArch64 has no segment indexed emitters (ArchCodegen default: false).
+            crate::backend::generation::collect_folded_index_links(func, false),
             &self.state.ra_config,
             // Not alias-aware yet: ignored scratch map keeps the pre-alias freshness behavior.
             &mut crate::common::fx_hash::FxHashMap::default(),

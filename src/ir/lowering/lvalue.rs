@@ -114,10 +114,9 @@ impl Lowerer {
                 // (__tls_init_tp: `((struct pthread __seg_fs *)0)
                 // ->specific[0] = ...` stored to the NULL page, killing
                 // every external binary at TLS-init time — LK-26).
-                let addr_space = match self.get_addr_space_of_ptr_expr(base) {
-                    AddressSpace::Default => self.get_addr_space_of_struct_expr(base),
-                    s => s,
-                };
+                // Same rule as the load path: the subscript's own space, which
+                // covers the reversed form `i[p]` (see get_addr_space_of_struct_expr).
+                let addr_space = self.get_addr_space_of_struct_expr(expr);
                 let addr = self.compute_array_element_addr(base, index);
                 Some(LValue::address(addr, addr_space, vol))
             }
@@ -183,7 +182,11 @@ impl Lowerer {
                 // __real__ z as lvalue -> address of real part (offset 0 from complex base)
                 if let Some(lv) = self.lower_lvalue(inner) {
                     let addr = self.lvalue_addr(&lv);
-                    Some(LValue::address(addr, AddressSpace::Default, vol))
+                    Some(LValue::address(
+                        addr,
+                        self.get_addr_space_of_struct_expr(inner),
+                        vol,
+                    ))
                 } else {
                     None
                 }
@@ -201,7 +204,11 @@ impl Lowerer {
                         offset: Operand::Const(IrConst::I64(comp_size)),
                         ty: IrType::I8,
                     });
-                    Some(LValue::address(imag_addr, AddressSpace::Default, vol))
+                    Some(LValue::address(
+                        imag_addr,
+                        self.get_addr_space_of_struct_expr(inner),
+                        vol,
+                    ))
                 } else {
                     None
                 }

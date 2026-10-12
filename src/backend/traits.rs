@@ -350,7 +350,17 @@ pub trait ArchCodegen {
     ) -> bool {
         false
     }
-
+    /// Store counterpart of `emit_seg_load_with_const_offset`.
+    fn emit_seg_store_with_const_offset(
+        &mut self,
+        _val: &Operand,
+        _base: &Value,
+        _offset: i64,
+        _ty: IrType,
+        _seg: AddressSpace,
+    ) -> bool {
+        false
+    }
     fn emit_seg_load(&mut self, _dest: &Value, _ptr: &Value, _ty: IrType, _seg: AddressSpace) {
         panic!("segment override loads only supported on x86");
     }
@@ -545,6 +555,64 @@ pub trait ArchCodegen {
         false
     }
 
+    /// Whether the backend folds a segment-qualified indexed access
+    /// (`%gs:disp(base,idx,scale)` / `%gs:sym(,idx,scale)`) through the
+    /// `*_seg_*_indexed*` emitters below. Gates keeping a segment access in
+    /// the indexed-GEP map: a backend without the emitters must keep the GEP
+    /// materialised, or the dead-producer skip would leave nothing to remat.
+    fn supports_seg_indexed_fold(&self) -> bool {
+        false
+    }
+
+    /// Segment dual of [`Self::emit_load_indexed`]: `dest = seg:[base +
+    /// (index << shift) + disp]`. Accepts exactly the types the generic
+    /// emitter accepts for the segment-fold width set. Returns false if it
+    /// cannot be emitted; the caller then rematerialises the GEP.
+    fn emit_seg_load_indexed(
+        &mut self,
+        _dest: &Value,
+        _info: &super::generation::IndexedGepInfo,
+        _ty: IrType,
+        _seg: AddressSpace,
+    ) -> bool {
+        false
+    }
+
+    /// Store dual of [`Self::emit_seg_load_indexed`].
+    fn emit_seg_store_indexed(
+        &mut self,
+        _val: &Operand,
+        _info: &super::generation::IndexedGepInfo,
+        _ty: IrType,
+        _seg: AddressSpace,
+    ) -> bool {
+        false
+    }
+
+    /// Segment dual of [`Self::emit_load_indexed_sym`] (symbol base).
+    fn emit_seg_load_indexed_sym(
+        &mut self,
+        _dest: &Value,
+        _sym: &str,
+        _info: &super::generation::IndexedGepInfo,
+        _ty: IrType,
+        _seg: AddressSpace,
+    ) -> bool {
+        false
+    }
+
+    /// Store dual of [`Self::emit_seg_load_indexed_sym`].
+    fn emit_seg_store_indexed_sym(
+        &mut self,
+        _val: &Operand,
+        _sym: &str,
+        _info: &super::generation::IndexedGepInfo,
+        _ty: IrType,
+        _seg: AddressSpace,
+    ) -> bool {
+        false
+    }
+
     /// Constant-offset GEP folds with a REGISTER-RESIDENT base (non-alloca).
     ///
     /// Sound only when ALL of the following hold on the backend:
@@ -563,6 +631,13 @@ pub trait ArchCodegen {
     /// proven alloca-only contract.
     fn const_offset_fold_reg_base_ok(&self, _base: &Value) -> bool {
         false
+    }
+
+    /// Whether a register-resident base may be folded into a segment-overridden
+    /// access (`%gs:off(%base)`). Defaults to the generic hook; backends whose
+    /// segment forms read only the base may accept more homes.
+    fn seg_const_offset_fold_base_ok(&self, base: &Value) -> bool {
+        self.const_offset_fold_reg_base_ok(base)
     }
 
     /// Emit a RIP-relative load from a global symbol (folded GlobalAddr + Load).

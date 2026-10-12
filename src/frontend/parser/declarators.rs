@@ -84,6 +84,11 @@ impl Parser {
         // Bounded: see POINTER_DEPTH_BUDGET. The span is taken BEFORE
         // consuming so the diagnostic points at the offending `*`.
         let mut star_depth = 0u32;
+        // Space written after the most recent `*`. After the loop it is the
+        // space after the LAST `*`, the one adjacent to the name: that pointer
+        // is the declared object (`long *__seg_gs p` puts `p` in %gs), while a
+        // qualifier on an earlier `*` belongs to the pointee (`long *__seg_gs *p`).
+        let mut object_space = AddressSpace::Default;
         loop {
             let star_span = self.peek_span();
             if !self.consume_if(&TokenKind::Star) {
@@ -93,14 +98,26 @@ impl Parser {
             if !self.enter_pointer_level(star_depth, star_span) {
                 break;
             }
-            derived.push(DerivedDeclarator::Pointer);
             // Only the outermost level's qualifiers describe the object.
             self.attrs.set_pointer_const(false);
+            // The base-specifier space already sits in the slot; keep it, and
+            // collect only the qualifier written after this `*`.
+            let base_space =
+                std::mem::replace(&mut self.attrs.parsing_address_space, AddressSpace::Default);
             self.skip_cv_qualifiers();
+            let star_space = std::mem::replace(&mut self.attrs.parsing_address_space, base_space);
+            // Each star keeps its own qualifier (see `DerivedDeclarator::Pointer`).
+            // The last star's is also the declared object's space.
+            derived.push(DerivedDeclarator::Pointer(star_space));
+            object_space = star_space;
             self.skip_gcc_extensions();
         }
 
         // Parse the direct-declarator part
+        // Space of the object declared by a parenthesised inner declarator
+        // (`long (*__seg_gs ap)[4]`). The inner call records it in
+        // `declarator_object_space`, which the outer call must not overwrite.
+        let mut inner_object_space = AddressSpace::Default;
         let (name, inner_derived) = if let TokenKind::Identifier(n) = self.peek() {
             let n = n.clone();
             self.advance();
@@ -109,8 +126,10 @@ impl Parser {
             let save = self.pos;
             self.advance(); // consume '('
             let (inner_name, inner_derived) = self.parse_declarator();
+            inner_object_space = self.attrs.declarator_object_space;
             if !self.consume_if(&TokenKind::RParen) {
                 self.pos = save;
+                inner_object_space = AddressSpace::Default;
                 (None, Vec::new())
             } else {
                 (inner_name, inner_derived)
@@ -165,6 +184,13 @@ impl Parser {
             (None, None) => None,
         };
 
+        // The outermost stars name the object when present; otherwise the
+        // parenthesised declarator's object space stands.
+        self.attrs.declarator_object_space = if object_space == AddressSpace::Default {
+            inner_object_space
+        } else {
+            object_space
+        };
         (name, combined, mode_kind, has_common, aligned, is_packed)
     }
 
@@ -237,12 +263,15 @@ impl Parser {
         }
 
         // Check for function pointer: inner has Pointer(s), outer starts with Function
-        let inner_only_ptr_and_array = inner_derived
-            .iter()
-            .all(|d| matches!(d, DerivedDeclarator::Pointer | DerivedDeclarator::Array(_)));
+        let inner_only_ptr_and_array = inner_derived.iter().all(|d| {
+            matches!(
+                d,
+                DerivedDeclarator::Pointer(_) | DerivedDeclarator::Array(_)
+            )
+        });
         let inner_has_pointer = inner_derived
             .iter()
-            .any(|d| matches!(d, DerivedDeclarator::Pointer));
+            .any(|d| matches!(d, DerivedDeclarator::Pointer(_)));
         let outer_starts_with_function = matches!(
             outer_suffixes.first(),
             Some(DerivedDeclarator::Function(_, _))
@@ -279,7 +308,7 @@ impl Parser {
             // All others are extra indirection levels placed AFTER the FunctionPointer.
             let inner_ptr_count = inner_derived
                 .iter()
-                .filter(|d| matches!(d, DerivedDeclarator::Pointer))
+                .filter(|d| matches!(d, DerivedDeclarator::Pointer(_)))
                 .count();
             let extra_indirection_ptrs = if inner_ptr_count > 0 {
                 inner_ptr_count - 1
@@ -288,7 +317,7 @@ impl Parser {
             };
 
             // Emit the function pointer syntax marker + FunctionPointer
-            result.push(DerivedDeclarator::Pointer);
+            result.push(DerivedDeclarator::Pointer(AddressSpace::Default));
             if let Some(DerivedDeclarator::Function(params, variadic)) =
                 outer_suffixes.into_iter().next()
             {
@@ -297,7 +326,7 @@ impl Parser {
 
             // Emit extra indirection Pointers (beyond the syntax marker)
             for _ in 0..extra_indirection_ptrs {
-                result.push(DerivedDeclarator::Pointer);
+                result.push(DerivedDeclarator::Pointer(AddressSpace::Default));
             }
 
             // Emit inner arrays (for array of function pointers, e.g., `int (*fps[10])(int)`)
@@ -333,7 +362,7 @@ impl Parser {
             // - post_ptr_arrays: arrays after the last pointer (variable's own array dimensions)
             let last_ptr_idx = inner_derived
                 .iter()
-                .rposition(|d| matches!(d, DerivedDeclarator::Pointer))
+                .rposition(|d| matches!(d, DerivedDeclarator::Pointer(_)))
                 .expect("inner_has_pointer is true, so a Pointer must exist");
             let mut result = outer_pointers;
             // 1. Arrays from inner that come before the pointer (pointee array dimensions)
@@ -346,7 +375,7 @@ impl Parser {
             result.extend(outer_suffixes);
             // 3. Pointer(s)
             for d in &inner_derived[..=last_ptr_idx] {
-                if matches!(d, DerivedDeclarator::Pointer) {
+                if matches!(d, DerivedDeclarator::Pointer(_)) {
                     result.push(d.clone());
                 }
             }
@@ -396,13 +425,13 @@ impl Parser {
             .iter()
             .any(|d| matches!(d, DerivedDeclarator::Function(_, _)));
         let remainder_ptr_binds_function = inner_derived[1..].windows(2).any(|w| {
-            matches!(w[0], DerivedDeclarator::Pointer)
+            matches!(w[0], DerivedDeclarator::Pointer(_))
                 && matches!(w[1], DerivedDeclarator::Function(_, _))
         });
         if inner_has_function
             && outer_starts_with_function
             && outer_suffixes.len() == 1
-            && matches!(inner_derived.first(), Some(DerivedDeclarator::Pointer))
+            && matches!(inner_derived.first(), Some(DerivedDeclarator::Pointer(_)))
             && matches!(
                 inner_derived.last(),
                 Some(DerivedDeclarator::Function(_, _))
@@ -410,7 +439,7 @@ impl Parser {
             && !remainder_ptr_binds_function
         {
             let mut result = outer_pointers;
-            result.push(DerivedDeclarator::Pointer);
+            result.push(DerivedDeclarator::Pointer(AddressSpace::Default));
             if let Some(DerivedDeclarator::Function(params, variadic)) =
                 outer_suffixes.into_iter().next()
             {
@@ -429,7 +458,7 @@ impl Parser {
         // This does NOT match function definitions returning function pointers like
         // `int (*g(int))(int)`, where inner has Function (not FunctionPointer).
         let inner_starts_with_pointer =
-            matches!(inner_derived.first(), Some(DerivedDeclarator::Pointer));
+            matches!(inner_derived.first(), Some(DerivedDeclarator::Pointer(_)));
         let inner_has_fptr = inner_derived
             .iter()
             .any(|d| matches!(d, DerivedDeclarator::FunctionPointer(_, _)));
@@ -441,7 +470,7 @@ impl Parser {
             for suffix in outer_suffixes {
                 match suffix {
                     DerivedDeclarator::Function(params, variadic) => {
-                        result.push(DerivedDeclarator::Pointer);
+                        result.push(DerivedDeclarator::Pointer(AddressSpace::Default));
                         result.push(DerivedDeclarator::FunctionPointer(params, variadic));
                     }
                     other => result.push(other),
@@ -555,6 +584,7 @@ impl Parser {
                 // every `p->member` load was emitted without the %gs prefix
                 // (kernel: srcu_read_unlock_fast's per-CPU counter pointer).
                 let param_addr_space = std::mem::take(&mut self.attrs.parsing_address_space);
+                let param_span = self.peek_span();
                 // Capture whether the base type (before pointer declarators) was const.
                 // For `const int *p`, parsing_const is true here; the `*` is handled below.
                 let param_is_const = self.attrs.parsing_const();
@@ -570,7 +600,27 @@ impl Parser {
                     inner_ptr_depth,
                     param_is_restrict,
                     paren_ptr_total,
+                    star_spaces,
                 ) = self.parse_param_declarator_full();
+                // A parameter has automatic storage, so a named space cannot
+                // hold it: GCC 14.2 rejects `long __seg_gs x`. A pointer parameter
+                // (`long __seg_gs *p`) is fine; its qualifier names the pointee.
+                if param_addr_space != AddressSpace::Default
+                    && pointer_depth == 0
+                    && inner_ptr_depth == 0
+                    && array_dims.is_empty()
+                    && ptr_to_array_dims.is_empty()
+                    && !is_func_ptr
+                {
+                    self.emit_error(
+                        format!(
+                            "'{}' specified for parameter '{}'",
+                            param_addr_space,
+                            name.as_deref().unwrap_or("")
+                        ),
+                        param_span,
+                    );
+                }
                 // Post-name GCC attributes: `int x __attribute__((aligned(32)))`.
                 // The parameter declarator parser does not consume them; parse
                 // them here and merge `aligned` with any pre-name/_Alignas
@@ -620,10 +670,15 @@ impl Parser {
                     0
                 };
                 for level in 0..leading_depth {
+                    // Level L's pointee is the storage of the pointer built by the
+                    // star before it, so it takes that star's qualifier.
                     let space = if level == 0 {
                         param_addr_space
                     } else {
-                        AddressSpace::Default
+                        star_spaces
+                            .get(level as usize - 1)
+                            .copied()
+                            .unwrap_or(AddressSpace::Default)
                     };
                     type_spec = TypeSpecifier::Pointer(Box::new(type_spec), space);
                 }
@@ -735,9 +790,15 @@ impl Parser {
         // OUTSIDE, while the leading stars bind to the base type from the
         // inside (see the construction in parse_param_list).
         u32,
+        Vec<AddressSpace>,
     ) {
+        let param_start = self.peek_span();
         let mut pointer_depth: u32 = 0;
         let mut is_restrict = false;
+        // Space written after each leading `*`, in written order (see
+        // `DerivedDeclarator::Pointer`): `star_spaces[k]` qualifies the pointee
+        // of the pointer built by star k+2.
+        let mut star_spaces: Vec<AddressSpace> = Vec::new();
         loop {
             // Bounded: see POINTER_DEPTH_BUDGET. The span is taken before
             // consuming so the diagnostic points at the offending `*`.
@@ -753,7 +814,13 @@ impl Parser {
             // dropping it with const/volatile. Scan exactly the qualifier run
             // attached to this `*`, before nested function declarators begin.
             let qualifier_start = self.pos;
+            let base_space =
+                std::mem::replace(&mut self.attrs.parsing_address_space, AddressSpace::Default);
             self.skip_cv_qualifiers();
+            star_spaces.push(std::mem::replace(
+                &mut self.attrs.parsing_address_space,
+                base_space,
+            ));
             is_restrict |= self.tokens[qualifier_start..self.pos]
                 .iter()
                 .any(|tok| matches!(tok.kind, TokenKind::Restrict));
@@ -787,6 +854,22 @@ impl Parser {
         } else {
             None
         };
+
+        // The last `*` qualifier names the parameter object itself
+        // (`long *__seg_gs p`), which GCC rejects. A qualifier on an earlier
+        // `*` or on the base type belongs to the pointee and is accepted.
+        if let Some(&object_space) = star_spaces.last() {
+            if object_space != AddressSpace::Default {
+                self.emit_error(
+                    format!(
+                        "'{}' specified for parameter '{}'",
+                        object_space,
+                        name.as_deref().unwrap_or("")
+                    ),
+                    param_start,
+                );
+            }
+        }
 
         // Parse trailing array dimensions
         while matches!(self.peek(), TokenKind::LBracket) {
@@ -833,6 +916,7 @@ impl Parser {
             fptr_inner_ptr_depth,
             is_restrict,
             paren_ptr_total,
+            star_spaces,
         )
     }
 
@@ -876,6 +960,11 @@ impl Parser {
         } else if matches!(self.peek(), TokenKind::Star) {
             // Function pointer or pointer-to-array: (*name)(params) or (*name)[N]
             let mut inner_ptr_depth = 0u32;
+            // The space written after the last inner `*` qualifies the object
+            // being declared (`(*__seg_gs p)`), as in the outer `*` loop, and
+            // is rejected below. The earlier stars' spaces qualify pointees.
+            let mut object_space = AddressSpace::Default;
+            let mut object_span = self.peek_span();
             loop {
                 let star_span = self.peek_span();
                 if !self.consume_if(&TokenKind::Star) {
@@ -885,7 +974,11 @@ impl Parser {
                 if !self.enter_pointer_level(inner_ptr_depth, star_span) {
                     break;
                 }
+                let base_space =
+                    std::mem::replace(&mut self.attrs.parsing_address_space, AddressSpace::Default);
                 self.skip_cv_qualifiers();
+                object_space = std::mem::replace(&mut self.attrs.parsing_address_space, base_space);
+                object_span = star_span;
                 // Also skip __attribute__(...) after pointer qualifiers.
                 // E.g., `void (*__attribute__((unused)) fp)(int)` is valid GNU C.
                 self.skip_gcc_extensions();
@@ -899,6 +992,16 @@ impl Parser {
             } else {
                 None
             };
+            // A parameter has automatic storage and cannot live in a named
+            // space; GCC 14.2 rejects `void f(long (*__seg_gs p)[4])` and the
+            // unnamed form. Same rule as the non-parenthesised declarator.
+            if object_space != AddressSpace::Default {
+                let msg = match name.as_deref() {
+                    Some(n) => format!("'{object_space}' specified for parameter '{n}'"),
+                    None => format!("'{object_space}' specified for unnamed parameter"),
+                };
+                self.emit_error(msg, object_span);
+            }
             *pointer_depth += inner_ptr_depth.saturating_sub(1);
             // Parse array dimensions inside parens: (*a[]) or (*a[N])
             // These represent "array of pointers" and need to be propagated

@@ -229,10 +229,26 @@ pub trait TypeConvertContext {
 ///
 /// Returns `Some(index)` where the core begins, or `None` if no function
 /// pointer/function declarator is present.
+/// Address space of the storage the pointer at `derived[i]` points into.
+///
+/// The qualifier written after a `*` (carried by that `Pointer`) qualifies the
+/// pointer built by the NEXT `*`: in `long *__seg_gs *p` the first star's
+/// `__seg_gs` makes the first pointer's storage the segment, so `p`'s pointee
+/// is a `%gs` pointer. The pointer at `i` therefore takes its pointee space from
+/// the star immediately before it. The first star has no earlier star, so its
+/// pointee is the base type, and the base-specifier space is placed on it by
+/// `apply_declaration_address_space`.
+fn pointee_space_before(derived: &[DerivedDeclarator], i: usize) -> AddressSpace {
+    match i.checked_sub(1).map(|j| &derived[j]) {
+        Some(DerivedDeclarator::Pointer(space)) => *space,
+        _ => AddressSpace::Default,
+    }
+}
+
 fn find_function_pointer_core(derived: &[DerivedDeclarator]) -> Option<usize> {
     for i in 0..derived.len() {
         // Look for Pointer followed by FunctionPointer
-        if matches!(&derived[i], DerivedDeclarator::Pointer)
+        if matches!(&derived[i], DerivedDeclarator::Pointer(_))
             && i + 1 < derived.len()
             && matches!(&derived[i + 1], DerivedDeclarator::FunctionPointer(_, _))
         {
@@ -360,9 +376,9 @@ pub fn build_full_ctype_with_base(
         //   core    = [Pointer, FunctionPointer] — the `(*)(int)` syntax
         // We fold prefix Pointer declarators into the base to form the return type.
         let mut result = base;
-        for d in &derived[..fp_start] {
-            if matches!(d, DerivedDeclarator::Pointer) {
-                result = CType::Pointer(Box::new(result), AddressSpace::Default);
+        for (i, d) in derived[..fp_start].iter().enumerate() {
+            if matches!(d, DerivedDeclarator::Pointer(_)) {
+                result = CType::Pointer(Box::new(result), pointee_space_before(derived, i));
             }
             // Array declarators in prefix are outer wrappers, handled after the core.
         }
@@ -372,7 +388,7 @@ pub fn build_full_ctype_with_base(
         let mut i = fp_start;
         while i < derived.len() {
             match &derived[i] {
-                DerivedDeclarator::Pointer => {
+                DerivedDeclarator::Pointer(_) => {
                     if i + 1 < derived.len()
                         && matches!(
                             &derived[i + 1],
@@ -396,7 +412,7 @@ pub fn build_full_ctype_with_base(
                         result = CType::Pointer(Box::new(func_type), AddressSpace::Default);
                         i += 2;
                     } else {
-                        result = CType::Pointer(Box::new(result), AddressSpace::Default);
+                        result = CType::Pointer(Box::new(result), pointee_space_before(derived, i));
                         i += 1;
                     }
                 }
@@ -455,8 +471,8 @@ pub fn build_full_ctype_with_base(
         let mut i = 0;
         while i < derived.len() {
             match &derived[i] {
-                DerivedDeclarator::Pointer => {
-                    result = CType::Pointer(Box::new(result), AddressSpace::Default);
+                DerivedDeclarator::Pointer(_) => {
+                    result = CType::Pointer(Box::new(result), pointee_space_before(derived, i));
                     i += 1;
                 }
                 DerivedDeclarator::Array(_) => {
@@ -520,19 +536,24 @@ pub fn apply_declaration_address_space(ty: &mut CType, space: AddressSpace) -> b
     }
     match ty {
         CType::Pointer(inner, sp) => {
-            if matches!(inner.as_ref(), CType::Pointer(..)) {
+            // gcc 14.2: the space qualifies the innermost pointer's pointee. An
+            // array of pointers between this level and that pointer is
+            // transparent (`struct c __seg_gs *(*pa)[4]`: the outer pointer and
+            // the array stay generic; each element points into the segment).
+            if pointee_reaches_pointer_level(inner) {
                 apply_declaration_address_space(inner, space)
+            } else if let CType::Function(ft) = inner.as_mut() {
+                // `T __seg_gs *(*f)(void)`: the space names the pointer in the
+                // return type; the function pointer itself stays generic.
+                apply_declaration_address_space(&mut ft.return_type, space)
             } else {
+                // The pointee is an object (`int __seg_gs (*p)[4]` points at an
+                // array that lives in the segment), so the space qualifies it.
                 *sp = space;
                 true
             }
         }
         CType::Array(elem, _) => apply_declaration_address_space(elem, space),
-        // `T __seg_gs *f(void)`: the qualifier belongs to the pointer in the
-        // return type, not to the function designator itself. Without this arm
-        // a function returning a per-CPU pointer (srcu_read_lock_fast) reported
-        // a plain pointer at every call site, so a correctly qualified argument
-        // was rejected as "incompatible pointer type".
         CType::Function(ft) => apply_declaration_address_space(&mut ft.return_type, space),
         // A plain object (or an array of plain objects): the data IS the object,
         // so the space is the object's own storage and nothing absorbed it.
@@ -550,7 +571,7 @@ pub fn declarator_supplies_pointer(derived: &[DerivedDeclarator]) -> bool {
     derived.iter().any(|d| {
         matches!(
             d,
-            DerivedDeclarator::Pointer | DerivedDeclarator::FunctionPointer(_, _)
+            DerivedDeclarator::Pointer(_) | DerivedDeclarator::FunctionPointer(_, _)
         )
     })
 }
@@ -633,6 +654,24 @@ pub fn object_storage_address_space(
     } else {
         space
     }
+}
+
+/// The object's storage space, including an object-level qualifier.
+///
+/// `object_space` is the qualifier written after the declarator's LAST `*`
+/// (`void *__seg_gs ix_p[N]`: the element pointers' qualifier names the array's
+/// storage, as in gcc 14.2, where `ix_p[i]` is a `%gs` load). When it is set it
+/// wins outright; otherwise the declaration-level rule of
+/// [`object_storage_address_space`] applies unchanged.
+pub fn object_storage_address_space_with_object(
+    space: AddressSpace,
+    derived: &[DerivedDeclarator],
+    object_space: AddressSpace,
+) -> AddressSpace {
+    if object_space != AddressSpace::Default {
+        return object_space;
+    }
+    object_storage_address_space(space, derived)
 }
 
 #[cfg(test)]
@@ -720,7 +759,7 @@ mod address_space_tests {
         assert!(apply_declaration_address_space_for_object(
             &mut ty,
             AddressSpace::SegGs,
-            &[DerivedDeclarator::Pointer]
+            &[DerivedDeclarator::Pointer(AddressSpace::Default)]
         ));
         assert_eq!(
             ty,
@@ -746,7 +785,10 @@ mod address_space_tests {
         assert!(apply_declaration_address_space_for_object(
             &mut ty,
             AddressSpace::SegGs,
-            &[DerivedDeclarator::Pointer, DerivedDeclarator::Pointer]
+            &[
+                DerivedDeclarator::Pointer(AddressSpace::Default),
+                DerivedDeclarator::Pointer(AddressSpace::Default)
+            ]
         ));
         assert_eq!(
             ty,
@@ -767,7 +809,7 @@ mod address_space_tests {
             &mut ty,
             AddressSpace::SegGs,
             &[
-                DerivedDeclarator::Pointer,
+                DerivedDeclarator::Pointer(AddressSpace::Default),
                 DerivedDeclarator::Function(Vec::new(), false)
             ]
         ));
@@ -791,7 +833,10 @@ mod address_space_tests {
         assert_eq!(
             object_storage_address_space(
                 AddressSpace::SegGs,
-                &[DerivedDeclarator::Pointer, DerivedDeclarator::Array(None)]
+                &[
+                    DerivedDeclarator::Pointer(AddressSpace::Default),
+                    DerivedDeclarator::Array(None)
+                ]
             ),
             AddressSpace::Default
         );
@@ -804,7 +849,10 @@ mod address_space_tests {
             AddressSpace::SegGs
         );
         assert_eq!(
-            object_storage_address_space(AddressSpace::SegFs, &[DerivedDeclarator::Pointer]),
+            object_storage_address_space(
+                AddressSpace::SegFs,
+                &[DerivedDeclarator::Pointer(AddressSpace::Default)]
+            ),
             AddressSpace::Default
         );
         assert_eq!(
@@ -814,12 +862,334 @@ mod address_space_tests {
 
         // Function pointers count as declarator-supplied pointers.
         assert!(declarator_supplies_pointer(&[
-            DerivedDeclarator::Pointer,
+            DerivedDeclarator::Pointer(AddressSpace::Default),
             DerivedDeclarator::FunctionPointer(Vec::new(), false)
         ]));
         assert!(!declarator_supplies_pointer(&[
             DerivedDeclarator::Array(None),
             DerivedDeclarator::Function(Vec::new(), false)
         ]));
+    }
+}
+
+/// Does the pointee of a pointer declarator reach a pointer level through its
+/// arrays? If so the innermost pointer owns the named space (`T __seg_gs
+/// *a[4]`). If not, the pointee object itself is the segment object: the array
+/// in `int __seg_gs (*p)[4]` is the one in %gs, and the space belongs on the
+/// pointer, as for `struct c __seg_gs *p`.
+fn pointee_reaches_pointer_level(ty: &CType) -> bool {
+    match ty {
+        CType::Pointer(..) | CType::Function(..) => true,
+        CType::Array(elem, _) => pointee_reaches_pointer_level(elem),
+        _ => false,
+    }
+}
+
+/// Does the named address space qualify the declared type as a whole?
+///
+/// `__seg_gs` written against a typedef name or `typeof` qualifies the type
+/// itself, so for `__seg_gs __typeof__(T *) p;` the pointer object `p` is the
+/// one in the segment (the kernel's per-CPU pointer variables). Written against
+/// a base specifier (`__seg_gs T *p;`) it qualifies the base type, and so the
+/// pointee. The two cases are distinguished by the type specifier alone.
+///
+/// A typedef or typeof base only qualifies the whole object when the declarator
+/// adds no pointer level: `typedef long L; L __seg_gs *p;` makes `p` ordinary
+/// memory pointing into %gs, exactly like `long __seg_gs *p;`. Without this
+/// check the typedef path put `p` itself in %gs and loaded it through the
+/// segment (silent miscompile).
+pub fn named_space_qualifies_whole_type(
+    type_spec: &TypeSpecifier,
+    derived: &[DerivedDeclarator],
+) -> bool {
+    let typedef_base = matches!(
+        type_spec,
+        TypeSpecifier::TypedefName(_) | TypeSpecifier::Typeof(_) | TypeSpecifier::TypeofType(_)
+    );
+    typedef_base
+        && !derived.iter().any(|d| {
+            matches!(
+                d,
+                DerivedDeclarator::Pointer(_) | DerivedDeclarator::FunctionPointer(..)
+            )
+        })
+}
+
+/// Apply a declaration's named address space to the declared object's type and
+/// return the storage space of the object itself.
+///
+/// This is the single entry point for declaration sites (file scope, asm
+/// register globals, extern re-declarations, locals). A whole-type qualifier
+/// (`named_space_qualifies_whole_type`) is the object's own space and leaves
+/// the type unchanged. Otherwise the space is placed on the declared type
+/// (`apply_declaration_address_space`) and the storage follows
+/// `declared_object_space`. With no CType available the declaration space is
+/// the storage space, as before.
+pub fn place_declared_space(
+    ct: Option<&mut CType>,
+    space: AddressSpace,
+    type_spec: &TypeSpecifier,
+    derived: &[DerivedDeclarator],
+    object_space: AddressSpace,
+) -> AddressSpace {
+    let whole_type = named_space_qualifies_whole_type(type_spec, derived);
+    match ct {
+        None => {
+            if object_space != AddressSpace::Default {
+                object_space
+            } else {
+                space
+            }
+        }
+        Some(ct) => {
+            if !whole_type {
+                apply_declaration_address_space(ct, space);
+            }
+            // A named space after the declarator's last `*` (`long *__seg_gs p`)
+            // is the object's own space; it does not reach the pointee.
+            if object_space != AddressSpace::Default {
+                object_space
+            } else {
+                declared_object_space(space, ct, whole_type)
+            }
+        }
+    }
+}
+
+/// Address space in which the object a declaration declares is stored.
+///
+/// * `whole_type` (see `named_space_qualifies_whole_type`): the object is in
+///   `space`, whatever its shape.
+/// * Otherwise `space` qualifies the base type. A plain object
+///   (`int __seg_gs x;`, `struct pcpu __seg_gs arr[4];`) lives in `space`.
+///   Once the declared type has a pointer level (`struct c __seg_gs *g;`,
+///   `struct c __seg_gs *a[4];`) the space belongs to the pointee, so the
+///   pointer object is ordinary memory. Using `space` as the storage for these
+///   made `g` load itself through %gs.
+///
+/// Call this after `apply_declaration_address_space` on the same type, and only
+/// when `whole_type` is false (a whole-type qualifier does not reach the
+/// pointee).
+pub fn declared_object_space(space: AddressSpace, ty: &CType, whole_type: bool) -> AddressSpace {
+    if space == AddressSpace::Default {
+        AddressSpace::Default
+    } else if matches!(ty, CType::Function(_)) {
+        // A function designator is code, not an object: it has no %gs storage,
+        // whatever qualifier the declaration carries.
+        AddressSpace::Default
+    } else if whole_type {
+        space
+    } else if has_pointer_level(ty) {
+        AddressSpace::Default
+    } else {
+        space
+    }
+}
+
+fn has_pointer_level(ty: &CType) -> bool {
+    match ty {
+        CType::Pointer(..) => true,
+        CType::Array(elem, _) => has_pointer_level(elem),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod seg_placement_tests {
+    use super::*;
+
+    /// Pointee of every test pointer: a non-derived scalar.
+    fn base() -> CType {
+        CType::Long
+    }
+    fn gs_ptr_plain() -> CType {
+        CType::Pointer(Box::new(base()), AddressSpace::Default)
+    }
+    fn func_returning(ret: CType) -> CType {
+        CType::Function(Box::new(FunctionType {
+            return_type: ret,
+            params: Vec::new(),
+            variadic: false,
+        }))
+    }
+    /// Space of the pointer that directly points at the base struct, found by
+    /// walking from `ty` down the pointer/array/function chain.
+    fn innermost_space(ty: &CType) -> Option<AddressSpace> {
+        match ty {
+            CType::Pointer(inner, sp) => match inner.as_ref() {
+                CType::Pointer(..) | CType::Array(..) | CType::Function(..) => {
+                    innermost_space(inner)
+                }
+                _ => Some(*sp),
+            },
+            CType::Array(elem, _) => innermost_space(elem),
+            CType::Function(ft) => innermost_space(&ft.return_type),
+            _ => None,
+        }
+    }
+    /// Space stored on the outermost pointer, if `ty` is a pointer.
+    fn outer_space(ty: &CType) -> Option<AddressSpace> {
+        match ty {
+            CType::Pointer(_, sp) => Some(*sp),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn plain_pointer_gets_its_own_space() {
+        let mut t = gs_ptr_plain();
+        apply_declaration_address_space(&mut t, AddressSpace::SegGs);
+        assert_eq!(outer_space(&t), Some(AddressSpace::SegGs));
+    }
+
+    #[test]
+    fn pointer_to_pointer_qualifies_only_the_inner_level() {
+        let mut t = CType::Pointer(Box::new(gs_ptr_plain()), AddressSpace::Default);
+        apply_declaration_address_space(&mut t, AddressSpace::SegGs);
+        assert_eq!(outer_space(&t), Some(AddressSpace::Default));
+        assert_eq!(innermost_space(&t), Some(AddressSpace::SegGs));
+    }
+
+    #[test]
+    fn pointer_to_function_returning_gs_pointer_qualifies_the_return_pointer() {
+        // struct c __seg_gs *(*fp)(void)
+        let mut t = CType::Pointer(
+            Box::new(func_returning(gs_ptr_plain())),
+            AddressSpace::Default,
+        );
+        apply_declaration_address_space(&mut t, AddressSpace::SegGs);
+        assert_eq!(
+            outer_space(&t),
+            Some(AddressSpace::Default),
+            "fp itself stays generic"
+        );
+        assert_eq!(innermost_space(&t), Some(AddressSpace::SegGs));
+    }
+
+    #[test]
+    fn function_returning_gs_pointer_qualifies_the_return_pointer() {
+        // struct c __seg_gs *f(void)
+        let mut t = func_returning(gs_ptr_plain());
+        apply_declaration_address_space(&mut t, AddressSpace::SegGs);
+        assert_eq!(innermost_space(&t), Some(AddressSpace::SegGs));
+    }
+
+    #[test]
+    fn array_of_gs_pointers_qualifies_the_element_pointers() {
+        // struct c __seg_gs *a[4]
+        let mut t = CType::Array(Box::new(gs_ptr_plain()), Some(4));
+        apply_declaration_address_space(&mut t, AddressSpace::SegGs);
+        assert_eq!(innermost_space(&t), Some(AddressSpace::SegGs));
+    }
+
+    #[test]
+    fn pointer_to_array_of_gs_pointers_keeps_outer_pointer_generic() {
+        // struct c __seg_gs *(*pa)[4]
+        let mut t = CType::Pointer(
+            Box::new(CType::Array(Box::new(gs_ptr_plain()), Some(4))),
+            AddressSpace::Default,
+        );
+        apply_declaration_address_space(&mut t, AddressSpace::SegGs);
+        assert_eq!(outer_space(&t), Some(AddressSpace::Default));
+        assert_eq!(innermost_space(&t), Some(AddressSpace::SegGs));
+    }
+
+    #[test]
+    fn default_space_is_a_no_op() {
+        let mut t = CType::Pointer(Box::new(gs_ptr_plain()), AddressSpace::Default);
+        let before = t.clone();
+        apply_declaration_address_space(&mut t, AddressSpace::Default);
+        assert_eq!(t, before);
+    }
+
+    #[test]
+    fn plain_object_lives_in_the_declared_space() {
+        assert_eq!(
+            declared_object_space(AddressSpace::SegGs, &CType::Int, false),
+            AddressSpace::SegGs
+        );
+        assert_eq!(
+            declared_object_space(
+                AddressSpace::SegGs,
+                &CType::Array(Box::new(CType::Int), Some(4)),
+                false
+            ),
+            AddressSpace::SegGs
+        );
+        assert_eq!(
+            declared_object_space(AddressSpace::SegGs, &base(), false),
+            AddressSpace::SegGs
+        );
+    }
+
+    #[test]
+    fn whole_type_qualifier_puts_the_pointer_object_in_the_space() {
+        // __seg_gs __typeof__(struct c *) p;  -> p itself is %gs (kernel per-CPU pointer)
+        assert_eq!(
+            declared_object_space(AddressSpace::SegGs, &gs_ptr_plain(), true),
+            AddressSpace::SegGs
+        );
+        let arr = CType::Array(Box::new(gs_ptr_plain()), Some(4));
+        assert_eq!(
+            declared_object_space(AddressSpace::SegGs, &arr, true),
+            AddressSpace::SegGs
+        );
+    }
+
+    #[test]
+    fn pointer_object_is_generic_even_when_pointee_is_gs() {
+        assert_eq!(
+            declared_object_space(AddressSpace::SegGs, &gs_ptr_plain(), false),
+            AddressSpace::Default
+        );
+        let arr = CType::Array(Box::new(gs_ptr_plain()), Some(4));
+        assert_eq!(
+            declared_object_space(AddressSpace::SegGs, &arr, false),
+            AddressSpace::Default
+        );
+        assert_eq!(
+            declared_object_space(AddressSpace::Default, &base(), false),
+            AddressSpace::Default
+        );
+    }
+
+    #[test]
+    fn typedef_base_qualifies_whole_object_only_without_declarator_pointer() {
+        // typedef long L;  L __seg_gs x;   -> x itself is %gs
+        let td = TypeSpecifier::TypedefName("L".to_string());
+        assert!(named_space_qualifies_whole_type(&td, &[]));
+        // typedef long L;  L __seg_gs arr[4];  -> arr is %gs
+        assert!(named_space_qualifies_whole_type(
+            &td,
+            &[DerivedDeclarator::Array(None)]
+        ));
+        // typedef long L;  L __seg_gs *p;  -> p is generic, *p is %gs
+        assert!(!named_space_qualifies_whole_type(
+            &td,
+            &[DerivedDeclarator::Pointer(AddressSpace::Default)]
+        ));
+        // typedef long L;  L __seg_gs (*fp)(void);  -> fp is generic
+        assert!(!named_space_qualifies_whole_type(
+            &td,
+            &[DerivedDeclarator::FunctionPointer(Vec::new(), false)]
+        ));
+        // A plain base type never qualifies the whole object by itself.
+        assert!(!named_space_qualifies_whole_type(&TypeSpecifier::Int, &[]));
+    }
+
+    #[test]
+    fn typedef_pointer_base_with_declarator_pointer_keeps_object_generic() {
+        // typedef struct c *P;  P __seg_gs *pp;  -> pp is generic memory.
+        let ct = CType::Pointer(Box::new(gs_ptr_plain()), AddressSpace::Default);
+        let td = TypeSpecifier::TypedefName("P".to_string());
+        let whole = named_space_qualifies_whole_type(
+            &td,
+            &[DerivedDeclarator::Pointer(AddressSpace::Default)],
+        );
+        assert!(!whole);
+        assert_eq!(
+            declared_object_space(AddressSpace::SegGs, &ct, whole),
+            AddressSpace::Default
+        );
     }
 }

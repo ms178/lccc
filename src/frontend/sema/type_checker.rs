@@ -180,6 +180,9 @@ impl<'a> ExprTypeChecker<'a> {
 
             // Address-of wraps in Pointer
             Expr::AddressOf(inner, _) => {
+                // `&e` points into the object `e` designates, so it carries that
+                // object's space (`&gobj` of a `__seg_gs` object is `__seg_gs *`).
+                let space = self.lvalue_object_space(inner);
                 if let Some(inner_ct) = self.infer_expr_ctype(inner) {
                     // C11 6.5.3.2p3: `&E` is a pointer to the type of E, and a
                     // named address space is part of that storage, not a
@@ -190,7 +193,7 @@ impl<'a> ExprTypeChecker<'a> {
                     Some(CType::Pointer(Box::new(inner_ct), space))
                 } else {
                     // Even if inner type unknown, result is some pointer
-                    Some(CType::Pointer(Box::new(CType::Void), AddressSpace::Default))
+                    Some(CType::Pointer(Box::new(CType::Void), space))
                 }
             }
 
@@ -422,7 +425,12 @@ impl<'a> ExprTypeChecker<'a> {
                                 }
                             }
                         }
-                        return Some(CType::Pointer(elem.clone(), AddressSpace::Default));
+                        // The decayed array keeps the space of its object:
+                        // `long __seg_gs a[8]; a + 4` points into %gs.
+                        let space = self
+                            .operand_memory_space(lhs)
+                            .unwrap_or(AddressSpace::Default);
+                        return Some(CType::Pointer(elem.clone(), space));
                     }
                     _ => {}
                 }
@@ -433,7 +441,10 @@ impl<'a> ExprTypeChecker<'a> {
                     match r {
                         CType::Pointer(_, _) => return rct,
                         CType::Array(elem, _) => {
-                            return Some(CType::Pointer(elem.clone(), AddressSpace::Default));
+                            let space = self
+                                .operand_memory_space(rhs)
+                                .unwrap_or(AddressSpace::Default);
+                            return Some(CType::Pointer(elem.clone(), space));
                         }
                         _ => {}
                     }
@@ -937,7 +948,7 @@ impl<'a> ExprTypeChecker<'a> {
         let mut ctype = self.resolve_type_spec(&f.type_spec);
         for derived in &f.derived {
             match derived {
-                DerivedDeclarator::Pointer => {
+                DerivedDeclarator::Pointer(_) => {
                     ctype = CType::Pointer(Box::new(ctype), AddressSpace::Default);
                 }
                 DerivedDeclarator::Array(Some(size_expr)) => {
@@ -1144,7 +1155,7 @@ impl<'a> ExprTypeChecker<'a> {
                         self.resolve_type_spec_with_scope(&decl.type_spec, &local_scope);
                     for derived in &declarator.derived {
                         match derived {
-                            DerivedDeclarator::Pointer => {
+                            DerivedDeclarator::Pointer(_) => {
                                 ctype = CType::Pointer(Box::new(ctype), AddressSpace::Default);
                             }
                             DerivedDeclarator::Array(Some(size_expr)) => {
@@ -1193,7 +1204,7 @@ impl<'a> ExprTypeChecker<'a> {
                         self.resolve_type_spec_with_scope(&decl.type_spec, &local_scope);
                     for derived in &declarator.derived {
                         match derived {
-                            DerivedDeclarator::Pointer => {
+                            DerivedDeclarator::Pointer(_) => {
                                 ctype = CType::Pointer(Box::new(ctype), AddressSpace::Default);
                             }
                             DerivedDeclarator::Array(Some(size_expr)) => {
@@ -1279,6 +1290,40 @@ impl<'a> ExprTypeChecker<'a> {
     /// for identifiers not found in the symbol table.
     /// Handles common typeof patterns (identifier, deref, address-of).
     /// More complex expressions (member access, subscript, etc.) are not supported.
+    /// Address space of the object an lvalue designates: the declared space of
+    /// a variable, the pointee space of a `->` or `*` operand, and the space of
+    /// the enclosing object for `.` and `[]` on an array. Anything else (a call,
+    /// a temporary, a generic object) is `Default`.
+    pub fn lvalue_object_space(&self, expr: &Expr) -> AddressSpace {
+        match expr {
+            Expr::Identifier(name, _) => self
+                .symbols
+                .lookup(name)
+                .map_or(AddressSpace::Default, |sym| sym.address_space),
+            Expr::MemberAccess(base, _, _) => self.lvalue_object_space(base),
+            Expr::PointerMemberAccess(base, _, _) | Expr::Deref(base, _) => self
+                .operand_memory_space(base)
+                .unwrap_or(AddressSpace::Default),
+            // `a[i]` and the reversed `i[a]` walk into whichever operand is the
+            // pointer or array (C defines both as `*(a + i)`).
+            Expr::ArraySubscript(base, index, _) => self
+                .operand_memory_space(base)
+                .or_else(|| self.operand_memory_space(index))
+                .unwrap_or(AddressSpace::Default),
+            _ => AddressSpace::Default,
+        }
+    }
+
+    /// Space of the memory a pointer or array operand points into. `None` for
+    /// an operand that is neither (an integer index).
+    fn operand_memory_space(&self, operand: &Expr) -> Option<AddressSpace> {
+        match self.infer_expr_ctype(operand)? {
+            CType::Pointer(_, space) => Some(space),
+            CType::Array(_, _) => Some(self.lvalue_object_space(operand)),
+            _ => None,
+        }
+    }
+
     fn infer_expr_ctype_with_scope(
         &self,
         expr: &Expr,

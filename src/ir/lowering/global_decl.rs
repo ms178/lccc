@@ -75,10 +75,12 @@ impl Lowerer {
             // Register before evaluating initializer so self-referential
             // initializers (e.g., `struct Node n = {&n}`) can resolve.
             let mut ginfo = GlobalInfo::from_analysis(&da);
-            ginfo.var.address_space = crate::common::type_builder::object_storage_address_space(
-                decl.address_space,
-                &declarator.derived,
-            );
+            ginfo.var.address_space =
+                crate::common::type_builder::object_storage_address_space_with_object(
+                    decl.address_space,
+                    &declarator.derived,
+                    declarator.attrs.object_space,
+                );
             if let Some(ref mut ct) = ginfo.var.c_type {
                 // OBJECT declaration: the space lands on the pointee only when
                 // the DECLARATOR supplies the pointer.  A pointer from the type
@@ -241,10 +243,12 @@ impl Lowerer {
         }
         let mut ginfo = GlobalInfo::from_analysis(&da);
         ginfo.asm_register = Some(reg_name.clone());
-        ginfo.var.address_space = crate::common::type_builder::object_storage_address_space(
-            decl.address_space,
-            &declarator.derived,
-        );
+        ginfo.var.address_space =
+            crate::common::type_builder::object_storage_address_space_with_object(
+                decl.address_space,
+                &declarator.derived,
+                declarator.attrs.object_space,
+            );
         if let Some(ref mut ct) = ginfo.var.c_type {
             crate::common::type_builder::apply_declaration_address_space_for_object(
                 ct,
@@ -288,10 +292,12 @@ impl Lowerer {
                 da.apply_vector_size(vs);
             }
             let mut ginfo = GlobalInfo::from_analysis(&da);
-            ginfo.var.address_space = crate::common::type_builder::object_storage_address_space(
-                decl.address_space,
-                &declarator.derived,
-            );
+            ginfo.var.address_space =
+                crate::common::type_builder::object_storage_address_space_with_object(
+                    decl.address_space,
+                    &declarator.derived,
+                    declarator.attrs.object_space,
+                );
             if let Some(ref mut ct) = ginfo.var.c_type {
                 crate::common::type_builder::apply_declaration_address_space_for_object(
                     ct,
@@ -675,7 +681,7 @@ impl Lowerer {
         let is_array_of_pointers = is_array && {
             let ptr_pos = derived
                 .iter()
-                .position(|d| matches!(d, DerivedDeclarator::Pointer));
+                .position(|d| matches!(d, DerivedDeclarator::Pointer(_)));
             let last_arr_pos = derived
                 .iter()
                 .rposition(|d| matches!(d, DerivedDeclarator::Array(_)));
@@ -712,7 +718,7 @@ impl Lowerer {
 
         let has_derived_ptr = derived
             .iter()
-            .any(|d| matches!(d, DerivedDeclarator::Pointer));
+            .any(|d| matches!(d, DerivedDeclarator::Pointer(_)));
         let is_bool = self.is_type_bool(type_spec) && !has_derived_ptr && !is_array;
 
         let struct_layout = self.get_struct_layout_for_type(type_spec).or_else(|| {
@@ -785,7 +791,7 @@ impl Lowerer {
                         | DerivedDeclarator::Function(_, _) => {
                             found_fptr = true;
                         }
-                        DerivedDeclarator::Pointer if found_fptr => {
+                        DerivedDeclarator::Pointer(_) if found_fptr => {
                             ptrs_after_fptr += 1;
                         }
                         _ => {}

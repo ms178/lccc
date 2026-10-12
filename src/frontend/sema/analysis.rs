@@ -676,8 +676,11 @@ impl SemanticAnalyzer {
             );
             // Storage space: the shared complement of the call above (single
             // predicate, so sema and lowering can never disagree).
-            let object_address_space =
-                type_builder::object_storage_address_space(decl.address_space, &init_decl.derived);
+            let object_address_space = type_builder::object_storage_address_space_with_object(
+                decl.address_space,
+                &init_decl.derived,
+                init_decl.attrs.object_space,
+            );
 
             // Resolve incomplete array sizes from initializers (e.g., int arr[] = {1,2,3})
             // This must happen before storing the symbol so sizeof(arr) works in
@@ -888,6 +891,17 @@ impl SemanticAnalyzer {
                 }
             }
 
+            // An automatic object has no segment to live in: GCC 14.2 rejects a
+            // block-scope `__seg_gs` object unless it is static or extern.
+            if object_address_space != AddressSpace::Default && !links && !decl.is_static() {
+                self.diagnostics.borrow_mut().error(
+                    format!(
+                        "'{}' specified for auto variable '{}'",
+                        object_address_space, init_decl.name
+                    ),
+                    init_decl.span,
+                );
+            }
             self.symbol_table.declare(Symbol {
                 name: init_decl.name.clone(),
                 ty: full_type,
@@ -927,6 +941,13 @@ impl SemanticAnalyzer {
                                 &init_ty,
                                 &var_ty,
                                 init_expr.span(),
+                            );
+                            let init_ty = self.conversion_source_ctype(init_expr, init_ty);
+                            self.check_address_space_conversion(
+                                &init_ty,
+                                &var_ty,
+                                init_expr.span(),
+                                matches!(init_expr, Expr::Cast(..)),
                             );
                         }
                     }
@@ -1261,6 +1282,7 @@ impl SemanticAnalyzer {
                             expr_types: Some(&self.result.expr_types),
                         };
                         if let Some(actual) = checker.infer_expr_ctype(expr) {
+                            let actual = self.conversion_source_ctype(expr, actual);
                             self.check_assignment_compatibility(
                                 &actual,
                                 &expected,
@@ -1973,6 +1995,7 @@ impl SemanticAnalyzer {
                 if let (Some(lhs_ty), Some(rhs_ty)) =
                     (checker.infer_expr_ctype(lhs), checker.infer_expr_ctype(rhs))
                 {
+                    let rhs_ty = self.conversion_source_ctype(rhs, rhs_ty);
                     self.check_assignment_compatibility(
                         &rhs_ty,
                         &lhs_ty,
@@ -2006,8 +2029,9 @@ impl SemanticAnalyzer {
                 self.analyze_expr(obj);
                 self.check_member_exists(obj, field_name, *span, true);
             }
-            Expr::Cast(_, inner, _) => {
+            Expr::Cast(_, inner, span) => {
                 self.analyze_expr(inner);
+                self.check_explicit_cast_address_space(expr, inner, *span);
             }
             Expr::Sizeof(arg, span) => {
                 // sizeof is unevaluated context, but identifiers must still be declared
@@ -2279,6 +2303,7 @@ impl SemanticAnalyzer {
         };
         for (index, (arg, (param_ty, _))) in args.iter().zip(params).enumerate() {
             if let Some(arg_ty) = checker.infer_expr_ctype(arg) {
+                let arg_ty = self.conversion_source_ctype(arg, arg_ty);
                 self.check_pointer_float_conversion(&arg_ty, param_ty, arg.span());
                 self.check_record_argument_compatibility(
                     &arg_ty,
@@ -2406,6 +2431,172 @@ impl SemanticAnalyzer {
         self.diagnostics.borrow_mut().error(message, span);
     }
 
+    /// Implicit conversion between pointers into different named address
+    /// spaces is a constraint violation. GCC 14.2 rejects `struct c __seg_gs
+    /// *p = generic_ptr;` and the reverse, and `long __seg_gs *g = &n;`, each
+    /// with "from pointer to non-enclosed address space"; lccc accepted all of
+    /// them and then loaded or stored through the wrong segment. The argument
+    /// path (`pointer_argument_compat`) already enforces the rule. An explicit
+    /// cast is a deliberate conversion, and GCC only warns on it. `void *` gets
+    /// no exemption: GCC 14.2 rejects `void *` <-> `__seg_gs` in both directions
+    /// (return, argument and assignment alike).
+    fn check_address_space_conversion(
+        &self,
+        from_ty: &CType,
+        to_ty: &CType,
+        span: Span,
+        is_explicit_cast: bool,
+    ) {
+        if is_explicit_cast {
+            return;
+        }
+        if pointer_space_mismatch(from_ty, to_ty) {
+            let (from_space, to_space) = match (from_ty, to_ty) {
+                (CType::Pointer(_, f), CType::Pointer(_, t)) => (*f, *t),
+                _ => (AddressSpace::Default, AddressSpace::Default),
+            };
+            self.diagnostics.borrow_mut().error(
+                format!(
+                    "incompatible address space in pointer conversion: cannot convert pointer to '{}' memory to pointer to '{}' memory ('{}' to '{}')",
+                    from_space, to_space, from_ty, to_ty
+                ),
+                span,
+            );
+        }
+    }
+
+    /// The type an expression has for the implicit-conversion address-space
+    /// rule. An array in a named space decays to a pointer into that space,
+    /// wherever the array is written: an identifier
+    /// (`long __seg_gs arr[4]; long *p = arr;`), a member of a named object
+    /// (`struct S __seg_gs g; long *p = g.a;`), or a `+`/`-` on either. The
+    /// decayed pointer converts `%gs` memory to generic memory. Other
+    /// expressions keep their type.
+    fn conversion_source_ctype(&self, expr: &Expr, ct: CType) -> CType {
+        match &ct {
+            CType::Array(elem, _) => {
+                let space = self.array_expr_space(expr);
+                if space != AddressSpace::Default {
+                    return CType::Pointer(elem.clone(), space);
+                }
+            }
+            CType::Pointer(elem, AddressSpace::Default) => {
+                if let Expr::BinaryOp(BinOp::Add | BinOp::Sub, lhs, rhs, _) = expr {
+                    for operand in [lhs, rhs] {
+                        if self
+                            .expr_ctype(operand)
+                            .is_some_and(|t| matches!(t, CType::Array(..)))
+                        {
+                            let space = self.array_expr_space(operand);
+                            if space != AddressSpace::Default {
+                                return CType::Pointer(elem.clone(), space);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        ct
+    }
+
+    /// The type of an expression, by the same checker the call sites use.
+    fn expr_ctype(&self, expr: &Expr) -> Option<CType> {
+        let checker = super::type_checker::ExprTypeChecker {
+            symbols: &self.symbol_table,
+            types: &self.result.type_context,
+            functions: &self.result.functions,
+            expr_types: Some(&self.result.expr_types),
+        };
+        checker.infer_expr_ctype(expr)
+    }
+
+    /// The named address space an array-valued expression lives in, or
+    /// `Default`. An identifier answers with its own declared space; a member
+    /// of an object answers with the object's space (the member inherits it);
+    /// a pointer member answers with the pointee space of its base.
+    fn array_expr_space(&self, expr: &Expr) -> AddressSpace {
+        match expr {
+            Expr::Identifier(name, _) => self
+                .symbol_table
+                .lookup(name)
+                .map_or(AddressSpace::Default, |sym| sym.address_space),
+            Expr::MemberAccess(base, _, _) => self.object_expr_space(base),
+            Expr::PointerMemberAccess(base, _, _) => self.pointee_space(base),
+            Expr::ArraySubscript(base, _, _) => self.element_space(base),
+            _ => AddressSpace::Default,
+        }
+    }
+
+    /// The named space of an object expression (the base of a `.` access).
+    fn object_expr_space(&self, expr: &Expr) -> AddressSpace {
+        match expr {
+            Expr::Identifier(..) | Expr::MemberAccess(..) | Expr::ArraySubscript(..) => {
+                self.array_expr_space(expr)
+            }
+            Expr::PointerMemberAccess(base, _, _) => self.pointee_space(base),
+            _ => AddressSpace::Default,
+        }
+    }
+
+    /// The named space of an element of `base`: an array's element lives in
+    /// the array's space; a pointer's element lives in its pointee space.
+    fn element_space(&self, base: &Expr) -> AddressSpace {
+        match self.expr_ctype(base) {
+            Some(CType::Array(..)) => self.array_expr_space(base),
+            Some(CType::Pointer(_, space)) => space,
+            _ => AddressSpace::Default,
+        }
+    }
+
+    /// The pointee space of a pointer-valued expression (the base of a `->`).
+    fn pointee_space(&self, expr: &Expr) -> AddressSpace {
+        match self.expr_ctype(expr) {
+            Some(CType::Pointer(_, space)) => space,
+            _ => AddressSpace::Default,
+        }
+    }
+
+    /// An explicit cast between pointers in different named address spaces is
+    /// accepted (a deliberate conversion) but GCC 14.2 warns about it. The
+    /// rule is applied to the outermost pointer only, as GCC does:
+    /// `long *__seg_gs *` -> `long *__seg_gs *` is silent, `long *` ->
+    /// `long *__seg_gs *` warns. Wording follows GCC's two directions.
+    fn check_explicit_cast_address_space(&self, cast: &Expr, inner: &Expr, span: Span) {
+        let checker = super::type_checker::ExprTypeChecker {
+            symbols: &self.symbol_table,
+            types: &self.result.type_context,
+            functions: &self.result.functions,
+            expr_types: Some(&self.result.expr_types),
+        };
+        let (Some(CType::Pointer(_, from_space)), Some(CType::Pointer(_, to_space))) = (
+            checker.infer_expr_ctype(inner),
+            checker.infer_expr_ctype(cast),
+        ) else {
+            return;
+        };
+        if from_space == to_space {
+            return;
+        }
+        let message = if to_space == AddressSpace::Default {
+            format!(
+                "cast to generic address space pointer from disjoint '{}' address space pointer",
+                from_space
+            )
+        } else if from_space == AddressSpace::Default {
+            format!(
+                "cast to '{}' address space pointer from disjoint generic address space pointer",
+                to_space
+            )
+        } else {
+            format!(
+                "cast to '{}' address space pointer from disjoint '{}' address space pointer",
+                to_space, from_space
+            )
+        };
+        self.diagnostics.borrow_mut().warning(message, span);
+    }
+
     fn check_assignment_compatibility(
         &self,
         from_ty: &CType,
@@ -2433,6 +2624,7 @@ impl SemanticAnalyzer {
                 span,
             );
         }
+        self.check_address_space_conversion(from_ty, to_ty, span, is_explicit_cast);
         // GCC/clang suppress the incompatible-pointer-types diagnostic when the
         // source is an EXPLICIT cast (C-style `(T*)expr`): the cast is an
         // intentional conversion, so emitting a hard error here breaks
@@ -3261,11 +3453,13 @@ fn pointee_compat(from: &CType, to: &CType) -> PtrCompat {
 fn pointer_argument_compat(from: &CType, to: &CType) -> PtrCompat {
     match (from, to) {
         (CType::Pointer(from_inner, from_space), CType::Pointer(to_inner, to_space)) => {
-            if **from_inner == CType::Void || **to_inner == CType::Void {
-                return PtrCompat::Compatible;
-            }
+            // The address space is checked first and for every pointee: GCC 14.2
+            // rejects `void *` <-> `__seg_gs` in both directions too.
             if from_space != to_space {
                 return PtrCompat::Incompatible;
+            }
+            if **from_inner == CType::Void || **to_inner == CType::Void {
+                return PtrCompat::Compatible;
             }
             pointee_compat(from_inner, to_inner)
         }
@@ -3302,6 +3496,19 @@ fn pointer_argument_compat(from: &CType, to: &CType) -> PtrCompat {
         // integer type and has to keep working (`f(0)`, `f(NULL)`), and scalar
         // mixing is `check_pointer_float_conversion`'s job.
         _ => PtrCompat::Unknown,
+    }
+}
+
+/// Does converting `from` to `to` change a named address space anywhere along
+/// the pointer chain? Each pointer layer's space is the space of the memory it
+/// addresses. Arrays are stepped over on both sides, so an array of
+/// `__seg_gs` pointers keeps its inner space. The check recurses through
+/// pointees, matching GCC's named-address-space rule for pointer conversions.
+fn pointer_space_mismatch(from: &CType, to: &CType) -> bool {
+    match (from, to) {
+        (CType::Pointer(f, fs), CType::Pointer(t, ts)) => fs != ts || pointer_space_mismatch(f, t),
+        (CType::Array(f, _), CType::Array(t, _)) => pointer_space_mismatch(f, t),
+        _ => false,
     }
 }
 
