@@ -1517,6 +1517,14 @@ impl Parser {
         // Also handles nested function pointers: (*(*)(params))(params)
         if matches!(self.peek(), TokenKind::LParen) {
             let save = self.pos;
+            // A qualifier still pending here came from the base specifier
+            // (`long __seg_gs (*)[4]`): it names the storage the pointer
+            // addresses, so it belongs on the innermost pointer layer, exactly
+            // as a declaration's base qualifier does through
+            // `apply_declaration_address_space`. Star arms above have already
+            // taken their own qualifiers, so nothing is applied twice.
+            // Read, not taken: the slot stays with the declaration's snapshot.
+            let base_space = self.attrs.parsing_address_space;
             if let Some(paren_decl) = self.try_parse_paren_abstract_declarator() {
                 use super::declarators::ParenAbstractDecl;
                 match paren_decl {
@@ -1562,21 +1570,25 @@ impl Parser {
                             for dim in outer_dims.into_iter().rev() {
                                 result_type = TypeSpecifier::Array(Box::new(result_type), dim);
                             }
-                            for _ in 0..ptr_depth {
-                                result_type = TypeSpecifier::Pointer(
-                                    Box::new(result_type),
-                                    AddressSpace::Default,
-                                );
+                            for level in 0..ptr_depth {
+                                let space = if level == 0 {
+                                    base_space
+                                } else {
+                                    AddressSpace::Default
+                                };
+                                result_type = TypeSpecifier::Pointer(Box::new(result_type), space);
                             }
                             for dim in inner_array_dims.into_iter().rev() {
                                 result_type = TypeSpecifier::Array(Box::new(result_type), dim);
                             }
                         } else {
-                            for _ in 0..ptr_depth {
-                                result_type = TypeSpecifier::Pointer(
-                                    Box::new(result_type),
-                                    AddressSpace::Default,
-                                );
+                            for level in 0..ptr_depth {
+                                let space = if level == 0 {
+                                    base_space
+                                } else {
+                                    AddressSpace::Default
+                                };
+                                result_type = TypeSpecifier::Pointer(Box::new(result_type), space);
                             }
                         }
                     }

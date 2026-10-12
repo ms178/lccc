@@ -53,7 +53,7 @@
 # the summary at the end so a long log cannot hide one.
 set -u -o pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 export PATH="$CARGO_HOME/bin:$PATH"
@@ -494,6 +494,10 @@ gate "seg-conv-diagnostics" fast \
 
 gate "seg-target-diagnostics" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_seg_target_diagnostics.sh
+# Table-driven parity: 44 conversion shapes, each checked against gcc 14.2 and
+# lccc. Under CI a missing gcc fails the gate (tests/regression/lib/gcc_oracle.sh).
+gate "seg-conversion-parity" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_seg_conversion_parity.sh
 
 gate "chroot-bind" fast bash tests/regression/check_chroot_bind.sh
 

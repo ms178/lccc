@@ -25,12 +25,14 @@
 # ============================================================================
 set -euo pipefail
 
-here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-root=$(CDPATH= cd -- "$here/../.." && pwd)
+here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+root=$(CDPATH='' cd -- "$here/../.." && pwd)
 CCC=${CCC:-$root/target/fastbuild/lccc}
-GCC=${GCC:-gcc}
 [[ -x $CCC ]] || { echo "check_select_from_compare: lccc not found at $CCC" >&2; exit 1; }
-command -v "$GCC" >/dev/null 2>&1 || { echo "check_select_from_compare: no gcc oracle" >&2; exit 1; }
+# shellcheck source=tests/regression/lib/gcc_oracle.sh
+. "$here/lib/gcc_oracle.sh"
+require_gcc_oracle "check_select_from_compare" || exit 1
+GCC=$GCC_ORACLE_BIN
 
 corpus=$here/select_from_compare_fusion.c
 bench=$root/tests/benchmark/programs/ascii_case_fold.c

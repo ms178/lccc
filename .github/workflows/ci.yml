@@ -593,6 +593,10 @@ jobs:
         env:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_seg_target_diagnostics.sh
+      - name: Run __seg_gs conversion parity check (44 shapes against gcc 14.2)
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_seg_conversion_parity.sh
 
       # Chroot bind() creates a file target for a file source.
       - name: Run chroot bind regression

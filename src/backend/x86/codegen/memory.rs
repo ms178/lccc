@@ -1257,6 +1257,13 @@ impl X86Codegen {
         offset: i64,
         ty: IrType,
     ) {
+        // Invariant (see `can_const_addr_fold` in generation.rs): a folded
+        // default-space store always carries an i32 displacement. A wider one
+        // would be truncated by the encoder, so refuse it loudly here instead.
+        assert!(
+            i32::try_from(offset).is_ok(),
+            "folded store displacement {offset} exceeds i32; the fold decider must refuse it"
+        );
         // PF-TLS-1: `tls_array[CONST] = v` folds into
         // `movX %v, %fs:sym@TPOFF+N`.
         if self.try_emit_tls_direct_store_impl(val, base, offset, ty) {
@@ -1678,6 +1685,12 @@ impl X86Codegen {
         offset: i64,
         ty: IrType,
     ) {
+        // Same invariant as the store twin: the fold decider admits only i32
+        // displacements, so a wider one here is a caller bug, not an input.
+        assert!(
+            i32::try_from(offset).is_ok(),
+            "folded load displacement {offset} exceeds i32; the fold decider must refuse it"
+        );
         // PF-TLS-1: `v = tls_array[CONST]` folds into
         // `movX %fs:sym@TPOFF+N, %dst`.
         if self.try_emit_tls_direct_load_impl(dest, base, offset, ty) {
@@ -4043,6 +4056,11 @@ impl X86Codegen {
             AddressSpace::Default => return false,
         };
         if !crate::backend::generation::seg_indexed_fold_ty(ty) {
+            return false;
+        }
+        // x86 displacements are sign-extended 32-bit, the same width the
+        // load twin and the fold decider require.
+        if i32::try_from(offset).is_err() {
             return false;
         }
         let Some(base_reg) = self.seg_base_home(base) else {

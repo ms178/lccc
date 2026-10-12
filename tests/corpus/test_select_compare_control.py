@@ -14,6 +14,12 @@ ROOT = Path(__file__).resolve().parents[2]
 MOCK = r'''#!/usr/bin/env python3
 import json, os, pathlib, sys
 args = sys.argv[1:]
+# The gate pins its oracle to GCC 14 by major version (tests/regression/lib/
+# gcc_oracle.sh), so the stub answers the version query like GCC does. The
+# query is not a compile, so it is not logged.
+if '-dumpfullversion' in args:
+    print(os.environ.get('MOCK_GCC_VERSION', '14.2.0'))
+    sys.exit(0)
 with open(os.environ['MOCK_LOG'], 'a') as log:
     log.write(json.dumps({'args': args, 'skip': os.environ.get('CCC_PEEPHOLE_SKIP', '')}) + '\n')
 out = pathlib.Path(args[args.index('-o') + 1])
@@ -33,7 +39,7 @@ else:
 
 
 class SelectCompareControlTests(unittest.TestCase):
-    def invoke(self, ignore=False):
+    def invoke(self, ignore=False, gcc_version=None):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             compiler = directory / 'compiler protocol stub'
@@ -46,10 +52,13 @@ class SelectCompareControlTests(unittest.TestCase):
             env.pop('MOCK_IGNORE_SKIP', None)
             if ignore:
                 env['MOCK_IGNORE_SKIP'] = '1'
+            if gcc_version is not None:
+                env['MOCK_GCC_VERSION'] = gcc_version
             result = subprocess.run(
                 ['bash', str(ROOT / 'tests/regression/check_select_from_compare.sh')],
                 env=env, text=True, capture_output=True, timeout=30)
-            return result, [json.loads(line) for line in log.read_text().splitlines()]
+            text = log.read_text() if log.exists() else ''
+            return result, [json.loads(line) for line in text.splitlines()]
 
     def test_each_optimization_level_has_a_real_compile_time_control(self):
         result, calls = self.invoke()
@@ -61,6 +70,12 @@ class SelectCompareControlTests(unittest.TestCase):
         shapes = [c for c in calls if '-S' in c['args']
                   and any('ascii_case_fold.c' in a for a in c['args'])]
         self.assertEqual(sorted(c['skip'] for c in shapes), ['', 'setcc_cmov'])
+
+    def test_gcc13_oracle_is_refused_before_any_compile(self):
+        result, calls = self.invoke(gcc_version='13.3.0')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('the oracle is GCC 14', result.stdout + result.stderr)
+        self.assertEqual(calls, [])
 
     def test_noop_kill_switch_cannot_pass(self):
         result, _ = self.invoke(ignore=True)

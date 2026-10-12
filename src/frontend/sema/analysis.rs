@@ -943,11 +943,12 @@ impl SemanticAnalyzer {
                                 init_expr.span(),
                             );
                             let init_ty = self.conversion_source_ctype(init_expr, init_ty);
+                            let null_constant = self.is_void_null_pointer_constant(init_expr);
                             self.check_address_space_conversion(
                                 &init_ty,
                                 &var_ty,
                                 init_expr.span(),
-                                matches!(init_expr, Expr::Cast(..)),
+                                null_constant,
                             );
                         }
                     }
@@ -1283,11 +1284,13 @@ impl SemanticAnalyzer {
                         };
                         if let Some(actual) = checker.infer_expr_ctype(expr) {
                             let actual = self.conversion_source_ctype(expr, actual);
+                            let null_constant = self.is_void_null_pointer_constant(expr);
                             self.check_assignment_compatibility(
                                 &actual,
                                 &expected,
                                 *span,
                                 matches!(expr, Expr::Cast(..)),
+                                null_constant,
                             );
                         }
                     }
@@ -1975,6 +1978,7 @@ impl SemanticAnalyzer {
                 if *op == BinOp::Sub {
                     self.check_pointer_subtraction_compat(lhs, rhs, *span);
                 }
+                self.check_pointer_comparison_spaces(op, lhs, rhs, *span);
             }
             Expr::UnaryOp(_, operand, _) => {
                 self.analyze_expr(operand);
@@ -1996,11 +2000,13 @@ impl SemanticAnalyzer {
                     (checker.infer_expr_ctype(lhs), checker.infer_expr_ctype(rhs))
                 {
                     let rhs_ty = self.conversion_source_ctype(rhs, rhs_ty);
+                    let null_constant = self.is_void_null_pointer_constant(rhs);
                     self.check_assignment_compatibility(
                         &rhs_ty,
                         &lhs_ty,
                         *span,
                         matches!(&**rhs, Expr::Cast(..)),
+                        null_constant,
                     );
                 }
             }
@@ -2312,13 +2318,15 @@ impl SemanticAnalyzer {
                     index + 1,
                     arg.span(),
                 );
-                self.check_pointer_argument_compatibility(
-                    &arg_ty,
-                    param_ty,
-                    name,
-                    index + 1,
-                    arg.span(),
-                );
+                if !self.is_void_null_pointer_constant(arg) {
+                    self.check_pointer_argument_compatibility(
+                        &arg_ty,
+                        param_ty,
+                        name,
+                        index + 1,
+                        arg.span(),
+                    );
+                }
             }
         }
     }
@@ -2435,33 +2443,99 @@ impl SemanticAnalyzer {
     /// spaces is a constraint violation. GCC 14.2 rejects `struct c __seg_gs
     /// *p = generic_ptr;` and the reverse, and `long __seg_gs *g = &n;`, each
     /// with "from pointer to non-enclosed address space"; lccc accepted all of
-    /// them and then loaded or stored through the wrong segment. The argument
-    /// path (`pointer_argument_compat`) already enforces the rule. An explicit
-    /// cast is a deliberate conversion, and GCC only warns on it. `void *` gets
-    /// no exemption: GCC 14.2 rejects `void *` <-> `__seg_gs` in both directions
-    /// (return, argument and assignment alike).
+    /// them and then loaded or stored through the wrong segment.
+    ///
+    /// The check looks at the type the right-hand side has AFTER its cast, so
+    /// `gp = (int *)q` is judged on `int *` (rejected, as GCC does) and
+    /// `gp = (int __seg_gs *)q` on `int __seg_gs *` (accepted). The only
+    /// exemption is `null_constant`: a `void *` null pointer constant such as
+    /// `(void *)0` or `NULL`, which GCC accepts for any named pointer. `(int *)0`
+    /// is NOT exempt, matching GCC 14.2.
     fn check_address_space_conversion(
         &self,
         from_ty: &CType,
         to_ty: &CType,
         span: Span,
-        is_explicit_cast: bool,
+        null_constant: bool,
     ) {
-        if is_explicit_cast {
+        if null_constant {
             return;
         }
-        if pointer_space_mismatch(from_ty, to_ty) {
-            let (from_space, to_space) = match (from_ty, to_ty) {
-                (CType::Pointer(_, f), CType::Pointer(_, t)) => (*f, *t),
-                _ => (AddressSpace::Default, AddressSpace::Default),
-            };
+        if let Some(layer) = first_space_mismatch(from_ty, to_ty) {
             self.diagnostics.borrow_mut().error(
                 format!(
-                    "incompatible address space in pointer conversion: cannot convert pointer to '{}' memory to pointer to '{}' memory ('{}' to '{}')",
-                    from_space, to_space, from_ty, to_ty
+                    "incompatible address space in pointer conversion: cannot convert pointer to '{}' memory to pointer to '{}' memory at pointer level {} ('{}' to '{}')",
+                    layer.from_space, layer.to_space, layer.depth, from_ty, to_ty
                 ),
                 span,
             );
+        }
+    }
+
+    /// Is `expr` a null pointer constant of type `void *` (`(void *)0`,
+    /// `((void *)0)`, or `NULL` spelled that way)? GCC accepts exactly this
+    /// shape where a named-address-space pointer is expected. A bare integer
+    /// `0` never reaches the address-space check, since it is not a pointer.
+    fn is_void_null_pointer_constant(&self, expr: &Expr) -> bool {
+        let Expr::Cast(_, inner, _) = expr else {
+            return false;
+        };
+        let checker = super::type_checker::ExprTypeChecker {
+            symbols: &self.symbol_table,
+            types: &self.result.type_context,
+            functions: &self.result.functions,
+            expr_types: Some(&self.result.expr_types),
+        };
+        matches!(
+            checker.infer_expr_ctype(expr),
+            Some(CType::Pointer(ref pointee, AddressSpace::Default)) if **pointee == CType::Void
+        ) && self.eval_const_expr(inner) == Some(0)
+    }
+
+    /// `==`, `!=`, `<`, ... between pointers whose pointees live in different
+    /// named address spaces. GCC 14.2 errors with "comparison of pointers to
+    /// disjoint address spaces" (`gp == q`, `gp == fp`, `gp == arr`), and
+    /// accepts a null pointer constant on either side. Only the top-level
+    /// pointee space is compared, as in GCC: `int __seg_gs **` against
+    /// `int **` is accepted.
+    fn check_pointer_comparison_spaces(&self, op: &BinOp, lhs: &Expr, rhs: &Expr, span: Span) {
+        if !matches!(
+            op,
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+        ) {
+            return;
+        }
+        if self.is_void_null_pointer_constant(lhs) || self.is_void_null_pointer_constant(rhs) {
+            return;
+        }
+        let checker = super::type_checker::ExprTypeChecker {
+            symbols: &self.symbol_table,
+            types: &self.result.type_context,
+            functions: &self.result.functions,
+            expr_types: Some(&self.result.expr_types),
+        };
+        let (Some(lt), Some(rt)) = (checker.infer_expr_ctype(lhs), checker.infer_expr_ctype(rhs))
+        else {
+            return;
+        };
+        // An array operand decays to a pointer to its element; a generic
+        // array is a pointer into the default space.
+        let decay = |ct: CType| match ct {
+            CType::Array(elem, _) => CType::Pointer(elem, AddressSpace::Default),
+            other => other,
+        };
+        let lt = decay(self.conversion_source_ctype(lhs, lt));
+        let rt = decay(self.conversion_source_ctype(rhs, rt));
+        if let (CType::Pointer(_, ls), CType::Pointer(_, rs)) = (&lt, &rt) {
+            if ls != rs {
+                self.diagnostics.borrow_mut().error(
+                    format!(
+                        "comparison of pointers to disjoint address spaces ('{}' and '{}')",
+                        lt, rt
+                    ),
+                    span,
+                );
+            }
         }
     }
 
@@ -2603,6 +2677,7 @@ impl SemanticAnalyzer {
         to_ty: &CType,
         span: Span,
         is_explicit_cast: bool,
+        null_constant: bool,
     ) {
         self.check_pointer_float_conversion(from_ty, to_ty, span);
         let incompatible = match (from_ty, to_ty) {
@@ -2624,7 +2699,7 @@ impl SemanticAnalyzer {
                 span,
             );
         }
-        self.check_address_space_conversion(from_ty, to_ty, span, is_explicit_cast);
+        self.check_address_space_conversion(from_ty, to_ty, span, null_constant);
         // GCC/clang suppress the incompatible-pointer-types diagnostic when the
         // source is an EXPLICIT cast (C-style `(T*)expr`): the cast is an
         // intentional conversion, so emitting a hard error here breaks
@@ -3499,17 +3574,37 @@ fn pointer_argument_compat(from: &CType, to: &CType) -> PtrCompat {
     }
 }
 
-/// Does converting `from` to `to` change a named address space anywhere along
-/// the pointer chain? Each pointer layer's space is the space of the memory it
-/// addresses. Arrays are stepped over on both sides, so an array of
-/// `__seg_gs` pointers keeps its inner space. The check recurses through
-/// pointees, matching GCC's named-address-space rule for pointer conversions.
-fn pointer_space_mismatch(from: &CType, to: &CType) -> bool {
-    match (from, to) {
-        (CType::Pointer(f, fs), CType::Pointer(t, ts)) => fs != ts || pointer_space_mismatch(f, t),
-        (CType::Array(f, _), CType::Array(t, _)) => pointer_space_mismatch(f, t),
-        _ => false,
+/// The first pointer layer, outermost first, whose named address space
+/// changes in a conversion from `from` to `to`. Each pointer layer's space is
+/// the space of the memory it addresses. Arrays are stepped over on both
+/// sides, so an array of `__seg_gs` pointers keeps its inner space. The
+/// diagnostic prints this layer's spaces, not the outermost ones.
+struct SpaceMismatch {
+    /// 1-based pointer level, counting the outermost pointer as level 1.
+    depth: usize,
+    from_space: AddressSpace,
+    to_space: AddressSpace,
+}
+
+fn first_space_mismatch(from: &CType, to: &CType) -> Option<SpaceMismatch> {
+    fn walk(from: &CType, to: &CType, depth: usize) -> Option<SpaceMismatch> {
+        match (from, to) {
+            (CType::Pointer(f, fs), CType::Pointer(t, ts)) => {
+                if fs != ts {
+                    Some(SpaceMismatch {
+                        depth,
+                        from_space: *fs,
+                        to_space: *ts,
+                    })
+                } else {
+                    walk(f, t, depth + 1)
+                }
+            }
+            (CType::Array(f, _), CType::Array(t, _)) => walk(f, t, depth),
+            _ => None,
+        }
     }
+    walk(from, to, 1)
 }
 
 #[cfg(test)]

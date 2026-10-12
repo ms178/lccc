@@ -2,7 +2,9 @@
 set -Eeuo pipefail
 cd "$(dirname "$0")/../.."
 ccc=${CCC:-target/fastbuild/lccc}
-ref=${CC_REF:-gcc}
+. tests/regression/lib/gcc_oracle.sh
+require_gcc_oracle "check_memory_value_contracts" || exit 1
+ref=${CC_REF:-$GCC_ORACLE_BIN}
 td=$(mktemp -d)
 trap 'rm -rf "$td"' EXIT
 test=setup opt=none isa=native disabled=none phase=setup

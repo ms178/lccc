@@ -1,0 +1,48 @@
+# Conversion-shape parity table: compared against GCC 14.2 (gcc -w) and lccc.
+# Columns: id<TAB>expect<TAB>ctx<TAB>body. expect is the GCC 14.2 verdict (accept|reject).
+# ctx: stmt = body in a void function, ret = body in a function returning
+# gp_t, int = body in a function returning int. Prelude: check_seg_conversion_parity.sh.
+assign_gs_to_gs	accept	stmt	gq = gp;
+assign_gen_to_gs	reject	stmt	gp = q;
+assign_gs_to_gen	reject	stmt	q = gp;
+assign_null_void	accept	stmt	gp = (void *)0;
+assign_null_int	reject	stmt	gp = (int *)0;
+assign_null_zero	accept	stmt	gp = 0;
+assign_void_nonzero	reject	stmt	gp = (void *)q;
+assign_cast_to_seg	accept	stmt	gp = (int __seg_gs *)q;
+assign_cast_gs_to_gen	accept	stmt	q = (int *)gp;
+assign_cast_fs_to_gs	reject	stmt	gp = (int __seg_fs *)gp;
+assign_arith_gs	accept	stmt	gp = gp + 1;
+assign_cast_long	accept	stmt	long l = (long)gp; (void)l;
+arg_gen_to_gs	reject	stmt	take_gp(q);
+arg_gs_to_gs	accept	stmt	take_gp(gp);
+arg_null_void	accept	stmt	take_gp((void *)0);
+arg_null_int	reject	stmt	take_gp((int *)0);
+arg_null_zero	accept	stmt	take_gp(0);
+arg_cast_gen	reject	stmt	take_gp((int *)q);
+arg_cast_to_seg	accept	stmt	take_gp((int __seg_gs *)q);
+arg_void_nonzero	reject	stmt	take_gp((void *)q);
+arg_gs_to_void	reject	stmt	take_vp(gp);
+arg_gs_to_gen	reject	stmt	take_q(gp);
+ret_null_void	accept	ret	return (void *)0;
+ret_null_int	reject	ret	return (int *)0;
+ret_gen	reject	ret	return q;
+ret_gs	accept	ret	return gp;
+init_gen	reject	stmt	gp_t x = q; (void)x;
+init_null_void	accept	stmt	gp_t x = (void *)0; (void)x;
+init_cast_to_seg	accept	stmt	gp_t x = (int __seg_gs *)q; (void)x;
+init_cast_gen	reject	stmt	gp_t x = (int *)gq; (void)x;
+cmp_gs_gs	accept	int	return gp == gq;
+cmp_gs_gen	reject	int	return gp == q;
+cmp_null_void	accept	int	return gp == (void *)0;
+cmp_null_zero	accept	int	return gp == 0;
+cmp_gs_fs	reject	int	return gp == fp;
+cmp_gs_garr_elem	accept	int	return gp == garr[0];
+cmp_gs_gen_array	reject	int	return gp == arr;
+cmp_struct_gs_gen	reject	int	return sgp == sq;
+assign_struct_gen	reject	stmt	sgp = sq;
+assign_struct_cast	accept	stmt	sgp = (struct s __seg_gs *)sq;
+assign_struct_null	accept	stmt	sgp = (void *)0;
+pp_assign_pointee	reject	stmt	qq = pp;
+pp_cmp_top_only	accept	int	return a == b;
+init_array_null	accept	stmt	gp_t tab[2] = { (void *)0, gp }; (void)tab;

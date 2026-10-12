@@ -12,8 +12,8 @@ import os, sys
 from pathlib import Path
 name = Path(sys.argv[0]).name
 major = '13' if name == 'gcc' or name == 'gcc-13' else '14'
-if '-dumpversion' in sys.argv:
-    print(major); sys.exit(0)
+if '-dumpfullversion' in sys.argv:
+    print(major + '.2.0'); sys.exit(0)
 if '--version' in sys.argv:
     print('fake GCC ' + major); sys.exit(0)
 src = next(Path(a).name for a in sys.argv[1:] if a.endswith('.c'))
@@ -53,7 +53,7 @@ class SegmentConversionGateTests(unittest.TestCase):
             with self.subTest(gcc=gcc):
                 r = self.run_gate(GCC=gcc)
                 self.assertNotEqual(r.returncode, 0)
-                self.assertIn('requires GCC >= 14', r.stderr)
+                self.assertIn('requires GCC 14', r.stderr)
 
     def test_both_compilers_must_pass_semantic_positive_control(self):
         for compiler in ['BAD_CCC', 'BAD_GCC']:
