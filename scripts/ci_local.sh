@@ -396,6 +396,9 @@ gate "loop-memset-decisions" fast \
 gate "loop-store-motion" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_loop_store_motion.sh
 
+gate "const-trip-loop-inline" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_const_trip_loop_inline.sh
+
 gate "bool-pair-tail-jmp-contract" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_bool_pair_tail_jmp.sh
 
