@@ -398,12 +398,76 @@ impl I686Codegen {
                             // possible at word 0 when base==0) is written last.
                             self.operand_to_eax(&args[arg_i]);
                             for k in (0..words).rev() {
-                                emit!(
-                                    self.state,
-                                    "    movl {}(%eax), {}",
-                                    k * 4,
-                                    regparm_regs[base_reg_idx + k]
-                                );
+                                let off = (k * 4) as i64;
+                                let defined = (*size as i64 - off).min(4);
+                                if defined >= 4 {
+                                    emit!(
+                                        self.state,
+                                        "    movl {}(%eax), {}",
+                                        off,
+                                        regparm_regs[base_reg_idx + k]
+                                    );
+                                    continue;
+                                }
+                                // regparm rounds an aggregate up to whole words, and
+                                // the last word can hold as few as one defined byte.
+                                // Loading it with `movl` reads up to 3 bytes past the
+                                // C object: measured on -m32, sizes 1, 7, 9 and 15
+                                // faulted as the caller while 8 and 16 did not -- the
+                                // exact profile of word rounding, with the fixture's
+                                // aggregate placed flush against a PROT_NONE page.
+                                // Padding above the object is unspecified in the
+                                // register, so the fix is to stop reading, not to zero
+                                // what was never defined.  Staging goes through a
+                                // transient word of our own stack because %eax is the
+                                // only free GP here: every other one may already hold a
+                                // staged argument.  The pointer is parked and restored
+                                // so the descending order above (an %eax destination
+                                // must be written last) still holds.
+                                emit!(self.state, "    subl $8, %esp");
+                                emit!(self.state, "    movl %eax, 4(%esp)");
+                                let mut done = 0i64;
+                                while done < defined {
+                                    let (mn, ferry, width) = if defined - done >= 2 {
+                                        ("movw", "%ax", 2i64)
+                                    } else {
+                                        ("movb", "%al", 1i64)
+                                    };
+                                    emit!(self.state, "    movl 4(%esp), %eax");
+                                    self.state.emit_fmt(format_args!(
+                                        "    {mn} {}(%eax), {ferry}",
+                                        off + done
+                                    ));
+                                    self.state
+                                        .emit_fmt(format_args!("    {mn} {ferry}, {}(%esp)", done));
+                                    done += width;
+                                }
+                                // `%eax` is both the ferry and, at word 0, a legal
+                                // destination: `regparm_regs[0]` is `%eax`, and word 0
+                                // is the last iteration of the descending loop.  The
+                                // parked pointer must therefore be restored only when
+                                // the destination is some other register -- writing
+                                // `%eax` and then re-loading it from the frame puts the
+                                // source *address* where the argument belongs, which
+                                // is a silent miscompile of every 1-3 byte aggregate
+                                // passed in the first regparm register (the value the
+                                // callee sees is whatever the frame held, so it varies
+                                // with -O level and with ASLR: measured as 200, 88 and
+                                // 120 for one configuration across runs).  Skipping the
+                                // restore is safe rather than merely lucky: the loop is
+                                // over, `invalidate_acc` below tells the cache %eax is
+                                // clobbered, and the next aggregate argument re-parks
+                                // its own pointer via `operand_to_eax`.
+                                let dest = regparm_regs[base_reg_idx + k];
+                                if dest == "%eax" {
+                                    emit!(self.state, "    movl (%esp), %eax");
+                                } else {
+                                    emit!(self.state, "    movl (%esp), {}", dest);
+                                    // Still mid-loop: the next word's ferry loads read
+                                    // the parked pointer back.
+                                    emit!(self.state, "    movl 4(%esp), %eax");
+                                }
+                                emit!(self.state, "    addl $8, %esp");
                             }
                         }
                     }

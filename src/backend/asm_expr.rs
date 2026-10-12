@@ -741,12 +741,15 @@ pub struct AlignTail {
 ///
 /// A type rather than a message string because a target may legitimately ignore
 /// one operand and still have to report the other.  RISC-V's `.balign` forwards
-/// `BadFill` and `TooMany` (GAS rejects both) but swallows `BadMax` (its padding
-/// handler never looks at the cap, so a non-integer cap is not an error there --
-/// `.balign 8,,junk` assembles).  Triage by `e.contains("fill")` would let a
-/// reworded message silently change which inputs the assembler accepts; the
-/// variants are the contract and [`AlignTailError::to_message`] spells them the
-/// way GAS does.
+/// `BadFill`, `BadMax` and `TooMany` are all real rejections: `s_align` reads
+/// the max field with `get_absolute_expression()` before any target hook runs,
+/// so `.balign 8,,junk` is an error on riscv64 and on aarch64 alike (measured on
+/// as 2.47.20260726).  RISC-V used to swallow `BadMax` on the theory that its
+/// `.p2align` handler ignores the cap -- but "ignored when the padding is
+/// emitted" and "never parsed" are different claims, and the second one is
+/// false.  Triage by `e.contains("fill")` would let a reworded message silently
+/// change which inputs the assembler accepts; the variants are the contract and
+/// [`AlignTailError::to_message`] spells them the way GAS does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AlignTailError {
     /// The fill slot is present but is not an integer.
@@ -782,6 +785,20 @@ impl core::fmt::Display for AlignTailError {
 /// Parse the tail after the alignment operand. `integer` is the caller's own
 /// expression evaluator, because each backend resolves symbols and different
 /// radix forms through its own path.
+///
+/// An absent, empty, zero or negative `max` all mean *no cap* -- GAS only
+/// consults the value when it is strictly positive, measured on
+/// riscv64-linux-gnu-as, where `.p2align 4,0x13,0` still pads the full 15 bytes.
+/// The `v <= 0` arm below therefore must not be "corrected" into `Some(0)`: that
+/// would turn a no-op into a suppressed alignment on valid input, in every
+/// backend that shares this parser (x86, arm, riscv, and the `.balign`/`.p2align`
+/// spellings alike).
+///
+/// `TooMany` is checked last, after both operands have been evaluated, so a
+/// directive with a garbage third operand *and* a fourth reports the garbage
+/// rather than the arity. Both are hard errors -- nothing is accepted silently --
+/// and the ordering is deliberate: an unparseable operand is the more specific
+/// diagnosis, and leading with the arity complaint would hide it.
 pub fn parse_align_tail<F>(
     rest: &str,
     directive: &str,

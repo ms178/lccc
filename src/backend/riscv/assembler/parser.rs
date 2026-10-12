@@ -136,11 +136,19 @@ pub enum Directive {
         bytes: u64,
         tail: crate::backend::asm_expr::AlignTail,
     },
-    /// `.balign N[, fill]` — byte alignment, and deliberately no cap field:
-    /// GAS's `balign_directive` hands the backend an unlimited cap, so
-    /// `.balign 8,,2` pads 5 bytes where `.p2align 3,,2` skips (both measured
-    /// on as 2.47.20260726). A stray third operand is tolerated, not applied.
-    Balign { bytes: u64, fill: Option<u8> },
+    /// `.balign N[, fill[, max]]` — byte alignment: the same `s_align` handler
+    /// as `.p2align`, so the third operand is a BYTE cap and is consulted
+    /// wherever `.p2align`'s is (`.text` without a fill operand excepted:
+    /// `riscv_frag_align_code` never sees it). Measured on as 2.47.20260726:
+    /// `.balign 8,,4` pads 7 bytes in `.text` and skips in `.data`, and
+    /// `.balign 8,,junk` is an ERROR on every target (GAS parses the max field
+    /// with `get_absolute_expression` before any of the section logic runs), so
+    /// a non-integer cap is refused here rather than swallowed.
+    Balign {
+        bytes: u64,
+        fill: Option<u8>,
+        max_pad: Option<u64>,
+    },
     /// `.byte val, val, ...`
     Byte(Vec<DataValue>),
     /// `.short val, ...` / `.hword` / `.2byte` / `.half`
@@ -404,18 +412,23 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
             } else {
                 63
             };
-            let mut tail =
+            let tail =
                 crate::backend::asm_expr::parse_align_tail(rest, ".p2align", parse_int_literal)
                     .map_err(|e| e.to_message().replace(".p2align:", ".align:"))?;
-            // RISC-V has no padding cap. Its `.p2align` handler is
-            // `riscv_frag_align_code (int n)` — a single argument — and the
-            // generic fall-back it shares with `.balign` never sees the cap
-            // either, so the operand is read, validated, and dropped. Measured:
-            // `.p2align E,,M` pads identically for every M in {0,1,2,3,4,5,8,
-            // 11,12,20,40,2048,2049}. Silently honouring the cap instead — as
-            // this parser did until now — skips padding that GAS emits, moving
-            // every later address by up to the whole alignment quantum.
-            tail.max_pad = None;
+            // The cap is kept, not dropped: whether it applies is decided by
+            // the SECTION at emission time (`emit_align_with_reloc`), because
+            // GAS's RISC-V hook `riscv_frag_align_code (int n)` takes only the
+            // exponent -- so in a code section with no fill operand the cap is
+            // parsed and ignored, while everywhere else the generic
+            // `frag_align` compares it against the padding in BYTES.  Measured
+            // on as 2.47.20260726: `.p2align 4,,2` pads 15 bytes in .text and
+            // skips in .data; `.p2align 4,,15` pads and `,,14` skips in .data.
+            // Dropping it here (as this backend did) padded inside `.data`,
+            // where GAS leaves the offset alone, moving every later symbol;
+            // honouring it here skipped `.text` padding GAS emits.  A negative
+            // max is not an error: GAS warns ("ignoring out of range alignment
+            // maximum") and treats it as unlimited, which is what `max <= 0`
+            // already means downstream.
             Directive::Align {
                 bytes: 1u64 << exp,
                 tail,
@@ -434,26 +447,21 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
             if raw < 0 || (raw != 0 && !(raw as u64).is_power_of_two()) {
                 return Err(format!(".balign: alignment {raw} is not a power of 2"));
             }
-            // Read the tail for its fill byte and *only* that: `too many
-            // operands` still has to be reported (GAS rejects 4 operands), but
-            // a cap that is not an integer is not either, because GAS never
-            // looks at it (measured: `.balign 8,,junk` assembles).
-            let fill = match crate::backend::asm_expr::parse_align_tail(
-                rest,
-                ".balign",
-                parse_int_literal,
-            ) {
-                Ok(t) => t.fill,
-                // Matched on the variant, not on the message text: this target is
-                // allowed to ignore exactly one verdict, and a reworded error must
-                // not be able to turn that allowance into a silent acceptance of a
-                // bad fill or of a fourth operand.
-                Err(crate::backend::asm_expr::AlignTailError::BadMax { .. }) => None,
-                Err(e) => return Err(e.to_message()),
-            };
+            // Every verdict the tail parser has is this target's verdict: the
+            // fill byte, the byte-count cap, and the arity check. There used to
+            // be a `BadMax => None` arm here, justified by "GAS never looks at
+            // the cap" -- but `s_align` reads the max field with
+            // `get_absolute_expression()` *before* the section and the fill
+            // decide anything, so `.balign 8,,junk` is an assembler error
+            // (measured on as 2.47.20260726 for both riscv64 and aarch64). A
+            // swallowed rejection is a silently different object file.
+            let tail =
+                crate::backend::asm_expr::parse_align_tail(rest, ".balign", parse_int_literal)
+                    .map_err(|e| e.to_message())?;
             Directive::Balign {
                 bytes: if raw == 0 { 1 } else { raw as u64 },
-                fill,
+                fill: tail.fill,
+                max_pad: tail.max_pad,
             }
         }
 
@@ -667,11 +675,31 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
             Directive::Subsection(n)
         }
 
-        // Other ignorable directives
-        ".file" | ".loc" | ".ident" | ".addrsig" | ".addrsig_sym" | ".build_attributes"
-        | ".eabi_attribute" | ".end" | ".altmacro" | ".noaltmacro" | ".purgem" => {
-            Directive::Ignored
+        // A mode switch with file-wide consequences is not an ignorable directive.
+        // `.altmacro` changes how *every* macro argument in the file is expanded
+        // (quoted arguments, `\()` separators, `!` repeat counts, `%`-prefixed
+        // expressions), and the altmacro-only `local` directive is what makes labels
+        // inside a macro unique per expansion -- which this backend does not
+        // implement (`local lbl` reaches the writer as an unknown instruction).  So
+        // ignoring the switch does not merely lose a feature: it assembles the rest
+        // of the file under semantics the author explicitly did not ask for, and the
+        // result is bytes that look fine.  `.noaltmacro` stays ignorable, because
+        // non-altmacro mode *is* this backend's mode.
+        ".altmacro" => {
+            return Err(
+                ".altmacro is not supported: altmacro-mode macro argument and `local` \
+                 semantics differ, so the directive cannot be ignored; remove it and \
+                 avoid `local`/quoted macro arguments"
+                    .to_string(),
+            );
         }
+
+        // Other ignorable directives.  `.purgem` is listed here knowing it is not
+        // fully honest -- forgetting a macro removal lets a use GAS would reject
+        // assemble -- but it cannot change the bytes of a file GAS accepts, so it is
+        // a leniency on invalid input rather than a miscompile.  Recorded as open.
+        ".file" | ".loc" | ".ident" | ".addrsig" | ".addrsig_sym" | ".build_attributes"
+        | ".eabi_attribute" | ".end" | ".noaltmacro" | ".purgem" => Directive::Ignored,
 
         _ => Directive::Unknown {
             name: name.to_string(),
@@ -1353,12 +1381,16 @@ mod tests {
             .expect("a .p2align directive")
     }
 
-    fn balign_operands(src: &str) -> (u64, Option<u8>) {
+    fn balign_operands(src: &str) -> (u64, Option<u8>, Option<u64>) {
         stmts(src)
             .expect("parse")
             .into_iter()
             .find_map(|s| match s {
-                AsmStatement::Directive(Directive::Balign { bytes, fill }) => Some((bytes, fill)),
+                AsmStatement::Directive(Directive::Balign {
+                    bytes,
+                    fill,
+                    max_pad,
+                }) => Some((bytes, fill, max_pad)),
                 _ => None,
             })
             .expect("a .balign directive")
@@ -1367,25 +1399,69 @@ mod tests {
     /// RISC-V's alignment tail rules, asserted at the entry point that applies
     /// them.  The shared tail parser is unit-tested for the grammar; what only
     /// this file can prove is the target-specific *use* of the parsed operands --
-    /// that the cap is read and then dropped, that an explicit fill survives that
-    /// drop, that out-of-range exponents land in the signed-shift bucket, and that
-    /// `.balign` tolerates a junk cap but not a junk fill.  Honouring the cap
-    /// instead -- which is what this parser did before the oracle pass -- skips
-    /// padding GAS emits and moves every later label, and a writer-level test
-    /// cannot see it because the writer only ever receives an already-parsed
-    /// directive.
+    /// that the cap is read and KEPT (the writer decides per section whether it
+    /// applies, so dropping it here was the bug: a `.data` `.p2align 4,,2` pads in
+    /// LCCC and not in GAS), that an explicit fill survives, that out-of-range
+    /// exponents land in the signed-shift bucket, and that BOTH spellings refuse a
+    /// non-integer cap.  A writer-level test alone cannot see the drop because the
+    /// writer only ever receives an already-parsed directive, so the two halves
+    /// are pinned where they live.
+    /// `.altmacro` must be refused, not ignored.  The measured reason: with the
+    /// directive accepted-but-ignored, an altmacro `local` label reaches the writer
+    /// and fails as `unhandled instruction: local` -- so the file does not assemble
+    /// either way, and the only question is *where* the user is told.  Refusing at
+    /// the switch names the actual problem, and keeps a file that uses `\()` or
+    /// quoted arguments (which silently *do* change meaning) from assembling into
+    /// wrong bytes.
+    #[test]
+    fn altmacro_mode_is_refused_not_ignored() {
+        let err = match parse_asm(".altmacro\n.byte 1\n") {
+            Ok(_) => panic!(".altmacro must not be accepted as ignorable"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains(".altmacro is not supported"),
+            "unhelpful refusal: {err}"
+        );
+        assert!(
+            err.contains("local"),
+            "the refusal has to name `local`, since that is what the user will hit \
+             next: {err}"
+        );
+        // The mode-off form stays ignorable: non-altmacro is this backend's mode.
+        assert!(parse_asm(".noaltmacro\n.byte 1\n").is_ok());
+    }
+
     #[test]
     fn gas247_riscv_align_tail_verdicts_at_the_parser() {
-        // Cap read, validated, dropped: `.p2align E,,M` pads identically for
-        // every M in {0,1,2,3,4,5,8,11,12,20,40,2048,2049} (as 2.47).
-        assert_eq!(align_operands(".p2align 4,,8"), (16, None, None));
+        // Cap read and kept, in bytes, whatever its value: `.p2align E,,M`
+        // pads identically for every M in {0,1,2,3,4,5,8,11,12,20,40,2048,2049}
+        // *in a code section* (as 2.47) -- but that is the writer's section test,
+        // not a licence to lose the operand here (as 2.47, `.data`: `,,15` pads,
+        // `,,14` does not, so the value is load-bearing).
+        assert_eq!(align_operands(".p2align 4,,8"), (16, None, Some(8)));
+        assert_eq!(align_operands(".p2align 3,,2049"), (8, None, Some(2049)));
+        // `max <= 0` means "no cap" in GAS (`if (max && ...)` in frag_align),
+        // and the shared tail parser normalises it to `None` at parse time, so
+        // an explicit `.p2align 4,,0` is indistinguishable from a bare
+        // `.p2align 4` downstream.  That collapse is deliberate: a `Some(0)`
+        // would have to be re-interpreted by every consumer, and a consumer
+        // that instead read 0 as "pad nothing" would silently delete padding
+        // GAS emits.  A NEGATIVE cap is the same story -- GAS warns
+        // ("ignoring out of range alignment maximum") and clears it -- so both
+        // land in the unlimited bucket rather than becoming an error.
         assert_eq!(align_operands(".p2align 4,,0"), (16, None, None));
-        assert_eq!(align_operands(".p2align 3,,2049"), (8, None, None));
-        // An explicit fill is the operand GAS does read, so it survives.
+        assert_eq!(align_operands(".p2align 4,,-1"), (16, None, None));
+        assert_eq!(
+            align_operands(".p2align 4,,0"),
+            align_operands(".p2align 4"),
+            "an explicit zero max and no max operand at all are one instruction"
+        );
+        // An explicit fill is the operand GAS does read, so it survives too.
         assert_eq!(align_operands(".p2align 4,0xff"), (16, Some(0xff), None));
         assert_eq!(
             align_operands(".p2align 4, 300 ,2"),
-            (16, Some(0x2c), None),
+            (16, Some(0x2c), Some(2)),
             "the fill is the low byte of any integer, and whitespace around a slot is trimmed"
         );
         // An empty slot means "absent", not "zero fill"; two empty slots are
@@ -1398,10 +1474,16 @@ mod tests {
         // Out-of-range exponents clamp to the signed-shift bucket, never to 0.
         assert_eq!(align_operands(".p2align 64").0, 1u64 << 63);
         assert_eq!(align_operands(".p2align -1").0, 1u64 << 63);
-        // `.balign` has no cap slot at all: a junk cap is tolerated (GAS never
-        // reads it), a junk fill and a fourth operand are not.
-        assert_eq!(balign_operands(".balign 8,3"), (8, Some(3)));
-        assert_eq!(balign_operands(".balign 8,,junk"), (8, None));
+        // `.balign` shares the whole tail grammar, cap slot included; a junk cap
+        // is an error here as it is for `.p2align`, because `s_align` parses the
+        // third field before any target hook can decline to look at it.
+        assert_eq!(balign_operands(".balign 8,3"), (8, Some(3), None));
+        assert_eq!(balign_operands(".balign 8,,4"), (8, None, Some(4)));
+        assert_eq!(
+            stmts(".balign 8,,junk").unwrap_err(),
+            "Line 1: .balign: max-pad `junk` is not an integer: '.balign 8,,junk'",
+            "a junk cap must be refused, and by the max wording -- not as a fill problem"
+        );
         assert_eq!(
             stmts(".balign 8,,4,9").unwrap_err(),
             "Line 1: .balign: too many operands: '.balign 8,,4,9'"

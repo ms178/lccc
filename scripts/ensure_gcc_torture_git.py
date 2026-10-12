@@ -45,6 +45,23 @@ def git(root: Path, *args: str) -> bytes:
 
 
 def resolve(repository: str, ref: str) -> str:
+    # Both values are passed to `git ls-remote` as separate argv entries, which is
+    # the right shape (no shell), but git parses its *arguments* too: a value
+    # starting with a dash is an option, and `--ref=--upload-pack=<cmd>` turns a
+    # ref name into a subprocess request against a peer-supplied command line.
+    # Whitespace, control characters and a leading dash are refused before anything
+    # is spawned; a glob like `refs/heads/*` is deliberately still legal, because
+    # `git ls-remote` accepts patterns and the ambiguity check below is what makes
+    # one safe.  Refusing early also means the caller sees a usage error naming the
+    # argument, not a git failure three frames down.
+    for name, value in (("--ref", ref), ("--repository", repository)):
+        if not value or value.startswith("-") or any(c.isspace() or c == "\0" for c in value):
+            raise ValueError(f"{name} must be a non-empty URL/ref name that is not an option, got {value!r}")
+    if any(ord(c) < 32 for c in ref) or any(ord(c) < 32 for c in repository):
+        # A control character in a ref is not a name; `git ls-remote` takes glob
+        # patterns, so `refs/heads/*` stays legal (and stays caught by the
+        # ambiguity check below), while a newline-injected argument does not.
+        raise ValueError("--ref/--repository contain a control character")
     if re.fullmatch(r"[0-9a-fA-F]{40}", ref):
         return ref.lower()
     output = subprocess.check_output(

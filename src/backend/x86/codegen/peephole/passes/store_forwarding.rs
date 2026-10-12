@@ -1407,7 +1407,10 @@ pub(super) fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineIn
         // Per-function frame-pointer tracking.
         if infos[i].kind == LineKind::Directive {
             let dt = infos[i].trimmed(store.get(i));
-            if dt == ".cfi_startproc" {
+            if dt == ".cfi_startproc" || super::helpers::directive_emits_data(dt) {
+                // A data directive can hold `mov %rsp, %rbp` or anything
+                // else, so the frame-pointer property is not provable across
+                // it -- retire the assumption like a fresh prologue would.
                 rbp_is_frame = false;
             }
         } else if matches!(infos[i].kind, LineKind::Other { .. }) {
@@ -1692,6 +1695,7 @@ mod tests {
                     rbp_offset: RBP_OFFSET_NONE,
                     reg_refs: u16::MAX,
                     pinned: true,
+                    inert_dir: false,
                 };
             }
         }

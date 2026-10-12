@@ -493,7 +493,7 @@ fn scan_window(store: &LineStore, infos: &[LineInfo], from: usize, to: usize) ->
     let mut gap = 0usize;
     for k in from + 1..to {
         let info = &infos[k];
-        if info.is_nop() || info.kind == LineKind::Directive {
+        if super::helpers::steps_over_line(info, info.trimmed(store.get(k))) {
             continue;
         }
         if !is_window_kind(info.kind) || info.pinned {
@@ -517,9 +517,11 @@ fn scan_window(store: &LineStore, infos: &[LineInfo], from: usize, to: usize) ->
     Some(w)
 }
 
-/// Index of the next line that is neither NOP nor directive, or `len`.
-fn next_insn(infos: &[LineInfo], mut j: usize, len: usize) -> usize {
-    while j < len && (infos[j].is_nop() || infos[j].kind == LineKind::Directive) {
+/// Index of the next line that is neither a NOP nor a benign directive, or
+/// `len`.  A data directive is code the text does not spell out, so it counts
+/// as an instruction here (see `steps_over_line`).
+fn next_insn(store: &LineStore, infos: &[LineInfo], mut j: usize, len: usize) -> usize {
+    while j < len && super::helpers::steps_over_line(&infos[j], infos[j].trimmed(store.get(j))) {
         j += 1;
     }
     j
@@ -547,7 +549,7 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) 
 
         // Walk forward to the first line that mentions T; every line before
         // it must satisfy the window rules.
-        let mut j = next_insn(infos, i + 1, len);
+        let mut j = next_insn(store, infos, i + 1, len);
         let mut consumer = None;
         let mut gap = 0usize;
         while j < len {
@@ -571,7 +573,7 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) 
             if gap > MAX_GAP {
                 break;
             }
-            j = next_insn(infos, j + 1, len);
+            j = next_insn(store, infos, j + 1, len);
         }
         let Some(j) = consumer else {
             i += 1;
@@ -697,7 +699,7 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) 
         }
         let b_bit = 1u16 << b_fam;
         // Find the consumer of B: first line mentioning B after the copy.
-        let mut k = next_insn(infos, j + 1, len);
+        let mut k = next_insn(store, infos, j + 1, len);
         let mut op_line = None;
         let mut gap2 = 0usize;
         while k < len {
@@ -724,7 +726,7 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) 
             if gap2 > MAX_GAP {
                 break;
             }
-            k = next_insn(infos, k + 1, len);
+            k = next_insn(store, infos, k + 1, len);
         }
         let Some(k) = op_line else {
             i += 1;
@@ -899,7 +901,7 @@ pub(super) fn fold_recurrence_update(store: &mut LineStore, infos: &mut [LineInf
             continue;
         }
         // OP1 must be the very next instruction.
-        let j = next_insn(infos, i + 1, len);
+        let j = next_insn(store, infos, i + 1, len);
         if j >= len || infos[j].pinned || !matches!(infos[j].kind, LineKind::Other { .. }) {
             i += 1;
             continue;
@@ -920,7 +922,7 @@ pub(super) fn fold_recurrence_update(store: &mut LineStore, infos: &mut [LineInf
             continue;
         }
         // Find copy2 (`mov %X, %A`): first line after OP1 mentioning A or Tm.
-        let mut k = next_insn(infos, j + 1, len);
+        let mut k = next_insn(store, infos, j + 1, len);
         let mut copy2 = None;
         let mut gap = 0usize;
         let mut gap_written = 0u16;
@@ -946,7 +948,7 @@ pub(super) fn fold_recurrence_update(store: &mut LineStore, infos: &mut [LineInf
             if gap > MAX_GAP {
                 break;
             }
-            k = next_insn(infos, k + 1, len);
+            k = next_insn(store, infos, k + 1, len);
         }
         let Some(k) = copy2 else {
             i += 1;
@@ -967,7 +969,7 @@ pub(super) fn fold_recurrence_update(store: &mut LineStore, infos: &mut [LineInf
             continue;
         }
         // OP2 must immediately follow copy2.
-        let m = next_insn(infos, k + 1, len);
+        let m = next_insn(store, infos, k + 1, len);
         if m >= len || infos[m].pinned {
             i += 1;
             continue;
@@ -1329,7 +1331,7 @@ pub(super) fn fold_copy_into_dying_operand(store: &mut LineStore, infos: &mut [L
             i += 1;
             continue;
         }
-        let j = next_insn(infos, i + 1, len);
+        let j = next_insn(store, infos, i + 1, len);
         if j >= len || infos[j].pinned || !matches!(infos[j].kind, LineKind::Other { .. }) {
             i += 1;
             continue;
@@ -1352,7 +1354,7 @@ pub(super) fn fold_copy_into_dying_operand(store: &mut LineStore, infos: &mut [L
             i += 1;
             continue;
         }
-        let k = next_insn(infos, j + 1, len);
+        let k = next_insn(store, infos, j + 1, len);
         if k >= len || infos[k].pinned || !is_window_kind(infos[k].kind) {
             i += 1;
             continue;
@@ -1422,7 +1424,7 @@ pub(super) fn eliminate_redundant_symbol_lea(store: &LineStore, infos: &mut [Lin
     let mut changed = false;
     for i in 0..len {
         let info = &infos[i];
-        if info.is_nop() || info.kind == LineKind::Directive {
+        if super::helpers::steps_over_line(info, info.trimmed(store.get(i))) {
             continue;
         }
         if !is_window_kind(info.kind)
@@ -2126,7 +2128,7 @@ pub(super) fn fuse_zero_ext_cmp(store: &mut LineStore, infos: &mut [LineInfo]) -
             i += 1;
             continue;
         };
-        let j = next_insn(infos, i + 1, len);
+        let j = next_insn(store, infos, i + 1, len);
         if !plain(infos, j, false) {
             i += 1;
             continue;
@@ -2145,7 +2147,7 @@ pub(super) fn fuse_zero_ext_cmp(store: &mut LineStore, infos: &mut [LineInfo]) -
             i += 1;
             continue;
         }
-        let k = next_insn(infos, j + 1, len);
+        let k = next_insn(store, infos, j + 1, len);
         if !plain(infos, k, true) {
             i += 1;
             continue;

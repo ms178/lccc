@@ -161,6 +161,9 @@ fn pin_inline_asm_regions(store: &LineStore, infos: &mut [LineInfo]) {
                 rbp_offset: RBP_OFFSET_NONE,
                 reg_refs: u16::MAX,
                 pinned: true,
+                // Not a directive line; the field is only read for
+                // `LineKind::Directive`, and false is the fail-closed value.
+                inert_dir: false,
             };
         }
     }

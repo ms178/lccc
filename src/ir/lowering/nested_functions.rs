@@ -1252,6 +1252,26 @@ impl Lowerer {
         self.func().nested_functions.get(name).cloned()
     }
 
+    /// The key under which the *signature* of a call to `name` is recorded.
+    ///
+    /// A visible GNU nested function is a distinct entity that merely shares a
+    /// basename with whatever the file scope holds, and it is registered under
+    /// its mangled `parent.name` key -- which is also the symbol the emitted call
+    /// targets (`try_lower_nested_call` rewrites the callee). Any lookup that asks
+    /// "what type does this call have" by the *plain* name therefore consults the
+    /// wrong entity's record while emitting a call to the right one: measured, a
+    /// nested `double f(double)` beside a file-scope `int f(int)` made `g`'s
+    /// `f(1.5)` return a double in `%xmm0` and then re-convert that result through
+    /// `vcvtsi2sd` because the type said `int`. Resolving the key here, in one
+    /// place, keeps every typing site honest without each of them having to
+    /// remember the rule.
+    pub(super) fn callee_signature_key(&self, name: &str) -> String {
+        match self.lookup_nested_function(name) {
+            Some(entry) => entry.mangled,
+            None => name.to_string(),
+        }
+    }
+
     /// Compute the static-chain operand for calling `callee` from the
     /// current function: the frame pointer of the callee's parent,
     /// reached via the current frame or chain-link walks.
