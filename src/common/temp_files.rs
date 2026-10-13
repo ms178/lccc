@@ -314,6 +314,9 @@ mod tests {
             let _ = std::fs::remove_file(&candidate);
             let _ = std::fs::remove_dir(&victim);
         }
-        assert_eq!(adopted, 0, "pre-placed symlink was adopted as a private dir");
+        assert_eq!(
+            adopted, 0,
+            "pre-placed symlink was adopted as a private dir"
+        );
     }
 }

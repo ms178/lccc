@@ -85,6 +85,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends gcc-14
 
+      # The named-address-space and constant-initializer gates pin GCC 16 as
+      # their verdict oracle (tests/regression/lib/gcc_oracle.sh): older GCC
+      # disagrees on named-space verdicts, and the gates fail rather than
+      # substitute another oracle. ubuntu-24.04 ships no gcc-16 package, so
+      # provision it from the toolchain PPA; without this step the nine
+      # GCC-16 gates below (and ci_local.sh's mirrors of them, whose parity
+      # scripts/check_ci_gate_parity.py enforces) cannot run hosted at all.
+      - name: Install the GCC 16 verdict oracle
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends software-properties-common
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-16
+
       - name: Cache cargo registry
         uses: actions/cache@v6
         with:
@@ -212,7 +227,6 @@ jobs:
           python3 scripts/check_repro_replay.py --self-test
           env CCC=target/fastbuild/lccc python3 scripts/check_repro_replay.py
 
-      
       # AUD-ICE-1/AUD-DIAG-1: malformed `__builtin_shuffle` masks diagnose
       # instead of panicking, and the valid forms still lower (oracle-checked
       # against gcc).
@@ -254,6 +268,39 @@ jobs:
           set -euo pipefail
           python3 scripts/check_ill_typed_builtins.py --self-test
           env CCC=target/fastbuild/lccc LCCC_REPO=. python3 scripts/check_ill_typed_builtins.py
+
+      # Constant-initializer, designator, named-space-conversion and
+      # volatile-object gates. Each row's verdict was measured against
+      # GCC 16.2, so these run against the GCC 16 oracle provisioned above
+      # (tests/regression/lib/gcc_oracle.sh fails, never substitutes, when
+      # it is absent). ci_local.sh registers the same nine gates;
+      # scripts/check_ci_gate_parity.py fails if the two lists drift.
+      - name: Static-local constant initializers
+        run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_static_local_init.sh
+
+      - name: Designated initializer validity
+        run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_designator_init.sh
+
+      - name: File-scope constant initializers
+        run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_file_scope_init.sh
+
+      - name: Typedef-volatile code generation
+        run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_typedef_volatile_codegen.sh
+
+      - name: Named-space brace-elided initializers
+        run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_seg_init_brace_elision.sh
+
+      - name: Volatile member code generation
+        run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_volatile_member_codegen.sh
+
+      - name: Const-volatile object reads are not folded
+        run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_const_volatile_objects.sh
+
+      - name: Named-space typedef code generation
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_seg_typedef_codegen.sh
+
+      - name: Named-space conversion parity
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_seg_conversion_parity.sh
 
       - name: Run tests
         env:

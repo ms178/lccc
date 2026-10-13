@@ -55,6 +55,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -229,6 +230,21 @@ def main() -> int:
     ap.add_argument("--list", action="store_true", help="print the plan and exit")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
+
+    # The self-test and the replay both execute the compilers; a missing
+    # binary is a configuration error, not a traceback. Report it the way
+    # the gates that source gcc_oracle.sh report a missing oracle: by name,
+    # with the remedy, and non-zero.
+    for label, tool in (("lccc", args.lccc), ("gcc", args.gcc)):
+        if shutil.which(tool) is None:
+            print(
+                f"FAIL: check_repro_replay: {label} compiler {tool!r} is not "
+                "an executable on PATH or at that path; build it first "
+                "(cargo build --profile fastbuild --locked) or pass "
+                "--lccc/--gcc (or CCC/GCC) naming it",
+                file=sys.stderr,
+            )
+            return 2
 
     if args.self_test:
         return self_test(args.lccc, args.gcc)
