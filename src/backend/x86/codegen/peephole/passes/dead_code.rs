@@ -9,6 +9,7 @@
 //!   read anywhere in the function (global, whole-function analysis).
 
 use super::super::types::*;
+use super::fp_liveness::FpLiveness;
 use super::helpers::*;
 
 // SOUNDNESS: LCCC compiles with -fomit-frame-pointer, so %rbp is a general
@@ -229,6 +230,87 @@ pub(super) fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]
         i += 1;
     }
 
+    changed
+}
+
+// ── Dead XMM reg-move elimination ────────────────────────────────────────────
+
+/// Parse a pure XMM→XMM register move: every operand is `%xmmN`, 2 or 3 of
+/// them, destination last (AT&T). Returns `(src_first, dst)`. Covers the
+/// scalar (`movsd`/`movss`), packed (`movapd`/`movups`/`movdqa`/`movdqu`/
+/// `movupd`) and VEX spellings the emitter produces, plus the 3-operand merge
+/// forms (`vmovsd %xmmA, %xmmB, %xmmC`) that store forwarding emits. Anything
+/// with a memory operand, an immediate, or a GP operand returns `None`.
+fn parse_fp_reg_move(t: &str) -> Option<(u32, u32)> {
+    let rest = t
+        .strip_prefix("vmovsd ")
+        .or_else(|| t.strip_prefix("vmovss "))
+        .or_else(|| t.strip_prefix("vmovapd "))
+        .or_else(|| t.strip_prefix("vmovaps "))
+        .or_else(|| t.strip_prefix("vmovupd "))
+        .or_else(|| t.strip_prefix("vmovups "))
+        .or_else(|| t.strip_prefix("vmovdqa "))
+        .or_else(|| t.strip_prefix("vmovdqu "))
+        .or_else(|| t.strip_prefix("vmovq "))
+        .or_else(|| t.strip_prefix("movsd "))
+        .or_else(|| t.strip_prefix("movss "))
+        .or_else(|| t.strip_prefix("movapd "))
+        .or_else(|| t.strip_prefix("movaps "))
+        .or_else(|| t.strip_prefix("movupd "))
+        .or_else(|| t.strip_prefix("movups "))
+        .or_else(|| t.strip_prefix("movdqa "))
+        .or_else(|| t.strip_prefix("movdqu "))
+        .or_else(|| t.strip_prefix("movq "))?;
+    let mut idxs = [u32::MAX; 3];
+    let mut n = 0usize;
+    for op in rest.split(',') {
+        let op = op.trim();
+        let name = op.strip_prefix('%')?;
+        let num = name.strip_prefix("xmm")?.parse::<u32>().ok()?;
+        if n == 3 {
+            return None;
+        }
+        idxs[n] = num;
+        n += 1;
+    }
+    if n < 2 {
+        return None;
+    }
+    // "movq %rax, %xmm0" is excluded by the %xmm parse above; "movq %xmm0,
+    // %rax" likewise (dst would not parse). Self-moves are included — deleting
+    // a copy into a dead destination is safe, self-move or not.
+    Some((idxs[0], idxs[n - 1]))
+}
+
+/// Dead XMM→XMM move elimination — the FP counterpart of
+/// [`eliminate_dead_reg_moves`] (which cannot serve: `reg_refs` is a 16-bit
+/// GP mask and its scan is `movq`-shaped). A register-only FP move whose
+/// destination is never read before it is next rewritten writes nothing
+/// observable; deleting it saves the instruction and the rename pressure.
+/// The extract-staging idiom of vector-lane lowering is the hot case:
+/// `movapd %xmm15, %xmm0` immediately overwritten by `pshufd $0x0E,
+/// %xmm15, %xmm0` — the lane-0 copy is dead the instant it is written, and
+/// it sat in the nbody pair loop's inner loop until this pass existed.
+pub(super) fn eliminate_dead_fp_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    let len = store.len();
+    let fp = FpLiveness::new(store, infos);
+    for i in 0..len {
+        if infos[i].is_nop() || infos[i].is_barrier() {
+            continue;
+        }
+        if !matches!(infos[i].kind, LineKind::Other { .. }) {
+            continue;
+        }
+        let trimmed = infos[i].trimmed(store.get(i));
+        let Some((_src, dst)) = parse_fp_reg_move(trimmed) else {
+            continue;
+        };
+        if fp.xmm_dead_after(store, infos, i, dst, &[i]) {
+            mark_nop(&mut infos[i]);
+            changed = true;
+        }
+    }
     changed
 }
 
@@ -1359,4 +1441,150 @@ fn is_epilogue_rsp_shift(store: &LineStore, infos: &[LineInfo], k: usize, func_e
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::types::*;
+    use super::*;
+
+    fn build(asm: &str) -> (LineStore, Vec<LineInfo>) {
+        let store = LineStore::new(asm.to_string());
+        let infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        (store, infos)
+    }
+
+    #[test]
+    fn shufps_reads_its_destination_so_the_feeding_move_stays() {
+        // `shufps $0x00, %xmm0, %xmm0` takes result lanes 0..1 from the
+        // DESTINATION's old value: it is NOT a full def (that is `pshufd`).
+        // The `vmovss` reset feeding the splat must survive, or the splat
+        // degenerates to [s, s, t, t] (bb_slp_v8 C2 miscompile chain).
+        let asm = concat!(
+            "f:\n",
+            "    vmovss %xmm1, %xmm1, %xmm0
+",
+            "    shufps $0x00, %xmm0, %xmm0
+",
+            "    movdqa %xmm0, %xmm14
+",
+            "    ret
+",
+        );
+        let (store, mut infos) = build(asm);
+        let changed = eliminate_dead_fp_moves(&store, &mut infos);
+        let kept = (0..store.len()).any(|i| store.get(i).contains("vmovss %xmm1, %xmm1, %xmm0"));
+        assert!(
+            kept,
+            "shufps reads its destination; the reset must stay (changed={changed})"
+        );
+    }
+
+    #[test]
+    fn dead_fp_staging_copy_is_killed() {
+        // The nbody extract-staging idiom: lane-0 copy written and never read
+        // before the next full def of the same register.
+        let asm = concat!(
+            "f:\n",
+            "    movapd %xmm15, %xmm0\n",
+            "    pshufd $0x0E, %xmm15, %xmm0\n",
+            "    movsd %xmm0, %xmm1\n",
+            "    ret\n",
+        );
+        let (store, mut infos) = build(asm);
+        assert!(eliminate_dead_fp_moves(&store, &mut infos));
+        let at = |s: &str| {
+            (0..store.len())
+                .find(|&i| store.get(i).contains(s))
+                .unwrap()
+        };
+        assert!(
+            infos[at("movapd")].is_nop(),
+            "the dead movapd staging copy must go"
+        );
+        assert!(!infos[at("pshufd")].is_nop(), "the live pshufd stays");
+    }
+
+    #[test]
+    fn live_fp_move_is_kept() {
+        let asm = concat!(
+            "f:\n",
+            "    movapd %xmm15, %xmm0\n",
+            "    addsd %xmm0, %xmm1\n",
+            "    ret\n",
+        );
+        let (store, mut infos) = build(asm);
+        eliminate_dead_fp_moves(&store, &mut infos);
+        let at = |s: &str| {
+            (0..store.len())
+                .find(|&i| store.get(i).contains(s))
+                .unwrap()
+        };
+        assert!(
+            !infos[at("movapd")].is_nop(),
+            "the move feeds addsd — it is live"
+        );
+    }
+
+    #[test]
+    fn partial_fp_move_needs_full_death() {
+        // `movsd` merges into the low 64 of the destination: the upper bits
+        // survive, so a later read of ANY xmm0 bit keeps the move. Here
+        // `movaps` reads all of xmm0 after the merge copy — the copy stays.
+        let asm = concat!(
+            "f:\n",
+            "    movsd %xmm6, %xmm0\n",
+            "    movaps %xmm0, %xmm2\n",
+            "    ret\n",
+        );
+        let (store, mut infos) = build(asm);
+        eliminate_dead_fp_moves(&store, &mut infos);
+        let at = |s: &str| {
+            (0..store.len())
+                .find(|&i| store.get(i).contains(s))
+                .unwrap()
+        };
+        assert!(
+            !infos[at("movsd %xmm6")].is_nop(),
+            "xmm0 is read before its next def"
+        );
+    }
+
+    #[test]
+    fn memory_operands_are_not_fp_reg_moves() {
+        let asm = concat!(
+            "f:\n",
+            "    movsd %xmm6, 8(%rsp)\n",
+            "    movsd 8(%rsp), %xmm0\n",
+            "    ret\n",
+        );
+        let (store, mut infos) = build(asm);
+        eliminate_dead_fp_moves(&store, &mut infos);
+        let at = |s: &str| {
+            (0..store.len())
+                .find(|&i| store.get(i).contains(s))
+                .unwrap()
+        };
+        assert!(
+            !infos[at("movsd %xmm6")].is_nop() && !infos[at("movsd 8(%rsp)")].is_nop(),
+            "slot traffic untouched"
+        );
+    }
+
+    #[test]
+    fn merge_copy_into_dead_dest_is_killed() {
+        // store forwarding's 3-operand vmovsd form into a destination whose
+        // bits are never observed.
+        let asm = concat!("f:\n", "    vmovsd %xmm6, %xmm6, %xmm7\n", "    ret\n",);
+        let (store, mut infos) = build(asm);
+        assert!(eliminate_dead_fp_moves(&store, &mut infos));
+        let at = |s: &str| {
+            (0..store.len())
+                .find(|&i| store.get(i).contains(s))
+                .unwrap()
+        };
+        assert!(infos[at("vmovsd")].is_nop(), "dead merge copy must go");
+    }
 }

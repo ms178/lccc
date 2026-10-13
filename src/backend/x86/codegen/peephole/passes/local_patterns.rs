@@ -24,8 +24,9 @@ use super::helpers::{
 };
 use super::liveness::FileLiveness;
 use super::relay_and_lea::{
-    LazyDeadness, function_range, is_writable_family_gpr, line_refs_family, plain_gp_operand,
-    provably_dead_lv, rbp_is_gpr_in_function, splice_lea_into_mem_operand, split_two_operands,
+    LazyDeadness, fam_written_only_as_dest, function_range, is_writable_family_gpr,
+    line_refs_family, plain_gp_operand, provably_dead_lv, rbp_is_gpr_in_function,
+    splice_lea_into_mem_operand, split_two_operands,
 };
 
 #[cfg(test)]
@@ -1547,7 +1548,7 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
                 continue;
             }
             let base_family = register_family_fast(base);
-            if base_family == REG_NONE || base_family > REG_GP_MAX || dst_family == base_family {
+            if base_family == REG_NONE || base_family > REG_GP_MAX {
                 i += 1;
                 continue;
             }
@@ -1560,6 +1561,20 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
                 continue;
             }
             let next = infos[j].trimmed(store.get(j));
+            // A consumer that full-width-redefines the LEA destination kills
+            // its value here (`movq (%rdx), %rdx`): the LEA result has no
+            // other reader, the composed address reads the PRE-LEA base, and
+            // later uses of the family see the consumer's fresh value. That
+            // path even admits base == dst (`leaq 8(%rdx), %rdx; movq
+            // (%rdx), %rdx` -> `movq 8(%rdx), %rdx`): the address's %rdx is
+            // the pre-LEA value by construction. Without the redefinition the
+            // old discipline stands: dst must differ from base and die after
+            // the consumer.
+            let consumer_redefines_dst = fam_written_only_as_dest(next, dst_family);
+            if dst_family == base_family && !consumer_redefines_dst {
+                i += 1;
+                continue;
+            }
             // Compose, never splice text: `8(%rdx)` after `leaq 2(%r9),%rdx`
             // is `10(%r9)`. See `splice_lea_into_mem_operand`.
             let Some(replacement) = splice_lea_into_mem_operand(next, dst_text, addr_text) else {
@@ -1567,8 +1582,10 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
                 continue;
             };
             // The address was already computed by the LEA; dropping it is valid
-            // only if the destination register is dead after the memory op.
-            if !dead.dead_after(store, infos, j, dst_family, &[i, j]) {
+            // only if the destination register is dead after the memory op —
+            // or the memory op itself redefines the destination (its write
+            // kills the LEA value, so nothing after can want it).
+            if !consumer_redefines_dst && !dead.dead_after(store, infos, j, dst_family, &[i, j]) {
                 i += 1;
                 continue;
             }
@@ -1579,7 +1596,16 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
             // pd->robust_head.list = &pd->robust_head, where GVN legally
             // CSEs both GEPs into one value) — dropping the LEA leaves that
             // use reading an unwritten register (LK-24 startup SIGSEGV).
-            if line_refs_gp_family(&replacement, dst_family) {
+            // The redefining path's residue is different: mentions may remain
+            // inside the composed address (the pre-LEA base/index reads) and
+            // as the consumer's fresh destination — exactly what
+            // `fam_written_only_as_dest` admits.
+            let residue_ok = if consumer_redefines_dst {
+                fam_written_only_as_dest(&replacement, dst_family)
+            } else {
+                !line_refs_gp_family(&replacement, dst_family)
+            };
+            if !residue_ok {
                 i += 1;
                 continue;
             }
@@ -1602,8 +1628,6 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
             || index_family == REG_NONE
             || base_family > REG_GP_MAX
             || index_family > REG_GP_MAX
-            || dst_family == base_family
-            || dst_family == index_family
         {
             i += 1;
             continue;
@@ -1622,6 +1646,14 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
             continue;
         }
         let next = infos[j].trimmed(store.get(j));
+        // Same consumer-redefines-dst admission as the single-base arm (the
+        // LEA value dies at the consumer's fresh destination write; the
+        // composed address keeps reading the pre-LEA base/index).
+        let consumer_redefines_dst = fam_written_only_as_dest(next, dst_family);
+        if !consumer_redefines_dst && (dst_family == base_family || dst_family == index_family) {
+            i += 1;
+            continue;
+        }
         // Compose the LEA address with the consumer operand -- summing the
         // displacements, never gluing their text together (`8(%r9)` after
         // `leaq 8(%r13,%r10),%r9` is `16(%r13, %r10)`, not `88(...)`).
@@ -1684,15 +1716,24 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
             continue;
         };
         // The address fields were already evaluated by LEA. Removing it is
-        // valid only if the temporary is dead after the memory operation.
-        if !dead.dead_after(store, infos, j, dst_family, &[i, j]) {
+        // valid only if the temporary is dead after the memory operation —
+        // or the memory op redefines the destination (its write kills the
+        // LEA value; see the single-base arm).
+        if !consumer_redefines_dst && !dead.dead_after(store, infos, j, dst_family, &[i, j]) {
             i += 1;
             continue;
         }
         // Same full-absorption rule as the single-base arm: a leftover
         // reference to the LEA dest outside the replaced address operand
-        // means the LEA is still live and must not be dropped.
-        if line_refs_gp_family(&replacement, dst_family) {
+        // means the LEA is still live and must not be dropped. On the
+        // redefining path the residue may live in the composed address and
+        // the fresh destination only.
+        let residue_ok = if consumer_redefines_dst {
+            fam_written_only_as_dest(&replacement, dst_family)
+        } else {
+            !line_refs_gp_family(&replacement, dst_family)
+        };
+        if !residue_ok {
             i += 1;
             continue;
         }

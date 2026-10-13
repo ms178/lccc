@@ -51,7 +51,8 @@
 
 use super::super::types::*;
 use super::helpers::{
-    get_dest_reg, has_implicit_reg_usage, implicit_read_reg_family, writes_family,
+    get_dest_reg, has_implicit_reg_usage, implicit_read_reg_family, is_read_modify_write,
+    replace_reg_family, writes_family,
 };
 use super::liveness::FileLiveness;
 
@@ -825,6 +826,92 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
                         }
                     }
                 }
+                if !folded {
+                    // The copy's destination is mentioned inside a MEMORY
+                    // operand (`addq $1, (%r9, %r11, 8)`, `movzbl (%rdi, %r9),
+                    // %edx`): the SIB base/index registers are read before the
+                    // instruction's own register writes, so renaming them to
+                    // the copy's source is value-preserving even when the
+                    // consumer later overwrites that source (`movzbl (%rdi,
+                    // %rdx), %edx` — the address is computed first) and even
+                    // when the source is mentioned elsewhere in the line: the
+                    // relay invariant gives %D == %S at the consumer, so all
+                    // mentions fold to one value (`addq $1, (%r11, %r9, 8)`
+                    // with %r11 a copy of %r9 is `(%r9, %r9, 8)`). Memory
+                    // operands read their registers at 64 bits, so a 32-bit
+                    // copy needs `upper32_zero_at` exactly like any other
+                    // 64-bit read of the source.
+                    //
+                    // The one hazard is the rename introducing a REGISTER
+                    // WRITE of %S: `imull %esi, (%r9,%r11,8), %r11d` folded to
+                    // `%eax` would zero-extend over %rax's live high half. A
+                    // bare-register destination naming %D therefore refuses —
+                    // unless that destination is a write-only full-width def
+                    // of %D (`fam_written_only_as_dest`): then the source-only
+                    // rename leaves the destination register untouched (it
+                    // holds a FRESH value, not the copy's), no register write
+                    // of %S appears anywhere, and the copy's value is killed
+                    // at the consumer by the destination write itself — so no
+                    // later-deadness proof is needed or wanted (the new
+                    // destination value may well be live). A memory
+                    // destination's registers are reads, never the write.
+                    let writes_dst_as_reg = consumer_writes_dst_as_reg(t, dst_fam);
+                    let write_only_dst = writes_dst_as_reg && fam_written_only_as_dest(t, dst_fam);
+                    if t.contains('(') && (!writes_dst_as_reg || write_only_dst) {
+                        // The high-byte trap (pinned by
+                        // `test_rcx_address_copy_high_byte_use_is_not_a_kill`):
+                        // `%ch` reads bits 8..15 of the copied value at a
+                        // LATER line, and no canonical spelling of the family
+                        // names that read. Established remedy, as in
+                        // `copy_coalesce` rule 5: veto when a high-byte
+                        // spelling of either family appears anywhere in the
+                        // enclosing function.
+                        let high_byte_ok = {
+                            let hb: [(&str, RegId); 4] =
+                                [("%ah", 0), ("%ch", 1), ("%dh", 2), ("%bh", 3)];
+                            let (lo, hi) =
+                                function_range(store, infos, i).unwrap_or((0, store.len()));
+                            (lo..hi).all(|k| {
+                                infos[k].is_nop() || {
+                                    let tk = infos[k].trimmed(store.get(k));
+                                    !hb.iter().any(|(name, fam)| {
+                                        (*fam == src_fam || *fam == dst_fam) && tk.contains(name)
+                                    })
+                                }
+                            })
+                        };
+                        let reads_64 = true; // a memory operand reads its registers at 64 bits
+                        if high_byte_ok
+                            && reads_64
+                            && (copy_w == 64 || upper32_zero_at(store, infos, i, src_fam))
+                        {
+                            let new_line = if write_only_dst {
+                                replace_reg_family_in_source(t, dst_fam, src_fam)
+                                    .map(|s| format!("    {}", s))
+                            } else {
+                                Some(format!("    {}", replace_reg_family(t, dst_fam, src_fam)))
+                            };
+                            if let Some(new_line) = new_line {
+                                let ok = if write_only_dst {
+                                    // The destination still names %D — that is
+                                    // the point; the source-only rename proved
+                                    // nothing else does.
+                                    fam_written_only_as_dest(&new_line, dst_fam)
+                                } else {
+                                    !line_refs_family(&new_line, dst_fam)
+                                        && provably_dead_lv(&lv, store, infos, j, dst_fam, &[i, j])
+                                };
+                                if ok {
+                                    mark_nop(&mut infos[i]);
+                                    replace_line(store, &mut infos[j], j, new_line);
+                                    lv.refresh_at(store, infos, j);
+                                    changed = true;
+                                    folded = true;
+                                }
+                            }
+                        }
+                    }
+                }
                 let _ = folded;
                 break;
             }
@@ -839,6 +926,92 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
         i += 1;
     }
     changed
+}
+
+/// `true` when `t`'s destination operand is a BARE REGISTER naming `fam` —
+/// the line writes that register (possibly reading it first), so a relay
+/// rename of `fam` would move the write onto the copy's source register and
+/// clobber its live high bits (a 32-bit RMW like `addl $1, %r11d` zero-
+/// extends). A memory destination's registers are address READS, never the
+/// written value, so SIB mentions never count. Three-operand forms name the
+/// destination last (`imul %esi, (%r9,%r11,8), %r11d`); one-operand RMW
+/// (`incq %r11`) names it only.
+fn consumer_writes_dst_as_reg(t: &str, fam: RegId) -> bool {
+    let trimmed = t.trim_start();
+    let Some(sp) = trimmed.find(' ') else {
+        let dst = trimmed;
+        return dst.starts_with('%') && !dst.contains('(') && line_refs_family(dst, fam);
+    };
+    let ops = trimmed[sp + 1..].trim_start();
+    let dst = match last_top_level_comma(ops.as_bytes()) {
+        Some(c) => ops[c + 1..].trim(),
+        None => ops.trim(),
+    };
+    dst.starts_with('%') && !dst.contains('(') && line_refs_family(dst, fam)
+}
+
+/// `true` when `fam` is written by `t` ONLY as a bare-register destination
+/// that the instruction overwrites without reading (`imull %esi, (%r9,%r11,8),
+/// %r11d` — the three-operand imul's destination is a fresh value). Every
+/// other register-operand mention of `fam` disqualifies: a source read would
+/// want the copy's value at a spot the source-only rename does not retarget,
+/// and an RMW destination (`addq (%r9,%r11,8), %r11`) reads the copy's value
+/// from a register the fold would leave undefined. Mentions inside MEMORY
+/// operands are address reads — exactly what the relay rename retargets — and
+/// do not count against this predicate. The destination must be full-width
+/// (`%r11`/`%r11d`; a 32-bit write zero-extends into the full family), so
+/// the write kills the copy's value here and no later read can want it.
+pub(super) fn fam_written_only_as_dest(t: &str, fam: RegId) -> bool {
+    if !consumer_writes_dst_as_reg(t, fam) || is_read_modify_write(t.trim_start()) {
+        return false;
+    }
+    let trimmed = t.trim_start();
+    let Some(sp) = trimmed.find(' ') else {
+        return false;
+    };
+    let ops = trimmed[sp + 1..].trim_start();
+    let Some(c) = last_top_level_comma(ops.as_bytes()) else {
+        return false;
+    };
+    let (src_part, dst_part) = (ops[..c].trim(), ops[c + 1..].trim());
+    if !line_refs_family(dst_part, fam) {
+        return false;
+    }
+    if dest_width(dst_part) != Some(64) && dest_width(dst_part) != Some(32) {
+        return false;
+    }
+    // Any register mention of `fam` outside memory operands must be the
+    // destination alone; strip balanced parentheses and inspect the rest.
+    let mut no_mem = String::with_capacity(src_part.len());
+    let mut depth = 0usize;
+    for ch in src_part.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => no_mem.push(ch),
+            _ => {}
+        }
+    }
+    !line_refs_family(&no_mem, fam)
+}
+
+/// Rename `old_id`→`new_id` family spellings in the SOURCE operands only
+/// (everything before the last top-level comma); the destination operand is
+/// emitted verbatim. Used by the relay fold when the consumer writes the
+/// copy's destination as a fresh register value ([`fam_written_only_as_dest`]):
+/// the memory-operand mentions retarget to the copy's source while the
+/// destination keeps its own register. The split at the last comma is
+/// top-level-exact precisely because that variant only runs for bare-register
+/// destinations — a destination carries no comma, so the last comma in the
+/// line is always its separator (never one inside a SIB list).
+fn replace_reg_family_in_source(t: &str, old_id: RegId, new_id: RegId) -> Option<String> {
+    let c = last_top_level_comma(t.as_bytes())?;
+    let (src_part, dst_part) = (&t[..c], &t[c..]);
+    Some(format!(
+        "{}{}",
+        replace_reg_family(src_part, old_id, new_id),
+        dst_part
+    ))
 }
 
 // ── Pass 2: windowed LEA → memory-operand folding ────────────────────────────
@@ -1701,6 +1874,92 @@ pub(super) fn fold_lea_into_load(store: &mut LineStore, infos: &mut [LineInfo]) 
             j += 1;
         }
         i += 1;
+    }
+    changed
+}
+
+// ── Pass 2b: same-block redundant rip-LEA elimination ────────────────────────
+
+/// Parse `leaq SYM(%rip), %R` → `(sym_text, dst_family)`. The address must be
+/// the bare rip form (symbolic or numeric displacement) — no SIB, no base.
+fn parse_rip_symbol_lea(t: &str) -> Option<(String, RegId)> {
+    let rest = t.strip_prefix("leaq ")?;
+    let (addr, dst) = rest.rsplit_once(',')?;
+    let (addr, dst) = (addr.trim(), dst.trim());
+    if !addr.ends_with("(%rip)") {
+        return None;
+    }
+    let fam = plain_gp_operand(dst)?;
+    if fam == 4 || fam == 5 {
+        return None;
+    }
+    Some((addr.to_string(), fam))
+}
+
+/// `leaq sym(%rip), %R` is a pure constant materialization: when an earlier
+/// instruction of the same straight-line run already materialized the same
+/// symbol into `%H` and `%H` has not been rewritten since, the second LEA
+/// computes a value the register file already holds.
+///
+/// * `%R == %H` → the redef is architecturally a no-op → delete it. This is
+///   the remat duplicate the unrolled histogram loop emits four times per
+///   iteration (`leaq bins(%rip), %r9` for every element) — each copy burns
+///   an issue slot and a rename for a value already in flight.
+/// * `%R != %H` → replace with `movq %H, %R` so the move-relay pass can fold
+///   the copy into the uses (or dead-move elimination deletes it when the
+///   register goes unread). A rename-conflicting consumer (the SIB index of
+///   `addq $1, (%R, %H, 8)` already naming `%H`) simply keeps the copy —
+///   correct, if less folded.
+///
+/// The home dies at ANY write of `%H` (a partial write corrupts the address
+/// like a full one); barriers end the run (a jump target may enter with a
+/// different home). Homes are tracked per symbol text: `leaq a(%rip)` and
+/// `leaq b(%rip)` are independent constants.
+pub(super) fn cse_symbol_lea(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    let len = store.len();
+    let mut homes: Vec<(String, RegId)> = Vec::new();
+    for i in 0..len {
+        if infos[i].is_nop() || infos[i].kind == LineKind::Empty {
+            continue;
+        }
+        if infos[i].is_barrier() {
+            homes.clear();
+            continue;
+        }
+        let t = infos[i].trimmed(store.get(i)).to_string();
+        if let Some((sym, dst_fam)) = parse_rip_symbol_lea(&t) {
+            // The LEA writes %R: any other symbol's home in %R dies first.
+            homes.retain(|(s, f)| *f != dst_fam || *s == sym);
+            if let Some(pos) = homes.iter().position(|(s, _)| *s == sym) {
+                let home_fam = homes[pos].1;
+                if home_fam == dst_fam {
+                    // Value already in the destination register: no-op.
+                    mark_nop(&mut infos[i]);
+                    changed = true;
+                } else {
+                    let new_line = format!(
+                        "    movq {}, {}",
+                        REG_NAMES[0][home_fam as usize], REG_NAMES[0][dst_fam as usize]
+                    );
+                    replace_line(store, &mut infos[i], i, new_line);
+                    changed = true;
+                    homes[pos].1 = dst_fam;
+                }
+                continue;
+            }
+            homes.push((sym, dst_fam));
+            continue;
+        }
+        // Any write to a home register retires that home.
+        let mut k = 0;
+        while k < homes.len() {
+            if writes_family(&infos[i], &t, homes[k].1) {
+                homes.swap_remove(k);
+            } else {
+                k += 1;
+            }
+        }
     }
     changed
 }
@@ -3403,6 +3662,160 @@ fn rename_plain_family_reads(t: &str, from: RegId, to: RegId) -> Option<String> 
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn mem_index_relay_folds_movl_copy() {
+        // The unrolled histogram shape: a 32-bit relay copy feeding the SIB
+        // index of an RMW, with the source zero-extended by a movzbl producer.
+        let asm = concat!(
+            "f:\n.cfi_startproc\n",
+            "    movzbl (%rdi, %rsi), %eax\n",
+            "    movl %eax, %r11d\n",
+            "    leaq bins(%rip), %r9\n",
+            "    addq $1, (%r9, %r11, 8)\n",
+            "    ret\n.cfi_endproc\n",
+        );
+        let out = crate::backend::x86::codegen::peephole::peephole_optimize(asm.to_string());
+        assert!(
+            out.contains("addq $1, (%r9, %rax, 8)"),
+            "the SIB index must relay to the zero-extended source:\n{out}"
+        );
+        assert!(!out.contains("%r11"), "the relay copy must be gone:\n{out}");
+    }
+
+    #[test]
+    fn mem_base_relay_tolerates_dst_collision() {
+        // `movq %rdx,%r9; movzbl (%rdi,%r9),%edx` -> `movzbl (%rdi,%rdx),%edx`:
+        // the address is computed before the destination write.
+        let asm = concat!(
+            "f:\n.cfi_startproc\n",
+            "    movq %rdx, %r9\n",
+            "    movzbl (%rdi, %r9), %edx\n",
+            "    ret\n.cfi_endproc\n",
+        );
+        let out = crate::backend::x86::codegen::peephole::peephole_optimize(asm.to_string());
+        assert!(
+            out.contains("movzbl (%rdi, %rdx), %edx"),
+            "the base relay must fold despite the dest collision:\n{out}"
+        );
+    }
+
+    #[test]
+    fn mem_relay_merges_same_value_sib_legally() {
+        // `movq %r9,%r11` makes %r11 == %r9 at the consumer, so folding the
+        // copy away and merging the SIB base/index to one register computes
+        // %r9 + %r9*8 both before and after — the rename is value-preserving
+        // even though the source appears twice in the line.
+        let asm = concat!(
+            "f:\n.cfi_startproc\n",
+            "    movq %r9, %r11\n",
+            "    addq $1, (%r11, %r9, 8)\n",
+            "    ret\n.cfi_endproc\n",
+        );
+        let out = crate::backend::x86::codegen::peephole::peephole_optimize(asm.to_string());
+        assert!(
+            out.contains("addq $1, (%r9, %r9, 8)"),
+            "the same-value SIB must fold to one register:\n{out}"
+        );
+        assert!(!out.contains("%r11"), "no stale %r11 may remain:\n{out}");
+    }
+
+    #[test]
+    fn mem_relay_refuses_register_write_of_source() {
+        // The consumer's bare-register destination is an RMW of the copy's
+        // destination (`addl %esi, %r11d` reads %r11d first): a full rename
+        // would write the copy's SOURCE register (`%eax`) and clobber its
+        // live high half, and the source-only rename cannot touch an RMW
+        // destination's read. The fold must refuse. The stored result keeps
+        // the body observable (dead-code elimination must not decide this).
+        let asm = concat!(
+            "f:\n.cfi_startproc\n",
+            "    movq %rax, %r11\n",
+            "    addl %esi, %r11d\n",
+            "    movl %r11d, (%rdi)\n",
+            "    ret\n.cfi_endproc\n",
+        );
+        let out = crate::backend::x86::codegen::peephole::peephole_optimize(asm.to_string());
+        // The mem-relay contract this pins: whatever other passes make of the
+        // pair (the lea former legitimately rebuilds it as
+        // `leal (%rax,%rsi),%r11d`), the rename may never WRITE the copy's
+        // source family — that would clobber its live high half.
+        assert!(
+            !out.contains(", %eax") && !out.contains(", %rax") && !out.contains(", %ax"),
+            "the copy's source register must never be written:\n{out}"
+        );
+        assert!(
+            out.contains("movl %r11d, (%rdi)"),
+            "the stored result must stay observable:\n{out}"
+        );
+    }
+
+    #[test]
+    fn mem_relay_folds_write_only_reg_dest() {
+        // The three-operand imul's destination is a WRITE-ONLY fresh value
+        // (`imull %esi, (%r9,%r11,8), %r11d`): the SIB mentions of %r11 are
+        // address reads that retarget to %rax, the destination register keeps
+        // its own name, and the destination write kills the copy's value.
+        // What used to be a refusal now folds to one instruction.
+        let asm = concat!(
+            "f:\n.cfi_startproc\n",
+            "    movq %rax, %r11\n",
+            "    imull %esi, (%r9, %r11, 8), %r11d\n",
+            "    movl %r11d, (%rdi)\n",
+            "    ret\n.cfi_endproc\n",
+        );
+        let out = crate::backend::x86::codegen::peephole::peephole_optimize(asm.to_string());
+        assert!(
+            out.contains("imull %esi, (%r9, %rax, 8), %r11d"),
+            "the SIB retargets to %rax while the write-only dest stays:\n{out}"
+        );
+        assert!(
+            !out.contains("movq %rax, %r11"),
+            "the relayed copy must be gone:\n{out}"
+        );
+    }
+
+    #[test]
+    fn rip_lea_redef_is_deleted() {
+        let asm = concat!(
+            "f:\n.cfi_startproc\n",
+            "    leaq bins(%rip), %r9\n",
+            "    addq $1, (%r9, %rax, 8)\n",
+            "    leaq bins(%rip), %r9\n",
+            "    addq $1, (%r9, %rdx, 8)\n",
+            "    ret\n.cfi_endproc\n",
+        );
+        let out = crate::backend::x86::codegen::peephole::peephole_optimize(asm.to_string());
+        assert_eq!(
+            out.matches("leaq bins(%rip), %r9").count(),
+            1,
+            "the redundant redef must go:\n{out}"
+        );
+    }
+
+    #[test]
+    fn rip_lea_home_dies_on_write() {
+        // `addq $5, %r9` clobbers the home with a USED value (stored to
+        // memory), so the second lea is NOT a redundant redef — two distinct
+        // materializations must remain.
+        let asm = concat!(
+            "f:\n.cfi_startproc\n",
+            "    leaq bins(%rip), %r9\n",
+            "    addq $5, %r9\n",
+            "    addq %r9, %r8\n",
+            "    leaq bins(%rip), %r9\n",
+            "    movq %r9, (%rdi)\n",
+            "    movq %r8, (%rsi)\n",
+            "    ret\n.cfi_endproc\n",
+        );
+        let out = crate::backend::x86::codegen::peephole::peephole_optimize(asm.to_string());
+        assert_eq!(
+            out.matches("leaq bins(%rip)").count(),
+            2,
+            "the second lea is NOT redundant after the clobber:\n{out}"
+        );
+    }
+
     use super::super::super::peephole_optimize;
     use super::{SibAddr, compose_sib, operand_start, parse_disp, splice_lea_into_mem_operand};
 

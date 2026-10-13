@@ -640,6 +640,45 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) 
                 i = j + 1;
                 continue;
             }
+            // ── commuted adjacent fuse: fresh load feeds a writing
+            // commutative op ────────────────────────────────────────────────
+            // `movq (q), %rdx ; imulq %rax, %rdx` is `rdx = rax * [q]`, one
+            // memory-reading RMW away from the loop GCC emits: commuting the
+            // consumer and folding the load gives `imulq (q), %rax` — the
+            // product lands in the OTHER operand's family, so every later use
+            // of the product is renamed %rdx→%rax.  The load is ADJACENT to
+            // the consumer (gap == 0): nothing is reordered across it, so the
+            // volatile-order discipline holds by construction.  Soundness of
+            // the rename (fail-closed at every step):
+            //   * the fused RMW destroys the other operand's old value, so
+            //     that family must be dead after the consumer;
+            //   * the product's range after the consumer is renamed family-
+            //     consistently; `rename_product_range` vetoes any line that
+            //     touches the result family (stale reads or clobbers), any
+            //     RMW/partial-width kill of the product family, and any
+            //     barrier the product is live over (a call could consume it
+            //     as an argument without a text mention);
+            //   * `%ah`-class spellings veto the rename (no REX encoding).
+            if op_q == load_q
+                && dst == t_fam
+                && src != t_fam
+                && gap == 0
+                && src != 4
+                && dst != 4
+                && COMMUTATIVE_OPS.contains(&op)
+                && lv.live_after(j, src) == Some(false)
+            {
+                if let Some(span_end) = rename_product_range(store, infos, j, dst, src, &lv) {
+                    let new_line =
+                        format!("    {op}{suffix} {mem}, {}", REG_NAMES[width][src as usize]);
+                    mark_nop(&mut infos[i]);
+                    replace_line(store, &mut infos[j], j, new_line);
+                    lv.refresh_span(store, infos, i, span_end);
+                    changed = true;
+                    i = span_end + 1;
+                    continue;
+                }
+            }
             i += 1;
             continue;
         }
@@ -1299,6 +1338,117 @@ fn rename_family(text: &str, from: RegId, to: RegId) -> Option<String> {
     Some(out)
 }
 
+/// `%rsp`'s family id (REG_NAMES[0] index 4): renaming it is never sane.
+const RSP_FAM: RegId = 4;
+
+/// True when `t`'s mentions of `fam` include a partial-width spelling
+/// (16-bit, 8-bit or a high-byte alias) — those do not kill the family.
+fn fam_mentions_partial_width(t: &str, fam: RegId) -> bool {
+    const HIGH: [&str; 4] = ["%ah", "%ch", "%dh", "%bh"];
+    if HIGH.iter().any(|h| t.contains(h)) {
+        // Only the first four families even have high-byte spellings, and a
+        // high-byte touch is a partial-width touch of whichever family it
+        // belongs to; the exact owner does not matter for this predicate
+        // (rename_family independently vetoes these on renamed lines).
+        return true;
+    }
+    let mut rest = t;
+    while let Some(pct) = rest.find('%') {
+        let tok = &rest[pct..];
+        let end = tok[1..]
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .map(|e| e + 1)
+            .unwrap_or(tok.len());
+        let reg = &tok[..end];
+        for w in 2..4 {
+            if reg == REG_NAMES[w][fam as usize] {
+                return true;
+            }
+        }
+        rest = &rest[pct + end..];
+    }
+    false
+}
+
+/// Rename every read of `from` to `to` over `from`'s live range starting just
+/// after `start`, for the commuted-adjacent fuse (the fused RMW wrote the
+/// product into `to`, so `from`'s old value is that same product).
+///
+/// Two-phase (verify the whole span before mutating anything — a late veto
+/// must leave the file untouched). The walk covers exactly the lines the
+/// product is live over and stops at its death:
+///   * a line that touches `to` while the product is live is a stale read or
+///     a clobber → veto;
+///   * a line that writes `from` ends the range: accepted only as a clean
+///     full-width pure def (left in place — `from` gets a fresh value);
+///     RMW or partial-width kills → veto (the product would need both a
+///     renamed read and an unrenamed write);
+///   * any other line reading `from` is renamed with `rename_family`
+///     (which vetoes `%ah`-class spellings);
+///   * once `from` is dead after a line, the range is over — later touches
+///     of `to` are fresh values and none of this walk's business;
+///   * a barrier (label, jump, call, ret, pinned line) met while the product
+///     is still live → veto: a call could consume the product as an argument
+///     without a text mention, so textual checks cannot save a live crossing;
+///   * `%rsp` may never be renamed.
+///
+/// Returns the last index whose text is part of the product's range (the
+/// consumer `start` when nothing needed renaming), or `None` on veto.
+fn rename_product_range(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    start: usize,
+    from: RegId,
+    to: RegId,
+    lv: &FileLiveness,
+) -> Option<usize> {
+    if from == RSP_FAM || to == RSP_FAM {
+        return None;
+    }
+    let len = store.len();
+    let d_bit = 1u16 << from;
+    let t_bit = 1u16 << to;
+    let mut renames: Vec<(usize, String)> = Vec::new();
+    let mut end = start;
+    let mut k = next_insn(store, infos, start + 1, len);
+    while k < len {
+        let info = &infos[k];
+        if !is_window_kind(info.kind) || info.pinned {
+            // The product is live here (the walk only continues while it is),
+            // and a live range cannot cross control flow or side-effect
+            // barriers soundly at text level → veto.
+            return None;
+        }
+        let t = info.trimmed(store.get(k));
+        if info.reg_refs & t_bit != 0 {
+            return None;
+        }
+        if info.reg_refs & d_bit != 0 {
+            if may_write_families(t, info) & d_bit != 0 {
+                // Kill: only a clean full-width pure def ends the range.
+                if super::helpers::is_read_modify_write(t) || fam_mentions_partial_width(t, from) {
+                    return None;
+                }
+                break;
+            }
+            // Pure read of the product: rename (vetoes `%ah` spellings).
+            let new_text = rename_family(store.get(k), from, to)?;
+            renames.push((k, new_text));
+            end = k;
+        }
+        if lv.live_after(k, from) == Some(false) {
+            // Product dead: the range is over. Later `to` touches are fresh
+            // values outside this transform's scope.
+            break;
+        }
+        k = next_insn(store, infos, k + 1, len);
+    }
+    for (r, new_text) in renames {
+        replace_line(store, &mut infos[r], r, new_text);
+    }
+    Some(end)
+}
+
 /// ```text
 ///     movl %ebp, %eax          xorl %ebp, %edi
 ///     xorl %edi, %eax     ->   movzbl %dil, %esi
@@ -1556,6 +1706,65 @@ mod tests {
         let out = body(&run(&asm, fuse_load_into_alu));
         assert!(has(&out, "xorl (%r12,%rsi,4), %ebp"), "{out:?}");
         assert!(!out.iter().any(|l| l.starts_with("movl (%r12")), "{out:?}");
+    }
+
+    #[test]
+    fn fuses_commuting_adjacent_load_with_product_rename() {
+        // The dot-product pair GCC writes as `imulq (b,%i,8), %rax`:
+        // `movq (a), %rax; movq (b), %rdx; imulq %rax, %rdx` commutes and
+        // folds to `imulq (b), %rax`; the product's later uses rename
+        // %rdx→%rax.
+        let asm = format!(
+            "{PRO}    movq (%rsi,%r11,8), %rax\n    movq (%rdi,%r11,8), %rdx\n    imulq %rax, %rdx\n    addq %rdx, %rcx\n    movq $0, %rdx\n    movq %rcx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "imulq (%rdi,%r11,8), %rax"), "{out:?}");
+        assert!(
+            !out.iter().any(|l| l.starts_with("movq (%rdi,%r11,8)")),
+            "{out:?}"
+        );
+        assert!(has(&out, "addq %rax, %rcx"), "{out:?}");
+        assert!(!has(&out, "addq %rdx, %rcx"), "{out:?}");
+        assert!(has(&out, "movq $0, %rdx"), "{out:?}");
+    }
+
+    #[test]
+    fn commuting_adjacent_fuse_refused_when_other_operand_stays_live() {
+        // %rax (the fused RMW's destination) is still used after the
+        // consumer: the product would clobber that value. Refuse.
+        let asm = format!(
+            "{PRO}    movq (%rsi), %rax\n    movq (%rdi), %rdx\n    imulq %rax, %rdx\n    addq %rdx, %rcx\n    addq %rax, %rcx\n    movq %rcx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(!out.iter().any(|l| l == "imulq (%rdi), %rax"), "{out:?}");
+        assert!(has(&out, "movq (%rdi), %rdx"), "{out:?}");
+        assert!(has(&out, "imulq %rax, %rdx"), "{out:?}");
+    }
+
+    #[test]
+    fn commuting_adjacent_fuse_refused_on_high_byte_in_product_range() {
+        // %dh is the product's high byte: renaming it to %ah would change
+        // the REX encoding contract. Refuse the whole fold.
+        let asm = format!(
+            "{PRO}    movq (%rsi), %rax\n    movq (%rdi), %rdx\n    imulq %rax, %rdx\n    addb %dh, %cl\n    movq %rcx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(!out.iter().any(|l| l == "imulq (%rdi), %rax"), "{out:?}");
+        assert!(has(&out, "movq (%rdi), %rdx"), "{out:?}");
+    }
+
+    #[test]
+    fn commuting_adjacent_fuse_stops_rename_at_clean_kill() {
+        // `movq $0, %rdx` is a clean full-width kill: the fresh %rdx value
+        // stays in %rdx while the product's uses before it rename to %rax.
+        let asm = format!(
+            "{PRO}    movq (%rsi), %rax\n    movq (%rdi), %rdx\n    imulq %rax, %rdx\n    addq %rdx, %rcx\n    movq $0, %rdx\n    movq %rdx, (%r8)\n    movq %rcx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "imulq (%rdi), %rax"), "{out:?}");
+        assert!(has(&out, "addq %rax, %rcx"), "{out:?}");
+        assert!(has(&out, "movq $0, %rdx"), "{out:?}");
+        assert!(has(&out, "movq %rdx, (%r8)"), "{out:?}");
     }
 
     #[test]

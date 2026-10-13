@@ -1065,6 +1065,37 @@ pub(super) fn line_writes_memory(t: &str) -> bool {
     if t.starts_with("lock") || t.starts_with("rep") || t.starts_with("movs") && !t.contains('%') {
         return true;
     }
+    // Implicit memory WRITERS with no AT&T memory-operand convention to
+    // rely on: string stores (`stos*`, `ins*` write (%rdi)/(%rdi)), the
+    // streaming store `maskmov*` (writes (%rdi) with two REGISTER operands
+    // — the dst-is-memory check below would misclassify it as a pure read),
+    // and the read-modify-write forms `xchg*`/`cmpxchg*` (either operand
+    // may be the memory one, so the last-operand rule cannot see the write
+    // in `xchg (%rax), %rbx`). Every addition here is toward `true`, so
+    // both consumers (dead store removal, store-forwarding barriers) only
+    // get more conservative.
+    if t.starts_with("stos")
+        || t.starts_with("insb")
+        || t.starts_with("insw")
+        || t.starts_with("insl")
+        || t.starts_with("insd")
+        || t.starts_with("maskmov")
+        || t.starts_with("xchg")
+        || t.starts_with("cmpxchg")
+    {
+        return true;
+    }
+    // Comparisons and tests READ their memory operand even when it sits in
+    // AT&T destination position (`cmpb $0, (%rdx)`, `testq %rax, (%rbx)`):
+    // the last-operand rule below would misfile them as writers. (`cmpxchg*`
+    // is a genuine RMW writer and was handled above.)
+    if t.starts_with("cmp")
+        || t.starts_with("test")
+        || t.starts_with("ucomi")
+        || t.starts_with("comi")
+    {
+        return false;
+    }
     let Some(comma) = last_top_level_comma(t.as_bytes()) else {
         // Single-operand forms that write memory (`incl (%rax)`, `negq (%rax)`).
         return t.contains('(') && !t.starts_with("lea") && !t.starts_with("j");

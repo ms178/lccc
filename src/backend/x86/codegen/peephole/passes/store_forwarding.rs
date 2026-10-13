@@ -1253,6 +1253,27 @@ fn gsf_handle_other(
     }
 
     if infos[i].has_indirect_mem {
+        // A pure memory READ through an unknown pointer cannot change the
+        // contents of a frame slot: the store→load mapping survives ordinary
+        // base-displacement loads and memory-source arithmetic. Only an
+        // actual (or RMW / implicit) memory WRITE may alias the slot, so
+        // `line_writes_memory` — the shared conservative classifier the dead-
+        // writes pass maintains (unrecognized shapes report `true` and stay
+        // barriers) — decides, instead of the old blanket `has_indirect_mem`
+        // kill. That blanket rule kept the scalar-FP square chains of numeric
+        // kernels out of the forwarding window: the nbody d² loop stores its
+        // `dx`/`dy` extracts to spill slots, interleaves plain loads of the
+        // pair coordinates (`movsd (%r11), %xmm4`, `vsubsd 16(%r10), ...`),
+        // and then reloads the slots — reads in between, and the forwarding
+        // never fired, costing two extra slot round-trips in the inner loop.
+        if super::dead_writes::line_writes_memory(infos[i].trimmed(store.get(i))) {
+            invalidate_all_mappings(slot_entries, reg_offsets);
+        }
+    } else if super::dead_writes::line_writes_memory(infos[i].trimmed(store.get(i))) {
+        // Implicit memory writers with NO memory operand at all (`stosq`,
+        // `maskmovq %xmm0, %xmm1`) never set `has_indirect_mem`, but they
+        // can write any address a pointer names — including a frame slot.
+        // `line_writes_memory` knows them; keep them barriers too.
         invalidate_all_mappings(slot_entries, reg_offsets);
     } else if infos[i].rbp_offset != RBP_OFFSET_NONE {
         // A folded memory operand is a RANGE access, not a point: x87
@@ -1962,6 +1983,79 @@ mod tests {
             !(0..store.len()).any(|i| store.get(i).contains("movsd 72(%rsp), %xmm0")),
             "the memory load must be gone"
         );
+    }
+
+    #[test]
+    fn fp_slot_forward_survives_read_only_indirect_lines() {
+        // The nbody d² shape: the extract is spilled to a slot, PLAIN READS
+        // through other pointers follow, and the slot is reloaded. A read
+        // cannot change the slot contents, so the mapping must survive and
+        // the reload must forward — the old blanket `has_indirect_mem` kill
+        // made every such round-trip a double memory stall.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movsd %xmm15, 24(%rsp)\n",
+            "    movsd (%r11), %xmm4\n",
+            "    vsubsd 16(%r10), %xmm4, %xmm4\n",
+            "    movsd 24(%rsp), %xmm6\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (mut store, mut infos) = build_pinned(asm);
+        assert!(global_store_forwarding(&mut store, &mut infos));
+        assert!(
+            (0..store.len()).any(|i| store.get(i).contains("movsd %xmm15, %xmm6")),
+            "the reload must forward to a reg-reg move across read-only loads"
+        );
+        assert!(
+            !(0..store.len()).any(|i| store.get(i).contains("movsd 24(%rsp), %xmm6")),
+            "the memory reload must be gone"
+        );
+    }
+
+    #[test]
+    fn fp_slot_mapping_killed_by_indirect_write() {
+        // Soundness twin of the test above: an unknown-pointer STORE may
+        // alias the frame slot, so the mapping must die and the reload must
+        // stay a real memory load.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movsd %xmm15, 24(%rsp)\n",
+            "    movsd %xmm0, (%rax)\n",
+            "    movsd 24(%rsp), %xmm6\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (mut store, mut infos) = build_pinned(asm);
+        global_store_forwarding(&mut store, &mut infos);
+        assert!(
+            (0..store.len()).any(|i| store.get(i).contains("movsd 24(%rsp), %xmm6")),
+            "the reload must NOT forward across an unknown-pointer store"
+        );
+    }
+
+    #[test]
+    fn fp_slot_mapping_killed_by_rmw_string_writers() {
+        // Implicit memory writers (stos*, maskmov*, xchg with the memory
+        // operand FIRST) have no dst-is-memory shape; `line_writes_memory`
+        // classifies them as writers and they stay barriers.
+        for writer in [
+            "    stosq\n",
+            "    xchg (%rax), %rbx\n",
+            "    maskmovq %xmm0, %xmm1\n",
+        ] {
+            let asm = format!(
+                "f:\n.cfi_startproc\n    movsd %xmm15, 24(%rsp)\n{writer}    movsd 24(%rsp), %xmm6\n    ret\n.cfi_endproc\n"
+            );
+            let (mut store, mut infos) = build_pinned(&asm);
+            global_store_forwarding(&mut store, &mut infos);
+            assert!(
+                (0..store.len()).any(|i| store.get(i).contains("movsd 24(%rsp), %xmm6")),
+                "the reload must NOT forward across `{writer:?}`"
+            );
+        }
     }
 
     #[test]

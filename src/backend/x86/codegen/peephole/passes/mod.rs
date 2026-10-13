@@ -1047,6 +1047,11 @@ fn peephole_optimize_inner(
                 trace("fold_lea_into_load", pass_count, c, &store, &infos);
                 changed |= c;
             }
+            if !sk("cse_symbol_lea") {
+                let c = relay_and_lea::cse_symbol_lea(&mut store, &mut infos);
+                trace("cse_symbol_lea", pass_count, c, &store, &infos);
+                changed |= c;
+            }
         }
         // Flags-aware cleanups: copy+add -> lea (also removes a flags write
         // from between a comparison and its consumer), the setcc/movzbl/test
@@ -1474,6 +1479,7 @@ fn peephole_optimize_inner(
         }
         if !sk("dead_regs") {
             global_changed |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
+            global_changed |= dead_code::eliminate_dead_fp_moves(&store, &mut infos);
             self_zext::eliminate_redundant_self_zext(&store, &mut infos);
         }
         if !sk("dead_stores") {
@@ -1588,6 +1594,7 @@ fn peephole_optimize_inner(
             changed2 |= local_patterns::eliminate_fp_spill_around_load(&mut store, &mut infos);
             if !sk("dead_regs") {
                 changed2 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
+                changed2 |= dead_code::eliminate_dead_fp_moves(&store, &mut infos);
                 self_zext::eliminate_redundant_self_zext(&store, &mut infos);
             }
             if !sk("dead_stores") {
@@ -1680,6 +1687,7 @@ fn peephole_optimize_inner(
             changed3 |= local_patterns::fold_ptr_deref_through_stack(&mut store, &mut infos);
             if !sk("dead_regs") {
                 changed3 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
+                changed3 |= dead_code::eliminate_dead_fp_moves(&store, &mut infos);
                 self_zext::eliminate_redundant_self_zext(&store, &mut infos);
             }
             if !sk("dead_stores") {

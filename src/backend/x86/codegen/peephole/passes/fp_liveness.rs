@@ -394,6 +394,17 @@ fn xmm_mentions(t: &str) -> u64 {
 }
 
 /// Split `t` into (mnemonic, operand text).
+/// True when `t` writes its destination XMM register WITHOUT reading it
+/// (see `is_full_xmm_def`). Exported for `vector_copy::propagate_vector_copies`:
+/// before renaming reads at a destination write it must distinguish true full
+/// defs (`vmulsd %xmmA, %xmmB, %xmmD` — safe to rename through) from
+/// destination-reading writes (`shufps $0x00, %x, %x` — renaming hides the
+/// implicit destination read and later passes mis-kill its feeder).
+pub(super) fn is_full_xmm_def_line(t: &str) -> bool {
+    let (mn, ops) = split_mnemonic(t);
+    is_full_xmm_def(mn, ops)
+}
+
 fn split_mnemonic(t: &str) -> (&str, &str) {
     match t.find(|c: char| c.is_ascii_whitespace()) {
         Some(p) => (&t[..p], t[p..].trim()),
@@ -437,6 +448,20 @@ fn is_full_xmm_def(mn: &str, operands: &str) -> bool {
         | "vmovd" | "lddqu" | "vlddqu" | "movddup" | "vmovddup" | "vbroadcastsd"
         | "vbroadcastss" | "vpbroadcastd" | "vpbroadcastq" | "vpbroadcastb" | "vpbroadcastw"
         | "movshdup" | "movsldup" | "vmovshdup" | "vmovsldup" | "vmovdqa64" | "vmovdqu64" => true,
+        // Immediate-operand shuffles read their SOURCE plus an immediate and
+        // write the whole destination (`pshufd $0x0E, %xmm15, %xmm0` builds
+        // xmm0 from xmm15 alone) — full defs, unlike the register-mask
+        // interleave family (`unpckl*`, `pshufb`, `palignr`) which folds
+        // into the destructive 2-operand form and READS the destination.
+        // `shufps`/`shufpd` do NOT belong here: their legacy 2-operand form
+        // takes result lanes 0..1 from the DESTINATION's old value
+        // (`shufps $0x00, %xmm1, %xmm0` is [xmm0[0], xmm0[0], xmm1[0],
+        // xmm1[0]]) — a hidden dst read every bit as real as `unpcklps`'.
+        // Misclassifying them as full defs let dead-FP-move elimination drop
+        // the `vmovss` reset feeding a splat and turn it into
+        // [s, s, t, t] (bb_slp_v8 C2 miscompile). The VEX 3-operand
+        // spellings are true full defs and classify above.
+        "pshufd" | "pshufhw" | "pshuflw" => true,
         // Packed conversions define the whole destination.
         "cvtdq2pd" | "cvtdq2ps" | "cvtpd2ps" | "cvtps2pd" | "cvttpd2dq" | "cvttps2dq"
         | "cvtpd2dq" | "cvtps2dq" | "vcvtdq2pd" | "vcvtdq2ps" | "vcvtpd2ps" | "vcvtps2pd"

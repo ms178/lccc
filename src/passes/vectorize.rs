@@ -2818,20 +2818,7 @@ fn analyze_reduction_pattern(
             return None;
         }
         let latch_label = func.blocks[latch_idx].label;
-        let mut iv_init = None;
-        for inst in &header.instructions {
-            if let Instruction::Phi { dest, incoming, .. } = inst {
-                if *dest == iv {
-                    for (op, lbl) in incoming {
-                        if *lbl != latch_label {
-                            if let Operand::Const(c) = op {
-                                iv_init = c.to_i64();
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let iv_init = iv_init_const(func, header_idx, iv, latch_label);
         let Some(iv_init) = iv_init else {
             if debug {
                 eprintln!("[VEC-RED]   Max-reduction IV init is not a constant");
@@ -2891,10 +2878,23 @@ fn analyze_reduction_pattern(
                 }
             }
         }
+        // (c) A direct IV-indexed GEP with iv_init == c != 0, admitted when
+        //     the byte-offset IV form is available for the access: the byte
+        //     counter is rescaled to start at the ABSOLUTE byte position
+        //     c*elem and steps elem*vec_width, the bound is the matching
+        //     absolute byte stop c*elem + ((n-c)/w)*stride, and the remainder
+        //     (absolute addressing under the byte IV) resumes at element
+        //     c + w*iters with the plain limit n. Without the byte IV the
+        //     scaled-GEP fallback cannot express a nonzero start, so c != 0
+        //     keeps requirement (a) there.
+        //
         // `gep_is_iv_indexed && iv_init == 0` is shape (b); it needs no
         // pointer check because there is no separate pointer to match.
         let iv_indexed_zero_start = gep_is_iv_indexed && iv_init == 0;
-        if !ptr_init_ok && !iv_indexed_zero_start {
+        let iv_indexed_byte_start = gep_is_iv_indexed
+            && iv_init != 0
+            && find_reduction_byte_iv(func, &loop_info.body, array_gep, 4).is_some();
+        if !ptr_init_ok && !iv_indexed_zero_start && !iv_indexed_byte_start {
             if debug {
                 eprintln!(
                     "[VEC-RED]   Min/Max-reduction pointer/IV init mismatch \
@@ -15804,6 +15804,19 @@ fn offset_is_canonical_unit_stride(
                 return c.to_i64() == Some(elem_size.trailing_zeros() as i64)
                     && scaled_operand_is_iv(func, *a, iv, iv_derived);
             }
+            // `i + i` is the SIB-preserved spelling of `i * 2`: the SIB cost
+            // rule keeps the doubled add form alive, so the map matcher must
+            // accept it as the canonical `iv * elem_size` offset for 2-byte
+            // elements. Generalizing the matcher (rather than forcing the
+            // addressing back to mul/shl) preserves the SIB win.
+            Instruction::BinOp {
+                op: IrBinOp::Add,
+                lhs: Operand::Value(a),
+                rhs: Operand::Value(b),
+                ..
+            } if a == b => {
+                return elem_size == 2 && scaled_operand_is_iv(func, *a, iv, iv_derived);
+            }
             _ => return false,
         }
     }
@@ -16988,6 +17001,31 @@ fn offset_is_index_times(
     false
 }
 
+/// Constant preheader initialization of `iv` (the phi incoming that is NOT
+/// the latch's). Shared by the Min/Max matcher's coverage shapes and by the
+/// remainder's c-relative start math — one scan, one truth.
+fn iv_init_const(
+    func: &IrFunction,
+    header_idx: usize,
+    iv: Value,
+    latch_label: BlockId,
+) -> Option<i64> {
+    for inst in &func.blocks[header_idx].instructions {
+        if let Instruction::Phi { dest, incoming, .. } = inst {
+            if *dest == iv {
+                for (op, lbl) in incoming {
+                    if *lbl != latch_label {
+                        if let Operand::Const(c) = op {
+                            return c.to_i64();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn find_reduction_byte_iv(
     func: &IrFunction,
     loop_blocks: &FxHashSet<usize>,
@@ -17073,6 +17111,23 @@ fn find_reduction_byte_iv(
                                 };
                                 if let Some(v) = iv_op {
                                     return Some((*base, v));
+                                }
+                            }
+                            // `i + i` is the SIB-preserved spelling of `i * 2`
+                            // (2-byte elements): recover the unscaled index
+                            // from the doubled add form.
+                            Instruction::BinOp {
+                                op: IrBinOp::Add,
+                                lhs,
+                                rhs,
+                                ..
+                            } => {
+                                if elem_size == 2 {
+                                    if let (Operand::Value(a), Operand::Value(b)) = (lhs, rhs) {
+                                        if a == b {
+                                            return Some((*base, *a));
+                                        }
+                                    }
                                 }
                             }
                             _ => {}
@@ -20755,22 +20810,13 @@ fn insert_reduction_remainder_loop(
     // addresses RELATIVE to element c (the pointer's preheader value). Its
     // start index is w*(iv_final - c) and its limit is n - c.
     let max_shift: i64 = if matches!(pattern.kind, ReductionKind::Max | ReductionKind::Min) {
-        let latch_label = func.blocks[pattern.latch_idx].label;
-        let mut c = 0i64;
-        for inst in &func.blocks[pattern.header_idx].instructions {
-            if let Instruction::Phi { dest, incoming, .. } = inst {
-                if *dest == pattern.iv {
-                    for (op, lbl) in incoming {
-                        if *lbl != latch_label {
-                            if let Operand::Const(k) = op {
-                                c = k.to_i64().unwrap_or(0);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        c
+        iv_init_const(
+            func,
+            pattern.header_idx,
+            pattern.iv,
+            func.blocks[pattern.latch_idx].label,
+        )
+        .unwrap_or(0)
     } else {
         0
     };
@@ -20947,8 +20993,11 @@ fn insert_reduction_remainder_loop(
             }
         });
         // Max with IV init c != 0: start = w*iv_final - w*c (relative to
-        // element c), and a dynamic limit becomes n - c.
-        if max_shift != 0 {
+        // element c), and a dynamic limit becomes n - c. Under the byte-offset
+        // IV the counter is ABSOLUTE (it started at the rescaled c*elem byte
+        // position), so the remainder start is already the absolute element
+        // index and the c-relative adjustment must not run.
+        if max_shift != 0 && !byte_offset_iv {
             instructions.push(Instruction::BinOp {
                 dest: i_rem_start,
                 op: IrBinOp::Sub,
@@ -21011,10 +21060,11 @@ fn insert_reduction_remainder_loop(
         dest: i_rem_cmp,
         op: IrCmpOp::Slt,
         lhs: Operand::Value(i_rem_iv),
-        rhs: if max_shift != 0 {
+        rhs: if max_shift != 0 && !byte_offset_iv {
             // Max with IV init c != 0: the remainder counts RELATIVE to
-            // element c, so the bound is n - c (folded for constants, the
-            // vec_exit Sub for dynamic limits).
+            // element c (marching-pointer form), so the bound is n - c
+            // (folded for constants, the vec_exit Sub for dynamic limits).
+            // The byte-offset IV counts absolutely: plain limit n.
             match &pattern.limit {
                 Operand::Const(IrConst::I32(n)) => {
                     Operand::Const(IrConst::I32(n - max_shift as i32))
@@ -21444,6 +21494,7 @@ fn emit_invariant_vector_bound(
     vec_width: u64,
     byte_stride: u64,
     use_byte_iv: bool,
+    start_elem: i64,
     next_val_id: &mut u32,
     debug: bool,
 ) -> (Operand, usize) {
@@ -21514,6 +21565,31 @@ fn emit_invariant_vector_bound(
         _ => IrConst::I64(v as i64),
     };
 
+    // Shape (c) support: under the byte-offset IV the counter is ABSOLUTE,
+    // so a nonzero element start c turns the stop into
+    //     c*elem + ((limit - c) / w) * stride
+    // via sub (limit - c), div (/ w), mul (* stride), add (+ c*elem). The
+    // element-index scheme keeps the plain `limit / w`: its IV starts at c
+    // and the exit compare is `iv < bound`, so subtracting c there would
+    // steal c iterations the marching-pointer remainder (max_shift) still
+    // assumes. c == 0 skips the sub/add entirely.
+    let use_start = use_byte_iv && start_elem != 0;
+    let start_byte = start_elem * (byte_stride / vec_width.max(1)) as i64;
+
+    let sub_dest = Value(*next_val_id);
+    let sub_inst = if use_start {
+        *next_val_id += 1;
+        Some(Instruction::BinOp {
+            dest: sub_dest,
+            op: IrBinOp::Sub,
+            lhs: Operand::Value(limit_val),
+            rhs: Operand::Const(const_of(start_elem as u64)),
+            ty: limit_ty,
+        })
+    } else {
+        None
+    };
+
     let div_dest = Value(*next_val_id);
     *next_val_id += 1;
     let div_inst = Instruction::BinOp {
@@ -21523,7 +21599,11 @@ fn emit_invariant_vector_bound(
         } else {
             IrBinOp::UDiv
         },
-        lhs: Operand::Value(limit_val),
+        lhs: if use_start {
+            Operand::Value(sub_dest)
+        } else {
+            Operand::Value(limit_val)
+        },
         rhs: Operand::Const(const_of(if width_pow2 {
             vec_width.trailing_zeros() as u64
         } else {
@@ -21557,26 +21637,40 @@ fn emit_invariant_vector_bound(
         None
     };
 
-    let has_byte_limit = byte_limit_inst.is_some();
+    let add_dest = Value(*next_val_id);
+    let add_inst = if use_start {
+        *next_val_id += 1;
+        Some(Instruction::BinOp {
+            dest: add_dest,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(mul_dest),
+            rhs: Operand::Const(const_of(start_byte as u64)),
+            ty: limit_ty,
+        })
+    } else {
+        None
+    };
+
+    let mut chain: Vec<Instruction> = Vec::with_capacity(4);
+    chain.extend(sub_inst);
+    chain.push(div_inst);
+    chain.extend(byte_limit_inst);
+    chain.extend(add_inst);
+    let added = chain.len();
+
     match preheader_idx {
         Some(pre_idx) => {
-            func.blocks[pre_idx].instructions.push(div_inst);
-            if let Some(mul_inst) = byte_limit_inst {
-                func.blocks[pre_idx].instructions.push(mul_inst);
-            }
+            func.blocks[pre_idx].instructions.extend(chain);
         }
         None => {
-            func.blocks[pattern.header_idx]
-                .instructions
-                .insert(pattern.exit_cmp_inst_idx, div_inst);
-            if let Some(mul_inst) = byte_limit_inst {
+            let at = pattern.exit_cmp_inst_idx;
+            for (k, inst) in chain.into_iter().enumerate() {
                 func.blocks[pattern.header_idx]
                     .instructions
-                    .insert(pattern.exit_cmp_inst_idx + 1, mul_inst);
+                    .insert(at + k, inst);
             }
         }
     }
-    let added = 1 + has_byte_limit as usize;
 
     if debug {
         eprintln!(
@@ -21590,7 +21684,9 @@ fn emit_invariant_vector_bound(
         );
     }
 
-    let bound = if has_byte_limit {
+    let bound = if use_start {
+        Operand::Value(add_dest)
+    } else if use_byte_iv {
         Operand::Value(mul_dest)
     } else {
         Operand::Value(div_dest)
@@ -21828,18 +21924,60 @@ fn transform_reduction_avx2(
             sec_byte_iv_a.is_some() && (sec.array_b_gep.is_none() || sec_byte_iv_b.is_some());
     }
 
-    // Step 1: Divide loop bound by vector width (byte limit under byte-offset IV)
+    // Shape (c) byte-IV init rescale: with a nonzero constant start c the
+    // byte counter must begin at the ABSOLUTE byte position of element c
+    // (c*elem), not at the element index — under the byte-IV scheme the GEP
+    // offset IS the counter. c == 0 is a no-op; loops without a byte IV keep
+    // their element-counting IV and the marching-pointer remainder's
+    // c-relative math (max_shift).
+    let start_c = iv_init_const(
+        func,
+        pattern.header_idx,
+        pattern.iv,
+        func.blocks[pattern.latch_idx].label,
+    )
+    .unwrap_or(0);
+    if use_byte_iv && start_c != 0 {
+        let latch_lbl = func.blocks[pattern.latch_idx].label;
+        for inst in &mut func.blocks[pattern.header_idx].instructions {
+            if let Instruction::Phi { dest, incoming, .. } = inst {
+                if *dest == pattern.iv {
+                    for (op, lbl) in incoming.iter_mut() {
+                        if *lbl != latch_lbl {
+                            if let Operand::Const(k) = op {
+                                let scaled = k.to_i64().unwrap_or(0) * elem_sz as i64;
+                                *op = match k {
+                                    IrConst::I32(_) => Operand::Const(IrConst::I32(scaled as i32)),
+                                    _ => Operand::Const(IrConst::I64(scaled)),
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 1: Divide loop bound by vector width (byte limit under byte-offset
+    // IV). The byte-IV stop is ABSOLUTE: c*elem + ((n-c)/w)*stride — the
+    // counter starts at c*elem and steps stride bytes per vector iteration,
+    // so ((n-c)/w) iterations land on c*elem + ((n-c)/w)*stride and the scalar
+    // remainder (absolute element index) resumes at c + ((n-c)/w)*w.
     let divided_limit = match &pattern.limit {
         Operand::Const(IrConst::I32(n)) => {
             if use_byte_iv {
-                Operand::Const(IrConst::I32((*n / vec_width as i32) * byte_stride as i32))
+                let nc = *n as i64 - start_c;
+                let bound = start_c * elem_sz as i64 + (nc / vec_width as i64) * byte_stride as i64;
+                Operand::Const(IrConst::I32(bound as i32))
             } else {
                 Operand::Const(IrConst::I32(*n / vec_width as i32))
             }
         }
         Operand::Const(IrConst::I64(n)) => {
             if use_byte_iv {
-                Operand::Const(IrConst::I64((*n / vec_width as i64) * byte_stride as i64))
+                let nc = *n - start_c;
+                let bound = start_c * elem_sz as i64 + (nc / vec_width as i64) * byte_stride as i64;
+                Operand::Const(IrConst::I64(bound))
             } else {
                 Operand::Const(IrConst::I64(*n / vec_width as i64))
             }
@@ -21852,6 +21990,7 @@ fn transform_reduction_avx2(
                 vec_width,
                 byte_stride,
                 use_byte_iv,
+                start_c,
                 &mut next_val_id,
                 debug,
             );
@@ -23083,18 +23222,60 @@ fn transform_reduction_sse2(
             sec_byte_iv_a.is_some() && (sec.array_b_gep.is_none() || sec_byte_iv_b.is_some());
     }
 
-    // Step 1: Divide loop bound by vector width (byte limit under byte-offset IV)
+    // Shape (c) byte-IV init rescale: with a nonzero constant start c the
+    // byte counter must begin at the ABSOLUTE byte position of element c
+    // (c*elem), not at the element index — under the byte-IV scheme the GEP
+    // offset IS the counter. c == 0 is a no-op; loops without a byte IV keep
+    // their element-counting IV and the marching-pointer remainder's
+    // c-relative math (max_shift).
+    let start_c = iv_init_const(
+        func,
+        pattern.header_idx,
+        pattern.iv,
+        func.blocks[pattern.latch_idx].label,
+    )
+    .unwrap_or(0);
+    if use_byte_iv && start_c != 0 {
+        let latch_lbl = func.blocks[pattern.latch_idx].label;
+        for inst in &mut func.blocks[pattern.header_idx].instructions {
+            if let Instruction::Phi { dest, incoming, .. } = inst {
+                if *dest == pattern.iv {
+                    for (op, lbl) in incoming.iter_mut() {
+                        if *lbl != latch_lbl {
+                            if let Operand::Const(k) = op {
+                                let scaled = k.to_i64().unwrap_or(0) * elem_sz as i64;
+                                *op = match k {
+                                    IrConst::I32(_) => Operand::Const(IrConst::I32(scaled as i32)),
+                                    _ => Operand::Const(IrConst::I64(scaled)),
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 1: Divide loop bound by vector width (byte limit under byte-offset
+    // IV). The byte-IV stop is ABSOLUTE: c*elem + ((n-c)/w)*stride — the
+    // counter starts at c*elem and steps stride bytes per vector iteration,
+    // so ((n-c)/w) iterations land on c*elem + ((n-c)/w)*stride and the scalar
+    // remainder (absolute element index) resumes at c + ((n-c)/w)*w.
     let divided_limit = match &pattern.limit {
         Operand::Const(IrConst::I32(n)) => {
             if use_byte_iv {
-                Operand::Const(IrConst::I32((*n / vec_width as i32) * byte_stride as i32))
+                let nc = *n as i64 - start_c;
+                let bound = start_c * elem_sz as i64 + (nc / vec_width as i64) * byte_stride as i64;
+                Operand::Const(IrConst::I32(bound as i32))
             } else {
                 Operand::Const(IrConst::I32(*n / vec_width as i32))
             }
         }
         Operand::Const(IrConst::I64(n)) => {
             if use_byte_iv {
-                Operand::Const(IrConst::I64((*n / vec_width as i64) * byte_stride as i64))
+                let nc = *n - start_c;
+                let bound = start_c * elem_sz as i64 + (nc / vec_width as i64) * byte_stride as i64;
+                Operand::Const(IrConst::I64(bound))
             } else {
                 Operand::Const(IrConst::I64(*n / vec_width as i64))
             }
@@ -23107,6 +23288,7 @@ fn transform_reduction_sse2(
                 vec_width,
                 byte_stride,
                 use_byte_iv,
+                start_c,
                 &mut next_val_id,
                 debug,
             );

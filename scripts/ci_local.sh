@@ -221,6 +221,14 @@ gate "audit-loop-contracts" fast \
 gate "ivsr-integer-domains" fast \
     env CCC="$LCCC" bash tests/regression/check_ivsr_domains.sh
 
+# nbody pair-loop family: vector-memory `(base, index, disp)` triples and
+# GEP offsets through GVN Copy glue join one pointer recurrence, affine
+# siblings chain (no second recurrence).  Pins the SHAPE (zero stride
+# multiplies, one hoisted base materialisation) and the correctness of the
+# transform at every opt level, ILP32, and under the ptr-add kill switch.
+gate "ivsr-vecaddr-struct-walk" fast \
+    env CCC="$LCCC" bash tests/regression/check_ivsr_vecaddr_struct_walk.sh
+
 # Executed miscompile regression for the iv_widen trajectory gates and the
 # exposed-latch intercept: runtime ring-top seeds over a 2^32-span marker
 # buffer, gcc-parity matrix (-O0..-O3 x {default, kill switch, -m32 SKIP}).
