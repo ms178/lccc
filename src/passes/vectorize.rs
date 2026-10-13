@@ -2858,7 +2858,7 @@ mod minmax_reduction_legality_tests {
                 ty: IrType::Ptr,
                 incoming: vec![
                     (Operand::Value(Value(10)), BlockId(0)),
-                    (Operand::Value(Value(6)), BlockId(3)),
+                    (Operand::Value(Value(11)), BlockId(3)),
                 ],
             },
         );
@@ -31865,7 +31865,7 @@ mod range_fusion_tests {
 #[cfg(test)]
 mod map_fp_select_tests {
     use super::*;
-    use crate::ir::reexports::{BasicBlock, BlockId, IrConst, Terminator};
+    use crate::ir::reexports::{BasicBlock, BlockId, IrConst, IrParam, Terminator};
 
     fn blk(label: u32, insts: Vec<Instruction>, term: Terminator) -> BasicBlock {
         BasicBlock {
@@ -31876,8 +31876,21 @@ mod map_fp_select_tests {
         }
     }
 
+    fn param(ty: IrType) -> IrParam {
+        IrParam {
+            ty,
+            noalias: false,
+            struct_size: None,
+            struct_align: None,
+            param_align: None,
+            struct_eightbyte_classes: Vec::new(),
+            is_f128_sse: false,
+            riscv_float_class: None,
+        }
+    }
+
     /// Canonical vectorizer loop around `d[i] = <store_value_inst>`:
-    /// entry (params d,a,b,n) -> header (U64 iv phi + exit test) -> body ->
+    /// entry (params d,a,b,n) -> header (U32 iv phi + exit test) -> body ->
     /// backedge -> exit.  `body_tail` builds the store-value computation on
     /// top of the two stream loads (loads at value ids 20/21).
     fn build_loop(
@@ -31885,7 +31898,17 @@ mod map_fp_select_tests {
         body_tail: impl FnOnce(&mut u32, u32, u32) -> Vec<Instruction>,
     ) -> IrFunction {
         let mut next = 40u32;
-        let mut f = IrFunction::new("map".into(), IrType::I32, vec![], false);
+        let mut f = IrFunction::new(
+            "map".into(),
+            IrType::Void,
+            vec![
+                param(IrType::Ptr),
+                param(IrType::Ptr),
+                param(IrType::Ptr),
+                param(IrType::U32),
+            ],
+            false,
+        );
         // Entry: params d,a,b,n (ids 0..3), branch to header.
         f.blocks.push(blk(
             0,
@@ -31893,22 +31916,22 @@ mod map_fp_select_tests {
                 Instruction::ParamRef {
                     dest: Value(0),
                     param_idx: 0,
-                    ty: IrType::F32,
+                    ty: IrType::Ptr,
                 },
                 Instruction::ParamRef {
                     dest: Value(1),
                     param_idx: 1,
-                    ty: IrType::F32,
+                    ty: IrType::Ptr,
                 },
                 Instruction::ParamRef {
                     dest: Value(2),
                     param_idx: 2,
-                    ty: IrType::F32,
+                    ty: IrType::Ptr,
                 },
                 Instruction::ParamRef {
                     dest: Value(3),
                     param_idx: 3,
-                    ty: IrType::U64,
+                    ty: IrType::U32,
                 },
             ],
             Terminator::Branch(BlockId(1)),
@@ -31919,9 +31942,9 @@ mod map_fp_select_tests {
             vec![
                 Instruction::Phi {
                     dest: Value(10),
-                    ty: IrType::U64,
+                    ty: IrType::U32,
                     incoming: vec![
-                        (Operand::Const(IrConst::I64(0)), BlockId(0)),
+                        (Operand::Const(IrConst::I32(0)), BlockId(0)),
                         (Operand::Value(Value(11)), BlockId(2)),
                     ],
                 },
@@ -31930,7 +31953,7 @@ mod map_fp_select_tests {
                     op: IrCmpOp::Ult,
                     lhs: Operand::Value(Value(10)),
                     rhs: Operand::Value(Value(3)),
-                    ty: IrType::U64,
+                    ty: IrType::U32,
                 },
             ],
             Terminator::CondBranch {
@@ -31949,6 +31972,14 @@ mod map_fp_select_tests {
             vec![(1, 20)]
         };
         for (base, id) in streams {
+            let wide_iv = Value(next);
+            next += 1;
+            body.push(Instruction::Cast {
+                dest: wide_iv,
+                src: Operand::Value(Value(10)),
+                from_ty: IrType::U32,
+                to_ty: IrType::I64,
+            });
             let shl = Value(next);
             next += 1;
             let gep = Value(next);
@@ -31956,7 +31987,7 @@ mod map_fp_select_tests {
             body.push(Instruction::BinOp {
                 dest: shl,
                 op: IrBinOp::Shl,
-                lhs: Operand::Value(Value(10)),
+                lhs: Operand::Value(wide_iv),
                 rhs: Operand::Const(IrConst::I32(2)),
                 ty: IrType::I64,
             });
@@ -31975,6 +32006,14 @@ mod map_fp_select_tests {
             });
         }
         body.extend(body_tail(&mut next, 20, 21));
+        let wide_iv = Value(next);
+        next += 1;
+        body.push(Instruction::Cast {
+            dest: wide_iv,
+            src: Operand::Value(Value(10)),
+            from_ty: IrType::U32,
+            to_ty: IrType::I64,
+        });
         let shl = Value(next);
         next += 1;
         let gep = Value(next);
@@ -31982,7 +32021,7 @@ mod map_fp_select_tests {
         body.push(Instruction::BinOp {
             dest: shl,
             op: IrBinOp::Shl,
-            lhs: Operand::Value(Value(10)),
+            lhs: Operand::Value(wide_iv),
             rhs: Operand::Const(IrConst::I32(2)),
             ty: IrType::I64,
         });
@@ -32003,8 +32042,8 @@ mod map_fp_select_tests {
             dest: Value(11),
             op: IrBinOp::Add,
             lhs: Operand::Value(Value(10)),
-            rhs: Operand::Const(IrConst::I64(1)),
-            ty: IrType::U64,
+            rhs: Operand::Const(IrConst::I32(1)),
+            ty: IrType::U32,
         });
         f.blocks.push(blk(2, body, Terminator::Branch(BlockId(1))));
         // Exit.
@@ -32018,8 +32057,13 @@ mod map_fp_select_tests {
         let loops =
             loop_analysis::find_natural_loops(func.blocks.len(), &cfg.preds, &cfg.succs, &cfg.idom);
         let loop_info = &loops[0];
-        let pattern =
-            analyze_map_pattern(func, loop_info, false).expect("canonical select loop must parse");
+        take_reject();
+        let pattern = analyze_map_pattern(func, loop_info, false).unwrap_or_else(|| {
+            panic!(
+                "canonical select loop must parse: {}",
+                take_reject().unwrap_or("no rejection reason recorded")
+            )
+        });
         pattern.expr
     }
 

@@ -2048,16 +2048,17 @@ mod tests {
 
     #[test]
     fn commuting_adjacent_fuse_keeps_full_width_self_move_reads_live() {
-        // The q-width self move is a semantic no-op rather than a kill. The
-        // subsequent product consumer must still be renamed to the fused
-        // destination; this pins the full-width form separately from movl.
+        // This one-register return marks %rdx dead at ret; without that ABI
+        // fact the product in %rdx is observable and the fold must be refused.
+        // The q-width self move is a semantic no-op rather than a kill, so it
+        // follows the product to the fused destination (unlike a movl kill).
         let asm = format!(
-            "{PRO}    movq (%rsi), %rax\n    movq (%rdi), %rdx\n    imulq %rax, %rdx\n    addq %rdx, %rcx\n    movq %rdx, %rdx\n    movq %rdx, (%r8)\n    movq %rcx, %rax\n{EPI}"
+            "{PRO}    # LCCC_RET_RDX 0\n    movq (%rsi), %rax\n    movq (%rdi), %rdx\n    imulq %rax, %rdx\n    addq %rdx, %rcx\n    movq %rdx, %rdx\n    movq %rdx, (%r8)\n    movq %rcx, %rax\n{EPI}"
         );
         let out = body(&run(&asm, fuse_load_into_alu));
         assert!(has(&out, "imulq (%rdi), %rax"), "{out:?}");
         assert!(has(&out, "addq %rax, %rcx"), "{out:?}");
-        assert!(has(&out, "movq %rdx, %rdx"), "{out:?}");
+        assert!(has(&out, "movq %rax, %rax"), "{out:?}");
         assert!(has(&out, "movq %rax, (%r8)"), "{out:?}");
     }
 
@@ -2078,11 +2079,11 @@ mod tests {
 
     #[test]
     fn commuting_adjacent_fuse_rehomes_a_single_family_rmw_product_update() {
-        // This RMW reads the product and produces its next value. Rehome the
-        // whole update to the fused destination rather than treating the write
-        // to %rdx as a clean kill or refusing the safe single-family form.
+        // This one-register return marks %rdx dead at ret. The RMW reads the
+        // product and produces its next value, so rehome the whole update to
+        // the fused destination rather than treating it as a clean kill.
         let asm = format!(
-            "{PRO}    movq (%rsi), %rax\n    movq (%rdi), %rdx\n    imulq %rax, %rdx\n    addq %rdx, %rcx\n    addq %r8, %rdx\n    movq %rdx, (%r9)\n    movq %rcx, %rax\n{EPI}"
+            "{PRO}    # LCCC_RET_RDX 0\n    movq (%rsi), %rax\n    movq (%rdi), %rdx\n    imulq %rax, %rdx\n    addq %rdx, %rcx\n    addq %r8, %rdx\n    movq %rdx, (%r9)\n    movq %rcx, %rax\n{EPI}"
         );
         let out = body(&run(&asm, fuse_load_into_alu));
         assert!(has(&out, "imulq (%rdi), %rax"), "{out:?}");
