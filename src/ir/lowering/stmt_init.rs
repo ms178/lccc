@@ -430,7 +430,21 @@ impl Lowerer {
             .enumerate()
             .map(|(i, p)| {
                 if param_struct_sizes.get(i).copied().flatten().is_some() {
-                    if let Some(layout) = self.get_struct_layout_for_type(&p.type_spec) {
+                    if crate::common::types::target_elf_machine() == 62 {
+                        // AUD-VABI-1: same rule as the definition path -- a
+                        // vector argument is ONE xmm register (SSE + SSEUP),
+                        // not a two-GP by-value struct.  Declarations matter
+                        // because the call site reads its classification from
+                        // this signature.
+                        match self.type_spec_to_ctype(&p.type_spec).sysv_vector_carrier() {
+                            Some((classes, _)) => classes,
+                            None => match self.get_struct_layout_for_type(&p.type_spec) {
+                                Some(layout) => layout
+                                    .classify_sysv_eightbytes(&*self.types.borrow_struct_layouts()),
+                                None => Vec::new(),
+                            },
+                        }
+                    } else if let Some(layout) = self.get_struct_layout_for_type(&p.type_spec) {
                         layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts())
                     } else {
                         Vec::new()

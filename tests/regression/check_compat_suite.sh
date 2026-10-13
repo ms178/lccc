@@ -1,43 +1,64 @@
-#!/bin/bash
-# LCCC vs GCC Compatibility Test Suite
-# Tests real-world C patterns from simple to complex
+#!/usr/bin/env bash
+# LCCC vs GCC compatibility suite: real-world C patterns, simple to complex,
+# compared by RUNNING both compilers' output and diffing stdout (a program that
+# compiles but prints the wrong thing is exactly the class the corpus' compile-
+# only legs cannot see).
+#
+# AUD-HYGIENE-1: this suite used to live at tests/compat_test.sh, unreferenced by
+# any workflow, writing through fixed `/tmp/lccc_test*` paths and always exiting
+# 0 -- so it could not fail anything, and two concurrent runs clobbered each
+# other's binaries.  It is a gate now: private scratch directory, the compiler
+# under test comes from $CCC (the repo's gate convention), and the exit status
+# reports the verdict.
+#
+# Usage: CCC=target/fastbuild/lccc bash tests/regression/check_compat_suite.sh
+set -euo pipefail
 
-set -e
+repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+ccc=${CCC:-$repo/target/fastbuild/lccc}
 GCC_INC="-I$(gcc -print-file-name=include)"
-LCCC="${LCCC_BIN:-./target/release/lccc} $GCC_INC -O2"
+LCCC="$ccc $GCC_INC -O2"
 GCC="gcc -O2"
+td=$(mktemp -d)
+trap 'rm -rf "$td"' EXIT
 PASS=0
 FAIL=0
 SKIP=0
 TOTAL=0
 
+# test_program <name> <source> -- compile and run the program with GCC and with
+# LCCC, and require identical stdout+stderr.  There is no third "expected
+# output" argument: GCC's output IS the expectation, so a test can never pass by
+# agreeing with a hand-written string that both compilers disagree with.
 test_program() {
     local name="$1"
     local src="$2"
-    local expected="$3"
     TOTAL=$((TOTAL + 1))
 
-    echo "$src" > /tmp/lccc_test.c
+    printf '%s\n' "$src" > "$td/test.c"
 
     # Compile with GCC (reference)
-    if ! $GCC -o /tmp/lccc_test_gcc /tmp/lccc_test.c -lm 2>/dev/null; then
+    if ! $GCC -o "$td/gcc" "$td/test.c" -lm 2>"$td/gcc.err"; then
         echo "SKIP  $name (GCC compile failed)"
         SKIP=$((SKIP + 1))
         return
     fi
 
     # Get GCC output
-    local gcc_out=$(/tmp/lccc_test_gcc 2>&1 || true)
+    local gcc_out
+    gcc_out=$("$td/gcc" 2>&1 || true)
 
     # Compile with LCCC
-    if ! $LCCC -o /tmp/lccc_test_lccc /tmp/lccc_test.c -lm 2>/dev/null; then
+    if ! $LCCC -o "$td/lccc" "$td/test.c" -lm 2>"$td/lccc.err"; then
         echo "FAIL  $name (LCCC compile failed)"
+        sed 's/^/      /' "$td/lccc.err" >&2
         FAIL=$((FAIL + 1))
         return
     fi
 
     # Get LCCC output
-    local lccc_out=$(/tmp/lccc_test_lccc 2>&1 || true)
+    local lccc_out
+    lccc_out=$("$td/lccc" 2>&1 || true)
 
     if [ "$gcc_out" = "$lccc_out" ]; then
         echo "PASS  $name"
@@ -312,3 +333,6 @@ int main() {
 # --- Summary ---
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed, $SKIP skipped (of $TOTAL) ==="
+[ "$FAIL" -eq 0 ] || { echo "FAIL: $FAIL compatibility test(s) disagreed with GCC" >&2; exit 1; }
+[ "$PASS" -gt 0 ] || { echo "FAIL: no compatibility test ran" >&2; exit 1; }
+echo "PASS: every compatibility program matched GCC"

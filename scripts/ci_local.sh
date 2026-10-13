@@ -212,6 +212,12 @@ gate "empty-aggregate-abi" fast \
 gate "aggregate-call-abi" fast \
     env CCC="$LCCC" bash tests/regression/check_aggregate_call_abi.sh
 
+# AUD-VABI-1: a 16-byte vector is ONE %xmm (SSE + SSEUP), not an INTEGER pair,
+# in BOTH directions and through function pointers. Same-compiler agreement
+# cannot show this -- the gate links each side against a GCC-compiled TU.
+gate "vector-abi-boundary" fast \
+    env CCC="$LCCC" bash tests/regression/check_vector_abi_boundary.sh
+
 # AUD-TMP-1: temp files must be symlink-proof. Drives the pre-placed-symlink
 # reproducer (and its pre-placed-directory variant) against the built compiler
 # and asserts the victim file is untouched, the compile still succeeds and
@@ -223,6 +229,16 @@ gate "temp-symlink-hardening" fast \
 # never a file named `-`. Build systems pipe through this.
 gate "o-stdout" fast \
     env CCC="$LCCC" bash tests/regression/check_o_stdout.sh
+
+# AUD-HYGIENE-1: the loose `tests/*.c`/`*.sh` scratch (compat_test.sh and the
+# IVSR/univsr probes) are gates now instead of unreferenced files.  The compat
+# suite is a 20-program run-and-compare differential against GCC; the probe
+# gate is metamorphic -- the same programs must produce the same numbers with
+# the strength-reduction pass on, off, and at -O3.
+gate "compat-suite" fast \
+    env CCC="$LCCC" bash tests/regression/check_compat_suite.sh
+gate "ivsr-reproducers" fast \
+    env CCC="$LCCC" bash tests/regression/check_ivsr_reproducers.sh
 
 # AUD-CPU-1: `__builtin_cpu_supports` must fold from the effective codegen
 # permission (target + -march + -m* flags), not from a hard-coded CPU list.
@@ -765,6 +781,19 @@ gate "phi-acyclic-copy-order" fast \
 
 gate "doc-link-integrity" fast \
     python3 scripts/check_doc_links.py
+
+# AUD-RATCHET-1: the audit's site counts are a ratchet, not a snapshot.  The
+# scanner self-tests first (its tokenizer is what every number rests on), then
+# --check refuses any metric that grew past scripts/audit_census_baseline.json:
+# panic-class sites overall and in the user-input pipeline, `unsafe` sites,
+# unannotated `#[ignore]`, functions over 300/500/1000 lines, and CCC_*/LCCC_*
+# literals without documentation.  A count may only be re-baselined in the
+# commit that adds the sites; lowering the baseline belongs to the commit that
+# removes them.
+gate "audit-census-selftest" fast \
+    python3 scripts/audit_census.py --selftest
+gate "audit-census-ratchet" fast \
+    python3 scripts/audit_census.py --check
 
 # The Expat differential is only a differential if both compilers ran the SAME
 # tests under the SAME feature configuration.  `junit_check.py` compares testcase

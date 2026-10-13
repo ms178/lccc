@@ -142,8 +142,23 @@ jobs:
       - name: Aggregate-call byte boundaries and cross-compiler ABI
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_aggregate_call_abi.sh
 
+      # AUD-VABI-1: a 16-byte vector is ONE %xmm (SSE + SSEUP), not an
+      # INTEGER/GP pair, in both directions and through function pointers --
+      # proved by linking each side against a GCC-compiled translation unit.
+      - name: Vector arguments and returns at the compiler boundary
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_vector_abi_boundary.sh
+
       # AUD-TMP-1: temp files must be symlink-proof (pre-placed symlink and
       # pre-placed directory reproducers; victim file must stay untouched).
+      # AUD-HYGIENE-1: the previously unreferenced tests/compat_test.sh and the
+      # loose IVSR probes run in ci_local.sh too; scripts/check_ci_gate_parity.py
+      # fails if these two lists drift.
+      - name: LCCC vs GCC compatibility suite
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_compat_suite.sh
+
+      - name: IVSR/univsr loop-strength-reduction probe contracts
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_ivsr_reproducers.sh
+
       - name: Temp-file symlink hardening
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_temp_symlink.sh
 
@@ -1295,6 +1310,11 @@ jobs:
           bash tests/regression/check_redundant_test_elimination.sh
           python3 tests/regression/verify_pr713_audit.py --quiet
           python3 scripts/check_doc_links.py
+          # AUD-RATCHET-1: the audit census (scripts/audit_census.py) is the
+          # only place the audit's site counts are measurable; the ratchet is
+          # what stops them growing back.  Runs in ci_local.sh too.
+          python3 scripts/audit_census.py --selftest
+          python3 scripts/audit_census.py --check
           python3 scripts/check_peephole_directive_step.py
           python3 scripts/check_pr_claim_fidelity.py
           bash tests/regression/check_ra_web_inloop_use.sh

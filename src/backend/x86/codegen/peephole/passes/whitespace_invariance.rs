@@ -359,9 +359,18 @@ fn corpus() -> Vec<(String, String)> {
         .collect();
 
     let manifest = env!("CARGO_MANIFEST_DIR");
+    // Committed assembly only: the regression/pin corpora under `tests/`, plus
+    // the Godbolt oracle corpus the asm-diff gates compare against.  The old
+    // second root was `work/`, a scratch directory that is in `.gitignore` --
+    // a corpus that can vanish with a cleanup (AUD-HYGIENE-1 removed it) is
+    // evidence whose absence the vacuity check has to catch, and an invariant
+    // test is stronger when its inputs are files the repository promises to
+    // keep.  Third-party assembly (gcc/clang/icx) is deliberately included:
+    // the peephole must be whitespace-invariant on foreign text too, because
+    // asm-diff feeds it exactly that.
     out.extend(collect_asm(
         std::path::Path::new(manifest),
-        &["tests", "work"],
+        &["tests", "engineering/evidence/godbolt/corpus"],
     ));
 
     if let Some(dir) = std::env::var_os("LCCC_ASM_CORPUS") {
