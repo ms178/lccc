@@ -2994,6 +2994,17 @@ impl Driver {
         set.insert_if(isa.ymm && self.enable_avxvnniint8, F::AvxVnniInt8);
         set.insert_if(isa.ymm && self.enable_avxvnniint16, F::AvxVnniInt16);
 
+        // GFNI: `gf2p8mulb` and the two affine transforms.  Legacy-encoded for
+        // xmm (there is no non-VEX-free requirement), so -- unlike the four
+        // extensions above -- the permission is the vector class alone plus the
+        // extension's own flag, and `-mno-avx` does NOT remove it.  Measured
+        // against GCC 12.2: `-mgfni` accepts `_mm_gf2p8mul_epi8` with and
+        // without `-mavx`, `-march=x86-64`/`-v3`/`-maes` reject it, and before
+        // this row lccc emitted `gf2p8mulb %xmm1, %xmm0` for `-march=x86-64`:
+        // the same SIGILL class as the VNNI case, on an instruction whose
+        // *legacy* encoding makes `-mno-avx` useless as a defence.
+        set.insert_if(simd && self.enable_gfni, F::Gfni);
+
         // Integer ISA: the resolved predicates already encode the default
         // grant, the `-march` ceiling and the sticky denials — the same
         // predicates `__BMI__`/`__BMI2__`/`__LZCNT__`/`__MOVBE__` use.

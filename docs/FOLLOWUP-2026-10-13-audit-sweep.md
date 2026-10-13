@@ -48,7 +48,7 @@ TUs with `CALLEE_ONLY`) links each caller/callee combination against GCC at
 `{double,double}` control) so the two conventions cannot silently merge.
 Mutation-verified: neutering the carrier helper fails the gate.
 
-### AUD-CPU-3 (VNNI remainder) — the three dot-product extensions are gated (FIXED)
+### AUD-CPU-3 (remainder) — VNNI and GFNI are gated (FIXED for these families)
 
 The audit's live SIGILL case was AVX-VNNI: `_mm_dpbusd_epi32` compiled with
 `-march=x86-64` emitted `vpdpbusd %ymm1, %ymm0, %ymm0` — an Alder-Lake-era
@@ -77,6 +77,13 @@ not, so the denial was silently ignored), the `__builtin_cpu_supports` fold for
 all three names, the CPU-support gate extended to 27 probed features
 (Alder/Raptor Lake bring AVX-VNNI; Arrow Lake/Sierra Forest add INT8;
 `-march=arrowlake-s`/Lunar Lake add INT16), and 27 new intrinsic-gate rows.
+
+GFNI went in the same way (28 features now): `gf2p8mulb` is **legacy-encoded**,
+so its permission is the flag alone — `-mgfni -mno-avx` accepts in both
+compilers, measured — and before the row existed lccc emitted
+`gf2p8mulb %xmm1, %xmm0` for `-march=x86-64` with no diagnostic. lccc now
+agrees with GCC 12.2 on every one of the eight oracle rows for that family,
+including the `-maes` and `-mno-avx` corners.
 
 **Found while doing it: AUD-CPU-4** (see §2) — the 32-bit target emits 256-bit
 VEX code with no permission at all, in the *vector-op* path, while the
@@ -220,9 +227,10 @@ more honest corpus, since asm-diff feeds the peephole foreign assembly).
 
 Ordered by value ÷ cost, with the entry point each one needs.
 
-1. **AUD-CPU-3 remainder — with VAES/VPCLMULQDQ and the three VNNI groups
-   landed, the table covers the crypto extensions and the dot products; what
-   is left is GFNI, SHA, AVX-512 and the `X86Crc32Load*` forms.** `x86_intrinsic_required_feature` (`src/ir/lowering/expr_builtins.rs`)
+1. **AUD-CPU-3 remainder — with VAES/VPCLMULQDQ, the three VNNI groups and
+   GFNI landed, the table covers every extension the frontend currently
+   exposes; what is left is the AVX-512 layer (512-bit rows and a 512-bit class
+   notion) and SHA, which has no builtins to gate yet.** `x86_intrinsic_required_feature` (`src/ir/lowering/expr_builtins.rs`)
    covers CRC32, the six 128-bit AES ops and `pclmulqdq128`; the audit names
    256-bit VAES/VPCLMULQDQ, `X86Crc32Load*`, SHA/GFNI/AVX-512 as missing, and
    the family sweep above now proves that at least VAES-256/VPCLMULQDQ-256
@@ -257,22 +265,22 @@ Ordered by value ÷ cost, with the entry point each one needs.
    That hole is closed (measured: `-march=x86-64` now diagnoses
    `_mm_dpbusd_epi32` and names `-mavxvnni`). What remains in this entry:
 
-   * **GFNI** — `vgf2p8mulb`/`vgf2p8affineqb`/`vgf2p8affineinvqb`, three
-     builtins (`X86Gf2p8mulb128`, `X86Gf2p8affineqb128`,
-     `X86Gf2p8affineinvqb128`), all 128-bit. The oracle rule is measured:
-     `-mgfni` alone rejects, `-mgfni -mavx` accepts, `-march=alderlake`
-     accepts. The 256-bit forms are a declaration gap first: GCC declares
-     `_mm256_gf2p8mul_epi8` and lccc's bundled headers do not
-     (implicit-declaration warning), so they are unreachable from source until
-     the headers grow them.
-   * **SHA** — no `X86Feature` bit and no `-msha` acceptance, so a dispatcher
-     asking `__builtin_cpu_supports("sha")` gets 0 while the backend has no
-     permission model for it either; same treatment as VNNI: bit, flag, rows.
+   * **SHA** — no `X86Sha*` builtin exists and `-msha` is not accepted, so
+     there is nothing to gate: a dispatcher asking
+     `__builtin_cpu_supports("sha")` gets 0, which is the safe answer, and the
+     name stays in the untracked list with a test that keeps it there. Adding
+     SHA means adding codegen first.
    * **AVX-512** — the `-mavx512*` flags exist in the CLI and the 512-bit
      builtins exist, but no row gates them; the fold has no 512-bit class
      notion (that is also what AUD-CPU-4 is about, one width down).
-   * **`X86Crc32Load*`** — the `_mm_crc32_u8` rows cover the register forms;
-     the load forms need their own names in the table.
+   * **`X86Crc32Load*`** — checked and not applicable as written: the CRC32
+     family is exactly four builtins (`X86Crc32_8/16/32/64`), and the load
+     forms are the *same* builtins with a memory operand, so the existing rows
+     cover them.
+   * **The 256-bit GFNI forms** — `_mm256_gf2p8mul_epi8` is declared by GCC but
+     not by lccc's bundled headers (implicit-declaration warning), so they are
+     unreachable from source until the headers grow them; that is a header
+     change with an ABI question (32-byte vector argument), not a table row.
 2. **AUD-ICE-1 remainder — 889 panic-class sites (109 in the hot set).**
    Worklist: `python3 scripts/audit_census.py --top-fns` for size and
    `grep -nE 'panic!|unreachable!|\.expect\(|\.unwrap\('` per file for sites.

@@ -315,6 +315,39 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# GFNI: the Galois-field byte instructions.  Legacy-encoded (no VEX), so this
+# is the one extension whose permission is the flag ALONE -- `-mno-avx` must
+# not remove it, and, measured before the row below existed, `-march=x86-64`
+# emitted `gf2p8mulb %xmm1, %xmm0` with no diagnostic.  GCC rejects that same
+# source, and GCC 12.2 knows `-mgfni`, so every row here is oracle-checked.
+cat >"$tmp/gfni.c" <<'EOF'
+typedef char v16qi __attribute__((vector_size(16)));
+v16qi gmul(v16qi a, v16qi b) { return __builtin_ia32_gf2p8mulb(a, b); }
+EOF
+
+reject gfni.c -mgfni -march=x86-64
+reject gfni.c -mgfni -march=x86-64-v3
+reject gfni.c -mgfni -maes
+reject gfni.c -mgfni -march=alderlake -mno-gfni
+accept gfni.c gf2p8mulb -mgfni
+accept gfni.c gf2p8mulb -mgfni -mavx
+accept gfni.c gf2p8mulb -mgfni -mno-avx
+accept gfni.c gf2p8mulb -march=alderlake
+
+cat >"$tmp/o_gfni.c" <<'EOF'
+#include <immintrin.h>
+__m128i gmul(__m128i a, __m128i b) { return _mm_gf2p8mul_epi8(a, b); }
+EOF
+compare o_gfni.c -march=x86-64
+compare o_gfni.c -march=x86-64-v3
+compare o_gfni.c -mgfni
+compare o_gfni.c -mgfni -mavx
+compare o_gfni.c -mgfni -mno-avx
+compare o_gfni.c -march=alderlake
+compare o_gfni.c -maes
+compare o_gfni.c -march=alderlake -mno-gfni
+
+# ---------------------------------------------------------------------------
 # RECORDED DEBT (AUD-CPU-4), asserted rather than fixed here: the i686
 # *vector-op* path emits 256-bit VEX code with no permission at all.  Measured
 # before this row was written:

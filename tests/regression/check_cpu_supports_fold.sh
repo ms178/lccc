@@ -69,6 +69,7 @@ int main(void) {
     P("pclmul", 20); P("rdrnd", 21);
     P("vaes", 22);   P("vpclmulqdq", 23);
     P("avxvnni", 24); P("avxvnniint8", 25); P("avxvnniint16", 26);
+    P("gfni", 27);
     printf("| 0x%x\n", v);
     return 0;
 }
@@ -112,7 +113,7 @@ expect_set "cmov fxsr mmx sse sse2 sse3 ssse3 sse4.1 sse4.2 popcnt cx16" \
 #    deliberately absent — lccc has no SHA codegen permission (`-msha` is
 #    rejected), so a dispatcher must not be told otherwise.  Raptor Lake *does*
 #    bring AVX-VNNI (it shares Alder Lake's ISA), which lccc's profile grants.
-expect_set "$V3 aes pclmul rdrnd vaes vpclmulqdq avxvnni" -O2 -march=raptorlake
+expect_set "$V3 aes pclmul rdrnd vaes vpclmulqdq avxvnni gfni" -O2 -march=raptorlake
 # 4. Denials are sticky against the baseline and against -march.
 expect_set "$V3_NO_AVX" -O2 -march=x86-64-v3 -mno-avx
 expect_set "$V3_NO_AVX2" -O2 -march=x86-64-v3 -mno-avx2
@@ -152,8 +153,8 @@ expect_set "$V3_NO_AVX2" -O2 -mvaes -mno-avx2
 # things at once.)
 expect_set "$V3_NO_AVX" -O2 -march=x86-64-v3 -mvpclmulqdq -mno-avx
 expect_set "$V3" -O2 -mno-vaes -mno-vpclmulqdq
-expect_set "$V3 aes pclmul rdrnd vaes vpclmulqdq avxvnni" -O2 -march=alderlake
-expect_set "$V3 aes pclmul rdrnd avxvnni" -O2 -march=alderlake -mno-vaes -mno-vpclmulqdq
+expect_set "$V3 aes pclmul rdrnd vaes vpclmulqdq avxvnni gfni" -O2 -march=alderlake
+expect_set "$V3 aes pclmul rdrnd avxvnni gfni" -O2 -march=alderlake -mno-vaes -mno-vpclmulqdq
 # 8. Aliases and case folding must resolve (GCC/Clang spellings real code uses).
 cat >alias.c <<'C'
 int main(void) {
@@ -265,13 +266,22 @@ expect_set "$V3" -O2 -mavx512vnni
 # Denials are sticky against the profile that granted them, and the class half
 # is not a detail: no 256-bit vectors, no VNNI answer.
 expect_set "$V3" -O2 -mavxvnni -mno-avxvnni
-expect_set "$V3 aes pclmul rdrnd vaes vpclmulqdq" -O2 -march=alderlake -mno-avxvnni
+# GFNI is the legacy-encoded exception: `-mno-avx` does NOT remove it (GCC
+# agrees, measured), and the profile's grant is deniable by name.
+expect_set "$V3 gfni" -O2 -mgfni
+# (`-mno-avx` on the *default* baseline also drops the SSE4.2 rung -- the same
+#  sticky-denial rule the v3 row above pins -- so the expected set is the
+#  no-AVX one from that path, not V3_NO_AVX.)
+expect_set "cmov fxsr mmx sse sse2 sse3 ssse3 sse4.1 popcnt cx16 bmi bmi2 lzcnt movbe gfni" \
+    -O2 -mgfni -mno-avx
+expect_set "$V3 aes pclmul rdrnd vaes vpclmulqdq avxvnni" -O2 -march=alderlake -mno-gfni
+expect_set "$V3 aes pclmul rdrnd vaes vpclmulqdq gfni" -O2 -march=alderlake -mno-avxvnni
 expect_set "$V3_NO_AVX" -O2 -march=x86-64-v3 -mavxvnni -mavxvnniint8 -mno-avx
 expect_set "$V3_NO_AVX2" -O2 -march=x86-64-v3 -mavxvnni -mno-avx2
 #    Arrow Lake / Sierra Forest carry INT8 (not INT16); the -S and Lunar Lake
 #    spellings add INT16, exactly as the profile table says.
-expect_set "$V3 aes pclmul rdrnd vaes vpclmulqdq avxvnni avxvnniint8" -O2 -march=arrowlake
-expect_set "$V3 aes pclmul rdrnd vaes vpclmulqdq avxvnni avxvnniint8 avxvnniint16" \
+expect_set "$V3 aes pclmul rdrnd vaes vpclmulqdq avxvnni avxvnniint8 gfni" -O2 -march=arrowlake
+expect_set "$V3 aes pclmul rdrnd vaes vpclmulqdq avxvnni avxvnniint8 avxvnniint16 gfni" \
     -O2 -march=arrowlake-s
 # A v1 target asked for VNNI explicitly: the *flag* is honoured by the
 # intrinsic table only where the 256-bit class exists, so the dispatcher must

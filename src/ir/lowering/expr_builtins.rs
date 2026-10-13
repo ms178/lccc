@@ -2743,6 +2743,17 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
             flag: "-mavxvnniint8",
             also: Some(" and a 256-bit vector class (AVX2 or AVX-512)"),
         },
+        // GFNI: the Galois-field byte instructions.  Legacy-encoded, so the
+        // requirement is the extension's flag (plus the xmm class every x86-64
+        // target has); `-mno-avx` deliberately does not appear in the
+        // conjunction, because GCC does not require AVX either.
+        B::X86Gf2p8mulb128 | B::X86Gf2p8affineqb128 | B::X86Gf2p8affineinvqb128 => {
+            IntrinsicRequirement {
+                feature: F::Gfni,
+                flag: "-mgfni",
+                also: None,
+            }
+        }
         // AVX-VNNI-INT16: the unsigned-word forms.
         B::X86Dpwusd128
         | B::X86Dpwusds128

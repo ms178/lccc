@@ -132,11 +132,16 @@ pub enum X86Feature {
     /// AVX-VNNI-INT16: `vpdpwusd(s)`, `vpdpwuud(s)` -- the unsigned-word
     /// forms.  A third, separate bit and flag (`-mavxvnniint16`).
     AvxVnniInt16,
+    /// GFNI: the Galois-field byte instructions (`gf2p8mulb`,
+    /// `gf2p8affineqb`, `gf2p8affineinvqb`).  Legacy-encoded for xmm, so
+    /// `-mno-avx` does not remove it, and a separate CPUID bit and flag
+    /// (`-mgfni`) from the VNNI families.
+    Gfni,
 }
 
 impl X86Feature {
     /// Every tracked feature, for table-driven tests.
-    pub const ALL: [X86Feature; 27] = [
+    pub const ALL: [X86Feature; 28] = [
         X86Feature::Cmov,
         X86Feature::Fxsr,
         X86Feature::Mmx,
@@ -164,6 +169,7 @@ impl X86Feature {
         X86Feature::AvxVnni,
         X86Feature::AvxVnniInt8,
         X86Feature::AvxVnniInt16,
+        X86Feature::Gfni,
     ];
 
     /// Canonical GCC spelling of the feature (the one `-m` flags use).
@@ -196,6 +202,7 @@ impl X86Feature {
             X86Feature::AvxVnni => "avxvnni",
             X86Feature::AvxVnniInt8 => "avxvnniint8",
             X86Feature::AvxVnniInt16 => "avxvnniint16",
+            X86Feature::Gfni => "gfni",
         }
     }
 
@@ -235,6 +242,7 @@ impl X86Feature {
             "avxvnni" => X86Feature::AvxVnni,
             "avxvnniint8" => X86Feature::AvxVnniInt8,
             "avxvnniint16" => X86Feature::AvxVnniInt16,
+            "gfni" => X86Feature::Gfni,
             _ => return None,
         })
     }
@@ -245,7 +253,7 @@ impl X86Feature {
     }
 }
 
-/// A set of [`X86Feature`]s (bitmask; 27 tracked features fit in a `u64`).
+/// A set of [`X86Feature`]s (bitmask; 28 tracked features fit in a `u64`).
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct EffectiveFeatures(u64);
 
@@ -354,8 +362,8 @@ mod tests {
             "fsgsbase",
             "xsave",
             "xsaveopt",
-            "gfni",
             "avx512vnni",
+            "avx512gfni",
             "avx512f",
             "avx512bw",
             "amx_tile",
@@ -367,6 +375,21 @@ mod tests {
         ] {
             assert_eq!(X86Feature::parse(name), None, "{name} must not be tracked");
         }
+    }
+
+    /// GFNI is tracked: it is a legacy-encoded (non-VEX) extension with its
+    /// own flag, so the fold must not tie it to the vector class the way the
+    /// 256-bit extensions are tied.
+    #[test]
+    fn gfni_is_tracked_and_separable_from_the_crypto_bits() {
+        assert_eq!(X86Feature::parse("gfni"), Some(X86Feature::Gfni));
+        assert_eq!(X86Feature::Gfni.name(), "gfni");
+        assert!(X86Feature::ALL.contains(&X86Feature::Gfni));
+        let mut set = EffectiveFeatures::EMPTY.with(X86Feature::Aes);
+        assert!(!set.contains(X86Feature::Gfni));
+        set.insert(X86Feature::Gfni);
+        assert!(set.contains(X86Feature::Gfni));
+        assert!(!set.contains(X86Feature::Pclmul));
     }
 
     /// The three AVX-VNNI groups are tracked separately and must stay
