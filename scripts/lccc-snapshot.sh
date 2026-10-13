@@ -41,7 +41,23 @@ set -euo pipefail
 # must work from any clone: the deliverable is produced by running this script
 # from the tree it describes.
 REPO=${LCCC_REPO:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
-ART=${LCCC_ARTIFACTS:-/home/user/artifacts}
+# The persisted-workspace helper lives in the repository; the contract tests
+# build REDUCED trees (scripts/ only) to exercise this tool, so a missing
+# helper falls back to the historical default instead of failing the run.
+_ws_helper="$REPO/tools/workspace_dirs.sh"
+if [[ -r $_ws_helper ]]; then
+  # shellcheck source=../tools/workspace_dirs.sh
+  source "$_ws_helper"
+else
+  lccc_workspace_dir() { printf '%s\n' "${LCCC_WORKSPACE:-/home/user}"; }
+  lccc_artifacts_dir() { printf '%s/artifacts\n' "$(lccc_workspace_dir)"; }
+  lccc_deliverable_path() { printf '%s/ms178-1.patch\n' "$(lccc_workspace_dir)"; }
+fi
+# The persisted (user-facing) workspace is resolved from the environment (see
+# tools/workspace_dirs.sh): /home/user in the primary harness,
+# /mnt/user-data/outputs in the alternate one.  LCCC_ARTIFACTS/LCCC_DELIVERABLE
+# still override both.
+ART=${LCCC_ARTIFACTS:-$(lccc_artifacts_dir)}
 # Source archive and review series are persisted as SINGLE compressed files.
 # The worktree, EDG checkout and toolchains belong in the excluded .cache zone.
 # A source archive must survive a wipe of that zone, not merely be derivable
@@ -49,7 +65,7 @@ ART=${LCCC_ARTIFACTS:-/home/user/artifacts}
 BULK=${LCCC_BULK_ARTIFACTS:-$ART}
 mkdir -p "$BULK"
 BASE_REF_FILE="$ART/.base_ref"
-DELIVERABLE=${LCCC_DELIVERABLE:-/home/user/ms178-1.patch}
+DELIVERABLE=${LCCC_DELIVERABLE:-$(lccc_deliverable_path)}
 LEDGER="$ART/SNAPSHOT_LEDGER.md"
 
 slug=${1:-snapshot}
@@ -133,7 +149,9 @@ fi
 #   * Five tracked files match patterns in this repo's own .gitignore
 #     (`core.*` covers src/backend/{x86,i686}/assembler/encoder/core.rs;
 #     `test_*` covers tests/integration/test_progressive.py and
-#     tests/test_ivsr_indexed{.c,_before.s}). Once a wipe removes them,
+#     tests/integration/test_progressive.py; the old tests/test_ivsr_indexed*
+#     fixtures were moved to tests/regression/fixtures/ivsr/ in AUD-HYGIENE-1).
+#     Once a wipe removes them,
 #     `git add -A` stages the deletion and -- because ignored paths are
 #     omitted from `git status` -- the tree reports CLEAN, so the loss stays
 #     invisible until the published patch deletes two backend encoders.

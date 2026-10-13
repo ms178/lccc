@@ -243,7 +243,7 @@ fn memory_operand_families(mem: &str) -> u16 {
 /// `CCC_NO_SEG_OPERAND_FUSE=1` restores the pre-fusion behaviour (every
 /// segment override refused) so an A/B instruction-count or Callgrind run can
 /// attribute a delta to this rule alone.
-fn is_plain_memory_operand(op: &str) -> bool {
+pub(super) fn is_plain_memory_operand(op: &str) -> bool {
     if std::env::var_os("CCC_NO_SEG_OPERAND_FUSE").is_some() {
         return op.contains('(')
             && op.ends_with(')')
@@ -520,7 +520,7 @@ fn scan_window(store: &LineStore, infos: &[LineInfo], from: usize, to: usize) ->
 /// Index of the next line that is neither a NOP nor a benign directive, or
 /// `len`.  A data directive is code the text does not spell out, so it counts
 /// as an instruction here (see `steps_over_line`).
-fn next_insn(store: &LineStore, infos: &[LineInfo], mut j: usize, len: usize) -> usize {
+pub(super) fn next_insn(store: &LineStore, infos: &[LineInfo], mut j: usize, len: usize) -> usize {
     while j < len && super::helpers::steps_over_line(&infos[j], infos[j].trimmed(store.get(j))) {
         j += 1;
     }

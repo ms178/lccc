@@ -73,8 +73,8 @@ flag and declares none of those intrinsics — so the gate says so and pins the
 lccc-side contract instead.
 
 Landed with it: `-mno-avxvnni` (the enabling flag existed, the denial arm did
-not, so the denial was silently ignored), the `__builtin_cpu_supports` fold for
-all three names, the CPU-support gate extended to 27 probed features
+not, so the denial was silently ignored), the intrinsic permission rows for all
+three names, the CPU-support gate extended to 27 probed features
 (Alder/Raptor Lake bring AVX-VNNI; Arrow Lake/Sierra Forest add INT8;
 `-march=arrowlake-s`/Lunar Lake add INT16), and 27 new intrinsic-gate rows.
 
@@ -135,7 +135,7 @@ commands), which is the mechanism that keeps the two mirrors from drifting.
     **exits non-zero** (it always exited 0 before, so it could not fail
     anything). 20/20 vs GCC in ~2 s.
   * `tests/regression/check_ivsr_reproducers.sh` + the probe sources under
-    `tests/regression/ivsr-probes/`: metamorphic rather than shape-pinned —
+    `tests/regression/fixtures/ivsr/`: metamorphic rather than shape-pinned —
     the same programs must compute identical numbers at `-O0..-O3` with
     `CCC_NO_IVSR` on and off, differentially against GCC. Pinning today's
     instruction selection would fight every future improvement; pinning the
@@ -256,21 +256,102 @@ left unconstrained: an unverifiable guess would start rejecting valid code.
 
 ### The hosted Test Suite red that was ours — `fib_rec2iter` (FIXED)
 
-`7b0ea71` added `tests/regression/fib_rec2iter.c`, the end-to-end test for the
-rec2iter pass: it evaluates `fib(90)`, which the pass makes instant and which
-**GCC cannot do at all** (2^90 calls). The corpus runner therefore killed the
-reference compiler's leg at the per-test timeout and reported
-`compare:fail (gcc rc=-9)` — a test that can never pass, which is why the
-hosted `Test Suite` job was red while every local run of the same suite showed
-"only the known host-limited failures". GCC has no rec2iter, so the comparison
-was never an oracle: `fib_rec2iter.env` now marks the test
-`LCCC_NO_COMPARE=1` with that reasoning, and LCCC's own answer is still
-checked, because the program returns non-zero unless every value matches.
+`7b0ea71` added a `fib_rec2iter` corpus test: it evaluates `fib(90)`, which the
+rec2iter pass makes instant and which **GCC cannot do at all** (2^90 calls).
+The corpus runner therefore killed the reference compiler's leg at the
+per-test timeout and reported `compare:fail (gcc rc=-9)` — a test that can
+never pass, which is why the hosted `Test Suite` job was red while every local
+run of the same suite showed "only the known host-limited failures".
 
 *Lesson for the harness rules: a red that the local host cannot reproduce
 (gcc's leg here is a timeout, not a rejection) is invisible in a per-test diff
 and only shows up as `compare:fail` — check `rc=-9` before assuming an lccc
 regression.*
+
+This session first fixed it by declaring the test `LCCC_NO_COMPARE`. Upstream's
+PR #815 then settled the same problem at the root, and **that resolution is the
+one that survives the merge**: the program moved out of the corpus glob into
+`tests/regression/fixtures/rec2iter/`, where `scripts/verify_fib_perf.sh` and
+the `rec2iter` gate in `scripts/ci_local.sh` run it as a self-check rather than
+a differential — a fixture the corpus cannot pick up cannot produce a phantom
+`compare:fail` on any host. The `.env` workaround is therefore gone.
+
+### Merging upstream PR #815 into this branch (INTEGRATION)
+
+Both sessions worked the same audit list, so the merge hit fourteen files with
+real overlap. The rule applied throughout: keep whichever side is *stronger*,
+and never keep two copies of the same thing.
+
+* **`__builtin_cpu_supports` — upstream's runtime probe wins** (AUD-CPU-1).
+  This branch had folded the builtin to a compile-time constant from the
+  invocation's permission; upstream probes CPUID at run time through a
+  libgcc-compatible `__cpu_model` (`src/common/cpu_probe.rs`, lazy per-function
+  init, GCC's own error wording, constant-context diagnosis). Runtime is what
+  GCC, Clang and ICX do, and it is what runtime-dispatch code (zlib-ng, zstd,
+  xz, OpenSSL, FFmpeg) needs: a `-march=x86-64` build must still be able to
+  take an AVX2 path on hardware that has AVX2. The permission fold would have
+  pinned those builds to the slow path. Consequently the audit's named gate
+  `check_cpu_supports_fold.sh` and the `.env` file that suppressed the GCC
+  comparison are **deleted**, and `check_cpu_supports_runtime.sh` (upstream's,
+  differential in every row) is the gate. What this branch adds on top of
+  upstream's implementation is the audit's third requirement: a name from the
+  x86 feature set is now *diagnosed* on a non-x86 target instead of silently
+  folding to 0, while names from other architectures' sets keep the
+  conservative 0 (upstream's reason stands: those sets are GCC's per-architecture
+  lists, which LCCC does not model, and rejecting them would turn accepted GCC
+  code into a compile error).
+* **The intrinsic permission gate stays ours** (AUD-CPU-3): upstream rejects
+  x86 intrinsics on foreign targets but never asks whether the *invocation*
+  granted the extension. `x86_features::effective()` remains the model for
+  that question, and the non-x86 half of the check now defers to
+  `lower_x86_intrinsic`'s rejection so one bad call produces one diagnostic,
+  not two.
+* **Temp files, debug dumps and the peephole corpus stay ours** (AUD-TMP-1,
+  AUD-HYGIENE-1): the private 0700 directory with the ownership probe, the
+  symlink-safe debug dump, and the whitespace-invariance corpus rooted in
+  committed assembly only (`tests/` + `engineering/evidence/godbolt/corpus`)
+  are stricter than upstream's equivalents, and `check_temp_symlink.sh` (182
+  rows) is the gate for the first of them. Upstream's call sites that expected
+  a fallible constructor were adapted to the infallible one.
+* **`-o -` / `-M -o -` stay ours** (AUD-DRV-1): every text producer funnels
+  through the single `write_text_output`, and `check_o_stdout.sh` pins it.
+* **`__builtin_shuffle*` diagnostics take upstream's wording**: both sides
+  fixed the panic (AUD-ICE-1/AUD-DIAG-1), upstream's messages are GCC's own
+  ("number of elements …", "must be an integer vector", "invalid element
+  index"), and the gate now asserts those fragments.
+* **Layout follows upstream** where it moved files: the IVSR probes are
+  `tests/regression/fixtures/ivsr/`, the rec2iter program is
+  `tests/regression/fixtures/rec2iter/`, `verify_fib_perf.sh` lives in
+  `scripts/`, and the gate that consumed the old paths was re-pointed.
+* **`artifacts/repros/` keeps this branch's `__env_` names**: the replay gate
+  parses the environment out of the file name (`ENV_RE`), and upstream's
+  `_default_` / `_CCC_RA_GLOBAL_LOCATION-1_` spellings do not match it — a name
+  the gate cannot parse is a hard failure, so the enforced convention wins.
+* **The census baseline moves by exactly what upstream brought in**: the
+  merged tree measures `panic_sites` 889 → 890 (+1, the
+  `expect("canonical_name returns table entries")` invariant in upstream's
+  `src/common/isa_features.rs` — unreachable, since the name comes from the
+  same table) and `unsafe_sites` 27 → 29 (+2, the `Self::cpuid` /
+  `Self::cpuid_count` wrappers, `unsafe` for toolchains older than 1.97 with
+  `#[allow(unused_unsafe)]` for the ones where `__cpuid` is already safe).
+  Re-baselined in the merge commit that adds them, which is what the ratchet
+  asks for; every other metric is unchanged.
+* **Upstream's `check_cpu_supports_runtime.sh` gained two rows** for the audit's
+  third requirement: an x86 feature name on aarch64/riscv64 is now expected to
+  be *diagnosed* (upstream asserted the opposite — a silent 0), and a name from
+  another architecture's set (`crypto`) is still expected to fold to the
+  conservative 0, so upstream's reason survives the change.
+* **Upstream's second replay gate is gone** in favour of
+  `scripts/check_repro_replay.py` (both are described in `scripts/README.md`):
+  one directory (`artifacts/repros/`) has one naming contract, and only one of
+  the two gates can parse this repository's file names (`__env_<K>-<V>`), so
+  keeping both meant a red CI from names the other gate could not read. Upstream's `audit-census` duplicate registrations
+  are gone for the same reason.
+
+* **`audit_census.py`, its baseline, and `check_ill_typed_builtins.py` stay
+  ours**: the pair is one implementation plus one measured baseline (they must
+  not be mixed), and the ICE gate is the one whose ratchet was measured
+  (650 → 174 ICE, 380 → 294 silent).
 
 ### AUD-POS-1 — every diagnostic after a `#include` was one line high (FIXED)
 
@@ -327,7 +408,7 @@ Ordered by value ÷ cost, with the entry point each one needs.
    oracle-checked against `gcc -march=x86-64 -S` (error ⇒ the row needs a
    feature), exactly the way `check_intrinsic_feature_gate.sh` does it today.
    The AVX-VNNI half of this entry is now **done** (three bits, 28 rows, GCC
-   oracle rows, and the `__builtin_cpu_supports` fold); the oracle rules that
+   oracle rows, and the intrinsic permission rows); the oracle rules that
    were measured for it are kept here because the same method is what the
    remaining families need, and because they are the record behind the rows
    (`-march=raptorlake` is unknown to GCC 12; use `-march=alderlake` for a CPU

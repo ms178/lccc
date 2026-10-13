@@ -627,18 +627,33 @@ impl X86Cpu {
         })
     }
 
+    /// Read CPUID leaf `leaf` into `eax/ebx/ecx/edx` (subleaf 0).
+    ///
+    /// The call is unprivileged and available on every x86-64 CPU.  It is
+    /// wrapped in `unsafe` with an `unused_unsafe` allowance because the
+    /// intrinsic's safety changed across Rust releases (AUD-TOOLCHAIN-1): the
+    /// declared `rust-version`/stable channel for this tree treats it as
+    /// `unsafe`, while older compilers accepted it as safe.  One wrapper keeps
+    /// the file building warning-free on every toolchain.
+    #[cfg(target_arch = "x86_64")]
+    #[allow(unused_unsafe)]
+    fn cpuid(leaf: u32) -> std::arch::x86_64::CpuidResult {
+        unsafe { std::arch::x86_64::__cpuid(leaf) }
+    }
+
+    /// `CPUID(leaf, subleaf)` variant, same safety contract as [`Self::cpuid`].
+    #[cfg(target_arch = "x86_64")]
+    #[allow(unused_unsafe)]
+    fn cpuid_count(leaf: u32, subleaf: u32) -> std::arch::x86_64::CpuidResult {
+        unsafe { std::arch::x86_64::__cpuid_count(leaf, subleaf) }
+    }
+
     /// Identify the host core from CPUID family/model (leaf 1) for
     /// `-march=native` / `-mtune=native`.
     #[cfg(target_arch = "x86_64")]
     pub fn detect_host() -> X86Cpu {
-        // CPUID is unprivileged and available on every x86-64 CPU.
-        // `std::arch::__cpuid` is callable from safe code on the toolchains
-        // this project supports (AUD-TOOLCHAIN-1: the MSRV in Cargo.toml is
-        // 1.97.0, where this file compiles without an `unsafe` block; the
-        // previous comment claimed "safe since Rust 1.86", which was wrong —
-        // rustc 1.91 rejected exactly these calls with E0133).
-        let vendor = std::arch::x86_64::__cpuid(0);
-        let leaf1 = std::arch::x86_64::__cpuid(1);
+        let vendor = Self::cpuid(0);
+        let leaf1 = Self::cpuid(1);
         let (is_intel, is_amd) = Self::vendor_flags(&vendor);
         let eax = leaf1.eax;
         let family = ((eax >> 8) & 0xF) + ((eax >> 20) & 0xFF);
@@ -667,11 +682,10 @@ impl X86Cpu {
     /// unavailable (e.g. under a hypervisor that masks it).
     #[cfg(target_arch = "x86_64")]
     pub fn detect_host_cache(base: CacheModel) -> CacheModel {
-        use std::arch::x86_64::{__cpuid, __cpuid_count};
-        let vendor = __cpuid(0);
+        let vendor = Self::cpuid(0);
         let (is_intel, is_amd) = Self::vendor_flags(&vendor);
         let leaf = if is_amd {
-            if __cpuid(0x8000_0000).eax < 0x8000_001D {
+            if Self::cpuid(0x8000_0000).eax < 0x8000_001D {
                 return base;
             }
             0x8000_001Du32
@@ -683,7 +697,7 @@ impl X86Cpu {
         let mut out = base;
         let mut any = false;
         for sub in 0..32u32 {
-            let r = __cpuid_count(leaf, sub);
+            let r = Self::cpuid_count(leaf, sub);
             let ctype = r.eax & 0x1F; // 0 = no more caches, 1 = data, 2 = insn, 3 = unified
             if ctype == 0 {
                 break;

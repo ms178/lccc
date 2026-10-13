@@ -757,10 +757,10 @@ Provides safe temporary file management with automatic cleanup.
 **`temp_dir()`** -- Returns the platform temp directory, respecting `$TMPDIR`
 on Unix (falling back to `/tmp`).
 
-**`make_temp_path(prefix, stem, extension)`** -- Generates a unique temp file
-path. The filename includes the process ID and an atomic counter to avoid
-collisions in parallel builds and multi-file compilations. Format:
-`{prefix}_{pid}_{stem}.{counter}.{extension}`.
+**`TempFile::new(prefix, stem, extension)`** -- Returns a fallible RAII guard
+for a path inside an atomically created private (0700 on Unix) directory in
+`$TMPDIR`. Pre-existing files/symlinks cannot redirect reservation. Drop removes
+the file and directory; `set_keep(true)` retains both for debugging.
 
 **`TempFile`** -- An RAII guard that deletes the file when dropped. Ensures
 cleanup happens even on early returns, panics, or errors. Has a `keep` flag

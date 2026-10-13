@@ -157,6 +157,16 @@ impl X86Arch for I686Arch {
         // NOT TLS types.)
         matches!(reloc_type, 14..=19 | 24..=37 | 39..=41)
     }
+    fn is_got_slot_reloc(reloc_type: u32) -> bool {
+        // i386 GOT-slot operator classes: @GOT (R_386_GOT32 = 3) and its
+        // relaxable spelling @GOT in a `mov`-load (R_386_GOT32X = 43).  The
+        // GOT-base class @GOTOFF/@GOTPC is NOT in this set: their addend
+        // participates in the same `S + A` arithmetic the section symbol
+        // reproduces, so GAS folds them (`leal .bss@GOTOFF(%ebx)` carries a
+        // section symbol; measured) and so does this writer.
+        matches!(reloc_type, R_386_GOT32 | R_386_GOT32X)
+    }
+
     fn needs_got_base_symbol(reloc_type: u32) -> bool {
         // i386 operator classes that make GAS 2.47 record
         // `_GLOBAL_OFFSET_TABLE_` (GLOBAL UND NOTYPE) in the symbol table

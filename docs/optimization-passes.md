@@ -451,3 +451,23 @@ LCCC_PGO_HOT_FRAC / LCCC_PGO_COLD_FRAC  # summary percentiles
 The PGO A/B harness — `tests/benchmark/run_pgo_ab.py` — builds plain and
 profile-guided binaries for lccc and a reference compiler, verifies differential
 output equivalence, and reports paired bootstrap-CI speedups.
+
+## Exact FP recurrence reuse and late branch threading
+
+- **`loop_square`**: first O2+ optimizer iteration on x86-64/SIMD, outside size
+  mode; reuse one existing next-square per innermost loop. Signed-zero seed,
+  dominance, SSA, single-latch and stable FP-environment proofs prevent
+  speculation/reassociation. Six FP header phis reject the pressure heuristic.
+  Disable: `CCC_DISABLE_PASSES=loop_square`.
+- **`fp_double`**: x86-64/SIMD O2+ (including size modes), after scalar algebra and
+  before FP constant hoisting. Exact `2*x` to `x+x`; protect copy-connected
+  add/sub consumers only when permitted target FMA contraction can occur.
+  Disable: `CCC_DISABLE_PASSES=fp_double`; timings: `CCC_TIME_PASSES=1`.
+- **`jump_thread`**: late x86 peephole after `identical_blocks`, before
+  `epilogue_merge`; retarget local branch-only relays, preserving labels/code.
+  Only inert debug attribution crosses directive boundaries. Disabled for
+  size-oriented codegen until layout-aware growth control is available.
+  Disable: `CCC_PEEPHOLE_SKIP=jump_thread`.
+
+The floating transforms are not fast-math identities. Architecture expansion
+requires equivalent rounding/environment proofs and target-specific measurement.

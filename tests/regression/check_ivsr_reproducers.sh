@@ -26,8 +26,8 @@ repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 ccc=${CCC:-$repo/target/fastbuild/lccc}
 [ -x "$ccc" ] || { echo "SKIP: $ccc not built" >&2; exit 0; }
 
-src=$repo/tests/regression/ivsr-probes/ivsr_indexed_loop.c
-simple=$repo/tests/regression/ivsr-probes/ivsr_simple_loop.c
+src=$repo/tests/regression/fixtures/ivsr/test_ivsr_indexed.c
+simple=$repo/tests/regression/fixtures/ivsr/simple_loop.c
 td=$(mktemp -d)
 trap 'rm -rf "$td"' EXIT
 

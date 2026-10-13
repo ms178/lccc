@@ -253,6 +253,36 @@ impl X86Arch for X86_64Arch {
         matches!(reloc_type, 16..=23 | 34..=36 | 44 | 45 | 47 | 48 | 50 | 51)
     }
 
+    /// x86-64 GOT-slot operator classes: @GOTPCREL (9) and every relaxable
+    /// spelling GAS can emit for it — GOTPCRELX (41), REX_GOTPCRELX (42),
+    /// CODE_4 (43, REX2), CODE_5 (46, APX EVEX / `.insn`-only) and CODE_6
+    /// (49, APX EVEX) — plus the immediate-addressing group @GOT (GOT32 = 3),
+    /// GOT64 (11), GOTPCREL64 (12) and GOTPC32 (13), whose addend is the
+    /// instruction's PC correction just like GOTPCREL's.
+    ///
+    /// Measured against GAS 2.47: `movq q1@GOTPCREL(%rip),%rax` keeps the
+    /// symbol (`q1`, or `.Lloc` for a local label) in every one of these
+    /// forms; only the non-GOT operators fold to `.data`/`.bss`.  Folding
+    /// here is a miscompile, not a size trade: with two locals the linker
+    /// computes the slot from the section and adds the symbol offset a
+    /// second time (measured: 145 instead of 25, and a fault under the lccc
+    /// linker).
+    fn is_got_slot_reloc(reloc_type: u32) -> bool {
+        matches!(
+            reloc_type,
+            R_X86_64_GOT32
+                | R_X86_64_GOTPCREL
+                | R_X86_64_GOTPCRELX
+                | R_X86_64_REX_GOTPCRELX
+                | R_X86_64_CODE_4_GOTPCRELX
+                | R_X86_64_CODE_5_GOTPCRELX
+                | R_X86_64_CODE_6_GOTPCRELX
+                | 11 // GOT64
+                | 12 // GOTPCREL64
+                | 13 // GOTPC32
+        )
+    }
+
     /// GOT-base computing operator classes on x86-64 (measured against
     /// GAS 2.47, one @operator per object, `readelf -s` for the symbol):
     /// @GOTPCREL (9 / relaxable 41-49), @GOT (GOT32 = 3), @GOTTPOFF

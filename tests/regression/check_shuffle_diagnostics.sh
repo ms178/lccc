@@ -66,9 +66,9 @@ expect_rejected() {
     echo "ok: $file -> $(head -1 "$file.err")"
 }
 
-expect_rejected count.c "mask element count must match"
-expect_rejected floatmask.c "must be a vector of integers"
-expect_rejected nonvector.c "must be a vector of integers"
+expect_rejected count.c "number of elements"
+expect_rejected floatmask.c "must be an integer vector"
+expect_rejected nonvector.c "must be an integer vector"
 
 # AUD-ICE-1's sibling arms (the same `panic!` family, reached through
 # `__builtin_shufflevector`'s constant-index form).
@@ -80,7 +80,7 @@ cat >svnonconst.c <<'C'
 typedef int v4si __attribute__((vector_size(16)));
 v4si s(v4si a, v4si b, int i) { return __builtin_shufflevector(a, b, 0, 1, 2, i); }
 C
-expect_rejected svrange.c "out of range"
+expect_rejected svrange.c "invalid element index"
 expect_rejected svnonconst.c "must be an integer constant expression"
 
 # --- the oracle: GCC rejects the same three programs ------------------------

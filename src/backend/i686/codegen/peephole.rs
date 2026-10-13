@@ -3577,6 +3577,7 @@ fn forward_slot_loads_cfg_range(
             starts.push(j);
             continue;
         }
+        // DIRECTIVE-LAW: bails -- every directive terminates the block window.
         let is_edge = matches!(
             infos[j].kind,
             LineKind::Jmp
@@ -10301,19 +10302,40 @@ fn thread_trivial_blocks(store: &mut LineStore, infos: &mut [LineInfo]) -> bool 
             if !guarded {
                 continue;
             }
-            // Census: branches referencing this label (label def excluded).
-            let refs = (fstart..fend)
-                .filter(|&i| {
-                    !infos[i].is_nop()
-                        && matches!(infos[i].kind, LineKind::Jmp | LineKind::CondJmp)
-                        && trimmed(store, &infos[i], i)
-                            .split_whitespace()
-                            .next_back()
-                            .is_some_and(|t| t == name)
-                })
-                .count();
-            let _ = refs;
-            retarget_label_refs(store, infos, fstart, fend, name, &target);
+            // Ordinary branches and jump-table data can be retargeted. A
+            // reference inside inline asm, a computed address, or any other
+            // directive cannot: deleting the label turns that edge into an
+            // unresolved symbol (observed: i686 -O0 asm goto jumped to address
+            // 0). Keep the pure trampoline for those edges. Normal branches
+            // still skip it, so the retained jump is paid only by the opaque
+            // edge.
+            let opaque = (fstart..fend).any(|i| {
+                if i == label_idx || i == jmp_idx || infos[i].is_nop() {
+                    return false;
+                }
+                let text = trimmed(store, &infos[i], i);
+                if !label_referenced_whole_word(text, name) {
+                    return false;
+                }
+                match infos[i].kind {
+                    LineKind::Jmp | LineKind::CondJmp
+                        if text.split_whitespace().next_back() == Some(name.as_str()) =>
+                    {
+                        false
+                    }
+                    LineKind::Directive
+                        if text.starts_with(".long ") || text.starts_with(".quad ") =>
+                    {
+                        false
+                    }
+                    _ => true,
+                }
+            });
+            let retargeted = retarget_label_refs(store, infos, fstart, fend, name, &target);
+            if opaque {
+                changed |= retargeted > 0;
+                continue;
+            }
             infos[label_idx].kind = LineKind::Nop;
             infos[jmp_idx].kind = LineKind::Nop;
             changed = true;
@@ -17699,6 +17721,47 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_trampoline_is_still_deleted() {
+        let asm = "f:\n.cfi_startproc\n    jne .LBB5\n    ret\n.LBB5:\n    jmp .LBB3\n.LBB3:\n    ret\n.cfi_endproc\n";
+        let result = peephole_optimize(asm.to_string());
+        // The redundant jump is deleted and the old label falls into its
+        // destination. Retargeting the edge is also acceptable. Keeping both
+        // the label and its jump would be the missed fold.
+        assert!(
+            !result.contains("jmp "),
+            "redundant jump must go:\n{result}"
+        );
+        let compact = result.replace(' ', "");
+        assert!(
+            compact.contains(".LBB5:\n.LBB3:") || result.contains("jne .LBB3"),
+            "edge must reach .LBB3 with no trampoline jump:\n{result}"
+        );
+    }
+
+    #[test]
+    fn asm_goto_trampoline_survives_and_normal_edges_still_thread() {
+        let asm = "f:\n.cfi_startproc\n    jne .LBB5\n#APP\n    testl %ecx, %ecx; jnz .LBB5\n#NO_APP\n    jmp .LBB2\n.LBB5:\n    jmp .LBB3\n.LBB2:\n    movl $1, %eax\n.LBB3:\n    ret\n.cfi_endproc\n";
+        let result = peephole_optimize(asm.to_string());
+        let app = result.find("#APP").expect("asm marker");
+        let noapp = result.find("#NO_APP").expect("asm end");
+        assert!(
+            result[app..noapp].contains("jnz .LBB5"),
+            "inline asm edge must keep its exact label:\n{result}"
+        );
+        assert!(
+            result.contains(".LBB5:"),
+            "opaque target must not be deleted:\n{result}"
+        );
+        assert!(
+            result.contains("jne .LBB3"),
+            "ordinary edge must skip the trampoline:\n{result}"
+        );
+        assert!(
+            result.contains("jmp .LBB3"),
+            "retained trampoline must stay pure"
+        );
+    }
+
     fn test_inline_asm_region_is_never_rewritten() {
         // User-authored asm between #APP/#NO_APP must survive byte-for-byte
         // even when its text matches a foldable store/load shape, and it

@@ -6,10 +6,23 @@ on:
   pull_request:
     branches: [main]
 
+# AUD-CI-1: least privilege, no duplicate runs on the same ref, pinned runner.
+# (The job-level split of the monolithic `test` job is tracked as a follow-up:
+# it needs the artifact-sharing refactor plus an update to
+# scripts/check_ci_gate_parity.py, which currently verifies that ci_local.sh
+# runs the same *commands*, not the same job layout.)
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: Test Suite
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -108,6 +121,24 @@ jobs:
       - name: Build
         run: ./scripts/build_lccc_fast.sh
 
+      - name: Check the recursion-to-iteration pass
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_rec2iter.sh
+
+      - name: Check FP-contraction parity with GCC
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_fp_contract_parity.sh
+
+      - name: Check -o - stdout semantics
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_dash_o_stdout.sh
+
+      - name: Check builtin_cpu_supports runtime semantics
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_cpu_supports_runtime.sh
+
+      - name: Check GOT-slot references to local symbols
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_got_slot_local_addend.sh
+
+      - name: Check temporary-file symlink isolation
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_temp_symlink.sh
+
       - name: i686 execution capability policy
         run: bash tests/regression/check_i386_run_policy.sh
 
@@ -181,12 +212,7 @@ jobs:
           python3 scripts/check_repro_replay.py --self-test
           env CCC=target/fastbuild/lccc python3 scripts/check_repro_replay.py
 
-      # AUD-CPU-1: `__builtin_cpu_supports` folds from the effective codegen
-      # permission (target + -march + -m*), so runtime dispatch cannot select
-      # an instruction set the build was not allowed to assume.
-      - name: CPU feature fold honours -march and target
-        run: env CCC=target/fastbuild/lccc CCC_ARM=target/fastbuild/lccc-arm bash tests/regression/check_cpu_supports_fold.sh
-
+      
       # AUD-ICE-1/AUD-DIAG-1: malformed `__builtin_shuffle` masks diagnose
       # instead of panicking, and the valid forms still lower (oracle-checked
       # against gcc).
@@ -1251,6 +1277,7 @@ jobs:
           bash tests/regression/check_loop_store_motion.sh
           bash tests/regression/check_const_trip_loop_inline.sh
           bash tests/regression/check_fp_recurrence.sh
+          python3 tests/regression/check_debug_code_parity.py
           bash tests/regression/check_bool_pair_tail_jmp.sh
           bash tests/regression/check_bool_pair_prune.sh
           bash tests/regression/check_demorgan_branch_split.sh
@@ -1367,6 +1394,7 @@ jobs:
           bash tests/regression/check_debug_info_flags.sh
           bash tests/regression/check_dep_files.sh
           bash tests/regression/check_i686_boot_asm.sh
+          bash tests/regression/check_asm_goto_phi_edge.sh
           bash tests/regression/check_narrow_cmp_flag_law.sh
           bash tests/regression/check_zero_ext_cmp_fold.sh
           bash tests/regression/check_boot_size_measurement.sh
@@ -1531,8 +1559,9 @@ jobs:
           if-no-files-found: warn
 
   clippy:
+    timeout-minutes: 45
     name: Clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -1562,8 +1591,9 @@ jobs:
   # Networked, so a Compiler Explorer outage is a recorded skip (exit 0), never
   # a red build; the self-tests in the `test` job pin the gate logic itself.
   oracle-delta:
+    timeout-minutes: 30
     name: Compiler Explorer oracle delta
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v7

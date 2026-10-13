@@ -173,6 +173,36 @@ if [ ! -x "$LCCC" ]; then
 fi
 
 # --------------------------------------------------------------- job:test --
+# The ratchet that keeps the 2026-10-13 audit's debt numbers from growing:
+# panic-class sites (AUD-ICE-1), unsafe sites, giant functions (AUD-MONO-1),
+# undeclared CCC_*/LCCC_* knobs (AUD-KNOB-1) and unannotated #[ignore]s
+# (AUD-ARM-GSF-1). Pure static scan -- it needs no compiler, and it must run
+# before the build so a regression is reported as itself.
+
+gate "rec2iter" fast \
+    env CCC="$LCCC" bash tests/regression/check_rec2iter.sh
+
+gate "fp-contract-parity" fast \
+    env CCC="$LCCC" bash tests/regression/check_fp_contract_parity.sh
+
+# ~97 compiles per arm plus the runs: seconds, not minutes -- and it is the
+# only gate that exercises the historical crash/miscompile corpus end to end.
+gate "dash-o-stdout" fast \
+    env CCC="$LCCC" bash tests/regression/check_dash_o_stdout.sh
+
+gate "cpu-supports-runtime" fast \
+    env CCC="$LCCC" bash tests/regression/check_cpu_supports_runtime.sh
+
+# The GOT-slot half of the same work: a local symbol referenced through its
+# GOT slot must keep the symbol in the relocation (folding it produced 145
+# instead of 25 with GNU ld and a fault under lccc-ld), and the x86-64 spelling
+# must match the pinned GAS 2.47 oracle form by form.
+gate "got-slot-local-addend" fast \
+    env CCC="$LCCC" bash tests/regression/check_got_slot_local_addend.sh
+
+gate "temp-symlink-isolation" fast \
+    env CCC="$LCCC" bash tests/regression/check_temp_symlink.sh
+
 gate "rust-toolchain-selector" fast \
     bash tests/regression/check_rust_toolchain_selector.sh
 
@@ -250,14 +280,6 @@ gate "compat-suite" fast \
 gate "ivsr-reproducers" fast \
     env CCC="$LCCC" bash tests/regression/check_ivsr_reproducers.sh
 
-# AUD-CPU-1: `__builtin_cpu_supports` must fold from the effective codegen
-# permission (target + -march + -m* flags), not from a hard-coded CPU list.
-# The old table answered "yes" to AVX2/BMI2/SHA for every invocation, which put
-# runtime dispatch in zlib-ng/zstd/xz/OpenSSL on paths that SIGILL on hardware
-# without them. Also asserts non-x86 targets and non-literal arguments are
-# diagnosed instead of silently folding to 0.
-gate "cpu-supports-fold" fast \
-    env CCC="$LCCC" CCC_ARM=target/fastbuild/lccc-arm bash tests/regression/check_cpu_supports_fold.sh
 
 # AUD-ICE-1/AUD-DIAG-1: a malformed `__builtin_shuffle` mask must produce a
 # diagnostic, not a Rust panic (and the valid forms must still lower).  The
@@ -506,6 +528,9 @@ gate "loop-store-motion" fast \
 
 gate "const-trip-loop-inline" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_const_trip_loop_inline.sh
+
+gate "debug-code-parity" fast \
+    env CCC=target/fastbuild/lccc python3 tests/regression/check_debug_code_parity.py
 
 gate "fp-recurrence-and-jump-thread" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_fp_recurrence.sh
@@ -979,6 +1004,9 @@ gate "dep-files" fast \
 
 gate "i686-boot-asm" fast \
     bash tests/regression/check_i686_boot_asm.sh
+
+gate "asm-goto-phi-edge" fast \
+    bash tests/regression/check_asm_goto_phi_edge.sh
 
 # ci.yml "Verify inline-asm UTF-8 assembly text".
 gate "inline-asm-utf8" fast \

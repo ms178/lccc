@@ -273,10 +273,26 @@ impl Lowerer {
 
     /// Evaluate a case constant and truncate to the switch expression type.
     pub(super) fn eval_case_constant(&mut self, expr: &Expr) -> i64 {
-        let mut val = self
+        // A case label must be an integer constant expression (C11 6.8.4.2p3).
+        // Folding a non-constant to 0 silently turns `case f(x):` into
+        // `case 0:` — a different program, and one that can collide with a real
+        // `case 0:` — which is exactly what GCC, Clang and ICX refuse to do
+        // ("case label does not reduce to an integer constant"); measured
+        // against all three.  Diagnose, then keep 0 so the enclosing switch
+        // still lowers into well-formed IR.
+        let constant = self
             .eval_const_expr(expr)
-            .and_then(|c| self.const_to_i64(&c))
-            .unwrap_or(0);
+            .and_then(|c| self.const_to_i64(&c));
+        let mut val = match constant {
+            Some(val) => val,
+            None => {
+                self.diagnostics.borrow_mut().error(
+                    "case label does not reduce to an integer constant",
+                    expr.span(),
+                );
+                0
+            }
+        };
         if let Some(switch_ty) = self.func_mut().switch_stack.last().map(|f| &f.expr_type) {
             val = switch_ty.truncate_i64(val);
         }

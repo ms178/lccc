@@ -1,11 +1,14 @@
 pub(crate) mod asm_constraints;
 pub(crate) mod const_arith;
 pub(crate) mod const_eval;
+pub(crate) mod cpu_probe;
 pub(crate) mod decimal;
 pub(crate) mod encoding;
 pub(crate) mod error;
+pub(crate) mod forwarding;
 pub(crate) mod fp_contract;
 pub(crate) mod fx_hash;
+pub(crate) mod isa_features;
 pub(crate) mod long_double;
 pub(crate) mod source;
 pub(crate) mod symbol_table;

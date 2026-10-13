@@ -2416,7 +2416,15 @@ mod tests {
             ".cfi_endproc\n",
         ));
         assert!(!out.contains("leaq 0(,%rbx,4)"), "{out}");
-        assert!(out.contains("bswapl %eax"), "{out}");
+        // The subject is the dead scaled `lea`; the load/swap pair is the
+        // witness that the value still reaches its store.  `movbe_fuse` (phase
+        // 7a, earlier in the pipeline) may legally consume that pair into one
+        // instruction, so both spellings of the swap are accepted.
+        assert!(
+            out.contains("bswapl %eax") || out.contains("movbel (%rsi,%rbx,4), %eax"),
+            "{out}"
+        );
+        assert!(out.contains("movl %eax, (%rsi,%rbx,4)"), "{out}");
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub(crate) mod backedge_pre;
 pub(crate) mod bit_idioms;
 pub(crate) mod block_layout;
 pub(crate) mod bool_thread;
+pub(crate) mod byte_load;
 pub(crate) mod cfg_simplify;
 pub(crate) mod const_array_promote;
 pub(crate) mod constant_fold;
@@ -2135,9 +2136,8 @@ pub(crate) fn run_passes(
             );
             total_changes += n;
             total_changes_excl_dce += n;
-            if n > 0 {
-                verify::verify_after_pass(module, "loop_square");
-            }
+            // timed_pass! already performs the structural checkpoint; do not
+            // verify the same module twice when the recurrence changed.
         }
 
         // Phase 2b-rot: Loop rotation — iter 0, AFTER iv_widen (so the
@@ -2259,6 +2259,24 @@ pub(crate) fn run_passes(
             cur_pass_changes[3] += n;
             total_changes += n;
             total_changes_excl_dce += n;
+
+            // Byte-load reassembly: `p[0] | p[1] << 8 | ...` is an unaligned
+            // little-endian load spelled out, and GCC/Clang/ICX all fold it
+            // back (see the pass module docs for the measured gap). Placed
+            // right after bit_idioms, which must see the byte version of the
+            // chain (its `bswap` idiom is the big-endian twin) and never an
+            // already-widened one.
+            if !pass_disabled(&disabled, "byte_load") {
+                let n = timed_pass!(
+                    "byte_load",
+                    run_on_visited(module, &dirty, &mut changed, |func| {
+                        byte_load::run_function(func, target)
+                    })
+                );
+                cur_pass_changes[3] += n;
+                total_changes += n;
+                total_changes_excl_dce += n;
+            }
 
             // Correlated value propagation: fold compares, selects and
             // branches whose outcome is implied by dominating conditional
@@ -3015,8 +3033,18 @@ pub(crate) fn run_passes(
         && x86_isa.simd
         && !pass_disabled(&disabled, "fp_double")
     {
-        module.for_each_function(fp_double::run);
-        verify::verify_after_pass(module, "fp_double");
+        let start = time_passes.then(std::time::Instant::now);
+        let keep_contraction_inputs = fp_contract != FpContract::Off && x86_isa.fma;
+        let changes = module.for_each_function(|f| fp_double::run(f, keep_contraction_inputs));
+        if changes > 0 {
+            verify::verify_after_pass(module, "fp_double");
+        }
+        if let Some(start) = start {
+            eprintln!(
+                "[PASS-TIME] fp_double: {:.3} ms ({changes} changes)",
+                start.elapsed().as_secs_f64() * 1e3
+            );
+        }
     }
 
     // Hoist FP constants used in loop bodies into preheader Copies so they can

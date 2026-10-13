@@ -8,13 +8,39 @@
 //! - expr_builtins_fpclass.rs: FP classification (fpclassify, isnan, isinf, etc.)
 
 use super::lower::Lowerer;
+use crate::common::source::Span;
 use crate::common::types::{AddressSpace, CType, IrType, target_is_32bit};
 use crate::frontend::parser::ast::{Expr, UnaryOp};
 use crate::frontend::sema::builtins::{self, BuiltinIntrinsic, BuiltinKind};
 use crate::ir::reexports::{
-    CallInfo, Instruction, IntrinsicOp, IrBinOp, IrCmpOp, IrConst, IrUnaryOp, Operand, Terminator,
-    Value,
+    BasicBlock, CallInfo, Instruction, IntrinsicOp, IrBinOp, IrCmpOp, IrConst, IrUnaryOp, Operand,
+    Terminator, Value,
 };
+
+/// How `__builtin_cpu_supports("f")` is answered (AUD-CPU-1).
+///
+/// The answer is a runtime CPUID bit test (see `crate::common::cpu_probe`) for
+/// every name this compiler models on x86, and the constant 0 on targets that
+/// cannot run x86 code.  There is deliberately no "the target guarantees it, so
+/// fold to 1" case: measured against the competition (GCC 16.2, Clang 23.1, ICX
+/// latest, `-O2 -march=x86-64` and `-march=x86-64-v3`/`raptorlake`), all three
+/// compile `!!__builtin_cpu_supports("sse2")` to a load from `__cpu_model`
+/// *even when the effective target enables the feature* — GCC probes `sse2`
+/// with `-mavxvnni` enabled and probes `avxvnni` under `-march=raptorlake`
+/// while itself emitting AVX-VNNI instructions elsewhere.  Their contract (and
+/// GCC's documentation: "returns a positive integer if the running CPU
+/// supports the feature") is about the CPU that *executes* the program, so
+/// folding a guaranteed feature to 1 would answer 1 on a machine that cannot
+/// execute it — the one answer the reference compilers never give.
+enum CpuSupport {
+    /// The answer is a runtime CPUID bit test (see `crate::common::cpu_probe`).
+    Runtime(crate::common::cpu_probe::Probe),
+    /// No runtime CPU property exists for this target (AArch64/RISC-V): the
+    /// conservative 0 is the only sound answer, and — unlike an unknown x86
+    /// name — it is not diagnosed, because these targets have their own
+    /// feature-name space GCC accepts that LCCC does not model yet.
+    Unsupported,
+}
 
 impl Lowerer {
     /// Determine the return type for creal/crealf/creall/cimag/cimagf/cimagl based on function name.
@@ -530,6 +556,326 @@ impl Lowerer {
         }
     }
 
+    // --- Builtin-call diagnostics (AUD-ICE-1 / AUD-DIAG-1) -------------------
+    //
+    // Ill-typed builtin calls used to `panic!` ("internal error: ...") out of
+    // the lowering of *invalid user code*.  A user typo must never look like a
+    // compiler crash: every reachable panic becomes a diagnostic with a source
+    // span, and the call lowers to a shape-correct placeholder so the rest of
+    // lowering stays total (the driver aborts the compile on the emitted
+    // error, before any pass or codegen sees the module).
+
+    /// Span to report for a builtin call: the first argument, or a dummy when
+    /// the call has no arguments (GCC points at the builtin's own token; the
+    /// argument is the closest span this lowering stage has).
+    fn builtin_arg_span(args: &[Expr]) -> Span {
+        args.first().map(|a| a.span()).unwrap_or_else(Span::dummy)
+    }
+
+    /// Placeholder result for a builtin call that was rejected with a
+    /// diagnostic.  Shaped like the vector-by-memory return convention so the
+    /// discarded IR stays well-formed.
+    fn rejected_vector_operand(&mut self, bytes: usize) -> Operand {
+        let result = self.fresh_value();
+        self.emit(Instruction::Alloca {
+            dest: result,
+            ty: IrType::Ptr,
+            size: bytes,
+            align: 16,
+            volatile: false,
+            semantic_volatile: false,
+        });
+        Operand::Value(result)
+    }
+
+    /// Reject a builtin call, lower the arguments for their side effects, and
+    /// return a placeholder of `bytes` bytes.
+    fn reject_builtin_call(
+        &mut self,
+        message: String,
+        args: &[Expr],
+        bytes: usize,
+    ) -> Option<Operand> {
+        self.diagnostics
+            .borrow_mut()
+            .error(message, Self::builtin_arg_span(args));
+        for a in args {
+            let _ = self.lower_expr(a);
+        }
+        Some(self.rejected_vector_operand(bytes))
+    }
+
+    /// Resolve the argument of `__builtin_cpu_supports` (AUD-CPU-1).
+    ///
+    /// The answer is always the runtime CPUID probe
+    /// (`crate::common::cpu_probe`) — see [`CpuSupport`] for the measured
+    /// competition behavior behind that decision.  A non-literal argument or a
+    /// name no compiler accepts is a hard error with GCC's own wording;
+    /// silently folding it to 0 is the AUD-SILENT-ZERO-1 defect this replaces.
+    fn resolve_cpu_support(&self, args: &[Expr]) -> Result<CpuSupport, String> {
+        let name = match args {
+            [crate::frontend::parser::ast::Expr::StringLiteral(s, _)] => s,
+            [] => return Err("too few arguments to function '__builtin_cpu_supports'".to_string()),
+            [_, _, ..] => {
+                return Err("too many arguments to function '__builtin_cpu_supports'".to_string());
+            }
+            _ => {
+                return Err("parameter to builtin must be a string constant or literal".to_string());
+            }
+        };
+        // A runtime probe needs CPUID; on AArch64/RISC-V the question has no
+        // runtime answer here, so it keeps the conservative 0 and no
+        // diagnostic (their feature names are GCC's per-architecture set —
+        // `fp`, `crypto`, ... — which LCCC does not model yet: rejecting them
+        // would turn accepted GCC code into a compile error).
+        if !matches!(
+            self.target,
+            crate::backend::Target::X86_64 | crate::backend::Target::I686
+        ) {
+            // AUD-CPU-1 (3): a name from the x86 feature set is a question this
+            // target cannot answer at all, and silently folding it to 0 turns
+            // `__builtin_cpu_supports("avx2") ? fast() : slow()` into a silent
+            // slow path (GCC diagnoses the name on every non-x86 target).  A
+            // name from another architecture's set keeps the conservative 0:
+            // LCCC does not model those sets yet, and rejecting them would turn
+            // accepted GCC code into a compile error.
+            if crate::common::x86_features::X86Feature::parse(name).is_some() {
+                return Err(format!("parameter to builtin not valid: {name}"));
+            }
+            return Ok(CpuSupport::Unsupported);
+        }
+        match crate::common::cpu_probe::lookup(name) {
+            Some(probe) => Ok(CpuSupport::Runtime(probe)),
+            None => Err(format!("parameter to builtin not valid: {name}")),
+        }
+    }
+
+    /// Record that this function reads a probe word, so the runtime CPU probe
+    /// words are initialised in it (AUD-CPU-1).
+    ///
+    /// The initialising call is materialised once per function, guarded by the
+    /// ready flag, by [`Self::splice_cpu_probe_init`] at function finalisation —
+    /// a probe inside a conditional branch must not depend on that branch
+    /// having been taken, and guarding the call in the entry block also means
+    /// the probe itself stays a three-instruction bit test at every use.
+    pub(super) fn mark_cpu_probe_init(&mut self) {
+        if let Some(state) = self.func_state.as_mut() {
+            state.cpu_probe_init = true;
+        }
+        crate::common::cpu_probe::mark_runtime_needed();
+    }
+
+    /// Materialise the guarded probe initialiser in the function just lowered,
+    /// when any probe site asked for it.
+    ///
+    /// The entry block is split at the first probe-word read into
+    ///
+    /// ```text
+    ///   entry:  <head>                  ; arguments, allocas, anything before the first read
+    ///           ready = load __lccc_cpu_ready
+    ///           if (ready != 0) goto hot else goto cold
+    ///   cold:   call __lccc_cpu_init    ; runs at most once per program
+    ///           goto hot
+    ///   hot:    <tail>                  ; the first probe-word read and everything after
+    /// ```
+    ///
+    /// so that
+    ///
+    /// * the words are initialised before *every* read of them: the guard
+    ///   dominates the hot block, which holds the first read and all later
+    ///   ones;
+    /// * a probe that runs after the first initialisation costs a compare and
+    ///   a not-taken branch instead of a call into the initialiser's
+    ///   prologue, a register save around it and the caller-side spill of
+    ///   everything live across the call.  Measured with callgrind on
+    ///   `tests/workloads/dispatch` (x86-64, `-O2`): the unconditional call
+    ///   cost ~11 instructions per probe, the inline guard ~2 (plus the
+    ///   register pressure the cold call still implies);
+    /// * the initialiser still runs lazily from user code, so a translation
+    ///   unit that probes stays correct without any ELF constructor — the
+    ///   property that motivates the lazy model over GCC's
+    ///   `__cpu_indicator_init` constructor
+    ///   (`engineering/cpu-supports-runtime-model.md`, §3);
+    /// * `cold` is appended last, so block layout keeps the once-per-program
+    ///   path out of the fall-through line;
+    /// * the head of the entry block — in particular the leading parameter
+    ///   allocas, which `mem2reg` identifies positionally — never moves.
+    ///
+    /// An entry block whose moved range carries phis falls back to an
+    /// unconditional call placed exactly like before: phi operands name their
+    /// predecessor block, so moving a phi means rewriting the incoming edges
+    /// of the block that owns it, which is only reachable when a loop re-enters
+    /// the entry block *and* the first probe read sits after a phi.  The
+    /// fallback is correct, just slower on the hot path.
+    pub(super) fn splice_cpu_probe_init(&mut self) {
+        if !self.func_state.as_ref().is_some_and(|s| s.cpu_probe_init) {
+            return;
+        }
+        let (entry_label, pos, splittable) = {
+            let Some(f) = self.func_state.as_ref() else {
+                return;
+            };
+            let Some(entry) = f.blocks.first() else {
+                return;
+            };
+            let pos = entry
+                .instructions
+                .iter()
+                .position(|inst| {
+                    matches!(inst, Instruction::GlobalAddr { name, .. }
+                        if crate::common::cpu_probe::is_probe_word_symbol(name))
+                })
+                .unwrap_or(entry.instructions.len());
+            let splittable = !entry.instructions[pos..]
+                .iter()
+                .any(|inst| matches!(inst, Instruction::Phi { .. }));
+            (entry.label, pos, splittable)
+        };
+
+        if !splittable {
+            let Some(entry) = self.func_state.as_mut().and_then(|s| s.blocks.first_mut()) else {
+                return;
+            };
+            entry.instructions.insert(pos, Self::cpu_probe_init_call());
+            if !entry.source_spans.is_empty() {
+                entry.source_spans.insert(pos, Span::dummy());
+            }
+            return;
+        }
+
+        let hot = self.fresh_label();
+        let cold = self.fresh_label();
+        let ready_addr = self.fresh_value();
+        let ready_val = self.fresh_value();
+        let ready_cond = self.fresh_value();
+
+        let Some(f) = self.func_state.as_mut() else {
+            return;
+        };
+        let Some(entry) = f.blocks.first_mut() else {
+            return;
+        };
+        let tracked = !entry.source_spans.is_empty();
+        let tail = entry.instructions.split_off(pos);
+        let tail_spans = if tracked {
+            entry.source_spans.split_off(pos)
+        } else {
+            Vec::new()
+        };
+        let old_terminator = std::mem::replace(
+            &mut entry.terminator,
+            Terminator::CondBranch {
+                cond: Operand::Value(ready_cond),
+                true_label: hot,
+                false_label: cold,
+            },
+        );
+        entry.instructions.push(Instruction::GlobalAddr {
+            dest: ready_addr,
+            name: crate::common::cpu_probe::READY_SYMBOL.to_string(),
+        });
+        entry.instructions.push(Instruction::Load {
+            dest: ready_val,
+            ptr: ready_addr,
+            ty: IrType::I32,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        });
+        entry.instructions.push(Instruction::Cmp {
+            dest: ready_cond,
+            op: IrCmpOp::Ne,
+            lhs: Operand::Value(ready_val),
+            rhs: Operand::Const(IrConst::I32(0)),
+            ty: IrType::I32,
+        });
+        if tracked {
+            entry.source_spans.extend([Span::dummy(); 3]);
+        }
+        f.blocks.push(BasicBlock {
+            label: hot,
+            instructions: tail,
+            terminator: old_terminator,
+            source_spans: tail_spans,
+        });
+        f.blocks.push(BasicBlock {
+            label: cold,
+            instructions: vec![Self::cpu_probe_init_call()],
+            terminator: Terminator::Branch(hot),
+            source_spans: if tracked {
+                vec![Span::dummy()]
+            } else {
+                Vec::new()
+            },
+        });
+        // The edges that used to leave the entry block leave `hot` now, so phi
+        // operands in the successor blocks must name `hot` instead of the
+        // entry label.  (`entry` keeps its own phis: those name its
+        // predecessors, which did not change.)
+        for block in f.blocks.iter_mut() {
+            for inst in block.instructions.iter_mut() {
+                if let Instruction::Phi { incoming, .. } = inst {
+                    for (_, from) in incoming.iter_mut() {
+                        if *from == entry_label {
+                            *from = hot;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The `call __lccc_cpu_init` instruction (AUD-CPU-1).
+    fn cpu_probe_init_call() -> Instruction {
+        Instruction::Call {
+            func: crate::common::cpu_probe::INIT_SYMBOL.to_string(),
+            info: CallInfo {
+                dest: None,
+                args: Vec::new(),
+                arg_types: Vec::new(),
+                return_type: IrType::Void,
+                is_variadic: false,
+                num_fixed_args: 0,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Emit the read of one cached probe word: `(word & mask) != 0`.
+    ///
+    /// The load is a plain, non-volatile `i32` load from a `.local` `.bss`
+    /// symbol the driver defines in this same translation unit, so it needs no
+    /// relocation model support beyond an ordinary global and is CSE-able by
+    /// later passes when the answer is re-used.
+    fn emit_cpu_probe_read(&mut self, probe: crate::common::cpu_probe::Probe) -> Value {
+        let addr = self.fresh_value();
+        self.emit(Instruction::GlobalAddr {
+            dest: addr,
+            name: probe.word.symbol().to_string(),
+        });
+        let word = self.fresh_value();
+        self.emit(Instruction::Load {
+            dest: word,
+            ptr: addr,
+            ty: IrType::I32,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        });
+        let masked = self.fresh_value();
+        self.emit(Instruction::BinOp {
+            dest: masked,
+            op: IrBinOp::And,
+            lhs: Operand::Value(word),
+            rhs: Operand::Const(IrConst::I32(probe.bit_mask() as i32)),
+            ty: IrType::I32,
+        });
+        self.emit_cmp_val(
+            IrCmpOp::Ne,
+            Operand::Value(masked),
+            Operand::Const(IrConst::I32(0)),
+            IrType::I32,
+        )
+    }
+
     /// Lower a builtin intrinsic (the BuiltinKind::Intrinsic arm of try_lower_builtin_call).
     fn lower_builtin_intrinsic(
         &mut self,
@@ -652,73 +998,74 @@ impl Lowerer {
                 }
                 Some(Operand::Const(IrConst::I64(0)))
             }
-            // __builtin_cpu_init() — no-op: the folded form below never needs
-            // the runtime `__cpu_model`, so there is nothing to initialise.
-            // (GCC calls `__cpu_indicator_init` here; programs that call it
-            // stay correct either way, which is why it remains a no-op rather
-            // than a call into libgcc.)
-            BuiltinIntrinsic::CpuInit => Some(Operand::Const(IrConst::I32(0))),
-            // __builtin_cpu_supports("feature") — AUD-CPU-1.
+            // __builtin_cpu_init() - ensure the runtime CPU probe words are
+            // populated.  GCC's libgcc fills `__cpu_model` from a constructor
+            // (priority 101) and documents this builtin for the ifunc resolvers
+            // that run before it; LCCC initialises lazily instead — one guarded
+            // call per function that probes, which needs no runtime constructor
+            // and therefore also works in freestanding translation units.  The
+            // value is 0, matching the way GCC accepts it in an int context.
+            BuiltinIntrinsic::CpuInit => {
+                self.mark_cpu_probe_init();
+                Some(Operand::Const(IrConst::I32(0)))
+            }
+            // __builtin_cpu_supports("feature") - answer the question GCC
+            // answers (AUD-CPU-1): 1 iff the CPU executing this code has the
+            // feature, at run time, for *every* name — the target's feature set
+            // never turns the answer into a constant (GCC, Clang and ICX probe
+            // unconditionally; see `CpuSupport` above).  A non-literal argument
+            // or an unknown name is a hard error with GCC's wording.
             //
-            // Folds to 1 iff the *effective code-generation permission* of this
-            // invocation guarantees the feature (see `common::x86_features`),
-            // otherwise 0. The previous hard-coded "Raptor Lake" allowlist
-            // ignored `-march`, `-mno-*` and even the target architecture, so a
-            // `-march=x86-64` build reported AVX2/BMI2/SHA as present and every
-            // runtime-dispatched library took a path that SIGILLs on hardware
-            // without them. `1` is now only ever produced for instructions the
-            // backend is already allowed to emit unconditionally.
+            // Inside a constant-expression context there is no function to
+            // emit the probe into (a static initialiser: `static int v =
+            // __builtin_cpu_supports("avx2");`), so the context is diagnosed as
+            // non-constant — exactly what all three reference compilers do.
             BuiltinIntrinsic::CpuSupports => {
-                for arg in args {
-                    self.lower_expr(arg);
-                }
-                let span = args
-                    .first()
-                    .map(|a| a.span())
-                    .unwrap_or_else(|| crate::common::source::Span::new(0, 0, 0));
-                // Only x86 targets have x86 feature names; on aarch64/riscv64
-                // every feature would have to fold to 0 silently, which turns
-                //   __builtin_cpu_supports("avx2") ? fast_path() : slow_path()
-                // into an unconditional slow path with no diagnostic at all.
-                // GCC errors for a builtin that does not exist on the target;
-                // match that instead of guessing.
-                let elf_machine = crate::common::types::target_elf_machine();
-                if !matches!(elf_machine, 3 | 62) {
-                    // 3 = EM_386 (i686), 62 = EM_X86_64.
-                    self.diagnostics.borrow_mut().error(
-                        "__builtin_cpu_supports is not available on this target architecture"
-                            .to_string(),
-                        span,
-                    );
-                    return Some(Operand::Const(IrConst::I32(0)));
-                }
-                let granted = match args.first() {
-                    Some(crate::frontend::parser::ast::Expr::StringLiteral(name, _)) => {
-                        crate::common::x86_features::X86Feature::parse(name)
-                            .is_some_and(|f| crate::common::x86_features::effective().contains(f))
+                match self.resolve_cpu_support(args) {
+                    Ok(CpuSupport::Runtime(probe)) if self.func_state.is_some() => {
+                        for arg in args {
+                            let _ = self.lower_expr(arg);
+                        }
+                        self.mark_cpu_probe_init();
+                        Some(Operand::Value(self.emit_cpu_probe_read(probe)))
                     }
-                    // A non-literal argument cannot be resolved at compile
-                    // time. GCC diagnoses the non-constant case; folding 0 in
-                    // silence would be a wrong answer nobody can see, so say it
-                    // (the TU is rejected by the driver's lowering-error check).
-                    Some(other) => {
+                    Ok(CpuSupport::Runtime(_)) => {
+                        // A runtime answer needs IR, and this path has no
+                        // function to emit it into: the only way a lowered
+                        // `__builtin_cpu_supports` reaches here is a
+                        // constant-expression context — a static initialiser —
+                        // where GCC, Clang and ICX all refuse to compile with
+                        // this exact wording (`static int v =
+                        // __builtin_cpu_supports("avx2");` is rejected by all
+                        // three; measured).  Diagnose and keep the discarded
+                        // value well-formed.
+                        for arg in args {
+                            let _ = self.lower_expr(arg);
+                        }
                         self.diagnostics.borrow_mut().error(
-                            "__builtin_cpu_supports requires a string literal feature name"
-                                .to_string(),
-                            other.span(),
+                            "initializer element is not constant",
+                            Self::builtin_arg_span(args),
                         );
-                        false
+                        Some(Operand::Const(IrConst::I32(0)))
                     }
-                    None => {
-                        self.diagnostics.borrow_mut().error(
-                            "__builtin_cpu_supports expects one string literal argument"
-                                .to_string(),
-                            span,
-                        );
-                        false
+                    Ok(CpuSupport::Unsupported) => {
+                        // AArch64/RISC-V: the question has no x86 answer at
+                        // all, so the conservative 0 is the constant answer.
+                        for arg in args {
+                            let _ = self.lower_expr(arg);
+                        }
+                        Some(Operand::Const(IrConst::I32(0)))
                     }
-                };
-                Some(Operand::Const(IrConst::I32(i32::from(granted))))
+                    Err(message) => {
+                        self.diagnostics
+                            .borrow_mut()
+                            .error(message, Self::builtin_arg_span(args));
+                        for arg in args {
+                            let _ = self.lower_expr(arg);
+                        }
+                        Some(Operand::Const(IrConst::I32(0)))
+                    }
+                }
             }
             // X86 SSE/AES/CRC intrinsics - delegated to lower_x86_intrinsic
             BuiltinIntrinsic::X86Lfence
@@ -990,7 +1337,7 @@ impl Lowerer {
             | BuiltinIntrinsic::X86Pcmpgtb256
             | BuiltinIntrinsic::X86CastReinterpret => {
                 self.check_x86_intrinsic_feature(intrinsic, name, args);
-                self.lower_x86_intrinsic(intrinsic, args)
+                self.lower_x86_intrinsic(intrinsic, name, args)
             }
             // __builtin_shufflevector(v1, v2, i0, i1, i2, i3): 4-lane 32-bit
             // lane gather with constant indices (Clang/GCC generic shuffle).
@@ -1730,16 +2077,13 @@ impl Lowerer {
             2 => (&args[..1], &args[1]),
             3 => (&args[..2], &args[2]),
             n => {
-                self.diagnostics.borrow_mut().error(
-                    format!(
-                        "__builtin_shuffle expects (vector, mask) or (vector, vector, mask), got {} argument(s)",
-                        n
-                    ),
-                    args.first()
-                        .map(|a| a.span())
-                        .unwrap_or_else(|| crate::common::source::Span::new(0, 0, 0)),
+                // GCC: "wrong number of arguments to '__builtin_shuffle'".
+                let _ = n;
+                return self.reject_builtin_call(
+                    "wrong number of arguments to '__builtin_shuffle'".to_string(),
+                    args,
+                    16,
                 );
-                return None;
             }
         };
 
@@ -1748,47 +2092,50 @@ impl Lowerer {
         let (elem_size, total_bytes) = match &v0_ctype {
             CType::Vector(elem, bytes) => (self.ctype_size(elem), *bytes),
             other => {
-                self.diagnostics.borrow_mut().error(
+                return self.reject_builtin_call(
                     format!(
-                        "__builtin_shuffle's first argument must be a vector, got {}",
+                        "'__builtin_shuffle' first argument must be a vector type, got {:?}",
                         other
                     ),
-                    vec_args[0].span(),
+                    args,
+                    16,
                 );
-                return None;
             }
         };
         if elem_size == 0 || total_bytes == 0 || total_bytes % elem_size != 0 {
-            // A vector type whose size is not a whole number of elements cannot
-            // be described by the C type system; reaching here means the type
-            // itself is malformed, so name the geometry instead of guessing.
-            self.diagnostics.borrow_mut().error(
+            return self.reject_builtin_call(
                 format!(
-                    "__builtin_shuffle: malformed vector type (element size {}, total size {})",
+                    "'__builtin_shuffle' argument vector has degenerate geometry (element {} bytes, total {} bytes)",
                     elem_size, total_bytes
                 ),
-                vec_args[0].span(),
+                args,
+                total_bytes.max(16),
             );
             return None;
         }
         let n_elems: i64 = (total_bytes / elem_size) as i64;
-        // Mask element width from the mask operand's CType; the mask must have
-        // the same element count as the result AND integral elements.  GCC
-        // ("last argument must be an integer vector") rejects a float mask;
-        // accepting one silently reinterpreted its BIT PATTERNS as lane
-        // indices (`1.0f` = 0x3f800000 -> lane 0), i.e. wrong answers with no
-        // diagnostic at all.
+        // Mask element class and width from the mask operand's CType.  GCC:
+        // "'__builtin_shuffle' last argument must be an integer vector".
         let mask_ctype = self.expr_ctype(mask_expr);
         let mask_elem_size = match &mask_ctype {
             CType::Vector(elem, bytes) => {
-                let es = self.ctype_size(elem);
                 if !elem.is_integer() {
-                    self.diagnostics.borrow_mut().error(
-                        format!(
-                            "__builtin_shuffle's mask must be a vector of integers, got a vector of {}",
-                            elem
-                        ),
-                        mask_expr.span(),
+                    return self.reject_builtin_call(
+                        "'__builtin_shuffle' last argument must be an integer vector".to_string(),
+                        args,
+                        total_bytes,
+                    );
+                }
+                let es = self.ctype_size(elem);
+                if es == 0 || *bytes == 0 || bytes % es != 0 || (bytes / es) as i64 != n_elems {
+                    // GCC: "number of elements of the argument vector(s) and
+                    // the mask vector should be the same".
+                    return self.reject_builtin_call(
+                        "'__builtin_shuffle' number of elements of the argument vector(s) \
+                         and the mask vector should be the same"
+                            .to_string(),
+                        args,
+                        total_bytes,
                     );
                     return None;
                 }
@@ -1805,15 +2152,12 @@ impl Lowerer {
                 }
                 es
             }
-            other => {
-                self.diagnostics.borrow_mut().error(
-                    format!(
-                        "__builtin_shuffle's mask must be a vector of integers, got {}",
-                        other
-                    ),
-                    mask_expr.span(),
+            _ => {
+                return self.reject_builtin_call(
+                    "'__builtin_shuffle' last argument must be an integer vector".to_string(),
+                    args,
+                    total_bytes,
                 );
-                return None;
             }
         };
 
@@ -1824,14 +2168,11 @@ impl Lowerer {
             8 => IrType::I64,
             16 => IrType::I128,
             other => {
-                self.diagnostics.borrow_mut().error(
-                    format!(
-                        "__builtin_shuffle: unsupported vector element size {}",
-                        other
-                    ),
-                    vec_args[0].span(),
+                return self.reject_builtin_call(
+                    format!("'__builtin_shuffle' unsupported element size {}", other),
+                    args,
+                    total_bytes,
                 );
-                return None;
             }
         };
         let mask_ir_ty = match mask_elem_size {
@@ -1840,11 +2181,14 @@ impl Lowerer {
             4 => IrType::U32,
             8 => IrType::U64,
             other => {
-                self.diagnostics.borrow_mut().error(
-                    format!("__builtin_shuffle: unsupported mask element size {}", other),
-                    mask_expr.span(),
+                return self.reject_builtin_call(
+                    format!(
+                        "'__builtin_shuffle' unsupported mask element size {}",
+                        other
+                    ),
+                    args,
+                    total_bytes,
                 );
-                return None;
             }
         };
 
@@ -2032,14 +2376,11 @@ impl Lowerer {
 
     fn lower_shufflevector(&mut self, args: &[Expr]) -> Option<Operand> {
         if args.len() != 6 {
-            self.diagnostics.borrow_mut().error(
-                format!(
-                    "__builtin_shufflevector: only the 4-lane 32-bit form (2 vectors + 4 constant indices) is supported, got {} argument(s)",
-                    args.len()
-                ),
-                args.first()
-                    .map(|a| a.span())
-                    .unwrap_or_else(|| crate::common::source::Span::new(0, 0, 0)),
+            return self.reject_builtin_call(
+                "wrong number of arguments to '__builtin_shufflevector' (this                  implementation supports the 4-lane 32-bit form: 2 vectors + 4 indices)"
+                    .to_string(),
+                args,
+                16,
             );
             return None;
         }
@@ -2062,15 +2403,15 @@ impl Lowerer {
                 Some(IrConst::I32(v)) => v as i64,
                 Some(IrConst::I8(v)) => v as i64,
                 Some(IrConst::I16(v)) => v as i64,
-                _ => {
-                    self.diagnostics.borrow_mut().error(
+                _other => {
+                    return self.reject_builtin_call(
                         format!(
-                            "__builtin_shufflevector: lane index {} must be an integer constant expression",
-                            lane
+                            "argument {} of '__builtin_shufflevector' must be an integer constant expression",
+                            3 + lane
                         ),
-                        args[2 + lane].span(),
+                        args,
+                        16,
                     );
-                    return None;
                 }
             };
             let (src, off) = if idx < 0 {
@@ -2080,15 +2421,13 @@ impl Lowerer {
             } else if idx < 8 {
                 (v2p, (idx - 4) * 4)
             } else {
-                // GCC's range: 0..7 for two 4-lane vectors, plus negative
-                // indices for "don't care" (which the `idx < 0` arm above
-                // takes as lane 0 of the first vector).
-                self.diagnostics.borrow_mut().error(
+                return self.reject_builtin_call(
                     format!(
-                        "__builtin_shufflevector: lane index {} is out of range for two 4-lane vectors (0..7)",
+                        "invalid element index '{}' to '__builtin_shufflevector'",
                         idx
                     ),
-                    args[2 + lane].span(),
+                    args,
+                    16,
                 );
                 return None;
             };
@@ -2165,33 +2504,14 @@ impl Lowerer {
             .first()
             .map(|a| a.span())
             .unwrap_or_else(|| crate::common::source::Span::new(0, 0, 0));
-        // AUD-SILENT-ZERO-1: this function is reached only from the arm that
-        // dispatches the x86 builtin families, so on a target that is not x86
-        // every call here names an intrinsic the target cannot execute at all.
-        // GCC rejects the same programs (the name does not exist on aarch64,
-        // and `#ifdef`-guarded code never lowers the call), so the compile
-        // fails here rather than deferring to a trap at run time.
+        // AUD-SILENT-ZERO-1 / AUD-CPU-3: this function owns the *permission*
+        // half — on x86 the intrinsic exists, but the invocation may not have
+        // granted the extension it needs.  A foreign target is
+        // `lower_x86_intrinsic`'s rejection to make (it runs after this check
+        // and names the target: "'_mm_add_ps' is not available on aarch64");
+        // diagnosing it here as well would print two errors for one call.
         // 3 = EM_386 (i686), 62 = EM_X86_64.
         if !matches!(crate::common::types::target_elf_machine(), 3 | 62) {
-            // Naming the extension when we know it makes the message
-            // actionable; a builtin outside the table is still x86-only.
-            let hint = match x86_intrinsic_required_feature(intrinsic) {
-                Some(requirement) => format!(
-                    " ({} instruction-set extension, {})",
-                    requirement.feature.name(),
-                    requirement.flag
-                ),
-                None => String::new(),
-            };
-            self.diagnostics.borrow_mut().error(
-                format!(
-                    "`{}` is an x86-only intrinsic and is not available on {}{}",
-                    name,
-                    crate::common::types::target_arch_name(),
-                    hint
-                ),
-                span,
-            );
             return;
         }
         let Some(requirement) = x86_intrinsic_required_feature(intrinsic) else {
@@ -2215,8 +2535,29 @@ impl Lowerer {
     fn lower_x86_intrinsic(
         &mut self,
         intrinsic: &BuiltinIntrinsic,
+        name: &str,
         args: &[Expr],
     ) -> Option<Operand> {
+        // AUD-SILENT-ZERO-1: an x86-only intrinsic compiled for a foreign
+        // target used to lower to a silently zeroed result in the ARM/RISC-V
+        // backends -- a wrong answer instead of a rejection.  GCC rejects the
+        // builtin outright on those targets; so do we, at the one place every
+        // x86 intrinsic passes through.
+        if !matches!(
+            self.target,
+            crate::backend::Target::X86_64 | crate::backend::Target::I686
+        ) {
+            let arch = match self.target {
+                crate::backend::Target::Aarch64 => "aarch64",
+                crate::backend::Target::Riscv64 => "riscv64",
+                other => other.triple(),
+            };
+            return self.reject_builtin_call(
+                format!("'{}' is not available on {}", name, arch),
+                args,
+                16,
+            );
+        }
         let op = x86_intrinsic_op(intrinsic);
         match x86_intrinsic_kind(intrinsic) {
             X86IntrinsicKind::Fence => {
