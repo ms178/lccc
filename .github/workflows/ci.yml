@@ -208,6 +208,27 @@ jobs:
       - name: ISA-sensitive intrinsic feature gate
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_intrinsic_feature_gate.sh
 
+      # AUD-POS-1: positions after a #include, oracle-diffed against gcc.
+      - name: Diagnostic positions survive the preprocessor
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_diagnostic_positions.sh
+
+      # AUD-ICE-1: the argument counts the front end enforces for builtins are
+      # derived from include/*.h; this fails if the checked-in table drifts.
+      - name: Intrinsic arity table matches the headers
+        run: |
+          set -euo pipefail
+          python3 scripts/check_intrinsic_arity.py --self-test
+          python3 scripts/check_intrinsic_arity.py --check
+
+      # AUD-ICE-1: an ill-typed call to any builtin in the compiler's name
+      # table must diagnose, never panic; the ratchet baseline records the
+      # panics and silent accepts that exist today.
+      - name: Ill-typed builtin acceptance
+        run: |
+          set -euo pipefail
+          python3 scripts/check_ill_typed_builtins.py --self-test
+          env CCC=target/fastbuild/lccc LCCC_REPO=. python3 scripts/check_ill_typed_builtins.py
+
       - name: Run tests
         env:
           CARGO_BUILD_JOBS: "2"

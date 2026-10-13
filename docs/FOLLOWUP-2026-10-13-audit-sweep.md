@@ -221,6 +221,91 @@ can be deleted by a cleanup is not evidence. The second root is now
 `engineering/evidence/godbolt/corpus` (committed GCC/Clang/ICX output — also the
 more honest corpus, since asm-diff feeds the peephole foreign assembly).
 
+### AUD-ICE-1 — the acceptance gate, and the arity half of the fix (GATED + PARTIAL)
+
+*Measured first.* The audit's own reproduction (`__builtin_shuffle` with an
+`int` mask) was already fixed; what the gate found underneath it was a whole
+class: ill-typed calls to *any* intrinsic were passed to the backend, which
+panics on operand indexing (`ccc: internal error: emit_sse_binary_128:
+malformed intrinsic addps (0 args)`) — 650 of 624 × 2 names × optimisation
+levels at the time of measurement, and separately 380 that compiled silently.
+
+*The gate.* 624 names × 4 shapes × 2 levels, table-driven from
+`src/frontend/sema/builtins.rs` so a builtin added tomorrow is covered
+tomorrow. Compiles are full `-S` compiles (`-fsyntax-only` never reaches the
+backend, and the backend is where the panics live). Both the ICE list and the
+silent list are ratcheted against
+`tests/regression/ill_typed_builtins_baseline.json`; the ratchet logic has a
+self-test, and the first run of *that* self-test is what proved the gate can
+fail (a stale baseline entry is a note, a missing one is a hard red).
+
+*The arity fix.* `src/frontend/sema/intrinsic_arity.rs` (generated, 303 rows)
+gives the front end the argument count of a builtin under its own name, and
+the `builtins::is_builtin` arm of `src/frontend/sema/analysis.rs` reports
+`too few`/`too many arguments to function '…' (expected N, have M)` when the
+name is not declared in scope — GCC's wording, GCC's verdict. Enforcing it
+only for undeclared names is what keeps a header-included translation unit
+from being told twice.
+
+*Why the headers.* An intrinsic is only a prototype when the translation unit
+included the header that declares it, and the `__builtin_ia32_*` primitives
+are never declared anywhere — so the count is derived from the headers
+themselves and checked in, with `--check` in CI to stop the table from
+rotting. A name whose header uses disagree, or that no header mentions, is
+left unconstrained: an unverifiable guess would start rejecting valid code.
+
+### The hosted Test Suite red that was ours — `fib_rec2iter` (FIXED)
+
+`7b0ea71` added `tests/regression/fib_rec2iter.c`, the end-to-end test for the
+rec2iter pass: it evaluates `fib(90)`, which the pass makes instant and which
+**GCC cannot do at all** (2^90 calls). The corpus runner therefore killed the
+reference compiler's leg at the per-test timeout and reported
+`compare:fail (gcc rc=-9)` — a test that can never pass, which is why the
+hosted `Test Suite` job was red while every local run of the same suite showed
+"only the known host-limited failures". GCC has no rec2iter, so the comparison
+was never an oracle: `fib_rec2iter.env` now marks the test
+`LCCC_NO_COMPARE=1` with that reasoning, and LCCC's own answer is still
+checked, because the program returns non-zero unless every value matches.
+
+*Lesson for the harness rules: a red that the local host cannot reproduce
+(gcc's leg here is a timeout, not a rejection) is invisible in a per-test diff
+and only shows up as `compare:fail` — check `rc=-9` before assuming an lccc
+regression.*
+
+### AUD-POS-1 — every diagnostic after a `#include` was one line high (FIXED)
+
+*Symptom.* `printf '#include <stddef.h>\nint bad = ;\n'` compiled with LCCC
+blamed `d.c:3:11` for the syntax error on physical line 2. GCC blames 2:11.
+Any file that includes a header — i.e. every real translation unit — reported
+every subsequent position one line too high.
+
+*Cause.* `preprocess_source` splices an include's text into the output followed
+by a return-to-parent line marker (`# N "file" 2`). That marker already names
+the parent's **next** line, so the directive's own line is accounted for; the
+"preserve line numbering" block at the end of the directive path pushed one
+more `\n` anyway. The phantom blank line sat between the marker and the next
+parent line, and everything the lexer mapped afterwards was off by one. The
+shift is exactly +1 regardless of how many includes a file has, because each
+later marker re-anchors the parent file's numbering — which is why two
+includes did not produce +2 and why the bug looked like a rounding error.
+
+*Fix.* `emitted_include_content` is set when the directive produced include
+content, and the line-preservation newline is skipped in that case (the
+`pp_output_line` accounting for macro-expansion diagnostics is deliberately
+left alone — it counts the newlines actually written).
+
+*Verified.* `tests/regression/check_diagnostic_positions.sh` compiles twelve
+shapes with both compilers and requires the *same* `line:col`: error after an
+include, include on line 2, two includes, local include, nested include, error
+inside the header, no include at all, error six lines below an include, past a
+`#define` and past a `#pragma`, the missing-header case, and `__LINE__` after
+an include. Each row is checked in three ways — LCCC agrees with GCC, the row
+actually produced a diagnostic, and the position is the one the fixture
+documents — so the gate cannot pass by both compilers staying silent. Measured on the same host, the binary built
+from the parent commit fails 8 of the 12 rows -- exactly the eight whose fixture puts the
+error after an include -- and the fixed binary passes all 12, so the gate is shown to be
+able to fail before it is trusted to pass.
+
 ---
 
 ## 2. Verified-open items (start here)
@@ -281,20 +366,52 @@ Ordered by value ÷ cost, with the entry point each one needs.
      not by lccc's bundled headers (implicit-declaration warning), so they are
      unreachable from source until the headers grow them; that is a header
      change with an ABI question (32-byte vector argument), not a table row.
-2. **AUD-ICE-1 remainder — 889 panic-class sites (109 in the hot set).**
-   Worklist: `python3 scripts/audit_census.py --top-fns` for size and
-   `grep -nE 'panic!|unreachable!|\.expect\(|\.unwrap\('` per file for sites.
-   Hottest files: `x86/codegen/intrinsics.rs` (47), `slp_vectorizer.rs` (32),
-   `x86/assembler/parser.rs` (29), `backend/traits.rs` (27), `pgo/mod.rs` (22),
-   `ir/lowering/init_canon.rs` (13), `frontend/parser/declarators.rs` (13).
-   The audit's acceptance test still to write: an ill-typed-builtin gate (a
-   new script next to the audit census, driven by the same name table) — a
-   table of ill-typed calls of *every*
-   `BuiltinIntrinsic` (wrong arity, wrong type class, non-constant where a
-   constant is required) at `-O0` and `-O2`, asserting exit 1, a
-   `file:line:col: error:` prefix and the absence of `internal error`.
-   AUD-DIAG-1 (`__builtin_shuffle` mask element class) folds into it, and
-   `__builtin_shuffle` is already fixed for the arity/type cases.
+2. **AUD-ICE-1 remainder — the gate exists, the arity half is fixed, the
+   type-class half is measured.** The acceptance gate is
+   `scripts/check_ill_typed_builtins.py`: it reads the compiler's own name
+   table (624 intrinsic names), calls every one of them through four
+   ill-typed shapes at `-O0` and `-O2`, and classifies each compile as
+   **ICE** (panic text in the output), **diagnosed**, or **silent** (exit 0,
+   no diagnostic). `tests/regression/ill_typed_builtins_baseline.json`
+   ratchets the first and third: a name that starts panicking, or that newly
+   accepts an ill-typed call without a word, fails the gate; a name that stops
+   panicking is reported so the baseline can be tightened in the fixing
+   commit. `--self-test` exercises the ratchet itself (grow, shrink, hold)
+   without a compiler, and it is wired into both CI mirrors.
+   What it found, and what is left:
+   * **Arity is fixed** for every name whose count the bundled headers pin
+     down (303 of 624 — the `_mm*` wrappers from their parameter lists, the
+     `__builtin_ia32_*` primitives from the call sites inside the wrapper
+     bodies). `src/frontend/sema/intrinsic_arity.rs` is generated from
+     `include/*.h` by `scripts/check_intrinsic_arity.py --write`, and
+     `--check` (a CI gate) fails if the table drifts from the headers.
+     Measured with the gate: **650 → 174 ICE (name, opt) pairs, no additions**,
+     and 380 → 294 silent. GCC is the oracle for the wording and the verdict:
+     `too few arguments to function '_mm_add_ps' (expected 2, have 0)`, and a
+     header-declared name still reports exactly once (the prototype check wins
+     when a declaration is in scope).
+   * **Type classes are the remainder.** The headers give arity, not types, so
+     `__builtin_ia32_paddb128(x, &x)` (right arity, wrong classes) still
+     reaches the backend, where the operand indexing panics — 174 pairs today,
+     concentrated in `__builtin_ia32_*` names the headers never call (93 of
+     them have no call site) and in ops whose emitter reads an operand the
+     lowering did not type-check. 294 pairs are *silently accepted* ill-typed
+     calls, the AUD-DIAG-1 class (`_mm_loadu_si128(&int)` style pointer
+     mismatches are legitimate — GCC warns, not errors — but the integer-class
+     cases are not).
+   * **The entry point for the next slice** is the same table: give it a type
+     class per argument (GCC's own `-m` flag diagnostics are the oracle, and
+     `gcc -c` on each shape says which argument is wrong: `incompatible type
+     for argument 1 of '__builtin_ia32_addps'`), then extend
+     `expected_arity` to `expected_signature` and enforce it in the same
+     `builtins::is_builtin` arm of `src/frontend/sema/analysis.rs` that now
+     enforces the count.
+   The wider census (889 panic-class sites, 109 in the hot set) is unchanged
+   by this work and still stands as the audit's item list for
+   `x86/codegen/intrinsics.rs` (47), `slp_vectorizer.rs` (32),
+   `x86/assembler/parser.rs` (29) — those are *backend* sites that only a
+   front-end validation can keep unreachable from source.
+
 3. **AUD-DEBUG-1 — `-g` still yields line tables only** (no
    `.debug_info`/type info, `-gsplit-dwarf` rejected). Minimal DWARF 5 for
    `-O0`: `DW_TAG_compile_unit/subprogram/formal_parameter/variable/base_type/

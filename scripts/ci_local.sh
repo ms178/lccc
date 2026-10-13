@@ -285,6 +285,29 @@ gate "cross-target-intrinsic-trap" fast \
 gate "intrinsic-feature-gate" fast \
     env CCC="$LCCC" bash tests/regression/check_intrinsic_feature_gate.sh
 
+# AUD-POS-1: a diagnostic's file:line:col must survive the preprocessor -- the
+# case that regressed was "every position after a #include is one line high".
+# Oracle-diffed against gcc on positions, not wording.
+gate "diagnostic-positions" fast \
+    env CCC="$LCCC" bash tests/regression/check_diagnostic_positions.sh
+
+# AUD-ICE-1: an ill-typed builtin call is a diagnostic, never a panic.  The
+# worklist is the compiler's own name table, so a builtin added tomorrow is
+# covered tomorrow; the baseline ratchets the panics and silently-accepted
+# calls that exist today and fails the moment either list grows.
+gate "ill-typed-builtins-selftest" fast \
+    python3 scripts/check_ill_typed_builtins.py --self-test
+
+# AUD-ICE-1: the argument counts the front end enforces for builtins come from
+# include/*.h; the checked-in table is regenerated, never hand-edited, and this
+# gate fails if it stops matching the headers it was derived from.
+gate "intrinsic-arity-selftest" fast \
+    python3 scripts/check_intrinsic_arity.py --self-test
+gate "intrinsic-arity" fast \
+    python3 scripts/check_intrinsic_arity.py --check
+gate "ill-typed-builtins" fast \
+    env CCC="$LCCC" LCCC_REPO="$REPO" python3 scripts/check_ill_typed_builtins.py
+
 # The unit-test gate is what GitHub's required check runs on every PR, so it
 # belongs in the fast set: a red PR has to be reproducible with --fast.
 #
