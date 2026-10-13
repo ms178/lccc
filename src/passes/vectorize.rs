@@ -9677,7 +9677,7 @@ fn analyze_byte_count_loop(
             break;
         }
     }
-    let iv = iv?;
+    let (iv, selected_iv_ty) = iv?;
     let Some(iv_phi) = func.blocks[header_idx]
         .instructions
         .iter()
@@ -9694,7 +9694,9 @@ fn analyze_byte_count_loop(
         return None;
     };
     let iv_ty = *iv_ty;
-    if !matches!(iv_ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64) {
+    if iv_ty != selected_iv_ty
+        || !matches!(iv_ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64)
+    {
         return None; // narrow IV: same wrap hazard as the sum reduction
     }
     // The IV must start at ZERO and step by exactly +1.  Two reasons,

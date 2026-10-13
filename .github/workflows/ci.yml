@@ -130,12 +130,34 @@ jobs:
             # but the annotation remains inspectable through the Checks API.
             python3 - "$RUNNER_TEMP/lccc-build.log" <<'PY'
           from pathlib import Path
+          import re
           import sys
 
-          lines = Path(sys.argv[1]).read_text(errors="replace").splitlines()
-          context = lines[:40] + (["... build log truncated ..."] if len(lines) > 120 else []) + lines[-80:]
-          tail = chr(10).join(context)
-          escaped = tail.replace(chr(37), "%25").replace(chr(13), "%0D").replace(chr(10), "%0A")
+          text = Path(sys.argv[1]).read_text(errors="replace")
+          text = re.sub(chr(27) + r"\[[0-9;]*m", "", text)
+          lines = text.splitlines()
+          ranges = []
+          for index, line in enumerate(lines):
+              if re.match(r"^(?:error(?:\[[^]]+\])?:|warning:)", line):
+                  ranges.append((max(0, index - 2), min(len(lines), index + 32)))
+          merged = []
+          for start, end in ranges:
+              if merged and start <= merged[-1][1]:
+                  merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+              else:
+                  merged.append((start, end))
+          if merged:
+              context = []
+              for start, end in merged:
+                  if context:
+                      context.append("... omitted log lines ...")
+                  context.extend(lines[start:end])
+          else:
+              context = lines[-120:]
+          detail = chr(10).join(context)
+          if len(detail) > 40000:
+              detail = detail[:20000] + chr(10) + "... diagnostic output truncated ..." + chr(10) + detail[-20000:]
+          escaped = detail.replace(chr(37), "%25").replace(chr(13), "%0D").replace(chr(10), "%0A")
           print(f"::error title=Rust build diagnostics::{escaped}")
           PY
           fi
