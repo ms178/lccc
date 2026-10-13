@@ -988,7 +988,10 @@ impl Lowerer {
             | BuiltinIntrinsic::X86MulEpi32
             | BuiltinIntrinsic::X86MulloEpi32
             | BuiltinIntrinsic::X86Pcmpgtb256
-            | BuiltinIntrinsic::X86CastReinterpret => self.lower_x86_intrinsic(intrinsic, args),
+            | BuiltinIntrinsic::X86CastReinterpret => {
+                self.check_x86_intrinsic_feature(intrinsic, name, args);
+                self.lower_x86_intrinsic(intrinsic, args)
+            }
             // __builtin_shufflevector(v1, v2, i0, i1, i2, i3): 4-lane 32-bit
             // lane gather with constant indices (Clang/GCC generic shuffle).
             BuiltinIntrinsic::ShuffleVector => self.lower_shufflevector(args),
@@ -2130,6 +2133,59 @@ impl Lowerer {
     /// - PtrStore: first arg is dest pointer, remaining args are data (movnti, storedqu, etc.)
     /// - Vec128: allocates 16-byte result slot, returns pointer (SSE/AES packed ops)
     /// - Scalar: returns a scalar value in a dest register (pmovmskb, crc32, pextrw, etc.)
+    /// AUD-CPU-3: diagnose an intrinsic whose instruction-set extension the
+    /// requested target level does not have.
+    ///
+    /// `IntrinsicOp` is target-independent, so nothing downstream stopped a
+    /// `crc32`/`aesenc`/`pclmulqdq` from being emitted for a target that had
+    /// explicitly been told not to assume the extension: `-march=x86-64`
+    /// (SSE2 only) compiled `_mm_crc32_u8` to `crc32b`, i.e. to an illegal
+    /// instruction on exactly the hardware the user declared -- a SIGILL with
+    /// no diagnostic at any stage.  GCC and Clang reject the same source
+    /// ("target specific option mismatch" / "requires target feature"), and
+    /// the permission consulted here is the SAME `effective()` set
+    /// `__builtin_cpu_supports` folds against (AUD-CPU-1), so the two can
+    /// never disagree.
+    ///
+    /// x86 targets only: on AArch64/RISC-V every x86 extension is absent, and
+    /// those intrinsics are handled by the AUD-SILENT-ZERO-1 trap instead of a
+    /// second, differently-worded failure path (target-scoped intrinsics are a
+    /// separate item in the follow-up document).
+    ///
+    /// The call is still lowered after the error is recorded: the driver
+    /// rejects the translation unit on any lowering error, and bailing here
+    /// would only add a way to skip the diagnostic.
+    fn check_x86_intrinsic_feature(
+        &mut self,
+        intrinsic: &BuiltinIntrinsic,
+        name: &str,
+        args: &[Expr],
+    ) {
+        let Some((feature, flag)) = x86_intrinsic_required_feature(intrinsic) else {
+            return;
+        };
+        // 3 = EM_386 (i686), 62 = EM_X86_64.
+        if !matches!(crate::common::types::target_elf_machine(), 3 | 62) {
+            return;
+        }
+        if crate::common::x86_features::effective().contains(feature) {
+            return;
+        }
+        let span = args
+            .first()
+            .map(|a| a.span())
+            .unwrap_or_else(|| crate::common::source::Span::new(0, 0, 0));
+        self.diagnostics.borrow_mut().error(
+            format!(
+                "`{}` requires the {} instruction-set extension ({}), which the requested target does not have",
+                name,
+                feature.name(),
+                flag
+            ),
+            span,
+        );
+    }
+
     fn lower_x86_intrinsic(
         &mut self,
         intrinsic: &BuiltinIntrinsic,
@@ -2552,6 +2608,35 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
 }
 
 /// Map a BuiltinIntrinsic to its corresponding IntrinsicOp.
+/// AUD-CPU-3: the instruction-set extension an x86 intrinsic's instruction
+/// belongs to, for the families whose permission bit exists in
+/// [`crate::common::x86_features`].
+///
+/// Only *unambiguous* families are listed.  The 256-bit AES/CLMUL forms are
+/// VAES/VPCLMULQDQ (which also require AVX state, and whose permission bits do
+/// not exist yet), and the SHA/GFNI/AVX-512 families have no bit either -- see
+/// the follow-up document's AUD-CPU-3 entry, which tracks giving them one.
+fn x86_intrinsic_required_feature(
+    intrinsic: &BuiltinIntrinsic,
+) -> Option<(crate::common::x86_features::X86Feature, &'static str)> {
+    use crate::common::x86_features::X86Feature as F;
+    use BuiltinIntrinsic as B;
+    Some(match intrinsic {
+        // SSE4.2 introduced CRC32: `_mm_crc32_u8` and its width siblings.
+        B::X86Crc32_8 | B::X86Crc32_16 | B::X86Crc32_32 | B::X86Crc32_64 => (F::Sse42, "-msse4.2"),
+        // AES-NI, 128-bit forms (the `_mm_*`/`__builtin_ia32_*` spellings that
+        // map onto the legacy-encoded instructions).
+        B::X86Aesenc128
+        | B::X86Aesenclast128
+        | B::X86Aesdec128
+        | B::X86Aesdeclast128
+        | B::X86Aesimc128
+        | B::X86Aeskeygenassist128 => (F::Aes, "-maes"),
+        B::X86Pclmulqdq128 => (F::Pclmul, "-mpclmul"),
+        _ => return None,
+    })
+}
+
 fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
     match intrinsic {
         BuiltinIntrinsic::X86Rdtsc => IntrinsicOp::Rdtsc,

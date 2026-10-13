@@ -23,7 +23,7 @@ ccc=${CCC:-$repo/target/fastbuild/lccc}
 ccc_arm=${CCC_ARM:-$repo/target/fastbuild/lccc-arm}
 ccc_riscv=${CCC_RISCV:-$repo/target/fastbuild/lccc-riscv}
 ccc_i686=${CCC_I686:-$repo/target/fastbuild/lccc-i686}
-src=$repo/tests/regression/cross_target_intrinsic.c
+src=$repo/tests/regression/cross_target_intrinsics/x86_only.c
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
@@ -112,10 +112,16 @@ for opt in -O0 -O2; do
     [ "$(grep -cE '^[[:space:]]+brk[[:space:]]' "$tmp/arm$tag.s")" = 1 ] ||
         fail "AArch64 $opt: the trap leaked outside the unlowerable intrinsic"
     for fn in portable_sqrt portable_fabs; do
-        function_body "$fn" "$tmp/arm$tag.s" | grep -qE '^[[:space:]]+brk[[:space:]]' &&
+        # Capture, then match a here-string: `producer | grep -q` would let
+        # grep exit early and SIGPIPE the producer, which `set -o pipefail`
+        # turns into a failure of the gate itself (the repo's own
+        # pipefail-sigpipe gate rejects that shape).
+        body=$(function_body "$fn" "$tmp/arm$tag.s")
+        grep -qE '^[[:space:]]+brk[[:space:]]' <<<"$body" &&
             fail "AArch64 $opt: $fn was trapped although AArch64 can compute it"
     done
-    function_body portable_sqrt "$tmp/arm$tag.s" | grep -qE '^[[:space:]]+fsqrt[[:space:]]' ||
+    body=$(function_body portable_sqrt "$tmp/arm$tag.s")
+    grep -qE '^[[:space:]]+fsqrt[[:space:]]' <<<"$body" ||
         fail "AArch64 $opt: portable_sqrt no longer lowers to fsqrt"
     "$ccc_arm" "$opt" -c "$src" -o "$tmp/arm$tag.o"
     trap_in_object "$tmp/arm$tag.o" 0xd4200000 ||
@@ -130,7 +136,8 @@ for opt in -O0 -O2; do
         fail "RISC-V $opt: x86-only intrinsic still zero-fills its destination"
     [ "$(grep -cE '^[[:space:]]+ebreak$' "$tmp/riscv$tag.s")" = 1 ] ||
         fail "RISC-V $opt: the trap leaked outside the unlowerable intrinsic"
-    function_body portable_sqrt "$tmp/riscv$tag.s" | grep -qE '^[[:space:]]+fsqrt' ||
+    body=$(function_body portable_sqrt "$tmp/riscv$tag.s")
+    grep -qE '^[[:space:]]+fsqrt' <<<"$body" ||
         fail "RISC-V $opt: portable_sqrt no longer lowers to fsqrt"
     "$ccc_riscv" "$opt" -c "$src" -o "$tmp/riscv$tag.o"
     trap_in_object "$tmp/riscv$tag.o" 0x00100073 0x9002 ||
@@ -138,10 +145,12 @@ for opt in -O0 -O2; do
 done
 
 # 3. Positive controls: the x86 family must keep computing the intrinsic, so
-#    this cannot be "fixed" by trapping every target.
+#    this cannot be "fixed" by trapping every target.  `-maes` is required:
+#    AUD-CPU-3 makes an x86 target without the AES permission reject the
+#    intrinsic (GCC does the same), so the control must ask for it.
 for tool in "$ccc_i686" "$ccc"; do
     out=$tmp/$(basename "$tool").s
-    "$tool" -O2 -S "$src" -o "$out"
+    "$tool" -O2 -maes -S "$src" -o "$out"
     grep -qE '^[[:space:]]+v?aesenc([[:space:]]|$)' "$out" ||
         { printf '%s\n' "$(function_body x86_only_enc "$out")" >&2;
           fail "$(basename "$tool"): AES-NI intrinsic no longer lowers to aesenc"; }

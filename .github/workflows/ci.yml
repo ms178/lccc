@@ -174,6 +174,11 @@ jobs:
               CCC_I686=target/fastbuild/lccc-i686 \
               bash tests/regression/check_cross_target_intrinsic_trap.sh
 
+      # AUD-CPU-3: `-march=x86-64` must reject `_mm_crc32_u8`/`_mm_aesenc_si128`
+      # (GCC does), and the flag that grants the extension must still lower it.
+      - name: ISA-sensitive intrinsic feature gate
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_intrinsic_feature_gate.sh
+
       - name: Run tests
         env:
           CARGO_BUILD_JOBS: "2"

@@ -252,6 +252,13 @@ gate "cross-target-intrinsic-trap" fast \
     CCC_I686=target/fastbuild/lccc-i686 \
     bash tests/regression/check_cross_target_intrinsic_trap.sh
 
+# AUD-CPU-3: an intrinsic whose instruction-set extension the invocation does
+# not permit must be diagnosed (GCC/Clang reject it too), and the invocation
+# that does permit it must still emit the instruction.  Oracle-checked against
+# gcc wherever gcc ships the same intrinsic.
+gate "intrinsic-feature-gate" fast \
+    env CCC="$LCCC" bash tests/regression/check_intrinsic_feature_gate.sh
+
 # The unit-test gate is what GitHub's required check runs on every PR, so it
 # belongs in the fast set: a red PR has to be reproducible with --fast.
 #

@@ -1,20 +1,14 @@
-/* AUD-SILENT-ZERO-1 gate input.
+/* AUD-SILENT-ZERO-1 corpus entry.
  *
- * `__builtin_ia32_aesenc128` is an x86-only intrinsic: AArch64 and RISC-V have
- * no instruction for it, and their backends cannot compute it.  Before the
- * fix those backends "zeroed dest if present" -- a 16-byte store of zeros, or
- * NOTHING AT ALL when the destination was register-allocated -- so an x86
- * intrinsic compiled for another target silently produced a wrong value with
- * rc=0 and no diagnostic anywhere in the pipeline.
- *
- * The two functions below pin both halves of the contract: the x86-only one
- * must be unable to hand back a value (trap), and the portable ones must keep
- * lowering to real instructions (no collateral trapping).
+ * The fixture the trap gate compiles lives in `cross_target_intrinsics/`, out
+ * of the corpus glob: `run_regression.py` compiles every `tests/regression/*.c`
+ * as a complete stand-alone TU, and the gate needs the SAME source compiled
+ * once per target (and, on x86, with `-maes` so AUD-CPU-3's feature gate
+ * permits the intrinsic).  This wrapper pulls the fixture in so the corpus
+ * still compiles it on every run — with `-maes` from the `.flags` file — which
+ * is what keeps the x86 half of the contract (the intrinsic still lowers to
+ * `aesenc` where the target has it) exercised by the ordinary corpus.
  */
-typedef long long v2di __attribute__((vector_size(16)));
+#include "cross_target_intrinsics/x86_only.c"
 
-v2di x86_only_enc(v2di a, v2di b) { return __builtin_ia32_aesenc128(a, b); }
-
-double portable_sqrt(double x) { return __builtin_sqrt(x); }
-
-double portable_fabs(double x) { return __builtin_fabs(x); }
+int main(void) { return 0; }
