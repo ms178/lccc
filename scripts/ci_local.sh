@@ -908,6 +908,8 @@ gate "i686-boot-asm" fast \
 
 gate "asm-goto-phi-edge" fast \
     bash tests/regression/check_asm_goto_phi_edge.sh
+gate "i686-label-ref-safety" fast \
+    bash tests/regression/check_i686_label_ref_safety.sh
 
 # ci.yml "Verify inline-asm UTF-8 assembly text".
 gate "inline-asm-utf8" fast \

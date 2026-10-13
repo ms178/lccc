@@ -2168,14 +2168,21 @@ pub trait ArchCodegen {
     /// Fall-through elision: when the branch target is the physically next
     /// emitted block (the driver records it in `next_block_label` before
     /// each terminator), the transfer is implicit — the `jmp` is dead
-    /// weight. This is semantics-preserving on every block-based ISA the
+    /// weight. This is control-flow preserving on every block-based ISA the
     /// driver lowers (sequential fall-through between adjacent blocks), and
     /// the text-level CFG consumers (peephole liveness) model a `jmp` as
     /// *only* the target edge and every other line as fall-through to the
     /// next line, so a block that now ends without a jump is still modeled
     /// exactly: the next block's label is reachable via the fall edge.
+    ///
+    /// Address identity is not control flow. An empty address-taken block
+    /// (`&&label`, a static initializer, an asm-goto target) whose only
+    /// transfer was this branch would otherwise share its address with the
+    /// next label. GCC keeps those distinct. Emit the jump in that case.
     fn emit_branch_to_block(&mut self, block: BlockId) {
-        if self.state().next_block_label == Some(block) {
+        if self.state().next_block_label == Some(block)
+            && !self.state().fallthrough_would_alias_observable_label()
+        {
             return;
         }
         // Cache the mnemonic first to avoid borrow conflict with state()
