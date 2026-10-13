@@ -484,7 +484,9 @@ impl Driver {
                 return lock
                     .write_all(content.as_bytes())
                     .and_then(|()| lock.flush())
-                    .map_err(|e| format!("Cannot write dependency rules to standard output: {}", e));
+                    .map_err(|e| {
+                        format!("Cannot write dependency rules to standard output: {}", e)
+                    });
             }
             std::fs::write(&dep_path, content)
                 .map_err(|e| format!("Cannot write dependency file {}: {}", dep_path, e))

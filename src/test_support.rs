@@ -39,6 +39,24 @@ pub(crate) fn backend_flag_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// The one lock that serializes every test publishing the effective x86
+/// feature set (`common::x86_features::set_effective`). Same reasoning as
+/// `BACKEND_FLAG_LOCK`: the published set is a process-global read by IR
+/// lowering, so a window that flips it must be mutually exclusive against
+/// every other test that lowers `__builtin_cpu_supports` — and the window
+/// must restore the previous value in `Drop`, not by hand.
+static X86_FEATURE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+pub(crate) fn x86_feature_lock() -> MutexGuard<'static, ()> {
+    X86_FEATURE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        // A poisoned lock means a test panicked while holding it. The
+        // window's `Drop` restores the set regardless, so the state is not
+        // left inconsistent and the remaining tests should still run.
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 thread_local! {
     /// Flag-window nesting depth for THIS thread. `Mutex` is not reentrant,
     /// and nesting is a real shape (a precise-mode pin held across asserts

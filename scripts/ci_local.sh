@@ -224,6 +224,15 @@ gate "temp-symlink-hardening" fast \
 gate "o-stdout" fast \
     env CCC="$LCCC" bash tests/regression/check_o_stdout.sh
 
+# AUD-CPU-1: `__builtin_cpu_supports` must fold from the effective codegen
+# permission (target + -march + -m* flags), not from a hard-coded CPU list.
+# The old table answered "yes" to AVX2/BMI2/SHA for every invocation, which put
+# runtime dispatch in zlib-ng/zstd/xz/OpenSSL on paths that SIGILL on hardware
+# without them. Also asserts non-x86 targets and non-literal arguments are
+# diagnosed instead of silently folding to 0.
+gate "cpu-supports-fold" fast \
+    env CCC="$LCCC" CCC_ARM=target/fastbuild/lccc-arm bash tests/regression/check_cpu_supports_fold.sh
+
 # The unit-test gate is what GitHub's required check runs on every PR, so it
 # belongs in the fast set: a red PR has to be reproducible with --fast.
 #

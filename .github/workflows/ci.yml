@@ -152,6 +152,12 @@ jobs:
       - name: Standard-output contract for -o -
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_o_stdout.sh
 
+      # AUD-CPU-1: `__builtin_cpu_supports` folds from the effective codegen
+      # permission (target + -march + -m*), so runtime dispatch cannot select
+      # an instruction set the build was not allowed to assume.
+      - name: CPU feature fold honours -march and target
+        run: env CCC=target/fastbuild/lccc CCC_ARM=target/fastbuild/lccc-arm bash tests/regression/check_cpu_supports_fold.sh
+
       - name: Run tests
         env:
           CARGO_BUILD_JOBS: "2"

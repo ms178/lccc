@@ -652,75 +652,73 @@ impl Lowerer {
                 }
                 Some(Operand::Const(IrConst::I64(0)))
             }
-            // __builtin_cpu_init() - no-op on glibc systems (auto-initialized)
+            // __builtin_cpu_init() — no-op: the folded form below never needs
+            // the runtime `__cpu_model`, so there is nothing to initialise.
+            // (GCC calls `__cpu_indicator_init` here; programs that call it
+            // stay correct either way, which is why it remains a no-op rather
+            // than a call into libgcc.)
             BuiltinIntrinsic::CpuInit => Some(Operand::Const(IrConst::I32(0))),
-            // __builtin_cpu_supports("feature") - returns 1 if feature is enabled for target.
-            // For Raptor Lake (-march=raptorlake) we enable AES, PCLMUL, AVX, AVX2, etc.
-            // This matches GCC's behavior where __builtin_cpu_supports checks runtime CPUID,
-            // but for PGO we want to enable the optimized path when the compile-time target supports it.
+            // __builtin_cpu_supports("feature") — AUD-CPU-1.
+            //
+            // Folds to 1 iff the *effective code-generation permission* of this
+            // invocation guarantees the feature (see `common::x86_features`),
+            // otherwise 0. The previous hard-coded "Raptor Lake" allowlist
+            // ignored `-march`, `-mno-*` and even the target architecture, so a
+            // `-march=x86-64` build reported AVX2/BMI2/SHA as present and every
+            // runtime-dispatched library took a path that SIGILLs on hardware
+            // without them. `1` is now only ever produced for instructions the
+            // backend is already allowed to emit unconditionally.
             BuiltinIntrinsic::CpuSupports => {
                 for arg in args {
                     self.lower_expr(arg);
                 }
-                // Compile-time fold against the project's compile target
-                // (x86-64 Raptor Lake). The old behavior returned 1 for EVERY
-                // feature except avx512* - including features Raptor Lake
-                // does not have (AMX, XOP, SSE4A, ...), which turned runtime
-                // dispatch into guaranteed SIGILL paths. Fold from an exact
-                // allowlist instead; UNKNOWN features fold to 0 (the safe
-                // direction for dispatchers: they fall back to generic code).
-                let mut ret = 0;
-                if !args.is_empty() {
-                    if let crate::frontend::parser::ast::Expr::StringLiteral(s, _) = &args[0] {
-                        let feat = s.to_ascii_lowercase();
-                        // Features present on Raptor Lake (and the x86-64-v3
-                        // baseline this project targets).
-                        const PRESENT: &[&str] = &[
-                            "cmov",
-                            "mmx",
-                            "sse",
-                            "sse2",
-                            "sse3",
-                            "ssse3",
-                            "sse4.1",
-                            "sse4.2",
-                            "popcnt",
-                            "avx",
-                            "avx2",
-                            "fma",
-                            "bmi",
-                            "bmi2",
-                            "lzcnt",
-                            "movbe",
-                            "f16c",
-                            "aes",
-                            "pclmul",
-                            "pclmulqdq",
-                            "rdrnd",
-                            "rdrand",
-                            "rdseed",
-                            "sha",
-                            "adx",
-                            "fsgsbase",
-                            "xsave",
-                            "xsaveopt",
-                            "xsavec",
-                            "avxvnni",
-                            "vaes",
-                            "vpclmulqdq",
-                            "gfni",
-                            "cx16",
-                            "fxsr",
-                            "osxsave",
-                        ];
-                        if PRESENT.contains(&feat.as_str()) {
-                            ret = 1;
-                        }
-                        // Everything else (avx512*, amx*, xop, sse4a, fma4,
-                        // tbm, prefetchwt1, ...) folds to 0.
-                    }
+                let span = args
+                    .first()
+                    .map(|a| a.span())
+                    .unwrap_or_else(|| crate::common::source::Span::new(0, 0, 0));
+                // Only x86 targets have x86 feature names; on aarch64/riscv64
+                // every feature would have to fold to 0 silently, which turns
+                //   __builtin_cpu_supports("avx2") ? fast_path() : slow_path()
+                // into an unconditional slow path with no diagnostic at all.
+                // GCC errors for a builtin that does not exist on the target;
+                // match that instead of guessing.
+                let elf_machine = crate::common::types::target_elf_machine();
+                if !matches!(elf_machine, 3 | 62) {
+                    // 3 = EM_386 (i686), 62 = EM_X86_64.
+                    self.diagnostics.borrow_mut().error(
+                        "__builtin_cpu_supports is not available on this target architecture"
+                            .to_string(),
+                        span,
+                    );
+                    return Some(Operand::Const(IrConst::I32(0)));
                 }
-                Some(Operand::Const(IrConst::I32(ret)))
+                let granted = match args.first() {
+                    Some(crate::frontend::parser::ast::Expr::StringLiteral(name, _)) => {
+                        crate::common::x86_features::X86Feature::parse(name)
+                            .is_some_and(|f| crate::common::x86_features::effective().contains(f))
+                    }
+                    // A non-literal argument cannot be resolved at compile
+                    // time. GCC diagnoses the non-constant case; folding 0 in
+                    // silence would be a wrong answer nobody can see, so say it
+                    // (the TU is rejected by the driver's lowering-error check).
+                    Some(other) => {
+                        self.diagnostics.borrow_mut().error(
+                            "__builtin_cpu_supports requires a string literal feature name"
+                                .to_string(),
+                            other.span(),
+                        );
+                        false
+                    }
+                    None => {
+                        self.diagnostics.borrow_mut().error(
+                            "__builtin_cpu_supports expects one string literal argument"
+                                .to_string(),
+                            span,
+                        );
+                        false
+                    }
+                };
+                Some(Operand::Const(IrConst::I32(i32::from(granted))))
             }
             // X86 SSE/AES/CRC intrinsics - delegated to lower_x86_intrinsic
             BuiltinIntrinsic::X86Lfence

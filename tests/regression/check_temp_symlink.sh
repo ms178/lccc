@@ -115,10 +115,10 @@ cmp -s "$vault/victim.txt" "$vault/victim.expected" \
 # ---------------------------------------------------------------------------
 # 2. no stray files in $TMPDIR; private dir is 0700 and reaped
 # ---------------------------------------------------------------------------
-strays=$(find "$vault" -maxdepth 1 -type f ! -name 'ccc_*' ! -name 'victim.*' ! -name 'a_asm.o' | head -5)
+strays=$(find "$vault" -maxdepth 1 -type f ! -name 'ccc_*' ! -name 'victim.*' ! -name 'a_asm.o' | sed -n '1,5p')
 [[ -z $strays ]] || fail "unexpected files written directly into TMPDIR: $strays"
 
-leftovers=$(find "$vault" -maxdepth 1 -type d -name 'lccc-*' | head -5)
+leftovers=$(find "$vault" -maxdepth 1 -type d -name 'lccc-*' | sed -n '1,5p')
 [[ -z $leftovers ]] || fail "private temp directory was not reaped: $leftovers"
 
 # Prove the private directory is really used (and really 0700) rather than the
@@ -133,7 +133,7 @@ ASM
 set +e
 ( cd "$work" && TMPDIR="$vault" CCC_ASM_DEBUG=1 "$CCC" -c a.S -o a_asm.o ) >"$tmp/dbg.log" 2>&1
 set -e
-dump=$(sed -n 's/^\[ccc\] CCC_ASM_DEBUG: wrote //p' "$tmp/dbg.log" | head -1)
+dump=$(sed -n 's/^\[ccc\] CCC_ASM_DEBUG: wrote //p' "$tmp/dbg.log" | sed -n '1p')
 [[ -n $dump ]] || { cat "$tmp/dbg.log" >&2; fail "CCC_ASM_DEBUG produced no dump path"; }
 [[ -f $dump ]] || fail "CCC_ASM_DEBUG dump $dump does not exist"
 [[ $dump == "$vault"/lccc-*/* ]] || fail "CCC_ASM_DEBUG dump $dump is not inside a private TMPDIR subdirectory"
@@ -165,7 +165,7 @@ rc=$?
 set -e
 [[ $rc -eq 0 ]] || { cat "$tmp/build2.log" >&2; fail "lccc exited $rc with a pre-placed directory in TMPDIR"; }
 [[ -x "$work/prog2" ]] || fail "no executable produced with a pre-placed directory in TMPDIR"
-[[ -z $(find "$vault" -maxdepth 1 -type f -newer "$vault/victim.expected" | head -1) ]]     || fail "files were written directly into TMPDIR"
+[[ -z $(find "$vault" -maxdepth 1 -type f -newer "$vault/victim.expected" | sed -n '1p') ]]     || fail "files were written directly into TMPDIR"
 
 # ---------------------------------------------------------------------------
 # 4. cross-target sanity: the same discipline for a non-x86 backend

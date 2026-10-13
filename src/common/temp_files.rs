@@ -148,9 +148,7 @@ fn create_private_dir() -> Option<PathBuf> {
 /// Created lazily on first use and shared by every temp file of this process.
 pub fn private_temp_dir() -> Option<&'static Path> {
     static PRIVATE_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
-    PRIVATE_DIR
-        .get_or_init(create_private_dir)
-        .as_deref()
+    PRIVATE_DIR.get_or_init(create_private_dir).as_deref()
 }
 
 /// Remove the private temp directory if it is empty.
@@ -212,7 +210,12 @@ pub fn write_file_exclusive(path: &Path, contents: &[u8]) -> io::Result<()> {
 /// concurrent compilations cannot collide (the old fixed
 /// `/tmp/asm_debug_<stem>.s` name could be pre-created as a symlink by another
 /// local user and every parallel run overwrote the same file).
-pub fn write_debug_dump(prefix: &str, stem: &str, extension: &str, contents: &[u8]) -> Option<PathBuf> {
+pub fn write_debug_dump(
+    prefix: &str,
+    stem: &str,
+    extension: &str,
+    contents: &[u8],
+) -> Option<PathBuf> {
     let path = make_temp_path(prefix, stem, extension);
     match write_file_exclusive(&path, contents) {
         Ok(()) => Some(path),
