@@ -79,6 +79,28 @@ def extractall_takes_filter() -> bool:
         return False
 
 
+def chmod_ignores_a_none_mode() -> bool:
+    """True when ``TarFile.chmod`` tolerates the filter's ``mode=None``.
+
+    PEP 706 shipped the ``filter=`` keyword to 3.12/3.11.4 *and* an early
+    return for ``mode is None`` in ``TarFile.chmod``.  A floor interpreter
+    (docs/getting-started.md: Python 3.9+) can have neither, and one whose
+    distro backported only the keyword -- Debian 12's 3.11.2, measured --
+    raises ``TypeError`` from ``os.chmod(path, None)`` for every DIRECTORY
+    member whose mode the neutralizer cleared.  Probed by calling the unbound
+    method, which never reads ``self`` on any version, so ``None`` is a safe
+    receiver and no version number has to be trusted.
+    """
+    probe = tarfile.TarInfo("probe")
+    probe.type = tarfile.DIRTYPE
+    probe.mode = None
+    try:
+        tarfile.TarFile.chmod(None, probe, os.devnull)
+    except TypeError:
+        return False
+    return True
+
+
 def _neutralize_archive_attrs(m: tarfile.TarInfo) -> tarfile.TarInfo:
     """Metadata half of tarfile's ``data`` filter, for pre-3.12 interpreters.
 
@@ -179,8 +201,20 @@ def extract_untrusted(tf: tarfile.TarFile, dest: Path) -> None:
         # tests/corpus/test_workload_extraction_safety.py, which feeds both
         # helpers the same hostile archives and compares verdicts and the
         # resulting on-disk attributes.
+        guarded = chmod_ignores_a_none_mode()
+        umask = os.umask(0)
+        os.umask(umask)
         for m in tf.getmembers():
             _neutralize_archive_attrs(m)
+            if m.isdir() and m.mode is None and not guarded:
+                # The neutralizer mirrors the data filter, which expresses
+                # "ignore this member's mode" as mode=None; an interpreter
+                # whose chmod predates the PEP 706 guard dies on that for
+                # every directory, so substitute the mode its own unfiltered
+                # extraction ends up with: os.mkdir's default.  The umask can
+                # only CLEAR bits, so the group/other-write clamp this helper
+                # exists for is unaffected.
+                m.mode = 0o777 & ~umask
         tf.extractall(dest)
 
 

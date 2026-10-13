@@ -34,6 +34,14 @@
 //! sites are fixed turns hosted CI red. That is the intended failure mode, and
 //! the reason the list is kept to the exact set the tree violates instead of a
 //! comfortable superset.
+// A *newer* Clippy spells names this list cannot avoid naming (see
+// scripts/clippy_msrv_lints.txt). An older Clippy reports those names as
+// `unknown_lints`, which `-D warnings` promotes to an error and the declared
+// `rust-version` in Cargo.toml would stop building; this allow is scoped to
+// this crate for exactly that reason. It is not a licence to misspell: the
+// `clippy` CI gate runs scripts/check_clippy_policy.py, which fails on any
+// unknown lint that is not a documented, dated entry in that file.
+#![allow(unknown_lints)]
 #![allow(
     clippy::bind_instead_of_map,
     clippy::chunks_exact_to_as_chunks,

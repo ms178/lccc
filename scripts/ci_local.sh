@@ -1626,8 +1626,14 @@ clippy_gate() {
     fi
     # RUSTFLAGS reuses the build gate's resolved flags (see cargo_test_repeated):
     # without them clippy recompiles the whole crate under a different flag set.
-    RUSTFLAGS="$flags" cargo clippy --all-targets --profile fastbuild \
-        --locked -j "$jobs" -- -D warnings
+    #
+    # The wrapper (not bare `cargo clippy`) is load-bearing: the crate root
+    # carries `#![allow(unknown_lints)]` so that a Clippy newer than the
+    # declared MSRV cannot break `-D warnings` on a lint name that does not
+    # exist yet, and the wrapper re-probes every name in the policy list under
+    # `#![deny(unknown_lints)]` to keep typos from hiding behind that allow.
+    RUSTFLAGS="$flags" CARGO_BUILD_JOBS="$jobs" \
+        python3 scripts/check_clippy_policy.py
 }
 gate "clippy" fast clippy_gate
 

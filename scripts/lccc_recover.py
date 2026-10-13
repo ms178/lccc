@@ -60,6 +60,30 @@ def extractall_takes_filter():
         return False
 
 
+def chmod_ignores_a_none_mode():
+    """True when TarFile.chmod tolerates the filter's mode=None.
+
+    PEP 706 landed the filter in 3.12 and 3.11.4 and *with it* an early return
+    for `tarinfo.mode is None` in `TarFile.chmod`.  A 3.11.3-or-older
+    interpreter therefore crashes with `TypeError: 'NoneType' object cannot be
+    interpreted as an integer` on every DIRECTORY member whose mode the filter
+    cleared — measured on Debian 12's 3.11.2 with this module's own unit tests
+    (20 errors, all `tarfile.py: self.chmod(tarinfo, dirpath)`), i.e. on
+    exactly the interpreters the documented 3.9+ floor covers and which cannot
+    use the filter branch at all.
+
+    Probed by calling the unbound method rather than by version number: a
+    distro backport can move either half of PEP 706 independently, and
+    `chmod` never reads `self` on ANY version, so `None` is a safe receiver.
+    """
+    member=tarfile.TarInfo('probe');member.type=tarfile.DIRTYPE;member.mode=None
+    try:
+        tarfile.TarFile.chmod(None,member,os.devnull)
+    except TypeError:
+        return False
+    return True
+
+
 def read_json(path):
     def pairs(values):
         r={}
@@ -170,7 +194,22 @@ def extract(archive,stage,r):
         if extractall_takes_filter():
             t.extractall(stage,filter='data')
         else:
-            for member in members:neutralize_archive_attrs(member)
+            guarded=chmod_ignores_a_none_mode()
+            umask=os.umask(0);os.umask(umask)
+            for member in members:
+                neutralize_archive_attrs(member)
+                if member.isdir() and member.mode is None and not guarded:
+                    # The neutralizer mirrors the data filter, which expresses
+                    # "ignore this member's mode" as mode=None.  An interpreter
+                    # whose chmod predates PEP 706's None guard passes that
+                    # straight to os.chmod() and dies on every directory, so
+                    # give the directory the mode the guard-era interpreter
+                    # ends up with after its own unfiltered `_extract_member`:
+                    # os.mkdir's default (`0o777 & ~umask`) — the filter never
+                    # puts a directory back to the archive's mode, and the
+                    # group/other-write clamp this helper exists for is
+                    # unaffected because the umask can only CLEAR bits.
+                    member.mode=0o777&~umask
             t.extractall(stage)
     repo=stage/'lccc';require(repo.is_dir(),'source root missing');return repo
 

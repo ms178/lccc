@@ -1471,10 +1471,15 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
+      # The wrapper runs the same strict Clippy invocation and additionally
+      # re-probes the crate-root lint policy under `#![deny(unknown_lints)]`:
+      # the root carries `#![allow(unknown_lints)]` for lints that exist only
+      # in Clippy versions newer than the declared MSRV, and that allow would
+      # otherwise also silence a typo in the policy list.
       - name: Run strict Clippy
         env:
           CARGO_BUILD_JOBS: "2"
-        run: cargo clippy --all-targets --profile fastbuild --locked -j 2 -- -D warnings
+        run: python3 scripts/check_clippy_policy.py
 
   # MS-01 (competitive half): compare LCCC against GCC / Clang / ICX on
   # Compiler Explorer and fail on regression against the committed baseline.
