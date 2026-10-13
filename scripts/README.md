@@ -301,9 +301,11 @@ These three behaviours were audit findings; they are documented here because
 each one is a contract build systems rely on, and each now has a gate:
 
 * **`-o -` is stdout** for the text modes (`-S`, `-E`, `-M`/`-MM`, `-dM`), and
-  `-MF -` sends the make rule to stdout. Object/executable modes reject
-  `-o -` with a diagnostic instead of writing a file named `-`
-  (`tests/regression/check_dash_o_stdout.sh`).
+  `-MF -` sends the make rule to stdout. `-c -o -` is rejected up front with an
+  actionable message (GCC's assembler refuses it too), and link mode keeps
+  GCC's literal-`-` behaviour: `gcc -o - m.c` exits 0 and creates a file named
+  `-`, so the driver must not "helpfully" reject it
+  (`tests/regression/check_o_stdout.sh`).
 * **Temporary files are private**: every temp object/assembly file is reserved
   inside an atomically created 0700 directory under `$TMPDIR`
   (`src/common/temp_files.rs`), so a pre-placed symlink or file at a predicted
