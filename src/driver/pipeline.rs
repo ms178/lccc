@@ -2934,6 +2934,24 @@ impl Driver {
         // remove them.
         set.insert_if(simd && self.enable_aes, F::Aes);
         set.insert_if(simd && self.enable_pclmul, F::Pclmul);
+        // VAES / VPCLMULQDQ: the EVEX 256-bit forms of `aesenc` and
+        // `pclmulqdq`.  Two conditions, both measured against GCC 12.2:
+        //   * the 256-bit vector class must be permitted (`isa.ymm`, the
+        //     AVX2-and-not-denied ceiling).  `-mvaes` alone rejects
+        //     `_mm256_aesenc_epi128`; `-mavx2 -mvaes` and `-mavx512f -mvaes`
+        //     accept it -- AVX-512 brings its own 256-bit permission, which is
+        //     why this follows `isa` (and not a second `-mavx2` test) rather
+        //     than the raw `enable_avx2` flag;
+        //   * the extension itself must be requested, exactly like AES-NI:
+        //     no `-march=` profile in the table grants it implicitly, and the
+        //     backend emits the 256-bit classes only for the `-mvaes` /
+        //     `-mvpclmulqdq` request.
+        // Folding `1` here promises the class, and the two halves of the
+        // conjunction are the two ways the promise could be wrong: without
+        // `isa.ymm` the emitter cannot encode the instruction, and without the
+        // request flag the backend was never asked for it.
+        set.insert_if(isa.ymm && self.enable_vaes, F::Vaes);
+        set.insert_if(isa.ymm && self.enable_vpclmulqdq, F::Vpclmulqdq);
 
         // Integer ISA: the resolved predicates already encode the default
         // grant, the `-march` ceiling and the sticky denials — the same

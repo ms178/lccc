@@ -2176,9 +2176,11 @@ impl Lowerer {
             // Naming the extension when we know it makes the message
             // actionable; a builtin outside the table is still x86-only.
             let hint = match x86_intrinsic_required_feature(intrinsic) {
-                Some((feature, flag)) => {
-                    format!(" ({} instruction-set extension, {})", feature.name(), flag)
-                }
+                Some(requirement) => format!(
+                    " ({} instruction-set extension, {})",
+                    requirement.feature.name(),
+                    requirement.flag
+                ),
                 None => String::new(),
             };
             self.diagnostics.borrow_mut().error(
@@ -2192,18 +2194,19 @@ impl Lowerer {
             );
             return;
         }
-        let Some((feature, flag)) = x86_intrinsic_required_feature(intrinsic) else {
+        let Some(requirement) = x86_intrinsic_required_feature(intrinsic) else {
             return;
         };
-        if crate::common::x86_features::effective().contains(feature) {
+        if crate::common::x86_features::effective().contains(requirement.feature) {
             return;
         }
         self.diagnostics.borrow_mut().error(
             format!(
-                "`{}` requires the {} instruction-set extension ({}), which the requested target does not have",
+                "`{}` requires the {} instruction-set extension ({}){}, which the requested target does not have",
                 name,
-                feature.name(),
-                flag
+                requirement.feature.name(),
+                requirement.flag,
+                requirement.also.unwrap_or("")
             ),
             span,
         );
@@ -2630,23 +2633,42 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
     }
 }
 
+/// One row of the AUD-CPU-3 permission table: what an intrinsic's instruction
+/// needs before the invocation may contain it.
+struct IntrinsicRequirement {
+    /// The feature whose bit in [`crate::common::x86_features::effective`] is
+    /// the permission (the fold for a conjunction is inside the fold, so one
+    /// lookup is enough).
+    feature: crate::common::x86_features::X86Feature,
+    /// The `-m` flag that grants `feature`, for the diagnostic.
+    flag: &'static str,
+    /// A conjunct the feature's own bit does not spell out.  The 256-bit
+    /// VAES/VPCLMULQDQ forms are the case: their permission is the extension
+    /// *and* the 256-bit vector class, and a user who passed `-mvaes` on a
+    /// target without AVX2 needs to be told the second half, not the first.
+    also: Option<&'static str>,
+}
+
 /// Map a BuiltinIntrinsic to its corresponding IntrinsicOp.
 /// AUD-CPU-3: the instruction-set extension an x86 intrinsic's instruction
 /// belongs to, for the families whose permission bit exists in
 /// [`crate::common::x86_features`].
 ///
 /// Only *unambiguous* families are listed.  The 256-bit AES/CLMUL forms are
-/// VAES/VPCLMULQDQ (which also require AVX state, and whose permission bits do
-/// not exist yet), and the SHA/GFNI/AVX-512 families have no bit either -- see
-/// the follow-up document's AUD-CPU-3 entry, which tracks giving them one.
-fn x86_intrinsic_required_feature(
-    intrinsic: &BuiltinIntrinsic,
-) -> Option<(crate::common::x86_features::X86Feature, &'static str)> {
+/// VAES/VPCLMULQDQ, whose permission is the conjunction the fold already
+/// encodes (256-bit vector class AND the `-mvaes`/`-mvpclmulqdq` request), so a
+/// single lookup covers both halves; the SHA/GFNI/AVX-512 families still have
+/// no bit -- see the follow-up document's AUD-CPU-3 entry.
+fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<IntrinsicRequirement> {
     use crate::common::x86_features::X86Feature as F;
     use BuiltinIntrinsic as B;
     Some(match intrinsic {
         // SSE4.2 introduced CRC32: `_mm_crc32_u8` and its width siblings.
-        B::X86Crc32_8 | B::X86Crc32_16 | B::X86Crc32_32 | B::X86Crc32_64 => (F::Sse42, "-msse4.2"),
+        B::X86Crc32_8 | B::X86Crc32_16 | B::X86Crc32_32 | B::X86Crc32_64 => IntrinsicRequirement {
+            feature: F::Sse42,
+            flag: "-msse4.2",
+            also: None,
+        },
         // AES-NI, 128-bit forms (the `_mm_*`/`__builtin_ia32_*` spellings that
         // map onto the legacy-encoded instructions).
         B::X86Aesenc128
@@ -2654,8 +2676,35 @@ fn x86_intrinsic_required_feature(
         | B::X86Aesdec128
         | B::X86Aesdeclast128
         | B::X86Aesimc128
-        | B::X86Aeskeygenassist128 => (F::Aes, "-maes"),
-        B::X86Pclmulqdq128 => (F::Pclmul, "-mpclmul"),
+        | B::X86Aeskeygenassist128 => IntrinsicRequirement {
+            feature: F::Aes,
+            flag: "-maes",
+            also: None,
+        },
+        B::X86Pclmulqdq128 => IntrinsicRequirement {
+            feature: F::Pclmul,
+            flag: "-mpclmul",
+            also: None,
+        },
+        // VAES: the EVEX 256-bit AES round instructions.  A v3 target without
+        // `-mvaes` is exactly the SIGILL case `_mm_crc32_u8` under
+        // `-march=x86-64` was: measured emitting `vaesenc %ymm1, %ymm0, %ymm0`
+        // on a target whose own class does not contain it.
+        B::X86Aesenc256 | B::X86Aesenclast256 | B::X86Aesdec256 | B::X86Aesdeclast256 => {
+            IntrinsicRequirement {
+                feature: F::Vaes,
+                flag: "-mvaes",
+                also: Some(" and a 256-bit vector class (AVX2 or AVX-512)"),
+            }
+        }
+        // VPCLMULQDQ: the 256-bit carry-less multiply.  Separate bit from
+        // VAES (GCC rejects `_mm256_clmulepi64_epi128` under `-mavx2 -mvaes`),
+        // so the two must not share a row.
+        B::X86Vpclmulqdq256 => IntrinsicRequirement {
+            feature: F::Vpclmulqdq,
+            flag: "-mvpclmulqdq",
+            also: Some(" and a 256-bit vector class (AVX2 or AVX-512)"),
+        },
         _ => return None,
     })
 }

@@ -35,6 +35,21 @@ typedef int v4si __attribute__((vector_size(16)));
 v4si clmul(v4si a, v4si b) { return __builtin_ia32_pclmulqdq128(a, b, 0); }
 EOF
 
+# The 256-bit AES/CLMUL forms.  They share the mnemonic with the 128-bit forms
+# and are a DIFFERENT extension: `vaesenc %ymm1, %ymm0, %ymm0` came out of
+# `-march=x86-64` before the fix below, i.e. a SIGILL on the hardware the user
+# named.  Their permission is a conjunction -- 256-bit vector class AND the
+# extension's own `-m` flag -- so the rejection cases below split along both
+# halves, and both are oracle-checked against GCC further down.
+cat >"$tmp/vaes256.c" <<'EOF'
+typedef long long v4di __attribute__((vector_size(32)));
+v4di aes_enc256(v4di a, v4di b) { return __builtin_ia32_aesenc256(a, b); }
+EOF
+cat >"$tmp/vpclmul256.c" <<'EOF'
+typedef long long v4di __attribute__((vector_size(32)));
+v4di clmul256(v4di a, v4di b) { return __builtin_ia32_vpclmulqdq256(a, b, 0); }
+EOF
+
 # reject <source> <flag-expected-in-message> <flags...>
 reject() {
     local src=$1 want=$2
@@ -73,6 +88,25 @@ accept aes.c aesenc -march=raptorlake
 
 reject clmul.c -mpclmul -march=x86-64
 accept clmul.c pclmulqdq -mpclmul
+
+# (the second argument of `reject` is the text the diagnostic must contain;
+#  every rejection names the `-m` flag that would have granted the extension.)
+reject vaes256.c -mvaes -march=x86-64             # v1: neither half
+reject vaes256.c -mvaes -march=x86-64-v3          # class yes, extension no
+reject vaes256.c -mvaes -march=x86-64-v3 -mno-avx2  # extension yes, class no
+reject vaes256.c -mvaes -march=x86-64-v3 -mno-avx   # no VEX at all
+reject vaes256.c -mvaes -march=alderlake -mno-vaes  # explicit denial of the profile's grant
+accept vaes256.c vaesenc -mvaes                   # project baseline is v3, so the class is granted
+accept vaes256.c vaesenc -march=alderlake
+
+reject vpclmul256.c -mvpclmulqdq -march=x86-64
+reject vpclmul256.c -mvpclmulqdq -march=x86-64-v3
+reject vpclmul256.c -mvpclmulqdq -march=alderlake -mno-vpclmulqdq
+# VAES is not VPCLMULQDQ: separate bits, separate rows (GCC rejects this too).
+reject vpclmul256.c -mvpclmulqdq -mvaes -march=x86-64-v3
+reject vpclmul256.c -mvpclmulqdq -mvaes -march=alderlake -mno-vpclmulqdq
+accept vpclmul256.c vpclmulqdq -mvpclmulqdq
+accept vpclmul256.c vpclmulqdq -march=alderlake
 
 # The 32-bit target has the same rule and the same escape hatch: i686 has no
 # SSE4.2 by default, and `-msse4.2` is what grants it.
@@ -137,5 +171,38 @@ compare o_crc.c -msse4.2
 compare o_crc.c -march=x86-64-v2
 compare o_aes.c -march=x86-64
 compare o_aes.c -maes
+
+# The 256-bit rows, same oracle rule.  `-march=alderlake` (not `raptorlake`:
+# GCC 12 does not know that name) is the CPU profile both compilers agree on.
+cat >"$tmp/o_vaes256.c" <<'EOF'
+#include <immintrin.h>
+__m256i aes_enc256(__m256i a, __m256i b) { return _mm256_aesenc_epi128(a, b); }
+EOF
+cat >"$tmp/o_vpclmul256.c" <<'EOF'
+#include <immintrin.h>
+__m256i clmul256(__m256i a, __m256i b) { return _mm256_clmulepi64_epi128(a, b, 0); }
+EOF
+
+compare o_vaes256.c -march=x86-64
+compare o_vaes256.c -march=x86-64-v3
+compare o_vaes256.c -march=x86-64-v3 -mvaes
+compare o_vaes256.c -march=x86-64-v3 -mvaes -mno-avx
+compare o_vaes256.c -march=alderlake
+compare o_vaes256.c -march=alderlake -mno-vaes
+compare o_vpclmul256.c -march=x86-64-v3
+compare o_vpclmul256.c -march=x86-64-v3 -mvaes
+compare o_vpclmul256.c -march=x86-64-v3 -mvpclmulqdq
+compare o_vpclmul256.c -march=alderlake
+
+# Documented deviation, asserted rather than compared.  lccc ties ALL 256-bit
+# emission to the AVX2-class permission (`x86_isa().ymm`), so `-mno-avx2` also
+# removes the 256-bit VEX forms whose float half GCC keeps with AVX alone:
+# GCC accepts `_mm256_aesenc_epi128` under `-mvaes -mno-avx2` (measured), lccc
+# refuses.  Refusing is the safe direction -- lccc emits no 256-bit code at all
+# on that target -- and it keeps the promise the fold makes.
+ours=$(verdict "$ccc" o_vaes256.c -march=x86-64-v3 -mvaes -mno-avx2)
+[ "$ours" = reject ] ||
+    fail "o_vaes256.c -mvaes -mno-avx2: lccc $ours, expected reject (no 256-bit class on that target)"
+echo "ok: o_vaes256.c -mvaes -mno-avx2 -> reject (documented deviation: GCC accepts)"
 
 echo "PASS: ISA-sensitive intrinsics are gated on the permitted feature set, oracle-checked"

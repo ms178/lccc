@@ -18,10 +18,16 @@
 #   * -mno-<feat> -> that rung folds to 0, sticky against the baseline
 #   * non-x86     -> a diagnostic, never a silent constant
 #
-# Features with no codegen permission bit (sha, adx, rdseed, gfni, vaes,
-# avx512*, amx*, ...) fold to 0 even for a Raptor Lake profile: reporting a
-# feature the backend cannot promise is exactly the SIGILL bug. The runtime
+# Features with no codegen permission bit (sha, adx, rdseed, gfni, avx512*,
+# amx*, ...) fold to 0 even for a Raptor Lake profile: reporting a feature the
+# backend cannot promise is exactly the SIGILL bug. The runtime
 # CPUID/libgcc-`__cpu_model` form is tracked separately as AUD-CPU-2.
+#
+# vaes/vpclmulqdq ARE tracked, as the 256-bit permission they are: the fold
+# grants them only when the 256-bit vector class is permitted AND the
+# extension's own flag was given, which is the same conjunction the intrinsic
+# gate enforces (tests/regression/check_intrinsic_feature_gate.sh, GCC-checked)
+# and the same one GCC uses.
 set -euo pipefail
 
 CCC=${CCC:-./target/fastbuild/lccc}
@@ -61,12 +67,17 @@ int main(void) {
     P("avx2", 12);  P("fma", 13);   P("f16c", 14);  P("bmi", 15);
     P("bmi2", 16);  P("lzcnt", 17); P("movbe", 18); P("aes", 19);
     P("pclmul", 20); P("rdrnd", 21);
+    P("vaes", 22);   P("vpclmulqdq", 23);
     printf("| 0x%x\n", v);
     return 0;
 }
 C
 
 V3="cmov fxsr mmx sse sse2 sse3 ssse3 sse4.1 sse4.2 popcnt cx16 avx avx2 fma f16c bmi bmi2 lzcnt movbe"
+# The two denials the 256-bit crypto rows are built on: no AVX at all, and the
+# AVX1-class target `-mno-avx2` names.
+V3_NO_AVX="cmov fxsr mmx sse sse2 sse3 ssse3 sse4.1 sse4.2 popcnt cx16 bmi bmi2 lzcnt movbe"
+V3_NO_AVX2="cmov fxsr mmx sse sse2 sse3 ssse3 sse4.1 sse4.2 popcnt cx16 avx fma f16c bmi bmi2 lzcnt movbe"
 
 # expect_set <expected-names|-> <flags...>
 expect_set() {
@@ -99,12 +110,10 @@ expect_set "cmov fxsr mmx sse sse2 sse3 ssse3 sse4.1 sse4.2 popcnt cx16" \
 # 3. A named CPU profile: Raptor Lake also brings AES/PCLMUL/RDRAND. SHA is
 #    deliberately absent — lccc has no SHA codegen permission (`-msha` is
 #    rejected), so a dispatcher must not be told otherwise.
-expect_set "$V3 aes pclmul rdrnd" -O2 -march=raptorlake
+expect_set "$V3 aes pclmul rdrnd vaes vpclmulqdq" -O2 -march=raptorlake
 # 4. Denials are sticky against the baseline and against -march.
-expect_set "cmov fxsr mmx sse sse2 sse3 ssse3 sse4.1 sse4.2 popcnt cx16 bmi bmi2 lzcnt movbe" \
-    -O2 -march=x86-64-v3 -mno-avx
-expect_set "cmov fxsr mmx sse sse2 sse3 ssse3 sse4.1 sse4.2 popcnt cx16 avx fma f16c bmi bmi2 lzcnt movbe" \
-    -O2 -march=x86-64-v3 -mno-avx2
+expect_set "$V3_NO_AVX" -O2 -march=x86-64-v3 -mno-avx
+expect_set "$V3_NO_AVX2" -O2 -march=x86-64-v3 -mno-avx2
 expect_set "cmov fxsr mmx sse sse2 sse3 ssse3 sse4.1 popcnt bmi bmi2 lzcnt movbe" \
     -O2 -march=x86-64-v3 -mno-sse4.2
 expect_set "cmov fxsr mmx sse sse2 popcnt bmi bmi2 lzcnt movbe" \
@@ -127,6 +136,22 @@ expect_set "cmov fxsr mmx sse sse2 sse3 ssse3 sse4.1 sse4.2 popcnt cx16 avx avx2
 expect_set "$V3 aes" -O2 -maes
 expect_set "$V3 rdrnd" -O2 -mrdrnd
 expect_set "$V3 aes pclmul" -O2 -maes -mpclmul
+# 7b. The 256-bit crypto extensions: granted only by the CONJUNCTION of the
+#     class and the flag. The negative rows are the ones that matter -- a
+#     dispatcher told `vaes = 1` on a target whose 256-bit class is denied
+#     would take a VAES path into a SIGILL.
+expect_set "$V3 vaes" -O2 -mvaes
+expect_set "$V3 vpclmulqdq" -O2 -mvpclmulqdq
+expect_set "$V3 vaes vpclmulqdq" -O2 -mvaes -mvpclmulqdq
+expect_set "$V3_NO_AVX2" -O2 -mvaes -mno-avx2
+# (`-march=x86-64-v3` is named here so the denial is the only difference from
+# the row above it: without an explicit profile, `-mno-avx` also suppresses the
+# baseline grant of the SSE4.2-era surface, which would make the row test two
+# things at once.)
+expect_set "$V3_NO_AVX" -O2 -march=x86-64-v3 -mvpclmulqdq -mno-avx
+expect_set "$V3" -O2 -mno-vaes -mno-vpclmulqdq
+expect_set "$V3 aes pclmul rdrnd vaes vpclmulqdq" -O2 -march=alderlake
+expect_set "$V3 aes pclmul rdrnd" -O2 -march=alderlake -mno-vaes -mno-vpclmulqdq
 # 8. Aliases and case folding must resolve (GCC/Clang spellings real code uses).
 cat >alias.c <<'C'
 int main(void) {
@@ -135,7 +160,9 @@ int main(void) {
         || __builtin_cpu_supports("fma3") != __builtin_cpu_supports("fma")
         || __builtin_cpu_supports("pclmulqdq") != __builtin_cpu_supports("pclmul")
         || __builtin_cpu_supports("rdrand") != __builtin_cpu_supports("rdrnd")
+        || __builtin_cpu_supports("vpclmul") != __builtin_cpu_supports("vpclmulqdq")
         || __builtin_cpu_supports("avx2") != 1
+        || __builtin_cpu_supports("vaes") != 0
         || __builtin_cpu_supports("sha") != 0;
 }
 C
