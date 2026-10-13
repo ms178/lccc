@@ -233,6 +233,13 @@ gate "o-stdout" fast \
 gate "cpu-supports-fold" fast \
     env CCC="$LCCC" CCC_ARM=target/fastbuild/lccc-arm bash tests/regression/check_cpu_supports_fold.sh
 
+# AUD-ICE-1/AUD-DIAG-1: a malformed `__builtin_shuffle` mask must produce a
+# diagnostic, not a Rust panic (and the valid forms must still lower).  The
+# gate is oracle-checked against gcc, so it cannot pass by rejecting more than
+# GCC does.
+gate "shuffle-diagnostics" fast \
+    env CCC="$LCCC" bash tests/regression/check_shuffle_diagnostics.sh
+
 # The unit-test gate is what GitHub's required check runs on every PR, so it
 # belongs in the fast set: a red PR has to be reproducible with --fast.
 #

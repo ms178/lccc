@@ -1715,50 +1715,103 @@ impl Lowerer {
     /// equally correct. gcc.c-torture pr85331 (V2DF reverse) and pr94591
     /// (V2SI identity) drive the rules.
     fn lower_shuffle(&mut self, args: &[Expr]) -> Option<Operand> {
+        // Every rejection below used to be a `panic!`, i.e. an ICE on input a
+        // user can write: a mask whose element count differs from the vector's
+        // (`v8si` mask for a `v4si`), a non-vector mask, a non-vector first
+        // operand. GCC diagnoses all three; so does this now. The returned
+        // `None` means "not lowered as this builtin", and the caller's
+        // ordinary-call fallback cannot panic. Reporting with the *operand's*
+        // span matters: `lower_shuffle` is reached from a nested expression,
+        // and a location-less error in a 50k-line TU is not actionable.
         let (vec_args, mask_expr): (&[Expr], &Expr) = match args.len() {
             2 => (&args[..1], &args[1]),
             3 => (&args[..2], &args[2]),
-            n => panic!(
-                "__builtin_shuffle: expected (v, mask) or (v1, v2, mask), got {} args",
-                n
-            ),
+            n => {
+                self.diagnostics.borrow_mut().error(
+                    format!(
+                        "__builtin_shuffle expects (vector, mask) or (vector, vector, mask), got {} argument(s)",
+                        n
+                    ),
+                    args.first()
+                        .map(|a| a.span())
+                        .unwrap_or_else(|| crate::common::source::Span::new(0, 0, 0)),
+                );
+                return None;
+            }
         };
 
         // Element geometry from the first vector's CType.
         let v0_ctype = self.expr_ctype(&vec_args[0]);
         let (elem_size, total_bytes) = match &v0_ctype {
             CType::Vector(elem, bytes) => (self.ctype_size(elem), *bytes),
-            other => panic!(
-                "__builtin_shuffle: first operand must be a vector type, got {:?}",
-                other
-            ),
+            other => {
+                self.diagnostics.borrow_mut().error(
+                    format!(
+                        "__builtin_shuffle's first argument must be a vector, got {}",
+                        other
+                    ),
+                    vec_args[0].span(),
+                );
+                return None;
+            }
         };
         if elem_size == 0 || total_bytes == 0 || total_bytes % elem_size != 0 {
-            panic!(
-                "__builtin_shuffle: degenerate vector geometry (elem={}, total={})",
-                elem_size, total_bytes
+            // A vector type whose size is not a whole number of elements cannot
+            // be described by the C type system; reaching here means the type
+            // itself is malformed, so name the geometry instead of guessing.
+            self.diagnostics.borrow_mut().error(
+                format!(
+                    "__builtin_shuffle: malformed vector type (element size {}, total size {})",
+                    elem_size, total_bytes
+                ),
+                vec_args[0].span(),
             );
+            return None;
         }
         let n_elems: i64 = (total_bytes / elem_size) as i64;
-        // Mask element width from the mask operand's CType; the mask must
-        // have the same element count as the result.
+        // Mask element width from the mask operand's CType; the mask must have
+        // the same element count as the result AND integral elements.  GCC
+        // ("last argument must be an integer vector") rejects a float mask;
+        // accepting one silently reinterpreted its BIT PATTERNS as lane
+        // indices (`1.0f` = 0x3f800000 -> lane 0), i.e. wrong answers with no
+        // diagnostic at all.
         let mask_ctype = self.expr_ctype(mask_expr);
         let mask_elem_size = match &mask_ctype {
             CType::Vector(elem, bytes) => {
                 let es = self.ctype_size(elem);
-                if es == 0 || bytes % es != 0 || (bytes / es) as i64 != n_elems {
-                    panic!(
-                        "__builtin_shuffle: mask element count mismatch (mask {} elems, vector {} elems)",
-                        if es > 0 { bytes / es } else { 0 },
-                        n_elems
+                if !elem.is_integer() {
+                    self.diagnostics.borrow_mut().error(
+                        format!(
+                            "__builtin_shuffle's mask must be a vector of integers, got a vector of {}",
+                            elem
+                        ),
+                        mask_expr.span(),
                     );
+                    return None;
+                }
+                if es == 0 || bytes % es != 0 || (bytes / es) as i64 != n_elems {
+                    self.diagnostics.borrow_mut().error(
+                        format!(
+                            "__builtin_shuffle: mask element count must match the vector's ({} mask element(s) for {} vector element(s))",
+                            if es > 0 { bytes / es } else { 0 },
+                            n_elems
+                        ),
+                        mask_expr.span(),
+                    );
+                    return None;
                 }
                 es
             }
-            other => panic!(
-                "__builtin_shuffle: mask must be a vector type, got {:?}",
-                other
-            ),
+            other => {
+                self.diagnostics.borrow_mut().error(
+                    format!(
+                        "__builtin_shuffle's mask must be a vector of integers, got {}",
+                        other
+                    ),
+                    mask_expr.span(),
+                );
+                return None;
+            }
         };
 
         let ir_ty = match elem_size {
@@ -1767,14 +1820,29 @@ impl Lowerer {
             4 => IrType::I32,
             8 => IrType::I64,
             16 => IrType::I128,
-            other => panic!("__builtin_shuffle: unsupported element size {}", other),
+            other => {
+                self.diagnostics.borrow_mut().error(
+                    format!(
+                        "__builtin_shuffle: unsupported vector element size {}",
+                        other
+                    ),
+                    vec_args[0].span(),
+                );
+                return None;
+            }
         };
         let mask_ir_ty = match mask_elem_size {
             1 => IrType::U8,
             2 => IrType::U16,
             4 => IrType::U32,
             8 => IrType::U64,
-            other => panic!("__builtin_shuffle: unsupported mask element size {}", other),
+            other => {
+                self.diagnostics.borrow_mut().error(
+                    format!("__builtin_shuffle: unsupported mask element size {}", other),
+                    mask_expr.span(),
+                );
+                return None;
+            }
         };
 
         // Lower operands (vector-by-memory convention: alloca pointers).
@@ -1816,7 +1884,19 @@ impl Lowerer {
                 seg_override: AddressSpace::Default,
             });
             // m = mask_elem % total_selectable (N for 2-arg, 2N for 3-arg)
-            let selectable = n_elems * if vec_args.len() == 2 { 1 } else { 2 };
+            // `vec_args` holds the VECTOR arguments only, so its length is 1
+            // for the 2-argument form `(v, mask)` and 2 for the 3-argument
+            // form `(v1, v2, mask)`.  The selectable index range is
+            // accordingly N (the 2-argument form behaves as if both operands
+            // were `v`, so the index is reduced modulo N) or 2N (the index
+            // picks a lane of the concatenation).  Both this multiplier and
+            // the select below were keyed on the wrong length: `== 2` meant a
+            // 2-argument mask was reduced modulo 2N -- letting a mask element
+            // >= N read past the vector -- and a 3-argument mask modulo N,
+            // which made the "is it the first vector?" test below a constant
+            // true.  Together they compiled `__builtin_shuffle(a, b,
+            // (v4si){4, 5, 6, 7})` into `a` unchanged.
+            let selectable = n_elems * if vec_args.len() >= 2 { 2 } else { 1 };
             let m_idx = if selectable > 0 && (selectable & (selectable - 1)) == 0 {
                 let and_val = self.fresh_value();
                 self.emit(Instruction::BinOp {
@@ -1839,7 +1919,7 @@ impl Lowerer {
                 rem_val
             };
             // 3-arg form: base = m < N ? v1 : v2; offset within base = m mod N.
-            let (base, elem_idx) = if vec_args.len() == 3 {
+            let (base, elem_idx) = if vec_args.len() >= 2 {
                 let in_first = self.fresh_value();
                 self.emit(Instruction::Cmp {
                     dest: in_first,
@@ -1949,10 +2029,16 @@ impl Lowerer {
 
     fn lower_shufflevector(&mut self, args: &[Expr]) -> Option<Operand> {
         if args.len() != 6 {
-            panic!(
-                "__builtin_shufflevector: only the 4-lane 32-bit form (2 vectors + 4 indices) is supported, got {} args",
-                args.len()
+            self.diagnostics.borrow_mut().error(
+                format!(
+                    "__builtin_shufflevector: only the 4-lane 32-bit form (2 vectors + 4 constant indices) is supported, got {} argument(s)",
+                    args.len()
+                ),
+                args.first()
+                    .map(|a| a.span())
+                    .unwrap_or_else(|| crate::common::source::Span::new(0, 0, 0)),
             );
+            return None;
         }
         let v1 = self.vec128_arg_ptr(&args[0]);
         let v2 = self.vec128_arg_ptr(&args[1]);
@@ -1973,10 +2059,16 @@ impl Lowerer {
                 Some(IrConst::I32(v)) => v as i64,
                 Some(IrConst::I8(v)) => v as i64,
                 Some(IrConst::I16(v)) => v as i64,
-                other => panic!(
-                    "__builtin_shufflevector: lane index {} is not an integer constant ({:?})",
-                    lane, other
-                ),
+                _ => {
+                    self.diagnostics.borrow_mut().error(
+                        format!(
+                            "__builtin_shufflevector: lane index {} must be an integer constant expression",
+                            lane
+                        ),
+                        args[2 + lane].span(),
+                    );
+                    return None;
+                }
             };
             let (src, off) = if idx < 0 {
                 (v1p, 0i64)
@@ -1985,10 +2077,17 @@ impl Lowerer {
             } else if idx < 8 {
                 (v2p, (idx - 4) * 4)
             } else {
-                panic!(
-                    "__builtin_shufflevector: lane index {} out of range for 4-lane vectors",
-                    idx
+                // GCC's range: 0..7 for two 4-lane vectors, plus negative
+                // indices for "don't care" (which the `idx < 0` arm above
+                // takes as lane 0 of the first vector).
+                self.diagnostics.borrow_mut().error(
+                    format!(
+                        "__builtin_shufflevector: lane index {} is out of range for two 4-lane vectors (0..7)",
+                        idx
+                    ),
+                    args[2 + lane].span(),
                 );
+                return None;
             };
             let src_ptr = self.fresh_value();
             self.emit(Instruction::GetElementPtr {

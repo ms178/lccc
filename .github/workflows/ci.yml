@@ -158,6 +158,12 @@ jobs:
       - name: CPU feature fold honours -march and target
         run: env CCC=target/fastbuild/lccc CCC_ARM=target/fastbuild/lccc-arm bash tests/regression/check_cpu_supports_fold.sh
 
+      # AUD-ICE-1/AUD-DIAG-1: malformed `__builtin_shuffle` masks diagnose
+      # instead of panicking, and the valid forms still lower (oracle-checked
+      # against gcc).
+      - name: Shuffle builtin diagnostics
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_shuffle_diagnostics.sh
+
       - name: Run tests
         env:
           CARGO_BUILD_JOBS: "2"
