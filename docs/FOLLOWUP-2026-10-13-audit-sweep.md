@@ -102,6 +102,29 @@ commands), which is the mechanism that keeps the two mirrors from drifting.
     workflow's new path (`.github/workflows/bench.yml` updated in lockstep).
 * Stale pre-fix `.s` snapshots deleted (they were records of a state, not
   tests).
+* `artifacts/repros/` (97 programs, the directory's own scar tissue) replayed
+  by `scripts/check_repro_replay.py`: **none of them still reproduce**. Getting
+  there needed the ISA to be pinned on both compilers, which is the finding
+  worth keeping — see the box below. The three `csmith` programs that
+  `#include "csmith.h"` (a header the generator emits and this repository does
+  not vendor) are *declared* rather than skipped, and the declaration is
+  checked in both directions so it cannot rot into a skip list. The bracketed
+  file names (`[CCC_RA_GLOBAL_LOCATION=1]`) now use the shell-safe
+  `__env_CCC_RA_GLOBAL_LOCATION-1` form, and `artifacts/repros/README.md`
+  documents the naming contract the gate parses.
+
+> **Reading a differential result: pin the ISA on both sides.** An unpinned
+> replay of `artifacts/repros/` reports 29 failures; with `-march=x86-64` handed
+> to both compilers, 94 of 97 agree (the other three are the header-dependent
+> csmith files). The gap is not codegen: lccc's documented project baseline is
+> `x86-64-v3`, GCC's default is plain `x86-64`, and lccc's backend **contracts
+> `a*b+c` into FMA at every level including `-O0`** (measured: 10 `vfmadd`/
+> `vfmsub` sites in an `-O0 -march=x86-64-v3` build) while GCC starts
+> contracting at `-O2`. Contraction is implementation-defined in C, so this is
+> legal — but it means `-O0` numerics differ from GCC unless the comparison is
+> pinned. The gate therefore runs two pinned legs (`-march=x86-64` and
+> `-march=x86-64-v3 -mno-fma`); a `-ffp-contract=` flag is the obvious knob if
+> GCC-identical `-O0` numerics are ever required.
 
 ### AUD-SILENT-ZERO-1 — the remainder (FIXED, two layers + the ICEs)
 

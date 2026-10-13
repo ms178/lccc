@@ -406,6 +406,18 @@ gate "loop-alignment-contract" fast \
 gate "i386-small-struct-abi-debt" fast \
     bash tests/regression/check_i386_regparm_small_struct_abi.sh
 
+# AUD-HYGIENE-1: the crash/miscompile reproducers in artifacts/repros/ are the
+# compiler's scar tissue and used to be replayed by nobody. Two legs with the
+# ISA pinned on BOTH compilers (an unpinned replay measures the difference
+# between lccc's x86-64-v3 baseline and gcc's x86-64 default, i.e. FMA
+# contraction, and reports 29 phantom failures); the declared
+# not-self-contained csmith files are checked in both directions so the list
+# cannot become a skip list.  See artifacts/repros/README.md.
+gate "repro-replay-selftest" fast \
+    python3 scripts/check_repro_replay.py --self-test
+gate "repro-replay" fast \
+    env CCC="$LCCC" python3 scripts/check_repro_replay.py
+
 # Same predicate, three consumers (-Wreturn-type, switch fallthrough, statement
 # expression value) and two ways to get it wrong: resolving a call's entity by
 # bare name, and dropping an attribute written on a nested definition.  The faces
