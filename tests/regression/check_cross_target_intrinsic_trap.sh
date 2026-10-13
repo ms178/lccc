@@ -173,9 +173,16 @@ for opt in -O0 -O2; do
         "$tool" "$opt" -S "$repo/tests/regression/cross_target_intrinsics/portable_only.c" -o "$out" 2>"$out.err" ||
             { cat "$out.err" >&2; fail "$(basename "$tool") $opt: rejected a portable builtin"; }
     done
+    # Each non-x86 target must still LOWER the portable builtin, not merely
+    # accept the file: asserting the arch's own square-root instruction is what
+    # separates "the target gate spared this builtin" from "it produced
+    # something".
     body=$(function_body portable_sqrt "$tmp/portable-$(basename "$ccc_arm")$tag.s")
     grep -qE '^[[:space:]]+fsqrt[[:space:]]' <<<"$body" ||
         fail "AArch64 $opt: portable_sqrt no longer lowers to fsqrt"
+    body=$(function_body portable_sqrt "$tmp/portable-$(basename "$ccc_riscv")$tag.s")
+    grep -qE '^[[:space:]]+fsqrt' <<<"$body" ||
+        fail "RISC-V $opt: portable_sqrt no longer lowers to fsqrt"
 done
 
 # 3. Positive controls: an x86 target that HAS the extension keeps lowering the

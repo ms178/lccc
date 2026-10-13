@@ -50,7 +50,11 @@ for opt in -O0 -O2; do
     "$gcc_bin" "$tmp/caller_gcc$tag.o" "$tmp/callee_lccc$tag.o" -o "$tmp/c2$tag" ||
         fail "$opt: linking gcc caller with lccc callee failed"
     "$tmp/c2$tag" >"$tmp/c2$tag.out"
-    diff -u "$tmp/ref$tag.out" "$tmp/c1$tag.out" >&2 ||
+    # Compare THIS leg's output: an earlier version of this gate diffed
+    # "$tmp/c1$tag.out" here, so the gcc-caller/lccc-callee leg -- the one that
+    # proves lccc UNDERSTANDS the ABI -- passed vacuously on the back of the
+    # previous leg's already-verified file.
+    diff -u "$tmp/ref$tag.out" "$tmp/c2$tag.out" >&2 ||
         fail "$opt: gcc caller + lccc callee disagrees with gcc/gcc"
 
     # and lccc/lccc must not have been left behind by the fix
@@ -60,6 +64,18 @@ for opt in -O0 -O2; do
     diff -u "$tmp/ref$tag.out" "$tmp/c3$tag.out" >&2 ||
         fail "$opt: lccc/lccc disagrees with gcc/gcc"
     echo "ok: $opt all four caller/callee combinations match gcc/gcc"
+
+    # Liveness of the comparison itself.  A gate that diffs the wrong file
+    # passes vacuously -- which is precisely what this gate did before review
+    # (the gcc-caller/lccc-callee leg compared the previous leg's output).  A
+    # callee that returns the wrong value MUST make one of those diffs fail;
+    # if it does not, the comparison is not looking at the callee's result.
+    "$ccc" "$opt" -DCALLEE_ONLY -DVABI_CALLEE_MUTATION -c "$src" -o "$tmp/callee_mut$tag.o"
+    "$gcc_bin" "$tmp/caller_gcc$tag.o" "$tmp/callee_mut$tag.o" -o "$tmp/mut$tag"
+    "$tmp/mut$tag" >"$tmp/mut$tag.out" || true
+    if cmp -s "$tmp/ref$tag.out" "$tmp/mut$tag.out"; then
+        fail "$opt: a deliberately wrong callee produced the reference output; the comparison is not live"
+    fi
 done
 
 # Assert the CONVENTION, not the arithmetic: which registers the arguments

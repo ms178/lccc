@@ -37,21 +37,38 @@ struct mixed { int n; v4si v; };
 /* Every shape a boundary can take: vector-only, vector among scalars (so the
  * GP and SSE register sequences are interleaved), 8-byte and 16-byte vectors,
  * a struct embedding one, and a vector smuggled through a function pointer. */
-v4si add_v4si(v4si a, v4si b) { return a + b; }
+/* Self-test hook for the gate (never compiled into a real run): with
+ * -DVABI_CALLEE_MUTATION the vector callees answer with something that is NOT
+ * the ABI answer, and the gate requires its own comparison to notice.  A gate
+ * that diffs the wrong file passes vacuously -- this gate did exactly that
+ * until review -- so the mutation is what keeps the comparison honest.
+ *
+ * The macro form matters: the mutation must not remove any definition, or the
+ * mutated object fails to link for an unrelated reason and the check would be
+ * measuring the linker instead. */
+#ifdef VABI_CALLEE_MUTATION
+#define VABI_ANSWER(a, b) (b)
+#define VABI_BIAS(n) ((n) + 1)
+#else
+#define VABI_ANSWER(a, b) ((a) + (b))
+#define VABI_BIAS(n) (n)
+#endif
 
-v4si scale_v4si(v4si a, int k) { return a * k; }
+v4si add_v4si(v4si a, v4si b) { return VABI_ANSWER(a, b); }
 
-int sum_v4si(int tag, v4si a, int k) { return tag + a[0] + a[1] + a[2] + a[3] + k; }
+v4si scale_v4si(v4si a, int k) { return a * VABI_BIAS(k); }
 
-v4si pick_third(v4si a, v4si b, v4si c) { return c; }
+int sum_v4si(int tag, v4si a, int k) { return tag + a[0] + a[1] + a[2] + a[3] + VABI_BIAS(k); }
 
-v4si add_three(v4si a, v4si b, v4si c) { return a + b + c; }
+v4si pick_third(v4si a, v4si b, v4si c) { return VABI_ANSWER(c, b); }
 
-v2si add_v2si(v2si a, v2si b) { return a + b; }
+v4si add_three(v4si a, v4si b, v4si c) { return a + b + c + (v4si){VABI_BIAS(0), VABI_BIAS(0), VABI_BIAS(0), VABI_BIAS(0)}; }
 
-v2di xor_v2di(v2di a, v2di b) { return a ^ b; }
+v2si add_v2si(v2si a, v2si b) { return VABI_ANSWER(a, b); }
 
-v2df add_v2df(v2df a, v2df b) { return a + b; }
+v2di xor_v2di(v2di a, v2di b) { return VABI_ANSWER(a, b); }
+
+v2df add_v2df(v2df a, v2df b) { return VABI_ANSWER(a, b); }
 
 struct two_f64 add_two_f64(struct two_f64 x, struct two_f64 y) {
     struct two_f64 r;
