@@ -1,1 +1,1 @@
--mavx2 -maes -mpclmul
+-mavx2 -maes -mpclmul -mvaes -mvpclmulqdq

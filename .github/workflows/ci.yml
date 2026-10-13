@@ -148,6 +148,12 @@ jobs:
       - name: Vector arguments and returns at the compiler boundary
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_vector_abi_boundary.sh
 
+      # AUD-VABI-2: the 32-byte vector convention (one %ymm) is missing; this
+      # gate latches the measured debt (silent garbage one way, SIGSEGV the
+      # other) and asserts the two configurations that DO work stay working.
+      - name: Wide-vector ABI debt (latched)
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_vector_abi_wide.sh
+
       # AUD-TMP-1: temp files must be symlink-proof (pre-placed symlink and
       # pre-placed directory reproducers; victim file must stay untouched).
       # AUD-HYGIENE-1: the previously unreferenced tests/compat_test.sh and the

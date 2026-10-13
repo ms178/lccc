@@ -218,6 +218,16 @@ gate "aggregate-call-abi" fast \
 gate "vector-abi-boundary" fast \
     env CCC="$LCCC" bash tests/regression/check_vector_abi_boundary.sh
 
+# AUD-VABI-2: the 32-byte case of the same rule (WHOLE %ymm with AVX on).  Not
+# fixable like the 16-byte one -- it needs a %ymm carrier through return and
+# argument classification, the prologue, location allocation and the call
+# sequence -- so the gate measures and LATCHES the debt: the two working
+# configurations are asserted to stay correct, and the two broken cross legs
+# must show exactly the recorded verdict, so the bug cannot silently change
+# shape or be declared fixed without the fix.
+gate "vector-abi-wide-latched" fast \
+    env CCC="$LCCC" bash tests/regression/check_vector_abi_wide.sh
+
 # AUD-TMP-1: temp files must be symlink-proof. Drives the pre-placed-symlink
 # reproducer (and its pre-placed-directory variant) against the built compiler
 # and asserts the victim file is untouched, the compile still succeeds and
