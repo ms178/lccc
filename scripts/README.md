@@ -6,7 +6,13 @@ Compiler-free corpus audit entrypoint: `bash scripts/ci_corpus_tools.sh` (not
 `ci_local.sh --fast`). It is a tooling/contract gate, not compiler CI or runtime
 performance validation. Compact recovery: `python3 scripts/lccc_recover.py
 --repo /opt/lccc-work/lccc --offline --require-exact-history`; the published
-standalone `LCCC-RECOVER.py` survives a worktree reset. See the
+standalone `LCCC-RECOVER.py` survives a worktree reset. A session range that
+*merged* upstream is proved and restored against BASE **and its ancestry** (the
+receipt records which proof ran, `base_fetch`): the merged range's second
+prerequisite is the old fork point, which a `--depth=1` BASE cannot satisfy, so
+both the snapshot proof and the recovery tool deepen BASE instead of rejecting
+a bundle that restores perfectly. Offline recovery, which has BASE alone by
+construction, reports the honest source fallback for that shape. See the
 [audit and recovery instructions](../engineering/PR724-AUDIT-2026-10-02.md).
 
 | Script | Purpose |

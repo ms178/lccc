@@ -325,6 +325,18 @@ and never keep two copies of the same thing.
   check is gone, and `tests/regression/check_o_stdout.sh` is the single gate:
   its rows are the union of both (upstream's pipe-shaped streaming rows,
   `-dM`, `-MF -` and the real-path negative control were folded in).
+* **Re-anchoring onto a newer main broke the snapshot's proof, not the
+  bundle.** `scripts/session_bundle.py` proved each bundle in an isolated
+  clone that fetched BASE with `--depth=1`. A range that *merges* upstream
+  records the old fork point as a second prerequisite beside BASE, so the
+  proof rejected a bundle that restores perfectly (`Repository lacks these
+  prerequisite commits: 7e94441…`), and `scripts/lccc_recover.py` would have
+  done the same to the delivered artifact on the user's side. Both now retry
+  against BASE **and its ancestry** (the receipt records `base_fetch`), and
+  `tests/corpus/test_recovery_contracts.py` has a miniature merged-range repo
+  that proves the bundle, restores it, and pins the offline answer. Without the
+  fix the same test reproduces the reported error; the recovery half fails
+  identically on the pre-fix tool.
 * **`ci_local.sh`'s ill-typed-builtin gate passed an undefined `$REPO`** to the
   checker. Under `set -u` that killed the whole local suite mid-run — the
   reason no `--fast` stamp could ever be obtained on this branch — while the
