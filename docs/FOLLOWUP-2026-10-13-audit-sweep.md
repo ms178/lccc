@@ -286,11 +286,16 @@ and never keep two copies of the same thing.
   This branch had folded the builtin to a compile-time constant from the
   invocation's permission; upstream probes CPUID at run time through a
   libgcc-compatible `__cpu_model` (`src/common/cpu_probe.rs`, lazy per-function
-  init, GCC's own error wording, constant-context diagnosis). Runtime is what
-  GCC, Clang and ICX do, and it is what runtime-dispatch code (zlib-ng, zstd,
-  xz, OpenSSL, FFmpeg) needs: a `-march=x86-64` build must still be able to
-  take an AVX2 path on hardware that has AVX2. The permission fold would have
-  pinned those builds to the slow path. Consequently the audit's named gate
+  init, GCC's own error wording, constant-context diagnosis). Upstream measured
+  the competition before choosing: GCC 16.2, Clang 23.1 and ICX all compile
+  `!!__builtin_cpu_supports("sse2")` into a load from `__cpu_model` *even when
+  the effective target enables `sse2`*, because the question is about the CPU
+  that executes the program. The fold answers a different question: a
+  `-march=x86-64-v3` binary that folded `"avx2"` to `1` claims AVX2 on hardware
+  that lacks it — the one answer none of the three gives — and it is also what
+  runtime-dispatch code needs the other way round, since a `-march=x86-64`
+  build must still be able to take an AVX2 path where AVX2 exists.
+  Consequently the audit's named gate
   `check_cpu_supports_fold.sh` and the `.env` file that suppressed the GCC
   comparison are **deleted**, and `check_cpu_supports_runtime.sh` (upstream's,
   differential in every row) is the gate. What this branch adds on top of

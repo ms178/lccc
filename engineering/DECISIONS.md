@@ -2815,6 +2815,32 @@ seven parity-check unit tests.
 
 ## 2026-10-13 — AUD-CPU-1: `__builtin_cpu_supports` folds against the effective target
 
+**SUPERSEDED the same day** by the merge with upstream PR #815, which lowered
+the same builtin to a runtime CPUID probe (`src/common/cpu_probe.rs`,
+libgcc-compatible `__cpu_model` words, lazy per-function init). Upstream
+measured the competition before choosing: GCC 16.2, Clang 23.1 and ICX all
+compile `!!__builtin_cpu_supports("sse2")` into a load from `__cpu_model`
+*even when the effective target enables `sse2`*, and probe `avxvnni` under
+`-march=raptorlake` while emitting AVX-VNNI code elsewhere. The contract is
+about the CPU that executes the program, so the fold below was answering a
+different question than the reference compilers answer — and a
+`-march=x86-64-v3` binary that folds `"avx2"` to `1` claims AVX2 on hardware
+that lacks it, which is the one answer none of them gives. The fold's partial
+value (constant-folding statically guaranteed features) is what upstream's
+probe trades away, for the same answer at the same cost as GCC. What survives
+from this entry as *policy*: the default target stays a **feature set**
+(x86-64-v3, `cli.rs`), never a CPU table, and the AUD-CPU-3 permission gate
+(`x86_features::effective()`) still decides which intrinsics may be emitted.
+What this branch adds to the merged implementation is the audit's third
+requirement: an x86 feature name is *diagnosed* on a non-x86 target instead of
+silently answering 0 (a name from another architecture's set still answers the
+conservative 0, because those sets are GCC's per-architecture space which LCCC
+does not model yet). The gate is `check_cpu_supports_runtime.sh`, differential
+against GCC in every row; `check_cpu_supports_fold.sh` is deleted with the
+fold it verified.
+
+### The superseded entry, kept for the reasoning it contains
+
 - **Semantics change (deliberate).** `__builtin_cpu_supports("f")` now folds to
   `1` **iff the feature is statically guaranteed by the code-generation target
   of this translation unit** — the same
@@ -2836,8 +2862,9 @@ seven parity-check unit tests.
 - **Known cost, accepted with the fix:** the fold is now *more* conservative
   than GCC, which answers from runtime CPUID (`__cpu_model`). Dispatchers lose
   the widest path on hosts that do have the feature.
-- **Follow-up (FE-25, still open):** lower the unresolved cases to a real
-  runtime test (libgcc `__cpu_model` when the symbol is available, else an
+- **Follow-up (FE-25) — closed by the merge above:** lower the unresolved
+  cases to a real runtime test (libgcc `__cpu_model` when the symbol is
+  available, else an
   inline CPUID+XGETBV helper) and make `__builtin_cpu_init()` call
   `__cpu_indicator_init`; add `sha`/`adx`/`rdseed` to the ISA applicator so they
   can be statically guaranteed when the target implies them. Gates:
