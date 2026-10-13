@@ -52,7 +52,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends software-properties-common
           sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-16
+          sudo apt-get install -y --no-install-recommends gcc-16 gcc-16-multilib lib32gcc-16-dev
           gcc-16 --version | head -1
 
       - name: No merge conflict markers
