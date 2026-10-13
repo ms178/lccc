@@ -714,3 +714,45 @@ Ordered by value ÷ cost, with the entry point each one needs.
 * `tests/regression/*.c` is globbed **non-recursively** and each file must be a
   self-contained program; multi-file fixtures belong in a subdirectory (this
   is also what `run_regression.py`'s own failure text says).
+
+## AUD-ICE-1 residual — measured composition and the design for the next slice
+
+The arity half of AUD-ICE-1 pinned 303 names from `include/*.h` and took the
+ratchet from 650 ICE / 380 silent to **174 ICE / 294 silent**
+(`tests/regression/ill_typed_builtins_baseline.json`). The remaining 174 are
+87 names x 2 optimisation levels, and every one of them is a name whose
+argument count the headers do **not** pin, so the ill-typed call still reaches
+codegen. Measured this session, not inferred:
+
+* The panics come from two shapes, both reached with **zero** arguments: the
+  five `assert!(args.len() >= N, "malformed intrinsic …")` guards in
+  `src/backend/x86/codegen/intrinsics.rs` (lines 614, 8462, 9381, 9506, 10180)
+  and direct `args[i]` indexing at other sites (883, 2768, 3325, …). Example:
+  `__builtin_ia32_pxor128()` → `emit_sse_binary_128: malformed intrinsic pxor
+  (0 args)`; `_mm_insert_epi16()` → `index out of bounds: the len is 0`.
+* Why the count is unknown for these names, in two parts:
+  `_mm_slli_epi32`, `_mm_shuffle_epi32`, `_mm_and_si128` and their 256-bit
+  siblings are **function-like macros** in `include/*.h`, and the derivation
+  only read *declarations* (its regex excludes `#` deliberately); and the
+  `__builtin_ia32_*` primitives they expand to have **no call site at all** in
+  the headers, because many wrappers are written with vector operators.
+* Two measured levers, in increasing order of coverage:
+  1. **Macro-aware derivation** — read `#define _mm_x(a, b)` parameter lists
+     too (skipping variadic ones): 303 → **332** names, which pins 22 of the
+     87 ICE names.
+  2. **Variant propagation** — the front end's own name table (`builtins.rs`)
+     maps both spellings of an intrinsic to one `BuiltinIntrinsic` variant
+     (`_mm_and_si128` and `__builtin_ia32_pand128` are both `X86Pand128`).
+     Propagating the header-derived arity along that mapping gives **216
+     variants** an arity (4 dropped as conflicting) and covers **72 of the 87**
+     ICE names. The 15 left over are variants with no header-derived public
+     name at all (`X86Cmpps256`, `X86Rdtscp`, …): they need a different source
+     (the emitter's own contract, or GCC's prototypes for the
+     `__builtin_ia32_*` primitives).
+* Design note for the slice: (2) wants a *variant*-keyed lookup, i.e. the
+  generated file grows a `match variant { … }` beside the name-keyed table, and
+  the sema hook in `analysis.rs` — which already holds the variant — asks for
+  the variant's arity when the name is unknown. The backend asserts stay where
+  they are: the audit's criterion is that they are unreachable from any
+  ill-typed source, not that they are deleted, and they are the last line of
+  defence behind the front end.
