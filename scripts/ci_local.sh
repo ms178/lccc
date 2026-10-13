@@ -1753,6 +1753,12 @@ gate "codegen-quality-gate" fast \
 # the two multi-minute oracles `--fast` exists to skip.
 gate "rustfmt" fast cargo fmt --all -- --check
 
+# The declared rust-version floor (Cargo.toml, 1.97.0) is a measurement only
+# if something rebuilds the tree on that toolchain: the hosted `msrv` job
+# does, and this gate is its local mirror (check_ci_gate_parity.py requires
+# the pair). Needs the 1.97.0 rustup toolchain installed.
+gate "msrv-check" fast cargo +1.97.0 check --locked
+
 # Memory-constrained hosts OOM-kill the clippy gate the same way they kill
 # the cargo-test compile (see cargo_test_repeated): clippy-driver's metadata
 # compile of the monolithic lib-test target has the same resident peak as

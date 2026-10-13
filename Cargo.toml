@@ -10,12 +10,10 @@ version = "0.1.0"
 # floor is now the version the tree is verified against:
 #   * verified locally: `cargo build --profile fastbuild --locked`
 #     with rustc 1.97.0 (2d8144b78), warnings denied (-D warnings) — clean.
-# No hosted job currently re-checks this floor (there is no `msrv` job in
-# .github/workflows/ci.yml), so until one exists the number rests on that
-# local measurement alone. Adding the job is follow-up work: it needs a
-# `cargo check` mirror (or a ci_hosted_only.txt entry) to satisfy
-# scripts/check_ci_gate_parity.py. Raise the floor only together with the
-# job that tests the new floor.
+# The GitHub workflow's `msrv` job re-runs `cargo check --locked` on
+# exactly this toolchain (mirrored locally by ci_local.sh's `msrv-check`
+# gate), so the number stays a measurement. Raise the floor only together
+# with the job that tests the new floor.
 rust-version = "1.97.0"
 edition = "2024"
 description = "LCCC (Lev's C Compiler) — a high-performance C compiler fork targeting x86-64, i686, ARM64, and RISC-V"

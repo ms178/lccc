@@ -1633,6 +1633,26 @@ jobs:
           CARGO_BUILD_JOBS: "2"
         run: python3 scripts/check_clippy_policy.py
 
+  # The declared rust-version floor (Cargo.toml) is a measurement only if
+  # a job rebuilds the tree on that toolchain; without this job the number
+  # rested on one local build. Mirrored locally by ci_local.sh's
+  # `msrv-check` gate, as scripts/check_ci_gate_parity.py requires.
+  msrv:
+    timeout-minutes: 30
+    name: MSRV check (declared rust-version floor)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install the declared MSRV toolchain
+        uses: dtolnay/rust-toolchain@1.97.0
+
+      - name: Check the tree builds on the MSRV toolchain
+        run: cargo check --locked
+
   # MS-01 (competitive half): compare LCCC against GCC / Clang / ICX on
   # Compiler Explorer and fail on regression against the committed baseline.
   # Networked, so a Compiler Explorer outage is a recorded skip (exit 0), never
