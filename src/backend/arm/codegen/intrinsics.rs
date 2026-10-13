@@ -1031,7 +1031,10 @@ impl ArmCodegen {
             | IntrinsicOp::VecHorizontalAddI32x8
             | IntrinsicOp::VecZeroF64x4
             | IntrinsicOp::VecZeroI32x8 => {
-                unimplemented!("4-wide/AVX vector intrinsics not implemented for ARM");
+                // Same invariant as the 256-bit arm below: an x86-shaped
+                // 4-wide/AVX op must not reach AArch64 at all.  Trap loudly
+                // instead of raising a compiler ICE.
+                self.emit_unreachable();
             }
             // Long-double / _Float128 sign-bit intrinsics. AArch64 long
             // double is IEEE binary128: sign bit 127 = bit 63 of the HIGH
@@ -1054,7 +1057,16 @@ impl ArmCodegen {
                         // the f64-extend fallback (wrong for copysign/fabs).
                         self.state.track_f128_self(d.0);
                     } else {
-                        unimplemented!("LDFabs: dest is not slot-homed");
+                        // Invariant: on AArch64 every f128 value lives in a
+                        // stack slot -- `track_f128_self` registers a value the
+                        // f128 readers resolve through `f128_resolve_slot_addr`,
+                        // so a register home would be invisible to its own
+                        // consumers.  The register allocator has never produced
+                        // one here (checked across -O0..-O3 on the f128
+                        // intrinsic corpus), so this is unreachable today; if
+                        // that ever changes, trap rather than leave the
+                        // destination uninitialised.
+                        self.emit_unreachable();
                     }
                 }
             }
@@ -1071,7 +1083,16 @@ impl ArmCodegen {
                         self.emit_f128_store_q0_to_slot(slot);
                         self.state.track_f128_self(d.0);
                     } else {
-                        unimplemented!("F128Neg: dest is not slot-homed");
+                        // Invariant: on AArch64 every f128 value lives in a
+                        // stack slot -- `track_f128_self` registers a value the
+                        // f128 readers resolve through `f128_resolve_slot_addr`,
+                        // so a register home would be invisible to its own
+                        // consumers.  The register allocator has never produced
+                        // one here (checked across -O0..-O3 on the f128
+                        // intrinsic corpus), so this is unreachable today; if
+                        // that ever changes, trap rather than leave the
+                        // destination uninitialised.
+                        self.emit_unreachable();
                     }
                 }
             }
@@ -1094,7 +1115,16 @@ impl ArmCodegen {
                         self.emit_f128_store_q0_to_slot(slot);
                         self.state.track_f128_self(d.0);
                     } else {
-                        unimplemented!("LDCopysign: dest is not slot-homed");
+                        // Invariant: on AArch64 every f128 value lives in a
+                        // stack slot -- `track_f128_self` registers a value the
+                        // f128 readers resolve through `f128_resolve_slot_addr`,
+                        // so a register home would be invisible to its own
+                        // consumers.  The register allocator has never produced
+                        // one here (checked across -O0..-O3 on the f128
+                        // intrinsic corpus), so this is unreachable today; if
+                        // that ever changes, trap rather than leave the
+                        // destination uninitialised.
+                        self.emit_unreachable();
                     }
                 }
             }
@@ -1130,10 +1160,13 @@ impl ArmCodegen {
             | IntrinsicOp::VecStoreI32x8
             | IntrinsicOp::VecWidenAddI32x4ToI64x2
             | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2 => {
-                unimplemented!(
-                    "AArch64: no NEON lowering for vector intrinsic {:?} (x86-only shape leaked past the vectorizer target gate)",
-                    op
-                );
+                // An x86-shaped 256-bit op reached the AArch64 emitter: the
+                // vectorizer's target gate is the invariant that prevents this,
+                // and `unimplemented!` used to turn that invariant into a
+                // compiler ICE.  Emit the target's trap instead -- the program
+                // fails loudly at the instruction, and a backend bug no longer
+                // aborts the compiler.
+                self.emit_unreachable();
             }
             _ => { /* x86-only scalar/SSE-builtin op on arm: no-op */ }
         }

@@ -506,7 +506,10 @@ impl RiscvCodegen {
             | IntrinsicOp::VecSmlalHiI32x4 => {
                 // These are x86-64/AArch64-specific register-based vector operations
                 // RISC-V would use RVV (RISC-V Vector extension) differently
-                unimplemented!("Register-based vector intrinsics not implemented for RISC-V");
+                // x86-shaped op in the RISC-V emitter: the target gate that
+                // keeps it out is the invariant, and a compiler ICE is the
+                // wrong way to report a broken invariant.  Trap instead.
+                self.emit_unreachable();
             }
             // ── _Float128 / long double sign-bit intrinsics ─────────────
             //

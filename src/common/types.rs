@@ -61,6 +61,22 @@ pub fn set_target_elf_machine(machine: u16) {
 }
 
 /// ELF e_machine of the current target.
+/// Human-readable name of the compilation target, for diagnostics that must
+/// name the architecture ("`__builtin_ia32_aesenc128` is not available on
+/// aarch64").  Mirrors the backend's own `elf_machine_name`, but lives in the
+/// common layer so the lowering pipeline can name the target without depending
+/// on a backend.
+pub fn target_arch_name() -> &'static str {
+    match target_elf_machine() {
+        3 => "i686",
+        40 => "arm",
+        62 => "x86-64",
+        183 => "aarch64",
+        243 => "riscv64",
+        _ => "the target architecture",
+    }
+}
+
 pub fn target_elf_machine() -> u16 {
     TARGET_ELF_MACHINE.with(|c| c.get())
 }

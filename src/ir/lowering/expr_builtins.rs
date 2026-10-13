@@ -2161,20 +2161,43 @@ impl Lowerer {
         name: &str,
         args: &[Expr],
     ) {
-        let Some((feature, flag)) = x86_intrinsic_required_feature(intrinsic) else {
-            return;
-        };
-        // 3 = EM_386 (i686), 62 = EM_X86_64.
-        if !matches!(crate::common::types::target_elf_machine(), 3 | 62) {
-            return;
-        }
-        if crate::common::x86_features::effective().contains(feature) {
-            return;
-        }
         let span = args
             .first()
             .map(|a| a.span())
             .unwrap_or_else(|| crate::common::source::Span::new(0, 0, 0));
+        // AUD-SILENT-ZERO-1: this function is reached only from the arm that
+        // dispatches the x86 builtin families, so on a target that is not x86
+        // every call here names an intrinsic the target cannot execute at all.
+        // GCC rejects the same programs (the name does not exist on aarch64,
+        // and `#ifdef`-guarded code never lowers the call), so the compile
+        // fails here rather than deferring to a trap at run time.
+        // 3 = EM_386 (i686), 62 = EM_X86_64.
+        if !matches!(crate::common::types::target_elf_machine(), 3 | 62) {
+            // Naming the extension when we know it makes the message
+            // actionable; a builtin outside the table is still x86-only.
+            let hint = match x86_intrinsic_required_feature(intrinsic) {
+                Some((feature, flag)) => {
+                    format!(" ({} instruction-set extension, {})", feature.name(), flag)
+                }
+                None => String::new(),
+            };
+            self.diagnostics.borrow_mut().error(
+                format!(
+                    "`{}` is an x86-only intrinsic and is not available on {}{}",
+                    name,
+                    crate::common::types::target_arch_name(),
+                    hint
+                ),
+                span,
+            );
+            return;
+        }
+        let Some((feature, flag)) = x86_intrinsic_required_feature(intrinsic) else {
+            return;
+        };
+        if crate::common::x86_features::effective().contains(feature) {
+            return;
+        }
         self.diagnostics.borrow_mut().error(
             format!(
                 "`{}` requires the {} instruction-set extension ({}), which the requested target does not have",
