@@ -1589,11 +1589,11 @@ fn rename_full_def_source(t: &str, from: RegId, to: RegId) -> Option<String> {
 /// product is live over and stops at its death:
 ///   * a line that touches `to` while the product is live is a stale read or
 ///     a clobber → veto;
-///   * a destination-only full-width def of `from` ends the range; a q-width
-///     self-move is renamed as a read-through, while pure source-dependent
-///     definitions retarget their source and leave the fresh result in `from`;
-///     a single-family full-width RMW is renamed as a continuing product
-///     update; partial-width or multi/opaque writes → veto;
+///   * a destination-only full-width def of `from` ends the range; the
+///     recognized q-width self-move is effectless and may be crossed, while
+///     pure source-dependent definitions retarget their source and leave the
+///     fresh result in `from`; a single-family full-width RMW is renamed as a
+///     continuing product update; partial-width or multi/opaque writes → veto;
 ///   * any other line reading `from` is renamed with `rename_family`
 ///     (which vetoes `%ah`-class spellings);
 ///   * once `from` is dead after a line, the range is over — later touches
@@ -1624,10 +1624,12 @@ fn rename_product_range(
     let mut k = next_insn(store, infos, start + 1, len);
     while k < len {
         let info = &infos[k];
-        if !is_window_kind(info.kind) || info.pinned {
-            // The product is live here (the walk only continues while it is),
-            // and a live range cannot cross control flow or side-effect
-            // barriers soundly at text level → veto.
+        if !(is_window_kind(info.kind) || matches!(info.kind, LineKind::SelfMove)) || info.pinned {
+            // `SelfMove` is preclassified with no GP effects, but
+            // `is_window_kind` excludes it. A q-width self-move is a semantic
+            // no-op, so admit it locally; the following real product reads
+            // still have to follow the renamed value. Other barriers cannot be
+            // crossed while the product is live.
             return None;
         }
         let t = info.trimmed(store.get(k));
@@ -2047,18 +2049,18 @@ mod tests {
     }
 
     #[test]
-    fn commuting_adjacent_fuse_keeps_full_width_self_move_reads_live() {
+    fn commuting_adjacent_fuse_steps_over_full_width_self_move() {
         // This one-register return marks %rdx dead at ret; without that ABI
         // fact the product in %rdx is observable and the fold must be refused.
-        // The q-width self move is a semantic no-op rather than a kill, so it
-        // follows the product to the fused destination (unlike a movl kill).
+        // The q-width self-move is effectless, not a kill: leave it in place
+        // and still rename the following real product consumer.
         let asm = format!(
             "{PRO}    # LCCC_RET_RDX 0\n    movq (%rsi), %rax\n    movq (%rdi), %rdx\n    imulq %rax, %rdx\n    addq %rdx, %rcx\n    movq %rdx, %rdx\n    movq %rdx, (%r8)\n    movq %rcx, %rax\n{EPI}"
         );
         let out = body(&run(&asm, fuse_load_into_alu));
         assert!(has(&out, "imulq (%rdi), %rax"), "{out:?}");
         assert!(has(&out, "addq %rax, %rcx"), "{out:?}");
-        assert!(has(&out, "movq %rax, %rax"), "{out:?}");
+        assert!(has(&out, "movq %rdx, %rdx"), "{out:?}");
         assert!(has(&out, "movq %rax, (%r8)"), "{out:?}");
     }
 
