@@ -807,7 +807,10 @@ impl ArchCodegen for RiscvCodegen {
         // Fall-through elision, mirroring the shared default: RISC-V block
         // code has sequential fall-through semantics between adjacent
         // emitted blocks, so a `jump` to the physically next label is dead.
-        if self.state.next_block_label == Some(block) {
+        // An empty address-taken block must still keep a distinct address.
+        if self.state.next_block_label == Some(block)
+            && !self.state.fallthrough_would_alias_observable_label()
+        {
             return;
         }
         let out = &mut self.state.out;

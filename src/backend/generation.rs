@@ -4871,8 +4871,30 @@ fn generate_function(
     let mut last_debug_file: u32 = 0;
     let mut last_debug_line: u32 = 0;
     cg.state().current_program_point = 0;
+    // Blocks whose address is observable. Fall-through elision of an empty
+    // one would make `&&label` compare equal to the next label. CFG merge
+    // already refuses to fuse these; the emitter must not undo that by
+    // omitting the only instruction that separated the labels.
+    let mut observable_labels: FxHashSet<_> =
+        func.global_init_label_blocks.iter().copied().collect();
+    for b in &func.blocks {
+        for inst in &b.instructions {
+            match inst {
+                Instruction::LabelAddr { label, .. } => {
+                    observable_labels.insert(*label);
+                }
+                Instruction::InlineAsm { goto_labels, .. } => {
+                    for (_, label) in goto_labels {
+                        observable_labels.insert(*label);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 
     for (block_idx, block) in func.blocks.iter().enumerate() {
+        cg.state().preserve_label_identity = observable_labels.contains(&block.label);
         cg.begin_home_write_block(block.label);
         if Some(block.label) != entry_label {
             cg.state().reg_cache.invalidate_all();

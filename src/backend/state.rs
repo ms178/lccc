@@ -644,6 +644,10 @@ pub struct CodegenState {
     /// Label emitted immediately after the current block, if any. Used to
     /// elide unconditional jumps on the hot fall-through path.
     pub next_block_label: Option<BlockId>,
+    /// The block being emitted has an observable address (`&&label`, a
+    /// static initializer, or an asm-goto target). Fall-through elision of
+    /// an empty body's branch would make that address equal the next label.
+    pub preserve_label_identity: bool,
 }
 
 impl CodegenState {
@@ -786,11 +790,34 @@ impl CodegenState {
             fp_const_pool: FxHashMap::default(),
             vec_const_pool: FxHashMap::default(),
             next_block_label: None,
+            preserve_label_identity: false,
         }
     }
 
     pub fn next_label_id(&mut self) -> u32 {
         self.out.next_label_id()
+    }
+
+    /// True when eliding a branch to the physically next block would make
+    /// this block's observable address equal that next label. Directives
+    /// and debug locations do not occupy an address; an instruction does.
+    pub fn fallthrough_would_alias_observable_label(&self) -> bool {
+        if !self.preserve_label_identity {
+            return false;
+        }
+        for line in self.out.buf.lines().rev() {
+            let t = line.trim();
+            if t.is_empty()
+                || t.starts_with('#')
+                || t.starts_with(".cfi_")
+                || t.starts_with(".loc")
+                || t.starts_with(".file")
+            {
+                continue;
+            }
+            return t.ends_with(':') && !t.contains(' ');
+        }
+        false
     }
 
     /// Mark that a `.section` directive for a NON-TEXT section has just been
@@ -1023,6 +1050,7 @@ impl CodegenState {
         self.dirty_upper_ymm = false;
         self.uses_sret = false;
         self.next_block_label = None;
+        self.preserve_label_identity = false;
         // GEP-fold bookkeeping is function-local too: `folded_gep_values`
         // holds the value IDs of skipped address producers, and value IDs
         // restart at 0 in every function.  Without this clear, IDs leaked
