@@ -2954,3 +2954,35 @@ fold it verified.
   `lccc-harness-snapshot.sh` carry deprecation headers pointing at the
   canonical snapshot tool; `scripts/README.md` documents the `-o -`, private
   temp directory and cpu-supports contracts.
+
+## 2026-10-13 — CI failure observability (CI-DIAG-1)
+
+- **Decision:** a red run must name its own cause.  Both mirrors now run the
+  suite through `scripts/ci_test_report.py`, which streams the command's output
+  through unchanged and, on failure, publishes one check annotation per failing
+  test *on the panic's own `file:line`*, a summary annotation naming every
+  failure first, and a complete Markdown `$GITHUB_STEP_SUMMARY`.
+- **Why it was needed:** for a failed job, `actions/jobs/{id}/logs` answers
+  HTTP 500, `check-runs/{id}` carries no title/summary/text, and the only
+  annotation a bare `cargo test` step produces is `Process completed with exit
+  code 101`.  On 2026-10-13 a branch sat red with ten failing tests that were
+  recoverable only because that branch had wrapped `cargo test` in a
+  re-annotating script of its own (absent from `main`).  An unreadable red
+  costs hours per occurrence and invites fixing the wrong side.
+- **Not a substitute for a gate:** the wrapper changes no verdict — the exit
+  status is preserved exactly, including `128+n` for a signalled child — so it
+  cannot turn a red run green; it only makes a red run legible.
+- **Mirror doctrine unchanged:** the tool is invoked by both mirrors, so
+  `check_ci_gate_parity.py` two-way parity holds without an allowlist entry,
+  and its `--self-test` runs on both sides before the suite it explains.
+- **Honest-annotation rule:** the corpus-failure surfacing step no longer
+  prints `no regression-results.json was written` when an unrelated earlier
+  step failed; it states that the corpus gate never ran and points at the step
+  that did fail.  An annotation that misnames the cause is worse than none.
+- **Forensic record:** the same pass proved the four other red branches are
+  branch-local (`a615b49b` breaks six pre-existing `map_fp_select_tests` plus
+  its own four new tests; `074efb69` fails its own GCC-16 provisioning step;
+  `24fe00ee` fails its own `__seg_gs conversion diagnostics` gate while its
+  hand-maintained diagnostic replay reports `fail flag=0`).  Detail and the
+  exact failing test names: `docs/FOLLOWUP-2026-10-13-audit-sweep.md`,
+  section CI-DIAG-1.

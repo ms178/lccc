@@ -258,7 +258,21 @@ jobs:
           RUSTFLAGS: -D warnings
         # Keep every Rust compilation that produces LCCC code at the project
         # fastbuild policy: opt-level 1 and no more than two Cargo jobs.
-        run: cargo test --profile fastbuild --all-targets --locked -j 2
+        #
+        # The suite runs through scripts/ci_test_report.py because a red
+        # `cargo test` step is simultaneously the most common red in this
+        # repository and the least readable one: GitHub's own annotation for it
+        # is "Process completed with exit code 101", `actions/jobs/{id}/logs`
+        # answers HTTP 500 for a failed job, and the public job page carries no
+        # verdict text. The wrapper streams the output through unchanged and,
+        # on failure, republishes the verdict as one annotation per failing
+        # test -- placed on the panic's own file:line -- plus a Markdown job
+        # summary carrying the complete list. Its self-test runs first: a
+        # reporting tool that quietly stops reporting is worse than none.
+        run: |
+          set -euo pipefail
+          python3 scripts/ci_test_report.py --self-test
+          python3 scripts/ci_test_report.py -- cargo test --profile fastbuild --all-targets --locked -j 2
 
       # The fastbuild profile inherits `release`, which compiles every
       # debug_assert! OUT - and with them the mechanical enforcement this
@@ -278,6 +292,7 @@ jobs:
           CARGO_BUILD_JOBS: "2"
           RUSTFLAGS: -D warnings
         run: >-
+          python3 scripts/ci_test_report.py --
           cargo test --profile fastbuild --all-targets --locked -j 2
           --config 'profile.fastbuild.debug-assertions=true'
           --config 'profile.fastbuild.incremental=false'
@@ -407,7 +422,12 @@ jobs:
 
           path = Path("regression-results.json")
           if not path.is_file():
-              print("::error title=Regression harness::no regression-results.json was written")
+              print(
+                  "::error title=Regression harness::"
+                  "the corpus gate did not run, so no regression-results.json exists"
+                  " (an earlier step in this job failed first; that step's own"
+                  " annotations name it)"
+              )
           else:
               report = json.loads(path.read_text(encoding="utf-8"))
               failures = report.get("failures", [])

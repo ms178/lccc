@@ -378,6 +378,10 @@ cargo_test_repeated() {
         incr=0
     fi
     n="${LCCC_TEST_REPEATS:-1}"
+    # The reporter's own test corpus runs first: it is what fails when the
+    # reporter quietly stops reporting, and the suite below is exactly the log
+    # it exists to explain (see scripts/ci_test_report.py).
+    python3 scripts/ci_test_report.py --self-test
     for ((i = 1; i <= n; i++)); do
         if [ -n "$dbg" ]; then
             export CARGO_PROFILE_FASTBUILD_DEBUG="$dbg"
@@ -389,7 +393,8 @@ cargo_test_repeated() {
         else
             unset CARGO_INCREMENTAL
         fi
-        if ! RUSTFLAGS="$flags" cargo test --profile fastbuild --all-targets --locked -j "$jobs"; then
+        if ! RUSTFLAGS="$flags" python3 scripts/ci_test_report.py -- \
+            cargo test --profile fastbuild --all-targets --locked -j "$jobs"; then
             printf 'cargo-test: FAILED on repeat %d/%d\n' "$i" "$n" >&2
             return 1
         fi
@@ -410,7 +415,8 @@ DBGASSERT_CONFIG=(--config 'profile.fastbuild.debug-assertions=true'
 cargo_test_dbgassert() {
     local flags="" jobs="${CI_LOCAL_JOBS:-2}"
     [ -r target/lccc-rustflags ] && flags="$(cat target/lccc-rustflags)"
-    CARGO_INCREMENTAL=0 RUSTFLAGS="$flags" cargo test --profile fastbuild \
+    CARGO_INCREMENTAL=0 RUSTFLAGS="$flags" python3 scripts/ci_test_report.py -- \
+        cargo test --profile fastbuild \
         --all-targets --locked -j "$jobs" "${DBGASSERT_CONFIG[@]}"
 }
 gate "cargo-test-debug-assertions" slow cargo_test_dbgassert
