@@ -83,15 +83,24 @@ impl Lowerer {
                     IrType::F32 | IrType::F64 | IrType::F128
                 )
         );
-        // Identifiers are NOT answered from the sema map: sema records every
-        // `const`-qualified object's initializer there, including `const
-        // volatile` objects, whose every read must reach memory (C11 6.7.3p7).
-        // Identifier values come from `eval_const_identifier`, which knows the
-        // object's volatility and shadowing.
-        if !matches!(expr, Expr::Identifier(_, _))
-            && !float_cast
-            && !Self::expr_contains_sizeof(expr)
-        {
+        // Identifiers are answered first by `eval_const_identifier` (enum
+        // constants and const locals, with lowering's own shadowing rules).
+        // What it cannot answer may still be a folded const object: sema
+        // records an identifier in its const map only when the innermost
+        // visible declaration of that name is a const object with a constant
+        // initializer (`annotate_const_value` -> `SymbolTable::folded_value`;
+        // `const volatile` objects are never marked folded, so a read that
+        // must reach memory, C11 6.7.3p7, is never answered here). Without
+        // this, a bare `int x = cc;` at file scope fell through to the
+        // "initializer element is not constant" diagnostic while `cc * 2`
+        // folded through the parent expression's map entry.
+        if let Expr::Identifier(name, _) = expr {
+            if let Some(val) = self.eval_const_identifier(name) {
+                return Some(val);
+            }
+            return self.lookup_sema_const(expr);
+        }
+        if !float_cast && !Self::expr_contains_sizeof(expr) {
             if let Some(val) = self.lookup_sema_const(expr) {
                 return Some(val);
             }

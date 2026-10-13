@@ -698,8 +698,8 @@ impl Driver {
         }
         match self.mode {
             CompileMode::ObjectOnly | CompileMode::Full => {
-                Err("cannot write an object file or executable to stdout; \
-                 '-o -' is only valid with -S, -E, -M/-MM or -dM"
+                Err("cannot write an object file or executable to stdout \
+                 (standard output); '-o -' is only valid with -S, -E, -M/-MM or -dM"
                     .to_string())
             }
             CompileMode::AssemblyOnly | CompileMode::PreprocessOnly
