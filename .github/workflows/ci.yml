@@ -1277,6 +1277,7 @@ jobs:
           bash tests/regression/check_dep_files.sh
           bash tests/regression/check_i686_boot_asm.sh
           bash tests/regression/check_asm_goto_phi_edge.sh
+          bash tests/regression/check_i686_label_ref_safety.sh
           bash tests/regression/check_narrow_cmp_flag_law.sh
           bash tests/regression/check_zero_ext_cmp_fold.sh
           bash tests/regression/check_boot_size_measurement.sh

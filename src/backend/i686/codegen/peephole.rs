@@ -1142,6 +1142,9 @@ fn next_reads_carry_flag(store: &LineStore, infos: &[LineInfo], start: usize) ->
 fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = infos.len();
     let mut changed = false;
+    // Filled only if a jump-to-next is seen. Identity pins must not be
+    // recomputed on every line, and must not be guessed from the window.
+    let mut identity_pins: Option<std::collections::HashSet<String>> = None;
 
     let mut i = 0;
     while i < len {
@@ -2018,13 +2021,19 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             }
         }
 
-        // Pattern 3: Redundant jump to next label
+        // Pattern 3: Redundant jump to next label.
+        // Deleting the jump is control-flow equivalent, but it also moves the
+        // address of every label that sat on that jump onto the next label.
+        // An observable `&&label` must stay distinct from its target; a
+        // dispatch-only case label may still fall through.
         if infos[i].kind == LineKind::Jmp && infos[j].kind == LineKind::Label {
             let jmp_s = trimmed(store, &infos[i], i);
             let label_s = trimmed(store, &infos[j], j);
             if let Some(target) = parse_jmp_target(jmp_s) {
                 if let Some(label_name) = label_s.strip_suffix(':') {
-                    if target.trim() == label_name {
+                    if target.trim() == label_name
+                        && !jump_carries_observable_address(store, infos, i, &mut identity_pins)
+                    {
                         infos[i].kind = LineKind::Nop;
                         changed = true;
                         i += 1;
@@ -10078,109 +10087,569 @@ fn census_reg_reads(
     n
 }
 
-/// Rewrite every branch in `[fstart, fend)` whose target is `from_name` to
-/// target `to_name` instead.  Returns the number of rewritten branches.
-///
-/// Also rewrites whole-word references to `from_name` inside `.long`/`.quad`
-/// data directives: jump tables hold ` .long LABEL - BASE` entries that bind
-/// just as strongly as branch targets.  Threaded labels whose definition is
-/// removed must not survive in table data, or the entry resolves to an
-/// undefined symbol and the indirect jump lands on garbage
-/// (gcc.c-torture execute/20011109-1.c @O1/O2, SIGSEGV in foo(1)).
-fn retarget_label_refs(
-    store: &mut LineStore,
-    infos: &mut [LineInfo],
-    fstart: usize,
-    fend: usize,
-    from_name: &str,
-    to_name: &str,
-) -> usize {
-    let mut n = 0;
-    for i in fstart..fend {
+/// A counter branch with no relaxable long form. The i686 encoder emits
+/// `jecxz`/`jcxz` as `E3 cb` and `loop` as `E2 cb`; the ELF writer marks those
+/// mnemonics short-only. `loope`/`loopne` and `jrcxz` have the same ISA limit
+/// where a backend accepts them. Final rel8 range is not knowable here: later
+/// peephole passes and jump relaxation still change sizes, so a text-distance
+/// guess can assemble today and fail after the next fold. The relay stays.
+fn short_only_mnemonic(mnemonic: &str) -> bool {
+    matches!(
+        mnemonic,
+        "jecxz" | "jcxz" | "jrcxz" | "loop" | "loope" | "loopz" | "loopne" | "loopnz"
+    )
+}
+
+fn syntax_of<'a>(store: &'a LineStore, infos: &[LineInfo], idx: usize) -> &'a str {
+    let raw = trimmed(store, &infos[idx], idx);
+    let n = crate::backend::peephole_common::line_len_without_trailing_comment(raw.as_bytes());
+    raw[..n].trim_end()
+}
+
+fn local_symbol(text: &str) -> Option<&str> {
+    let b = text.as_bytes();
+    if b.len() < 3 || b[0] != b'.' || b[1] != b'L' {
+        return None;
+    }
+    let mut n = 2;
+    while n < b.len()
+        && (b[n].is_ascii_alphanumeric() || b[n] == b'_' || b[n] == b'.' || b[n] == b'$')
+    {
+        n += 1;
+    }
+    (n > 2).then_some(&text[..n])
+}
+
+fn bare_local_label(text: &str) -> bool {
+    local_symbol(text).is_some_and(|sym| sym.len() == text.len())
+}
+
+/// Non-PIC switches emit `jmp *TABLE(, %reg, scale)`. PIC switches emit
+/// `leal TABLE@GOTOFF(%ebx), %reg` and difference entries. Both spellings are
+/// the compiler's own dispatch use, not an observable address load.
+fn jump_table_base(text: &str) -> Option<String> {
+    if let Some(idx) = text.find("jmp *") {
+        let rest = text[idx + "jmp *".len()..].trim_start();
+        if let Some(sym) = local_symbol(rest) {
+            if rest[sym.len()..].starts_with("(,") {
+                return Some(sym.to_string());
+            }
+        }
+    }
+    if let Some(idx) = text.find("@GOTOFF") {
+        let head = &text[..idx];
+        let start = head
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '$'))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let sym = &head[start..];
+        if local_symbol(sym).is_some_and(|s| s.len() == sym.len()) {
+            return Some(sym.to_string());
+        }
+    }
+    None
+}
+
+fn collect_jump_table_bases(
+    store: &LineStore,
+    infos: &[LineInfo],
+) -> std::collections::HashSet<String> {
+    let mut bases = std::collections::HashSet::new();
+    for i in 0..infos.len() {
+        if infos[i].is_nop() || infos[i].kind == LineKind::InlineAsm {
+            continue;
+        }
+        if let Some(base) = jump_table_base(syntax_of(store, infos, i)) {
+            bases.insert(base);
+        }
+    }
+    bases
+}
+
+fn label_defined_once(store: &LineStore, infos: &[LineInfo], name: &str) -> bool {
+    let mut n = 0u32;
+    for i in 0..infos.len() {
+        if infos[i].is_nop() || infos[i].kind != LineKind::Label {
+            continue;
+        }
+        let text = syntax_of(store, infos, i);
+        if text.strip_suffix(':').is_some_and(|def| def.trim() == name) {
+            n += 1;
+            if n > 1 {
+                return false;
+            }
+        }
+    }
+    n == 1
+}
+
+fn data_payload(text: &str) -> Option<&str> {
+    let rest = text
+        .strip_prefix(".long")
+        .or_else(|| text.strip_prefix(".quad"))?;
+    let rest = rest.strip_prefix([' ', '\t'])?.trim();
+    (!rest.is_empty()).then_some(rest)
+}
+
+fn label_diff(payload: &str) -> Option<(&str, &str)> {
+    let (left, right) = if let Some((a, b)) = payload.split_once(" - ") {
+        (a.trim(), b.trim())
+    } else if let Some(idx) = payload.find('-') {
+        if idx == 0 {
+            return None;
+        }
+        (&payload[..idx], &payload[idx + 1..])
+    } else {
+        return None;
+    };
+    (bare_local_label(left) && bare_local_label(right)).then_some((left, right))
+}
+
+/// A data line is a dispatch entry only when it sits in the contiguous run
+/// under a symbol the module actually uses as a jump-table base, and the
+/// payload is either that table's absolute case label or `CASE - TABLE`.
+/// `static void *p = &&label` is the same `.long .LBB` spelling with a
+/// different owner, so it must not match.
+fn dispatch_case<'a>(
+    text: &'a str,
+    owning: &str,
+    bases: &std::collections::HashSet<String>,
+) -> Option<&'a str> {
+    if owning.is_empty() || !bases.contains(owning) {
+        return None;
+    }
+    let payload = data_payload(text)?;
+    if bare_local_label(payload) {
+        return Some(payload);
+    }
+    let (left, right) = label_diff(payload)?;
+    (right == owning).then_some(left)
+}
+
+fn table_run_transparent(text: &str) -> bool {
+    text.is_empty()
+        || text.starts_with(".align")
+        || text.starts_with(".p2align")
+        || text.starts_with(".balign")
+}
+
+fn direct_branch<'a>(kind: LineKind, text: &'a str) -> Option<(&'a str, &'a str)> {
+    if !matches!(kind, LineKind::Jmp | LineKind::CondJmp) {
+        return None;
+    }
+    let mut parts = text.split_whitespace();
+    let mnemonic = parts.next()?;
+    let target = parts.next()?;
+    if parts.next().is_some() || mnemonic.contains('*') || target.starts_with('*') {
+        return None;
+    }
+    Some((mnemonic, target))
+}
+
+fn short_only_target(text: &str) -> Option<&str> {
+    let mut parts = text.split_whitespace();
+    let mnemonic = parts.next()?;
+    let target = parts.next()?;
+    if parts.next().is_some() || !short_only_mnemonic(mnemonic) {
+        return None;
+    }
+    Some(target)
+}
+
+struct TrampolinePins {
+    identity: bool,
+    short_only: bool,
+}
+
+/// Pins are module-wide. A function window that starts at the previous
+/// `.cfi_endproc` cannot see `.long .LBB` emitted in the data section before
+/// the first function, which is exactly where a later function's static
+/// `&&label` initializer lives.
+fn trampoline_pins(
+    store: &LineStore,
+    infos: &[LineInfo],
+    bases: &std::collections::HashSet<String>,
+    name: &str,
+) -> TrampolinePins {
+    let mut pins = TrampolinePins {
+        identity: false,
+        short_only: false,
+    };
+    let mut owning = String::new();
+    let mut run_open = false;
+    for i in 0..infos.len() {
         if infos[i].is_nop() {
             continue;
         }
-        // DIRECTIVE-LAW: selecting -- this pass rewrites the label tokens *inside*
-        // jump-table data; it reads every directive it touches and moves nothing.
-        if matches!(infos[i].kind, LineKind::Directive) {
-            // Jump-table data references: `.long LABEL - BASE` /
-            // `.long BASE - LABEL`.  Replace whole-word label tokens only
-            // (`.LBB7` must not match `.LBB77`).
-            let line = trimmed(store, &infos[i], i);
-            if !(line.starts_with(".long ") || line.starts_with(".quad ")) {
-                continue;
+        let text = syntax_of(store, infos, i);
+        if infos[i].kind == LineKind::Label {
+            if let Some(def) = text.strip_suffix(':') {
+                owning = def.trim().to_string();
+                run_open = bases.contains(&owning);
+            } else {
+                owning.clear();
+                run_open = false;
             }
-            if !label_referenced_whole_word(&line, from_name) {
-                continue;
-            }
-            let new_line = replace_label_whole_word(&line, from_name, to_name);
-            store.replace(i, format!("    {}", new_line));
-            infos[i] = classify_line(store.get(i));
-            n += 1;
             continue;
         }
-        if !matches!(infos[i].kind, LineKind::Jmp | LineKind::CondJmp) {
+        if infos[i].kind == LineKind::InlineAsm {
+            if label_referenced_whole_word(text, name) {
+                pins.identity = true;
+            }
+            run_open = false;
             continue;
         }
-        let line = trimmed(store, &infos[i], i);
-        let targets_from = line
-            .split_whitespace()
-            .next_back()
-            .is_some_and(|t| t == from_name);
-        if targets_from {
-            let prefix_len = line.len() - from_name.len();
-            let new_line = format!("    {}{}", &line[..prefix_len], to_name);
-            store.replace(i, new_line);
-            infos[i] = classify_line(store.get(i));
+        if run_open {
+            if let Some(case) = dispatch_case(text, &owning, bases) {
+                if case != name && label_referenced_whole_word(text, name) {
+                    pins.identity = true;
+                }
+                continue;
+            }
+            if table_run_transparent(text) {
+                if label_referenced_whole_word(text, name) {
+                    pins.identity = true;
+                }
+                continue;
+            }
+            run_open = false;
+        }
+        if short_only_target(text) == Some(name) {
+            pins.short_only = true;
+            continue;
+        }
+        if let Some((mnemonic, target)) = direct_branch(infos[i].kind, text) {
+            if target == name && !short_only_mnemonic(mnemonic) {
+                continue;
+            }
+        }
+        if label_referenced_whole_word(text, name)
+            && !text
+                .strip_prefix(name)
+                .is_some_and(|rest| rest.starts_with(':'))
+        {
+            pins.identity = true;
+        }
+    }
+    pins
+}
+
+fn rewrite_label_token(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    idx: usize,
+    from: &str,
+    to: &str,
+) {
+    let raw = store.get(idx);
+    let new_raw = replace_label_whole_word(raw, from, to);
+    if new_raw != raw {
+        store.replace(idx, new_raw);
+        infos[idx] = classify_line(store.get(idx));
+    }
+}
+
+/// Retarget relaxable direct branches always (control-flow equivalent; the
+/// label's address does not change). Retarget a proven dispatch entry only
+/// when nothing observes the label's address. Never retarget short-only
+/// branches, inline asm, or any other data use.
+fn retarget_proven_refs(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    bases: &std::collections::HashSet<String>,
+    from: &str,
+    to: &str,
+    allow_dispatch: bool,
+) -> usize {
+    let mut n = 0;
+    let mut owning = String::new();
+    let mut run_open = false;
+    for i in 0..infos.len() {
+        if infos[i].is_nop() {
+            continue;
+        }
+        if infos[i].kind == LineKind::InlineAsm {
+            run_open = false;
+            continue;
+        }
+        let text = syntax_of(store, infos, i);
+        if infos[i].kind == LineKind::Label {
+            if let Some(def) = text.strip_suffix(':') {
+                owning = def.trim().to_string();
+                run_open = bases.contains(&owning);
+            } else {
+                owning.clear();
+                run_open = false;
+            }
+            continue;
+        }
+        let mut rewrite = false;
+        if run_open {
+            if let Some(case) = dispatch_case(text, &owning, bases) {
+                rewrite = allow_dispatch && case == from;
+                if rewrite {
+                    rewrite_label_token(store, infos, i, from, to);
+                    n += 1;
+                }
+                continue;
+            }
+            if table_run_transparent(text) {
+                continue;
+            }
+            run_open = false;
+        }
+        if let Some((mnemonic, target)) = direct_branch(infos[i].kind, text) {
+            rewrite = target == from && !short_only_mnemonic(mnemonic);
+        }
+        if rewrite {
+            rewrite_label_token(store, infos, i, from, to);
             n += 1;
         }
     }
     n
 }
 
-/// Whether `name` appears in `text` as a whole word (identifier-boundary
-/// delimited on both sides).  Used by retarget_label_refs for data directives.
-fn label_referenced_whole_word(text: &str, name: &str) -> bool {
+/// Thread one proven trampoline. Returns whether the assembly changed.
+/// The label is deleted only when every reference was retargeted. A
+/// short-only branch or an address use keeps the relay; ordinary branches
+/// may still skip it.
+fn each_local_symbol(text: &str, mut visit: impl FnMut(&str)) {
     let bytes = text.as_bytes();
-    let nb = name.as_bytes();
-    if nb.len() > bytes.len() {
-        return false;
+    let mut i = 0;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        if let Some(q) = quote {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match bytes[i] {
+            b'"' | b'\'' => {
+                quote = Some(bytes[i]);
+                i += 1;
+            }
+            b'.' => {
+                let bound = i > 0
+                    && (bytes[i - 1].is_ascii_alphanumeric()
+                        || bytes[i - 1] == b'_'
+                        || bytes[i - 1] == b'.'
+                        || bytes[i - 1] == b'$');
+                if bound {
+                    i += 1;
+                    continue;
+                }
+                if let Some(sym) = local_symbol(&text[i..]) {
+                    visit(sym);
+                    i += sym.len();
+                } else {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
     }
-    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'$';
-    let mut start = 0usize;
-    while start + nb.len() <= bytes.len() {
-        if &bytes[start..start + nb.len()] == nb
-            && (start == 0 || !is_word(bytes[start - 1]))
-            && (start + nb.len() == bytes.len() || !is_word(bytes[start + nb.len()]))
-        {
+}
+
+/// Labels whose address is observable. One module scan: a jump-to-next fold
+/// must not call the per-label census once per instruction.
+fn identity_pinned_labels(
+    store: &LineStore,
+    infos: &[LineInfo],
+) -> std::collections::HashSet<String> {
+    let bases = collect_jump_table_bases(store, infos);
+    let mut pinned = std::collections::HashSet::new();
+    let mut owning = String::new();
+    let mut run_open = false;
+    for i in 0..infos.len() {
+        if infos[i].is_nop() {
+            continue;
+        }
+        let text = syntax_of(store, infos, i);
+        if infos[i].kind == LineKind::Label {
+            if let Some(def) = text.strip_suffix(':') {
+                owning = def.trim().to_string();
+                run_open = bases.contains(&owning);
+            } else {
+                owning.clear();
+                run_open = false;
+            }
+            continue;
+        }
+        let mut note = |sym: &str| {
+            pinned.insert(sym.to_string());
+        };
+        if infos[i].kind == LineKind::InlineAsm {
+            each_local_symbol(text, &mut note);
+            run_open = false;
+            continue;
+        }
+        if run_open {
+            if let Some(case) = dispatch_case(text, &owning, &bases) {
+                each_local_symbol(text, |sym| {
+                    if sym != case {
+                        note(sym);
+                    }
+                });
+                continue;
+            }
+            if table_run_transparent(text) {
+                each_local_symbol(text, &mut note);
+                continue;
+            }
+            run_open = false;
+        }
+        if let Some(target) = short_only_target(text) {
+            each_local_symbol(text, |sym| {
+                if sym != target {
+                    note(sym);
+                }
+            });
+            continue;
+        }
+        if let Some((mnemonic, target)) = direct_branch(infos[i].kind, text) {
+            if !short_only_mnemonic(mnemonic) {
+                each_local_symbol(text, |sym| {
+                    if sym != target {
+                        note(sym);
+                    }
+                });
+                continue;
+            }
+        }
+        each_local_symbol(text, |sym| {
+            if !text
+                .strip_prefix(sym)
+                .is_some_and(|rest| rest.starts_with(':'))
+            {
+                note(sym);
+            }
+        });
+    }
+    pinned
+}
+
+/// True when this jump is the first instruction of a label whose address is
+/// observable. Deleting it would make `&&label` compare equal to the next label.
+fn jump_carries_observable_address(
+    store: &LineStore,
+    infos: &[LineInfo],
+    jmp_idx: usize,
+    cache: &mut Option<std::collections::HashSet<String>>,
+) -> bool {
+    let mut idx = jmp_idx;
+    while idx > 0 {
+        idx -= 1;
+        if infos[idx].is_nop() || is_debug_location(store, infos, idx) {
+            continue;
+        }
+        if infos[idx].kind != LineKind::Label {
+            break;
+        }
+        let text = syntax_of(store, infos, idx);
+        let Some(name) = text.strip_suffix(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let pins = cache.get_or_insert_with(|| identity_pinned_labels(store, infos));
+        if pins.contains(name) {
             return true;
         }
-        start += 1;
     }
     false
 }
 
-/// Replace every whole-word occurrence of `from` with `to` in `text`.
+fn thread_resolved_trampoline(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    bases: &std::collections::HashSet<String>,
+    name: &str,
+    target: &str,
+    label_idx: usize,
+    jmp_idx: usize,
+) -> bool {
+    if !label_defined_once(store, infos, name) || !label_defined_once(store, infos, target) {
+        return false;
+    }
+    let pins = trampoline_pins(store, infos, bases, name);
+    let retargeted = retarget_proven_refs(store, infos, bases, name, target, !pins.identity);
+    if pins.identity || pins.short_only {
+        return retargeted > 0;
+    }
+    infos[label_idx].kind = LineKind::Nop;
+    infos[jmp_idx].kind = LineKind::Nop;
+    true
+}
+
+fn is_label_ident_byte(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'$'
+}
+
+/// Next unquoted whole-word match of `name` at or after `from`.
+/// A `.string ".LBB1"` or a comment `"# .LBB1"` is text, not a symbol use.
+/// A backslash escapes the next byte, including a quote.
+fn find_unquoted_label(bytes: &[u8], name: &[u8], from: usize) -> Option<usize> {
+    if name.is_empty() || from > bytes.len() {
+        return None;
+    }
+    let mut i = from;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        if let Some(q) = quote {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'"' || bytes[i] == b'\'' {
+            quote = Some(bytes[i]);
+            i += 1;
+            continue;
+        }
+        if i + name.len() <= bytes.len()
+            && &bytes[i..i + name.len()] == name
+            && (i == 0 || !is_label_ident_byte(bytes[i - 1]))
+            && (i + name.len() == bytes.len() || !is_label_ident_byte(bytes[i + name.len()]))
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Whether `name` appears in `text` as a whole word outside quotes.
+/// Used by trampoline reference classification. A quoted copy must not pin
+/// or be rewritten: `.string ".LBB1"` does not reference the symbol.
+fn label_referenced_whole_word(text: &str, name: &str) -> bool {
+    find_unquoted_label(text.as_bytes(), name.as_bytes(), 0).is_some()
+}
+
+/// Replace every unquoted whole-word occurrence of `from` with `to`.
 fn replace_label_whole_word(text: &str, from: &str, to: &str) -> String {
     let bytes = text.as_bytes();
     let nb = from.as_bytes();
-    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'$';
     let mut out = String::with_capacity(text.len() + to.len());
     let mut i = 0usize;
-    while i < bytes.len() {
-        if i + nb.len() <= bytes.len()
-            && &bytes[i..i + nb.len()] == nb
-            && (i == 0 || !is_word(bytes[i - 1]))
-            && (i + nb.len() == bytes.len() || !is_word(bytes[i + nb.len()]))
-        {
-            out.push_str(to);
-            i += nb.len();
-        } else {
-            let ch_len = utf8_char_len(bytes[i]);
-            out.push_str(&text[i..i + ch_len]);
-            i += ch_len;
-        }
+    while let Some(at) = find_unquoted_label(bytes, nb, i) {
+        out.push_str(&text[i..at]);
+        out.push_str(to);
+        i = at + nb.len();
     }
+    out.push_str(&text[i..]);
     out
 }
 
@@ -10208,6 +10677,7 @@ fn utf8_char_len(b: u8) -> usize {
 fn thread_trivial_blocks(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = infos.len();
     let mut changed = false;
+    let table_bases = collect_jump_table_bases(store, infos);
 
     let mut fstart = 0usize;
     for idx in 0..=len {
@@ -10302,43 +10772,19 @@ fn thread_trivial_blocks(store: &mut LineStore, infos: &mut [LineInfo]) -> bool 
             if !guarded {
                 continue;
             }
-            // Ordinary branches and jump-table data can be retargeted. A
-            // reference inside inline asm, a computed address, or any other
-            // directive cannot: deleting the label turns that edge into an
-            // unresolved symbol (observed: i686 -O0 asm goto jumped to address
-            // 0). Keep the pure trampoline for those edges. Normal branches
-            // still skip it, so the retained jump is paid only by the opaque
-            // edge.
-            let opaque = (fstart..fend).any(|i| {
-                if i == label_idx || i == jmp_idx || infos[i].is_nop() {
-                    return false;
-                }
-                let text = trimmed(store, &infos[i], i);
-                if !label_referenced_whole_word(text, name) {
-                    return false;
-                }
-                match infos[i].kind {
-                    LineKind::Jmp | LineKind::CondJmp
-                        if text.split_whitespace().next_back() == Some(name.as_str()) =>
-                    {
-                        false
-                    }
-                    LineKind::Directive
-                        if text.starts_with(".long ") || text.starts_with(".quad ") =>
-                    {
-                        false
-                    }
-                    _ => true,
-                }
-            });
-            let retargeted = retarget_label_refs(store, infos, fstart, fend, name, &target);
-            if opaque {
-                changed |= retargeted > 0;
-                continue;
-            }
-            infos[label_idx].kind = LineKind::Nop;
-            infos[jmp_idx].kind = LineKind::Nop;
-            changed = true;
+            // References are classified across the whole module. The
+            // function window cannot see static `&&label` data emitted
+            // before the first body, and a `.long`/`.quad` token is not
+            // proof of a jump table. Short-only branches keep the relay.
+            changed |= thread_resolved_trampoline(
+                store,
+                infos,
+                &table_bases,
+                name,
+                &target,
+                label_idx,
+                jmp_idx,
+            );
         }
 
         fstart = idx + 1;
@@ -17760,6 +18206,272 @@ mod tests {
             result.contains("jmp .LBB3"),
             "retained trampoline must stay pure"
         );
+    }
+
+    #[test]
+    fn static_label_outside_function_window_is_not_deleted_or_retargeted() {
+        // Data is emitted before every function. The second function's
+        // census window starts after the first `.cfi_endproc`, so a
+        // window-local scan misses `.long .LBB5` and used to delete the
+        // trampoline. Address identity must also survive: rewriting the
+        // data reference to `.LBB3` makes `&&mid == &&end`.
+        let asm = "\
+.data
+    .long .LBB5
+.text
+decoy:
+.cfi_startproc
+    ret
+.cfi_endproc
+.size decoy, .-decoy
+later:
+.cfi_startproc
+    jne .LBB5
+    ret
+.LBB5:
+    jmp .LBB3
+.LBB3:
+    movl $1, %eax
+    ret
+.cfi_endproc
+";
+        let result = peephole_optimize(asm.to_string());
+        assert!(
+            result.contains(".long .LBB5"),
+            "static label address must keep its identity:\n{result}"
+        );
+        assert!(
+            !result.contains(".long .LBB3"),
+            "address use must not be rewritten as a jump table:\n{result}"
+        );
+        assert!(
+            result.contains(".LBB5:"),
+            "referenced trampoline must remain:\n{result}"
+        );
+        assert!(
+            result.contains("jmp .LBB3"),
+            "retained relay must stay a pure jump:\n{result}"
+        );
+        assert!(
+            result.contains("jne .LBB3"),
+            "ordinary edge may still skip the relay:\n{result}"
+        );
+    }
+
+    #[test]
+    fn quoted_label_text_does_not_pin_or_get_rewritten() {
+        // `.string ".LBB1"` and a quoted comment are not symbol uses. The
+        // trampoline is not jump-to-next, so the threader rewrites the real
+        // edge. That rewrite must not edit the quoted copy, and the quoted
+        // copy must not keep the relay.
+        let asm = "\
+f:
+.cfi_startproc
+    jmp .LBB1 # \".LBB1\"
+    ret
+.LBB1:
+    jmp .LBB3
+.Lgap:
+    nop
+    ret
+.LBB3:
+    ret
+    .string \".LBB1\"
+.cfi_endproc
+";
+        let result = peephole_optimize(asm.to_string());
+        assert!(
+            !result.contains(".LBB1:"),
+            "quoted text must not pin the trampoline:\\n{result}"
+        );
+        assert!(
+            result.contains("jmp .LBB3"),
+            "the real edge must still thread:\\n{result}"
+        );
+        assert!(
+            result.contains(".string \".LBB1\""),
+            "string payload must stay quoted and unrewritten:\\n{result}"
+        );
+        assert!(
+            result.contains("# \".LBB1\""),
+            "quoted comment must not be rewritten with the edge:\\n{result}"
+        );
+    }
+
+    fn absolute_long_inside_first_window_is_not_a_jump_table() {
+        // fstart == 0 includes the data section. The old pass treated every
+        // `.long` as a dispatch entry and rewrote this address.
+        let asm = "\
+    .long .LBB5
+f:
+.cfi_startproc
+    jmp .LBB5
+.LBB5:
+    jmp .LBB3
+.LBB3:
+    ret
+.cfi_endproc
+";
+        let result = peephole_optimize(asm.to_string());
+        assert!(result.contains(".long .LBB5"), "{result}");
+        assert!(!result.contains(".long .LBB3"), "{result}");
+        assert!(result.contains(".LBB5:"), "{result}");
+        assert!(result.contains("jmp .LBB3"), "{result}");
+    }
+
+    #[test]
+    fn label_difference_is_not_a_dispatch_entry() {
+        let asm = "\
+    .long .LBB5 - .Lbase
+.Lbase:
+f:
+.cfi_startproc
+    jmp .LBB5
+.LBB5:
+    jmp .LBB3
+.LBB3:
+    ret
+.cfi_endproc
+";
+        let result = peephole_optimize(asm.to_string());
+        assert!(
+            result.contains(".long .LBB5 - .Lbase"),
+            "computed-goto difference must keep both labels:\n{result}"
+        );
+        assert!(result.contains(".LBB5:"), "{result}");
+    }
+
+    #[test]
+    fn proven_switch_table_still_threads_and_chains() {
+        let asm = "\
+f:
+.cfi_startproc
+    jmp *.Ljt_0(, %eax, 4)
+    ret
+.LBB1:
+    jmp .LBB2
+.Lgap1:
+    nop
+    ret
+.LBB2:
+    jmp .LBB3
+.Lgap2:
+    nop
+.LBB3:
+    ret
+.section .rodata
+.align 4
+.Ljt_0:
+    .long .LBB1
+    .long .LBB2
+.section .text,\"ax\",@progbits
+.cfi_endproc
+";
+        let result = peephole_optimize(asm.to_string());
+        assert!(
+            result.contains(".long .LBB3"),
+            "dispatch-only entries must reach the final target:\n{result}"
+        );
+        assert!(
+            !result.contains(".long .LBB1") && !result.contains(".long .LBB2"),
+            "threaded case labels must not dangle:\n{result}"
+        );
+        assert!(
+            !result.contains(".LBB1:") && !result.contains(".LBB2:"),
+            "proven trampolines may be deleted:\n{result}"
+        );
+        assert!(result.contains("jmp *.Ljt_0(, %eax, 4)"), "{result}");
+    }
+
+    #[test]
+    fn pic_switch_difference_threads_but_address_pin_blocks_it() {
+        let table = "\
+f:
+.cfi_startproc
+    leal .Ljt_1@GOTOFF(%ebx), %ecx
+    movl (%ecx, %eax, 4), %eax
+    addl %ecx, %eax
+    jmp *%eax
+    ret
+.LBB5:
+    jmp .LBB3
+.Lgap:
+    nop
+.LBB3:
+    ret
+.Ljt_1:
+    .long .LBB5 - .Ljt_1
+.cfi_endproc
+";
+        let threaded = peephole_optimize(table.to_string());
+        assert!(
+            threaded.contains(".long .LBB3 - .Ljt_1"),
+            "PIC dispatch difference may skip a pure trampoline:\n{threaded}"
+        );
+        assert!(!threaded.contains(".LBB5:"), "{threaded}");
+
+        let pinned = format!("    .quad .LBB5\n{table}");
+        let kept = peephole_optimize(pinned);
+        assert!(
+            kept.contains(".quad .LBB5"),
+            "observable address must not be rewritten:\n{kept}"
+        );
+        assert!(
+            kept.contains(".long .LBB5 - .Ljt_1"),
+            "an address pin blocks dispatch retargeting too:\n{kept}"
+        );
+        assert!(kept.contains(".LBB5:"), "{kept}");
+    }
+
+    #[test]
+    fn short_only_branches_keep_the_relay_in_both_directions() {
+        for mnemonic in ["jecxz", "jcxz", "loop", "loope", "loopne"] {
+            for body in [
+                format!(
+                    "f:\n.cfi_startproc\n    {mnemonic} .LBB5\n    movl $2, %eax\n    ret\n.LBB5:\n    jmp .LBB3\n.Lpad:\n    .space 200\n.LBB3:\n    movl $1, %eax\n    ret\n.cfi_endproc\n"
+                ),
+                format!(
+                    "f:\n.cfi_startproc\n.LBB3:\n    movl $1, %eax\n    ret\n.Lpad:\n    .space 200\n    {mnemonic} .LBB5\n    movl $2, %eax\n    ret\n.LBB5:\n    jmp .LBB3\n.cfi_endproc\n"
+                ),
+            ] {
+                let result = peephole_optimize(body);
+                assert!(
+                    result.contains(&format!("{mnemonic} .LBB5")),
+                    "{mnemonic} must not be retargeted:\n{result}"
+                );
+                assert!(
+                    result.contains(".LBB5:"),
+                    "{mnemonic} relay must survive:\n{result}"
+                );
+                assert!(
+                    result.contains("jmp .LBB3"),
+                    "{mnemonic} relay must stay a jump:\n{result}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn short_only_relay_still_lets_relaxable_edges_skip() {
+        let asm = "\
+f:
+.cfi_startproc
+    jne .LBB5
+    jecxz .LBB5
+    ret
+.LBB5:
+    jmp .LBB3
+.Lgap:
+    nop
+.LBB3:
+    ret
+.cfi_endproc
+";
+        let result = peephole_optimize(asm.to_string());
+        assert!(result.contains("jne .LBB3"), "{result}");
+        assert!(result.contains("jecxz .LBB5"), "{result}");
+        assert!(result.contains(".LBB5:"), "{result}");
+        assert!(result.contains("jmp .LBB3"), "{result}");
     }
 
     fn test_inline_asm_region_is_never_rewritten() {
