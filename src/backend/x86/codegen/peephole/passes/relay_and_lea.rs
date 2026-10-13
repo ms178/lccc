@@ -1550,7 +1550,7 @@ pub(super) fn fold_lea_into_load(store: &mut LineStore, infos: &mut [LineInfo]) 
     let mut changed = false;
     let mut i = 0;
     while i < len {
-        if infos[i].is_nop() || infos[i].pinned {
+        if debug_transparent(store, infos[i], i) || infos[i].pinned {
             i += 1;
             continue;
         }
@@ -1612,7 +1612,7 @@ pub(super) fn fold_lea_into_load(store: &mut LineStore, infos: &mut [LineInfo]) 
         let mut j = i + 1;
         let mut window = 0;
         while j < len && window < LEA_WINDOW {
-            if infos[j].is_nop() {
+            if debug_transparent(store, infos[j], j) {
                 j += 1;
                 continue;
             }
@@ -1754,7 +1754,7 @@ pub(super) fn retarget_producer_into_copy(store: &mut LineStore, infos: &mut [Li
     let mut changed = false;
     let mut i = 0;
     while i < len {
-        if infos[i].is_nop() || infos[i].pinned {
+        if debug_transparent(store, infos[i], i) || infos[i].pinned {
             i += 1;
             continue;
         }
@@ -1789,7 +1789,7 @@ pub(super) fn retarget_producer_into_copy(store: &mut LineStore, infos: &mut [Li
         }
         // Next real instruction must be the copy.
         let mut j = i + 1;
-        while j < len && infos[j].is_nop() {
+        while j < len && debug_transparent(store, infos[j], j) {
             j += 1;
         }
         if j >= len || infos[j].pinned || infos[j].is_barrier() {

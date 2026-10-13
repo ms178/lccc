@@ -778,7 +778,7 @@ pub(super) fn widen_private_vector_copies(store: &mut LineStore, infos: &mut [Li
 /// end of the function comes first. "Adjacent" in this pass means exactly that.
 fn next_real(store: &LineStore, infos: &[LineInfo], from: usize, fend: usize) -> Option<usize> {
     for n in from..fend {
-        if infos[n].is_nop() || infos[n].kind == LineKind::Empty {
+        if debug_transparent(store, infos[n], n) || infos[n].kind == LineKind::Empty {
             continue;
         }
         let t = infos[n].trimmed(store.get(n));
@@ -796,7 +796,7 @@ fn prev_real(store: &LineStore, infos: &[LineInfo], before: usize, fstart: usize
     let mut n = before;
     while n > fstart {
         n -= 1;
-        if infos[n].is_nop() || infos[n].kind == LineKind::Empty {
+        if debug_transparent(store, infos[n], n) || infos[n].kind == LineKind::Empty {
             continue;
         }
         let t = infos[n].trimmed(store.get(n));

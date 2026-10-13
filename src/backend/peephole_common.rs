@@ -504,9 +504,15 @@ impl LineStore {
 /// only -- stays benign.
 pub(crate) fn directive_emits_data(text: &str) -> bool {
     let trimmed = text.trim();
-    let Some(rest) = trimmed.strip_prefix('.') else {
+    if !trimmed.starts_with('.') {
         return false;
+    }
+    // A metadata-looking first statement cannot certify the whole line.
+    // In particular CFI followed by `; .byte ...` contains executable bytes.
+    let Some(trimmed) = single_asm_statement(trimmed) else {
+        return true;
     };
+    let rest = &trimmed[1..];
     // A local label like `.Ltmp3:` is dotted but not a directive: it emits no
     // bytes and is not what this predicate is for.  Callers select on
     // `LineKind::Directive` first (labels are a barrier of their own there), so
@@ -633,6 +639,43 @@ pub(crate) fn line_len_without_trailing_comment(b: &[u8]) -> usize {
     b.len()
 }
 
+/// Return one complete statement, without a trailing comment. Unknown quoting
+/// and statement separators fail closed. This is shared by both directive
+/// predicates so metadata cannot hide executable statements from either one.
+fn single_asm_statement(text: &str) -> Option<&str> {
+    let mut quote = None;
+    let mut escaped = false;
+    for (i, b) in text.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if let Some(q) = quote {
+            if b == b'\\' {
+                escaped = true;
+            } else if b == q {
+                quote = None;
+            }
+        } else {
+            match b {
+                b'"' | b'\'' => quote = Some(b),
+                b'#' => return Some(text[..i].trim_end()),
+                b';' | b'\n' | b'\r' => return None,
+                _ => {}
+            }
+        }
+    }
+    (quote.is_none() && !escaped).then_some(text)
+}
+
+/// Exact debug-attribution tokens, excluding compound assembler statements.
+/// Honor quoted filenames, escapes and trailing comments without allocation.
+pub(crate) fn is_debug_marker_directive(text: &str) -> bool {
+    let text = text.trim();
+    matches!(text.split_whitespace().next(), Some(".loc" | ".file"))
+        && single_asm_statement(text).is_some()
+}
+
 /// Directives a peephole window may step over: they emit no bytes, reference no
 /// data whose value depends on code layout, and cannot switch section.
 ///
@@ -666,38 +709,30 @@ pub(crate) fn line_len_without_trailing_comment(b: &[u8]) -> usize {
 /// cost of a wrong one is a miscompiled object.
 pub(crate) fn inert_directive(text: &str) -> bool {
     let t = text.trim();
-    if t.starts_with(".cfi_") {
-        // Unwind records put nothing into the section being assembled, so they are
-        // steppable -- except the one that chooses *which section* they go into.
-        // `.cfi_sections <list>` redirects every following FDE, so its position is
-        // meaning exactly as `.section`'s is.  Measured with GNU as 2.44 on a
-        // two-instruction function: with `.cfi_sections .debug_frame` before
-        // `.cfi_startproc` the object has `.debug_frame` (0x38) and no `.eh_frame`
-        // at all; delete the line and the object has `.eh_frame` (0x30) and no
-        // `.debug_frame`; `.text` is 0xb bytes either way -- which is why
-        // `directive_emits_data` may answer "no bytes" for it while this predicate
-        // must not answer "steppable".
-        return !t.starts_with(".cfi_sections");
+    if !t.starts_with('.') {
+        return false;
     }
-    if t.starts_with(".LFB")
-        || t.starts_with(".loc ")
-        || t.starts_with(".file ")
-        || t.starts_with(".size ")
-        || t.starts_with(".type ")
-        || t.starts_with(".globl ")
-        || t.starts_with(".weak ")
-        || t.starts_with(".hidden ")
-        || t.starts_with(".set ")
-        || t.starts_with(".equ ")
+    let Some(t) = single_asm_statement(t) else {
+        return false;
+    };
+    let name = t.split_whitespace().next().unwrap_or("");
+    if name.starts_with(".cfi_") {
+        // No text bytes, but .cfi_sections redirects subsequent unwind FDEs.
+        return name != ".cfi_sections";
+    }
+    if (t.starts_with(".LFB") && t.ends_with(':'))
+        || matches!(
+            name,
+            ".loc" | ".file" | ".size" | ".type" | ".globl" | ".weak" | ".hidden" | ".set" | ".equ"
+        )
     {
         return true;
     }
-    for prefix in [".p2align", ".balign", ".align"] {
-        // Longest prefix first, so `.p2align`/`.balign` are not shadowed by the
-        // `.align` spelling rules.
-        if let Some(rest) = t.strip_prefix(prefix) {
-            return !alignment_fill_is_explicit(rest);
-        }
+    if matches!(
+        name,
+        ".p2align" | ".p2alignw" | ".p2alignl" | ".balign" | ".balignw" | ".balignl" | ".align"
+    ) {
+        return !alignment_fill_is_explicit(&t[name.len()..]);
     }
     false
 }
@@ -707,13 +742,79 @@ mod inert_directive_tests {
     use super::*;
 
     #[test]
+    fn compound_metadata_must_not_hide_executable_bytes() {
+        for prefix in [
+            ".cfi_def_cfa_offset 8",
+            ".size f, .-f",
+            ".type f, @function",
+            ".globl f",
+            ".weak f",
+            ".hidden f",
+            ".set a, 0",
+            ".equ b, 0",
+            ".p2align 0",
+            ".balign 1",
+            ".loc 1 7 3",
+            ".file 1 \"x.c\"",
+        ] {
+            for suffix in [".byte 0xf9", "stc", ".Lafter:"] {
+                let text = format!("{prefix}; {suffix}");
+                assert!(!inert_directive(&text), "stepped across {text}");
+                assert!(directive_emits_data(&text), "hid bytes in {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn directive_tokens_comments_and_quotes_have_one_lexical_contract() {
+        for text in [
+            ".p2alignment 0",
+            ".balignment 1",
+            ".align_extra 4",
+            ".LFB_not_a_label",
+        ] {
+            assert!(!inert_directive(text), "unknown token: {text}");
+        }
+        for text in [
+            r#".file 1 "semi;#colon.c""#,
+            ".cfi_def_cfa_offset 8 # ; .byte 0xf9",
+        ] {
+            assert!(inert_directive(text), "comment/quoted punctuation: {text}");
+            assert!(
+                !directive_emits_data(text),
+                "comment/quoted punctuation: {text}"
+            );
+        }
+        assert!(inert_directive(".globl\tf"));
+        assert!(inert_directive(".type\tf, @function"));
+    }
+
+    #[test]
+    fn debug_tokens_reject_statement_chains_and_lookalikes() {
+        for text in [
+            ".loc 1 7 3; .byte 0xcc",
+            ".file 2 \"x.c\"; ret",
+            ".location 1",
+            ".file_data 1",
+            ".file 2 \"unterminated",
+        ] {
+            assert!(!is_debug_marker_directive(text), "{text}");
+            assert!(!inert_directive(text), "{text}");
+        }
+    }
+
+    #[test]
     fn inert_directives_are_the_ones_that_emit_and_reference_nothing() {
         for t in [
             ".cfi_startproc",
             ".cfi_adjust_cfa_offset 16",
             ".cfi_def_cfa_register 6",
             ".loc 1 12 4",
+            ".loc\t1 12 4",
+            ".file\t1 \"k.c\"",
             ".file 1 \"k.c\"",
+            ".file 1 \"semi;hash#name.c\"",
+            ".loc 1 7 3 # ; .byte 0xcc",
             ".LFB0:",
             ".size f, .-f",
             ".type f, @function",

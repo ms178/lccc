@@ -4,6 +4,7 @@ pub(crate) mod const_eval;
 pub(crate) mod decimal;
 pub(crate) mod encoding;
 pub(crate) mod error;
+pub(crate) mod forwarding;
 pub(crate) mod fp_contract;
 pub(crate) mod fx_hash;
 pub(crate) mod long_double;

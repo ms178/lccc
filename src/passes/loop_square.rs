@@ -11,7 +11,7 @@
 use super::loop_analysis::{self, DominanceChecker};
 use crate::common::types::IrType;
 use crate::ir::analysis::CfgAnalysis;
-use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
+use crate::ir::reexports::{BlockId, Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
 
 fn square_zero(operand: Operand, ty: IrType) -> Option<Operand> {
     match (operand, ty) {
@@ -49,10 +49,29 @@ fn stable_fp_environment(inst: &Instruction) -> bool {
     )
 }
 
+struct SquarePlan {
+    header: usize,
+    pre: BlockId,
+    latch: BlockId,
+    block: usize,
+    instruction: usize,
+    dest: Value,
+    replacement: Value,
+    zero: Operand,
+    ty: IrType,
+}
+
+fn has_fp_square(func: &IrFunction) -> bool {
+    func.blocks.iter().flat_map(|b| &b.instructions).any(|i| {
+        matches!(i, Instruction::BinOp { op: IrBinOp::Mul, lhs, rhs,
+            ty: IrType::F32 | IrType::F64, .. } if lhs == rhs)
+    })
+}
+
 pub(crate) fn run(func: &mut IrFunction) -> usize {
-    // Cheap triage: most functions have no floating-point squares.
-    if !func.blocks.iter().flat_map(|b| &b.instructions).any(|i| matches!(i,
-        Instruction::BinOp { op: IrBinOp::Mul, lhs, rhs, ty: IrType::F32 | IrType::F64, .. } if lhs == rhs)) { return 0; }
+    if !has_fp_square(func) {
+        return 0;
+    }
     if func.blocks.is_empty() || !super::gvn::find_multi_def_values(func).is_empty() {
         return 0;
     }
@@ -172,17 +191,17 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                         _ => None,
                     });
                     if let Some(replacement) = replacement {
-                        plans.push((
-                            lp.header,
-                            pre_label,
-                            latch_label,
-                            b,
-                            ii,
-                            *dest,
+                        plans.push(SquarePlan {
+                            header: lp.header,
+                            pre: pre_label,
+                            latch: latch_label,
+                            block: b,
+                            instruction: ii,
+                            dest: *dest,
                             replacement,
                             zero,
-                            *ty,
-                        ));
+                            ty: *ty,
+                        });
                         break 'one_per_loop;
                     }
                 }
@@ -196,7 +215,18 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     // Rewrite the old instruction in place to a Copy before inserting any
     // phis, so header indices never become stale. Preserve original spans.
     let mut additions = Vec::new();
-    for (header, pre, latch, b, ii, dest, replacement, zero, ty) in &plans {
+    for SquarePlan {
+        header,
+        pre,
+        latch,
+        block: b,
+        instruction: ii,
+        dest,
+        replacement,
+        zero,
+        ty,
+    } in &plans
+    {
         let carried = Value(func.next_value_id);
         func.next_value_id += 1;
         func.blocks[*b].instructions[*ii] = Instruction::Copy {

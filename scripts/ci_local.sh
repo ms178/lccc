@@ -399,6 +399,9 @@ gate "loop-store-motion" fast \
 gate "const-trip-loop-inline" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_const_trip_loop_inline.sh
 
+gate "debug-code-parity" fast \
+    env CCC=target/fastbuild/lccc python3 tests/regression/check_debug_code_parity.py
+
 gate "fp-recurrence-and-jump-thread" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_fp_recurrence.sh
 
@@ -858,6 +861,9 @@ gate "dep-files" fast \
 
 gate "i686-boot-asm" fast \
     bash tests/regression/check_i686_boot_asm.sh
+
+gate "asm-goto-phi-edge" fast \
+    bash tests/regression/check_asm_goto_phi_edge.sh
 
 # ci.yml "Verify inline-asm UTF-8 assembly text".
 gate "inline-asm-utf8" fast \

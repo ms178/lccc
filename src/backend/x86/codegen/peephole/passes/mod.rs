@@ -417,12 +417,16 @@ fn line_count_estimate(asm: &str) -> usize {
 /// Compatibility entry point for isolated peephole tests. Production code
 /// passes the driver-owned policy through [`peephole_optimize_with_config`].
 pub fn peephole_optimize(asm: String) -> String {
-    peephole_optimize_with_config(asm, &RaConfig::default())
+    peephole_optimize_with_config(asm, &RaConfig::default(), false)
 }
 
 /// Full peephole pipeline using the RA/codegen policy captured by the driver.
-pub(crate) fn peephole_optimize_with_config(asm: String, ra_config: &RaConfig) -> String {
-    let mut out = peephole_optimize_inner(asm, ra_config);
+pub(crate) fn peephole_optimize_with_config(
+    asm: String,
+    ra_config: &RaConfig,
+    optimize_for_size: bool,
+) -> String {
+    let mut out = peephole_optimize_inner(asm, ra_config, optimize_for_size);
     if std::env::var("CCC_NO_VEX_PROMOTE").is_err() {
         let _ = vex_promote::promote_legacy_sse_to_vex(&mut out);
     }
@@ -461,7 +465,11 @@ fn retire_dead_pure_writes(
     any
 }
 
-fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
+fn peephole_optimize_inner(
+    mut asm: String,
+    ra_config: &RaConfig,
+    optimize_for_size: bool,
+) -> String {
     // ms178 debug: dump pre-peephole asm
     if let Ok(path) = std::env::var("CCC_DUMP_ASM") {
         let _ = std::fs::write(path, &asm);
@@ -1758,7 +1766,9 @@ fn peephole_optimize_inner(mut asm: String, ra_config: &RaConfig) -> String {
     // Dead copies can leave branch-only blocks after the IR CFG cleanup.
     // Retarget their direct edges while lines are still individually parsed.
     // Never delete labels: computed gotos and address identity stay intact.
-    if !sk("jump_thread") {
+    // Retargeting can widen a rel8 branch while retaining its relay. Until
+    // exact layout proves non-growth, preserve size mode rather than guess.
+    if !optimize_for_size && !sk("jump_thread") {
         jump_thread::run(&mut store, &mut infos);
     }
 
@@ -5234,3 +5244,6 @@ mod regression_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod debug_adjacency_tests;
