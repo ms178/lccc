@@ -8571,6 +8571,7 @@ impl ArchCodegen for X86Codegen {
         crate::backend::x86::codegen::peephole::peephole_optimize_with_config(
             text,
             self.state_ref().ra_config.as_ref(),
+            self.optimize_for_size,
         )
     }
 

@@ -215,6 +215,8 @@ impl MoveSize {
     }
 }
 
+pub(super) use crate::backend::peephole_common::is_debug_marker_directive;
+
 impl LineInfo {
     #[inline]
     pub(super) fn is_nop(self) -> bool {
@@ -1200,6 +1202,30 @@ pub(super) fn replace_line(
 #[inline]
 pub(super) fn all_editable(infos: &[LineInfo], lines: &[usize]) -> bool {
     lines.iter().all(|&l| !infos[l].pinned)
+}
+
+/// Local instruction adjacency ignores only deleted lines and unpinned inert
+/// debug attribution. Unlike is_steppable, this does NOT cross CFI/alignment:
+/// moving a definition across those can change unwind or code-layout semantics.
+#[inline]
+pub(super) fn debug_transparent(store: &LineStore, info: LineInfo, i: usize) -> bool {
+    info.is_nop()
+        || (!info.pinned
+            && info.is_steppable()
+            && is_debug_marker_directive(info.trimmed(store.get(i))))
+}
+
+pub(super) fn next_non_debug(
+    store: &LineStore,
+    infos: &[LineInfo],
+    start: usize,
+    limit: usize,
+) -> usize {
+    let mut i = start;
+    while i < limit && debug_transparent(store, infos[i], i) {
+        i += 1;
+    }
+    i
 }
 
 /// Find the next non-NOP line at or after `start`, returning its index.

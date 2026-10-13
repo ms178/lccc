@@ -19,10 +19,6 @@ use crate::ir::reexports::{
     BasicBlock, BlockId, Instruction, IrCmpOp, IrConst, IrFunction, Operand, Terminator, Value,
 };
 
-/// Maximum depth for resolving transitive jump chains (A→B→C→...),
-/// to prevent pathological cases.
-const MAX_CHAIN_DEPTH: u32 = 32;
-
 /// Maximum depth for walking single-predecessor chains when resolving
 /// a value to a constant across blocks.
 const MAX_PRED_CHAIN_DEPTH: usize = 8;
@@ -435,344 +431,180 @@ fn fold_constant_switches(
 // Sub-pass: jump chain threading
 // ---------------------------------------------------------------------------
 
-/// Thread jump chains: if a block branches to an empty forwarding block
-/// (no instructions, terminates with unconditional Branch), redirect to
-/// skip the intermediate block.
-///
-/// Special care: when threading would cause a CondBranch's true and false
-/// targets to become the same block (both edges merge), AND the target has
-/// phi nodes that carry different values from the two paths, we must NOT
-/// thread. Otherwise the merge block's phi loses the ability to distinguish
-/// the two control flow paths, causing miscompilation.
+/// Thread empty forwarding blocks using an immutable graph snapshot. No
+/// instruction is cloned. Every source terminator and its PHI additions are
+/// validated together before *any* CFG mutation; failure needs no rollback.
 fn thread_jump_chains(func: &mut IrFunction, label_to_idx: &FxHashMap<BlockId, usize>) -> usize {
-    // Build forwarding map: empty blocks that just branch unconditionally.
-    let forwarding: FxHashMap<BlockId, BlockId> = func
+    if label_to_idx.len() != func.blocks.len() {
+        return 0;
+    }
+    let forwarding: FxHashMap<_, _> = func
         .blocks
         .iter()
-        .filter(|block| {
-            block.instructions.is_empty() && matches!(&block.terminator, Terminator::Branch(_))
-        })
-        .map(|block| {
-            if let Terminator::Branch(target) = &block.terminator {
-                (block.label, *target)
+        .filter_map(|b| {
+            if b.instructions.is_empty()
+                && let Terminator::Branch(target) = b.terminator
+            {
+                Some((b.label, target))
             } else {
-                unreachable!("block was filtered to have Branch terminator")
+                None
             }
         })
         .collect();
-
-    if forwarding.is_empty() {
-        return 0;
-    }
-
-    // Resolve transitive chains with cycle detection.
-    // resolved[B] = (final_target, immediate_predecessor_of_final)
-    let resolved = resolve_forwarding_chains(&forwarding);
+    let resolved = crate::common::forwarding::resolve(&forwarding);
     if resolved.is_empty() {
         return 0;
     }
-
-    // Collect the redirections we need to make.
-    let redirections = collect_thread_redirections(func, &resolved, label_to_idx);
-    if redirections.is_empty() {
-        return 0;
-    }
-
-    // Apply the redirections.
-    apply_thread_redirections(func, &redirections, label_to_idx)
-}
-
-/// Resolve transitive forwarding chains.
-/// Returns a map: start_block -> (final_target, immediate_pred_of_final).
-fn resolve_forwarding_chains(
-    forwarding: &FxHashMap<BlockId, BlockId>,
-) -> FxHashMap<BlockId, (BlockId, BlockId)> {
-    let mut resolved = FxHashMap::default();
-    for &start in forwarding.keys() {
-        let mut prev = start;
-        let mut current = start;
-        let mut depth = 0;
-        while let Some(&next) = forwarding.get(&current) {
-            if next == start || depth > MAX_CHAIN_DEPTH {
-                break;
-            }
-            prev = current;
-            current = next;
-            depth += 1;
-        }
-        if current != start {
-            resolved.insert(start, (current, prev));
-        }
-    }
-    resolved
-}
-
-/// Collect edge redirections for jump chain threading.
-/// Returns: Vec<(block_idx, Vec<(old_target, new_target, phi_lookup_block)>)>
-fn collect_thread_redirections(
-    func: &IrFunction,
-    resolved: &FxHashMap<BlockId, (BlockId, BlockId)>,
-    label_to_idx: &FxHashMap<BlockId, usize>,
-) -> Vec<(usize, Vec<(BlockId, BlockId, BlockId)>)> {
-    // Build a set of intermediate blocks that are referenced in phi nodes of
-    // their successors. Threading through these blocks would make them dead,
-    // and dead block removal would corrupt the phi entries.
-    // We must NOT thread through a block if it's the only predecessor
-    // contributing a particular value to a successor's phi node.
+    // A sole predecessor of an empty relay is the only edge keeping that
+    // relay's PHI contribution alive. Redirecting it deletes the arm unless
+    // every consumer is rewritten in the same transaction. The measured
+    // pipeline, including loop-header remat, depends on that relay remaining.
+    // Multi-predecessor relays stay threadable: another edge preserves the arm.
     let (pred_counts, _) = build_pred_info(func);
-    let mut unsafe_to_thread: FxHashSet<BlockId> = FxHashSet::default();
+    let mut phi_fed = FxHashSet::default();
     for block in &func.blocks {
-        // Check if this block is referenced in any phi of its successors
-        for_each_terminator_target(&block.terminator, |succ| {
-            if let Some(&succ_idx) = label_to_idx.get(&succ) {
-                for inst in &func.blocks[succ_idx].instructions {
-                    if let Instruction::Phi { incoming, .. } = inst {
-                        // If this block contributes to a phi in a successor, and
-                        // it has multiple predecessors (i.e., the edge from this
-                        // block isn't the only one), then threading a predecessor
-                        // through this block is fine. But if this block IS in the
-                        // forwarding set (empty+branch) AND its successor has phis
-                        // from other predecessors, threading could be unsafe.
-                        if incoming.iter().any(|(_, l)| *l == block.label) {
-                            // This block feeds a phi in its successor. If it becomes
-                            // dead after threading, that phi entry disappears.
-                            // Only safe if the predecessor count > 1 (other blocks
-                            // also feed this block, so it won't become fully dead).
-                            let pc = pred_counts.get(&block.label).copied().unwrap_or(0);
-                            if pc <= 1 {
-                                // Threading the sole predecessor away makes this block dead
-                                unsafe_to_thread.insert(block.label);
-                            }
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    let mut redirections = Vec::with_capacity(16);
-
-    for block_idx in 0..func.blocks.len() {
-        let mut edge_changes = Vec::with_capacity(16);
-        let block_label = func.blocks[block_idx].label;
-
-        match &func.blocks[block_idx].terminator {
-            Terminator::Branch(target) => {
-                if let Some(&(resolved_target, phi_block)) = resolved.get(target) {
-                    if !unsafe_to_thread.contains(target) {
-                        edge_changes.push((*target, resolved_target, phi_block));
-                    }
-                }
-            }
-            Terminator::CondBranch {
-                true_label,
-                false_label,
-                ..
-            } => {
-                let true_resolved = resolved.get(true_label).copied();
-                let false_resolved = resolved.get(false_label).copied();
-                let true_final = true_resolved.map(|(t, _)| t).unwrap_or(*true_label);
-                let false_final = false_resolved.map(|(t, _)| t).unwrap_or(*false_label);
-
-                if true_final == false_final && true_label != false_label {
-                    // Threading would merge both edges — check for phi conflict.
-                    if would_create_phi_conflict(
-                        func,
-                        block_label,
-                        *true_label,
-                        *false_label,
-                        true_final,
-                        resolved,
-                        label_to_idx,
-                    ) {
-                        continue; // Skip: phi conflict
-                    }
-                }
-                // Safe to thread (different final targets, or no phi conflict).
-                if let Some((rt, rt_phi)) = true_resolved {
-                    if !unsafe_to_thread.contains(true_label) {
-                        edge_changes.push((*true_label, rt, rt_phi));
-                    }
-                }
-                if let Some((rf, rf_phi)) = false_resolved {
-                    if !unsafe_to_thread.contains(false_label) {
-                        if !edge_changes
-                            .iter()
-                            .any(|(old, new, _)| *old == *false_label && *new == rf)
-                        {
-                            edge_changes.push((*false_label, rf, rf_phi));
-                        }
-                    }
-                }
-            }
-            // TODO: IndirectBranch targets could also be threaded through
-            // empty blocks, but computed goto is rare enough to skip for now.
-            _ => {}
-        }
-
-        if !edge_changes.is_empty() {
-            redirections.push((block_idx, edge_changes));
-        }
-    }
-
-    redirections
-}
-
-/// Apply collected thread redirections: update terminators and phi nodes.
-fn apply_thread_redirections(
-    func: &mut IrFunction,
-    redirections: &[(usize, Vec<(BlockId, BlockId, BlockId)>)],
-    label_to_idx: &FxHashMap<BlockId, usize>,
-) -> usize {
-    let mut count = 0;
-    for (block_idx, edge_changes) in redirections {
-        let block_label = func.blocks[*block_idx].label;
-
-        // Update the terminator.
-        match &mut func.blocks[*block_idx].terminator {
-            Terminator::Branch(target) => {
-                for (old, new, _) in edge_changes {
-                    if target == old {
-                        *target = *new;
-                    }
-                }
-            }
-            Terminator::CondBranch {
-                true_label,
-                false_label,
-                ..
-            } => {
-                for (old, new, _) in edge_changes {
-                    if true_label == old {
-                        *true_label = *new;
-                    }
-                    if false_label == old {
-                        *false_label = *new;
-                    }
-                }
-            }
-            _ => {}
-        }
-        count += 1;
-
-        // Update phi nodes in new target blocks.
-        for (_old, new_target, phi_lookup_block) in edge_changes {
-            if let Some(&target_idx) = label_to_idx.get(new_target) {
-                // Safety check: if the target block has ANY phi that doesn't have
-                // an entry for the intermediate block (phi_lookup_block or _old),
-                // we can't safely thread — the phi would get a missing predecessor.
-                // This happens when the target is a loop header with phi nodes from
-                // an outer loop that don't pass through the intermediate block.
-                let all_phis_covered = func.blocks[target_idx].instructions.iter().all(|inst| {
-                    if let Instruction::Phi { incoming, .. } = inst {
-                        incoming.iter().any(|(_, label)| *label == block_label)
-                            || incoming
-                                .iter()
-                                .any(|(_, label)| *label == *phi_lookup_block)
-                            || incoming.iter().any(|(_, label)| *label == *_old)
-                    } else {
-                        true
-                    }
-                });
-                if !all_phis_covered {
-                    // Revert the terminator change for this edge.
-                    match &mut func.blocks[*block_idx].terminator {
-                        Terminator::Branch(target) => {
-                            if *target == *new_target {
-                                *target = *_old;
-                            }
-                        }
-                        Terminator::CondBranch {
-                            true_label,
-                            false_label,
-                            ..
-                        } => {
-                            if *true_label == *new_target {
-                                *true_label = *_old;
-                            }
-                            if *false_label == *new_target {
-                                *false_label = *_old;
-                            }
-                        }
-                        _ => {}
-                    }
-                    count -= 1;
-                    continue;
-                }
-
-                let block = &mut func.blocks[target_idx];
-                for inst in &mut block.instructions {
-                    if let Instruction::Phi { incoming, .. } = inst {
-                        if incoming.iter().any(|(_, label)| *label == block_label) {
-                            continue;
-                        }
-                        let value_from_chain = incoming
-                            .iter()
-                            .find(|(_, label)| *label == *phi_lookup_block)
-                            .or_else(|| incoming.iter().find(|(_, label)| *label == *_old))
-                            .map(|(val, _)| *val);
-                        if let Some(val) = value_from_chain {
-                            incoming.push((val, block_label));
-                        }
-                    }
+        for inst in &block.instructions {
+            if let Instruction::Phi { incoming, .. } = inst {
+                for (_, from) in incoming {
+                    phi_fed.insert(*from);
                 }
             }
         }
     }
-
-    count
-}
-
-/// Check if threading a CondBranch's two edges to the same final target would
-/// create a phi conflict — i.e., the target has phi nodes that carry different
-/// values from the two paths.
-fn would_create_phi_conflict(
-    func: &IrFunction,
-    block_label: BlockId,
-    true_label: BlockId,
-    false_label: BlockId,
-    target: BlockId,
-    resolved: &FxHashMap<BlockId, (BlockId, BlockId)>,
-    label_to_idx: &FxHashMap<BlockId, usize>,
-) -> bool {
-    let target_block = match label_to_idx.get(&target) {
-        Some(&idx) => &func.blocks[idx],
-        None => return false,
+    let unsafe_relay = |label: BlockId| {
+        phi_fed.contains(&label) && pred_counts.get(&label).copied().unwrap_or(0) <= 1
     };
 
-    // Determine the phi-lookup label for each path.
-    let true_phi_label = resolved
-        .get(&true_label)
-        .map(|&(_, pb)| pb)
-        .unwrap_or(block_label);
-    let false_phi_label = resolved
-        .get(&false_label)
-        .map(|&(_, pb)| pb)
-        .unwrap_or(block_label);
-
-    if true_phi_label == false_phi_label {
-        return false;
-    }
-
-    for inst in &target_block.instructions {
-        if let Instruction::Phi { incoming, .. } = inst {
-            let true_value = incoming
-                .iter()
-                .find(|(_, l)| *l == true_phi_label)
-                .map(|(v, _)| v);
-            let false_value = incoming
-                .iter()
-                .find(|(_, l)| *l == false_phi_label)
-                .map(|(v, _)| v);
-            if let (Some(tv), Some(fv)) = (true_value, false_value) {
-                if !operands_equal(tv, fv) {
-                    return true;
+    // Empty blocks can still factor PHI copies. Bound metadata expansion by
+    // the original arm count, rather than letting N predecessors times P phis
+    // create an unbounded quadratic expansion of supposedly "free" nodes.
+    let mut phi_budget = func
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .fold(0usize, |n, i| {
+            if let Instruction::Phi { incoming, .. } = i {
+                n.saturating_add(incoming.len())
+            } else {
+                n
+            }
+        });
+    let mut plans = Vec::new();
+    for (source, b) in func.blocks.iter().enumerate() {
+        let targets = match b.terminator {
+            Terminator::Branch(to) => [Some(to), None],
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => [Some(true_label), Some(false_label)],
+            // Computed branches, switches and asm-goto destinations retain
+            // their identities. An asm-goto *source* may have a normal edge;
+            // its pre-existing successor PHI arm must agree with that edge.
+            _ => continue,
+        };
+        let edges = targets.map(|to| {
+            to.and_then(|to| {
+                if unsafe_relay(to) {
+                    None
+                } else {
+                    resolved.get(&to).copied()
                 }
+            })
+        });
+        if edges.iter().all(Option::is_none) {
+            continue;
+        }
+        let Some(additions) = plan_thread_phis(func, b.label, &edges, label_to_idx, phi_budget)
+        else {
+            continue;
+        };
+        let mut terminator = b.terminator.clone();
+        match &mut terminator {
+            Terminator::Branch(to) => {
+                if let Some((end, _)) = edges[0] {
+                    *to = end;
+                }
+            }
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => {
+                if let Some((end, _)) = edges[0] {
+                    *true_label = end;
+                }
+                if let Some((end, _)) = edges[1] {
+                    *false_label = end;
+                }
+            }
+            _ => unreachable!("only direct branches were selected"),
+        }
+        phi_budget -= additions.len();
+        plans.push((source, terminator, additions));
+    }
+    let changed = plans.len();
+    for (source, terminator, additions) in plans {
+        let label = func.blocks[source].label;
+        func.blocks[source].terminator = terminator;
+        for (target, instruction, value) in additions {
+            if let Instruction::Phi { incoming, .. } =
+                &mut func.blocks[target].instructions[instruction]
+            {
+                incoming.push((value, label));
             }
         }
     }
+    changed
+}
 
-    false
+/// Missing or duplicated required PHI arms are not evidence for a rewrite.
+fn unique_phi_value(incoming: &[(Operand, BlockId)], label: BlockId) -> Option<Operand> {
+    let mut arms = incoming.iter().filter(|(_, from)| *from == label);
+    let value = arms.next()?.0;
+    arms.next().is_none().then_some(value)
+}
+
+fn plan_thread_phis(
+    func: &IrFunction,
+    source: BlockId,
+    edges: &[Option<(BlockId, BlockId)>; 2],
+    labels: &FxHashMap<BlockId, usize>,
+    budget: usize,
+) -> Option<Vec<(usize, usize, Operand)>> {
+    let mut additions = Vec::new();
+    for (edge_index, edge) in edges.iter().enumerate() {
+        let Some((target, last)) = edge else { continue };
+        let target_index = *labels.get(target)?;
+        for (instruction, inst) in func.blocks[target_index].instructions.iter().enumerate() {
+            let Instruction::Phi { incoming, .. } = inst else {
+                continue;
+            };
+            let value = unique_phi_value(incoming, *last)?;
+            if incoming.iter().any(|(_, from)| *from == source) {
+                // Includes a direct other conditional arm and implicit asm
+                // edges. Presence alone is NOT enough: the values must agree.
+                if !operands_equal(&value, &unique_phi_value(incoming, source)?) {
+                    return None;
+                }
+            } else if let Some((_, previous_last)) = edges[..edge_index]
+                .iter()
+                .flatten()
+                .find(|(end, _)| end == target)
+            {
+                // Both rewritten arms would become one predecessor in SSA.
+                if !operands_equal(&value, &unique_phi_value(incoming, *previous_last)?) {
+                    return None;
+                }
+            } else {
+                if additions.len() == budget {
+                    return None;
+                }
+                additions.push((target_index, instruction, value));
+            }
+        }
+    }
+    Some(additions)
 }
 
 // ---------------------------------------------------------------------------
@@ -1177,10 +1009,14 @@ fn find_fusion_candidates(
             continue;
         }
 
-        // Successor contains InlineAsm with goto_labels — must stay separate.
-        let has_asm_goto = func.blocks[succ_idx].instructions.iter().any(|inst| {
-            matches!(inst, Instruction::InlineAsm { goto_labels, .. } if !goto_labels.is_empty())
-        });
+        // An asm-goto source is not a single-successor block even when its
+        // terminator is Branch. Absorbing its fallthrough can coalesce two
+        // different PHI values under one predecessor label (the implicit asm
+        // exit versus normal fallthrough). Keep both sides of this boundary.
+        let has_asm_goto = block.instructions.iter()
+            .chain(&func.blocks[succ_idx].instructions).any(|inst| {
+                matches!(inst, Instruction::InlineAsm { goto_labels, .. } if !goto_labels.is_empty())
+            });
         if has_asm_goto {
             continue;
         }
@@ -2457,3 +2293,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "cfg_thread_tests.rs"]
+mod thread_tests;

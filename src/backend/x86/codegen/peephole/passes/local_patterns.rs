@@ -256,7 +256,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
 
     let mut i = 0;
     while i < len {
-        if infos[i].is_nop() {
+        if debug_transparent(store, infos[i], i) {
             i += 1;
             continue;
         }
@@ -303,7 +303,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                 .or_else(|| cur.strip_prefix("movl ").map(|x| (x, 'l')));
             if let Some((ops, width)) = move_ops {
                 let mut j = i + 1;
-                while j < len && infos[j].is_nop() {
+                while j < len && debug_transparent(store, infos[j], j) {
                     j += 1;
                 }
                 if j < len {
@@ -337,7 +337,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
             if trimmed == "xorl %eax, %eax" {
                 // Check if the next non-nop instruction overwrites %rax.
                 let mut j = i + 1;
-                while j < len && infos[j].is_nop() {
+                while j < len && debug_transparent(store, infos[j], j) {
                     j += 1;
                 }
                 if j < len {
@@ -548,7 +548,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                             let mut j = i + 1;
                             let search_limit = (i + 8).min(len);
                             while j < search_limit {
-                                if infos[j].is_nop() {
+                                if debug_transparent(store, infos[j], j) {
                                     j += 1;
                                     continue;
                                 }
@@ -771,7 +771,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
             size: ss,
         } = infos[i].kind
         {
-            if i + 1 < len && !infos[i + 1].is_nop() {
+            if i + 1 < len && !debug_transparent(store, infos[i + 1], i + 1) {
                 if let LineKind::LoadRbp {
                     reg: lr,
                     offset: lo,
@@ -852,9 +852,9 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
         {
             if matches!(ss, MoveSize::Q | MoveSize::L) && is_valid_gp_reg(sr) && sr != 4 && sr != 5
             {
-                let m = next_non_nop(infos, i + 1, len);
+                let m = next_non_debug(store, infos, i + 1, len);
                 if m < len && !infos[m].is_barrier() {
-                    let l = next_non_nop(infos, m + 1, len);
+                    let l = next_non_debug(store, infos, m + 1, len);
                     if l < len {
                         if let LineKind::LoadRbp {
                             reg: lr,
@@ -927,7 +927,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
         // string comparisons on every iteration.
         let mut ext_idx = i + 1;
         while ext_idx < len && ext_idx < i + 10 {
-            if infos[ext_idx].is_nop() {
+            if debug_transparent(store, infos[ext_idx], ext_idx) {
                 ext_idx += 1;
                 continue;
             }
@@ -938,7 +938,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
             break;
         }
 
-        if ext_idx < len && !infos[ext_idx].is_nop() {
+        if ext_idx < len && !debug_transparent(store, infos[ext_idx], ext_idx) {
             let next_ext = infos[ext_idx].ext_kind;
             let prev_ext = infos[i].ext_kind;
 
@@ -1002,7 +1002,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                     let scan_limit = i.saturating_sub(6);
                     let mut k = i - 1;
                     while k >= scan_limit {
-                        if infos[k].is_nop() {
+                        if debug_transparent(store, infos[k], k) {
                             if k == 0 {
                                 break;
                             }
@@ -6800,7 +6800,7 @@ pub(super) fn fuse_staged_add_and_relay(store: &mut LineStore, infos: &mut [Line
     let mut changed = false;
     let mut i = 0;
     while i < len {
-        if infos[i].is_nop() || infos[i].pinned {
+        if debug_transparent(store, infos[i], i) || infos[i].pinned {
             i += 1;
             continue;
         }
@@ -6836,7 +6836,7 @@ pub(super) fn fuse_staged_add_and_relay(store: &mut LineStore, infos: &mut [Line
 
         // The add must be the next real instruction.
         let mut j = i + 1;
-        while j < len && infos[j].is_nop() {
+        while j < len && debug_transparent(store, infos[j], j) {
             j += 1;
         }
         if j >= len || infos[j].pinned {
@@ -6961,7 +6961,7 @@ pub(super) fn fuse_staged_add_and_relay(store: &mut LineStore, infos: &mut [Line
 
         // Optional relay into the final home.
         let mut k = j + 1;
-        while k < len && infos[k].is_nop() {
+        while k < len && debug_transparent(store, infos[k], k) {
             k += 1;
         }
         let mut relay_w: Option<u8> = None;

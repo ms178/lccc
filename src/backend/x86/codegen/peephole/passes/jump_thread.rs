@@ -3,14 +3,22 @@
 //! Retarget edges, never remove/reorder code or labels. The skipped window
 //! contains only labels, comments, deleted lines and one unconditional jump:
 //! registers, memory and flags are unchanged. Keep function scope, inline asm,
-//! pinned lines, every directive (including CFI and custom alignment padding),
+//! pinned lines, semantic directives (including CFI and alignment padding),
 //! short-only counter branches and cyclic/overlong chains fail-closed.
 use super::super::types::*;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
-fn local_label(s: &str) -> bool {
-    s.strip_prefix(".LBB")
-        .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+fn local_label(s: &str) -> Option<u32> {
+    let n = s.strip_prefix(".LBB")?;
+    // Canonical spelling prevents distinct assembler symbols (e.g. 01 and 1)
+    // from collapsing to one numeric key; oversized labels fail closed.
+    if n.is_empty() || (n.len() > 1 && n.starts_with('0')) {
+        return None;
+    }
+    n.bytes()
+        .all(|c| c.is_ascii_digit())
+        .then(|| n.parse().ok())
+        .flatten()
 }
 
 fn label_text(s: &str) -> &str {
@@ -21,23 +29,28 @@ fn label_text(s: &str) -> &str {
         .trim_end_matches(':')
 }
 
-fn branch(s: &str) -> Option<(&str, &str)> {
+fn branch(s: &str) -> Option<(&str, u32)> {
     if !s.starts_with('j') {
         return None;
     }
     let mut fields = s.split('#').next()?.split_whitespace();
     let mnemonic = fields.next()?;
     let target = fields.next()?;
-    // Reuse the shared opcode recognizer with a canonical separator;
-    // LineKind's legacy fixed-space fast path does not classify jmp-tab.
-    if (mnemonic != "jmp" && !is_conditional_jump(&format!("{mnemonic} ")))
+    // A bounded stack buffer reuses the shared recognizer without a heap
+    // allocation or changing its legacy literal-space contract.
+    let mut canonical = [b' '; 8];
+    if mnemonic.len() >= canonical.len() {
+        return None;
+    }
+    canonical[..mnemonic.len()].copy_from_slice(mnemonic.as_bytes());
+    let opcode = std::str::from_utf8(&canonical).ok()?;
+    if (mnemonic != "jmp" && !is_conditional_jump(opcode))
         || fields.next().is_some()
-        || !local_label(target)
         || matches!(mnemonic, "jcxz" | "jecxz" | "jrcxz")
     {
         return None;
     }
-    Some((mnemonic, target))
+    Some((mnemonic, local_label(target)?))
 }
 
 fn thread_function(store: &mut LineStore, infos: &mut [LineInfo], lo: usize, hi: usize) -> bool {
@@ -45,13 +58,15 @@ fn thread_function(store: &mut LineStore, infos: &mut [LineInfo], lo: usize, hi:
     for i in lo..hi {
         if infos[i].kind == LineKind::Label && !infos[i].pinned {
             let label = label_text(infos[i].trimmed(store.get(i)));
-            if local_label(label) && !labels.insert(label.to_owned()) {
+            if let Some(label) = local_label(label)
+                && !labels.insert(label)
+            {
                 return false; // Ambiguous label: never guess which definition.
             }
         }
     }
     let mut redirects = FxHashMap::default();
-    let mut next: Option<String> = None;
+    let mut next: Option<u32> = None;
     for i in (lo..hi).rev() {
         let info = infos[i];
         let s = info.trimmed(store.get(i));
@@ -65,35 +80,35 @@ fn thread_function(store: &mut LineStore, infos: &mut [LineInfo], lo: usize, hi:
             // compiler-owned liveness/ABI markers opaque to this CFG rewrite.
             _ if s.starts_with('#') && s != "#APP" && s != "#NO_APP" && !s.contains("LCCC_") => {}
             LineKind::Label => {
-                let label = label_text(s);
-                if labels.contains(label) {
-                    if let Some(target) = &next {
-                        redirects.insert(label.to_owned(), target.clone());
+                if let Some(label) = local_label(label_text(s)).filter(|l| labels.contains(l)) {
+                    if let Some(target) = next {
+                        redirects.insert(label, target);
                     }
                 } else {
                     next = None;
                 }
             }
-            _ if branch(s).is_some_and(|(mnemonic, _)| mnemonic == "jmp") => {
-                next = branch(s)
-                    .and_then(|(_, target)| labels.contains(target).then(|| target.to_owned()));
+            LineKind::Directive if info.is_steppable() && is_debug_marker_directive(s) => {}
+            _ => {
+                next = branch(s).and_then(|(op, target)| {
+                    (op == "jmp" && labels.contains(&target)).then_some(target)
+                });
             }
-            _ => next = None,
         }
     }
     let mut resolved = FxHashMap::default();
     for (label, first) in &redirects {
         let mut seen = FxHashSet::default();
-        seen.insert(label.as_str());
-        let mut target = first.as_str();
+        seen.insert(*label);
+        let mut target = *first;
         for _ in 0..64 {
             if !seen.insert(target) {
                 break;
             }
-            if let Some(next) = redirects.get(target) {
-                target = next;
+            if let Some(next) = redirects.get(&target) {
+                target = *next;
             } else {
-                resolved.insert(label.clone(), target.to_owned());
+                resolved.insert(*label, target);
                 break;
             }
         }
@@ -101,6 +116,7 @@ fn thread_function(store: &mut LineStore, infos: &mut [LineInfo], lo: usize, hi:
     let mut changed = false;
     for i in lo..hi {
         if infos[i].pinned
+            // DIRECTIVE-LAW: selecting -- rewrite branches only, never directives.
             || matches!(
                 infos[i].kind,
                 LineKind::Nop
@@ -116,11 +132,11 @@ fn thread_function(store: &mut LineStore, infos: &mut [LineInfo], lo: usize, hi:
         let Some((mnemonic, target)) = branch(s) else {
             continue;
         };
-        let Some(final_target) = resolved.get(target) else {
+        let Some(final_target) = resolved.get(&target) else {
             continue;
         };
         let comment = s.find('#').map(|at| &s[at..]).unwrap_or("");
-        let replacement = format!("    {mnemonic} {final_target} {comment}");
+        let replacement = format!("    {mnemonic} .LBB{final_target} {comment}");
         replace_line(store, &mut infos[i], i, replacement);
         changed = true;
     }
@@ -132,7 +148,7 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let mut changed = false;
     for i in 0..store.len() {
         // DIRECTIVE-LAW: selecting function-boundary markers, not skipping
-        // directives in a motion window (all window directives are barriers).
+        // directives in a motion window (only inert debug attribution is transparent).
         if infos[i].pinned || infos[i].kind != LineKind::Directive {
             continue;
         }
@@ -187,6 +203,45 @@ mod tests {
                 assert!(out.contains(&format!(".LBB{label}:")));
             }
             assert!(out.contains("adcq $0, %rax")); // Incoming flags untouched.
+        }
+    }
+
+    #[test]
+    fn debug_markers_are_transparent_but_lookalikes_are_not() {
+        for marker in [".loc 1 7 3", r#".file 2 "x.c""#, ".loc\t1 7 3"] {
+            let body = format!("jne .LBB1\nret\n.LBB1:\n{marker}\njmp .LBB2\n.LBB2:\nret");
+            let (changed, out) = apply(&body, None);
+            assert!(changed && out.contains("jne .LBB2"), "{out}");
+            assert!(out.contains(marker));
+            assert!(!apply(&body, Some(marker)).0);
+        }
+        for marker in [
+            ".location 1",
+            ".file_data 2",
+            ".cfi_remember_state",
+            ".balign 16",
+            ".quad .LBB2",
+        ] {
+            let body = format!("jne .LBB1\nret\n.LBB1:\n{marker}\njmp .LBB2\n.LBB2:\nret");
+            assert!(!apply(&body, None).0, "{marker}");
+        }
+    }
+
+    #[test]
+    fn retains_address_taken_jump_table_and_fallthrough_labels() {
+        let body = "leaq .LBB1(%rip), %rax\njne .LBB1\n.LBB1:\njmp .LBB2\n.LBB2:\nret\n.quad .LBB1\n.long .LBB1-.LBB2";
+        let (_, out) = apply(body, None);
+        for text in [
+            "leaq .LBB1(%rip)",
+            ".quad .LBB1",
+            ".long .LBB1-.LBB2",
+            ".LBB1:",
+            "jmp .LBB2",
+        ] {
+            assert!(out.contains(text), "{text}: {out}");
+        }
+        for label in [".LBB01", ".LBB4294967296", ".LBB", ".LBB-1"] {
+            assert!(local_label(label).is_none());
         }
     }
 

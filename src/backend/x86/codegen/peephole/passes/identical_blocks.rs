@@ -64,18 +64,6 @@ fn is_alignment_directive(trimmed: &str) -> bool {
         || trimmed.starts_with(".balign")
 }
 
-/// True for the debug-marker directives (`.loc`, `.file`): inert text
-/// markers that carry no code, no control flow, and no register/flag
-/// semantics. They must not fragment a block (boundary scan) and must not
-/// pose as a terminator or as dirt (terminator scan, cleanliness): a `.loc`
-/// between a guard's branch and the next label is as transparent as the
-/// `.p2align` the alignment pass emits there. They DO stay in the block
-/// hash and identity (see below): merging blocks with different line
-/// attribution would lie to the debugger.
-fn is_debug_marker_directive(trimmed: &str) -> bool {
-    trimmed.starts_with(".loc") || trimmed.starts_with(".file")
-}
-
 /// True for lines that carry no block identity: NOPs and
 /// alignment-directive padding. Skipped by the block hash and the
 /// text-identity comparison, so blocks that differ ONLY in padding hash
