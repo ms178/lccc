@@ -73,9 +73,17 @@ the log tail is published verbatim under a "the command named no test or
 diagnostic" annotation -- an exit code alone is precisely the unhelpful signal
 this tool exists to replace.
 
+The corpus is itself environment-blind by rule: `--self-test` re-runs the file
+as a child process with `GITHUB_ACTIONS` set, with it absent, and with an ASCII
+stdout, because the first hosted run of this tool failed its own corpus while
+every local run passed -- an assertion was reading the runner's environment
+instead of the code.  A suite that only runs where it was written cannot tell a
+correct decision from an inherited one.
+
 Exit codes: last command's status for `--parse-log` (0 published something,
 3 nothing was parsable, 2 usage error); the wrapped command's status in run
-mode; 0/1 for `--self-test`.
+mode (70 if the tool itself crashes, after publishing the traceback); 0/1 for
+`--self-test`.
 """
 from __future__ import annotations
 
@@ -177,18 +185,22 @@ class Report:
         return not self.failures and not self.build_errors
 
 
-def _clean_span(path: str) -> str:
+def _clean_span(path: str, root: str | None = None) -> str:
     """Annotations must point at a repo-relative path, not at ./src/... .
 
     GitHub only attaches an annotation to the file list when the path is
     relative to the repository root, and a panic inside a test binary reports
     an absolute path, so a path under the working tree is made relative here.
+    `root` is injectable so the rule can be tested from anywhere -- and the
+    filesystem root is deliberately NOT treated as "the tree": `/src/x.rs` from
+    a process whose cwd is `/` is ambiguous, and guessing there would rewrite
+    paths that have nothing to do with this repository.
     """
     path = path.strip()
     if os.path.isabs(path):
-        root = os.getcwd().rstrip("/") + "/"
-        if path.startswith(root):
-            path = path[len(root):]
+        base = (os.getcwd() if root is None else root).rstrip("/")
+        if base and base != "/" and path.startswith(base + "/"):
+            path = path[len(base) + 1:]
     while path.startswith("./"):
         path = path[2:]
     return path
@@ -226,11 +238,26 @@ class Scanner:
         self._await_message: Failure | None = None
         self._pending_error: BuildError | None = None
         self._in_failure_list = False
+        self._carry = b""
 
     # -- feeding -----------------------------------------------------------
     def feed_bytes(self, chunk: bytes) -> None:
-        for line in chunk.decode("utf-8", "replace").split("\n"):
-            self.feed_line(line)
+        """Feed raw bytes, keeping a partial line for the next chunk.
+
+        `read1` returns whatever the pipe has, so a panic location can be split
+        across two reads; decoding each chunk on its own would then present two
+        half-lines to the state machine and lose the failure.  The carry is
+        bytes, not text, so a multi-byte character split across reads also
+        stays intact.
+        """
+        data = self._carry + chunk
+        head, newline, tail = data.rpartition(b"\n")
+        if not newline:
+            self._carry = data
+            return
+        self._carry = tail
+        for line in head.split(b"\n"):
+            self.feed_line(line.decode("utf-8", "replace"))
 
     def feed_line(self, line: str) -> None:
         line = ANSI_ESCAPE.sub("", line.rstrip("\r"))
@@ -337,6 +364,9 @@ class Scanner:
         return failure
 
     def report(self) -> Report:
+        if self._carry:  # a log whose last line has no newline
+            self.feed_line(self._carry.decode("utf-8", "replace"))
+            self._carry = b""
         return Report(
             failures=list(self._failures.values()),
             build_errors=list(self._build_errors),
@@ -360,6 +390,23 @@ def _escape_data(text: str) -> str:
 
 def _escape_property(text: str) -> str:
     return _escape_data(text).replace(":", "%3A").replace(",", "%2C")
+
+
+def annotations_enabled(mode: str) -> bool:
+    """`always` / `never` are explicit; `auto` follows GitHub's own marker.
+
+    This is a function, not an `if` inside `publish`, because the self-test
+    MUST be independent of the ambient environment: the first CI run of this
+    tool failed its own corpus because a test asserted the local-digest path
+    while `GITHUB_ACTIONS=true` was inherited from the runner.  The behaviour
+    was right and the test was wrong, which is exactly the failure a pure
+    predicate makes visible without a runner.
+    """
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    return os.environ.get("GITHUB_ACTIONS") == "true"
 
 
 def workflow_command(level: str, data: str, **props: object) -> str:
@@ -616,7 +663,7 @@ def publish(
     if exit_code == 0 and report.empty() and not report.counts.endswith("FAILED."):
         return
 
-    enabled = annotate == "always" or (annotate == "auto" and os.environ.get("GITHUB_ACTIONS") == "true")
+    enabled = annotations_enabled(annotate)
     for line in annotations(report, command, exit_code, max_tests=max_tests):
         if enabled:
             print(line, file=anno_stream)
@@ -717,7 +764,24 @@ def _failure(report: Report, name: str) -> Failure | None:
     return next((f for f in report.failures if f.name == name), None)
 
 
-def self_test() -> int:
+def publish_self_test_problems(problems: list[str], annotate: str, stream=None) -> None:
+    """Announce the tool's own failures on the channel that a triager can read.
+
+    The reason this file exists is that a red step naming nothing is
+    unreadable; its own red has no exemption.  The step still fails -- an
+    annotation is not a pass.
+    """
+    if not problems or not annotations_enabled(annotate):
+        return
+    if stream is None:
+        stream = sys.stdout
+    for problem in problems[:DEFAULT_MAX_TESTS]:
+        print(workflow_command("error", problem, title="scripts/ci_test_report.py --self-test"), file=stream)
+
+
+def self_test(annotate: str = "auto") -> int:
+    import io
+
     problems: list[str] = []
     # -- escaping: the two rules GitHub documents, applied where they apply ----
     _check(
@@ -732,9 +796,35 @@ def self_test() -> int:
     )
 
     # -- annotation paths must be repo-relative, commands must stay short -----
+    # `root` is injected and NOT taken from this process: a test whose verdict
+    # depends on where it runs is the defect this corpus exists to prevent.
     _check(_clean_span("./src/x.rs") == "src/x.rs", "_clean_span must strip a leading ./", problems)
-    _check(_clean_span(os.path.join(os.getcwd(), "src/x.rs")) == "src/x.rs", "a path inside the tree must become repo-relative", problems)
-    _check(_clean_span("/opt/rust/x.rs") == "/opt/rust/x.rs", "a path outside the tree must stay absolute", problems)
+    _check(
+        _clean_span("/w/lccc/src/x.rs", root="/w/lccc") == "src/x.rs",
+        "a path inside the tree must become repo-relative",
+        problems,
+    )
+    _check(
+        _clean_span("/opt/rust/x.rs", root="/w/lccc") == "/opt/rust/x.rs",
+        "a path outside the tree must stay absolute",
+        problems,
+    )
+    _check(_clean_span("/src/x.rs", root="/") == "/src/x.rs", "the filesystem root is not a tree and must not rewrite paths", problems)
+    _check(_clean_span("src/x.rs", root="/w/lccc") == "src/x.rs", "a relative path must be left alone", problems)
+
+    # -- the annotations/local-digest decision is a pure predicate ------------
+    saved_actions = os.environ.pop("GITHUB_ACTIONS", None)
+    _check(annotations_enabled("auto") is False, "auto without GITHUB_ACTIONS must stay local", problems)
+    os.environ["GITHUB_ACTIONS"] = "true"
+    _check(annotations_enabled("auto") is True, "auto with GITHUB_ACTIONS=true must annotate", problems)
+    _check(annotations_enabled("never") is False, "never is never, even where annotations exist", problems)
+    os.environ["GITHUB_ACTIONS"] = "false"
+    _check(annotations_enabled("auto") is False, "GITHUB_ACTIONS=false is not an annotation channel", problems)
+    if saved_actions is None:
+        os.environ.pop("GITHUB_ACTIONS", None)
+    else:
+        os.environ["GITHUB_ACTIONS"] = saved_actions
+    _check(annotations_enabled("always") is True, "always must not depend on the environment", problems)
     long_command = "cargo test " + " ".join(f"--flag{i}" for i in range(40))
     _check(_short_command(long_command).endswith("…") and len(_short_command(long_command)) <= 120, "a long command must be shortened for annotations", problems)
     _check(_exit_phrase(None) == "an unknown exit status", "an unknown exit status must not be invented", problems)
@@ -851,20 +941,102 @@ def self_test() -> int:
     _check([e.message for e in messy_report.build_errors] == ["bad"], f"ANSI/CRLF handling: {[e.message for e in messy_report.build_errors]}", problems)
     _check(bool(messy_report.build_errors) and messy_report.build_errors[0].line == 7, "the span must survive ANSI and CRLF", problems)
 
+    # -- a line split across two reads must not be lost ----------------------
+    split = Scanner(tail_lines=10)
+    split.feed_bytes(b"---- boom::split stdout ----\nthread 'boom::split' (9) panicked at src/boo")
+    split.feed_bytes(b"m.rs:3:1:\nsplit across read boundaries\n")
+    split_report = split.report()
+    _check(
+        [f.location() for f in split_report.failures] == ["src/boom.rs:3:1"],
+        f"a panic split across reads must still parse: {[f.location() for f in split_report.failures]}",
+        problems,
+    )
+    _check(
+        [f.message for f in split_report.failures] == ["split across read boundaries"],
+        f"the message after a split line must still attach: {[f.message for f in split_report.failures]}",
+        problems,
+    )
+    tail_only = Scanner(tail_lines=5)
+    tail_only.feed_bytes(b"make: *** [Makefile:12: all] Error 137")  # no trailing newline
+    _check(tail_only.report().tail == ["make: *** [Makefile:12: all] Error 137"], "an unterminated last line must be kept", problems)
+
+    # -- the tool's own failure is published on the readable channel ----------
+    fake_stream = io.StringIO()
+    publish_self_test_problems(["assertion X failed"], "always", fake_stream)
+    _check(
+        fake_stream.getvalue().startswith("::error title=scripts/ci_test_report.py --self-test::"),
+        f"a self-test failure must become an annotation: {fake_stream.getvalue()!r}",
+        problems,
+    )
+    quiet_stream = io.StringIO()
+    publish_self_test_problems(["assertion X failed"], "never", quiet_stream)
+    _check(quiet_stream.getvalue() == "", "never must not annotate a self-test failure", problems)
+
     # -- a stderr-only failure still reaches the digest -----------------------
     digest_text = digest(Report(tail=["boom"]), "make all", 2)
     _check("boom" in digest_text and "make all" in digest_text, f"the digest must carry the tail: {digest_text!r}", problems)
 
     # -- run mode end to end --------------------------------------------------
     problems += _self_test_run_mode()
+    problems += self_test_under_foreign_environments()
 
     if problems:
         print("ci-test-report self-test: FAIL", file=sys.stderr)
         for problem in problems:
             print(f"  {problem}", file=sys.stderr)
+        publish_self_test_problems(problems, annotate)
         return 1
     print("ci-test-report self-test: ok")
     return 0
+
+
+# The child marker makes the re-exec probe terminate: this corpus runs a
+# subprocess of itself, and a subprocess that repeats the probe recurses.
+SELF_TEST_CHILD = "LCCC_CI_TEST_REPORT_SELF_TEST_CHILD"
+
+
+def self_test_under_foreign_environments() -> list[str]:
+    """Re-run this corpus under the environments the CI runner actually has.
+
+    Written because the first hosted run of this tool failed *its own corpus*
+    while every local run passed: an assertion exercised the local-digest path
+    while the runner's exported `GITHUB_ACTIONS=true` turned the very same call
+    into the annotation path.  The behaviour was right; the test was reading
+    the ambient environment.  A suite that only ever runs in the developer's
+    environment cannot tell those two apart, so the probe runs the file again
+    as a child process with the runner's variables set, with them absent, and
+    with an ASCII stdout -- and the local suite is green only if all of them
+    are.
+    """
+    if os.environ.get(SELF_TEST_CHILD) == "1":
+        return []  # this *is* the child
+    problems: list[str] = []
+    environments = (
+        {"GITHUB_ACTIONS": "true"},
+        {"GITHUB_ACTIONS": "true", "PYTHONIOENCODING": "ascii", "LC_ALL": "C", "LANG": "C"},
+        {},
+    )
+    for extra in environments:
+        env = {key: value for key, value in os.environ.items() if key != "GITHUB_ACTIONS"}
+        env.update(extra)
+        env[SELF_TEST_CHILD] = "1"
+        label = ", ".join(f"{k}={v}" for k, v in extra.items()) or "a scrubbed environment"
+        try:
+            result = subprocess.run(  # noqa: S603 - this file, with its own interpreter
+                [sys.executable, __file__, "--self-test", "--annotate", "never"],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=300,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            problems.append(f"--self-test under {label}: could not be re-run: {error}")
+            continue
+        if result.returncode != 0:
+            tail = result.stdout.decode("utf-8", "replace").strip().splitlines()[-8:]
+            problems.append(f"--self-test under {label}: exit {result.returncode}: " + " | ".join(tail))
+    return problems
 
 
 def _self_test_run_mode() -> list[str]:
@@ -929,7 +1101,7 @@ def _self_test_run_mode() -> list[str]:
         status = run_wrapped(
             failing,
             sink=io.BytesIO(),
-            annotate="auto",
+            annotate="never",
             anno_stream=io.StringIO(),
             digest_stream=digest_out,
         )
@@ -1000,23 +1172,39 @@ def main(argv: list[str]) -> int:
     parser.add_argument("command", nargs=argparse.REMAINDER, help="command to run, after `--`")
     args = parser.parse_args(argv)
 
-    if args.self_test:
-        return self_test()
-    if args.parse_log:
-        return parse_log_command(args.parse_log, annotate=args.annotate, summary_file=args.summary_file)
+    try:
+        if args.self_test:
+            return self_test(annotate=args.annotate)
+        if args.parse_log:
+            return parse_log_command(args.parse_log, annotate=args.annotate, summary_file=args.summary_file)
 
-    command = [token for token in args.command if token != "--"]
-    if not command:
-        parser.print_usage(sys.stderr)
-        print("ci_test_report: no command given (put it after `--`)", file=sys.stderr)
-        return 2
-    return run_wrapped(
-        command,
-        tail_lines=args.tail_lines,
-        annotate=args.annotate,
-        max_tests=args.max_tests,
-        summary_file=args.summary_file,
-    )
+        command = [token for token in args.command if token != "--"]
+        if not command:
+            parser.print_usage(sys.stderr)
+            print("ci_test_report: no command given (put it after `--`)", file=sys.stderr)
+            return 2
+        return run_wrapped(
+            command,
+            tail_lines=args.tail_lines,
+            annotate=args.annotate,
+            max_tests=args.max_tests,
+            summary_file=args.summary_file,
+        )
+    except Exception:  # noqa: BLE001 - a silent reporter is the bug this closes
+        import traceback
+
+        trace = traceback.format_exc()
+        print(trace, file=sys.stderr)
+        if annotations_enabled(args.annotate):
+            print(
+                workflow_command(
+                    "error",
+                    f"scripts/ci_test_report.py crashed and published nothing; traceback tail:\n{trace[-1200:]}",
+                    title="ci_test_report.py internal error",
+                ),
+                file=sys.stdout,
+            )
+        return 70  # EX_SOFTWARE
 
 
 if __name__ == "__main__":

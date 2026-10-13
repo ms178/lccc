@@ -858,6 +858,49 @@ side.  That is the defect this branch fixes.
   `check_ci_workflow_shell.py`, `check_script_imports.py`,
   `check_no_conflict_markers.py`, `check_doc_links.py` — all green.
 
+#### Addendum — the reporter's own first hosted run was red
+
+The first hosted run of this work (`a7869d79`) failed `Run tests` with exit
+code 1 and produced **no** annotation from the new tool.  The cause was the
+tool's own corpus, not the tool: one assertion exercised the local-digest path
+while the runner exported `GITHUB_ACTIONS=true`, which turns the identical call
+into the annotation path.  Reproduced locally against that commit
+(`GITHUB_ACTIONS=true python3 <a7869d79 version> --self-test` →
+`local digest missing: ''`, exit 1), because the only surviving evidence was
+the step's exit status — the job log is unreachable by the three facts above,
+which is the whole reason this work exists.
+
+Four structural fixes, not a patch to one assertion:
+
+* the annotation/local-digest decision is the pure predicate
+  `annotations_enabled(mode)`, tested directly for `auto`/`always`/`never` under
+  both settings of `GITHUB_ACTIONS`; the end-to-end digest case passes
+  `--annotate never`, so no assertion inherits a runner variable;
+* `_clean_span` takes an injectable `root` instead of reading `os.getcwd()`,
+  and the filesystem root is no longer treated as "the tree" (from `/`, every
+  absolute path was being rewritten);
+* `--self-test` re-runs the whole file as a child process under
+  `GITHUB_ACTIONS=true`, under that plus an ASCII stdout
+  (`PYTHONIOENCODING=ascii`, `LC_ALL=C`), and under a scrubbed environment — the
+  defect class is now a permanent probe, not a lesson;
+* a tool that stops reporting has no exemption: `--self-test` publishes each
+  failing assertion as a Checks annotation when annotations are enabled, and an
+  internal crash publishes its traceback the same way (exit 70) instead of
+  disappearing into a step exit code.
+
+One parsing defect was found while fixing this and is pinned by its own test:
+`read1` can split a line across reads, and decoding each chunk independently
+would have presented two half-lines to the state machine and lost the panic
+location.  The scanner now carries the incomplete tail as bytes (so a
+multi-byte character split across reads survives too).
+
+Re-validated after the fix: `--self-test` green in every environment of the
+matrix (including `GITHUB_ACTIONS=true`, `LC_ALL=C`, `cwd=/`, and an empty
+environment); the real `rustc --test` probe still exits 101 with three
+annotations; the real suite through the wrapper is green (`4556 passed`); and
+the parity, workflow-shell, script-imports, conflict-marker and doc-link gates
+pass.
+
 ### ToDo for the red branches (this branch cannot push to them)
 
 1. `arena/a615b49b-lccc`: fix the ten failing tests listed above — six are
