@@ -1391,17 +1391,15 @@ fn find_derived_exprs(
                             (Operand::Value(v), Operand::Const(c))
                             | (Operand::Const(c), Operand::Value(v)) => {
                                 match (find_iv(v.0), c.to_i64()) {
-                                    (Some(idx), Some(raw_k)) => {
-                                        affine_add_offset_cannot_wrap(
-                                            func,
-                                            natural_loop,
-                                            back_blocks,
-                                            &basic_ivs[idx],
-                                            raw_k,
-                                            *ty,
-                                        )
-                                        .map(|k| (idx, k))
-                                    }
+                                    (Some(idx), Some(raw_k)) => affine_add_offset_cannot_wrap(
+                                        func,
+                                        natural_loop,
+                                        back_blocks,
+                                        &basic_ivs[idx],
+                                        raw_k,
+                                        *ty,
+                                    )
+                                    .map(|k| (idx, k)),
                                     _ => None,
                                 }
                             }
@@ -2112,8 +2110,8 @@ fn affine_add_offset_cannot_wrap(
     if !add_ty.is_integer() {
         return None;
     }
-    let narrow_unsigned = add_ty.is_unsigned()
-        && (add_ty.size() as usize) < crate::common::types::target_ptr_size();
+    let narrow_unsigned =
+        add_ty.is_unsigned() && (add_ty.size() as usize) < crate::common::types::target_ptr_size();
     if !narrow_unsigned {
         return Some(raw_offset);
     }
@@ -3076,11 +3074,14 @@ mod tests {
             0,
             "the affine pointer recurrence must be declined when U32 i+2 may wrap"
         );
-        assert!(wrapping.blocks[2].instructions.iter().any(|i| matches!(
-            i,
-            Instruction::BinOp { dest, op: IrBinOp::Add, ty: IrType::I64, .. }
-                if *dest == Value(6)
-        )), "the original address Add must remain intact");
+        assert!(
+            wrapping.blocks[2].instructions.iter().any(|i| matches!(
+                i,
+                Instruction::BinOp { dest, op: IrBinOp::Add, ty: IrType::I64, .. }
+                    if *dest == Value(6)
+            )),
+            "the original address Add must remain intact"
+        );
 
         // A smaller, statically bounded interval proves the same U32 Add
         // cannot wrap, so LP64 retains the strength reduction.
