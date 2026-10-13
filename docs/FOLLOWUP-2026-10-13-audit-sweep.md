@@ -197,6 +197,33 @@ Ordered by value ÷ cost, with the entry point each one needs.
    mechanically extractable), and the verdict for each row can be
    oracle-checked against `gcc -march=x86-64 -S` (error ⇒ the row needs a
    feature), exactly the way `check_intrinsic_feature_gate.sh` does it today.
+   The two families left after VAES/VPCLMULQDQ are **AVX-VNNI** and **GFNI**,
+   and the oracle rules for them were measured against GCC 12.2
+   (`-march=raptorlake` is unknown to GCC 12; use `-march=alderlake` for a CPU
+   profile):
+
+   ```
+   _mm_dpbusd_epi32 / _mm256_dpbusd_epi32   (AVX-VNNI)
+       -mavxvnni                -> accept  (128-bit AND 256-bit; VEX, not AVX2)
+       -mavx2                   -> reject
+       -mavx512vnni             -> reject  (128-bit forms need VL)
+       -mavx512vnni -mavx512vl  -> accept
+       -march=alderlake         -> accept
+
+   _mm_gf2p8mul_epi8 / _mm256_gf2p8mul_epi8  (GFNI)
+       -mgfni                   -> reject  (GFNI has no legacy encoding)
+       -mgfni -mavx             -> accept
+       -march=alderlake         -> accept
+   ```
+
+   The hole is live: lccc emits `vpdpbusd` for `_mm_dpbusd_epi32` **under
+   `-march=x86-64`** (measured), i.e. an AVX-VNNI instruction in a v1 object —
+   the SIGILL class AUD-CPU-3 exists to close. That family is 28 builtins
+   (`X86Dpbusd128` … `X86Dpwuuds256`); do the rows table-driven from the
+   frontend's builtin table, not one match arm at a time. The GFNI 256-bit
+   forms are a different gap: gcc declares `_mm256_gf2p8mul_epi8` but lccc's
+   bundled headers do not (implicit-declaration warning), so that half is a
+   declaration problem before it is a permission problem.
 2. **AUD-ICE-1 remainder — 889 panic-class sites (109 in the hot set).**
    Worklist: `python3 scripts/audit_census.py --top-fns` for size and
    `grep -nE 'panic!|unreachable!|\.expect\(|\.unwrap\('` per file for sites.
@@ -263,9 +290,55 @@ Ordered by value ÷ cost, with the entry point each one needs.
     its backlog section) still mixes closed and open items and has a duplicate
     `IVOPTS-1`; each open entry should carry front matter naming its
     reproducer, with a gate that the path exists.
-11. **`sv_assign` miscompile (segfault at `-O2`)** — carried over from the
-    audit digest; not in the audit's own item list, but it is a real
-    correctness bug with a reproducer in the backlog.
+11. ~~**`sv_assign` miscompile (segfault at `-O2`)**~~ — **closed as
+    unreproducible.** `git log -S sv_assign --all` turns up the follow-up
+    document and nothing else: no `src/` occurrence, no symbol in the built
+    rlib. The backlog entry names no reproducer, so there is nothing to fix
+    until someone produces one; it is a documentation defect in the backlog
+    (AUD-BL-1), not a known bug.
+
+12. **AUD-VABI-2 — the 32-byte vector ABI (latched, gated, NOT fixed).** Found
+    by running the AUD-VABI-1 four-way differential on a 32-byte vector
+    typedef. The psABI classifies a vector as SSE plus one SSEUP per further
+    eightbyte, so with AVX enabled a 32-byte vector travels in **one `%ymm`**;
+    lccc's struct rule has no SSEUP notion and `CType::sysv_vector_carrier()`
+    stops at 16 bytes, so the value falls back to the memory/sret convention.
+    Measured with the four-way build in
+    `tests/regression/vector_abi_boundary/` (`wide.c`, compiled by each
+    compiler on each side, linked in all four combinations):
+
+    | configuration | gcc/gcc | lccc/lccc | lccc caller + gcc callee | gcc caller + lccc callee |
+    |---|---|---|---|---|
+    | `-mavx2` | correct | correct | `add: 0 0 0 0 0 0 0 0` | **SIGSEGV** |
+    | no `-mavx2` | correct | correct | correct | correct |
+
+    The default code-generation baseline is x86-64-v3 (AVX2 on), so the broken
+    column is the *default* one, and the caller-side failure is a silently
+    wrong answer — AUD-VABI-1's class, one register width out.
+    `tests/regression/check_vector_abi_wide.sh` **latches** the debt: the two
+    working configurations are asserted to stay correct (the no-AVX2 four-way
+    agreement is also the gate's liveness proof) and the two broken legs must
+    show exactly the recorded verdict (`garbage` / `signal`) — a leg that
+    changes, in either direction, fails the gate until its budget constants are
+    updated in the commit that changed it.
+
+    Fix shape (the AUD-VABI-1 fix, one width further out): a `%ymm` carrier for
+    vector arguments and returns — `CType::sysv_vector_carrier()` (add 32, and
+    64 for AVX-512), the signature classification in
+    `src/ir/lowering/{lower,expr_calls,func_lowering,stmt_init}.rs`, the x86
+    prologue/return path (`src/backend/x86/codegen/prologue.rs`) and
+    `location_alloc` — then flip the gate's `DEBT_LCCC_CALLER`/
+    `DEBT_GCC_CALLER` to `agree`.
+13. **FMA contraction happens at `-O0`, unlike GCC.** With FMA permitted
+    (the x86-64-v3 default), lccc contracts `a*b+c` even at `-O0` — measured:
+    10 `vfmadd`/`vfmsub` sites in an `-O0 -march=x86-64-v3` build — while GCC
+    contracts from `-O2` only. C leaves contraction implementation-defined, so
+    this is legal, but it makes `-O0` numerics differ from GCC on FP-heavy code
+    (this is what the `miscompile_gen_fp_stress_*` backlog family was actually
+    measuring; all 24 agree once the ISA is pinned on both sides). There is no
+    `-ffp-contract=` flag; adding it (and defaulting `-O0` to `off`) is the
+    low-risk conformance win, and it makes the reproducer replay
+    (`scripts/check_repro_replay.py`) simpler than its two pinned legs.
 
 ---
 
@@ -297,6 +370,33 @@ Ordered by value ÷ cost, with the entry point each one needs.
 * `PyYAML` is needed by `scripts/check_ci_gate_parity.py`
   (`pip install --break-system-packages pyyaml`); without it the gate fails
   cleanly instead of silently passing.
+* **Check a tool exists before writing a replacement for it.** `git ls-files`
+  is the authority: `scripts/audit_census.py` and its baseline are committed
+  and green (AUD-RATCHET-1 landed in `7b0ea71`); a rewritten copy would have
+  silently replaced a better-specified engine (it also latches `#[ignore]`
+  annotations, and its knob-documentation rule is "named in a tracked `*.md`").
+* **Never edit a script while a bash process is executing it.** The local CI
+  runner reads `scripts/ci_local.sh` incrementally by byte offset, so an edit
+  in the middle of a run made the running shell die with `syntax error near
+  unexpected token 'else'` at a line that is valid in the commit. Land the
+  edit, then start the run — and treat a run that outlived an edit as
+  evidence-free.
+* **A new permission gate can invalidate existing tests whose flags were
+  permissive.** `tests/regression/clmul256` carried `-mavx2 -maes -mpclmul`
+  while emitting `vpclmulqdq`; the VAES/VPCLMULQDQ gate made that flag set
+  illegal, and the corpus sweep is what caught it (`clmul256 (compile:fail)`).
+  GCC 12.2 rejects the old set too, so the test's flags — not the new gate —
+  were stale. After landing a gate: run `python3 tests/regression/run_regression.py
+  --lccc ./target/fastbuild/lccc -j 2 --compile-only` and diff the failure list
+  against the recorded baseline (8 failures, all `cannot find -lgcc`).
+* **Silencing the oracle's own note can be right.** The wide-vector gate
+  passes `-Wno-psabi` to gcc: in the no-AVX2 configuration the warning *is* the
+  property under test (the memory convention), so it is expected output, not a
+  finding.
+* **Pin the ISA on both sides of a differential, or measure the wrong thing.**
+  lccc's documented baseline is x86-64-v3 and GCC's default is x86-64; an
+  unpinned comparison of the two reports 29 "failures" that are FMA
+  contraction. State the baseline in the gate, in both directions.
 * Gate files must avoid `producer | grep -q` and `producer | head -N` under
   `set -o pipefail` (the repo has `scripts/check_pipefail_sigpipe.py`, which
   caught exactly that in the new IVSR gate): capture first, or use
