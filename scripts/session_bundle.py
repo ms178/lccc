@@ -47,7 +47,17 @@ def build(repo: Path, base: str, destination: Path) -> dict:
         with tempfile.TemporaryDirectory(prefix='lccc-bundle-verify-', dir=repo.parent) as td:
             isolated=Path(td)
             git(isolated, 'init', '-q')
-            git(isolated, 'fetch', '-q', '--depth=1', '--no-tags', str(repo), base)
+            # FULL history of base, not --depth=1: a session that merges
+            # another branch makes that branch's boundary parents (commits
+            # reachable from base but parents of included merge commits)
+            # prerequisites of the bundle.  A depth-1 checkout of base lacks
+            # them and `bundle verify` fails with "Repository lacks these
+            # prerequisite commits" on exactly the sessions that need the
+            # bundle most (measured on the 2026-10-13 merge session: the
+            # verify clone was missing 6733d68f, a main-side ancestor).  The
+            # isolation property this step exists for -- an independent object
+            # database that cannot be masked by HEAD's objects -- is unchanged.
+            git(isolated, 'fetch', '-q', '--no-tags', str(repo), base)
             git(isolated, 'bundle', 'verify', str(temp))
             git(isolated, 'fetch', '-q', str(temp), f'refs/heads/{branch}')
             git(isolated, 'checkout', '-q', '-B', branch, 'FETCH_HEAD')

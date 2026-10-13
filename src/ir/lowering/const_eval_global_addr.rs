@@ -143,7 +143,7 @@ impl Lowerer {
             // where open_fds_init is an `unsigned long[1]` field.
             Expr::MemberAccess(_, _, _) => self.resolve_member_access_array_decay(expr),
             // (type *)expr -> try evaluating the inner expression
-            Expr::Cast(_, inner, _) => self.eval_global_addr_expr(inner),
+            Expr::Cast(_, inner, _, _) => self.eval_global_addr_expr(inner),
             // Compound literal -> check if it was materialized as an anonymous global
             // by materialize_compound_literals_in_expr(), then fall back to trying
             // to extract a global address from the initializer content.
@@ -332,7 +332,7 @@ impl Lowerer {
                     Some(GlobalInit::GlobalAddrOffset(global_name, total_offset))
                 }
             }
-            Expr::Cast(type_spec, inner, _) => {
+            Expr::Cast(type_spec, inner, _, _) => {
                 // Handle patterns like ((const char *)boot_cpu_data.x86_capability)[N]
                 // The inner expression should resolve to a global address, and the cast's
                 // pointee type determines the element size for subscript strides.
@@ -569,7 +569,7 @@ impl Lowerer {
             // AddressOf(&x) -> address of x
             Expr::AddressOf(_inner, _) => self.eval_global_addr_expr(expr),
             // Cast preserves the address
-            Expr::Cast(_, inner, _) => self.resolve_inner_as_global_addr(inner),
+            Expr::Cast(_, inner, _, _) => self.resolve_inner_as_global_addr(inner),
             _ => None,
         }
     }
@@ -981,7 +981,7 @@ impl Lowerer {
     fn eval_addr_comparison_cond(&self, expr: &Expr) -> Option<IrConst> {
         // Unwrap casts (e.g., (fn_type)NULL is Cast(fn_type, 0))
         let expr = match expr {
-            Expr::Cast(_, inner, _) => inner.as_ref(),
+            Expr::Cast(_, inner, _, _) => inner.as_ref(),
             _ => expr,
         };
         match expr {

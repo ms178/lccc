@@ -2898,10 +2898,12 @@ seven parity-check unit tests.
 
 ## 2026-10-13 — corpus replay, census ratchet, hygiene, CI hardening
 
-- `scripts/repros_replay.py` replays every historical reproducer with an
-  ISA-matched GCC arm (`-march=x86-64-v3`, which IS lccc's default target) and
-  treats "needs csmith.h" as a loud skip, not a pass. Wired into `ci_local.sh`
-  (fast) and CI with a `--selftest`.
+- `scripts/check_repro_replay.py` replays every historical reproducer with the
+  ISA pinned on BOTH compilers (`-march=x86-64-v3 [-mno-fma]`, matching lccc's
+  default target) and treats "needs csmith.h" as a declared skip, not a pass.
+  Wired into `ci_local.sh` (fast) and CI with a `--self-test`.  (This replaced
+  the `repros_replay.py` variant when the two 2026-10-13 branches were merged:
+  one directory, one naming contract, one replay gate.)
 - `scripts/audit_census.py` (+ `audit_census_baseline.json`) ratchets the
   audit's debt numbers: panic-class sites, `unsafe`, functions over
   300/500/1000 lines, distinct `CCC_*`/`LCCC_*` knobs and undocumented knobs,

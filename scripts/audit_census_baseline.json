@@ -1,15 +1,11 @@
 {
-  "comment": "Ratchet baseline for scripts/audit_census.py, recorded on the 2026-10-13 audit-fix session tree (upstream base 7e94441). Counts come from THIS tool's stripping rules (comments and string literals removed, everything after the first top-level #[cfg(test)] mod cut) and therefore differ slightly from the audit's own census implementation; the ratchet is about growth, not about matching that number. `ignores_all` counts #[ignore] including test modules. Lower a number only in the commit that removes the sites; never raise it to make CI green.",
-  "metrics": {
-    "ignores": 0,
-    "ignores_all": 6,
-    "knobs_distinct": 438,
-    "knobs_undocumented": 243,
-    "over_1000": 23,
-    "over_300": 196,
-    "over_500": 77,
-    "panic_class": 917,
-    "panic_class_frontend_lowering_driver": 109,
-    "unsafe_sites": 29
-  }
+  "fns_over_1000": 23,
+  "fns_over_300": 192,
+  "fns_over_500": 76,
+  "ignored_tests": 1,
+  "knob_literals": 499,
+  "knobs_undocumented": 293,
+  "panic_sites": 889,
+  "panic_sites_hot": 109,
+  "unsafe_sites": 29
 }

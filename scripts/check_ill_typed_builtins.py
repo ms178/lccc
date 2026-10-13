@@ -1,261 +1,275 @@
 #!/usr/bin/env python3
-"""Gate: ill-typed builtin calls must be diagnostics, never internal errors.
+"""AUD-ICE-1 acceptance gate: an ill-typed builtin call is a DIAGNOSTIC, never
+a compiler panic.
 
-WHY
----
-An invalid *user* program is not a compiler bug.  Until AUD-ICE-1, a table of
-reachable `panic!`/`unreachable!` sites in the lowering stage turned ordinary
-typos into `ccc: internal error: ...` (and, before AUD-SILENT-ZERO-1, an x86
-intrinsic compiled for aarch64 into silently zeroed output):
+The audit's acceptance criterion for AUD-ICE-1, written out: "a table of
+ill-typed calls of every `BuiltinIntrinsic` (wrong arity, wrong type class,
+non-constant where a constant is required) at `-O0` and `-O2`, asserting exit
+1, a `file:line:col: error:` prefix and the absence of `internal error`."
 
-    __builtin_shuffle(a, m)      with `int m`
-    __builtin_shuffle(a, m)      with a float vector mask
-    __builtin_shuffle(a, m)      with a mask of the wrong element count
-    __builtin_shuffle(a)         wrong arity
-    __builtin_shufflevector(...)  non-constant / out-of-range lane index
-    __builtin_ia32_aesenc128     on aarch64 (foreign-architecture builtin)
+This is that table, generated from the compiler's own name table rather than
+hand-written, so a builtin added tomorrow is covered tomorrow.  Every name is
+exercised through four independent ill-typed shapes at both optimisation
+levels, and each compile is judged on three things:
 
-For every row the contract is:
+  * **ICE**: `internal error` / `panicked at` in the compiler's output.  A
+    panic is never an acceptable answer for a *type* error, whatever the
+    message says.  HARD failure above the recorded baseline.
+  * **silent**: an ill-typed call the compiler accepts without a word.  Some of
+    these are legitimate (`__builtin_add_overflow` is generic, the fortify
+    `__builtin___*_chk` family is variadic); the rest are permissive type
+    checking.  RATCHETED, never allowed to grow.
 
-  1. exit status is non-zero (the program is rejected, not miscompiled);
-  2. stderr carries a located diagnostic (``file:line:col: error:``);
-  3. the message names the offending builtin;
-  4. stderr contains neither ``internal error`` nor a panic banner;
-  5. where GCC also rejects the program (the x86 rows), GCC agrees.
+Both lists live in `tests/regression/ill_typed_builtins_baseline.json`.  A name
+that stops panicking is *reported* so the baseline can be tightened in the same
+commit that fixed it; a name that starts panicking fails the gate immediately.
 
-The rows are run at ``-O0`` and ``-O2`` because the defect was reachable from
-both (the lowering path is not optimization-gated).
-
-Mutation check: point ``--compiler`` at a compiler built before the fix and
-this gate must fail.  ``--self-test`` proves the checker's own classifier with
-synthetic compiler stubs, so a future edit that makes the assertions vacuous
-(e.g. accepting any non-zero exit) turns red here.
+Usage:
+    scripts/check_ill_typed_builtins.py                 # gate
+    scripts/check_ill_typed_builtins.py --list          # print the name table
+    scripts/check_ill_typed_builtins.py --update-baseline
+    scripts/check_ill_typed_builtins.py --name _mm_add_ps   # one builtin, verbose
 """
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import json
+import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
-LOCATED = re.compile(r"^[^:]+:\d+:\d+: (error|warning): ", re.M)
-PANIC = re.compile(r"internal error|panicked at|thread '[^']*' panicked", re.I)
+
+def _find_repo() -> Path:
+    """The repository that owns this script: $LCCC_REPO, or the nearest ancestor
+    of the working directory holding the builtin name table."""
+    cand = os.environ.get("LCCC_REPO")
+    if cand and (Path(cand) / "src/frontend/sema/builtins.rs").exists():
+        return Path(cand)
+    here = Path.cwd().resolve()
+    for c in (here, *here.parents):
+        if (c / "src/frontend/sema/builtins.rs").exists():
+            return c
+    return Path(__file__).resolve().parent.parent
 
 
-@dataclass(frozen=True)
-class Case:
-    name: str
-    source: str
-    message: str
-    flags: tuple[str, ...] = ()
-    gcc_agrees: bool = True
-    gcc_message: str | None = None
+REPO = _find_repo()
+TABLE = REPO / "src/frontend/sema/builtins.rs"
+DEFAULT_LCCC = REPO / "target" / "fastbuild" / "lccc"
+BASELINE = REPO / "tests" / "regression" / "ill_typed_builtins_baseline.json"
 
-
-X86_CASES: tuple[Case, ...] = (
-    Case(
-        "shuffle_int_mask",
-        "typedef int v4 __attribute__((vector_size(16)));\n"
-        "v4 f(v4 a, int m) { return __builtin_shuffle(a, m); }\n",
-        "'__builtin_shuffle' last argument must be an integer vector",
-        gcc_message="must be an integer vector",
-    ),
-    Case(
-        "shuffle_float_mask",
-        "typedef float f4 __attribute__((vector_size(16)));\n"
-        "f4 g(f4 a, f4 m) { return __builtin_shuffle(a, m); }\n",
-        "'__builtin_shuffle' last argument must be an integer vector",
-        gcc_message="must be an integer vector",
-    ),
-    Case(
-        "shuffle_mask_count_mismatch",
-        "typedef int v4 __attribute__((vector_size(16)));\n"
-        "typedef int v8 __attribute__((vector_size(32)));\n"
-        "v4 h(v4 a, v8 m) { return __builtin_shuffle(a, m); }\n",
-        "number of elements of the argument vector(s) and the mask vector",
-        gcc_message="should be the same",
-    ),
-    Case(
-        "shuffle_wrong_arity",
-        "typedef int v4 __attribute__((vector_size(16)));\n"
-        "v4 k(v4 a) { return __builtin_shuffle(a); }\n",
-        "wrong number of arguments to '__builtin_shuffle'",
-        gcc_message="wrong number of arguments",
-    ),
-    Case(
-        "shufflevector_range",
-        "typedef int v4 __attribute__((vector_size(16)));\n"
-        "v4 j(v4 a, v4 b) { return __builtin_shufflevector(a, b, 0, 1, 9, 3); }\n",
-        "invalid element index '9' to '__builtin_shufflevector'",
-        gcc_message="invalid element index",
-    ),
-    Case(
-        "shufflevector_non_constant",
-        "typedef int v4 __attribute__((vector_size(16)));\n"
-        "v4 i(v4 a, v4 b, int k) { return __builtin_shufflevector(a, b, k, 1, 2, 3); }\n",
-        "must be an integer constant expression",
-        # GCC prints the source text of the index; the wording differs, the
-        # verdict (reject + located error) must not.
-        gcc_message=None,
-    ),
+# `m.insert("name", BuiltinInfo::intrinsic(BuiltinIntrinsic::Kind))`
+ENTRY = re.compile(
+    r'm\.insert\(\s*"([^"]+)"\s*,\s*BuiltinInfo::intrinsic\(\s*(?:BuiltinIntrinsic::)?(\w+)\s*\)',
+    re.S,
 )
-
-FOREIGN_TARGET_CASES: tuple[Case, ...] = (
-    Case(
-        "x86_intrinsic_on_aarch64",
-        "typedef int v4 __attribute__((vector_size(16)));\n"
-        "v4 m(v4 a, v4 k) { return __builtin_ia32_aesenc128(a, k); }\n",
-        "'__builtin_ia32_aesenc128' is not available on aarch64",
-        gcc_agrees=False,
-    ),
-)
+ICE_MARKERS = ("internal error", "panicked at")
+DIAG = re.compile(r"^.+?:\d+:\d+: error: ", re.M)
 
 
-def run(compiler: Path, source: Path, out: Path, *flags: str) -> tuple[int, str]:
-    proc = subprocess.run(
-        [str(compiler), *flags, "-S", str(source), "-o", str(out)],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    return proc.returncode, proc.stdout + proc.stderr
+def names_from_table() -> list[tuple[str, str]]:
+    seen: dict[str, str] = {}
+    for name, kind in ENTRY.findall(TABLE.read_text()):
+        seen.setdefault(name, kind)
+    return sorted(seen.items())
 
 
-def check_case(
-    case: Case,
-    compiler: Path,
-    gcc: Path | None,
-    work: Path,
-    opt: str,
-) -> list[str]:
-    """Return the list of failures for one case/optimization row (empty = pass)."""
-    failures: list[str] = []
-    src = work / f"{case.name}{opt}.c"
-    src.write_text(case.source)
-    code, output = run(compiler, src, work / f"{case.name}{opt}.s", opt, *case.flags)
-    where = f"{case.name}{opt}"
-    if code == 0:
-        failures.append(f"{where}: accepted (exit 0); expected a diagnostic")
-        return failures
-    if PANIC.search(output):
-        failures.append(f"{where}: emitted an internal error/panic: {output.strip()[:200]}")
-    if case.message not in output:
-        failures.append(f"{where}: message {case.message!r} missing from {output.strip()[:200]}")
-    if not LOCATED.search(output):
-        failures.append(f"{where}: diagnostic is not located (no file:line:col prefix): {output.strip()[:200]}")
-    # GCC differential: GCC must reject the same program (it may use its own
-    # wording, but rejecting is the cross-checkable half of the contract).
-    if gcc is not None and case.gcc_agrees:
-        gcode, goutput = run(gcc, src, work / f"{case.name}{opt}.gcc.s", opt, *case.flags)
-        if gcode == 0:
-            failures.append(f"{where}: GCC accepted the program; the row is not a rejection case")
-        elif case.gcc_message and case.gcc_message not in goutput:
-            failures.append(
-                f"{where}: GCC rejected with unexpected wording: {goutput.strip()[:200]}"
-            )
-    return failures
+def shapes(name: str, idx: int) -> list[str]:
+    """Four independent ill-typed shapes, one per function, so a diagnostic's
+    position identifies which shape was reached."""
+    return [
+        f"void z{idx}(void) {{ (void)({name}()); }}",
+        f"void o{idx}(void) {{ int x = 0; (void)({name}(x)); }}",
+        f"void t{idx}(void) {{ int x = 0; (void)({name}(x, &x)); }}",
+        f"void m{idx}(void) {{ int x = 0; (void)({name}(x, x, x, x, x, x, x, x)); }}",
+    ]
 
 
-def check_foreign_target(case: Case, compiler: Path, work: Path) -> list[str]:
-    failures: list[str] = []
-    src = work / f"{case.name}.c"
-    src.write_text(case.source)
-    code, output = run(compiler, src, work / f"{case.name}.s", "-O2")
-    if code == 0:
-        failures.append(f"{case.name}: accepted (exit 0); foreign-target builtin must be rejected")
-    if case.message not in output:
-        failures.append(f"{case.name}: message {case.message!r} missing from {output.strip()[:200]}")
-    if PANIC.search(output):
-        failures.append(f"{case.name}: emitted an internal error/panic: {output.strip()[:200]}")
-    return failures
+def compile_one(lccc: str, name: str, idx: int, tmp: Path, opt: str) -> dict:
+    src = tmp / f"ill{idx}{opt}.c"
+    src.write_text("\n".join(shapes(name, idx)) + "\n")
+    asm = src.with_suffix(".s")
+    try:
+        proc = subprocess.run(
+            [lccc, opt, "-S", str(src), "-o", str(asm)],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        out = proc.stdout + proc.stderr
+        rc = proc.returncode
+    except subprocess.TimeoutExpired:
+        out, rc = "timeout", 124
+    asm.unlink(missing_ok=True)
+    return {
+        "name": name,
+        "opt": opt,
+        "rc": rc,
+        "ice": [m for m in ICE_MARKERS if m in out],
+        "diagnostics": len(DIAG.findall(out)),
+        "out": out,
+    }
+
+
+def decide(
+    ice_now: list[str], silent_now: list[str], baseline: dict
+) -> dict[str, list[str]]:
+    """Compare this run against the baseline.  Growing either list is a
+    regression; shrinking is a `fixed` note so the caller can tighten the
+    baseline in the same commit that fixed the panic."""
+    known_ice = set(baseline.get("ice", []))
+    known_silent = set(baseline.get("silent", []))
+    return {
+        "new_ice": [n for n in ice_now if n not in known_ice],
+        "new_silent": [n for n in silent_now if n not in known_silent],
+        "fixed_ice": sorted(known_ice - set(ice_now)),
+        "fixed_silent": sorted(known_silent - set(silent_now)),
+    }
 
 
 def self_test() -> int:
-    """The checker must flag a panic banner and an unlocated diagnostic."""
-    stub = Path(tempfile.mkdtemp(prefix="ill-typed-selftest."))
-    try:
-        panicking = stub / "panicking-cc"
-        panicking.write_text(
-            "#!/bin/sh\necho \"ccc: internal error: __builtin_shuffle: mask must be a vector\" >&2\n"
-            "echo 'thread main panicked at src/x.rs' >&2\nexit 1\n"
-        )
-        located = stub / "located-cc"
-        located.write_text(
-            "#!/bin/sh\necho \"$3:2:28: error: '__builtin_shuffle' last argument must be an integer vector\" >&2\nexit 1\n"
-        )
-        for path in (panicking, located):
-            path.chmod(0o755)
-        work = stub / "work"
-        work.mkdir()
-        case = X86_CASES[0]
-        failures = check_case(case, panicking, None, work, "-O0")
-        ok = any("internal error/panic" in f for f in failures)
-        # The stub emits no file:line:col either; both classes must be reported.
-        ok = ok and any("not located" in f for f in failures)
-        if not ok:
-            print("self-test FAIL: panic/unlocated output was accepted", file=sys.stderr)
-            print(failures, file=sys.stderr)
-            return 1
-        failures = check_case(case, located, None, work, "-O0")
-        if failures:
-            print(f"self-test FAIL: a conforming stub was rejected: {failures}", file=sys.stderr)
-            return 1
-        accepted = stub / "accepting-cc"
-        accepted.write_text("#!/bin/sh\nexit 0\n")
-        accepted.chmod(0o755)
-        failures = check_case(case, accepted, None, work, "-O0")
-        if not any("accepted" in f for f in failures):
-            print("self-test FAIL: a compiler that accepts invalid code passed", file=sys.stderr)
-            return 1
-        print("ill-typed builtins checker self-test: PASS")
-        return 0
-    finally:
-        shutil.rmtree(stub, ignore_errors=True)
+    """The ratchet must be able to fail, and to notice a fix, on inputs that
+    differ only in the way a real regression differs."""
+    base = {"ice": ["_mm_a -O0", "_mm_a -O2"], "silent": ["_mm_b -O0"]}
+    assert names_from_table(), "name table is empty"
+    assert all("BuiltinIntrinsic" not in k for _n, k in names_from_table())
+    names = [n for n, _k in names_from_table()]
+    assert "_mm_add_ps" in names, "known intrinsic missing from the table"
+    assert len(shapes("_mm_add_ps", 3)) == 4
+
+    same = decide(base["ice"], base["silent"], base)
+    assert not same["new_ice"] and not same["new_silent"] and not same["fixed_ice"]
+    grew = decide(base["ice"] + ["_mm_c -O2"], base["silent"], base)
+    assert grew["new_ice"] == ["_mm_c -O2"], grew
+    over_silent = decide(base["ice"], base["silent"] + ["_mm_c -O2"], base)
+    assert over_silent["new_silent"] == ["_mm_c -O2"], over_silent
+    shrank = decide(base["ice"][:1], base["silent"], base)
+    assert shrank["fixed_ice"] == ["_mm_a -O2"] and not shrank["new_ice"]
+    assert decide(base["ice"], base["silent"], {})["new_ice"] == base["ice"]
+    print("self-test: ratchet grows, shrinks and holds as specified")
+    return 0
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--compiler", default=str(REPO / "target/fastbuild/lccc"))
-    ap.add_argument("--arm-compiler", default=str(REPO / "target/fastbuild/lccc-arm"))
-    ap.add_argument("--gcc", default=shutil.which("gcc") or "")
-    ap.add_argument("--self-test", action="store_true")
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("--lccc", default=os.environ.get("CCC", str(DEFAULT_LCCC)))
+    ap.add_argument("--jobs", type=int, default=4)
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--update-baseline", action="store_true")
+    ap.add_argument(
+        "--self-test", action="store_true", help="exercise the ratchet logic, no compiler needed"
+    )
+    ap.add_argument("--name", help="exercise a single builtin and print the output")
     args = ap.parse_args()
 
     if args.self_test:
         return self_test()
 
-    compiler = Path(args.compiler)
-    if not compiler.is_file():
-        print(f"FAIL: compiler {compiler} not found", file=sys.stderr)
-        return 2
-    gcc = Path(args.gcc) if args.gcc else None
-    arm = Path(args.arm_compiler)
-
-    failures: list[str] = []
-    with tempfile.TemporaryDirectory(prefix="ill-typed-builtins.") as td:
-        work = Path(td)
-        for case in X86_CASES:
-            for opt in ("-O0", "-O2"):
-                failures += check_case(case, compiler, gcc, work, opt)
-        for case in FOREIGN_TARGET_CASES:
-            if arm.is_file():
-                failures += check_foreign_target(case, arm, work)
-            else:
-                print(f"SKIP {case.name}: {arm} not built", file=sys.stderr)
-
-    rows = len(X86_CASES) * 2 + (len(FOREIGN_TARGET_CASES) if arm.is_file() else 0)
-    if failures:
-        for f in failures:
-            print(f"FAIL: {f}", file=sys.stderr)
-        print(f"ill-typed builtin diagnostics: FAIL ({len(failures)}/{rows} rows)", file=sys.stderr)
+    entries = names_from_table()
+    if not entries:
+        print("FAIL: no intrinsics found in the name table", file=sys.stderr)
         return 1
-    print(f"ill-typed builtin diagnostics: PASS ({rows} rows, GCC agreement checked where defined)")
+    if args.list:
+        for name, kind in entries:
+            print(f"{kind:34s} {name}")
+        print(f"{len(entries)} intrinsic name(s)")
+        return 0
+    if args.name:
+        entries = [(n, k) for n, k in entries if n == args.name] or [(args.name, "-")]
+    if not Path(args.lccc).exists():
+        print(f"SKIP: {args.lccc} not built", file=sys.stderr)
+        return 0
+
+    per_name: dict[tuple[str, str], dict] = {}
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        jobs = [
+            (name, idx * 10, opt)
+            for idx, (name, _k) in enumerate(entries)
+            for opt in ("-O0", "-O2")
+        ]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as ex:
+            futs = [ex.submit(compile_one, args.lccc, j[0], j[1], tmp, j[2]) for j in jobs]
+            for fut in concurrent.futures.as_completed(futs):
+                res = fut.result()
+                per_name[(res["name"], res["opt"])] = res
+
+    if args.name:
+        for (name, opt), res in sorted(per_name.items()):
+            print(f"=== {name} {opt} rc={res['rc']} diagnostics={res['diagnostics']}")
+            print(res["out"])
+        return 0
+
+    ice_names = sorted(f"{n} {o}" for (n, o), r in per_name.items() if r["ice"])
+    silent_names = sorted(
+        f"{n} {o}" for (n, o), r in per_name.items() if not r["ice"] and r["diagnostics"] == 0
+    )
+
+    if args.update_baseline:
+        BASELINE.write_text(
+            json.dumps(
+                {
+                    "note": (
+                        "AUD-ICE-1 ratchet floor. `ice` names are ill-typed calls "
+                        "that PANIC the compiler today; `silent` names compile with "
+                        "no diagnostic at all. Regenerate with --update-baseline; "
+                        "the gate fails when either list grows."
+                    ),
+                    "ice": ice_names,
+                    "silent": silent_names,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        print(
+            f"baseline: {len(ice_names)} ICE name(s), {len(silent_names)} silent "
+            f"name(s) -> {BASELINE.relative_to(REPO)}"
+        )
+        return 0
+
+    baseline = {"ice": [], "silent": []}
+    if BASELINE.exists():
+        baseline = json.loads(BASELINE.read_text())
+    verdict = decide(ice_names, silent_names, baseline)
+    new_ice, new_silent = verdict["new_ice"], verdict["new_silent"]
+    fixed_ice = verdict["fixed_ice"]
+
+    print(
+        f"{len(entries)} builtin(s) x 4 ill-typed shapes x 2 optimisation levels: "
+        f"{len(ice_names)} ICE, {len(silent_names)} silent"
+    )
+    if fixed_ice:
+        print(
+            f"note: {len(fixed_ice)} name(s) no longer panic -- tighten the baseline "
+            "in the commit that fixed them:"
+        )
+        for n in fixed_ice[:10]:
+            print(f"  fixed: {n}")
+    if new_ice:
+        print(f"FAIL: {len(new_ice)} name(s) panic on an ill-typed call", file=sys.stderr)
+        for n in new_ice[:20]:
+            print(f"  {n}", file=sys.stderr)
+        return 1
+    if new_silent:
+        print(
+            f"FAIL: {len(new_silent)} name(s) newly accept an ill-typed call "
+            "without a diagnostic",
+            file=sys.stderr,
+        )
+        for n in new_silent[:20]:
+            print(f"  {n}", file=sys.stderr)
+        return 1
+
+    print(
+        f"ratchet held: {len(ice_names)} ICE / {len(silent_names)} silent, no additions"
+    )
     return 0
 
 

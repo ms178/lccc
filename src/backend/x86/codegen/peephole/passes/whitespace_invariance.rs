@@ -358,20 +358,20 @@ fn corpus() -> Vec<(String, String)> {
         .map(|(i, text)| (format!("fixture[{i}]"), (*text).to_string()))
         .collect();
 
-    // Committed assembly only.  `tests/` is the curated set (asm-diff corpus,
-    // regression captures, `tests/regression/fixtures/`); a scratch `work/`
-    // tree is picked up when it exists, but the anti-vacuity floor below is
-    // anchored to what is COMMITTED, not to the scratch directory -- the
-    // former `work/*.s` dumps were removed as untracked leftovers
-    // (AUD-HYGIENE-1) and must not be able to make this test red by their
-    // absence.
     let manifest = env!("CARGO_MANIFEST_DIR");
-    let root = std::path::Path::new(manifest);
-    let mut subdirs = vec!["tests"];
-    if root.join("work").is_dir() {
-        subdirs.push("work");
-    }
-    out.extend(collect_asm(root, &subdirs));
+    // Committed assembly only: the regression/pin corpora under `tests/`, plus
+    // the Godbolt oracle corpus the asm-diff gates compare against.  The old
+    // second root was `work/`, a scratch directory that is in `.gitignore` --
+    // a corpus that can vanish with a cleanup (AUD-HYGIENE-1 removed it) is
+    // evidence whose absence the vacuity check has to catch, and an invariant
+    // test is stronger when its inputs are files the repository promises to
+    // keep.  Third-party assembly (gcc/clang/icx) is deliberately included:
+    // the peephole must be whitespace-invariant on foreign text too, because
+    // asm-diff feeds it exactly that.
+    out.extend(collect_asm(
+        std::path::Path::new(manifest),
+        &["tests", "engineering/evidence/godbolt/corpus"],
+    ));
 
     if let Some(dir) = std::env::var_os("LCCC_ASM_CORPUS") {
         let generated = collect_asm(std::path::Path::new(&dir), &[]);
@@ -439,17 +439,13 @@ fn collect_asm(root: &std::path::Path, subdirs: &[&str]) -> Vec<(String, String)
 fn the_corpus_is_not_vacuous() {
     let corpus = corpus();
     let lines: usize = corpus.iter().map(|(_, text)| text.lines().count()).sum();
-    // Floors, not targets: `tests/` holds 14 committed `.s` files (~1.3k
-    // lines) after the AUD-HYGIENE-1 removal of the untracked `work/` dumps.
-    // A tree that cannot find the committed assembly (a broken checkout, a
-    // test run outside the repository) still fails loudly.
     assert!(
-        corpus.len() >= FIXTURES.len() + 8,
+        corpus.len() >= FIXTURES.len() + 20,
         "corpus holds only {} texts; the repository's committed assembly was not found",
         corpus.len()
     );
     assert!(
-        lines > 1_000,
+        lines > 2_000,
         "corpus holds only {lines} lines of assembly; too little to be evidence"
     );
 }

@@ -110,11 +110,6 @@ jobs:
       - name: No merge conflict markers
         run: python3 scripts/check_no_conflict_markers.py
 
-      - name: Audit census ratchet
-        run: |
-          python3 scripts/audit_census.py --selftest
-          python3 scripts/audit_census.py --check
-
       - name: Verify manifest Rust-toolchain selection
         run: bash tests/regression/check_rust_toolchain_selector.sh
 
@@ -132,18 +127,8 @@ jobs:
       - name: Check FP-contraction parity with GCC
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_fp_contract_parity.sh
 
-      - name: Replay the historical reproducer corpus
-        run: |
-          python3 scripts/repros_replay.py --selftest
-          python3 scripts/repros_replay.py --lccc target/fastbuild/lccc --check
-
       - name: Check -o - stdout semantics
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_dash_o_stdout.sh
-
-      - name: Check ill-typed builtin diagnostics
-        run: |
-          python3 scripts/check_ill_typed_builtins.py --self-test
-          python3 scripts/check_ill_typed_builtins.py --compiler target/fastbuild/lccc
 
       - name: Check builtin_cpu_supports runtime semantics
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_cpu_supports_runtime.sh
@@ -187,6 +172,88 @@ jobs:
 
       - name: Aggregate-call byte boundaries and cross-compiler ABI
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_aggregate_call_abi.sh
+
+      # AUD-VABI-1: a 16-byte vector is ONE %xmm (SSE + SSEUP), not an
+      # INTEGER/GP pair, in both directions and through function pointers --
+      # proved by linking each side against a GCC-compiled translation unit.
+      - name: Vector arguments and returns at the compiler boundary
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_vector_abi_boundary.sh
+
+      # AUD-VABI-2: the 32-byte vector convention (one %ymm) is missing; this
+      # gate latches the measured debt (silent garbage one way, SIGSEGV the
+      # other) and asserts the two configurations that DO work stay working.
+      - name: Wide-vector ABI debt (latched)
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_vector_abi_wide.sh
+
+      # AUD-TMP-1: temp files must be symlink-proof (pre-placed symlink and
+      # pre-placed directory reproducers; victim file must stay untouched).
+      # AUD-HYGIENE-1: the previously unreferenced tests/compat_test.sh and the
+      # loose IVSR probes run in ci_local.sh too; scripts/check_ci_gate_parity.py
+      # fails if these two lists drift.
+      - name: LCCC vs GCC compatibility suite
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_compat_suite.sh
+
+      - name: IVSR/univsr loop-strength-reduction probe contracts
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_ivsr_reproducers.sh
+
+      - name: Temp-file symlink hardening
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_temp_symlink.sh
+
+      # AUD-DRV-1: `-o -` streams to stdout for -S/-E/-M and is rejected for
+      # -c / multiple inputs, exactly like GCC.
+      - name: Standard-output contract for -o -
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_o_stdout.sh
+
+      # AUD-HYGIENE-1: replay every crash/miscompile reproducer with the ISA
+      # pinned on both compilers (see artifacts/repros/README.md).
+      - name: Reproducer replay (pinned ISA, both legs)
+        run: |
+          set -euo pipefail
+          python3 scripts/check_repro_replay.py --self-test
+          env CCC=target/fastbuild/lccc python3 scripts/check_repro_replay.py
+
+      
+      # AUD-ICE-1/AUD-DIAG-1: malformed `__builtin_shuffle` masks diagnose
+      # instead of panicking, and the valid forms still lower (oracle-checked
+      # against gcc).
+      - name: Shuffle builtin diagnostics
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_shuffle_diagnostics.sh
+
+      # AUD-SILENT-ZERO-1: an x86-only intrinsic compiled for AArch64/RISC-V
+      # must trap (and be encodable), never silently compute zeros.
+      - name: Cross-target intrinsic trap
+        run: |
+          env CCC=target/fastbuild/lccc \
+              CCC_ARM=target/fastbuild/lccc-arm \
+              CCC_RISCV=target/fastbuild/lccc-riscv \
+              CCC_I686=target/fastbuild/lccc-i686 \
+              bash tests/regression/check_cross_target_intrinsic_trap.sh
+
+      # AUD-CPU-3: `-march=x86-64` must reject `_mm_crc32_u8`/`_mm_aesenc_si128`
+      # (GCC does), and the flag that grants the extension must still lower it.
+      - name: ISA-sensitive intrinsic feature gate
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_intrinsic_feature_gate.sh
+
+      # AUD-POS-1: positions after a #include, oracle-diffed against gcc.
+      - name: Diagnostic positions survive the preprocessor
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_diagnostic_positions.sh
+
+      # AUD-ICE-1: the argument counts the front end enforces for builtins are
+      # derived from include/*.h; this fails if the checked-in table drifts.
+      - name: Intrinsic arity table matches the headers
+        run: |
+          set -euo pipefail
+          python3 scripts/check_intrinsic_arity.py --self-test
+          python3 scripts/check_intrinsic_arity.py --check
+
+      # AUD-ICE-1: an ill-typed call to any builtin in the compiler's name
+      # table must diagnose, never panic; the ratchet baseline records the
+      # panics and silent accepts that exist today.
+      - name: Ill-typed builtin acceptance
+        run: |
+          set -euo pipefail
+          python3 scripts/check_ill_typed_builtins.py --self-test
+          env CCC=target/fastbuild/lccc LCCC_REPO=. python3 scripts/check_ill_typed_builtins.py
 
       - name: Run tests
         env:
@@ -1305,6 +1372,11 @@ jobs:
           bash tests/regression/check_redundant_test_elimination.sh
           python3 tests/regression/verify_pr713_audit.py --quiet
           python3 scripts/check_doc_links.py
+          # AUD-RATCHET-1: the audit census (scripts/audit_census.py) is the
+          # only place the audit's site counts are measurable; the ratchet is
+          # what stops them growing back.  Runs in ci_local.sh too.
+          python3 scripts/audit_census.py --selftest
+          python3 scripts/audit_census.py --check
           python3 scripts/check_peephole_directive_step.py
           python3 scripts/check_pr_claim_fidelity.py
           bash tests/regression/check_ra_web_inloop_use.sh
@@ -1504,10 +1576,15 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
+      # The wrapper runs the same strict Clippy invocation and additionally
+      # re-probes the crate-root lint policy under `#![deny(unknown_lints)]`:
+      # the root carries `#![allow(unknown_lints)]` for lints that exist only
+      # in Clippy versions newer than the declared MSRV, and that allow would
+      # otherwise also silence a typo in the policy list.
       - name: Run strict Clippy
         env:
           CARGO_BUILD_JOBS: "2"
-        run: cargo clippy --all-targets --profile fastbuild --locked -j 2 -- -D warnings
+        run: python3 scripts/check_clippy_policy.py
 
   # MS-01 (competitive half): compare LCCC against GCC / Clang / ICX on
   # Compiler Explorer and fail on regression against the committed baseline.

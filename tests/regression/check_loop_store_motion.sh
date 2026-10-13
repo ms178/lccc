@@ -30,16 +30,14 @@ if [ "$(uname -m)" != "x86_64" ] || [ "$(uname -s)" != "Linux" ]; then
     echo "SKIP: loop store motion placement check needs x86-64 Linux assembly"
     exit 0
 fi
-if ! command -v gcc >/dev/null 2>&1; then
-    echo "FAIL: gcc is required as the oracle"
-    exit 1
-fi
+. tests/regression/lib/gcc_oracle.sh
+require_gcc_oracle "check_loop_store_motion" || exit 1
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/lccc-loop-store-motion.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 fail=0
 
-gcc -O0 -w -o "$tmp/oracle" "$src"
+"$GCC_ORACLE_BIN" -O0 -w -o "$tmp/oracle" "$src"
 "$tmp/oracle" > "$tmp/oracle.out"
 
 for lvl in -O0 -O2; do

@@ -19,15 +19,20 @@ use super::const_eval::{ConstMap, SemaConstEval};
 use super::type_context::{FunctionTypedefInfo, TypeContext};
 use crate::common::error::DiagnosticEngine;
 use crate::common::source::Span;
-use crate::common::symbol_table::{Symbol, SymbolTable};
+use crate::common::symbol_table::{FoldedValue, Symbol, SymbolTable};
 use crate::common::type_builder;
-use crate::common::types::{AddressSpace, CType, FunctionType, RcLayout, StructLayout};
+use crate::common::type_builder::TypeConvertContext;
+use crate::common::types::{
+    AddressSpace, CType, FunctionType, RcLayout, StructFieldLayout, StructLayout,
+};
 use crate::frontend::parser::ast::{
     BinOp, BlockItem, CompoundStmt, Declaration, DerivedDeclarator, Designator, EnumVariant, Expr,
-    ExprId, ExternalDecl, ForInit, FunctionDef, InitDeclarator, Initializer, SizeofArg, Stmt,
-    StructFieldDecl, TranslationUnit, TypeSpecifier,
+    ExprId, ExternalDecl, ForInit, FunctionDef, GenericAssociation, InitDeclarator, Initializer,
+    InitializerItem, SizeofArg, Stmt, StructFieldDecl, TranslationUnit, TypeSpecifier,
 };
 use crate::frontend::sema::builtins;
+use crate::frontend::sema::intrinsic_arity;
+use crate::ir::reexports::IrConst;
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
@@ -130,6 +135,10 @@ pub struct SemanticAnalyzer {
     result: SemaResult,
     /// Current enum counter for auto-incrementing enum values.
     enum_counter: i64,
+    /// Pointer typedefs whose pointee is `const`/`volatile` (`typedef const
+    /// void *CNPT;`). `CType` carries no qualifiers, so the name is recorded
+    /// here for the null pointer constant rule: `(CNPT)0` is not one.
+    qualified_pointee_typedefs: FxHashSet<String>,
     // Anonymous struct/union keys are generated via TypeContext::next_anon_struct_id()
     // to ensure a single shared counter across both declaration processing and
     // expression type inference, avoiding key collisions between the two paths.
@@ -163,6 +172,7 @@ impl SemanticAnalyzer {
             symbol_table: SymbolTable::new(),
             result: SemaResult::default(),
             enum_counter: 0,
+            qualified_pointee_typedefs: FxHashSet::default(),
             diagnostics: RefCell::new(DiagnosticEngine::new()),
             defined_structs: RefCell::new(FxHashSet::default()),
             current_return_type: None,
@@ -308,6 +318,7 @@ impl SemanticAnalyzer {
                     explicit_alignment: None,
                     address_space: AddressSpace::Default,
                 });
+                self.symbol_table.mark_automatic(name);
             }
         }
         let previous_return_type = self.current_return_type.replace(return_type.clone());
@@ -391,6 +402,7 @@ impl SemanticAnalyzer {
                     explicit_alignment: None,
                     address_space: AddressSpace::Default,
                 });
+                self.symbol_table.mark_automatic(name);
             }
         }
 
@@ -626,6 +638,20 @@ impl SemanticAnalyzer {
                         Some(vs) => CType::Vector(Box::new(resolved_ctype), vs),
                         None => resolved_ctype,
                     };
+                // Pointee qualifier of a pointer typedef, from the declaration's
+                // base-type `const`/`volatile`, or inherited from a typedef
+                // name it is built on (`typedef CNPT CNPT2;`).
+                let pointee_qualified = (decl.is_const() || decl.is_volatile())
+                    && matches!(resolved_ctype, CType::Pointer(..))
+                    || (declarator.derived.is_empty()
+                        && matches!(&decl.type_spec, TypeSpecifier::TypedefName(base)
+                            if self.qualified_pointee_typedefs.contains(base)));
+                if pointee_qualified {
+                    self.qualified_pointee_typedefs
+                        .insert(declarator.name.clone());
+                } else {
+                    self.qualified_pointee_typedefs.remove(&declarator.name);
+                }
                 self.result
                     .type_context
                     .typedefs
@@ -714,13 +740,13 @@ impl SemanticAnalyzer {
             // segment exactly as gcc models it (drivers/base/cacheinfo.c).
             type_builder::apply_declaration_address_space_for_object(
                 &mut full_type,
-                decl.address_space,
+                self.declaration_address_space(decl.address_space, &decl.type_spec),
                 &init_decl.derived,
             );
             // Storage space: the shared complement of the call above (single
             // predicate, so sema and lowering can never disagree).
             let object_address_space = type_builder::object_storage_address_space_with_object(
-                decl.address_space,
+                self.declaration_address_space(decl.address_space, &decl.type_spec),
                 &init_decl.derived,
                 init_decl.attrs.object_space,
             );
@@ -945,6 +971,7 @@ impl SemanticAnalyzer {
                     init_decl.span,
                 );
             }
+            let is_object = !matches!(full_type, CType::Function(_)) && !decl.is_typedef();
             self.symbol_table.declare(Symbol {
                 name: init_decl.name.clone(),
                 ty: full_type,
@@ -953,6 +980,8 @@ impl SemanticAnalyzer {
             });
             if links && !self.symbol_table.at_file_scope() {
                 self.symbol_table.mark_linked(&init_decl.name);
+            } else if is_object && !decl.is_static() && !self.symbol_table.at_file_scope() {
+                self.symbol_table.mark_automatic(&init_decl.name);
             }
 
             // Analyze array size expressions in derived declarators
@@ -966,6 +995,16 @@ impl SemanticAnalyzer {
             // Analyze initializer expressions
             if let Some(init) = &init_decl.init {
                 self.analyze_initializer(init);
+                self.check_object_initializer(decl, init_decl, init);
+                if let Initializer::List(_) = init {
+                    let var_ty = self
+                        .symbol_table
+                        .lookup(&init_decl.name)
+                        .map(|s| s.ty.clone());
+                    if let Some(var_ty) = var_ty {
+                        self.check_initializer_element_spaces(&var_ty, init);
+                    }
+                }
                 // Check for invalid pointer <-> float conversions in scalar initializers
                 if let Initializer::Expr(init_expr) = init {
                     let var_ty = self
@@ -986,16 +1025,285 @@ impl SemanticAnalyzer {
                                 init_expr.span(),
                             );
                             let init_ty = self.conversion_source_ctype(init_expr, init_ty);
+                            let null_constant = self.is_void_null_pointer_constant(init_expr);
                             self.check_address_space_conversion(
                                 &init_ty,
                                 &var_ty,
                                 init_expr.span(),
-                                matches!(init_expr, Expr::Cast(..)),
+                                null_constant,
                             );
                         }
                     }
                 }
             }
+        }
+    }
+
+    /// Designator validity for one braced initializer (C11 6.7.9p2-p6).
+    ///
+    /// A `.name` designator must name a member of the record it applies to,
+    /// searching the members of anonymous struct and union members. A `[i]` or
+    /// `[lo ... hi]` designator must be a non-negative index within the bounds
+    /// of an array of known length. Designator chains are followed through
+    /// braced lists. A braced positional element of an array is checked against
+    /// the element type when the list has no designators (its index is then its
+    /// position). Positional members of records are not tracked, so designators
+    /// inside them are not checked. That is the one gap in this pass.
+    fn check_designators(&self, ct: &CType, init: &Initializer, span: Span) {
+        let Initializer::List(items) = init else {
+            return;
+        };
+        let any_designator = items.iter().any(|item| !item.designators.is_empty());
+        for item in items {
+            // The type this item initializes: a designator chain selects it from
+            // the list's type; a positional item is an element only of an array
+            // when the list has no designators (its index is then its position).
+            let target: Option<CType> = if item.designators.is_empty() {
+                match ct {
+                    CType::Array(elem, _) if !any_designator => Some((**elem).clone()),
+                    _ => None,
+                }
+            } else {
+                let mut cur = Some(ct.clone());
+                for designator in &item.designators {
+                    cur = match cur {
+                        Some(c) => self.designator_step(&c, designator, span),
+                        None => None,
+                    };
+                }
+                cur
+            };
+            if let (Some(sub), Initializer::List(_)) = (target, &item.init) {
+                self.check_designators(&sub, &item.init, span);
+            }
+        }
+    }
+
+    /// The type of the member `name` of a record, searching the members of
+    /// anonymous struct and union members (C11 6.7.2.2p13).
+    fn find_named_member(&self, layout: &StructLayout, name: &str) -> Option<CType> {
+        for field in &layout.fields {
+            if field.name == name {
+                return Some(field.ty.clone());
+            }
+            if field.name.is_empty() {
+                if let CType::Struct(key) | CType::Union(key) = &field.ty {
+                    let inner = self
+                        .result
+                        .type_context
+                        .borrow_struct_layouts()
+                        .get(&**key)
+                        .cloned();
+                    if let Some(ty) = inner.and_then(|l| self.find_named_member(&l, name)) {
+                        return Some(ty);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The type a single designator selects inside `cur`, or `None` after a
+    /// diagnostic (or when the type is not known well enough to decide).
+    fn designator_step(&self, cur: &CType, designator: &Designator, span: Span) -> Option<CType> {
+        match (designator, cur) {
+            (Designator::Field(name), CType::Struct(key) | CType::Union(key)) => {
+                // A record whose layout is not available is skipped, not reported.
+                let layout = self
+                    .result
+                    .type_context
+                    .borrow_struct_layouts()
+                    .get(&**key)?
+                    .clone();
+                match self.find_named_member(&layout, name) {
+                    Some(ty) => Some(ty),
+                    None => {
+                        self.diagnostics.borrow_mut().error(
+                            format!("unknown field '{name}' specified in initializer"),
+                            span,
+                        );
+                        None
+                    }
+                }
+            }
+            (Designator::Field(_), CType::Array(..)) => {
+                self.diagnostics.borrow_mut().error(
+                    "field name not in record or union initializer".to_string(),
+                    span,
+                );
+                None
+            }
+            (Designator::Index(index) | Designator::Range(index, _), CType::Array(elem, len)) => {
+                self.check_designator_bound(index, *len, span);
+                if let Designator::Range(_, hi) = designator {
+                    self.check_designator_bound(hi, *len, span);
+                }
+                Some((**elem).clone())
+            }
+            (Designator::Index(_) | Designator::Range(..), CType::Struct(_) | CType::Union(_)) => {
+                self.diagnostics
+                    .borrow_mut()
+                    .error("array index in non-array initializer".to_string(), span);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// One array designator index: non-negative, and below a known length.
+    /// A zero length (GNU `T a[0]`) and an unknown one (`T a[]`) are not bounded.
+    fn check_designator_bound(&self, index: &Expr, len: Option<usize>, span: Span) {
+        let Some(value) = self.eval_const_expr(index) else {
+            return;
+        };
+        let too_big = len.is_some_and(|n| n > 0 && value >= n as i64);
+        if value < 0 || too_big {
+            self.diagnostics.borrow_mut().error(
+                "array index in initializer exceeds array bounds".to_string(),
+                span,
+            );
+        }
+    }
+
+    /// The constant-initializer rules for one object (C11 6.7.9p4).
+    ///
+    /// A block-scope `static` object needs a constant initializer, so every
+    /// leaf must be an arithmetic or address constant (`static_init`). A const
+    /// object whose initializer is constant has its value folded, which later
+    /// initializers may use (GCC accepts `const int c = 5; static int v = c;`).
+    fn check_object_initializer(
+        &mut self,
+        decl: &Declaration,
+        init_decl: &InitDeclarator,
+        init: &Initializer,
+    ) {
+        let (non_constant, folds) = {
+            let type_checker = super::type_checker::ExprTypeChecker {
+                symbols: &self.symbol_table,
+                types: &self.result.type_context,
+                functions: &self.result.functions,
+                expr_types: Some(&self.result.expr_types),
+            };
+            let eval = |e: &Expr| self.eval_const_expr(e);
+            let ctype = |e: &Expr| type_checker.infer_expr_ctype(e);
+            let select = |controlling: &Expr, associations: &[GenericAssociation]| {
+                type_checker.generic_selection_index(controlling, associations)
+            };
+            let checker = super::static_init::StaticInitChecker::new(
+                &self.symbol_table,
+                &eval,
+                &ctype,
+                &select,
+            );
+            // An object with static storage (file scope, or a block-scope
+            // `static`) needs a constant initializer (C11 6.7.9p4). An automatic
+            // object does not.
+            let non_constant = if decl.is_static() || self.symbol_table.at_file_scope() {
+                checker.non_constant_leaves(init)
+            } else {
+                Vec::new()
+            };
+            let folds =
+                declares_const_object(decl, init_decl) && checker.is_constant_initializer(init);
+            (non_constant, folds)
+        };
+        for span in non_constant {
+            self.diagnostics
+                .borrow_mut()
+                .error("initializer element is not constant".to_string(), span);
+        }
+        if folds {
+            let value = self.folded_value(decl, init_decl, init);
+            self.symbol_table.mark_folded(&init_decl.name, value);
+        }
+        if matches!(init, Initializer::List(_)) {
+            let ct = type_builder::build_full_ctype(self, &decl.type_spec, &init_decl.derived);
+            self.check_designators(&ct, init, init_decl.span);
+        }
+    }
+
+    /// The value of a const object with a constant scalar initializer, after
+    /// conversion to the object's type (`const unsigned char c = 300;` is 44,
+    /// `const float f = 0.1;` is the nearest float). `None` for aggregates,
+    /// pointers, `long double` and the other types not folded here, and for
+    /// initializers that are not a single constant scalar.
+    fn folded_value(
+        &self,
+        decl: &Declaration,
+        init_decl: &InitDeclarator,
+        init: &Initializer,
+    ) -> Option<FoldedValue> {
+        let expr = match init {
+            Initializer::Expr(e) => e,
+            // `const int c = {5};` is the same scalar initializer.
+            Initializer::List(items) => match items.as_slice() {
+                [item] if item.designators.is_empty() => match &item.init {
+                    Initializer::Expr(e) => e,
+                    Initializer::List(_) => return None,
+                },
+                _ => return None,
+            },
+        };
+        let ct = type_builder::build_full_ctype(self, &decl.type_spec, &init_decl.derived);
+        let evaluator = SemaConstEval {
+            types: &self.result.type_context,
+            symbols: &self.symbol_table,
+            functions: &self.result.functions,
+            const_values: Some(&self.result.const_values),
+            expr_types: Some(&self.result.expr_types),
+        };
+        let value = evaluator.eval_const_expr(expr)?;
+        let is_float = matches!(value, IrConst::F32(_) | IrConst::F64(_));
+        match ct {
+            CType::Float => Some(FoldedValue::Float(f64::from(value.to_f64()? as f32))),
+            CType::Double => Some(FoldedValue::Float(value.to_f64()?)),
+            CType::Bool => {
+                let nonzero = if is_float {
+                    value.to_f64()? != 0.0
+                } else {
+                    value.to_i64()? != 0
+                };
+                Some(FoldedValue::Int(i64::from(nonzero)))
+            }
+            _ if ct.is_integer() && ct.size() > 8 => {
+                // A 128-bit object is carried in the i64 `FoldedValue`, so it
+                // folds only when its exact value fits that carrier. Keeping
+                // the low 64 bits of `(u128)1 << 100 | 3` made `c >> 64` read
+                // the low half (tests/regression/i128_const_local_half.c).
+                // Anything else is left unfolded: a missed fold, never a wrong
+                // one. A float initializer is never folded here.
+                if is_float {
+                    return None;
+                }
+                let v = value.to_i128()?;
+                let fits = if ct.is_signed() {
+                    i128::from(i64::MIN) <= v && v <= i128::from(i64::MAX)
+                } else {
+                    // An unsigned object: a negative source converts to a value
+                    // above i64::MAX, so `0 <= v` is required before the check.
+                    0 <= v && v <= i128::from(i64::MAX)
+                };
+                if fits {
+                    Some(FoldedValue::Int(v as i64))
+                } else {
+                    None
+                }
+            }
+            _ if ct.is_integer() => {
+                // A float initializer of an integer object truncates toward zero.
+                let raw = if is_float {
+                    value.to_f64()? as i64
+                } else {
+                    value.to_i64()?
+                };
+                let (bits, _) = crate::common::const_arith::truncate_and_extend_bits(
+                    raw as u64,
+                    ct.size() * 8,
+                    ct.is_signed(),
+                );
+                Some(FoldedValue::Int(bits as i64))
+            }
+            _ => None,
         }
     }
 
@@ -1337,11 +1645,13 @@ impl SemanticAnalyzer {
                         };
                         if let Some(actual) = checker.infer_expr_ctype(expr) {
                             let actual = self.conversion_source_ctype(expr, actual);
+                            let null_constant = self.is_void_null_pointer_constant(expr);
                             self.check_assignment_compatibility(
                                 &actual,
                                 &expected,
                                 *span,
                                 matches!(expr, Expr::Cast(..)),
+                                null_constant,
                             );
                         }
                     }
@@ -1884,7 +2194,7 @@ impl SemanticAnalyzer {
             // Handle comma expressions: (void)0, __builtin_unreachable()
             Expr::Comma(_, rhs, _) => self.is_noreturn_call(rhs),
             // Handle cast expressions: (void)noreturn_call()
-            Expr::Cast(_, inner, _) => self.is_noreturn_call(inner),
+            Expr::Cast(_, inner, _, _) => self.is_noreturn_call(inner),
             // Handle GCC statement expressions: ({ ...; return val; })
             // A return inside a statement expression returns from the enclosing
             // function, so if the compound body cannot fall through, the
@@ -1916,7 +2226,7 @@ impl SemanticAnalyzer {
                 self.try_eval_constant_bool(inner).map(|v| !v)
             }
             // Cast to another type preserves truthiness
-            Expr::Cast(_, inner, _) => self.try_eval_constant_bool(inner),
+            Expr::Cast(_, inner, _, _) => self.try_eval_constant_bool(inner),
             // Enum constants (e.g., kernel's `true` defined as `enum { false = 0, true = 1 }`)
             Expr::Identifier(name, _) => self
                 .result
@@ -1951,7 +2261,43 @@ impl SemanticAnalyzer {
                 // Check for builtin calls
                 if let Expr::Identifier(name, callee_span) = callee.as_ref() {
                     if builtins::is_builtin(name) {
-                        // Valid builtin call - will be resolved during lowering
+                        // A builtin under its own name carries no prototype, so
+                        // nothing below could check the call and lowering used
+                        // to pass whatever the user wrote straight through to
+                        // the backend's operand indexing -- `_mm_add_ps()` was
+                        // a compiler ICE (AUD-ICE-1) where GCC says "too few
+                        // arguments to function '_mm_add_ps'".  The arity comes
+                        // from the bundled headers
+                        // (scripts/check_intrinsic_arity.py keeps that table in
+                        // step with include/*.h); a builtin whose headers do not
+                        // pin the count down stays unconstrained.
+                        //
+                        // Only undeclared names: once a header is included the
+                        // name has a prototype, the ordinary argument check
+                        // below already reports the mismatch, and reporting it
+                        // twice would be noise.
+                        if self.symbol_table.lookup(name).is_none()
+                            && !self.result.functions.contains_key(name)
+                        {
+                            if let Some(expected) = intrinsic_arity::builtin_intrinsic_arity(name) {
+                                if args.len() != expected {
+                                    self.diagnostics.borrow_mut().error(
+                                        format!(
+                                            "{} arguments to function '{}' (expected {}, have {})",
+                                            if args.len() < expected {
+                                                "too few"
+                                            } else {
+                                                "too many"
+                                            },
+                                            name,
+                                            expected,
+                                            args.len()
+                                        ),
+                                        *callee_span,
+                                    );
+                                }
+                            }
+                        }
                     } else if !self.result.functions.contains_key(name)
                         && self.symbol_table.lookup(name).is_none()
                     {
@@ -2029,6 +2375,7 @@ impl SemanticAnalyzer {
                 if *op == BinOp::Sub {
                     self.check_pointer_subtraction_compat(lhs, rhs, *span);
                 }
+                self.check_pointer_comparison_spaces(op, lhs, rhs, *span);
             }
             Expr::UnaryOp(_, operand, _) => {
                 self.analyze_expr(operand);
@@ -2050,11 +2397,13 @@ impl SemanticAnalyzer {
                     (checker.infer_expr_ctype(lhs), checker.infer_expr_ctype(rhs))
                 {
                     let rhs_ty = self.conversion_source_ctype(rhs, rhs_ty);
+                    let null_constant = self.is_void_null_pointer_constant(rhs);
                     self.check_assignment_compatibility(
                         &rhs_ty,
                         &lhs_ty,
                         *span,
                         matches!(&**rhs, Expr::Cast(..)),
+                        null_constant,
                     );
                 }
             }
@@ -2062,10 +2411,11 @@ impl SemanticAnalyzer {
                 self.analyze_expr(lhs);
                 self.analyze_expr(rhs);
             }
-            Expr::Conditional(cond, then_expr, else_expr, _) => {
+            Expr::Conditional(cond, then_expr, else_expr, span) => {
                 self.analyze_expr(cond);
                 self.analyze_expr(then_expr);
                 self.analyze_expr(else_expr);
+                self.check_conditional_pointer_spaces(then_expr, else_expr, *span);
             }
             Expr::GnuConditional(cond, else_expr, _) => {
                 self.analyze_expr(cond);
@@ -2083,7 +2433,7 @@ impl SemanticAnalyzer {
                 self.analyze_expr(obj);
                 self.check_member_exists(obj, field_name, *span, true);
             }
-            Expr::Cast(_, inner, span) => {
+            Expr::Cast(_, inner, span, _) => {
                 self.analyze_expr(inner);
                 self.check_explicit_cast_address_space(expr, inner, *span);
             }
@@ -2115,8 +2465,10 @@ impl SemanticAnalyzer {
                 self.analyze_expr(lhs);
                 self.analyze_expr(rhs);
             }
-            Expr::CompoundLiteral(_, init, _) => {
+            Expr::CompoundLiteral(ts, init, _) => {
                 self.analyze_initializer(init);
+                let ct = self.type_spec_to_ctype(ts);
+                self.check_initializer_element_spaces(&ct, init);
             }
             Expr::StmtExpr(compound, _) => {
                 self.analyze_compound_stmt(compound);
@@ -2188,6 +2540,19 @@ impl SemanticAnalyzer {
     /// SemaConstEval and record the result in the const_values map.
     /// The lowerer will consult this as an O(1) fast path.
     fn annotate_const_value(&mut self, expr: &Expr) {
+        // Only a folded const object is recorded for an identifier. Enumerators
+        // are not: the lowerer resolves them itself, after its local scopes.
+        if let Expr::Identifier(name, _) = expr {
+            let folded = match self.symbol_table.folded_value(name) {
+                Some(FoldedValue::Int(v)) => Some(IrConst::I64(v)),
+                Some(FoldedValue::Float(v)) => Some(IrConst::F64(v)),
+                None => None,
+            };
+            if let Some(val) = folded {
+                self.result.const_values.insert(expr.id(), val);
+            }
+            return;
+        }
         let evaluator = SemaConstEval {
             types: &self.result.type_context,
             symbols: &self.symbol_table,
@@ -2366,13 +2731,15 @@ impl SemanticAnalyzer {
                     index + 1,
                     arg.span(),
                 );
-                self.check_pointer_argument_compatibility(
-                    &arg_ty,
-                    param_ty,
-                    name,
-                    index + 1,
-                    arg.span(),
-                );
+                if !self.is_void_null_pointer_constant(arg) {
+                    self.check_pointer_argument_compatibility(
+                        &arg_ty,
+                        param_ty,
+                        name,
+                        index + 1,
+                        arg.span(),
+                    );
+                }
             }
         }
     }
@@ -2489,33 +2856,413 @@ impl SemanticAnalyzer {
     /// spaces is a constraint violation. GCC 14.2 rejects `struct c __seg_gs
     /// *p = generic_ptr;` and the reverse, and `long __seg_gs *g = &n;`, each
     /// with "from pointer to non-enclosed address space"; lccc accepted all of
-    /// them and then loaded or stored through the wrong segment. The argument
-    /// path (`pointer_argument_compat`) already enforces the rule. An explicit
-    /// cast is a deliberate conversion, and GCC only warns on it. `void *` gets
-    /// no exemption: GCC 14.2 rejects `void *` <-> `__seg_gs` in both directions
-    /// (return, argument and assignment alike).
+    /// them and then loaded or stored through the wrong segment.
+    ///
+    /// The check looks at the type the right-hand side has AFTER its cast, so
+    /// `gp = (int *)q` is judged on `int *` (rejected, as GCC does) and
+    /// `gp = (int __seg_gs *)q` on `int __seg_gs *` (accepted). The only
+    /// exemption is `null_constant`: a `void *` null pointer constant such as
+    /// `(void *)0` or `NULL`, which GCC accepts for any named pointer. `(int *)0`
+    /// is NOT exempt, matching GCC 14.2.
     fn check_address_space_conversion(
         &self,
         from_ty: &CType,
         to_ty: &CType,
         span: Span,
-        is_explicit_cast: bool,
+        null_constant: bool,
     ) {
-        if is_explicit_cast {
+        if null_constant {
             return;
         }
-        if pointer_space_mismatch(from_ty, to_ty) {
-            let (from_space, to_space) = match (from_ty, to_ty) {
-                (CType::Pointer(_, f), CType::Pointer(_, t)) => (*f, *t),
-                _ => (AddressSpace::Default, AddressSpace::Default),
-            };
+        if let Some(layer) = first_space_mismatch(from_ty, to_ty) {
             self.diagnostics.borrow_mut().error(
                 format!(
-                    "incompatible address space in pointer conversion: cannot convert pointer to '{}' memory to pointer to '{}' memory ('{}' to '{}')",
-                    from_space, to_space, from_ty, to_ty
+                    "incompatible address space in pointer conversion: cannot convert pointer to '{}' memory to pointer to '{}' memory at pointer level {} ('{}' to '{}')",
+                    layer.from_space, layer.to_space, layer.depth, from_ty, to_ty
                 ),
                 span,
             );
+        }
+    }
+
+    /// Is `expr` a null pointer constant of type `void *` (`(void *)0`,
+    /// `((void *)0)`, or `NULL` spelled that way)? GCC accepts exactly this
+    /// shape where a named-address-space pointer is expected. A bare integer
+    /// `0` never reaches the address-space check, since it is not a pointer.
+    fn is_void_null_pointer_constant(&self, expr: &Expr) -> bool {
+        // The predicate is shared with lowering (`const_arith`); sema supplies
+        // the one thing the syntax cannot tell: whether the cast's type,
+        // typedef names included, is an unqualified `void *`.
+        crate::common::const_arith::is_void_pointer_null_constant(
+            expr,
+            &|ts| {
+                if let TypeSpecifier::TypedefName(name) = ts {
+                    if self.qualified_pointee_typedefs.contains(name) {
+                        return false;
+                    }
+                }
+                self.type_spec_to_ctype(ts)
+                    == CType::Pointer(Box::new(CType::Void), AddressSpace::Default)
+            },
+            &|operand| self.eval_const_expr(operand) == Some(0),
+        )
+    }
+
+    /// Brace-list and compound-literal elements convert implicitly into their
+    /// element objects, so each pointer element gets the scalar initializer's
+    /// named-address-space check. GCC 14 rejects `gp_t t[1] = { q };`,
+    /// `struct { gp_t p; } s = { q };` and `((gp_t[]){ q })[0]` with generic
+    /// `q` ("from pointer to non-enclosed address space"); lccc accepted them
+    /// and stored the generic pointer into a segment-typed object.
+    ///
+    /// The walk follows the object model of C11 6.7.9, not a shape guess. One
+    /// braced list keeps a stack of open aggregates (`WalkFrame`), each with the
+    /// index of its next subobject:
+    ///
+    /// * A positional item takes the next subobject of the innermost open
+    ///   aggregate that still has one (p17), popping full aggregates.
+    /// * An expression whose type does not match an aggregate subobject elides
+    ///   the braces and initializes that subobject's first subobject (p20); a
+    ///   braced list for a subobject is a new object of its own.
+    /// * A designator resolves from the closest surrounding braced object (p17).
+    ///   A name also finds members of unnamed struct and union members (6.7.2.2p13),
+    ///   and the stack is rebuilt so the next positional item continues after the
+    ///   designated subobject.
+    /// * An unnamed bit-field is not a member and takes no slot (6.7.2.1p13).
+    ///
+    /// The only stop is a designator that does not resolve, which sema reports as
+    /// an error; the walk then skips that item without guessing a target.
+    fn check_initializer_element_spaces(&self, target: &CType, init: &Initializer) {
+        match init {
+            Initializer::Expr(expr) => self.check_element_space(target, expr),
+            Initializer::List(items) => self.check_braced_element_spaces(target, items),
+        }
+    }
+
+    /// One braced list for the object `target` (see `check_initializer_element_spaces`).
+    fn check_braced_element_spaces(&self, target: &CType, items: &[InitializerItem]) {
+        if !target.is_struct_or_union() && !matches!(target, CType::Array(..)) {
+            // A scalar in braces (`gp_t x = { q };`) initializes from its first element.
+            if let Some(first) = items.first() {
+                self.check_initializer_element_spaces(target, &first.init);
+            }
+            return;
+        }
+        let mut stack = vec![WalkFrame {
+            ty: target.clone(),
+            next: 0,
+        }];
+        for item in items {
+            if item.designators.is_empty() {
+                if let Some(slot) = self.take_initializer_slot(&mut stack) {
+                    self.check_slot_element_spaces(&mut stack, &slot, &item.init);
+                }
+            } else if let Some((frames, leaf)) = self.designated_slot(target, &item.designators) {
+                stack = frames;
+                self.check_slot_element_spaces(&mut stack, &leaf, &item.init);
+            }
+        }
+    }
+
+    /// The type of the next subobject a positional initializer takes. Full
+    /// aggregates are popped, so the next slot belongs to the enclosing object.
+    /// `None` when the braced object is full: an excess element that sema diagnoses.
+    fn take_initializer_slot(&self, stack: &mut Vec<WalkFrame>) -> Option<CType> {
+        loop {
+            let top = stack.last_mut()?;
+            if top.next < self.initializer_slot_count(&top.ty) {
+                let index = top.next;
+                top.next += 1;
+                return self.initializer_slot_type(&top.ty, index);
+            }
+            if stack.len() == 1 {
+                return None;
+            }
+            stack.pop();
+        }
+    }
+
+    /// One initializer for the subobject `slot`. A braced list is a new object.
+    /// An expression initializes `slot` whole when `slot` is a scalar or the
+    /// expression has the same aggregate type (or is an array, e.g. a string);
+    /// otherwise the braces are elided and the expression initializes the first
+    /// subobject of `slot`, recursively (p20). An unknown expression type is
+    /// treated as a whole initializer, which can only skip a check.
+    fn check_slot_element_spaces(
+        &self,
+        stack: &mut Vec<WalkFrame>,
+        slot: &CType,
+        init: &Initializer,
+    ) {
+        match init {
+            Initializer::List(items) => self.check_braced_element_spaces(slot, items),
+            Initializer::Expr(expr) => {
+                if self.expr_initializes_whole(slot, expr) {
+                    self.check_element_space(slot, expr);
+                    return;
+                }
+                stack.push(WalkFrame {
+                    ty: slot.clone(),
+                    next: 0,
+                });
+                if let Some(inner) = self.take_initializer_slot(stack) {
+                    self.check_slot_element_spaces(stack, &inner, init);
+                }
+            }
+        }
+    }
+
+    /// Whether `expr` initializes an aggregate `slot` as a whole, without brace
+    /// elision: the expression has the aggregate's own type or is an array.
+    fn expr_initializes_whole(&self, slot: &CType, expr: &Expr) -> bool {
+        if !slot.is_struct_or_union() && !matches!(slot, CType::Array(..)) {
+            return true;
+        }
+        let checker = super::type_checker::ExprTypeChecker {
+            symbols: &self.symbol_table,
+            types: &self.result.type_context,
+            functions: &self.result.functions,
+            expr_types: Some(&self.result.expr_types),
+        };
+        match checker.infer_expr_ctype(expr) {
+            Some(CType::Struct(_) | CType::Union(_) | CType::Array(..)) | None => true,
+            Some(_) => false,
+        }
+    }
+
+    /// The number of subobjects a positional initializer can take in `ty`:
+    /// array elements (unbounded when the length is unknown), the
+    /// initializable members of a struct, and the first member of a union.
+    fn initializer_slot_count(&self, ty: &CType) -> usize {
+        match ty {
+            CType::Array(_, Some(len)) => *len,
+            CType::Array(_, None) => usize::MAX,
+            CType::Struct(key) | CType::Union(key) => {
+                let layouts = self.result.type_context.borrow_struct_layouts();
+                match layouts.get(&**key) {
+                    Some(layout) if layout.is_union => 1,
+                    Some(layout) => layout
+                        .fields
+                        .iter()
+                        .filter(|f| is_initializer_slot(f))
+                        .count(),
+                    None => 0,
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    /// The type of subobject `index` of `ty` (see `initializer_slot_count`).
+    fn initializer_slot_type(&self, ty: &CType, index: usize) -> Option<CType> {
+        match ty {
+            CType::Array(elem, _) => Some((**elem).clone()),
+            CType::Struct(key) | CType::Union(key) => {
+                let layouts = self.result.type_context.borrow_struct_layouts();
+                let layout = layouts.get(&**key)?;
+                layout
+                    .fields
+                    .iter()
+                    .filter(|f| is_initializer_slot(f))
+                    .nth(index)
+                    .map(|f| f.ty.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// The index path, from a record to a named member, through unnamed
+    /// struct and union members (C11 6.7.2.2p13). `None` if no member matches.
+    fn designated_field_path(&self, ty: &CType, name: &str) -> Option<Vec<usize>> {
+        let (CType::Struct(key) | CType::Union(key)) = ty else {
+            return None;
+        };
+        let layouts = self.result.type_context.borrow_struct_layouts();
+        let layout = layouts.get(&**key)?;
+        let slots: Vec<&StructFieldLayout> = layout
+            .fields
+            .iter()
+            .filter(|f| is_initializer_slot(f))
+            .collect();
+        if let Some(index) = slots.iter().position(|f| f.name == name) {
+            return Some(vec![index]);
+        }
+        for (index, field) in slots.iter().enumerate() {
+            if field.name.is_empty() && field.ty.is_struct_or_union() {
+                if let Some(mut rest) = self.designated_field_path(&field.ty, name) {
+                    rest.insert(0, index);
+                    return Some(rest);
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolves one designator list against the braced object `target`. Returns
+    /// the rebuilt stack (one frame per object on the path, each with the index
+    /// after the designated subobject) and the designated subobject's type.
+    fn designated_slot(
+        &self,
+        target: &CType,
+        designators: &[Designator],
+    ) -> Option<(Vec<WalkFrame>, CType)> {
+        let mut frames = Vec::new();
+        let mut cur = target.clone();
+        for designator in designators {
+            match designator {
+                Designator::Field(name) => {
+                    for index in self.designated_field_path(&cur, name)? {
+                        frames.push(WalkFrame {
+                            ty: cur.clone(),
+                            next: index + 1,
+                        });
+                        cur = self.initializer_slot_type(&cur, index)?;
+                    }
+                }
+                Designator::Index(index) => {
+                    let index = usize::try_from(self.eval_const_expr(index)?).ok()?;
+                    frames.push(WalkFrame {
+                        ty: cur.clone(),
+                        next: index + 1,
+                    });
+                    cur = self.array_element_type(&cur)?;
+                }
+                Designator::Range(_, hi) => {
+                    let hi = usize::try_from(self.eval_const_expr(hi)?).ok()?;
+                    frames.push(WalkFrame {
+                        ty: cur.clone(),
+                        next: hi + 1,
+                    });
+                    cur = self.array_element_type(&cur)?;
+                }
+            }
+        }
+        Some((frames, cur))
+    }
+
+    fn array_element_type(&self, ty: &CType) -> Option<CType> {
+        match ty {
+            CType::Array(elem, _) => Some((**elem).clone()),
+            _ => None,
+        }
+    }
+
+    /// The scalar conversion check for one element expression (see
+    /// `check_initializer_element_spaces`). Only pointer targets have a
+    /// named-space conversion to check.
+    fn check_element_space(&self, target: &CType, expr: &Expr) {
+        if !matches!(target, CType::Pointer(..)) {
+            return;
+        }
+        let checker = super::type_checker::ExprTypeChecker {
+            symbols: &self.symbol_table,
+            types: &self.result.type_context,
+            functions: &self.result.functions,
+            expr_types: Some(&self.result.expr_types),
+        };
+        let Some(from) = checker.infer_expr_ctype(expr) else {
+            return;
+        };
+        let from = self.conversion_source_ctype(expr, from);
+        let null_constant = self.is_void_null_pointer_constant(expr);
+        self.check_address_space_conversion(&from, target, expr.span(), null_constant);
+    }
+
+    /// `==`, `!=`, `<`, ... and `-` between pointers whose pointees live in
+    /// different named address spaces. GCC 14.2 errors with "comparison of pointers to
+    /// disjoint address spaces" (`gp == q`, `gp == fp`, `gp == arr`), and
+    /// accepts a `(void *)0` operand only for `==` and `!=`. Only the top-level
+    /// pointee space is compared, as in GCC: `int __seg_gs **` against
+    /// `int **` is accepted.
+    fn check_pointer_comparison_spaces(&self, op: &BinOp, lhs: &Expr, rhs: &Expr, span: Span) {
+        if !matches!(
+            op,
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Sub
+        ) {
+            return;
+        }
+        // GCC 14.2 exempts a `(void *)0` operand only for `==` and `!=`: the
+        // relational forms are still "comparison of pointers to disjoint
+        // address spaces" (`gp < (void *)0`, `(void *)0 >= gp`).
+        if matches!(op, BinOp::Eq | BinOp::Ne)
+            && (self.is_void_null_pointer_constant(lhs) || self.is_void_null_pointer_constant(rhs))
+        {
+            return;
+        }
+        let checker = super::type_checker::ExprTypeChecker {
+            symbols: &self.symbol_table,
+            types: &self.result.type_context,
+            functions: &self.result.functions,
+            expr_types: Some(&self.result.expr_types),
+        };
+        let (Some(lt), Some(rt)) = (checker.infer_expr_ctype(lhs), checker.infer_expr_ctype(rhs))
+        else {
+            return;
+        };
+        // An array operand decays to a pointer to its element; a generic
+        // array is a pointer into the default space.
+        let decay = |ct: CType| match ct {
+            CType::Array(elem, _) => CType::Pointer(elem, AddressSpace::Default),
+            other => other,
+        };
+        let lt = decay(self.conversion_source_ctype(lhs, lt));
+        let rt = decay(self.conversion_source_ctype(rhs, rt));
+        if let (CType::Pointer(_, ls), CType::Pointer(_, rs)) = (&lt, &rt) {
+            if ls != rs {
+                let what = if *op == BinOp::Sub {
+                    format!(
+                        "invalid operands to binary - (pointers into disjoint address spaces: '{}' and '{}')",
+                        lt, rt
+                    )
+                } else {
+                    format!(
+                        "comparison of pointers to disjoint address spaces ('{}' and '{}')",
+                        lt, rt
+                    )
+                };
+                self.diagnostics.borrow_mut().error(what, span);
+            }
+        }
+    }
+
+    /// `c ? p : q` with pointer operands in different named address spaces is
+    /// an error ("pointers to disjoint address spaces used in conditional
+    /// expression", GCC 14.2). A null pointer constant operand is exempt, as in
+    /// `c ? gp : (void *)0`, and an array decays to a pointer as usual.
+    fn check_conditional_pointer_spaces(&self, then_expr: &Expr, else_expr: &Expr, span: Span) {
+        if self.is_void_null_pointer_constant(then_expr)
+            || self.is_void_null_pointer_constant(else_expr)
+        {
+            return;
+        }
+        let checker = super::type_checker::ExprTypeChecker {
+            symbols: &self.symbol_table,
+            types: &self.result.type_context,
+            functions: &self.result.functions,
+            expr_types: Some(&self.result.expr_types),
+        };
+        let (Some(tt), Some(et)) = (
+            checker.infer_expr_ctype(then_expr),
+            checker.infer_expr_ctype(else_expr),
+        ) else {
+            return;
+        };
+        let decay = |ct: CType| match ct {
+            CType::Array(elem, _) => CType::Pointer(elem, AddressSpace::Default),
+            other => other,
+        };
+        let tt = decay(self.conversion_source_ctype(then_expr, tt));
+        let et = decay(self.conversion_source_ctype(else_expr, et));
+        if let (CType::Pointer(_, ts), CType::Pointer(_, es)) = (&tt, &et) {
+            if ts != es {
+                self.diagnostics.borrow_mut().error(
+                    format!(
+                        "pointers to disjoint address spaces used in conditional expression ('{}' and '{}')",
+                        tt, et
+                    ),
+                    span,
+                );
+            }
         }
     }
 
@@ -2657,6 +3404,7 @@ impl SemanticAnalyzer {
         to_ty: &CType,
         span: Span,
         is_explicit_cast: bool,
+        null_constant: bool,
     ) {
         self.check_pointer_float_conversion(from_ty, to_ty, span);
         let incompatible = match (from_ty, to_ty) {
@@ -2678,7 +3426,7 @@ impl SemanticAnalyzer {
                 span,
             );
         }
-        self.check_address_space_conversion(from_ty, to_ty, span, is_explicit_cast);
+        self.check_address_space_conversion(from_ty, to_ty, span, null_constant);
         // GCC/clang suppress the incompatible-pointer-types diagnostic when the
         // source is an EXPLICIT cast (C-style `(T*)expr`): the cast is an
         // intentional conversion, so emitting a hard error here breaks
@@ -2916,6 +3664,8 @@ impl SemanticAnalyzer {
                     bit_width,
                     alignment: field_alignment,
                     is_packed: f.is_packed,
+                    base_volatile: f.base_volatile,
+                    object_volatile: f.object_volatile,
                 })
             })
             .collect()
@@ -3097,6 +3847,16 @@ fn record_layouts_correspond(
 /// - typeof: returns CType::Int (sema doesn't have full expr type resolution yet)
 
 impl type_builder::TypeConvertContext for SemanticAnalyzer {
+    fn typeof_object_space(&self, expr: &Expr) -> AddressSpace {
+        let checker = super::type_checker::ExprTypeChecker {
+            symbols: &self.symbol_table,
+            types: &self.result.type_context,
+            functions: &self.result.functions,
+            expr_types: Some(&self.result.expr_types),
+        };
+        checker.lvalue_address_space(expr)
+    }
+
     fn resolve_typedef(&self, name: &str) -> CType {
         if let Some(resolved) = self.result.type_context.typedefs.get(name) {
             resolved.clone()
@@ -3553,17 +4313,37 @@ fn pointer_argument_compat(from: &CType, to: &CType) -> PtrCompat {
     }
 }
 
-/// Does converting `from` to `to` change a named address space anywhere along
-/// the pointer chain? Each pointer layer's space is the space of the memory it
-/// addresses. Arrays are stepped over on both sides, so an array of
-/// `__seg_gs` pointers keeps its inner space. The check recurses through
-/// pointees, matching GCC's named-address-space rule for pointer conversions.
-fn pointer_space_mismatch(from: &CType, to: &CType) -> bool {
-    match (from, to) {
-        (CType::Pointer(f, fs), CType::Pointer(t, ts)) => fs != ts || pointer_space_mismatch(f, t),
-        (CType::Array(f, _), CType::Array(t, _)) => pointer_space_mismatch(f, t),
-        _ => false,
+/// The first pointer layer, outermost first, whose named address space
+/// changes in a conversion from `from` to `to`. Each pointer layer's space is
+/// the space of the memory it addresses. Arrays are stepped over on both
+/// sides, so an array of `__seg_gs` pointers keeps its inner space. The
+/// diagnostic prints this layer's spaces, not the outermost ones.
+struct SpaceMismatch {
+    /// 1-based pointer level, counting the outermost pointer as level 1.
+    depth: usize,
+    from_space: AddressSpace,
+    to_space: AddressSpace,
+}
+
+fn first_space_mismatch(from: &CType, to: &CType) -> Option<SpaceMismatch> {
+    fn walk(from: &CType, to: &CType, depth: usize) -> Option<SpaceMismatch> {
+        match (from, to) {
+            (CType::Pointer(f, fs), CType::Pointer(t, ts)) => {
+                if fs != ts {
+                    Some(SpaceMismatch {
+                        depth,
+                        from_space: *fs,
+                        to_space: *ts,
+                    })
+                } else {
+                    walk(f, t, depth + 1)
+                }
+            }
+            (CType::Array(f, _), CType::Array(t, _)) => walk(f, t, depth),
+            _ => None,
+        }
     }
+    walk(from, to, 1)
 }
 
 #[cfg(test)]
@@ -3598,6 +4378,8 @@ mod record_layouts_correspond_tests {
             bit_width: None,
             sso: crate::common::types::SsoMode::None,
             sso_storage_ty: None,
+            base_volatile: false,
+            object_volatile: false,
         }
     }
 
@@ -4418,4 +5200,43 @@ mod kr_prototype_tests {
         assert!(analyze("int outer(void) { int old(p) short *p; { return *p; } short a[2]; return old(&a); }").1.is_ok());
         assert!(analyze("int old(p) short *p; { return *p; } int use(void) { short a[2]; return (&old)(&a); }").1.is_ok());
     }
+}
+
+/// Whether `init_decl` declares a const-qualified object (C11 6.7.3p5): the
+/// base type is const when the declarator has no pointer, and the outermost
+/// pointer is const when it has one (`const int *p` is not a const object).
+fn declares_const_object(decl: &Declaration, init_decl: &InitDeclarator) -> bool {
+    let has_pointer = init_decl
+        .derived
+        .iter()
+        .any(|d| matches!(d, DerivedDeclarator::Pointer(_)));
+    // A volatile object is never a folded constant: every read of it is an
+    // access that must reach memory (C11 6.7.3p7), so `const volatile` objects
+    // are not recorded here. For a pointer declarator only the object's own
+    // qualifier counts (`volatile int *p` is a non-volatile pointer).
+    let volatile_object = if has_pointer {
+        init_decl.attrs.object_volatile
+    } else {
+        decl.is_volatile() || init_decl.attrs.object_volatile
+    };
+    if volatile_object {
+        return false;
+    }
+    if has_pointer {
+        decl.is_pointer_const()
+    } else {
+        decl.is_const()
+    }
+}
+
+/// An open aggregate in a braced initializer: its type and the index of the
+/// next subobject a positional initializer takes (see `check_braced_element_spaces`).
+struct WalkFrame {
+    ty: CType,
+    next: usize,
+}
+
+/// A member that takes an initializer slot. Unnamed bit-fields do not (C11 6.7.2.1p13).
+fn is_initializer_slot(field: &StructFieldLayout) -> bool {
+    !(field.name.is_empty() && field.bit_width.is_some())
 }

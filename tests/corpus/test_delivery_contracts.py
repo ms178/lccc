@@ -46,6 +46,30 @@ class DeliveryContracts(unittest.TestCase):
         self.assertEqual(result['zip_sha256'], d.digest(self.old))
         self.assertEqual(stat.S_IMODE(self.old.stat().st_mode), 0o644)
 
+    def test_excluded_subtrees_do_not_count_against_the_budget(self):
+        """A workspace that also holds a checkout/build tree must still publish.
+
+        The census models what the delivery ADDS to the visible workspace, so a
+        subtree passed as an exclusion (the checkout, the artifact zone) and the
+        harness-excluded directory names (target/, caches) are pruned instead of
+        failing the run. Without the exclusions the same workspace is refused -
+        which is the property that keeps the check meaningful.
+        """
+        (self.root/'checkout'/'src').mkdir(parents=True)
+        (self.root/'checkout'/'src'/'huge.rs').write_bytes(b'x' * 64 * 1024)
+        (self.root/'target').mkdir()
+        (self.root/'target'/'blob').write_bytes(b'y' * 64 * 1024)
+        small = 16 * 1024  # the delivery outputs plus the patch fit; the trees do not
+
+        with self.assertRaises(d.DeliveryError):
+            self.publish(max_bytes=small)
+
+        result = self.publish(max_bytes=small, exclude_dirs=frozenset({'target'}),
+                              exclude_paths=(self.root/'checkout',))
+        self.assertLess(result['workspace']['bytes'], small)
+        self.assertEqual(result['patch_sha256'],
+                         hashlib.sha256(self.patch.read_bytes()).hexdigest())
+
     def test_readme_never_upgrades_an_ungated_or_partial_status(self):
         for status in ('UNGATED', 'ci_local-fast-PARTIAL-NOT-DELIVERABLE',
                        'ci_local-fast-PASS@debian-13'):

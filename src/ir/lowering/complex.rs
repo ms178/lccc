@@ -1040,7 +1040,7 @@ impl Lowerer {
             // Unary plus
             Expr::UnaryOp(UnaryOp::Plus, inner, _) => self.eval_complex_const(inner),
             // Cast to complex
-            Expr::Cast(_, inner, _) => self.eval_complex_const(inner),
+            Expr::Cast(_, inner, _, _) => self.eval_complex_const(inner),
             // Real number literal -> (val, 0)
             _ => {
                 if let Some(val) = self.eval_const_expr(expr) {

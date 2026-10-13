@@ -130,3 +130,8 @@ work/
 /docs/.edg-changes.lock
 /tests/corpus/clang-c/.index.lock
 /tests/corpus/.corpus-publish.lock
+
+# Audit hygiene (AUD-HYGIENE-1): per-clone tool permissions and the snapshot
+# tool's anchor file are local state, never source.
+.claude/settings.local.json
+/.base_ref

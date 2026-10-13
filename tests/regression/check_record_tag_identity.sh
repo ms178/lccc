@@ -74,9 +74,9 @@ if [[ -n "${GCC:-}" ]]; then
     candidates=("$GCC")
 else
     # Newest first: the c23 rows need GCC >= 14, and a pinned newer toolchain
-    # beats the image default when both are present. CI installs gcc-14
+    # beats the image default when both are present. CI installs gcc-16
     # explicitly so this list resolves on a hosted runner too.
-    candidates=(gcc-16 gcc-15 gcc-14 gcc)
+    candidates=(gcc-16 gcc)
 fi
 GCC=''
 for cand in "${candidates[@]}"; do
@@ -92,7 +92,7 @@ if [[ -z "$GCC" ]]; then
          >&2
     echo "  compare a rejection of the FLAG against a rejection of the" \
          >&2
-    echo "  PROGRAM.  Install gcc-14 or point GCC= at a suitable compiler." >&2
+    echo "  PROGRAM.  Install gcc-16 or point GCC= at a suitable compiler." >&2
     exit 1
 fi
 ORACLE_VERSION=$("$GCC" --version 2>/dev/null)

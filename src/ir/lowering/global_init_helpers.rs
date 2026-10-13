@@ -58,7 +58,7 @@ pub(super) fn expr_contains_string_literal(expr: &Expr) -> bool {
         Expr::BinaryOp(_, lhs, rhs, _) => {
             expr_contains_string_literal(lhs) || expr_contains_string_literal(rhs)
         }
-        Expr::Cast(_, inner, _) => expr_contains_string_literal(inner),
+        Expr::Cast(_, inner, _, _) => expr_contains_string_literal(inner),
         _ => false,
     }
 }
@@ -116,7 +116,7 @@ fn expr_might_be_addr(expr: &Expr, enum_constants: &FxHashMap<String, i64>) -> b
         // Member access might be array-to-pointer decay (e.g., s.arr where arr is an array field)
         Expr::MemberAccess(_, _, _) => true,
         // Cast of an address expression
-        Expr::Cast(_, inner, _) => expr_might_be_addr(inner, enum_constants),
+        Expr::Cast(_, inner, _, _) => expr_might_be_addr(inner, enum_constants),
         // Binary ops on addresses (e.g., &x + offset, arr + n)
         Expr::BinaryOp(_, lhs, rhs, _) => {
             expr_might_be_addr(lhs, enum_constants) || expr_might_be_addr(rhs, enum_constants)

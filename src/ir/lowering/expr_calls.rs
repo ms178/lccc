@@ -219,6 +219,21 @@ impl Lowerer {
         // buffer ADDRESS, and the 16-byte carrier value must be loaded out of
         // it (see the sret result handling below).
         let mut f128_sret_ret = false;
+        // AUD-VABI-1: the indirect-call paths below have no FuncSig to read, so
+        // the "ONE 16-byte %xmm" carrier for a vector-returning indirect call
+        // has to come from the callee expression's own function type.  Without
+        // it `pick_impl(0)(a, b, c)` read the result from %rdx:%rax while the
+        // callee (whatever compiled it) had written %xmm0.
+        let indirect_vector_carrier = if crate::common::types::target_elf_machine() == 62 {
+            self.call_return_ctype(effective_func)
+                .and_then(|ct| ct.sysv_vector_carrier())
+        } else {
+            None
+        };
+        let (indirect_ret_classes, indirect_ret_is_one_xmm) = match &indirect_vector_carrier {
+            Some((classes, one_xmm)) => (classes.clone(), *one_xmm),
+            None => (Vec::new(), false),
+        };
         let (sret_size, two_reg_size, call_ret_classes) =
             if let Expr::Identifier(name, _) = stripped_func {
                 if self.is_func_ptr_variable(name) {
@@ -228,7 +243,7 @@ impl Lowerer {
                     match self.get_call_return_struct_size(effective_func) {
                         Some(size) => {
                             let (s, t) = Self::classify_struct_return(size);
-                            (s, t, Vec::new())
+                            (s, t, indirect_ret_classes.clone())
                         }
                         None => (None, None, Vec::new()),
                     }
@@ -250,7 +265,7 @@ impl Lowerer {
                 match self.get_call_return_struct_size(effective_func) {
                     Some(size) => {
                         let (s, t) = Self::classify_struct_return(size);
-                        (s, t, Vec::new())
+                        (s, t, indirect_ret_classes.clone())
                     }
                     None => (None, None, Vec::new()),
                 }
@@ -368,17 +383,26 @@ impl Lowerer {
         // Unknown/unprototyped/variadic-tail/complex-callee positions keep
         // the argument expression's own type (covers indirect calls and
         // variadic positions, as before).
+        // AUD-VABI-1: a 16-byte VECTOR argument is carried in ONE 16-byte xmm
+        // register just like _Float128 (its eightbytes are SSE + SSEUP, the
+        // upper half of the same register).  Without this the [Sse, Sse]
+        // classes below send it through the two-register struct path, so a
+        // gcc-compiled callee read the vector from xmm0 while lccc's caller
+        // had put its halves in a GP pair.
+        let one_xmm_carrier = |ct: &CType| -> bool {
+            ct.sysv_vector_carrier().is_some_and(|(_, one_xmm)| one_xmm)
+                && crate::common::types::target_elf_machine() == 62
+        };
         let struct_arg_is_f128_sse: Vec<bool> = args
             .iter()
             .enumerate()
             .map(|(i, a)| {
                 if let Some(p) = param_ctypes_for_decompose.as_ref().and_then(|v| v.get(i)) {
-                    return matches!(p, CType::Float128 | CType::Decimal128);
+                    return matches!(p, CType::Float128 | CType::Decimal128) || one_xmm_carrier(p);
                 }
-                matches!(
-                    self.get_expr_ctype(a),
-                    Some(CType::Float128) | Some(CType::Decimal128)
-                )
+                self.get_expr_ctype(a).is_some_and(|ct| {
+                    matches!(ct, CType::Float128 | CType::Decimal128) || one_xmm_carrier(&ct)
+                })
             })
             .collect();
         let mut struct_arg_is_f128_sse = struct_arg_is_f128_sse;
@@ -449,6 +473,10 @@ impl Lowerer {
             two_reg_size,
             sret_size,
             call_ret_classes,
+            // AUD-VABI-1: "the indirect callee returns a 16-byte vector in ONE
+            // %xmm" -- derived from the callee expression's function type,
+            // since these paths have no FuncSig to consult.
+            indirect_ret_is_one_xmm,
         );
 
         // After call to noreturn function, emit unreachable and start dead block.
@@ -1280,6 +1308,7 @@ impl Lowerer {
         two_reg_size: Option<usize>,
         sret_size: Option<usize>,
         call_ret_classes: Vec<crate::common::types::EightbyteClass>,
+        indirect_ret_is_one_xmm: bool,
     ) -> IrType {
         let mut indirect_ret_ty = self.get_func_ptr_return_ir_type(func);
         if two_reg_size.is_some() {
@@ -1313,7 +1342,7 @@ impl Lowerer {
                             is_pure: false,
                             is_const: false,
                             ret_eightbyte_classes: call_ret_classes,
-                            ret_is_f128_sse: false,
+                            ret_is_f128_sse: indirect_ret_is_one_xmm,
                         },
                     });
                     indirect_ret_ty
@@ -1423,7 +1452,9 @@ impl Lowerer {
                         is_pure: false,
                         is_const: false,
                         ret_eightbyte_classes: call_ret_classes,
-                        ret_is_f128_sse: false,
+                        // AUD-VABI-1: the same carrier rule as the other
+                        // indirect arms -- see `indirect_vector_carrier`.
+                        ret_is_f128_sse: indirect_ret_is_one_xmm,
                     },
                 });
                 indirect_ret_ty
@@ -1532,7 +1563,9 @@ impl Lowerer {
                             is_pure: false,
                             is_const: false,
                             ret_eightbyte_classes: call_ret_classes,
-                            ret_is_f128_sse: false,
+                            // AUD-VABI-1: the same carrier rule as the other
+                            // indirect arms -- see `indirect_vector_carrier`.
+                            ret_is_f128_sse: indirect_ret_is_one_xmm,
                         },
                     });
                     indirect_ret_ty

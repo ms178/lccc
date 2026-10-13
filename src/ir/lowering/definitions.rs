@@ -96,6 +96,9 @@ pub(super) struct LocalInfo {
     /// variable's own accesses are volatile; for pointer locals the pointee
     /// accesses are (when the pointee is not itself a pointer).
     pub base_type_volatile: bool,
+    /// Whether the variable object itself is volatile (`int *volatile p`).
+    /// See `object_access_is_volatile`.
+    pub object_volatile: bool,
     /// Pointed-to signature when this binding is a function pointer whose
     /// declarator spelled the parameter list (`int (*fp)(void *, long)`,
     /// function-typedef parameters).  It lives on the binding itself so it
@@ -135,6 +138,8 @@ pub(super) struct GlobalInfo {
     /// DeclAnalysis::base_type_volatile).  `volatile` globals (jiffies, MMIO
     /// descriptors) must perform every load and store.
     pub base_type_volatile: bool,
+    /// Whether the object itself is volatile (see `LocalInfo::object_volatile`).
+    pub object_volatile: bool,
 }
 
 impl std::ops::Deref for GlobalInfo {
@@ -192,6 +197,9 @@ pub(super) struct DeclAnalysis {
     /// accesses are volatile; for pointer declarations the POINTEE accesses
     /// (deref) are volatile when exactly one pointer level was added.
     pub base_type_volatile: bool,
+    /// Whether the object itself is volatile: the qualifier after the
+    /// declarator's last `*`, or the specifier's when nothing is derived.
+    pub object_volatile: bool,
     /// Whether this is a _Bool variable (not pointer or array of _Bool).
     pub is_bool: bool,
     /// The element IR type for arrays (accounts for typedef'd arrays).
@@ -485,6 +493,7 @@ impl GlobalInfo {
             var: VarInfo::from_analysis(da),
             asm_register: None,
             base_type_volatile: da.base_type_volatile,
+            object_volatile: da.object_volatile,
         }
     }
 }
@@ -505,6 +514,7 @@ impl LocalInfo {
             cleanup_fn: None,
             is_const,
             base_type_volatile: da.base_type_volatile,
+            object_volatile: da.object_volatile,
             fptr_sig: None,
         }
     }
@@ -524,7 +534,25 @@ impl LocalInfo {
             cleanup_fn: None,
             is_const,
             base_type_volatile: da.base_type_volatile,
+            object_volatile: da.object_volatile,
             fptr_sig: None,
         }
+    }
+}
+
+/// Whether an access to a variable's own object is volatile. For a pointer
+/// variable that is the object qualifier (`int *volatile p`, which the
+/// pointee-qualifier `base_type_volatile` of `volatile int *p` does not cover).
+/// Pointee accesses use `base_type_volatile` and are decided elsewhere. Other
+/// types have their object qualifier in `base_type_volatile`.
+pub(super) fn object_access_is_volatile(
+    base_type_volatile: bool,
+    object_volatile: bool,
+    c_type: Option<&CType>,
+) -> bool {
+    if matches!(c_type, Some(CType::Pointer(..))) {
+        object_volatile
+    } else {
+        base_type_volatile
     }
 }

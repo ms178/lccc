@@ -321,6 +321,6 @@ each one is a contract build systems rely on, and each now has a gate:
 | script | purpose | gate |
 |---|---|---|
 | `audit_census.py` | static ratchet over panic-class sites, `unsafe`, giant functions, `CCC_*`/`LCCC_*` knobs, `#[ignore]`s | `ci_local.sh` (fast), CI | 
-| `repros_replay.py` | replays every `artifacts/repros/*.c` against GCC (ISA-matched) | `ci_local.sh` (fast), CI |
+| `check_repro_replay.py` | replays every `artifacts/repros/*.c` against GCC with the ISA pinned on BOTH compilers (see `artifacts/repros/README.md`); `repros_replay.py` was the pre-merge variant and is gone | `ci_local.sh` (fast), CI |
 | `verify_fib_perf.sh` | Fibonacci rec2iter perf probe (moved from `tests/`) | manual |
 | `../tools/workspace_dirs.sh` | resolves the persisted workspace dir (`LCCC_WORKSPACE`, `/home/user`, `/mnt/user-data/outputs`) | sourced by the snapshot tool |

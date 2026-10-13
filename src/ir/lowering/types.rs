@@ -32,7 +32,7 @@ impl Lowerer {
         match ts {
             TypeSpecifier::TypedefName(name) => self.types.typedefs.get(name).cloned(),
             TypeSpecifier::TypeofType(inner) => self.resolve_typedef_ctype(inner),
-            TypeSpecifier::Typeof(expr) => self.get_expr_ctype(expr),
+            TypeSpecifier::Typeof(expr, _) => self.get_expr_ctype(expr),
             _ => None,
         }
     }
@@ -104,7 +104,7 @@ impl Lowerer {
     /// is handled by resolving the typedef to CType first.
     pub(super) fn resolve_typeof(&self, ts: &TypeSpecifier) -> TypeSpecifier {
         match ts {
-            TypeSpecifier::Typeof(expr) => {
+            TypeSpecifier::Typeof(expr, _) => {
                 // For _Generic selections inside typeof(), resolve fresh to avoid stale cache.
                 let ctype =
                     if let Expr::GenericSelection(controlling, associations, _) = expr.as_ref() {
@@ -283,7 +283,7 @@ impl Lowerer {
                     IrType::I64
                 }
             }
-            TypeSpecifier::Typeof(expr) => {
+            TypeSpecifier::Typeof(expr, _) => {
                 // For _Generic selections inside typeof(), resolve fresh to avoid stale cache.
                 let ctype =
                     if let Expr::GenericSelection(controlling, associations, _) = expr.as_ref() {
@@ -483,6 +483,8 @@ impl Lowerer {
                     bit_width,
                     alignment: field_alignment,
                     is_packed: f.is_packed,
+                    base_volatile: f.base_volatile,
+                    object_volatile: f.object_volatile,
                 })
             })
             .collect();
@@ -524,7 +526,7 @@ impl Lowerer {
             }
         }
         // Handle typeof(expr) by resolving the expression's type
-        if let TypeSpecifier::Typeof(expr) = ts {
+        if let TypeSpecifier::Typeof(expr, _) = ts {
             if let Some(ctype) = self.get_expr_ctype(expr) {
                 return ctype.size_ctx(&*self.types.borrow_struct_layouts());
             }
@@ -570,7 +572,7 @@ impl Lowerer {
             return natural;
         }
         // Handle typeof(expr) by resolving the expression's type
-        if let TypeSpecifier::Typeof(expr) = ts {
+        if let TypeSpecifier::Typeof(expr, _) = ts {
             if let Some(ctype) = self.get_expr_ctype(expr) {
                 return self.ctype_align(&ctype);
             }
@@ -617,7 +619,7 @@ impl Lowerer {
             }
             return natural;
         }
-        if let TypeSpecifier::Typeof(expr) = ts {
+        if let TypeSpecifier::Typeof(expr, _) = ts {
             if let Some(ctype) = self.get_expr_ctype(expr) {
                 return ctype.preferred_align_ctx(&*self.types.borrow_struct_layouts());
             }

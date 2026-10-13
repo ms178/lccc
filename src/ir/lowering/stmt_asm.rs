@@ -488,7 +488,7 @@ impl Lowerer {
                     self.extract_symbol_from_global_addr_expr(expr)
                 }
             }
-            Expr::Cast(_, inner, _) => self.extract_symbol_name(inner),
+            Expr::Cast(_, inner, _, _) => self.extract_symbol_name(inner),
             _ => None,
         }
     }
@@ -500,7 +500,7 @@ impl Lowerer {
     fn peel_to_string_literal(expr: &Expr) -> Option<String> {
         match expr {
             Expr::StringLiteral(s, _) => Some(s.clone()),
-            Expr::Cast(_, inner, _) => Self::peel_to_string_literal(inner),
+            Expr::Cast(_, inner, _, _) => Self::peel_to_string_literal(inner),
             _ => None,
         }
     }
@@ -519,7 +519,7 @@ impl Lowerer {
                     .or_else(|| self.extract_mem_operand_symbol(inner))
             }
             // Cast: look through it
-            Expr::Cast(_, inner, _) => self.extract_mem_operand_symbol(inner),
+            Expr::Cast(_, inner, _, _) => self.extract_mem_operand_symbol(inner),
             // Direct identifier: if it's a global, return its name
             Expr::Identifier(name, _) => {
                 if self.is_global_or_function(name) {
@@ -695,7 +695,9 @@ impl Lowerer {
             // A pointer-typed cast may itself carry the qualifier
             // (`(T __seg_gs *)p`); get_addr_space_of_ptr_expr checks the cast
             // type first and falls through to the operand.
-            Expr::Cast(TypeSpecifier::Pointer(..), _, _) => self.get_addr_space_of_ptr_expr(expr),
+            Expr::Cast(TypeSpecifier::Pointer(..), _, _, _) => {
+                self.get_addr_space_of_ptr_expr(expr)
+            }
             // Everything else — identifier, member access, array element,
             // address-of — denotes an OBJECT: the segment is the object's
             // declared address space. This is the "+m" shape of the kernel's

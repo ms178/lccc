@@ -10,9 +10,9 @@
 //! AVX2/SHA path on a CPU that has them.
 //!
 //! LCCC used to fold the builtin against the *effective target* feature set
-//! ([`crate::common::isa_features`]).  That was wrong twice over, and both
-//! errors were measured against GCC 16.2, Clang 23.1 and ICX (see
-//! `scripts/godbolt.py` and the census in `tests/data/`):
+//! (the old static fold in `crate::common::isa_features`).  That was wrong
+//! twice over, and both errors were measured against GCC 16.2, Clang 23.1 and
+//! ICX (see `scripts/godbolt.py` and the census in `tests/data/`):
 //!
 //! * `-march=`/`-mno-*` describe the code the compiler may *emit*, not what
 //!   the CPU running the program supports: all three reference compilers keep

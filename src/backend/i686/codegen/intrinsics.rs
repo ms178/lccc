@@ -1315,7 +1315,11 @@ impl I686Codegen {
             | IntrinsicOp::VecSmlalLoI32x4
             | IntrinsicOp::VecSmlalHiI32x4 => {
                 // These are x86-64/AArch64-specific register-based vector operations
-                unimplemented!("Register-based vector intrinsics not implemented for i686");
+                // i686 has no lowering for these register-shaped 128-bit
+                // vector ops (its vectors live in stack slots); reaching this
+                // arm means the target gate let one through.  Trap -- an ICE
+                // tells the user nothing about their program.
+                self.emit_unreachable();
             }
 
             // ==================== AVX / AVX2 (VEX, 256-bit) ====================

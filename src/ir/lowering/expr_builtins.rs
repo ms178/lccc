@@ -632,6 +632,16 @@ impl Lowerer {
             self.target,
             crate::backend::Target::X86_64 | crate::backend::Target::I686
         ) {
+            // AUD-CPU-1 (3): a name from the x86 feature set is a question this
+            // target cannot answer at all, and silently folding it to 0 turns
+            // `__builtin_cpu_supports("avx2") ? fast() : slow()` into a silent
+            // slow path (GCC diagnoses the name on every non-x86 target).  A
+            // name from another architecture's set keeps the conservative 0:
+            // LCCC does not model those sets yet, and rejecting them would turn
+            // accepted GCC code into a compile error.
+            if crate::common::x86_features::X86Feature::parse(name).is_some() {
+                return Err(format!("parameter to builtin not valid: {name}"));
+            }
             return Ok(CpuSupport::Unsupported);
         }
         match crate::common::cpu_probe::lookup(name) {
@@ -1326,6 +1336,7 @@ impl Lowerer {
             | BuiltinIntrinsic::X86MulloEpi32
             | BuiltinIntrinsic::X86Pcmpgtb256
             | BuiltinIntrinsic::X86CastReinterpret => {
+                self.check_x86_intrinsic_feature(intrinsic, name, args);
                 self.lower_x86_intrinsic(intrinsic, name, args)
             }
             // __builtin_shufflevector(v1, v2, i0, i1, i2, i3): 4-lane 32-bit
@@ -1822,7 +1833,7 @@ impl Lowerer {
                 !matches!(op, UnaryOp::PreInc | UnaryOp::PreDec)
                     && self.constant_query_can_lower(inner)
             }
-            Expr::Cast(_, inner, _) => self.constant_query_can_lower(inner),
+            Expr::Cast(_, inner, _, _) => self.constant_query_can_lower(inner),
             Expr::Conditional(cond, yes, no, _) => {
                 self.constant_query_can_lower(cond)
                     && self.constant_query_can_lower(yes)
@@ -2054,6 +2065,14 @@ impl Lowerer {
     /// equally correct. gcc.c-torture pr85331 (V2DF reverse) and pr94591
     /// (V2SI identity) drive the rules.
     fn lower_shuffle(&mut self, args: &[Expr]) -> Option<Operand> {
+        // Every rejection below used to be a `panic!`, i.e. an ICE on input a
+        // user can write: a mask whose element count differs from the vector's
+        // (`v8si` mask for a `v4si`), a non-vector mask, a non-vector first
+        // operand. GCC diagnoses all three; so does this now. The returned
+        // `None` means "not lowered as this builtin", and the caller's
+        // ordinary-call fallback cannot panic. Reporting with the *operand's*
+        // span matters: `lower_shuffle` is reached from a nested expression,
+        // and a location-less error in a 50k-line TU is not actionable.
         let (vec_args, mask_expr): (&[Expr], &Expr) = match args.len() {
             2 => (&args[..1], &args[1]),
             3 => (&args[..2], &args[2]),
@@ -2199,7 +2218,19 @@ impl Lowerer {
                 seg_override: AddressSpace::Default,
             });
             // m = mask_elem % total_selectable (N for 2-arg, 2N for 3-arg)
-            let selectable = n_elems * if vec_args.len() == 2 { 1 } else { 2 };
+            // `vec_args` holds the VECTOR arguments only, so its length is 1
+            // for the 2-argument form `(v, mask)` and 2 for the 3-argument
+            // form `(v1, v2, mask)`.  The selectable index range is
+            // accordingly N (the 2-argument form behaves as if both operands
+            // were `v`, so the index is reduced modulo N) or 2N (the index
+            // picks a lane of the concatenation).  Both this multiplier and
+            // the select below were keyed on the wrong length: `== 2` meant a
+            // 2-argument mask was reduced modulo 2N -- letting a mask element
+            // >= N read past the vector -- and a 3-argument mask modulo N,
+            // which made the "is it the first vector?" test below a constant
+            // true.  Together they compiled `__builtin_shuffle(a, b,
+            // (v4si){4, 5, 6, 7})` into `a` unchanged.
+            let selectable = n_elems * if vec_args.len() >= 2 { 2 } else { 1 };
             let m_idx = if selectable > 0 && (selectable & (selectable - 1)) == 0 {
                 let and_val = self.fresh_value();
                 self.emit(Instruction::BinOp {
@@ -2222,7 +2253,7 @@ impl Lowerer {
                 rem_val
             };
             // 3-arg form: base = m < N ? v1 : v2; offset within base = m mod N.
-            let (base, elem_idx) = if vec_args.len() == 3 {
+            let (base, elem_idx) = if vec_args.len() >= 2 {
                 let in_first = self.fresh_value();
                 self.emit(Instruction::Cmp {
                     dest: in_first,
@@ -2338,6 +2369,7 @@ impl Lowerer {
                 args,
                 16,
             );
+            return None;
         }
         let v1 = self.vec128_arg_ptr(&args[0]);
         let v2 = self.vec128_arg_ptr(&args[1]);
@@ -2384,6 +2416,7 @@ impl Lowerer {
                     args,
                     16,
                 );
+                return None;
             };
             let src_ptr = self.fresh_value();
             self.emit(Instruction::GetElementPtr {
@@ -2426,6 +2459,66 @@ impl Lowerer {
     /// - PtrStore: first arg is dest pointer, remaining args are data (movnti, storedqu, etc.)
     /// - Vec128: allocates 16-byte result slot, returns pointer (SSE/AES packed ops)
     /// - Scalar: returns a scalar value in a dest register (pmovmskb, crc32, pextrw, etc.)
+    /// AUD-CPU-3: diagnose an intrinsic whose instruction-set extension the
+    /// requested target level does not have.
+    ///
+    /// `IntrinsicOp` is target-independent, so nothing downstream stopped a
+    /// `crc32`/`aesenc`/`pclmulqdq` from being emitted for a target that had
+    /// explicitly been told not to assume the extension: `-march=x86-64`
+    /// (SSE2 only) compiled `_mm_crc32_u8` to `crc32b`, i.e. to an illegal
+    /// instruction on exactly the hardware the user declared -- a SIGILL with
+    /// no diagnostic at any stage.  GCC and Clang reject the same source
+    /// ("target specific option mismatch" / "requires target feature"), and
+    /// the permission consulted here is the SAME `effective()` set
+    /// `__builtin_cpu_supports` folds against (AUD-CPU-1), so the two can
+    /// never disagree.
+    ///
+    /// x86 targets only: on AArch64/RISC-V every x86 extension is absent, and
+    /// those intrinsics are handled by the AUD-SILENT-ZERO-1 trap instead of a
+    /// second, differently-worded failure path (target-scoped intrinsics are a
+    /// separate item in the follow-up document).
+    ///
+    /// The call is still lowered after the error is recorded: the driver
+    /// rejects the translation unit on any lowering error, and bailing here
+    /// would only add a way to skip the diagnostic.
+    fn check_x86_intrinsic_feature(
+        &mut self,
+        intrinsic: &BuiltinIntrinsic,
+        name: &str,
+        args: &[Expr],
+    ) {
+        let span = args
+            .first()
+            .map(|a| a.span())
+            .unwrap_or_else(|| crate::common::source::Span::new(0, 0, 0));
+        // AUD-SILENT-ZERO-1 / AUD-CPU-3: this function owns the *permission*
+        // half — on x86 the intrinsic exists, but the invocation may not have
+        // granted the extension it needs.  A foreign target is
+        // `lower_x86_intrinsic`'s rejection to make (it runs after this check
+        // and names the target: "'_mm_add_ps' is not available on aarch64");
+        // diagnosing it here as well would print two errors for one call.
+        // 3 = EM_386 (i686), 62 = EM_X86_64.
+        if !matches!(crate::common::types::target_elf_machine(), 3 | 62) {
+            return;
+        }
+        let Some(requirement) = x86_intrinsic_required_feature(intrinsic) else {
+            return;
+        };
+        if crate::common::x86_features::effective().contains(requirement.feature) {
+            return;
+        }
+        self.diagnostics.borrow_mut().error(
+            format!(
+                "`{}` requires the {} instruction-set extension ({}){}, which the requested target does not have",
+                name,
+                requirement.feature.name(),
+                requirement.flag,
+                requirement.also.unwrap_or("")
+            ),
+            span,
+        );
+    }
+
     fn lower_x86_intrinsic(
         &mut self,
         intrinsic: &BuiltinIntrinsic,
@@ -2868,7 +2961,144 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
     }
 }
 
+/// One row of the AUD-CPU-3 permission table: what an intrinsic's instruction
+/// needs before the invocation may contain it.
+struct IntrinsicRequirement {
+    /// The feature whose bit in [`crate::common::x86_features::effective`] is
+    /// the permission (the fold for a conjunction is inside the fold, so one
+    /// lookup is enough).
+    feature: crate::common::x86_features::X86Feature,
+    /// The `-m` flag that grants `feature`, for the diagnostic.
+    flag: &'static str,
+    /// A conjunct the feature's own bit does not spell out.  The 256-bit
+    /// VAES/VPCLMULQDQ forms are the case: their permission is the extension
+    /// *and* the 256-bit vector class, and a user who passed `-mvaes` on a
+    /// target without AVX2 needs to be told the second half, not the first.
+    also: Option<&'static str>,
+}
+
 /// Map a BuiltinIntrinsic to its corresponding IntrinsicOp.
+/// AUD-CPU-3: the instruction-set extension an x86 intrinsic's instruction
+/// belongs to, for the families whose permission bit exists in
+/// [`crate::common::x86_features`].
+///
+/// Only *unambiguous* families are listed.  The 256-bit AES/CLMUL forms are
+/// VAES/VPCLMULQDQ and the three dot-product groups are AVX-VNNI,
+/// AVX-VNNI-INT8 and AVX-VNNI-INT16, whose permissions are the conjunction the
+/// fold already encodes (256-bit vector class AND the extension's own request),
+/// so a single lookup covers both halves; the SHA/GFNI/AVX-512 families still
+/// have no bit -- see the follow-up document's AUD-CPU-3 entry.
+fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<IntrinsicRequirement> {
+    use crate::common::x86_features::X86Feature as F;
+    use BuiltinIntrinsic as B;
+    Some(match intrinsic {
+        // SSE4.2 introduced CRC32: `_mm_crc32_u8` and its width siblings.
+        B::X86Crc32_8 | B::X86Crc32_16 | B::X86Crc32_32 | B::X86Crc32_64 => IntrinsicRequirement {
+            feature: F::Sse42,
+            flag: "-msse4.2",
+            also: None,
+        },
+        // AES-NI, 128-bit forms (the `_mm_*`/`__builtin_ia32_*` spellings that
+        // map onto the legacy-encoded instructions).
+        B::X86Aesenc128
+        | B::X86Aesenclast128
+        | B::X86Aesdec128
+        | B::X86Aesdeclast128
+        | B::X86Aesimc128
+        | B::X86Aeskeygenassist128 => IntrinsicRequirement {
+            feature: F::Aes,
+            flag: "-maes",
+            also: None,
+        },
+        B::X86Pclmulqdq128 => IntrinsicRequirement {
+            feature: F::Pclmul,
+            flag: "-mpclmul",
+            also: None,
+        },
+        // VAES: the EVEX 256-bit AES round instructions.  A v3 target without
+        // `-mvaes` is exactly the SIGILL case `_mm_crc32_u8` under
+        // `-march=x86-64` was: measured emitting `vaesenc %ymm1, %ymm0, %ymm0`
+        // on a target whose own class does not contain it.
+        B::X86Aesenc256 | B::X86Aesenclast256 | B::X86Aesdec256 | B::X86Aesdeclast256 => {
+            IntrinsicRequirement {
+                feature: F::Vaes,
+                flag: "-mvaes",
+                also: Some(" and a 256-bit vector class (AVX2 or AVX-512)"),
+            }
+        }
+        // VPCLMULQDQ: the 256-bit carry-less multiply.  Separate bit from
+        // VAES (GCC rejects `_mm256_clmulepi64_epi128` under `-mavx2 -mvaes`),
+        // so the two must not share a row.
+        B::X86Vpclmulqdq256 => IntrinsicRequirement {
+            feature: F::Vpclmulqdq,
+            flag: "-mvpclmulqdq",
+            also: Some(" and a 256-bit vector class (AVX2 or AVX-512)"),
+        },
+        // AVX-VNNI: `vpdpbusd(s)` and `vpdpwssd(s)`, the VEX-encoded
+        // signed-byte-times-unsigned-byte and signed-word dot products.  This
+        // is the family the audit's live SIGILL case belongs to: measured
+        // emitting `vpdpbusd %ymm1, %ymm0, %ymm0` for `_mm_dpbusd_epi32`
+        // under `-march=x86-64`, i.e. an Alder-Lake-era instruction inside a
+        // v1 object.
+        B::X86Dpbusd128
+        | B::X86Dpbusds128
+        | B::X86Dpwssd128
+        | B::X86Dpwssds128
+        | B::X86Dpbusd256
+        | B::X86Dpbusds256
+        | B::X86Dpwssd256
+        | B::X86Dpwssds256 => IntrinsicRequirement {
+            feature: F::AvxVnni,
+            flag: "-mavxvnni",
+            also: Some(" and a 256-bit vector class (AVX2 or AVX-512)"),
+        },
+        // AVX-VNNI-INT8: the byte forms where either input may be signed.
+        // A separate extension with its own flag; `-mavxvnni` does not grant
+        // it, and the two must not share a row.
+        B::X86Dpbssd128
+        | B::X86Dpbssds128
+        | B::X86Dpbsud128
+        | B::X86Dpbsuds128
+        | B::X86Dpbuud128
+        | B::X86Dpbuuds128
+        | B::X86Dpbssd256
+        | B::X86Dpbssds256
+        | B::X86Dpbsud256
+        | B::X86Dpbsuds256
+        | B::X86Dpbuud256
+        | B::X86Dpbuuds256 => IntrinsicRequirement {
+            feature: F::AvxVnniInt8,
+            flag: "-mavxvnniint8",
+            also: Some(" and a 256-bit vector class (AVX2 or AVX-512)"),
+        },
+        // GFNI: the Galois-field byte instructions.  Legacy-encoded, so the
+        // requirement is the extension's flag (plus the xmm class every x86-64
+        // target has); `-mno-avx` deliberately does not appear in the
+        // conjunction, because GCC does not require AVX either.
+        B::X86Gf2p8mulb128 | B::X86Gf2p8affineqb128 | B::X86Gf2p8affineinvqb128 => {
+            IntrinsicRequirement {
+                feature: F::Gfni,
+                flag: "-mgfni",
+                also: None,
+            }
+        }
+        // AVX-VNNI-INT16: the unsigned-word forms.
+        B::X86Dpwusd128
+        | B::X86Dpwusds128
+        | B::X86Dpwuud128
+        | B::X86Dpwuuds128
+        | B::X86Dpwusd256
+        | B::X86Dpwusds256
+        | B::X86Dpwuud256
+        | B::X86Dpwuuds256 => IntrinsicRequirement {
+            feature: F::AvxVnniInt16,
+            flag: "-mavxvnniint16",
+            also: Some(" and a 256-bit vector class (AVX2 or AVX-512)"),
+        },
+        _ => return None,
+    })
+}
+
 fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
     match intrinsic {
         BuiltinIntrinsic::X86Rdtsc => IntrinsicOp::Rdtsc,

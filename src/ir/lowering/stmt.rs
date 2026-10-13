@@ -2,6 +2,7 @@ use super::definitions::{DeclAnalysis, FuncSig, GlobalInfo, LocalInfo};
 use super::lower::Lowerer;
 use super::string_init::StringInit;
 use super::structs::VlaDynCursor;
+use crate::common::type_builder::TypeConvertContext;
 use crate::common::types::{AddressSpace, CType, IrType, StructLayout, target_int_ir_type};
 use crate::frontend::parser::ast::{
     BlockItem, CompoundStmt, Declaration, DerivedDeclarator, Designator, Expr, InitDeclarator,
@@ -93,6 +94,7 @@ impl Lowerer {
 
             let mut da = self.analyze_declaration(type_spec, &declarator.derived);
             da.base_type_volatile = decl.is_volatile();
+            da.object_volatile = declarator.attrs.object_volatile;
             let elem_size = da.c_type.as_ref().map_or(0, |ct| ct.size());
             if let Some(vs) = decl.resolve_vector_size(elem_size) {
                 da.apply_vector_size(vs);
@@ -192,7 +194,7 @@ impl Lowerer {
     ) -> &'a TypeSpecifier {
         if !matches!(
             &decl.type_spec,
-            TypeSpecifier::Typeof(_) | TypeSpecifier::TypeofType(_) | TypeSpecifier::AutoType
+            TypeSpecifier::Typeof(..) | TypeSpecifier::TypeofType(_) | TypeSpecifier::AutoType
         ) {
             return &decl.type_spec;
         }
@@ -384,7 +386,7 @@ impl Lowerer {
         let mut local_info = LocalInfo::from_analysis(da, alloca, decl.is_const());
         local_info.var.address_space =
             crate::common::type_builder::object_storage_address_space_with_object(
-                decl.address_space,
+                self.declaration_address_space(decl.address_space, &decl.type_spec),
                 &declarator.derived,
                 declarator.attrs.object_space,
             );
@@ -398,7 +400,7 @@ impl Lowerer {
         if let Some(ref mut ct) = local_info.var.c_type {
             crate::common::type_builder::apply_declaration_address_space_for_object(
                 ct,
-                decl.address_space,
+                self.declaration_address_space(decl.address_space, &decl.type_spec),
                 &declarator.derived,
             );
         }
@@ -469,7 +471,15 @@ impl Lowerer {
     ) {
         match init {
             Initializer::Expr(expr) => {
-                if decl.is_const() && !da.is_pointer && !da.is_array && !da.is_struct && !is_complex
+                // A `const volatile` local is never cached: each read must load
+                // (C11 6.7.3p7), so it is not a compile-time constant.
+                if decl.is_const()
+                    && !da.base_type_volatile
+                    && !da.object_volatile
+                    && !da.is_pointer
+                    && !da.is_array
+                    && !da.is_struct
+                    && !is_complex
                 {
                     if let Some(const_val) = self.eval_const_expr(expr) {
                         if let Some(ival) = self.const_to_i64(&const_val) {
@@ -2031,7 +2041,7 @@ impl Lowerer {
                 return Some(vla_size);
             }
         }
-        if let TypeSpecifier::Typeof(expr) = type_spec {
+        if let TypeSpecifier::Typeof(expr, _) = type_spec {
             if let Expr::Identifier(name, _) = &**expr {
                 if let Some(vla_size) = self
                     .func_state

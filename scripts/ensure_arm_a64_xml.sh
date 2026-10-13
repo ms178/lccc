@@ -11,7 +11,7 @@
 #   * the tarball bytes are pinned by SHA-256 below (Arm exploration
 #     packages are immutable per release; the digest was taken from the
 #     developer.arm.com permalink the first time this tree fetched it),
-#   * a pre-placed tarball (ARM_XML_DL_DIR, default $HOME/dl — the same
+#   * a pre-placed tarball (ARM_XML_DL_DIR, default $HOME/.cache/dl — the same
 #     channel ensure_gas_247.sh uses) must hash to the same digest, so a
 #     doctored or truncated archive is a failed provision, not a wrong
 #     oracle, and
@@ -33,7 +33,7 @@ ARM_XML_TARBALL_SHA256="62917cba0da668deb6c28005231f4b94d1044cd52dbe4a4729fcc26d
 ARM_XML_URL="https://developer.arm.com/-/cdn-downloads/permalink/Exploration-Tools-A64-ISA/ISA_A64/ISA_A64_xml_A_profile-2026-09_md.tar.gz"
 
 prefix="${1:-${HOME}/.cache/arm-isa-a64-2026-09}"
-dl_dir="${ARM_XML_DL_DIR:-${HOME}/dl}"
+dl_dir="${ARM_XML_DL_DIR:-${HOME}/.cache/dl}"
 tarball="$dl_dir/$ARM_XML_DIRNAME.tar.gz"
 install_dir="$prefix/$ARM_XML_DIRNAME"
 manifest="$install_dir/build-manifest.json"

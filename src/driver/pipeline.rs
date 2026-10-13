@@ -647,11 +647,76 @@ impl Driver {
         !self.input_files.is_empty()
     }
 
+    /// True when `-o -` asks for standard output.
+    ///
+    /// GCC treats `-o -` as "write to stdout" for the modes that stream text
+    /// (`-S`, `-E`, and the `-M*` dependency printers) and rejects it for `-c`
+    /// (its assembler fails with "can't open a bfd on stdout") — either way it
+    /// never creates a file called `-`. lccc used to create that file for
+    /// every mode, which silently swallowed the output of
+    ///   `lccc -S -o - t.c | ...`   and `lccc -E -o - t.c | ...`.
+    pub(crate) fn output_is_stdout(&self) -> bool {
+        self.output_path_set && self.output_path == "-"
+    }
+
+    /// Write textual output (assembly, preprocessed source, dependency rules)
+    /// to `-o`'s destination, honouring `-o -` == stdout.
+    ///
+    /// Every text producer in the driver funnels through here so the `-` rule
+    /// exists exactly once; binary producers (objects, executables) must not
+    /// come near it, because a streamed ELF is not a thing any consumer can
+    /// use and GCC errors out instead.
+    fn write_text_output(&self, text: &str) -> Result<(), String> {
+        if self.output_is_stdout() {
+            use std::io::Write;
+            let stdout = std::io::stdout();
+            let mut lock = stdout.lock();
+            lock.write_all(text.as_bytes())
+                .and_then(|()| lock.flush())
+                .map_err(|e| format!("Cannot write to standard output: {}", e))
+        } else {
+            std::fs::write(&self.output_path, text)
+                .map_err(|e| format!("Cannot write {}: {}", self.output_path, e))
+        }
+    }
+
+    /// Reject `-o -` where GCC rejects it, before any work is done.
+    ///
+    /// * `-c`: the object is a binary; `as` cannot emit one on stdout, so GCC
+    ///   aborts — we say so once, up front, instead of letting the assembler
+    ///   write a file called `-` (the pre-fix behaviour) or fail obscurely.
+    /// * linking: a streamed ELF is not a thing any consumer can use.  GCC 12
+    ///   here silently writes a *file named `-`* for `t.c -o -` (measured); we
+    ///   reject it with the same wording as `-c`, because a build system that
+    ///   asked for stdout wants stdout or a hard error, never a surprise file.
+    /// * several inputs: GCC refuses `-o` outright because one output cannot
+    ///   hold several translation units, and for `-S -o -` concatenating them
+    ///   on stdout would produce unusable output.
+    fn validate_output_destination(&self) -> Result<(), String> {
+        if !self.output_is_stdout() {
+            return Ok(());
+        }
+        match self.mode {
+            CompileMode::ObjectOnly | CompileMode::Full => {
+                Err("cannot write an object file or executable to stdout; \
+                 '-o -' is only valid with -S, -E, -M/-MM or -dM"
+                    .to_string())
+            }
+            CompileMode::AssemblyOnly | CompileMode::PreprocessOnly
+                if self.input_files.len() > 1 =>
+            {
+                Err("cannot specify '-o' with '-c', '-S' or '-E' with multiple files".to_string())
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Run the compiler pipeline.
     pub fn run(&self) -> Result<(), String> {
         if self.input_files.is_empty() {
             return Err("No input files".to_string());
         }
+        self.validate_output_destination()?;
 
         // Set the thread-local target pointer size for type system queries.
         // Must be done before any CType/IrType size computations.
@@ -662,6 +727,14 @@ impl Driver {
         ));
         // Per-ISA relocation number space (see Target::elf_machine).
         crate::common::types::set_target_elf_machine(self.target.elf_machine());
+        // AUD-CPU-3: publish the invocation's code-generation permission set
+        // (target + `-march` + `-m*` flags) for the intrinsic feature gate in
+        // `expr_builtins`.  `effective_x86_features()` is the *same* model
+        // `x86_isa()` feeds to the backend, so an intrinsic can never be
+        // lowered to an instruction the emitted code is not already allowed
+        // to use.  (`__builtin_cpu_supports` is a *runtime* CPUID question
+        // and deliberately does NOT consult this set — see `cpu_probe`.)
+        crate::common::x86_features::set_effective(self.effective_x86_features());
         // 4-byte width-partitioned spill slots are only enabled where the
         // backend's store/load paths are proven width-consistent.  x86-64
         // narrows ≤32-bit spills; i686 naturally accesses every non-wide
@@ -670,16 +743,6 @@ impl Driver {
             self.target,
             Target::X86_64 | Target::I686
         ));
-
-        // `-o -` is stdout for the TEXT modes; an object file or an
-        // executable cannot be piped, and GCC refuses too (AUD-DRV-1).
-        if self.output_path == "-"
-            && matches!(self.mode, CompileMode::ObjectOnly | CompileMode::Full)
-        {
-            return Err("cannot write an object file or executable to stdout; \
-                 '-o -' is only valid with -S, -E, -M/-MM or -dM"
-                .to_string());
-        }
 
         match self.mode {
             CompileMode::PreprocessOnly => self.run_preprocess_only(),
@@ -691,23 +754,6 @@ impl Driver {
     }
 
     // ---- Run modes ----
-
-    /// Write a text output to `self.output_path`, or to stdout when the path is
-    /// `-` (AUD-DRV-1).
-    ///
-    /// GCC semantics: `-o -` means "the standard output" for the modes that
-    /// produce TEXT (`-S`, `-E`, `-M`/`-MM`, `-dM`).  Build systems and
-    /// pipelines (`-o - | ...`) depend on it; before this, LCCC created a file
-    /// literally named `-`.  Modes that produce a binary (object, executable)
-    /// are rejected up front in `run()` instead.
-    fn write_text_output(&self, contents: &str) -> Result<(), String> {
-        if self.output_path == "-" {
-            print!("{}", contents);
-            return Ok(());
-        }
-        std::fs::write(&self.output_path, contents)
-            .map_err(|e| format!("Cannot write {}: {}", self.output_path, e))
-    }
 
     fn run_preprocess_only(&self) -> Result<(), String> {
         for input_file in &self.input_files {
@@ -785,6 +831,8 @@ impl Driver {
                 }
 
                 if self.output_path_set {
+                    // `-M -o -` prints the rules (GCC does; see the oracle in
+                    // tests/regression/check_o_stdout.sh).
                     self.write_text_output(&dep_text)?;
                 } else {
                     print!("{}", dep_text);
@@ -851,6 +899,8 @@ impl Driver {
                     // Write dependency file if requested (e.g., -Wp,-MMD,<depfile>).
                     // The kernel build uses this when preprocessing linker scripts
                     // (.lds.S -> .lds) and fixdep expects the .d file to exist.
+                    // With `-o -` the derived name is `-.d`, exactly as GCC
+                    // derives it (verified against gcc 12.2: -MD -E -o -).
                     self.write_dep_file(input_file, &self.output_path)?;
                 } else {
                     print!("{}", output);
@@ -1149,8 +1199,11 @@ impl Driver {
             }
             // Default path: compile with internal codegen (handles .code16gcc prepend)
             let asm = self.compile_to_assembly(input_file)?;
-            if out_path == "-" {
-                print!("{}", asm);
+            if self.output_path_set {
+                // `-o -` streams the assembly (write_text_output is the single
+                // place that knows the convention); a real path is written
+                // exactly as before.
+                self.write_text_output(&asm)?;
             } else {
                 std::fs::write(&out_path, &asm)
                     .map_err(|e| format!("Cannot write {}: {}", out_path, e))?;
@@ -1583,121 +1636,11 @@ impl Driver {
 
     // ---- Core compilation pipeline ----
 
-    /// Core pipeline: preprocess, lex, parse, sema, lower, optimize, codegen.
-    ///
-    /// Set `CCC_TIME_PHASES=1` in the environment to print per-phase timing to stderr.
-    /// The ISA feature set this translation unit's code generation is
-    /// allowed to assume unconditionally (AUD-CPU-1).
-    ///
-    /// Derived from the same state that gates instruction selection:
-    /// `x86_isa()` (the SIMD ceiling: `X86Isa::V3` without an explicit
-    /// `-march=`, the requested flags with one) and the `resolved_*` integer
-    /// accessors (BMI1/BMI2/LZCNT/MOVBE/POPCNT).  `__builtin_cpu_supports`
-    /// therefore can never answer `1` for a feature this TU was not compiled
-    /// for.  Features outside the modelled set are deliberately absent.
-    fn effective_isa_features(&self) -> crate::common::isa_features::FeatureSet {
-        use crate::common::isa_features::FeatureSet;
-        let mut set = FeatureSet::empty();
-        if self.target != Target::X86_64 {
-            // i686 promises broad compatibility (no implicit default grant in
-            // this tree either): only explicitly requested integer extensions
-            // are guaranteed there.  AArch64/RISC-V get the empty set, so
-            // every x86 feature name folds to 0.
-            if self.target == Target::I686 {
-                set.apply([
-                    ("bmi", self.resolved_bmi1()),
-                    ("bmi2", self.resolved_bmi2()),
-                    ("lzcnt", self.resolved_lzcnt()),
-                    ("movbe", self.resolved_movbe()),
-                    ("popcnt", self.resolved_popcnt()),
-                ]);
-            }
-            return set;
-        }
-        // x86-64 (v1) baseline: every x86-64 CPU implements these.
-        set.insert_x86_64_baseline();
-
-        let isa = self.x86_isa();
-        let simd = isa.simd;
-        if simd {
-            // SSE3/SSSE3/SSE4.x: the documented absent-`-march` baseline is
-            // x86-64-v3 (ranges.md / cli.rs), whose SIMD group is exactly
-            // `X86Isa::V3`; with an explicit `-march=` the requested flags are
-            // the ceiling, so only what they (or a wider ceiling) imply is
-            // guaranteed.
-            let v3_baseline = !self.x86_march_explicit;
-            let sse41 = isa.sse41;
-            let avx = isa.avx;
-            set.apply([
-                ("sse3", sse41 || avx || self.enable_sse3),
-                ("ssse3", sse41 || avx || self.enable_ssse3),
-                ("sse4.1", sse41),
-                ("sse4.2", self.enable_sse4_2 || v3_baseline),
-                ("avx", avx),
-                ("avx2", isa.ymm),
-                ("f16c", self.enable_f16c || v3_baseline),
-                ("fma", isa.fma),
-                ("aes", self.enable_aes),
-                ("pclmul", self.enable_pclmul),
-                ("avxvnni", self.enable_avxvnni),
-                ("avxifma", self.enable_avxifma),
-                ("avxneconvert", self.enable_avxneconvert),
-                ("avxvnniint8", self.enable_avxvnniint8),
-                ("avxvnniint16", self.enable_avxvnniint16),
-                ("gfni", self.enable_gfni),
-                ("vaes", self.enable_vaes),
-                ("vpclmulqdq", self.enable_vpclmulqdq),
-                ("sm3", self.enable_sm3),
-                ("sm4", self.enable_sm4),
-                ("avx512f", self.enable_avx512f),
-                ("avx512cd", self.enable_avx512cd),
-                ("avx512dq", self.enable_avx512dq),
-                ("avx512bw", self.enable_avx512bw),
-                ("avx512vl", self.enable_avx512vl),
-                ("avx512ifma", self.enable_avx512ifma),
-                ("avx512vbmi", self.enable_avx512vbmi),
-                ("avx512vbmi2", self.enable_avx512vbmi2),
-                ("avx512vnni", self.enable_avx512vnni),
-                ("avx512bitalg", self.enable_avx512bitalg),
-                ("avx512vpopcntdq", self.enable_avx512vpopcntdq),
-                ("avx512bf16", self.enable_avx512bf16),
-                ("avx512fp16", self.enable_avx512fp16),
-                ("avx512er", self.enable_avx512er),
-                ("avx512pf", self.enable_avx512pf),
-                ("avx512vp2intersect", self.enable_avx512vp2intersect),
-                ("sha512", self.enable_sha512),
-            ]);
-        }
-        // Integer ISA: legal under -mno-sse, exactly as instruction selection
-        // treats it (`enable_x86_v3_profile` doc comment).
-        set.apply([
-            ("bmi", self.resolved_bmi1()),
-            ("bmi2", self.resolved_bmi2()),
-            ("lzcnt", self.resolved_lzcnt()),
-            ("movbe", self.resolved_movbe()),
-            ("popcnt", self.resolved_popcnt()),
-            ("rdrnd", self.enable_rdrnd),
-            ("cmpccxadd", self.enable_cmpccxadd),
-            ("amx-tile", self.enable_amx_tile),
-            ("amx-int8", self.enable_amx_int8),
-            ("amx-bf16", self.enable_amx_bf16),
-        ]);
-        // AVX implies the XSAVE/OSXSAVE state enables: a CPU without them
-        // cannot execute a single VEX instruction.
-        set.insert_avx_implied();
-        set
-    }
-
     fn compile_to_assembly(&self, input_file: &str) -> Result<String, String> {
         // Capture RA/codegen bisection policy once, before this compilation
         // reaches any function-level backend path.  The Arc is threaded via
         // CodegenOptions rather than re-reading process environment there.
         let ra_config = std::sync::Arc::new(crate::backend::regalloc::RaConfig::from_process_env());
-
-        // Publish the effective ISA feature set before lowering: this is the
-        // single source of truth for compile-time `__builtin_cpu_supports`
-        // folding (AUD-CPU-1).
-        crate::common::isa_features::publish(self.effective_isa_features());
 
         // Clear the "this translation unit reads a runtime CPU probe word"
         // latch before lowering; the codegen tail below appends the probe
@@ -1881,7 +1824,16 @@ impl Driver {
             diagnostics,
             self.gnu89_inline,
         );
-        let (mut module, diagnostics) = lowerer.lower(&ast);
+        let (mut module, mut diagnostics) = lowerer.lower(&ast);
+        // IR lowering is a user-facing phase: it rejects ill-typed builtins,
+        // target-specific intrinsics and unsupported constructs, and every one
+        // of those diagnostics carries a span. The engine therefore keeps the
+        // SourceManager *through* lowering — without it `render_diagnostic`
+        // silently drops the `file:line:col` prefix and the caret snippet, and
+        // the user gets a location-less error. The debug-info phase below is
+        // the only consumer that needs the manager back, so take it once
+        // lowering has returned the engine.
+        let source_manager = diagnostics.take_source_manager();
 
         // Apply #pragma weak directives from the preprocessor.
         for (symbol, target) in &preprocessor.weak_pragmas {
@@ -1938,12 +1890,6 @@ impl Driver {
                 diagnostics.error_count()
             ));
         }
-
-        // Extract the source manager for codegen's debug-info emission (-g).
-        // It stays attached to the diagnostic engine through lowering so that
-        // lowering-phase diagnostics (AUD-ICE-1) render with file:line:col
-        // exactly like parser/sema ones, instead of a bare "error: ...".
-        let source_manager = diagnostics.share_source_manager();
 
         // Log diagnostic summary if there were any warnings during lowering
         if self.verbose && diagnostics.warning_count() > 0 {
@@ -2948,6 +2894,181 @@ impl Driver {
         self.target == Target::X86_64
             && !self.movbe_explicitly_disabled
             && (self.enable_movbe || !self.x86_march_explicit)
+    }
+
+    /// Effective x86 feature set — the compile-time guarantees this invocation
+    /// gives the generated code (AUD-CPU-1).
+    ///
+    /// This is the *codegen permission* model, not the "what did the command
+    /// line ask for" model the predefined macros (`__AVX2__`, `__BMI__`) use:
+    ///
+    /// * features the resolved ISA ceiling grants by default (project baseline
+    ///   x86-64-v3 when no `-march=` is given) are present, exactly like
+    ///   [`Self::x86_isa`]'s default;
+    /// * an explicit `-march=<level|cpu>` replaces the ceiling, so a v2 target
+    ///   reports no AVX2;
+    /// * `-mno-<feat>` denials are honoured through the same resolved
+    ///   predicates the backend consults (`resolved_bmi1`, `x86_isa`, ...);
+    /// * non-x86 targets get an empty set — `__builtin_cpu_supports` is not
+    ///   available there at all (see the lowering's diagnostic).
+    ///
+    /// Kept next to `x86_isa` on purpose: whoever changes the ceiling must see
+    /// both consumers in one screen, so the folded builtin and the emitted
+    /// instructions cannot disagree.
+    pub(crate) fn effective_x86_features(&self) -> crate::common::x86_features::EffectiveFeatures {
+        use crate::common::x86_features::{EffectiveFeatures, X86Feature as F};
+        let mut set = EffectiveFeatures::EMPTY;
+        if !matches!(self.target, Target::X86_64 | Target::I686) {
+            return set;
+        }
+        let x86_64 = self.target == Target::X86_64;
+        // xmm-level code is legal at all (mirrors `x86_isa()` / `set_sse_macros`).
+        let simd = !self.no_sse && !self.general_regs_only;
+        // With no explicit `-march=`, the project baseline is x86-64-v3
+        // (backend::x86::isa policy): its features are granted unless denied.
+        let baseline = x86_64 && !self.x86_march_explicit;
+
+        // Scalar features every supported x86 CPU has.
+        set.insert_if(x86_64, F::Cmov);
+        set.insert_if(x86_64, F::Fxsr);
+        set.insert_if(x86_64 && simd, F::Mmx);
+        // SSE/SSE2 are part of the x86-64 architectural baseline (v1 already
+        // has them); i686 has neither by default.
+        set.insert_if(x86_64 && simd, F::Sse);
+        set.insert_if(x86_64 && simd, F::Sse2);
+
+        // The SSE3..SSE4.2 ladder.  `x86_isa()` carries only the 128-bit
+        // SSE4.1 class, so SSE3/SSSE3/SSE4.2 have no codegen bit of their
+        // own: the baseline half is guarded by the sticky denial that the CLI
+        // sets when it clears this rung (`-mno-sse3/-mno-ssse3/-mno-sse4.1`
+        // all set `sse41_explicitly_disabled`; `-mno-sse4.2` clears the
+        // SSE4.2-era AVX surface, which is the only denial signal SSE4.2
+        // has).  Without the guard the baseline grant would resurrect a rung
+        // the user explicitly removed — `-mno-sse4.1 -msse3` was measured
+        // reporting SSE4.1.
+        let sse41_denied = self.sse41_explicitly_disabled;
+        set.insert_if(
+            simd && (self.enable_sse3 || (baseline && !sse41_denied)),
+            F::Sse3,
+        );
+        set.insert_if(
+            simd && (self.enable_ssse3 || (baseline && !sse41_denied)),
+            F::Ssse3,
+        );
+        set.insert_if(self.x86_isa().sse41, F::Sse41);
+        set.insert_if(
+            simd && (self.enable_sse4_2 || (baseline && !self.avx_explicitly_disabled)),
+            F::Sse42,
+        );
+        set.insert_if(self.resolved_popcnt(), F::Popcnt);
+        // CMPXCHG16B: x86-64-v2 requires it, and every default (-v3) target has
+        // it; the v1 baseline (`-march=x86-64`) does not mandate it, so it
+        // follows the SSE4.2-era request bit the `-march` profiles set.
+        set.insert_if(x86_64 && (baseline || self.enable_sse4_2), F::Cx16);
+
+        // SIMD classes straight from the codegen ceiling.
+        let isa = self.x86_isa();
+        set.insert_if(isa.avx, F::Avx);
+        set.insert_if(isa.ymm, F::Avx2);
+        set.insert_if(isa.fma, F::Fma);
+        // F16C is VEX-encoded: `-mno-avx` removes it even when a `-march=`
+        // profile asked for it (GCC undefines `__F16C__` for the same
+        // combination — measured), and it *is* part of x86-64-v3, so the
+        // project baseline grants it.
+        set.insert_if(simd && isa.avx && (self.enable_f16c || baseline), F::F16c);
+        // AES-NI and PCLMUL are NOT part of any psABI microarchitecture level
+        // (v2 has SSE4.2/POPCNT, v3 adds AVX2/BMI2/FMA/F16C). Granting them
+        // from the "v3 default" would promise an instruction class the target
+        // level does not imply, so they follow the explicit request only —
+        // and nothing in the backend emits them without `-maes`/`-mpclmul`
+        // (or an `-march=<cpu>` profile), which is what makes the claim true.
+        // Both have legacy (non-VEX) encodings, so `-mno-avx` does not
+        // remove them.
+        set.insert_if(simd && self.enable_aes, F::Aes);
+        set.insert_if(simd && self.enable_pclmul, F::Pclmul);
+        // VAES / VPCLMULQDQ: the EVEX 256-bit forms of `aesenc` and
+        // `pclmulqdq`.  Two conditions, both measured against GCC 12.2:
+        //   * the 256-bit vector class must be permitted (`isa.ymm`, the
+        //     AVX2-and-not-denied ceiling).  `-mvaes` alone rejects
+        //     `_mm256_aesenc_epi128`; `-mavx2 -mvaes` and `-mavx512f -mvaes`
+        //     accept it -- AVX-512 brings its own 256-bit permission, which is
+        //     why this follows `isa` (and not a second `-mavx2` test) rather
+        //     than the raw `enable_avx2` flag;
+        //   * the extension itself must be requested, exactly like AES-NI:
+        //     no `-march=` profile in the table grants it implicitly, and the
+        //     backend emits the 256-bit classes only for the `-mvaes` /
+        //     `-mvpclmulqdq` request.
+        // Folding `1` here promises the class, and the two halves of the
+        // conjunction are the two ways the promise could be wrong: without
+        // `isa.ymm` the emitter cannot encode the instruction, and without the
+        // request flag the backend was never asked for it.
+        set.insert_if(isa.ymm && self.enable_vaes, F::Vaes);
+        set.insert_if(isa.ymm && self.enable_vpclmulqdq, F::Vpclmulqdq);
+
+        // The three AVX-VNNI groups: `vpdpbusd`/`vpdpwssd` (AVX-VNNI),
+        // `vpdpbssd`/`vpdpbsud`/`vpdpbuud` (AVX-VNNI-INT8) and
+        // `vpdpwusd`/`vpdpwuud` (AVX-VNNI-INT16).  Distinct CPUID bits
+        // (leaf 7: EBX bit 4, ECX bit 4, EDX bit 4) and distinct GCC flags,
+        // so they get distinct bits here -- one bit each, never a shared
+        // "vnni" umbrella.
+        //
+        // Shape, measured against GCC 12.2 (`-march=raptorlake` is unknown to
+        // it; `-march=alderlake` is the CPU profile):
+        //
+        //   _mm_dpbusd_epi32 / _mm256_dpbusd_epi32
+        //     -march=x86-64               reject   <- lccc emitted vpdpbusd
+        //     -march=x86-64-v3            reject      in ALL of these columns,
+        //     -mavxvnni                   accept      i.e. an AVX-VNNI
+        //     -mavxvnni -mno-avx          reject      instruction inside a v1
+        //     -mavxvnni -mno-avx2         reject      object: the SIGILL class
+        //     -mavx512vnni                reject      AUD-CPU-3 exists for
+        //     -mavx512vnni -mavx512vl     accept
+        //     -march=alderlake            accept
+        //
+        // The measured rows are the VEX-256 class (`isa.ymm`, which AVX-512
+        // also grants) conjoined with the extension's own flag -- the same
+        // shape as VAES/VPCLMULQDQ above, and the same one GCC's header guard
+        // implements.  One row deviates and is asserted as such by
+        // tests/regression/check_intrinsic_feature_gate.sh: GCC's `-mavxvnni`
+        // also implies AVX2, so `-march=x86-64 -mavxvnni` is accepted there
+        // while this fold refuses it, because the user asked for a v1 baseline
+        // and the 256-bit class is what the backend actually needs to emit the
+        // instruction.  Refusing a request is the safe direction; emitting an
+        // unrequested instruction is not.
+        //
+        // GCC 12.2 cannot be an oracle for the INT8/INT16 halves: it does not
+        // know either flag (measured: `unrecognized command-line option
+        // '-mavxvnniint8'`), and its headers declare none of those intrinsics.
+        // Those rows are therefore pinned by lccc's own flag contract, and the
+        // gate says so instead of pretending to compare.
+        let avx512_vnni = self.enable_avx512vnni && self.enable_avx512vl;
+        set.insert_if(isa.ymm && (self.enable_avxvnni || avx512_vnni), F::AvxVnni);
+        set.insert_if(isa.ymm && self.enable_avxvnniint8, F::AvxVnniInt8);
+        set.insert_if(isa.ymm && self.enable_avxvnniint16, F::AvxVnniInt16);
+
+        // GFNI: `gf2p8mulb` and the two affine transforms.  Legacy-encoded for
+        // xmm (there is no non-VEX-free requirement), so -- unlike the four
+        // extensions above -- the permission is the vector class alone plus the
+        // extension's own flag, and `-mno-avx` does NOT remove it.  Measured
+        // against GCC 12.2: `-mgfni` accepts `_mm_gf2p8mul_epi8` with and
+        // without `-mavx`, `-march=x86-64`/`-v3`/`-maes` reject it, and before
+        // this row lccc emitted `gf2p8mulb %xmm1, %xmm0` for `-march=x86-64`:
+        // the same SIGILL class as the VNNI case, on an instruction whose
+        // *legacy* encoding makes `-mno-avx` useless as a defence.
+        set.insert_if(simd && self.enable_gfni, F::Gfni);
+
+        // Integer ISA: the resolved predicates already encode the default
+        // grant, the `-march` ceiling and the sticky denials — the same
+        // predicates `__BMI__`/`__BMI2__`/`__LZCNT__`/`__MOVBE__` use.
+        set.insert_if(self.resolved_bmi1(), F::Bmi);
+        set.insert_if(self.resolved_bmi2(), F::Bmi2);
+        set.insert_if(self.resolved_lzcnt(), F::Lzcnt);
+        set.insert_if(self.resolved_movbe(), F::Movbe);
+        // RDRAND has no resolved predicate and no explicit-denial bit; the
+        // request flag is the only signal, so it is used as-is (an
+        // unrequested feature folds to 0, the safe direction).
+        set.insert_if(x86_64 && self.enable_rdrnd, F::Rdrnd);
+        set
     }
 
     /// Code-generation ISA permission for the x86-64 SIMD world.

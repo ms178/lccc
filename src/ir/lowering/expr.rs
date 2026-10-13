@@ -326,7 +326,7 @@ impl Lowerer {
                 self.lower_conditional(cond, then_expr, else_expr)
             }
             Expr::GnuConditional(cond, else_expr, _) => self.lower_gnu_conditional(cond, else_expr),
-            Expr::Cast(target_type, inner, _) => self.lower_cast(target_type, inner),
+            Expr::Cast(target_type, inner, _, _) => self.lower_cast(target_type, inner),
             Expr::CompoundLiteral(type_spec, init, _) => {
                 self.lower_compound_literal(type_spec, init)
             }
@@ -496,8 +496,11 @@ impl Lowerer {
             }
         }
         let dest = self.fresh_value();
-        let is_vol = ginfo.base_type_volatile
-            && !matches!(ginfo.var.c_type.as_ref(), Some(CType::Pointer(..)));
+        let is_vol = super::definitions::object_access_is_volatile(
+            ginfo.base_type_volatile,
+            ginfo.object_volatile,
+            ginfo.var.c_type.as_ref(),
+        );
         self.emit(Instruction::Load {
             volatile: is_vol,
             dest,
@@ -527,8 +530,11 @@ impl Lowerer {
             let is_struct = info.is_struct;
             let is_complex = info.c_type.as_ref().is_some_and(|ct| ct.is_complex());
             let is_vector = info.c_type.as_ref().is_some_and(|ct| ct.is_vector());
-            let is_vol = info.base_type_volatile
-                && !matches!(info.var.c_type.as_ref(), Some(CType::Pointer(..)));
+            let is_vol = super::definitions::object_access_is_volatile(
+                info.base_type_volatile,
+                info.object_volatile,
+                info.var.c_type.as_ref(),
+            );
             let static_global_name = info.static_global_name.clone();
             let asm_register = info.asm_register.clone();
             let asm_register_has_init = info.asm_register_has_init;

@@ -724,7 +724,7 @@ pub fn is_zero_expr(expr: &crate::frontend::parser::ast::Expr) -> bool {
         | Expr::ULongLiteral(0, _)
         | Expr::LongLongLiteral(0, _)
         | Expr::ULongLongLiteral(0, _) => true,
-        Expr::Cast(_, inner, _) => is_zero_expr(inner),
+        Expr::Cast(_, inner, _, _) => is_zero_expr(inner),
         _ => false,
     }
 }
@@ -749,11 +749,19 @@ pub fn is_null_pointer_constant(expr: &crate::frontend::parser::ast::Expr) -> bo
         | Expr::LongLongLiteral(0, _)
         | Expr::ULongLongLiteral(0, _) => true,
         // (void*)ICE_zero is an NPC
-        Expr::Cast(ts, inner, _) => {
+        Expr::Cast(ts, inner, _, _) => {
             if let TypeSpecifier::Pointer(p, _) = ts {
                 if matches!(p.as_ref(), TypeSpecifier::Void) {
-                    // Cast to void*: inner must be an integer constant expression with value 0
-                    return is_integer_constant_expr_zero(inner);
+                    // Cast to void*: the shared void-pointer predicate decides
+                    // (it also excludes `(const void *)0`), so no recursion.
+                    return is_void_pointer_null_constant(
+                        expr,
+                        &|t| {
+                            matches!(t, TypeSpecifier::Pointer(p, _)
+                                if matches!(p.as_ref(), TypeSpecifier::Void))
+                        },
+                        &is_integer_constant_expr_zero,
+                    );
                 }
             }
             // Cast to non-void-pointer type: still check if it's an NPC
@@ -762,6 +770,26 @@ pub fn is_null_pointer_constant(expr: &crate::frontend::parser::ast::Expr) -> bo
         }
         _ => false,
     }
+}
+
+/// The void-pointer form of a null pointer constant (C23 6.3.2.3p3): an integer
+/// constant expression with value 0 cast to an UNQUALIFIED `void *`. This is the
+/// one predicate both semantic analysis and lowering use for that form; the two
+/// callers differ only in how they decide that a cast's type is `void *` and
+/// that its operand is an integer constant zero: sema resolves typedef names
+/// (`typedef void *NPT; (NPT)0`) and folds the operand with its evaluator, while
+/// the syntactic caller checks the `TypeSpecifier` shape with the AST test. The
+/// `pointee_qualified` flag of the cast excludes `(const void *)0`.
+pub fn is_void_pointer_null_constant(
+    expr: &crate::frontend::parser::ast::Expr,
+    is_void_pointer: &dyn Fn(&crate::frontend::parser::ast::TypeSpecifier) -> bool,
+    is_zero: &dyn Fn(&crate::frontend::parser::ast::Expr) -> bool,
+) -> bool {
+    use crate::frontend::parser::ast::Expr;
+    let Expr::Cast(ts, inner, _, qualifiers) = expr else {
+        return false;
+    };
+    !qualifiers.pointee_qualified && is_void_pointer(ts) && is_zero(inner)
 }
 
 /// Check if an expression is an integer constant expression that evaluates to 0.
@@ -802,7 +830,7 @@ fn is_syntactically_constant(expr: &crate::frontend::parser::ast::Expr) -> bool 
         | Expr::GnuAlignofExpr(_, _) => true,
 
         // Casts of constant expressions are constant
-        Expr::Cast(_, inner, _) => is_syntactically_constant(inner),
+        Expr::Cast(_, inner, _, _) => is_syntactically_constant(inner),
 
         // Unary ops on constant expressions are constant
         Expr::UnaryOp(_, inner, _) | Expr::PostfixOp(_, inner, _) => {
@@ -843,7 +871,7 @@ fn is_zero_valued_constant(expr: &crate::frontend::parser::ast::Expr) -> bool {
         Expr::ULongLongLiteral(v, _) => *v == 0,
         Expr::CharLiteral(v, _) => *v == '\0',
         // Cast of zero is zero
-        Expr::Cast(_, inner, _) => is_zero_valued_constant(inner),
+        Expr::Cast(_, inner, _, _) => is_zero_valued_constant(inner),
         // x * 0 = 0 for any constant x; 0 * x = 0
         Expr::BinaryOp(BinOp::Mul, lhs, rhs, _) => {
             is_zero_valued_constant(lhs) || is_zero_valued_constant(rhs)

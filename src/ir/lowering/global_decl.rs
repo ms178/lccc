@@ -8,6 +8,7 @@
 
 use super::definitions::{DeclAnalysis, GlobalInfo};
 use super::lower::Lowerer;
+use crate::common::type_builder::TypeConvertContext;
 use crate::common::types::{CType, IrType};
 use crate::frontend::parser::ast::{
     Declaration, DerivedDeclarator, Expr, InitDeclarator, Initializer, TypeSpecifier,
@@ -77,7 +78,7 @@ impl Lowerer {
             let mut ginfo = GlobalInfo::from_analysis(&da);
             ginfo.var.address_space =
                 crate::common::type_builder::object_storage_address_space_with_object(
-                    decl.address_space,
+                    self.declaration_address_space(decl.address_space, &decl.type_spec),
                     &declarator.derived,
                     declarator.attrs.object_space,
                 );
@@ -91,7 +92,7 @@ impl Lowerer {
                 // apply_declaration_address_space_for_object.
                 crate::common::type_builder::apply_declaration_address_space_for_object(
                     ct,
-                    decl.address_space,
+                    self.declaration_address_space(decl.address_space, &decl.type_spec),
                     &declarator.derived,
                 );
             }
@@ -133,7 +134,7 @@ impl Lowerer {
             let mut resolved_ctype = self.build_full_ctype(&decl.type_spec, &declarator.derived);
             crate::common::type_builder::apply_declaration_address_space(
                 &mut resolved_ctype,
-                decl.address_space,
+                self.declaration_address_space(decl.address_space, &decl.type_spec),
             );
             if let Some(vs) = decl.resolve_vector_size(resolved_ctype.size()) {
                 resolved_ctype = CType::Vector(Box::new(resolved_ctype), vs);
@@ -215,7 +216,7 @@ impl Lowerer {
             }
             if matches!(
                 &decl.type_spec,
-                TypeSpecifier::Typeof(_) | TypeSpecifier::TypeofType(_)
+                TypeSpecifier::Typeof(..) | TypeSpecifier::TypeofType(_)
             ) && self.known_functions.contains(&declarator.name)
             {
                 return true;
@@ -245,14 +246,14 @@ impl Lowerer {
         ginfo.asm_register = Some(reg_name.clone());
         ginfo.var.address_space =
             crate::common::type_builder::object_storage_address_space_with_object(
-                decl.address_space,
+                self.declaration_address_space(decl.address_space, &decl.type_spec),
                 &declarator.derived,
                 declarator.attrs.object_space,
             );
         if let Some(ref mut ct) = ginfo.var.c_type {
             crate::common::type_builder::apply_declaration_address_space_for_object(
                 ct,
-                decl.address_space,
+                self.declaration_address_space(decl.address_space, &decl.type_spec),
                 &declarator.derived,
             );
         }
@@ -294,14 +295,14 @@ impl Lowerer {
             let mut ginfo = GlobalInfo::from_analysis(&da);
             ginfo.var.address_space =
                 crate::common::type_builder::object_storage_address_space_with_object(
-                    decl.address_space,
+                    self.declaration_address_space(decl.address_space, &decl.type_spec),
                     &declarator.derived,
                     declarator.attrs.object_space,
                 );
             if let Some(ref mut ct) = ginfo.var.c_type {
                 crate::common::type_builder::apply_declaration_address_space_for_object(
                     ct,
-                    decl.address_space,
+                    self.declaration_address_space(decl.address_space, &decl.type_spec),
                     &declarator.derived,
                 );
             }
@@ -426,6 +427,7 @@ impl Lowerer {
     ) -> DeclAnalysis {
         let mut da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
         da.base_type_volatile = decl.is_volatile();
+        da.object_volatile = declarator.attrs.object_volatile;
         let elem_size = da.c_type.as_ref().map_or(0, |ct| ct.size());
         if let Some(vs) = decl.resolve_vector_size(elem_size) {
             da.apply_vector_size(vs);
@@ -822,6 +824,7 @@ impl Lowerer {
             elem_ir_ty,
             is_ptr_to_func_ptr,
             base_type_volatile: false,
+            object_volatile: false,
         }
     }
 

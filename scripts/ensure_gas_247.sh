@@ -605,7 +605,7 @@ if _prefix_provisioned; then
 fi
 
 ver=2.47
-dl_dir=${GAS_DL_DIR:-${HOME}/dl}
+dl_dir=${GAS_DL_DIR:-${HOME}/.cache/dl}
 cache=${GAS_CACHE:-${HOME}/.cache}
 tarball="$dl_dir/binutils-$ver.tar.xz"
 mkdir -p "$dl_dir" "$cache"

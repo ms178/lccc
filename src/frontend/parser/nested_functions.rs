@@ -104,6 +104,9 @@ impl Parser {
         let saved_attrs = self.attrs.clone();
         let saved_typedefs = self.typedefs.clone();
         let saved_shadowed = self.shadowed_typedefs.clone();
+        let saved_typedef_spaces = self.typedef_object_spaces.clone();
+        let saved_typedef_volatile = self.typedef_object_volatile.clone();
+        let saved_typedef_base_volatile = self.typedef_base_volatile.clone();
         let saved_pragma_pack = self.pragma_pack_align.clone();
         let saved_pack_stack = self.pragma_pack_stack.clone();
         let saved_enum_consts = self.enum_constants.clone();
@@ -120,6 +123,9 @@ impl Parser {
                 self.attrs = saved_attrs;
                 self.typedefs = saved_typedefs;
                 self.shadowed_typedefs = saved_shadowed;
+                self.typedef_object_spaces = saved_typedef_spaces;
+                self.typedef_object_volatile = saved_typedef_volatile;
+                self.typedef_base_volatile = saved_typedef_base_volatile;
                 self.pragma_pack_align = saved_pragma_pack;
                 self.pragma_pack_stack = saved_pack_stack;
                 self.enum_constants = saved_enum_consts;

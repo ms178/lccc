@@ -171,6 +171,55 @@ fn pin_inline_asm_regions(store: &LineStore, infos: &mut [LineInfo]) {
     }
 }
 
+/// Pin every instruction emitted for a C `volatile` load or store.
+///
+/// The codegen brackets the text of each volatile access with
+/// `# LCCC_VOLATILE_BEGIN` / `# LCCC_VOLATILE_END` (see `generate_instruction`).
+/// Text passes see only assembly, where a volatile load looks like any other
+/// load, so `reuse_redundant_loads` turned the second of two volatile reads of
+/// `*(volatile unsigned *)p` into a register copy, and one store of two
+/// consecutive volatile stores was folded away. Each line in the region gets the
+/// conservative `InlineAsm` classification (opaque, clobbers everything), which
+/// is the same fallback user inline asm uses, so no pass reorders, deletes, or
+/// reuses it. The markers are comments and reach the assembler harmlessly.
+fn pin_volatile_access_regions(store: &LineStore, infos: &mut [LineInfo]) {
+    let mut in_volatile = false;
+    for i in 0..store.len() {
+        let trimmed = infos[i].trimmed(store.get(i));
+        // The markers are consumed here, so they are deleted from the output:
+        // a marker-free `.s` is what every other lccc path produces. Deleting
+        // them does not weaken the region, because the region's own lines are
+        // pinned `InlineAsm` (a barrier to every pass) regardless of neighbours.
+        if trimmed == "# LCCC_VOLATILE_BEGIN" {
+            in_volatile = true;
+            mark_nop(&mut infos[i]);
+            continue;
+        }
+        if trimmed == "# LCCC_VOLATILE_END" {
+            in_volatile = false;
+            mark_nop(&mut infos[i]);
+            continue;
+        }
+        if !in_volatile
+            || trimmed.is_empty()
+            || trimmed.starts_with('#')
+            || trimmed.starts_with('.')
+        {
+            continue;
+        }
+        infos[i] = LineInfo {
+            kind: LineKind::InlineAsm,
+            ext_kind: ExtKind::None,
+            trim_start: infos[i].trim_start,
+            has_indirect_mem: true,
+            rbp_offset: RBP_OFFSET_NONE,
+            reg_refs: u16::MAX,
+            pinned: true,
+            inert_dir: false,
+        };
+    }
+}
+
 /// Pin fallback parameter-ABI reads so no text pass rewrites their source.
 ///
 /// `emit_param_ref_impl` falls back to reading a parameter from its incoming
@@ -529,6 +578,7 @@ fn peephole_optimize_inner(
         .map(|i| classify_line(store.get(i)))
         .collect();
     pin_inline_asm_regions(&store, &mut infos);
+    pin_volatile_access_regions(&store, &mut infos);
     pin_volatile_stack_slots(&store, &mut infos);
     pin_address_taken_stack_slots(&store, &mut infos);
     pin_param_abi_reads(&store, &mut infos);

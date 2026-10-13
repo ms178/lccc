@@ -371,7 +371,7 @@ impl Lowerer {
             | Expr::PostfixOp(_, a, _)
             | Expr::AddressOf(a, _)
             | Expr::Deref(a, _)
-            | Expr::Cast(_, a, _)
+            | Expr::Cast(_, a, _, _)
             | Expr::GnuAlignofExpr(a, _)
             | Expr::AlignofExpr(a, _) => {
                 self.capture_expr(a, visible, scopes, result);

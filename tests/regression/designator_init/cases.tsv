@@ -1,0 +1,16 @@
+# Braced-initializer designators, measured against GCC 16.2 (drift-checked per run).
+# id<TAB>expect(accept|reject)<TAB>diag-substring-or-dash<TAB>self-contained translation unit (one line)
+unknown_field_file_scope	reject	unknown field	struct s { int x; }; struct s a = {.nosuch = 1};
+unknown_field_second	reject	unknown field	struct s { int x; int y; }; struct s v = {.x = 1, .z = 2};
+anon_member_named_ok	accept	-	struct s { int x; union { int m; long n; }; }; struct s v = {.m = 3};
+anon_member_unknown	reject	unknown field	struct s { int x; union { int m; long n; }; }; struct s v = {.nosuch = 3};
+index_past_end	reject	exceeds array bounds	int a[3] = {[5] = 1};
+index_negative	reject	exceeds array bounds	int a[3] = {[-1] = 1};
+range_past_end	reject	exceeds array bounds	int a[3] = {[1 ... 5] = 1};
+nested_index_past_end	reject	exceeds array bounds	struct t { int a[2]; }; struct t w = {.a[5] = 1};
+local_index_past_end	reject	exceeds array bounds	void f(void) { int a[3] = {[5] = 1}; (void)a; }
+local_unknown_field	reject	unknown field	void f(void) { struct s { int x; } v = {.nosuch = 1}; (void)v; }
+incomplete_array_index_ok	accept	-	int a[] = {[5] = 1};
+braced_union_member_ok	accept	-	struct One { int a; int b; }; struct Three { union { struct One one; int z; } both; }; struct Three t0 = { { .one = { 1, 2 } } };
+field_on_array	reject	field name not in	int a[2] = {.x = 1};
+index_on_struct	reject	non-array initializer	struct s { int x; }; struct s v = {[0] = 1};

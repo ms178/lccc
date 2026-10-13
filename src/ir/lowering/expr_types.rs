@@ -165,8 +165,31 @@ impl Lowerer {
                     | "__builtin_ia32_minps"
                     | "__builtin_ia32_shufps"
                     | "__builtin_shufflevector"
-                    | "__builtin_shuffle"
                     | "__builtin_ia32_vextractf128_ps256" => return None,
+                    // __builtin_shuffle is the one raw vector builtin whose
+                    // value is NOT packed by value: its lowering hands back
+                    // the result alloca POINTER for every result wider than 8
+                    // bytes and only packs ≤8-byte results. Reporting None
+                    // here (the packed answer) made the consumers read that
+                    // POINTER as if it were the vector data —
+                    // `return __builtin_shuffle(v, m);` returned the alloca's
+                    // ADDRESS to a caller that stored it as the 16 bytes, and
+                    // a 32-byte result dereferenced the address as data and
+                    // faulted. The geometry is known because sema types the
+                    // call (see ExprTypeChecker::infer_expr_ctype), so the
+                    // size can be answered here instead of asserted.
+                    "__builtin_shuffle" => {
+                        let bytes = match self.get_expr_ctype(expr) {
+                            Some(CType::Vector(_, bytes)) => bytes,
+                            // Not resolvable: keep the historical packed
+                            // answer rather than inventing a size.
+                            _ => return None,
+                        };
+                        if bytes > 8 {
+                            return Some(bytes);
+                        }
+                        return None;
+                    }
                     _ => {}
                 }
             }
@@ -215,7 +238,7 @@ impl Lowerer {
             | Expr::Assign(_, _, _)
             | Expr::CompoundAssign(_, _, _, _)
             | Expr::Comma(_, _, _)
-            | Expr::Cast(_, _, _)
+            | Expr::Cast(_, _, _, _)
             | Expr::BinaryOp(_, _, _, _)
             | Expr::UnaryOp(_, _, _) => {
                 let ctype = self.get_expr_ctype(expr)?;
@@ -1110,7 +1133,7 @@ impl Lowerer {
             Expr::StringLiteral(_, _)
             | Expr::WideStringLiteral(_, _)
             | Expr::Char16StringLiteral(_, _) => IrType::Ptr,
-            Expr::Cast(target_type, _, _) => self.type_spec_to_ir(target_type),
+            Expr::Cast(target_type, _, _, _) => self.type_spec_to_ir(target_type),
             Expr::UnaryOp(UnaryOp::RealPart, inner, _)
             | Expr::UnaryOp(UnaryOp::ImagPart, inner, _) => {
                 let inner_ct = self.expr_ctype(inner);
@@ -1599,7 +1622,7 @@ impl Lowerer {
                 }
                 None
             }
-            Expr::Cast(type_spec, _, _) => Some(self.type_spec_to_ctype(type_spec)),
+            Expr::Cast(type_spec, _, _, _) => Some(self.type_spec_to_ctype(type_spec)),
             Expr::MemberAccess(base_expr, field_name, _) => {
                 self.get_field_ctype(base_expr, field_name, false)
             }
@@ -1952,7 +1975,7 @@ impl Lowerer {
         scope: &FxHashMap<String, CType>,
     ) -> Option<TypeSpecifier> {
         match ts {
-            TypeSpecifier::Typeof(expr) => {
+            TypeSpecifier::Typeof(expr, _) => {
                 if let Some(ctype) = self.get_expr_ctype(expr) {
                     return Some(Self::ctype_to_type_spec(&ctype));
                 }
@@ -2000,7 +2023,7 @@ impl Lowerer {
                 }
                 None
             }
-            Expr::Cast(type_spec, _, _) => {
+            Expr::Cast(type_spec, _, _, _) => {
                 // typeof((type)expr) = type
                 Some(self.type_spec_to_ctype(type_spec))
             }

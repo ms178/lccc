@@ -17,6 +17,8 @@
 # x86-64 GS base and arch_prctl(ARCH_SET_GS).
 set -euo pipefail
 CCC=${CCC:-./target/fastbuild/lccc}
+. tests/regression/lib/gcc_oracle.sh
+require_gcc_oracle "check_seg_gs_runtime" || exit 1
 # Self-checking programs, each paired with the gcc optimisation level used as its
 # oracle. Every program is built with $CCC at -O0, -O1 and -O2 and must print
 # the PASSED line; when gcc is available its output must match the gcc build
@@ -97,15 +99,12 @@ done
 run_program() {
 src=$1
 oracle_opt=$2
-ref=""
-if command -v gcc >/dev/null 2>&1; then
-    if ! gcc "$oracle_opt" -w -o "$tmp/ref" "$src"; then
-        echo "FAIL: gcc $oracle_opt oracle failed to build $src" >&2
-        fail=1
-        return
-    fi
-    ref=$("$tmp/ref")
+if ! "$GCC_ORACLE_BIN" "$oracle_opt" -w -o "$tmp/ref" "$src"; then
+    echo "FAIL: gcc $oracle_opt oracle failed to build $src" >&2
+    fail=1
+    return
 fi
+ref=$("$tmp/ref")
 for opt in -O0 -O1 -O2 -O3; do
     bin="$tmp/lccc$opt"
     if ! "$CCC" "$opt" -o "$bin" "$src"; then

@@ -329,6 +329,7 @@ impl Driver {
             "-mamx-int8" => self.enable_amx_int8 = true,
             "-mamx-bf16" => self.enable_amx_bf16 = true,
             "-mcmpccxadd" => self.enable_cmpccxadd = true,
+            "-mno-avxvnni" => self.enable_avxvnni = false,
             "-mno-avxvnniint8" => self.enable_avxvnniint8 = false,
             "-mno-avxvnniint16" => self.enable_avxvnniint16 = false,
             "-mno-sha512" => self.enable_sha512 = false,

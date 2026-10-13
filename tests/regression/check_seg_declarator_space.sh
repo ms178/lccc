@@ -18,8 +18,8 @@ CCC=${CCC:-./target/fastbuild/lccc}
 dir=tests/regression/seg_decl
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/lccc-seg-decl.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
-have_gcc=0
-command -v gcc >/dev/null 2>&1 && have_gcc=1
+. tests/regression/lib/gcc_oracle.sh
+require_gcc_oracle "check_seg_declarator_space" || exit 1
 fail=0
 shopt -s nullglob
 files=("$dir"/neg_*.c "$dir"/pos_*.c)
@@ -49,19 +49,17 @@ for f in "${files[@]}"; do
         fail=1
         continue
     fi
-    if [ "$have_gcc" -eq 1 ]; then
-        set +e
-        gcc -std=gnu11 -c -o "$tmp/g.o" "$f" >/dev/null 2>&1
-        grc=$?
-        set -e
-        if [ "$grc" -ne 0 ]; then gg=reject; else gg=accept; fi
-        if [ "$gg" != "$want" ]; then
-            echo "FAIL: fixture $base expects $want but gcc $gg; fix the fixture" >&2
-            fail=1
-            continue
-        fi
+    set +e
+    "$GCC_ORACLE_BIN" -std=gnu11 -c -o "$tmp/g.o" "$f" >/dev/null 2>&1
+    grc=$?
+    set -e
+    if [ "$grc" -ne 0 ]; then gg=reject; else gg=accept; fi
+    if [ "$gg" != "$want" ]; then
+        echo "FAIL: fixture $base expects $want but gcc $gg; fix the fixture" >&2
+        fail=1
+        continue
     fi
-    echo "PASS: $base lccc $got$( [ "$have_gcc" -eq 1 ] && echo " (gcc $gg)")"
+    echo "PASS: $base lccc $got (gcc $gg)"
 done
 if [ "$fail" -ne 0 ]; then
     echo "check_seg_declarator_space: FAILED" >&2

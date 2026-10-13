@@ -21,7 +21,7 @@
 # ============================================================================
 set -euo pipefail
 
-here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 CCC=${CCC:-$here/../../target/fastbuild/lccc}
 [[ -x $CCC ]] || { echo "check_const_trip_loop_inline: lccc not found at $CCC" >&2; exit 1; }
 

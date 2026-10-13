@@ -269,16 +269,36 @@ cat >"$td/cross.c" <<'EOF'
 int f(void) { return __builtin_cpu_supports("avx2"); }
 int main(void) { return f(); }
 EOF
+# AUD-CPU-1 (3): an x86 feature NAME on a target that cannot answer it is a
+# diagnostic, not a silent 0 -- GCC's non-x86 builtin accepts only its own
+# architecture's names, and folding `avx2` to 0 turns a dispatch test into a
+# silent slow path.  Names from other architectures' sets keep the conservative
+# 0 (below), because LCCC does not model those names yet and rejecting them
+# would turn accepted GCC code into a compile error.
 for pair in "aarch64:$CCC_ARM" "riscv64:$CCC_RISCV"; do
     arch=${pair%%:*}; cc=${pair#*:}
     if [ -x "$cc" ]; then
         if "$cc" -O2 -c "$td/cross.c" -o /dev/null 2>"$td/cross.err"; then
-            ok "$arch: builtin compiles (conservative 0, no x86 probe)"
+            bad "$arch: an x86 feature name compiled (expected a diagnostic)"
+        elif grep -qF "parameter to builtin not valid: avx2" "$td/cross.err"; then
+            ok "$arch: x86 feature name diagnosed, not folded"
         else
-            bad "$arch: builtin does not compile"; head -3 "$td/cross.err" | sed 's/^/      /'
+            bad "$arch: not diagnosed with the builtin's own wording"
+            head -3 "$td/cross.err" | sed 's/^/      /'
+        fi
+        # A name this backend does not model (GCC's per-architecture set) still
+        # folds to the conservative 0 rather than being rejected.
+        cat >"$td/cross_other.c" <<'EOF'
+int f(void) { return __builtin_cpu_supports("crypto"); }
+EOF
+        if "$cc" -O2 -c "$td/cross_other.c" -o /dev/null 2>"$td/cross_other.err"; then
+            ok "$arch: an unmodelled architecture-specific name still folds"
+        else
+            bad "$arch: an unmodelled name is rejected"
+            head -3 "$td/cross_other.err" | sed 's/^/      /'
         fi
     else
-        echo "SKIP $arch row (no $cc)"
+        echo "SKIP $arch rows (no $cc)"
     fi
 done
 
