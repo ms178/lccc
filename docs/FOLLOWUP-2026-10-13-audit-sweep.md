@@ -48,6 +48,41 @@ TUs with `CALLEE_ONLY`) links each caller/callee combination against GCC at
 `{double,double}` control) so the two conventions cannot silently merge.
 Mutation-verified: neutering the carrier helper fails the gate.
 
+### AUD-CPU-3 (VNNI remainder) — the three dot-product extensions are gated (FIXED)
+
+The audit's live SIGILL case was AVX-VNNI: `_mm_dpbusd_epi32` compiled with
+`-march=x86-64` emitted `vpdpbusd %ymm1, %ymm0, %ymm0` — an Alder-Lake-era
+instruction inside a v1 object. Closing it needed three feature bits, not one:
+AVX-VNNI (`vpdpbusd`/`vpdpwssd`), AVX-VNNI-INT8 (`vpdpbssd`/`vpdpbsud`/
+`vpdpbuud`) and AVX-VNNI-INT16 (`vpdpwusd`/`vpdpwuud`) are three CPUID bits,
+three GCC flags and three separate promises, so `X86Feature` goes 24 → 27 and
+the 28 builtins in that family each get a row.
+
+The permission is the same conjunction VAES/VPCLMULQDQ uses — 256-bit vector
+class (`-mavx2`/AVX-512) AND the extension's own flag — because that is what
+the emitter needs and what GCC's header guard implements. Verified against GCC
+12.2 row by row: reject on `-march=x86-64`/`-v3`, on `-mavx2`, on
+`-mavx512vnni` without VL and on `-mno-avx`/`-mno-avx2`; accept on
+`-mavxvnni`, on `-mavx512vnni -mavx512vl` and on `-march=alderlake` — lccc
+agrees with the oracle on every one of those. One deviation is asserted in the
+gate rather than compared: GCC's `-mavxvnni` also implies AVX2, so
+`-march=x86-64 -mavxvnni` is accepted there and refused here (the user asked
+for a v1 baseline and the 256-bit class is what the backend would need).
+INT8/INT16 have no oracle on this toolchain — GCC 12.2 does not know either
+flag and declares none of those intrinsics — so the gate says so and pins the
+lccc-side contract instead.
+
+Landed with it: `-mno-avxvnni` (the enabling flag existed, the denial arm did
+not, so the denial was silently ignored), the `__builtin_cpu_supports` fold for
+all three names, the CPU-support gate extended to 27 probed features
+(Alder/Raptor Lake bring AVX-VNNI; Arrow Lake/Sierra Forest add INT8;
+`-march=arrowlake-s`/Lunar Lake add INT16), and 27 new intrinsic-gate rows.
+
+**Found while doing it: AUD-CPU-4** (see §2) — the 32-bit target emits 256-bit
+VEX code with no permission at all, in the *vector-op* path, while the
+intrinsic table refuses the same class of instruction there. Latched by the
+same gate rather than quietly fixed inside this change.
+
 ### AUD-RATCHET-1 — the audit census is measurable and enforced (DONE)
 
 `scripts/audit_census.py` + `scripts/audit_census_baseline.json`:
@@ -185,8 +220,9 @@ more honest corpus, since asm-diff feeds the peephole foreign assembly).
 
 Ordered by value ÷ cost, with the entry point each one needs.
 
-1. **AUD-CPU-3 remainder — the feature table is 11 rows for 268 x86 builtin
-   variants.** `x86_intrinsic_required_feature` (`src/ir/lowering/expr_builtins.rs`)
+1. **AUD-CPU-3 remainder — with VAES/VPCLMULQDQ and the three VNNI groups
+   landed, the table covers the crypto extensions and the dot products; what
+   is left is GFNI, SHA, AVX-512 and the `X86Crc32Load*` forms.** `x86_intrinsic_required_feature` (`src/ir/lowering/expr_builtins.rs`)
    covers CRC32, the six 128-bit AES ops and `pclmulqdq128`; the audit names
    256-bit VAES/VPCLMULQDQ, `X86Crc32Load*`, SHA/GFNI/AVX-512 as missing, and
    the family sweep above now proves that at least VAES-256/VPCLMULQDQ-256
@@ -197,8 +233,10 @@ Ordered by value ÷ cost, with the entry point each one needs.
    mechanically extractable), and the verdict for each row can be
    oracle-checked against `gcc -march=x86-64 -S` (error ⇒ the row needs a
    feature), exactly the way `check_intrinsic_feature_gate.sh` does it today.
-   The two families left after VAES/VPCLMULQDQ are **AVX-VNNI** and **GFNI**,
-   and the oracle rules for them were measured against GCC 12.2
+   The AVX-VNNI half of this entry is now **done** (three bits, 28 rows, GCC
+   oracle rows, and the `__builtin_cpu_supports` fold); the oracle rules that
+   were measured for it are kept here because the same method is what the
+   remaining families need, and because they are the record behind the rows
    (`-march=raptorlake` is unknown to GCC 12; use `-march=alderlake` for a CPU
    profile):
 
@@ -216,14 +254,25 @@ Ordered by value ÷ cost, with the entry point each one needs.
        -march=alderlake         -> accept
    ```
 
-   The hole is live: lccc emits `vpdpbusd` for `_mm_dpbusd_epi32` **under
-   `-march=x86-64`** (measured), i.e. an AVX-VNNI instruction in a v1 object —
-   the SIGILL class AUD-CPU-3 exists to close. That family is 28 builtins
-   (`X86Dpbusd128` … `X86Dpwuuds256`); do the rows table-driven from the
-   frontend's builtin table, not one match arm at a time. The GFNI 256-bit
-   forms are a different gap: gcc declares `_mm256_gf2p8mul_epi8` but lccc's
-   bundled headers do not (implicit-declaration warning), so that half is a
-   declaration problem before it is a permission problem.
+   That hole is closed (measured: `-march=x86-64` now diagnoses
+   `_mm_dpbusd_epi32` and names `-mavxvnni`). What remains in this entry:
+
+   * **GFNI** — `vgf2p8mulb`/`vgf2p8affineqb`/`vgf2p8affineinvqb`, three
+     builtins (`X86Gf2p8mulb128`, `X86Gf2p8affineqb128`,
+     `X86Gf2p8affineinvqb128`), all 128-bit. The oracle rule is measured:
+     `-mgfni` alone rejects, `-mgfni -mavx` accepts, `-march=alderlake`
+     accepts. The 256-bit forms are a declaration gap first: GCC declares
+     `_mm256_gf2p8mul_epi8` and lccc's bundled headers do not
+     (implicit-declaration warning), so they are unreachable from source until
+     the headers grow them.
+   * **SHA** — no `X86Feature` bit and no `-msha` acceptance, so a dispatcher
+     asking `__builtin_cpu_supports("sha")` gets 0 while the backend has no
+     permission model for it either; same treatment as VNNI: bit, flag, rows.
+   * **AVX-512** — the `-mavx512*` flags exist in the CLI and the 512-bit
+     builtins exist, but no row gates them; the fold has no 512-bit class
+     notion (that is also what AUD-CPU-4 is about, one width down).
+   * **`X86Crc32Load*`** — the `_mm_crc32_u8` rows cover the register forms;
+     the load forms need their own names in the table.
 2. **AUD-ICE-1 remainder — 889 panic-class sites (109 in the hot set).**
    Worklist: `python3 scripts/audit_census.py --top-fns` for size and
    `grep -nE 'panic!|unreachable!|\.expect\(|\.unwrap\('` per file for sites.
@@ -339,6 +388,26 @@ Ordered by value ÷ cost, with the entry point each one needs.
     `-ffp-contract=` flag; adding it (and defaulting `-O0` to `off`) is the
     low-risk conformance win, and it makes the reproducer replay
     (`scripts/check_repro_replay.py`) simpler than its two pinned legs.
+
+14. **AUD-CPU-4 — the 32-bit target emits 256-bit VEX code with no permission
+    at all.** Measured on this tree (`-O2`, the x86-64 driver with `-m32`):
+
+    ```
+    -m32            -S f256.c (_mm256_add_ps)   -> vaddps %ymm1, %ymm0, %ymm0
+    -m32 -mno-avx   -S f256.c                   -> vaddps %ymm1, %ymm0, %ymm0
+    -m32 -mno-avx2  -S i256.c (_mm256_add_epi32)-> vpaddd %ymm1, %ymm0, %ymm0
+    ```
+
+    So `-mno-avx` does not stop VEX emission on i686 — the SIGILL class
+    AUD-CPU-3 closed for x86-64, in the vector-op path rather than the
+    intrinsic table. The same model refuses those intrinsics on i686
+    (`x86_isa()` is `NONE` for anything but x86-64 by design), so the two
+    halves of the permission story disagree: an intrinsic is refused while an
+    equivalent operator is lowered to the same instruction. One model has to
+    serve both, and it needs the 32-bit backend's own notion of a vector class.
+    Latched by `tests/regression/check_intrinsic_feature_gate.sh`, which
+    asserts the current emission in both directions, so the fix cannot land
+    without updating those rows in the same commit.
 
 ---
 

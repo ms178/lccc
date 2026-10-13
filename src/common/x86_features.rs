@@ -121,11 +121,22 @@ pub enum X86Feature {
     Rdrnd,
     Vaes,
     Vpclmulqdq,
+    /// AVX-VNNI: the VEX-encoded dot-product family, `vpdpbusd`/`vpdpbusds`/
+    /// `vpdpwssd`/`vpdpwssds`.  Its own CPUID bit (leaf 7, EBX bit 4) and its
+    /// own `-mavxvnni` flag; VEX-encoded, so it needs a vector class too.
+    AvxVnni,
+    /// AVX-VNNI-INT8: `vpdpbssd(s)`, `vpdpbsud(s)`, `vpdpbuud(s)` -- the byte
+    /// forms where either input may be signed.  A separate CPUID bit and flag
+    /// (`-mavxvnniint8`), not a synonym of AVX-VNNI.
+    AvxVnniInt8,
+    /// AVX-VNNI-INT16: `vpdpwusd(s)`, `vpdpwuud(s)` -- the unsigned-word
+    /// forms.  A third, separate bit and flag (`-mavxvnniint16`).
+    AvxVnniInt16,
 }
 
 impl X86Feature {
     /// Every tracked feature, for table-driven tests.
-    pub const ALL: [X86Feature; 24] = [
+    pub const ALL: [X86Feature; 27] = [
         X86Feature::Cmov,
         X86Feature::Fxsr,
         X86Feature::Mmx,
@@ -150,6 +161,9 @@ impl X86Feature {
         X86Feature::Rdrnd,
         X86Feature::Vaes,
         X86Feature::Vpclmulqdq,
+        X86Feature::AvxVnni,
+        X86Feature::AvxVnniInt8,
+        X86Feature::AvxVnniInt16,
     ];
 
     /// Canonical GCC spelling of the feature (the one `-m` flags use).
@@ -179,6 +193,9 @@ impl X86Feature {
             X86Feature::Rdrnd => "rdrnd",
             X86Feature::Vaes => "vaes",
             X86Feature::Vpclmulqdq => "vpclmulqdq",
+            X86Feature::AvxVnni => "avxvnni",
+            X86Feature::AvxVnniInt8 => "avxvnniint8",
+            X86Feature::AvxVnniInt16 => "avxvnniint16",
         }
     }
 
@@ -215,6 +232,9 @@ impl X86Feature {
             "rdrnd" | "rdrand" => X86Feature::Rdrnd,
             "vaes" => X86Feature::Vaes,
             "vpclmulqdq" | "vpclmul" => X86Feature::Vpclmulqdq,
+            "avxvnni" => X86Feature::AvxVnni,
+            "avxvnniint8" => X86Feature::AvxVnniInt8,
+            "avxvnniint16" => X86Feature::AvxVnniInt16,
             _ => return None,
         })
     }
@@ -225,7 +245,7 @@ impl X86Feature {
     }
 }
 
-/// A set of [`X86Feature`]s (bitmask; 24 tracked features fit in a `u64`).
+/// A set of [`X86Feature`]s (bitmask; 27 tracked features fit in a `u64`).
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct EffectiveFeatures(u64);
 
@@ -335,7 +355,7 @@ mod tests {
             "xsave",
             "xsaveopt",
             "gfni",
-            "avxvnni",
+            "avx512vnni",
             "avx512f",
             "avx512bw",
             "amx_tile",
@@ -346,6 +366,34 @@ mod tests {
             "",
         ] {
             assert_eq!(X86Feature::parse(name), None, "{name} must not be tracked");
+        }
+    }
+
+    /// The three AVX-VNNI groups are tracked separately and must stay
+    /// separate: one bit each, round-tripping through the canonical names a
+    /// `__builtin_cpu_supports` call uses, and never answering for a sibling.
+    #[test]
+    fn the_three_vnni_groups_are_tracked_and_distinct() {
+        for (feature, name) in [
+            (X86Feature::AvxVnni, "avxvnni"),
+            (X86Feature::AvxVnniInt8, "avxvnniint8"),
+            (X86Feature::AvxVnniInt16, "avxvnniint16"),
+        ] {
+            assert_eq!(X86Feature::parse(name), Some(feature));
+            assert_eq!(feature.name(), name);
+            assert!(X86Feature::ALL.contains(&feature));
+            let mut set = EffectiveFeatures::EMPTY;
+            set.insert(feature);
+            assert!(set.contains(feature));
+            for other in [
+                X86Feature::AvxVnni,
+                X86Feature::AvxVnniInt8,
+                X86Feature::AvxVnniInt16,
+            ] {
+                if other != feature {
+                    assert!(!set.contains(other), "{name} answered for {:?}", other);
+                }
+            }
         }
     }
 

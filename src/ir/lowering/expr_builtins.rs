@@ -2655,10 +2655,11 @@ struct IntrinsicRequirement {
 /// [`crate::common::x86_features`].
 ///
 /// Only *unambiguous* families are listed.  The 256-bit AES/CLMUL forms are
-/// VAES/VPCLMULQDQ, whose permission is the conjunction the fold already
-/// encodes (256-bit vector class AND the `-mvaes`/`-mvpclmulqdq` request), so a
-/// single lookup covers both halves; the SHA/GFNI/AVX-512 families still have
-/// no bit -- see the follow-up document's AUD-CPU-3 entry.
+/// VAES/VPCLMULQDQ and the three dot-product groups are AVX-VNNI,
+/// AVX-VNNI-INT8 and AVX-VNNI-INT16, whose permissions are the conjunction the
+/// fold already encodes (256-bit vector class AND the extension's own request),
+/// so a single lookup covers both halves; the SHA/GFNI/AVX-512 families still
+/// have no bit -- see the follow-up document's AUD-CPU-3 entry.
 fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<IntrinsicRequirement> {
     use crate::common::x86_features::X86Feature as F;
     use BuiltinIntrinsic as B;
@@ -2703,6 +2704,56 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
         B::X86Vpclmulqdq256 => IntrinsicRequirement {
             feature: F::Vpclmulqdq,
             flag: "-mvpclmulqdq",
+            also: Some(" and a 256-bit vector class (AVX2 or AVX-512)"),
+        },
+        // AVX-VNNI: `vpdpbusd(s)` and `vpdpwssd(s)`, the VEX-encoded
+        // signed-byte-times-unsigned-byte and signed-word dot products.  This
+        // is the family the audit's live SIGILL case belongs to: measured
+        // emitting `vpdpbusd %ymm1, %ymm0, %ymm0` for `_mm_dpbusd_epi32`
+        // under `-march=x86-64`, i.e. an Alder-Lake-era instruction inside a
+        // v1 object.
+        B::X86Dpbusd128
+        | B::X86Dpbusds128
+        | B::X86Dpwssd128
+        | B::X86Dpwssds128
+        | B::X86Dpbusd256
+        | B::X86Dpbusds256
+        | B::X86Dpwssd256
+        | B::X86Dpwssds256 => IntrinsicRequirement {
+            feature: F::AvxVnni,
+            flag: "-mavxvnni",
+            also: Some(" and a 256-bit vector class (AVX2 or AVX-512)"),
+        },
+        // AVX-VNNI-INT8: the byte forms where either input may be signed.
+        // A separate extension with its own flag; `-mavxvnni` does not grant
+        // it, and the two must not share a row.
+        B::X86Dpbssd128
+        | B::X86Dpbssds128
+        | B::X86Dpbsud128
+        | B::X86Dpbsuds128
+        | B::X86Dpbuud128
+        | B::X86Dpbuuds128
+        | B::X86Dpbssd256
+        | B::X86Dpbssds256
+        | B::X86Dpbsud256
+        | B::X86Dpbsuds256
+        | B::X86Dpbuud256
+        | B::X86Dpbuuds256 => IntrinsicRequirement {
+            feature: F::AvxVnniInt8,
+            flag: "-mavxvnniint8",
+            also: Some(" and a 256-bit vector class (AVX2 or AVX-512)"),
+        },
+        // AVX-VNNI-INT16: the unsigned-word forms.
+        B::X86Dpwusd128
+        | B::X86Dpwusds128
+        | B::X86Dpwuud128
+        | B::X86Dpwuuds128
+        | B::X86Dpwusd256
+        | B::X86Dpwusds256
+        | B::X86Dpwuud256
+        | B::X86Dpwuuds256 => IntrinsicRequirement {
+            feature: F::AvxVnniInt16,
+            flag: "-mavxvnniint16",
             also: Some(" and a 256-bit vector class (AVX2 or AVX-512)"),
         },
         _ => return None,

@@ -2953,6 +2953,47 @@ impl Driver {
         set.insert_if(isa.ymm && self.enable_vaes, F::Vaes);
         set.insert_if(isa.ymm && self.enable_vpclmulqdq, F::Vpclmulqdq);
 
+        // The three AVX-VNNI groups: `vpdpbusd`/`vpdpwssd` (AVX-VNNI),
+        // `vpdpbssd`/`vpdpbsud`/`vpdpbuud` (AVX-VNNI-INT8) and
+        // `vpdpwusd`/`vpdpwuud` (AVX-VNNI-INT16).  Distinct CPUID bits
+        // (leaf 7: EBX bit 4, ECX bit 4, EDX bit 4) and distinct GCC flags,
+        // so they get distinct bits here -- one bit each, never a shared
+        // "vnni" umbrella.
+        //
+        // Shape, measured against GCC 12.2 (`-march=raptorlake` is unknown to
+        // it; `-march=alderlake` is the CPU profile):
+        //
+        //   _mm_dpbusd_epi32 / _mm256_dpbusd_epi32
+        //     -march=x86-64               reject   <- lccc emitted vpdpbusd
+        //     -march=x86-64-v3            reject      in ALL of these columns,
+        //     -mavxvnni                   accept      i.e. an AVX-VNNI
+        //     -mavxvnni -mno-avx          reject      instruction inside a v1
+        //     -mavxvnni -mno-avx2         reject      object: the SIGILL class
+        //     -mavx512vnni                reject      AUD-CPU-3 exists for
+        //     -mavx512vnni -mavx512vl     accept
+        //     -march=alderlake            accept
+        //
+        // The measured rows are the VEX-256 class (`isa.ymm`, which AVX-512
+        // also grants) conjoined with the extension's own flag -- the same
+        // shape as VAES/VPCLMULQDQ above, and the same one GCC's header guard
+        // implements.  One row deviates and is asserted as such by
+        // tests/regression/check_intrinsic_feature_gate.sh: GCC's `-mavxvnni`
+        // also implies AVX2, so `-march=x86-64 -mavxvnni` is accepted there
+        // while this fold refuses it, because the user asked for a v1 baseline
+        // and the 256-bit class is what the backend actually needs to emit the
+        // instruction.  Refusing a request is the safe direction; emitting an
+        // unrequested instruction is not.
+        //
+        // GCC 12.2 cannot be an oracle for the INT8/INT16 halves: it does not
+        // know either flag (measured: `unrecognized command-line option
+        // '-mavxvnniint8'`), and its headers declare none of those intrinsics.
+        // Those rows are therefore pinned by lccc's own flag contract, and the
+        // gate says so instead of pretending to compare.
+        let avx512_vnni = self.enable_avx512vnni && self.enable_avx512vl;
+        set.insert_if(isa.ymm && (self.enable_avxvnni || avx512_vnni), F::AvxVnni);
+        set.insert_if(isa.ymm && self.enable_avxvnniint8, F::AvxVnniInt8);
+        set.insert_if(isa.ymm && self.enable_avxvnniint16, F::AvxVnniInt16);
+
         // Integer ISA: the resolved predicates already encode the default
         // grant, the `-march` ceiling and the sticky denials — the same
         // predicates `__BMI__`/`__BMI2__`/`__LZCNT__`/`__MOVBE__` use.
