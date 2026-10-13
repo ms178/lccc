@@ -78,6 +78,25 @@ impl Lowerer {
         }
     }
 
+    /// True when `e` is a call to a `__builtin_*` name.
+    ///
+    /// The signature fallback in `try_two_reg_struct_return` exists for
+    /// expressions whose size the CType cannot express — intrinsic wrappers
+    /// around the raw vector builtins, where only the function's signature
+    /// knows the object is returned by value. A builtin call is not that case:
+    /// `struct_value_size` answers for the raw vector builtins
+    /// authoritatively, and its two answers mean opposite things — `None` for
+    /// a value that IS already the packed register pair (the
+    /// `__builtin_ia32_*` 128-bit family, `__builtin_shufflevector`), `Some(n)`
+    /// for a pointer to n bytes of data (`__builtin_shuffle` >8 bytes). Letting
+    /// the signature override the `None` answer made the return path load the
+    /// packed value as an aggregate, i.e. dereference the vector data as a
+    /// pointer.
+    fn expr_is_builtin_call(e: &Expr) -> bool {
+        matches!(e, Expr::FunctionCall(callee, _, _)
+            if matches!(&**callee, Expr::Identifier(n, _) if n.starts_with("__builtin_")))
+    }
+
     /// Try to handle return via sret (hidden pointer for large structs/complex).
     /// Returns Some(operand) if this is an sret return, None otherwise.
     fn try_sret_return(&mut self, e: &Expr, sret_alloca: Value) -> Option<Operand> {
@@ -130,7 +149,8 @@ impl Lowerer {
         // where CType::size() returns 0 for Struct/Union types. Fall back to the
         // current function's sret_size from sig metadata.
         let mut struct_size = self.struct_value_size(e).unwrap_or(0);
-        if struct_size == 0 && !Self::expr_is_arithmetic_binop(e) {
+        if struct_size == 0 && !Self::expr_is_arithmetic_binop(e) && !Self::expr_is_builtin_call(e)
+        {
             if let Some(ctype) = self.get_expr_ctype(e) {
                 if ctype.is_struct_or_union() || ctype.is_vector() {
                     let fname = self.func().name.clone();

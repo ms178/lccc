@@ -23,7 +23,7 @@ jobs:
     # A hung compiler in the corpus step would otherwise burn the default six
     # hours before failing; the timed corpus is ~9 minutes on a good day.
     timeout-minutes: 45
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -70,7 +70,7 @@ jobs:
           GCC_INC: ${{ steps.gcc.outputs.inc }}
         run: |
           echo "Compiling rec2iter correctness test..."
-          target/fastbuild/lccc -I"$GCC_INC" -O2 -o /tmp/fib_rec2iter tests/fib_rec2iter.c
+          target/fastbuild/lccc -I"$GCC_INC" -O2 -o /tmp/fib_rec2iter tests/regression/fib_rec2iter.c
           echo "Running (includes fib(90) — impossible without rec2iter)..."
           /tmp/fib_rec2iter
 

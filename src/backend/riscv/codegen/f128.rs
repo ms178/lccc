@@ -370,7 +370,11 @@ impl RiscvCodegen {
             self.emit_store_to_s0("a1", slot.0 + 8, "sd");
             self.state.track_f128_self(dest_id);
         } else {
-            unimplemented!("f128 sign-bit intrinsic: dest is not slot-homed");
+            // Invariant: an f128 value on RISC-V is slot-homed -- the sign-bit
+            // ops publish their result through `track_f128_self`, whose readers
+            // resolve the value's slot.  A register home would be invisible to
+            // them, so trap rather than leave it unset.
+            self.emit_unreachable();
         }
     }
 

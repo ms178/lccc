@@ -41,7 +41,7 @@ impl Lowerer {
             Expr::UnaryOp(_, inner, _) | Expr::PostfixOp(_, inner, _) => {
                 Self::expr_contains_sizeof(inner)
             }
-            Expr::Cast(_, inner, _) => Self::expr_contains_sizeof(inner),
+            Expr::Cast(_, inner, _, _) => Self::expr_contains_sizeof(inner),
             Expr::Conditional(cond, then_e, else_e, _) => {
                 Self::expr_contains_sizeof(cond)
                     || Self::expr_contains_sizeof(then_e)
@@ -77,12 +77,17 @@ impl Lowerer {
         //     such as `sizeof(x) / sizeof(x[0]) + 1`.
         let float_cast = matches!(
             expr,
-            Expr::Cast(target, _, _)
+            Expr::Cast(target, _, _, _)
                 if matches!(
                     self.type_spec_to_ir(target),
                     IrType::F32 | IrType::F64 | IrType::F128
                 )
         );
+        // Identifiers are NOT answered from the sema map: sema records every
+        // `const`-qualified object's initializer there, including `const
+        // volatile` objects, whose every read must reach memory (C11 6.7.3p7).
+        // Identifier values come from `eval_const_identifier`, which knows the
+        // object's volatility and shadowing.
         if !matches!(expr, Expr::Identifier(_, _))
             && !float_cast
             && !Self::expr_contains_sizeof(expr)
@@ -274,7 +279,7 @@ impl Lowerer {
                 }
                 Some(result)
             }
-            Expr::Cast(target_type, inner, _) => self.eval_const_cast(target_type, inner),
+            Expr::Cast(target_type, inner, _, _) => self.eval_const_cast(target_type, inner),
             Expr::Identifier(name, _) => self.eval_const_identifier(name),
             Expr::Sizeof(arg, _) => {
                 // VLA sizeof is a runtime value (C99 6.7.6.2 / 6.5.3.4): the
@@ -797,7 +802,7 @@ impl Lowerer {
     /// for the struct type and any accumulated offset from nested member access.
     fn extract_null_pointer_cast_with_offset(&self, expr: &Expr) -> Option<(TypeSpecifier, usize)> {
         match expr {
-            Expr::Cast(type_spec, inner, _) => {
+            Expr::Cast(type_spec, inner, _, _) => {
                 // The type should be a Pointer to a struct
                 if let TypeSpecifier::Pointer(inner_ts, _) = type_spec {
                     // Check that the inner expression is 0
@@ -821,7 +826,7 @@ impl Lowerer {
     /// Signedness determines how the value is widened in the next cast.
     fn eval_const_expr_as_bits(&self, expr: &Expr) -> Option<(u64, bool)> {
         match expr {
-            Expr::Cast(target_type, inner, _) => {
+            Expr::Cast(target_type, inner, _, _) => {
                 let (bits, _src_signed) = self.eval_const_expr_as_bits(inner)?;
                 let target_ir_ty = self.type_spec_to_ir(target_type);
                 let target_width = target_ir_ty.size() * 8;
@@ -917,7 +922,7 @@ impl Lowerer {
 
     /// Check if an expression has an unsigned type for constant evaluation.
     pub(super) fn is_expr_unsigned_for_const(&self, expr: &Expr) -> bool {
-        if let Expr::Cast(target_type, _, _) = expr {
+        if let Expr::Cast(target_type, _, _, _) = expr {
             let ty = self.type_spec_to_ir(target_type);
             return ty.is_unsigned();
         }
@@ -1069,7 +1074,7 @@ impl Lowerer {
             | Expr::Char16StringLiteral(..) => true,
             // A cast of a string literal is also always nonzero
             // (e.g., (int)"hello" in constant context)
-            Expr::Cast(_, inner, _) => Self::expr_is_always_nonzero(inner),
+            Expr::Cast(_, inner, _, _) => Self::expr_is_always_nonzero(inner),
             _ => false,
         }
     }

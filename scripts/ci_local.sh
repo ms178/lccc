@@ -53,7 +53,7 @@
 # the summary at the end so a long log cannot hide one.
 set -u -o pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 export PATH="$CARGO_HOME/bin:$PATH"
@@ -194,6 +194,39 @@ gate "audit-loop-contracts" fast \
 gate "ivsr-integer-domains" fast \
     env CCC="$LCCC" bash tests/regression/check_ivsr_domains.sh
 
+# Block-scope static initializers (C11 6.7.9p4), designator validity (6.7.9p2-p6),
+# and volatile typedef objects (6.7.8): each row is checked against GCC 16.2.
+gate "static-local-init" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_static_local_init.sh
+
+gate "designator-init" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_designator_init.sh
+
+# File-scope initializers (C11 6.7.9p4) against GCC 16.2, plus runtime values of
+# folded forms: a constant that is accepted but emitted as zero fails the values check.
+gate "file-scope-init" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_file_scope_init.sh
+
+gate "typedef-volatile-codegen" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_typedef_volatile_codegen.sh
+
+# Named-space initializers through brace elision and anonymous members, against
+# GCC 16.2 line by line (C11 6.7.9p17-p20, 6.7.2.2p13).
+gate "seg-init-brace-elision" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_seg_init_brace_elision.sh
+
+# Volatile struct members (memory-mapped register blocks, nested and anonymous
+# members) keep their stores and loads at -O2, against GCC 16.2 (C11 6.7.3p7).
+gate "volatile-member-codegen" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_volatile_member_codegen.sh
+
+# A `const volatile` object is volatile at every read: the `const` qualifier
+# forbids writes, it does not make the object a constant, so the read must not
+# be folded away (C11 6.7.3p7).  Globals, casts, typedef-qualified objects and
+# members, against GCC 16.2's per-function memory-reference counts.
+gate "const-volatile-objects" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_const_volatile_objects.sh
+
 # Executed miscompile regression for the iv_widen trajectory gates and the
 # exposed-latch intercept: runtime ring-top seeds over a 2^32-span marker
 # buffer, gcc-parity matrix (-O0..-O3 x {default, kill switch, -m32 SKIP}).
@@ -211,6 +244,69 @@ gate "empty-aggregate-abi" fast \
 
 gate "aggregate-call-abi" fast \
     env CCC="$LCCC" bash tests/regression/check_aggregate_call_abi.sh
+
+# AUD-VABI-1: a 16-byte vector is ONE %xmm (SSE + SSEUP), not an INTEGER pair,
+# in BOTH directions and through function pointers. Same-compiler agreement
+# cannot show this -- the gate links each side against a GCC-compiled TU.
+gate "vector-abi-boundary" fast \
+    env CCC="$LCCC" bash tests/regression/check_vector_abi_boundary.sh
+
+# AUD-TMP-1: temp files must be symlink-proof. Drives the pre-placed-symlink
+# reproducer (and its pre-placed-directory variant) against the built compiler
+# and asserts the victim file is untouched, the compile still succeeds and
+# nothing is written directly into $TMPDIR.
+gate "temp-symlink-hardening" fast \
+    env CCC="$LCCC" bash tests/regression/check_temp_symlink.sh
+
+# AUD-DRV-1: `-o -` is stdout for -S/-E/-M (and rejected for -c / multi-input),
+# never a file named `-`. Build systems pipe through this.
+gate "o-stdout" fast \
+    env CCC="$LCCC" bash tests/regression/check_o_stdout.sh
+
+# AUD-HYGIENE-1: the loose `tests/*.c`/`*.sh` scratch (compat_test.sh and the
+# IVSR/univsr probes) are gates now instead of unreferenced files.  The compat
+# suite is a 20-program run-and-compare differential against GCC; the probe
+# gate is metamorphic -- the same programs must produce the same numbers with
+# the strength-reduction pass on, off, and at -O3.
+gate "compat-suite" fast \
+    env CCC="$LCCC" bash tests/regression/check_compat_suite.sh
+gate "ivsr-reproducers" fast \
+    env CCC="$LCCC" bash tests/regression/check_ivsr_reproducers.sh
+
+# AUD-CPU-1: `__builtin_cpu_supports` must fold from the effective codegen
+# permission (target + -march + -m* flags), not from a hard-coded CPU list.
+# The old table answered "yes" to AVX2/BMI2/SHA for every invocation, which put
+# runtime dispatch in zlib-ng/zstd/xz/OpenSSL on paths that SIGILL on hardware
+# without them. Also asserts non-x86 targets and non-literal arguments are
+# diagnosed instead of silently folding to 0.
+gate "cpu-supports-fold" fast \
+    env CCC="$LCCC" CCC_ARM=target/fastbuild/lccc-arm bash tests/regression/check_cpu_supports_fold.sh
+
+# AUD-ICE-1/AUD-DIAG-1: a malformed `__builtin_shuffle` mask must produce a
+# diagnostic, not a Rust panic (and the valid forms must still lower).  The
+# gate is oracle-checked against gcc, so it cannot pass by rejecting more than
+# GCC does.
+gate "shuffle-diagnostics" fast \
+    env CCC="$LCCC" bash tests/regression/check_shuffle_diagnostics.sh
+
+# AUD-SILENT-ZERO-1: a target that cannot execute an x86-only intrinsic must
+# trap at the first execution, not silently compute zeros (and must not trap
+# anything it CAN compute).  The host cannot execute AArch64/RISC-V, so the
+# gate asserts on the instruction stream AND on the trap's encoding in the
+# object.
+gate "cross-target-intrinsic-trap" fast \
+    env CCC="$LCCC" \
+    CCC_ARM=target/fastbuild/lccc-arm \
+    CCC_RISCV=target/fastbuild/lccc-riscv \
+    CCC_I686=target/fastbuild/lccc-i686 \
+    bash tests/regression/check_cross_target_intrinsic_trap.sh
+
+# AUD-CPU-3: an intrinsic whose instruction-set extension the invocation does
+# not permit must be diagnosed (GCC/Clang reject it too), and the invocation
+# that does permit it must still emit the instruction.  Oracle-checked against
+# gcc wherever gcc ships the same intrinsic.
+gate "intrinsic-feature-gate" fast \
+    env CCC="$LCCC" bash tests/regression/check_intrinsic_feature_gate.sh
 
 # The unit-test gate is what GitHub's required check runs on every PR, so it
 # belongs in the fast set: a red PR has to be reproducible with --fast.
@@ -488,6 +584,12 @@ gate "seg-cast-warning" fast \
 gate "seg-declarator-space" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_seg_declarator_space.sh
 
+# Named-space codegen through a typedef or typeof: every access to the __seg_gs
+# object must carry the %gs: prefix (audit H2, silent miscompile). Mirrors the
+# hosted step in ci.yml; ci-gate-parity fails if the two drift apart.
+gate "seg-typedef-codegen" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_seg_typedef_codegen.sh
+
 # Named-space conversions: a decayed array in a named space (through an
 # identifier, a member of a named object, a subscript of a named array, or
 # pointer arithmetic on any of these) must be rejected where gcc 14.2 rejects
@@ -497,6 +599,10 @@ gate "seg-conv-diagnostics" fast \
 
 gate "seg-target-diagnostics" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_seg_target_diagnostics.sh
+# Table-driven parity: every conversion shape in seg_conv/parity_table.tsv is
+# checked against GCC 16.2 and lccc. Under CI a missing gcc fails the gate (tests/regression/lib/gcc_oracle.sh).
+gate "seg-conversion-parity" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_seg_conversion_parity.sh
 
 gate "chroot-bind" fast bash tests/regression/check_chroot_bind.sh
 
@@ -721,6 +827,19 @@ gate "phi-acyclic-copy-order" fast \
 
 gate "doc-link-integrity" fast \
     python3 scripts/check_doc_links.py
+
+# AUD-RATCHET-1: the audit's site counts are a ratchet, not a snapshot.  The
+# scanner self-tests first (its tokenizer is what every number rests on), then
+# --check refuses any metric that grew past scripts/audit_census_baseline.json:
+# panic-class sites overall and in the user-input pipeline, `unsafe` sites,
+# unannotated `#[ignore]`, functions over 300/500/1000 lines, and CCC_*/LCCC_*
+# literals without documentation.  A count may only be re-baselined in the
+# commit that adds the sites; lowering the baseline belongs to the commit that
+# removes them.
+gate "audit-census-selftest" fast \
+    python3 scripts/audit_census.py --selftest
+gate "audit-census-ratchet" fast \
+    python3 scripts/audit_census.py --check
 
 # The Expat differential is only a differential if both compilers ran the SAME
 # tests under the SAME feature configuration.  `junit_check.py` compares testcase
@@ -1611,8 +1730,14 @@ clippy_gate() {
     fi
     # RUSTFLAGS reuses the build gate's resolved flags (see cargo_test_repeated):
     # without them clippy recompiles the whole crate under a different flag set.
-    RUSTFLAGS="$flags" cargo clippy --all-targets --profile fastbuild \
-        --locked -j "$jobs" -- -D warnings
+    #
+    # The wrapper (not bare `cargo clippy`) is load-bearing: the crate root
+    # carries `#![allow(unknown_lints)]` so that a Clippy newer than the
+    # declared MSRV cannot break `-D warnings` on a lint name that does not
+    # exist yet, and the wrapper re-probes every name in the policy list under
+    # `#![deny(unknown_lints)]` to keep typos from hiding behind that allow.
+    RUSTFLAGS="$flags" CARGO_BUILD_JOBS="$jobs" \
+        python3 scripts/check_clippy_policy.py
 }
 gate "clippy" fast clippy_gate
 

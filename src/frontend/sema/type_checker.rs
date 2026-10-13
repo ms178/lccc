@@ -169,7 +169,7 @@ impl<'a> ExprTypeChecker<'a> {
             }
 
             // Cast: type is the target type
-            Expr::Cast(type_spec, _, _) => Some(self.resolve_type_spec(type_spec)),
+            Expr::Cast(type_spec, _, _, _) => Some(self.resolve_type_spec(type_spec)),
 
             // Sizeof and Alignof always produce size_t (unsigned long on 64-bit)
             Expr::Sizeof(_, _)
@@ -307,6 +307,39 @@ impl<'a> ExprTypeChecker<'a> {
                         } else {
                             self.infer_expr_ctype(&args[2])
                         };
+                    }
+
+                    // `__builtin_shuffle` (GCC vector extension): the result
+                    // is the FIRST vector operand's type — verified against
+                    // gcc -O0 with _Generic (a `v4si` shuffle is a `v4si`, an
+                    // `v8hi` shuffle an `v8hi`, in the 2- and 3-argument
+                    // forms).  The name is not in `builtin_return_ctype`,
+                    // which is keyed by name alone and cannot express an
+                    // argument-dependent result, so before this arm the call
+                    // had NO CType at all and every consumer that needs one
+                    // treated a 16-byte vector as an untyped scalar:
+                    // sizeof(__builtin_shuffle(v, m)) was 8, _Generic matched
+                    // nothing, subscripting read the wrong lane, and — the
+                    // miscompile — the lowering's by-value return path handed
+                    // back the shuffle alloca's ADDRESS where the caller
+                    // expected the 16 bytes of data.
+                    //
+                    // `__builtin_shufflevector` is deliberately NOT annotated
+                    // here.  It shares this builtin's semantics but not its
+                    // value convention: its lowering returns the result as a
+                    // PACKED I128 by value (struct_value_size reports None for
+                    // it, and the four name-keyed conventions in expr_types /
+                    // expr_calls / vec128_arg_ptr are written against that),
+                    // while the CType is likewise what makes
+                    // vector_temp_promotion treat the result alloca as a
+                    // promotable vector temporary.  Annotating it made
+                    // `return __builtin_shufflevector(a, b, 3, 2, 1, 0)` read
+                    // a stale slot at -O2 (lanes 2-3 duplicated lanes 0-1).
+                    // Typing it correctly needs that convention rework first.
+                    if name == "__builtin_shuffle" && !args.is_empty() {
+                        if let Some(ct @ CType::Vector(_, _)) = self.infer_expr_ctype(&args[0]) {
+                            return Some(ct);
+                        }
                     }
                 }
                 self.infer_call_return_ctype(func)
@@ -584,29 +617,36 @@ impl<'a> ExprTypeChecker<'a> {
         controlling: &Expr,
         associations: &[GenericAssociation],
     ) -> Option<CType> {
-        let controlling_ct = self.infer_expr_ctype(controlling);
-        let mut default_expr: Option<&Expr> = None;
+        let index = self.generic_selection_index(controlling, associations)?;
+        self.infer_expr_ctype(&associations[index].expr)
+    }
 
-        for assoc in associations {
+    /// The index of the association a `_Generic` selects (C11 6.5.1.1p2): the
+    /// first whose type is compatible with the controlling expression's type,
+    /// else the `default` association, else `None`. The controlling expression
+    /// is not evaluated. This is the single selection rule for the type
+    /// checker and the static-initializer check, so the two cannot disagree.
+    pub fn generic_selection_index(
+        &self,
+        controlling: &Expr,
+        associations: &[GenericAssociation],
+    ) -> Option<usize> {
+        let controlling_ct = self.infer_expr_ctype(controlling);
+        let mut default_index = None;
+        for (index, assoc) in associations.iter().enumerate() {
             match &assoc.type_spec {
-                None => {
-                    default_expr = Some(&assoc.expr);
-                }
+                None => default_index = Some(index),
                 Some(type_spec) => {
                     let assoc_ct = self.resolve_type_spec(type_spec);
                     if let Some(ref ctrl_ct) = controlling_ct {
                         if self.ctype_matches_generic(ctrl_ct, &assoc_ct) {
-                            return self.infer_expr_ctype(&assoc.expr);
+                            return Some(index);
                         }
                     }
                 }
             }
         }
-
-        if let Some(def) = default_expr {
-            return self.infer_expr_ctype(def);
-        }
-        None
+        default_index
     }
 
     /// Check if two CTypes match for _Generic selection purposes.
@@ -682,28 +722,28 @@ impl<'a> ExprTypeChecker<'a> {
                 // overflow by a deeply-starred declarator. The recursive call
                 // below handles only the innermost NON-pointer node, so
                 // pointer depth costs no stack frames at any level.
-                if !matches!(**inner, TypeSpecifier::Pointer(_, _)) {
-                    // Single level -- the overwhelmingly common case. Zero
-                    // allocation, identical result.
-                    CType::Pointer(Box::new(self.resolve_type_spec(inner)), *addr_space)
-                } else {
-                    let mut spaces = Vec::with_capacity(8);
-                    spaces.push(*addr_space);
-                    let mut cur: &TypeSpecifier = inner;
-                    let mut ty = loop {
-                        match cur {
-                            TypeSpecifier::Pointer(i, s) => {
-                                spaces.push(*s);
-                                cur = i;
-                            }
-                            other => break self.resolve_type_spec(other),
-                        }
-                    };
-                    for space in spaces.iter().rev() {
-                        ty = CType::Pointer(Box::new(ty), *space);
-                    }
-                    ty
+                //
+                // An unqualified innermost pointer over `typeof(expr)` takes
+                // the space of `expr`, as in type_builder (GCC behaviour).
+                let mut spaces = Vec::with_capacity(8);
+                spaces.push(*addr_space);
+                let mut cur: &TypeSpecifier = inner;
+                while let TypeSpecifier::Pointer(i, s) = cur {
+                    spaces.push(*s);
+                    cur = i;
                 }
+                let leaf_space = self.typeof_pointee_space(cur);
+                let mut ty = self.resolve_type_spec(cur);
+                let innermost = spaces.len() - 1;
+                for (i, space) in spaces.iter().enumerate().rev() {
+                    let space = if i == innermost && *space == AddressSpace::Default {
+                        leaf_space
+                    } else {
+                        *space
+                    };
+                    ty = CType::Pointer(Box::new(ty), space);
+                }
+                ty
             }
             TypeSpecifier::Array(elem, size) => {
                 let elem_ct = self.resolve_type_spec(elem);
@@ -822,7 +862,7 @@ impl<'a> ExprTypeChecker<'a> {
                 }
             }
             TypeSpecifier::TypeofType(inner) => self.resolve_type_spec(inner),
-            TypeSpecifier::Typeof(expr) => {
+            TypeSpecifier::Typeof(expr, _) => {
                 // typeof(expr): try to infer the expression's type
                 self.infer_expr_ctype(expr).unwrap_or(CType::Int)
             }
@@ -902,6 +942,8 @@ impl<'a> ExprTypeChecker<'a> {
                         .and_then(|bw| self.eval_const_expr(bw).map(|v| v as u32)),
                     alignment: f.alignment,
                     is_packed: f.is_packed,
+                    base_volatile: f.base_volatile,
+                    object_volatile: f.object_volatile,
                 })
             })
             .collect();
@@ -1269,7 +1311,7 @@ impl<'a> ExprTypeChecker<'a> {
         scope: &FxHashMap<String, CType>,
     ) -> CType {
         match ts {
-            TypeSpecifier::Typeof(expr) => {
+            TypeSpecifier::Typeof(expr, _) => {
                 // Try normal resolution first
                 if let Some(ctype) = self.infer_expr_ctype(expr) {
                     return ctype;
@@ -1357,6 +1399,16 @@ impl<'a> ExprTypeChecker<'a> {
         }
     }
 
+    /// Space that `typeof(expr)` as a pointer base contributes; see
+    /// `type_builder::TypeConvertContext::typeof_pointee_space`.
+    fn typeof_pointee_space(&self, leaf: &TypeSpecifier) -> AddressSpace {
+        match leaf {
+            // typeof_unqual drops the named address space: no space.
+            TypeSpecifier::Typeof(expr, false) => self.lvalue_address_space(expr),
+            _ => AddressSpace::Default,
+        }
+    }
+
     /// Named address space of the storage an lvalue designates — the property
     /// `&E` must carry into its pointer type (C11 6.5.3.2p3).
     ///
@@ -1370,7 +1422,7 @@ impl<'a> ExprTypeChecker<'a> {
     /// rejects correct kernel code such as `__tasklet_schedule_common(t,
     /// &tasklet_vec, TASKLET_SOFTIRQ)` whose parameter is `struct tasklet_head
     /// __percpu *`.
-    fn lvalue_address_space(&self, expr: &Expr) -> AddressSpace {
+    pub(super) fn lvalue_address_space(&self, expr: &Expr) -> AddressSpace {
         match expr {
             Expr::Identifier(name, _) => {
                 // `__func__` and enum constants are not objects with storage.
@@ -1379,17 +1431,23 @@ impl<'a> ExprTypeChecker<'a> {
                     .map(|sym| sym.address_space)
                     .unwrap_or(AddressSpace::Default)
             }
-            // `s.inner.field` / `arr[i]` live in the base object's space.
-            Expr::MemberAccess(base, _, _) | Expr::ArraySubscript(base, _, _) => {
-                self.lvalue_address_space(base)
-            }
+            // `s.inner.field` lives in the base object's space.
+            Expr::MemberAccess(base, _, _) => self.lvalue_address_space(base),
+            // `arr[i]` lives in the array's space, but `p[i]` for a pointer `p`
+            // dereferences `p`: the element lives in the space `p` points into,
+            // not in the space of the pointer variable (which is generic).
+            // GCC 14.2: `int __seg_gs *gp; &gp[1]` is a `__seg_gs` pointer.
+            Expr::ArraySubscript(base, _, _) => match self.infer_expr_ctype(base) {
+                Some(CType::Pointer(_, _)) => self.pointee_address_space(base),
+                _ => self.lvalue_address_space(base),
+            },
             // `p->field` / `(*p).field`: the member lives in the space p points
             // into, which may come from p's type rather than its declaration.
             Expr::PointerMemberAccess(base, _, _) | Expr::Deref(base, _) => {
                 self.pointee_address_space(base)
             }
             // `*(__seg_gs T *)n` and friends.
-            Expr::Cast(TypeSpecifier::Pointer(_, space), _, _) => *space,
+            Expr::Cast(TypeSpecifier::Pointer(_, space), _, _, _) => *space,
             _ => AddressSpace::Default,
         }
     }
@@ -1405,14 +1463,14 @@ impl<'a> ExprTypeChecker<'a> {
             }
         }
         match expr {
-            Expr::Cast(TypeSpecifier::Pointer(_, space), inner, _) => {
+            Expr::Cast(TypeSpecifier::Pointer(_, space), inner, _, _) => {
                 if *space != AddressSpace::Default {
                     *space
                 } else {
                     self.pointee_address_space(inner)
                 }
             }
-            Expr::Cast(_, inner, _) => self.pointee_address_space(inner),
+            Expr::Cast(_, inner, _, _) => self.pointee_address_space(inner),
             Expr::AddressOf(inner, _) => self.lvalue_address_space(inner),
             _ => AddressSpace::Default,
         }

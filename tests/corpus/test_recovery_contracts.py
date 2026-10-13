@@ -249,8 +249,17 @@ class MetadataContractTests(unittest.TestCase):
         # probes inspect.signature(tarfile.TarFile.extractall) at call time, so
         # a `**kw` wrapper reads as unsupported and flips the helper to the
         # legacy branch.  Measured -- a `**kw` spy made this observe ABSENT.
-        seen={}
+        #
+        # The probe reads the PATCHED function, so on an interpreter without
+        # PEP 706 (the documented 3.9+ floor, e.g. 3.11.2) the spy makes the
+        # helper report support and the forwarded `filter=` then fails inside
+        # the real extractall.  The claim under test -- "the supported path
+        # passes filter='data'" -- has no subject there: skip it instead of
+        # asserting a capability the interpreter does not have.
         real=tarfile.TarFile.extractall
+        if 'filter' not in inspect.signature(real).parameters:
+            self.skipTest('interpreter extractall has no PEP 706 filter keyword')
+        seen={}
         def spy(self,path='.',members=None,*,filter=None,**kw):
             seen['filter']=filter if filter is not None else 'ABSENT'
             return real(self,path,members=members,filter=filter)
@@ -262,11 +271,15 @@ class MetadataContractTests(unittest.TestCase):
 
     def test_legacy_path_neutralizes_ownership_and_mode(self):
         real=tarfile.TarFile.extractall
+        # `fully_trusted` pins the legacy behaviour on interpreters that have
+        # PEP 706, and does not exist before it (3.11.2 and older reject the
+        # keyword outright) -- forward it only where it is accepted.
+        forward=(lambda kw: kw) if 'filter' in inspect.signature(real).parameters else (lambda kw: {})
         seen={}
         def spy(self,path='.',members=None,*,filter=None,**kw):
             seen['members']=[(m.mode,m.uid,m.gid,m.uname,m.gname)
                              for m in (members if members is not None else self.getmembers())]
-            return real(self,path,members=members,filter='fully_trusted')
+            return real(self,path,members=members,**forward({'filter':'fully_trusted'}))
         archive,record=self.write(_bytes('lccc',[
             _reg('lccc/x',mode=0o777,uid=1234,gid=4321,uname='mallory',gname='mallory')]))
         with tempfile.TemporaryDirectory() as stage:
@@ -286,9 +299,10 @@ class MetadataContractTests(unittest.TestCase):
         sub=tarfile.TarInfo('lccc/sub');sub.type=tarfile.DIRTYPE;sub.mode=0o707
         entries=[sub,_reg('lccc/a',mode=0o777),_reg('lccc/b',mode=0o600),_reg('lccc/c',mode=0o000)]
         real=tarfile.TarFile.extractall
+        forward=(lambda kw: kw) if 'filter' in inspect.signature(real).parameters else (lambda kw: {})
         def legacy(self,path='.',members=None,**kw):
             kw.pop('filter',None)
-            return real(self,path,members=members,filter='fully_trusted')
+            return real(self,path,members=members,**forward({'filter':'fully_trusted'}))
         with tempfile.TemporaryDirectory() as filtered,tempfile.TemporaryDirectory() as legacy_dir:
             archive,record=self.write(_bytes('lccc',entries))
             recovery.extract(archive,Path(filtered),record)

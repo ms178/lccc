@@ -631,8 +631,12 @@ impl X86Cpu {
     /// `-march=native` / `-mtune=native`.
     #[cfg(target_arch = "x86_64")]
     pub fn detect_host() -> X86Cpu {
-        // CPUID is unprivileged and available on every x86-64 CPU (the
-        // intrinsic is safe since Rust 1.86).
+        // CPUID is unprivileged and available on every x86-64 CPU.
+        // `std::arch::__cpuid` is callable from safe code on the toolchains
+        // this project supports (AUD-TOOLCHAIN-1: the MSRV in Cargo.toml is
+        // 1.97.0, where this file compiles without an `unsafe` block; the
+        // previous comment claimed "safe since Rust 1.86", which was wrong —
+        // rustc 1.91 rejected exactly these calls with E0133).
         let vendor = std::arch::x86_64::__cpuid(0);
         let leaf1 = std::arch::x86_64::__cpuid(1);
         let (is_intel, is_amd) = Self::vendor_flags(&vendor);

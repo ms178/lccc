@@ -295,13 +295,35 @@ impl Driver {
             Self::read_source(input_file)?
         };
 
-        // Debug: dump preprocessed assembly to /tmp/asm_debug_<basename>.s
+        // Debug: dump preprocessed assembly next to the other temp files.
+        //
+        // AUD-TMP-1: the path used to be the *fixed* `/tmp/asm_debug_<stem>.s`,
+        // which another local user could pre-create as a symlink to any file
+        // the invoking user may write (and which parallel compiles of the same
+        // stem silently overwrote, so the dump was frequently not the assembly
+        // of the unit being debugged either). The dump now gets a unique,
+        // never-reused name inside the process-private 0700 temp directory and
+        // is created with O_CREAT|O_EXCL, so it can neither follow a symlink
+        // nor collide with another run. It survives process exit by design
+        // (that is the point of a debug dump), and its path is reported so it
+        // can actually be found.
         if std::env::var("CCC_ASM_DEBUG").is_ok() {
             let basename = std::path::Path::new(input_file)
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown");
-            let _ = std::fs::write(format!("/tmp/asm_debug_{}.s", basename), &asm_text);
+            match crate::common::temp_files::write_debug_dump(
+                "ccc_asm_debug",
+                basename,
+                "s",
+                asm_text.as_bytes(),
+            ) {
+                Some(path) => eprintln!("[ccc] CCC_ASM_DEBUG: wrote {}", path.display()),
+                None => eprintln!(
+                    "[ccc] CCC_ASM_DEBUG: could not write the assembly dump for {}",
+                    input_file
+                ),
+            }
         }
 
         let extra = self.build_asm_extra_args();
@@ -450,6 +472,21 @@ impl Driver {
                 for p in prereqs.iter().skip(usize::from(input_file != "-")) {
                     content.push_str(&format!("\n{}:\n", p));
                 }
+            }
+            if dep_path == "-" {
+                // `-MF -` (and `-Wp,-MMD,-`) asks GCC to print the rules to
+                // standard output, which is how build systems capture
+                // dependencies without a temp file. It was previously treated
+                // as a literal file named `-`.
+                use std::io::Write;
+                let stdout = std::io::stdout();
+                let mut lock = stdout.lock();
+                return lock
+                    .write_all(content.as_bytes())
+                    .and_then(|()| lock.flush())
+                    .map_err(|e| {
+                        format!("Cannot write dependency rules to standard output: {}", e)
+                    });
             }
             std::fs::write(&dep_path, content)
                 .map_err(|e| format!("Cannot write dependency file {}: {}", dep_path, e))

@@ -54,6 +54,39 @@ pub trait TypeConvertContext {
     /// Lowering: evaluates the expression's type.
     fn resolve_typeof_expr(&self, expr: &Expr) -> CType;
 
+    /// Named address space of the object an expression designates, as
+    /// `typeof(expr)` inherits it. GCC gives `typeof(obj)` the object's
+    /// qualifier: `__typeof__(gobj) *p` points into `gobj`'s segment and
+    /// `__typeof__(gobj) v;` declares a segment object. Sema answers from its
+    /// symbol table, lowering from its scope. `Default` for rvalues.
+    fn typeof_object_space(&self, expr: &Expr) -> AddressSpace;
+
+    /// Space the pointee of a pointer whose innermost base is `leaf` gets from
+    /// that base: `typeof(expr)` contributes the space of `expr`, any other
+    /// base contributes nothing.
+    fn typeof_pointee_space(&self, leaf: &TypeSpecifier) -> AddressSpace {
+        match leaf {
+            // typeof_unqual drops the named address space: no space.
+            TypeSpecifier::Typeof(expr, false) => self.typeof_object_space(expr),
+            _ => AddressSpace::Default,
+        }
+    }
+
+    /// Space the objects declared with `decl_space` and `type_spec` live in:
+    /// the declaration's own qualifier, or for an unqualified `typeof(expr)`
+    /// the space of `expr`. Sema and lowering both read declarations through
+    /// this, so the two can never disagree about where an object lives.
+    fn declaration_address_space(
+        &self,
+        decl_space: AddressSpace,
+        type_spec: &TypeSpecifier,
+    ) -> AddressSpace {
+        if decl_space != AddressSpace::Default {
+            return decl_space;
+        }
+        self.typeof_pointee_space(type_spec)
+    }
+
     /// Try to evaluate a constant expression to a usize (for array sizes).
     /// Returns None if the expression cannot be evaluated at compile time.
     fn eval_const_expr_as_usize(&self, expr: &Expr) -> Option<usize>;
@@ -111,11 +144,16 @@ pub trait TypeConvertContext {
                 // the old code: no scratch allocation, one call, one Box. Only
                 // a genuinely multi-level pointer pays for the Vec, and even
                 // then it trades N call frames for N pushes, which is cheaper.
+                // The innermost pointer's pointee is the base type, so when
+                // the base is `typeof(expr)` an unqualified innermost pointer
+                // takes the space of `expr` (GCC: `__typeof__(gobj) *`).
                 if !matches!(&**inner, TypeSpecifier::Pointer(..)) {
-                    return CType::Pointer(
-                        Box::new(self.resolve_type_spec_to_ctype(inner)),
-                        *addr_space,
-                    );
+                    let space = if *addr_space == AddressSpace::Default {
+                        self.typeof_pointee_space(inner)
+                    } else {
+                        *addr_space
+                    };
+                    return CType::Pointer(Box::new(self.resolve_type_spec_to_ctype(inner)), space);
                 }
                 let mut spaces: Vec<AddressSpace> = vec![*addr_space];
                 let mut node: &TypeSpecifier = inner;
@@ -123,8 +161,15 @@ pub trait TypeConvertContext {
                     spaces.push(*space);
                     node = next.as_ref();
                 }
+                let leaf_space = self.typeof_pointee_space(node);
                 let mut ty = self.resolve_type_spec_to_ctype(node);
-                for space in spaces.into_iter().rev() {
+                let innermost = spaces.len() - 1;
+                for (i, space) in spaces.into_iter().enumerate().rev() {
+                    let space = if i == innermost && space == AddressSpace::Default {
+                        leaf_space
+                    } else {
+                        space
+                    };
                     ty = CType::Pointer(Box::new(ty), space);
                 }
                 ty
@@ -211,7 +256,7 @@ pub trait TypeConvertContext {
             TypeSpecifier::Enum(name, variants, is_packed) => {
                 self.resolve_enum(name, variants, *is_packed)
             }
-            TypeSpecifier::Typeof(expr) => self.resolve_typeof_expr(expr),
+            TypeSpecifier::Typeof(expr, _) => self.resolve_typeof_expr(expr),
             TypeSpecifier::Vector(inner, total_bytes) => {
                 let elem_ctype = self.resolve_type_spec_to_ctype(inner);
                 CType::Vector(Box::new(elem_ctype), *total_bytes)
@@ -904,7 +949,7 @@ pub fn named_space_qualifies_whole_type(
 ) -> bool {
     let typedef_base = matches!(
         type_spec,
-        TypeSpecifier::TypedefName(_) | TypeSpecifier::Typeof(_) | TypeSpecifier::TypeofType(_)
+        TypeSpecifier::TypedefName(_) | TypeSpecifier::Typeof(..) | TypeSpecifier::TypeofType(_)
     );
     typedef_base
         && !derived.iter().any(|d| {

@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import importlib.util
+import inspect
 import io
 import os
 import pathlib
@@ -26,6 +27,22 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+
+
+def forward(real, **kw):
+    """Keywords the *real* extractall accepts on this interpreter.
+
+    The spies below pin behaviour that only exists where PEP 706 does; on the
+    documented 3.9+ floor (and on distros that backported only part of it)
+    forwarding `filter=` to the real function raises TypeError.  Passing only
+    what the real signature takes keeps each test measuring its own claim.
+    """
+    try:
+        params = inspect.signature(real).parameters
+    except (TypeError, ValueError):
+        return {}
+    return {k: v for k, v in kw.items() if k in params}
+
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 RUNNER = REPO / 'tests' / 'workloads' / 'gzip-1.14' / 'run.py'
@@ -253,7 +270,8 @@ def pre_pep706(module):
 
     def legacy(self, path='.', members=None, **kw):
         kw.pop('filter', None)
-        return real(self, path, members=members, filter='fully_trusted')
+        return real(self, path, members=members,
+                    **forward(real, filter='fully_trusted'))
 
     with mock.patch.object(module, 'extractall_takes_filter', lambda: False), \
             mock.patch.object(tarfile.TarFile, 'extractall', legacy):
@@ -297,7 +315,7 @@ class DataFilterKeywordTests(unittest.TestCase):
         # purpose, so a patched extractall is a patched probe.
         def spy(self, path='.', members=None, *, filter=None, **kw):
             seen['filter'] = filter if filter is not None else 'ABSENT'
-            return real(self, path, members=members, filter=filter)
+            return real(self, path, members=members, **forward(real, filter=filter))
 
         data = _build('gzip-1.14', [_reg('gzip-1.14', 'ok.txt')])
         with tempfile.TemporaryDirectory() as dest:
@@ -305,13 +323,25 @@ class DataFilterKeywordTests(unittest.TestCase):
                 runner.extract_untrusted(_open(data), Path(dest))
         self.assertEqual(seen.get('filter'), 'data')
 
+    def test_supported_path_is_only_asserted_where_the_interpreter_has_it(self):
+        # The probe reads the LIVE extractall object, so installing a spy that
+        # spells `filter=` makes the helper report support even on an
+        # interpreter without PEP 706 (the documented 3.9+ floor).  What the
+        # supporting-path tests assert -- "extract_untrusted passes
+        # filter='data'" -- has no subject there; pair this sentinel with the
+        # `forward` helper below so a skip is always explicit.
+        real = tarfile.TarFile.extractall
+        if 'filter' not in inspect.signature(real).parameters:
+            self.skipTest('interpreter extractall has no PEP 706 filter keyword')
+
     def test_legacy_path_never_passes_a_filter_keyword(self):
         seen = {}
         real = tarfile.TarFile.extractall
 
         def spy(self, path='.', members=None, **kw):
             seen['filter'] = kw.get('filter', 'ABSENT')
-            return real(self, path, members=members, filter='fully_trusted')
+            return real(self, path, members=members,
+                        **forward(real, filter='fully_trusted'))
 
         data = _build('gzip-1.14', [_reg('gzip-1.14', 'ok.txt')])
         with tempfile.TemporaryDirectory() as dest:
@@ -328,7 +358,8 @@ class DataFilterKeywordTests(unittest.TestCase):
         def spy(self, path='.', members=None, *, filter=None, **kw):
             seen['members'] = [(m.mode, m.uid, m.gid, m.uname, m.gname)
                                for m in (members if members is not None else self.getmembers())]
-            return real(self, path, members=members, filter='fully_trusted')
+            return real(self, path, members=members,
+                        **forward(real, filter='fully_trusted'))
 
         data = _build('gzip-1.14', [_reg('gzip-1.14', 'x', mode=0o777,
                                          uid=1234, gid=4321, uname='mallory', gname='mallory')])

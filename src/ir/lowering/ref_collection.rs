@@ -274,7 +274,7 @@ impl Lowerer {
             }
             Expr::UnaryOp(_, operand, _)
             | Expr::PostfixOp(_, operand, _)
-            | Expr::Cast(_, operand, _) => {
+            | Expr::Cast(_, operand, _, _) => {
                 self.collect_refs_from_expr(operand, refs);
             }
             Expr::Conditional(c, t, f, _) => {

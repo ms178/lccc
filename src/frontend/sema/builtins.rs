@@ -752,8 +752,11 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         BuiltinInfo::intrinsic(BuiltinIntrinsic::CpuInit),
     );
     // __builtin_cpu_supports("feature") returns nonzero if the CPU supports
-    // the named feature. We conservatively return 0 (not supported) so that
-    // code always takes the safe fallback path.
+    // the named feature. lccc has no runtime CPUID probe (AUD-CPU-2 tracks the
+    // libgcc-compatible `__cpu_model` path), so lowering folds it against the
+    // effective code-generation permission of this invocation: 1 exactly when
+    // the backend may emit the feature unconditionally, 0 otherwise. See
+    // `common::x86_features` and `tests/regression/check_cpu_supports_fold.sh`.
     m.insert(
         "__builtin_cpu_supports",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::CpuSupports),
@@ -2909,7 +2912,8 @@ pub enum BuiltinIntrinsic {
     Nop,
     /// __builtin_cpu_init() - no-op, glibc handles CPU feature detection init
     CpuInit,
-    /// __builtin_cpu_supports("feature") - conservatively returns 0 (unsupported)
+    /// __builtin_cpu_supports("feature") - folds on the effective feature set
+    /// (1 = the backend guarantees the feature for this invocation)
     CpuSupports,
     /// __builtin_add_overflow(a, b, result_ptr) -> bool (1 if overflow)
     AddOverflow,

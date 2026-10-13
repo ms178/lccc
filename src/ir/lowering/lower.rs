@@ -1226,26 +1226,43 @@ impl Lowerer {
         // _Float128 returns are 16-byte SSE-class values (SysV psABI): ONE XMM
         // register (xmm0).
         let mut ret_is_f128_sse = false;
-        let ret_eightbyte_classes =
-            if matches!(full_ret_ctype, CType::Float128) || full_ret_ctype == CType::Decimal128 {
-                ret_is_f128_sse = true;
-                vec![
-                    crate::common::types::EightbyteClass::Sse,
-                    crate::common::types::EightbyteClass::Sse,
-                ]
-            } else if two_reg_ret_size.is_some() && ptr_count == 0 {
-                if full_ret_ctype.is_struct_or_union() || full_ret_ctype.is_vector() {
-                    if let Some(layout) = self.get_struct_layout_for_type(ret_type_spec) {
-                        layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts())
-                    } else {
-                        Vec::new()
-                    }
+        let ret_eightbyte_classes = if matches!(full_ret_ctype, CType::Float128)
+            || full_ret_ctype == CType::Decimal128
+        {
+            ret_is_f128_sse = true;
+            vec![
+                crate::common::types::EightbyteClass::Sse,
+                crate::common::types::EightbyteClass::Sse,
+            ]
+        } else if crate::common::types::target_elf_machine() == 62 && full_ret_ctype.is_vector() {
+            // AUD-VABI-1: a vector is not a struct.  Its first eightbyte
+            // is SSE and its second SSEUP ("upper half of the same
+            // register"), so `<4 x i32>` returns in ONE xmm0 -- while the
+            // by-value struct path below, which has no SSEUP notion, put
+            // the two halves in rdx:rax.  Measured against gcc 12.2: an
+            // lccc-compiled caller read a stack pointer and printed
+            // `16 0 65536 0` where gcc's callee had returned
+            // `11 22 33 44` in xmm0.
+            match full_ret_ctype.sysv_vector_carrier() {
+                Some((classes, one_xmm)) => {
+                    ret_is_f128_sse = one_xmm;
+                    classes
+                }
+                None => Vec::new(),
+            }
+        } else if two_reg_ret_size.is_some() && ptr_count == 0 {
+            if full_ret_ctype.is_struct_or_union() || full_ret_ctype.is_vector() {
+                if let Some(layout) = self.get_struct_layout_for_type(ret_type_spec) {
+                    layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts())
                 } else {
                     Vec::new()
                 }
             } else {
                 Vec::new()
-            };
+            }
+        } else {
+            Vec::new()
+        };
 
         // A K&R definition needs the declared body types before default
         // promotions. A prototype declaration instead needs its callable
@@ -1357,6 +1374,19 @@ impl Lowerer {
                             crate::common::types::EightbyteClass::Sse,
                             crate::common::types::EightbyteClass::Sse,
                         ]
+                    } else if crate::common::types::target_elf_machine() == 62 {
+                        // AUD-VABI-1: a vector argument is SSE (+SSEUP for the
+                        // second eightbyte), i.e. ONE xmm register; the struct
+                        // path classified it as INTEGER and the callee read
+                        // the argument from a GP pair.
+                        match self.type_spec_to_ctype(&p.type_spec).sysv_vector_carrier() {
+                            Some((classes, _)) => classes,
+                            None => match self.get_struct_layout_for_type(&p.type_spec) {
+                                Some(layout) => layout
+                                    .classify_sysv_eightbytes(&*self.types.borrow_struct_layouts()),
+                                None => Vec::new(),
+                            },
+                        }
                     } else if let Some(layout) = self.get_struct_layout_for_type(&p.type_spec) {
                         layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts())
                     } else {
@@ -1374,6 +1404,13 @@ impl Lowerer {
             .map(|p| {
                 matches!(self.type_spec_to_ctype(&p.type_spec), CType::Float128)
                     || self.type_spec_to_ctype(&p.type_spec) == CType::Decimal128
+                    // AUD-VABI-1: a 16-byte vector is carried in ONE 16-byte
+                    // xmm register exactly like _Float128 (SSE + SSEUP).
+                    || (crate::common::types::target_elf_machine() == 62
+                        && self
+                            .type_spec_to_ctype(&p.type_spec)
+                            .sysv_vector_carrier()
+                            .is_some_and(|(_, one_xmm)| one_xmm))
             })
             .collect();
 

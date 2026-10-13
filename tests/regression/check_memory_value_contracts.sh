@@ -2,7 +2,12 @@
 set -Eeuo pipefail
 cd "$(dirname "$0")/../.."
 ccc=${CCC:-target/fastbuild/lccc}
-ref=${CC_REF:-gcc}
+. tests/regression/lib/gcc_oracle.sh
+require_gcc_oracle "check_memory_value_contracts" || exit 1
+ref=${CC_REF:-$GCC_ORACLE_BIN}
+# The i686 leg runs "$ref" -m32; fail up front with the install hint if that
+# reference cannot link (a bare link error here reads as a compiler failure).
+[ -n "${CC_REF:-}" ] || gcc_oracle_require_m32 "check_memory_value_contracts" || exit 1
 td=$(mktemp -d)
 trap 'rm -rf "$td"' EXIT
 test=setup opt=none isa=native disabled=none phase=setup

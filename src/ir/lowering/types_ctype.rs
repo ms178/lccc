@@ -345,6 +345,8 @@ impl Lowerer {
                         bit_width,
                         alignment: f.alignment,
                         is_packed: f.is_packed,
+                        base_volatile: f.base_volatile,
+                        object_volatile: f.object_volatile,
                     })
                 })
                 .collect();
@@ -468,6 +470,10 @@ impl Lowerer {
 /// - enum: returns CType::Int (enums are plain ints at IR level)
 /// - typeof: evaluates the expression's actual type
 impl type_builder::TypeConvertContext for Lowerer {
+    fn typeof_object_space(&self, expr: &Expr) -> AddressSpace {
+        self.get_addr_space_of_struct_expr(expr)
+    }
+
     fn resolve_typedef(&self, name: &str) -> CType {
         // Check function pointer typedefs first (they carry richer type info)
         if let Some(fptr_ctype) = self.build_function_pointer_ctype_from_typedef(name) {

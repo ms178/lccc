@@ -9,7 +9,7 @@ on:
 jobs:
   test:
     name: Test Suite
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -67,10 +67,23 @@ jobs:
       # the stated reason, and prints the oracle's --version in its summary --
       # so this step is what makes the oracle deterministic, and the gate is
       # what makes a missing one loud instead of vacuous.
-      - name: Install a C23-capable GCC oracle
+      # The GCC 16 oracle is also the i686 reference for
+      # check_memory_value_contracts.sh (`"$ref" -m32`). The default-GCC
+      # multilib above does NOT provide 32-bit crt objects or libgcc for
+      # gcc-16, so that gate's -m32 reference link failed on this runner
+      # (PR #809 CI). Provision the 32-bit runtime for the oracle itself,
+      # then prove it links and runs an i686 binary before any gate depends
+      # on it.
+      - name: Install the GCC 16 oracle
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-14
+          # g++-16-multilib and lib32stdc++-16-dev supply the 32-bit C++
+          # headers and runtime that the linker suite's i386_dso_emit_semantics
+          # cxxprobe needs (it names exactly these packages when they are missing).
+          sudo apt-get install -y --no-install-recommends gcc-16 gcc-16-multilib g++-16-multilib lib32stdc++-16-dev
+          printf 'int main(void){return 0;}\n' > /tmp/oracle_m32.c
+          gcc-16 -m32 /tmp/oracle_m32.c -o /tmp/oracle_m32
+          /tmp/oracle_m32
 
       - name: Cache cargo registry
         uses: actions/cache@v6
@@ -141,6 +154,58 @@ jobs:
 
       - name: Aggregate-call byte boundaries and cross-compiler ABI
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_aggregate_call_abi.sh
+
+      # AUD-VABI-1: a 16-byte vector is ONE %xmm (SSE + SSEUP), not an
+      # INTEGER/GP pair, in both directions and through function pointers --
+      # proved by linking each side against a GCC-compiled translation unit.
+      - name: Vector arguments and returns at the compiler boundary
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_vector_abi_boundary.sh
+
+      # AUD-TMP-1: temp files must be symlink-proof (pre-placed symlink and
+      # pre-placed directory reproducers; victim file must stay untouched).
+      # AUD-HYGIENE-1: the previously unreferenced tests/compat_test.sh and the
+      # loose IVSR probes run in ci_local.sh too; scripts/check_ci_gate_parity.py
+      # fails if these two lists drift.
+      - name: LCCC vs GCC compatibility suite
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_compat_suite.sh
+
+      - name: IVSR/univsr loop-strength-reduction probe contracts
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_ivsr_reproducers.sh
+
+      - name: Temp-file symlink hardening
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_temp_symlink.sh
+
+      # AUD-DRV-1: `-o -` streams to stdout for -S/-E/-M and is rejected for
+      # -c / multiple inputs, exactly like GCC.
+      - name: Standard-output contract for -o -
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_o_stdout.sh
+
+      # AUD-CPU-1: `__builtin_cpu_supports` folds from the effective codegen
+      # permission (target + -march + -m*), so runtime dispatch cannot select
+      # an instruction set the build was not allowed to assume.
+      - name: CPU feature fold honours -march and target
+        run: env CCC=target/fastbuild/lccc CCC_ARM=target/fastbuild/lccc-arm bash tests/regression/check_cpu_supports_fold.sh
+
+      # AUD-ICE-1/AUD-DIAG-1: malformed `__builtin_shuffle` masks diagnose
+      # instead of panicking, and the valid forms still lower (oracle-checked
+      # against gcc).
+      - name: Shuffle builtin diagnostics
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_shuffle_diagnostics.sh
+
+      # AUD-SILENT-ZERO-1: an x86-only intrinsic compiled for AArch64/RISC-V
+      # must trap (and be encodable), never silently compute zeros.
+      - name: Cross-target intrinsic trap
+        run: |
+          env CCC=target/fastbuild/lccc \
+              CCC_ARM=target/fastbuild/lccc-arm \
+              CCC_RISCV=target/fastbuild/lccc-riscv \
+              CCC_I686=target/fastbuild/lccc-i686 \
+              bash tests/regression/check_cross_target_intrinsic_trap.sh
+
+      # AUD-CPU-3: `-march=x86-64` must reject `_mm_crc32_u8`/`_mm_aesenc_si128`
+      # (GCC does), and the flag that grants the extension must still lower it.
+      - name: ISA-sensitive intrinsic feature gate
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_intrinsic_feature_gate.sh
 
       - name: Run tests
         env:
@@ -582,17 +647,76 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_seg_declarator_space.sh
 
+      # Named-space codegen through a typedef or typeof: every access to the
+      # Block-scope static initializers, designator validity, volatile typedef
+      # objects: each checked against the GCC 16.2 oracle.
+      - name: Run static-local initializer check
+        env:
+          CCC: target/fastbuild/lccc
+          GCC: gcc-16
+        run: bash tests/regression/check_static_local_init.sh
+
+      - name: Run designator initializer check
+        env:
+          CCC: target/fastbuild/lccc
+          GCC: gcc-16
+        run: bash tests/regression/check_designator_init.sh
+
+      - name: Run file-scope initializer check
+        env:
+          CCC: target/fastbuild/lccc
+          GCC: gcc-16
+        run: bash tests/regression/check_file_scope_init.sh
+
+      - name: Run typedef volatile codegen check
+        env:
+          CCC: target/fastbuild/lccc
+          GCC: gcc-16
+        run: bash tests/regression/check_typedef_volatile_codegen.sh
+
+      # Named-space initializers through brace elision and anonymous members (GCC 16.2 lines).
+      - name: Run __seg_gs brace-elision initializer check
+        env:
+          CCC: target/fastbuild/lccc
+          GCC: gcc-16
+        run: bash tests/regression/check_seg_init_brace_elision.sh
+
+      # Volatile struct members keep their accesses at -O2 (GCC 16.2 counts, C11 6.7.3p7).
+      - name: Run volatile member codegen check
+        env:
+          CCC: target/fastbuild/lccc
+          GCC: gcc-16
+        run: bash tests/regression/check_volatile_member_codegen.sh
+
+      # `const volatile` objects are volatile at every read: `const` forbids
+      # writes, it does not license folding the access away (C11 6.7.3p7).
+      - name: Run const volatile object check
+        env:
+          CCC: target/fastbuild/lccc
+          GCC: gcc-16
+        run: bash tests/regression/check_const_volatile_objects.sh
+
+      # __seg_gs object must carry the %gs: prefix (audit H2, silent miscompile).
+      - name: Run __seg_gs typedef codegen check
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_seg_typedef_codegen.sh
+
       # Named-space array decay through identifiers, members, subscripts and arithmetic.
       - name: Run __seg_gs conversion diagnostics check
         env:
           CCC: target/fastbuild/lccc
-          GCC: gcc-14
+          GCC: gcc-16
         run: bash tests/regression/check_seg_conv_diagnostics.sh
 
       - name: Reject named address spaces on unsupported targets without an ICE
         env:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_seg_target_diagnostics.sh
+      - name: Run __seg_gs conversion parity check (44 shapes against gcc 16.2)
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_seg_conversion_parity.sh
 
       # Chroot bind() creates a file target for a file source.
       - name: Run chroot bind regression
@@ -1259,6 +1383,11 @@ jobs:
           bash tests/regression/check_redundant_test_elimination.sh
           python3 tests/regression/verify_pr713_audit.py --quiet
           python3 scripts/check_doc_links.py
+          # AUD-RATCHET-1: the audit census (scripts/audit_census.py) is the
+          # only place the audit's site counts are measurable; the ratchet is
+          # what stops them growing back.  Runs in ci_local.sh too.
+          python3 scripts/audit_census.py --selftest
+          python3 scripts/audit_census.py --check
           python3 scripts/check_peephole_directive_step.py
           python3 scripts/check_pr_claim_fidelity.py
           bash tests/regression/check_ra_web_inloop_use.sh
@@ -1442,7 +1571,7 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -1457,10 +1586,15 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
+      # The wrapper runs the same strict Clippy invocation and additionally
+      # re-probes the crate-root lint policy under `#![deny(unknown_lints)]`:
+      # the root carries `#![allow(unknown_lints)]` for lints that exist only
+      # in Clippy versions newer than the declared MSRV, and that allow would
+      # otherwise also silence a typo in the policy list.
       - name: Run strict Clippy
         env:
           CARGO_BUILD_JOBS: "2"
-        run: cargo clippy --all-targets --profile fastbuild --locked -j 2 -- -D warnings
+        run: python3 scripts/check_clippy_policy.py
 
   # MS-01 (competitive half): compare LCCC against GCC / Clang / ICX on
   # Compiler Explorer and fail on regression against the committed baseline.
@@ -1468,7 +1602,7 @@ jobs:
   # a red build; the self-tests in the `test` job pin the gate logic itself.
   oracle-delta:
     name: Compiler Explorer oracle delta
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v7

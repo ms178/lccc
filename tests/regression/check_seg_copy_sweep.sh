@@ -33,11 +33,9 @@ trap 'rm -rf "$tmp"' EXIT
 python3 "$gen" "$tmp/sweep.c"
 
 fail=0
-if ! command -v gcc >/dev/null 2>&1; then
-    echo "FAIL: gcc is required as the oracle for the sweep"
-    exit 1
-fi
-gcc -O0 -w -o "$tmp/oracle" "$tmp/sweep.c"
+. tests/regression/lib/gcc_oracle.sh
+require_gcc_oracle "check_seg_copy_sweep" || exit 1
+"$GCC_ORACLE_BIN" -O0 -w -o "$tmp/oracle" "$tmp/sweep.c"
 "$tmp/oracle" > "$tmp/oracle.out" 2>&1 || true
 if [ "$(tail -n 1 "$tmp/oracle.out")" != "seg_copy_sweep PASSED (192 sizes)" ]; then
     echo "FAIL: gcc -O0 oracle did not pass the sweep"

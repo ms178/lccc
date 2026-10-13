@@ -13,9 +13,16 @@
 //! for each initializer category, keeping each function short and readable.
 
 use crate::frontend::parser::ast::{
-    BinOp, Designator, Expr, Initializer, InitializerItem, TypeSpecifier,
+    BinOp, Designator, Expr, Initializer, InitializerItem, TypeSpecifier, UnaryOp,
 };
 use crate::ir::reexports::{GlobalInit, IrConst, IrGlobal};
+
+/// An operand of a folded global relational expression (`eval_global_relational`):
+/// an integer constant, or the address of a named global plus a byte offset.
+enum GlobalOperand {
+    Int(i64),
+    Addr(String, i64),
+}
 
 /// Kind of string literal for extract_string_literal helper.
 enum StringLitKind {
@@ -246,8 +253,106 @@ impl Lowerer {
             return label_diff;
         }
 
+        // Relational, equality and logical operators over address constants,
+        // and characters of string literals. GCC folds these in a static
+        // initializer, and sema accepts exactly these forms (static_init.rs),
+        // so each is folded here instead of falling through to the zero init.
+        if let Some(v) = self.eval_global_relational(expr) {
+            return GlobalInit::Scalar(self.coerce_scalar_const(
+                IrConst::I64(v),
+                expr,
+                base_ty,
+                is_long_double_target,
+                is_bool_target,
+            ));
+        }
+
         // Can't evaluate - zero init as fallback
         GlobalInit::Zero
+    }
+
+    /// The operand of a folded global relational or logical expression: an
+    /// integer constant, or the address of a named global with a byte offset.
+    fn global_operand(&self, expr: &Expr) -> Option<GlobalOperand> {
+        if let Some(v) = self.eval_const_expr(expr).and_then(|c| c.to_i64()) {
+            return Some(GlobalOperand::Int(v));
+        }
+        match self.eval_global_addr_expr(expr)? {
+            GlobalInit::GlobalAddr(name) => Some(GlobalOperand::Addr(name, 0)),
+            GlobalInit::GlobalAddrOffset(name, off) => Some(GlobalOperand::Addr(name, off)),
+            _ => None,
+        }
+    }
+
+    /// The truth value of a folded operand: an address is never null.
+    fn global_truth(&self, expr: &Expr) -> Option<bool> {
+        match self.global_operand(expr)? {
+            GlobalOperand::Int(v) => Some(v != 0),
+            GlobalOperand::Addr(..) => Some(true),
+        }
+    }
+
+    /// The value of a relational, equality or logical expression over address
+    /// constants, or of a character of an ASCII string literal, as an integer.
+    /// `None` when the form is not one of these (the caller then decides).
+    fn eval_global_relational(&self, expr: &Expr) -> Option<i64> {
+        match expr {
+            Expr::ArraySubscript(base, index, _) => {
+                let Expr::StringLiteral(text, _) = base.as_ref() else {
+                    return None;
+                };
+                if !text.is_ascii() {
+                    return None;
+                }
+                let i = usize::try_from(self.eval_const_expr(index)?.to_i64()?).ok()?;
+                // The character at `len` is the terminating NUL.
+                text.as_bytes()
+                    .get(i)
+                    .map(|&b| i64::from(b))
+                    .or_else(|| (i == text.len()).then_some(0))
+            }
+            Expr::UnaryOp(UnaryOp::LogicalNot, inner, _) => {
+                Some(i64::from(!self.global_truth(inner)?))
+            }
+            Expr::BinaryOp(BinOp::LogicalAnd, lhs, rhs, _) => Some(i64::from(
+                self.global_truth(lhs)? && self.global_truth(rhs)?,
+            )),
+            Expr::BinaryOp(BinOp::LogicalOr, lhs, rhs, _) => Some(i64::from(
+                self.global_truth(lhs)? || self.global_truth(rhs)?,
+            )),
+            Expr::BinaryOp(op, lhs, rhs, _) => self.eval_global_compare(*op, lhs, rhs),
+            _ => None,
+        }
+    }
+
+    /// A comparison of two global operands. Distinct objects are never equal
+    /// (GCC folds `&g == &h` to 0), an address is greater than the null
+    /// constant, and ordering across distinct objects is not a constant (GCC
+    /// rejects `&g < &h`), so it yields `None`.
+    fn eval_global_compare(&self, op: BinOp, lhs: &Expr, rhs: &Expr) -> Option<i64> {
+        use std::cmp::Ordering;
+        let (a, b) = (self.global_operand(lhs)?, self.global_operand(rhs)?);
+        let equal = match (&a, &b) {
+            (GlobalOperand::Addr(x, ox), GlobalOperand::Addr(y, oy)) => Some(x == y && ox == oy),
+            (GlobalOperand::Addr(..), GlobalOperand::Int(0))
+            | (GlobalOperand::Int(0), GlobalOperand::Addr(..)) => Some(false),
+            _ => None,
+        };
+        let order = match (&a, &b) {
+            (GlobalOperand::Addr(x, ox), GlobalOperand::Addr(y, oy)) if x == y => Some(ox.cmp(oy)),
+            (GlobalOperand::Addr(..), GlobalOperand::Int(0)) => Some(Ordering::Greater),
+            (GlobalOperand::Int(0), GlobalOperand::Addr(..)) => Some(Ordering::Less),
+            _ => None,
+        };
+        match op {
+            BinOp::Eq => equal.map(i64::from),
+            BinOp::Ne => equal.map(|e| i64::from(!e)),
+            BinOp::Lt => order.map(|o| i64::from(o.is_lt())),
+            BinOp::Le => order.map(|o| i64::from(o.is_le())),
+            BinOp::Gt => order.map(|o| i64::from(o.is_gt())),
+            BinOp::Ge => order.map(|o| i64::from(o.is_ge())),
+            _ => None,
+        }
     }
 
     /// Recursively walk an expression tree and materialize any compound literals
@@ -273,7 +378,7 @@ impl Lowerer {
                     }
                 }
             }
-            Expr::Cast(_, inner, _) => {
+            Expr::Cast(_, inner, _, _) => {
                 self.materialize_compound_literals_in_expr(inner);
             }
             Expr::BinaryOp(_, lhs, rhs, _) => {
@@ -1311,7 +1416,7 @@ impl Lowerer {
                     None
                 }
             }
-            Expr::Cast(_, inner, _) => self.eval_string_literal_addr_expr(inner),
+            Expr::Cast(_, inner, _, _) => self.eval_string_literal_addr_expr(inner),
             Expr::StringLiteral(s, _) => {
                 Some(GlobalInit::GlobalAddr(self.intern_string_literal(s)))
             }
@@ -1354,7 +1459,7 @@ impl Lowerer {
             Expr::StringLiteral(s, _) => Some((s.clone(), StringLitKind::Narrow)),
             Expr::WideStringLiteral(s, _) => Some((s.clone(), StringLitKind::Wide)),
             Expr::Char16StringLiteral(s, _) => Some((s.clone(), StringLitKind::Char16)),
-            Expr::Cast(_, inner, _) => self.extract_string_literal(inner),
+            Expr::Cast(_, inner, _, _) => self.extract_string_literal(inner),
             _ => None,
         }
     }
@@ -2245,7 +2350,7 @@ impl Lowerer {
     /// Strip cast expressions to find the underlying expression.
     pub(super) fn strip_casts(expr: &Expr) -> &Expr {
         match expr {
-            Expr::Cast(_, inner, _) => Self::strip_casts(inner),
+            Expr::Cast(_, inner, _, _) => Self::strip_casts(inner),
             _ => expr,
         }
     }
@@ -2257,7 +2362,7 @@ impl Lowerer {
             Expr::BinaryOp(_, lhs, rhs, _) => {
                 Self::expr_contains_label_addr(lhs) || Self::expr_contains_label_addr(rhs)
             }
-            Expr::Cast(_, inner, _) => Self::expr_contains_label_addr(inner),
+            Expr::Cast(_, inner, _, _) => Self::expr_contains_label_addr(inner),
             _ => false,
         }
     }

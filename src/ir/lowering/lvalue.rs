@@ -249,28 +249,47 @@ impl Lowerer {
     ///    itself not a pointer (`volatile u32 *p; *p;`), including
     ///    pointer-to-volatile parameters;
     ///  * propagation through member access and array subscripts
-    ///    (`v->field`, `volatile_buf[i]`, `v.field`).
+    ///    (`volatile_buf[i]`, `regs[i]`);
+    ///  * volatile-qualified struct and union members, through `.` and `->`
+    ///    (`volatile struct regs *r; r->ctrl`), by the member's own flags;
+    ///    a member's qualifier does not leak into a later member.
     ///
-    /// Not yet covered (documented follow-up): casts to volatile-qualified
-    /// pointer types (`*(volatile u32 *)addr`, the kernel MMIO idiom, needs
-    /// qualifier retention in TypeSpecifier), volatile-qualified struct
-    /// FIELDS, and `volatile` on the pointer itself (`int * volatile p`).
+    ///  * `*(volatile T *)addr` and `((volatile T *)addr)[i]`: casts to a
+    ///    single-level pointer whose pointee is volatile (the kernel MMIO idiom).
+    ///
+    /// Not yet covered (documented follow-up): volatile pointer OBJECTS read
+    /// through a pointer (`int *volatile p; *p` does not reload `p`), and
+    /// pointers to volatile pointers beyond one level (`int *volatile *pp`).
     pub(super) fn expr_access_is_volatile(&self, expr: &Expr) -> bool {
         match expr {
             Expr::Identifier(name, _) => {
                 if let Some(info) = self.func_state.as_ref().and_then(|fs| fs.locals.get(name)) {
-                    return info.base_type_volatile
-                        && !matches!(info.var.c_type.as_ref(), Some(CType::Pointer(..)));
+                    return super::definitions::object_access_is_volatile(
+                        info.base_type_volatile,
+                        info.object_volatile,
+                        info.var.c_type.as_ref(),
+                    );
                 }
                 if let Some(g) = self.globals.get(name) {
-                    return g.base_type_volatile
-                        && !matches!(g.var.c_type.as_ref(), Some(CType::Pointer(..)));
+                    return super::definitions::object_access_is_volatile(
+                        g.base_type_volatile,
+                        g.object_volatile,
+                        g.var.c_type.as_ref(),
+                    );
                 }
                 false
             }
             Expr::Deref(inner, _) => self.pointee_expr_is_volatile(inner),
-            Expr::MemberAccess(base, _, _) | Expr::PointerMemberAccess(base, _, _) => {
-                self.expr_access_is_volatile(base)
+            // `s.f` is volatile when `s` is, or when the field itself is declared
+            // volatile. `p->f` is volatile through a pointer to volatile struct
+            // (`volatile struct regs *p`, the MMIO register-block idiom) or when
+            // the field is declared volatile. The pointer object's own qualifier
+            // does not make `p->f` volatile.
+            Expr::MemberAccess(base, field, _) => {
+                self.expr_access_is_volatile(base) || self.member_is_volatile(base, false, field)
+            }
+            Expr::PointerMemberAccess(base, field, _) => {
+                self.pointee_expr_is_volatile(base) || self.member_is_volatile(base, true, field)
             }
             // `p[i]` is `*(p + i)`: volatile when the base is a volatile
             // array object (`volatile int buf[8]; buf[i]`) OR a pointer to
@@ -302,6 +321,9 @@ impl Lowerer {
                 return self.pointee_expr_is_volatile(t) || self.pointee_expr_is_volatile(f);
             }
             Expr::Comma(_, r, _) => return self.pointee_expr_is_volatile(r),
+            // `*(volatile u32 *)addr`, `((volatile u32 *)addr)[i]`: the cast's
+            // type names a volatile pointee (MMIO register access).
+            Expr::Cast(_, _, _, q) => return q.pointee_volatile,
             // `volatile int *tbl[4]; *tbl[i]` / `tbl[i][j]`: the element of a
             // volatile-based array of pointers points at volatile T.
             Expr::ArraySubscript(base, _, _) => {

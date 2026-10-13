@@ -652,75 +652,73 @@ impl Lowerer {
                 }
                 Some(Operand::Const(IrConst::I64(0)))
             }
-            // __builtin_cpu_init() - no-op on glibc systems (auto-initialized)
+            // __builtin_cpu_init() — no-op: the folded form below never needs
+            // the runtime `__cpu_model`, so there is nothing to initialise.
+            // (GCC calls `__cpu_indicator_init` here; programs that call it
+            // stay correct either way, which is why it remains a no-op rather
+            // than a call into libgcc.)
             BuiltinIntrinsic::CpuInit => Some(Operand::Const(IrConst::I32(0))),
-            // __builtin_cpu_supports("feature") - returns 1 if feature is enabled for target.
-            // For Raptor Lake (-march=raptorlake) we enable AES, PCLMUL, AVX, AVX2, etc.
-            // This matches GCC's behavior where __builtin_cpu_supports checks runtime CPUID,
-            // but for PGO we want to enable the optimized path when the compile-time target supports it.
+            // __builtin_cpu_supports("feature") — AUD-CPU-1.
+            //
+            // Folds to 1 iff the *effective code-generation permission* of this
+            // invocation guarantees the feature (see `common::x86_features`),
+            // otherwise 0. The previous hard-coded "Raptor Lake" allowlist
+            // ignored `-march`, `-mno-*` and even the target architecture, so a
+            // `-march=x86-64` build reported AVX2/BMI2/SHA as present and every
+            // runtime-dispatched library took a path that SIGILLs on hardware
+            // without them. `1` is now only ever produced for instructions the
+            // backend is already allowed to emit unconditionally.
             BuiltinIntrinsic::CpuSupports => {
                 for arg in args {
                     self.lower_expr(arg);
                 }
-                // Compile-time fold against the project's compile target
-                // (x86-64 Raptor Lake). The old behavior returned 1 for EVERY
-                // feature except avx512* - including features Raptor Lake
-                // does not have (AMX, XOP, SSE4A, ...), which turned runtime
-                // dispatch into guaranteed SIGILL paths. Fold from an exact
-                // allowlist instead; UNKNOWN features fold to 0 (the safe
-                // direction for dispatchers: they fall back to generic code).
-                let mut ret = 0;
-                if !args.is_empty() {
-                    if let crate::frontend::parser::ast::Expr::StringLiteral(s, _) = &args[0] {
-                        let feat = s.to_ascii_lowercase();
-                        // Features present on Raptor Lake (and the x86-64-v3
-                        // baseline this project targets).
-                        const PRESENT: &[&str] = &[
-                            "cmov",
-                            "mmx",
-                            "sse",
-                            "sse2",
-                            "sse3",
-                            "ssse3",
-                            "sse4.1",
-                            "sse4.2",
-                            "popcnt",
-                            "avx",
-                            "avx2",
-                            "fma",
-                            "bmi",
-                            "bmi2",
-                            "lzcnt",
-                            "movbe",
-                            "f16c",
-                            "aes",
-                            "pclmul",
-                            "pclmulqdq",
-                            "rdrnd",
-                            "rdrand",
-                            "rdseed",
-                            "sha",
-                            "adx",
-                            "fsgsbase",
-                            "xsave",
-                            "xsaveopt",
-                            "xsavec",
-                            "avxvnni",
-                            "vaes",
-                            "vpclmulqdq",
-                            "gfni",
-                            "cx16",
-                            "fxsr",
-                            "osxsave",
-                        ];
-                        if PRESENT.contains(&feat.as_str()) {
-                            ret = 1;
-                        }
-                        // Everything else (avx512*, amx*, xop, sse4a, fma4,
-                        // tbm, prefetchwt1, ...) folds to 0.
-                    }
+                let span = args
+                    .first()
+                    .map(|a| a.span())
+                    .unwrap_or_else(|| crate::common::source::Span::new(0, 0, 0));
+                // Only x86 targets have x86 feature names; on aarch64/riscv64
+                // every feature would have to fold to 0 silently, which turns
+                //   __builtin_cpu_supports("avx2") ? fast_path() : slow_path()
+                // into an unconditional slow path with no diagnostic at all.
+                // GCC errors for a builtin that does not exist on the target;
+                // match that instead of guessing.
+                let elf_machine = crate::common::types::target_elf_machine();
+                if !matches!(elf_machine, 3 | 62) {
+                    // 3 = EM_386 (i686), 62 = EM_X86_64.
+                    self.diagnostics.borrow_mut().error(
+                        "__builtin_cpu_supports is not available on this target architecture"
+                            .to_string(),
+                        span,
+                    );
+                    return Some(Operand::Const(IrConst::I32(0)));
                 }
-                Some(Operand::Const(IrConst::I32(ret)))
+                let granted = match args.first() {
+                    Some(crate::frontend::parser::ast::Expr::StringLiteral(name, _)) => {
+                        crate::common::x86_features::X86Feature::parse(name)
+                            .is_some_and(|f| crate::common::x86_features::effective().contains(f))
+                    }
+                    // A non-literal argument cannot be resolved at compile
+                    // time. GCC diagnoses the non-constant case; folding 0 in
+                    // silence would be a wrong answer nobody can see, so say it
+                    // (the TU is rejected by the driver's lowering-error check).
+                    Some(other) => {
+                        self.diagnostics.borrow_mut().error(
+                            "__builtin_cpu_supports requires a string literal feature name"
+                                .to_string(),
+                            other.span(),
+                        );
+                        false
+                    }
+                    None => {
+                        self.diagnostics.borrow_mut().error(
+                            "__builtin_cpu_supports expects one string literal argument"
+                                .to_string(),
+                            span,
+                        );
+                        false
+                    }
+                };
+                Some(Operand::Const(IrConst::I32(i32::from(granted))))
             }
             // X86 SSE/AES/CRC intrinsics - delegated to lower_x86_intrinsic
             BuiltinIntrinsic::X86Lfence
@@ -990,7 +988,10 @@ impl Lowerer {
             | BuiltinIntrinsic::X86MulEpi32
             | BuiltinIntrinsic::X86MulloEpi32
             | BuiltinIntrinsic::X86Pcmpgtb256
-            | BuiltinIntrinsic::X86CastReinterpret => self.lower_x86_intrinsic(intrinsic, args),
+            | BuiltinIntrinsic::X86CastReinterpret => {
+                self.check_x86_intrinsic_feature(intrinsic, name, args);
+                self.lower_x86_intrinsic(intrinsic, args)
+            }
             // __builtin_shufflevector(v1, v2, i0, i1, i2, i3): 4-lane 32-bit
             // lane gather with constant indices (Clang/GCC generic shuffle).
             BuiltinIntrinsic::ShuffleVector => self.lower_shufflevector(args),
@@ -1485,7 +1486,7 @@ impl Lowerer {
                 !matches!(op, UnaryOp::PreInc | UnaryOp::PreDec)
                     && self.constant_query_can_lower(inner)
             }
-            Expr::Cast(_, inner, _) => self.constant_query_can_lower(inner),
+            Expr::Cast(_, inner, _, _) => self.constant_query_can_lower(inner),
             Expr::Conditional(cond, yes, no, _) => {
                 self.constant_query_can_lower(cond)
                     && self.constant_query_can_lower(yes)
@@ -1717,50 +1718,103 @@ impl Lowerer {
     /// equally correct. gcc.c-torture pr85331 (V2DF reverse) and pr94591
     /// (V2SI identity) drive the rules.
     fn lower_shuffle(&mut self, args: &[Expr]) -> Option<Operand> {
+        // Every rejection below used to be a `panic!`, i.e. an ICE on input a
+        // user can write: a mask whose element count differs from the vector's
+        // (`v8si` mask for a `v4si`), a non-vector mask, a non-vector first
+        // operand. GCC diagnoses all three; so does this now. The returned
+        // `None` means "not lowered as this builtin", and the caller's
+        // ordinary-call fallback cannot panic. Reporting with the *operand's*
+        // span matters: `lower_shuffle` is reached from a nested expression,
+        // and a location-less error in a 50k-line TU is not actionable.
         let (vec_args, mask_expr): (&[Expr], &Expr) = match args.len() {
             2 => (&args[..1], &args[1]),
             3 => (&args[..2], &args[2]),
-            n => panic!(
-                "__builtin_shuffle: expected (v, mask) or (v1, v2, mask), got {} args",
-                n
-            ),
+            n => {
+                self.diagnostics.borrow_mut().error(
+                    format!(
+                        "__builtin_shuffle expects (vector, mask) or (vector, vector, mask), got {} argument(s)",
+                        n
+                    ),
+                    args.first()
+                        .map(|a| a.span())
+                        .unwrap_or_else(|| crate::common::source::Span::new(0, 0, 0)),
+                );
+                return None;
+            }
         };
 
         // Element geometry from the first vector's CType.
         let v0_ctype = self.expr_ctype(&vec_args[0]);
         let (elem_size, total_bytes) = match &v0_ctype {
             CType::Vector(elem, bytes) => (self.ctype_size(elem), *bytes),
-            other => panic!(
-                "__builtin_shuffle: first operand must be a vector type, got {:?}",
-                other
-            ),
+            other => {
+                self.diagnostics.borrow_mut().error(
+                    format!(
+                        "__builtin_shuffle's first argument must be a vector, got {}",
+                        other
+                    ),
+                    vec_args[0].span(),
+                );
+                return None;
+            }
         };
         if elem_size == 0 || total_bytes == 0 || total_bytes % elem_size != 0 {
-            panic!(
-                "__builtin_shuffle: degenerate vector geometry (elem={}, total={})",
-                elem_size, total_bytes
+            // A vector type whose size is not a whole number of elements cannot
+            // be described by the C type system; reaching here means the type
+            // itself is malformed, so name the geometry instead of guessing.
+            self.diagnostics.borrow_mut().error(
+                format!(
+                    "__builtin_shuffle: malformed vector type (element size {}, total size {})",
+                    elem_size, total_bytes
+                ),
+                vec_args[0].span(),
             );
+            return None;
         }
         let n_elems: i64 = (total_bytes / elem_size) as i64;
-        // Mask element width from the mask operand's CType; the mask must
-        // have the same element count as the result.
+        // Mask element width from the mask operand's CType; the mask must have
+        // the same element count as the result AND integral elements.  GCC
+        // ("last argument must be an integer vector") rejects a float mask;
+        // accepting one silently reinterpreted its BIT PATTERNS as lane
+        // indices (`1.0f` = 0x3f800000 -> lane 0), i.e. wrong answers with no
+        // diagnostic at all.
         let mask_ctype = self.expr_ctype(mask_expr);
         let mask_elem_size = match &mask_ctype {
             CType::Vector(elem, bytes) => {
                 let es = self.ctype_size(elem);
-                if es == 0 || bytes % es != 0 || (bytes / es) as i64 != n_elems {
-                    panic!(
-                        "__builtin_shuffle: mask element count mismatch (mask {} elems, vector {} elems)",
-                        if es > 0 { bytes / es } else { 0 },
-                        n_elems
+                if !elem.is_integer() {
+                    self.diagnostics.borrow_mut().error(
+                        format!(
+                            "__builtin_shuffle's mask must be a vector of integers, got a vector of {}",
+                            elem
+                        ),
+                        mask_expr.span(),
                     );
+                    return None;
+                }
+                if es == 0 || bytes % es != 0 || (bytes / es) as i64 != n_elems {
+                    self.diagnostics.borrow_mut().error(
+                        format!(
+                            "__builtin_shuffle: mask element count must match the vector's ({} mask element(s) for {} vector element(s))",
+                            if es > 0 { bytes / es } else { 0 },
+                            n_elems
+                        ),
+                        mask_expr.span(),
+                    );
+                    return None;
                 }
                 es
             }
-            other => panic!(
-                "__builtin_shuffle: mask must be a vector type, got {:?}",
-                other
-            ),
+            other => {
+                self.diagnostics.borrow_mut().error(
+                    format!(
+                        "__builtin_shuffle's mask must be a vector of integers, got {}",
+                        other
+                    ),
+                    mask_expr.span(),
+                );
+                return None;
+            }
         };
 
         let ir_ty = match elem_size {
@@ -1769,14 +1823,29 @@ impl Lowerer {
             4 => IrType::I32,
             8 => IrType::I64,
             16 => IrType::I128,
-            other => panic!("__builtin_shuffle: unsupported element size {}", other),
+            other => {
+                self.diagnostics.borrow_mut().error(
+                    format!(
+                        "__builtin_shuffle: unsupported vector element size {}",
+                        other
+                    ),
+                    vec_args[0].span(),
+                );
+                return None;
+            }
         };
         let mask_ir_ty = match mask_elem_size {
             1 => IrType::U8,
             2 => IrType::U16,
             4 => IrType::U32,
             8 => IrType::U64,
-            other => panic!("__builtin_shuffle: unsupported mask element size {}", other),
+            other => {
+                self.diagnostics.borrow_mut().error(
+                    format!("__builtin_shuffle: unsupported mask element size {}", other),
+                    mask_expr.span(),
+                );
+                return None;
+            }
         };
 
         // Lower operands (vector-by-memory convention: alloca pointers).
@@ -1818,7 +1887,19 @@ impl Lowerer {
                 seg_override: AddressSpace::Default,
             });
             // m = mask_elem % total_selectable (N for 2-arg, 2N for 3-arg)
-            let selectable = n_elems * if vec_args.len() == 2 { 1 } else { 2 };
+            // `vec_args` holds the VECTOR arguments only, so its length is 1
+            // for the 2-argument form `(v, mask)` and 2 for the 3-argument
+            // form `(v1, v2, mask)`.  The selectable index range is
+            // accordingly N (the 2-argument form behaves as if both operands
+            // were `v`, so the index is reduced modulo N) or 2N (the index
+            // picks a lane of the concatenation).  Both this multiplier and
+            // the select below were keyed on the wrong length: `== 2` meant a
+            // 2-argument mask was reduced modulo 2N -- letting a mask element
+            // >= N read past the vector -- and a 3-argument mask modulo N,
+            // which made the "is it the first vector?" test below a constant
+            // true.  Together they compiled `__builtin_shuffle(a, b,
+            // (v4si){4, 5, 6, 7})` into `a` unchanged.
+            let selectable = n_elems * if vec_args.len() >= 2 { 2 } else { 1 };
             let m_idx = if selectable > 0 && (selectable & (selectable - 1)) == 0 {
                 let and_val = self.fresh_value();
                 self.emit(Instruction::BinOp {
@@ -1841,7 +1922,7 @@ impl Lowerer {
                 rem_val
             };
             // 3-arg form: base = m < N ? v1 : v2; offset within base = m mod N.
-            let (base, elem_idx) = if vec_args.len() == 3 {
+            let (base, elem_idx) = if vec_args.len() >= 2 {
                 let in_first = self.fresh_value();
                 self.emit(Instruction::Cmp {
                     dest: in_first,
@@ -1951,10 +2032,16 @@ impl Lowerer {
 
     fn lower_shufflevector(&mut self, args: &[Expr]) -> Option<Operand> {
         if args.len() != 6 {
-            panic!(
-                "__builtin_shufflevector: only the 4-lane 32-bit form (2 vectors + 4 indices) is supported, got {} args",
-                args.len()
+            self.diagnostics.borrow_mut().error(
+                format!(
+                    "__builtin_shufflevector: only the 4-lane 32-bit form (2 vectors + 4 constant indices) is supported, got {} argument(s)",
+                    args.len()
+                ),
+                args.first()
+                    .map(|a| a.span())
+                    .unwrap_or_else(|| crate::common::source::Span::new(0, 0, 0)),
             );
+            return None;
         }
         let v1 = self.vec128_arg_ptr(&args[0]);
         let v2 = self.vec128_arg_ptr(&args[1]);
@@ -1975,10 +2062,16 @@ impl Lowerer {
                 Some(IrConst::I32(v)) => v as i64,
                 Some(IrConst::I8(v)) => v as i64,
                 Some(IrConst::I16(v)) => v as i64,
-                other => panic!(
-                    "__builtin_shufflevector: lane index {} is not an integer constant ({:?})",
-                    lane, other
-                ),
+                _ => {
+                    self.diagnostics.borrow_mut().error(
+                        format!(
+                            "__builtin_shufflevector: lane index {} must be an integer constant expression",
+                            lane
+                        ),
+                        args[2 + lane].span(),
+                    );
+                    return None;
+                }
             };
             let (src, off) = if idx < 0 {
                 (v1p, 0i64)
@@ -1987,10 +2080,17 @@ impl Lowerer {
             } else if idx < 8 {
                 (v2p, (idx - 4) * 4)
             } else {
-                panic!(
-                    "__builtin_shufflevector: lane index {} out of range for 4-lane vectors",
-                    idx
+                // GCC's range: 0..7 for two 4-lane vectors, plus negative
+                // indices for "don't care" (which the `idx < 0` arm above
+                // takes as lane 0 of the first vector).
+                self.diagnostics.borrow_mut().error(
+                    format!(
+                        "__builtin_shufflevector: lane index {} is out of range for two 4-lane vectors (0..7)",
+                        idx
+                    ),
+                    args[2 + lane].span(),
                 );
+                return None;
             };
             let src_ptr = self.fresh_value();
             self.emit(Instruction::GetElementPtr {
@@ -2033,6 +2133,82 @@ impl Lowerer {
     /// - PtrStore: first arg is dest pointer, remaining args are data (movnti, storedqu, etc.)
     /// - Vec128: allocates 16-byte result slot, returns pointer (SSE/AES packed ops)
     /// - Scalar: returns a scalar value in a dest register (pmovmskb, crc32, pextrw, etc.)
+    /// AUD-CPU-3: diagnose an intrinsic whose instruction-set extension the
+    /// requested target level does not have.
+    ///
+    /// `IntrinsicOp` is target-independent, so nothing downstream stopped a
+    /// `crc32`/`aesenc`/`pclmulqdq` from being emitted for a target that had
+    /// explicitly been told not to assume the extension: `-march=x86-64`
+    /// (SSE2 only) compiled `_mm_crc32_u8` to `crc32b`, i.e. to an illegal
+    /// instruction on exactly the hardware the user declared -- a SIGILL with
+    /// no diagnostic at any stage.  GCC and Clang reject the same source
+    /// ("target specific option mismatch" / "requires target feature"), and
+    /// the permission consulted here is the SAME `effective()` set
+    /// `__builtin_cpu_supports` folds against (AUD-CPU-1), so the two can
+    /// never disagree.
+    ///
+    /// x86 targets only: on AArch64/RISC-V every x86 extension is absent, and
+    /// those intrinsics are handled by the AUD-SILENT-ZERO-1 trap instead of a
+    /// second, differently-worded failure path (target-scoped intrinsics are a
+    /// separate item in the follow-up document).
+    ///
+    /// The call is still lowered after the error is recorded: the driver
+    /// rejects the translation unit on any lowering error, and bailing here
+    /// would only add a way to skip the diagnostic.
+    fn check_x86_intrinsic_feature(
+        &mut self,
+        intrinsic: &BuiltinIntrinsic,
+        name: &str,
+        args: &[Expr],
+    ) {
+        let span = args
+            .first()
+            .map(|a| a.span())
+            .unwrap_or_else(|| crate::common::source::Span::new(0, 0, 0));
+        // AUD-SILENT-ZERO-1: this function is reached only from the arm that
+        // dispatches the x86 builtin families, so on a target that is not x86
+        // every call here names an intrinsic the target cannot execute at all.
+        // GCC rejects the same programs (the name does not exist on aarch64,
+        // and `#ifdef`-guarded code never lowers the call), so the compile
+        // fails here rather than deferring to a trap at run time.
+        // 3 = EM_386 (i686), 62 = EM_X86_64.
+        if !matches!(crate::common::types::target_elf_machine(), 3 | 62) {
+            // Naming the extension when we know it makes the message
+            // actionable; a builtin outside the table is still x86-only.
+            let hint = match x86_intrinsic_required_feature(intrinsic) {
+                Some((feature, flag)) => {
+                    format!(" ({} instruction-set extension, {})", feature.name(), flag)
+                }
+                None => String::new(),
+            };
+            self.diagnostics.borrow_mut().error(
+                format!(
+                    "`{}` is an x86-only intrinsic and is not available on {}{}",
+                    name,
+                    crate::common::types::target_arch_name(),
+                    hint
+                ),
+                span,
+            );
+            return;
+        }
+        let Some((feature, flag)) = x86_intrinsic_required_feature(intrinsic) else {
+            return;
+        };
+        if crate::common::x86_features::effective().contains(feature) {
+            return;
+        }
+        self.diagnostics.borrow_mut().error(
+            format!(
+                "`{}` requires the {} instruction-set extension ({}), which the requested target does not have",
+                name,
+                feature.name(),
+                flag
+            ),
+            span,
+        );
+    }
+
     fn lower_x86_intrinsic(
         &mut self,
         intrinsic: &BuiltinIntrinsic,
@@ -2455,6 +2631,35 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
 }
 
 /// Map a BuiltinIntrinsic to its corresponding IntrinsicOp.
+/// AUD-CPU-3: the instruction-set extension an x86 intrinsic's instruction
+/// belongs to, for the families whose permission bit exists in
+/// [`crate::common::x86_features`].
+///
+/// Only *unambiguous* families are listed.  The 256-bit AES/CLMUL forms are
+/// VAES/VPCLMULQDQ (which also require AVX state, and whose permission bits do
+/// not exist yet), and the SHA/GFNI/AVX-512 families have no bit either -- see
+/// the follow-up document's AUD-CPU-3 entry, which tracks giving them one.
+fn x86_intrinsic_required_feature(
+    intrinsic: &BuiltinIntrinsic,
+) -> Option<(crate::common::x86_features::X86Feature, &'static str)> {
+    use crate::common::x86_features::X86Feature as F;
+    use BuiltinIntrinsic as B;
+    Some(match intrinsic {
+        // SSE4.2 introduced CRC32: `_mm_crc32_u8` and its width siblings.
+        B::X86Crc32_8 | B::X86Crc32_16 | B::X86Crc32_32 | B::X86Crc32_64 => (F::Sse42, "-msse4.2"),
+        // AES-NI, 128-bit forms (the `_mm_*`/`__builtin_ia32_*` spellings that
+        // map onto the legacy-encoded instructions).
+        B::X86Aesenc128
+        | B::X86Aesenclast128
+        | B::X86Aesdec128
+        | B::X86Aesdeclast128
+        | B::X86Aesimc128
+        | B::X86Aeskeygenassist128 => (F::Aes, "-maes"),
+        B::X86Pclmulqdq128 => (F::Pclmul, "-mpclmul"),
+        _ => return None,
+    })
+}
+
 fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
     match intrinsic {
         BuiltinIntrinsic::X86Rdtsc => IntrinsicOp::Rdtsc,

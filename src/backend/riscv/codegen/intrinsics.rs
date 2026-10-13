@@ -3,6 +3,7 @@
 //! RISC-V instructions, plus hardware intrinsics (fences, CRC32, sqrt, fabs).
 
 use super::emit::RiscvCodegen;
+use crate::backend::traits::ArchCodegen;
 use crate::ir::reexports::{IntrinsicOp, Operand, Value};
 
 impl RiscvCodegen {
@@ -465,13 +466,12 @@ impl RiscvCodegen {
             | IntrinsicOp::HorizontalAddF64x2
             | IntrinsicOp::HorizontalAddI32x8
             | IntrinsicOp::HorizontalAddI32x4 => {
-                // x86-only: zero dest if present
-                if let Some(dptr) = dest_ptr {
-                    if let Some(slot) = self.state.get_slot(dptr.0) {
-                        self.emit_store_to_s0("zero", slot.0, "sd");
-                        self.emit_store_to_s0("zero", slot.0 + 8, "sd");
-                    }
-                }
+                // x86-only intrinsic (AUD-SILENT-ZERO-1): see the AArch64
+                // backend's identical arm.  Zeroing the destination (and
+                // emitting nothing at all for a register-held one) turned an
+                // x86 intrinsic on a RISC-V target into a silent wrong value;
+                // the target trap makes it fail at the first execution.
+                self.emit_unreachable();
             }
 
             // Register-based vector intrinsics (x86-specific, not implemented for RISC-V)
@@ -506,7 +506,10 @@ impl RiscvCodegen {
             | IntrinsicOp::VecSmlalHiI32x4 => {
                 // These are x86-64/AArch64-specific register-based vector operations
                 // RISC-V would use RVV (RISC-V Vector extension) differently
-                unimplemented!("Register-based vector intrinsics not implemented for RISC-V");
+                // x86-shaped op in the RISC-V emitter: the target gate that
+                // keeps it out is the invariant, and a compiler ICE is the
+                // wrong way to report a broken invariant.  Trap instead.
+                self.emit_unreachable();
             }
             // ── _Float128 / long double sign-bit intrinsics ─────────────
             //

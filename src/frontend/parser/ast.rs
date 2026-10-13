@@ -655,6 +655,15 @@ pub struct DeclAttributes {
     /// Named address space written after the declarator's last `*`
     /// (`long *__seg_gs p`): the space of the object itself, not its pointee.
     pub object_space: AddressSpace,
+    /// Whether the declared object is itself `volatile`: the qualifier written
+    /// after the declarator's last `*`, or the specifier's qualifier when the
+    /// declarator has no derivations. A typedef recorded with this flag makes
+    /// each object declared through it volatile, as its written text would.
+    pub object_volatile: bool,
+    /// Whether the declaration's specifiers are `volatile`-qualified (the base
+    /// qualifier, not the declarator's own). A typedef recorded with this flag
+    /// qualifies each use of the name (see `Parser::typedef_base_volatile`).
+    pub base_volatile: bool,
     /// __attribute__((alias("target"))) - this symbol is an alias for target
     pub alias_target: Option<String>,
     /// __attribute__((visibility("hidden"))) etc.
@@ -1150,8 +1159,9 @@ pub enum TypeSpecifier {
     /// resolution. Unlike FunctionPointer which represents Pointer(Function(...)),
     /// this represents just Function(...) without the pointer wrapper.
     BareFunction(Box<TypeSpecifier>, Vec<ParamDecl>, bool),
-    /// typeof(expr) - GCC extension: type of an expression
-    Typeof(Box<Expr>),
+    /// typeof(expr) - GCC extension: type of an expression. The flag is true for
+    /// `typeof_unqual`, which also drops the expression's named address space.
+    Typeof(Box<Expr>, bool),
     /// typeof(type-name) - GCC extension: type from a type name
     TypeofType(Box<TypeSpecifier>),
     /// __auto_type - GCC extension: type inferred from initializer expression
@@ -1177,6 +1187,12 @@ pub struct StructFieldDecl {
     pub alignment: Option<usize>,
     /// Per-field __attribute__((packed)) - forces this field's alignment to 1.
     pub is_packed: bool,
+    /// `volatile` on the field's base type (`volatile u32 ctrl`, `volatile int a[4]`):
+    /// the element or pointee access is volatile. Mirrors `DeclAttributes::base_volatile`.
+    pub base_volatile: bool,
+    /// `volatile` on the field object itself (`int *volatile p`). Mirrors
+    /// `DeclAttributes::object_volatile`.
+    pub object_volatile: bool,
 }
 
 /// An enum variant.
@@ -1314,6 +1330,17 @@ impl ExprId {
     }
 }
 
+/// Qualifiers of a cast's type name, read from its tokens by the parser.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct CastQualifiers {
+    /// A `const` or `volatile` appears before the type's first top-level `*`
+    /// (`(const void *)0`). The null-pointer-constant rule excludes these.
+    pub pointee_qualified: bool,
+    /// The type is a single-level pointer whose pointee is `volatile`
+    /// (`(volatile u32 *)addr`, the MMIO idiom): `*cast` is a volatile access.
+    pub pointee_volatile: bool,
+}
+
 /// Expressions.
 #[derive(Debug, Clone)]
 pub enum Expr {
@@ -1360,7 +1387,11 @@ pub enum Expr {
     ArraySubscript(Box<Expr>, Box<Expr>, Span),
     MemberAccess(Box<Expr>, String, Span),
     PointerMemberAccess(Box<Expr>, String, Span),
-    Cast(TypeSpecifier, Box<Expr>, Span),
+    /// `(type) operand`. The qualifiers record the pointee's `const`/`volatile`
+    /// (`(const void *)`): C23 6.3.2.3p3 admits only an UNQUALIFIED `void *`
+    /// cast as a null pointer constant, so that form is not one even when its
+    /// operand is `0`. `pointee_volatile` makes `*(volatile T *)p` volatile.
+    Cast(TypeSpecifier, Box<Expr>, Span, CastQualifiers),
     CompoundLiteral(TypeSpecifier, Box<Initializer>, Span),
     StmtExpr(CompoundStmt, Span),
     Sizeof(Box<SizeofArg>, Span),
@@ -1532,7 +1563,7 @@ impl Expr {
             | Expr::ArraySubscript(_, _, s)
             | Expr::MemberAccess(_, _, s)
             | Expr::PointerMemberAccess(_, _, s)
-            | Expr::Cast(_, _, s)
+            | Expr::Cast(_, _, s, _)
             | Expr::CompoundLiteral(_, _, s)
             | Expr::StmtExpr(_, s)
             | Expr::Sizeof(_, s)

@@ -6,9 +6,14 @@ text preview) contains its exact bytes, SHA-256, base/head and honest CI status.
 All writes are same-directory fsync/rename. The ZIP is the commit point; sidecar
 receipts are independently atomic, not a fictional multi-file transaction.
 
-Workspace budgets count *all* regular files, including otherwise-excluded
-caches. Keep checkouts/toolchains outside this small delivery workspace. Never
-delete user files to meet a budget: fail loudly and preserve the previous ZIP.
+Workspace budgets bound what the publication adds to the *visible* workspace.
+The census is taken with `--exclude-path` / `--exclude-dir`, because a session
+workspace also holds the repository checkout, the recovery-artifact zone and the
+harness-excluded build tree (`target/`, caches, ...) - none of which this tool
+publishes and none of which the harness persists as workspace content. Callers
+that pass no exclusions keep the original strict semantics: every regular file
+under `--workspace` counts. Never delete user files to meet a budget: fail
+loudly and preserve the previous ZIP.
 """
 from __future__ import annotations
 
@@ -42,20 +47,34 @@ def digest(path: Path) -> str:
     return h.hexdigest()
 
 
-def inventory(root: Path, *, exclude: set[Path] = frozenset()) -> dict:
-    """Bounded, non-symlink-following census; excluded items are owned temps."""
+def inventory(root: Path, *, exclude: set[Path] = frozenset(),
+              exclude_dirs: frozenset[str] = frozenset(),
+              exclude_paths: tuple[Path, ...] = ()) -> dict:
+    """Bounded, non-symlink-following census; excluded items are owned temps.
+
+    `exclude` is exact-path (the tool's own temp files), `exclude_dirs` matches
+    directory names anywhere (build/cache trees the harness does not persist),
+    and `exclude_paths` prunes whole subtrees (a checkout or artifact zone
+    whose contents are reconstructed by the patch/bundle, not by the budget).
+    """
     files = size = symlinks = 0
     def fail(exc):
         raise DeliveryError(f'cannot inventory workspace: {exc}') from exc
+    def pruned(p: Path) -> bool:
+        return any(p == q or q in p.parents for q in exclude_paths)
     for directory, dirs, names in os.walk(root, followlinks=False, onerror=fail):
         for name in list(dirs):
             p = Path(directory) / name
+            if name in exclude_dirs or pruned(p):
+                files += 1  # the directory entry itself still exists on disk
+                dirs.remove(name)
+                continue
             if p.is_symlink():
                 symlinks += 1; files += 1; size += p.lstat().st_size
                 dirs.remove(name)
         for name in names:
             p = Path(directory) / name
-            if p in exclude:
+            if p in exclude or pruned(p):
                 continue
             s = p.lstat()
             if stat.S_ISREG(s.st_mode) or stat.S_ISLNK(s.st_mode):
@@ -144,7 +163,9 @@ def canonical_json(value: dict) -> bytes:
 
 def publish(patch: Path, workspace: Path, metadata: dict, *,
             max_bytes: int = MAX_WORKSPACE_BYTES,
-            max_files: int = MAX_WORKSPACE_FILES) -> dict:
+            max_files: int = MAX_WORKSPACE_FILES,
+            exclude_dirs: frozenset[str] = frozenset(),
+            exclude_paths: tuple[Path, ...] = ()) -> dict:
     workspace = workspace.resolve(strict=True)
     # Reject the original path's symlink before resolving it.
     if patch.is_symlink() or not patch.is_file():
@@ -168,7 +189,9 @@ def publish(patch: Path, workspace: Path, metadata: dict, *,
     temps = set()
     with writer_lock(workspace):
         # Reject already oversized workspaces before creating another archive.
-        check_budget(inventory(workspace), {}, max_bytes=max_bytes, max_files=max_files)
+        check_budget(inventory(workspace, exclude_dirs=exclude_dirs,
+                               exclude_paths=exclude_paths),
+                     {}, max_bytes=max_bytes, max_files=max_files)
         identity = patch.stat()
         patch_sha = digest(patch)
         manifest = dict(format='lccc-patch-delivery-v1', **metadata,
@@ -216,7 +239,9 @@ def publish(patch: Path, workspace: Path, metadata: dict, *,
             receipt = dict(manifest, zip='ms178-1.patch.zip', zip_bytes=archive.stat().st_size,
                            zip_sha256=digest(archive))
             receipt_data = canonical_json(receipt)
-            projected = check_budget(inventory(workspace, exclude=temps),
+            projected = check_budget(inventory(workspace, exclude=temps,
+                                               exclude_dirs=exclude_dirs,
+                                               exclude_paths=exclude_paths),
                                      {destinations[0]: archive.stat().st_size,
                                       destinations[1]: len(receipt_data), destinations[2]: len(readme)},
                                      max_bytes=max_bytes, max_files=max_files)
@@ -242,11 +267,18 @@ def main(argv=None) -> int:
     ap.add_argument('--ci-gate', required=True)
     ap.add_argument('--budget-mib', type=int, default=64)
     ap.add_argument('--file-budget', type=int, default=256)
+    ap.add_argument('--exclude-dir', action='append', default=[], metavar='NAME',
+                    help='directory name (any depth) to leave out of the census')
+    ap.add_argument('--exclude-path', action='append', default=[], metavar='PATH',
+                    help='subtree to leave out of the census (repeatable)')
     args = ap.parse_args(argv)
+    exclude_paths = tuple(Path(p).resolve() for p in args.exclude_path)
     try:
         result = publish(args.patch, args.workspace,
                          dict(base=args.base, head=args.head, snapshot=args.snapshot, ci_gate=args.ci_gate),
-                         max_bytes=args.budget_mib*MIB, max_files=args.file_budget)
+                         max_bytes=args.budget_mib*MIB, max_files=args.file_budget,
+                         exclude_dirs=frozenset(args.exclude_dir),
+                         exclude_paths=exclude_paths)
     except (DeliveryError, OSError, ValueError, zipfile.BadZipFile) as exc:
         ap.exit(1, f'delivery FAILED: {exc}\n')
     print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))

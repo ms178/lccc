@@ -12,6 +12,7 @@
 #   line 4  __seg_gs -> __seg_gs         silent
 #   line 5  generic -> `long *__seg_gs *` warns
 #   line 6  void * -> void *             silent
+#   line 8  `q = (int *)gp` (__seg_gs)   warns (the cast-RHS shape of cast_rev.c)
 #
 # The runtime half checks sizeof and the unnamed-parameter and cast reads
 # against the values GCC produces.
@@ -28,14 +29,16 @@ void c(long __seg_fs *p) { long __seg_gs *z = (long __seg_gs *)p; (void)z; }
 void d(long *__seg_gs *p) { long *__seg_gs *w = (long *__seg_gs *)p; (void)w; }
 void e(long *p) { long *__seg_gs *w = (long *__seg_gs *)p; (void)w; }
 void f(void *p) { void *q = (void *)p; (void)q; }
+int __seg_gs *gp; int *q;
+void g(void) { q = (int *)gp; }
 C
 
 fail=0
 "$CCC" -O0 -c -o "$tmp/casts.o" "$src" 2> "$tmp/casts.err" || { echo "FAIL: casts.c rejected"; cat "$tmp/casts.err"; exit 1; }
 warned=$(grep -c "warning: cast to" "$tmp/casts.err" || true)
 lines=$( (grep "warning: cast to" "$tmp/casts.err" || true) | sed -E 's/^[^:]*:([0-9]+):.*/\1/' | tr '\n' ' ')
-if [ "$warned" -ne 4 ] || [ "$lines" != "1 2 3 5 " ]; then
-    echo "FAIL: expected 4 cast warnings on lines 1 2 3 5, got $warned on: $lines"
+if [ "$warned" -ne 5 ] || [ "$lines" != "1 2 3 5 8 " ]; then
+    echo "FAIL: expected 5 cast warnings on lines 1 2 3 5 8, got $warned on: $lines"
     cat "$tmp/casts.err"
     fail=1
 fi
@@ -71,4 +74,4 @@ fi
 if [ "$fail" -ne 0 ]; then
     exit 1
 fi
-echo "check_seg_cast_warning: PASSED (4 cast warnings on lines 1 2 3 5; 0 on 4 6; sizeof 8 8)"
+echo "check_seg_cast_warning: PASSED (5 cast warnings on lines 1 2 3 5 8; 0 on 4 6; sizeof 8 8)"
