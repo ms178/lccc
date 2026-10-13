@@ -132,7 +132,9 @@ jobs:
           from pathlib import Path
           import sys
 
-          tail = chr(10).join(Path(sys.argv[1]).read_text(errors="replace").splitlines()[-80:])
+          lines = Path(sys.argv[1]).read_text(errors="replace").splitlines()
+          context = lines[:40] + (["... build log truncated ..."] if len(lines) > 120 else []) + lines[-80:]
+          tail = chr(10).join(context)
           escaped = tail.replace(chr(37), "%25").replace(chr(13), "%0D").replace(chr(10), "%0A")
           print(f"::error title=Rust build diagnostics::{escaped}")
           PY

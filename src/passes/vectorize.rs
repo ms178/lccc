@@ -3573,7 +3573,7 @@ fn analyze_reduction_pattern(
     if accumulator_phi.is_none() {
         let latch_label = func.blocks[latch_idx].label;
         for inst in &header.instructions {
-            if let Instruction::Phi { dest, incoming, .. } = inst {
+            if let Instruction::Phi { dest, .. } = inst {
                 if *dest != iv
                     && loop_phi_single_preheader_seed(
                         func,
@@ -17431,7 +17431,6 @@ fn map_max_executed_iv(limit: &Operand, iv_ty: IrType, exit_cmp_op: IrCmpOp) -> 
     let max_limit = match limit {
         Operand::Const(c) => integer_const_in_cmp_domain(*c, iv_ty, signed)?,
         Operand::Value(_) => integer_cmp_domain_max(iv_ty, signed)?,
-        _ => return None,
     };
     if max_limit <= 0 {
         // With a zero initial IV and a strict ascending comparison, this loop
@@ -26055,12 +26054,6 @@ fn transform_reduction_avx2(
             changes += added;
             bound
         }
-        _ => {
-            if debug {
-                eprintln!("[VEC-RED]   Unsupported limit type");
-            }
-            return 0;
-        }
     };
 
     // Convert the source element start to an absolute byte offset only after
@@ -27383,12 +27376,6 @@ fn transform_reduction_sse2(
             };
             changes += added;
             bound
-        }
-        _ => {
-            if debug {
-                eprintln!("[VEC-RED]   Unsupported limit type");
-            }
-            return 0;
         }
     };
 
@@ -29421,7 +29408,6 @@ fn transform_map_vector(
                 .extend(quotient_insts);
             Operand::Value(div_dest)
         }
-        _ => unreachable!("map limit operand kind was preflighted before mutation"),
     };
 
     // Rewrite the canonical IV < limit test to IV < floor(limit / width).
