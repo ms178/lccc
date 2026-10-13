@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# DEPRECATED (AUD-DOC-1) for patch delivery.  This script builds a single-file
+# Vite HTML bundle for the web-app harness; it does NOT publish or verify
+# ms178-1.patch.  The canonical, gate-aware patch snapshot is
+# `scripts/lccc-snapshot.sh`.
 # ============================================================================
 # LCCC session snapshot for the Vite/web-app harness ("Kontinuität v3").
 #

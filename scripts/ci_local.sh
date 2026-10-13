@@ -173,6 +173,50 @@ if [ ! -x "$LCCC" ]; then
 fi
 
 # --------------------------------------------------------------- job:test --
+# The ratchet that keeps the 2026-10-13 audit's debt numbers from growing:
+# panic-class sites (AUD-ICE-1), unsafe sites, giant functions (AUD-MONO-1),
+# undeclared CCC_*/LCCC_* knobs (AUD-KNOB-1) and unannotated #[ignore]s
+# (AUD-ARM-GSF-1). Pure static scan -- it needs no compiler, and it must run
+# before the build so a regression is reported as itself.
+gate "audit-census-selftest" fast \
+    python3 scripts/audit_census.py --selftest
+gate "audit-census" fast \
+    python3 scripts/audit_census.py --check
+
+gate "rec2iter" fast \
+    env CCC="$LCCC" bash tests/regression/check_rec2iter.sh
+
+gate "fp-contract-parity" fast \
+    env CCC="$LCCC" bash tests/regression/check_fp_contract_parity.sh
+
+gate "repros-replay-selftest" fast \
+    python3 scripts/repros_replay.py --selftest
+# ~97 compiles per arm plus the runs: seconds, not minutes -- and it is the
+# only gate that exercises the historical crash/miscompile corpus end to end.
+gate "repros-replay" fast \
+    python3 scripts/repros_replay.py --lccc "$LCCC" --check
+
+gate "dash-o-stdout" fast \
+    env CCC="$LCCC" bash tests/regression/check_dash_o_stdout.sh
+
+gate "ill-typed-builtins-selftest" fast \
+    python3 scripts/check_ill_typed_builtins.py --self-test
+gate "ill-typed-builtins" fast \
+    env CCC="$LCCC" python3 scripts/check_ill_typed_builtins.py --compiler "$LCCC"
+
+gate "cpu-supports-runtime" fast \
+    env CCC="$LCCC" bash tests/regression/check_cpu_supports_runtime.sh
+
+# The GOT-slot half of the same work: a local symbol referenced through its
+# GOT slot must keep the symbol in the relocation (folding it produced 145
+# instead of 25 with GNU ld and a fault under lccc-ld), and the x86-64 spelling
+# must match the pinned GAS 2.47 oracle form by form.
+gate "got-slot-local-addend" fast \
+    env CCC="$LCCC" bash tests/regression/check_got_slot_local_addend.sh
+
+gate "temp-symlink-isolation" fast \
+    env CCC="$LCCC" bash tests/regression/check_temp_symlink.sh
+
 gate "rust-toolchain-selector" fast \
     bash tests/regression/check_rust_toolchain_selector.sh
 

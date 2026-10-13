@@ -671,6 +671,16 @@ impl Driver {
             Target::X86_64 | Target::I686
         ));
 
+        // `-o -` is stdout for the TEXT modes; an object file or an
+        // executable cannot be piped, and GCC refuses too (AUD-DRV-1).
+        if self.output_path == "-"
+            && matches!(self.mode, CompileMode::ObjectOnly | CompileMode::Full)
+        {
+            return Err("cannot write an object file or executable to stdout; \
+                 '-o -' is only valid with -S, -E, -M/-MM or -dM"
+                .to_string());
+        }
+
         match self.mode {
             CompileMode::PreprocessOnly => self.run_preprocess_only(),
             CompileMode::AssemblyOnly => self.run_assembly_only(),
@@ -681,6 +691,23 @@ impl Driver {
     }
 
     // ---- Run modes ----
+
+    /// Write a text output to `self.output_path`, or to stdout when the path is
+    /// `-` (AUD-DRV-1).
+    ///
+    /// GCC semantics: `-o -` means "the standard output" for the modes that
+    /// produce TEXT (`-S`, `-E`, `-M`/`-MM`, `-dM`).  Build systems and
+    /// pipelines (`-o - | ...`) depend on it; before this, LCCC created a file
+    /// literally named `-`.  Modes that produce a binary (object, executable)
+    /// are rejected up front in `run()` instead.
+    fn write_text_output(&self, contents: &str) -> Result<(), String> {
+        if self.output_path == "-" {
+            print!("{}", contents);
+            return Ok(());
+        }
+        std::fs::write(&self.output_path, contents)
+            .map_err(|e| format!("Cannot write {}: {}", self.output_path, e))
+    }
 
     fn run_preprocess_only(&self) -> Result<(), String> {
         for input_file in &self.input_files {
@@ -758,8 +785,7 @@ impl Driver {
                 }
 
                 if self.output_path_set {
-                    std::fs::write(&self.output_path, &dep_text)
-                        .map_err(|e| format!("Cannot write {}: {}", self.output_path, e))?;
+                    self.write_text_output(&dep_text)?;
                 } else {
                     print!("{}", dep_text);
                 }
@@ -801,8 +827,7 @@ impl Driver {
 
                 let output = preprocessor.dump_defines();
                 if self.output_path_set {
-                    std::fs::write(&self.output_path, format!("{}\n", output))
-                        .map_err(|e| format!("Cannot write {}: {}", self.output_path, e))?;
+                    self.write_text_output(&format!("{}\n", output))?;
                 } else {
                     println!("{}", output);
                 }
@@ -822,8 +847,7 @@ impl Driver {
                 };
 
                 if self.output_path_set {
-                    std::fs::write(&self.output_path, &output)
-                        .map_err(|e| format!("Cannot write {}: {}", self.output_path, e))?;
+                    self.write_text_output(&output)?;
                     // Write dependency file if requested (e.g., -Wp,-MMD,<depfile>).
                     // The kernel build uses this when preprocessing linker scripts
                     // (.lds.S -> .lds) and fixdep expects the .d file to exist.
@@ -1032,8 +1056,7 @@ impl Driver {
             };
 
             if self.output_path_set {
-                std::fs::write(&self.output_path, &output)
-                    .map_err(|e| format!("Cannot write {}: {}", self.output_path, e))?;
+                self.write_text_output(&output)?;
                 self.write_dep_file(input_file, &self.output_path)?;
             } else {
                 print!("{}", output);
@@ -1126,8 +1149,12 @@ impl Driver {
             }
             // Default path: compile with internal codegen (handles .code16gcc prepend)
             let asm = self.compile_to_assembly(input_file)?;
-            std::fs::write(&out_path, &asm)
-                .map_err(|e| format!("Cannot write {}: {}", out_path, e))?;
+            if out_path == "-" {
+                print!("{}", asm);
+            } else {
+                std::fs::write(&out_path, &asm)
+                    .map_err(|e| format!("Cannot write {}: {}", out_path, e))?;
+            }
             self.write_dep_file(input_file, &out_path)?;
             if self.verbose {
                 eprintln!("Assembly output: {}", out_path);
@@ -1182,7 +1209,7 @@ impl Driver {
                 // to -Wl, and -l flags. This is critical for --whole-archive support.
             } else if Self::is_assembly_source(input_file) || self.is_explicit_assembly() {
                 // .s/.S files (or -x assembler): pass to assembler, then link
-                let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o");
+                let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o")?;
                 self.assemble_source_file(input_file, tmp.to_str())?;
                 temp_guards.push(tmp);
             } else if !Self::is_c_source(input_file) && Self::looks_like_binary_object(input_file) {
@@ -1195,7 +1222,7 @@ impl Driver {
                 #[cfg(feature = "gcc_m16")]
                 if self.code16gcc {
                     use super::external_tools::GccM16Mode;
-                    let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o");
+                    let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o")?;
                     self.compile_with_gcc_m16(input_file, tmp.to_str(), GccM16Mode::Object)?;
                     if self.verbose {
                         eprintln!("Compiled (GCC -m16): {}", input_file);
@@ -1207,7 +1234,7 @@ impl Driver {
                 // Compile .c files to .o (handles .code16gcc prepend via internal codegen)
                 let asm = self.compile_to_assembly(input_file)?;
 
-                let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o");
+                let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o")?;
                 let extra = self.build_asm_extra_args();
                 self.target
                     .assemble_with_extra(&asm, tmp.to_str(), &extra)?;
@@ -1559,11 +1586,123 @@ impl Driver {
     /// Core pipeline: preprocess, lex, parse, sema, lower, optimize, codegen.
     ///
     /// Set `CCC_TIME_PHASES=1` in the environment to print per-phase timing to stderr.
+    /// The ISA feature set this translation unit's code generation is
+    /// allowed to assume unconditionally (AUD-CPU-1).
+    ///
+    /// Derived from the same state that gates instruction selection:
+    /// `x86_isa()` (the SIMD ceiling: `X86Isa::V3` without an explicit
+    /// `-march=`, the requested flags with one) and the `resolved_*` integer
+    /// accessors (BMI1/BMI2/LZCNT/MOVBE/POPCNT).  `__builtin_cpu_supports`
+    /// therefore can never answer `1` for a feature this TU was not compiled
+    /// for.  Features outside the modelled set are deliberately absent.
+    fn effective_isa_features(&self) -> crate::common::isa_features::FeatureSet {
+        use crate::common::isa_features::FeatureSet;
+        let mut set = FeatureSet::empty();
+        if self.target != Target::X86_64 {
+            // i686 promises broad compatibility (no implicit default grant in
+            // this tree either): only explicitly requested integer extensions
+            // are guaranteed there.  AArch64/RISC-V get the empty set, so
+            // every x86 feature name folds to 0.
+            if self.target == Target::I686 {
+                set.apply([
+                    ("bmi", self.resolved_bmi1()),
+                    ("bmi2", self.resolved_bmi2()),
+                    ("lzcnt", self.resolved_lzcnt()),
+                    ("movbe", self.resolved_movbe()),
+                    ("popcnt", self.resolved_popcnt()),
+                ]);
+            }
+            return set;
+        }
+        // x86-64 (v1) baseline: every x86-64 CPU implements these.
+        set.insert_x86_64_baseline();
+
+        let isa = self.x86_isa();
+        let simd = isa.simd;
+        if simd {
+            // SSE3/SSSE3/SSE4.x: the documented absent-`-march` baseline is
+            // x86-64-v3 (ranges.md / cli.rs), whose SIMD group is exactly
+            // `X86Isa::V3`; with an explicit `-march=` the requested flags are
+            // the ceiling, so only what they (or a wider ceiling) imply is
+            // guaranteed.
+            let v3_baseline = !self.x86_march_explicit;
+            let sse41 = isa.sse41;
+            let avx = isa.avx;
+            set.apply([
+                ("sse3", sse41 || avx || self.enable_sse3),
+                ("ssse3", sse41 || avx || self.enable_ssse3),
+                ("sse4.1", sse41),
+                ("sse4.2", self.enable_sse4_2 || v3_baseline),
+                ("avx", avx),
+                ("avx2", isa.ymm),
+                ("f16c", self.enable_f16c || v3_baseline),
+                ("fma", isa.fma),
+                ("aes", self.enable_aes),
+                ("pclmul", self.enable_pclmul),
+                ("avxvnni", self.enable_avxvnni),
+                ("avxifma", self.enable_avxifma),
+                ("avxneconvert", self.enable_avxneconvert),
+                ("avxvnniint8", self.enable_avxvnniint8),
+                ("avxvnniint16", self.enable_avxvnniint16),
+                ("gfni", self.enable_gfni),
+                ("vaes", self.enable_vaes),
+                ("vpclmulqdq", self.enable_vpclmulqdq),
+                ("sm3", self.enable_sm3),
+                ("sm4", self.enable_sm4),
+                ("avx512f", self.enable_avx512f),
+                ("avx512cd", self.enable_avx512cd),
+                ("avx512dq", self.enable_avx512dq),
+                ("avx512bw", self.enable_avx512bw),
+                ("avx512vl", self.enable_avx512vl),
+                ("avx512ifma", self.enable_avx512ifma),
+                ("avx512vbmi", self.enable_avx512vbmi),
+                ("avx512vbmi2", self.enable_avx512vbmi2),
+                ("avx512vnni", self.enable_avx512vnni),
+                ("avx512bitalg", self.enable_avx512bitalg),
+                ("avx512vpopcntdq", self.enable_avx512vpopcntdq),
+                ("avx512bf16", self.enable_avx512bf16),
+                ("avx512fp16", self.enable_avx512fp16),
+                ("avx512er", self.enable_avx512er),
+                ("avx512pf", self.enable_avx512pf),
+                ("avx512vp2intersect", self.enable_avx512vp2intersect),
+                ("sha512", self.enable_sha512),
+            ]);
+        }
+        // Integer ISA: legal under -mno-sse, exactly as instruction selection
+        // treats it (`enable_x86_v3_profile` doc comment).
+        set.apply([
+            ("bmi", self.resolved_bmi1()),
+            ("bmi2", self.resolved_bmi2()),
+            ("lzcnt", self.resolved_lzcnt()),
+            ("movbe", self.resolved_movbe()),
+            ("popcnt", self.resolved_popcnt()),
+            ("rdrnd", self.enable_rdrnd),
+            ("cmpccxadd", self.enable_cmpccxadd),
+            ("amx-tile", self.enable_amx_tile),
+            ("amx-int8", self.enable_amx_int8),
+            ("amx-bf16", self.enable_amx_bf16),
+        ]);
+        // AVX implies the XSAVE/OSXSAVE state enables: a CPU without them
+        // cannot execute a single VEX instruction.
+        set.insert_avx_implied();
+        set
+    }
+
     fn compile_to_assembly(&self, input_file: &str) -> Result<String, String> {
         // Capture RA/codegen bisection policy once, before this compilation
         // reaches any function-level backend path.  The Arc is threaded via
         // CodegenOptions rather than re-reading process environment there.
         let ra_config = std::sync::Arc::new(crate::backend::regalloc::RaConfig::from_process_env());
+
+        // Publish the effective ISA feature set before lowering: this is the
+        // single source of truth for compile-time `__builtin_cpu_supports`
+        // folding (AUD-CPU-1).
+        crate::common::isa_features::publish(self.effective_isa_features());
+
+        // Clear the "this translation unit reads a runtime CPU probe word"
+        // latch before lowering; the codegen tail below appends the probe
+        // helper it latches (AUD-CPU-1).
+        crate::common::cpu_probe::reset_runtime_needed();
 
         // Resolve the microarchitectural tuning row once per compilation.
         // `-mtune` wins over `-march`, `native` goes through CPUID; both
@@ -1708,10 +1847,8 @@ impl Driver {
             // Errors already emitted through diagnostic engine with source spans
             return Err(format!("{} error(s) during semantic analysis", error_count));
         }
-        let mut diagnostics = sema.take_diagnostics();
+        let diagnostics = sema.take_diagnostics();
         let sema_result = sema.into_result();
-        // Extract source manager for debug info emission (-g) after sema is done
-        let source_manager = diagnostics.take_source_manager();
         if time_phases {
             eprintln!("[TIME] sema: {:.3}s", t3.elapsed().as_secs_f64());
         }
@@ -1801,6 +1938,12 @@ impl Driver {
                 diagnostics.error_count()
             ));
         }
+
+        // Extract the source manager for codegen's debug-info emission (-g).
+        // It stays attached to the diagnostic engine through lowering so that
+        // lowering-phase diagnostics (AUD-ICE-1) render with file:line:col
+        // exactly like parser/sema ones, instead of a bare "error: ...".
+        let source_manager = diagnostics.share_source_manager();
 
         // Log diagnostic summary if there were any warnings during lowering
         if self.verbose && diagnostics.warning_count() > 0 {
@@ -1917,7 +2060,7 @@ impl Driver {
             self.target,
             self.code16gcc,
             self.fp_reassoc,
-            self.fp_contract,
+            self.resolved_fp_contract(),
             // Code-generation ISA permission — one struct shared with the
             // backend (see backend::x86::isa for the policy). i686 has no
             // baseline SSE2 and its vector lowerings are x86-64 shapes, so it
@@ -2566,7 +2709,7 @@ impl Driver {
             data_sections: self.data_sections,
             code16gcc: self.code16gcc,
             regparm: self.regparm,
-            fp_contract: self.fp_contract,
+            fp_contract: self.resolved_fp_contract(),
             fma: self.enable_fma,
             preferred_stack_bytes: self.preferred_stack_bytes,
             omit_frame_pointer: self.omit_frame_pointer,
@@ -2579,7 +2722,7 @@ impl Driver {
         let asm = self.target.generate_assembly_with_opts_and_debug(
             &module,
             &opts,
-            source_manager.as_ref(),
+            source_manager.as_deref(),
         );
         // `-mno-sse` / `-mgeneral-regs-only` (x86-64): the xmm register file
         // is architecturally off-limits — the kernel runs with CR4.OSFXSR
@@ -2638,6 +2781,31 @@ impl Driver {
         if self.verbose {
             eprintln!("Generated {:?} assembly ({} bytes)", self.target, asm.len());
         }
+
+        // Runtime CPU probe helper (AUD-CPU-1): appended only when a probe
+        // site was actually lowered, so a translation unit that never asks
+        // about CPU features carries no extra bytes.  The helper's symbols are
+        // `.local`: several objects in one link each get their own copy, none
+        // of them can collide, and no user definition can preempt the
+        // initialiser the generated call sites resolve to.
+        let probe_target = match self.target {
+            Target::X86_64 => Some(crate::common::cpu_probe::ProbeTarget::X86_64),
+            Target::I686 => Some(crate::common::cpu_probe::ProbeTarget::I686),
+            Target::Aarch64 | Target::Riscv64 => None,
+        };
+        let asm = match probe_target {
+            Some(probe_target) if crate::common::cpu_probe::take_runtime_needed() => {
+                let mut text = asm;
+                text.push('\n');
+                text.push_str(&crate::common::cpu_probe::runtime_asm(
+                    probe_target,
+                    self.pic || self.shared_lib || self.pie,
+                    !self.no_unwind_tables,
+                ));
+                text
+            }
+            _ => asm,
+        };
 
         Ok(asm)
     }
@@ -2757,6 +2925,25 @@ impl Driver {
         }
     }
 
+    /// Effective FP contraction policy (GCC parity, measured 2026-10-13 on
+    /// gcc 14.2 with `-march=x86-64-v3` probes).
+    ///
+    /// GCC never fuses `a*b + c` into an FMA at `-O0` or `-O1` — not even when
+    /// the target has FMA and not even under `-ffast-math`; the fusion appears
+    /// at `-O2`.  LCCC's C default is `-ffp-contract=fast` (which matches
+    /// GCC's *flag* default), and applying it at every optimization level made
+    /// `-O0`/`-O1` output differ from GCC's in the last ulp(s) — which is how
+    /// 26 in-repo reproducers came to be filed as "miscompile" although both
+    /// results are conforming.  An explicit `-ffp-contract=` or `-ffast-math`
+    /// still wins at any level.
+    pub(super) fn resolved_fp_contract(&self) -> crate::common::fp_contract::FpContract {
+        use crate::common::fp_contract::FpContract;
+        if !self.fp_contract_explicit && self.opt_level < 2 {
+            return FpContract::Off;
+        }
+        self.fp_contract
+    }
+
     pub(super) fn resolved_movbe(&self) -> bool {
         self.target == Target::X86_64
             && !self.movbe_explicitly_disabled
@@ -2771,6 +2958,10 @@ impl Driver {
         if self.target != Target::X86_64 || self.no_sse || self.general_regs_only {
             return X86Isa::NONE;
         }
+        // MOVBE is orthogonal to the SIMD ceiling: `resolved_movbe` owns its
+        // permission (`-mno-movbe`, or an explicit `-march=` that does not
+        // include it), so it is carried through both arms below.
+        let movbe = self.resolved_movbe();
         let ceiling = if self.x86_march_explicit {
             X86Isa {
                 simd: true,
@@ -2778,9 +2969,13 @@ impl Driver {
                 avx: self.enable_avx,
                 ymm: self.enable_avx2,
                 fma: self.enable_fma,
+                movbe,
             }
         } else {
-            X86Isa::V3
+            X86Isa {
+                movbe,
+                ..X86Isa::V3
+            }
         };
         X86Isa {
             simd: true,
@@ -2792,6 +2987,10 @@ impl Driver {
             // including the scalar FMA families).
             ymm: ceiling.ymm && !self.avx_explicitly_disabled && !self.avx2_explicitly_disabled,
             fma: ceiling.fma && !self.fma_explicitly_disabled,
+            // NOT `&& !self.sse41_explicitly_disabled` and not gated on
+            // `simd`: MOVBE has no SSE dependency, and `-mno-sse` must leave
+            // it intact.
+            movbe: ceiling.movbe,
         }
         .normalized()
     }

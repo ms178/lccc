@@ -246,7 +246,16 @@ impl Lowerer {
             return label_diff;
         }
 
-        // Can't evaluate - zero init as fallback
+        // Every value-preserving form above failed, so this initialiser is not
+        // a constant expression.  C requires a constant expression here
+        // (C11 6.6/6.7.9), and the old fallback silently stored zero —
+        // `static int v = f();` became `v = 0` with no diagnostic while GCC,
+        // Clang and ICX all report "initializer element is not constant"
+        // (measured, including for `__builtin_cpu_supports`, which GCC refuses
+        // to fold in constant contexts).  Diagnose instead of miscompiling.
+        self.diagnostics
+            .borrow_mut()
+            .error("initializer element is not constant", expr.span());
         GlobalInit::Zero
     }
 

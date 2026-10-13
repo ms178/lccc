@@ -2,14 +2,16 @@
 # Verify Fibonacci performance claim: LCCC should be dramatically faster
 # than GCC on recursive Fibonacci thanks to the rec2iter optimization.
 #
-# Usage: ./tests/verify_fib_perf.sh [path-to-lccc] [reps]
+# Usage: ./scripts/verify_fib_perf.sh [path-to-lccc] [reps]
+# (moved from tests/ to scripts/ in AUD-HYGIENE-1; SRC now resolves relative to
+#  the script's new location)
 set -euo pipefail
 
 LCCC="${1:-target/release/lccc}"
 REPS="${2:-5}"
 GCC_INC="$(gcc -print-file-name=include)"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SRC="$SCRIPT_DIR/benchmark/programs/fib.c"
+SRC="$SCRIPT_DIR/../tests/benchmark/programs/fib.c"
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
@@ -36,7 +38,7 @@ echo "Correctness: PASS ($GCC_OUT)"
 
 # 3. Verify rec2iter fires
 REC_OUT=$(LCCC_DEBUG_RECURSION=1 "$LCCC" -I"$GCC_INC" -O2 -o /dev/null "$SRC" 2>&1 || true)
-if echo "$REC_OUT" | grep -q "REC→ITER.*Transformed"; then
+if grep -c "REC→ITER.*Transformed" <<<"$REC_OUT" >/dev/null; then
     echo "rec2iter pass: ACTIVE"
 else
     echo "FAIL: rec2iter pass did not fire!"
@@ -104,7 +106,7 @@ echo "PASS: LCCC is $(printf '%.0f' "$ratio")x faster than GCC on recursive Fibo
 # 6. Run the comprehensive correctness test
 echo ""
 echo "Running comprehensive rec2iter correctness test..."
-"$LCCC" -I"$GCC_INC" -O2 -o "$TMPDIR/fib_comprehensive" "$SCRIPT_DIR/fib_rec2iter.c"
+"$LCCC" -I"$GCC_INC" -O2 -o "$TMPDIR/fib_comprehensive" "$SCRIPT_DIR/../tests/regression/fixtures/rec2iter/fib_rec2iter.c"
 COMP_OUT=$("$TMPDIR/fib_comprehensive")
 if [ "$COMP_OUT" = "ALL PASS" ]; then
     echo "Comprehensive test: PASS (includes fib(90) — impossible without rec2iter)"

@@ -677,7 +677,60 @@ impl super::InstructionEncoder {
         )
     }
 
-    /// Relaxable GOTPCREL reloc for the instruction currently in `self.bytes`.
+    /// Whether a linker may rewrite a `@GOTPCREL` reference in an instruction
+    /// whose classic-map opcode starts at `op_index`.
+    ///
+    /// This mirrors GAS 2.47's predicate (`gas/config/tc-i386.c`,
+    /// `output_disp`, the `fx_tcbit` block): a relocation is relaxable for
+    /// "call/jmp \*mem", "push mem", "mov mem, %reg", "movrs mem, %reg",
+    /// "test %reg, mem" and the eight binops (adc, add, and, cmp, or, sbb,
+    /// sub, xor) in *both* directions, and only without an operand-size
+    /// prefix.  Everything else — stores, `lea`, immediate forms, multi-byte
+    /// maps — keeps the plain, un-relaxable relocation even when the
+    /// instruction carries a REX prefix.  Measured with GAS 2.47 on the same
+    /// `.s` (`readelf -r`):
+    ///
+    /// ```text
+    /// movq  q1@GOTPCREL(%rip), %rax   R_X86_64_REX_GOTPCRELX  q1
+    /// movl  q2@GOTPCREL(%rip), %eax   R_X86_64_GOTPCRELX      q2
+    /// addq  q3@GOTPCREL(%rip), %rax   R_X86_64_REX_GOTPCRELX  q3
+    /// movl  %eax, q4@GOTPCREL(%rip)   R_X86_64_GOTPCREL        q4   (store)
+    /// pushq q5@GOTPCREL(%rip)         R_X86_64_GOTPCRELX      q5
+    /// cmpl  $1, q6@GOTPCREL(%rip)     R_X86_64_GOTPCREL        q6   (0x83 /7)
+    /// leaq  q7@GOTPCREL(%rip), %rax   R_X86_64_GOTPCREL        q7   (0x8d)
+    /// ```
+    ///
+    /// The mask trick is GAS's own: `op | 0x38 == 0x3b` selects
+    /// `r <- r op m` (0x03, 0x0b, 0x13, 0x1b, 0x23, 0x2b, 0x33, 0x3b) and
+    /// `op | 0x3a == 0x3b` selects `m <- m op r` (0x01, 0x09, ..., 0x39).
+    fn gotpcrel_form_relaxable(&self, op_index: usize) -> bool {
+        // GAS requires `i.prefix[DATA_PREFIX] == 0`: there is no relaxation
+        // for the 16-bit spelling.
+        if self.bytes[..self.prefix_start()].contains(&0x66) {
+            return false;
+        }
+        match self.bytes.get(op_index).copied() {
+            // `mov reg, mem` and `test`, the two non-binop forms.
+            Some(0x8B) | Some(0x85) => true,
+            // The eight binops, both directions.
+            Some(op) if (op | 0x38) == 0x3B || (op | 0x3A) == 0x3B => true,
+            // `call|jmp|push *mem` (FF /2, /4, /6).
+            Some(0xFF) => matches!(
+                self.bytes.get(op_index + 1).map(|b| (b >> 3) & 7),
+                Some(2) | Some(4) | Some(6)
+            ),
+            // Stores (0x88/0x89), `lea` (0x8d), immediate forms (0x81/0x83/
+            // 0xC7/...), the `0F` map without APX (classic `imul` has no
+            // relaxation), VEX (0xC4/0xC5) and AVX-512 EVEX: plain.
+            _ => false,
+        }
+    }
+
+    /// GOTPCREL reloc for the instruction currently in `self.bytes`.
+    ///
+    /// The *instruction form* decides whether the relocation is relaxable at
+    /// all ([`Self::gotpcrel_form_relaxable`], GAS's predicate); the prefix
+    /// then decides which relaxable spelling applies:
     ///
     /// REX (0x40-0x4F) → `R_X86_64_REX_GOTPCRELX` (42).
     /// REX2 (0xD5)     → `R_X86_64_CODE_4_GOTPCRELX` (43) — the displacement
@@ -685,15 +738,28 @@ impl super::InstructionEncoder {
     /// APX EVEX ALU    → `R_X86_64_CODE_6_GOTPCRELX` (49) — disp sits 6 bytes
     /// after `0x62` (`62 p1 p2 p3 opc modrm disp32`).
     /// AVX-512 EVEX / APX map-4 BMI → `R_X86_64_GOTPCREL` (9), matching GAS.
-    /// Anything else   → `R_X86_64_GOTPCRELX` (41).
+    /// Non-relaxable form → `R_X86_64_GOTPCREL` (9), whatever the prefix.
+    /// Otherwise       → `R_X86_64_GOTPCRELX` (41).
     pub(crate) fn gotpcrel_x_type(&self) -> u32 {
         let i = self.prefix_start();
         match self.bytes.get(i).copied() {
-            Some(0x40..=0x4F) => R_X86_64_REX_GOTPCRELX,
+            Some(0x40..=0x4F) => {
+                if self.gotpcrel_form_relaxable(i + 1) {
+                    R_X86_64_REX_GOTPCRELX
+                } else {
+                    R_X86_64_GOTPCREL
+                }
+            }
             Some(0xD5) => R_X86_64_CODE_4_GOTPCRELX,
             Some(0x62) if self.apx_evex_legacy_relaxable() => R_X86_64_CODE_6_GOTPCRELX,
             Some(0x62) => R_X86_64_GOTPCREL,
-            _ => R_X86_64_GOTPCRELX,
+            _ => {
+                if self.gotpcrel_form_relaxable(i) {
+                    R_X86_64_GOTPCRELX
+                } else {
+                    R_X86_64_GOTPCREL
+                }
+            }
         }
     }
 
@@ -833,14 +899,15 @@ impl super::InstructionEncoder {
                         // Modifiers are case-insensitive in GNU as: glibc's
                         // multiarch sources emit lowercase `sym@gottpoff(%rip)`.
                         let reloc_type = match modifier.to_ascii_lowercase().as_str() {
-                            // GAS never emits the plain, un-relaxable
-                            // R_X86_64_GOTPCREL (9) for a RIP-relative GOT load.
-                            // It emits the "X" variants, which tell the linker
-                            // it may rewrite `mov sym@GOTPCREL(%rip),%reg` into
-                            // a direct `lea` when the symbol turns out to be
-                            // local -- removing a GOT entry and a load.  Which
-                            // of the two applies is decided purely by whether
-                            // the instruction carries a REX prefix.
+                            // GAS emits a "X" spelling only where the linker
+                            // may rewrite the reference into a direct `lea`
+                            // when the symbol turns out to be local -- removing
+                            // a GOT entry and a load: a `mov` load, `test`,
+                            // the eight binops, and indirect `call/jmp/push`.
+                            // Stores, `lea` and immediate forms get the plain,
+                            // un-relaxable R_X86_64_GOTPCREL (9) even with a
+                            // REX prefix (measured against GAS 2.47; see
+                            // `gotpcrel_form_relaxable`).
                             "gotpcrel" => self.gotpcrel_x_type(),
                             "gotpcrelx" => R_X86_64_GOTPCRELX,
                             "rex_gotpcrelx" => R_X86_64_REX_GOTPCRELX,

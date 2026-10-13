@@ -3,7 +3,7 @@
 //! Provides:
 //! - `temp_dir()`: returns the platform temp directory (respects $TMPDIR)
 //! - `TempFile`: RAII guard that deletes the file on drop (even on panic/error)
-//! - `make_temp_path()`: generates a unique temp file path
+//! Automatically named files live in atomically created private directories.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,44 +19,77 @@ pub fn temp_dir() -> PathBuf {
     std::env::temp_dir()
 }
 
-/// Generate a unique temp file path with the given prefix and extension.
+/// RAII guard for a file inside an exclusively created private directory.
 ///
-/// The path includes the PID and an atomic counter to avoid collisions
-/// in parallel builds and multi-file compilations.
-pub fn make_temp_path(prefix: &str, stem: &str, extension: &str) -> PathBuf {
-    let pid = std::process::id();
-    let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let filename = format!("{}_{}_{}.{}.{}", prefix, pid, stem, id, extension);
-    temp_dir().join(filename)
-}
-
-/// RAII guard for a temporary file. Deletes the file when dropped.
-///
-/// This ensures cleanup happens even on early returns, panics, or errors.
-/// The file path is accessible via `path()` and `to_str()`.
+/// A unique name alone is not a reservation: an attacker can pre-place a
+/// symlink in a shared TMPDIR. Directory creation is atomic, and on Unix the
+/// directory is mode 0700 from its creation (not a later chmod). Writers and
+/// external assemblers can safely reopen the path inside that directory.
 pub struct TempFile {
     path: PathBuf,
-    /// If true, the file will NOT be deleted on drop (for debugging).
+    directory: Option<PathBuf>,
+    /// If true, the file and its directory are retained for debugging.
     keep: bool,
 }
 
 impl TempFile {
-    /// Create a new TempFile guard for a unique temp path.
-    ///
-    /// The file is not created on disk — this just reserves the path and
-    /// registers it for cleanup on drop.
-    pub fn new(prefix: &str, stem: &str, extension: &str) -> Self {
-        Self {
-            path: make_temp_path(prefix, stem, extension),
-            keep: false,
-        }
+    /// Reserve a private directory, propagating I/O failures to the driver.
+    pub fn new(prefix: &str, stem: &str, extension: &str) -> Result<Self, String> {
+        Self::new_in(&temp_dir(), prefix, stem, extension)
+            .map_err(|e| format!("Failed to reserve temporary file: {e}"))
     }
 
-    /// Create a TempFile with a specific path (for cases where the caller
-    /// controls the path but wants RAII cleanup).
-    #[cfg_attr(not(feature = "gcc_assembler"), allow(dead_code))] // Used by gcc_assembler's CCC_KEEP_ASM path
+    fn new_in(parent: &Path, prefix: &str, stem: &str, extension: &str) -> std::io::Result<Self> {
+        use std::io::{Error, ErrorKind};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        // All caller-controlled parts must stay within the private directory.
+        let filename = format!("{prefix}_{stem}.{extension}");
+        if Path::new(&filename).file_name() != Some(std::ffi::OsStr::new(&filename)) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "invalid temporary filename",
+            ));
+        }
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        for _ in 0..128 {
+            let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let directory = parent.join(format!("lccc_{}_{nanos:x}_{id:x}", std::process::id()));
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(&directory) {
+                Ok(()) => {
+                    return Ok(Self {
+                        path: directory.join(&filename),
+                        directory: Some(directory),
+                        keep: false,
+                    });
+                }
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Error::new(
+            ErrorKind::AlreadyExists,
+            "temporary directory collision limit exceeded",
+        ))
+    }
+
+    /// Guard an explicitly requested output path, not an automatically named
+    /// temporary file. This is used only for the assembler's kept .s output.
+    #[cfg_attr(not(feature = "gcc_assembler"), allow(dead_code))]
     pub fn with_path(path: PathBuf) -> Self {
-        Self { path, keep: false }
+        Self {
+            path,
+            directory: None,
+            keep: false,
+        }
     }
 
     /// Mark this temp file to be kept (not deleted on drop).
@@ -85,6 +118,9 @@ impl Drop for TempFile {
         if !self.keep {
             // Silently ignore errors (file may not have been created).
             let _ = std::fs::remove_file(&self.path);
+            if let Some(directory) = &self.directory {
+                let _ = std::fs::remove_dir(directory);
+            }
         }
     }
 }
@@ -92,5 +128,50 @@ impl Drop for TempFile {
 impl std::fmt::Display for TempFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.path.display())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_temp_cleanup_and_permissions() {
+        let file = TempFile::new("test", "private", "o").unwrap();
+        let path = file.path().to_path_buf();
+        let directory = path.parent().unwrap().to_path_buf();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        std::fs::write(&path, b"object").unwrap();
+        drop(file);
+        assert!(!path.exists());
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn private_temp_keep_and_uniqueness() {
+        let mut a = TempFile::new("test", "same", "o").unwrap();
+        let b = TempFile::new("test", "same", "o").unwrap();
+        assert_ne!(a.path(), b.path());
+        let directory = a.path().parent().unwrap().to_path_buf();
+        a.set_keep(true);
+        drop(a);
+        assert!(directory.is_dir());
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn private_temp_rejects_escape_and_missing_parent() {
+        assert!(TempFile::new("test", "../../victim", "o").is_err());
+        let parent = TempFile::new("test", "parent", "o").unwrap();
+        // The file path is not a directory, and cannot be used as a TMPDIR.
+        std::fs::write(parent.path(), b"not a directory").unwrap();
+        assert!(TempFile::new_in(parent.path(), "test", "child", "o").is_err());
     }
 }

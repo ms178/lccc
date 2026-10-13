@@ -3696,6 +3696,20 @@ fn collect_symbol_sets(cg: &mut dyn ArchCodegen, module: &IrModule) {
     for (label, _) in &module.wide_string_literals {
         state.local_symbols.insert(label.clone());
     }
+    // `__builtin_cpu_supports` emits its probe helper into this translation
+    // unit (see common::cpu_probe), so the helper's words, its `ready` flag
+    // and its initialiser are local definitions here.  Without this the i686
+    // PIC backend takes them for external data and materialises each probe
+    // read through a GOT slot (`movl __lccc_cpu_w..@GOT(%ebx)`, `call
+    // __lccc_cpu_init@PLT`), which costs an indirection per read and made the
+    // object depend on the assembler's GOT-relocation handling; GCC addresses
+    // its own `__cpu_model` directly.  Harmless on targets that never
+    // reference the symbols (AArch64/RISC-V lower the builtin to a constant).
+    if crate::common::cpu_probe::runtime_needed() {
+        for symbol in crate::common::cpu_probe::defined_symbols() {
+            state.local_symbols.insert(symbol.to_string());
+        }
+    }
 }
 
 fn build_and_emit_dwarf_file_table(

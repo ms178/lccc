@@ -21,6 +21,7 @@
   "double_reduction": "-DREDUCTION_PASSES=1",
   "ascii_case_fold": "",
   "binary_search": "",
+  "byte_load_reassembly": "",
   "ring_fifo": "",
   "aarch64_select_patterns": "-DSELECT_ITERS=20000",
   "histogram": "",
