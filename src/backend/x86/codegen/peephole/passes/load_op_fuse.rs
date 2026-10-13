@@ -527,6 +527,50 @@ pub(super) fn next_insn(store: &LineStore, infos: &[LineInfo], mut j: usize, len
     j
 }
 
+/// Try the adjacent commuted form `mov MEM, %T; OP %S, %T` by writing the
+/// product into `%S` and safely renaming its live range from `%T`.
+fn try_fuse_commuted_adjacent_load(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    lv: &mut FileLiveness,
+    load_idx: usize,
+    consumer_idx: usize,
+    mem: &str,
+    load_q: bool,
+    op: &str,
+    op_q: bool,
+    scratch: RegId,
+    source: RegId,
+    dest: RegId,
+    gap: usize,
+) -> Option<usize> {
+    // This is legal only for an adjacent, same-width commutative RMW whose
+    // old source value dies there. The result-family rename is fail-closed:
+    // it rejects stale reads, unsafe writes, barriers, and high-byte aliases.
+    if op_q != load_q
+        || dest != scratch
+        || source == scratch
+        || gap != 0
+        || source == 4
+        || dest == 4
+        || !COMMUTATIVE_OPS.contains(&op)
+        || lv.live_after(consumer_idx, source) != Some(false)
+    {
+        return None;
+    }
+    let span_end = rename_product_range(store, infos, consumer_idx, dest, source, lv)?;
+    let suffix = if load_q { "q" } else { "l" };
+    let width = if load_q { 0 } else { 1 };
+    let new_line = format!(
+        "    {op}{suffix} {mem}, {}",
+        REG_NAMES[width][source as usize]
+    );
+    mark_nop(&mut infos[load_idx]);
+    replace_line(store, &mut infos[consumer_idx], consumer_idx, new_line);
+    lv.refresh_span(store, infos, load_idx, span_end);
+    Some(span_end)
+}
+
 /// Fuse `mov MEM, %T ... OP %T, %D` into `OP MEM, %D` (see module docs).
 pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
@@ -640,44 +684,12 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) 
                 i = j + 1;
                 continue;
             }
-            // ── commuted adjacent fuse: fresh load feeds a writing
-            // commutative op ────────────────────────────────────────────────
-            // `movq (q), %rdx ; imulq %rax, %rdx` is `rdx = rax * [q]`, one
-            // memory-reading RMW away from the loop GCC emits: commuting the
-            // consumer and folding the load gives `imulq (q), %rax` — the
-            // product lands in the OTHER operand's family, so every later use
-            // of the product is renamed %rdx→%rax.  The load is ADJACENT to
-            // the consumer (gap == 0): nothing is reordered across it, so the
-            // volatile-order discipline holds by construction.  Soundness of
-            // the rename (fail-closed at every step):
-            //   * the fused RMW destroys the other operand's old value, so
-            //     that family must be dead after the consumer;
-            //   * the product's range after the consumer is renamed family-
-            //     consistently; `rename_product_range` vetoes any line that
-            //     touches the result family (stale reads or clobbers), any
-            //     partial-width or multi-output write it cannot safely rehome,
-            //     and any barrier the product is live over (a call could
-            //     consume it as an argument without a text mention);
-            //   * `%ah`-class spellings veto the rename (no REX encoding).
-            if op_q == load_q
-                && dst == t_fam
-                && src != t_fam
-                && gap == 0
-                && src != 4
-                && dst != 4
-                && COMMUTATIVE_OPS.contains(&op)
-                && lv.live_after(j, src) == Some(false)
-            {
-                if let Some(span_end) = rename_product_range(store, infos, j, dst, src, &lv) {
-                    let new_line =
-                        format!("    {op}{suffix} {mem}, {}", REG_NAMES[width][src as usize]);
-                    mark_nop(&mut infos[i]);
-                    replace_line(store, &mut infos[j], j, new_line);
-                    lv.refresh_span(store, infos, i, span_end);
-                    changed = true;
-                    i = span_end + 1;
-                    continue;
-                }
+            if let Some(span_end) = try_fuse_commuted_adjacent_load(
+                store, infos, &mut lv, i, j, mem, load_q, op, op_q, t_fam, src, dst, gap,
+            ) {
+                changed = true;
+                i = span_end + 1;
+                continue;
             }
             i += 1;
             continue;

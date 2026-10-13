@@ -1875,6 +1875,110 @@ fn analyze_loop_pattern(
     })
 }
 
+/// Return the unique Select update that implements the recognized guarded reduction.
+/// `Some(None)` means no guard is present; `None` means a present guard has no
+/// exact Select update or has multiple matching updates.
+fn find_guarded_reduction_select(
+    func: &IrFunction,
+    body_idx: usize,
+    adds: &[(usize, Value)],
+    guard_cond: Option<Value>,
+    accumulator_phis: &[Value],
+    debug: bool,
+) -> Option<Option<usize>> {
+    let Some(guard_cond) = guard_cond else {
+        return Some(None);
+    };
+    let mut guarded_select = None;
+    for (inst_idx, inst) in func.blocks[body_idx].instructions.iter().enumerate() {
+        let Instruction::Select {
+            cond: Operand::Value(cond),
+            true_val: Operand::Value(add_result),
+            false_val: Operand::Value(accumulator),
+            ..
+        } = inst
+        else {
+            continue;
+        };
+        let recognized_add = adds.iter().any(|&(_, result)| result == *add_result);
+        let recognized_accumulator = accumulator_phis.contains(accumulator);
+        if *cond == guard_cond && recognized_add && recognized_accumulator {
+            if guarded_select.replace(inst_idx).is_some() {
+                return None;
+            }
+        }
+    }
+    if guarded_select.is_none() {
+        if debug {
+            eprintln!(
+                "[VEC-RED]   Rejecting: recognized reduction guard has no exact Select update"
+            );
+        }
+        return None;
+    }
+    Some(guarded_select)
+}
+
+/// Check that no loop-local reduction value, except the values repaired by
+/// the vectorizer, is used after the loop.
+fn reduction_loop_values_do_not_escape(
+    func: &IrFunction,
+    loop_blocks: &FxHashSet<usize>,
+    accumulator_phis: &[Value],
+    iv_phi: Value,
+    debug: bool,
+) -> bool {
+    let mut loop_defs: FxHashSet<u32> = FxHashSet::default();
+    for &bi in loop_blocks {
+        for inst in &func.blocks[bi].instructions {
+            if let Some(dest) = inst.dest() {
+                loop_defs.insert(dest.0);
+            }
+        }
+    }
+
+    for (bi, block) in func.blocks.iter().enumerate() {
+        if loop_blocks.contains(&bi) {
+            continue;
+        }
+        for inst in &block.instructions {
+            let mut unsafe_escape = false;
+            inst.for_each_used_value(|used| {
+                if loop_defs.contains(&used)
+                    && used != iv_phi.0
+                    && !accumulator_phis.iter().any(|phi| phi.0 == used)
+                {
+                    unsafe_escape = true;
+                }
+            });
+            if unsafe_escape {
+                if debug {
+                    eprintln!("[VEC-RED]   Rejecting: unmodelled reduction value escapes loop");
+                }
+                return false;
+            }
+        }
+        let mut unsafe_escape = false;
+        block.terminator.for_each_used_value(|used| {
+            if loop_defs.contains(&used)
+                && used != iv_phi.0
+                && !accumulator_phis.iter().any(|phi| phi.0 == used)
+            {
+                unsafe_escape = true;
+            }
+        });
+        if unsafe_escape {
+            if debug {
+                eprintln!(
+                    "[VEC-RED]   Rejecting: unmodelled reduction value escapes through terminator"
+                );
+            }
+            return false;
+        }
+    }
+    true
+}
+
 /// Analyze a loop to detect vectorizable reduction patterns (sum += arr[i], sum += a[i] * b[i]).
 /// Soundness gate for reduction vectorization.
 ///
@@ -1920,52 +2024,23 @@ fn reduction_pattern_is_sound(
                 .iter()
                 .any(|&(add_idx, add_result)| add_idx == inst_idx && add_result == dest)
     };
-    // A single guarded reduction Select is part of the modeled accumulator
-    // update (`Select(cond, add_result, accumulator_phi)`). Permit only the
-    // exact guard recognized by analysis; arbitrary comparisons/selects that
-    // read the accumulator remain unsupported.
-    let mut guarded_select = None;
-    if let Some(guard_cond) = guard_cond {
-        for (inst_idx, inst) in func.blocks[body_idx].instructions.iter().enumerate() {
-            let Instruction::Select {
-                cond: Operand::Value(cond),
-                true_val: Operand::Value(add_result),
-                false_val: Operand::Value(accumulator),
-                ..
-            } = inst
-            else {
-                continue;
-            };
-            let recognized_add = adds.iter().any(|&(_, result)| result == *add_result);
-            let recognized_accumulator = accumulator_phis.contains(accumulator);
-            if *cond == guard_cond && recognized_add && recognized_accumulator {
-                if guarded_select.replace(inst_idx).is_some() {
-                    return false;
-                }
-            }
-        }
-        if guarded_select.is_none() {
-            if debug {
-                eprintln!(
-                    "[VEC-RED]   Rejecting: recognized reduction guard has no exact Select update"
-                );
-            }
-            return false;
-        }
-    }
+    // A guarded reduction must match one exact Select update; arbitrary
+    // comparisons/selects that read the accumulator remain unsupported.
+    let Some(guarded_select) = find_guarded_reduction_select(
+        func,
+        body_idx,
+        adds,
+        guard_cond,
+        accumulator_phis,
+        debug,
+    ) else {
+        return false;
+    };
     // Labels of every loop block, to detect a phi's back-edge incoming.
     let loop_block_labels: FxHashSet<u32> = loop_blocks
         .iter()
         .map(|&bi| func.blocks[bi].label.0)
         .collect();
-    let mut loop_defs: FxHashSet<u32> = FxHashSet::default();
-    for &bi in loop_blocks {
-        for inst in &func.blocks[bi].instructions {
-            if let Some(dest) = inst.dest() {
-                loop_defs.insert(dest.0);
-            }
-        }
-    }
 
     // (4) terminators: only the header may branch (its exit condition);
     //     every other loop block must end in an unconditional branch.
@@ -2234,48 +2309,10 @@ fn reduction_pattern_is_sound(
         return false;
     }
 
-    // The transform can repair only the induction value and recognized
-    // accumulator phis after the loop. Any other loop-local definition used
-    // outside remains a scalar-iteration value that the vector body did not
-    // preserve, so refuse it.
-    for (bi, block) in func.blocks.iter().enumerate() {
-        if loop_blocks.contains(&bi) {
-            continue;
-        }
-        for inst in &block.instructions {
-            let mut unsafe_escape = false;
-            inst.for_each_used_value(|used| {
-                if loop_defs.contains(&used)
-                    && used != iv_phi.0
-                    && !accumulator_phis.iter().any(|phi| phi.0 == used)
-                {
-                    unsafe_escape = true;
-                }
-            });
-            if unsafe_escape {
-                if debug {
-                    eprintln!("[VEC-RED]   Rejecting: unmodelled reduction value escapes loop");
-                }
-                return false;
-            }
-        }
-        let mut unsafe_escape = false;
-        block.terminator.for_each_used_value(|used| {
-            if loop_defs.contains(&used)
-                && used != iv_phi.0
-                && !accumulator_phis.iter().any(|phi| phi.0 == used)
-            {
-                unsafe_escape = true;
-            }
-        });
-        if unsafe_escape {
-            if debug {
-                eprintln!(
-                    "[VEC-RED]   Rejecting: unmodelled reduction value escapes through terminator"
-                );
-            }
-            return false;
-        }
+    // The transform repairs only the induction value and accumulator phis;
+    // reject other loop-local values that remain live after the loop.
+    if !reduction_loop_values_do_not_escape(func, loop_blocks, accumulator_phis, iv_phi, debug) {
+        return false;
     }
 
     true
