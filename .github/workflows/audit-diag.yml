@@ -111,3 +111,48 @@ jobs:
           gate seg-conversion      env CCC=target/fastbuild/lccc bash tests/regression/check_seg_conversion_parity.sh
           echo "::notice title=DIAG-SUMMARY::fail flag=$fail (see DIAG-GATE-FAIL annotations)"
           exit $fail
+
+  diag2:
+    name: Audit diagnostics (late steps)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install i686 C runtime and development files
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-multilib g++-multilib libc6-dev-i386
+
+      - name: Install differential linker oracles
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mold lld
+
+      - name: Install a C23-capable GCC oracle
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-14
+
+      - name: Install the GCC 16 verdict oracle
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends software-properties-common python3-yaml
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-16 gcc-16-multilib lib32gcc-16-dev
+
+      - name: Build
+        run: ./scripts/build_lccc_fast.sh
+
+      - name: Replay Test Suite steps 55-150, reporting every verdict
+        run: python3 scripts/audit_diag_replay.py 55 150
