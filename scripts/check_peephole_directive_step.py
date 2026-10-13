@@ -76,7 +76,7 @@ TARGETS = [
 # about deciding by class, and a construction decides nothing.
 DIRECTIVE_TEST = re.compile(
     r"\.kind\s*[!=]=\s*LineKind::Directive"
-    r"|matches!\s*\(\s*[^)]*\.kind\s*,\s*LineKind::Directive"
+    r"|matches!\s*\(\s*[^,)]*\.kind\s*,[^)]*\bLineKind::Directive\b"
 )
 
 # A `match kind` arm naming the directive variant.  Its class test sits on the
@@ -492,6 +492,21 @@ fn walk(infos: &[LineInfo]) {
         True,
     ),
 ]
+
+
+# Every alternative position and both polarities, with newlines and a guard.
+# These are class-only walkers: none may silently pass a data directive.
+for variants in [
+    "LineKind::Directive | LineKind::Nop | LineKind::Empty",
+    "LineKind::Nop | LineKind::Directive | LineKind::Empty",
+    "LineKind::Nop |\n LineKind::Empty |\n LineKind::Directive",
+]:
+    for polarity in ["", "!"]:
+        WITNESSES.append((
+            f"matches alternative position / polarity {variants!r} {polarity!r}",
+            "fn walk() {\n if " + polarity + "matches!(infos[j].kind, " + variants
+            + ") { j += 1; continue; }\n}", True,
+        ))
 
 
 def self_test() -> int:

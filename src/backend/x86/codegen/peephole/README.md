@@ -751,3 +751,18 @@ hot path.
 | `passes/tail_call.rs` | ~420 | Phase 5: tail call optimization (call+epilogue+ret -> epilogue+jmp) |
 | `passes/callee_saves.rs` | ~160 | Phase 6: unused callee-saved register save/restore elimination |
 | `passes/frame_compact.rs` | ~320 | Phase 7: stack frame compaction after dead store/callee-save elimination |
+
+### Empty jump threading
+
+`jump_thread` runs after `identical_blocks` and before `epilogue_merge`.
+`CCC_PEEPHOLE_SKIP=jump_thread` disables it. It redirects direct local edges
+through bounded, acyclic branch-only chains without deleting any label or code.
+Computed-goto addresses, jump tables and fall-through entries remain present.
+Inert `.loc`/`.file` attribution is transparent; pinned/inline-asm windows, CFI,
+alignment/data/section directives remain barriers. Canonical numeric label keys
+and allocation-free opcode parsing avoid per-edge string allocation.
+
+Retargeting can widen a short branch while leaving the old relay in place.
+Until layout-aware non-growth is proved, size-oriented codegen disables this
+pass explicitly via the driver-owned size flag, not an environment heuristic.
+Debug/non-debug `.text` parity is checked across all benchmark programs.

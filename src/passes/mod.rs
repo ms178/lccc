@@ -2135,9 +2135,8 @@ pub(crate) fn run_passes(
             );
             total_changes += n;
             total_changes_excl_dce += n;
-            if n > 0 {
-                verify::verify_after_pass(module, "loop_square");
-            }
+            // timed_pass! already performs the structural checkpoint; do not
+            // verify the same module twice when the recurrence changed.
         }
 
         // Phase 2b-rot: Loop rotation — iter 0, AFTER iv_widen (so the
@@ -3015,8 +3014,18 @@ pub(crate) fn run_passes(
         && x86_isa.simd
         && !pass_disabled(&disabled, "fp_double")
     {
-        module.for_each_function(fp_double::run);
-        verify::verify_after_pass(module, "fp_double");
+        let start = time_passes.then(std::time::Instant::now);
+        let keep_contraction_inputs = fp_contract != FpContract::Off && x86_isa.fma;
+        let changes = module.for_each_function(|f| fp_double::run(f, keep_contraction_inputs));
+        if changes > 0 {
+            verify::verify_after_pass(module, "fp_double");
+        }
+        if let Some(start) = start {
+            eprintln!(
+                "[PASS-TIME] fp_double: {:.3} ms ({changes} changes)",
+                start.elapsed().as_secs_f64() * 1e3
+            );
+        }
     }
 
     // Hoist FP constants used in loop bodies into preheader Copies so they can

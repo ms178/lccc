@@ -9,10 +9,21 @@
 #include <xmmintrin.h>
 #endif
 #define NI __attribute__((noinline))
+static uint64_t digest = 14695981039346656037ULL;
+static void hash_word(uint64_t word) {
+    for (unsigned i = 0; i < 8; ++i) {
+        digest = (digest ^ (word & 255)) * 1099511628211ULL;
+        word >>= 8;
+    }
+}
 
 NI double twice64(double x) { return 2.0 * x; }
 NI float twice32(float x) { return x * 2.0f; }
 NI double twice_plus(double x, double y) { return x * 2.0 + y; }
+NI double twice_minus(double x, double y) { return 2.0 * x - y; }
+NI float twice_plus32(float x, float y) { return 2.0f * x + y; }
+static NI double reference_plus(double x, double y) { volatile double two = 2.0; return two * x + y; }
+static NI float reference_plus32(float x, float y) { volatile float two = 2.0f; return two * x + y; }
 NI double scaled_fma(double x, double y, double z) { return 2.0 * x * y + z; }
 static NI double reference64(double x) { volatile double two = 2.0; return two * x; }
 static NI float reference32(float x) { volatile float two = 2.0f; return x * two; }
@@ -71,10 +82,26 @@ static int check_double(uint64_t u) {
     feclearexcept(FE_ALL_EXCEPT);
     double actual = twice64(x);
     int af = fetestexcept(FE_ALL_EXCEPT);
+    hash_word(bits64(expected)); hash_word((unsigned)ef);
+    hash_word(bits64(actual)); hash_word((unsigned)af);
     if (bits64(expected) != bits64(actual) || ef != af) {
         printf("double %llx: %llx/%x != %llx/%x\n", (unsigned long long)u,
             (unsigned long long)bits64(expected), ef, (unsigned long long)bits64(actual), af);
         return 1;
+    }
+    for (int subtract = 0; subtract < 2; ++subtract) {
+        feclearexcept(FE_ALL_EXCEPT);
+        expected = reference_plus(x, subtract ? -0.125 : 0.125);
+        ef = fetestexcept(FE_ALL_EXCEPT);
+        feclearexcept(FE_ALL_EXCEPT);
+        actual = subtract ? twice_minus(x, 0.125) : twice_plus(x, 0.125);
+        af = fetestexcept(FE_ALL_EXCEPT);
+        hash_word(bits64(expected)); hash_word((unsigned)ef);
+        hash_word(bits64(actual)); hash_word((unsigned)af);
+        if (bits64(expected) != bits64(actual) || ef != af) {
+            printf("double consumer %llx/%d mismatch\n", (unsigned long long)u, subtract);
+            return 1;
+        }
     }
     return 0;
 }
@@ -86,8 +113,22 @@ static int check_float(uint32_t u) {
     feclearexcept(FE_ALL_EXCEPT);
     float actual = twice32(x);
     int af = fetestexcept(FE_ALL_EXCEPT);
+    hash_word(bits32(expected)); hash_word((unsigned)ef);
+    hash_word(bits32(actual)); hash_word((unsigned)af);
     if (bits32(expected) != bits32(actual) || ef != af) {
         printf("float %x: %x/%x != %x/%x\n", u, bits32(expected), ef, bits32(actual), af);
+        return 1;
+    }
+    feclearexcept(FE_ALL_EXCEPT);
+    expected = reference_plus32(x, 0.125f);
+    ef = fetestexcept(FE_ALL_EXCEPT);
+    feclearexcept(FE_ALL_EXCEPT);
+    actual = twice_plus32(x, 0.125f);
+    af = fetestexcept(FE_ALL_EXCEPT);
+    hash_word(bits32(expected)); hash_word((unsigned)ef);
+    hash_word(bits32(actual)); hash_word((unsigned)af);
+    if (bits32(expected) != bits32(actual) || ef != af) {
+        printf("float consumer %x mismatch\n", u);
         return 1;
     }
     return 0;
@@ -99,6 +140,8 @@ static int check_loop(double c, int n, int changing) {
     feclearexcept(FE_ALL_EXCEPT);
     double actual = changing ? changing_round(c, n) : square_loop(c, n);
     int af = fetestexcept(FE_ALL_EXCEPT);
+    hash_word(bits64(expected)); hash_word((unsigned)ef);
+    hash_word(bits64(actual)); hash_word((unsigned)af);
     if (bits64(expected) != bits64(actual) || ef != af) {
         printf("loop %d/%d: %llx/%x != %llx/%x\n", n, changing,
             (unsigned long long)bits64(expected), ef, (unsigned long long)bits64(actual), af);
@@ -159,6 +202,6 @@ int main(void) {
 #if defined(__x86_64__)
     _mm_setcsr(csr);
 #endif
-    puts("fp recurrence: PASS");
+    printf("fp recurrence: PASS %016llx\n", (unsigned long long)digest);
     return 0;
 }

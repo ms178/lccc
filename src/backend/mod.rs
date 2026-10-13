@@ -539,6 +539,7 @@ impl Target {
                     x86::codegen::peephole::peephole_optimize_with_config(
                         raw,
                         opts.ra_config.as_ref(),
+                        opts.optimize_for_size,
                     )
                 };
                 finish_fn_boundaries(&asm, &cg.state, opts.emit_cfi, cfi_synth::CfiArch::X86_64)

@@ -216,7 +216,11 @@ pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInf
     let mut lv = FpLiveness::new(store, infos);
     let mut i = 0;
     while i + 1 < len {
-        if infos[i].is_nop() || infos[i + 1].is_nop() {
+        let j = next_non_debug(store, infos, i + 1, len);
+        if j == len {
+            break;
+        }
+        if infos[i].is_nop() || infos[i].pinned || infos[j].pinned {
             i += 1;
             continue;
         }
@@ -240,7 +244,7 @@ pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInf
             continue;
         }
 
-        let consumer = infos[i + 1].trimmed(store.get(i + 1));
+        let consumer = infos[j].trimmed(store.get(j));
         let Some((arith_op, arith_operands)) = consumer.split_once(' ') else {
             i += 1;
             continue;
@@ -290,7 +294,7 @@ pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInf
             .strip_prefix("%xmm")
             .and_then(|d| d.parse::<u32>().ok())
             .unwrap_or(u32::MAX);
-        if !lv.xmm_dead_after(store, infos, i + 1, src_n, &[i, i + 1]) {
+        if !lv.xmm_dead_after(store, infos, j, src_n, &[i, j]) {
             i += 1;
             continue;
         }
@@ -303,10 +307,10 @@ pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInf
             format!("    {} {}, {}", arith_op, mem, ops[1])
         };
         mark_nop(&mut infos[i]);
-        replace_line(store, &mut infos[i + 1], i + 1, replacement);
+        replace_line(store, &mut infos[j], j, replacement);
         lv.refresh_at(store, infos, i);
         changed = true;
-        i += 2;
+        i = j + 1;
     }
     changed
 }

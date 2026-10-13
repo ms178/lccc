@@ -3577,6 +3577,7 @@ fn forward_slot_loads_cfg_range(
             starts.push(j);
             continue;
         }
+        // DIRECTIVE-LAW: bails -- every directive terminates the block window.
         let is_edge = matches!(
             infos[j].kind,
             LineKind::Jmp

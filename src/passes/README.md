@@ -935,3 +935,25 @@ behavior across iterations.
 | `reassoc_latency.rs`     | Loop-recurrence-driven reassociation of int trees      |
 | `resolve_asm.rs`         | Post-inline assembly symbol resolution                 |
 | `simplify.rs`            | Algebraic simplification, strength reduction, and peephole |
+
+### Exact floating recurrences and doubling
+
+`loop_square` (x86-64/SIMD, O2+, not size mode, first optimizer iteration)
+reuses a dominating next-value square across an innermost loop backedge. Only
+F32/F64 recurrences starting at signed zero qualify: the new phi starts at +0,
+so zero-trip loops perform no speculative arithmetic. A dedicated preheader,
+single latch, SSA/dominance proof and closed effect whitelist exclude changing
+rounding environments. At most one recurrence is added, leaving multiplication
+available for FMA contraction; six or more FP header phis reject the heuristic.
+This pressure limit is not a spill-freedom proof. Disable with
+`CCC_DISABLE_PASSES=loop_square`.
+
+`fp_double` (x86-64/SIMD, O2+ including size mode) runs after scalar algebra and
+before FP constant hoisting: binary32/64 multiplication by positive two becomes
+self-addition, preserving rounding, signed zeros and exceptions. It does not
+reassociate. If contraction is permitted **and** target FMA is available, it
+preserves add/sub consumers through copies; otherwise no such restriction is
+needed. The no-candidate path allocates no maps, and unchanged modules are not
+reverified. `CCC_TIME_PASSES=1` reports its time and rewrite count; disable with
+`CCC_DISABLE_PASSES=fp_double`. Neither pass assumes x87 excess precision equals
+SSE rounding, nor is cross-target profitability inferred from x86 measurements.

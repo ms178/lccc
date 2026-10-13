@@ -399,6 +399,9 @@ gate "loop-store-motion" fast \
 gate "const-trip-loop-inline" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_const_trip_loop_inline.sh
 
+gate "debug-code-parity" fast \
+    env CCC=target/fastbuild/lccc python3 tests/regression/check_debug_code_parity.py
+
 gate "fp-recurrence-and-jump-thread" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_fp_recurrence.sh
 

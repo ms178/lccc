@@ -633,6 +633,38 @@ pub(crate) fn line_len_without_trailing_comment(b: &[u8]) -> usize {
     b.len()
 }
 
+/// Exact debug-attribution tokens, excluding compound assembler statements.
+/// Honor quoted filenames, escapes and trailing comments without allocation.
+pub(crate) fn is_debug_marker_directive(text: &str) -> bool {
+    let text = text.trim();
+    if !matches!(text.split_whitespace().next(), Some(".loc" | ".file")) {
+        return false;
+    }
+    let bytes = &text.as_bytes()[..line_len_without_trailing_comment(text.as_bytes())];
+    let mut quote = None;
+    let mut escaped = false;
+    for &b in bytes {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if let Some(q) = quote {
+            if b == b'\\' {
+                escaped = true;
+            } else if b == q {
+                quote = None;
+            }
+        } else if matches!(b, b'"' | b'\'') {
+            quote = Some(b);
+        } else if b == b';' {
+            // A second statement could emit arbitrary code. Quoted filename
+            // punctuation and trailing comments are not statement separators.
+            return false;
+        }
+    }
+    quote.is_none() && !escaped
+}
+
 /// Directives a peephole window may step over: they emit no bytes, reference no
 /// data whose value depends on code layout, and cannot switch section.
 ///
@@ -680,8 +712,7 @@ pub(crate) fn inert_directive(text: &str) -> bool {
         return !t.starts_with(".cfi_sections");
     }
     if t.starts_with(".LFB")
-        || t.starts_with(".loc ")
-        || t.starts_with(".file ")
+        || is_debug_marker_directive(t)
         || t.starts_with(".size ")
         || t.starts_with(".type ")
         || t.starts_with(".globl ")
@@ -707,13 +738,31 @@ mod inert_directive_tests {
     use super::*;
 
     #[test]
+    fn debug_tokens_reject_statement_chains_and_lookalikes() {
+        for text in [
+            ".loc 1 7 3; .byte 0xcc",
+            ".file 2 \"x.c\"; ret",
+            ".location 1",
+            ".file_data 1",
+            ".file 2 \"unterminated",
+        ] {
+            assert!(!is_debug_marker_directive(text), "{text}");
+            assert!(!inert_directive(text), "{text}");
+        }
+    }
+
+    #[test]
     fn inert_directives_are_the_ones_that_emit_and_reference_nothing() {
         for t in [
             ".cfi_startproc",
             ".cfi_adjust_cfa_offset 16",
             ".cfi_def_cfa_register 6",
             ".loc 1 12 4",
+            ".loc\t1 12 4",
+            ".file\t1 \"k.c\"",
             ".file 1 \"k.c\"",
+            ".file 1 \"semi;hash#name.c\"",
+            ".loc 1 7 3 # ; .byte 0xcc",
             ".LFB0:",
             ".size f, .-f",
             ".type f, @function",
