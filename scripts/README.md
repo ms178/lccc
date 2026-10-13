@@ -303,7 +303,7 @@ each one is a contract build systems rely on, and each now has a gate:
 * **`-o -` is stdout** for the text modes (`-S`, `-E`, `-M`/`-MM`, `-dM`), and
   `-MF -` sends the make rule to stdout. Object/executable modes reject
   `-o -` with a diagnostic instead of writing a file named `-`
-  (`tests/regression/check_dash_o_stdout.sh`).
+  (`tests/regression/check_o_stdout.sh`).
 * **Temporary files are private**: every temp object/assembly file is reserved
   inside an atomically created 0700 directory under `$TMPDIR`
   (`src/common/temp_files.rs`), so a pre-placed symlink or file at a predicted

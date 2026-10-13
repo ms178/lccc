@@ -187,9 +187,6 @@ gate "fp-contract-parity" fast \
 
 # ~97 compiles per arm plus the runs: seconds, not minutes -- and it is the
 # only gate that exercises the historical crash/miscompile corpus end to end.
-gate "dash-o-stdout" fast \
-    env CCC="$LCCC" bash tests/regression/check_dash_o_stdout.sh
-
 gate "cpu-supports-runtime" fast \
     env CCC="$LCCC" bash tests/regression/check_cpu_supports_runtime.sh
 
@@ -328,7 +325,7 @@ gate "intrinsic-arity-selftest" fast \
 gate "intrinsic-arity" fast \
     python3 scripts/check_intrinsic_arity.py --check
 gate "ill-typed-builtins" fast \
-    env CCC="$LCCC" LCCC_REPO="$REPO" python3 scripts/check_ill_typed_builtins.py
+    env CCC="$LCCC" LCCC_REPO=. python3 scripts/check_ill_typed_builtins.py
 
 # The unit-test gate is what GitHub's required check runs on every PR, so it
 # belongs in the fast set: a red PR has to be reproducible with --fast.

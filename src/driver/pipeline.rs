@@ -698,6 +698,9 @@ impl Driver {
                  use -S -o - for assembly or -E -o - for preprocessed source"
                     .to_string())
             }
+            CompileMode::Full => Err("Cannot write an executable to standard output ('-o -'); \
+                 use -S -o - for assembly or -E -o - for preprocessed source"
+                .to_string()),
             CompileMode::AssemblyOnly | CompileMode::PreprocessOnly
                 if self.input_files.len() > 1 =>
             {
@@ -737,16 +740,6 @@ impl Driver {
             self.target,
             Target::X86_64 | Target::I686
         ));
-
-        // `-o -` is stdout for the TEXT modes; an object file or an
-        // executable cannot be piped, and GCC refuses too (AUD-DRV-1).
-        if self.output_path == "-"
-            && matches!(self.mode, CompileMode::ObjectOnly | CompileMode::Full)
-        {
-            return Err("cannot write an object file or executable to stdout; \
-                 '-o -' is only valid with -S, -E, -M/-MM or -dM"
-                .to_string());
-        }
 
         match self.mode {
             CompileMode::PreprocessOnly => self.run_preprocess_only(),

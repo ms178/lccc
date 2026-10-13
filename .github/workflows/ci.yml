@@ -127,9 +127,6 @@ jobs:
       - name: Check FP-contraction parity with GCC
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_fp_contract_parity.sh
 
-      - name: Check -o - stdout semantics
-        run: env CCC=target/fastbuild/lccc bash tests/regression/check_dash_o_stdout.sh
-
       - name: Check builtin_cpu_supports runtime semantics
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_cpu_supports_runtime.sh
 

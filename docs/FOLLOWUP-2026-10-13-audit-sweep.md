@@ -315,6 +315,21 @@ and never keep two copies of the same thing.
   a fallible constructor were adapted to the infallible one.
 * **`-o -` / `-M -o -` stay ours** (AUD-DRV-1): every text producer funnels
   through the single `write_text_output`, and `check_o_stdout.sh` pins it.
+* **`-o -` has one guard and one gate after the merge.** Both sides added the
+  same refusal on different code paths (this branch in
+  `Pipeline::validate_output_destination`, upstream inline in `run()`), and
+  both sides had a gate asserting *its own* message — so the tree carried two
+  rejection messages for `-c -o -` and upstream's gate failed on ours (this
+  branch's guard fires first). The validator now also refuses a link
+  (`Cannot write an executable to standard output ('-o -')`), upstream's inline
+  check is gone, and `tests/regression/check_o_stdout.sh` is the single gate:
+  its rows are the union of both (upstream's pipe-shaped streaming rows,
+  `-dM`, `-MF -` and the real-path negative control were folded in).
+* **`ci_local.sh`'s ill-typed-builtin gate passed an undefined `$REPO`** to the
+  checker. Under `set -u` that killed the whole local suite mid-run — the
+  reason no `--fast` stamp could ever be obtained on this branch — while the
+  hosted CI step (which spells `LCCC_REPO=.`) stayed green. It is `LCCC_REPO=.`
+  now, the same value CI uses; the script `cd`s to the repo root first.
 * **`__builtin_shuffle*` diagnostics take upstream's wording**: both sides
   fixed the panic (AUD-ICE-1/AUD-DIAG-1), upstream's messages are GCC's own
   ("number of elements …", "must be an integer vector", "invalid element
