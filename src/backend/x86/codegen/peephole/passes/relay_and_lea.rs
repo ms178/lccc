@@ -1881,16 +1881,22 @@ pub(super) fn fold_lea_into_load(store: &mut LineStore, infos: &mut [LineInfo]) 
 // ── Pass 2b: same-block redundant rip-LEA elimination ────────────────────────
 
 /// Parse `leaq SYM(%rip), %R` → `(sym_text, dst_family)`. The address must be
-/// the bare rip form (symbolic or numeric displacement) — no SIB, no base.
+/// the bare rip form with a symbolic displacement — no SIB, no base. Numeric
+/// RIP displacements are deliberately excluded: `leaq 8(%rip), %r9` computes
+/// the address relative to *that instruction's* next RIP, so identical text at
+/// two instruction locations does not denote the same value.
 fn parse_rip_symbol_lea(t: &str) -> Option<(String, RegId)> {
     let rest = t.strip_prefix("leaq ")?;
     let (addr, dst) = rest.rsplit_once(',')?;
     let (addr, dst) = (addr.trim(), dst.trim());
-    if !addr.ends_with("(%rip)") {
+    let displacement = addr.strip_suffix("(%rip)")?;
+    // `parse_disp` also accepts absolute numeric displacements. Only a true
+    // relocatable symbol expression names a stable address across instructions.
+    let Some((Some(_symbol), _)) = parse_disp(displacement) else {
         return None;
-    }
+    };
     let fam = plain_gp_operand(dst)?;
-    if fam == 4 || fam == 5 {
+    if fam == 4 || fam == 5 || dst != REG_NAMES[0][fam as usize] {
         return None;
     }
     Some((addr.to_string(), fam))
@@ -3790,6 +3796,29 @@ mod tests {
             out.matches("leaq bins(%rip), %r9").count(),
             1,
             "the redundant redef must go:\n{out}"
+        );
+    }
+
+    #[test]
+    fn rip_lea_cse_rejects_location_relative_numeric_displacements() {
+        // A numeric RIP-relative displacement is relative to each LEA's own
+        // next instruction address. Reusing the first materialized value for
+        // the second identical spelling would therefore change the address.
+        let asm = concat!(
+            "f:\n.cfi_startproc\n",
+            "    leaq 8(%rip), %r9\n",
+            "    movq %r9, (%rdi)\n",
+            "    leaq 8(%rip), %r9\n",
+            "    movq %r9, (%rsi)\n",
+            "    ret\n.cfi_endproc\n",
+        );
+        let mut store = super::LineStore::new(asm.to_string());
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| super::classify_line(store.get(i)))
+            .collect();
+        assert!(
+            !super::cse_symbol_lea(&mut store, &mut infos),
+            "numeric RIP-relative expressions are position-dependent, not CSE-able"
         );
     }
 

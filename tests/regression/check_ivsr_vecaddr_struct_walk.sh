@@ -31,9 +31,12 @@
 # bit-exact reference vs optimized loop in the same TU) must pass built
 # with lccc at -O0..-O3, in 64- and 32-bit mode, and under the
 # CCC_NO_IVSR_PTR_ADD=1 kill switch (an escape hatch nobody exercises is
-# how a switch rots into a no-op or a crash).
+# how a switch rots into a no-op or a crash). Each output is ALSO compared
+# with a separately GCC-built executable; the in-TU reference is not the
+# only oracle.
 set -u
 CCC=${CCC:-target/fastbuild/lccc}
+GCC=${GCC_BIN:-gcc}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 fails=0
@@ -46,9 +49,10 @@ if [ ! -x "$CCC" ]; then
 fi
 
 # ── host 32-bit probe (same doctrine as check_ivsr_domains.sh) ─────────
-inc=$("${GCC_BIN:-gcc}" -print-file-name=include)
+command -v "$GCC" >/dev/null 2>&1 || { bad "no GCC oracle ($GCC)"; exit 1; }
+inc=$("$GCC" -print-file-name=include)
 if ! printf 'int main(void) { return 0; }\n' >"$TMP/i386-probe.c" \
-   || ! ${GCC_BIN:-gcc} -m32 "$TMP/i386-probe.c" -o "$TMP/i386-probe" 2>"$TMP/i386-probe.err" \
+   || ! "$GCC" -m32 "$TMP/i386-probe.c" -o "$TMP/i386-probe" 2>"$TMP/i386-probe.err" \
    || ! "$TMP/i386-probe" >/dev/null 2>&1; then
     bad "host, not lccc: gcc -m32 cannot build and run a trivial program; install gcc-multilib and libc6-dev-i386"
     sed -n '1,2p' "$TMP/i386-probe.err" >&2
@@ -95,7 +99,10 @@ static void advance(long long dt, int n) {
 
 int main(int argc, char **argv) {
     int n = argc > 1 ? atoi(argv[1]) : 2000;
-    long long dt = 2;
+    /* Make the first interaction produce nonzero forces; after the bodies
+       separate, integer division naturally reaches zero and the bounded
+       values remain well inside int64_t for this gate's 2000 steps. */
+    long long dt = 100;
     Body ref[6];
     for (int i = 0; i < 6; i++) {
         bodies[i].x = 3 * i + 1;
@@ -147,13 +154,42 @@ int main(int argc, char **argv) {
         fprintf(stderr, "FAIL: pairwalk optimized loop diverged from reference\n");
         return 1;
     }
-    long long sum = 0;
+    /* Emit the full post-state, not only a scalar checksum: each lccc run is
+       compared byte-for-byte with the independently GCC-built oracle. */
     for (int i = 0; i < 6; i++)
-        sum += bodies[i].x + bodies[i].y + bodies[i].z + bodies[i].vx + bodies[i].vy + bodies[i].vz;
-    printf("ok %lld\n", sum);
+        printf("%d %lld %lld %lld %lld %lld %lld %lld\n", i,
+               bodies[i].x, bodies[i].y, bodies[i].z,
+               bodies[i].vx, bodies[i].vy, bodies[i].vz, bodies[i].mass);
     return 0;
 }
 EOF
+
+# Build independent execution oracles once. The same C source is intentionally
+# used, but GCC's generated executable and the lccc-internal reference are
+# separate checks: a shared lowering defect cannot make both pass by accident.
+oracle64_ready=0
+if "$GCC" -O2 "$TMP/pairwalk.c" -o "$TMP/pw64.oracle" 2>"$TMP/gcc64.err"; then
+    if "$TMP/pw64.oracle" 2000 >"$TMP/pw64.oracle.out"; then
+        oracle64_ready=1
+    else
+        bad "GCC 64-bit pair-walk oracle exited non-zero"
+    fi
+else
+    bad "GCC 64-bit pair-walk oracle did not compile"
+    sed -n '1,4p' "$TMP/gcc64.err" >&2
+fi
+
+oracle32_ready=0
+if "$GCC" -O2 -m32 -msse2 "$TMP/pairwalk.c" -o "$TMP/pw32.oracle" 2>"$TMP/gcc32.err"; then
+    if "$TMP/pw32.oracle" 2000 >"$TMP/pw32.oracle.out"; then
+        oracle32_ready=1
+    else
+        bad "GCC i386 pair-walk oracle exited non-zero"
+    fi
+else
+    bad "GCC i386 pair-walk oracle did not compile"
+    sed -n '1,4p' "$TMP/gcc32.err" >&2
+fi
 
 # ── the shape program (exactly the pair-walk advance, nothing else) ────
 cat >"$TMP/pairwalk_shape.c" <<'EOF'
@@ -187,19 +223,40 @@ EOF
 # ── correctness: every opt level, 64-bit, and the kill switch ──────────
 for opt in -O0 -O1 -O2 -O3; do
     if "$CCC" "$opt" "$TMP/pairwalk.c" -o "$TMP/pw64" 2>"$TMP/cc.err"; then
-        "$TMP/pw64" 2000 >/dev/null || bad "pairwalk $opt 64-bit self-check failed"
+        if "$TMP/pw64" 2000 >"$TMP/pw64.out"; then
+            if [ "$oracle64_ready" -eq 1 ] && ! cmp -s "$TMP/pw64.oracle.out" "$TMP/pw64.out"; then
+                bad "pairwalk $opt 64-bit output differs from the GCC oracle"
+                diff -u "$TMP/pw64.oracle.out" "$TMP/pw64.out" | sed -n '1,8p' >&2 || true
+            fi
+        else
+            bad "pairwalk $opt 64-bit self-check failed"
+        fi
     else
         bad "pairwalk $opt 64-bit did not compile"
         sed -n '1,4p' "$TMP/cc.err" >&2
     fi
     if "$CCC" "$opt" -m32 -msse2 -I"$inc" "$TMP/pairwalk.c" -o "$TMP/pw32" 2>"$TMP/cc32.err"; then
-        "$TMP/pw32" 2000 >/dev/null || bad "pairwalk $opt i386 self-check failed"
+        if "$TMP/pw32" 2000 >"$TMP/pw32.out"; then
+            if [ "$oracle32_ready" -eq 1 ] && ! cmp -s "$TMP/pw32.oracle.out" "$TMP/pw32.out"; then
+                bad "pairwalk $opt i386 output differs from the GCC oracle"
+                diff -u "$TMP/pw32.oracle.out" "$TMP/pw32.out" | sed -n '1,8p' >&2 || true
+            fi
+        else
+            bad "pairwalk $opt i386 self-check failed"
+        fi
     else
         bad "pairwalk $opt i386 did not compile"
         sed -n '1,4p' "$TMP/cc32.err" >&2
     fi
     if CCC_NO_IVSR_PTR_ADD=1 "$CCC" "$opt" "$TMP/pairwalk.c" -o "$TMP/pwoff" 2>"$TMP/ccoff.err"; then
-        "$TMP/pwoff" 2000 >/dev/null || bad "pairwalk $opt CCC_NO_IVSR_PTR_ADD=1 self-check failed"
+        if "$TMP/pwoff" 2000 >"$TMP/pwoff.out"; then
+            if [ "$oracle64_ready" -eq 1 ] && ! cmp -s "$TMP/pw64.oracle.out" "$TMP/pwoff.out"; then
+                bad "pairwalk $opt CCC_NO_IVSR_PTR_ADD=1 output differs from the GCC oracle"
+                diff -u "$TMP/pw64.oracle.out" "$TMP/pwoff.out" | sed -n '1,8p' >&2 || true
+            fi
+        else
+            bad "pairwalk $opt CCC_NO_IVSR_PTR_ADD=1 self-check failed"
+        fi
     else
         bad "pairwalk $opt CCC_NO_IVSR_PTR_ADD=1 did not compile"
         sed -n '1,4p' "$TMP/ccoff.err" >&2

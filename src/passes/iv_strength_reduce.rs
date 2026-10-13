@@ -363,7 +363,14 @@ fn reduce_loop(
     }
 
     // Step 2: Find derived expressions (iv * const) used in GEPs.
-    let derived = find_derived_exprs(func, &basic_ivs, &natural_loop.body, ptr_add);
+    let derived = find_derived_exprs(
+        func,
+        &basic_ivs,
+        &natural_loop.body,
+        ptr_add,
+        natural_loop,
+        &back_blocks,
+    );
     if derived.is_empty() {
         if dbg {
             eprintln!("[IVSR] header={} no derived exprs", header);
@@ -1223,6 +1230,8 @@ fn find_derived_exprs(
     basic_ivs: &[BasicIV],
     loop_body: &FxHashSet<usize>,
     ptr_add: bool,
+    natural_loop: &NaturalLoop,
+    back_blocks: &[usize],
 ) -> Vec<DerivedExpr> {
     let mut derived = Vec::with_capacity(16);
     // Read the debug switch ONCE per function, not once per instruction: this
@@ -1310,15 +1319,13 @@ fn find_derived_exprs(
     // below it (`mul(sext(i + 1), stride)`), so the affine Add is located by
     // walking Copy glue and offset-preserving Casts from the multiply's
     // operand. Each hop is checked by `cast_preserves_offset_value`, the same
-    // certificate the `iv_derived` closure uses, so the mapped value is
-    // (iv + k) in the multiply's ring whenever the source arithmetic is
-    // faithful. WRAP LICENSE: if the narrow Add wraps, `sext(wrap(a + k))`
-    // differs from `ext(a) + k`. Narrow signed overflow is undefined in the C
-    // semantics LCCC compiles (the driver has no -fwrapv contract), and a
-    // narrow UNSIGNED add can only wrap outside a proven IV bound — the same
-    // corner quadratic_sr documents for the triangular sum. The recurrence's
-    // `offset_product_cannot_overflow` gate runs on the decoded product after
-    // this resolution.
+    // certificate the `iv_derived` closure uses. A narrow unsigned Add is a
+    // separate proof obligation: `U32(i + 2)` may wrap before it is widened to
+    // the pointer ring, while the pointer recurrence keeps counting linearly.
+    // `affine_add_offset_cannot_wrap` proves the Add's own range from the IV's
+    // header bound; if it cannot, this affine form is declined. The later
+    // `offset_product_cannot_overflow` check still independently certifies the
+    // multiply/product ring.
     let find_affine = |val_id: u32, _result_ty: IrType| -> Option<(usize, i64)> {
         // Candidate definition ids: the operand itself plus every value
         // reachable through Copy / offset-preserving Cast glue.
@@ -1376,18 +1383,32 @@ fn find_derived_exprs(
                         op: IrBinOp::Add,
                         lhs,
                         rhs,
+                        ty,
                         ..
                     } = inst
                     {
-                        if let (Operand::Value(v), Operand::Const(c)) = (lhs, rhs) {
-                            if let (Some(idx), Some(k)) = (find_iv(v.0), c.to_i64()) {
-                                return Some((idx, k));
+                        let candidate = match (lhs, rhs) {
+                            (Operand::Value(v), Operand::Const(c))
+                            | (Operand::Const(c), Operand::Value(v)) => {
+                                match (find_iv(v.0), c.to_i64()) {
+                                    (Some(idx), Some(raw_k)) => {
+                                        affine_add_offset_cannot_wrap(
+                                            func,
+                                            natural_loop,
+                                            back_blocks,
+                                            &basic_ivs[idx],
+                                            raw_k,
+                                            *ty,
+                                        )
+                                        .map(|k| (idx, k))
+                                    }
+                                    _ => None,
+                                }
                             }
-                        }
-                        if let (Operand::Const(c), Operand::Value(v)) = (lhs, rhs) {
-                            if let (Some(idx), Some(k)) = (find_iv(v.0), c.to_i64()) {
-                                return Some((idx, k));
-                            }
+                            _ => None,
+                        };
+                        if candidate.is_some() {
+                            return candidate;
                         }
                     }
                 }
@@ -1926,6 +1947,13 @@ fn unsigned_iv_bound(
     back_blocks: &[usize],
 ) -> Option<UnsignedIvBound> {
     use crate::ir::reexports::{IrCmpOp as C, Terminator};
+    // This interval is interpreted in the IV's own unsigned domain below.
+    // The main IV-widening caller currently enforces this too, but affine-Add
+    // proofs call the helper independently; accepting a signed phi paired with
+    // an unsigned Cmp would decode signed carrier bits as an unsigned range.
+    if !iv.ty.is_integer() || !iv.ty.is_unsigned() || iv.ty.size() == 0 || iv.ty.size() > 8 {
+        return None;
+    }
     if back_blocks.contains(&lp.header) {
         return None;
     }
@@ -2067,6 +2095,53 @@ fn unsigned_iv_bound(
         return Some(UnsignedIvBound { lo, hi, bounded });
     }
     None
+}
+
+/// Decode an affine Add's constant in the Add type's own domain and prove
+/// that a narrow unsigned `iv + k` cannot wrap over any value the loop body
+/// may observe. The returned offset is the mathematical `k` used to seed the
+/// pointer recurrence; `None` means the affine form must remain untouched.
+fn affine_add_offset_cannot_wrap(
+    func: &IrFunction,
+    lp: &NaturalLoop,
+    back_blocks: &[usize],
+    iv: &BasicIV,
+    raw_offset: i64,
+    add_ty: IrType,
+) -> Option<i64> {
+    if !add_ty.is_integer() {
+        return None;
+    }
+    let narrow_unsigned = add_ty.is_unsigned()
+        && (add_ty.size() as usize) < crate::common::types::target_ptr_size();
+    if !narrow_unsigned {
+        return Some(raw_offset);
+    }
+    // The pre-widening Add's no-wrap interval below is an unsigned-IV proof.
+    // Do not let a signed phi enter it just because the comparison happens to
+    // use Ult/Ugt; that pair has no unsigned-phi range semantics.
+    if !iv.ty.is_unsigned() {
+        return None;
+    }
+
+    // An IrConst's signed carrier is not its unsigned mathematical value.
+    // For example, U32's 0xffff_ffff arrives as -1; when widened after the
+    // Add it denotes +4294967295, not pointer-ring -1.
+    let k = const_in_iv_domain(raw_offset, add_ty);
+    let k = i64::try_from(k).ok()?;
+    if k == 0 {
+        return Some(0);
+    }
+
+    // Only an unsigned IV with a header-test certificate supplies a sound
+    // interval for the pre-widening Add. The certificate may be an over-approx
+    // (for a dynamic endpoint); that is fine, since a range that is too wide
+    // merely refuses more cases.
+    let bound = unsigned_iv_bound(func, lp, iv, back_blocks)?;
+    let limit = 1i128 << ((add_ty.size() * 8) as u32);
+    let lo = bound.lo.checked_add(k as i128)?;
+    let hi = bound.hi.checked_add(k as i128)?;
+    (lo >= 0 && hi < limit).then_some(k)
 }
 
 /// Whether replacing `offset(iv) = (iv + add_offset) * stride`, evaluated in
@@ -2638,6 +2713,33 @@ mod tests {
     }
 
     #[test]
+    fn unsigned_bound_rejects_signed_iv_even_with_unsigned_comparison() {
+        use crate::ir::reexports::IrCmpOp as C;
+        let lp = NaturalLoop {
+            header: 1,
+            body: [1, 2].into_iter().collect(),
+        };
+        let mut f = cast_backedge(IrType::I32, IrType::I32);
+        if let Instruction::Cmp { op, .. } = &mut f.blocks[1].instructions[1] {
+            *op = C::Ult;
+        }
+        let iv = BasicIV {
+            phi_dest: Value(0),
+            ty: IrType::I32,
+            init: Operand::Const(IrConst::I32(0)),
+            step: 1,
+        };
+        assert!(
+            unsigned_iv_bound(&f, &lp, &iv, &[2]).is_none(),
+            "an unsigned comparison does not turn a signed IV into an unsigned range"
+        );
+        assert!(
+            affine_add_offset_cannot_wrap(&f, &lp, &[2], &iv, 1, IrType::U8).is_none(),
+            "the narrow-unsigned Add proof must fail closed on a signed IV"
+        );
+    }
+
+    #[test]
     fn derived_signedness_then_widening_is_not_a_pointer_iv() {
         use crate::common::types::AddressSpace;
         for (middle, expected) in [(IrType::I32, 0), (IrType::U32, 1)] {
@@ -2870,6 +2972,121 @@ mod tests {
         });
         f.next_value_id = 10;
         f
+    }
+
+    /// An unsigned U32 affine index is formed BEFORE widening it into the
+    /// pointer ring: `addr = base + (I64)(i + 2)`.  The loop and comparison
+    /// deliberately admit values for which the narrow Add wraps.
+    fn narrow_unsigned_affine_address_loop(init: i32, limit: i32) -> IrFunction {
+        let mut f = IrFunction::new("narrow_unsigned_affine".into(), IrType::I32, vec![], false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I64(0x4000)),
+            }],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: vec![],
+        });
+        f.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(2),
+                    ty: IrType::U32,
+                    incoming: vec![
+                        (Operand::Const(IrConst::I32(init)), BlockId(0)),
+                        (Operand::Value(Value(10)), BlockId(2)),
+                    ],
+                },
+                Instruction::Cmp {
+                    dest: Value(3),
+                    op: IrCmpOp::Ult,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Const(IrConst::I32(limit)),
+                    ty: IrType::U32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(3)),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+            source_spans: vec![],
+        });
+        f.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::BinOp {
+                    dest: Value(4),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Const(IrConst::I32(2)),
+                    ty: IrType::U32,
+                },
+                Instruction::Cast {
+                    dest: Value(5),
+                    src: Operand::Value(Value(4)),
+                    from_ty: IrType::U32,
+                    to_ty: IrType::I64,
+                },
+                Instruction::BinOp {
+                    dest: Value(6),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Value(Value(5)),
+                    ty: IrType::I64,
+                },
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(7),
+                    ptr: Value(6),
+                    ty: IrType::I8,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::BinOp {
+                    dest: Value(10),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::U32,
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: vec![],
+        });
+        f.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            source_spans: vec![],
+        });
+        f.next_value_id = 11;
+        f
+    }
+
+    #[test]
+    fn narrow_unsigned_affine_add_requires_an_operative_no_wrap_proof() {
+        // U32 i runs through UINT32_MAX-1; `i + 2` wraps in U32 on its last
+        // body iteration before the cast to I64.  A pointer-width product
+        // check alone cannot see that intermediate wrap.
+        let mut wrapping = narrow_unsigned_affine_address_loop(-4, -1);
+        assert_eq!(
+            ivsr_function(&mut wrapping),
+            0,
+            "the affine pointer recurrence must be declined when U32 i+2 may wrap"
+        );
+        assert!(wrapping.blocks[2].instructions.iter().any(|i| matches!(
+            i,
+            Instruction::BinOp { dest, op: IrBinOp::Add, ty: IrType::I64, .. }
+                if *dest == Value(6)
+        )), "the original address Add must remain intact");
+
+        // A smaller, statically bounded interval proves the same U32 Add
+        // cannot wrap, so LP64 retains the strength reduction.
+        let mut bounded = narrow_unsigned_affine_address_loop(0, 64);
+        let fired = ivsr_function(&mut bounded) > 0;
+        assert_eq!(fired, !crate::common::types::target_is_32bit());
     }
 
     #[test]
