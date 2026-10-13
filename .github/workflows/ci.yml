@@ -164,6 +164,16 @@ jobs:
       - name: Shuffle builtin diagnostics
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_shuffle_diagnostics.sh
 
+      # AUD-SILENT-ZERO-1: an x86-only intrinsic compiled for AArch64/RISC-V
+      # must trap (and be encodable), never silently compute zeros.
+      - name: Cross-target intrinsic trap
+        run: |
+          env CCC=target/fastbuild/lccc \
+              CCC_ARM=target/fastbuild/lccc-arm \
+              CCC_RISCV=target/fastbuild/lccc-riscv \
+              CCC_I686=target/fastbuild/lccc-i686 \
+              bash tests/regression/check_cross_target_intrinsic_trap.sh
+
       - name: Run tests
         env:
           CARGO_BUILD_JOBS: "2"

@@ -4,6 +4,7 @@
 //! F128: IEEE 754 binary128 via compiler-rt/libgcc soft-float libcalls.
 
 use super::emit::{ArmCodegen, arm_fp_name, arm_vector_name, callee_saved_name, is_arm_fp_phys};
+use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;
 use crate::ir::reexports::{IntrinsicOp, Operand, Value};
 
@@ -569,14 +570,27 @@ impl ArmCodegen {
             | IntrinsicOp::HorizontalAddF64x2
             | IntrinsicOp::HorizontalAddI32x8
             | IntrinsicOp::HorizontalAddI32x4 => {
-                // x86-only: zero dest if present
-                if let Some(dptr) = dest_ptr {
-                    if let Some(slot) = self.state.get_slot(dptr.0) {
-                        self.state
-                            .emit_fmt(format_args!("    add x9, sp, #{}", slot.0));
-                        self.state.emit("    stp xzr, xzr, [x9]");
-                    }
-                }
+                // x86-only intrinsic (AUD-SILENT-ZERO-1).
+                //
+                // These used to "zero dest if present": 16 bytes of zeros
+                // stored ONLY when the destination pointer was a known stack
+                // slot.  Any other destination -- a value held in a register,
+                // a global, a computed address -- got no store at all and kept
+                // its previous contents.  Either way a program that used an
+                // x86 intrinsic on an AArch64 target produced a wrong value
+                // with no diagnostic anywhere in the pipeline: rc=0 and an
+                // all-zero (or stale) "result".
+                //
+                // Emitting the target's trap instead makes such a program fail
+                // loudly at the first EXECUTION of the intrinsic, and leaves
+                // the documented cross-compilation idiom intact: code that
+                // guards these behind `#ifdef __x86_64__` never reaches this
+                // arm, and code that does reach it can no longer compute a
+                // value this target has no instruction for.  The destination
+                // is deliberately not written: a trap is a terminator, so the
+                // following code is unreachable and the register allocator's
+                // state after the trap is irrelevant.
+                self.emit_unreachable();
             }
 
             IntrinsicOp::FmaF64x2 => {

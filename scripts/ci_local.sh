@@ -240,6 +240,18 @@ gate "cpu-supports-fold" fast \
 gate "shuffle-diagnostics" fast \
     env CCC="$LCCC" bash tests/regression/check_shuffle_diagnostics.sh
 
+# AUD-SILENT-ZERO-1: a target that cannot execute an x86-only intrinsic must
+# trap at the first execution, not silently compute zeros (and must not trap
+# anything it CAN compute).  The host cannot execute AArch64/RISC-V, so the
+# gate asserts on the instruction stream AND on the trap's encoding in the
+# object.
+gate "cross-target-intrinsic-trap" fast \
+    env CCC="$LCCC" \
+    CCC_ARM=target/fastbuild/lccc-arm \
+    CCC_RISCV=target/fastbuild/lccc-riscv \
+    CCC_I686=target/fastbuild/lccc-i686 \
+    bash tests/regression/check_cross_target_intrinsic_trap.sh
+
 # The unit-test gate is what GitHub's required check runs on every PR, so it
 # belongs in the fast set: a red PR has to be reproducible with --fast.
 #
