@@ -5,15 +5,15 @@
 # a constant expression: an address constant (of a static object, a function,
 # or a string) or an arithmetic constant. lccc used to accept `static int *p =
 # &a;` for an automatic `a`, and stored a stack address into static storage
-# that dangles after the function returns. GCC 16.2 rejects it with
+# that dangles after the function returns. the oracle rejects it with
 # "initializer element is not constant".
 #
-# Rows: tests/regression/static_local/cases.tsv, measured against GCC 16.2.
+# Rows: tests/regression/static_local/cases.tsv, measured against the oracle.
 # Each row is checked twice:
 #   * the oracle must still give the recorded verdict (drift check), and
 #   * lccc must give the same verdict, and a rejection must carry the
 #     "not constant" diagnostic.
-# The oracle is GCC 16.2 (tests/regression/lib/gcc_oracle.sh). A missing
+# The oracle is the oracle (tests/regression/lib/gcc_oracle.sh). A missing
 # oracle fails the gate; it is never skipped.
 set -euo pipefail
 . tests/regression/lib/gcc_oracle.sh
@@ -39,14 +39,14 @@ while IFS=$'\t' read -r id expect diag body; do
 
     if "$GCC_ORACLE_BIN" -fsyntax-only -w "$tu" >/dev/null 2>&1; then gv=accept; else gv=reject; fi
     if [[ $gv != "$expect" ]]; then
-        echo "FAIL $id: oracle drift: GCC 16.2 says $gv, the table says $expect" >&2
+        echo "FAIL $id: oracle drift: GCC $GCC_ORACLE_MAJOR says $gv, the table says $expect" >&2
         fail=$((fail + 1)); continue
     fi
 
     lerr=$tmp/$id.err
     if "$CCC" -fsyntax-only "$tu" >/dev/null 2>"$lerr"; then lv=accept; else lv=reject; fi
     if [[ $lv != "$expect" ]]; then
-        echo "FAIL $id: lccc $lv, GCC 16.2 $expect" >&2
+        echo "FAIL $id: lccc $lv, GCC $GCC_ORACLE_MAJOR $expect" >&2
         sed -n '1,3p' "$lerr" >&2
         fail=$((fail + 1)); continue
     fi

@@ -19,7 +19,10 @@
 #      0700 directory owned by the invoking user, which is reaped afterwards;
 #   4. the same holds for the `CCC_ASM_DEBUG` assembly dump, whose historical
 #      path was the fixed /tmp/asm_debug_<stem>.s;
-#   5. a pre-placed *directory* at the legacy path cannot be adopted either.
+#   5. a pre-placed *directory* at the legacy path cannot be adopted either;
+#   6. an unusable $TMPDIR (a regular file, a read-only path) is a NORMAL driver
+#      error naming the reservation, never an ICE or a panic -- and never a
+#      quiet fallback to the predictable flat names.
 #
 # Mutation check (the gate must be able to fail): `--expect-vulnerable` asserts
 # the historical behaviour instead, i.e. that a symlink pre-placed at a legacy
@@ -178,5 +181,31 @@ if [[ -x $CCC_ARM ]]; then
     [[ $rc -eq 0 ]] || { cat "$tmp/arm.log" >&2; fail "lccc-arm exited $rc under the hardened TMPDIR"; }
     cmp -s "$vault/victim.txt" "$vault/victim.expected" || fail "lccc-arm followed a pre-placed symlink"
 fi
+
+# ---------------------------------------------------------------------------
+# 5. an unusable $TMPDIR is a reported driver error, not an ICE and not a
+#    silent downgrade to predictable names
+# ---------------------------------------------------------------------------
+printf 'not a directory\n' >"$tmp/notdir"
+before=$(cd "$work" && ls -A | sort)
+set +e
+( cd "$work" && TMPDIR="$tmp/notdir" "$CCC" -O1 a.c b.c main.c -o "$tmp/bad" ) >"$tmp/badtmp.out" 2>"$tmp/badtmp.err"
+rc=$?
+set -e
+[[ $rc -ne 0 ]] || fail "accepted a non-directory TMPDIR"
+grep -q 'Failed to reserve temporary file' "$tmp/badtmp.err" \
+    || { cat "$tmp/badtmp.err" >&2; fail "non-directory TMPDIR did not report the failed temp reservation"; }
+if grep -Eq 'internal error|panicked' "$tmp/badtmp.err"; then
+    cat "$tmp/badtmp.err" >&2
+    fail "non-directory TMPDIR produced an ICE or a panic"
+fi
+# Nothing may have been written through the flat legacy shape either: a failed
+# reservation must leave the working directory exactly as it was (no fallback
+# to the predictable `ccc_<pid>_<stem>.<ext>` names, no debris), and the
+# unusable TMPDIR path itself must still be the regular file it was.
+after=$(cd "$work" && ls -A | sort)
+[[ "$before" = "$after" ]] \
+    || fail "the failed temp reservation left files in the working directory"
+[[ -f "$tmp/notdir" ]] || fail "a non-directory TMPDIR was replaced by something else"
 
 echo "PASS: temp files are symlink-safe (private 0700 directory, victim untouched, no TMPDIR debris)"

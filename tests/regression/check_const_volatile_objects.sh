@@ -15,11 +15,11 @@
 # the fold is correct and the control probes pin zero memory references.
 #
 # The check counts, per function at -O2, the memory-operand references (loads
-# and stores). lccc must match GCC 16.2 on every probe, and each probe's GCC
+# and stores). lccc must match the oracle on every probe, and each probe's GCC
 # count is pinned, so a fixture drift is reported as drift, not as a lccc bug.
 #
 # One documented exception: `f_field_twice` reads the `const volatile` member
-# `f` of a `const struct` global. GCC 16.2 folds that read to 2 (no memory
+# `f` of a `const struct` global. the oracle folds that read to 2 (no memory
 # reference), which C11 6.7.3p7 does not allow. lccc keeps the read, as the
 # standard requires, and the pinned lccc count is 1. A GCC/standard divergence
 # is reported here, not silently matched.
@@ -89,10 +89,10 @@ for probe in f_cvi_twice:2 f_cvd_cast:1 f_cvi_plus:1 f_typedef_twice:2 \
     g=$(count_mem_refs "$tmp/gcc.s" "$fn")
     l=$(count_mem_refs "$tmp/lccc.s" "$fn")
     if [[ $g != "$want" ]]; then
-        echo "FAIL $fn: GCC 16.2 memory-reference count is $g, the probe pins $want (fixture drift)" >&2
+        echo "FAIL $fn: GCC $GCC_ORACLE_MAJOR memory-reference count is $g, the probe pins $want (fixture drift)" >&2
         fail=$((fail + 1))
     elif [[ $l != "$g" ]]; then
-        echo "FAIL $fn: lccc memory-reference count is $l, GCC 16.2 keeps $g" >&2
+        echo "FAIL $fn: lccc memory-reference count is $l, GCC $GCC_ORACLE_MAJOR keeps $g" >&2
         sed -n "/^$fn:/,/\\.size $fn,/p" "$tmp/lccc.s" >&2
         fail=$((fail + 1))
     fi
@@ -103,7 +103,7 @@ done
 g=$(count_mem_refs "$tmp/gcc.s" f_field_twice)
 l=$(count_mem_refs "$tmp/lccc.s" f_field_twice)
 if [[ $g != 0 ]]; then
-    echo "FAIL f_field_twice: GCC 16.2 count is $g; the documented divergence pins 0 (fixture or GCC drift)" >&2
+    echo "FAIL f_field_twice: GCC $GCC_ORACLE_MAJOR count is $g; the documented divergence pins 0 (fixture or GCC drift)" >&2
     fail=$((fail + 1))
 elif [[ $l != 1 ]]; then
     echo "FAIL f_field_twice: lccc memory-reference count is $l; the standard requires both volatile reads (pinned 1 load, the second read is reused from the first)" >&2
@@ -121,10 +121,10 @@ for probe in f_cvi_twice:cvi:2 f_cvi_plus:cvi:1 f_cvd_cast:cvd:1 f_typedef_twice
     g=$(count_sym_refs "$tmp/gcc0.s" "$fn" "$sym")
     l=$(count_sym_refs "$tmp/lccc0.s" "$fn" "$sym")
     if [[ $g != "$want" ]]; then
-        echo "FAIL $fn at -O0: GCC 16.2 references $sym $g times, the probe pins $want (fixture drift)" >&2
+        echo "FAIL $fn at -O0: GCC $GCC_ORACLE_MAJOR references $sym $g times, the probe pins $want (fixture drift)" >&2
         fail=$((fail + 1))
     elif [[ $l != "$g" ]]; then
-        echo "FAIL $fn at -O0: lccc references $sym $l times, GCC 16.2 references it $g times" >&2
+        echo "FAIL $fn at -O0: lccc references $sym $l times, GCC $GCC_ORACLE_MAJOR references it $g times" >&2
         fail=$((fail + 1))
     fi
 done
@@ -133,4 +133,4 @@ if (( fail > 0 )); then
     echo "check_const_volatile_objects: FAILED ($fail)" >&2
     exit 1
 fi
-echo "check_const_volatile_objects: PASSED (10 functions at -O2 and 4 symbol checks at -O0; volatile reads match GCC 16.2, non-volatile const controls still fold)"
+echo "check_const_volatile_objects: PASSED (10 functions at -O2 and 4 symbol checks at -O0; volatile reads match GCC $GCC_ORACLE_MAJOR, non-volatile const controls still fold)"

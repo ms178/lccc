@@ -454,11 +454,54 @@ impl SemanticAnalyzer {
             .map(|v| v as usize)
     }
 
+    /// Diagnose a file-scope array whose size is not an integer constant
+    /// expression (C11 6.7.6.2p1).
+    ///
+    /// A non-constant size used to turn the declaration into an *incomplete*
+    /// array with no diagnostic, silently changing the object's size (and any
+    /// later `sizeof`); GCC, Clang and ICX all report "variably modified 'a' at
+    /// file scope" (measured — as does GCC for `__builtin_cpu_supports`, which
+    /// is a runtime builtin and therefore never a constant expression).
+    fn check_global_array_size(&self, decl: &Declaration, declarator: &InitDeclarator) {
+        let mut dims: Vec<&Expr> = Vec::new();
+        let mut spec = &decl.type_spec;
+        while let TypeSpecifier::Array(elem, size) = spec {
+            if let Some(size) = size.as_deref() {
+                dims.push(size);
+            }
+            spec = elem;
+        }
+        for derived in &declarator.derived {
+            if let DerivedDeclarator::Array(Some(size)) = derived {
+                dims.push(size.as_ref());
+            }
+        }
+        for dim in dims {
+            if self.eval_const_expr(dim).is_none() {
+                self.diagnostics.borrow_mut().error(
+                    format!("variably modified '{}' at file scope", declarator.name),
+                    dim.span(),
+                );
+            }
+        }
+    }
+
     fn analyze_declaration(&mut self, decl: &Declaration, is_global: bool) {
         // Register enum constants from this declaration's type specifier.
         // This recursively walks into struct/union fields to find inline
         // enum definitions (e.g., `struct { enum { A, B } mode; }`).
         self.collect_enum_constants_from_type_spec(&decl.type_spec);
+
+        // C11 6.7.6.2p1/6.7.6.2p4: every array dimension of a file-scope object
+        // (and of a typedef'd array type) must be an integer constant
+        // expression.  Checked here — before the type is refined below — so a
+        // non-constant dimension is reported instead of silently degrading the
+        // type to an incomplete array.
+        if is_global {
+            for declarator in &decl.declarators {
+                self.check_global_array_size(decl, declarator);
+            }
+        }
 
         // Handle __auto_type: infer base type from the first declarator's
         // initializer expression rather than defaulting to int.
@@ -1458,9 +1501,20 @@ impl SemanticAnalyzer {
                 // types and could exhibit O(2^N) blowup on deep expression chains
                 // (e.g., `enum { NUM = +1+1+1+...+1 }`).
                 self.analyze_expr(val_expr);
-                // Try to evaluate constant expression
-                if let Some(val) = self.eval_const_expr(val_expr) {
-                    self.enum_counter = val;
+                // C11 6.7.2.2p2: an enumerator's value must be an integer
+                // constant expression.  Keeping the previous value on failure
+                // silently gave `enum { A = f() }` the value 0 and shifted
+                // every following enumerator; GCC, Clang and ICX all reject
+                // that program with this exact wording (measured).
+                match self.eval_const_expr(val_expr) {
+                    Some(val) => self.enum_counter = val,
+                    None => self.diagnostics.borrow_mut().error(
+                        format!(
+                            "enumerator value for '{}' is not an integer constant",
+                            variant.name
+                        ),
+                        val_expr.span(),
+                    ),
                 }
             }
             // Use insert_enum_scoped so that enum constants defined inside

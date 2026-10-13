@@ -35,6 +35,21 @@ typedef int v4si __attribute__((vector_size(16)));
 v4si clmul(v4si a, v4si b) { return __builtin_ia32_pclmulqdq128(a, b, 0); }
 EOF
 
+# The 256-bit AES/CLMUL forms.  They share the mnemonic with the 128-bit forms
+# and are a DIFFERENT extension: `vaesenc %ymm1, %ymm0, %ymm0` came out of
+# `-march=x86-64` before the fix below, i.e. a SIGILL on the hardware the user
+# named.  Their permission is a conjunction -- 256-bit vector class AND the
+# extension's own `-m` flag -- so the rejection cases below split along both
+# halves, and both are oracle-checked against GCC further down.
+cat >"$tmp/vaes256.c" <<'EOF'
+typedef long long v4di __attribute__((vector_size(32)));
+v4di aes_enc256(v4di a, v4di b) { return __builtin_ia32_aesenc256(a, b); }
+EOF
+cat >"$tmp/vpclmul256.c" <<'EOF'
+typedef long long v4di __attribute__((vector_size(32)));
+v4di clmul256(v4di a, v4di b) { return __builtin_ia32_vpclmulqdq256(a, b, 0); }
+EOF
+
 # reject <source> <flag-expected-in-message> <flags...>
 reject() {
     local src=$1 want=$2
@@ -73,6 +88,25 @@ accept aes.c aesenc -march=raptorlake
 
 reject clmul.c -mpclmul -march=x86-64
 accept clmul.c pclmulqdq -mpclmul
+
+# (the second argument of `reject` is the text the diagnostic must contain;
+#  every rejection names the `-m` flag that would have granted the extension.)
+reject vaes256.c -mvaes -march=x86-64             # v1: neither half
+reject vaes256.c -mvaes -march=x86-64-v3          # class yes, extension no
+reject vaes256.c -mvaes -march=x86-64-v3 -mno-avx2  # extension yes, class no
+reject vaes256.c -mvaes -march=x86-64-v3 -mno-avx   # no VEX at all
+reject vaes256.c -mvaes -march=alderlake -mno-vaes  # explicit denial of the profile's grant
+accept vaes256.c vaesenc -mvaes                   # project baseline is v3, so the class is granted
+accept vaes256.c vaesenc -march=alderlake
+
+reject vpclmul256.c -mvpclmulqdq -march=x86-64
+reject vpclmul256.c -mvpclmulqdq -march=x86-64-v3
+reject vpclmul256.c -mvpclmulqdq -march=alderlake -mno-vpclmulqdq
+# VAES is not VPCLMULQDQ: separate bits, separate rows (GCC rejects this too).
+reject vpclmul256.c -mvpclmulqdq -mvaes -march=x86-64-v3
+reject vpclmul256.c -mvpclmulqdq -mvaes -march=alderlake -mno-vpclmulqdq
+accept vpclmul256.c vpclmulqdq -mvpclmulqdq
+accept vpclmul256.c vpclmulqdq -march=alderlake
 
 # The 32-bit target has the same rule and the same escape hatch: i686 has no
 # SSE4.2 by default, and `-msse4.2` is what grants it.
@@ -137,5 +171,222 @@ compare o_crc.c -msse4.2
 compare o_crc.c -march=x86-64-v2
 compare o_aes.c -march=x86-64
 compare o_aes.c -maes
+
+# The 256-bit rows, same oracle rule.  `-march=alderlake` (not `raptorlake`:
+# GCC 12 does not know that name) is the CPU profile both compilers agree on.
+cat >"$tmp/o_vaes256.c" <<'EOF'
+#include <immintrin.h>
+__m256i aes_enc256(__m256i a, __m256i b) { return _mm256_aesenc_epi128(a, b); }
+EOF
+cat >"$tmp/o_vpclmul256.c" <<'EOF'
+#include <immintrin.h>
+__m256i clmul256(__m256i a, __m256i b) { return _mm256_clmulepi64_epi128(a, b, 0); }
+EOF
+
+compare o_vaes256.c -march=x86-64
+compare o_vaes256.c -march=x86-64-v3
+compare o_vaes256.c -march=x86-64-v3 -mvaes
+compare o_vaes256.c -march=x86-64-v3 -mvaes -mno-avx
+compare o_vaes256.c -march=alderlake
+compare o_vaes256.c -march=alderlake -mno-vaes
+compare o_vpclmul256.c -march=x86-64-v3
+compare o_vpclmul256.c -march=x86-64-v3 -mvaes
+compare o_vpclmul256.c -march=x86-64-v3 -mvpclmulqdq
+compare o_vpclmul256.c -march=alderlake
+
+# Documented deviation, asserted rather than compared.  lccc ties ALL 256-bit
+# emission to the AVX2-class permission (`x86_isa().ymm`), so `-mno-avx2` also
+# removes the 256-bit VEX forms whose float half GCC keeps with AVX alone:
+# GCC accepts `_mm256_aesenc_epi128` under `-mvaes -mno-avx2` (measured), lccc
+# refuses.  Refusing is the safe direction -- lccc emits no 256-bit code at all
+# on that target -- and it keeps the promise the fold makes.
+ours=$(verdict "$ccc" o_vaes256.c -march=x86-64-v3 -mvaes -mno-avx2)
+[ "$ours" = reject ] ||
+    fail "o_vaes256.c -mvaes -mno-avx2: lccc $ours, expected reject (no 256-bit class on that target)"
+echo "ok: o_vaes256.c -mvaes -mno-avx2 -> reject (documented deviation: GCC accepts)"
+
+# ---------------------------------------------------------------------------
+# AVX-VNNI, AVX-VNNI-INT8 and AVX-VNNI-INT16: three extensions, three bits,
+# three flags.  This is where the audit's live SIGILL case lived: measured
+# emitting `vpdpbusd %ymm1, %ymm0, %ymm0` for `_mm_dpbusd_epi32` under
+# `-march=x86-64`, an Alder-Lake-era instruction inside a v1 object.
+cat >"$tmp/vnni128.c" <<'EOF'
+typedef int v4si __attribute__((vector_size(16)));
+v4si dpbusd128(v4si a, v4si b, v4si c) { return __builtin_ia32_vpdpbusd128(a, b, c); }
+EOF
+cat >"$tmp/vnni256.c" <<'EOF'
+typedef int v8si __attribute__((vector_size(32)));
+v8si dpbusd256(v8si a, v8si b, v8si c) { return __builtin_ia32_vpdpbusd256(a, b, c); }
+EOF
+cat >"$tmp/vnni_int8.c" <<'EOF'
+typedef int v4si __attribute__((vector_size(16)));
+v4si dpbssd128(v4si a, v4si b, v4si c) { return __builtin_ia32_vpdpbssd128(a, b, c); }
+EOF
+cat >"$tmp/vnni_int16.c" <<'EOF'
+typedef int v4si __attribute__((vector_size(16)));
+v4si dpwusd128(v4si a, v4si b, v4si c) { return __builtin_ia32_vpdpwusd128(a, b, c); }
+EOF
+
+# Both halves of the conjunction, on both widths: no vector class (v1), no
+# request (v3), no class (v3 -mno-avx2), an explicit denial of a request that
+# the flag itself just made, and -- the row that keeps the families apart --
+# AVX-VNNI's flag must NOT grant the INT8/INT16 instructions.
+reject vnni128.c -mavxvnni -march=x86-64
+reject vnni256.c -mavxvnni -march=x86-64
+reject vnni128.c -mavxvnni -march=x86-64-v3
+reject vnni256.c -mavxvnni -march=x86-64-v3
+reject vnni256.c -mavxvnni -march=x86-64-v3 -mno-avx2
+reject vnni256.c -mavxvnni -mavxvnni -mno-avxvnni
+reject vnni128.c -mavxvnni -march=alderlake -mno-avxvnni
+reject vnni_int8.c -mavxvnniint8 -march=x86-64
+reject vnni_int8.c -mavxvnniint8 -mavxvnni
+reject vnni_int8.c -mavxvnniint8 -march=alderlake
+reject vnni_int16.c -mavxvnniint16 -mavxvnni
+reject vnni_int16.c -mavxvnniint16 -march=alderlake
+accept vnni128.c vpdpbusd -mavxvnni
+accept vnni256.c vpdpbusd -mavxvnni
+accept vnni128.c vpdpbusd -march=alderlake
+accept vnni256.c vpdpbusd -mavx512vnni -mavx512vl
+accept vnni_int8.c vpdpbssd -mavxvnniint8
+accept vnni_int16.c vpdpwusd -mavxvnniint16
+accept vnni128.c vpdpbusd -mavxvnni -mno-avxvnni -mavxvnni  # re-enabled after denial
+
+# The i686 driver shares the flag spelling and rejects without it -- but its
+# fold reaches the intrinsic table through `x86_isa()`, which is `NONE` for
+# anything but x86-64 (by design: the 32-bit backend does not route its
+# *scalar/SSE* work through that model), so the 256-bit VEX intrinsics are
+# refused there even when `-mavx -mavxvnni` asks for them.  Refusing is the safe
+# direction and the row below pins it; the inconsistent half -- the `__m256`
+# *vector-op* path emitting `%ymm` on i686 with no permission at all -- is
+# latched separately as AUD-CPU-4 at the bottom of this gate.
+reject vnni128.c -mavxvnni -m32 -march=i686
+reject vnni128.c -mavxvnni -m32 -msse2 -mavx -mavxvnni
+
+# GCC oracle for the classic AVX-VNNI group (`-mavxvnni` exists in GCC 12).
+# The INT8/INT16 halves get no oracle on this toolchain and are declared as
+# such below rather than compared against a compiler that cannot express them.
+cat >"$tmp/o_vnni128.c" <<'EOF'
+#include <immintrin.h>
+__m128i dpbusd128(__m128i a, __m128i b, __m128i c) { return _mm_dpbusd_epi32(a, b, c); }
+EOF
+cat >"$tmp/o_vnni256.c" <<'EOF'
+#include <immintrin.h>
+__m256i dpbusd256(__m256i a, __m256i b, __m256i c) { return _mm256_dpbusd_epi32(a, b, c); }
+EOF
+
+compare o_vnni128.c -march=x86-64
+compare o_vnni256.c -march=x86-64
+compare o_vnni128.c -march=x86-64-v3
+compare o_vnni256.c -march=x86-64-v3
+compare o_vnni128.c -mavxvnni
+compare o_vnni256.c -mavxvnni
+compare o_vnni256.c -mavxvnni -mno-avx
+compare o_vnni256.c -mavxvnni -mno-avx2
+compare o_vnni128.c -mavx512vnni
+compare o_vnni256.c -mavx512vnni
+compare o_vnni128.c -mavx512vnni -mavx512vl
+compare o_vnni256.c -mavx512vnni -mavx512vl
+compare o_vnni128.c -march=alderlake
+compare o_vnni256.c -march=alderlake
+
+# Documented deviation, asserted rather than compared: GCC's `-mavxvnni` also
+# implies AVX2, so `-march=x86-64 -mavxvnni` is accepted there while lccc
+# refuses it -- the user asked for a v1 baseline and the 256-bit class is what
+# the backend would need to encode the instruction.  Refusing a request is the
+# safe direction; emitting an unrequested instruction is not.
+ours=$(verdict "$ccc" o_vnni128.c -march=x86-64 -mavxvnni)
+[ "$ours" = reject ] ||
+    fail "o_vnni128.c -march=x86-64 -mavxvnni: lccc $ours, expected reject (no 256-bit class on a v1 target)"
+echo "ok: o_vnni128.c -march=x86-64 -mavxvnni -> reject (documented deviation: GCC accepts)"
+
+# Declared no-oracle region: GCC 12.2 neither knows `-mavxvnniint8` /
+# `-mavxvnniint16` (measured: "unrecognized command-line option") nor declares
+# those intrinsics in its headers, so there is nothing to compare against.  The
+# rows above still pin the contract on the lccc side, and the two families are
+# accepted by no flag but their own.
+if "$gcc_bin" -mavxvnniint8 -E - </dev/null >/dev/null 2>&1; then
+    cat >"$tmp/o_vnni_int8.c" <<'EOF'
+#include <immintrin.h>
+__m128i dpbssd128(__m128i a, __m128i b, __m128i c) { return _mm_dpbssd_epi32(a, b, c); }
+EOF
+    compare o_vnni_int8.c -mavxvnniint8
+else
+    echo "note: no GCC oracle for AVX-VNNI-INT8/-INT16 on this toolchain ($gcc_bin rejects the flag); the lccc contract rows above are the whole gate for those two families"
+fi
+
+# ---------------------------------------------------------------------------
+# GFNI: the Galois-field byte instructions.  Legacy-encoded (no VEX), so this
+# is the one extension whose permission is the flag ALONE -- `-mno-avx` must
+# not remove it, and, measured before the row below existed, `-march=x86-64`
+# emitted `gf2p8mulb %xmm1, %xmm0` with no diagnostic.  GCC rejects that same
+# source, and GCC 12.2 knows `-mgfni`, so every row here is oracle-checked.
+cat >"$tmp/gfni.c" <<'EOF'
+typedef char v16qi __attribute__((vector_size(16)));
+v16qi gmul(v16qi a, v16qi b) { return __builtin_ia32_gf2p8mulb(a, b); }
+EOF
+
+reject gfni.c -mgfni -march=x86-64
+reject gfni.c -mgfni -march=x86-64-v3
+reject gfni.c -mgfni -maes
+reject gfni.c -mgfni -march=alderlake -mno-gfni
+accept gfni.c gf2p8mulb -mgfni
+accept gfni.c gf2p8mulb -mgfni -mavx
+accept gfni.c gf2p8mulb -mgfni -mno-avx
+accept gfni.c gf2p8mulb -march=alderlake
+
+cat >"$tmp/o_gfni.c" <<'EOF'
+#include <immintrin.h>
+__m128i gmul(__m128i a, __m128i b) { return _mm_gf2p8mul_epi8(a, b); }
+EOF
+compare o_gfni.c -march=x86-64
+compare o_gfni.c -march=x86-64-v3
+compare o_gfni.c -mgfni
+compare o_gfni.c -mgfni -mavx
+compare o_gfni.c -mgfni -mno-avx
+compare o_gfni.c -march=alderlake
+compare o_gfni.c -maes
+compare o_gfni.c -march=alderlake -mno-gfni
+
+# ---------------------------------------------------------------------------
+# RECORDED DEBT (AUD-CPU-4), asserted rather than fixed here: the i686
+# *vector-op* path emits 256-bit VEX code with no permission at all.  Measured
+# before this row was written:
+#
+#   lccc -O2 -m32            -S f256.c   ->  vaddps %ymm1, %ymm0, %ymm0
+#   lccc -O2 -m32 -mno-avx   -S f256.c   ->  vaddps %ymm1, %ymm0, %ymm0
+#   lccc -O2 -m32 -mno-avx   -S i256.c   ->  vpaddd %ymm1, %ymm0, %ymm0
+#
+# So on the 32-bit target a `__m256` operand is lowered to AVX instructions
+# regardless of `-mno-avx`, while the intrinsic table refuses the same class of
+# instruction there.  Both halves are the SIGILL class AUD-CPU-3 closed on
+# x86-64; they need one model, which is a change of its own.  These rows fail
+# the moment the behaviour changes in EITHER direction, so the fix cannot land
+# without updating them in the same commit.
+# (The debt is in the *intrinsic* 256-bit path: a bare `vector_size(32)`
+#  operator addition on i686 is lowered scalar-wise and correctly -- measured
+#  `addss` per lane, no `%ymm` -- so the probe has to name the intrinsic.)
+cat >"$tmp/i686_ymm_float.c" <<'EOF'
+#include <immintrin.h>
+__m256 add256(__m256 a, __m256 b) { return _mm256_add_ps(a, b); }
+EOF
+cat >"$tmp/i686_ymm_int.c" <<'EOF'
+#include <immintrin.h>
+__m256i addi256(__m256i a, __m256i b) { return _mm256_add_epi32(a, b); }
+EOF
+debt_ymm() {
+    local src=$1 want=$2
+    shift 2
+    local asm=$tmp/debt-${src%.c}-$(echo "$@" | tr -c 'a-z0-9' '_').s
+    "$ccc" -O2 "$@" -S "$tmp/$src" -o "$asm" ||
+        fail "$src with $*: the recorded AUD-CPU-4 debt no longer reproduces (lccc now refuses); flip this row to a rejection assertion"
+    grep -qE "%ymm" "$asm" ||
+        fail "$src with $*: no %ymm operand any more (AUD-CPU-4 may be fixed); flip this row"
+    grep -qE "^[[:space:]]+v?$want" "$asm" ||
+        fail "$src with $*: expected $want"
+    echo "ok: AUD-CPU-4 debt still reproduces: $src $* emits $want on %ymm"
+}
+debt_ymm i686_ymm_float.c addps -m32
+debt_ymm i686_ymm_float.c addps -m32 -mno-avx
+debt_ymm i686_ymm_int.c paddd -m32 -mno-avx2
 
 echo "PASS: ISA-sensitive intrinsics are gated on the permitted feature set, oracle-checked"

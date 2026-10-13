@@ -2,11 +2,11 @@
 # File-scope initializers of static-storage objects must be constants
 # (C11 6.7.9p4), and every form lccc accepts must be emitted with its value.
 #
-# Two checks against GCC 16.2 (tests/regression/lib/gcc_oracle.sh):
+# Two checks against the oracle (tests/regression/lib/gcc_oracle.sh):
 #   * tests/regression/file_scope_init/cases.tsv: each row is one translation
 #     unit. The oracle must still give the recorded verdict (drift check), lccc
 #     must give the same verdict, and a rejection must carry the diagnostic.
-#   * values.c: lccc and GCC 16.2 are linked and run; the printed values must
+#   * values.c: lccc and the oracle are linked and run; the printed values must
 #     match. A form accepted but zeroed would pass the verdict check and fail
 #     here.
 set -euo pipefail
@@ -34,13 +34,13 @@ while IFS=$'\t' read -r id expect diag decl; do
 
     if "$GCC_ORACLE_BIN" -fsyntax-only -w "$tu" >/dev/null 2>&1; then gv=accept; else gv=reject; fi
     if [[ $gv != "$expect" ]]; then
-        echo "FAIL $id: oracle drift: GCC 16.2 says $gv, the table says $expect" >&2
+        echo "FAIL $id: oracle drift: GCC $GCC_ORACLE_MAJOR says $gv, the table says $expect" >&2
         fail=$((fail + 1)); continue
     fi
     lerr=$tmp/$id.err
     if "$CCC" -fsyntax-only "$tu" >/dev/null 2>"$lerr"; then lv=accept; else lv=reject; fi
     if [[ $lv != "$expect" ]]; then
-        echo "FAIL $id: lccc $lv, GCC 16.2 $expect" >&2
+        echo "FAIL $id: lccc $lv, GCC $GCC_ORACLE_MAJOR $expect" >&2
         sed -n '1,3p' "$lerr" >&2
         fail=$((fail + 1)); continue
     fi
@@ -60,7 +60,7 @@ vsrc=$dir/values.c
 "$tmp/values_gcc" > "$tmp/values_gcc.out"
 "$tmp/values_lccc" > "$tmp/values_lccc.out"
 if ! cmp -s "$tmp/values_gcc.out" "$tmp/values_lccc.out"; then
-    echo "FAIL values: folded values differ from GCC 16.2" >&2
+    echo "FAIL values: folded values differ from GCC $GCC_ORACLE_MAJOR" >&2
     echo "  gcc:  $(cat "$tmp/values_gcc.out")" >&2
     echo "  lccc: $(cat "$tmp/values_lccc.out")" >&2
     fail=$((fail + 1))

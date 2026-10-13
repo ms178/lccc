@@ -48,6 +48,48 @@ TUs with `CALLEE_ONLY`) links each caller/callee combination against GCC at
 `{double,double}` control) so the two conventions cannot silently merge.
 Mutation-verified: neutering the carrier helper fails the gate.
 
+### AUD-CPU-3 (remainder) — VNNI and GFNI are gated (FIXED for these families)
+
+The audit's live SIGILL case was AVX-VNNI: `_mm_dpbusd_epi32` compiled with
+`-march=x86-64` emitted `vpdpbusd %ymm1, %ymm0, %ymm0` — an Alder-Lake-era
+instruction inside a v1 object. Closing it needed three feature bits, not one:
+AVX-VNNI (`vpdpbusd`/`vpdpwssd`), AVX-VNNI-INT8 (`vpdpbssd`/`vpdpbsud`/
+`vpdpbuud`) and AVX-VNNI-INT16 (`vpdpwusd`/`vpdpwuud`) are three CPUID bits,
+three GCC flags and three separate promises, so `X86Feature` goes 24 → 27 and
+the 28 builtins in that family each get a row.
+
+The permission is the same conjunction VAES/VPCLMULQDQ uses — 256-bit vector
+class (`-mavx2`/AVX-512) AND the extension's own flag — because that is what
+the emitter needs and what GCC's header guard implements. Verified against GCC
+12.2 row by row: reject on `-march=x86-64`/`-v3`, on `-mavx2`, on
+`-mavx512vnni` without VL and on `-mno-avx`/`-mno-avx2`; accept on
+`-mavxvnni`, on `-mavx512vnni -mavx512vl` and on `-march=alderlake` — lccc
+agrees with the oracle on every one of those. One deviation is asserted in the
+gate rather than compared: GCC's `-mavxvnni` also implies AVX2, so
+`-march=x86-64 -mavxvnni` is accepted there and refused here (the user asked
+for a v1 baseline and the 256-bit class is what the backend would need).
+INT8/INT16 have no oracle on this toolchain — GCC 12.2 does not know either
+flag and declares none of those intrinsics — so the gate says so and pins the
+lccc-side contract instead.
+
+Landed with it: `-mno-avxvnni` (the enabling flag existed, the denial arm did
+not, so the denial was silently ignored), the `__builtin_cpu_supports` fold for
+all three names, the CPU-support gate extended to 27 probed features
+(Alder/Raptor Lake bring AVX-VNNI; Arrow Lake/Sierra Forest add INT8;
+`-march=arrowlake-s`/Lunar Lake add INT16), and 27 new intrinsic-gate rows.
+
+GFNI went in the same way (28 features now): `gf2p8mulb` is **legacy-encoded**,
+so its permission is the flag alone — `-mgfni -mno-avx` accepts in both
+compilers, measured — and before the row existed lccc emitted
+`gf2p8mulb %xmm1, %xmm0` for `-march=x86-64` with no diagnostic. lccc now
+agrees with GCC 12.2 on every one of the eight oracle rows for that family,
+including the `-maes` and `-mno-avx` corners.
+
+**Found while doing it: AUD-CPU-4** (see §2) — the 32-bit target emits 256-bit
+VEX code with no permission at all, in the *vector-op* path, while the
+intrinsic table refuses the same class of instruction there. Latched by the
+same gate rather than quietly fixed inside this change.
+
 ### AUD-RATCHET-1 — the audit census is measurable and enforced (DONE)
 
 `scripts/audit_census.py` + `scripts/audit_census_baseline.json`:
@@ -102,6 +144,29 @@ commands), which is the mechanism that keeps the two mirrors from drifting.
     workflow's new path (`.github/workflows/bench.yml` updated in lockstep).
 * Stale pre-fix `.s` snapshots deleted (they were records of a state, not
   tests).
+* `artifacts/repros/` (97 programs, the directory's own scar tissue) replayed
+  by `scripts/check_repro_replay.py`: **none of them still reproduce**. Getting
+  there needed the ISA to be pinned on both compilers, which is the finding
+  worth keeping — see the box below. The three `csmith` programs that
+  `#include "csmith.h"` (a header the generator emits and this repository does
+  not vendor) are *declared* rather than skipped, and the declaration is
+  checked in both directions so it cannot rot into a skip list. The bracketed
+  file names (`[CCC_RA_GLOBAL_LOCATION=1]`) now use the shell-safe
+  `__env_CCC_RA_GLOBAL_LOCATION-1` form, and `artifacts/repros/README.md`
+  documents the naming contract the gate parses.
+
+> **Reading a differential result: pin the ISA on both sides.** An unpinned
+> replay of `artifacts/repros/` reports 29 failures; with `-march=x86-64` handed
+> to both compilers, 94 of 97 agree (the other three are the header-dependent
+> csmith files). The gap is not codegen: lccc's documented project baseline is
+> `x86-64-v3`, GCC's default is plain `x86-64`, and lccc's backend **contracts
+> `a*b+c` into FMA at every level including `-O0`** (measured: 10 `vfmadd`/
+> `vfmsub` sites in an `-O0 -march=x86-64-v3` build) while GCC starts
+> contracting at `-O2`. Contraction is implementation-defined in C, so this is
+> legal — but it means `-O0` numerics differ from GCC unless the comparison is
+> pinned. The gate therefore runs two pinned legs (`-march=x86-64` and
+> `-march=x86-64-v3 -mno-fma`); a `-ffp-contract=` flag is the obvious knob if
+> GCC-identical `-O0` numerics are ever required.
 
 ### AUD-SILENT-ZERO-1 — the remainder (FIXED, two layers + the ICEs)
 
@@ -162,8 +227,10 @@ more honest corpus, since asm-diff feeds the peephole foreign assembly).
 
 Ordered by value ÷ cost, with the entry point each one needs.
 
-1. **AUD-CPU-3 remainder — the feature table is 11 rows for 268 x86 builtin
-   variants.** `x86_intrinsic_required_feature` (`src/ir/lowering/expr_builtins.rs`)
+1. **AUD-CPU-3 remainder — with VAES/VPCLMULQDQ, the three VNNI groups and
+   GFNI landed, the table covers every extension the frontend currently
+   exposes; what is left is the AVX-512 layer (512-bit rows and a 512-bit class
+   notion) and SHA, which has no builtins to gate yet.** `x86_intrinsic_required_feature` (`src/ir/lowering/expr_builtins.rs`)
    covers CRC32, the six 128-bit AES ops and `pclmulqdq128`; the audit names
    256-bit VAES/VPCLMULQDQ, `X86Crc32Load*`, SHA/GFNI/AVX-512 as missing, and
    the family sweep above now proves that at least VAES-256/VPCLMULQDQ-256
@@ -174,6 +241,46 @@ Ordered by value ÷ cost, with the entry point each one needs.
    mechanically extractable), and the verdict for each row can be
    oracle-checked against `gcc -march=x86-64 -S` (error ⇒ the row needs a
    feature), exactly the way `check_intrinsic_feature_gate.sh` does it today.
+   The AVX-VNNI half of this entry is now **done** (three bits, 28 rows, GCC
+   oracle rows, and the `__builtin_cpu_supports` fold); the oracle rules that
+   were measured for it are kept here because the same method is what the
+   remaining families need, and because they are the record behind the rows
+   (`-march=raptorlake` is unknown to GCC 12; use `-march=alderlake` for a CPU
+   profile):
+
+   ```
+   _mm_dpbusd_epi32 / _mm256_dpbusd_epi32   (AVX-VNNI)
+       -mavxvnni                -> accept  (128-bit AND 256-bit; VEX, not AVX2)
+       -mavx2                   -> reject
+       -mavx512vnni             -> reject  (128-bit forms need VL)
+       -mavx512vnni -mavx512vl  -> accept
+       -march=alderlake         -> accept
+
+   _mm_gf2p8mul_epi8 / _mm256_gf2p8mul_epi8  (GFNI)
+       -mgfni                   -> reject  (GFNI has no legacy encoding)
+       -mgfni -mavx             -> accept
+       -march=alderlake         -> accept
+   ```
+
+   That hole is closed (measured: `-march=x86-64` now diagnoses
+   `_mm_dpbusd_epi32` and names `-mavxvnni`). What remains in this entry:
+
+   * **SHA** — no `X86Sha*` builtin exists and `-msha` is not accepted, so
+     there is nothing to gate: a dispatcher asking
+     `__builtin_cpu_supports("sha")` gets 0, which is the safe answer, and the
+     name stays in the untracked list with a test that keeps it there. Adding
+     SHA means adding codegen first.
+   * **AVX-512** — the `-mavx512*` flags exist in the CLI and the 512-bit
+     builtins exist, but no row gates them; the fold has no 512-bit class
+     notion (that is also what AUD-CPU-4 is about, one width down).
+   * **`X86Crc32Load*`** — checked and not applicable as written: the CRC32
+     family is exactly four builtins (`X86Crc32_8/16/32/64`), and the load
+     forms are the *same* builtins with a memory operand, so the existing rows
+     cover them.
+   * **The 256-bit GFNI forms** — `_mm256_gf2p8mul_epi8` is declared by GCC but
+     not by lccc's bundled headers (implicit-declaration warning), so they are
+     unreachable from source until the headers grow them; that is a header
+     change with an ABI question (32-byte vector argument), not a table row.
 2. **AUD-ICE-1 remainder — 889 panic-class sites (109 in the hot set).**
    Worklist: `python3 scripts/audit_census.py --top-fns` for size and
    `grep -nE 'panic!|unreachable!|\.expect\(|\.unwrap\('` per file for sites.
@@ -240,9 +347,75 @@ Ordered by value ÷ cost, with the entry point each one needs.
     its backlog section) still mixes closed and open items and has a duplicate
     `IVOPTS-1`; each open entry should carry front matter naming its
     reproducer, with a gate that the path exists.
-11. **`sv_assign` miscompile (segfault at `-O2`)** — carried over from the
-    audit digest; not in the audit's own item list, but it is a real
-    correctness bug with a reproducer in the backlog.
+11. ~~**`sv_assign` miscompile (segfault at `-O2`)**~~ — **closed as
+    unreproducible.** `git log -S sv_assign --all` turns up the follow-up
+    document and nothing else: no `src/` occurrence, no symbol in the built
+    rlib. The backlog entry names no reproducer, so there is nothing to fix
+    until someone produces one; it is a documentation defect in the backlog
+    (AUD-BL-1), not a known bug.
+
+12. **AUD-VABI-2 — the 32-byte vector ABI (latched, gated, NOT fixed).** Found
+    by running the AUD-VABI-1 four-way differential on a 32-byte vector
+    typedef. The psABI classifies a vector as SSE plus one SSEUP per further
+    eightbyte, so with AVX enabled a 32-byte vector travels in **one `%ymm`**;
+    lccc's struct rule has no SSEUP notion and `CType::sysv_vector_carrier()`
+    stops at 16 bytes, so the value falls back to the memory/sret convention.
+    Measured with the four-way build in
+    `tests/regression/vector_abi_boundary/` (`wide.c`, compiled by each
+    compiler on each side, linked in all four combinations):
+
+    | configuration | gcc/gcc | lccc/lccc | lccc caller + gcc callee | gcc caller + lccc callee |
+    |---|---|---|---|---|
+    | `-mavx2` | correct | correct | `add: 0 0 0 0 0 0 0 0` | **SIGSEGV** |
+    | no `-mavx2` | correct | correct | correct | correct |
+
+    The default code-generation baseline is x86-64-v3 (AVX2 on), so the broken
+    column is the *default* one, and the caller-side failure is a silently
+    wrong answer — AUD-VABI-1's class, one register width out.
+    `tests/regression/check_vector_abi_wide.sh` **latches** the debt: the two
+    working configurations are asserted to stay correct (the no-AVX2 four-way
+    agreement is also the gate's liveness proof) and the two broken legs must
+    show exactly the recorded verdict (`garbage` / `signal`) — a leg that
+    changes, in either direction, fails the gate until its budget constants are
+    updated in the commit that changed it.
+
+    Fix shape (the AUD-VABI-1 fix, one width further out): a `%ymm` carrier for
+    vector arguments and returns — `CType::sysv_vector_carrier()` (add 32, and
+    64 for AVX-512), the signature classification in
+    `src/ir/lowering/{lower,expr_calls,func_lowering,stmt_init}.rs`, the x86
+    prologue/return path (`src/backend/x86/codegen/prologue.rs`) and
+    `location_alloc` — then flip the gate's `DEBT_LCCC_CALLER`/
+    `DEBT_GCC_CALLER` to `agree`.
+13. **FMA contraction happens at `-O0`, unlike GCC.** With FMA permitted
+    (the x86-64-v3 default), lccc contracts `a*b+c` even at `-O0` — measured:
+    10 `vfmadd`/`vfmsub` sites in an `-O0 -march=x86-64-v3` build — while GCC
+    contracts from `-O2` only. C leaves contraction implementation-defined, so
+    this is legal, but it makes `-O0` numerics differ from GCC on FP-heavy code
+    (this is what the `miscompile_gen_fp_stress_*` backlog family was actually
+    measuring; all 24 agree once the ISA is pinned on both sides). There is no
+    `-ffp-contract=` flag; adding it (and defaulting `-O0` to `off`) is the
+    low-risk conformance win, and it makes the reproducer replay
+    (`scripts/check_repro_replay.py`) simpler than its two pinned legs.
+
+14. **AUD-CPU-4 — the 32-bit target emits 256-bit VEX code with no permission
+    at all.** Measured on this tree (`-O2`, the x86-64 driver with `-m32`):
+
+    ```
+    -m32            -S f256.c (_mm256_add_ps)   -> vaddps %ymm1, %ymm0, %ymm0
+    -m32 -mno-avx   -S f256.c                   -> vaddps %ymm1, %ymm0, %ymm0
+    -m32 -mno-avx2  -S i256.c (_mm256_add_epi32)-> vpaddd %ymm1, %ymm0, %ymm0
+    ```
+
+    So `-mno-avx` does not stop VEX emission on i686 — the SIGILL class
+    AUD-CPU-3 closed for x86-64, in the vector-op path rather than the
+    intrinsic table. The same model refuses those intrinsics on i686
+    (`x86_isa()` is `NONE` for anything but x86-64 by design), so the two
+    halves of the permission story disagree: an intrinsic is refused while an
+    equivalent operator is lowered to the same instruction. One model has to
+    serve both, and it needs the 32-bit backend's own notion of a vector class.
+    Latched by `tests/regression/check_intrinsic_feature_gate.sh`, which
+    asserts the current emission in both directions, so the fix cannot land
+    without updating those rows in the same commit.
 
 ---
 
@@ -274,6 +447,33 @@ Ordered by value ÷ cost, with the entry point each one needs.
 * `PyYAML` is needed by `scripts/check_ci_gate_parity.py`
   (`pip install --break-system-packages pyyaml`); without it the gate fails
   cleanly instead of silently passing.
+* **Check a tool exists before writing a replacement for it.** `git ls-files`
+  is the authority: `scripts/audit_census.py` and its baseline are committed
+  and green (AUD-RATCHET-1 landed in `7b0ea71`); a rewritten copy would have
+  silently replaced a better-specified engine (it also latches `#[ignore]`
+  annotations, and its knob-documentation rule is "named in a tracked `*.md`").
+* **Never edit a script while a bash process is executing it.** The local CI
+  runner reads `scripts/ci_local.sh` incrementally by byte offset, so an edit
+  in the middle of a run made the running shell die with `syntax error near
+  unexpected token 'else'` at a line that is valid in the commit. Land the
+  edit, then start the run — and treat a run that outlived an edit as
+  evidence-free.
+* **A new permission gate can invalidate existing tests whose flags were
+  permissive.** `tests/regression/clmul256` carried `-mavx2 -maes -mpclmul`
+  while emitting `vpclmulqdq`; the VAES/VPCLMULQDQ gate made that flag set
+  illegal, and the corpus sweep is what caught it (`clmul256 (compile:fail)`).
+  GCC 12.2 rejects the old set too, so the test's flags — not the new gate —
+  were stale. After landing a gate: run `python3 tests/regression/run_regression.py
+  --lccc ./target/fastbuild/lccc -j 2 --compile-only` and diff the failure list
+  against the recorded baseline (8 failures, all `cannot find -lgcc`).
+* **Silencing the oracle's own note can be right.** The wide-vector gate
+  passes `-Wno-psabi` to gcc: in the no-AVX2 configuration the warning *is* the
+  property under test (the memory convention), so it is expected output, not a
+  finding.
+* **Pin the ISA on both sides of a differential, or measure the wrong thing.**
+  lccc's documented baseline is x86-64-v3 and GCC's default is x86-64; an
+  unpinned comparison of the two reports 29 "failures" that are FMA
+  contraction. State the baseline in the gate, in both directions.
 * Gate files must avoid `producer | grep -q` and `producer | head -N` under
   `set -o pipefail` (the repo has `scripts/check_pipefail_sigpipe.py`, which
   caught exactly that in the new IVSR gate): capture first, or use

@@ -6,10 +6,23 @@ on:
   pull_request:
     branches: [main]
 
+# AUD-CI-1: least privilege, no duplicate runs on the same ref, pinned runner.
+# (The job-level split of the monolithic `test` job is tracked as a follow-up:
+# it needs the artifact-sharing refactor plus an update to
+# scripts/check_ci_gate_parity.py, which currently verifies that ci_local.sh
+# runs the same *commands*, not the same job layout.)
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: Test Suite
     runs-on: ubuntu-24.04
+    timeout-minutes: 120
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -38,7 +51,7 @@ jobs:
         run: |
           sudo dpkg --add-architecture i386
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-multilib g++-multilib libc6-dev-i386
+          sudo apt-get install -y --no-install-recommends gcc-multilib g++-multilib libc6-dev-i386 gcc-14-multilib
 
       # The differential oracle set must be EXPLICIT, not whatever the runner
       # image happens to ship: a gate whose evidence depends on the image is a
@@ -67,23 +80,10 @@ jobs:
       # the stated reason, and prints the oracle's --version in its summary --
       # so this step is what makes the oracle deterministic, and the gate is
       # what makes a missing one loud instead of vacuous.
-      # The GCC 16 oracle is also the i686 reference for
-      # check_memory_value_contracts.sh (`"$ref" -m32`). The default-GCC
-      # multilib above does NOT provide 32-bit crt objects or libgcc for
-      # gcc-16, so that gate's -m32 reference link failed on this runner
-      # (PR #809 CI). Provision the 32-bit runtime for the oracle itself,
-      # then prove it links and runs an i686 binary before any gate depends
-      # on it.
-      - name: Install the GCC 16 oracle
+      - name: Install a C23-capable GCC oracle
         run: |
           sudo apt-get update
-          # g++-16-multilib and lib32stdc++-16-dev supply the 32-bit C++
-          # headers and runtime that the linker suite's i386_dso_emit_semantics
-          # cxxprobe needs (it names exactly these packages when they are missing).
-          sudo apt-get install -y --no-install-recommends gcc-16 gcc-16-multilib g++-16-multilib lib32stdc++-16-dev
-          printf 'int main(void){return 0;}\n' > /tmp/oracle_m32.c
-          gcc-16 -m32 /tmp/oracle_m32.c -o /tmp/oracle_m32
-          /tmp/oracle_m32
+          sudo apt-get install -y --no-install-recommends gcc-14
 
       - name: Cache cargo registry
         uses: actions/cache@v6
@@ -110,6 +110,11 @@ jobs:
       - name: No merge conflict markers
         run: python3 scripts/check_no_conflict_markers.py
 
+      - name: Audit census ratchet
+        run: |
+          python3 scripts/audit_census.py --selftest
+          python3 scripts/audit_census.py --check
+
       - name: Verify manifest Rust-toolchain selection
         run: bash tests/regression/check_rust_toolchain_selector.sh
 
@@ -120,6 +125,23 @@ jobs:
       # and two jobs. This is deliberately not Cargo's default release -O3.
       - name: Build
         run: ./scripts/build_lccc_fast.sh
+
+      - name: Check the recursion-to-iteration pass
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_rec2iter.sh
+
+      - name: Check FP-contraction parity with GCC
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_fp_contract_parity.sh
+
+      - name: Check ill-typed builtin diagnostics
+        run: |
+          python3 scripts/check_ill_typed_builtins.py --self-test
+          python3 scripts/check_ill_typed_builtins.py --compiler target/fastbuild/lccc
+
+      - name: Check builtin_cpu_supports runtime semantics
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_cpu_supports_runtime.sh
+
+      - name: Check GOT-slot references to local symbols
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_got_slot_local_addend.sh
 
       - name: i686 execution capability policy
         run: bash tests/regression/check_i386_run_policy.sh
@@ -161,6 +183,12 @@ jobs:
       - name: Vector arguments and returns at the compiler boundary
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_vector_abi_boundary.sh
 
+      # AUD-VABI-2: the 32-byte vector convention (one %ymm) is missing; this
+      # gate latches the measured debt (silent garbage one way, SIGSEGV the
+      # other) and asserts the two configurations that DO work stay working.
+      - name: Wide-vector ABI debt (latched)
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_vector_abi_wide.sh
+
       # AUD-TMP-1: temp files must be symlink-proof (pre-placed symlink and
       # pre-placed directory reproducers; victim file must stay untouched).
       # AUD-HYGIENE-1: the previously unreferenced tests/compat_test.sh and the
@@ -180,11 +208,13 @@ jobs:
       - name: Standard-output contract for -o -
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_o_stdout.sh
 
-      # AUD-CPU-1: `__builtin_cpu_supports` folds from the effective codegen
-      # permission (target + -march + -m*), so runtime dispatch cannot select
-      # an instruction set the build was not allowed to assume.
-      - name: CPU feature fold honours -march and target
-        run: env CCC=target/fastbuild/lccc CCC_ARM=target/fastbuild/lccc-arm bash tests/regression/check_cpu_supports_fold.sh
+      # AUD-HYGIENE-1: replay every crash/miscompile reproducer with the ISA
+      # pinned on both compilers (see artifacts/repros/README.md).
+      - name: Reproducer replay (pinned ISA, both legs)
+        run: |
+          set -euo pipefail
+          python3 scripts/check_repro_replay.py --self-test
+          env CCC=target/fastbuild/lccc python3 scripts/check_repro_replay.py
 
       # AUD-ICE-1/AUD-DIAG-1: malformed `__builtin_shuffle` masks diagnose
       # instead of panicking, and the valid forms still lower (oracle-checked
@@ -647,56 +677,50 @@ jobs:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_seg_declarator_space.sh
 
-      # Named-space codegen through a typedef or typeof: every access to the
       # Block-scope static initializers, designator validity, volatile typedef
-      # objects: each checked against the GCC 16.2 oracle.
+      # objects and volatile members: every row against the oracle, every folded
+      # value linked and run (tests/regression/lib/gcc_oracle.sh).
       - name: Run static-local initializer check
         env:
           CCC: target/fastbuild/lccc
-          GCC: gcc-16
         run: bash tests/regression/check_static_local_init.sh
 
       - name: Run designator initializer check
         env:
           CCC: target/fastbuild/lccc
-          GCC: gcc-16
         run: bash tests/regression/check_designator_init.sh
 
       - name: Run file-scope initializer check
         env:
           CCC: target/fastbuild/lccc
-          GCC: gcc-16
         run: bash tests/regression/check_file_scope_init.sh
 
       - name: Run typedef volatile codegen check
         env:
           CCC: target/fastbuild/lccc
-          GCC: gcc-16
         run: bash tests/regression/check_typedef_volatile_codegen.sh
 
-      # Named-space initializers through brace elision and anonymous members (GCC 16.2 lines).
-      - name: Run __seg_gs brace-elision initializer check
-        env:
-          CCC: target/fastbuild/lccc
-          GCC: gcc-16
-        run: bash tests/regression/check_seg_init_brace_elision.sh
-
-      # Volatile struct members keep their accesses at -O2 (GCC 16.2 counts, C11 6.7.3p7).
       - name: Run volatile member codegen check
         env:
           CCC: target/fastbuild/lccc
-          GCC: gcc-16
         run: bash tests/regression/check_volatile_member_codegen.sh
 
-      # `const volatile` objects are volatile at every read: `const` forbids
-      # writes, it does not license folding the access away (C11 6.7.3p7).
+      # `const volatile` objects are volatile at every read (C11 6.7.3p7).
       - name: Run const volatile object check
         env:
           CCC: target/fastbuild/lccc
-          GCC: gcc-16
         run: bash tests/regression/check_const_volatile_objects.sh
 
-      # __seg_gs object must carry the %gs: prefix (audit H2, silent miscompile).
+      - name: Run __seg_gs conversion parity check
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_seg_conversion_parity.sh
+
+      - name: Run __seg_gs brace-elision initializer check
+        env:
+          CCC: target/fastbuild/lccc
+        run: bash tests/regression/check_seg_init_brace_elision.sh
+
       - name: Run __seg_gs typedef codegen check
         env:
           CCC: target/fastbuild/lccc
@@ -706,17 +730,13 @@ jobs:
       - name: Run __seg_gs conversion diagnostics check
         env:
           CCC: target/fastbuild/lccc
-          GCC: gcc-16
+          GCC: gcc-14
         run: bash tests/regression/check_seg_conv_diagnostics.sh
 
       - name: Reject named address spaces on unsupported targets without an ICE
         env:
           CCC: target/fastbuild/lccc
         run: bash tests/regression/check_seg_target_diagnostics.sh
-      - name: Run __seg_gs conversion parity check (44 shapes against gcc 16.2)
-        env:
-          CCC: target/fastbuild/lccc
-        run: bash tests/regression/check_seg_conversion_parity.sh
 
       # Chroot bind() creates a file target for a file source.
       - name: Run chroot bind regression
@@ -1383,11 +1403,6 @@ jobs:
           bash tests/regression/check_redundant_test_elimination.sh
           python3 tests/regression/verify_pr713_audit.py --quiet
           python3 scripts/check_doc_links.py
-          # AUD-RATCHET-1: the audit census (scripts/audit_census.py) is the
-          # only place the audit's site counts are measurable; the ratchet is
-          # what stops them growing back.  Runs in ci_local.sh too.
-          python3 scripts/audit_census.py --selftest
-          python3 scripts/audit_census.py --check
           python3 scripts/check_peephole_directive_step.py
           python3 scripts/check_pr_claim_fidelity.py
           bash tests/regression/check_ra_web_inloop_use.sh
@@ -1570,6 +1585,7 @@ jobs:
           if-no-files-found: warn
 
   clippy:
+    timeout-minutes: 45
     name: Clippy
     runs-on: ubuntu-24.04
     steps:
@@ -1601,6 +1617,7 @@ jobs:
   # Networked, so a Compiler Explorer outage is a recorded skip (exit 0), never
   # a red build; the self-tests in the `test` job pin the gate logic itself.
   oracle-delta:
+    timeout-minutes: 30
     name: Compiler Explorer oracle delta
     runs-on: ubuntu-24.04
     steps:

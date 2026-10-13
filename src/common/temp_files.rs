@@ -2,9 +2,9 @@
 //!
 //! Provides:
 //! - `temp_dir()`: returns the platform temp directory (respects $TMPDIR)
-//! - `private_temp_dir()`: a per-process 0700 directory owning every temp file
+//! - `private_temp_dir()`: the per-process 0700 directory owning every temp file
 //! - `TempFile`: RAII guard that deletes the file on drop (even on panic/error)
-//! - `make_temp_path()`: generates a unique temp file path inside the private dir
+//! - `make_temp_path()`: a unique temp file path inside the private directory
 //! - `write_file_exclusive()`: symlink-safe write for fixed-purpose debug dumps
 //!
 //! # Why a private directory (AUD-TMP-1)
@@ -22,14 +22,23 @@
 //! Every temp file now lives in `$TMPDIR/lccc-<pid>-<nanos>-<n>/`, created with
 //! `mkdir` mode 0700 and never reused: an attacker cannot pre-create it (a
 //! pre-placed file/symlink/directory makes `mkdir` fail with `EEXIST`, and we
-//! retry with the next candidate), and cannot write into it afterwards, because
-//! it is owned by us and mode 0700. The directory is removed when the last
-//! `TempFile` guard drops, so a compile leaves no debris behind.
+//! retry the next candidate), and cannot write into it afterwards, because it
+//! is owned by us and mode 0700. Creating the directory proves ownership with
+//! an `O_CREAT|O_EXCL` probe file (directory uid must equal probe uid, mode
+//! bits must exclude group/other), which costs one small file and removes any
+//! dependence on a world-writable parent mount behaving. The directory is
+//! removed when the last `TempFile` guard drops, so a compile leaves no debris.
 //!
-//! If no private directory can be created at all (read-only or missing
-//! `$TMPDIR`, exotic filesystems), we fall back to the historical flat naming
-//! so that compilation still works; the fallback is reported once on stderr
-//! under `CCC_TEMP_DEBUG=1` and is deliberately *not* silent.
+//! # Why reservation is fallible instead of falling back
+//!
+//! An earlier revision of this module fell back to the historical flat naming
+//! when no private directory could be created. That fallback silently
+//! re-introduced exactly the predictable-name shape this module exists to
+//! remove, on the one host class that needs it most (an unusual `$TMPDIR`: a
+//! file, a read-only mount, a directory with restrictive ACLs). `TempFile::new`
+//! therefore returns `Result` and the driver reports
+//! `Failed to reserve temporary file: …` — a normal driver error, never a
+//! panic, and never a quiet downgrade of the hardening.
 
 use std::fs;
 use std::io::{self, Write};
@@ -133,22 +142,26 @@ fn create_private_dir() -> Option<PathBuf> {
         // `create_private_dir_at` is all-or-nothing: it removes its own
         // candidate when verification fails, so the next attempt starts clean.
     }
-    // Never silent: the fallback re-introduces the predictable-name shape
-    // that AUD-TMP-1 hardened, so an operator must see that it happened.
-    eprintln!(
-        "ccc: warning: no private temp directory could be created under {}; \
-         falling back to flat temp-file names in that directory",
-        base.display()
-    );
     None
 }
 
 /// The process-private temp directory, or `None` if it could not be created.
 ///
 /// Created lazily on first use and shared by every temp file of this process.
+/// If the directory disappeared in the meantime (an external `tmpfiles`
+/// cleanup, a test that removed it), it is recreated at the same path rather
+/// than being written into while absent.
 pub fn private_temp_dir() -> Option<&'static Path> {
     static PRIVATE_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
-    PRIVATE_DIR.get_or_init(create_private_dir).as_deref()
+    let dir = PRIVATE_DIR.get_or_init(create_private_dir).as_deref()?;
+    if dir.is_dir() {
+        return Some(dir);
+    }
+    if create_private_dir_at(dir) {
+        Some(dir)
+    } else {
+        None
+    }
 }
 
 /// Remove the private temp directory if it is empty.
@@ -165,21 +178,32 @@ fn remove_private_dir_if_empty() {
     }
 }
 
-/// Generate a unique temp file path with the given prefix and extension.
+/// The file name of a temp file: `<prefix>_<pid>_<stem>.<n>.<ext>`.
 ///
-/// The path includes the PID and an atomic counter to avoid collisions
-/// in parallel builds and multi-file compilations. Inside the process-private
-/// directory the historical file-name shape is kept verbatim
-/// (`<prefix>_<pid>_<stem>.<n>.<ext>`) so diagnostics and `CCC_KEEP_*`
-/// workflows that read the name keep working; only the *directory* changed.
-pub fn make_temp_path(prefix: &str, stem: &str, extension: &str) -> PathBuf {
+/// The historical flat shape is kept verbatim *inside* the private directory,
+/// so diagnostics and `CCC_KEEP_*` workflows that read the name keep working;
+/// only the directory changed. `None` for a stem or extension that is not a
+/// plain file name: a caller-controlled `../` or `/` must never be joined onto
+/// the directory, or the write would land outside it — through a symlink
+/// again, which is the whole point of this module.
+fn temp_file_name(prefix: &str, stem: &str, extension: &str) -> Option<String> {
     let pid = std::process::id();
     let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let filename = format!("{}_{}_{}.{}.{}", prefix, pid, stem, id, extension);
-    match private_temp_dir() {
-        Some(dir) => dir.join(filename),
-        None => temp_dir().join(filename),
+    if Path::new(&filename).file_name() != Some(std::ffi::OsStr::new(&filename)) {
+        return None;
     }
+    Some(filename)
+}
+
+/// Generate a unique temp file path inside the private directory.
+///
+/// `None` when no private directory exists (see `private_temp_dir`) or the
+/// name is not a plain file name: there is deliberately no flat fallback, so
+/// no caller can end up writing at a predictable path in a shared directory.
+pub fn make_temp_path(prefix: &str, stem: &str, extension: &str) -> Option<PathBuf> {
+    let dir = private_temp_dir()?;
+    Some(dir.join(temp_file_name(prefix, stem, extension)?))
 }
 
 /// Write `contents` to a fresh file at `path` without following symlinks.
@@ -209,14 +233,15 @@ pub fn write_file_exclusive(path: &Path, contents: &[u8]) -> io::Result<()> {
 /// be inspected after the compiler exits. The name is unique per process, so
 /// concurrent compilations cannot collide (the old fixed
 /// `/tmp/asm_debug_<stem>.s` name could be pre-created as a symlink by another
-/// local user and every parallel run overwrote the same file).
+/// local user and every parallel run overwrote the same file). `None` when the
+/// dump could not be written at all; a debug aid never fails a compile.
 pub fn write_debug_dump(
     prefix: &str,
     stem: &str,
     extension: &str,
     contents: &[u8],
 ) -> Option<PathBuf> {
-    let path = make_temp_path(prefix, stem, extension);
+    let path = make_temp_path(prefix, stem, extension)?;
     match write_file_exclusive(&path, contents) {
         Ok(()) => Some(path),
         Err(_) => None,
@@ -234,15 +259,21 @@ pub struct TempFile {
 }
 
 impl TempFile {
-    /// Create a new TempFile guard for a unique temp path.
+    /// Reserve a temp path inside the process-private directory.
     ///
-    /// The file is not created on disk — this just reserves the path and
-    /// registers it for cleanup on drop.
-    pub fn new(prefix: &str, stem: &str, extension: &str) -> Self {
-        Self {
-            path: make_temp_path(prefix, stem, extension),
-            keep: false,
-        }
+    /// The file itself is not created here — this reserves a unique path and
+    /// registers it for cleanup on drop. Fails (with the driver's wording) when
+    /// no private directory can be created: an unusable `$TMPDIR` must be a
+    /// reported error, not a silent return to predictable names.
+    pub fn new(prefix: &str, stem: &str, extension: &str) -> Result<Self, String> {
+        let path = make_temp_path(prefix, stem, extension).ok_or_else(|| {
+            format!(
+                "Failed to reserve temporary file: no private temp directory could be created \
+                 under {} (check that $TMPDIR names a writable directory)",
+                temp_dir().display()
+            )
+        })?;
+        Ok(Self { path, keep: false })
     }
 
     /// Create a TempFile with a specific path (for cases where the caller
@@ -287,5 +318,78 @@ impl Drop for TempFile {
 impl std::fmt::Display for TempFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.path.display())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_temp_cleanup_and_permissions() {
+        let file = TempFile::new("test", "private", "o").unwrap();
+        let path = file.path().to_path_buf();
+        let directory = path.parent().unwrap().to_path_buf();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        std::fs::write(&path, b"object").unwrap();
+        drop(file);
+        assert!(!path.exists());
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn private_temp_keep_and_uniqueness() {
+        let mut a = TempFile::new("test", "same", "o").unwrap();
+        let b = TempFile::new("test", "same", "o").unwrap();
+        assert_ne!(a.path(), b.path());
+        let directory = a.path().parent().unwrap().to_path_buf();
+        a.set_keep(true);
+        drop(a);
+        assert!(directory.is_dir());
+        drop(b);
+    }
+
+    #[test]
+    fn private_temp_rejects_escape_and_missing_parent() {
+        // A caller-controlled stem must never escape the private directory.
+        assert!(TempFile::new("test", "../../victim", "o").is_err());
+        assert!(TempFile::new("test", "a/b", "o").is_err());
+        assert!(make_temp_path("test", "../victim", "o").is_none());
+        assert!(write_debug_dump("test", "../../victim", "s", b"x").is_none());
+        // A stem that is a plain name is accepted, dots included.
+        assert!(TempFile::new("test", "a.b", "o").is_ok());
+    }
+
+    #[test]
+    fn debug_dump_survives_and_lands_in_the_private_dir() {
+        let dump = write_debug_dump("test_dump", "probe", "s", b".text\n").unwrap();
+        assert!(dump.is_file());
+        assert_eq!(std::fs::read(&dump).unwrap(), b".text\n");
+        let dir = private_temp_dir().unwrap();
+        assert!(dump.starts_with(dir), "{dump:?} is not inside {dir:?}");
+        // …and a second dump for the same stem cannot collide with it.
+        let dump2 = write_debug_dump("test_dump", "probe", "s", b".data\n").unwrap();
+        assert_ne!(dump, dump2);
+        let _ = std::fs::remove_file(dump);
+        let _ = std::fs::remove_file(dump2);
+    }
+
+    #[test]
+    fn exclusive_write_refuses_an_existing_path() {
+        let file = TempFile::new("test", "exclusive", "o").unwrap();
+        let path = file.path().to_path_buf();
+        write_file_exclusive(&path, b"first").unwrap();
+        assert!(
+            write_file_exclusive(&path, b"second").is_err(),
+            "O_CREAT|O_EXCL must refuse to re-open an existing path"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
     }
 }

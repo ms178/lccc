@@ -37,6 +37,7 @@ mod helpers;
 mod identical_blocks;
 mod jump_thread;
 mod liveness;
+mod load_bswap_movbe;
 mod load_op_fuse;
 mod local_patterns;
 mod loop_trampoline;
@@ -177,10 +178,20 @@ fn pin_inline_asm_regions(store: &LineStore, infos: &mut [LineInfo]) {
 /// Text passes see only assembly, where a volatile load looks like any other
 /// load, so `reuse_redundant_loads` turned the second of two volatile reads of
 /// `*(volatile unsigned *)p` into a register copy, and one store of two
-/// consecutive volatile stores was folded away. Each line in the region gets the
-/// conservative `InlineAsm` classification (opaque, clobbers everything), which
-/// is the same fallback user inline asm uses, so no pass reorders, deletes, or
-/// reuses it. The markers are comments and reach the assembler harmlessly.
+/// consecutive volatile stores was folded away.
+///
+/// The pin is the `pinned` flag — the same "no pass may rewrite this line"
+/// contract the rest of the peephole honours (132 uses across 12 passes) — and
+/// deliberately NOT the opaque `InlineAsm` classification: a compiler-generated
+/// volatile access is a regular instruction whose register and memory operands
+/// the line parsers see exactly, whereas `InlineAsm` models an opaque body as
+/// reading every register.  Classifying these lines `InlineAsm` made the
+/// allocator pay defensive copies around every volatile access; the instruction
+/// ratchet in `check_vector_copy_elimination.sh` caught it (`reduction_vecreg`
+/// 99 -> 104 instructions against a budget of 103).  The pin keeps the
+/// semantics: no pass reorders, deletes, or reuses a volatile access.
+///
+/// The markers are comments and reach the assembler harmlessly.
 fn pin_volatile_access_regions(store: &LineStore, infos: &mut [LineInfo]) {
     let mut in_volatile = false;
     for i in 0..store.len() {
@@ -206,16 +217,9 @@ fn pin_volatile_access_regions(store: &LineStore, infos: &mut [LineInfo]) {
         {
             continue;
         }
-        infos[i] = LineInfo {
-            kind: LineKind::InlineAsm,
-            ext_kind: ExtKind::None,
-            trim_start: infos[i].trim_start,
-            has_indirect_mem: true,
-            rbp_offset: RBP_OFFSET_NONE,
-            reg_refs: u16::MAX,
-            pinned: true,
-            inert_dir: false,
-        };
+        // Keep the natural classification (and with it the accurate operand
+        // model); only forbid rewriting.
+        infos[i].pinned = true;
     }
 }
 
@@ -1798,6 +1802,26 @@ fn peephole_optimize_inner(
         // reference to %rsp): slots the allocator reserved and later
         // passes retired. GCC's leaf functions carry no such frame.
         frame_compact::remove_dead_leaf_frame(&mut store, &mut infos);
+    }
+
+    // Phase 7a: `load` + `bswap` on one register -> one MOVBE.
+    //
+    // It runs HERE, not with the phase-1 folds, because the pair does not
+    // exist until the copy/relay passes have settled: isel emits the byte swap
+    // against its own operand and the allocator's copies are still in place
+    // (`movq (%rdi), %rax; movq %rax, %rdi; bswapq %rdi`), so a phase-1
+    // matcher sees `load; copy` and nothing to fuse.  Measured for the oracle
+    // at -march=x86-64-v3: GCC 16.2 and ICX emit `movbeq (%rdi), %rax` where
+    // LCCC emitted `movq` + `bswapq`, and Clang 23.1 emits a twelve-instruction
+    // `vpmovzxbq`/`vpsllvq`/`vpor` chain.  Its own skip name (`movbe_fuse`) and
+    // its own `X86Isa::movbe` permission (`-mno-movbe`, `-march=x86-64`), so
+    // the A/B is one flag and the target contract is the driver's.
+    if !sk("movbe_fuse") {
+        load_bswap_movbe::fuse_load_bswap(
+            &mut store,
+            &mut infos,
+            crate::backend::x86::isa::current().movbe,
+        );
     }
 
     // Phase 7b: Narrow `movabsq/movq $imm` to `movl` where zero-extension

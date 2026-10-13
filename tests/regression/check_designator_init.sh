@@ -4,10 +4,10 @@
 # A `.name` designator must name a member (searching anonymous members); a
 # `[i]` designator must be a non-negative index within a known array length.
 # Rows are in tests/regression/designator_init/cases.tsv and were measured
-# against GCC 16.2. Each row is checked twice:
+# against the oracle. Each row is checked twice:
 #   * the oracle must still give the recorded verdict (drift check), and
 #   * lccc must give the same verdict; a rejection must carry the diagnostic.
-# The oracle is GCC 16.2 (tests/regression/lib/gcc_oracle.sh). A missing oracle
+# The oracle is the oracle (tests/regression/lib/gcc_oracle.sh). A missing oracle
 # fails the gate; it is never skipped.
 set -euo pipefail
 . tests/regression/lib/gcc_oracle.sh
@@ -31,14 +31,14 @@ while IFS=$'\t' read -r id expect diag body; do
 
     if "$GCC_ORACLE_BIN" -fsyntax-only -w "$tu" >/dev/null 2>&1; then gv=accept; else gv=reject; fi
     if [[ $gv != "$expect" ]]; then
-        echo "FAIL $id: oracle drift: GCC 16.2 says $gv, the table says $expect" >&2
+        echo "FAIL $id: oracle drift: GCC $GCC_ORACLE_MAJOR says $gv, the table says $expect" >&2
         fail=$((fail + 1)); continue
     fi
 
     lerr=$tmp/$id.err
     if "$CCC" -fsyntax-only "$tu" >/dev/null 2>"$lerr"; then lv=accept; else lv=reject; fi
     if [[ $lv != "$expect" ]]; then
-        echo "FAIL $id: lccc $lv, GCC 16.2 $expect" >&2
+        echo "FAIL $id: lccc $lv, GCC $GCC_ORACLE_MAJOR $expect" >&2
         sed -n '1,3p' "$lerr" >&2
         fail=$((fail + 1)); continue
     fi
@@ -53,4 +53,4 @@ if (( fail > 0 )); then
     echo "check_designator_init: FAILED ($fail of $rows rows)" >&2
     exit 1
 fi
-echo "check_designator_init: PASSED ($rows rows vs GCC 16)"
+echo "check_designator_init: PASSED ($rows rows vs GCC $GCC_ORACLE_MAJOR)"

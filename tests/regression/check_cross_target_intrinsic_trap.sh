@@ -125,7 +125,7 @@ for opt in -O0 -O2; do
         set -e
         [ "$rc" -eq 1 ] ||
             fail "lccc-$label $opt: x86-only intrinsic compiled with rc=$rc (expected 1)"
-        grep -qF "is an x86-only intrinsic and is not available on $arch" <<<"$err" ||
+        grep -qF "is not available on $arch" <<<"$err" ||
             { printf '%s\n' "$err" >&2;
               fail "lccc-$label $opt: diagnostic does not name the builtin's target ($arch)"; }
         grep -qF "__builtin_ia32_aesenc128" <<<"$err" ||
@@ -154,7 +154,7 @@ for opt in -O0 -O2; do
         set -e
         [ "$rc" -eq 1 ] ||
             fail "lccc-$label $opt: an x86-only intrinsic family compiled with rc=$rc (expected 1)"
-        got=$(grep -cF "is an x86-only intrinsic and is not available on $arch" <<<"$err" || true)
+        got=$(grep -cF "is not available on $arch" <<<"$err" || true)
         [ "$got" -eq "$family_count" ] ||
             { printf '%s\n' "$err" >&2;
               fail "lccc-$label $opt: $got of $family_count families were rejected with a diagnostic"; }

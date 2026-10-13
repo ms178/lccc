@@ -60,9 +60,17 @@
 //!
 //! * Features with no codegen permission bit fold to `0` even for a Raptor
 //!   Lake profile: `sha`, `adx`, `rdseed`, `fsgsbase`, `xsave*`, `gfni`,
-//!   `vaes`, `vpclmulqdq`, `avxvnni`, `avx512*`, `amx*`, `xop`, `sse4a`,
-//!   `tbm`, ... A `1` for an instruction the backend cannot promise is the bug
-//!   being fixed here; `-msha` is rejected outright for the same reason.
+//!   `avxvnni`, `avx512*`, `amx*`, `xop`, `sse4a`, `tbm`, ... A `1` for an
+//!   instruction the backend cannot promise is the bug being fixed here;
+//!   `-msha` is rejected outright for the same reason.
+//! * `vaes`/`vpclmulqdq` are tracked, but as the *256-bit* permission they
+//!   actually are: each requires the 256-bit vector class in addition to its
+//!   own `-m` flag, because the 128-bit encodings lccc emits are AES-NI and
+//!   PCLMUL and do not need VAES.  GCC's verdicts agree (`-mvaes` alone
+//!   rejects `_mm256_aesenc_epi128`; `-mavx2 -mvaes` and `-mavx512f -mvaes`
+//!   accept it), and `-mvaes` without AVX2 must not fold to `1`: the fold
+//!   promises what the backend may emit, and without the 256-bit class it may
+//!   not emit this one.
 //! * Because SSE4.2 has no codegen bit of its own, a denial of the SSE4.2-era
 //!   surface (`-mno-sse4.2`, `-mno-avx`) suppresses the *baseline* grant of
 //!   `sse4.2` even though legacy SSE4.2 encodings stay legal and the
@@ -111,11 +119,29 @@ pub enum X86Feature {
     Aes,
     Pclmul,
     Rdrnd,
+    Vaes,
+    Vpclmulqdq,
+    /// AVX-VNNI: the VEX-encoded dot-product family, `vpdpbusd`/`vpdpbusds`/
+    /// `vpdpwssd`/`vpdpwssds`.  Its own CPUID bit (leaf 7, EBX bit 4) and its
+    /// own `-mavxvnni` flag; VEX-encoded, so it needs a vector class too.
+    AvxVnni,
+    /// AVX-VNNI-INT8: `vpdpbssd(s)`, `vpdpbsud(s)`, `vpdpbuud(s)` -- the byte
+    /// forms where either input may be signed.  A separate CPUID bit and flag
+    /// (`-mavxvnniint8`), not a synonym of AVX-VNNI.
+    AvxVnniInt8,
+    /// AVX-VNNI-INT16: `vpdpwusd(s)`, `vpdpwuud(s)` -- the unsigned-word
+    /// forms.  A third, separate bit and flag (`-mavxvnniint16`).
+    AvxVnniInt16,
+    /// GFNI: the Galois-field byte instructions (`gf2p8mulb`,
+    /// `gf2p8affineqb`, `gf2p8affineinvqb`).  Legacy-encoded for xmm, so
+    /// `-mno-avx` does not remove it, and a separate CPUID bit and flag
+    /// (`-mgfni`) from the VNNI families.
+    Gfni,
 }
 
 impl X86Feature {
     /// Every tracked feature, for table-driven tests.
-    pub const ALL: [X86Feature; 22] = [
+    pub const ALL: [X86Feature; 28] = [
         X86Feature::Cmov,
         X86Feature::Fxsr,
         X86Feature::Mmx,
@@ -138,6 +164,12 @@ impl X86Feature {
         X86Feature::Aes,
         X86Feature::Pclmul,
         X86Feature::Rdrnd,
+        X86Feature::Vaes,
+        X86Feature::Vpclmulqdq,
+        X86Feature::AvxVnni,
+        X86Feature::AvxVnniInt8,
+        X86Feature::AvxVnniInt16,
+        X86Feature::Gfni,
     ];
 
     /// Canonical GCC spelling of the feature (the one `-m` flags use).
@@ -165,6 +197,12 @@ impl X86Feature {
             X86Feature::Aes => "aes",
             X86Feature::Pclmul => "pclmul",
             X86Feature::Rdrnd => "rdrnd",
+            X86Feature::Vaes => "vaes",
+            X86Feature::Vpclmulqdq => "vpclmulqdq",
+            X86Feature::AvxVnni => "avxvnni",
+            X86Feature::AvxVnniInt8 => "avxvnniint8",
+            X86Feature::AvxVnniInt16 => "avxvnniint16",
+            X86Feature::Gfni => "gfni",
         }
     }
 
@@ -199,6 +237,12 @@ impl X86Feature {
             "aes" => X86Feature::Aes,
             "pclmul" | "pclmulqdq" => X86Feature::Pclmul,
             "rdrnd" | "rdrand" => X86Feature::Rdrnd,
+            "vaes" => X86Feature::Vaes,
+            "vpclmulqdq" | "vpclmul" => X86Feature::Vpclmulqdq,
+            "avxvnni" => X86Feature::AvxVnni,
+            "avxvnniint8" => X86Feature::AvxVnniInt8,
+            "avxvnniint16" => X86Feature::AvxVnniInt16,
+            "gfni" => X86Feature::Gfni,
             _ => return None,
         })
     }
@@ -209,7 +253,7 @@ impl X86Feature {
     }
 }
 
-/// A set of [`X86Feature`]s (bitmask; 22 tracked features fit in a `u64`).
+/// A set of [`X86Feature`]s (bitmask; 28 tracked features fit in a `u64`).
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct EffectiveFeatures(u64);
 
@@ -300,6 +344,8 @@ mod tests {
         assert_eq!(X86Feature::parse("fma3"), Some(X86Feature::Fma));
         assert_eq!(X86Feature::parse("pclmulqdq"), Some(X86Feature::Pclmul));
         assert_eq!(X86Feature::parse("rdrand"), Some(X86Feature::Rdrnd));
+        // Clang/ICC spelling of the 256-bit carry-less multiply.
+        assert_eq!(X86Feature::parse("vpclmul"), Some(X86Feature::Vpclmulqdq));
         // Case-insensitive, like GCC's own comparison of the literal.
         assert_eq!(X86Feature::parse("AVX2"), Some(X86Feature::Avx2));
     }
@@ -316,10 +362,8 @@ mod tests {
             "fsgsbase",
             "xsave",
             "xsaveopt",
-            "gfni",
-            "vaes",
-            "vpclmulqdq",
-            "avxvnni",
+            "avx512vnni",
+            "avx512gfni",
             "avx512f",
             "avx512bw",
             "amx_tile",
@@ -331,6 +375,80 @@ mod tests {
         ] {
             assert_eq!(X86Feature::parse(name), None, "{name} must not be tracked");
         }
+    }
+
+    /// GFNI is tracked: it is a legacy-encoded (non-VEX) extension with its
+    /// own flag, so the fold must not tie it to the vector class the way the
+    /// 256-bit extensions are tied.
+    #[test]
+    fn gfni_is_tracked_and_separable_from_the_crypto_bits() {
+        assert_eq!(X86Feature::parse("gfni"), Some(X86Feature::Gfni));
+        assert_eq!(X86Feature::Gfni.name(), "gfni");
+        assert!(X86Feature::ALL.contains(&X86Feature::Gfni));
+        let mut set = EffectiveFeatures::EMPTY.with(X86Feature::Aes);
+        assert!(!set.contains(X86Feature::Gfni));
+        set.insert(X86Feature::Gfni);
+        assert!(set.contains(X86Feature::Gfni));
+        assert!(!set.contains(X86Feature::Pclmul));
+    }
+
+    /// The three AVX-VNNI groups are tracked separately and must stay
+    /// separate: one bit each, round-tripping through the canonical names a
+    /// `__builtin_cpu_supports` call uses, and never answering for a sibling.
+    #[test]
+    fn the_three_vnni_groups_are_tracked_and_distinct() {
+        for (feature, name) in [
+            (X86Feature::AvxVnni, "avxvnni"),
+            (X86Feature::AvxVnniInt8, "avxvnniint8"),
+            (X86Feature::AvxVnniInt16, "avxvnniint16"),
+        ] {
+            assert_eq!(X86Feature::parse(name), Some(feature));
+            assert_eq!(feature.name(), name);
+            assert!(X86Feature::ALL.contains(&feature));
+            let mut set = EffectiveFeatures::EMPTY;
+            set.insert(feature);
+            assert!(set.contains(feature));
+            for other in [
+                X86Feature::AvxVnni,
+                X86Feature::AvxVnniInt8,
+                X86Feature::AvxVnniInt16,
+            ] {
+                if other != feature {
+                    assert!(!set.contains(other), "{name} answered for {:?}", other);
+                }
+            }
+        }
+    }
+
+    /// VAES/VPCLMULQDQ are the 256-bit crypto extensions: tracked, but the
+    /// *permission* is a conjunction the driver folds (256-bit vector class
+    /// AND the extension's own flag).  The names must resolve so a dispatcher
+    /// that asks about them gets a truthful answer instead of `unknown`.
+    #[test]
+    fn the_256bit_crypto_extensions_are_tracked() {
+        assert_eq!(X86Feature::parse("vaes"), Some(X86Feature::Vaes));
+        assert_eq!(
+            X86Feature::parse("vpclmulqdq"),
+            Some(X86Feature::Vpclmulqdq)
+        );
+        assert_eq!(X86Feature::Vaes.name(), "vaes");
+        assert_eq!(X86Feature::Vpclmulqdq.name(), "vpclmulqdq");
+        assert!(X86Feature::ALL.contains(&X86Feature::Vaes));
+        assert!(X86Feature::ALL.contains(&X86Feature::Vpclmulqdq));
+        // The bitmask must keep the two apart, and apart from the 128-bit bits
+        // that share their mnemonics: `aes`/`pclmul` must never answer for
+        // them (GCC rejects `_mm256_aesenc_epi128` under `-mpclmul`, measured).
+        let mut set = EffectiveFeatures::EMPTY.with(X86Feature::Aes);
+        assert!(!set.contains(X86Feature::Vaes));
+        assert!(!set.contains(X86Feature::Vpclmulqdq));
+        set.insert(X86Feature::Vaes);
+        set.insert(X86Feature::Vpclmulqdq);
+        assert!(set.contains(X86Feature::Vaes));
+        assert!(set.contains(X86Feature::Vpclmulqdq));
+        assert!(set.contains(X86Feature::Aes));
+        // and `pclmul`/`vpclmulqdq` are not the same feature either
+        let clmul_only = EffectiveFeatures::EMPTY.with(X86Feature::Pclmul);
+        assert!(!clmul_only.contains(X86Feature::Vpclmulqdq));
     }
 
     #[test]

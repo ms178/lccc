@@ -66,9 +66,9 @@ expect_rejected() {
     echo "ok: $file -> $(head -1 "$file.err")"
 }
 
-expect_rejected count.c "mask element count must match"
-expect_rejected floatmask.c "must be a vector of integers"
-expect_rejected nonvector.c "must be a vector of integers"
+expect_rejected count.c "number of elements of the argument vector(s) and the mask vector should be the same"
+expect_rejected floatmask.c "last argument must be an integer vector"
+expect_rejected nonvector.c "last argument must be an integer vector"
 
 # AUD-ICE-1's sibling arms (the same `panic!` family, reached through
 # `__builtin_shufflevector`'s constant-index form).
@@ -80,7 +80,7 @@ cat >svnonconst.c <<'C'
 typedef int v4si __attribute__((vector_size(16)));
 v4si s(v4si a, v4si b, int i) { return __builtin_shufflevector(a, b, 0, 1, 2, i); }
 C
-expect_rejected svrange.c "out of range"
+expect_rejected svrange.c "invalid element index '9'"
 expect_rejected svnonconst.c "must be an integer constant expression"
 
 # --- the oracle: GCC rejects the same three programs ------------------------
@@ -110,6 +110,11 @@ static v4si three_arg(v4si a, v4si b) { return __builtin_shuffle(a, b, (v4si){4,
 /* Runtime mask: the lowering unrolls the gather, so this is not a
    constant-only builtin. Values are taken modulo the vector length. */
 static v4si runtime_mask(v4si a, v4si b, v4si m) { return __builtin_shuffle(a, b, m); }
+/* 2-argument form with an OUT-OF-RANGE mask: GCC accepts it and reduces the
+   index modulo the lane count (measured: `{4,5,6,7}` on a v4si returns that
+   vector unchanged), so nothing is read past the 16 bytes of v1.  The old
+   lowering reduced modulo 2N here and read 3 lanes of uninitialized stack. */
+static v4si oob_mask(v4si a) { return __builtin_shuffle(a, (v4si){4, 5, 6, 7}); }
 static v4si clang_static(v4si a, v4si b) {
     return __builtin_shufflevector(a, b, 0, 5, 2, -1); /* -1 = don't care */
 }
@@ -147,6 +152,7 @@ int main(void) {
     v4si r2 = two_arg(a);
     v4si r3 = three_arg(a, b);
     v4si rm = runtime_mask(a, b, (v4si){0, 5, 2, 7});
+    v4si ro = oob_mask(a);
     v4si rs = clang_static(a, b);
     v4si rn = narrow_mask(a, (v4u8){1, 0, 3, 2});
     v4si rd = direct_return(a);
@@ -167,6 +173,7 @@ int main(void) {
     printf("%d %d %d %d\n", r2[0], r2[1], r2[2], r2[3]);
     printf("%d %d %d %d\n", r3[0], r3[1], r3[2], r3[3]);
     printf("%d %d %d %d\n", rm[0], rm[1], rm[2], rm[3]);
+    printf("%d %d %d %d\n", ro[0], ro[1], ro[2], ro[3]);
     printf("%d %d %d\n", rs[0], rs[1], rs[2]);
     printf("%d %d %d %d\n", rn[0], rn[1], rn[2], rn[3]);
     return 0;
@@ -185,7 +192,7 @@ for opt in -O0 -O2; do
         ./"lccc-gcc$opt.bin" > "lccc-gcc$opt.txt"
         gcc $opt valid_gcc.c -o "gcc$opt.bin" || fail "oracle build failed at $opt"
         ./"gcc$opt.bin" > "gcc$opt.txt"
-        [[ $(wc -l < "gcc$opt.txt") == 8 ]] || fail "oracle output shape changed at $opt"
+        [[ $(wc -l < "gcc$opt.txt") == 9 ]] || fail "oracle output shape changed at $opt"
         cmp "lccc-gcc$opt.txt" "gcc$opt.txt" \
             || { paste "lccc-gcc$opt.txt" "gcc$opt.txt" >&2; fail "valid-form results differ from gcc at $opt"; }
     fi

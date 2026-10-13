@@ -3,9 +3,9 @@
 #
 # Each row of tests/regression/seg_conv/parity_table.tsv is one conversion
 # shape (assignment, argument, return, initializer, comparison, struct,
-# pointee chain). The row's `expect` column is GCC 16.2's verdict, recorded
+# pointee chain). The row's `expect` column is the oracle's verdict, recorded
 # when the table was written; the gate re-checks all three:
-#   expect == GCC 16.2 (gcc -w)  the table itself has not drifted from GCC;
+#   expect == the oracle (gcc -w)  the table itself has not drifted from GCC;
 #   expect == lccc                lccc agrees with the oracle on every shape.
 # Verdicts are accept/reject only. Diagnostic wording is not oracle-compared
 # (see the seg_conv README); a reject must carry an address-space,
@@ -79,7 +79,7 @@ while IFS=$'\t' read -r id expect ctx body; do
     lverdict=$(exit_verdict "$lrc")
     gverdict=$(exit_verdict "$grc")
     if [ "$gverdict" != "$expect" ]; then
-        echo "FAIL: $id: table says $expect but the GCC 16 oracle says $gverdict; fix the table" >&2
+        echo "FAIL: $id: table says $expect but the GCC $GCC_ORACLE_MAJOR oracle says $gverdict; fix the table" >&2
         fail=1
     fi
     if [ "$lverdict" != "$expect" ]; then

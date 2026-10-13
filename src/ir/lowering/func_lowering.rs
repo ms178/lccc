@@ -980,6 +980,13 @@ impl Lowerer {
             }
         }
 
+        // Runtime CPU probe initialisation (AUD-CPU-1): one guarded call at
+        // the end of the entry block for every function that reads a probe
+        // word.  Pushed last so it is after every IR instruction (it can
+        // therefore not perturb the leading alloca run mem2reg identifies
+        // positionally) and still dominates every successor block.
+        self.splice_cpu_probe_init();
+
         // Inline linkage rules (GNU89 vs C99):
         //
         // GNU89 mode (explicit __attribute__((gnu_inline)) OR -fgnu89-inline / -std=c89):

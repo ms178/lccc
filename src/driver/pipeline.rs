@@ -1256,7 +1256,7 @@ impl Driver {
                 // to -Wl, and -l flags. This is critical for --whole-archive support.
             } else if Self::is_assembly_source(input_file) || self.is_explicit_assembly() {
                 // .s/.S files (or -x assembler): pass to assembler, then link
-                let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o");
+                let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o")?;
                 self.assemble_source_file(input_file, tmp.to_str())?;
                 temp_guards.push(tmp);
             } else if !Self::is_c_source(input_file) && Self::looks_like_binary_object(input_file) {
@@ -1269,7 +1269,7 @@ impl Driver {
                 #[cfg(feature = "gcc_m16")]
                 if self.code16gcc {
                     use super::external_tools::GccM16Mode;
-                    let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o");
+                    let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o")?;
                     self.compile_with_gcc_m16(input_file, tmp.to_str(), GccM16Mode::Object)?;
                     if self.verbose {
                         eprintln!("Compiled (GCC -m16): {}", input_file);
@@ -1281,7 +1281,7 @@ impl Driver {
                 // Compile .c files to .o (handles .code16gcc prepend via internal codegen)
                 let asm = self.compile_to_assembly(input_file)?;
 
-                let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o");
+                let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o")?;
                 let extra = self.build_asm_extra_args();
                 self.target
                     .assemble_with_extra(&asm, tmp.to_str(), &extra)?;
@@ -1638,6 +1638,11 @@ impl Driver {
         // reaches any function-level backend path.  The Arc is threaded via
         // CodegenOptions rather than re-reading process environment there.
         let ra_config = std::sync::Arc::new(crate::backend::regalloc::RaConfig::from_process_env());
+
+        // Clear the "this translation unit reads a runtime CPU probe word"
+        // latch before lowering; the codegen tail below appends the probe
+        // helper it latches (AUD-CPU-1).
+        crate::common::cpu_probe::reset_runtime_needed();
 
         // Resolve the microarchitectural tuning row once per compilation.
         // `-mtune` wins over `-march`, `native` goes through CPUID; both
@@ -1998,7 +2003,7 @@ impl Driver {
             self.target,
             self.code16gcc,
             self.fp_reassoc,
-            self.fp_contract,
+            self.resolved_fp_contract(),
             // Code-generation ISA permission — one struct shared with the
             // backend (see backend::x86::isa for the policy). i686 has no
             // baseline SSE2 and its vector lowerings are x86-64 shapes, so it
@@ -2647,7 +2652,7 @@ impl Driver {
             data_sections: self.data_sections,
             code16gcc: self.code16gcc,
             regparm: self.regparm,
-            fp_contract: self.fp_contract,
+            fp_contract: self.resolved_fp_contract(),
             fma: self.enable_fma,
             preferred_stack_bytes: self.preferred_stack_bytes,
             omit_frame_pointer: self.omit_frame_pointer,
@@ -2660,7 +2665,7 @@ impl Driver {
         let asm = self.target.generate_assembly_with_opts_and_debug(
             &module,
             &opts,
-            source_manager.as_ref(),
+            source_manager.as_deref(),
         );
         // `-mno-sse` / `-mgeneral-regs-only` (x86-64): the xmm register file
         // is architecturally off-limits — the kernel runs with CR4.OSFXSR
@@ -2719,6 +2724,31 @@ impl Driver {
         if self.verbose {
             eprintln!("Generated {:?} assembly ({} bytes)", self.target, asm.len());
         }
+
+        // Runtime CPU probe helper (AUD-CPU-1): appended only when a probe
+        // site was actually lowered, so a translation unit that never asks
+        // about CPU features carries no extra bytes.  The helper's symbols are
+        // `.local`: several objects in one link each get their own copy, none
+        // of them can collide, and no user definition can preempt the
+        // initialiser the generated call sites resolve to.
+        let probe_target = match self.target {
+            Target::X86_64 => Some(crate::common::cpu_probe::ProbeTarget::X86_64),
+            Target::I686 => Some(crate::common::cpu_probe::ProbeTarget::I686),
+            Target::Aarch64 | Target::Riscv64 => None,
+        };
+        let asm = match probe_target {
+            Some(probe_target) if crate::common::cpu_probe::take_runtime_needed() => {
+                let mut text = asm;
+                text.push('\n');
+                text.push_str(&crate::common::cpu_probe::runtime_asm(
+                    probe_target,
+                    self.pic || self.shared_lib || self.pie,
+                    !self.no_unwind_tables,
+                ));
+                text
+            }
+            _ => asm,
+        };
 
         Ok(asm)
     }
@@ -2838,6 +2868,25 @@ impl Driver {
         }
     }
 
+    /// Effective FP contraction policy (GCC parity, measured 2026-10-13 on
+    /// gcc 14.2 with `-march=x86-64-v3` probes).
+    ///
+    /// GCC never fuses `a*b + c` into an FMA at `-O0` or `-O1` — not even when
+    /// the target has FMA and not even under `-ffast-math`; the fusion appears
+    /// at `-O2`.  LCCC's C default is `-ffp-contract=fast` (which matches
+    /// GCC's *flag* default), and applying it at every optimization level made
+    /// `-O0`/`-O1` output differ from GCC's in the last ulp(s) — which is how
+    /// 26 in-repo reproducers came to be filed as "miscompile" although both
+    /// results are conforming.  An explicit `-ffp-contract=` or `-ffast-math`
+    /// still wins at any level.
+    pub(super) fn resolved_fp_contract(&self) -> crate::common::fp_contract::FpContract {
+        use crate::common::fp_contract::FpContract;
+        if !self.fp_contract_explicit && self.opt_level < 2 {
+            return FpContract::Off;
+        }
+        self.fp_contract
+    }
+
     pub(super) fn resolved_movbe(&self) -> bool {
         self.target == Target::X86_64
             && !self.movbe_explicitly_disabled
@@ -2934,6 +2983,76 @@ impl Driver {
         // remove them.
         set.insert_if(simd && self.enable_aes, F::Aes);
         set.insert_if(simd && self.enable_pclmul, F::Pclmul);
+        // VAES / VPCLMULQDQ: the EVEX 256-bit forms of `aesenc` and
+        // `pclmulqdq`.  Two conditions, both measured against GCC 12.2:
+        //   * the 256-bit vector class must be permitted (`isa.ymm`, the
+        //     AVX2-and-not-denied ceiling).  `-mvaes` alone rejects
+        //     `_mm256_aesenc_epi128`; `-mavx2 -mvaes` and `-mavx512f -mvaes`
+        //     accept it -- AVX-512 brings its own 256-bit permission, which is
+        //     why this follows `isa` (and not a second `-mavx2` test) rather
+        //     than the raw `enable_avx2` flag;
+        //   * the extension itself must be requested, exactly like AES-NI:
+        //     no `-march=` profile in the table grants it implicitly, and the
+        //     backend emits the 256-bit classes only for the `-mvaes` /
+        //     `-mvpclmulqdq` request.
+        // Folding `1` here promises the class, and the two halves of the
+        // conjunction are the two ways the promise could be wrong: without
+        // `isa.ymm` the emitter cannot encode the instruction, and without the
+        // request flag the backend was never asked for it.
+        set.insert_if(isa.ymm && self.enable_vaes, F::Vaes);
+        set.insert_if(isa.ymm && self.enable_vpclmulqdq, F::Vpclmulqdq);
+
+        // The three AVX-VNNI groups: `vpdpbusd`/`vpdpwssd` (AVX-VNNI),
+        // `vpdpbssd`/`vpdpbsud`/`vpdpbuud` (AVX-VNNI-INT8) and
+        // `vpdpwusd`/`vpdpwuud` (AVX-VNNI-INT16).  Distinct CPUID bits
+        // (leaf 7: EBX bit 4, ECX bit 4, EDX bit 4) and distinct GCC flags,
+        // so they get distinct bits here -- one bit each, never a shared
+        // "vnni" umbrella.
+        //
+        // Shape, measured against GCC 12.2 (`-march=raptorlake` is unknown to
+        // it; `-march=alderlake` is the CPU profile):
+        //
+        //   _mm_dpbusd_epi32 / _mm256_dpbusd_epi32
+        //     -march=x86-64               reject   <- lccc emitted vpdpbusd
+        //     -march=x86-64-v3            reject      in ALL of these columns,
+        //     -mavxvnni                   accept      i.e. an AVX-VNNI
+        //     -mavxvnni -mno-avx          reject      instruction inside a v1
+        //     -mavxvnni -mno-avx2         reject      object: the SIGILL class
+        //     -mavx512vnni                reject      AUD-CPU-3 exists for
+        //     -mavx512vnni -mavx512vl     accept
+        //     -march=alderlake            accept
+        //
+        // The measured rows are the VEX-256 class (`isa.ymm`, which AVX-512
+        // also grants) conjoined with the extension's own flag -- the same
+        // shape as VAES/VPCLMULQDQ above, and the same one GCC's header guard
+        // implements.  One row deviates and is asserted as such by
+        // tests/regression/check_intrinsic_feature_gate.sh: GCC's `-mavxvnni`
+        // also implies AVX2, so `-march=x86-64 -mavxvnni` is accepted there
+        // while this fold refuses it, because the user asked for a v1 baseline
+        // and the 256-bit class is what the backend actually needs to emit the
+        // instruction.  Refusing a request is the safe direction; emitting an
+        // unrequested instruction is not.
+        //
+        // GCC 12.2 cannot be an oracle for the INT8/INT16 halves: it does not
+        // know either flag (measured: `unrecognized command-line option
+        // '-mavxvnniint8'`), and its headers declare none of those intrinsics.
+        // Those rows are therefore pinned by lccc's own flag contract, and the
+        // gate says so instead of pretending to compare.
+        let avx512_vnni = self.enable_avx512vnni && self.enable_avx512vl;
+        set.insert_if(isa.ymm && (self.enable_avxvnni || avx512_vnni), F::AvxVnni);
+        set.insert_if(isa.ymm && self.enable_avxvnniint8, F::AvxVnniInt8);
+        set.insert_if(isa.ymm && self.enable_avxvnniint16, F::AvxVnniInt16);
+
+        // GFNI: `gf2p8mulb` and the two affine transforms.  Legacy-encoded for
+        // xmm (there is no non-VEX-free requirement), so -- unlike the four
+        // extensions above -- the permission is the vector class alone plus the
+        // extension's own flag, and `-mno-avx` does NOT remove it.  Measured
+        // against GCC 12.2: `-mgfni` accepts `_mm_gf2p8mul_epi8` with and
+        // without `-mavx`, `-march=x86-64`/`-v3`/`-maes` reject it, and before
+        // this row lccc emitted `gf2p8mulb %xmm1, %xmm0` for `-march=x86-64`:
+        // the same SIGILL class as the VNNI case, on an instruction whose
+        // *legacy* encoding makes `-mno-avx` useless as a defence.
+        set.insert_if(simd && self.enable_gfni, F::Gfni);
 
         // Integer ISA: the resolved predicates already encode the default
         // grant, the `-march` ceiling and the sticky denials — the same
@@ -2957,6 +3076,10 @@ impl Driver {
         if self.target != Target::X86_64 || self.no_sse || self.general_regs_only {
             return X86Isa::NONE;
         }
+        // MOVBE is orthogonal to the SIMD ceiling: `resolved_movbe` owns its
+        // permission (`-mno-movbe`, or an explicit `-march=` that does not
+        // include it), so it is carried through both arms below.
+        let movbe = self.resolved_movbe();
         let ceiling = if self.x86_march_explicit {
             X86Isa {
                 simd: true,
@@ -2964,9 +3087,13 @@ impl Driver {
                 avx: self.enable_avx,
                 ymm: self.enable_avx2,
                 fma: self.enable_fma,
+                movbe,
             }
         } else {
-            X86Isa::V3
+            X86Isa {
+                movbe,
+                ..X86Isa::V3
+            }
         };
         X86Isa {
             simd: true,
@@ -2978,6 +3105,10 @@ impl Driver {
             // including the scalar FMA families).
             ymm: ceiling.ymm && !self.avx_explicitly_disabled && !self.avx2_explicitly_disabled,
             fma: ceiling.fma && !self.fma_explicitly_disabled,
+            // NOT `&& !self.sse41_explicitly_disabled` and not gated on
+            // `simd`: MOVBE has no SSE dependency, and `-mno-sse` must leave
+            // it intact.
+            movbe: ceiling.movbe,
         }
         .normalized()
     }

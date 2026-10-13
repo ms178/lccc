@@ -1118,6 +1118,11 @@ impl Lowerer {
             }
         }
 
+        // Runtime CPU probe initialisation (AUD-CPU-1), nested-function path:
+        // same rule as the top-level finaliser — one guarded call, entry
+        // block, after every IR instruction.
+        self.splice_cpu_probe_init();
+
         let next_val = self.func_mut().next_value;
         let param_alloca_vals = std::mem::take(&mut self.func_mut().param_alloca_values);
         let ret_eightbyte_classes = self

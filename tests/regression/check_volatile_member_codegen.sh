@@ -12,7 +12,7 @@
 #
 # The check counts, per function at -O2, the stores with an immediate source
 # (`mov $imm, mem`) and the memory-operand references (loads and stores). lccc
-# must match GCC 16.2 on every probe, and each probe's GCC count is pinned so a
+# must match the oracle on every probe, and each probe's GCC count is pinned so a
 # fixture drift is reported as drift, not as a lccc bug.
 set -euo pipefail
 . tests/regression/lib/gcc_oracle.sh
@@ -87,10 +87,10 @@ for probe in m_ptr_store:store:2 m_obj_store:store:2 m_global_store:store:2 \
         l=$(count_mem_refs "$tmp/lccc.s" "$fn")
     fi
     if [[ $g != "$want" ]]; then
-        echo "FAIL $fn: GCC 16.2 $metric count is $g, the probe pins $want (fixture drift)" >&2
+        echo "FAIL $fn: GCC $GCC_ORACLE_MAJOR $metric count is $g, the probe pins $want (fixture drift)" >&2
         fail=$((fail + 1))
     elif [[ $l != "$g" ]]; then
-        echo "FAIL $fn: lccc $metric count is $l, GCC 16.2 keeps $g" >&2
+        echo "FAIL $fn: lccc $metric count is $l, GCC $GCC_ORACLE_MAJOR keeps $g" >&2
         sed -n "/^$fn:/,/\.size $fn,/p" "$tmp/lccc.s" >&2
         fail=$((fail + 1))
     fi
@@ -99,4 +99,4 @@ if (( fail > 0 )); then
     echo "check_volatile_member_codegen: FAILED ($fail)" >&2
     exit 1
 fi
-echo "check_volatile_member_codegen: PASSED (15 functions, store and memory-reference counts match GCC 16.2)"
+echo "check_volatile_member_codegen: PASSED (15 functions, store and memory-reference counts match GCC $GCC_ORACLE_MAJOR)"

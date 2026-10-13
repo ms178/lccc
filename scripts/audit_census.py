@@ -35,6 +35,10 @@ Metric definitions (this docstring is the contract):
   ``src/``; ``knobs_undocumented`` -- those not named in any tracked ``*.md``.
 * ``ignored_tests`` -- occurrences of ``#[ignore`` (AUD-ARM-GSF-1 requires each
   one to carry a backlog id).
+* ``ignored_tests_all`` -- the same count over the RAW file, i.e. including
+  ``#[cfg(test)]`` modules, which the stripping rule above drops.  A ratchet on
+  the stripped count alone cannot see a test module that keeps growing skips;
+  this one can, and a growing skip list is a silent reduction in coverage.
 
 Usage::
 
@@ -227,6 +231,7 @@ def census() -> dict[str, object]:
         "panic_sites_hot": 0,
         "unsafe_sites": 0,
         "ignored_tests": 0,
+        "ignored_tests_all": 0,
         "fns_over_300": 0,
         "fns_over_500": 0,
         "fns_over_1000": 0,
@@ -247,6 +252,9 @@ def census() -> dict[str, object]:
                 metrics["panic_sites_hot"] += panics
             metrics["unsafe_sites"] += len(UNSAFE_PAT.findall(text))
             metrics["ignored_tests"] += len(IGNORE_PAT.findall(text))
+            # RAW text on purpose: the stripped text has test modules removed,
+            # and a skip added inside one of them is exactly what must show up.
+            metrics["ignored_tests_all"] += len(IGNORE_PAT.findall(raw))
             for name, start, end in scan_functions(text):
                 length = end - start + 1
                 if length > 1000:
@@ -307,6 +315,7 @@ RATCHETED = (
     "panic_sites_hot",
     "unsafe_sites",
     "ignored_tests",
+    "ignored_tests_all",
     "fns_over_300",
     "fns_over_500",
     "fns_over_1000",
@@ -411,6 +420,11 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--selftest", action="store_true", help="self-test the scanner")
     parser.add_argument("--top-fns", type=int, metavar="N", default=0, help="list the N longest functions")
     parser.add_argument(
+        "--json",
+        action="store_true",
+        help="print the census as a JSON object (machine-readable, for the audit record)",
+    )
+    parser.add_argument(
         "--list-undocumented-knobs",
         action="store_true",
         help="print the CCC_*/LCCC_* literals that no markdown file names",
@@ -421,6 +435,11 @@ def main(argv: list[str]) -> int:
         return cmd_selftest()
 
     current = census()
+
+    if args.json:
+        payload = {k: v for k, v in sorted(current.items()) if not k.endswith("_names")}
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
 
     if args.list_undocumented_knobs:
         for name in current["knob_undocumented_names"]:
@@ -444,6 +463,7 @@ def main(argv: list[str]) -> int:
         "panic_sites_hot",
         "unsafe_sites",
         "ignored_tests",
+        "ignored_tests_all",
         "fns_over_300",
         "fns_over_500",
         "fns_over_1000",

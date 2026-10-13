@@ -53,7 +53,7 @@
 # the summary at the end so a long log cannot hide one.
 set -u -o pipefail
 
-cd "$(dirname "$0")/.." || exit 1
+cd "$(dirname "$0")/.."
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 export PATH="$CARGO_HOME/bin:$PATH"
@@ -173,6 +173,41 @@ if [ ! -x "$LCCC" ]; then
 fi
 
 # --------------------------------------------------------------- job:test --
+# The ratchet that keeps the 2026-10-13 audit's debt numbers from growing:
+# panic-class sites (AUD-ICE-1) overall and in the user-input pipeline,
+# `unsafe` sites, giant functions over 300/500/1000 lines (AUD-MONO-1),
+# undeclared CCC_*/LCCC_* knobs (AUD-KNOB-1) and unannotated #[ignore]s
+# (AUD-ARM-GSF-1).  --check refuses any metric that grew past
+# scripts/audit_census_baseline.json; a count may only be re-baselined in
+# the commit that adds the sites, and lowering the baseline belongs to the
+# commit that removes them.  Pure static scan -- it needs no compiler, and
+# it must run before the build so a regression is reported as itself.
+gate "audit-census-selftest" fast \
+    python3 scripts/audit_census.py --selftest
+gate "audit-census" fast \
+    python3 scripts/audit_census.py --check
+
+gate "rec2iter" fast \
+    env CCC="$LCCC" bash tests/regression/check_rec2iter.sh
+
+gate "fp-contract-parity" fast \
+    env CCC="$LCCC" bash tests/regression/check_fp_contract_parity.sh
+
+gate "ill-typed-builtins-selftest" fast \
+    python3 scripts/check_ill_typed_builtins.py --self-test
+gate "ill-typed-builtins" fast \
+    env CCC="$LCCC" python3 scripts/check_ill_typed_builtins.py --compiler "$LCCC"
+
+gate "cpu-supports-runtime" fast \
+    env CCC="$LCCC" bash tests/regression/check_cpu_supports_runtime.sh
+
+# The GOT-slot half of the same work: a local symbol referenced through its
+# GOT slot must keep the symbol in the relocation (folding it produced 145
+# instead of 25 with GNU ld and a fault under lccc-ld), and the x86-64 spelling
+# must match the pinned GAS 2.47 oracle form by form.
+gate "got-slot-local-addend" fast \
+    env CCC="$LCCC" bash tests/regression/check_got_slot_local_addend.sh
+
 gate "rust-toolchain-selector" fast \
     bash tests/regression/check_rust_toolchain_selector.sh
 
@@ -193,39 +228,6 @@ gate "audit-loop-contracts" fast \
 
 gate "ivsr-integer-domains" fast \
     env CCC="$LCCC" bash tests/regression/check_ivsr_domains.sh
-
-# Block-scope static initializers (C11 6.7.9p4), designator validity (6.7.9p2-p6),
-# and volatile typedef objects (6.7.8): each row is checked against GCC 16.2.
-gate "static-local-init" fast \
-    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_static_local_init.sh
-
-gate "designator-init" fast \
-    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_designator_init.sh
-
-# File-scope initializers (C11 6.7.9p4) against GCC 16.2, plus runtime values of
-# folded forms: a constant that is accepted but emitted as zero fails the values check.
-gate "file-scope-init" fast \
-    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_file_scope_init.sh
-
-gate "typedef-volatile-codegen" fast \
-    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_typedef_volatile_codegen.sh
-
-# Named-space initializers through brace elision and anonymous members, against
-# GCC 16.2 line by line (C11 6.7.9p17-p20, 6.7.2.2p13).
-gate "seg-init-brace-elision" fast \
-    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_seg_init_brace_elision.sh
-
-# Volatile struct members (memory-mapped register blocks, nested and anonymous
-# members) keep their stores and loads at -O2, against GCC 16.2 (C11 6.7.3p7).
-gate "volatile-member-codegen" fast \
-    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_volatile_member_codegen.sh
-
-# A `const volatile` object is volatile at every read: the `const` qualifier
-# forbids writes, it does not make the object a constant, so the read must not
-# be folded away (C11 6.7.3p7).  Globals, casts, typedef-qualified objects and
-# members, against GCC 16.2's per-function memory-reference counts.
-gate "const-volatile-objects" fast \
-    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_const_volatile_objects.sh
 
 # Executed miscompile regression for the iv_widen trajectory gates and the
 # exposed-latch intercept: runtime ring-top seeds over a 2^32-span marker
@@ -251,6 +253,16 @@ gate "aggregate-call-abi" fast \
 gate "vector-abi-boundary" fast \
     env CCC="$LCCC" bash tests/regression/check_vector_abi_boundary.sh
 
+# AUD-VABI-2: the 32-byte case of the same rule (WHOLE %ymm with AVX on).  Not
+# fixable like the 16-byte one -- it needs a %ymm carrier through return and
+# argument classification, the prologue, location allocation and the call
+# sequence -- so the gate measures and LATCHES the debt: the two working
+# configurations are asserted to stay correct, and the two broken cross legs
+# must show exactly the recorded verdict, so the bug cannot silently change
+# shape or be declared fixed without the fix.
+gate "vector-abi-wide-latched" fast \
+    env CCC="$LCCC" bash tests/regression/check_vector_abi_wide.sh
+
 # AUD-TMP-1: temp files must be symlink-proof. Drives the pre-placed-symlink
 # reproducer (and its pre-placed-directory variant) against the built compiler
 # and asserts the victim file is untouched, the compile still succeeds and
@@ -272,15 +284,6 @@ gate "compat-suite" fast \
     env CCC="$LCCC" bash tests/regression/check_compat_suite.sh
 gate "ivsr-reproducers" fast \
     env CCC="$LCCC" bash tests/regression/check_ivsr_reproducers.sh
-
-# AUD-CPU-1: `__builtin_cpu_supports` must fold from the effective codegen
-# permission (target + -march + -m* flags), not from a hard-coded CPU list.
-# The old table answered "yes" to AVX2/BMI2/SHA for every invocation, which put
-# runtime dispatch in zlib-ng/zstd/xz/OpenSSL on paths that SIGILL on hardware
-# without them. Also asserts non-x86 targets and non-literal arguments are
-# diagnosed instead of silently folding to 0.
-gate "cpu-supports-fold" fast \
-    env CCC="$LCCC" CCC_ARM=target/fastbuild/lccc-arm bash tests/regression/check_cpu_supports_fold.sh
 
 # AUD-ICE-1/AUD-DIAG-1: a malformed `__builtin_shuffle` mask must produce a
 # diagnostic, not a Rust panic (and the valid forms must still lower).  The
@@ -429,6 +432,18 @@ gate "loop-alignment-contract" fast \
 gate "i386-small-struct-abi-debt" fast \
     bash tests/regression/check_i386_regparm_small_struct_abi.sh
 
+# AUD-HYGIENE-1: the crash/miscompile reproducers in artifacts/repros/ are the
+# compiler's scar tissue and used to be replayed by nobody. Two legs with the
+# ISA pinned on BOTH compilers (an unpinned replay measures the difference
+# between lccc's x86-64-v3 baseline and gcc's x86-64 default, i.e. FMA
+# contraction, and reports 29 phantom failures); the declared
+# not-self-contained csmith files are checked in both directions so the list
+# cannot become a skip list.  See artifacts/repros/README.md.
+gate "repro-replay-selftest" fast \
+    python3 scripts/check_repro_replay.py --self-test
+gate "repro-replay" fast \
+    env CCC="$LCCC" python3 scripts/check_repro_replay.py
+
 # Same predicate, three consumers (-Wreturn-type, switch fallthrough, statement
 # expression value) and two ways to get it wrong: resolving a call's entity by
 # bare name, and dropping an attribute written on a nested definition.  The faces
@@ -573,6 +588,33 @@ gate "seg-copy-size-sweep" fast \
 gate "seg-pointee-chain-asm" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_seg_pointee_chain_asm.sh
 
+# Block-scope static initializers (C11 6.7.9p4), designator validity (6.7.9p2-p6),
+# volatile typedef objects and volatile members: each row is checked against the
+# oracle, and every folded value is run and compared (see lib/gcc_oracle.sh).
+gate "static-local-init" fast \
+    env CCC="$LCCC" bash tests/regression/check_static_local_init.sh
+gate "designator-init" fast \
+    env CCC="$LCCC" bash tests/regression/check_designator_init.sh
+gate "file-scope-init" fast \
+    env CCC="$LCCC" bash tests/regression/check_file_scope_init.sh
+gate "typedef-volatile-codegen" fast \
+    env CCC="$LCCC" bash tests/regression/check_typedef_volatile_codegen.sh
+gate "volatile-member-codegen" fast \
+    env CCC="$LCCC" bash tests/regression/check_volatile_member_codegen.sh
+# A `const volatile` object is volatile at every read: `const` forbids writes, it
+# does not make the object a constant, so the read must not be folded away
+# (C11 6.7.3p7).  Globals, casts, typedef-qualified objects and members.
+gate "const-volatile-objects" fast \
+    env CCC="$LCCC" bash tests/regression/check_const_volatile_objects.sh
+# Named-space conversion parity (the row's expect column is the oracle's verdict),
+# brace elision through anonymous members, and typedef-carried spaces in codegen.
+gate "seg-conversion-parity" fast \
+    env CCC="$LCCC" bash tests/regression/check_seg_conversion_parity.sh
+gate "seg-init-brace-elision" fast \
+    env CCC="$LCCC" bash tests/regression/check_seg_init_brace_elision.sh
+gate "seg-typedef-codegen" fast \
+    env CCC="$LCCC" bash tests/regression/check_seg_typedef_codegen.sh
+
 # Explicit casts between named address spaces warn as GCC 14.2 does; sizeof and
 # unnamed-parameter pointer-to-segment-pointer values are checked at run time.
 gate "seg-cast-warning" fast \
@@ -584,12 +626,6 @@ gate "seg-cast-warning" fast \
 gate "seg-declarator-space" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_seg_declarator_space.sh
 
-# Named-space codegen through a typedef or typeof: every access to the __seg_gs
-# object must carry the %gs: prefix (audit H2, silent miscompile). Mirrors the
-# hosted step in ci.yml; ci-gate-parity fails if the two drift apart.
-gate "seg-typedef-codegen" fast \
-    env CCC=target/fastbuild/lccc bash tests/regression/check_seg_typedef_codegen.sh
-
 # Named-space conversions: a decayed array in a named space (through an
 # identifier, a member of a named object, a subscript of a named array, or
 # pointer arithmetic on any of these) must be rejected where gcc 14.2 rejects
@@ -599,10 +635,6 @@ gate "seg-conv-diagnostics" fast \
 
 gate "seg-target-diagnostics" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_seg_target_diagnostics.sh
-# Table-driven parity: every conversion shape in seg_conv/parity_table.tsv is
-# checked against GCC 16.2 and lccc. Under CI a missing gcc fails the gate (tests/regression/lib/gcc_oracle.sh).
-gate "seg-conversion-parity" fast \
-    env CCC=target/fastbuild/lccc bash tests/regression/check_seg_conversion_parity.sh
 
 gate "chroot-bind" fast bash tests/regression/check_chroot_bind.sh
 
@@ -827,19 +859,6 @@ gate "phi-acyclic-copy-order" fast \
 
 gate "doc-link-integrity" fast \
     python3 scripts/check_doc_links.py
-
-# AUD-RATCHET-1: the audit's site counts are a ratchet, not a snapshot.  The
-# scanner self-tests first (its tokenizer is what every number rests on), then
-# --check refuses any metric that grew past scripts/audit_census_baseline.json:
-# panic-class sites overall and in the user-input pipeline, `unsafe` sites,
-# unannotated `#[ignore]`, functions over 300/500/1000 lines, and CCC_*/LCCC_*
-# literals without documentation.  A count may only be re-baselined in the
-# commit that adds the sites; lowering the baseline belongs to the commit that
-# removes them.
-gate "audit-census-selftest" fast \
-    python3 scripts/audit_census.py --selftest
-gate "audit-census-ratchet" fast \
-    python3 scripts/audit_census.py --check
 
 # The Expat differential is only a differential if both compilers ran the SAME
 # tests under the SAME feature configuration.  `junit_check.py` compares testcase

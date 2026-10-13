@@ -125,6 +125,8 @@ BENCHMARKS: tuple[Benchmark, ...] = (
               ("tls_seg_access.c",), ("workload", "glibc", "tls", "memory")),
     Benchmark("percpu_ptr_walk", "computed GS-base per-CPU pointer walk",
               ("percpu_ptr_walk.c",), ("synthetic", "kernel", "percpu", "memory")),
+    Benchmark("byte_load_reassembly", "portable little-endian byte assembly (Linux get_unaligned_le shape)",
+              ("byte_load_reassembly.c",), ("synthetic", "endian", "memory", "integer")),
     Benchmark("zlib_ng_adler32", "zlib-ng Adler-32 NMAX accumulator",
               ("zlib_ng_adler32.c",), ("workload", "zlib-ng", "checksum", "loop")),
     Benchmark("zlib_ng_adler32_combine", "zlib-ng checksum composition / modular arithmetic",

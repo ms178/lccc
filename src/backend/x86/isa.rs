@@ -66,6 +66,14 @@ pub struct X86Isa {
     pub ymm: bool,
     /// FMA3 (`vfmadd*`), VEX-encoded.
     pub fma: bool,
+    /// MOVBE (`movbe`) is legal.  Deliberately OUTSIDE the SSE implication
+    /// chain above: it is an integer load/store that performs a byte swap, and
+    /// it is not implied by — nor does it imply — any SIMD feature.  Its
+    /// permission comes from `-mmovbe`/`-mno-movbe` and the `-march=` baseline
+    /// (`x86-64-v3` and the named micro-architectures include it, plain
+    /// `x86-64` does not), mirroring `Driver::resolved_movbe`, which is also
+    /// where `__builtin_cpu_supports("movbe")` gets its answer.
+    pub movbe: bool,
 }
 
 impl X86Isa {
@@ -76,6 +84,7 @@ impl X86Isa {
         avx: false,
         ymm: false,
         fma: false,
+        movbe: false,
     };
 
     /// Plain x86-64 baseline: SSE2 only.
@@ -85,6 +94,7 @@ impl X86Isa {
         avx: false,
         ymm: false,
         fma: false,
+        movbe: false,
     };
 
     /// x86-64-v3: the project's code-generation baseline.
@@ -94,6 +104,7 @@ impl X86Isa {
         avx: true,
         ymm: true,
         fma: true,
+        movbe: true,
     };
 
     /// Enforce the implication chain (`ymm ⇒ avx ⇒ sse41 ⇒ simd`, `fma ⇒ avx`).
@@ -110,6 +121,7 @@ impl X86Isa {
             avx,
             ymm,
             fma,
+            movbe: self.movbe,
         }
     }
 
@@ -118,6 +130,7 @@ impl X86Isa {
     const BIT_AVX: u8 = 1 << 2;
     const BIT_YMM: u8 = 1 << 3;
     const BIT_FMA: u8 = 1 << 4;
+    const BIT_MOVBE: u8 = 1 << 5;
 
     const fn to_bits(self) -> u8 {
         let n = self.normalized();
@@ -126,6 +139,7 @@ impl X86Isa {
             | (if n.avx { Self::BIT_AVX } else { 0 })
             | (if n.ymm { Self::BIT_YMM } else { 0 })
             | (if n.fma { Self::BIT_FMA } else { 0 })
+            | (if n.movbe { Self::BIT_MOVBE } else { 0 })
     }
 
     const fn from_bits(b: u8) -> X86Isa {
@@ -135,6 +149,7 @@ impl X86Isa {
             avx: b & Self::BIT_AVX != 0,
             ymm: b & Self::BIT_YMM != 0,
             fma: b & Self::BIT_FMA != 0,
+            movbe: b & Self::BIT_MOVBE != 0,
         }
     }
 }
@@ -176,6 +191,7 @@ mod tests {
             avx: true,
             ymm: true,
             fma: true,
+            movbe: false,
         };
         assert_eq!(bogus.normalized(), X86Isa::NONE);
         let no_vex_fma = X86Isa {
@@ -184,6 +200,7 @@ mod tests {
             avx: false,
             ymm: true,
             fma: true,
+            movbe: false,
         };
         let n = no_vex_fma.normalized();
         assert!(n.simd && n.sse41 && !n.avx && !n.ymm && !n.fma);
@@ -191,11 +208,28 @@ mod tests {
 
     #[test]
     fn bits_round_trip() {
-        for bits in 0u8..32 {
+        for bits in 0u8..64 {
             let isa = X86Isa::from_bits(bits).normalized();
             assert_eq!(X86Isa::from_bits(isa.to_bits()), isa);
         }
         assert_eq!(X86Isa::from_bits(X86Isa::V3.to_bits()), X86Isa::V3);
         assert_eq!(X86Isa::from_bits(X86Isa::SSE2.to_bits()), X86Isa::SSE2);
+    }
+
+    #[test]
+    fn movbe_is_independent_of_the_simd_chain() {
+        // `-mno-sse` must not take MOVBE away (it is an integer load), and
+        // `-mno-movbe` must not take the SIMD world away.  The level constant
+        // for a plain x86-64 TU does not grant it.
+        let no_simd_but_movbe = X86Isa {
+            movbe: true,
+            ..X86Isa::NONE
+        };
+        assert!(no_simd_but_movbe.normalized().movbe);
+        assert!(!no_simd_but_movbe.normalized().simd);
+        // Compile-time facts, not runtime ones: the level constants are
+        // `const`, so the compiler asserts them while building the test.
+        const { assert!(!X86Isa::SSE2.movbe) };
+        const { assert!(X86Isa::V3.movbe) };
     }
 }

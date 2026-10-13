@@ -331,7 +331,7 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
             // vice versa: a later asm read keeps an earlier store alive).
             // Treat any inline-asm line in the window as a potential reader
             // of every slot.
-            if infos[j].kind == LineKind::InlineAsm {
+            if infos[j].kind == LineKind::InlineAsm || infos[j].pinned {
                 slot_read = true;
                 break;
             }

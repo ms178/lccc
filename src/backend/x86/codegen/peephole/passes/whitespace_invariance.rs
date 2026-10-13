@@ -368,10 +368,17 @@ fn corpus() -> Vec<(String, String)> {
     // keep.  Third-party assembly (gcc/clang/icx) is deliberately included:
     // the peephole must be whitespace-invariant on foreign text too, because
     // asm-diff feeds it exactly that.
-    out.extend(collect_asm(
-        std::path::Path::new(manifest),
-        &["tests", "engineering/evidence/godbolt/corpus"],
-    ));
+    let root = std::path::Path::new(manifest);
+    let mut subdirs = vec!["tests", "engineering/evidence/godbolt/corpus"];
+    // `work/` is a scratch tree that is *not* committed (it is in .gitignore);
+    // it is picked up when it exists so a developer's local dumps are covered,
+    // but nothing here may depend on it: the anti-vacuity floor below is
+    // anchored to the COMMITTED corpora only, so a tree without `work/` cannot
+    // make this test red and a tree *with* it cannot make the floor pass.
+    if root.join("work").is_dir() {
+        subdirs.push("work");
+    }
+    out.extend(collect_asm(root, &subdirs));
 
     if let Some(dir) = std::env::var_os("LCCC_ASM_CORPUS") {
         let generated = collect_asm(std::path::Path::new(&dir), &[]);
@@ -439,13 +446,26 @@ fn collect_asm(root: &std::path::Path, subdirs: &[&str]) -> Vec<(String, String)
 fn the_corpus_is_not_vacuous() {
     let corpus = corpus();
     let lines: usize = corpus.iter().map(|(_, text)| text.lines().count()).sum();
+    // Per-root floors, not one total: a total can be met by one root while the
+    // other silently disappears.  Measured on the committed tree
+    // (2026-10-13): `tests/` holds 16 `.s` files / 1338 lines (the curated
+    // regression captures) and `engineering/evidence/godbolt/corpus` holds 84
+    // files / 17987 lines (the asm-diff oracle corpus).  The floors are far
+    // below both -- they exist to fail a checkout that cannot find the
+    // assembly, not to fail a corpus that changed on purpose.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let curated = collect_asm(root, &["tests"]).len();
+    let oracle = collect_asm(root, &["engineering/evidence/godbolt/corpus"]).len();
     assert!(
-        corpus.len() >= FIXTURES.len() + 20,
-        "corpus holds only {} texts; the repository's committed assembly was not found",
-        corpus.len()
+        curated >= 12,
+        "curated tests/**/*.s corpus holds only {curated} texts; the committed regression captures were not found"
     );
     assert!(
-        lines > 2_000,
+        oracle >= 70,
+        "Godbolt oracle corpus holds only {oracle} texts; asm-diff's input was not found"
+    );
+    assert!(
+        lines > 10_000,
         "corpus holds only {lines} lines of assembly; too little to be evidence"
     );
 }

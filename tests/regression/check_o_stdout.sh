@@ -76,7 +76,18 @@ fi
 grep -q 'int f(void)' md.out || fail "-MD -E -o - stdout lost the preprocessed source"
 [[ -s ./-.d ]] || fail "-MD -E -o - did not write the derived '-.d' dep file (GCC writes it)"
 
-# 7. Oracle agreement when a system GCC is available: the same rows must have
+# 7. -dM -E -o - : macro definitions on stdout (GCC's -dM printer).
+"$CCC" -dM -E -o - x.c >dm.out 2>dm.err || { cat dm.err >&2; fail "lccc -dM -E -o - failed"; }
+grep -q '^#define __STDC__' dm.out || fail "-dM -E -o - stdout lost the macro definitions"
+[[ ! -e ./- ]] || fail "-dM -E -o - created a file named '-'"
+
+# 8. -MF - with -c: the dependency rule streams to stdout while the object goes
+#    to a real path.  This is the compile-and-assemble driver path, not the -M
+#    printer, so it pins the `-MF -` contract where build systems use it.
+"$CCC" -c x.c -o /dev/null -MMD -MF - >mf.out 2>mf.err || { cat mf.err >&2; fail "lccc -c -MMD -MF - failed"; }
+grep -q 'x\.c' mf.out || fail "-MF - did not stream the dependency rule"
+
+# 9. Oracle agreement when a system GCC is available: the same rows must have
 #    the same accept/reject status, so a future refactor cannot drift back to
 #    "writes a file named -" for the rows GCC streams.
 if command -v "$GCC" >/dev/null 2>&1; then
@@ -96,4 +107,28 @@ if command -v "$GCC" >/dev/null 2>&1; then
     fi
 fi
 
-echo "PASS: -o - streams to stdout for -S/-E/-M, is rejected for -c and multi-input, and leaves no file named '-'"
+# 10. Link mode is the documented GCC *wart*, pinned as parity: GCC 12 (and
+#     every release measured for this gate) does NOT stream an executable —
+#     `gcc -o - m.c` exits 0 and creates a file literally named `-`.  lccc
+#     matches that byte for byte (rc 0, file `-`, empty stdout), which is why
+#     the driver must not "helpfully" reject `-o -` here: a build script that
+#     passes `-o -` to a link step would then fail where GCC succeeds.
+if command -v "$GCC" >/dev/null 2>&1; then
+    rm -f ./- ./-.d
+    printf 'int main(void){return 0;}\n' >mm.c
+    gcc -o - mm.c >gcc_link.out 2>gcc_link.err
+    gcc_rc=$?
+    gcc_streamed=$(wc -c <gcc_link.out)
+    rm -f ./-
+    if "$CCC" -o - mm.c >lccc_link.out 2>lccc_link.err; then
+        lccc_rc=0
+    else
+        lccc_rc=$?
+    fi
+    lccc_streamed=$(wc -c <lccc_link.out)
+    [[ $lccc_rc = "$gcc_rc" ]] || fail "link-mode -o -: lccc rc=$lccc_rc, gcc rc=$gcc_rc"
+    [[ $lccc_streamed = "$gcc_streamed" ]] || fail "link-mode -o -: lccc wrote $lccc_streamed bytes to stdout, gcc $gcc_streamed"
+    [[ -x ./- ]] || fail "link-mode -o -: lccc did not produce the literal '-' executable GCC produces"
+fi
+
+echo "PASS: -o - streams to stdout for -S/-E/-M/-dM/-MF, is rejected for -c and multi-input, and leaves no file named '-' (link mode keeps GCC's literal-'-' behaviour)"

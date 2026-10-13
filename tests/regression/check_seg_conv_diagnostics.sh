@@ -4,7 +4,7 @@
 # arguments, assignments, returns and initializers.
 #
 # Every fixture in tests/regression/seg_conv/ is compiled with $CCC and with the
-# GCC 16.2 oracle (see lib/gcc_oracle.sh). The file name is the expected verdict:
+# the oracle oracle (see lib/gcc_oracle.sh). The file name is the expected verdict:
 #   neg_*.c  must be REJECTED, with an address-space diagnostic;
 #   pos_*.c  must be ACCEPTED.
 #
@@ -76,13 +76,13 @@ for f in "${files[@]}"; do
     fi
     gg=$(compile_verdict "$GCC_ORACLE_BIN" "-w" "$f" "$tmp/gcc.err")
     if [ "$gg" != "$want" ]; then
-        echo "FAIL: fixture $base expects $want but the GCC 16 oracle says $gg; fix the fixture" >&2
+        echo "FAIL: fixture $base expects $want but the GCC $GCC_ORACLE_MAJOR oracle says $gg; fix the fixture" >&2
         grep -m2 . "$tmp/gcc.err" >&2 || true
         fail=1
         continue
     fi
     if [ "$want" = reject ] && ! grep -q -e 'address space' -e 'incompatible pointer type' "$tmp/gcc.err"; then
-        echo "FAIL: the GCC 16 oracle rejects $base for a reason other than the address space" >&2
+        echo "FAIL: the GCC $GCC_ORACLE_MAJOR oracle rejects $base for a reason other than the address space" >&2
         grep -m2 . "$tmp/gcc.err" >&2 || true
         fail=1
     fi

@@ -14,11 +14,11 @@ ROOT = Path(__file__).resolve().parents[2]
 MOCK = r'''#!/usr/bin/env python3
 import json, os, pathlib, sys
 args = sys.argv[1:]
-# The gate pins its oracle to GCC 16 by major version (tests/regression/lib/
+# The gate pins its oracle to GCC 14 by major version (tests/regression/lib/
 # gcc_oracle.sh), so the stub answers the version query like GCC does. The
 # query is not a compile, so it is not logged.
 if '-dumpfullversion' in args:
-    print(os.environ.get('MOCK_GCC_VERSION', '16.2.0'))
+    print(os.environ.get('MOCK_GCC_VERSION', '14.2.0'))
     sys.exit(0)
 with open(os.environ['MOCK_LOG'], 'a') as log:
     log.write(json.dumps({'args': args, 'skip': os.environ.get('CCC_PEEPHOLE_SKIP', '')}) + '\n')
@@ -74,7 +74,7 @@ class SelectCompareControlTests(unittest.TestCase):
     def test_gcc13_oracle_is_refused_before_any_compile(self):
         result, calls = self.invoke(gcc_version='13.3.0')
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('the oracle is GCC 16', result.stdout + result.stderr)
+        self.assertIn('the oracle is GCC 14', result.stdout + result.stderr)
         self.assertEqual(calls, [])
 
     def test_noop_kill_switch_cannot_pass(self):
