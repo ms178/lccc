@@ -2026,14 +2026,9 @@ fn reduction_pattern_is_sound(
     };
     // A guarded reduction must match one exact Select update; arbitrary
     // comparisons/selects that read the accumulator remain unsupported.
-    let Some(guarded_select) = find_guarded_reduction_select(
-        func,
-        body_idx,
-        adds,
-        guard_cond,
-        accumulator_phis,
-        debug,
-    ) else {
+    let Some(guarded_select) =
+        find_guarded_reduction_select(func, body_idx, adds, guard_cond, accumulator_phis, debug)
+    else {
         return false;
     };
     // Labels of every loop block, to detect a phi's back-edge incoming.
