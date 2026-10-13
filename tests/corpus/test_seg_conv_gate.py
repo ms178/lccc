@@ -11,7 +11,8 @@ FAKE = '''#!/usr/bin/env python3
 import os, sys
 from pathlib import Path
 name = Path(sys.argv[0]).name
-major = '13' if name == 'gcc' or name == 'gcc-13' else '14'
+major = {'gcc': '13', 'gcc-13': '13', 'gcc-14': '14',
+         'gcc-15': '15', 'gcc-16': '16'}.get(name, '0')
 if '-dumpversion' in sys.argv:
     print(major); sys.exit(0)
 if '--version' in sys.argv:
@@ -32,7 +33,7 @@ class SegmentConversionGateTests(unittest.TestCase):
     def run_gate(self, **overrides):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
-            for name in ['ccc', 'gcc', 'gcc-13', 'gcc-14']:
+            for name in ['ccc', 'gcc', 'gcc-13', 'gcc-14', 'gcc-15', 'gcc-16']:
                 p = d / name
                 p.write_text(FAKE)
                 p.chmod(0o755)
@@ -42,10 +43,10 @@ class SegmentConversionGateTests(unittest.TestCase):
             return subprocess.run(['bash', str(GATE)], cwd=ROOT, env=env,
                                   capture_output=True, text=True)
 
-    def test_versioned_oracle_beats_unversioned_gcc13(self):
+    def test_newest_versioned_oracle_beats_unversioned_gcc13(self):
         r = self.run_gate()
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn('Conversion oracle: gcc-14', r.stdout)
+        self.assertIn('Conversion oracle: gcc-16', r.stdout)
         self.assertIn('two compilers, positive controls', r.stdout)
 
     def test_explicit_unsupported_or_missing_oracle_is_not_silently_replaced(self):

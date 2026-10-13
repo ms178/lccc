@@ -12,7 +12,9 @@ trap 'rm -rf "$tmp"' EXIT
 if [[ -n ${GCC:-} ]]; then
     candidates=("$GCC")
 else
-    candidates=(gcc-14 gcc-15 gcc-16 gcc)
+    # Prefer the newest installed supported oracle; selecting gcc-14 first
+    # silently left the gate on an older compiler even when GCC 16 was present.
+    candidates=(gcc-16 gcc-15 gcc-14 gcc)
 fi
 GCC=''
 for candidate in "${candidates[@]}"; do
@@ -25,7 +27,7 @@ for candidate in "${candidates[@]}"; do
     fi
 done
 if [[ -z $GCC ]]; then
-    echo "FAIL: conversion oracle requires GCC >= 14; install gcc-14 or set GCC (tried: ${candidates[*]})" >&2
+    echo "FAIL: conversion oracle requires GCC >= 14; install gcc-16 (preferred) or set GCC to a suitable compiler (tried: ${candidates[*]})" >&2
     exit 1
 fi
 version=$("$GCC" --version)
