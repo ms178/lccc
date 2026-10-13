@@ -362,7 +362,7 @@ Same session, after the AArch64/RISC-V oracle work.  Full narrative and tables:
 Same session, after Part 1d.  Full tables: `engineering/byte-load-reassembly.md`.
 
 * **Closed — the `be64` gap.** `passes/load_bswap_movbe.rs` fuses
-  `mov{w,l,q} MEM,%T; bswap{w,l,q} %T` into one `movbe{w,l,q} MEM,%T` and
+  `mov{l,q} MEM,%T; bswap{l,q} %T` into one `movbe{l,q} MEM,%T` and
   coalesces the allocator's copy of the result, so `be64` is now
   `movbeq (%rdi), %rax; ret` = **2 instructions, matching GCC 16.2 and ICX and
   beating Clang 23.1 (12)**.  All five kernel functions are 2/2/2/2/2 against
@@ -418,19 +418,16 @@ Clang's 12).
 
 The implementation, so the next session does not re-derive it:
 
-* the run is 16 bits inside a 32-bit carrier, so `byte_load` should emit
-  `load u16` (which zero-extends into the carrier) + `bswap` at 16 bits; the
-  reversal writes only the low half and the zero-extension is already there, so
-  no explicit `zext` instruction is needed;
-* that requires ISel to lower a 16-bit `bswap` to `rolw $8` (the refusal exists
-  precisely because this path has no lowering today), and the `movbe` fold can
-  then consume the pair into `movbew`, which the encoder already carries
-  (`assembler/encoder/sse.rs`); on i686 the baseline has no MOVBE, so the
-  correct output there is `rolw`;
-* AArch64 needs the twin (`ldrh` + `rev16`) — the pass is enabled there — and
-  RISC-V stays off, so the differential gate must cover at least
-  x86-64/i686/aarch64 and must assert the byte footprint exactly like
-  `assert_loads_stay_in_footprint` does for the wide case.
+* the run is 16 bits inside a 32-bit or 64-bit carrier, so `byte_load` should
+  emit `load u16`, a 16-bit `bswap`, and a zero-extending `Cast` (`U16 -> ty`)
+  when `m < carrier` (ISel already lowers 16-bit `IrUnaryOp::Bswap` to
+  `rolw $8` on x86-64/i686 and `rev` + `lsr #16` on AArch64);
+* for 2-instruction `movzwl` + `movbew` parity when MOVBE is enabled on x86-64,
+  peephole fusion must account for the fact that `rolw $8` modifies `CF`/`OF`
+  and `movbew MEM, %r16` preserves bits 16..63 rather than zero-extending;
+* the differential gate must cover at least x86-64/i686/aarch64 and must assert
+  the byte footprint exactly like `assert_loads_stay_in_footprint` does for the
+  wide case.
 
 Not attempted here: the last commit of a session is the wrong place for a
 width-sensitive ISel change, and the little-endian twin of exactly this corner

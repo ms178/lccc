@@ -518,23 +518,30 @@ pub(crate) fn run_function(func: &mut IrFunction, target: crate::backend::Target
 
 /// Resolve a pointer operand to `(root, constant byte offset)`, following any
 /// chain of constant-offset `GetElementPtr`s (and `Copy`s — [`Ctx::peel`]).
-/// The root is the value the offsets are relative to; the caller requires it
-/// to be an incoming pointer parameter.
-fn resolve_ptr(ctx: &Ctx, op: Operand, depth: u32) -> Option<(Value, u64)> {
+/// Every `GetElementPtr` step traversed on the way to `root` is recorded in
+/// `gep_steps` so the caller can include its position in the stability window.
+fn resolve_ptr(
+    ctx: &Ctx,
+    op: Operand,
+    depth: u32,
+    gep_steps: &mut Vec<Value>,
+) -> Option<(Value, u64)> {
     if depth > 8 {
         return None;
     }
     let v = ctx.peel_or_self(operand_value(op)?, 0)?;
-    match ctx.def(v)? {
-        Instruction::GetElementPtr {
+    match ctx.def(v) {
+        Some(Instruction::GetElementPtr {
             dest,
             base,
             offset,
             ty: IrType::Ptr,
-        } if *dest == v => match const_u64(*offset) {
+        }) if *dest == v => match const_u64(*offset) {
             // Constant step: keep walking towards the root.
             Some(off) => {
-                let (root, root_off) = resolve_ptr(ctx, Operand::Value(*base), depth + 1)?;
+                gep_steps.push(v);
+                let (root, root_off) =
+                    resolve_ptr(ctx, Operand::Value(*base), depth + 1, gep_steps)?;
                 Some((root, root_off.checked_add(off)?))
             }
             // Variable step (`p = buf + i`): this `GetElementPtr` *is* the
@@ -589,8 +596,9 @@ fn validate(
 
     // Resolve every term's pointer to (base expression, byte offset).
     let mut resolved: Vec<(Value, u64)> = Vec::with_capacity(m);
+    let mut gep_steps: Vec<Value> = Vec::with_capacity(m);
     for ptr in &by_shift {
-        resolved.push(resolve_ptr(ctx, Operand::Value(*ptr), 0)?);
+        resolved.push(resolve_ptr(ctx, Operand::Value(*ptr), 0, &mut gep_steps)?);
     }
     let root = resolved[0].0;
     if resolved.iter().any(|(r, _)| *r != root) {
@@ -635,7 +643,10 @@ fn validate(
     let peeled_lowest = ctx.peel_or_self(lowest, 0)?;
     let fold_anchor = resolved[load_slot].1 == 0
         && peeled_lowest != root
-        && matches!(ctx.def(peeled_lowest)?, Instruction::GetElementPtr { .. });
+        && matches!(
+            ctx.def(peeled_lowest),
+            Some(Instruction::GetElementPtr { .. })
+        );
     let load_ptr = if fold_anchor {
         // The root denotes the same address, and the zero-offset `gep` chain
         // that reached it is dead once the byte loads go.
@@ -651,7 +662,7 @@ fn validate(
             continue;
         }
         let peeled = ctx.peel_or_self(*ptr, 0)?;
-        if matches!(ctx.def(peeled)?, Instruction::GetElementPtr { .. }) {
+        if matches!(ctx.def(peeled), Some(Instruction::GetElementPtr { .. })) {
             ctx.consume_dead_chain(&mut consumed, *ptr, peeled, block)?;
         } else if ctx.use_count(peeled) != 1 || ctx.loc_of(peeled)?.0 != block {
             return None;
@@ -659,7 +670,8 @@ fn validate(
     }
 
     // Ordering: no memory write between the earliest consumed instruction and
-    // the rewrite position.
+    // the rewrite position, and all constant-offset GEP steps must sit in the
+    // same block inside the base stability window.
     let mut consumed_locs: Vec<(usize, usize)> = Vec::with_capacity(consumed.len());
     for v in &consumed {
         if *v == dest || ctx.use_count(*v) != 1 {
@@ -671,12 +683,19 @@ fn validate(
         }
         consumed_locs.push((cb, ci));
     }
-    let earliest = consumed_locs
+    let mut earliest = consumed_locs
         .iter()
         .map(|(_, ci)| *ci)
         .min()
         .unwrap_or(top)
         .min(top);
+    for g in &gep_steps {
+        let (gb, gi) = ctx.loc_of(*g)?;
+        if gb != block {
+            return None;
+        }
+        earliest = earliest.min(gi);
+    }
     // The base must have one reaching definition across the whole window: a
     // pointer redefined between the byte loads and the merge would make the
     // wide load read a different address than the bytes it replaces.
@@ -1455,6 +1474,77 @@ mod tests {
         );
         f.next_value_id = 1001;
         assert_eq!(run_function(&mut f, X64), 0, "base redefined in the window");
+    }
+
+    #[test]
+    fn folds_when_multi_def_base_is_redefined_outside_the_window() {
+        // Post-phi loop-induction pointer: `Value(0)` is defined before the
+        // chain and updated by a `Copy` at the bottom of the block (after the
+        // merge). Because no definition sits inside `[earliest, top]`,
+        // `uniform_in_window` proves the base has one value across the chain.
+        let mut f = chain_func(32, IrType::U32, Flags::default());
+        f.blocks[0].instructions.push(Instruction::GetElementPtr {
+            dest: Value(1000),
+            base: Value(0),
+            offset: Operand::Const(IrConst::I64(4)),
+            ty: IrType::Ptr,
+        });
+        f.blocks[0].instructions.push(Instruction::Copy {
+            dest: Value(0),
+            src: Operand::Value(Value(1000)),
+        });
+        f.next_value_id = 1001;
+        assert_eq!(
+            run_function(&mut f, X64),
+            1,
+            "multi-def base updated after the window still folds"
+        );
+        let loads = wide_loads(&f);
+        assert_eq!(loads.len(), 1);
+        assert_eq!(loads[0].1, Value(0));
+        assert_eq!(loads[0].2, IrType::U32);
+    }
+
+    #[test]
+    fn refuses_when_base_is_redefined_after_unconsumed_anchor_gep() {
+        // When `anchor > 0`, `load_ptr` is an unconsumed `GetElementPtr` at the
+        // start of the chain. A redefinition of the base right after that GEP
+        // (before the first consumed instruction) must still be caught by the
+        // stability window `[earliest, top]`.
+        let mut f = chain_func(
+            32,
+            IrType::U32,
+            Flags {
+                run_offset: 8,
+                ..Flags::default()
+            },
+        );
+        let first_gep = f.blocks[0]
+            .instructions
+            .iter()
+            .position(|i| matches!(i, Instruction::GetElementPtr { .. }))
+            .expect("chain has anchor gep");
+        f.blocks[0].instructions.insert(
+            first_gep + 1,
+            Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Value(Value(1000)),
+            },
+        );
+        f.blocks[0].instructions.insert(
+            0,
+            Instruction::ParamRef {
+                dest: Value(1000),
+                param_idx: 1,
+                ty: IrType::Ptr,
+            },
+        );
+        f.next_value_id = 1001;
+        assert_eq!(
+            run_function(&mut f, X64),
+            0,
+            "base redefined after unconsumed anchor gep must be refused"
+        );
     }
 
     #[test]

@@ -41,9 +41,12 @@
 //!   refused every shape it was written for (`be64(x)` returning the loaded
 //!   value is a reader by definition).  The unit test
 //!   `fuses_a_big_endian_load` is the regression cover.
-//! * Widths: `movbew`/`movbel`/`movbeq` load 2/4/8 bytes and swap them, which
-//!   is what `bswapw`/`bswapl`/`bswapq` on a value loaded with
-//!   `movw`/`movl`/`movq` computes.  No width changes.
+//! * Widths: `movbel`/`movbeq` load 4/8 bytes and swap them, which is what
+//!   `bswapl`/`bswapq` on a value loaded with `movl`/`movq` computes.  No
+//!   width changes.  16-bit loads are deliberately not handled here: x86 has
+//!   no `bswapw` instruction (ISel lowers 16-bit `Bswap` to `rolw $8, %r16`,
+//!   which writes `CF`/`OF`, after a zero-extending `movzwl MEM, %r32` whose
+//!   high-half clearing a 16-bit `movbew MEM, %r16` would not preserve).
 //! * Memory semantics are preserved: one load of the same width from the same
 //!   addressing mode, at the same place in program order.  A `%gs:`/`%fs:`
 //!   qualified operand keeps its segment prefix on the fused instruction.  If
@@ -67,15 +70,13 @@ use super::load_op_fuse::{is_plain_memory_operand, next_insn};
 use super::relay_and_lea::provably_dead_lv;
 use super::relay_and_lea::{plain_gp_operand, split_two_operands};
 
-/// Parse `mov{w,l,q} MEM, %reg` into `(width, reg)`.  Only plain GP
+/// Parse `mov{l,q} MEM, %reg` into `(width, reg)`.  Only plain GP
 /// destinations spelled exactly as their bank (the shape the backend emits),
 /// and only plain memory operands: no register source, no immediate, no
 /// symbol-without-parenthesis form.
 fn parse_byte_load(t: &str) -> Option<(u8, RegId, &str)> {
-    let (width, rest) = if let Some(r) = t.strip_prefix("movw ") {
-        (2u8, r)
-    } else if let Some(r) = t.strip_prefix("movl ") {
-        (4, r)
+    let (width, rest) = if let Some(r) = t.strip_prefix("movl ") {
+        (4u8, r)
     } else if let Some(r) = t.strip_prefix("movq ") {
         (8, r)
     } else {
@@ -93,12 +94,10 @@ fn parse_byte_load(t: &str) -> Option<(u8, RegId, &str)> {
     Some((width, fam, src))
 }
 
-/// Parse `bswap{w,l,q} %reg` into `(width, reg)`.
+/// Parse `bswap{l,q} %reg` into `(width, reg)`.
 fn parse_bswap(t: &str) -> Option<(u8, RegId)> {
-    let (width, rest) = if let Some(r) = t.strip_prefix("bswapw ") {
-        (2u8, r)
-    } else if let Some(r) = t.strip_prefix("bswapl ") {
-        (4, r)
+    let (width, rest) = if let Some(r) = t.strip_prefix("bswapl ") {
+        (4u8, r)
     } else if let Some(r) = t.strip_prefix("bswapq ") {
         (8, r)
     } else {
@@ -113,13 +112,11 @@ fn parse_bswap(t: &str) -> Option<(u8, RegId)> {
     Some((width, fam))
 }
 
-/// Parse `mov{w,l,q} %S, %D` into `(width, src_fam, dst_fam)` for a plain
+/// Parse `mov{l,q} %S, %D` into `(width, src_fam, dst_fam)` for a plain
 /// register copy.  Only the exact bank spellings the backend emits.
 fn parse_reg_copy(t: &str) -> Option<(u8, RegId, RegId)> {
-    let (width, rest) = if let Some(r) = t.strip_prefix("movw ") {
-        (2u8, r)
-    } else if let Some(r) = t.strip_prefix("movl ") {
-        (4, r)
+    let (width, rest) = if let Some(r) = t.strip_prefix("movl ") {
+        (4u8, r)
     } else if let Some(r) = t.strip_prefix("movq ") {
         (8, r)
     } else {
@@ -135,7 +132,7 @@ fn parse_reg_copy(t: &str) -> Option<(u8, RegId, RegId)> {
     Some((width, s_fam, d_fam))
 }
 
-/// Rewrite `mov{w,l,q} MEM, %T; bswap{w,l,q} %T` into `movbe{w,l,q} MEM, %T`
+/// Rewrite `mov{l,q} MEM, %T; bswap{l,q} %T` into `movbe{l,q} MEM, %T`
 /// for every such pair whose un-swapped value is dead.  Returns whether
 /// anything changed; one call reaches a fixpoint for independent pairs (the
 /// rewrite only ever shortens a window).
@@ -183,11 +180,7 @@ pub(super) fn fuse_load_bswap(store: &mut LineStore, infos: &mut [LineInfo], mov
             i += 1;
             continue;
         }
-        let suffix = match l_width {
-            2 => "w",
-            4 => "l",
-            _ => "q",
-        };
+        let suffix = if l_width == 4 { "l" } else { "q" };
         let bank = if l_width == 8 { 0 } else { 1 };
         // The allocator's copy of the loaded value (`movq %rax, %rdi`) is now
         // a copy of the *swapped* value, so it can be coalesced into the fused
@@ -290,13 +283,21 @@ mod tests {
     #[test]
     fn fuses_each_width() {
         let out = run(concat!(
-            "f:\n    movw (%rdi), %eax\n    bswapw %eax\n",
             "g:\n    movl (%rdi), %eax\n    bswapl %eax\n",
             "h:\n    movq 8(%rdi,%rsi,2), %r9\n    bswapq %r9\n"
         ));
-        assert!(out.contains("movbew (%rdi), %eax"), "{out}");
         assert!(out.contains("movbel (%rdi), %eax"), "{out}");
         assert!(out.contains("movbeq 8(%rdi,%rsi,2), %r9"), "{out}");
+    }
+
+    #[test]
+    fn does_not_emit_invalid_16_bit_movbe() {
+        // x86 has no `bswapw`, and `movbew (%rdi), %eax` is rejected by the
+        // assembler (16-bit `movbew` requires `%ax`, and ISel lowers 16-bit
+        // bswap via `movzwl` + `rolw $8, %ax`).
+        let asm = "f:\n    movzwl (%rdi), %eax\n    rolw $8, %ax\n    ret\n";
+        let out = run(asm);
+        assert_eq!(out, asm);
     }
 
     #[test]

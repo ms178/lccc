@@ -157,9 +157,15 @@ value_row() {  # description, extra flags...
     # GCC folds nothing either, but a *name* it does not know is a hard error,
     # so drop exactly those until it compiles (GCC reports all of them at once).
     cp "$td/values.c" "$td/values_gcc.c"
+    local -a gcc_flags=("${flags[@]}")
+    if [ ${#gcc_flags[@]} -gt 0 ] && ! "$GCC" "${gcc_flags[@]}" -xc -c /dev/null -o /dev/null 2>/dev/null; then
+        # GCC 12 predates -march=raptorlake; alderlake is the same Golden Cove
+        # / Gracemont ISA (including AVX-VNNI) for the host oracle build.
+        gcc_flags=(-march=alderlake)
+    fi
     local attempt
     for attempt in 1 2 3 4 5; do
-        if "$GCC" -O2 "${flags[@]}" "$td/values_gcc.c" -o "$td/probe_g" 2>"$td/g.err"; then
+        if "$GCC" -O2 "${gcc_flags[@]}" "$td/values_gcc.c" -o "$td/probe_g" 2>"$td/g.err"; then
             break
         fi
         grep -o 'parameter to builtin not valid: [A-Za-z0-9._-]*' "$td/g.err" \
@@ -219,9 +225,10 @@ int main(void) {
 }
 EOF
 if [ -x "$CCC_I686" ]; then
-    if "$CCC_I686" -O2 "$td/i686.c" -o "$td/i686_l" 2>"$td/i686.err"; then
-        "$td/i686_l" >"$td/i686_l.txt"
-        if "$GCC" -m32 -O2 "$td/i686.c" -o "$td/i686_g" 2>/dev/null; then
+    if "$GCC" -m32 -xc /dev/null -o "$td/m32_probe" 2>/dev/null; then
+        if "$CCC_I686" -O2 "$td/i686.c" -o "$td/i686_l" 2>"$td/i686.err"; then
+            "$td/i686_l" >"$td/i686_l.txt"
+            "$GCC" -m32 -O2 "$td/i686.c" -o "$td/i686_g" 2>/dev/null
             "$td/i686_g" >"$td/i686_g.txt"
             if diff -q "$td/i686_l.txt" "$td/i686_g.txt" >/dev/null; then
                 ok "i686: LCCC and GCC -m32 agree ($(cat "$td/i686_l.txt"))"
@@ -230,10 +237,29 @@ if [ -x "$CCC_I686" ]; then
                 diff "$td/i686_l.txt" "$td/i686_g.txt" | sed -n '1,4p' | sed 's/^/      /'
             fi
         else
-            ok "i686: compiled and ran ($(cat "$td/i686_l.txt")); no multilib gcc to compare"
+            bad "i686: compile failed"; head -3 "$td/i686.err" | sed 's/^/      /'
         fi
     else
-        bad "i686: compile failed"; head -3 "$td/i686.err" | sed 's/^/      /'
+        # Host has no 32-bit multilib libc/libgcc: verify 32-bit PIC CPUID
+        # probe execution via a freestanding _start binary against the 64-bit
+        # GCC oracle answers from out_g.
+        sse2_exp=$(awk -F= '$1=="sse2"{print $2}' "$td/out_g")
+        avx2_exp=$(awk -F= '$1=="avx2"{print $2}' "$td/out_g")
+        avx512f_exp=$(awk -F= '$1=="avx512f"{print $2}' "$td/out_g")
+        cat >"$td/i686_freestanding.c" <<EOF
+void _start(void) {
+    int ok = (!!__builtin_cpu_supports("sse2") == ${sse2_exp:-1})
+          && (!!__builtin_cpu_supports("avx2") == ${avx2_exp:-1})
+          && (!!__builtin_cpu_supports("avx512f") == ${avx512f_exp:-0});
+    int rc = ok ? 0 : 1;
+    __asm__ volatile ("int \$0x80" :: "a"(1), "b"(rc));
+}
+EOF
+        if "$CCC_I686" -O2 -fPIC -nostdlib "$td/i686_freestanding.c" -o "$td/i686_l" 2>"$td/i686.err" && "$td/i686_l"; then
+            ok "i686: freestanding PIC runtime probe agrees with host CPUID (${sse2_exp:-1} ${avx2_exp:-1} ${avx512f_exp:-0})"
+        else
+            bad "i686: freestanding runtime probe failed"; head -3 "$td/i686.err" | sed 's/^/      /'
+        fi
     fi
 else
     echo "SKIP i686 rows (no $CCC_I686)"

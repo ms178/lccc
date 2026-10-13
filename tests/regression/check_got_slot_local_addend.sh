@@ -60,10 +60,38 @@ rm -f "$td/prog"
 if try_build "x86-64 default" "$CCC" "$x64_src" -o "$td/prog"; then run_25 "x86-64 default (LCCC driver)"; fi
 rm -f "$td/prog"
 if try_build "x86-64 -no-pie" "$CCC" -no-pie "$x64_src" -o "$td/prog"; then run_25 "x86-64 -no-pie (LCCC driver)"; fi
+
+printf 'int main(void) { return 0; }\n' >"$td/m32.c"
+if "$GCC" -m32 -no-pie "$td/m32.c" -o "$td/m32probe" >/dev/null 2>&1; then
+    has_m32_libc=1
+else
+    has_m32_libc=0
+    cat >"$td/shim32.s" <<'EOF'
+	.text
+	.globl	_start
+_start:
+	call	main
+	movl	%eax, %ebx
+	movl	$1, %eax
+	int	$0x80
+	.weak	__x86.get_pc_thunk.bx
+	.type	__x86.get_pc_thunk.bx, @function
+__x86.get_pc_thunk.bx:
+	movl	(%esp), %ebx
+	ret
+EOF
+fi
+
 rm -f "$td/prog"
-if try_build "i686 default" "$CCC" -m32 "$i686_src" -o "$td/prog"; then run_25 "i686 default (LCCC driver)"; fi
-rm -f "$td/prog"
-if try_build "i686 -no-pie" "$CCC" -m32 -no-pie "$i686_src" -o "$td/prog"; then run_25 "i686 -no-pie (LCCC driver)"; fi
+if [ "$has_m32_libc" = 1 ]; then
+    if try_build "i686 default" "$CCC" -m32 "$i686_src" -o "$td/prog"; then run_25 "i686 default (LCCC driver)"; fi
+    rm -f "$td/prog"
+    if try_build "i686 -no-pie" "$CCC" -m32 -no-pie "$i686_src" -o "$td/prog"; then run_25 "i686 -no-pie (LCCC driver)"; fi
+else
+    if try_build "i686 default" "$CCC" -m32 -nostdlib "$i686_src" "$td/shim32.s" -o "$td/prog"; then run_25 "i686 default (LCCC driver, freestanding)"; fi
+    rm -f "$td/prog"
+    if try_build "i686 -no-pie" "$CCC" -m32 -no-pie -nostdlib "$i686_src" "$td/shim32.s" -o "$td/prog"; then run_25 "i686 -no-pie (LCCC driver, freestanding)"; fi
+fi
 
 # Cross pipeline: the LCCC object, linked by GNU ld.  A fold defect shows up
 # here as 145 (GNU ld doubles the offset) rather than as a fault, so it is the
@@ -73,15 +101,21 @@ if try_build "x86-64 cross link" "$CCC" -c "$x64_src" -o "$td/x64.o" &&
    try_build "x86-64 cross link" "$GCC" -no-pie "$td/x64.o" -o "$td/prog"; then
     run_25 "x86-64 LCCC object + GNU ld"
 fi
-printf 'int main(void) { return 0; }\n' >"$td/m32.c"
-if "$GCC" -m32 -no-pie "$td/m32.c" -o "$td/m32probe" >/dev/null 2>&1; then
+if [ "$has_m32_libc" = 1 ]; then
     rm -f "$td/prog"
     if try_build "i686 cross link" "$CCC" -m32 -c "$i686_src" -o "$td/i686.o" &&
        try_build "i686 cross link" "$GCC" -m32 -no-pie "$td/i686.o" -o "$td/prog"; then
         run_25 "i686 LCCC object + GNU ld"
     fi
+elif command -v ld >/dev/null 2>&1; then
+    rm -f "$td/prog"
+    if try_build "i686 cross link" "$CCC" -m32 -c "$i686_src" -o "$td/i686.o" &&
+       try_build "i686 cross link" "$CCC" -m32 -c "$td/shim32.s" -o "$td/shim32.o" &&
+       try_build "i686 cross link" ld -m elf_i386 "$td/i686.o" "$td/shim32.o" -o "$td/prog"; then
+        run_25 "i686 LCCC object + GNU ld (freestanding)"
+    fi
 else
-    skip "i686 cross link (no gcc multilib)"
+    skip "i686 cross link (no gcc multilib or ld)"
 fi
 
 # ------------------------------------------------------ 2. relocation spelling

@@ -106,7 +106,7 @@ echo "PASS: LCCC is $(printf '%.0f' "$ratio")x faster than GCC on recursive Fibo
 # 6. Run the comprehensive correctness test
 echo ""
 echo "Running comprehensive rec2iter correctness test..."
-"$LCCC" -I"$GCC_INC" -O2 -o "$TMPDIR/fib_comprehensive" "$SCRIPT_DIR/fib_rec2iter.c"
+"$LCCC" -I"$GCC_INC" -O2 -o "$TMPDIR/fib_comprehensive" "$SCRIPT_DIR/../tests/regression/fixtures/rec2iter/fib_rec2iter.c"
 COMP_OUT=$("$TMPDIR/fib_comprehensive")
 if [ "$COMP_OUT" = "ALL PASS" ]; then
     echo "Comprehensive test: PASS (includes fib(90) — impossible without rec2iter)"
