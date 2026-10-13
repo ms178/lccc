@@ -55,9 +55,11 @@ def main() -> int:
             print(f"STEP {idx} {name}: rc={proc.returncode}", flush=True)
             if proc.returncode != 0:
                 failures += 1
-                tail = log.read_text(errors="replace")[-1500:]
-                tail = " ".join(tail.split())[:900]
-                print(f"::error title=DIAG-STEP-FAIL::step {idx} {name} rc={proc.returncode} tail: {tail}", flush=True)
+                text = log.read_text(errors="replace")
+                fails = [ln.strip() for ln in text.splitlines() if "FAIL" in ln][:5]
+                tail = " ".join(text[-1200:].split())[:500]
+                detail = " | ".join(fails)[:900] if fails else tail
+                print(f"::error title=DIAG-STEP-FAIL::step {idx} {name} rc={proc.returncode} fails: {detail}", flush=True)
             print("::endgroup::", flush=True)
             continue
     print(f"::notice title=DIAG2-SUMMARY::steps {lo}-{hi} failures={failures}", flush=True)

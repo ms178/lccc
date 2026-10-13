@@ -746,7 +746,7 @@ jobs:
       - name: Run __seg_gs conversion diagnostics check
         env:
           CCC: target/fastbuild/lccc
-          GCC: gcc-14
+          GCC: gcc-16
         run: bash tests/regression/check_seg_conv_diagnostics.sh
 
       - name: Reject named address spaces on unsupported targets without an ICE
