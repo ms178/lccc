@@ -83,12 +83,27 @@ import godbolt  # noqa: E402
 import godbolt_cache  # noqa: E402
 
 DEFAULT_FLAGS = "-O3 -march=x86-64-v3"
+# Flags are architecture-specific, and the x86 default was being handed to the
+# AArch64 and RISC-V channels: `-march=x86-64-v3` made every cross-architecture
+# oracle fail to compile, which a survey reported as "no oracles" rather than
+# as the flag bug it was.  These are the baseline micro-architectures of each
+# architecture family (x86-64-v3 covers the AVX2 baseline the research targets;
+# armv8-a and rv64gc are the channels' own architectures).
+DEFAULT_FLAGS_BY_ARCH = {
+    "x86": "-O3 -march=x86-64-v3",
+    "aarch64": "-O3 -march=armv8-a",
+    "riscv64": "-O3 -march=rv64gc",
+}
 # Rank mode keeps the scoreboard's historical survey default so old
 # --baseline comparisons remain meaningful; compare mode keeps -O3.
 RANK_DEFAULT_FLAGS = "-O2 -march=x86-64-v3"
 DEFAULT_ORACLES = ("gcc16.2", "clang", "icc", "icx")
-DEFAULT_AARCH64_ORACLES = ("carm64g1610", "carm64gtrunk", "cclang2210")
-DEFAULT_RISCV64_ORACLES = ("crv64g1520", "crv64g1610", "crv64gtrunk")
+# Per-architecture oracle sets, addressed through the aliases in
+# scripts/godbolt.py so `godbolt.py audit` keeps them resolving and current
+# (the dead `crv64g*` ids these replace are why every RISC-V survey used to
+# report "remote compile failed" on stderr and an empty table on stdout).
+DEFAULT_AARCH64_ORACLES = ("arm64gcc", "arm64gcc-trunk", "armv8clang")
+DEFAULT_RISCV64_ORACLES = ("rv64gcc", "rv64gcc-trunk", "rv64clang")
 
 _DIRECTIVE = re.compile(r"^\s*(?:\.|#|//|cfi_)")
 _LABEL = re.compile(r'^\s*"?([.\w$]+)"?:')
@@ -390,14 +405,82 @@ def _record_local(req: Request, executable: str) -> dict[str, Any]:
     }
 
 
+# Compiler Explorer ids name one channel each, and channels are per
+# architecture: `gcc16.2` is the x86-64 GCC, `carm64g1610` the AArch64 one,
+# `crv64g1610` the RISC-V one.  Requesting `--arch riscv64` with an x86 id used
+# to succeed: the x86 assembly came back *labelled* riscv64, entered the
+# manifest with that provenance, and every row below it was an x86 instruction
+# count wearing a RISC-V hat.  A measurement tool that can silently mislabel
+# its own evidence is worse than one that refuses to run, so the arch is now
+# checked against what the compiler channel actually targets.
+_ARCH_NEEDLES = (
+    ("aarch64", "aarch64"),
+    ("arm64", "aarch64"),
+    ("armv8", "aarch64"),
+    ("riscv", "riscv64"),
+    ("riscv64", "riscv64"),
+    ("rv64", "riscv64"),
+    ("x86-64", "x86"),
+    ("x86_64", "x86"),
+    ("amd64", "x86"),
+)
+
+
+def default_flags(arch: str, rank: bool = False) -> str:
+    """The survey flags for an architecture (`--rank` keeps the scoreboard's)."""
+    base = DEFAULT_FLAGS_BY_ARCH.get(arch, DEFAULT_FLAGS)
+    if rank and arch == "x86":
+        return RANK_DEFAULT_FLAGS
+    return base
+
+
+def _arch_of_compiler(metadata: dict[str, Any]) -> str | None:
+    """The architecture a CE channel targets, or None when unidentifiable."""
+    text = f"{metadata.get('id', '')} {metadata.get('name', '')}".lower()
+    for needle, arch in _ARCH_NEEDLES:
+        if needle in text:
+            return arch
+    return None
+
+
+def _flags_select_arch(flags: str, arch: str) -> bool:
+    """Whether `flags` explicitly retarget a host-compiler channel.
+
+    A channel hosted on x86-64 can still be asked for another backend
+    (`clang --target=aarch64-linux-gnu`, which `_record_remote` adds itself for
+    the AArch64 Clang channel); that is a deliberate cross target, not the
+    mislabelling this guard exists to stop.
+    """
+    needles = [n for n, a in _ARCH_NEEDLES if a == arch]
+    low = flags.lower()
+    return any(f"target={n}" in low or f"target {n}" in low for n in needles)
+
+
+def _check_arch(name: str, metadata: dict[str, Any], flags: str, arch: str) -> None:
+    """Refuse to measure a channel of the wrong architecture."""
+    found = _arch_of_compiler(metadata)
+    if found is None or found == arch or _flags_select_arch(flags, arch):
+        return
+    defaults = {"aarch64": DEFAULT_AARCH64_ORACLES, "riscv64": DEFAULT_RISCV64_ORACLES}
+    hint = ", ".join(defaults.get(arch, DEFAULT_ORACLES))
+    raise godbolt.GodboltError(
+        f"{name} ({metadata.get('id', '?')}, {metadata.get('name', '?')}) "
+        f"targets {found}, but --arch {arch} was requested; use a {arch} channel "
+        f"(e.g. {hint}) or pass an explicit --target= in --flags"
+    )
+
+
 def _record_remote(name: str, source: str, req: Request, compilers: list[dict[str, Any]]) -> dict[str, Any]:
     metadata = godbolt.compiler_metadata(name, compilers=compilers)
     flags = req.flags
     compiler_text = f"{metadata.get('id', '')} {metadata.get('name', '')}".lower()
     # CE's native ARM GCC channels already target AArch64, whereas the newest
     # Clang channel is hosted as x86-64 and needs an explicit backend target.
-    if req.arch == "aarch64" and "clang" in compiler_text and "--target=" not in flags:
+    already_aarch64 = _arch_of_compiler(metadata) == "aarch64"
+    if (req.arch == "aarch64" and not already_aarch64 and "clang" in compiler_text
+            and "--target=" not in flags):
         flags = f"{flags} --target=aarch64-linux-gnu"
+    _check_arch(name, metadata, flags, req.arch)
     started = time.perf_counter()
     lines = _compile_remote(name, source, flags)
     elapsed = time.perf_counter() - started
@@ -905,7 +988,7 @@ def _rank_main(args: argparse.Namespace, flags: str, oracles: list[str],
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     flags = (args.flags if args.flags is not None
-             else (RANK_DEFAULT_FLAGS if args.rank else DEFAULT_FLAGS))
+             else default_flags(args.arch, rank=args.rank))
     default_oracles = (
         DEFAULT_AARCH64_ORACLES
         if args.arch == "aarch64"

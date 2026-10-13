@@ -19,6 +19,7 @@ pub(crate) mod backedge_pre;
 pub(crate) mod bit_idioms;
 pub(crate) mod block_layout;
 pub(crate) mod bool_thread;
+pub(crate) mod byte_load;
 pub(crate) mod cfg_simplify;
 pub(crate) mod const_array_promote;
 pub(crate) mod constant_fold;
@@ -2258,6 +2259,24 @@ pub(crate) fn run_passes(
             cur_pass_changes[3] += n;
             total_changes += n;
             total_changes_excl_dce += n;
+
+            // Byte-load reassembly: `p[0] | p[1] << 8 | ...` is an unaligned
+            // little-endian load spelled out, and GCC/Clang/ICX all fold it
+            // back (see the pass module docs for the measured gap). Placed
+            // right after bit_idioms, which must see the byte version of the
+            // chain (its `bswap` idiom is the big-endian twin) and never an
+            // already-widened one.
+            if !pass_disabled(&disabled, "byte_load") {
+                let n = timed_pass!(
+                    "byte_load",
+                    run_on_visited(module, &dirty, &mut changed, |func| {
+                        byte_load::run_function(func, target)
+                    })
+                );
+                cur_pass_changes[3] += n;
+                total_changes += n;
+                total_changes_excl_dce += n;
+            }
 
             // Correlated value propagation: fold compares, selects and
             // branches whose outcome is implied by dominating conditional

@@ -110,6 +110,10 @@ pub(super) struct FunctionBuildState {
     pub return_ctype: Option<CType>,
     /// sret pointer alloca for current function (struct returns > 16 bytes)
     pub sret_ptr: Option<Value>,
+    /// Whether this function reads a runtime CPU probe word, so its entry
+    /// block gets the one `__lccc_cpu_init` call that populates them
+    /// (AUD-CPU-1; set by `Lowerer::mark_cpu_probe_init`).
+    pub cpu_probe_init: bool,
     /// Variable -> alloca mapping with metadata
     pub locals: FxHashMap<String, LocalInfo>,
     /// Loop context: (label, scope_depth) to jump to on `break`.
@@ -287,6 +291,7 @@ impl FunctionBuildState {
             return_is_bool,
             return_ctype: None,
             sret_ptr: None,
+            cpu_probe_init: false,
             locals: FxHashMap::default(),
             break_labels: Vec::new(),
             continue_labels: Vec::new(),

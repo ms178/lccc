@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# DEPRECATED (AUD-DOC-1).  The canonical snapshot tool is
+# `scripts/lccc-snapshot.sh`: it is gate-aware (it refuses to publish a tree
+# without a matching ci_local.sh pass unless LCCC_SNAPSHOT_UNGATED=1), writes
+# the atomic ms178-1.patch plus a format-patch series, session bundle and
+# ledger, and resolves the persisted workspace through tools/workspace_dirs.sh.
+# This script is kept only because older session notes reference it; new work
+# must call:  scripts/lccc-snapshot.sh "<slug>" "<description>"
 # Snapshot the current ms178-1 follow-up working tree into the user-facing
 # workspace. Standing order: re-run after every validated fix. Idempotent.
 # The patch is the full delta of this branch against its merge-base with

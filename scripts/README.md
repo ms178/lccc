@@ -294,3 +294,33 @@ python3 scripts/aarch64_execute_suite.py \
     --assembler /path/to/binutils-2.47/aarch64-linux-gnu-as \
     --jobs 2 --flags=-O2 --json /tmp/aarch64-torture.json
 ```
+
+## Contracts the gates now pin (2026-10-13 audit session)
+
+These three behaviours were audit findings; they are documented here because
+each one is a contract build systems rely on, and each now has a gate:
+
+* **`-o -` is stdout** for the text modes (`-S`, `-E`, `-M`/`-MM`, `-dM`), and
+  `-MF -` sends the make rule to stdout. Object/executable modes reject
+  `-o -` with a diagnostic instead of writing a file named `-`
+  (`tests/regression/check_dash_o_stdout.sh`).
+* **Temporary files are private**: every temp object/assembly file is reserved
+  inside an atomically created 0700 directory under `$TMPDIR`
+  (`src/common/temp_files.rs`), so a pre-placed symlink or file at a predicted
+  path can no longer redirect a write.  A TMPDIR that cannot be created is a
+  normal driver error, never a panic
+  (`tests/regression/check_temp_symlink.sh`).
+* **`__builtin_cpu_supports` folds against the effective target feature set**,
+  not against a CPU allowlist: `-march=x86-64 -mno-avx2` answers 0 for
+  `"avx2"`, AArch64/RISC-V answer 0 for x86 feature names, and only features
+  the driver can statically guarantee answer 1
+  (`tests/regression/check_cpu_supports_runtime.sh`).
+
+## New tools (and what they are for)
+
+| script | purpose | gate |
+|---|---|---|
+| `audit_census.py` | static ratchet over panic-class sites, `unsafe`, giant functions, `CCC_*`/`LCCC_*` knobs, `#[ignore]`s | `ci_local.sh` (fast), CI | 
+| `repros_replay.py` | replays every `artifacts/repros/*.c` against GCC (ISA-matched) | `ci_local.sh` (fast), CI |
+| `verify_fib_perf.sh` | Fibonacci rec2iter perf probe (moved from `tests/`) | manual |
+| `../tools/workspace_dirs.sh` | resolves the persisted workspace dir (`LCCC_WORKSPACE`, `/home/user`, `/mnt/user-data/outputs`) | sourced by the snapshot tool |

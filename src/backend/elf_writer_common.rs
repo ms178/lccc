@@ -73,6 +73,30 @@ pub trait X86Arch {
     /// stored in the relocation entry.
     fn uses_rel_format() -> bool;
 
+    /// True for relocations whose field is a GOT *slot* reference
+    /// (R_386_GOT32/GOT32X, R_X86_64_GOTPCREL/GOTPCRELX family).
+    ///
+    /// These are excluded from local-label folding for an ABI reason, not a
+    /// stylistic one: a GOT-slot relocation resolves through the *symbol's
+    /// own* GOT entry (`G + GOT + A - P` on x86-64, `GOT_slot(S) - GOT_base`
+    /// on i386) and the ABI fixes the addend to the instruction's PC
+    /// correction (-4 on x86-64, 0 on i386).  Folding rewrites the reference
+    /// into (section symbol, addend + symbol offset), so the linker computes
+    /// the slot from the *section* while the symbol offset is added a second
+    /// time by the field.  Measured on both targets with a two-symbol object
+    /// (q1 at offset 0, q2 at offset 8), the folded form is silently wrong:
+    /// x86-64 `movq q2@GOTPCREL(%rip),%rdx` linked to 145 instead of 25 and
+    /// faulted, i686 `movl q1@GOT(%ebx),%ecx` faulted, while the unfolded
+    /// object links correctly with GNU ld, lld and lccc's own linker.  GAS
+    /// 2.47 keeps the symbol for every GOT-slot operator — `q1@GOTPCRELX`,
+    /// `q1@GOT32X` — including `.L` labels; the fold below stays limited to
+    /// the classes whose addend covers the whole `S + A` computation
+    /// (R_32/R_PC32/R_GOTOFF/...).
+    fn is_got_slot_reloc(reloc_type: u32) -> bool {
+        let _ = reloc_type;
+        false
+    }
+
     /// True for TLS relocation types (R_386_TLS_* / R_X86_64_*TLS*).
     ///
     /// TLS relocs are excluded from local-label folding: the fold rewrites a
@@ -3393,11 +3417,17 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 // offset anyway), so folding is always safe here.
                 // TLS relocs are NOT foldable (see X86Arch::is_tls_reloc):
                 // the linker resolves them through the STT_TLS symbol, and a
-                // GOT-style TLS reloc's addend must remain 0.
+                // GOT-style TLS reloc's addend must remain 0.  GOT-slot relocs
+                // are NOT foldable either (see X86Arch::is_got_slot_reloc):
+                // they resolve through the symbol's own GOT entry, and the
+                // fold's (section, addend+offset) form makes linker and
+                // dynamic loader compute the wrong slot -- measured as a
+                // miscompile on both targets.
                 let is_foldable_local = self.label_positions.contains_key(&reloc.symbol)
                     && !self.pending_globals.contains(&reloc.symbol)
                     && !self.pending_weaks.contains(&reloc.symbol)
-                    && !A::is_tls_reloc(reloc.reloc_type);
+                    && !A::is_tls_reloc(reloc.reloc_type)
+                    && !A::is_got_slot_reloc(reloc.reloc_type);
                 let (sym_name, mut addend) = if is_foldable_local {
                     let &(target_sec, target_off) =
                         self.label_positions.get(&reloc.symbol).unwrap();

@@ -74,6 +74,20 @@ COMPILER_ALIASES: dict[str, str] = {
     "crv64g1430": "rv64-cgcc1430",
     # RISC-V (32-bits) trunk, for the LP64/ILP32 cross-checks.
     "crv32gtrunk": "rv32-cgcctrunk",
+    # Native AArch64 and RISC-V 64 channels.  These exist because the
+    # host-architecture channels cannot answer a cross-architecture question by
+    # themselves: an x86 oracle id under `--arch aarch64` used to be accepted
+    # and produced x86 assembly labelled aarch64 (the arch guard in
+    # scripts/codegen_oracle.py now refuses that), and the per-architecture
+    # oracle sets had no way to age -- `crv64g*` were dead ids, so every
+    # RISC-V survey reported "no oracles" on stderr and an empty table.
+    # Aliases route them through the same audit as the x86 pins.
+    "arm64gcc": "carm64g1610",
+    "arm64gcc-trunk": "carm64gtrunk",
+    "armv8clang": "armv8-cclang2310",
+    "rv64gcc": "rv64-cgcc1610",
+    "rv64gcc-trunk": "rv64-cgcctrunk",
+    "rv64clang": "rv64-cclang2310",
 }
 DEFAULT_ORACLES = ("gcc16.2", "clang", "icc", "icx")
 
@@ -87,6 +101,13 @@ PINNED_LATEST: dict[str, str] = {
     "gcc": r"^x86-64 gcc (\d+\.\d+)$",
     "clang": r"^x86-64 clang (\d+\.\d+\.\d+)$",
     "icc": r"^x86-64 icc (\d+\.\d+\.\d+)$",
+    # The other architectures the compiler covers (x86-64, i686, AArch64,
+    # RISC-V): a cross-architecture claim is only as good as the freshness of
+    # the channel behind it, so those pins are audited the same way.
+    "arm64gcc": r"^ARM64 GCC (\d+\.\d+\.\d+)$",
+    "armv8clang": r"^armv8-a clang (\d+\.\d+\.\d+)$",
+    "rv64gcc": r"^RISC-V \(64-bits\) gcc (\d+\.\d+\.\d+)$",
+    "rv64clang": r"^RISC-V rv64gc clang (\d+\.\d+\.\d+)$",
 }
 
 
@@ -553,7 +574,7 @@ def command_audit(args: argparse.Namespace) -> int:
     by_id = {c["id"]: c for c in compilers}
     problems = 0
 
-    print(f"{'ALIAS':<10}{'PINNED ID':<16}{'PINNED':<12}{'NEWEST':<12}STATUS")
+    print(f"{'ALIAS':<14}{'PINNED ID':<18}{'PINNED':<12}{'NEWEST':<12}STATUS")
     print("-" * 62)
     for alias, pattern in PINNED_LATEST.items():
         pinned_id = COMPILER_ALIASES[alias]
@@ -588,7 +609,7 @@ def command_audit(args: argparse.Namespace) -> int:
     # Moving channels: report what they resolve to right now so the manifest
     # reader can tell which build a past run actually used.
     print()
-    for alias in ("icx", "gcc-trunk"):
+    for alias in ("icx", "gcc-trunk", "arm64gcc-trunk", "rv64gcc-trunk"):
         cid = COMPILER_ALIASES.get(alias)
         if cid:
             name = by_id.get(cid, {}).get("name", "<missing>")

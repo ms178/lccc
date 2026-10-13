@@ -453,7 +453,7 @@ pub struct DiagnosticEngine {
     warning_config: WarningConfig,
     /// Reference to the source manager for span resolution and snippet display.
     /// Set after the preprocessing/lexing phase creates the SourceManager.
-    source_manager: Option<SourceManager>,
+    source_manager: Option<std::rc::Rc<SourceManager>>,
     /// Whether to use ANSI color codes in diagnostic output.
     /// Resolved once at creation from the ColorMode setting.
     use_color: bool,
@@ -553,11 +553,23 @@ impl DiagnosticEngine {
 
     /// Set the source manager for span resolution and snippet display.
     pub fn set_source_manager(&mut self, sm: SourceManager) {
-        self.source_manager = Some(sm);
+        self.source_manager = Some(std::rc::Rc::new(sm));
+    }
+
+    /// Share the attached source manager with another owner WITHOUT detaching
+    /// it from this engine.
+    ///
+    /// Why: the driver used to `take_source_manager()` right after sema so it
+    /// could hand the manager to codegen for debug-info emission -- which left
+    /// the lowering phase with no source manager, so every lowering diagnostic
+    /// printed as a bare `error: ...` without `file:line:col` (AUD-ICE-1).
+    /// Sharing by handle keeps the locations in both phases.
+    pub fn share_source_manager(&self) -> Option<std::rc::Rc<SourceManager>> {
+        self.source_manager.clone()
     }
 
     /// Take ownership of the source manager (for passing to codegen for debug info).
-    pub fn take_source_manager(&mut self) -> Option<SourceManager> {
+    pub fn take_source_manager(&mut self) -> Option<std::rc::Rc<SourceManager>> {
         self.source_manager.take()
     }
 

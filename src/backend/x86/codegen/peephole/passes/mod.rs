@@ -37,6 +37,7 @@ mod helpers;
 mod identical_blocks;
 mod jump_thread;
 mod liveness;
+mod load_bswap_movbe;
 mod load_op_fuse;
 mod local_patterns;
 mod loop_trampoline;
@@ -1748,6 +1749,26 @@ fn peephole_optimize_inner(
         // reference to %rsp): slots the allocator reserved and later
         // passes retired. GCC's leaf functions carry no such frame.
         frame_compact::remove_dead_leaf_frame(&mut store, &mut infos);
+    }
+
+    // Phase 7a: `load` + `bswap` on one register -> one MOVBE.
+    //
+    // It runs HERE, not with the phase-1 folds, because the pair does not
+    // exist until the copy/relay passes have settled: isel emits the byte swap
+    // against its own operand and the allocator's copies are still in place
+    // (`movq (%rdi), %rax; movq %rax, %rdi; bswapq %rdi`), so a phase-1
+    // matcher sees `load; copy` and nothing to fuse.  Measured for the oracle
+    // at -march=x86-64-v3: GCC 16.2 and ICX emit `movbeq (%rdi), %rax` where
+    // LCCC emitted `movq` + `bswapq`, and Clang 23.1 emits a twelve-instruction
+    // `vpmovzxbq`/`vpsllvq`/`vpor` chain.  Its own skip name (`movbe_fuse`) and
+    // its own `X86Isa::movbe` permission (`-mno-movbe`, `-march=x86-64`), so
+    // the A/B is one flag and the target contract is the driver's.
+    if !sk("movbe_fuse") {
+        load_bswap_movbe::fuse_load_bswap(
+            &mut store,
+            &mut infos,
+            crate::backend::x86::isa::current().movbe,
+        );
     }
 
     // Phase 7b: Narrow `movabsq/movq $imm` to `movl` where zero-extension

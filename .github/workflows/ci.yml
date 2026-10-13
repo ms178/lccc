@@ -6,10 +6,23 @@ on:
   pull_request:
     branches: [main]
 
+# AUD-CI-1: least privilege, no duplicate runs on the same ref, pinned runner.
+# (The job-level split of the monolithic `test` job is tracked as a follow-up:
+# it needs the artifact-sharing refactor plus an update to
+# scripts/check_ci_gate_parity.py, which currently verifies that ci_local.sh
+# runs the same *commands*, not the same job layout.)
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: Test Suite
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -96,6 +109,39 @@ jobs:
       # that never ran -- a green run that tested nothing.
       - name: No merge conflict markers
         run: python3 scripts/check_no_conflict_markers.py
+
+      - name: Audit census ratchet
+        run: |
+          python3 scripts/audit_census.py --selftest
+          python3 scripts/audit_census.py --check
+
+      - name: Check the recursion-to-iteration pass
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_rec2iter.sh
+
+      - name: Check FP-contraction parity with GCC
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_fp_contract_parity.sh
+
+      - name: Replay the historical reproducer corpus
+        run: |
+          python3 scripts/repros_replay.py --selftest
+          python3 scripts/repros_replay.py --lccc target/fastbuild/lccc --check
+
+      - name: Check -o - stdout semantics
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_dash_o_stdout.sh
+
+      - name: Check ill-typed builtin diagnostics
+        run: |
+          python3 scripts/check_ill_typed_builtins.py --self-test
+          python3 scripts/check_ill_typed_builtins.py --compiler target/fastbuild/lccc
+
+      - name: Check builtin_cpu_supports runtime semantics
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_cpu_supports_runtime.sh
+
+      - name: Check GOT-slot references to local symbols
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_got_slot_local_addend.sh
+
+      - name: Check temporary-file symlink isolation
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_temp_symlink.sh
 
       - name: Verify manifest Rust-toolchain selection
         run: bash tests/regression/check_rust_toolchain_selector.sh
@@ -1441,8 +1487,9 @@ jobs:
           if-no-files-found: warn
 
   clippy:
+    timeout-minutes: 45
     name: Clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -1467,8 +1514,9 @@ jobs:
   # Networked, so a Compiler Explorer outage is a recorded skip (exit 0), never
   # a red build; the self-tests in the `test` job pin the gate logic itself.
   oracle-delta:
+    timeout-minutes: 30
     name: Compiler Explorer oracle delta
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v7

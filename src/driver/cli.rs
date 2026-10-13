@@ -2677,6 +2677,63 @@ mod cli_tests {
         );
     }
 
+    /// GCC parity at the low optimization levels (measured, gcc 14.2):
+    /// `-O0`/`-O1` never contract `a*b+c` into an FMA, even with
+    /// `-march=x86-64-v3`; fusion starts at `-O2`.  The C-language default
+    /// (`-ffp-contract=fast`) must therefore not apply below `-O2`, while an
+    /// explicit flag still wins at every level.
+    #[test]
+    fn fp_contract_default_is_off_below_o2_and_explicit_wins() {
+        let mut d = Driver::new();
+        d.parse_cli_args(&["lccc".to_string(), "-O0".to_string(), "x.c".to_string()])
+            .unwrap();
+        assert!(
+            d.resolved_fp_contract() == FpContract::Off,
+            "-O0 must not contract by default (GCC parity)"
+        );
+        let mut d = Driver::new();
+        d.parse_cli_args(&["lccc".to_string(), "-O1".to_string(), "x.c".to_string()])
+            .unwrap();
+        assert!(
+            d.resolved_fp_contract() == FpContract::Off,
+            "-O1 must not contract by default"
+        );
+
+        let mut d = Driver::new();
+        d.parse_cli_args(&["lccc".to_string(), "-O2".to_string(), "x.c".to_string()])
+            .unwrap();
+        assert!(
+            d.resolved_fp_contract() == FpContract::Fast,
+            "-O2 keeps GCC's fast contraction default"
+        );
+
+        let mut d = Driver::new();
+        d.parse_cli_args(&[
+            "lccc".to_string(),
+            "-O0".to_string(),
+            "-ffp-contract=fast".to_string(),
+            "x.c".to_string(),
+        ])
+        .unwrap();
+        assert!(
+            d.resolved_fp_contract() == FpContract::Fast,
+            "an explicit -ffp-contract=fast must win at -O0"
+        );
+
+        let mut d = Driver::new();
+        d.parse_cli_args(&[
+            "lccc".to_string(),
+            "-O3".to_string(),
+            "-ffp-contract=off".to_string(),
+            "x.c".to_string(),
+        ])
+        .unwrap();
+        assert!(
+            d.resolved_fp_contract() == FpContract::Off,
+            "explicit off wins at -O3"
+        );
+    }
+
     #[test]
     fn fp_contract_is_independent_and_last_option_wins() {
         let mut explicit = Driver::new();

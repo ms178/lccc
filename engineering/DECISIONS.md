@@ -2812,3 +2812,116 @@ their rule is mutated away); `check_reassoc_latency.sh` checks 5 (rot
 bound <= 2, pass-off 5) and 6 (-m32 SHA/rot identical to pass-off, -m32
 bitops and x86-64 rot still rewritten); lea fold and refusal unit tests;
 seven parity-check unit tests.
+
+## 2026-10-13 — AUD-CPU-1: `__builtin_cpu_supports` folds against the effective target
+
+- **Semantics change (deliberate).** `__builtin_cpu_supports("f")` now folds to
+  `1` **iff the feature is statically guaranteed by the code-generation target
+  of this translation unit** — the same
+  `enable_*`/`-mno-sse` state that gates instruction selection
+  (`crate::common::isa_features`, published by `Driver::compile_to_assembly`).
+  Everything else folds to `0`: features beyond the target, features the driver
+  does not model (SHA-NI, ADX, RDSEED, XOP, SSE4A, `xsaveopt`/`xsavec`), unknown
+  spellings, and every x86 feature name on AArch64/RISC-V.
+- **Why:** the previous fold used a hard-coded Raptor Lake allowlist. A
+  `-march=x86-64 -mno-avx2` build still answered `1` for `"avx2"`, so
+  runtime-dispatched libraries (zlib-ng, zstd, xz, OpenSSL, FFmpeg) took their
+  AVX2/BMI2/SHA paths unconditionally — `#UD` on every CPU without them.
+  LCCC's default target is **x86-64-v3** (`cli.rs`, absent `-march`), not Raptor
+  Lake, so even the default answer for `"aes"`/`"sha"` was a lie.
+- **The default target is a feature set, not a CPU table.** `-march=raptorlake`
+  guarantees what its profile actually enables (v3 + AES/PCLMUL/RDRND +
+  AVX-VNNI/GFNI/VAES/VPCLMULQDQ) and nothing more; SHA-NI is not modelled by the
+  ISA applicator at all, so `-msha`-style dispatchers take the generic path.
+- **Known cost, accepted with the fix:** the fold is now *more* conservative
+  than GCC, which answers from runtime CPUID (`__cpu_model`). Dispatchers lose
+  the widest path on hosts that do have the feature.
+- **Follow-up (FE-25, still open):** lower the unresolved cases to a real
+  runtime test (libgcc `__cpu_model` when the symbol is available, else an
+  inline CPUID+XGETBV helper) and make `__builtin_cpu_init()` call
+  `__cpu_indicator_init`; add `sha`/`adx`/`rdseed` to the ISA applicator so they
+  can be statically guaranteed when the target implies them. Gates:
+  `tests/regression/check_cpu_supports_runtime.sh` (audit rows, assembly-level +
+  runtime), `tests/regression/builtin_cpu_supports_default.c`,
+  `tests/regression/builtin_cpu_supports_raptor.c` (`-march=raptorlake`).
+- **AUD-TOOLCHAIN-1:** the `__cpuid`/`__cpuid_count` calls in
+  `backend/x86/cpu_model.rs` now go through `#[allow(unused_unsafe)] unsafe`
+  wrappers, so the file builds warning-free on both sides of the intrinsic's
+  safety change instead of asserting a version-dependent claim in a comment.
+
+## 2026-10-13 — AUD-ICE-1 / AUD-DIAG-1 / AUD-SILENT-ZERO-1: invalid builtin calls are diagnostics
+
+- Every reachable `panic!` in `__builtin_shuffle` / `__builtin_shufflevector`
+  lowering became a located diagnostic with GCC's wording (`'__builtin_shuffle'
+  last argument must be an integer vector`, `... number of elements of the
+  argument vector(s) and the mask vector should be the same`, `wrong number of
+  arguments to '__builtin_shuffle'`, `invalid element index '<n>' to
+  '__builtin_shufflevector'`). The rejected call lowers to a shape-correct
+  pointer placeholder so the rest of lowering stays total — the driver still
+  aborts on the emitted error, before any pass or codegen.
+- **AUD-DIAG-1**: `__builtin_shuffle` now validates the mask element CLASS
+  (integer, not just "a vector") and the element-count agreement. A float
+  vector mask used to be accepted silently; GCC rejects it.
+- **AUD-SILENT-ZERO-1 (lowering half)**: an x86-only intrinsic compiled for a
+  foreign target is rejected at the single choke point every x86 intrinsic
+  passes through (`lower_x86_intrinsic`), e.g. `'__builtin_ia32_aesenc128' is
+  not available on aarch64`. The ARM/RISC-V backends' silent-zero lowerings are
+  no longer reachable from valid source; removing that dead code is the
+  follow-up in the module's TODO.
+- **Diagnostics plumbing**: lowering diagnostics printed as a bare
+  `error: ...` because the driver `take_source_manager()`d the source manager
+  right after sema, before lowering. It is now *shared* (`DiagnosticEngine::
+  share_source_manager`) and only taken for codegen's debug-info emission
+  afterwards, so lowering-phase diagnostics render with `file:line:col` like
+  parser/sema ones.
+- Gates: `scripts/check_ill_typed_builtins.py` (13 rows, `-O0`/`-O2`, GCC
+  agreement where the wording is comparable, `--self-test`), mutation-checked
+  against the pre-fix compiler (which panics on every row).
+
+## 2026-10-13 — FP-contraction parity: `-O0`/`-O1` must not contract
+
+- **Measured** (gcc 14.2, `a*b+c` probes): GCC never fuses to an FMA at `-O0`
+  or `-O1`, not even with `-march=x86-64-v3` and not even under `-ffast-math`;
+  fusion appears at `-O2`. LCCC's C default is `-ffp-contract=fast` (GCC's
+  *flag* default) and applied at every level, so `lccc -O0` printed different
+  FP results than `gcc -O0`.
+- **Consequence, now fixed**: `Driver::resolved_fp_contract()` returns `Off`
+  below `-O2` unless `-ffp-contract=`/`-ffast-math` was given explicitly.
+  `-O2`+ keeps fast contraction (and matches GCC `-O2 -march=x86-64-v3`).
+- **Why this mattered:** 26 `artifacts/repros/miscompile_gen_fp_stress_*` files
+  were filed as miscompiles although both results were conforming; the real
+  defect was the level mismatch. After the fix the whole corpus replays clean
+  (94 pass, 3 skipped for a missing Csmith harness, 0 fail).
+- Gate: `tests/regression/check_fp_contract_parity.sh` (level matrix on the
+  emitted assembly, positive control at `-O2`, both explicit flags, numeric
+  agreement with GCC per level), mutation-checked on the pre-fix compiler.
+
+## 2026-10-13 — corpus replay, census ratchet, hygiene, CI hardening
+
+- `scripts/repros_replay.py` replays every historical reproducer with an
+  ISA-matched GCC arm (`-march=x86-64-v3`, which IS lccc's default target) and
+  treats "needs csmith.h" as a loud skip, not a pass. Wired into `ci_local.sh`
+  (fast) and CI with a `--selftest`.
+- `scripts/audit_census.py` (+ `audit_census_baseline.json`) ratchets the
+  audit's debt numbers: panic-class sites, `unsafe`, functions over
+  300/500/1000 lines, distinct `CCC_*`/`LCCC_*` knobs and undocumented knobs,
+  `#[ignore]`. Counts come from this tool's stripping rules (documented in its
+  docstring) and are therefore not identical to the audit's own census — the
+  ratchet is about growth, not about matching that number.
+- Hygiene: removed `.claude/settings.local.json` (blanket shell auto-approval
+  shipped to every clone), the leaked `.base_ref`, and the scratch `work/`
+  directory; ignored all three. Moved the loose `tests/*` fixtures into
+  `tests/regression/fixtures/ivsr/` (documented) and `verify_fib_perf.sh` into
+  `scripts/` (its `SRC` path fixed). Renamed the two reproducer files containing
+  `[`/`]`/`=`.
+- CI: `permissions: contents: read`, `concurrency` with cancel-in-progress,
+  `runs-on: ubuntu-24.04`, per-job `timeout-minutes`. Splitting the monolithic
+  `test` job is a follow-up: `scripts/check_ci_gate_parity.py` verifies the
+  *commands* run locally match CI, so the split must land together with that
+  checker's update.
+- Docs/tooling: `tools/workspace_dirs.sh` resolves the persisted workspace
+  (`LCCC_WORKSPACE` → `/home/user` → `/mnt/user-data/outputs` → `$PWD`, loud
+  failure) and `scripts/lccc-snapshot.sh` uses it; `snapshot_ms178.sh` and
+  `lccc-harness-snapshot.sh` carry deprecation headers pointing at the
+  canonical snapshot tool; `scripts/README.md` documents the `-o -`, private
+  temp directory and cpu-supports contracts.

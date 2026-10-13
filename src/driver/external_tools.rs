@@ -295,13 +295,17 @@ impl Driver {
             Self::read_source(input_file)?
         };
 
-        // Debug: dump preprocessed assembly to /tmp/asm_debug_<basename>.s
+        // Debug dumps use the same private reservation as temporary objects.
         if std::env::var("CCC_ASM_DEBUG").is_ok() {
             let basename = std::path::Path::new(input_file)
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown");
-            let _ = std::fs::write(format!("/tmp/asm_debug_{}.s", basename), &asm_text);
+            let mut dump = crate::common::temp_files::TempFile::new("asm_debug", basename, "s")?;
+            std::fs::write(dump.path(), &asm_text)
+                .map_err(|e| format!("Failed to write assembly debug dump: {e}"))?;
+            dump.set_keep(true);
+            eprintln!("Assembly debug dump: {dump}");
         }
 
         let extra = self.build_asm_extra_args();
@@ -450,6 +454,13 @@ impl Driver {
                 for p in prereqs.iter().skip(usize::from(input_file != "-")) {
                     content.push_str(&format!("\n{}:\n", p));
                 }
+            }
+            if dep_path == "-" {
+                // GCC: `-MF -` writes the make rule to the standard output
+                // (AUD-DRV-1), which is how `-M`-style consumers read deps
+                // without a temp file.
+                print!("{}", content);
+                return Ok(());
             }
             std::fs::write(&dep_path, content)
                 .map_err(|e| format!("Cannot write dependency file {}: {}", dep_path, e))
