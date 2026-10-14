@@ -10437,6 +10437,8 @@ fn jump_carries_observable_address(
         }
         // Directives (including zero-byte alignment/space) and comments
         // cannot prove separation. Inline asm is opaque, so retain the jump.
+        // DIRECTIVE-LAW: selecting -- search for pins, not a movable window;
+        // ignoring even byte-emitting directives can only RETAIN more jumps.
         if matches!(infos[idx].kind, LineKind::Directive | LineKind::Empty) {
             continue;
         }
