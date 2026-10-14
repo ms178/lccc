@@ -7115,6 +7115,44 @@ mod indexed_gep_machinst_gate_tests {
     }
 
     #[test]
+    fn constant_access_bypasses_machinst_before_its_dominating_gep() {
+        let mut function = late_gep_function();
+        if let Instruction::GetElementPtr { offset, .. } = &mut function.blocks[2].instructions[0] {
+            *offset = Operand::Const(IrConst::I64(16));
+        } else {
+            panic!("fixture must define the GEP in the late block");
+        }
+        let uses = count_value_uses(&function);
+        let stability = analyze_base_stability(&function);
+        let constants = build_gep_fold_map(&function, &uses, &stability);
+        let indexed = build_indexed_gep_map(&function, &uses, &stability, false);
+        assert!(constants.contains_key(&3));
+        assert!(!indexed.contains_key(&3));
+        let load = &function.blocks[1].instructions[0];
+        assert!(mapped_gep_memory_access(load, &constants, &indexed));
+        let store = Instruction::Store {
+            val: Operand::Const(IrConst::I32(7)),
+            ptr: Value(3),
+            ty: IrType::U16,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        };
+        assert!(mapped_gep_memory_access(&store, &constants, &indexed));
+        // Empty maps retain the ordinary typed-memory path. A non-memory
+        // producer is not blocked just because its result is in a map.
+        assert!(!mapped_gep_memory_access(
+            load,
+            &FxHashMap::default(),
+            &indexed
+        ));
+        assert!(!mapped_gep_memory_access(
+            &function.blocks[2].instructions[0],
+            &constants,
+            &indexed
+        ));
+    }
+
+    #[test]
     fn constant_access_bypasses_machinst_before_producer_is_emitted() {
         for offset in [-16, 0, 16, i32::MAX as i64] {
             let mut function = late_gep_function();

@@ -1,0 +1,21 @@
+{
+  "tool_version": "GNU assembler (GNU Binutils for Debian) 2.44",
+  "rows": [
+    {
+      "flags": [
+        "-O2"
+      ],
+      "matched_bytes": 660,
+      "text_sha256": "5a020076907743d2ff8a3af11523c33829c472acff971a2e26770e9f9a777750"
+    },
+    {
+      "flags": [
+        "-O2",
+        "-mgeneral-regs-only"
+      ],
+      "matched_bytes": 964,
+      "text_sha256": "f60da6210767256d90e71b1fe533cc70ab6837ee6af5fa1ad5273eeaa7589c5b"
+    }
+  ],
+  "scope": "supplementary local GAS 2.44; not a 2.47 claim"
+}

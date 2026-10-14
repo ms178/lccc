@@ -1,0 +1,14 @@
+==404649== Memcheck, a memory error detector
+==404649== Copyright (C) 2002-2024, and GNU GPL'd, by Julian Seward et al.
+==404649== Using Valgrind-3.24.0 and LibVEX; rerun with -h for copyright info
+==404649== Command: /home/user/.cache/zlib-fix/full-fixed
+==404649==
+==404649==
+==404649== HEAP SUMMARY:
+==404649==     in use at exit: 0 bytes in 0 blocks
+==404649==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated
+==404649==
+==404649== All heap blocks were freed -- no leaks are possible
+==404649==
+==404649== For lists of detected and suppressed errors, rerun with: -s
+==404649== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)

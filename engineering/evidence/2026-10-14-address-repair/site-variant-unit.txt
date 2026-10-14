@@ -1,0 +1,10 @@
+   Compiling lccc v0.1.0 (/opt/lccc-audit-cache/lccc)
+    Finished `fastbuild` profile [optimized] target(s) in 3m 35s
+     Running unittests src/lib.rs (target/fastbuild/deps/lccc-63d4da9b885ca1e5)
+
+running 2 tests
+test backend::arm::linker::reloc::adr_checked_tests::input_site_validation_precedes_address_arithmetic ... ok
+test backend::arm::linker::reloc::adr_checked_tests::checked_address_patch_is_atomic_and_preserves_opcode_and_register ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 4576 filtered out; finished in 0.00s
+

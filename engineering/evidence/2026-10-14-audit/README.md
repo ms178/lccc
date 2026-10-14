@@ -31,3 +31,13 @@ run; do not expect them to survive a wipe. Source text is embedded in the
 contract records; source fixtures and replay instructions are committed here.
 Compiler binaries, source clones and build trees must be regenerated. The
 separate persisted source archive/cumulative patch restore this exact work.
+
+
+## Final-main repetitions
+
+`rebase-validation.json` is the summary/provenance for rebuilt 1e83776;
+`contracts-rebased.json` has 30 observations and 13 violated contracts. The
+new multiline-string control explains why the current count is not just the
+old count minus two fixes. `ctest-*-rebased.xml`, `gzip-check-*-rebased.log`,
+`zlib-ctest-rebased.log`, `expat-parser-rebased.log`, and the child-directory
+`*-rebased.json` files retain new executions without overwriting old evidence.

@@ -1,5 +1,10 @@
 # Whole-tree audit — 2026-10-14
 
+> Historical audit record. The later implementation session rebased to PR #820
+> (`e047aa1`), repaired A14-29/30, and reduced the queue to 31 open entries.
+> See [current fixes, validation and limits](FOLLOWUP-2026-10-14-constant-gep-fix.md).
+> Original evidence and claims below retain their original dates and bases.
+
 Initial audited base: `3b66cd1d73743a7a79f912c01df48ac15cc646ef`.
 Final rebased main: `1e83776f41529e2d754380d1d934ff901e25a097`.
 The initial results below retain their original identity. The final-main
@@ -233,3 +238,28 @@ New compiler/workload checks are recorded in `rebase-validation.json` and
 `contracts-rebased.json`. The standalone wrong-code reproducer, not an old
 linked executable, is recompiled for the new compiler. The delivered final
 CI receipt must name the rebased tree; the previous green receipt is insufficient.
+
+
+### Executed final-base revalidation
+
+All following checks use a freshly built compiler from main 1e83776, not the
+previous executable. The full-source receipt is `rebase-validation.json`.
+
+- Full gzip repeated: **30/30 upstream tests in each arm**, six exact compressed
+  streams; one-round timings discarded as statistically invalid.
+- Full Expat repeated: **4,932 checks in each arm pass**; the runner still exits
+  1 in JUnit postprocessing on status=run, exactly A14-29.
+- Full zlib-ng repeated: **68/69 CTests**, only maketrees fails; round-trip phase
+  returns 0. Full three-TU isolation and the standalone sanitizer matrix are
+  repeated: -O2/-O3 wrong, -O0/-O1 and no-widen correct.
+- Six kernel filters repeated: **28 pass, zero fail/skip**, across -O0..-O3.
+- Current contract replay: **30 observations / 13 violations**. Two old scanner
+  controls now pass, but the added multiline-body control reveals a remaining
+  tokenizer defect. This is not 13 new independent compiler bugs.
+- Non-UTF-8 symbol identity repeated: bfd/lld link and exit 0; LCCC falsely
+  rejects the two distinct names. No silent mislink is asserted.
+- The CI-memory replay still distinguishes isolated -j1 from inherited -j2.
+
+Final fast-CI status remains bound to the delivered final tree receipt, not the
+pre-rebase 217/0/5 result. Initial JSON/XML evidence is retained for traceability;
+new results have separate filenames rather than silently overwriting history.

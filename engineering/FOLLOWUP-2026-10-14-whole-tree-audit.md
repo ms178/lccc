@@ -1,5 +1,10 @@
 # Follow-up — whole-tree audit, 2026-10-14
 
+> Historical audit record. The later implementation session rebased to PR #820
+> (`e047aa1`), repaired A14-29/30, and reduced the queue to 31 open entries.
+> See [current fixes, validation and limits](FOLLOWUP-2026-10-14-constant-gep-fix.md).
+> Original evidence and claims below retain their original dates and bases.
+
 ## Accomplished
 
 - Started from main `3b66cd1d73743a7a79f912c01df48ac15cc646ef`; final refresh
@@ -86,3 +91,13 @@ non-x86 runtime validation or bare-metal throughput superiority is claimed.
 - S01..S04 preserve validated audit milestones. Later named generations carry
   subsequent documentation/validation. Consult the ledger rather than guessing
   the newest contents from timestamps or older session narratives.
+
+
+## Final-base rerun
+
+On 1e83776, the compiler was rebuilt fastbuild/-O1/-j2. Full gzip, Expat,
+zlib-ng, the 28 reduced kernel cases, zlib TU-mixing/standalone sanitizer matrix,
+ELF byte-name fixture, and 30 current contract observations were rerun. Results
+agree with the open findings (13 contract violations; 68/69 zlib tests; Expat
+parser false-failure). A14-05 is closed upstream, leaving 33 open entries.
+See `rebase-validation.json` and the report's final-base section for exact scope.

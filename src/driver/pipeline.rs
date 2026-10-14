@@ -2690,6 +2690,15 @@ impl Driver {
                 ));
             }
         }
+        if self.target == Target::Aarch64 && self.general_regs_only {
+            if let Some((func, line)) = first_arm_simd_reference(&asm) {
+                return Err(format!(
+                    "{input_file}: in function '{func}': FP/SIMD register use is forbidden \
+                     by -mgeneral-regs-only (offending instruction: `{}`)",
+                    line.trim()
+                ));
+            }
+        }
         // Debug-info honesty law: `-g` must never be silently dropped.
         // lccc's debug support today is line tables (.file/.loc →
         // .debug_line); it does not emit .debug_info (DIEs/types), and
@@ -3127,6 +3136,100 @@ impl Driver {
 /// dropped and the honesty warning in the pipeline must fire.
 fn asm_contains_debug_records(asm: &str) -> bool {
     asm.contains(".file ") || asm.contains(".loc ")
+}
+
+/// Check compiler-generated AArch64 instructions, not data, comments, symbol
+/// names, or explicit inline assembly (the same policy as the x86 guard).
+/// Emitted instructions occupy one line; no allocation is needed on success.
+fn first_arm_simd_reference(asm: &str) -> Option<(String, String)> {
+    let mut function = "<toplevel>";
+    let mut in_app = false;
+    for line in asm.lines() {
+        let text = line.trim();
+        if matches!(text, "#APP" | "//APP" | "// APP") {
+            in_app = true;
+            continue;
+        }
+        if matches!(text, "#NO_APP" | "//NO_APP" | "// NO_APP") {
+            in_app = false;
+            continue;
+        }
+        if in_app || text.is_empty() || text.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = text.strip_prefix(".type ") {
+            if rest.ends_with("function") {
+                function = rest.split(',').next().unwrap_or("<toplevel>").trim();
+            }
+        }
+        let text = text.split("//").next().unwrap_or("").trim();
+        if text.starts_with('.') || text.ends_with(':') {
+            continue;
+        }
+        let Some((mnemonic, operands)) = text.split_once(char::is_whitespace) else {
+            continue;
+        };
+        // These operand slots contain labels which may legally be named v0,
+        // d0, etc. They are addresses, not register-file references.
+        if matches!(mnemonic, "b" | "bl" | "prfm" | "prfum") || mnemonic.starts_with("b.") {
+            continue;
+        }
+        let operands = if matches!(mnemonic, "adr" | "adrp" | "cbz" | "cbnz" | "tbz" | "tbnz")
+            || mnemonic.starts_with("ldr")
+        {
+            operands.split(',').next().unwrap_or("")
+        } else {
+            operands
+        };
+        for operand in operands.split(',') {
+            let operand = operand.trim();
+            if operand.starts_with(['#', '=', ':']) {
+                continue;
+            }
+            for token in operand.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+                let bytes = token.as_bytes();
+                if bytes.len() >= 2
+                    && matches!(bytes[0], b'v' | b'q' | b'd' | b's' | b'h' | b'b')
+                    && bytes[1..].iter().all(u8::is_ascii_digit)
+                {
+                    return Some((function.to_owned(), line.to_owned()));
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod arm_simd_reference_tests {
+    use super::first_arm_simd_reference;
+
+    #[test]
+    fn detects_scalar_vector_loads_stores_and_lane_operands() {
+        for instruction in [
+            "fadd d0, d1, d2",
+            "fmov x0, d31",
+            "cnt v0.8b, v1.8b",
+            "ldr q0, [x0]",
+            "str s0, [x1]",
+            "stp q8, q9, [sp]",
+            "ld1 {v0.4s}, [x0]",
+            "umov w0, v31.s[0]",
+        ] {
+            let asm = format!(".type probe, %function\nprobe:\n    {instruction}\n");
+            let (function, _) = first_arm_simd_reference(&asm).unwrap();
+            assert_eq!(function, "probe");
+        }
+    }
+
+    #[test]
+    fn does_not_confuse_symbols_comments_immediates_or_user_assembly_with_registers() {
+        let asm = ".type v0, %function\nv0:\nadr x0, d0\nadrp x1, :got:q0\n\
+                   ldr x2, s0\nadd x0, x0, #:lo12:v0\nadd x1,x1,:lo12:v0\nmov x0, #d0\n\
+                   b v0\nbl q31\nb.eq d0\ncbz x0,v0\ntbz x1,#1,q0\nprfm pldl1keep,v0\nmov x0, x1 // v1.8b\n\
+                   .asciz \"v0 q0 d0\"\n#APP\nfmov d0, x0\n#NO_APP\nret\n";
+        assert!(first_arm_simd_reference(asm).is_none());
+    }
 }
 
 fn first_sse_reference(asm: &str) -> Option<(String, String)> {

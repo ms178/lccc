@@ -1,0 +1,38 @@
+[
+  {
+    "arm": "bfd",
+    "argv": [
+      "ld",
+      "/tmp/tmpaz_3g9m2/in.o",
+      "-o",
+      "/tmp/tmpaz_3g9m2/bfd"
+    ],
+    "link_rc": 0,
+    "stderr": "",
+    "run_rc": 0
+  },
+  {
+    "arm": "lld",
+    "argv": [
+      "ld.lld",
+      "/tmp/tmpaz_3g9m2/in.o",
+      "-o",
+      "/tmp/tmpaz_3g9m2/lld"
+    ],
+    "link_rc": 0,
+    "stderr": "",
+    "run_rc": 0
+  },
+  {
+    "arm": "lccc",
+    "argv": [
+      "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc-ld",
+      "/tmp/tmpaz_3g9m2/in.o",
+      "-o",
+      "/tmp/tmpaz_3g9m2/lccc"
+    ],
+    "link_rc": 1,
+    "stderr": "lccc-ld: error: multiple definition of 'sym\ufffd' (duplicate in /tmp/tmpaz_3g9m2/in.o)\n",
+    "run_rc": null
+  }
+]

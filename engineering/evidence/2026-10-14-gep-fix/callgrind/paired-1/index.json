@@ -1,0 +1,197 @@
+{
+  "complete": true,
+  "metric": "bounded whole-program simulated Ir; not runtime",
+  "selected": [
+    "expat_siphash24",
+    "glibc_memcmp",
+    "gzip_crc32",
+    "linux_find_bit",
+    "sqlite_varint",
+    "zlib_ng_adler32"
+  ],
+  "results": {
+    "gzip_crc32": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DDATA_SIZE=16384 -DPASSES=4",
+      "metrics": {
+        "conditional_mispredicts": [
+          3334,
+          3334
+        ],
+        "d1_misses": [
+          2208,
+          2208
+        ],
+        "i1_misses": [
+          1364,
+          1364
+        ],
+        "indirect_mispredicts": [
+          233,
+          233
+        ],
+        "ir_mine": 800758,
+        "ir_ratio": 1.0,
+        "ir_ref": 800758,
+        "ll_misses": [
+          3172,
+          3172
+        ]
+      },
+      "manifest": "/home/user/.cache/callgrind-paired-1/gzip_crc32/manifest.json"
+    },
+    "zlib_ng_adler32": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DDATA_SIZE=16384 -DPASSES=4",
+      "metrics": {
+        "conditional_mispredicts": [
+          3372,
+          3372
+        ],
+        "d1_misses": [
+          2187,
+          2187
+        ],
+        "i1_misses": [
+          1378,
+          1378
+        ],
+        "indirect_mispredicts": [
+          233,
+          233
+        ],
+        "ir_mine": 463601,
+        "ir_ratio": 1.0,
+        "ir_ref": 463601,
+        "ll_misses": [
+          3171,
+          3171
+        ]
+      },
+      "manifest": "/home/user/.cache/callgrind-paired-1/zlib_ng_adler32/manifest.json"
+    },
+    "expat_siphash24": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=1000",
+      "metrics": {
+        "conditional_mispredicts": [
+          116256,
+          116256
+        ],
+        "d1_misses": [
+          1894,
+          1894
+        ],
+        "i1_misses": [
+          1418,
+          1418
+        ],
+        "indirect_mispredicts": [
+          1429,
+          1429
+        ],
+        "ir_mine": 15209628,
+        "ir_ratio": 1.0,
+        "ir_ref": 15209628,
+        "ll_misses": [
+          2962,
+          2962
+        ]
+      },
+      "manifest": "/home/user/.cache/callgrind-paired-1/expat_siphash24/manifest.json"
+    },
+    "sqlite_varint": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DVALUE_COUNT=2048 -DPASSES=4",
+      "metrics": {
+        "conditional_mispredicts": [
+          12562,
+          12562
+        ],
+        "d1_misses": [
+          2228,
+          2228
+        ],
+        "i1_misses": [
+          1375,
+          1375
+        ],
+        "indirect_mispredicts": [
+          2054,
+          2054
+        ],
+        "ir_mine": 832858,
+        "ir_ratio": 1.0,
+        "ir_ref": 832858,
+        "ll_misses": [
+          3199,
+          3199
+        ]
+      },
+      "manifest": "/home/user/.cache/callgrind-paired-1/sqlite_varint/manifest.json"
+    },
+    "linux_find_bit": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=32",
+      "metrics": {
+        "conditional_mispredicts": [
+          11852,
+          11852
+        ],
+        "d1_misses": [
+          137228,
+          137228
+        ],
+        "i1_misses": [
+          1359,
+          1359
+        ],
+        "indirect_mispredicts": [
+          232,
+          232
+        ],
+        "ir_mine": 5957511,
+        "ir_ratio": 1.0,
+        "ir_ref": 5957511,
+        "ll_misses": [
+          6992,
+          6992
+        ]
+      },
+      "manifest": "/home/user/.cache/callgrind-paired-1/linux_find_bit/manifest.json"
+    },
+    "glibc_memcmp": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=16",
+      "metrics": {
+        "conditional_mispredicts": [
+          3364,
+          3364
+        ],
+        "d1_misses": [
+          25343,
+          25343
+        ],
+        "i1_misses": [
+          1362,
+          1362
+        ],
+        "indirect_mispredicts": [
+          232,
+          232
+        ],
+        "ir_mine": 722640,
+        "ir_ratio": 1.0,
+        "ir_ref": 722640,
+        "ll_misses": [
+          4945,
+          4945
+        ]
+      },
+      "manifest": "/home/user/.cache/callgrind-paired-1/glibc_memcmp/manifest.json"
+    }
+  },
+  "failures": [],
+  "worst_first": [
+    "gzip_crc32",
+    "zlib_ng_adler32",
+    "expat_siphash24",
+    "sqlite_varint",
+    "linux_find_bit",
+    "glibc_memcmp"
+  ]
+}

@@ -586,7 +586,7 @@ Supported operations include:
 
 ### Popcount
 
-Integer popcount uses NEON byte-count instructions:
+By default, integer popcount uses NEON byte-count instructions:
 
 ```asm
     fmov d0, x0           // move integer to FP register
@@ -596,6 +596,14 @@ Integer popcount uses NEON byte-count instructions:
 ```
 
 ---
+
+With `-mgeneral-regs-only`, 32-/64-bit popcount instead uses a fixed 12-instruction
+GPR-only SWAR sequence (pair/nibble/byte counts, multiply by repeated `0x01`,
+then extract the top byte). The only clobbers are the unary accumulator x0 and
+reserved scratch x1. W-register operations exclude unspecified upper argument
+bits for the 32-bit form. No helper, branch, spill, or FP/SIMD instruction is
+introduced by this sequence. This is an ISA correctness repair, not evidence
+that software popcount is faster than the unconstrained NEON implementation.
 
 ## Inline Assembly Support
 

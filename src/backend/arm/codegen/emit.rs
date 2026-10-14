@@ -277,8 +277,8 @@ pub struct ArmCodegen {
     /// For large stack frames: reserved for future x19 frame base optimization.
     /// Currently always None (optimization disabled due to correctness issue).
     pub(super) frame_base_offset: Option<i64>,
-    /// Whether -mgeneral-regs-only is set. When true, FP/SIMD registers (q0-q7)
-    /// must not be used. Variadic prologues skip saving q0-q7 and va_start
+    /// Whether -mgeneral-regs-only is set. Compiler-generated instructions must
+    /// not use any FP/SIMD registers. Variadic prologues skip q0-q7 and va_start
     /// sets __vr_offs=0 (no FP register save area available).
     pub(super) general_regs_only: bool,
     /// Exact AAPCS64 fixed-register conditional-increment leaf: no stack frame,

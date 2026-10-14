@@ -1,0 +1,93 @@
+{
+  "metric": "whole-program simulated Ir, NOT runtime or physical PMU",
+  "baseline_head": "f8377536af3d32e9fc6a5ad3cacd956af08ed1ab",
+  "candidate_head": "8e72a3e24d87e156c8ebf34d5387da2bde2837b5",
+  "rounds": 3,
+  "rows": [
+    {
+      "kernel": "expat_siphash24",
+      "ratios": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "binary_identical": [
+        true,
+        true,
+        true
+      ]
+    },
+    {
+      "kernel": "glibc_memcmp",
+      "ratios": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "binary_identical": [
+        true,
+        true,
+        true
+      ]
+    },
+    {
+      "kernel": "gzip_crc32",
+      "ratios": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "binary_identical": [
+        true,
+        true,
+        true
+      ]
+    },
+    {
+      "kernel": "linux_find_bit",
+      "ratios": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "binary_identical": [
+        true,
+        true,
+        true
+      ]
+    },
+    {
+      "kernel": "sqlite_varint",
+      "ratios": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "binary_identical": [
+        true,
+        true,
+        true
+      ]
+    },
+    {
+      "kernel": "zlib_ng_adler32",
+      "ratios": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "binary_identical": [
+        true,
+        true,
+        true
+      ]
+    }
+  ],
+  "arithmetic_mean": 1.0,
+  "geometric_mean": 1.0,
+  "best": 1.0,
+  "worst": 1.0,
+  "wins": 0,
+  "regressions": 0,
+  "ties": 6
+}

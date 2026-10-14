@@ -1,0 +1,20 @@
+Start testing: Oct 14 00:57 UTC
+----------------------------------------------------------
+1/1 Testing: runtests
+1/1 Test: runtests
+Command: "/usr/bin/bash" "run.sh" "/home/user/.cache/lccc-expat.9LkSAB/gcc/tests/runtests"
+Directory: /opt/lccc-audit-cache/lccc-expat.9LkSAB/gcc
+"runtests" start time: Oct 14 00:57 UTC
+Output:
+----------------------------------------------------------
+Expat version: expat_2.8.5
+100%: Checks: 4932, Failed: 0
+<end of output>
+Test time =  21.49 sec
+----------------------------------------------------------
+Test Passed.
+"runtests" end time: Oct 14 00:57 UTC
+"runtests" time elapsed: 00:00:21
+----------------------------------------------------------
+
+End testing: Oct 14 00:57 UTC

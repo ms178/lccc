@@ -1,0 +1,52 @@
+{
+  "gcc": {
+    "exit": 0,
+    "version": [
+      "gcc (Debian 14.2.0-19) 14.2.0",
+      "Copyright (C) 2024 Free Software Foundation, Inc.",
+      "This is free software; see the source for copying conditions.  There is NO"
+    ]
+  },
+  "clang": {
+    "exit": 0,
+    "version": [
+      "Debian clang version 19.1.7 (3+b1)",
+      "Target: x86_64-pc-linux-gnu",
+      "Thread model: posix"
+    ]
+  },
+  "as": {
+    "exit": 0,
+    "version": [
+      "GNU assembler (GNU Binutils for Debian) 2.44",
+      "Copyright (C) 2025 Free Software Foundation, Inc.",
+      "This program is free software; you may redistribute it under the terms of"
+    ]
+  },
+  "ld": {
+    "exit": 0,
+    "version": [
+      "GNU ld (GNU Binutils for Debian) 2.44",
+      "Copyright (C) 2025 Free Software Foundation, Inc.",
+      "This program is free software; you may redistribute it under the terms of"
+    ]
+  },
+  "ld.lld": {
+    "exit": 0,
+    "version": [
+      "Debian LLD 19.1.7 (compatible with GNU linkers)"
+    ]
+  },
+  "mold": {
+    "exit": 0,
+    "version": [
+      "mold 2.37.1 (compatible with GNU ld)"
+    ]
+  },
+  "valgrind": {
+    "exit": 0,
+    "version": [
+      "valgrind-3.24.0"
+    ]
+  }
+}

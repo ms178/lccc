@@ -1461,12 +1461,25 @@ pub(crate) fn encode_ldar_stlr(
 
 // ── Address computation ──────────────────────────────────────────────────
 
+/// Both PC-relative address instructions have exactly two operands and an X
+/// destination. Register class alone is insufficient: Wn shares the number.
+fn adr_destination(operands: &[Operand], mnemonic: &str) -> Result<u32, String> {
+    if operands.len() != 2 {
+        return Err(format!("{mnemonic} takes exactly 2 operands"));
+    }
+    let rd = reg_operand(operands, 0, GpRole::RegOrZr, mnemonic)?;
+    if !rd.is_64 {
+        return Err(format!("{mnemonic} requires a 64-bit destination register"));
+    }
+    Ok(rd.num)
+}
+
 pub(crate) fn encode_adrp(operands: &[Operand]) -> Result<EncodeResult, String> {
     // ADRP's Rd is a 64-bit general-purpose register: `adrp d0, sym` used to
     // encode `adrp x0, sym` because the permissive reader accepts the FP width
     // letters, i.e. a page-address computation written into a double register
     // became one into x0.  SP is not encodable either (field 31 is XZR here).
-    let rd = reg_operand(operands, 0, GpRole::RegOrZr, "adrp")?.num;
+    let rd = adr_destination(operands, "adrp")?;
 
     let (sym, addend) = match operands.get(1) {
         Some(Operand::Symbol(s)) => (s.clone(), 0i64),
@@ -1511,16 +1524,12 @@ pub(crate) fn encode_adrp(operands: &[Operand]) -> Result<EncodeResult, String> 
 }
 
 pub(crate) fn encode_adr(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let rd = reg_operand(operands, 0, GpRole::RegOrZr, "adr")?.num;
+    let rd = adr_destination(operands, "adr")?;
 
     // Check for immediate offset form: adr Rd, #imm
-    // TODO: validate 21-bit signed immediate range
     if let Some(Operand::Imm(imm)) = operands.get(1) {
-        let imm = *imm;
-        // ADR: 0 immlo[1:0] 10000 immhi[18:0] Rd
-        let immlo = ((imm as u32) & 3) << 29;
-        let immhi = (((imm as u32) >> 2) & 0x7FFFF) << 5;
-        let word = immlo | (0b10000 << 24) | immhi | rd;
+        let bits = crate::backend::arm::address::adr_imm_bits(*imm)?;
+        let word = bits | (0b10000 << 24) | rd;
         return Ok(EncodeResult::Word(word));
     }
 

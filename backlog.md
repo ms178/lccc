@@ -186,13 +186,15 @@ Priority: **P0 correctness/evidence integrity**, **P1 high-leverage code quality
 Evidence: **R** reproduced here; **S** direct source fact, runtime consequence
 unproven; **H** hypothesis requiring an experiment.
 
-**Final base:** `1e83776f41529e2d754380d1d934ff901e25a097`. A14-05 is now
-closed upstream; A14-01 is partially repaired. A14-29 and A14-30 were closed
-in the follow-up (see their entries). The queue contains
-**34 entries, 31 still open** (including residual A14-01). Original evidence is retained
-with its original base rather than misrepresented as a final-main execution.
+**Current upstream base:** `f764242` (PR #822).
+A14-05 is closed upstream; A14-14/19/29/30 are repaired; A14-01 is
+partially repaired. A14-35 records a newly reproduced existing visibility defect.
+The queue contains **35 entries, 30 still open**. Original
+negative evidence retains its original base. Current implementation and measured
+trade-offs: [constant-GEP follow-up](engineering/FOLLOWUP-2026-10-14-constant-gep-fix.md)
+and [AArch64 contracts follow-up](engineering/FOLLOWUP-2026-10-14-arm-contracts.md).
 
-**Remaining implementation order:** A14-17/19/14/15/13
+**Remaining implementation order:** A14-17/35/15/13
 (linker/ISA/encoding/type correctness), A14-20 (profile integrity), then
 A14-01/02/03 (evidence), before profitability work A14-24/25. Do not let a
 green fast-CI stamp override the known failures in this queue. Locations refer to baseline
@@ -401,7 +403,13 @@ semantic type resolution, checked multiplication and supported-element diagnosti
 literals and sizeof all agree with Clang; illegal element types fail cleanly.
 Do not globally shrink vector_size bytes, which already has a different contract.
 
-### A14-14 · P0 · R — AArch64 ADR silently truncates out-of-range immediate offsets
+### A14-14 · CLOSED — AArch64 ADR silently truncates out-of-range immediate offsets
+
+**Repair:** checked assembler/linker fields, input/output site validation,
+strict operands, retained local ADRP relocations/addends and shared ADR binding
+checks. Permanent fast gates and exact 544-word Clang 23.1 binary comparison;
+see [repair/evidence](engineering/FOLLOWUP-2026-10-14-arm-contracts.md).
+The original negative evidence follows; complete shared visibility is A14-35.
 
 **Where:** `src/backend/arm/assembler/encoder/load_store.rs::encode_adr`, lines
 around 1513–1531: direct immediate casts/masks without signed-21 range check.
@@ -491,7 +499,14 @@ ICX. Record the effective banner, not just the alias; this is the latest
 Static TU instruction totals are triage, NOT runtime or hot-loop work-normalized
 rankings; ICC absence must remain visible in the competition matrix.
 
-### A14-19 · P0 · R — AArch64 -mgeneral-regs-only still emits NEON for integer popcount
+### A14-19 · CLOSED — AArch64 -mgeneral-regs-only still emits NEON for integer popcount
+
+**Repair:** GPR-only 12-instruction SWAR lowering plus a context-aware final
+compiler-generated ISA guard. Default NEON unchanged. Ten QEMU optimization/ISA
+runs cover exhaustive 16-bit inputs, high-half placements, randoms, promotions,
+dirty upper argument bits and live pressure. Explicit inline assembly remains
+user-controlled, matching the x86 policy. See [repair/evidence](engineering/FOLLOWUP-2026-10-14-arm-contracts.md).
+The original reproducer and acceptance criteria follow.
 
 **Where:** `src/backend/arm/codegen/emit.rs` popcount path and
 `src/driver/pipeline.rs` final ISA guard (currently x86-only).
@@ -688,10 +703,24 @@ two unit tests and a 348-case unchanged benchmark-assembly census pass. See
 [follow-up](engineering/FOLLOWUP-2026-10-14B-maketrees-junit.md).
 Original diagnosis and acceptance contract follow for provenance.
 
-**Where to start:** `passes/iv_widen.rs::{try_widen_loop,analyze_iv,apply_widen}`
-and its interaction with `passes/licm.rs` / `passes/gvn.rs`; precise faulty
-rewrite is **not yet isolated**. A kill switch removing a symptom is not proof
-that its named pass is solely responsible.
+**Root cause and repair:** `src/backend/generation.rs::mapped_gep_memory_access`
+now guards Load/Store against both constant and indexed function-wide GEP maps.
+A dominating constant GEP can follow its consumer in block-vector emission order;
+the old indexed-only gate let MachInst use a never-materialized pointer home.
+Final IR was correct. No optimizer pass, GEP folding, or MachInst family was disabled.
+
+**Acceptance:** the new default fast/hosted gate fails the saved pre-fix compiler
+at O2, passes small and licensed full fixtures at O0/O1/O2/O3/Os, and checks an
+independent GAS arm. A real constant-map Rust fixture passes. Full pinned zlib
+now passes 69/69 plus four round trips; 14 post-fix kill-control arms match;
+Memcheck reports zero errors on both fixtures. Six kernel ELFs are byte-identical
+before/after; three paired Callgrind rounds give Ir ratio 1.0 for every kernel.
+See `engineering/FOLLOWUP-2026-10-14-constant-gep-fix.md` and its evidence root.
+
+**Historical diagnosis:** disabling IV widening/LICM/GVN hid the symptom by
+changing shape, not by repairing an invalid IR rewrite. All eight peephole
+controls still failed; disabling MachInst recovered the full table. The original
+reproducer and investigation contract below describe the pre-fix audit.
 **Reproducer and provenance:**
 `engineering/evidence/2026-10-14-audit/zlib-maketrees/README.md` contains a
 standalone two-TU extraction with license, pinned source hashes, expected and
@@ -716,8 +745,9 @@ turn off all widening and claim optimization is fixed.
 **Accept:** exact golden table across -O0/-O1/-O2/-O3/-Os, kill-switch parity,
 full 69/69 upstream tests and independent round trips; regression test runs by
 default after the fix, plus SQLite/Expat/IV-widen gates and measured codegen
-trade-off. This audit intentionally quarantines the failing reproducer in
-engineering evidence rather than falsely adding a green regression test.
+trade-off. The initial audit quarantined the failing reproducer; it is now exercised by
+`tests/regression/check_zlib_maketrees.sh` and
+`tests/regression/check_late_const_gep.sh` in both fast and hosted CI.
 
 ### A14-31 · P1 · R — lossy ELF string decoding merges distinct legal symbol names
 
@@ -803,6 +833,24 @@ explicit -j/debug/incremental overrides remain distinguishable from internal
 heuristics; fake-resource tests cover low/high memory and inherited variables.
 This audit adds 4 GiB swap (6 GiB total) for its explicit two-job final rerun,
 not a source fix or evidence that the state leak has disappeared.
+
+
+### A14-35 · P0 · R — AArch64 shared emission loses hidden/protected visibility
+
+**Where:** `arm/linker/types.rs::GlobalSymbol` has no merged visibility;
+`arm/linker/emit_shared.rs` exports defined globals and writes st_other=0.
+**Reproducer:** assemble `.text; .global target; .hidden target; target: ret`,
+then `lccc-arm -shared -nostdlib hidden.o -o hidden.so`. `readelf -Ws` reports
+`GLOBAL DEFAULT target`, despite the hidden input. Source and actual output:
+`engineering/evidence/2026-10-14-address-repair/visibility-limitation.{s,txt}`.
+**Implement:** retain/merge visibility through symbol resolution, filter/localize
+hidden/internal exports, serialize protected visibility, and apply the same
+binding decision to GOT/PLT and all relocation paths. The new ADR guard's input
+visibility set fixes cross-TU ADR admission, not the complete ELF symbol model.
+**Accept:** hidden/internal symbols are not externally resolvable; protected
+symbols export but bind internally; weak/default interposition remains valid;
+cross-TU order and same-named local controls agree with an independent ELF
+linker. Cover static/dynamic/shared paths without a one-emitter special case.
 
 ---
 

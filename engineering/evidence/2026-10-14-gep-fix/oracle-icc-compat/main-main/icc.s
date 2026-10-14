@@ -1,0 +1,54 @@
+main:
+..B1.1: # Preds ..B1.0
+  pushq %rbp #4.16
+  movq %rsp, %rbp #4.16
+  andq $-128, %rsp #4.16
+  subq $128, %rsp #4.16
+  movl $3, %edi #4.16
+  xorl %esi, %esi #4.16
+  call __intel_new_feature_proc_init #4.16
+..B1.6: # Preds ..B1.1
+  vmovdqu .L_2il0floatpacket.0(%rip), %ymm7 #7.25
+  lea (%rsp), %rdi #12.12
+  vmovdqu .L_2il0floatpacket.1(%rip), %ymm0 #7.25
+  vmovdqu .L_2il0floatpacket.2(%rip), %ymm10 #11.31
+  vstmxcsr 32(%rdi) #4.16
+  vpaddb %ymm7, %ymm0, %ymm1 #7.25
+  vpxor %ymm9, %ymm9, %ymm9 #14.24
+  vmovdqu %ymm0, guard(%rip) #7.25
+  vmovdqu %ymm10, tree(%rip) #11.21
+  vmovdqu %ymm1, 32+guard(%rip) #7.25
+  vmovdqu %ymm9, (%rdi) #14.24
+  vmovdqu %ymm10, 32+tree(%rip) #11.21
+  vmovdqu %ymm10, 64+tree(%rip) #11.21
+  vmovdqu %ymm10, 96+tree(%rip) #11.21
+  vmovdqu %ymm10, 128+tree(%rip) #11.21
+  vmovdqu %ymm10, 160+tree(%rip) #11.21
+  vmovdqu %ymm10, 192+tree(%rip) #11.21
+  vmovdqu %ymm10, 224+tree(%rip) #11.21
+  vmovdqu %ymm10, 256+tree(%rip) #11.21
+  vpaddb %ymm7, %ymm1, %ymm2 #7.25
+  vpaddb %ymm7, %ymm2, %ymm3 #7.25
+  movl $guard, %esi #12.12
+  vmovdqu %ymm2, 64+guard(%rip) #7.25
+  vpaddb %ymm7, %ymm3, %ymm4 #7.25
+  vmovdqu %ymm3, 96+guard(%rip) #7.25
+  vpaddb %ymm7, %ymm4, %ymm5 #7.25
+  vmovdqu %ymm4, 128+guard(%rip) #7.25
+  vpaddb %ymm7, %ymm5, %ymm6 #7.25
+  vmovdqu %ymm5, 160+guard(%rip) #7.25
+  vpaddb %ymm7, %ymm6, %ymm8 #7.25
+  vmovdqu %ymm6, 192+guard(%rip) #7.25
+  vmovdqu %ymm8, 224+guard(%rip) #7.25
+  orl $32832, 32(%rdi) #4.16
+  movl $tree, %edx #12.12
+  movzwl 16(%rdi), %eax #11.34
+  addl $144, %eax #11.34
+  vldmxcsr 32(%rdi) #4.16
+  movw %ax, 16(%rdi) #11.34
+  vzeroupper #12.12
+  call check #12.12
+..B1.2: # Preds ..B1.6
+  movq %rbp, %rsp #12.12
+  popq %rbp #12.12
+  ret #12.12

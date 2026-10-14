@@ -1,0 +1,153 @@
+Internal ctest changing into directory: /home/user/.cache/zlib-rebased-work/zlib-ng-2.3.3/build
+Test project /opt/lccc-audit-cache/zlib-rebased-work/zlib-ng-2.3.3/build
+      Start  1: example
+      Start  2: infcover
+ 1/69 Test  #1: example ..........................   Passed    0.00 sec
+      Start  3: CVE-2002-0059
+ 2/69 Test  #2: infcover .........................   Passed    0.00 sec
+      Start  4: CVE-2004-0797
+ 3/69 Test  #3: CVE-2002-0059 ....................   Passed    0.01 sec
+      Start  5: CVE-2005-1849
+ 4/69 Test  #4: CVE-2004-0797 ....................   Passed    0.01 sec
+      Start  6: CVE-2005-2096
+ 5/69 Test  #5: CVE-2005-1849 ....................   Passed    0.01 sec
+      Start  7: CVE-2018-25032-fixed-level-6
+ 6/69 Test  #6: CVE-2005-2096 ....................   Passed    0.01 sec
+      Start  8: CVE-2018-25032-default-level-6
+ 7/69 Test  #7: CVE-2018-25032-fixed-level-6 .....   Passed    0.04 sec
+      Start  9: CVE-2018-25032-fixed-level-1
+ 8/69 Test  #8: CVE-2018-25032-default-level-6 ...   Passed    0.05 sec
+      Start 10: CVE-2018-25032-default-level-1
+ 9/69 Test  #9: CVE-2018-25032-fixed-level-1 .....   Passed    0.04 sec
+      Start 11: CVE-2018-25032-fixed-level-2
+10/69 Test #10: CVE-2018-25032-default-level-1 ...   Passed    0.04 sec
+      Start 12: CVE-2018-25032-default-level-2
+11/69 Test #11: CVE-2018-25032-fixed-level-2 .....   Passed    0.04 sec
+      Start 13: minigzip-fireworks.jpg-R
+12/69 Test #12: CVE-2018-25032-default-level-2 ...   Passed    0.05 sec
+      Start 14: minigzip-fireworks.jpg-h
+13/69 Test #13: minigzip-fireworks.jpg-R .........   Passed    0.10 sec
+      Start 15: minigzip-fireworks.jpg-T
+14/69 Test #14: minigzip-fireworks.jpg-h .........   Passed    0.11 sec
+      Start 16: minigzip-fireworks.jpg-0
+15/69 Test #15: minigzip-fireworks.jpg-T .........   Passed    0.04 sec
+      Start 17: minigzip-fireworks.jpg-1
+16/69 Test #16: minigzip-fireworks.jpg-0 .........   Passed    0.10 sec
+      Start 18: minigzip-fireworks.jpg-2
+17/69 Test #17: minigzip-fireworks.jpg-1 .........   Passed    0.11 sec
+      Start 19: minigzip-fireworks.jpg-4
+18/69 Test #18: minigzip-fireworks.jpg-2 .........   Passed    0.11 sec
+      Start 20: minigzip-fireworks.jpg-5
+19/69 Test #19: minigzip-fireworks.jpg-4 .........   Passed    0.11 sec
+      Start 21: minigzip-fireworks.jpg-F
+20/69 Test #20: minigzip-fireworks.jpg-5 .........   Passed    0.11 sec
+      Start 22: minigzip-fireworks.jpg-6
+21/69 Test #21: minigzip-fireworks.jpg-F .........   Passed    0.11 sec
+      Start 23: minigzip-fireworks.jpg-9
+22/69 Test #22: minigzip-fireworks.jpg-6 .........   Passed    0.11 sec
+      Start 24: minigzip-fireworks.jpg-f
+23/69 Test #23: minigzip-fireworks.jpg-9 .........   Passed    0.11 sec
+      Start 25: minigzip-lcet10.txt-R
+24/69 Test #24: minigzip-fireworks.jpg-f .........   Passed    0.11 sec
+      Start 26: minigzip-lcet10.txt-h
+25/69 Test #25: minigzip-lcet10.txt-R ............   Passed    0.14 sec
+      Start 27: minigzip-lcet10.txt-T
+26/69 Test #27: minigzip-lcet10.txt-T ............   Passed    0.04 sec
+      Start 28: minigzip-lcet10.txt-0
+27/69 Test #26: minigzip-lcet10.txt-h ............   Passed    0.14 sec
+      Start 29: minigzip-lcet10.txt-1
+28/69 Test #28: minigzip-lcet10.txt-0 ............   Passed    0.13 sec
+      Start 30: minigzip-lcet10.txt-2
+29/69 Test #29: minigzip-lcet10.txt-1 ............   Passed    0.14 sec
+      Start 31: minigzip-lcet10.txt-4
+30/69 Test #30: minigzip-lcet10.txt-2 ............   Passed    0.14 sec
+      Start 32: minigzip-lcet10.txt-5
+31/69 Test #31: minigzip-lcet10.txt-4 ............   Passed    0.15 sec
+      Start 33: minigzip-lcet10.txt-F
+32/69 Test #32: minigzip-lcet10.txt-5 ............   Passed    0.15 sec
+      Start 34: minigzip-lcet10.txt-6
+33/69 Test #33: minigzip-lcet10.txt-F ............   Passed    0.16 sec
+      Start 35: minigzip-lcet10.txt-9
+34/69 Test #34: minigzip-lcet10.txt-6 ............   Passed    0.16 sec
+      Start 36: minigzip-lcet10.txt-f
+35/69 Test #35: minigzip-lcet10.txt-9 ............   Passed    0.16 sec
+      Start 37: minigzip-paper-100k.pdf-R
+36/69 Test #37: minigzip-paper-100k.pdf-R ........   Passed    0.10 sec
+      Start 38: minigzip-paper-100k.pdf-h
+37/69 Test #36: minigzip-lcet10.txt-f ............   Passed    0.16 sec
+      Start 39: minigzip-paper-100k.pdf-T
+38/69 Test #39: minigzip-paper-100k.pdf-T ........   Passed    0.04 sec
+      Start 40: minigzip-paper-100k.pdf-0
+39/69 Test #38: minigzip-paper-100k.pdf-h ........   Passed    0.11 sec
+      Start 41: minigzip-paper-100k.pdf-1
+40/69 Test #40: minigzip-paper-100k.pdf-0 ........   Passed    0.11 sec
+      Start 42: minigzip-paper-100k.pdf-2
+41/69 Test #41: minigzip-paper-100k.pdf-1 ........   Passed    0.11 sec
+      Start 43: minigzip-paper-100k.pdf-4
+42/69 Test #42: minigzip-paper-100k.pdf-2 ........   Passed    0.11 sec
+      Start 44: minigzip-paper-100k.pdf-5
+43/69 Test #43: minigzip-paper-100k.pdf-4 ........   Passed    0.11 sec
+      Start 45: minigzip-paper-100k.pdf-F
+44/69 Test #44: minigzip-paper-100k.pdf-5 ........   Passed    0.11 sec
+      Start 46: minigzip-paper-100k.pdf-6
+45/69 Test #45: minigzip-paper-100k.pdf-F ........   Passed    0.12 sec
+      Start 47: minigzip-paper-100k.pdf-9
+46/69 Test #46: minigzip-paper-100k.pdf-6 ........   Passed    0.12 sec
+      Start 48: minigzip-paper-100k.pdf-f
+47/69 Test #47: minigzip-paper-100k.pdf-9 ........   Passed    0.11 sec
+      Start 49: minigzip-detect-text-A
+48/69 Test #48: minigzip-paper-100k.pdf-f ........   Passed    0.12 sec
+      Start 50: minigzip-detect-binary-A
+49/69 Test #49: minigzip-detect-text-A ...........   Passed    0.14 sec
+      Start 51: GH-361
+50/69 Test #50: minigzip-detect-binary-A .........   Passed    0.10 sec
+      Start 52: GH-364
+51/69 Test #51: GH-361 ...........................   Passed    0.10 sec
+      Start 53: GH-382
+52/69 Test #52: GH-364 ...........................   Passed    0.10 sec
+      Start 54: GH-536-segfault
+53/69 Test #53: GH-382 ...........................   Passed    0.05 sec
+      Start 55: GH-536-incomplete-read
+54/69 Test #54: GH-536-segfault ..................   Passed    0.04 sec
+      Start 56: GH-536-zero-stored-block
+55/69 Test #55: GH-536-incomplete-read ...........   Passed    0.04 sec
+      Start 57: GH-751
+56/69 Test #56: GH-536-zero-stored-block .........   Passed    0.04 sec
+      Start 58: GH-1600-no-window-check
+57/69 Test #58: GH-1600-no-window-check ..........   Passed    0.01 sec
+      Start 59: GH-1600-no-window-no-check
+58/69 Test #59: GH-1600-no-window-no-check .......   Passed    0.01 sec
+      Start 60: minigzip-file_compress
+59/69 Test #57: GH-751 ...........................   Passed    0.10 sec
+      Start 61: minideflate-file_compress
+60/69 Test #60: minigzip-file_compress ...........   Passed    0.08 sec
+      Start 62: minigzip-help
+61/69 Test #62: minigzip-help ....................   Passed    0.01 sec
+      Start 63: minigzip-invalid
+62/69 Test #61: minideflate-file_compress ........   Passed    0.03 sec
+      Start 64: minideflate-help
+63/69 Test #63: minigzip-invalid .................   Passed    0.01 sec
+      Start 65: minideflate-invalid
+64/69 Test #64: minideflate-help .................   Passed    0.01 sec
+      Start 66: switchlevels-help
+65/69 Test #65: minideflate-invalid ..............   Passed    0.01 sec
+      Start 67: makecrct
+66/69 Test #66: switchlevels-help ................   Passed    0.01 sec
+      Start 68: makefixed
+67/69 Test #68: makefixed ........................   Passed    0.03 sec
+      Start 69: maketrees
+68/69 Test #67: makecrct .........................   Passed    0.05 sec
+69/69 Test #69: maketrees ........................***Failed    0.03 sec
+CMake Error at /home/user/.cache/zlib-rebased-work/zlib-ng-2.3.3/test/cmake/run-and-compare.cmake:71 (message):
+  Run compare failed: 1
+
+
+
+
+99% tests passed, 1 tests failed out of 69
+
+Total Test time (real) =   2.76 sec
+
+The following tests FAILED:
+	 69 - maketrees (Failed)
+Errors while running CTest

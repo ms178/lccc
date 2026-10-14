@@ -90,7 +90,7 @@ LOCAL = ROOT / "scripts" / "ci_local.sh"
 WORKFLOWS = ROOT / ".github" / "workflows"
 
 COMMAND = re.compile(
-    r"(?:tests/regression/[A-Za-z0-9_./-]+\.sh|"
+    r"(?:tests/regression/[A-Za-z0-9_./-]+\.(?:sh|py)|"
     r"tests/linker/[A-Za-z0-9_./-]+\.(?:py|sh)|"
     r"scripts/[A-Za-z0-9_./-]+\.py|"
     r"\.github/scripts/[A-Za-z0-9_./-]+\.py)"
@@ -613,6 +613,20 @@ INVOCATION_CONTRACTS: tuple[InvocationContract, ...] = (
         local_gate=("gas-oracle-pair-self-test", "fast"),
     ),
     InvocationContract(
+        program="tests/regression/check_arm_address_contract.py",
+        name="arm-address-contract",
+        sides=_BOTH,
+        env_spec=("CCC_ARM=target/fastbuild/lccc-arm",),
+        local_gate=("arm-address-contract", "fast"),
+    ),
+    InvocationContract(
+        program="tests/regression/check_arm_popcount_contract.py",
+        name="arm-popcount-contract",
+        sides=_BOTH,
+        env_spec=("CCC_ARM=target/fastbuild/lccc-arm",),
+        local_gate=("arm-popcount-contract", "fast"),
+    ),
+    InvocationContract(
         program="scripts/test_asmdiff.py",
         name="asmdiff-semantic-validation",
         sides=_BOTH,
@@ -683,6 +697,10 @@ GUARDED_PROGRAMS = tuple(sorted({c.program for c in INVOCATION_CONTRACTS}))
 # (where a shell assignment prefix wins over any exported value) so that a
 # step env of the same name can only ever be dead weight.
 PROGRAM_ENV_CHANNELS: dict[str, frozenset[str]] = {
+    "tests/regression/check_arm_address_contract.py": frozenset(
+        {"CCC_ARM", "PYTHONOPTIMIZE"}),
+    "tests/regression/check_arm_popcount_contract.py": frozenset(
+        {"CCC_ARM", "PYTHONOPTIMIZE"}),
     "scripts/asmdiff.py": frozenset(
         {"LCCC", "LCCC_GAS", "LCCC_OBJCOPY", "LCCC_OBJDUMP"}),
     "scripts/encdiff.py": frozenset(

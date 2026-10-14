@@ -477,6 +477,11 @@ class LinkerContractTest(unittest.TestCase):
         hosted = self.hosted.replace(block, commented, 1)
         self.assertEqual(self.check(hosted=hosted), 1)
 
+    def test_python_regression_gates_are_path_tracked(self) -> None:
+        for name in ("address", "popcount"):
+            path = f"tests/regression/check_arm_{name}_contract.py"
+            self.assertEqual(parity.COMMAND.findall("python3 " + path), [path])
+
     def test_linker_scripts_are_path_tracked(self) -> None:
         self.assertEqual(parity.COMMAND.findall("python3 tests/linker/fuzz_ld.py"),
                          ["tests/linker/fuzz_ld.py"])
@@ -606,6 +611,45 @@ class StepSemanticsGuardTest(unittest.TestCase):
             with self.subTest(env=env.strip().splitlines()[-1]):
                 path = self.workflow(env=env)
                 self.assertEqual(parity.check_step_guards([path]), 0)
+
+    def test_arm_regression_env_channels_are_guarded_at_every_scope(self) -> None:
+        for gate in ("address", "popcount"):
+            for var in ("CCC_ARM", "PYTHONOPTIMIZE"):
+                for scope in ("workflow", "job", "step"):
+                    with self.subTest(gate=gate, var=var, scope=scope):
+                        prefix = "name: CI\non: [push, pull_request]\n"
+                        if scope == "workflow":
+                            prefix += f"env:\n  {var}: override\n"
+                        prefix += "jobs:\n  test:\n    runs-on: ubuntu-latest\n"
+                        if scope == "job":
+                            prefix += f"    env:\n      {var}: override\n"
+                        prefix += "    steps:\n      - name: arm contract\n"
+                        if scope == "step":
+                            prefix += f"        env:\n          {var}: override\n"
+                        self.wf.write_text(prefix +
+                            "        run: env CCC_ARM=target/fastbuild/lccc-arm "
+                            f"python3 tests/regression/check_arm_{gate}_contract.py\n")
+                        self.assertEqual(parity.check_step_guards([self.wf]), 1)
+
+    def test_arm_regression_gates_refuse_disabled_assertions(self) -> None:
+        # Import only: runpy's non-main name cannot enter either compile loop.
+        # A normal import succeeds; all optimized forms must fail beforehand.
+        import os
+        import subprocess
+        import sys
+        for gate in ("address", "popcount"):
+            path = parity.ROOT / f"tests/regression/check_arm_{gate}_contract.py"
+            script = f"import runpy; runpy.run_path({str(path)!r})"
+            for flags, optimize in (([], ""), (["-O"], ""), (["-OO"], ""), ([], "1")):
+                with self.subTest(gate=gate, flags=flags, optimize=optimize):
+                    env = {**os.environ, "PYTHONOPTIMIZE": optimize}
+                    result = subprocess.run([sys.executable, *flags, "-c", script],
+                        env=env, capture_output=True, text=True, timeout=10)
+                    if flags or optimize:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("require Python assertions", result.stderr)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_provisioner_cache_redirects_are_channels(self) -> None:
         # W3: GAS_DL_DIR/GAS_CACHE can point provisioning at a doctored

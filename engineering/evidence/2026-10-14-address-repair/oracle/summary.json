@@ -1,0 +1,9 @@
+{
+  "compiler": "armv8-cclang2310 / Clang 23.1.0",
+  "mode": "binary linked output, -nostdlib -static -fuse-ld=lld; not CE -S",
+  "matched_ADR_machine_words": 544,
+  "native_text_sha256": "9fc2029667b9dc18de1084d6158eff947e76718d360a075c543367156c45b942",
+  "oracle_text_sha256": "9fc2029667b9dc18de1084d6158eff947e76718d360a075c543367156c45b942",
+  "GAS_2_47": "not available locally; no substitution claim",
+  "note": "Use an ordinary function name; CE disassembly suppresses reserved _start even with libraryCode=false."
+}
