@@ -334,6 +334,14 @@ gate "cross-target-intrinsic-trap" fast \
     CCC_I686=target/fastbuild/lccc-i686 \
     bash tests/regression/check_cross_target_intrinsic_trap.sh
 
+# A14-20: libc buffering must remain inside the profile-file lock.
+gate "pgo-io-contract" fast \
+    python3 tests/regression/check_pgo_io.py --lccc "$LCCC"
+
+# A14-17: shared linking must not silently consume unknown relocation kinds.
+gate "riscv-relocation-contract" fast \
+    python3 tests/linker/check_riscv_relocation_contract.py --lccc target/fastbuild/lccc-riscv
+
 # AUD-CPU-3: an intrinsic whose instruction-set extension the invocation does
 # not permit must be diagnosed (GCC/Clang reject it too), and the invocation
 # that does permit it must still emit the instruction.  Oracle-checked against
