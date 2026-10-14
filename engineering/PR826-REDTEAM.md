@@ -145,6 +145,20 @@ Unregistered sources, explicitly not covered by those runtime comparisons:
 `global_addr_pressure`, `i686_alu_chains`, `moving_stats`, `prefix_scan`,
 `reduction_vecreg`, `vecreg_new_ops`, `vector_remainder`.
 
+## Red-team finding in the new harness itself
+
+The first expanded exact-Debian job passed, but the Ubuntu main job failed in
+our new reference-driver compilation. A fast Ubuntu reproduction and bounded
+API-readable unittest annotations localized it to that compilation, not LCCC.
+A local `-D_FORTIFY_SOURCE=3 -O1 -Wall -Wextra -Werror` experiment reproduced the
+specific diagnostic: casting `write`'s return value to void does not satisfy its
+`warn_unused_result` contract. The reference driver now checks the return,
+cleans up, and preserves application status on diagnostic failure. Its compile
+command explicitly enables fortification so this cannot hide behind a distro's
+default settings. Compiler stderr is captured in failure annotations. Warnings
+remain errors; the test was fixed rather than weakened. This defect was introduced
+by the red-team harness, not by the original PR's production implementation.
+
 ## Design rationale for the fixes
 
 ### Bounded ULEB module

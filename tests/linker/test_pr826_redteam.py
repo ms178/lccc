@@ -40,13 +40,24 @@ int main(void) {
     for (int i = 0; i < 1000; ++i) fprintf(f, "record-%04d-abcdefgh\n", i);
     if (ferror(f)) {
         static const char msg[] = "lccc: PGO: profile write failed\n";
-        (void)write(2, msg, sizeof(msg)-1);
+        ssize_t written = write(2, msg, sizeof(msg)-1);
+        if (written != (ssize_t)(sizeof(msg)-1)) {
+            if (fclose(f)) perror("lccc: PGO: profile close/flush failed");
+            return 23;
+        }
     }
     if (getenv("DRIVER_EARLY_UNLOCK")) flock(fd, LOCK_UN);
     if (fclose(f)) perror("lccc: PGO: profile close/flush failed");
     return 23;
 }
 '''
+
+
+def compile_checked(command):
+    result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+    if result.returncode:
+        raise AssertionError(f"compiler command {command} failed ({result.returncode}):\n"
+                             + result.stdout + result.stderr)
 
 
 class RedTeam(unittest.TestCase):
@@ -114,8 +125,8 @@ class RedTeam(unittest.TestCase):
                 src.write_text(PGO["source"](count))
                 for opt in ("-O0", "-O2", "-O3"):
                     exe = root / "source"
-                    subprocess.run([CC, opt, "-fsanitize=undefined", "-fno-sanitize-recover=all",
-                                    str(src), "-o", str(exe)], check=True, timeout=30)
+                    compile_checked([CC, opt, "-fsanitize=undefined", "-fno-sanitize-recover=all",
+                                     str(src), "-o", str(exe)])
                     p = subprocess.run([str(exe)], capture_output=True, text=True, timeout=10)
                     self.assertEqual(p.returncode, 23)
                     self.assertEqual(p.stdout, f"{count - count * (count - 1) // 2}\n")
@@ -127,11 +138,11 @@ class RedTeam(unittest.TestCase):
             src = root / "driver.c"
             src.write_text(DRIVER)
             exe, so = root / "driver", root / "oracle.so"
-            subprocess.run([CC, "-O1", "-Wall", "-Wextra", "-Werror", str(src), "-o", str(exe)],
-                           check=True, timeout=30)
-            subprocess.run([CC, "-shared", "-fPIC", "-O1", "-Wall", "-Wextra", "-Werror",
-                            str(ROOT / "tests/regression/fixtures/pgo_io_interpose.c"),
-                            "-ldl", "-o", str(so)], check=True, timeout=30)
+            compile_checked([CC, "-D_FORTIFY_SOURCE=3", "-O1", "-Wall", "-Wextra", "-Werror",
+                             str(src), "-o", str(exe)])
+            compile_checked([CC, "-shared", "-fPIC", "-O1", "-Wall", "-Wextra", "-Werror",
+                             str(ROOT / "tests/regression/fixtures/pgo_io_interpose.c"),
+                             "-ldl", "-o", str(so)])
             base = {k: v for k, v in os.environ.items()
                     if not k.startswith(("PGO_IO_", "LCCC_PROFILE_", "DRIVER_")) and k != "LD_PRELOAD"}
             env = dict(base, LD_PRELOAD=str(so))
