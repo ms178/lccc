@@ -246,6 +246,12 @@ jobs:
 
       # AUD-CPU-3: `-march=x86-64` must reject `_mm_crc32_u8`/`_mm_aesenc_si128`
       # (GCC does), and the flag that grants the extension must still lower it.
+      - name: PGO buffered I/O lock lifetime and injected failures
+        run: python3 tests/regression/check_pgo_io.py --lccc target/fastbuild/lccc
+
+      - name: RISC-V relocation rejection and positive controls
+        run: python3 tests/linker/check_riscv_relocation_contract.py --lccc target/fastbuild/lccc-riscv
+
       - name: ISA-sensitive intrinsic feature gate
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_intrinsic_feature_gate.sh
 

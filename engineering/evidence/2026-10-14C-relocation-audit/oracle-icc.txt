@@ -1,0 +1,21 @@
+ERROR       lccc: GodboltError: local compile failed: /home/user/.cache/baseline/lccc -O2 -march=core-avx2 -S tests/benchmark/programs/zlib_ng_adler32.c -o /tmp/codegen-oracle-ff99c931dcc4038b-lwl9pom5.s
+ccc: error: unsupported x86 -march=core-avx2
+ERROR       lccc: GodboltError: local compile failed: /home/user/.cache/baseline/lccc -O2 -march=core-avx2 -S tests/benchmark/programs/gzip_crc32.c -o /tmp/codegen-oracle-37ba22c332c2c7b7-n9linfyp.s
+ccc: error: unsupported x86 -march=core-avx2
+ERROR       lccc: GodboltError: local compile failed: /home/user/.cache/baseline/lccc -O2 -march=core-avx2 -S tests/benchmark/programs/expat_siphash24.c -o /tmp/codegen-oracle-eb88a713fe7944a6-vpvjgk5k.s
+ccc: error: unsupported x86 -march=core-avx2
+
+tests/benchmark/programs/zlib_ng_adler32.c :: <all functions>
+compiler       insns  loads  stores   stack  branch   best-x  name
+--------------------------------------------------------------------------------------------
+icc              244     35      10      11      23    1.00x  x86-64 icc 2021.10.0
+
+tests/benchmark/programs/gzip_crc32.c :: <all functions>
+compiler       insns  loads  stores   stack  branch   best-x  name
+--------------------------------------------------------------------------------------------
+icc               60      7       6       3       6    1.00x  x86-64 icc 2021.10.0
+
+tests/benchmark/programs/expat_siphash24.c :: <all functions>
+compiler       insns  loads  stores   stack  branch   best-x  name
+--------------------------------------------------------------------------------------------
+icc              756    128      77     128      56    1.00x  x86-64 icc 2021.10.0

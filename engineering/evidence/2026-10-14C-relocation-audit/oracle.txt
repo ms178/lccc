@@ -1,0 +1,48 @@
+
+tests/benchmark/programs/zlib_ng_adler32.c :: <all functions>
+compiler       insns  loads  stores   stack  branch   best-x  name
+--------------------------------------------------------------------------------------------
+lccc             276     31       9      15      21    1.88x  local LCCC
+gcc16.2          156     19       3       2      10    1.06x  x86-64 gcc 16.2
+clang            148     17       9       0       7    1.01x  x86-64 clang 23.1.0
+icx              147     22       6       3       7    1.00x  x86-64 icx (latest)
+
+tests/benchmark/programs/expat_siphash24.c :: <all functions>
+compiler       insns  loads  stores   stack  branch   best-x  name
+--------------------------------------------------------------------------------------------
+lccc             846     72      75      54      67    2.75x  local LCCC
+gcc16.2          308     36      30      17      35    1.00x  x86-64 gcc 16.2
+clang            496     52      54      72      43    1.61x  x86-64 clang 23.1.0
+icx              515     56      50      65      47    1.67x  x86-64 icx (latest)
+
+tests/benchmark/programs/gzip_crc32.c :: <all functions>
+compiler       insns  loads  stores   stack  branch   best-x  name
+--------------------------------------------------------------------------------------------
+lccc              73      3       2       0      13    1.46x  local LCCC
+gcc16.2           50      5       2       0       8    1.00x  x86-64 gcc 16.2
+clang             82      9       9       0       5    1.64x  x86-64 clang 23.1.0
+icx              100     20       6       3       5    2.00x  x86-64 icx (latest)
+
+tests/benchmark/programs/sqlite_varint.c :: <all functions>
+compiler       insns  loads  stores   stack  branch   best-x  name
+--------------------------------------------------------------------------------------------
+lccc             397     32      32      22      59    1.22x  local LCCC
+gcc16.2          325     28      24      20      55    1.00x  x86-64 gcc 16.2
+clang            373     24      22       7      61    1.15x  x86-64 clang 23.1.0
+icx              421     35      40      21      59    1.30x  x86-64 icx (latest)
+
+tests/benchmark/programs/linux_find_bit.c :: <all functions>
+compiler       insns  loads  stores   stack  branch   best-x  name
+--------------------------------------------------------------------------------------------
+lccc             146      5       5       0      21    1.24x  local LCCC
+gcc16.2          156     13      12      13      22    1.32x  x86-64 gcc 16.2
+clang            118     12       5       0      13    1.00x  x86-64 clang 23.1.0
+icx              121     12       8       3      12    1.03x  x86-64 icx (latest)
+
+tests/benchmark/programs/glibc_memcmp.c :: <all functions>
+compiler       insns  loads  stores   stack  branch   best-x  name
+--------------------------------------------------------------------------------------------
+lccc             203     17      15      15      37    1.29x  local LCCC
+gcc16.2          157     18      15      11      29    1.00x  x86-64 gcc 16.2
+clang            227     14      11       7      37    1.45x  x86-64 clang 23.1.0
+icx              311     18      24       6      42    1.98x  x86-64 icx (latest)
