@@ -124,54 +124,60 @@ _ATTR_STATUS = {
 
 
 def _status_of(element: ET.Element) -> str:
-    """Reconcile all outcome signals; CTest status=run is execution metadata.
+    """Separate execution state from outcome, validating every channel.
 
-    `run` does not override a failure/error/skipped child. A missing outcome
-    uses JUnit's normal absence-of-failure convention, not a blanket mapping
-    of arbitrary execution states to success. Unknown or contradictory
-    attributes remain invalid even if a child already reported failure.
+    CTest's status="run" says the test executed; success is the absence of
+    failure/error/skipped records, not an early return from that attribute.
+    Never let one known attribute hide another unknown or conflicting one.
     """
-    outcomes = {status for tag, status in
-                (("failure", "failure"), ("error", "error"), ("skipped", "skipped"))
+    outcomes = {tag for tag in ("failure", "error", "skipped")
                 if element.find(tag) is not None}
+    executed = False
     for attribute in ("status", "result"):
         value = element.get(attribute)
         if value is None:
             continue
-        value = value.strip().lower()
-        if attribute == "status" and value == "run":
+        token = value.strip().lower()
+        if attribute == "status" and token == "run":
+            executed = True
             continue
-        normalized = _ATTR_STATUS.get(value)
+        normalized = _ATTR_STATUS.get(token)
         if normalized is None:
             raise ReportError(f"unrecognised {attribute}={value!r} on a <testcase>; "
                               f"refusing to read an unknown status as a pass")
         outcomes.add(normalized)
-    if len(outcomes) > 1:
-        raise ReportError(f"contradictory testcase outcomes: {sorted(outcomes)}")
+    if len(outcomes) > 1 or (executed and "skipped" in outcomes):
+        raise ReportError(f"contradictory testcase status: executed={executed}, "
+                          f"outcomes={sorted(outcomes)}")
     return next(iter(outcomes), "pass")
 
 
-def _check_suite_counts(root: ET.Element) -> None:
-    """Do not let nonzero suite failures disappear behind passing case rows."""
+def _validate_counts(root: ET.Element) -> None:
+    """Suite summaries must agree with the records they claim to summarize.
+
+    Counters are optional in JUnit. When present, validate each suite against
+    its own subtree, including nested suites; an aggregate failure must not
+    disappear simply because a truncated report omitted its failing testcase.
+    Disabled is a subset of skipped, not an additional set of executed tests.
+    """
     for suite in root.iter():
         if suite.tag not in ALLOWED_ROOTS:
             continue
-        statuses = Counter(_status_of(case) for case in suite.iter("testcase"))
-        counts = {"tests": sum(statuses.values()), "failures": statuses["failure"],
-                  "errors": statuses["error"]}
-        for key in ("tests", "failures", "errors", "skipped", "disabled"):
-            value = suite.get(key)
+        cases = list(suite.iter("testcase"))
+        counts = Counter(_status_of(case) for case in cases)
+        expected = {"tests": len(cases), "failures": counts["failure"],
+                    "errors": counts["error"], "skipped": counts["skipped"]}
+        for attribute in (*expected, "disabled"):
+            value = suite.get(attribute)
             if value is None:
                 continue
-            if not re.fullmatch(r"[0-9]+", value.strip()):
-                raise ReportError(f"invalid suite {key} count: {value!r}")
-            count = int(value)
-            # CTest distinguishes disabled tests from runtime skips; both
-            # have a skipped case outcome. Either declared subset must fit.
-            mismatch = (count != counts[key] if key in counts
-                        else count > statuses["skipped"])
-            if mismatch:
-                raise ReportError(f"suite {key}={count} contradicts its testcase outcomes")
+            if re.fullmatch(r"[0-9]+", value) is None:
+                raise ReportError(f"invalid suite {attribute}={value!r}")
+            actual = int(value)
+            valid = (actual <= counts["skipped"] if attribute == "disabled"
+                     else actual == expected[attribute])
+            if not valid:
+                raise ReportError(f"suite {attribute}={value} disagrees with testcase records")
 
 
 def parse_junit(path: Path) -> list[Case]:
@@ -200,7 +206,7 @@ def parse_junit(path: Path) -> list[Case]:
     if not cases:
         raise ReportError(f"{path}: contains no <testcase> elements; an empty CTest "
                           f"report is not a passing differential")
-    _check_suite_counts(root)
+    _validate_counts(root)
     return cases
 
 
@@ -332,16 +338,57 @@ def self_test() -> int:
         ok += 1
     else:
         raise AssertionError("a self-contradictory report must be refused, not compared")
-    for label, bad in (("empty report", "<testsuites></testsuites>"),
-                       ("unnamed testcase", '<testsuite><testcase classname="s"/></testsuite>'),
-                       ("wrong root", "<Foo/>")):
-        path = _fixture_text(label + ".xml", bad)
-        try:
-            parse_junit(path)
-        except ReportError:
+    # Parse-level controls exercise the same public API as the workload runner.
+    fixtures = [
+        ("run-pass", '<testcase name="a" status="run"/>', "pass"),
+        ("run-failure", '<testcase name="a" status="run"><failure/></testcase>', "failure"),
+        ("run-error", '<testcase name="a" status="run"><error/></testcase>', "error"),
+        ("run-result", '<testcase name="a" status="run" result="failed"/>', "failure"),
+        ("notrun", '<testcase name="a" status="notrun"/>', "skipped"),
+        ("conflicting-attrs", '<testcase name="a" status="passed" result="failed"/>', None),
+        ("conflicting-child", '<testcase name="a" status="passed"><failure/></testcase>', None),
+        ("conflicting-children", '<testcase name="a"><error/><failure/></testcase>', None),
+        ("run-skipped", '<testcase name="a" status="run"><skipped/></testcase>', None),
+        ("unknown-later-attr", '<testcase name="a" status="passed" result="mystery"/>', None),
+        ("unknown-with-child", '<testcase name="a" status="mystery"><failure/></testcase>', None),
+        ("run-is-not-an-outcome", '<testcase name="a" result="run"/>', None),
+        ("unnamed", '<testcase classname="s"/>', None),
+    ]
+    with tempfile.TemporaryDirectory(prefix="lccc-expat-junit-") as tmp:
+        path = Path(tmp) / "report.xml"
+        for label, body, outcome in fixtures:
+            path.write_text('<testsuite>' + body + '</testsuite>')
+            try:
+                cases = parse_junit(path)
+            except ReportError:
+                if outcome is not None:
+                    raise AssertionError(f"{label}: valid outcome rejected") from None
+            else:
+                if outcome is None or cases[0].status != outcome:
+                    raise AssertionError(f"{label}: unexpected result {cases}")
             ok += 1
-        else:
-            raise AssertionError(f"{label}: parse_junit accepted it")
+        for bad in ('<testsuites/>', '<Foo/>', '<testsuite>',
+                    '<testsuite failures="1"><testcase name="a" status="run"/></testsuite>',
+                    '<testsuite tests="2"><testcase name="a"/></testsuite>',
+                    '<testsuite errors="0"><testcase name="a"><error/></testcase></testsuite>',
+                    '<testsuite skipped="1"><testcase name="a"/></testsuite>',
+                    '<testsuite disabled="1"><testcase name="a"/></testsuite>',
+                    '<testsuite tests="-1"><testcase name="a"/></testsuite>',
+                    '<testsuite failures="unknown"><testcase name="a"/></testsuite>',
+                    '<testsuites failures="1"><testsuite><testcase name="a"/></testsuite></testsuites>'):
+            path.write_text(bad)
+            try:
+                parse_junit(path)
+            except ReportError:
+                ok += 1
+            else:
+                raise AssertionError(f"invalid report accepted: {bad}")
+        path.write_text('<testsuites tests="1" failures="1"><testsuite tests="1" failures="1">'
+                        '<testcase name="a" status="run"><failure/></testcase>'
+                        '</testsuite></testsuites>')
+        if parse_junit(path)[0].status != "failure":
+            raise AssertionError("nested matching failure counts lost")
+        ok += 1
     config_problems = compare_config({"EXPAT_BUILD_TESTS": "ON"}, {"EXPAT_BUILD_TESTS": "OFF"})
     if not config_problems:
         raise AssertionError("a feature switch that differs must be a problem")
@@ -379,55 +426,8 @@ def self_test() -> int:
     if not compare_config({"CMAKE_C_FLAGS": gcc_flags}, {}):
         raise AssertionError("a flags entry present on one side only must be a problem")
     ok += 1
-    for body, expected in [
-        ('<testcase name="x" status="run"/>', "pass"),
-        ('<testcase name="x" status="run"><failure/></testcase>', "failure"),
-        ('<testcase name="x" status="run"><error/></testcase>', "error"),
-        ('<testcase name="x" status="run"><skipped/></testcase>', "skipped"),
-        ('<testcase name="x" status="run" result="failed"/>', "failure"),
-        ('<testcase name="x" status="passed" result="passed"/>', "pass"),
-    ]:
-        if _status_of(ET.fromstring(body)) != expected:
-            raise AssertionError(f"incorrect CTest/JUnit outcome: {body}")
-        ok += 1
-    for body in [
-        '<testcase name="x" status="passed" result="failed"/>',
-        '<testcase name="x" status="passed"><failure/></testcase>',
-        '<testcase name="x" status="unknown"><failure/></testcase>',
-        '<testcase name="x" status="run" result="unknown"/>',
-        '<testcase name="x"><error/><skipped/></testcase>',
-        '<testcase name="x" result="run"/>',
-    ]:
-        try:
-            _status_of(ET.fromstring(body))
-        except ReportError:
-            ok += 1
-        else:
-            raise AssertionError(f"invalid testcase accepted: {body}")
-    with tempfile.TemporaryDirectory(prefix="lccc-expat-counts-") as work:
-        path = Path(work) / "report.xml"
-        for attrs in ['tests="2"', 'failures="1"', 'errors="1"',
-                      'skipped="1"', 'disabled="1"', 'failures="-1"', 'tests="wat"']:
-            path.write_text(f'<testsuite {attrs}><testcase name="x" status="run"/></testsuite>')
-            try:
-                parse_junit(path)
-            except ReportError:
-                ok += 1
-            else:
-                raise AssertionError(f"contradictory suite count accepted: {attrs}")
-        path.write_text('<testsuites tests="1" failures="1"><testsuite tests="1" failures="1">'
-                        '<testcase name="x" status="run"><failure/></testcase></testsuite></testsuites>')
-        assert parse_junit(path)[0].status == "failure"
-        ok += 1
     print(f"expat JUnit contract: {ok} checks passed")
     return 0
-
-
-def _fixture_text(name: str, text: str) -> Path:
-    """A throwaway report file for the parse-level witnesses."""
-    path = Path(tempfile.mkdtemp(prefix="lccc-expat-junit-")) / name
-    path.write_text(text)
-    return path
 
 
 def main(argv: list[str] | None = None) -> int:

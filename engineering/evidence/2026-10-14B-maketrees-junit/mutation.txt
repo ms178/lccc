@@ -1,0 +1,3 @@
+PASS zlib-ng maketrees O0 (complete table)
+PASS zlib-ng maketrees O1 (complete table)
+/home/user/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/expected.txt /tmp/tmp.Roy8F19rgl/actual differ: char 2025, line 35

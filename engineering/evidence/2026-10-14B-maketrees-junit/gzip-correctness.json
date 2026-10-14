@@ -1,0 +1,106 @@
+{
+  "schema": 2,
+  "date_utc": "2026-10-14T01:00:57.633668+00:00",
+  "archive": {
+    "url": "https://ftp.gnu.org/pub/gnu/gzip/gzip-1.14.tar.xz",
+    "path": "/home/user/.cache/gzip-1.14.tar.xz",
+    "sha256": "01a7b881bd220bfdf615f97b8718f80bdfd3f6add385b993dcf6efd14e8c0ac6",
+    "archpkgbuilds_selector": "packages/gzip/PKGBUILD pkgver=1.14",
+    "signature_verified": false
+  },
+  "corpora": {
+    "source": {
+      "bytes": 8388608,
+      "sha256": "420c2b0a3ade2664638f3c4597836511343971f6cb18c94835d9458c88280816"
+    },
+    "mixed": {
+      "bytes": 8388608,
+      "sha256": "db4bd04ec4a62f91184ee5e0380c30146a421930382772861d281a1ab3596d3b"
+    }
+  },
+  "builds": {
+    "lccc": {
+      "key": "lccc",
+      "cc": "/home/user/.cache/lccc/target/fastbuild/lccc",
+      "compiler_version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0",
+      "flags": "-O3 -march=x86-64-v3 -I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+      "environment": {},
+      "binary": "/home/user/.cache/a14/gzip/gzip-lccc",
+      "binary_sha256": "962c47a68262279ee6c748f1d8757453edc587c471e2ec6181b288f3b297c078",
+      "binary_bytes": 106416,
+      "check": {
+        "total": 30,
+        "pass": 30,
+        "skip": 0,
+        "xfail": 0,
+        "fail": 0,
+        "xpass": 0,
+        "error": 0
+      }
+    },
+    "gcc": {
+      "key": "gcc",
+      "cc": "/usr/bin/gcc",
+      "compiler_version": "gcc (Debian 14.2.0-19) 14.2.0",
+      "flags": "-O3 -march=x86-64-v3",
+      "environment": {},
+      "binary": "/home/user/.cache/a14/gzip/gzip-gcc",
+      "binary_sha256": "33167e4a6d8649e309f819f524a1b8fc70b56a9532f4bb29583a6d47886fb3bf",
+      "binary_bytes": 133616,
+      "check": {
+        "total": 30,
+        "pass": 30,
+        "skip": 0,
+        "xfail": 0,
+        "fail": 0,
+        "xpass": 0,
+        "error": 0
+      }
+    }
+  },
+  "correctness_streams": {
+    "compress-source-l1": {
+      "sha256": "5427f5a4eff1e2676c35de48751b09951a5ce0a5aa2f84fdaa657844d957aec1",
+      "compiler_sha256": {
+        "lccc": "5427f5a4eff1e2676c35de48751b09951a5ce0a5aa2f84fdaa657844d957aec1",
+        "gcc": "5427f5a4eff1e2676c35de48751b09951a5ce0a5aa2f84fdaa657844d957aec1"
+      }
+    },
+    "compress-source-l6": {
+      "sha256": "396c5d618de41083061760d45a1130a11aa2583ad9b91671ae59a24a15e86e38",
+      "compiler_sha256": {
+        "lccc": "396c5d618de41083061760d45a1130a11aa2583ad9b91671ae59a24a15e86e38",
+        "gcc": "396c5d618de41083061760d45a1130a11aa2583ad9b91671ae59a24a15e86e38"
+      }
+    },
+    "compress-source-l9": {
+      "sha256": "756d84bc9aec54a57d3b024c2a8f6c9e33bc6ece85063a5b8dd91fe890331f62",
+      "compiler_sha256": {
+        "lccc": "756d84bc9aec54a57d3b024c2a8f6c9e33bc6ece85063a5b8dd91fe890331f62",
+        "gcc": "756d84bc9aec54a57d3b024c2a8f6c9e33bc6ece85063a5b8dd91fe890331f62"
+      }
+    },
+    "compress-mixed-l1": {
+      "sha256": "a43bc0c416abd7e3bff1186c1b3611fe7f1fbf6bb0649a95983a6daf9ed29eb3",
+      "compiler_sha256": {
+        "lccc": "a43bc0c416abd7e3bff1186c1b3611fe7f1fbf6bb0649a95983a6daf9ed29eb3",
+        "gcc": "a43bc0c416abd7e3bff1186c1b3611fe7f1fbf6bb0649a95983a6daf9ed29eb3"
+      }
+    },
+    "compress-mixed-l6": {
+      "sha256": "219ba7008261efb92d4298d71e8dfee4e6fb64c455054b8982cdf3cbc78bff42",
+      "compiler_sha256": {
+        "lccc": "219ba7008261efb92d4298d71e8dfee4e6fb64c455054b8982cdf3cbc78bff42",
+        "gcc": "219ba7008261efb92d4298d71e8dfee4e6fb64c455054b8982cdf3cbc78bff42"
+      }
+    },
+    "compress-mixed-l9": {
+      "sha256": "9ccc8cfa69f6acb523e8218d037c3bb60354efc3cc273aa51a32caf6f5529728",
+      "compiler_sha256": {
+        "lccc": "9ccc8cfa69f6acb523e8218d037c3bb60354efc3cc273aa51a32caf6f5529728",
+        "gcc": "9ccc8cfa69f6acb523e8218d037c3bb60354efc3cc273aa51a32caf6f5529728"
+      }
+    }
+  },
+  "measurement": "correctness only; concurrent one-round timings excluded, no speed verdict"
+}

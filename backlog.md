@@ -186,7 +186,7 @@ Priority: **P0 correctness/evidence integrity**, **P1 high-leverage code quality
 Evidence: **R** reproduced here; **S** direct source fact, runtime consequence
 unproven; **H** hypothesis requiring an experiment.
 
-**Current base:** `e047aa1eb2ae59b3943a64ab7ec5e5dddb89a3ff` (PR #820).
+**Current upstream base:** `f764242` (PR #822).
 A14-05 is closed upstream; A14-14/19/29/30 are repaired; A14-01 is
 partially repaired. A14-35 records a newly reproduced existing visibility defect.
 The queue contains **35 entries, 30 still open**. Original
@@ -665,13 +665,15 @@ from evidence; move closed narrative to the journal without deleting provenance.
 H with a concrete experiment; each CLOSED claim points to a passing current gate;
 no duplicate RA/IV/PGO tasks with contradictory status.
 
-### A14-29 · CLOSED — Expat's JUnit validator rejects CTest's successful status=run
+### A14-29 · CLOSED 2026-10-14B — Expat JUnit execution/outcome validation
 
-**Repair:** execution metadata is separate from outcomes; all outcome signals
-are reconciled and suite counts are checked. 42 self-tests and the archived
-XML/config replay pass. A fresh complete Expat run passes 4,932 checks per arm
-plus all eight XML cases, runner exit 0. See the current follow-up above.
-The original reproducer/acceptance contract below is retained as history.
+**Resolution:** execution marker `run` is distinct from outcome; every outcome
+attribute/child is checked, contradictions and unknowns fail closed, and suite
+counters must agree with the cases. 44 self-tests and the retained failing XML
+pass. The full Expat runner now completes: 4,932 checks in each arm plus all
+8 canonical/rejection XML cases. See
+[follow-up](engineering/FOLLOWUP-2026-10-14B-maketrees-junit.md) and its evidence.
+Original diagnosis and acceptance contract follow for provenance.
 
 **Where:** `tests/workloads/expat-2.8.5/junit_check.py::_ATTR_STATUS/_status_of`.
 **Reproducer:** the full pinned Expat runner built both arms and each CTest
@@ -689,9 +691,19 @@ passed+result=failed, missing/duplicate cases and unknown statuses; full runner
 reaches its XML workload comparison and writes a complete summary. Do not map
 all unrecognized values to pass just to make the environment green.
 
-### A14-30 · CLOSED — zlib-ng late constant-GEP MachInst miscompile
+### A14-30 · CLOSED 2026-10-14B — zlib-ng maketrees late constant-GEP miscompile
 
-**Root cause and repair:** `src/backend/generation.rs::folded_gep_memory_access`
+**Resolution:** the defect was in backend dispatch, not an IV-widen theorem.
+MachInst read an unmaterialized constant-offset pointer before the dominating
+GEP's block had been emitted; its guard covered only indexed GEPs. Extend the
+function-wide map guard to constant offsets, retaining all IR optimizations.
+Full zlib-ng: 69/69 CTests and four round trips. New mutation-verified default CI
+gate checks the complete table at six optimization levels and three controls;
+two unit tests and a 348-case unchanged benchmark-assembly census pass. See
+[follow-up](engineering/FOLLOWUP-2026-10-14B-maketrees-junit.md).
+Original diagnosis and acceptance contract follow for provenance.
+
+**Root cause and repair:** `src/backend/generation.rs::mapped_gep_memory_access`
 now guards Load/Store against both constant and indexed function-wide GEP maps.
 A dominating constant GEP can follow its consumer in block-vector emission order;
 the old indexed-only gate let MachInst use a never-materialized pointer home.
@@ -734,6 +746,7 @@ turn off all widening and claim optimization is fixed.
 full 69/69 upstream tests and independent round trips; regression test runs by
 default after the fix, plus SQLite/Expat/IV-widen gates and measured codegen
 trade-off. The initial audit quarantined the failing reproducer; it is now exercised by
+`tests/regression/check_zlib_maketrees.sh` and
 `tests/regression/check_late_const_gep.sh` in both fast and hosted CI.
 
 ### A14-31 · P1 · R — lossy ELF string decoding merges distinct legal symbol names

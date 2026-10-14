@@ -1,0 +1,10 @@
+   Compiling lccc v0.1.0 (/home/user/lccc)
+    Finished `fastbuild` profile [optimized + debuginfo] target(s) in 5m 05s
+     Running unittests src/lib.rs (target/fastbuild/deps/lccc-e88428546de81db6)
+
+running 2 tests
+test backend::generation::indexed_gep_machinst_gate_tests::constant_access_bypasses_machinst_before_producer_is_emitted ... ok
+test backend::generation::indexed_gep_machinst_gate_tests::indexed_access_bypasses_machinst_when_consumer_precedes_gep_in_emission_order ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 4570 filtered out; finished in 0.01s
+
