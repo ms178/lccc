@@ -1,7 +1,7 @@
 //! Phase 6: Relocation application.
 //!
 //! Applies RISC-V relocations to merged section data. Handles all relocation
-//! types from the RISC-V ELF psABI, including PC-relative, GOT, TLS, and
+//! types implemented from the RISC-V ELF psABI, including PC-relative, GOT, TLS, and
 //! compressed instruction relocations.
 //!
 //! Shared between executable and shared library linking, with context-specific
@@ -51,6 +51,64 @@ pub struct RelocResult {
     pub relative_entries: Vec<(u64, u64)>,
 }
 
+/// Minimum byte extent touched by each implemented relocation. Validate against
+/// the INPUT section, not the merged output: a truncated input must not patch
+/// a following object's bytes. Unknown types are rejected at application time,
+/// so relocations in discarded/non-alloc sections do not require implementation.
+fn relocation_extent(kind: u32) -> Option<u64> {
+    match kind {
+        0 | R_RISCV_RELAX | R_RISCV_ALIGN | R_RISCV_TPREL_ADD => Some(0),
+        R_RISCV_ADD8 | R_RISCV_SUB8 | R_RISCV_SET6 | R_RISCV_SUB6 | R_RISCV_SET8
+        | R_RISCV_SET_ULEB128 | R_RISCV_SUB_ULEB128 => Some(1),
+        R_RISCV_ADD16 | R_RISCV_SUB16 | R_RISCV_SET16 | R_RISCV_RVC_BRANCH | R_RISCV_RVC_JUMP => {
+            Some(2)
+        }
+        R_RISCV_64 | R_RISCV_ADD64 | R_RISCV_SUB64 | R_RISCV_CALL_PLT => Some(8),
+        R_RISCV_32 | R_RISCV_32_PCREL | R_RISCV_ADD32 | R_RISCV_SUB32 | R_RISCV_SET32
+        | R_RISCV_PCREL_HI20 | R_RISCV_PCREL_LO12_I | R_RISCV_PCREL_LO12_S | R_RISCV_GOT_HI20
+        | R_RISCV_BRANCH | R_RISCV_JAL | R_RISCV_HI20 | R_RISCV_LO12_I | R_RISCV_LO12_S
+        | R_RISCV_TPREL_HI20 | R_RISCV_TPREL_LO12_I | R_RISCV_TPREL_LO12_S
+        | R_RISCV_TLS_GD_HI20 | R_RISCV_TLS_GOT_HI20 => Some(4),
+        _ => None,
+    }
+}
+
+/// Validate before GOT/TLS scans index symbol tables or any relocation mutates
+/// merged data. All loaded archive members go through the same entry point.
+/// This is structural validation, not permission to silently consume a type.
+pub(super) fn validate_input_relocations(input_objs: &[(String, ElfObject)]) -> Result<(), String> {
+    for (name, obj) in input_objs {
+        for (sec_idx, relocs) in obj.relocations.iter().enumerate() {
+            for reloc in relocs {
+                if reloc.rela_type == 0 {
+                    // R_RISCV_NONE has no operation, symbol or storage field.
+                    continue;
+                }
+                if reloc.sym_idx as usize >= obj.symbols.len() {
+                    return Err(format!(
+                        "invalid RISC-V relocation symbol index {} in '{}' section {}",
+                        reloc.sym_idx, name, sec_idx
+                    ));
+                }
+                let size = obj.sections.get(sec_idx).map(|s| s.size).ok_or_else(|| {
+                    format!(
+                        "invalid RISC-V relocation section {} in '{}'",
+                        sec_idx, name
+                    )
+                })?;
+                let width = relocation_extent(reloc.rela_type).unwrap_or(0);
+                if reloc.offset > size || width > size - reloc.offset {
+                    return Err(format!(
+                        "RISC-V relocation type {} at {:#x} exceeds input section {} (size {:#x}) in '{}'",
+                        reloc.rela_type, reloc.offset, sec_idx, size, name
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Apply all relocations for all input objects to the merged section data.
 pub fn apply_relocations(
     input_objs: &[(String, super::elf_read::ElfObject)],
@@ -74,21 +132,35 @@ pub fn apply_relocations(
             let ms_vaddr = ctx.section_vaddrs[merged_idx];
 
             for reloc in relocs {
-                let offset = sec_offset + reloc.offset;
-                let p = ms_vaddr + offset; // PC (address of relocation site)
+                if reloc.rela_type == 0 {
+                    continue; // R_RISCV_NONE, even without a symbol table.
+                }
+                let offset = sec_offset.checked_add(reloc.offset).ok_or_else(|| {
+                    format!("RISC-V relocation offset overflow in '{}'", obj_name)
+                })?;
+                let p = ms_vaddr.checked_add(offset).ok_or_else(|| {
+                    format!("RISC-V relocation address overflow in '{}'", obj_name)
+                })?;
 
                 let sym_idx = reloc.sym_idx as usize;
-                if sym_idx >= obj.symbols.len() {
-                    continue;
-                }
-                let sym = &obj.symbols[sym_idx];
+                let sym = obj.symbols.get(sym_idx).ok_or_else(|| {
+                    format!(
+                        "invalid RISC-V relocation symbol index {} in '{}'",
+                        sym_idx, obj_name
+                    )
+                })?;
 
                 // Resolve symbol value
                 let s = resolve_sym_value(sym, sym_idx, obj_idx, obj, ctx);
 
                 let a = reloc.addend;
                 let data = &mut merged_sections[merged_idx].data;
-                let off = offset as usize;
+                let off = usize::try_from(offset).map_err(|_| {
+                    format!(
+                        "RISC-V relocation offset does not fit host size in '{}'",
+                        obj_name
+                    )
+                })?;
 
                 apply_one_reloc(
                     reloc.rela_type,
@@ -458,14 +530,12 @@ fn apply_one_reloc(
             patch_u_type(data, off, offset_val as u32);
         }
         other => {
-            if !ctx.collect_relatives {
-                // Executable mode: unknown relocation is an error
-                return Err(format!(
-                    "unsupported RISC-V relocation type {} for symbol '{}' in '{}'",
-                    other, sym.name, obj_name
-                ));
-            }
-            // Shared lib mode: skip unknown relocations silently
+            // Collecting RELATIVE entries is not a license to discard other
+            // relocation kinds. No dynamic relocation is emitted by this arm.
+            return Err(format!(
+                "unsupported RISC-V relocation type {} for symbol '{}' in '{}'",
+                other, sym.name, obj_name
+            ));
         }
     }
 

@@ -922,6 +922,13 @@ fn dump_helper(
     // used verbatim as the output file path.
     let skip_l = BlockId(910099);
     let main_l = BlockId(910010);
+    let lock_l = BlockId(910020);
+    let write_l = BlockId(910021);
+    let close_l = BlockId(910022);
+    let open_error_l = BlockId(910023);
+    let io_error_l = BlockId(910024);
+    let write_error_l = BlockId(910025);
+    let close_error_l = BlockId(910026);
     let pathv = Value(next);
     next += 1;
     let e1 = Value(next);
@@ -1071,7 +1078,7 @@ fn dump_helper(
         b5,
         Terminator::CondBranch {
             cond: Operand::Value(is_null),
-            true_label: skip_l,
+            true_label: open_error_l,
             false_label: main_l,
         },
     );
@@ -1082,28 +1089,113 @@ fn dump_helper(
         source_spans: vec![],
     };
 
-    // Main dump block.
-    let mut is: Vec<Instruction> = Vec::new();
-    is.push(Instruction::Call {
-        func: "fileno".into(),
-        info: ci(
-            Some(fd),
+    // The lock belongs to the open file description. fclose flushes BEFORE
+    // closing that description, so keeping it locked through fclose covers
+    // every buffered write, including the last partial buffer. An explicit
+    // LOCK_UN before fclose would leave that final write outside the lock.
+    let mut io_blocks = Vec::new();
+    // Errors are diagnosed without changing the application's exit status.
+    // In particular a failed/interrupted flock MUST NOT proceed to fprintf.
+    // Abandon that dump rather than emitting an unlocked/partial transaction.
+    for (label, message, successor) in [
+        (open_error_l, "lccc: PGO: cannot open profile", skip_l),
+        (io_error_l, "lccc: PGO: cannot lock profile", close_l),
+        (write_error_l, "lccc: PGO: profile write failed", close_l),
+        (
+            close_error_l,
+            "lccc: PGO: profile close/flush failed",
+            skip_l,
+        ),
+    ] {
+        let text = format!("__lccc_pgo_io_error_{}_{}", m.functions.len(), label.0);
+        m.string_literals.push((text.clone(), message.into()));
+        let ptr = Value(next);
+        next += 1;
+        io_blocks.push(mk(
+            label.0,
+            vec![
+                Instruction::GlobalAddr {
+                    dest: ptr,
+                    name: text,
+                },
+                Instruction::Call {
+                    func: "perror".into(),
+                    info: ci(
+                        None,
+                        vec![Operand::Value(ptr)],
+                        vec![IrType::Ptr],
+                        IrType::Void,
+                        false,
+                    ),
+                },
+            ],
+            Terminator::Branch(successor),
+        ));
+    }
+    // Branching on each acquisition avoids lock/write attempts with invalid
+    // descriptors. Fresh SSA values avoid multi-definition join temporaries.
+    for (label, func, args, types, result, fail_op, failure, success) in [
+        (
+            main_l,
+            "fileno",
             vec![Operand::Value(file)],
             vec![IrType::Ptr],
-            IrType::I32,
-            false,
+            Some(fd),
+            crate::ir::ops::IrCmpOp::Slt,
+            io_error_l,
+            lock_l,
         ),
-    });
-    is.push(Instruction::Call {
-        func: "flock".into(),
-        info: ci(
-            None,
+        (
+            lock_l,
+            "flock",
             vec![Operand::Value(fd), Operand::Const(IrConst::I32(2))],
             vec![IrType::I32, IrType::I32],
-            IrType::I32,
-            false,
+            None,
+            crate::ir::ops::IrCmpOp::Ne,
+            io_error_l,
+            write_l,
         ),
-    });
+        (
+            close_l,
+            "fclose",
+            vec![Operand::Value(file)],
+            vec![IrType::Ptr],
+            None,
+            crate::ir::ops::IrCmpOp::Ne,
+            close_error_l,
+            skip_l,
+        ),
+    ] {
+        let result = result.unwrap_or_else(|| {
+            let value = Value(next);
+            next += 1;
+            value
+        });
+        let bad = Value(next);
+        next += 1;
+        io_blocks.push(mk(
+            label.0,
+            vec![
+                Instruction::Call {
+                    func: func.into(),
+                    info: ci(Some(result), args, types, IrType::I32, false),
+                },
+                Instruction::Cmp {
+                    dest: bad,
+                    op: fail_op,
+                    lhs: Operand::Value(result),
+                    rhs: Operand::Const(IrConst::I32(0)),
+                    ty: IrType::I32,
+                },
+            ],
+            Terminator::CondBranch {
+                cond: Operand::Value(bad),
+                true_label: failure,
+                false_label: success,
+            },
+        ));
+    }
+    let mut is: Vec<Instruction> = Vec::new();
     for (i, (fkey, cnt, edges, entry_slot, h0, h1, entry, uid)) in rec.iter().enumerate() {
         let np = Value(next);
         next += 1;
@@ -1429,45 +1521,55 @@ fn dump_helper(
             }
         }
     }
+    // ferror catches failures from earlier fprintf calls (including writes
+    // flushed by a full buffer); fclose separately checks the final flush.
+    let write_status = Value(next);
+    let write_bad = Value(next + 1);
+    next += 2;
     is.push(Instruction::Call {
-        func: "flock".into(),
+        func: "ferror".into(),
         info: ci(
-            None,
-            vec![Operand::Value(fd), Operand::Const(IrConst::I32(8))],
-            vec![IrType::I32, IrType::I32],
-            IrType::I32,
-            false,
-        ),
-    });
-    is.push(Instruction::Call {
-        func: "fclose".into(),
-        info: ci(
-            None,
+            Some(write_status),
             vec![Operand::Value(file)],
             vec![IrType::Ptr],
             IrType::I32,
             false,
         ),
     });
+    is.push(Instruction::Cmp {
+        dest: write_bad,
+        op: crate::ir::ops::IrCmpOp::Ne,
+        lhs: Operand::Value(write_status),
+        rhs: Operand::Const(IrConst::I32(0)),
+        ty: IrType::I32,
+    });
     let f = IrFunction {
         name: name.into(),
         return_type: IrType::I32,
         params: vec![],
-        blocks: vec![
-            entry_block,
-            env2_block,
-            use_env_block,
-            use_env2_block,
-            use_tag_block,
-            open_block,
-            BasicBlock {
-                label: main_l,
-                instructions: is,
-                terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
-                source_spans: vec![],
-            },
-            skip_block,
-        ],
+        blocks: {
+            let mut blocks = vec![
+                entry_block,
+                env2_block,
+                use_env_block,
+                use_env2_block,
+                use_tag_block,
+                open_block,
+                BasicBlock {
+                    label: write_l,
+                    instructions: is,
+                    terminator: Terminator::CondBranch {
+                        cond: Operand::Value(write_bad),
+                        true_label: write_error_l,
+                        false_label: close_l,
+                    },
+                    source_spans: vec![],
+                },
+                skip_block,
+            ];
+            blocks.extend(io_blocks);
+            blocks
+        },
         is_variadic: false,
         is_declaration: false,
         is_static: true,
@@ -1476,7 +1578,7 @@ fn dump_helper(
         is_noinline: true,
         next_value_id: next,
         fp_expr_tags: Default::default(),
-        next_label: 910011,
+        next_label: 910100,
         section: None,
         visibility: Some("hidden".into()),
         is_weak: false,
@@ -1498,11 +1600,13 @@ fn dump_helper(
     m.destructors.push(name.into());
     for (n, t, v) in [
         ("getenv", IrType::Ptr, false),
-        ("fopen", IrType::Ptr, true),
+        ("fopen", IrType::Ptr, false),
         ("fileno", IrType::I32, false),
         ("flock", IrType::I32, false),
         ("fprintf", IrType::I32, true),
         ("fclose", IrType::I32, false),
+        ("ferror", IrType::I32, false),
+        ("perror", IrType::Void, false),
     ] {
         if !m.functions.iter().any(|f| f.name == n) {
             m.functions.push(IrFunction {

@@ -323,8 +323,10 @@ fn find_function_pointer_core(derived: &[DerivedDeclarator]) -> Option<usize> {
 /// (here) and a definition through the analyzer -- so the same signature was
 /// typed differently depending on whether the body had been seen yet:
 ///
-///     void f(int (*p)(int));              // prototype: p is `int *`
-///     void f(int (*p)(int)) { ... }       // definition: p is `int (*)(int)`
+/// ```text
+/// void f(int (*p)(int));              // prototype: p is `int *`
+/// void f(int (*p)(int)) { ... }       // definition: p is `int (*)(int)`
+/// ```
 ///
 /// and `void g(void) { int (*q)(int); f(q); }` was a hard type error against the
 /// prototype while the identical call to the definition was fine. The analyzer's

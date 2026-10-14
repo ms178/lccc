@@ -131,6 +131,7 @@ pub fn link_builtin(
 
     // ── Phase 2: Merge sections ─────────────────────────────────────────
 
+    super::reloc::validate_input_relocations(&input_objs)?;
     let (mut merged_sections, mut merged_map, input_sec_refs) =
         sections::merge_sections(&input_objs);
 
@@ -294,6 +295,7 @@ pub fn link_shared(
 
     // ── Phase 2: Merge sections ─────────────────────────────────────
 
+    super::reloc::validate_input_relocations(&input_objs)?;
     let (mut merged_sections, mut merged_map, input_sec_refs) =
         sections::merge_sections(&input_objs);
 
