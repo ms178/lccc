@@ -1,108 +1,158 @@
-# CFG threading and asm-goto edge audit
+# Label identity and i686 trampoline threading
 
-Follow-up on `6733d68f41b00387a98d2a2658a86bbf49632c99` (PR #812,
-`6495e6eb6076d6ddf61dc92f3a0b9a7a3dd044cb`). That PR head's hosted Test
-Suite, Clippy, Compiler Explorer oracle, and LCCC-vs-GCC checks completed
-green. This note describes the additional i686 label-safety fix. It is not
-a hosted result for the follow-up head, and not a speedup claim.
+## Invariants
 
-## What the review got right
+Control-flow equivalence is not address equivalence. Removing the sole
+instruction between observable labels can change `&&a != &&b`; retargeting a
+short-only branch can exceed its architectural displacement range. Neither is
+proved safe by a nearby textual label or by a successful assembly on one input.
 
-The i686 text threader scanned only `fstart..fend`, and the first window
-starts at line 0. Module data is emitted before function bodies
-(`emit_data_sections`). A later function's static `&&label` (`.long .LBBn`
-in `.data`) is therefore outside the window that considers deleting that
-label. The same pass treated every in-window `.long`/`.quad` as a jump
-table and rewrote it. Those are different uses: a proven switch entry is
-dispatch, a static initializer is an address.
+The implementation distinguishes five uses: definitions, observable addresses,
+short-only branches, relaxable branches, and proven dispatch entries. Unknown
+uses retain identity. Inline assembly is opaque and never rewritten. References
+are collected across the module, including data emitted before later functions.
 
-`jecxz` is classified as `CondJmp` because its second character is `e`.
-The encoder and ELF writer have no long form (`E3 cb`, rel8). Retargeting
-it before layout can assemble only by accident. `jcxz` and `loop` were
-accidentally safe because they are not `CondJmp`; that is not a contract.
-Final rel8 range is not knowable in this pass: later folds and relaxation
-still change sizes. A text-distance guess would be a false proof. The
-relay stays. x86-64 already refuses `jcxz`/`jecxz`/`jrcxz` and never
-deletes labels.
+## Architecture and correctness argument
 
-## What the review overstated
+### One classification contract
 
-Hosted CI on the merged PR head is no longer pending. A green result there
-does not cover this follow-up. The suggested split is rejected: the
-label census belongs in the pass this change already hardens.
+`visit_label_uses` supplies both the lazy identity-pin set used by jump-to-next
+folds and the indexed reference census used by threading. They cannot silently
+disagree about whether a `.long` is an address or dispatch. Dispatch requires a
+contiguous run under a base proven by an actual indirect `jmp` or PIC `leal`;
+quoted text and data mentioning `@GOTOFF` do not prove a base. Both operands of
+unrecognized label differences are identity uses. Comments are not references. Quoted GAS symbol operands retain identity; only
+literal string directives make quoted payloads non-symbolic. This distinction
+also applies inside opaque inline assembly.
 
-No corpus-wide non-debug O2 speedup is claimed. Prior four-arm Callgrind
-and Os text notes belong to the merged revision; they were not rerun here.
-Ir is not cycles. This machine is not an i7-14700KF.
+Each candidate must have a unique definition, a unique target in its function
+window, exactly one unconditional jump in its body, and no incoming physical
+fallthrough. Those preconditions are checked before any mutation.
 
-## What changed
+### Analyze, resolve, then rewrite
 
-Reference classification is module-wide and use-based:
+The threader constructs a functional graph of candidates in assembly order.
+An iterative path-compression walk resolves every acyclic candidate to a final
+non-candidate destination. Cycles and paths into cycles are retained. There is
+no recursive stack growth and no dependence on randomized map iteration.
 
-- Relaxable `jmp`/`jcc` may skip a pure trampoline. The label address does
-  not change.
-- A short-only branch (`jecxz`, `jcxz`, `jrcxz`, `loop`, `loope`, `loopz`,
-  `loopne`, `loopnz`) keeps the relay. Ordinary edges may still skip it.
-- `.long`/`.quad` is rewritten only when it is a contiguous entry under a
-  symbol the module uses as `jmp *TABLE(, %reg, scale)` or `TABLE@GOTOFF`,
-  and the payload is `CASE` or `CASE - TABLE`. `static void *p = &&label`
-  and `&&a - &&b` do not match. An address pin also blocks dispatch
-  retargeting of that same label.
-- The label is deleted only when every reference was retargeted and the
-  name is defined once. Inline asm stays opaque (`%l[name]` can be
-  address-taken).
-- Jump-to-next folding still deletes a redundant `jmp` for dispatch-only
-  labels. It does not delete the jump that is the first instruction of an
-  address-observable label: that would make `&&mid == &&end`.
-- The pin scan and the rewrite skip GAS quotes. `.string ".LBB1"` and a
-  quoted comment are text, not a symbol use.
-- Fall-through elision is not address-preserving. An empty block whose
-  address is observable (`LabelAddr`, a static initializer, an asm-goto
-  target) still emits the jump when that jump is the only thing separating
-  it from the next label. A non-empty block still elides.
+Only after graph resolution does rewriting begin:
 
-A sole-predecessor empty relay that already feeds a PHI is still not
-bypassed. That relay is what keeps the arm alive; removing it miscompiled
-a vector map kernel. Multi-predecessor relays remain threadable. Empty
-asm-goto sources are not fused into their fallthrough.
+- Relaxable branches may bypass even identity-pinned trampolines: their original
+  label and separating jump remain when needed.
+- Dispatch entries may bypass a candidate only when its address is not pinned.
+- Short-only references are never changed; they keep the relay at its original
+  location relative to surrounding code. This pass does not invent long forms.
+- A candidate's label and jump are removed only if neither address nor short-only
+  references require them. All rewritten destinations are surviving definitions.
+- Inline assembly and trailing comments remain byte-for-byte unchanged.
 
-## What was not copied from LLVM
+Analysis is immutable and each indexed reference is rewritten at most once.
+There is no mutation-sensitive census cache or reference-list migration. For M
+module bytes, C candidates and R symbol references, expected work is O(M+C+R),
+with O(C+R) analysis storage (plus definition/name storage). Hash-table lookup
+cost is expected, not a worst-case adversarial complexity guarantee. This
+replaces multiple module scans per candidate; it does not claim faster generated
+programs or eliminate unrelated costs in the rest of the optimizer.
 
-LLVM's duplicating jump threader (`JumpThreading.cpp`, `ca1dbb8ee2aa`)
-evaluates conditions on predecessor edges and copies blocks under a size
-threshold. Its history includes quadratic IR growth when zero-cost
-instructions bypass that threshold. LCCC already folds constant branches
-and threads bool-phi diamonds without duplication. Cloning that pass
-without LazyValueInfo, a dominator updater, and a measured cost model
-would add compile time and code size without a demonstrated runtime win.
-The empty-block threader stays duplication-free. That is a scope decision,
-not a claim that no further threading is profitable.
+### Block-scoped emitter evidence
 
-## Oracle
+The shared codegen driver records an output offset immediately after emitting
+an observable block's label. The query sees only that block's emitted suffix;
+it cannot mistake a previous block's instruction for evidence of separation.
+The mark is private to `CodegenState`, reset per block/function, and a buffer
+shorter than the recorded mark fails closed.
 
-The asm-goto fallthrough oracle is unchanged: `fd6c281bebb77835` at
-`-m32`/`-m64`, `-O0` through `-Os`, matching GCC 16.2.0, Clang 23.1.0,
-ICX 2024.0.0, and catalog ICC 2021.10.0 at `-O2`/`-Os` on the merged
-revision. ICX's provider alias resolved to 2024.0.0, not a proof of
-Intel's newest 2026 release. No new vendor timing was collected.
+A real compiler-authored instruction establishes positive-size evidence.
+Metadata and padding do not: `.p2align`, `.align`, `.balign`, `.space`, `.skip`
+and `.fill` can emit zero bytes. Unknown directives, section changes, compound
+statements and inline assembly invalidate the proof. Unobservable blocks take
+an O(1) fast path. Observable blocks scan only their own emitted output.
 
-## What was run
+This deliberately does not add an instruction counter to every emission API:
+the output buffer also supports direct writes, deferred emission and truncation.
+A parallel counter would require transactional synchronization with all of those
+operations. The explicit block boundary plus a conservative output proof covers
+them without counting IR instructions that may disappear during lowering. The
+predicate still interprets compiler-authored assembly syntax; it is not an
+assembler or a claim of fully typed machine-instruction emission.
 
-`origin/main` was still `6733d68f` (PR #812). No hosted check covers this
-follow-up. No O2 speedup was measured.
+The i686 jump-to-next guard independently preserves a preceding pinned label
+across zero-byte directives; the emitter's proof cannot authorize a later pass
+to erase the last separating instruction. Conditional jumps use the same guard.
 
-`tests/regression/check_i686_label_ref_safety.sh` linked and ran with the
-fastbuild `-m32` compiler at `-O0`, `-O1`, `-O2`, and `-Os`. All four
-returned 0. GCC 14.2.0 `-m32` on the same source returned 0 at the same
-four levels. The corpus sidecar is `-m32 -O2`; without it the standalone
-corpus compiles the file as x86-64 and the `#error` fires. At `-O0` the two `.long` entries are `.LBB10` and `.LBB11`,
-and the compiler emits `.LBB10: jmp .LBB11`. Before that emitter fix the
-labels were adjacent and `hop(-1)` returned 14. The backward `jecxz`
-fixture enters past the far label; putting the far label at the function
-entry returns before the branch, which is a test bug, not a relay bug.
+## Tests
 
-The emitted `-O0` assembly assembles with `as --32`. Pointing `jecxz`,
-`jcxz`, and `loop` at the far labels instead of the relays does not:
-forward displacement 211 and backward `ffffff2c` are both too large for a
-1-byte field. The i686 peephole module tests passed: 341, including the
-quoted-text case.
+- Actual `.quad` dispatch rewriting with real local symbols and i686 registers.
+- Both identity pins for every supported small-width label-difference directive.
+- Address-pinned dispatch versus relaxable branches; all short-only mnemonics.
+- Fake jump-table evidence in strings, data and inline asm; broken dispatch runs.
+- Duplicate definitions, unchanged inline asm/comments, zero-size directives,
+  positive/negative conditional-jump folds, misleading target comments, compound
+  statement rejection, cycles and paths into cycles.
+- A 4,096-link chain resolved in one invocation, deterministic and idempotent.
+- All 625 four-node functional graphs, every start node, compared with an
+  independent cycle-detecting oracle.
+- Emitter metadata/padding, section changes, block/function resets, and rewind.
+- The assembly-data checker has seven Python self-tests covering every operand,
+  comments, quotes, token boundaries, and multiple statements/definitions.
+
+The existing i686 runtime regression invokes the lexical checker and its
+self-tests before running the compiler fixtures. Normal Cargo tests discover the
+Rust tests; the previously unregistered inline-assembly test is enabled.
+
+## Validation record
+
+Local provisioning activated a 2 GiB swap file. The official latest stable
+release is Rust 1.99.0, but the sandbox cannot reach `static.rust-lang.org`.
+The repository and hosted CI continue to select moving `stable` with rustfmt
+and Clippy; no MSRV or CI gate has been lowered to fit this sandbox.
+
+The expanded supplementary source-only harness passed 377 Rust tests (the
+manual timing test is ignored unless explicitly selected). Five tests requiring
+crate-level assembler/environment support were excluded only from that harness;
+they remain enabled in normal hosted Cargo tests. Python checker self-tests
+passed all seven cases. The quoted-symbol regression was first demonstrated
+failing with the previous scanner; GNU `as --32` independently confirmed that
+a quoted jump operand is a real symbol reference.
+Shell syntax, whitespace, conflict markers and CI/local gate parity also passed.
+
+An older Rust 1.88.0 tool bundle, obtained through the allowed npm registry with
+registry integrity verification, supports supplementary isolated tests of the
+actual label-pass source and its production classifier/LineStore, plus the pure
+emitter predicate. This is **not** a full-crate build, MSRV validation, or a
+substitute for hosted stable-Rust CI. State/driver integration is covered by the
+normal crate tests on CI, not by the isolated local harness.
+
+Reproducible manual microbenchmark (not part of timed CI acceptance):
+
+```sh
+cargo test --profile fastbuild --lib threading_scaling_benchmark -- \
+  --ignored --nocapture --test-threads=1
+```
+
+It measures only the threading pass on independent relays and chains at three
+sizes, reports the median of five runs, and checks each output. Parsing and
+fixture construction are outside the timed region. No corpus-wide runtime
+speedup, vendor comparison, or hardware-independent timing guarantee is claimed.
+
+### Local A/B measurements
+
+Same x86-64 sandbox (two logical CPUs, reported Xeon 2.60 GHz), same Rust 1.88.0
+`rustc --test -C opt-level=1`, same classifier/LineStore and benchmark fixture.
+The before/after harnesses extracted the respective production pass bodies;
+neither timed fixture parsing. Each cell is a five-run median in microseconds.
+
+| Shape | Candidates | Before | After |
+|---|---:|---:|---:|
+| Independent relays | 128 | 7,043 | 158 |
+| Independent relays | 512 | 67,517 | 816 |
+| Independent relays | 2,048 | 1,070,646 | 3,021 |
+| Chain | 128 | 4,349 | 182 |
+| Chain | 512 | 66,816 | 561 |
+| Chain | 2,048 | 1,304,722 | 2,271 |
+
+Both versions' benchmark outputs passed the same structural assertions. These
+synthetic pass-level measurements support the complexity improvement; they are
+not whole-compiler throughput or generated-code runtime measurements. Shared
+host noise, allocator/hash costs and the older local toolchain limit generality.

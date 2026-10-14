@@ -4902,7 +4902,6 @@ fn generate_function(
     }
 
     for (block_idx, block) in func.blocks.iter().enumerate() {
-        cg.state().preserve_label_identity = observable_labels.contains(&block.label);
         cg.begin_home_write_block(block.label);
         if Some(block.label) != entry_label {
             cg.state().reg_cache.invalidate_all();
@@ -4943,6 +4942,8 @@ fn generate_function(
             }
             cg.state().out.emit_block_label(block.label.0);
         }
+        cg.state()
+            .begin_block_address_identity(observable_labels.contains(&block.label));
 
         let fuse_idx = detect_cmp_branch_fusion(
             block,

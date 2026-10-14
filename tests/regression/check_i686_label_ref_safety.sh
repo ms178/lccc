@@ -12,21 +12,16 @@ src=$root/tests/regression/i686_label_ref_safety.c
 tmp=${TMPDIR:-/tmp}/lccc-i686-label-ref.$$
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp"
+python3 "$root/scripts/check_asm_local_labels.py" --selftest
 
 run_one() {
     local opt=$1
     "$CCC" -m32 -O"$opt" -Wall -Wextra -Werror "$src" -o "$tmp/t"
     "$CCC" -m32 -O"$opt" -S "$src" -o "$tmp/t.s"
+    python3 "$root/scripts/check_asm_local_labels.py" "$tmp/t.s"
     python3 - "$tmp/t.s" <<'PY'
 import re, sys
 asm = open(sys.argv[1]).read()
-defined = set(re.findall(r"(?m)^(\.L[\w.$]+):", asm))
-missing = []
-for kind, name in re.findall(r"(?m)^\s*\.(long|quad|word|short|byte|hword|value)\s+(\.L[\w.$]+)\b", asm):
-    if name not in defined:
-        missing.append(f".{kind} {name}")
-if missing:
-    sys.exit("undefined data label(s): " + ", ".join(missing))
 for insn, relay in (
     ("jecxz", ".Ljecxz_relay_fwd"),
     ("jecxz", ".Ljecxz_relay_back"),

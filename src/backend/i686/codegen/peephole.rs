@@ -1100,7 +1100,9 @@ fn trimmed<'a>(store: &'a LineStore, info: &LineInfo, idx: usize) -> &'a str {
 /// same peepholes that run without debug information.
 #[inline]
 fn is_debug_location(store: &LineStore, infos: &[LineInfo], idx: usize) -> bool {
-    infos[idx].kind == LineKind::Directive && trimmed(store, &infos[idx], idx).starts_with(".loc ")
+    infos[idx].kind == LineKind::Directive
+        && infos[idx].inert_dir
+        && syntax_of(store, infos, idx).split_whitespace().next() == Some(".loc")
 }
 
 /// Check if the next instruction reads the carry flag (CF).
@@ -10128,26 +10130,22 @@ fn bare_local_label(text: &str) -> bool {
 /// `leal TABLE@GOTOFF(%ebx), %reg` and difference entries. Both spellings are
 /// the compiler's own dispatch use, not an observable address load.
 fn jump_table_base(text: &str) -> Option<String> {
-    if let Some(idx) = text.find("jmp *") {
-        let rest = text[idx + "jmp *".len()..].trim_start();
-        if let Some(sym) = local_symbol(rest) {
-            if rest[sym.len()..].starts_with("(,") {
-                return Some(sym.to_string());
-            }
+    let (mnemonic, operand) = text.split_once(char::is_whitespace)?;
+    let operand = operand.trim_start();
+    match mnemonic {
+        "jmp" => {
+            let rest = operand.strip_prefix('*')?;
+            let sym = local_symbol(rest)?;
+            rest[sym.len()..].starts_with("(,").then(|| sym.to_string())
         }
-    }
-    if let Some(idx) = text.find("@GOTOFF") {
-        let head = &text[..idx];
-        let start = head
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '$'))
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        let sym = &head[start..];
-        if local_symbol(sym).is_some_and(|s| s.len() == sym.len()) {
-            return Some(sym.to_string());
+        "leal" => {
+            let sym = local_symbol(operand)?;
+            operand[sym.len()..]
+                .starts_with("@GOTOFF(")
+                .then(|| sym.to_string())
         }
+        _ => None,
     }
-    None
 }
 
 fn collect_jump_table_bases(
@@ -10164,23 +10162,6 @@ fn collect_jump_table_bases(
         }
     }
     bases
-}
-
-fn label_defined_once(store: &LineStore, infos: &[LineInfo], name: &str) -> bool {
-    let mut n = 0u32;
-    for i in 0..infos.len() {
-        if infos[i].is_nop() || infos[i].kind != LineKind::Label {
-            continue;
-        }
-        let text = syntax_of(store, infos, i);
-        if text.strip_suffix(':').is_some_and(|def| def.trim() == name) {
-            n += 1;
-            if n > 1 {
-                return false;
-            }
-        }
-    }
-    n == 1
 }
 
 fn data_payload(text: &str) -> Option<&str> {
@@ -10205,6 +10186,11 @@ fn label_diff(payload: &str) -> Option<(&str, &str)> {
     (bare_local_label(left) && bare_local_label(right)).then_some((left, right))
 }
 
+struct DispatchCase<'a> {
+    target: &'a str,
+    relative_base: Option<&'a str>,
+}
+
 /// A data line is a dispatch entry only when it sits in the contiguous run
 /// under a symbol the module actually uses as a jump-table base, and the
 /// payload is either that table's absolute case label or `CASE - TABLE`.
@@ -10214,16 +10200,22 @@ fn dispatch_case<'a>(
     text: &'a str,
     owning: &str,
     bases: &std::collections::HashSet<String>,
-) -> Option<&'a str> {
+) -> Option<DispatchCase<'a>> {
     if owning.is_empty() || !bases.contains(owning) {
         return None;
     }
     let payload = data_payload(text)?;
     if bare_local_label(payload) {
-        return Some(payload);
+        return Some(DispatchCase {
+            target: payload,
+            relative_base: None,
+        });
     }
     let (left, right) = label_diff(payload)?;
-    (right == owning).then_some(left)
+    (right == owning).then_some(DispatchCase {
+        target: left,
+        relative_base: Some(right),
+    })
 }
 
 fn table_run_transparent(text: &str) -> bool {
@@ -10233,7 +10225,7 @@ fn table_run_transparent(text: &str) -> bool {
         || text.starts_with(".balign")
 }
 
-fn direct_branch<'a>(kind: LineKind, text: &'a str) -> Option<(&'a str, &'a str)> {
+fn direct_branch(kind: LineKind, text: &str) -> Option<(&str, &str)> {
     if !matches!(kind, LineKind::Jmp | LineKind::CondJmp) {
         return None;
     }
@@ -10256,82 +10248,113 @@ fn short_only_target(text: &str) -> Option<&str> {
     Some(target)
 }
 
-struct TrampolinePins {
-    identity: bool,
-    short_only: bool,
+/// Semantic uses of local symbols. Definition, control flow, address identity,
+/// and range-constrained control flow are deliberately separate contracts.
+#[derive(Clone, Copy)]
+enum LabelUse {
+    Definition,
+    Identity,
+    ShortBranch,
+    Branch,
+    Dispatch,
 }
 
-/// Pins are module-wide. A function window that starts at the previous
-/// `.cfi_endproc` cannot see `.long .LBB` emitted in the data section before
-/// the first function, which is exactly where a later function's static
-/// `&&label` initializer lives.
-fn trampoline_pins(
+/// Visit the module once, using the same classification for jump deletion and
+/// trampoline threading. A data directive is dispatch only inside the contiguous
+/// run owned by a proven table base. All unrecognized uses pin address identity.
+fn visit_label_uses(
     store: &LineStore,
     infos: &[LineInfo],
-    bases: &std::collections::HashSet<String>,
-    name: &str,
-) -> TrampolinePins {
-    let mut pins = TrampolinePins {
-        identity: false,
-        short_only: false,
-    };
-    let mut owning = String::new();
+    mut visit: impl FnMut(&str, usize, LabelUse),
+) {
+    let bases = collect_jump_table_bases(store, infos);
+    let mut owning = "";
     let mut run_open = false;
-    for i in 0..infos.len() {
-        if infos[i].is_nop() {
+    for (i, info) in infos.iter().enumerate() {
+        if info.is_nop() {
             continue;
         }
         let text = syntax_of(store, infos, i);
-        if infos[i].kind == LineKind::Label {
-            if let Some(def) = text.strip_suffix(':') {
-                owning = def.trim().to_string();
-                run_open = bases.contains(&owning);
-            } else {
-                owning.clear();
+        if info.kind == LineKind::Empty {
+            if text == "#APP" || text == "#NO_APP" {
                 run_open = false;
             }
             continue;
         }
-        if infos[i].kind == LineKind::InlineAsm {
-            if label_referenced_whole_word(text, name) {
-                pins.identity = true;
-            }
+        if info.kind == LineKind::Label {
+            owning = text.strip_suffix(':').map(str::trim).unwrap_or("");
+            run_open = bases.contains(owning);
+            visit(owning, i, LabelUse::Definition);
+            continue;
+        }
+        if info.kind == LineKind::InlineAsm {
+            each_local_symbol(text, |sym| visit(sym, i, LabelUse::Identity));
             run_open = false;
             continue;
         }
         if run_open {
-            if let Some(case) = dispatch_case(text, &owning, bases) {
-                if case != name && label_referenced_whole_word(text, name) {
-                    pins.identity = true;
+            if let Some(case) = dispatch_case(text, owning, &bases) {
+                visit(case.target, i, LabelUse::Dispatch);
+                // The table's own address remains observable even in the
+                // degenerate CASE == TABLE difference expression.
+                if let Some(base) = case.relative_base {
+                    visit(base, i, LabelUse::Identity);
                 }
                 continue;
             }
             if table_run_transparent(text) {
-                if label_referenced_whole_word(text, name) {
-                    pins.identity = true;
-                }
+                each_local_symbol(text, |sym| visit(sym, i, LabelUse::Identity));
                 continue;
             }
             run_open = false;
         }
-        if short_only_target(text) == Some(name) {
-            pins.short_only = true;
-            continue;
-        }
-        if let Some((mnemonic, target)) = direct_branch(infos[i].kind, text) {
-            if target == name && !short_only_mnemonic(mnemonic) {
-                continue;
-            }
-        }
-        if label_referenced_whole_word(text, name)
-            && !text
-                .strip_prefix(name)
-                .is_some_and(|rest| rest.starts_with(':'))
-        {
-            pins.identity = true;
+        let control = short_only_target(text)
+            .map(|target| (target, LabelUse::ShortBranch))
+            .or_else(|| {
+                direct_branch(info.kind, text).map(|(_, target)| (target, LabelUse::Branch))
+            });
+        if let Some((target, kind)) = control {
+            visit(target, i, kind);
+            each_local_symbol(text, |sym| {
+                if sym != target {
+                    visit(sym, i, LabelUse::Identity);
+                }
+            });
+        } else {
+            each_local_symbol(text, |sym| visit(sym, i, LabelUse::Identity));
         }
     }
-    pins
+}
+
+#[derive(Default)]
+struct LabelReferences {
+    definitions: usize,
+    identity: bool,
+    short_only: bool,
+    branches: Vec<usize>,
+    dispatch: Vec<usize>,
+}
+
+/// Immutable analysis for one threading invocation. Rewrites are planned to
+/// final, surviving destinations before any mutation, so no cache invalidation
+/// or reference-list migration is necessary.
+fn label_reference_census(
+    store: &LineStore,
+    infos: &[LineInfo],
+) -> std::collections::HashMap<String, LabelReferences> {
+    let mut labels: std::collections::HashMap<String, LabelReferences> =
+        std::collections::HashMap::new();
+    visit_label_uses(store, infos, |name, idx, kind| {
+        let refs = labels.entry(name.to_string()).or_default();
+        match kind {
+            LabelUse::Definition => refs.definitions += 1,
+            LabelUse::Identity => refs.identity = true,
+            LabelUse::ShortBranch => refs.short_only = true,
+            LabelUse::Branch => refs.branches.push(idx),
+            LabelUse::Dispatch => refs.dispatch.push(idx),
+        }
+    });
+    labels
 }
 
 fn rewrite_label_token(
@@ -10342,78 +10365,26 @@ fn rewrite_label_token(
     to: &str,
 ) {
     let raw = store.get(idx);
-    let new_raw = replace_label_whole_word(raw, from, to);
+    let end = crate::backend::peephole_common::line_len_without_trailing_comment(raw.as_bytes());
+    let mut new_raw = replace_label_whole_word(&raw[..end], from, to);
+    new_raw.push_str(&raw[end..]);
     if new_raw != raw {
         store.replace(idx, new_raw);
         infos[idx] = classify_line(store.get(idx));
     }
 }
 
-/// Retarget relaxable direct branches always (control-flow equivalent; the
-/// label's address does not change). Retarget a proven dispatch entry only
-/// when nothing observes the label's address. Never retarget short-only
-/// branches, inline asm, or any other data use.
-fn retarget_proven_refs(
-    store: &mut LineStore,
-    infos: &mut [LineInfo],
-    bases: &std::collections::HashSet<String>,
-    from: &str,
-    to: &str,
-    allow_dispatch: bool,
-) -> usize {
-    let mut n = 0;
-    let mut owning = String::new();
-    let mut run_open = false;
-    for i in 0..infos.len() {
-        if infos[i].is_nop() {
-            continue;
-        }
-        if infos[i].kind == LineKind::InlineAsm {
-            run_open = false;
-            continue;
-        }
-        let text = syntax_of(store, infos, i);
-        if infos[i].kind == LineKind::Label {
-            if let Some(def) = text.strip_suffix(':') {
-                owning = def.trim().to_string();
-                run_open = bases.contains(&owning);
-            } else {
-                owning.clear();
-                run_open = false;
-            }
-            continue;
-        }
-        let mut rewrite = false;
-        if run_open {
-            if let Some(case) = dispatch_case(text, &owning, bases) {
-                rewrite = allow_dispatch && case == from;
-                if rewrite {
-                    rewrite_label_token(store, infos, i, from, to);
-                    n += 1;
-                }
-                continue;
-            }
-            if table_run_transparent(text) {
-                continue;
-            }
-            run_open = false;
-        }
-        if let Some((mnemonic, target)) = direct_branch(infos[i].kind, text) {
-            rewrite = target == from && !short_only_mnemonic(mnemonic);
-        }
-        if rewrite {
-            rewrite_label_token(store, infos, i, from, to);
-            n += 1;
-        }
-    }
-    n
-}
-
-/// Thread one proven trampoline. Returns whether the assembly changed.
-/// The label is deleted only when every reference was retargeted. A
-/// short-only branch or an address use keeps the relay; ordinary branches
-/// may still skip it.
 fn each_local_symbol(text: &str, mut visit: impl FnMut(&str)) {
+    // GAS permits quoted symbol names in operands (jmp ".Ltarget", or
+    // .quad ".Ltarget"). Only literal string directives make their quoted
+    // payload non-symbolic; treating every quote as data can leave dangling
+    // references, including inside otherwise opaque inline assembly.
+    let string_payload = matches!(
+        text.split_whitespace().next(),
+        Some(
+            ".ascii" | ".asciz" | ".string" | ".string8" | ".string16" | ".string32" | ".string64"
+        )
+    );
     let bytes = text.as_bytes();
     let mut i = 0;
     let mut quote: Option<u8> = None;
@@ -10430,7 +10401,7 @@ fn each_local_symbol(text: &str, mut visit: impl FnMut(&str)) {
             continue;
         }
         match bytes[i] {
-            b'"' | b'\'' => {
+            b'"' | b'\'' if string_payload => {
                 quote = Some(bytes[i]);
                 i += 1;
             }
@@ -10462,75 +10433,12 @@ fn identity_pinned_labels(
     store: &LineStore,
     infos: &[LineInfo],
 ) -> std::collections::HashSet<String> {
-    let bases = collect_jump_table_bases(store, infos);
     let mut pinned = std::collections::HashSet::new();
-    let mut owning = String::new();
-    let mut run_open = false;
-    for i in 0..infos.len() {
-        if infos[i].is_nop() {
-            continue;
-        }
-        let text = syntax_of(store, infos, i);
-        if infos[i].kind == LineKind::Label {
-            if let Some(def) = text.strip_suffix(':') {
-                owning = def.trim().to_string();
-                run_open = bases.contains(&owning);
-            } else {
-                owning.clear();
-                run_open = false;
-            }
-            continue;
-        }
-        let mut note = |sym: &str| {
+    visit_label_uses(store, infos, |sym, _, kind| {
+        if matches!(kind, LabelUse::Identity) {
             pinned.insert(sym.to_string());
-        };
-        if infos[i].kind == LineKind::InlineAsm {
-            each_local_symbol(text, &mut note);
-            run_open = false;
-            continue;
         }
-        if run_open {
-            if let Some(case) = dispatch_case(text, &owning, &bases) {
-                each_local_symbol(text, |sym| {
-                    if sym != case {
-                        note(sym);
-                    }
-                });
-                continue;
-            }
-            if table_run_transparent(text) {
-                each_local_symbol(text, &mut note);
-                continue;
-            }
-            run_open = false;
-        }
-        if let Some(target) = short_only_target(text) {
-            each_local_symbol(text, |sym| {
-                if sym != target {
-                    note(sym);
-                }
-            });
-            continue;
-        }
-        if let Some((mnemonic, target)) = direct_branch(infos[i].kind, text) {
-            if !short_only_mnemonic(mnemonic) {
-                each_local_symbol(text, |sym| {
-                    if sym != target {
-                        note(sym);
-                    }
-                });
-                continue;
-            }
-        }
-        each_local_symbol(text, |sym| {
-            if !text
-                .strip_prefix(sym)
-                .is_some_and(|rest| rest.starts_with(':'))
-            {
-                note(sym);
-            }
-        });
-    }
+    });
     pinned
 }
 
@@ -10547,6 +10455,16 @@ fn jump_carries_observable_address(
         idx -= 1;
         if infos[idx].is_nop() || is_debug_location(store, infos, idx) {
             continue;
+        }
+        // Directives (including zero-byte alignment/space) and comments
+        // cannot prove separation. Inline asm is opaque, so retain the jump.
+        // DIRECTIVE-LAW: selecting -- search for pins, not a movable window;
+        // ignoring even byte-emitting directives can only RETAIN more jumps.
+        if matches!(infos[idx].kind, LineKind::Directive | LineKind::Empty) {
+            continue;
+        }
+        if infos[idx].kind == LineKind::InlineAsm {
+            return true;
         }
         if infos[idx].kind != LineKind::Label {
             break;
@@ -10565,28 +10483,6 @@ fn jump_carries_observable_address(
         }
     }
     false
-}
-
-fn thread_resolved_trampoline(
-    store: &mut LineStore,
-    infos: &mut [LineInfo],
-    bases: &std::collections::HashSet<String>,
-    name: &str,
-    target: &str,
-    label_idx: usize,
-    jmp_idx: usize,
-) -> bool {
-    if !label_defined_once(store, infos, name) || !label_defined_once(store, infos, target) {
-        return false;
-    }
-    let pins = trampoline_pins(store, infos, bases, name);
-    let retargeted = retarget_proven_refs(store, infos, bases, name, target, !pins.identity);
-    if pins.identity || pins.short_only {
-        return retargeted > 0;
-    }
-    infos[label_idx].kind = LineKind::Nop;
-    infos[jmp_idx].kind = LineKind::Nop;
-    true
 }
 
 fn is_label_ident_byte(c: u8) -> bool {
@@ -10631,13 +10527,6 @@ fn find_unquoted_label(bytes: &[u8], name: &[u8], from: usize) -> Option<usize> 
     None
 }
 
-/// Whether `name` appears in `text` as a whole word outside quotes.
-/// Used by trampoline reference classification. A quoted copy must not pin
-/// or be rewritten: `.string ".LBB1"` does not reference the symbol.
-fn label_referenced_whole_word(text: &str, name: &str) -> bool {
-    find_unquoted_label(text.as_bytes(), name.as_bytes(), 0).is_some()
-}
-
 /// Replace every unquoted whole-word occurrence of `from` with `to`.
 fn replace_label_whole_word(text: &str, from: &str, to: &str) -> String {
     let bytes = text.as_bytes();
@@ -10653,17 +10542,69 @@ fn replace_label_whole_word(text: &str, from: &str, to: &str) -> String {
     out
 }
 
-/// Jump threading through trivial blocks.  A trivial block is a `.L` label
-/// whose body is exactly one unconditional `jmp X` (nops/directives aside)
-/// that nothing falls into.  Every branch to the label is retargeted to X
-/// and the block (label + jmp) is deleted.  Sound unconditionally: the
-/// elided control transfer is flag-neutral and stack-neutral, so any entrant
-/// observes identical state at X.  Iterated to a fixpoint by the caller, so
-/// chains thread transitively.
+struct Trampoline {
+    name: String,
+    target: String,
+    label_idx: usize,
+    jmp_idx: usize,
+}
+
+#[derive(Clone, Copy)]
+enum TrampolineResolution {
+    Unvisited,
+    Visiting,
+    Terminal(usize),
+    Cycle,
+}
+
+/// Resolve the functional trampoline graph without recursion. Each node is
+/// entered once and path-compressed once. A terminal names the candidate whose
+/// target is NOT another candidate; cycles and paths into cycles are retained.
+/// The latter is conservative: changing a cycle's entry is unnecessary here.
+fn resolve_trampolines(candidates: &[Trampoline]) -> Vec<TrampolineResolution> {
+    let by_name: std::collections::HashMap<&str, usize> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.name.as_str(), i))
+        .collect();
+    let mut resolved = vec![TrampolineResolution::Unvisited; candidates.len()];
+    let mut path = Vec::new();
+    for start in 0..candidates.len() {
+        if !matches!(resolved[start], TrampolineResolution::Unvisited) {
+            continue;
+        }
+        let mut current = start;
+        let result = loop {
+            match resolved[current] {
+                TrampolineResolution::Unvisited => {
+                    resolved[current] = TrampolineResolution::Visiting;
+                    path.push(current);
+                    if let Some(&next) = by_name.get(candidates[current].target.as_str()) {
+                        current = next;
+                    } else {
+                        break TrampolineResolution::Terminal(current);
+                    }
+                }
+                TrampolineResolution::Visiting => break TrampolineResolution::Cycle,
+                result => break result,
+            }
+        };
+        for node in path.drain(..) {
+            resolved[node] = result;
+        }
+    }
+    resolved
+}
+
+/// Thread pure, non-fallthrough trampolines with module-wide reference proofs.
+/// Analysis is immutable; mutation happens only after all chains are resolved.
+/// Expected O(module bytes + references + candidates), including long chains:
+/// no per-candidate module scans, recursion, or repeated edge rewriting.
 fn thread_trivial_blocks(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = infos.len();
     let mut changed = false;
-    let table_bases = collect_jump_table_bases(store, infos);
+    let census = label_reference_census(store, infos);
+    let mut candidates = Vec::new();
 
     let mut fstart = 0usize;
     for idx in 0..=len {
@@ -10685,15 +10626,23 @@ fn thread_trivial_blocks(store: &mut LineStore, infos: &mut [LineInfo]) -> bool 
             if infos[i].is_nop() || infos[i].kind != LineKind::Label {
                 continue;
             }
-            let t = trimmed(store, &infos[i], i);
+            let t = syntax_of(store, infos, i);
             if let Some(name) = t.strip_suffix(':') {
-                labels.insert(name.to_string(), i);
+                labels.insert(name.trim().to_string(), i);
             }
         }
 
-        for (name, &label_idx) in labels.iter() {
-            if infos[label_idx].is_nop() {
-                continue; // already threaded in this pass
+        // Assembly order, not randomized HashMap iteration, defines the plan.
+        for label_idx in fstart..fend {
+            if infos[label_idx].kind != LineKind::Label {
+                continue;
+            }
+            let Some(name) = syntax_of(store, infos, label_idx).strip_suffix(':') else {
+                continue;
+            };
+            let name = name.trim();
+            if census.get(name).is_none_or(|refs| refs.definitions != 1) {
+                continue;
             }
             if !name.starts_with(".L") {
                 continue;
@@ -10726,14 +10675,15 @@ fn thread_trivial_blocks(store: &mut LineStore, infos: &mut [LineInfo]) -> bool 
             if !trivial {
                 continue;
             }
-            let target = match trimmed(store, &infos[jmp_idx], jmp_idx)
-                .split_whitespace()
-                .next_back()
-            {
-                Some(t) => t.to_string(),
-                None => continue,
+            let Some((_, target)) =
+                direct_branch(infos[jmp_idx].kind, syntax_of(store, infos, jmp_idx))
+            else {
+                continue;
             };
-            if target == *name || !labels.contains_key(&target) {
+            let target = target.to_string();
+            if !labels.contains_key(&target)
+                || census.get(&target).is_none_or(|refs| refs.definitions != 1)
+            {
                 continue;
             }
             // Fallthrough guard: the previous real line must not enter the
@@ -10758,24 +10708,42 @@ fn thread_trivial_blocks(store: &mut LineStore, infos: &mut [LineInfo]) -> bool 
             if !guarded {
                 continue;
             }
-            // References are classified across the whole module. The
-            // function window cannot see static `&&label` data emitted
-            // before the first body, and a `.long`/`.quad` token is not
-            // proof of a jump table. Short-only branches keep the relay.
-            changed |= thread_resolved_trampoline(
-                store,
-                infos,
-                &table_bases,
-                name,
-                &target,
+            candidates.push(Trampoline {
+                name: name.to_string(),
+                target,
                 label_idx,
                 jmp_idx,
-            );
+            });
         }
 
         fstart = idx + 1;
     }
 
+    let resolved = resolve_trampolines(&candidates);
+    for (candidate, resolution) in candidates.iter().zip(resolved) {
+        let TrampolineResolution::Terminal(terminal) = resolution else {
+            continue;
+        };
+        let target = &candidates[terminal].target;
+        let refs = &census[&candidate.name];
+        for &idx in &refs.branches {
+            if !infos[idx].is_nop() {
+                rewrite_label_token(store, infos, idx, &candidate.name, target);
+                changed = true;
+            }
+        }
+        if !refs.identity {
+            for &idx in &refs.dispatch {
+                rewrite_label_token(store, infos, idx, &candidate.name, target);
+                changed = true;
+            }
+        }
+        if !refs.identity && !refs.short_only {
+            infos[candidate.label_idx].kind = LineKind::Nop;
+            infos[candidate.jmp_idx].kind = LineKind::Nop;
+            changed = true;
+        }
+    }
     changed
 }
 
@@ -10783,31 +10751,40 @@ fn thread_trivial_blocks(store: &mut LineStore, infos: &mut [LineInfo]) -> bool 
 /// paths reach the same target: `jCC X` immediately followed by `jmp X`
 /// (threading creates these), or `jCC X` immediately followed by `X:`.
 /// The jCC itself is flag-neutral and side-effect-free, so deleting it is
-/// unconditionally sound.
+/// control-flow sound. Address identity is not control flow: when the jCC
+/// is the only instruction after an address-observable label, deleting it
+/// makes `&&obs == &&X`. The `jmp X` variant is safe (the jmp still
+/// separates the labels); only the `X:` variant needs the guard.
 fn delete_redundant_cond_jumps(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = infos.len();
     let mut changed = false;
+    // Lazily computed: only passes that see a jCC + Label pair need the
+    // module-wide pin set. Most passes never touch it.
+    let mut identity_pins: Option<std::collections::HashSet<String>> = None;
     let mut i = 0;
     while i < len {
         if infos[i].is_nop() || infos[i].kind != LineKind::CondJmp {
             i += 1;
             continue;
         }
-        let target = match trimmed(store, &infos[i], i).split_whitespace().next_back() {
-            Some(t) => t.to_string(),
-            None => {
-                i += 1;
-                continue;
-            }
+        let Some((_, target)) = direct_branch(infos[i].kind, syntax_of(store, infos, i)) else {
+            i += 1;
+            continue;
         };
         let j = next_non_nop(infos, i + 1);
         if j < len {
             let redundant = match infos[j].kind {
-                LineKind::Jmp => trimmed(store, &infos[j], j)
-                    .split_whitespace()
-                    .next_back()
-                    .is_some_and(|t| t == target),
-                LineKind::Label => trimmed(store, &infos[j], j) == format!("{}:", target),
+                // jCC X; jmp X → the jmp still occupies an address between
+                // any preceding observable label and X:, so deletion is safe.
+                LineKind::Jmp => direct_branch(infos[j].kind, syntax_of(store, infos, j))
+                    .is_some_and(|(_, t)| t == target),
+                // jCC X; X: → deletion moves X:'s address onto the jCC's
+                // address. If an observable label sits on the jCC, the two
+                // addresses collapse. Refuse in that case.
+                LineKind::Label => {
+                    syntax_of(store, infos, j).strip_suffix(':') == Some(target)
+                        && !jump_carries_observable_address(store, infos, i, &mut identity_pins)
+                }
                 _ => false,
             };
             if redundant {
@@ -18461,6 +18438,7 @@ f:
         assert!(result.contains("jmp .LBB3"), "{result}");
     }
 
+    #[test]
     fn test_inline_asm_region_is_never_rewritten() {
         // User-authored asm between #APP/#NO_APP must survive byte-for-byte
         // even when its text matches a foldable store/load shape, and it
@@ -22655,5 +22633,371 @@ mod classify_law_tests {
             LineKind::Directive,
             "a quoted '#' is not a comment"
         );
+    }
+}
+
+#[cfg(test)]
+mod dispatch_and_pin_tests {
+    use super::*;
+
+    fn make_store(text: &str) -> (LineStore, Vec<LineInfo>) {
+        let store = LineStore::new(text.to_string());
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        pin_inline_asm_regions(&store, &mut infos);
+        (store, infos)
+    }
+
+    fn output(store: &LineStore, infos: &[LineInfo]) -> String {
+        (0..infos.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn thread(text: &str) -> String {
+        let (mut store, mut infos) = make_store(text);
+        thread_trivial_blocks(&mut store, &mut infos);
+        output(&store, &infos)
+    }
+
+    #[test]
+    fn quad_dispatch_run_under_proven_base_is_rewritten() {
+        // Use real i686 operands and production classification. Check the
+        // transformation, not just the parser's opinion of one data line.
+        let text = "f:\n.cfi_startproc\n    jmp *.Ltable(,%eax,4)\n    ret\n.Lcase:\n    jmp .Lend\n.Lend:\n    ret\n.Ltable:\n    .quad .Lcase - .Ltable\n    .quad .Lend - .Ltable\n.cfi_endproc\n";
+        let (store, infos) = make_store(text);
+        let census = label_reference_census(&store, &infos);
+        assert!(!census[".Lcase"].identity);
+        assert_eq!(census[".Lcase"].dispatch.len(), 1);
+        let out = thread(text);
+        assert!(!out.contains(".Lcase"), "{out}");
+        assert_eq!(out.matches(".quad .Lend - .Ltable").count(), 2, "{out}");
+        assert!(out.contains("jmp *.Ltable(,%eax,4)"), "{out}");
+    }
+
+    #[test]
+    fn short_label_differences_pin_both_labels() {
+        for directive in ["word", "short", "hword", "value", "byte"] {
+            let text = format!(
+                ".data\n.{directive} .Lone - .Ltwo\n.text\nf:\n.cfi_startproc\n    jne .Lone\n    ret\n.Lone:\n    jmp .Ltwo\n.Ltwo:\n    jmp .Lend\n.Lend:\n    ret\n.cfi_endproc\n"
+            );
+            let (store, infos) = make_store(&text);
+            let pins = identity_pinned_labels(&store, &infos);
+            assert!(
+                pins.contains(".Lone") && pins.contains(".Ltwo"),
+                "{directive}"
+            );
+            let out = thread(&text);
+            assert!(
+                out.contains(&format!(".{directive} .Lone - .Ltwo")),
+                "{out}"
+            );
+            assert!(out.contains(".Lone:") && out.contains(".Ltwo:"), "{out}");
+            assert!(
+                out.contains("jne .Lend"),
+                "ordinary control flow still threads: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn address_pins_block_dispatch_but_not_relaxable_branches() {
+        let text = ".data\n.quad .Lcase\nf:\n.cfi_startproc\n    jne .Lcase\n    jmp *.Ltable(,%eax,4)\n.Lcase:\n    jmp .Lend\n.Lend:\n    ret\n.Ltable:\n.long .Lcase - .Ltable\n.cfi_endproc\n";
+        let out = thread(text);
+        assert!(out.contains("jne .Lend"), "{out}");
+        assert!(
+            out.contains(".Lcase:") && out.contains(".quad .Lcase"),
+            "{out}"
+        );
+        assert!(out.contains(".long .Lcase - .Ltable"), "{out}");
+    }
+
+    #[test]
+    fn short_only_edges_retain_the_relay_without_blocking_other_edges() {
+        for mnemonic in [
+            "jecxz", "jcxz", "loop", "loope", "loopne", "loopz", "loopnz",
+        ] {
+            let text = format!(
+                "f:\n.cfi_startproc\n    jne .Lrelay\n    {mnemonic} .Lrelay\n    ret\n.Lrelay:\n    jmp .Lend\n.Lpad:\n    .space 200\n.Lend:\n    ret\n.cfi_endproc\n"
+            );
+            let out = thread(&text);
+            assert!(out.contains("jne .Lend"), "{out}");
+            assert!(out.contains(&format!("{mnemonic} .Lrelay")), "{out}");
+            assert!(out.contains(".Lrelay:\n    jmp .Lend"), "{out}");
+        }
+    }
+
+    #[test]
+    fn quoted_or_data_text_cannot_prove_a_jump_table() {
+        for bogus in [
+            ".string \"jmp *.Ltable(,%eax,4)\"",
+            ".long .Ltable@GOTOFF",
+            "# jmp *.Ltable(,%eax,4)",
+            "#APP\n    jmp *.Ltable(,%eax,4)\n#NO_APP",
+        ] {
+            let text = format!("{bogus}\n.Ltable:\n.quad .Lcase - .Ltable\n");
+            let (store, infos) = make_store(&text);
+            assert!(
+                collect_jump_table_bases(&store, &infos).is_empty(),
+                "{bogus}"
+            );
+            let pins = identity_pinned_labels(&store, &infos);
+            assert!(
+                pins.contains(".Lcase") && pins.contains(".Ltable"),
+                "{bogus}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_symbol_operands_pin_labels_but_literal_strings_do_not() {
+        for reference in [
+            "#APP\n    jmp \".Lrelay\"\n#NO_APP",
+            ".quad \".Lrelay\"",
+            ".word \".Lrelay\" - \".Lend\"",
+        ] {
+            let text = format!(
+                "{reference}\nf:\n.cfi_startproc\n    jne .Lrelay\n    ret\n.Lrelay:\n    jmp .Lend\n.Lend:\n    ret\n.cfi_endproc"
+            );
+            let (store, infos) = make_store(&text);
+            assert!(identity_pinned_labels(&store, &infos).contains(".Lrelay"));
+            let out = thread(&text);
+            assert!(out.contains(reference) && out.contains(".Lrelay:"), "{out}");
+            assert!(out.contains("jne .Lend"), "{out}");
+        }
+        for directive in [
+            ".ascii",
+            ".asciz",
+            ".string",
+            ".string8",
+            ".string16",
+            ".string32",
+            ".string64",
+        ] {
+            let text = format!("{directive} \".Lrelay\"");
+            let (store, infos) = make_store(&text);
+            assert!(identity_pinned_labels(&store, &infos).is_empty(), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_directive_ends_the_proven_dispatch_run() {
+        let text =
+            "jmp *.Ltable(,%eax,4)\n.Ltable:\n.long .Ldispatch\n.section .data\n.long .Laddress\n";
+        let (store, infos) = make_store(text);
+        let pins = identity_pinned_labels(&store, &infos);
+        assert!(!pins.contains(".Ldispatch"));
+        assert!(pins.contains(".Laddress"));
+    }
+
+    #[test]
+    fn duplicate_definitions_refuse_threading() {
+        for duplicated in [".Lrelay", ".Lend"] {
+            let text = format!(
+                "f:\n.cfi_startproc\n    jne .Lrelay\n    ret\n.Lrelay:\n    jmp .Lend\n.Lend:\n    ret\n{duplicated}:\n    ret\n.cfi_endproc"
+            );
+            assert_eq!(thread(&text), text);
+        }
+    }
+
+    #[test]
+    fn inline_asm_and_comments_are_byte_preserved() {
+        let text = "f:\n.cfi_startproc\n#APP\n    jne .Lrelay\n#NO_APP\n    jne .Lrelay # .Lrelay stays in this comment\n    ret\n.Lrelay:\n    jmp .Lend\n.Lend:\n    ret\n.cfi_endproc";
+        let out = thread(text);
+        assert!(out.contains("#APP\n    jne .Lrelay\n#NO_APP"), "{out}");
+        assert!(
+            out.contains("jne .Lend # .Lrelay stays in this comment"),
+            "{out}"
+        );
+        assert!(out.contains(".Lrelay:"), "{out}");
+    }
+
+    #[test]
+    fn conditional_jump_guards_zero_size_directives_and_commented_labels() {
+        for metadata in [
+            "",
+            ".loc 1 2 0\n",
+            ".p2align 4\n",
+            ".space 0\n",
+            "# comment\n",
+        ] {
+            let text = format!(
+                ".long .Lobs\nf:\n.Lobs: # observable\n{metadata}    je .Lnext\n.Lnext:\n    ret\n"
+            );
+            let (mut store, mut infos) = make_store(&text);
+            assert!(
+                !delete_redundant_cond_jumps(&mut store, &mut infos),
+                "{metadata}"
+            );
+            assert!(output(&store, &infos).contains("je .Lnext"));
+        }
+        for text in [
+            "f:\n.Lobs:\n    je .Lnext\n.Lnext:\n    ret\n",
+            ".long .Lobs\nf:\n.Lobs:\n    je .Lnext\n    jmp .Lnext\n.Lnext:\n    ret\n",
+            ".long .Lobs\nf:\n.Lobs:\n    nop\n    je .Lnext\n.Lnext:\n    ret\n",
+        ] {
+            let (mut store, mut infos) = make_store(text);
+            assert!(
+                delete_redundant_cond_jumps(&mut store, &mut infos),
+                "{text}"
+            );
+            assert!(!output(&store, &infos).contains("je .Lnext"));
+        }
+    }
+
+    #[test]
+    fn branch_comments_cannot_supply_a_different_control_flow_target() {
+        for text in [
+            "f:\n    je .Lother # .Lnext\n.Lnext:\n    ret\n.Lother:\n    ret\n",
+            "f:\n    je .Lother\n    jmp .Lnext # .Lother\n.Lnext:\n    ret\n.Lother:\n    ret\n",
+        ] {
+            let (mut store, mut infos) = make_store(text);
+            assert!(
+                !delete_redundant_cond_jumps(&mut store, &mut infos),
+                "{text}"
+            );
+        }
+        let (mut store, mut infos) =
+            make_store("f:\n    je .Lnext # actual target\n.Lnext: # label\n    ret\n");
+        assert!(delete_redundant_cond_jumps(&mut store, &mut infos));
+    }
+
+    #[test]
+    fn debug_locations_require_an_inert_exact_directive_token() {
+        for (text, expected) in [
+            (".loc 1 2 0", true),
+            (".loc\t1 2 0", true),
+            (".local symbol", false),
+            (".location 1", false),
+            (".loc 1 2 0; nop", false),
+        ] {
+            let (store, infos) = make_store(text);
+            assert_eq!(is_debug_location(&store, &infos, 0), expected, "{text}");
+        }
+        for body in ["    jmp .Lend; jmp .Lend", ".loc 1 2 0; nop\n    jmp .Lend"] {
+            let text = format!(
+                "f:\n.cfi_startproc\n    jne .Lrelay\n    ret\n.Lrelay:\n{body}\n.Lend:\n    ret\n.cfi_endproc"
+            );
+            assert_eq!(
+                thread(&text),
+                text,
+                "a compound statement is not a pure relay"
+            );
+        }
+    }
+
+    #[test]
+    fn cycles_and_incoming_paths_remain_unchanged() {
+        for body in [
+            ".L0:\n    jmp .L0\n",
+            ".L0:\n    jmp .L1\n.L1:\n    jmp .L0\n",
+            ".L0:\n    jmp .L1\n.L1:\n    jmp .L2\n.L2:\n    jmp .L1\n",
+        ] {
+            let text = format!("f:\n.cfi_startproc\n    jne .L0\n    ret\n{body}.cfi_endproc");
+            assert_eq!(thread(&text), text);
+        }
+    }
+
+    #[test]
+    fn long_chains_resolve_in_one_invocation_and_are_idempotent() {
+        let mut text = "f:\n.cfi_startproc\n    jne .L0\n    ret\n".to_string();
+        for i in 0..4096 {
+            text.push_str(&format!(".L{i}:\n    jmp .L{}\n", i + 1));
+        }
+        text.push_str(".L4096:\n    ret\n.cfi_endproc");
+        let out = thread(&text);
+        assert_eq!(
+            out,
+            "f:\n.cfi_startproc\n    jne .L4096\n    ret\n.L4096:\n    ret\n.cfi_endproc"
+        );
+        assert_eq!(thread(&out), out);
+        assert_eq!(thread(&text), out, "deterministic across fresh hash seeds");
+    }
+
+    #[test]
+    fn resolver_matches_independent_exhaustive_small_graph_oracle() {
+        // Every 4-node functional graph, including self loops, fan-in, cycles,
+        // and a fifth (terminal) destination: 5^4 = 625 graphs, every start.
+        for encoding in 0..625usize {
+            let mut digits = encoding;
+            let candidates: Vec<_> = (0..4)
+                .map(|i| {
+                    let target = digits % 5;
+                    digits /= 5;
+                    Trampoline {
+                        name: format!(".L{i}"),
+                        target: format!(".L{target}"),
+                        label_idx: 0,
+                        jmp_idx: 0,
+                    }
+                })
+                .collect();
+            let resolved = resolve_trampolines(&candidates);
+            for start in 0..4 {
+                let mut seen = std::collections::HashSet::new();
+                let mut node = start;
+                let terminal = loop {
+                    if !seen.insert(node) {
+                        break None;
+                    }
+                    let next: usize = candidates[node].target[2..].parse().unwrap();
+                    if next == 4 {
+                        break Some(node);
+                    }
+                    node = next;
+                };
+                match (terminal, resolved[start]) {
+                    (None, TrampolineResolution::Cycle) => {}
+                    (Some(expected), TrampolineResolution::Terminal(actual)) => {
+                        assert_eq!(actual, expected)
+                    }
+                    _ => panic!("graph {encoding}, start {start}: wrong resolution"),
+                }
+            }
+        }
+    }
+    /// Run explicitly with `cargo test --profile fastbuild --lib
+    /// threading_scaling_benchmark -- --ignored --nocapture --test-threads=1`.
+    /// Timing is diagnostic, never a flaky CI threshold or a runtime-speed claim.
+    #[test]
+    #[ignore = "manual compile-time microbenchmark; not a CI timing threshold"]
+    fn threading_scaling_benchmark() {
+        for chain in [false, true] {
+            for count in [128, 512, 2048] {
+                let mut text = "f:\n.cfi_startproc\n    jne .L0\n    ret\n".to_string();
+                for i in 0..count {
+                    let target = if chain {
+                        format!(".L{}", i + 1)
+                    } else {
+                        format!(".L{count}")
+                    };
+                    text.push_str(&format!(".L{i}:\n    jmp {target}\n"));
+                }
+                text.push_str(&format!(
+                    ".L{count}:\n    movl $42, %eax\n    ret\n.cfi_endproc"
+                ));
+                let mut timings = Vec::new();
+                for _ in 0..5 {
+                    let (mut store, mut infos) = make_store(&text);
+                    let start = std::time::Instant::now();
+                    assert!(thread_trivial_blocks(
+                        std::hint::black_box(&mut store),
+                        &mut infos
+                    ));
+                    timings.push(start.elapsed());
+                    let out = output(&store, &infos);
+                    assert!(out.contains(&format!("jne .L{count}")), "{out}");
+                    assert_eq!(out.lines().filter(|s| s.ends_with(':')).count(), 2);
+                }
+                timings.sort();
+                println!(
+                    "chain={chain} candidates={count} median_us={}",
+                    timings[2].as_micros()
+                );
+            }
+        }
     }
 }
