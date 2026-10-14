@@ -1,0 +1,30 @@
+{
+  "fixtures": 233,
+  "accepting": 115,
+  "rejecting": 118,
+  "invocations": 466,
+  "positive_kinds_including_none": [
+    0,
+    2,
+    16,
+    17,
+    44,
+    45,
+    51,
+    60,
+    61
+  ],
+  "rust_branch_valid_exhaustive": 1054976,
+  "rust_uleb_stated_cases": 90115,
+  "rust_latest_api": {
+    "published_at": "2026-10-01T12:41:12Z",
+    "tag_name": "1.99.0"
+  },
+  "swap": "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n/swapfile                               file\t\t8388604\t\t0\t\t-2\n",
+  "source_delta_from_original": " src/common/type_builder.rs | 6 ++++--\n 1 file changed, 4 insertions(+), 2 deletions(-)\n",
+  "gcc": "gcc (Debian 12.2.0-14+deb12u1) 12.2.0",
+  "clang": "clang version 22.1.8\nTarget: x86_64-unknown-linux5.10.0-gnu2.36.0\nThread model: posix\nInstalledDir: /home/user/lccc/.cache/python/ziglang\n",
+  "lld": "LLD 22.1.8 (compatible with GNU linkers)\n",
+  "zig_sha256": "7c61539af19fa4082c94848f1c2b57b89e76dc6cfd5bd4c57764c3caf8f82272",
+  "compiled_three_way_status": "pending hosted comparison, not measured locally"
+}

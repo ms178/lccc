@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import random
 from pathlib import Path
 import struct
 import sys
@@ -19,7 +20,7 @@ import tempfile
 
 
 def fixture(kind=2, offset=0, symidx=2, addend=0, binding=0, visibility=0,
-            defined=True, payload=None, uleb=None, no_symbols=False):
+            defined=True, payload=None, uleb=None, no_symbols=False, displacement=None):
     """NULL, .text, .data, .data.more, .rela.data, .symtab, .strtab, .shstrtab.
 
     .data.more deliberately follows .data after section merging, so checking
@@ -37,9 +38,10 @@ def fixture(kind=2, offset=0, symidx=2, addend=0, binding=0, visibility=0,
     text = struct.pack("<III", 0x00000513, 0x05D00893, 0x00000073)
     if uleb is not None:
         text += bytes(0x1010 - len(text))
+    target_section, target_value = (1, 0) if displacement is None else (2, offset + displacement)
     symbols = bytes(24)
     symbols += struct.pack("<IBBHQQ", 8, binding << 4, visibility,
-                           1 if defined else 0, 0, 0)
+                           target_section if defined else 0, target_value, 0)
     symbols += struct.pack("<IBBHQQ", 1, 0x12, 0, 1, 0, len(text))
     # Local symbols precede globals. Relocations normally target symbol 1;
     # symidx=2 denotes the abstract target in callers, not an ELF index.
@@ -85,7 +87,7 @@ def fixture(kind=2, offset=0, symidx=2, addend=0, binding=0, visibility=0,
     data.extend(b"".join(headers))
     ident = b"\x7fELF\x02\x01\x01" + bytes(9)
     data[:64] = struct.pack("<16sHHIQQQIHHHHHH", ident, 1, 243, 1, 0, 0,
-                            shoff, 0, 64, 0, 0, 64, len(headers), 7)
+                            shoff, int(kind in (44, 45)), 64, 0, 0, 64, len(headers), 7)
     return bytes(data)
 
 
@@ -116,6 +118,32 @@ def run(command):
     return p.returncode, diagnostic
 
 
+def decode_displacement(kind, data):
+    """Independent ISA immediate decoder, not the linker's patch implementation."""
+    word = int.from_bytes(data, "little")
+    if kind == 16:
+        value = ((word >> 31) << 12) | (((word >> 7) & 1) << 11)
+        value |= ((word >> 25) & 63) << 5 | ((word >> 8) & 15) << 1
+        bits, mask = 13, 0xfe000f80
+    elif kind == 17:
+        value = ((word >> 31) << 20) | (((word >> 12) & 255) << 12)
+        value |= ((word >> 20) & 1) << 11 | ((word >> 21) & 1023) << 1
+        bits, mask = 21, 0xfffff000
+    elif kind == 44:
+        value = ((word >> 12) & 1) << 8 | ((word >> 10) & 3) << 3
+        value |= ((word >> 5) & 3) << 6 | ((word >> 3) & 3) << 1 | ((word >> 2) & 1) << 5
+        bits, mask = 9, 0x1c7c
+    else:
+        assert kind == 45, kind
+        value = ((word >> 12) & 1) << 11 | ((word >> 11) & 1) << 4
+        value |= ((word >> 9) & 3) << 8 | ((word >> 8) & 1) << 10
+        value |= ((word >> 7) & 1) << 6 | ((word >> 6) & 1) << 7
+        value |= ((word >> 3) & 7) << 1 | ((word >> 2) & 1) << 5
+        bits, mask = 12, 0x1ffc
+    signed = value - (1 << bits) if value & (1 << (bits - 1)) else value
+    return signed, word & ~mask
+
+
 def cases():
     # Unknown numbers span unsigned r_type, for local, preemptible, hidden,
     # protected, weak and undefined symbols, not just the original 255 case.
@@ -137,6 +165,26 @@ def cases():
     for addend in (-7, 0, 11):
         for offset in (0, 8):
             yield f"valid-64-{offset}-{addend}", dict(offset=offset, addend=addend), True, ""
+    # Boundary, alignment and seeded interior points for all four branch forms.
+    # Both site and symbol stay inside this input contribution, including every
+    # out-of-range control: these are not invalid-section/extent substitutes.
+    for kind, bits, width, opcode in ((16, 13, 4, 0x63), (17, 21, 4, 0xef),
+                                     (44, 9, 2, 0xc001), (45, 12, 2, 0xa001)):
+        limit = 1 << (bits - 1)
+        site = limit + 4
+        payload = bytearray(2 * site + 8)
+        payload[site:site + width] = opcode.to_bytes(width, "little")
+        valid = {-limit, -limit + 2, -2, 0, 2, limit - 4, limit - 2, 4}
+        rng = random.Random(kind)
+        while len(valid) < 24:
+            valid.add(-limit + 2 * rng.randrange(limit))
+        for delta in sorted(valid):
+            yield (f"valid-range-{kind}-{delta}", dict(kind=kind, offset=site,
+                   payload=bytes(payload), displacement=delta), True, "")
+        for delta in (-limit - 4, -limit - 2, limit, limit + 2, -limit + 1, -1, 1, limit - 1):
+            diagnostic = "misaligned" if delta & 1 else "does not fit"
+            yield (f"bad-range-{kind}-{delta}", dict(kind=kind, offset=site,
+                   payload=bytes(payload), displacement=delta), False, diagnostic)
     # NONE and RELAX must not be confused with unknown relocation kinds.
     for kind in (0, 51):
         yield f"valid-marker-{kind}", dict(kind=kind, symidx=0), True, ""
@@ -222,6 +270,18 @@ def main():
                                 expected_field = bytes(((result >> (7 * i)) & 127) | (128 if i + 1 < width else 0)
                                                        for i in range(width))
                                 assert sec[".data"][1][offset:offset + width] == expected_field
+                            elif options.get("displacement") is not None:
+                                offset, kind = options["offset"], options["kind"]
+                                width = 2 if kind in (44, 45) else 4
+                                data = sec[".data"][1]
+                                field = data[offset:offset + width]
+                                decoded, preserved = decode_displacement(kind, field)
+                                original = options["payload"]
+                                _, original_bits = decode_displacement(kind, original[offset:offset + width])
+                                assert decoded == options["displacement"], (decoded, options["displacement"])
+                                assert preserved == original_bits, "opcode/register bits overwritten"
+                                assert data[:offset] == original[:offset], "prefix overwritten"
+                                assert data[offset + width:len(original)] == original[offset + width:], "suffix overwritten"
                             elif options.get("kind", 2) == 2:
                                 offset = options.get("offset", 0)
                                 value = sec[".text"][0][3] + options.get("addend", 0)

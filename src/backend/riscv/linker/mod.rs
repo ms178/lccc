@@ -23,6 +23,7 @@
 //! - `emit_exec`: Executable emission (static and dynamic)
 //! - `emit_shared`: Shared library (.so) emission
 
+mod displacement;
 mod elf_read;
 mod emit_exec;
 mod emit_shared;

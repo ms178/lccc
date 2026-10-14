@@ -47,8 +47,12 @@ FILE *fopen(const char *path, const char *mode) {
         int (*fd_of)(FILE *) = dlsym(RTLD_NEXT, "fileno");
         profile = f;
         profile_fd = fd_of(f);
+#ifndef PGO_IO_DIAGNOSTIC_ONLY
+        /* Comparative errno probes may isolate diagnostics with a separately
+           compiled oracle. The production gate NEVER defines this macro. */
         int flags = fcntl(profile_fd, F_GETFD);
         if (flags < 0 || !(flags & FD_CLOEXEC)) _exit(99);
+#endif
     }
     return f;
 }

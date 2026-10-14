@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   bounded-uleb:
-    name: Rust 1.99 bounded ULEB tests
+    name: Rust 1.99 relocation value contracts
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -86,7 +86,7 @@ jobs:
       - name: Build the changed compiler and run Rust contract tests
         run: |
           cargo +1.99.0 build --profile fastbuild --locked -j 2 --bin lccc --bin lccc-riscv
-          cargo +1.99.0 test --profile fastbuild --locked -j 2 uleb128
+          cargo +1.99.0 test --profile fastbuild --locked -j 2 backend::riscv::linker
       - name: Execute changed runtime and relocation contracts
         run: |
           python3 tests/regression/check_pgo_io.py --lccc target/fastbuild/lccc --cc gcc-16 --json target/redteam/pgo.json
@@ -125,4 +125,39 @@ jobs:
         with:
           name: pr826-redteam-contracts
           path: target/redteam/
+          if-no-files-found: warn
+
+  causal-comparison:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.number == 826
+    name: Compiled PR827 vs prior PR826 vs candidate
+    runs-on: ubuntu-24.04
+    container: debian:unstable-slim
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: gcc-16
+    steps:
+      - name: Provision causal comparison tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git python3 gcc-16 libc6-dev strace valgrind
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+          components: rustfmt, clippy
+      - name: Build immutable baselines and execute causal comparison
+        run: bash tests/linker/check_pr827_comparison.sh
+      - name: Retain causal comparison evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr827-causal-comparison
+          path: |
+            target/contrast/sources.txt
+            target/contrast/results/
           if-no-files-found: warn

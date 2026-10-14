@@ -457,19 +457,39 @@ fn apply_one_reloc(
             }
         }
         R_RISCV_BRANCH => {
-            let offset_val = (s as i64 + a - p as i64) as u32;
+            let offset_val = super::displacement::checked_delta(
+                super::displacement::Encoding::Branch,
+                s,
+                a,
+                p,
+            )?;
             patch_b_type(data, off, offset_val);
         }
         R_RISCV_JAL => {
-            let offset_val = (s as i64 + a - p as i64) as u32;
+            let offset_val = super::displacement::checked_delta(
+                super::displacement::Encoding::Jal,
+                s,
+                a,
+                p,
+            )?;
             patch_j_type(data, off, offset_val);
         }
         R_RISCV_RVC_BRANCH => {
-            let offset_val = (s as i64 + a - p as i64) as u32;
+            let offset_val = super::displacement::checked_delta(
+                super::displacement::Encoding::RvcBranch,
+                s,
+                a,
+                p,
+            )?;
             patch_cb_type(data, off, offset_val);
         }
         R_RISCV_RVC_JUMP => {
-            let offset_val = (s as i64 + a - p as i64) as u32;
+            let offset_val = super::displacement::checked_delta(
+                super::displacement::Encoding::RvcJump,
+                s,
+                a,
+                p,
+            )?;
             patch_cj_type(data, off, offset_val);
         }
         R_RISCV_HI20 => {
