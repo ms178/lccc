@@ -32,6 +32,7 @@ mod reloc;
 mod relocations;
 mod sections;
 mod symbols;
+mod uleb128;
 
 pub use link::link_builtin;
 pub use link::link_shared;

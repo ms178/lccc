@@ -12,12 +12,13 @@ import argparse
 import json
 from pathlib import Path
 import struct
+import sys
 import subprocess
 import tempfile
 
 
 def fixture(kind=2, offset=0, symidx=2, addend=0, binding=0, visibility=0,
-            defined=True):
+            defined=True, payload=None, uleb=None, no_symbols=False):
     """NULL, .text, .data, .data.more, .rela.data, .symtab, .strtab, .shstrtab.
 
     .data.more deliberately follows .data after section merging, so checking
@@ -33,6 +34,8 @@ def fixture(kind=2, offset=0, symidx=2, addend=0, binding=0, visibility=0,
     strings = b"\0_start\0target\0"
     # exit(0), independent of the data-relocation tests.
     text = struct.pack("<III", 0x00000513, 0x05D00893, 0x00000073)
+    if uleb is not None:
+        text += bytes(0x1010 - len(text))
     symbols = bytes(24)
     symbols += struct.pack("<IBBHQQ", 8, binding << 4, visibility,
                            1 if defined else 0, 0, 0)
@@ -45,10 +48,23 @@ def fixture(kind=2, offset=0, symidx=2, addend=0, binding=0, visibility=0,
         target_idx = 2
     actual_idx = target_idx if symidx == 2 else symidx
     rela = struct.pack("<QQq", offset, (actual_idx << 32) | kind, addend)
-    chunks = [b"", text, bytes(16), b"\xa5" * 16, rela, symbols, strings, shstr]
+    local_count = 1 if binding else 2
+    if uleb is not None:
+        set_value, sub_value, sequence = uleb
+        # Two local labels and a global entry, with no intermediate mutation.
+        symbols = bytes(24) + struct.pack("<IBBHQQ", 8, 0, 0, 1, set_value, 0)
+        symbols += struct.pack("<IBBHQQ", 8, 0, 0, 1, sub_value, 0)
+        symbols += struct.pack("<IBBHQQ", 1, 0x12, 0, 1, 0, 12)
+        local_count = 3
+        rela = b"".join(struct.pack("<QQq", offset, ((1 if k == 60 else 2) << 32) | k, addend)
+                        for k in sequence)
+    if no_symbols:
+        symbols = b""
+    chunks = [b"", text, bytes(16) if payload is None else payload,
+              b"\xa5" * 16, rela, symbols, strings, shstr]
     meta = [(0, 0, 0, 0, 0, 0), (1, 6, 0, 0, 4, 0), (1, 3, 0, 0, 8, 0),
             (1, 3, 0, 0, 8, 0), (4, 0, 5, 2, 8, 24),
-            (2, 0, 6, 1 if binding else 2, 8, 24), (3, 0, 0, 0, 1, 0),
+            (0 if no_symbols else 2, 0, 6, local_count, 8, 24), (3, 0, 0, 0, 1, 0),
             (3, 0, 0, 0, 1, 0)]
     data = bytearray(64)
     headers = []
@@ -92,7 +108,7 @@ def run(command):
     p = subprocess.run(command, capture_output=True, text=True, timeout=20)
     diagnostic = p.stdout + p.stderr
     if p.returncode < 0 or any(s in diagnostic.lower() for s in
-                              ("panicked at", "internal compiler error", "segmentation fault")):
+                              ("panicked at", "internal compiler error", "ccc: internal error", "segmentation fault")):
         raise AssertionError(f"crash is not a diagnostic: {command}: {diagnostic}")
     return p.returncode, diagnostic
 
@@ -122,23 +138,47 @@ def cases():
     for kind in (0, 51):
         yield f"valid-marker-{kind}", dict(kind=kind, symidx=0), True, ""
 
+    for width in range(1, 11):
+        payload = bytes(16 - width) + bytes([0x80] * (width - 1) + [0])
+        yield (f"valid-uleb-padded-{width}", dict(offset=16 - width, payload=payload,
+               uleb=(0x1000, 0xfff, (60, 61))), True, "")
+    yield ("valid-none-empty", dict(kind=0, symidx=0,
+           offset=0xffffffffffffffff, payload=b""), True, "")
+    yield ("bad-uleb-unterminated", dict(offset=15, payload=bytes(15) + b"\x80",
+           uleb=(0x1000, 0xfff, (60, 61))), False, "ULEB128")
+    yield ("bad-uleb-capacity", dict(offset=15, payload=bytes(16),
+           uleb=(0x1000, 0, (60, 61))), False, "ULEB128")
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--lccc", required=True, help="lccc-riscv driver")
+    ap.add_argument("--lccc", help="lccc-riscv driver")
+    ap.add_argument("--oracle-only", action="store_true", help="validate fixtures with the real linker only")
     ap.add_argument("--oracle", help="optional real linker, e.g. ld.lld")
     ap.add_argument("--json", type=Path)
+    ap.add_argument("--only", help="comma-separated case prefixes; never an empty selection")
     args = ap.parse_args()
+    if not __debug__:
+        ap.error("optimized Python disables test assertions")
+    if args.oracle_only and not args.oracle:
+        ap.error("--oracle-only requires --oracle")
+    if not args.oracle_only and not args.lccc:
+        ap.error("--lccc is required unless --oracle-only")
+    tools = ["oracle"] if args.oracle_only else (["lccc", "oracle"] if args.oracle else ["lccc"])
+    selected = [case for case in cases() if not args.only or
+                any(case[0].startswith(prefix) for prefix in args.only.split(",") if prefix)]
+    if not selected:
+        ap.error("empty fixture selection")
     records = []
     with tempfile.TemporaryDirectory(prefix="lccc-rv-reloc-") as tmp:
         root = Path(tmp)
-        for name, options, accept, expected in cases():
+        for name, options, accept, expected in selected:
             src = root / (name + ".o")
             src.write_bytes(fixture(**options))
             # Check the fixture's own structure; oracle runs also validate it.
-            assert sections(src)[".rela.data"][0][5] == 24
+            assert sections(src)[".rela.data"][0][5] % 24 == 0
             for shared in (False, True):
-                for tool in (["lccc", "oracle"] if args.oracle else ["lccc"]):
+                for tool in tools:
                     out = root / (name + f"-{shared}-{tool}.elf")
                     command = ([args.lccc, "-nostdlib", "-shared" if shared else "-static"]
                                if tool == "lccc" else
@@ -162,7 +202,15 @@ def main():
                             assert not out.exists(), "published output despite rejection"
                         if accept:
                             sec = sections(out)
-                            if options.get("kind", 2) == 2:
+                            if options.get("uleb") is not None:
+                                offset = options.get("offset", 0)
+                                original = options["payload"][offset:]
+                                width = next(i + 1 for i, b in enumerate(original) if b < 128)
+                                result = options["uleb"][0] - options["uleb"][1]
+                                expected_field = bytes(((result >> (7 * i)) & 127) | (128 if i + 1 < width else 0)
+                                                       for i in range(width))
+                                assert sec[".data"][1][offset:offset + width] == expected_field
+                            elif options.get("kind", 2) == 2:
                                 offset = options.get("offset", 0)
                                 value = sec[".text"][0][3] + options.get("addend", 0)
                                 if shared:
@@ -177,12 +225,14 @@ def main():
                             # lld may retain its name instead of merging .data.*.
                             adjacent = sec.get(".data.more", sec[".data"])[1][-16:]
                             assert adjacent == b"\xa5" * 16, "adjacent section overwritten"
-                        records.append(dict(case=name, shared=shared, tool=tool, passed=True))
+                        records.append(dict(case=name, shared=shared, tool=tool, passed=True,
+                                            command=command, returncode=rc, diagnostic=diagnostic))
                     except (AssertionError, OSError, subprocess.TimeoutExpired, ValueError,
                             struct.error, KeyError) as error:
                         records.append(dict(case=name, shared=shared, tool=tool, passed=False,
-                                            error=str(error)))
-    summary = dict(passed=sum(r["passed"] for r in records),
+                                            error=str(error), command=command))
+    summary = dict(oracle_version=(run([args.oracle, "--version"])[1].strip() if args.oracle else None),
+                   passed=sum(r["passed"] for r in records),
                    failed=sum(not r["passed"] for r in records), skipped=0, records=records)
     if args.json:
         args.json.parent.mkdir(parents=True, exist_ok=True)

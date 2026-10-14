@@ -33,9 +33,11 @@ def counters(text):
     header = function = None
     for line in text.splitlines():
         fields = line.split()
+        assert fields, f"blank profile record: {line!r}"
         if fields[0] == "lccc-pgo-v1":
             assert len(fields) == 5, line
             header = tuple(fields[1:])
+            function = None
         elif fields[0] == "func":
             assert len(fields) == 2 and header, line
             function = fields[1]
@@ -55,6 +57,8 @@ def main():
     ap.add_argument("--cc", default="gcc", help="host compiler for LD_PRELOAD oracle only")
     ap.add_argument("--json", type=Path)
     args = ap.parse_args()
+    if not __debug__:
+        ap.error("optimized Python disables test assertions")
     checks = []
     with tempfile.TemporaryDirectory(prefix="lccc-pgo-io-") as tmp:
         root = Path(tmp)
@@ -72,21 +76,28 @@ def main():
                 run([args.lccc, opt, "-fprofile-generate=" + str(golden), str(src), "-o", str(exe)])
                 expected = run([str(exe)], env=base_env, expected=23)
                 assert not expected.stderr, expected.stderr
+                expected_sum = count - count * (count - 1) // 2
+                assert expected.stdout == f"{expected_sum}\n", expected.stdout
                 raw = golden.read_bytes()
                 if count == 96:
                     assert len(raw) > 8192, len(raw)
                 baseline_counts = counters(raw.decode())
+                entries = {key[1]: value for key, value in baseline_counts.items() if key[2] == ("f",)}
+                assert len(entries) == count + 1 and all(value == 1 for value in entries.values()), entries
                 checks.append(f"{opt}/{count}: single-process profile")
                 # Faults must diagnose, preserve application status/output, and
                 # never write profile data after failure to acquire the lock.
                 for fault, diagnostic in (("fopen", "cannot open profile"),
                         ("fileno", "cannot lock profile"), ("flock", "cannot lock profile"),
                         ("eintr", "cannot lock profile"), ("ferror", "profile write failed"),
+                        ("ferror-zero", "profile write failed"), ("ferror-stale", "profile write failed"),
                         ("fclose", "profile close/flush failed")):
                     profile = root / f"fault-{opt}-{count}-{fault}.profraw"
                     env = dict(base_env, LD_PRELOAD=str(so), LCCC_PROFILE_FILE=str(profile), PGO_IO_FAULT=fault)
                     p = run([str(exe)], env=env, expected=23)
                     assert p.stdout == expected.stdout and diagnostic in p.stderr, (fault, p.stdout, p.stderr)
+                    if fault.startswith("ferror"):
+                        assert "profile write failed:" not in p.stderr, p.stderr
                     if fault in ("fopen", "fileno", "flock", "eintr"):
                         assert not profile.exists() or profile.stat().st_size == 0, fault
                     checks.append(f"{opt}/{count}: injected {fault}")

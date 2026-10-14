@@ -79,7 +79,7 @@ fn relocation_extent(kind: u32) -> Option<u64> {
 pub(super) fn validate_input_relocations(input_objs: &[(String, ElfObject)]) -> Result<(), String> {
     for (name, obj) in input_objs {
         for (sec_idx, relocs) in obj.relocations.iter().enumerate() {
-            for reloc in relocs {
+            for (ri, reloc) in relocs.iter().enumerate() {
                 if reloc.rela_type == 0 {
                     // R_RISCV_NONE has no operation, symbol or storage field.
                     continue;
@@ -102,6 +102,27 @@ pub(super) fn validate_input_relocations(input_objs: &[(String, ElfObject)]) -> 
                         "RISC-V relocation type {} at {:#x} exceeds input section {} (size {:#x}) in '{}'",
                         reloc.rela_type, reloc.offset, sec_idx, size, name
                     ));
+                }
+                if reloc.rela_type == R_RISCV_SET_ULEB128 {
+                    let paired = relocs.get(ri + 1).is_some_and(|sub| {
+                        sub.rela_type == R_RISCV_SUB_ULEB128 && sub.offset == reloc.offset
+                    });
+                    if !paired {
+                        return Err(format!("unpaired RISC-V SET_ULEB128 in '{}' section {}", name, sec_idx));
+                    }
+                    let off = usize::try_from(reloc.offset)
+                        .map_err(|_| format!("RISC-V ULEB128 offset exceeds host size in '{}'", name))?;
+                    let field = obj.section_data[sec_idx].as_slice().get(off..)
+                        .ok_or_else(|| format!("missing RISC-V ULEB128 input field in '{}'", name))?;
+                    super::uleb128::field_len(field)
+                        .map_err(|error| format!("{} in '{}' section {} at {:#x}", error, name, sec_idx, reloc.offset))?;
+                } else if reloc.rela_type == R_RISCV_SUB_ULEB128 {
+                    let paired = ri.checked_sub(1).and_then(|i| relocs.get(i)).is_some_and(|set| {
+                        set.rela_type == R_RISCV_SET_ULEB128 && set.offset == reloc.offset
+                    });
+                    if !paired {
+                        return Err(format!("unpaired RISC-V SUB_ULEB128 in '{}' section {}", name, sec_idx));
+                    }
                 }
             }
         }
@@ -131,8 +152,9 @@ pub fn apply_relocations(
 
             let ms_vaddr = ctx.section_vaddrs[merged_idx];
 
-            for reloc in relocs {
-                if reloc.rela_type == 0 {
+            let mut paired_sub = None;
+            for (ri, reloc) in relocs.iter().enumerate() {
+                if paired_sub == Some(ri) || reloc.rela_type == 0 {
                     continue; // R_RISCV_NONE, even without a symbol table.
                 }
                 let offset = sec_offset.checked_add(reloc.offset).ok_or_else(|| {
@@ -161,6 +183,33 @@ pub fn apply_relocations(
                         obj_name
                     )
                 })?;
+
+                if reloc.rela_type == R_RISCV_SET_ULEB128 {
+                    let sub = relocs.get(ri + 1).filter(|sub| {
+                        sub.rela_type == R_RISCV_SUB_ULEB128 && sub.offset == reloc.offset
+                    }).ok_or_else(|| format!("unpaired RISC-V SET_ULEB128 in '{}'", obj_name))?;
+                    let sub_sym_idx = sub.sym_idx as usize;
+                    let sub_sym = obj.symbols.get(sub_sym_idx).ok_or_else(|| {
+                        format!("invalid RISC-V relocation symbol index {} in '{}'", sub_sym_idx, obj_name)
+                    })?;
+                    let sub_value = resolve_sym_value(sub_sym, sub_sym_idx, obj_idx, obj, ctx);
+                    let original_off = usize::try_from(reloc.offset).map_err(|_| {
+                        format!("RISC-V ULEB128 offset exceeds host size in '{}'", obj_name)
+                    })?;
+                    let original = obj.section_data[sec_idx].as_slice().get(original_off..)
+                        .ok_or_else(|| format!("missing RISC-V ULEB128 input field in '{}'", obj_name))?;
+                    let reserved = super::uleb128::field_len(original)?;
+                    let end = off.checked_add(reserved).ok_or_else(|| {
+                        format!("RISC-V ULEB128 input extent overflow in '{}'", obj_name)
+                    })?;
+                    let field = data.get_mut(off..end).ok_or_else(|| {
+                        format!("RISC-V ULEB128 input contribution exceeds output in '{}'", obj_name)
+                    })?;
+                    super::uleb128::apply_pair(field, s, a, sub_value, sub.addend)
+                        .map_err(|error| format!("{} in '{}' section {} at {:#x}", error, obj_name, sec_idx, reloc.offset))?;
+                    paired_sub = Some(ri + 1);
+                    continue;
+                }
 
                 apply_one_reloc(
                     reloc.rela_type,
@@ -508,11 +557,8 @@ fn apply_one_reloc(
                 data[off..off + 4].copy_from_slice(&val.to_le_bytes());
             }
         }
-        R_RISCV_SET_ULEB128 => {
-            apply_set_uleb128(data, off, (s as i64 + a) as u64);
-        }
-        R_RISCV_SUB_ULEB128 => {
-            apply_sub_uleb128(data, off, (s as i64 + a) as u64);
+        R_RISCV_SET_ULEB128 | R_RISCV_SUB_ULEB128 => {
+            return Err(format!("unpaired RISC-V ULEB128 relocation in '{}'", obj_name));
         }
         R_RISCV_TLS_GD_HI20 => {
             // GD->LE relaxation: rewrite auipc -> lui with tprel
@@ -583,64 +629,6 @@ fn find_hi20_value_for_reloc(
             ctx.gd_tls_relax_info,
             ctx.tls_vaddr,
         )
-    }
-}
-
-/// Encode a ULEB128 SET value into data.
-fn apply_set_uleb128(data: &mut [u8], off: usize, val: u64) {
-    let mut v = val;
-    let mut i = off;
-    loop {
-        if i >= data.len() {
-            break;
-        }
-        let byte = (v & 0x7F) as u8;
-        v >>= 7;
-        if v != 0 {
-            data[i] = byte | 0x80;
-        } else {
-            data[i] = byte;
-            break;
-        }
-        i += 1;
-    }
-}
-
-/// Decode a ULEB128 value from data, subtract, and re-encode.
-fn apply_sub_uleb128(data: &mut [u8], off: usize, sub_val: u64) {
-    // Decode
-    let mut cur: u64 = 0;
-    let mut shift = 0;
-    let mut i = off;
-    loop {
-        if i >= data.len() {
-            break;
-        }
-        let byte = data[i];
-        cur |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 == 0 {
-            break;
-        }
-        shift += 7;
-        i += 1;
-    }
-    // Re-encode
-    let val = cur.wrapping_sub(sub_val);
-    let mut v = val;
-    let mut j = off;
-    loop {
-        if j >= data.len() {
-            break;
-        }
-        let byte = (v & 0x7F) as u8;
-        v >>= 7;
-        if v != 0 {
-            data[j] = byte | 0x80;
-        } else {
-            data[j] = byte;
-            break;
-        }
-        j += 1;
     }
 }
 

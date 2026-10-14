@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""Executable red-team checks for PR826 fixtures, parsers, and preload oracle.
+
+Host-compiled drivers validate the test oracle, not LCCC's generated runtime.
+LCCC integration and the production Rust ULEB implementation have separate gates.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import runpy
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+
+ROOT = Path(__file__).resolve().parents[2]
+PGO = runpy.run_path(str(ROOT / "tests/regression/check_pgo_io.py"), run_name="audit_pgo")
+RV = runpy.run_path(str(ROOT / "tests/linker/check_riscv_relocation_contract.py"), run_name="audit_rv")
+
+# A reference runtime deliberately offers the original ordering bug as a mutant.
+# The same interposer used by the integration gate must distinguish the two.
+DRIVER = r'''
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/file.h>
+#include <unistd.h>
+int main(void) {
+    FILE *f = fopen(getenv("LCCC_PROFILE_FILE"), "a");
+    if (!f) { perror("lccc: PGO: cannot open profile"); return 23; }
+    int fd = fileno(f);
+    if (fd < 0 || flock(fd, LOCK_EX)) {
+        perror("lccc: PGO: cannot lock profile");
+        fclose(f); return 23;
+    }
+    for (int i = 0; i < 1000; ++i) fprintf(f, "record-%04d-abcdefgh\n", i);
+    if (ferror(f)) {
+        static const char msg[] = "lccc: PGO: profile write failed\n";
+        (void)write(2, msg, sizeof(msg)-1);
+    }
+    if (getenv("DRIVER_EARLY_UNLOCK")) flock(fd, LOCK_UN);
+    if (fclose(f)) perror("lccc: PGO: profile close/flush failed");
+    return 23;
+}
+'''
+
+
+class RedTeam(unittest.TestCase):
+    def test_profile_parser_resets_record_identity(self):
+        text = "lccc-pgo-v1 1 2 3 4\nfunc f\nf 1\nlccc-pgo-v1 5 6 7 8\nf 1\n"
+        with self.assertRaises(AssertionError):
+            PGO["counters"](text)
+
+    def test_profile_parser_rejects_blank_and_malformed_records(self):
+        for record in ("\n", "x\n", "func f\nf 1\n", "lccc-pgo-v1 1 2 3 4\nfunc f\nf x\n"):
+            with self.subTest(record=record), self.assertRaises((AssertionError, ValueError)):
+                PGO["counters"](record)
+
+    def test_profile_counts_preserve_header_identity(self):
+        one = "lccc-pgo-v1 1 2 3 4\nfunc f\nf 1\ne 0 1 1\n"
+        counts = PGO["counters"](one * 2)
+        self.assertEqual(set(counts.values()), {2})
+        self.assertEqual(len(counts), 2)
+
+    def test_assertion_disabled_invocations_fail_closed(self):
+        for path, args in (("tests/regression/check_pgo_io.py", ["--lccc", "unused"]),
+                           ("tests/linker/check_riscv_relocation_contract.py", ["--lccc", "unused"])):
+            p = subprocess.run([sys.executable, "-O", str(ROOT / path), *args],
+                               capture_output=True, text=True, timeout=10)
+            self.assertEqual(p.returncode, 2)
+            self.assertIn("disables test assertions", p.stderr)
+
+    def test_elf_fixtures_have_unique_names_and_valid_tables(self):
+        cases = list(RV["cases"]())
+        self.assertEqual(len(cases), len({case[0] for case in cases}))
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, options, _, _ in cases:
+                with self.subTest(name=name):
+                    path = Path(tmp) / "fixture.o"
+                    path.write_bytes(RV["fixture"](**options))
+                    secs = RV["sections"](path)
+                    self.assertEqual(secs[".rela.data"][0][5] % 24, 0)
+                    self.assertEqual(secs[".data.more"][1], b"\xa5" * 16)
+
+    def test_generated_c_has_independent_output_at_all_opts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for count in (1, 96):
+                src = root / "source.c"
+                src.write_text(PGO["source"](count))
+                for opt in ("-O0", "-O2", "-O3"):
+                    exe = root / "source"
+                    subprocess.run([CC, opt, "-fsanitize=undefined", "-fno-sanitize-recover=all",
+                                    str(src), "-o", str(exe)], check=True, timeout=30)
+                    p = subprocess.run([str(exe)], capture_output=True, text=True, timeout=10)
+                    self.assertEqual(p.returncode, 23)
+                    self.assertEqual(p.stdout, f"{count - count * (count - 1) // 2}\n")
+                    self.assertEqual(p.stderr, "")
+
+    def test_preload_detects_original_unlock_mutant_and_faults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "driver.c"
+            src.write_text(DRIVER)
+            exe, so = root / "driver", root / "oracle.so"
+            subprocess.run([CC, "-O1", "-Wall", "-Wextra", "-Werror", str(src), "-o", str(exe)],
+                           check=True, timeout=30)
+            subprocess.run([CC, "-shared", "-fPIC", "-O1", "-Wall", "-Wextra", "-Werror",
+                            str(ROOT / "tests/regression/fixtures/pgo_io_interpose.c"),
+                            "-ldl", "-o", str(so)], check=True, timeout=30)
+            base = {k: v for k, v in os.environ.items()
+                    if not k.startswith(("PGO_IO_", "LCCC_PROFILE_", "DRIVER_")) and k != "LD_PRELOAD"}
+            env = dict(base, LD_PRELOAD=str(so))
+            golden = root / "golden"
+            p = subprocess.run([str(exe)], env=dict(env, LCCC_PROFILE_FILE=str(golden)),
+                               capture_output=True, timeout=10)
+            self.assertEqual((p.returncode, p.stderr), (23, b""))
+            raw = golden.read_bytes()
+            self.assertGreater(len(raw), 8192)
+            for fault in ("fopen", "fileno", "flock", "eintr", "ferror", "ferror-zero", "ferror-stale", "fclose"):
+                path = root / fault
+                p = subprocess.run([str(exe)], env=dict(env, LCCC_PROFILE_FILE=str(path), PGO_IO_FAULT=fault),
+                                   capture_output=True, text=True, timeout=10)
+                self.assertEqual(p.returncode, 23)
+                self.assertIn("lccc: PGO:", p.stderr)
+                if fault in ("fopen", "fileno", "flock", "eintr"):
+                    self.assertTrue(not path.exists() or path.stat().st_size == 0)
+                if fault.startswith("ferror"):
+                    self.assertEqual(p.stderr, "lccc: PGO: profile write failed\n")
+            for mutant in (False, True):
+                sync = root / f"sync-{mutant}"
+                sync.mkdir()
+                path = root / f"profile-{mutant}"
+                pair_env = dict(env, LCCC_PROFILE_FILE=str(path), PGO_IO_SYNC=str(sync))
+                if mutant:
+                    pair_env["DRIVER_EARLY_UNLOCK"] = "1"
+                a = subprocess.Popen([str(exe)], env=dict(pair_env, PGO_IO_ROLE="A"),
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                b = None
+                try:
+                    deadline = time.monotonic() + 10
+                    while not (sync / "A-held").exists():
+                        self.assertIsNone(a.poll(), "A exited before acquiring lock")
+                        self.assertLess(time.monotonic(), deadline, "A lock acquisition timeout")
+                        time.sleep(.001)
+                    b = subprocess.Popen([str(exe)], env=dict(pair_env, PGO_IO_ROLE="B"),
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    for process in (a, b):
+                        stdout, stderr = process.communicate(timeout=15)
+                        self.assertEqual((process.returncode, stdout, stderr), (23, b"", b""))
+                finally:
+                    for process in (a, b):
+                        if process is None:
+                            continue
+                        if process.poll() is None:
+                            process.kill()
+                        process.wait()
+                self.assertEqual((sync / "unlocked-close").exists(), mutant)
+                self.assertEqual(path.read_bytes() == raw * 2, not mutant)
+                self.assertTrue((sync / "B-attempting").exists())
+
+
+def main():
+    global CC
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--cc", default="gcc")
+    ap.add_argument("--json", type=Path)
+    args = ap.parse_args()
+    CC = args.cc
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(RedTeam)
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    if args.json:
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        version = subprocess.run([CC, "--version"], capture_output=True, text=True, timeout=10)
+        args.json.write_text(json.dumps(dict(tests=result.testsRun, failures=len(result.failures),
+                                            errors=len(result.errors), skipped=len(result.skipped),
+                                            compiler=version.stdout.splitlines()[0]), indent=2) + "\n")
+    return 0 if result.wasSuccessful() else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
