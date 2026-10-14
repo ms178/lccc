@@ -3,7 +3,8 @@
 //! Emits an ELF64 shared library (ET_DYN) with PIC relocations, PLT stubs
 //! for external function calls, and a `.dynamic` section for the dynamic linker.
 
-use crate::common::fx_hash::FxHashMap;
+use crate::backend::elf::{STB_LOCAL, STV_DEFAULT};
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 use super::elf::*;
 use super::reloc;
@@ -23,6 +24,15 @@ pub(super) fn emit_shared_library(
     pending_defsyms: &[(String, String, usize)],
 ) -> Result<(), String> {
     let base_addr: u64 = 0;
+    // A non-default visibility declaration in any input constrains binding,
+    // including a hidden definition referenced by a default-visible undefined
+    // symbol in another TU. GlobalSymbol does not yet retain merged visibility.
+    let locally_bound: FxHashSet<&str> = objects
+        .iter()
+        .flat_map(|obj| &obj.symbols)
+        .filter(|sym| sym.binding() != STB_LOCAL && sym.visibility() != STV_DEFAULT)
+        .map(|sym| sym.name.as_str())
+        .collect();
 
     let mut dynstr = DynStrTab::new();
     for lib in needed_sonames {
@@ -1131,6 +1141,16 @@ pub(super) fn emit_shared_library(
             let sfo = output_sections[out_idx].file_offset;
 
             for rela in relas {
+                if rela.rela_type == R_AARCH64_NONE {
+                    continue;
+                }
+                reloc::validate_address_site(
+                    rela.rela_type,
+                    rela.offset,
+                    rela.sym_idx,
+                    objects[obj_idx].section_data[sec_idx].len(),
+                    objects[obj_idx].symbols.len(),
+                )?;
                 let si = rela.sym_idx as usize;
                 if si >= objects[obj_idx].symbols.len() {
                     continue;
@@ -1174,22 +1194,43 @@ pub(super) fn emit_shared_library(
                             {
                                 let page_g = gea & !0xFFF;
                                 let page_p = p & !0xFFF;
-                                let imm = (page_g as i64 - page_p as i64) >> 12;
-                                reloc::encode_adrp(&mut out, fp, imm);
+                                let imm = (page_g as i64).wrapping_sub(page_p as i64) >> 12;
+                                reloc::encode_adrp(&mut out, fp, imm)?;
                             } else {
-                                let sa_val = (s as i64 + a) as u64;
+                                let sa_val = (s as i64).wrapping_add(a) as u64;
                                 let page_s = sa_val & !0xFFF;
                                 let page_p = p & !0xFFF;
-                                let imm = (page_s as i64 - page_p as i64) >> 12;
-                                reloc::encode_adrp(&mut out, fp, imm);
+                                let imm = (page_s as i64).wrapping_sub(page_p as i64) >> 12;
+                                reloc::encode_adrp(&mut out, fp, imm)?;
                             }
                         } else {
-                            let sa_val = (s as i64 + a) as u64;
+                            let sa_val = (s as i64).wrapping_add(a) as u64;
                             let page_s = sa_val & !0xFFF;
                             let page_p = p & !0xFFF;
-                            let imm = (page_s as i64 - page_p as i64) >> 12;
-                            reloc::encode_adrp(&mut out, fp, imm);
+                            let imm = (page_s as i64).wrapping_sub(page_p as i64) >> 12;
+                            reloc::encode_adrp(&mut out, fp, imm)?;
                         }
+                    }
+                    R_AARCH64_ADR_PREL_LO21 => {
+                        // Load bias cancels only for a locally bound,
+                        // section-relative target. ADR cannot implement symbol
+                        // interposition or an absolute address in an ET_DYN.
+                        let global = globals_snap.get(sym.name.as_str());
+                        let preemptible = sym.binding() != STB_LOCAL
+                            && (!locally_bound.contains(sym.name.as_str())
+                                || global.is_none_or(|g| {
+                                    g.is_dynamic
+                                        || g.defined_in.is_none()
+                                        || g.section_idx == SHN_ABS
+                                }));
+                        if preemptible || sym.shndx == SHN_ABS {
+                            return Err(format!(
+                                "ADR relocation requires a locally bound section-relative symbol: '{}'",
+                                sym.name
+                            ));
+                        }
+                        let delta = (s as i64).wrapping_add(a).wrapping_sub(p as i64);
+                        reloc::encode_adr(&mut out, fp, delta)?;
                     }
                     R_AARCH64_ADD_ABS_LO12_NC => {
                         // For undefined/dynamic symbols in shared libs, convert ADD to LDR from GOT
@@ -1212,11 +1253,11 @@ pub(super) fn emit_shared_library(
                                     w32(&mut out, fp, ldr);
                                 }
                             } else {
-                                let sa_val = (s as i64 + a) as u64;
+                                let sa_val = (s as i64).wrapping_add(a) as u64;
                                 reloc::encode_add_imm12(&mut out, fp, (sa_val & 0xFFF) as u32);
                             }
                         } else {
-                            let sa_val = (s as i64 + a) as u64;
+                            let sa_val = (s as i64).wrapping_add(a) as u64;
                             reloc::encode_add_imm12(&mut out, fp, (sa_val & 0xFFF) as u32);
                         }
                     }
@@ -1245,69 +1286,69 @@ pub(super) fn emit_shared_library(
                         }
                     }
                     R_AARCH64_LDST8_ABS_LO12_NC => {
-                        let sa_val = (s as i64 + a) as u64;
+                        let sa_val = (s as i64).wrapping_add(a) as u64;
                         reloc::encode_ldst_imm12(&mut out, fp, (sa_val & 0xFFF) as u32, 0);
                     }
                     R_AARCH64_LDST16_ABS_LO12_NC => {
-                        let sa_val = (s as i64 + a) as u64;
+                        let sa_val = (s as i64).wrapping_add(a) as u64;
                         reloc::encode_ldst_imm12(&mut out, fp, (sa_val & 0xFFF) as u32, 1);
                     }
                     R_AARCH64_LDST32_ABS_LO12_NC => {
-                        let sa_val = (s as i64 + a) as u64;
+                        let sa_val = (s as i64).wrapping_add(a) as u64;
                         reloc::encode_ldst_imm12(&mut out, fp, (sa_val & 0xFFF) as u32, 2);
                     }
                     R_AARCH64_LDST64_ABS_LO12_NC => {
-                        let sa_val = (s as i64 + a) as u64;
+                        let sa_val = (s as i64).wrapping_add(a) as u64;
                         reloc::encode_ldst_imm12(&mut out, fp, (sa_val & 0xFFF) as u32, 3);
                     }
                     R_AARCH64_LDST128_ABS_LO12_NC => {
-                        let sa_val = (s as i64 + a) as u64;
+                        let sa_val = (s as i64).wrapping_add(a) as u64;
                         reloc::encode_ldst_imm12(&mut out, fp, (sa_val & 0xFFF) as u32, 4);
                     }
                     R_AARCH64_ADR_GOT_PAGE => {
                         if let Some(&gea) = got_sym_addrs.get(sym.name.as_str()) {
                             let page_g = gea & !0xFFF;
                             let page_p = p & !0xFFF;
-                            let imm = (page_g as i64 - page_p as i64) >> 12;
-                            reloc::encode_adrp(&mut out, fp, imm);
+                            let imm = (page_g as i64).wrapping_sub(page_p as i64) >> 12;
+                            reloc::encode_adrp(&mut out, fp, imm)?;
                         } else {
-                            let sa_val = (s as i64 + a) as u64;
+                            let sa_val = (s as i64).wrapping_add(a) as u64;
                             let page_s = sa_val & !0xFFF;
                             let page_p = p & !0xFFF;
-                            let imm = (page_s as i64 - page_p as i64) >> 12;
-                            reloc::encode_adrp(&mut out, fp, imm);
+                            let imm = (page_s as i64).wrapping_sub(page_p as i64) >> 12;
+                            reloc::encode_adrp(&mut out, fp, imm)?;
                         }
                     }
                     R_AARCH64_LD64_GOT_LO12_NC => {
                         if let Some(&gea) = got_sym_addrs.get(sym.name.as_str()) {
                             reloc::encode_ldst_imm12(&mut out, fp, (gea & 0xFFF) as u32, 3);
                         } else {
-                            let sa_val = (s as i64 + a) as u64;
+                            let sa_val = (s as i64).wrapping_add(a) as u64;
                             reloc::encode_ldst_imm12(&mut out, fp, (sa_val & 0xFFF) as u32, 3);
                         }
                     }
                     R_AARCH64_MOVW_UABS_G0 | R_AARCH64_MOVW_UABS_G0_NC => {
-                        let sa_val = (s as i64 + a) as u64;
+                        let sa_val = (s as i64).wrapping_add(a) as u64;
                         reloc::encode_movw(&mut out, fp, (sa_val & 0xffff) as u32);
                     }
                     R_AARCH64_MOVW_UABS_G1_NC => {
-                        let sa_val = (s as i64 + a) as u64;
+                        let sa_val = (s as i64).wrapping_add(a) as u64;
                         reloc::encode_movw(&mut out, fp, ((sa_val >> 16) & 0xffff) as u32);
                     }
                     R_AARCH64_MOVW_UABS_G2_NC => {
-                        let sa_val = (s as i64 + a) as u64;
+                        let sa_val = (s as i64).wrapping_add(a) as u64;
                         reloc::encode_movw(&mut out, fp, ((sa_val >> 32) & 0xffff) as u32);
                     }
                     R_AARCH64_MOVW_UABS_G3 => {
-                        let sa_val = (s as i64 + a) as u64;
+                        let sa_val = (s as i64).wrapping_add(a) as u64;
                         reloc::encode_movw(&mut out, fp, ((sa_val >> 48) & 0xffff) as u32);
                     }
                     R_AARCH64_NONE => {}
                     other => {
-                        eprintln!(
-                            "warning: unsupported relocation type {} for '{}' in shared library",
+                        return Err(format!(
+                            "unsupported AArch64 relocation type {} for '{}' in shared library",
                             other, sym.name
-                        );
+                        ));
                     }
                 }
             }
@@ -1346,11 +1387,10 @@ pub(super) fn emit_shared_library(
         let got2_addr = so_got_plt_addr + 16;
         let page_g = got2_addr & !0xFFF;
         let page_p = so_plt_addr & !0xFFF;
-        let page_diff = ((page_g as i64 - page_p as i64) >> 12) as i32;
-        let immlo = (page_diff & 3) as u32;
-        let immhi = ((page_diff >> 2) & 0x7ffff) as u32;
+        let page_diff = (page_g as i64).wrapping_sub(page_p as i64) >> 12;
+        let adr_bits = crate::backend::arm::address::adr_imm_bits(page_diff)?;
         w32(&mut out, po, 0xa9bf7bf0u32); // stp x16, x30, [sp, #-16]!
-        w32(&mut out, po + 4, 0x90000010 | (immlo << 29) | (immhi << 5)); // adrp x16, GOT+16
+        w32(&mut out, po + 4, 0x90000010 | adr_bits); // adrp x16, GOT+16
         let lo12 = (got2_addr & 0xFFF) as u32;
         w32(&mut out, po + 8, 0xf9400211 | ((lo12 / 8) << 10)); // ldr x17, [x16, #lo12]
         w32(&mut out, po + 12, 0x91000210 | ((lo12 & 0xFFF) << 10)); // add x16, x16, #lo12
@@ -1366,10 +1406,9 @@ pub(super) fn emit_shared_library(
             let gea = so_got_plt_addr + 24 + i as u64 * 8;
             let page_g = gea & !0xFFF;
             let page_p = pea & !0xFFF;
-            let page_diff = ((page_g as i64 - page_p as i64) >> 12) as i32;
-            let immlo = (page_diff & 3) as u32;
-            let immhi = ((page_diff >> 2) & 0x7ffff) as u32;
-            w32(&mut out, ep, 0x90000010 | (immlo << 29) | (immhi << 5)); // adrp x16
+            let page_diff = (page_g as i64).wrapping_sub(page_p as i64) >> 12;
+            let adr_bits = crate::backend::arm::address::adr_imm_bits(page_diff)?;
+            w32(&mut out, ep, 0x90000010 | adr_bits); // adrp x16
             let lo12 = (gea & 0xFFF) as u32;
             w32(&mut out, ep + 4, 0xf9400211 | ((lo12 / 8) << 10)); // ldr x17, [x16, #lo12]
             w32(&mut out, ep + 8, 0x91000210 | ((lo12 & 0xFFF) << 10)); // add x16, x16, #lo12

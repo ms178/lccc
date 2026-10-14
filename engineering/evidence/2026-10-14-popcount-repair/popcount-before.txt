@@ -1,0 +1,267 @@
+Traceback (most recent call last):
+  File "/opt/lccc-audit-cache/lccc/tests/regression/check_arm_popcount_contract.py", line 66, in <module>
+    main()
+    ~~~~^^
+  File "/opt/lccc-audit-cache/lccc/tests/regression/check_arm_popcount_contract.py", line 43, in main
+    assert not re.search(r"\b[vqdsbh][0-9]+\b", text), text
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: .text
+.globl pc32
+.type pc32, %function
+pc32:
+.cfi_startproc
+    stp x29, x30, [sp, #-32]!
+    .cfi_def_cfa_offset 32
+    .cfi_offset x29, -32
+    .cfi_offset x30, -24
+    mov x29, sp
+    .cfi_def_cfa_register x29
+    str w0, [sp, #16]
+    ldr w0, [sp, #16]
+    str x0, [sp, #16]
+    ldr x0, [sp, #16]
+    str w0, [sp, #16]
+    ldr w0, [sp, #16]
+    fmov s0, w0
+    cnt v0.8b, v0.8b
+    uaddlv h0, v0.8b
+    fmov w0, s0
+    mov w0, w0
+    str x0, [sp, #24]
+    ldp x29, x30, [sp], #32
+    ret
+.cfi_endproc
+.size pc32, .-pc32
+.globl pc64
+.type pc64, %function
+pc64:
+.cfi_startproc
+    stp x29, x30, [sp, #-32]!
+    .cfi_def_cfa_offset 32
+    .cfi_offset x29, -32
+    .cfi_offset x30, -24
+    mov x29, sp
+    .cfi_def_cfa_register x29
+    str x0, [sp, #16]
+    ldr x0, [sp, #16]
+    str x0, [sp, #16]
+    ldr x0, [sp, #16]
+    str x0, [sp, #16]
+    ldr x0, [sp, #16]
+    fmov d0, x0
+    cnt v0.8b, v0.8b
+    uaddlv h0, v0.8b
+    fmov w0, s0
+    mov w0, w0
+    str x0, [sp, #24]
+    ldp x29, x30, [sp], #32
+    ret
+.cfi_endproc
+.size pc64, .-pc64
+.globl pcs32
+.type pcs32, %function
+pcs32:
+.cfi_startproc
+    stp x29, x30, [sp, #-32]!
+    .cfi_def_cfa_offset 32
+    .cfi_offset x29, -32
+    .cfi_offset x30, -24
+    mov x29, sp
+    .cfi_def_cfa_register x29
+    str w0, [sp, #16]
+    ldrsw x0, [sp, #16]
+    str x0, [sp, #16]
+    ldr x0, [sp, #16]
+    str w0, [sp, #16]
+    ldrsw x0, [sp, #16]
+    mov w0, w0
+    fmov s0, w0
+    cnt v0.8b, v0.8b
+    uaddlv h0, v0.8b
+    fmov w0, s0
+    mov w0, w0
+    str x0, [sp, #24]
+    ldp x29, x30, [sp], #32
+    ret
+.cfi_endproc
+.size pcs32, .-pcs32
+.globl pcs64
+.type pcs64, %function
+pcs64:
+.cfi_startproc
+    stp x29, x30, [sp, #-32]!
+    .cfi_def_cfa_offset 32
+    .cfi_offset x29, -32
+    .cfi_offset x30, -24
+    mov x29, sp
+    .cfi_def_cfa_register x29
+    str x0, [sp, #16]
+    ldr x0, [sp, #16]
+    str x0, [sp, #16]
+    ldr x0, [sp, #16]
+    str x0, [sp, #16]
+    ldr x0, [sp, #16]
+    fmov d0, x0
+    cnt v0.8b, v0.8b
+    uaddlv h0, v0.8b
+    fmov w0, s0
+    mov w0, w0
+    str x0, [sp, #24]
+    ldp x29, x30, [sp], #32
+    ret
+.cfi_endproc
+.size pcs64, .-pcs64
+.globl pressure
+.type pressure, %function
+pressure:
+.cfi_startproc
+    stp x29, x30, [sp, #-384]!
+    .cfi_def_cfa_offset 384
+    .cfi_offset x29, -384
+    .cfi_offset x30, -376
+    mov x29, sp
+    .cfi_def_cfa_register x29
+    str x0, [sp, #16]
+    str x1, [sp, #24]
+    str x2, [sp, #32]
+    str x3, [sp, #40]
+    str x4, [sp, #48]
+    str x5, [sp, #56]
+    str x6, [sp, #64]
+    str x7, [sp, #72]
+    ldr x9, [sp, #384]
+    str x9, [sp, #80]
+    ldr x9, [sp, #392]
+    str x9, [sp, #88]
+    ldr x0, [sp, #16]
+    str x0, [sp, #16]
+    ldr x0, [sp, #16]
+    str x0, [sp, #16]
+    ldr x0, [sp, #24]
+    str x0, [sp, #24]
+    ldr x0, [sp, #24]
+    str x0, [sp, #24]
+    ldr x0, [sp, #32]
+    str x0, [sp, #32]
+    ldr x0, [sp, #32]
+    str x0, [sp, #32]
+    ldr x0, [sp, #40]
+    str x0, [sp, #40]
+    ldr x0, [sp, #40]
+    str x0, [sp, #40]
+    ldr x0, [sp, #48]
+    str x0, [sp, #48]
+    ldr x0, [sp, #48]
+    str x0, [sp, #48]
+    ldr x0, [sp, #56]
+    str x0, [sp, #56]
+    ldr x0, [sp, #56]
+    str x0, [sp, #56]
+    ldr x0, [sp, #64]
+    str x0, [sp, #64]
+    ldr x0, [sp, #64]
+    str x0, [sp, #64]
+    ldr x0, [sp, #72]
+    str x0, [sp, #72]
+    ldr x0, [sp, #72]
+    str x0, [sp, #72]
+    ldr x0, [sp, #80]
+    str x0, [sp, #80]
+    ldr x0, [sp, #80]
+    str x0, [sp, #80]
+    ldr x0, [sp, #88]
+    str x0, [sp, #88]
+    ldr x0, [sp, #88]
+    str x0, [sp, #88]
+    ldr x0, [sp, #16]
+    fmov d0, x0
+    cnt v0.8b, v0.8b
+    uaddlv h0, v0.8b
+    fmov w0, s0
+    sxtw x0, w0
+    str x0, [sp, #96]
+    ldr x0, [sp, #24]
+    str x0, [sp, #104]
+    ldr x0, [sp, #96]
+    mov x1, x0
+    ldr x0, [sp, #104]
+    add x0, x1, x0
+    str x0, [sp, #112]
+    mov x0, #3
+    str x0, [sp, #120]
+    ldr x0, [sp, #32]
+    str x0, [sp, #128]
+    ldr x2, [sp, #128]
+    ldr x1, [sp, #120]
+    ldr x3, [sp, #112]
+    madd x0, x1, x2, x3
+    str x0, [sp, #144]
+    mov x0, #5
+    str x0, [sp, #152]
+    ldr x0, [sp, #40]
+    str x0, [sp, #160]
+    ldr x2, [sp, #160]
+    ldr x1, [sp, #152]
+    ldr x3, [sp, #144]
+    madd x0, x1, x2, x3
+    str x0, [sp, #176]
+    mov x0, #7
+    str x0, [sp, #184]
+    ldr x0, [sp, #48]
+    str x0, [sp, #192]
+    ldr x2, [sp, #192]
+    ldr x1, [sp, #184]
+    ldr x3, [sp, #176]
+    madd x0, x1, x2, x3
+    str x0, [sp, #208]
+    mov x0, #11
+    str x0, [sp, #216]
+    ldr x0, [sp, #56]
+    str x0, [sp, #224]
+    ldr x2, [sp, #224]
+    ldr x1, [sp, #216]
+    ldr x3, [sp, #208]
+    madd x0, x1, x2, x3
+    str x0, [sp, #240]
+    mov x0, #13
+    str x0, [sp, #248]
+    ldr x0, [sp, #64]
+    str x0, [sp, #256]
+    ldr x2, [sp, #256]
+    ldr x1, [sp, #248]
+    ldr x3, [sp, #240]
+    madd x0, x1, x2, x3
+    str x0, [sp, #272]
+    mov x0, #17
+    str x0, [sp, #280]
+    ldr x0, [sp, #72]
+    str x0, [sp, #288]
+    ldr x2, [sp, #288]
+    ldr x1, [sp, #280]
+    ldr x3, [sp, #272]
+    madd x0, x1, x2, x3
+    str x0, [sp, #304]
+    mov x0, #19
+    str x0, [sp, #312]
+    ldr x0, [sp, #80]
+    str x0, [sp, #320]
+    ldr x2, [sp, #320]
+    ldr x1, [sp, #312]
+    ldr x3, [sp, #304]
+    madd x0, x1, x2, x3
+    str x0, [sp, #336]
+    mov x0, #23
+    str x0, [sp, #344]
+    ldr x0, [sp, #88]
+    str x0, [sp, #352]
+    ldr x2, [sp, #352]
+    ldr x1, [sp, #344]
+    ldr x3, [sp, #336]
+    madd x0, x1, x2, x3
+    str x0, [sp, #368]
+    ldp x29, x30, [sp], #384
+    ret
+.cfi_endproc
+.size pressure, .-pressure
+.section .note.GNU-stack,"",@progbits
+

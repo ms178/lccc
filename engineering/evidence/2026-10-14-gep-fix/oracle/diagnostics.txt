@@ -1,0 +1,12 @@
+godbolt: cicc2021100: compilation exit missing or unsuccessful: 1: icc: remark #10441: The Intel(R) C++ Compiler Classic (ICC) is deprecated and will be removed from product release in the second half of 2023. The Intel(R) oneAPI DPC++/C++ Compiler (ICX) is the recommended compiler moving forward. Please transition to use this compiler. Use '-diag-disable=10441' to disable this message.
+icc: command line warning #10148: option '-march=x86-64-v3' not supported
+icc: command line error: Unrecognized keyword 'raptorlake' for option '-mtune'
+ERROR       icc: GodboltError: remote compile failed: icc (cicc2021100)
+
+tests/regression/fixtures/late_const_gep/main.c :: main
+compiler       insns  loads  stores   stack  branch   best-x  name
+--------------------------------------------------------------------------------------------
+lccc              30      1       4       3       6    1.00x  local LCCC
+gcc16.2           61      1       6       2       4    2.03x  x86-64 gcc 16.2
+clang             37      9      19       2       2    1.23x  x86-64 clang 23.1.0
+icx               59     19      33       8       2    1.97x  x86-64 icx (latest)

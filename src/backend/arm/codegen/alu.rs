@@ -347,6 +347,56 @@ impl ArmCodegen {
     }
 
     pub(super) fn emit_int_popcount_impl(&mut self, ty: IrType) {
+        if self.general_regs_only {
+            // Count within 2-, 4-, then 8-bit lanes. Each byte holds 0..8;
+            // multiplying by repeated 0x01 sums the bytes into the top byte
+            // without a carry (total <= 64). No data-dependent branch, helper
+            // call, memory access, or forbidden FP/SIMD register is needed.
+            // x0 is the unary accumulator; x1 is reserved emitter scratch,
+            // never an allocated SSA home (ARM_CALLER_SAVED excludes it).
+            let narrow = matches!(ty, IrType::I32 | IrType::U32);
+            let (r, pairs, nibbles, bytes, ones, shift) = if narrow {
+                (
+                    "w",
+                    "0x55555555",
+                    "0x33333333",
+                    "0x0f0f0f0f",
+                    "0x01010101",
+                    24,
+                )
+            } else {
+                (
+                    "x",
+                    "0x5555555555555555",
+                    "0x3333333333333333",
+                    "0x0f0f0f0f0f0f0f0f",
+                    "0x0101010101010101",
+                    56,
+                )
+            };
+            self.state.emit_fmt(format_args!("    lsr {r}1, {r}0, #1"));
+            self.state
+                .emit_fmt(format_args!("    and {r}1, {r}1, #{pairs}"));
+            self.state
+                .emit_fmt(format_args!("    sub {r}0, {r}0, {r}1"));
+            self.state.emit_fmt(format_args!("    lsr {r}1, {r}0, #2"));
+            self.state
+                .emit_fmt(format_args!("    and {r}0, {r}0, #{nibbles}"));
+            self.state
+                .emit_fmt(format_args!("    and {r}1, {r}1, #{nibbles}"));
+            self.state
+                .emit_fmt(format_args!("    add {r}0, {r}0, {r}1"));
+            self.state
+                .emit_fmt(format_args!("    add {r}0, {r}0, {r}0, lsr #4"));
+            self.state
+                .emit_fmt(format_args!("    and {r}0, {r}0, #{bytes}"));
+            self.state.emit_fmt(format_args!("    mov {r}1, #{ones}"));
+            self.state
+                .emit_fmt(format_args!("    mul {r}0, {r}0, {r}1"));
+            self.state
+                .emit_fmt(format_args!("    lsr {r}0, {r}0, #{shift}"));
+            return;
+        }
         if ty == IrType::I32 || ty == IrType::U32 {
             self.state.emit("    fmov s0, w0");
         } else {

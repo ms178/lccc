@@ -1,7 +1,11 @@
 # A14-30 — real zlib-ng Huffman-table miscompile
 
 Baseline LCCC `3b66cd1d73743a7a79f912c01df48ac15cc646ef`; compiler itself built
-fastbuild/-O1/-j2. This is a **known failing audit reproducer**, not a fixed test.
+fastbuild/-O1/-j2. This **failed on the audit baseline**. The later constant-GEP
+repair closes A14-30: this licensed fixture now runs by default in
+`tests/regression/check_late_const_gep.sh` at O0/O1/O2/O3/Os. The historical
+commands/results below retain their baseline meaning; current full zlib is 69/69.
+See `engineering/FOLLOWUP-2026-10-14-constant-gep-fix.md`.
 
 `maketrees-small.c` / `gencodes-small.c` are altered, standalone extractions
 from zlib-ng 2.3.3. `provenance.json` pins upstream, the archpkgbuilds patch and

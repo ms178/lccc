@@ -90,7 +90,7 @@ LOCAL = ROOT / "scripts" / "ci_local.sh"
 WORKFLOWS = ROOT / ".github" / "workflows"
 
 COMMAND = re.compile(
-    r"(?:tests/regression/[A-Za-z0-9_./-]+\.sh|"
+    r"(?:tests/regression/[A-Za-z0-9_./-]+\.(?:sh|py)|"
     r"tests/linker/[A-Za-z0-9_./-]+\.(?:py|sh)|"
     r"scripts/[A-Za-z0-9_./-]+\.py|"
     r"\.github/scripts/[A-Za-z0-9_./-]+\.py)"
@@ -611,6 +611,18 @@ INVOCATION_CONTRACTS: tuple[InvocationContract, ...] = (
         sides=_BOTH,
         rest_spec=("--self-test",),
         local_gate=("gas-oracle-pair-self-test", "fast"),
+    ),
+    InvocationContract(
+        program="tests/regression/check_arm_address_contract.py",
+        name="arm-address-contract",
+        sides=_BOTH,
+        local_gate=("arm-address-contract", "fast"),
+    ),
+    InvocationContract(
+        program="tests/regression/check_arm_popcount_contract.py",
+        name="arm-popcount-contract",
+        sides=_BOTH,
+        local_gate=("arm-popcount-contract", "fast"),
     ),
     InvocationContract(
         program="scripts/test_asmdiff.py",

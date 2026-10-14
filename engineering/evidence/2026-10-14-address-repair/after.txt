@@ -1,0 +1,1 @@
+PASS: AArch64 address contract (621 checks)

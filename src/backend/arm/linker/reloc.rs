@@ -186,6 +186,16 @@ pub fn apply_relocations(
             let sfo = output_sections[out_idx].file_offset;
 
             for rela in relas {
+                if rela.rela_type == R_AARCH64_NONE {
+                    continue;
+                }
+                validate_address_site(
+                    rela.rela_type,
+                    rela.offset,
+                    rela.sym_idx,
+                    objects[obj_idx].section_data[sec_idx].len(),
+                    objects[obj_idx].symbols.len(),
+                )?;
                 let si = rela.sym_idx as usize;
                 if si >= objects[obj_idx].symbols.len() {
                     continue;
@@ -292,15 +302,15 @@ pub fn apply_one_reloc(
             let sa = (s as i64).wrapping_add(a) as u64;
             let page_s = sa & !0xFFF;
             let page_p = p & !0xFFF;
-            let offset = page_s as i64 - page_p as i64;
+            let offset = (page_s as i64).wrapping_sub(page_p as i64);
             let imm = offset >> 12;
-            encode_adrp(out, fp, imm);
+            encode_adrp(out, fp, imm)?;
         }
 
         // ── ADR: PC-relative low 21 bits ──
         R_AARCH64_ADR_PREL_LO21 => {
             let offset = (s as i64).wrapping_add(a).wrapping_sub(p as i64);
-            encode_adr(out, fp, offset);
+            encode_adr(out, fp, offset)?;
         }
 
         // ── ADD: absolute low 12 bits (no carry check) ──
@@ -413,15 +423,15 @@ pub fn apply_one_reloc(
             if let Some(got_entry_addr) = got_info.entry_addr(got_key) {
                 let page_g = got_entry_addr & !0xFFF;
                 let page_p = p & !0xFFF;
-                let imm = (page_g as i64 - page_p as i64) >> 12;
-                encode_adrp(out, fp, imm);
+                let imm = (page_g as i64).wrapping_sub(page_p as i64) >> 12;
+                encode_adrp(out, fp, imm)?;
             } else {
                 // Fallback: treat like ADR_PREL_PG_HI21
                 let sa = (s as i64).wrapping_add(a) as u64;
                 let page_s = sa & !0xFFF;
                 let page_p = p & !0xFFF;
-                let imm = (page_s as i64 - page_p as i64) >> 12;
-                encode_adrp(out, fp, imm);
+                let imm = (page_s as i64).wrapping_sub(page_p as i64) >> 12;
+                encode_adrp(out, fp, imm)?;
             }
         }
         R_AARCH64_LD64_GOT_LO12_NC => {
@@ -480,8 +490,8 @@ pub fn apply_one_reloc(
             if let Some(got_entry_addr) = got_info.entry_addr(got_key) {
                 let page_g = got_entry_addr & !0xFFF;
                 let page_p = p & !0xFFF;
-                let imm = (page_g as i64 - page_p as i64) >> 12;
-                encode_adrp(out, fp, imm);
+                let imm = (page_g as i64).wrapping_sub(page_p as i64) >> 12;
+                encode_adrp(out, fp, imm)?;
             } else {
                 // Fallback: relax to MOVZ
                 let tp = tprel(s, a, tls_info);
@@ -587,29 +597,63 @@ pub fn apply_one_reloc(
     Ok(())
 }
 
-// ── Instruction encoding helpers ───────────────────────────────────────
-
-pub(super) fn encode_adrp(out: &mut [u8], fp: usize, imm: i64) {
-    if fp + 4 > out.len() {
-        return;
+/// Check the *input* instruction range before forming output addresses. An
+/// output-only check can overwrite a neighboring input section, and a huge
+/// r_offset can overflow address arithmetic before reaching the field patcher.
+pub(super) fn validate_address_site(
+    kind: u32,
+    offset: u64,
+    symbol: u32,
+    section_size: usize,
+    symbol_count: usize,
+) -> Result<(), String> {
+    if !matches!(
+        kind,
+        R_AARCH64_ADR_PREL_LO21
+            | R_AARCH64_ADR_PREL_PG_HI21
+            | R_AARCH64_ADR_GOT_PAGE
+            | R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21
+            | R_AARCH64_TLSDESC_ADR_PAGE21
+            | R_AARCH64_TLSGD_ADR_PAGE21
+    ) {
+        return Ok(());
     }
-    let mut insn = read_u32(out, fp);
-    let immlo = (imm as u32) & 0x3;
-    let immhi = ((imm as u32) >> 2) & 0x7ffff;
-    insn = (insn & 0x9f00001f) | (immlo << 29) | (immhi << 5);
-    w32(out, fp, insn);
+    if symbol as usize >= symbol_count {
+        return Err(format!(
+            "ADR/ADRP relocation has invalid symbol index {symbol}"
+        ));
+    }
+    if offset
+        .checked_add(4)
+        .is_none_or(|end| end > section_size as u64)
+    {
+        return Err(format!(
+            "ADR/ADRP relocation site {offset:#x} exceeds input section size {section_size:#x}"
+        ));
+    }
+    Ok(())
 }
 
-pub(super) fn encode_adr(out: &mut [u8], fp: usize, offset: i64) {
-    if fp + 4 > out.len() {
-        return;
-    }
-    let mut insn = read_u32(out, fp);
-    let imm = offset as u32;
-    let immlo = imm & 0x3;
-    let immhi = (imm >> 2) & 0x7ffff;
-    insn = (insn & 0x9f00001f) | (immlo << 29) | (immhi << 5);
-    w32(out, fp, insn);
+// ── Instruction encoding helpers ───────────────────────────────────────
+
+pub(super) fn encode_adrp(out: &mut [u8], fp: usize, imm: i64) -> Result<(), String> {
+    encode_adr(out, fp, imm)
+}
+
+pub(super) fn encode_adr(out: &mut [u8], fp: usize, offset: i64) -> Result<(), String> {
+    let bits = crate::backend::arm::address::adr_imm_bits(offset)?;
+    let end = fp
+        .checked_add(4)
+        .filter(|&end| end <= out.len())
+        .ok_or_else(|| {
+            format!(
+                "ADR/ADRP relocation site {fp:#x} exceeds output size {:#x}",
+                out.len()
+            )
+        })?;
+    let insn = read_u32(out, fp);
+    out[fp..end].copy_from_slice(&((insn & 0x9f00001f) | bits).to_le_bytes());
+    Ok(())
 }
 
 pub(super) fn encode_add_imm12(out: &mut [u8], fp: usize, imm12: u32) {
@@ -731,5 +775,52 @@ mod tests {
         // And the other end of the family: 544 is G2, not G0.
         let hi: u64 = 0x0000_00ab_0000_0000;
         assert_eq!(movw_imm(544, hi), 0x00ab, "544 must take bits 47:32");
+    }
+}
+
+#[cfg(test)]
+mod adr_checked_tests {
+    use super::*;
+
+    #[test]
+    fn input_site_validation_precedes_address_arithmetic() {
+        for kind in [
+            R_AARCH64_ADR_PREL_LO21,
+            R_AARCH64_ADR_PREL_PG_HI21,
+            R_AARCH64_ADR_GOT_PAGE,
+            R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21,
+            R_AARCH64_TLSDESC_ADR_PAGE21,
+            R_AARCH64_TLSGD_ADR_PAGE21,
+        ] {
+            assert!(validate_address_site(kind, 4, 1, 8, 2).is_ok());
+            for offset in [5, 8, u64::MAX] {
+                assert!(validate_address_site(kind, offset, 1, 8, 2).is_err());
+            }
+            assert!(validate_address_site(kind, 0, 2, 8, 2).is_err());
+        }
+    }
+
+    #[test]
+    fn checked_address_patch_is_atomic_and_preserves_opcode_and_register() {
+        for opcode in [0x10000000_u32, 0x90000000] {
+            for rd in 0..32 {
+                for value in [-1048576, -1, 0, 1, 1048575] {
+                    let original = (opcode | rd).to_le_bytes();
+                    let mut out = original;
+                    encode_adr(&mut out, 0, value).unwrap();
+                    assert_eq!(u32::from_le_bytes(out) & 0x9f00001f, opcode | rd);
+                    for bad in [i64::MIN, -1048577, 1048576, i64::MAX] {
+                        let before = out;
+                        assert!(encode_adr(&mut out, 0, bad).is_err());
+                        assert_eq!(out, before);
+                    }
+                    for site in [1, 4, usize::MAX] {
+                        let before = out;
+                        assert!(encode_adr(&mut out, site, 0).is_err());
+                        assert_eq!(out, before);
+                    }
+                }
+            }
+        }
     }
 }

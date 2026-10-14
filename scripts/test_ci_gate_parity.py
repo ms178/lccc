@@ -477,6 +477,11 @@ class LinkerContractTest(unittest.TestCase):
         hosted = self.hosted.replace(block, commented, 1)
         self.assertEqual(self.check(hosted=hosted), 1)
 
+    def test_python_regression_gates_are_path_tracked(self) -> None:
+        for name in ("address", "popcount"):
+            path = f"tests/regression/check_arm_{name}_contract.py"
+            self.assertEqual(parity.COMMAND.findall("python3 " + path), [path])
+
     def test_linker_scripts_are_path_tracked(self) -> None:
         self.assertEqual(parity.COMMAND.findall("python3 tests/linker/fuzz_ld.py"),
                          ["tests/linker/fuzz_ld.py"])

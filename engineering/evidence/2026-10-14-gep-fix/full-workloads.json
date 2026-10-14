@@ -1,0 +1,45 @@
+{
+  "zlib-fixed": {
+    "command": [
+      "bash",
+      "tests/workloads/zlib-ng-2.3.3/run.sh"
+    ],
+    "environment": {
+      "ARTIFACT_DIR": "/home/user/.cache/zlib-fixed",
+      "WORK_DIR": "/home/user/.cache/zlib-fixed-work",
+      "KEEP_WORK": "1"
+    },
+    "exit": 0,
+    "log": "/home/user/.cache/zlib-fixed.log"
+  },
+  "expat-fixed": {
+    "command": [
+      "bash",
+      "tests/workloads/expat-2.8.5/run.sh"
+    ],
+    "environment": {
+      "ARTIFACT_DIR": "/home/user/.cache/expat-fixed",
+      "WORK_ROOT": "/home/user/.cache",
+      "KEEP_WORK": "1"
+    },
+    "exit": 0,
+    "log": "/home/user/.cache/expat-fixed.log"
+  },
+  "gzip-fixed": {
+    "command": [
+      "python3",
+      "tests/workloads/gzip-1.14/run.py",
+      "--lccc",
+      "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+      "--artifact-dir",
+      "/home/user/.cache/gzip-fixed",
+      "--rounds",
+      "1",
+      "--warmups",
+      "0"
+    ],
+    "environment": {},
+    "exit": 0,
+    "log": "/home/user/.cache/gzip-fixed.log"
+  }
+}

@@ -1,0 +1,1 @@
+PASS: AArch64 popcount O0/O1/O2/O3/Os, default/restricted; FP guard; 10 QEMU runs (--run requires availability)

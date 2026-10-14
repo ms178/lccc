@@ -1461,6 +1461,17 @@ gate "cross-backend-atomics" fast \
 gate "indexed-fold-scratch-index" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_indexed_fold_scratch_index.sh
 
+# Constant-folded late-dominating GEP: small external-TU observer and full
+# zlib-derived table output. Both fixtures must pass at every optimization level.
+gate "late-constant-gep" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_late_const_gep.sh
+
+gate "arm-address-contract" fast \
+    python3 tests/regression/check_arm_address_contract.py
+
+gate "arm-popcount-contract" fast \
+    python3 tests/regression/check_arm_popcount_contract.py
+
 # _Decimal64 indexed fold: the x86-64 indexed path must accept D64 on
 # the load half, the store half, and the decider. Structural SIB-movsd
 # assertions plus an integer-checksum gcc differential (mirrors the ci.yml

@@ -124,28 +124,54 @@ _ATTR_STATUS = {
 
 
 def _status_of(element: ET.Element) -> str:
-    """The status of one testcase, from child elements or from attributes.
+    """Reconcile all outcome signals; CTest status=run is execution metadata.
 
-    CTest's `--output-junit` records a problem as a child element
-    (`<failure/>`, `<error/>`, `<skipped/>`); other JUnit writers -- and CTest's
-    own `<Test status="notrun">` style -- use an attribute.  Reading only the
-    children would call an attribute-flagged failure a pass, which is the exact
-    inversion this module must never perform, so both are consulted and an
-    unrecognised attribute value is refused instead of defaulted.
+    `run` does not override a failure/error/skipped child. A missing outcome
+    uses JUnit's normal absence-of-failure convention, not a blanket mapping
+    of arbitrary execution states to success. Unknown or contradictory
+    attributes remain invalid even if a child already reported failure.
     """
-    for tag, status in (("failure", "failure"), ("error", "error"), ("skipped", "skipped")):
-        if element.find(tag) is not None:
-            return status
+    outcomes = {status for tag, status in
+                (("failure", "failure"), ("error", "error"), ("skipped", "skipped"))
+                if element.find(tag) is not None}
     for attribute in ("status", "result"):
         value = element.get(attribute)
         if value is None:
             continue
-        normalized = _ATTR_STATUS.get(value.strip().lower())
+        value = value.strip().lower()
+        if attribute == "status" and value == "run":
+            continue
+        normalized = _ATTR_STATUS.get(value)
         if normalized is None:
             raise ReportError(f"unrecognised {attribute}={value!r} on a <testcase>; "
                               f"refusing to read an unknown status as a pass")
-        return normalized
-    return "pass"
+        outcomes.add(normalized)
+    if len(outcomes) > 1:
+        raise ReportError(f"contradictory testcase outcomes: {sorted(outcomes)}")
+    return next(iter(outcomes), "pass")
+
+
+def _check_suite_counts(root: ET.Element) -> None:
+    """Do not let nonzero suite failures disappear behind passing case rows."""
+    for suite in root.iter():
+        if suite.tag not in ALLOWED_ROOTS:
+            continue
+        statuses = Counter(_status_of(case) for case in suite.iter("testcase"))
+        counts = {"tests": sum(statuses.values()), "failures": statuses["failure"],
+                  "errors": statuses["error"]}
+        for key in ("tests", "failures", "errors", "skipped", "disabled"):
+            value = suite.get(key)
+            if value is None:
+                continue
+            if not re.fullmatch(r"[0-9]+", value.strip()):
+                raise ReportError(f"invalid suite {key} count: {value!r}")
+            count = int(value)
+            # CTest distinguishes disabled tests from runtime skips; both
+            # have a skipped case outcome. Either declared subset must fit.
+            mismatch = (count != counts[key] if key in counts
+                        else count > statuses["skipped"])
+            if mismatch:
+                raise ReportError(f"suite {key}={count} contradicts its testcase outcomes")
 
 
 def parse_junit(path: Path) -> list[Case]:
@@ -174,6 +200,7 @@ def parse_junit(path: Path) -> list[Case]:
     if not cases:
         raise ReportError(f"{path}: contains no <testcase> elements; an empty CTest "
                           f"report is not a passing differential")
+    _check_suite_counts(root)
     return cases
 
 
@@ -352,6 +379,46 @@ def self_test() -> int:
     if not compare_config({"CMAKE_C_FLAGS": gcc_flags}, {}):
         raise AssertionError("a flags entry present on one side only must be a problem")
     ok += 1
+    for body, expected in [
+        ('<testcase name="x" status="run"/>', "pass"),
+        ('<testcase name="x" status="run"><failure/></testcase>', "failure"),
+        ('<testcase name="x" status="run"><error/></testcase>', "error"),
+        ('<testcase name="x" status="run"><skipped/></testcase>', "skipped"),
+        ('<testcase name="x" status="run" result="failed"/>', "failure"),
+        ('<testcase name="x" status="passed" result="passed"/>', "pass"),
+    ]:
+        if _status_of(ET.fromstring(body)) != expected:
+            raise AssertionError(f"incorrect CTest/JUnit outcome: {body}")
+        ok += 1
+    for body in [
+        '<testcase name="x" status="passed" result="failed"/>',
+        '<testcase name="x" status="passed"><failure/></testcase>',
+        '<testcase name="x" status="unknown"><failure/></testcase>',
+        '<testcase name="x" status="run" result="unknown"/>',
+        '<testcase name="x"><error/><skipped/></testcase>',
+        '<testcase name="x" result="run"/>',
+    ]:
+        try:
+            _status_of(ET.fromstring(body))
+        except ReportError:
+            ok += 1
+        else:
+            raise AssertionError(f"invalid testcase accepted: {body}")
+    with tempfile.TemporaryDirectory(prefix="lccc-expat-counts-") as work:
+        path = Path(work) / "report.xml"
+        for attrs in ['tests="2"', 'failures="1"', 'errors="1"',
+                      'skipped="1"', 'disabled="1"', 'failures="-1"', 'tests="wat"']:
+            path.write_text(f'<testsuite {attrs}><testcase name="x" status="run"/></testsuite>')
+            try:
+                parse_junit(path)
+            except ReportError:
+                ok += 1
+            else:
+                raise AssertionError(f"contradictory suite count accepted: {attrs}")
+        path.write_text('<testsuites tests="1" failures="1"><testsuite tests="1" failures="1">'
+                        '<testcase name="x" status="run"><failure/></testcase></testsuite></testsuites>')
+        assert parse_junit(path)[0].status == "failure"
+        ok += 1
     print(f"expat JUnit contract: {ok} checks passed")
     return 0
 

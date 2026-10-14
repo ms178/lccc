@@ -1021,20 +1021,25 @@ impl ElfWriter {
                 continue;
             };
 
-            if target_section != reloc.section {
-                // Cross-section reference - convert to section symbol + offset
+            if target_section != reloc.section || reloc.reloc_type == 275 {
+                // ADRP must remain relocatable even for a same-section local:
+                // page(S+A)-page(P) depends on the section's final page offset.
+                // Folding it here also used to drop the symbol's addend.
+                // Canonicalize locals to section symbol + offset.
                 if let Some(section) = self.base.sections.get_mut(&reloc.section) {
                     section.relocs.push(ObjReloc {
                         offset: reloc.offset,
                         reloc_type: reloc.reloc_type,
                         symbol_name: target_section.clone(),
-                        addend: target_offset as i64 + reloc.addend,
+                        addend: (target_offset as i64).wrapping_add(reloc.addend),
                     });
                 }
                 continue;
             }
 
-            let pc_offset = (target_offset as i64) - (reloc.offset as i64) + reloc.addend;
+            let pc_offset = (target_offset as i64)
+                .wrapping_sub(reloc.offset as i64)
+                .wrapping_add(reloc.addend);
 
             // GAS parity: an out-of-range PC-relative offset is a hard error.
             //
@@ -1046,15 +1051,7 @@ impl ElfWriter {
             // for the linker to catch -- the corrupted branch is invisible in
             // the object file. (Upstream fork issue #121.)
             //
-            // ADRP (275) is encoded as a page difference rather than a byte
-            // offset, so it gets its own operand.
-            let checked = if reloc.reloc_type == 275 {
-                let pc_page = (reloc.offset as i64) & !0xFFF;
-                let target_page = (target_offset as i64) & !0xFFF;
-                target_page - pc_page
-            } else {
-                pc_offset
-            };
+            let checked = pc_offset;
             let (lo, hi) = match reloc.reloc_type {
                 // R_AARCH64_JUMP26 / R_AARCH64_CALL26: imm26 << 2
                 282 | 283 => (-(1i64 << 27), (1i64 << 27)),
@@ -1064,8 +1061,6 @@ impl ElfWriter {
                 279 => (-(1i64 << 15), (1i64 << 15)),
                 // R_AARCH64_ADR_PREL_LO21: 21-bit signed byte offset
                 274 => (-(1i64 << 20), (1i64 << 20)),
-                // R_AARCH64_ADR_PREL_PG_HI21: 21-bit signed *page* offset
-                275 => (-(1i64 << 32), (1i64 << 32)),
                 _ => (i64::MIN, i64::MAX),
             };
             if !(lo..hi).contains(&checked) {
@@ -1123,16 +1118,6 @@ impl ElfWriter {
                     274 => {
                         // R_AARCH64_ADR_PREL_LO21 - ADR instruction
                         let imm = pc_offset as i32;
-                        let immlo = (imm as u32) & 0x3;
-                        let immhi = ((imm as u32) >> 2) & 0x7FFFF;
-                        word |= (immlo << 29) | (immhi << 5);
-                    }
-                    275 => {
-                        // R_AARCH64_ADR_PREL_PG_HI21 - ADRP instruction (local resolution)
-                        let pc_page = (reloc.offset as i64) & !0xFFF;
-                        let target_page = (target_offset as i64) & !0xFFF;
-                        let page_off = target_page - pc_page;
-                        let imm = (page_off >> 12) as i32;
                         let immlo = (imm as u32) & 0x3;
                         let immhi = ((imm as u32) >> 2) & 0x7FFFF;
                         word |= (immlo << 29) | (immhi << 5);
