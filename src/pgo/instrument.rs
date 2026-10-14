@@ -1109,7 +1109,11 @@ fn dump_helper(
     ] {
         let text = format!("__lccc_pgo_io_error_{}_{}", m.functions.len(), label.0);
         let stream_error = label == write_error_l;
-        let message = if stream_error { format!("{}\n", message) } else { message.into() };
+        let message = if stream_error {
+            format!("{}\n", message)
+        } else {
+            message.into()
+        };
         let message_len = message.len() as i64;
         m.string_literals.push((text.clone(), message));
         let ptr = Value(next);
@@ -1126,11 +1130,25 @@ fn dump_helper(
                     info: if stream_error {
                         // ferror is sticky and does not identify the original
                         // errno. Emit a stable diagnostic without inventing it.
-                        ci(None, vec![Operand::Const(IrConst::I32(2)), Operand::Value(ptr),
-                            Operand::Const(IrConst::I64(message_len))],
-                            vec![IrType::I32, IrType::Ptr, IrType::I64], IrType::I64, false)
+                        ci(
+                            None,
+                            vec![
+                                Operand::Const(IrConst::I32(2)),
+                                Operand::Value(ptr),
+                                Operand::Const(IrConst::I64(message_len)),
+                            ],
+                            vec![IrType::I32, IrType::Ptr, IrType::I64],
+                            IrType::I64,
+                            false,
+                        )
                     } else {
-                        ci(None, vec![Operand::Value(ptr)], vec![IrType::Ptr], IrType::Void, false)
+                        ci(
+                            None,
+                            vec![Operand::Value(ptr)],
+                            vec![IrType::Ptr],
+                            IrType::Void,
+                            false,
+                        )
                     },
                 },
             ],

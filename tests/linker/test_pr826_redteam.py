@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import runpy
+import re
 import subprocess
 import sys
 import tempfile
@@ -96,6 +97,14 @@ class RedTeam(unittest.TestCase):
                     secs = RV["sections"](path)
                     self.assertEqual(secs[".rela.data"][0][5] % 24, 0)
                     self.assertEqual(secs[".data.more"][1], b"\xa5" * 16)
+
+    def test_relocation_extent_metadata_matches_dispatcher(self):
+        source = (ROOT / "src/backend/riscv/linker/reloc.rs").read_text()
+        table = source.split("fn relocation_extent", 1)[1].split("/// Validate", 1)[0]
+        dispatcher = source.split("fn apply_one_reloc", 1)[1].split("/// Find the hi20", 1)[0]
+        kinds = lambda text: set(re.findall(r"R_RISCV_[A-Z0-9_]+", text))
+        self.assertEqual(kinds(table), kinds(dispatcher))
+        self.assertEqual(len(kinds(table)), 38)  # Plus numeric NONE, checked separately.
 
     def test_generated_c_has_independent_output_at_all_opts(self):
         with tempfile.TemporaryDirectory() as tmp:

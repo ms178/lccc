@@ -1,5 +1,11 @@
 # PR #826: critical audit and implementation handoff
 
+> **Historical review:** This documents the pre-fix implementation and its then-current evidence.
+> [The empirical red-team follow-up](PR826-REDTEAM.md) supersedes the blanket
+> oracle-agreement recommendation, narrows NONE compatibility claims, and records
+> the implemented fixes and real test results. Do not apply this old grade or
+> merge checklist to the current branch without reading that follow-up.
+
 ## Decision
 
 **Do not merge the current implementation yet.** The direction is good and the

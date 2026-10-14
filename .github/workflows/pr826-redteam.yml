@@ -93,6 +93,30 @@ jobs:
         run: |
           python3 tests/benchmark/run_benchmarks.py --compilers lccc,gcc,clang --gcc gcc-16 --opt=-O2 --skip-perf --strict --json target/redteam/corpus-o2.json
           python3 tests/benchmark/run_benchmarks.py --compilers lccc,gcc,clang --gcc gcc-16 --opt=-O3 --skip-perf --strict --json target/redteam/corpus-o3.json
+      - name: Publish compact API-readable result provenance
+        if: always()
+        run: |
+          python3 - <<'PYCODE'
+          import hashlib
+          import json
+          from pathlib import Path
+          summary = {}
+          for name in ("harness", "valid-oracle", "pgo", "relocations", "corpus-o2", "corpus-o3"):
+              path = Path("target/redteam") / (name + ".json")
+              if not path.exists():
+                  summary[name] = {"status": "missing"}
+                  continue
+              data = json.loads(path.read_text())
+              if "benchmarks" in data:
+                  rows = data["benchmarks"]
+                  result = {"workloads": len(rows), "correct": sum(bool(row["correctness"]) and all(value["matches_baseline"] and value["stable_within_compiler"] for value in row["correctness"].values()) for row in rows), "timing_claim": False}
+              else:
+                  result = {key: data[key] for key in ("passed", "failed", "tests", "failures", "errors", "skipped", "compiler", "oracle_version") if key in data}
+              result["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+              summary[name] = result
+          text = json.dumps(summary, sort_keys=True)
+          print("::notice title=redteam result::" + text.replace("%", "%25"))
+          PYCODE
       - name: Retain raw contract evidence
         if: always()
         uses: actions/upload-artifact@v7

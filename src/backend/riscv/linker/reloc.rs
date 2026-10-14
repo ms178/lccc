@@ -204,28 +204,47 @@ pub fn apply_relocations(
                 })?;
 
                 if reloc.rela_type == R_RISCV_SET_ULEB128 {
-                    let sub = relocs.get(ri + 1).filter(|sub| {
-                        sub.rela_type == R_RISCV_SUB_ULEB128 && sub.offset == reloc.offset
-                    }).ok_or_else(|| format!("unpaired RISC-V SET_ULEB128 in '{}'", obj_name))?;
+                    let sub = relocs
+                        .get(ri + 1)
+                        .filter(|sub| {
+                            sub.rela_type == R_RISCV_SUB_ULEB128 && sub.offset == reloc.offset
+                        })
+                        .ok_or_else(|| format!("unpaired RISC-V SET_ULEB128 in '{}'", obj_name))?;
                     let sub_sym_idx = sub.sym_idx as usize;
                     let sub_sym = obj.symbols.get(sub_sym_idx).ok_or_else(|| {
-                        format!("invalid RISC-V relocation symbol index {} in '{}'", sub_sym_idx, obj_name)
+                        format!(
+                            "invalid RISC-V relocation symbol index {} in '{}'",
+                            sub_sym_idx, obj_name
+                        )
                     })?;
                     let sub_value = resolve_sym_value(sub_sym, sub_sym_idx, obj_idx, obj, ctx);
                     let original_off = usize::try_from(reloc.offset).map_err(|_| {
                         format!("RISC-V ULEB128 offset exceeds host size in '{}'", obj_name)
                     })?;
-                    let original = obj.section_data[sec_idx].as_slice().get(original_off..)
-                        .ok_or_else(|| format!("missing RISC-V ULEB128 input field in '{}'", obj_name))?;
+                    let original = obj.section_data[sec_idx]
+                        .as_slice()
+                        .get(original_off..)
+                        .ok_or_else(|| {
+                            format!("missing RISC-V ULEB128 input field in '{}'", obj_name)
+                        })?;
                     let reserved = super::uleb128::field_len(original)?;
                     let end = off.checked_add(reserved).ok_or_else(|| {
                         format!("RISC-V ULEB128 input extent overflow in '{}'", obj_name)
                     })?;
                     let field = data.get_mut(off..end).ok_or_else(|| {
-                        format!("RISC-V ULEB128 input contribution exceeds output in '{}'", obj_name)
+                        format!(
+                            "RISC-V ULEB128 input contribution exceeds output in '{}'",
+                            obj_name
+                        )
                     })?;
-                    super::uleb128::apply_pair(field, s, a, sub_value, sub.addend)
-                        .map_err(|error| format!("{} in '{}' section {} at {:#x}", error, obj_name, sec_idx, reloc.offset))?;
+                    super::uleb128::apply_pair(field, s, a, sub_value, sub.addend).map_err(
+                        |error| {
+                            format!(
+                                "{} in '{}' section {} at {:#x}",
+                                error, obj_name, sec_idx, reloc.offset
+                            )
+                        },
+                    )?;
                     paired_sub = Some(ri + 1);
                     continue;
                 }
@@ -577,7 +596,10 @@ fn apply_one_reloc(
             }
         }
         R_RISCV_SET_ULEB128 | R_RISCV_SUB_ULEB128 => {
-            return Err(format!("unpaired RISC-V ULEB128 relocation in '{}'", obj_name));
+            return Err(format!(
+                "unpaired RISC-V ULEB128 relocation in '{}'",
+                obj_name
+            ));
         }
         R_RISCV_TLS_GD_HI20 => {
             // GD->LE relaxation: rewrite auipc -> lui with tprel

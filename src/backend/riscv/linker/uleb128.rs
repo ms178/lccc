@@ -33,12 +33,15 @@ pub(super) fn apply_pair(
     if len == 0 || len > 10 {
         return Err("invalid RISC-V ULEB128 reserved field length".into());
     }
-    let difference = i128::from(set) + i128::from(set_addend)
-        - i128::from(sub) - i128::from(sub_addend);
+    let difference =
+        i128::from(set) + i128::from(set_addend) - i128::from(sub) - i128::from(sub_addend);
     let mut value = u64::try_from(difference)
         .map_err(|_| "RISC-V ULEB128 pair result is outside unsigned 64-bit range")?;
     if len < 10 && value >> (7 * len) != 0 {
-        return Err(format!("RISC-V ULEB128 pair result does not fit reserved {}-byte field", len));
+        return Err(format!(
+            "RISC-V ULEB128 pair result does not fit reserved {}-byte field",
+            len
+        ));
     }
     for (i, byte) in data[..len].iter_mut().enumerate() {
         *byte = (value & 0x7f) as u8 | if i + 1 < len { 0x80 } else { 0 };
@@ -52,9 +55,9 @@ mod tests {
     use super::*;
 
     fn decode(data: &[u8]) -> u64 {
-        data.iter().enumerate().fold(0, |value, (i, b)| {
-            value | (u64::from(b & 0x7f) << (7 * i))
-        })
+        data.iter()
+            .enumerate()
+            .fold(0, |value, (i, b)| value | (u64::from(b & 0x7f) << (7 * i)))
     }
 
     #[test]
@@ -108,8 +111,13 @@ mod tests {
 
     #[test]
     fn malformed_original_fields_are_rejected() {
-        for field in [vec![], vec![0x80], vec![0x80; 10],
-                      [vec![0x80; 9], vec![2]].concat(), vec![0x80; 20]] {
+        for field in [
+            vec![],
+            vec![0x80],
+            vec![0x80; 10],
+            [vec![0x80; 9], vec![2]].concat(),
+            vec![0x80; 20],
+        ] {
             assert!(field_len(&field).is_err());
         }
     }
@@ -125,8 +133,11 @@ mod tests {
 
     #[test]
     fn widened_arithmetic_rejects_underflow_and_overflow() {
-        for (set, sa, sub, sb) in [(0, 0, 1, 0), (u64::MAX, 1, 0, 0),
-                                  (0, i64::MIN, 0, i64::MAX)] {
+        for (set, sa, sub, sb) in [
+            (0, 0, 1, 0),
+            (u64::MAX, 1, 0, 0),
+            (0, i64::MIN, 0, i64::MAX),
+        ] {
             let mut field = [0x80; 10];
             field[9] = 0;
             let before = field;
@@ -136,5 +147,37 @@ mod tests {
         let mut field = [0];
         apply_pair(&mut field, u64::MAX, 1, u64::MAX, 0).unwrap();
         assert_eq!(field, [1]);
+    }
+
+    #[test]
+    fn deterministic_full_width_samples_preserve_fields_and_sentinels() {
+        let mut state = 0x8f47_913a_21dd_700bu64;
+        for len in 1..=10 {
+            for _ in 0..4096 {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let value = if len == 10 {
+                    state
+                } else {
+                    state & ((1u64 << (7 * len)) - 1)
+                };
+                let mut merged = [0xa5; 12];
+                merged[..len].fill(0x80);
+                merged[len - 1] = 0;
+                apply_pair(&mut merged[..len], u64::MAX, 17, u64::MAX - value, 17).unwrap();
+                assert_eq!(decode(&merged[..len]), value);
+                assert_eq!(field_len(&merged[..len]).unwrap(), len);
+                assert!(merged[len..].iter().all(|&byte| byte == 0xa5));
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_reserved_lengths_do_not_mutate() {
+        for len in [0, 11] {
+            let mut field = vec![0xa5; len];
+            let before = field.clone();
+            assert!(apply_pair(&mut field, 1, 0, 0, 0).is_err());
+            assert_eq!(field, before);
+        }
     }
 }
