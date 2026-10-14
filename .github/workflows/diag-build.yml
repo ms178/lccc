@@ -1,0 +1,18 @@
+name: Diag build (temporary)
+on:
+  push:
+    branches: [arena/24fe00ee-lccc]
+jobs:
+  b:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Check with warnings denied
+        run: |
+          RUSTFLAGS="-D warnings" cargo check --profile fastbuild --locked --all-targets > /tmp/chk.log 2>&1 || { grep -E '^(error|warning)' -A 8 /tmp/chk.log | head -80 | sed 's/%/%25/g' | tr '\n' '|' | cut -c1-3500 | sed 's/^/::error title=CHECK-FAIL::/'; exit 1; }
+          cargo clippy --profile fastbuild --locked --all-targets > /tmp/clip.log 2>&1 || { grep -E '^(error|warning)' -A 8 /tmp/clip.log | head -80 | sed 's/%/%25/g' | tr '\n' '|' | cut -c1-3500 | sed 's/^/::error title=CLIPPY-FAIL::/'; exit 1; }
+          echo "::notice title=CHECK::clean"
