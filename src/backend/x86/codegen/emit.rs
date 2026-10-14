@@ -7322,6 +7322,16 @@ impl X86Codegen {
 }
 
 impl ArchCodegen for X86Codegen {
+    /// Provenance markers for user inline-asm bodies: `#APP`/`#NO_APP`.
+    /// `#` starts a comment in this target's GAS syntax, so the markers are
+    /// invisible to the assembler, to objdump, and to this backend's text
+    /// peephole alike; downstream scanners (the -mno-sse /
+    /// -mgeneral-regs-only SIMD guard) use them to exempt user-authored
+    /// text from the compiler-generated code policy.
+    fn asm_block_markers(&self) -> Option<(&'static str, &'static str)> {
+        Some(("#APP", "#NO_APP"))
+    }
+
     fn supports_switch_bounds(&self) -> bool {
         true
     }
@@ -9286,6 +9296,7 @@ impl ArchCodegen for X86Codegen {
     ) {
         // Lazy flush: inline asm may clobber XMM registers or read slots.
         self.flush_pending_vec_store_impl();
+        let markers = self.asm_block_markers();
         emit_inline_asm_common(
             self,
             template,
@@ -9295,6 +9306,7 @@ impl ArchCodegen for X86Codegen {
             operand_types,
             goto_labels,
             input_symbols,
+            markers,
         );
         self.emit_callee_saved_clobber_annotations(clobbers);
         // SOUNDNESS (audit F5): the asm template may write any register in
@@ -9325,6 +9337,7 @@ impl ArchCodegen for X86Codegen {
     ) {
         // Lazy flush: inline asm may clobber XMM registers or read slots.
         self.flush_pending_vec_store_impl();
+        let markers = self.asm_block_markers();
         crate::backend::inline_asm::emit_inline_asm_common_impl(
             self,
             template,
@@ -9334,6 +9347,7 @@ impl ArchCodegen for X86Codegen {
             operand_types,
             goto_labels,
             input_symbols,
+            markers,
             seg_overrides,
         );
         self.emit_callee_saved_clobber_annotations(clobbers);

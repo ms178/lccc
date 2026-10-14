@@ -21,16 +21,20 @@ concurrency:
 jobs:
   test:
     name: Test Suite
+    # AUD-CI-1: pinned runner (ubuntu-latest floats the userland under the
+    # gates; PR #638 shipped red because the runner image moved).
     runs-on: ubuntu-24.04
+    # AUD-CI-1: every job is time-bounded; a hung gate fails loudly instead
+    # of burning the 6-hour default. 120 covers the qemu-backed ARM gates.
     timeout-minutes: 120
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # stable (2026-10)
 
       # The regression corpus includes executable i686 cases.  ubuntu-latest
       # can provide /lib/ld-linux.so.2 without the 32-bit development/startup
@@ -101,13 +105,13 @@ jobs:
           sudo apt-get install -y --no-install-recommends gcc-16 gcc-16-multilib lib32gcc-16-dev
 
       - name: Cache cargo registry
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache cargo index
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
@@ -435,6 +439,48 @@ jobs:
       # where no warning distinguishes the two answers.
       - name: Scoped-noreturn diagnostic gate
         run: bash tests/regression/check_scoped_noreturn_diagnostics.sh
+
+      # AUD-DRV-1: `-o -` is a stream, not a filename, wherever GCC says so
+      # (measured on GCC 14.2): -S/-E stream to stdout and create no dash
+      # file, -c fails cleanly, -MF - streams the dep rule with the
+      # object-derived target, a derived .d is skipped when the output is
+      # stdout, and full-link -o - keeps the file-named-`-` parity.  The
+      # gate's --self-test rejects a fake compiler with the old behavior,
+      # so it bites even where the row set drifts.
+      - name: Dash-output stdout gate
+        run: bash tests/regression/check_dash_output.sh
+
+      # AUD-SILENT-ZERO-1: x86-only intrinsics are a lowering-time diagnostic
+      # on aarch64/riscv64 (GCC-shape file:line:col, exit 1), never silent
+      # zeros; a lowering leak would hit the backends' trap safety nets
+      # (encoding-pinned by check_cross_target_intrinsic_trap.sh), never an
+      # ICE.  The sweep is exhaustive over the registered x86-only builtin
+      # names and mutation-tests itself against a fake silent-zero compiler.
+      - name: foreign-intrinsics rejected gate
+        run: python3 scripts/check_foreign_intrinsics.py
+
+      # PR #821 F1: user-authored AArch64 assembly (ordinary inline asm,
+      # naked-function raw bodies, top-level asm) is exempt from the
+      # -mgeneral-regs-only SIMD guard via #APP/#NO_APP provenance brackets;
+      # compiler-generated SIMD is still rejected and cannot borrow the
+      # exemption.  Mutation-tested against the pre-fix compiler.
+      - name: AArch64 inline-asm provenance gate
+        run: bash tests/regression/check_arm_inline_asm_provenance.sh
+
+      # PR #821 F3: shared-library ADR relocations must prove the
+      # section-relative precondition through the SECTION MAP (null symbol,
+      # local-undefined and discarded-section symbols are link-time
+      # diagnostics, valid locals still link, NONE stays untouched).
+      - name: AArch64 shared ADR contract gate
+        run: bash tests/regression/check_arm_adr_shared_contract.sh
+
+      # PR #821 F2: the gABI-merged visibility flows through symbol
+      # resolution into the export decision, the dynsym st_other byte and
+      # the ADR predicate — the input-visibility contract and the emitted
+      # ELF can no longer disagree (hidden unexported, protected exported-
+      # and-internal, order-independent).
+      - name: AArch64 shared visibility gate
+        run: bash tests/regression/check_arm_visibility_shared.sh
 
       # i386 register-argument staging: the clobber-before-last-read law on the
       # emitted asm, the no-16-byte-move law for a 12-byte packed argument, and the
@@ -1107,7 +1153,7 @@ jobs:
       # prefixes are cached, keyed on the provisioner that carries the pin
       # (version + tarball digest live in that script).
       - name: Cache GNU as 2.47 prefixes
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cache/gas-2.47-x86_64-linux-gnu
@@ -1219,7 +1265,7 @@ jobs:
       # encodings.  Cached the way the GAS prefixes are, keyed on the
       # provisioner that carries the digest.
       - name: Cache Arm A64 ISA XML 2026-09 package
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cache/arm-isa-a64-2026-09
@@ -1533,7 +1579,7 @@ jobs:
       # arch/x86/tools/relocs, the kernel's own consumer of --emit-relocs,
       # built from SHA-256-pinned v6.12 sources (emit_relocs_kernel_relocs_tool).
       - name: Cache kernel relocs tool
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.cache/lccc-kernel-tools
           key: ${{ runner.os }}-kernel-tools-${{ hashFiles('tests/linker/setup_kernel_tools.sh') }}
@@ -1565,7 +1611,7 @@ jobs:
       # the sources, objects, links and outputs of exactly the failing cases.
       - name: Upload linker results and i386 scratch on failure
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: linker-test-failures
           path: |
@@ -1619,7 +1665,7 @@ jobs:
       # (regression-dbgassert-results.{json,log}) when IT fails.
       - name: Upload regression results
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: regression-results
           path: |
@@ -1637,12 +1683,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # stable (2026-10)
         with:
           components: rustfmt, clippy
 
@@ -1683,18 +1729,25 @@ jobs:
   # Compiler Explorer and fail on regression against the committed baseline.
   # Networked, so a Compiler Explorer outage is a recorded skip (exit 0), never
   # a red build; the self-tests in the `test` job pin the gate logic itself.
+
+  # AUD-TOOLCHAIN-1 note: the msrv job above is the single MSRV gate.  An
+  # earlier session-local variant (1.98.1, pre-dating the 1.97.0 floor) was
+  # dropped during the 2026-10-14 rebase rather than kept as a duplicate —
+  # two jobs testing different floors is worse than one testing the declared
+  # one.
+
   oracle-delta:
     timeout-minutes: 30
     name: Compiler Explorer oracle delta
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # stable (2026-10)
 
       - name: Build LCCC (fastbuild)
         env:
@@ -1709,7 +1762,7 @@ jobs:
 
       - name: Upload oracle report
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: oracle-delta
           path: results/oracle-delta/

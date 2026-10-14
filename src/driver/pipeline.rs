@@ -875,8 +875,22 @@ impl Driver {
                 let output = preprocessor.dump_defines();
                 if self.output_path_set {
                     self.write_text_output(&format!("{}\n", output))?;
+                    // GCC still writes the dep rule in -dM mode when an
+                    // -M-class flag is present (gcc 14.2: -E -dM -MD x.c
+                    // -> x.d ruling `x.o:`); the -o value only names the
+                    // derived file, never the target.
+                    self.write_dep_file(
+                        input_file,
+                        &self.output_path,
+                        &Self::dep_rule_object_target(input_file),
+                    )?;
                 } else {
                     println!("{}", output);
+                    self.write_dep_file(
+                        input_file,
+                        input_file,
+                        &Self::dep_rule_object_target(input_file),
+                    )?;
                 }
             } else {
                 let preprocessed = preprocessor.preprocess(&source);
@@ -899,10 +913,25 @@ impl Driver {
                     // The kernel build uses this when preprocessing linker scripts
                     // (.lds.S -> .lds) and fixdep expects the .d file to exist.
                     // With `-o -` the derived name is `-.d`, exactly as GCC
-                    // derives it (verified against gcc 12.2: -MD -E -o -).
-                    self.write_dep_file(input_file, &self.output_path)?;
+                    // derives it (verified against gcc 12.2: -MD -E -o -), but
+                    // the rule TARGET stays the would-be object (`x.o:`), not
+                    // the dash — gcc 14.2, pinned by check_dash_output.sh row 4.
+                    self.write_dep_file(
+                        input_file,
+                        &self.output_path,
+                        &Self::dep_rule_object_target(input_file),
+                    )?;
                 } else {
                     print!("{}", output);
+                    // GCC writes the dep rule on this path too: `-E -MF -
+                    // -MMD x.c` streams `x.o: x.c` on stdout and `-E -MD`
+                    // derives x.d (both measured, gcc 14.2).  Same contract
+                    // as the -o arm, with input-derived names.
+                    self.write_dep_file(
+                        input_file,
+                        input_file,
+                        &Self::dep_rule_object_target(input_file),
+                    )?;
                 }
 
                 // Check for preprocessor errors (missing includes, #error,
@@ -1106,9 +1135,24 @@ impl Driver {
 
             if self.output_path_set {
                 self.write_text_output(&output)?;
-                self.write_dep_file(input_file, &self.output_path)?;
+                // Same GCC dep contract as the C -E path: the derived .d
+                // name follows the -o value (`-o -` -> `-.d`, measured), the
+                // rule target stays the would-be object (`s1.o:`).
+                self.write_dep_file(
+                    input_file,
+                    &self.output_path,
+                    &Self::dep_rule_object_target(input_file),
+                )?;
             } else {
                 print!("{}", output);
+                // No -o: GCC still writes the dep rule (`.S -E -MF -` streams
+                // `s1.o: s1.S` on stdout; `.S -E -MD` derives s1.d) — same
+                // input-derived names as the C -E path.
+                self.write_dep_file(
+                    input_file,
+                    input_file,
+                    &Self::dep_rule_object_target(input_file),
+                )?;
             }
             Ok(())
         }
@@ -1161,8 +1205,36 @@ impl Driver {
             cmd.arg("-P");
         }
         if let Some(ref dep_path) = self.dep_file {
-            if !dep_path.is_empty() {
-                cmd.arg(format!("-Wp,-MMD,{}", dep_path));
+            // gcc -E owns the dep-rule format here, so mirror the driver's
+            // dep state onto -Wp flags instead of post-processing:
+            //  * an explicit -MF/-MMD path passes through (and `-` streams
+            //    the rule to stdout inside gcc — measured: -Wp,-MMD,- ==
+            //    -MF -);
+            //  * a bare -MD/-MMD derives the file name exactly as gcc does
+            //    (the -o value when this phase has one, else the input);
+            //  * the flag class follows dep_exclude_system (-MMD vs -MD),
+            //    and -MT/-MP pass through (gcc -E -MD s1.S rules `s1.o:`,
+            //    includes stdc-predef.h for -MD — both measured).
+            let flag_value = if dep_path.is_empty() {
+                let base = if self.output_path_set {
+                    self.output_path.clone()
+                } else {
+                    input_file.to_string()
+                };
+                std::path::Path::new(&base)
+                    .with_extension("d")
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                dep_path.clone()
+            };
+            let m_flag = if self.dep_exclude_system { "MMD" } else { "MD" };
+            cmd.arg(format!("-Wp,-{},{}", m_flag, flag_value));
+            if let Some(t) = self.dep_target.as_deref() {
+                cmd.arg(format!("-Wp,-MT,{}", t));
+            }
+            if self.dep_phony {
+                cmd.arg("-Wp,-MP");
             }
         }
         cmd.arg(input_file);
@@ -1190,7 +1262,7 @@ impl Driver {
             if self.code16gcc && Self::is_c_source(input_file) {
                 use super::external_tools::GccM16Mode;
                 self.compile_with_gcc_m16(input_file, &out_path, GccM16Mode::Assembly)?;
-                self.write_dep_file(input_file, &out_path)?;
+                self.write_dep_file_gcc_semantics(input_file, &out_path)?;
                 if self.verbose {
                     eprintln!("Assembly output (GCC -m16): {}", out_path);
                 }
@@ -1207,7 +1279,7 @@ impl Driver {
                 std::fs::write(&out_path, &asm)
                     .map_err(|e| format!("Cannot write {}: {}", out_path, e))?;
             }
-            self.write_dep_file(input_file, &out_path)?;
+            self.write_dep_file_gcc_semantics(input_file, &out_path)?;
             if self.verbose {
                 eprintln!("Assembly output: {}", out_path);
             }
@@ -1227,7 +1299,7 @@ impl Driver {
                 if self.code16gcc {
                     use super::external_tools::GccM16Mode;
                     self.compile_with_gcc_m16(input_file, &out_path, GccM16Mode::Object)?;
-                    self.write_dep_file(input_file, &out_path)?;
+                    self.write_dep_file_gcc_semantics(input_file, &out_path)?;
                     if self.verbose {
                         eprintln!("Object output (GCC -m16): {}", out_path);
                     }
@@ -1238,7 +1310,7 @@ impl Driver {
                 let extra = self.build_asm_extra_args();
                 self.target.assemble_with_extra(&asm, &out_path, &extra)?;
             }
-            self.write_dep_file(input_file, &out_path)?;
+            self.write_dep_file_gcc_semantics(input_file, &out_path)?;
             if self.verbose {
                 eprintln!("Object output: {}", out_path);
             }
@@ -1279,7 +1351,7 @@ impl Driver {
                     if self.verbose {
                         eprintln!("Compiled (GCC -m16): {}", input_file);
                     }
-                    self.write_dep_file(input_file, &self.output_path)?;
+                    self.write_dep_file(input_file, &self.output_path, &self.output_path)?;
                     temp_guards.push(tmp);
                     continue;
                 }
@@ -1294,7 +1366,7 @@ impl Driver {
                 // linking in one step, GCC's -Wp,-MMD uses the .o name as the
                 // dependency target. We use the output executable path as target,
                 // which is sufficient for kernel build's fixdep processing.
-                self.write_dep_file(input_file, &self.output_path)?;
+                self.write_dep_file(input_file, &self.output_path, &self.output_path)?;
                 temp_guards.push(tmp);
             }
         }

@@ -519,6 +519,18 @@ pub fn link_shared(
     // fail to resolve PLT symbols at runtime.
     resolve_dynamic_symbols_for_shared(&objects, &globals, &mut needed_sonames, &all_lib_paths);
 
+    // gABI visibility merge (PR #821 F2): the most constraining STV_* of
+    // every reference AND the definition applies to the output symbol, so a
+    // hidden declaration in one TU constrains a default definition in
+    // another regardless of input order.  It runs AFTER the dynamic
+    // resolution above because a replaced entry (is_dynamic) must not wipe
+    // the constraint a hidden input reference put on the symbol — the ADR
+    // predicate rejects exactly that case.  The shared emitter consumes the
+    // merged value for its export decision, the dynsym st_other byte and
+    // the ADR admission predicate — the same binding decision everywhere,
+    // instead of a per-emitter name-only side table.
+    linker_common::merge_object_visibility(&objects, &mut globals);
+
     // --defsym: aliases resolve here; expressions evaluate in the emitter
     // after layout (same design as the x86-64 linker).
     let pending_defsyms = apply_defsyms(&mut globals, &defsym_defs)?;
@@ -612,6 +624,7 @@ fn apply_defsyms(
                 copy_reloc: false,
                 lib_sym_value: 0,
                 lib_in_exec: false,
+                visibility: crate::backend::elf::STV_DEFAULT,
             },
         );
     }

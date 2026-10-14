@@ -1030,6 +1030,7 @@ impl ArchCodegen for RiscvCodegen {
         goto_labels: &[(String, BlockId)],
         input_symbols: &[Option<String>],
     ) {
+        let markers = self.asm_block_markers();
         emit_inline_asm_common(
             self,
             template,
@@ -1039,6 +1040,7 @@ impl ArchCodegen for RiscvCodegen {
             operand_types,
             goto_labels,
             input_symbols,
+            markers,
         );
         // Restore any callee-saved registers that were borrowed by the scratch
         // allocator. These were saved to the stack before input loading and need

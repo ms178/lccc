@@ -856,6 +856,28 @@ linker. Cover static/dynamic/shared paths without a one-emitter special case.
 
 ## P0 — largest measured gaps
 
+### VECRET-1 · **NEW 2026-10-13** — a 16-byte vector rvalue returned by value reads its alloca pointer as data (miscompile)
+
+Found during the AUD-ICE-1 spot-checks (the ill-typed sweep only proves no
+ICE; the behavior spot-check caught this).  Reproducer:
+`artifacts/repros/miscompile_vec_return_by_value_O2.c`.
+
+`v4 passret(v4 a, v4 b){ return __builtin_shuffle(a, b); }` — the return
+path copies the result's alloca POINTER (the printed high halves are a
+stack address, 0x7fff…) instead of the 16 bytes it addresses.  The identity
+return of a parameter (`return a;`) is correct through the same path, and
+assignment/global flows are correct — the gap is specific to a computed
+vector RVALUE flowing into the by-value return convention, at -O0 AND -O2
+(so it is the convention, not an optimization pass).
+
+Task: decide the vector-rvalue convention once (builtin results materialize
+as alloca pointers; the return path must copy FROM the pointer for
+vector-typed rvalues the way the assignment path does), wire it at the
+return/parameter-boundary boundary, and re-enable the reproducer as a
+regression gate.  GCC 14.2 is the oracle for every 16-byte class (int/float
+element, signed/unsigned).  Audit the sibling paths (vector parameters,
+nested calls, compound literals) before choosing the fix point.
+
 ### TAG-ID-1 · **FIXED 2026-10-03** — nested same-tag structs no longer alias; the miscompile is gone
 
 `f(s)` for the reproducer below is now a hard error matching GCC, and no
