@@ -9,8 +9,9 @@
  *               non-zero seed.
  *
  *   REFUSED     every shape the transform does not model: unsigned compares,
- *               16-bit elements, float elements, a `continue` guard, and any
- *               second accumulator in the same loop.  These must stay scalar —
+ *               16-bit elements, float elements, a `continue` guard, volatile
+ *               loads/stores, and any second accumulator in the same loop.
+ *               These must stay scalar —
  *               the alternative is the sum == 0 miscompile this gate exists to
  *               prevent (a single-accumulator pattern silently dropping the
  *               loop's other accumulators).
@@ -24,6 +25,15 @@
 
 int max_i32(const int *a, int n) {
     int m = a[0];
+    for (int i = 0; i < n; i++)
+        if (a[i] > m) m = a[i];
+    return m;
+}
+
+/* Zero-start signed bound remains vectorized, but negative dynamic limits
+ * must not become positive byte thresholds after division and scaling. */
+int max_zero_start_dynamic_limit(const int *a, int n) {
+    int m = -2147483647 - 1;
     for (int i = 0; i < n; i++)
         if (a[i] > m) m = a[i];
     return m;
@@ -67,6 +77,28 @@ int max_start1(const int *a, int n) {
     return m;
 }
 
+/* The induction variable escapes after a nonzero-start min/max loop. */
+int max_start1_exit_iv(const int *a, int n, int *out_i) {
+    int m = -2147483647 - 1;
+    int i = 1;
+    for (; i < n; i++)
+        if (a[i] > m) m = a[i];
+    *out_i = i;
+    return m;
+}
+
+/* A direct IV-indexed GEP with a large negative nonzero start.  When n is
+ * smaller than the start, the source loop is empty.  Scaling this signed I32
+ * byte counter by four crosses INT_MIN; a wrapped vector bound can then make
+ * the empty loop execute packed loads.  Keep this shape scalar until the
+ * byte-IV start and bound have a complete no-overflow proof. */
+int max_empty_negative_start(const int *a, int n) {
+    int m = -2147483647 - 1;
+    for (int i = -536870912; i < n; i++)
+        if (a[i] > m) m = a[i];
+    return m;
+}
+
 /* Constant non-zero seed (not an element of the array). */
 int max_const_init(const int *a, int n) {
     int m = -2147483647;
@@ -76,6 +108,46 @@ int max_const_init(const int *a, int n) {
 }
 
 /* ---- group 2: must stay scalar ----------------------------------------- */
+
+static volatile int minmax_observer;
+
+/* A side effect in the reduction body must remain once per scalar
+ * iteration; the min/max vector path does not model stores. */
+int max_with_volatile_store(const int *a, int n) {
+    int m = -2147483647 - 1;
+    for (int i = 0; i < n; i++) {
+        int x = a[i];
+        minmax_observer = i;
+        if (x > m) m = x;
+    }
+    return m;
+}
+
+int minmax_observer_value(void) {
+    return minmax_observer;
+}
+
+void reset_minmax_observer(int value) {
+    minmax_observer = value;
+}
+
+/* Volatile element reads are observable and must not be replaced by a packed
+ * nonvolatile vector load. Keep one source-level read per iteration. */
+int max_volatile_load(const volatile int *a, int n) {
+    int m = -2147483647 - 1;
+    for (int i = 0; i < n; i++) {
+        int x = a[i];
+        if (x > m) m = x;
+    }
+    return m;
+}
+
+/* The ordinary sum/dot legality gate shares the same volatile-load rule. */
+long long sum_volatile_load(const volatile int *a, int n) {
+    long long sum = 0;
+    for (int i = 0; i < n; i++) sum += a[i];
+    return sum;
+}
 
 /* Unsigned compare: vpmaxsd/vpminsd are signed-only. */
 unsigned max_u32(const unsigned *a, int n) {
@@ -118,13 +190,13 @@ int max_guarded(const int *a, int n) {
     return m;
 }
 
-/* Second accumulator in the same loop (an independent sum). */
-int max_with_sum(const int *a, int n, int *sum) {
+/* Second accumulator, with defined modulo arithmetic even for INT_MIN/MAX. */
+int max_with_sum(const int *a, int n, unsigned *sum) {
     int m = a[0];
-    int s = 0;
+    unsigned s = 0;
     for (int i = 0; i < n; i++) {
         if (a[i] > m) m = a[i];
-        s += a[i];
+        s += (unsigned)a[i];
     }
     *sum = s;
     return m;

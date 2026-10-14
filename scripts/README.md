@@ -18,10 +18,12 @@ construction, reports the honest source fallback for that shape. See the
 | Script | Purpose |
 |---|---|
 | `audit_levkropp_since.py` | Historical marker scan, plus exact `--commit SHA --against REF` JSON inventory for consolidation audits: compares all changed Git entries without pretending filename/subject matches prove semantic adoption. Offline fixture: `test_audit_levkropp_since.py`. |
-| `rust_toolchain.sh` | Shared selector: resolves the current channel from `rust-toolchain.toml` (currently stable Rust 1.98.1), while honoring an explicit bisection/reproduction override. Its behavior is covered by `tests/regression/check_rust_toolchain_selector.sh`. |
+| `rust_toolchain.sh` | Shared selector: resolves the moving channel from `rust-toolchain.toml` (stable Rust/Cargo, with matching rustfmt and Clippy), while honoring an explicit bisection/reproduction override. CI records the resolved component versions on every run. Its behavior is covered by `tests/regression/check_rust_toolchain_selector.sh`. |
 | `build_lccc_fast.sh` | Incremental `fastbuild` profile (target compiler opt-level 1, no LTO), using the manifest-selected current Rust/Cargo release, exactly two Cargo jobs, and warnings denied by default. Use for RA/codegen loops. |
 | `build_lccc_o1_j2.sh` | Ship-quality release: Rust opt-level 1, two Cargo jobs, thin LTO, swap active, manifest-selected current Rust/Cargo release, and warnings denied by default. |
 | `ensure_swap.sh` | Idempotently verify swap or recreate/activate the disposable 8 GiB `/swapfile` after a constrained-harness root reset; both compiler build scripts invoke it. |
+| `ci_enable_swap.sh` | Create and verify an active 4 GiB swap file in the ephemeral GitHub runner temp directory before memory-heavy CI, Clippy, oracle, and benchmark jobs; `LCCC_CI_SWAP_SIZE` overrides the size. |
+| `ci_install_gcc16.sh` | Provision GCC/G++ 16 from the runner distribution or Ubuntu Toolchain PPA when needed; `--multilib` adds both GCC16 and system multilib runtimes for the i686 differential suite. |
 | `arena_session_restore.sh` | Rehydrates swap, the manifest-selected current Rust/Cargo toolchain, host multilib/kernel packages, git metadata and fastbuild after an Arena reset. |
 | `prepare_kernel_tree.sh` | Recreate Linux 6.18.55 with the linux-cachymod patch series and generated boot headers after a harness wipe. |
 | `build_kernel_boot.sh` | Build all x86 real-mode setup objects with LCCC (`-ffunction-sections`), link with `lccc-ld --gc-sections`, preserve non-relocation boot payloads through a build-local `KEEP` script, enforce the authentic 32 KiB ASSERTs, and require flat-image byte identity with available BFD/LLD oracles. |

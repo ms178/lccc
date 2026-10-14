@@ -108,6 +108,23 @@ for arch in x86-64 x86-64-v3; do
     done
 done
 
+# Wide source/promoted counters: small tails and empty 64-bit limits whose
+# low 32 bits look positive, with escaping post-loop IVs in both start forms.
+note "wide counters: five optimisation levels, empty I64 limits and escaping IVs"
+"$GCC" -O2 "$here/minmax_shapes/minmax_wide.c" -o "$work/wide-ref"
+"$work/wide-ref" > "$work/wide-expected"
+for opt in -O0 -O1 -O2 -O3 -Os; do
+    if "$CCC" "$opt" -march=x86-64-v3 "$here/minmax_shapes/minmax_wide.c" -o "$work/wide"; then
+        if timeout 120 "$work/wide" > "$work/wide-got"; then
+            cmp -s "$work/wide-expected" "$work/wide-got" || bad "$opt: wide counter output differs"
+        else
+            bad "$opt: wide counter program failed"
+        fi
+    else
+        bad "$opt: wide counter build failed"
+    fi
+done
+
 # ---------------------------------------------------------------- contract 2
 note "contract 2: the min/max steady-state loop is 256-bit (AVX2)"
 python3 "$root/scripts/check_minmax_shapes.py" --ccc "$CCC" --source "$shapes" \

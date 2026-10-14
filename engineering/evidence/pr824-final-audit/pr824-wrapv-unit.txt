@@ -1,0 +1,39 @@
+   Compiling lccc v0.1.0 (/home/user/.cache/lccc)
+    Finished `fastbuild` profile [optimized] target(s) in 3m 20s
+     Running unittests src/lib.rs (target/fastbuild/deps/lccc-2790982c43eeadfa)
+
+running 31 tests
+test backend::arm::assembler::elf_writer::branch_range_tests::out_of_range_tbz_is_diagnosed_not_wrapped ... ok
+test backend::asm_expr::tests::gas247_divmod_zero_and_wrap_law ... ok
+test backend::elf::io::bounds_tests::slice_at_rejects_wrapping_range ... ok
+test backend::generation::conditional_increment_tests::detects_u32_wrapping_increment_with_widened_select ... ok
+test backend::i686::linker::input::tests::wrap_renames_undefined_references_only ... ok
+test backend::linker_common::defsym::tests::subtraction_wraps_like_an_address_difference_should ... ok
+test backend::live_range::tests::test_occupy_does_not_wrap ... ok
+test backend::regalloc::allocation_kernel_tests::summed_use_weight_saturates_instead_of_wrapping ... ok
+test backend::riscv::linker::displacement::tests::xlen_wrap_and_signed_boundary_are_not_host_overflows ... ok
+test backend::x86::linker::reloc_field::tests::an_offset_that_would_overflow_usize_is_rejected_not_wrapped ... ok
+test common::long_double::exponent_and_rounding_tests::round_shift_reports_carry_without_wrapping ... ok
+test driver::cli::cli_tests::signed_wrap_option_is_explicit_and_last_wins ... ok
+test frontend::sema::intrinsic_arity::tests::known_wrappers_and_primitives_carry_their_header_arity ... ok
+test ir::constants::low_mask_tests::low_mask_at_the_i64_boundary_is_not_wrapped_or_truncated ... ok
+test passes::inline::inline_limit_tests::multisite_loop_wrapper_policy_survives_a_later_inline_invocation ... ok
+test passes::iv_strength_reduce::tests::narrow_unsigned_affine_add_requires_an_operative_no_wrap_proof ... ok
+test passes::iv_strength_reduce::tests::unsigned_no_wrap_requires_header_polarity_unit_step_and_unsigned_cmp ... ok
+test passes::iv_strength_reduce::tests::unsigned_wrap_certificate_uses_the_decoded_limit ... ok
+test passes::iv_widen::tests::test_unsigned_shl_wrap_bails ... ok
+test backend::arm::assembler::elf_writer::branch_range_tests::out_of_range_cond_branch_is_diagnosed_not_wrapped ... ok
+test passes::iv_widen::tests::unsigned_wrap_step_is_declined_not_widened ... ok
+test passes::loop_unroll::tests::unroll_trip_extremes_never_wrap ... ok
+test passes::range_check::tests::u64_wrapped_empty_range_rejects ... ok
+test passes::simplify::exact_product_half_tests::exact_half_identity_includes_negative_wrapped_products ... ok
+test passes::vectorize::byte_lane_demotion_tests::range_arithmetic_saturates_instead_of_wrapping ... ok
+test passes::vectorize::map_offset_wrap_tests::doubled_add_map_offsets_need_a_range_proof_before_widening ... ok
+test passes::vectorize::map_offset_wrap_tests::dynamic_u64_versioning_proves_only_the_guarded_offset_range ... ok
+test passes::vectorize::map_offset_wrap_tests::emitted_u64_quotient_guard_bounds_bytes_and_keeps_unsafe_domains_scalar ... ok
+test passes::vectorize::map_offset_wrap_tests::map_scale_multiply_and_signed_add_are_checked_in_their_own_types ... ok
+test passes::vectorize::reduction_bound_safety_tests::nonzero_start_remainder_bound_clamps_empty_signed_ranges_without_wrapping ... ok
+test passes::signed_wrap_policy_tests::wrapping_policy_resets_for_every_translation_unit_and_level ... ok
+
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 4698 filtered out; finished in 0.00s
+

@@ -19,7 +19,11 @@ That recognition is the exact vec_arx target: lccc can match it and beat it
 (see 3-step rotate folding below), because ICX still pays 3 ops for rotl12/7
 where a fused shuffle form exists.
 
-## ICX lane form (disassembled, `results/oracle-chacha/chacha20_block-all/icx.s`)
+## ICX lane form (historical disassembly summary)
+
+The original ICX assembly was an ephemeral oracle artifact, not archived in
+this checkout. The observations below describe that earlier measurement; they
+are not a live assembly link or fresh validation of the current compiler.
 
 * State = 4 XMM registers, each holding one COLUMN (lane k of all four QRs).
 * Double rounds use the standard diagonalization: lane-rotate rows by

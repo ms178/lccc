@@ -131,6 +131,9 @@ const MULTI_BIT: u32 = 1 << 31;
 /// non-zero return as a "something changed" signal to iterate cooperating
 /// passes (DCE → simplifycfg → DCE, …).
 pub(crate) fn eliminate_dead_code(func: &mut IrFunction) -> usize {
+    if super::fp_environment_blocks_reordering(func) {
+        return 0;
+    }
     if func.blocks.is_empty() {
         return 0;
     }

@@ -906,7 +906,7 @@ pub(super) fn src_mentions_family(trimmed: &str, fam: RegId) -> bool {
 
 /// Count AT&T operands in `ops`, honoring the balanced-paren scanner so a SIB
 /// address's internal commas (`disp(%base,%idx,4)`) never split an operand.
-fn count_top_level_operands(ops: &str) -> usize {
+pub(super) fn count_top_level_operands(ops: &str) -> usize {
     let mut n = 0usize;
     let mut rest = ops.trim();
     if rest.is_empty() {
@@ -1089,6 +1089,28 @@ mod writes_family_tests {
         // 32-bit ALU forms zero-extend too.
         let info = classify_line("    addl %ecx, %eax");
         assert!(writes_family_full(&info, "addl %ecx, %eax", 0));
+    }
+
+    #[test]
+    fn architectural_implicit_operand_matrix() {
+        for line in include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/implicit_operands.tsv"
+        ))
+        .lines()
+        {
+            let fields: Vec<_> = line.split('\t').collect();
+            assert_eq!(fields.len(), 4);
+            let text = fields[0].to_owned();
+            let reads: u16 = fields[1].parse().unwrap();
+            let writes: u16 = fields[2].parse().unwrap();
+            let full: u16 = fields[3].parse().unwrap();
+            for asm in [text.clone(), format!("{text} # trailing comment")] {
+                assert_eq!(implicit_read_refs(asm.as_bytes()) & reads, reads, "{asm}");
+                assert_eq!(implicit_write_refs(asm.as_bytes()), writes, "{asm}");
+                assert_eq!(implicit_full_write_refs(asm.as_bytes()), full, "{asm}");
+            }
+        }
     }
 
     #[test]

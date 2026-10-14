@@ -42,11 +42,13 @@ import hot_loop_metric as H  # noqa: E402
 # Function -> expected group.
 VECTORIZED = {
     "max_i32",
+    "max_zero_start_dynamic_limit",
     "min_i32",
     "max_swapped",
     "min_le",
     "max_ge",
     "max_start1",
+    "max_start1_exit_iv",
     "max_const_init",
 }
 REFUSED = {
@@ -55,6 +57,10 @@ REFUSED = {
     "min_i16",
     "min_f32",          # NaN semantics: FP min/max needs -ffast-math
     "max_guarded",      # `continue`: not every iteration contributes
+    "max_empty_negative_start",  # nonzero signed byte-IV start lacks a range proof
+    "max_with_volatile_store",  # min/max legality rejects body side effects
+    "max_volatile_load",  # vector loads cannot replace volatile scalar reads
+    "sum_volatile_load",  # ordinary-reduction legality has the same load rule
     "max_with_sum",     # second accumulator (independent sum)
     "minmax_pair",      # second accumulator (min AND max)
 }

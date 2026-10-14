@@ -1430,6 +1430,9 @@ fn cross_type_load_cse_ok(
 }
 
 pub(crate) fn run_gvn_function_with_context(func: &mut IrFunction, context: &GvnContext) -> usize {
+    if super::fp_environment_blocks_reordering(func) {
+        return 0;
+    }
     let num_blocks = func.blocks.len();
     if num_blocks == 0 || function_uses_128(func) {
         return 0;
@@ -1469,6 +1472,9 @@ pub(crate) fn run_gvn_with_analysis_and_context(
     cfg: &analysis::CfgAnalysis,
     context: &GvnContext,
 ) -> usize {
+    if super::fp_environment_blocks_reordering(func) {
+        return 0;
+    }
     let num_blocks = func.blocks.len();
     if num_blocks == 0 || function_uses_128(func) {
         return 0;

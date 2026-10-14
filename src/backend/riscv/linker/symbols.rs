@@ -31,7 +31,7 @@ pub fn build_global_symbols(
             }
 
             if sym.shndx == SHN_UNDEF {
-                global_syms
+                let entry = global_syms
                     .entry(sym.name.to_string())
                     .or_insert_with(|| GlobalSym {
                         value: 0,
@@ -45,6 +45,11 @@ pub fn build_global_symbols(
                         got_offset: None,
                         section_idx: None,
                     });
+                // A weak reference seen first must not make a later strong
+                // unresolved reference optional (including hidden symbols).
+                if !entry.defined && sym.binding() == STB_GLOBAL {
+                    entry.binding = STB_GLOBAL;
+                }
                 continue;
             }
 
@@ -69,6 +74,9 @@ pub fn build_global_symbols(
                     entry.binding = sym.binding();
                     entry.sym_type = sym.sym_type();
                     entry.defined = true;
+                    // An absolute definition replacing a weak section symbol
+                    // no longer receives the old section's load address.
+                    entry.section_idx = None;
                 }
                 continue;
             }
@@ -113,6 +121,21 @@ pub fn build_global_symbols(
         }
     }
 
+    // The gABI combines visibility from ALL definitions and references, not
+    // just the winning definition. A hidden reference in a second TU must
+    // constrain a default-visible definition in either input order.
+    for (_, obj) in input_objs {
+        for sym in &obj.symbols {
+            if sym.binding() != STB_LOCAL && sym.visibility() != STV_DEFAULT {
+                if let Some(global) = global_syms.get_mut(sym.name.as_str()) {
+                    global.visibility = crate::backend::linker_common::most_constraining_visibility(
+                        global.visibility,
+                        sym.visibility(),
+                    );
+                }
+            }
+        }
+    }
     global_syms
 }
 

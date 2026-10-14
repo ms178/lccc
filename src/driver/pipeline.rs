@@ -93,6 +93,10 @@ pub struct Driver {
     /// fp_reassoc because GCC does not define __FAST_MATH__ for the individual
     /// -fassociative-math/-funsafe-math-optimizations options.
     pub(super) fast_math: bool,
+    /// -fwrapv makes signed Add/Sub/Mul modular; never infer no-wrap from C UB.
+    pub(super) wrap_signed_overflow: bool,
+    /// Explicitly observable FP traps; ordinary TUs retain the FENV-off policy.
+    pub(super) fp_trapping_math: bool,
     pub(super) verbose: bool,
     pub(super) mode: CompileMode,
     pub(super) debug_info: bool,
@@ -501,6 +505,8 @@ impl Driver {
             fp_contract: crate::common::fp_contract::FpContract::c_language_default(),
             fp_contract_explicit: false,
             fast_math: false,
+            wrap_signed_overflow: false,
+            fp_trapping_math: false,
             verbose: false,
             mode: CompileMode::Full,
             debug_info: false,
@@ -1683,6 +1689,7 @@ impl Driver {
         preprocessor.set_filename(filename);
         self.process_force_includes(&mut preprocessor)?;
         let preprocessed = preprocessor.preprocess(&source);
+        let fp_environment_observable = self.fp_trapping_math || preprocessor.fenv_access_requested;
         *self.last_dep_files.borrow_mut() = preprocessor.take_dep_files();
         if time_phases {
             eprintln!("[TIME] preprocess: {:.3}s", t0.elapsed().as_secs_f64());
@@ -2004,6 +2011,8 @@ impl Driver {
             self.opt_level,
             self.target,
             self.code16gcc,
+            self.wrap_signed_overflow,
+            fp_environment_observable,
             self.fp_reassoc,
             self.resolved_fp_contract(),
             // Code-generation ISA permission — one struct shared with the
@@ -2654,7 +2663,11 @@ impl Driver {
             data_sections: self.data_sections,
             code16gcc: self.code16gcc,
             regparm: self.regparm,
-            fp_contract: self.resolved_fp_contract(),
+            fp_contract: if fp_environment_observable {
+                crate::common::fp_contract::FpContract::Off
+            } else {
+                self.resolved_fp_contract()
+            },
             fma: self.enable_fma,
             preferred_stack_bytes: self.preferred_stack_bytes,
             omit_frame_pointer: self.omit_frame_pointer,

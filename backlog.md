@@ -186,16 +186,16 @@ Priority: **P0 correctness/evidence integrity**, **P1 high-leverage code quality
 Evidence: **R** reproduced here; **S** direct source fact, runtime consequence
 unproven; **H** hypothesis requiring an experiment.
 
-**Current upstream base:** `f764242` (PR #822).
-A14-05 is closed upstream; A14-14/19/29/30 are repaired; A14-01 is
+**Current upstream base:** `3ff36e85` (PR #826; also includes PR #827).
+A14-05 is closed upstream; A14-14/19/20/29/30 are repaired; A14-01/17 are
 partially repaired. A14-35 records a newly reproduced existing visibility defect.
-The queue contains **35 entries, 30 still open**. Original
+The queue contains **35 entries, 29 still open**. Original
 negative evidence retains its original base. Current implementation and measured
 trade-offs: [constant-GEP follow-up](engineering/FOLLOWUP-2026-10-14-constant-gep-fix.md)
 and [AArch64 contracts follow-up](engineering/FOLLOWUP-2026-10-14-arm-contracts.md).
 
 **Remaining implementation order:** A14-17/35/15/13
-(linker/ISA/encoding/type correctness), A14-20 (profile integrity), then
+(linker/ISA/encoding/type correctness), then
 A14-01/02/03 (evidence), before profitability work A14-24/25. Do not let a
 green fast-CI stamp override the known failures in this queue. Locations refer to baseline
 `3b66cd1`; use function names if lines move. Do not close an item merely by
@@ -461,6 +461,13 @@ all -f flags indiscriminately, breaking legitimate build-system probes.
 
 ### A14-17 · P0 · R — RISC-V shared linker silently drops unknown relocations
 
+**Status 2026-10-14D: PARTIAL.** Unknown/malformed relocation, ULEB and range
+contracts now pass 466 checks. Added shared R64/GOT/visibility/import/weak/ABS
+matrix passes 240 cases (fresh upstream: 10/240), plus 240 supplemental LLD19
+checks. Cross-target audit, dynamic TLS, shared calls and nonzero GOT addends
+remain open. Evidence: `engineering/FOLLOWUP-2026-10-14D-shared-binding.md`.
+The following diagnosis describes the original reproducer, not the repaired tree.
+
 **Where:** `src/backend/riscv/linker/reloc.rs::apply_relocation` default arm:
 error only when `!ctx.collect_relatives`; shared mode explicitly skips unknowns.
 **Reproducer:** assemble `.data; .quad missing` with Clang's RISC-V target;
@@ -523,7 +530,14 @@ kernel code does not use popcount builtins as a correctness justification.
 **Accept:** exact integer popcount results for zeros/all-ones/randoms, no FP/NEON
 references under the flag, default NEON path unchanged, cross-assembler legality.
 
-### A14-20 · P0 · R/S — PGO releases the file lock before stdio flush
+### A14-20 · P0 · R/S — **CLOSED 2026-10-14D** PGO releases the file lock before stdio flush
+
+**Resolution:** upstream keeps the lock through checked fclose, diagnoses I/O
+and lock errors, and enforces descriptor ownership/close-on-exec. Fresh current
+candidate: 72/72 PGO I/O checks, including concurrent writers and fault injection.
+This closes the stated locking/error contract, not atomic rollback after partial
+I/O. EINTR is diagnosed rather than retried. Evidence is in the 14D follow-up.
+The original diagnosis below is retained as history.
 
 **Where:** `src/pgo/instrument.rs::dump_helper`, LOCK_EX around 1098,
 LOCK_UN around 1433, `fclose` afterwards; no intervening `fflush`.

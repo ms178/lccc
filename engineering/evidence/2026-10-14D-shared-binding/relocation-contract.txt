@@ -1,0 +1,1 @@
+RISC-V relocation contract: 466 PASS / 0 FAIL / 0 SKIP

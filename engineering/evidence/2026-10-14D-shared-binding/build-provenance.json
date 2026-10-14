@@ -1,0 +1,27 @@
+{
+  "base": "3ff36e8592b0d0e26645bf37d6685395b1a6eca5",
+  "candidate_source_commit": "14b6d37d00662251c9d9a9c2ff3f3d8432f92fda",
+  "build_policy": "independent worktrees and target dirs; fastbuild O1 j2; CARGO_PROFILE_FASTBUILD_DEBUG=0 CARGO_INCREMENTAL=0; 4 GiB active swap",
+  "binaries": {
+    "base": {
+      "path": "/home/user/.cache/reference-source/target/fastbuild/lccc",
+      "sha256": "c7589bb428d970ac336b12da28f08800cc99219529eb2e316aa2a88ac858f6e2"
+    },
+    "candidate": {
+      "path": "/home/user/.cache/lccc/target/fastbuild/lccc",
+      "sha256": "c104a49dd2b00378ad303a9b1b7f23c165bfc49810b312b985f836813e225c45"
+    }
+  },
+  "source_sha256": {
+    "base": {
+      "src/backend/riscv/linker/reloc.rs": "a09799c21288147a6feff74b83847015f6519abd613360a42ea63b1f40fc2015",
+      "src/backend/riscv/linker/symbols.rs": "bfc5f4fe2bea28a5ae8d539fc7be229934f92aca8c0dd14e401eff5d9cbab3cd",
+      "src/backend/riscv/linker/emit_shared.rs": "847fd862da1594fb728257f76e79d4ac7c438b88b906c7aa100325e6bbbb7206"
+    },
+    "candidate": {
+      "src/backend/riscv/linker/reloc.rs": "f86bb91c6c6077d60ff66566e508e7fcf6f3b2337350c4b578b8e1db393e9b6f",
+      "src/backend/riscv/linker/symbols.rs": "7af0650ad978ce99e5fd6ed996947b7eae620a3eabb1baa484d624516b6a114c",
+      "src/backend/riscv/linker/emit_shared.rs": "f29e9bfeafa9babb528092db9aa7897e1879ef7ae68c03a7cbb79d4cff338921"
+    }
+  }
+}

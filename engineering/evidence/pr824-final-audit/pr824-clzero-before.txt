@@ -1,0 +1,47 @@
+   Compiling lccc v0.1.0 (/home/user/.cache/lccc)
+    Finished `fastbuild` profile [optimized] target(s) in 3m 18s
+     Running unittests src/lib.rs (target/fastbuild/deps/lccc-2790982c43eeadfa)
+
+running 3 tests
+test backend::x86::codegen::peephole::passes::dead_writes::tests::clzero_is_an_implicit_memory_writer ... FAILED
+test backend::x86::codegen::peephole::passes::dead_writes::tests::clzero_implicit_address_setup_survives_the_full_pipeline ... FAILED
+test backend::x86::codegen::peephole::passes::dead_writes::tests::clzero_prevents_stale_reload_reuse_directly_and_in_full_pipeline ... FAILED
+
+failures:
+
+---- backend::x86::codegen::peephole::passes::dead_writes::tests::clzero_is_an_implicit_memory_writer stdout ----
+
+thread 'backend::x86::codegen::peephole::passes::dead_writes::tests::clzero_is_an_implicit_memory_writer' (620139) panicked at src/backend/x86/codegen/peephole/passes/dead_writes.rs:2775:9:
+assertion failed: line_writes_memory("clzero")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- backend::x86::codegen::peephole::passes::dead_writes::tests::clzero_implicit_address_setup_survives_the_full_pipeline stdout ----
+
+thread 'backend::x86::codegen::peephole::passes::dead_writes::tests::clzero_implicit_address_setup_survives_the_full_pipeline' (620138) panicked at src/backend/x86/codegen/peephole/passes/dead_writes.rs:2781:9:
+assertion `left != right` failed: implicit rax read
+  left: 0
+ right: 0
+
+---- backend::x86::codegen::peephole::passes::dead_writes::tests::clzero_prevents_stale_reload_reuse_directly_and_in_full_pipeline stdout ----
+
+thread 'backend::x86::codegen::peephole::passes::dead_writes::tests::clzero_prevents_stale_reload_reuse_directly_and_in_full_pipeline' (620140) panicked at src/backend/x86/codegen/peephole/passes/dead_writes.rs:2797:13:
+reused pre-CLZERO bytes: f:
+.cfi_startproc
+movq (%rdi), %r8
+movq %rdi, %rax
+clzero
+movq %r8, %r9
+addq %r8, %r9
+movq %r9, %rax
+ret
+.cfi_endproc
+
+
+failures:
+    backend::x86::codegen::peephole::passes::dead_writes::tests::clzero_implicit_address_setup_survives_the_full_pipeline
+    backend::x86::codegen::peephole::passes::dead_writes::tests::clzero_is_an_implicit_memory_writer
+    backend::x86::codegen::peephole::passes::dead_writes::tests::clzero_prevents_stale_reload_reuse_directly_and_in_full_pipeline
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 4735 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

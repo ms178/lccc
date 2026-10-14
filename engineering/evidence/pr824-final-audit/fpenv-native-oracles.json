@@ -1,0 +1,134 @@
+[
+  {
+    "name": "before",
+    "case": "trap-order",
+    "command": [
+      "/home/user/.cache/pr824-measurements/wrap-range-lccc",
+      "-O2",
+      "-march=x86-64-v3",
+      "-ftrapping-math",
+      "-ffp-contract=off",
+      "tests/regression/strict_recip_traps.c",
+      "-lm",
+      "-o",
+      "/home/user/.cache/pr824-static/fpenv-before-trap-order"
+    ],
+    "status": 43
+  },
+  {
+    "name": "before",
+    "case": "empty-loop",
+    "command": [
+      "/home/user/.cache/pr824-measurements/wrap-range-lccc",
+      "-O2",
+      "-march=x86-64-v3",
+      "-ftrapping-math",
+      "-ffp-contract=off",
+      "-DONLY_EMPTY",
+      "tests/regression/strict_recip_traps.c",
+      "-lm",
+      "-o",
+      "/home/user/.cache/pr824-static/fpenv-before-empty-loop"
+    ],
+    "status": 0
+  },
+  {
+    "name": "fixed",
+    "case": "trap-order",
+    "command": [
+      "target/fastbuild/lccc",
+      "-O2",
+      "-march=x86-64-v3",
+      "-ftrapping-math",
+      "-ffp-contract=off",
+      "tests/regression/strict_recip_traps.c",
+      "-lm",
+      "-o",
+      "/home/user/.cache/pr824-static/fpenv-fixed-trap-order"
+    ],
+    "status": 0
+  },
+  {
+    "name": "fixed",
+    "case": "empty-loop",
+    "command": [
+      "target/fastbuild/lccc",
+      "-O2",
+      "-march=x86-64-v3",
+      "-ftrapping-math",
+      "-ffp-contract=off",
+      "-DONLY_EMPTY",
+      "tests/regression/strict_recip_traps.c",
+      "-lm",
+      "-o",
+      "/home/user/.cache/pr824-static/fpenv-fixed-empty-loop"
+    ],
+    "status": 0
+  },
+  {
+    "name": "gcc16",
+    "case": "trap-order",
+    "command": [
+      "/home/user/.cache/oracles/gcc-16.2.0/bin/gcc",
+      "-O2",
+      "-march=x86-64-v3",
+      "-ftrapping-math",
+      "-ffp-contract=off",
+      "tests/regression/strict_recip_traps.c",
+      "-lm",
+      "-o",
+      "/home/user/.cache/pr824-static/fpenv-gcc16-trap-order"
+    ],
+    "status": 0
+  },
+  {
+    "name": "gcc16",
+    "case": "empty-loop",
+    "command": [
+      "/home/user/.cache/oracles/gcc-16.2.0/bin/gcc",
+      "-O2",
+      "-march=x86-64-v3",
+      "-ftrapping-math",
+      "-ffp-contract=off",
+      "-DONLY_EMPTY",
+      "tests/regression/strict_recip_traps.c",
+      "-lm",
+      "-o",
+      "/home/user/.cache/pr824-static/fpenv-gcc16-empty-loop"
+    ],
+    "status": 0
+  },
+  {
+    "name": "clang23",
+    "case": "trap-order",
+    "command": [
+      "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+      "-O2",
+      "-march=x86-64-v3",
+      "-ftrapping-math",
+      "-ffp-contract=off",
+      "tests/regression/strict_recip_traps.c",
+      "-lm",
+      "-o",
+      "/home/user/.cache/pr824-static/fpenv-clang23-trap-order"
+    ],
+    "status": 0
+  },
+  {
+    "name": "clang23",
+    "case": "empty-loop",
+    "command": [
+      "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+      "-O2",
+      "-march=x86-64-v3",
+      "-ftrapping-math",
+      "-ffp-contract=off",
+      "-DONLY_EMPTY",
+      "tests/regression/strict_recip_traps.c",
+      "-lm",
+      "-o",
+      "/home/user/.cache/pr824-static/fpenv-clang23-empty-loop"
+    ],
+    "status": 0
+  }
+]

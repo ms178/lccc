@@ -1,0 +1,104 @@
+{
+  "complete": true,
+  "metric": "bounded whole-program simulated Ir; not runtime",
+  "selected": [
+    "byte_load_reassembly",
+    "expat_xml_scan",
+    "spectral_norm"
+  ],
+  "results": {
+    "spectral_norm": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=128",
+      "metrics": {
+        "conditional_mispredicts": [
+          8576,
+          8583
+        ],
+        "d1_misses": [
+          1931,
+          1932
+        ],
+        "i1_misses": [
+          1422,
+          1421
+        ],
+        "indirect_mispredicts": [
+          233,
+          233
+        ],
+        "ir_mine": 5326546,
+        "ir_ratio": 0.6448442084858417,
+        "ir_ref": 8260206,
+        "ll_misses": [
+          2964,
+          2964
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/packed-initial/spectral_norm/manifest.json"
+    },
+    "byte_load_reassembly": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+      "metrics": {
+        "conditional_mispredicts": [
+          23362,
+          23362
+        ],
+        "d1_misses": [
+          1949,
+          1949
+        ],
+        "i1_misses": [
+          1382,
+          1382
+        ],
+        "indirect_mispredicts": [
+          237,
+          237
+        ],
+        "ir_mine": 72111979,
+        "ir_ratio": 1.0,
+        "ir_ref": 72111979,
+        "ll_misses": [
+          2990,
+          2990
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/packed-initial/byte_load_reassembly/manifest.json"
+    },
+    "expat_xml_scan": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DXML_SIZE=16384 -DPASSES=4",
+      "metrics": {
+        "conditional_mispredicts": [
+          25504,
+          25504
+        ],
+        "d1_misses": [
+          2180,
+          2180
+        ],
+        "i1_misses": [
+          1363,
+          1363
+        ],
+        "indirect_mispredicts": [
+          232,
+          232
+        ],
+        "ir_mine": 1651396,
+        "ir_ratio": 1.0,
+        "ir_ref": 1651396,
+        "ll_misses": [
+          3158,
+          3158
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/packed-initial/expat_xml_scan/manifest.json"
+    }
+  },
+  "failures": [],
+  "worst_first": [
+    "byte_load_reassembly",
+    "expat_xml_scan",
+    "spectral_norm"
+  ]
+}

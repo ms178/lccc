@@ -1,0 +1,290 @@
+{
+  "complete": true,
+  "failures": [],
+  "cases": [
+    {
+      "label": "lccc",
+      "abi": "x86-64-v3",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-march=x86-64-v3",
+        "/home/user/.cache/lccc/tests/regression/readonly_reduction_guard.c",
+        "-o",
+        "/tmp/lccc-readonly-guard-a9yu1mxt/lccc-x86-64-v3"
+      ],
+      "environment": {},
+      "compiler_sha256": "c073a29411fc44ad20ec1b6bb970e5d5f5ae9b17f1d8dd74b03dabeb279d91ec",
+      "compiler_version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone\n",
+      "build_status": 0,
+      "build_log": "",
+      "native_status": 0,
+      "stdout": "d3a1ee5f\n",
+      "memcheck_status": 0,
+      "memcheck_log": "==652770== Memcheck, a memory error detector\n==652770== Copyright (C) 2002-2024, and GNU GPL'd, by Julian Seward et al.\n==652770== Using Valgrind-3.24.0 and LibVEX; rerun with -h for copyright info\n==652770== Command: /tmp/lccc-readonly-guard-a9yu1mxt/lccc-x86-64-v3\n==652770== \n==652770== \n==652770== HEAP SUMMARY:\n==652770==     in use at exit: 0 bytes in 0 blocks\n==652770==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==652770== \n==652770== All heap blocks were freed -- no leaks are possible\n==652770== \n==652770== For lists of detected and suppressed errors, rerun with: -s\n==652770== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n"
+    },
+    {
+      "label": "lccc",
+      "abi": "i686-SSE2",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-m32",
+        "-march=i686",
+        "-msse2",
+        "/home/user/.cache/lccc/tests/regression/readonly_reduction_guard.c",
+        "-o",
+        "/tmp/lccc-readonly-guard-a9yu1mxt/lccc-i686-SSE2"
+      ],
+      "environment": {},
+      "compiler_sha256": "c073a29411fc44ad20ec1b6bb970e5d5f5ae9b17f1d8dd74b03dabeb279d91ec",
+      "compiler_version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone\n",
+      "build_status": 0,
+      "build_log": "",
+      "native_status": 0,
+      "stdout": "d3a1ee5f\n",
+      "memcheck_status": 0,
+      "memcheck_log": "==652774== Memcheck, a memory error detector\n==652774== Copyright (C) 2002-2024, and GNU GPL'd, by Julian Seward et al.\n==652774== Using Valgrind-3.24.0 and LibVEX; rerun with -h for copyright info\n==652774== Command: /tmp/lccc-readonly-guard-a9yu1mxt/lccc-i686-SSE2\n==652774== \n==652774== \n==652774== HEAP SUMMARY:\n==652774==     in use at exit: 0 bytes in 0 blocks\n==652774==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==652774== \n==652774== All heap blocks were freed -- no leaks are possible\n==652774== \n==652774== For lists of detected and suppressed errors, rerun with: -s\n==652774== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n"
+    },
+    {
+      "label": "lccc-O3",
+      "abi": "x86-64-v3",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-O3",
+        "-fwrapv",
+        "-march=x86-64-v3",
+        "/home/user/.cache/lccc/tests/regression/readonly_reduction_guard.c",
+        "-o",
+        "/tmp/lccc-readonly-guard-a9yu1mxt/lccc-O3-x86-64-v3"
+      ],
+      "environment": {},
+      "compiler_sha256": "c073a29411fc44ad20ec1b6bb970e5d5f5ae9b17f1d8dd74b03dabeb279d91ec",
+      "compiler_version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone\n",
+      "build_status": 0,
+      "build_log": "",
+      "native_status": 0,
+      "stdout": "d3a1ee5f\n",
+      "memcheck_status": 0,
+      "memcheck_log": "==652780== Memcheck, a memory error detector\n==652780== Copyright (C) 2002-2024, and GNU GPL'd, by Julian Seward et al.\n==652780== Using Valgrind-3.24.0 and LibVEX; rerun with -h for copyright info\n==652780== Command: /tmp/lccc-readonly-guard-a9yu1mxt/lccc-O3-x86-64-v3\n==652780== \n==652780== \n==652780== HEAP SUMMARY:\n==652780==     in use at exit: 0 bytes in 0 blocks\n==652780==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==652780== \n==652780== All heap blocks were freed -- no leaks are possible\n==652780== \n==652780== For lists of detected and suppressed errors, rerun with: -s\n==652780== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n"
+    },
+    {
+      "label": "lccc-O3",
+      "abi": "i686-SSE2",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-O3",
+        "-fwrapv",
+        "-m32",
+        "-march=i686",
+        "-msse2",
+        "/home/user/.cache/lccc/tests/regression/readonly_reduction_guard.c",
+        "-o",
+        "/tmp/lccc-readonly-guard-a9yu1mxt/lccc-O3-i686-SSE2"
+      ],
+      "environment": {},
+      "compiler_sha256": "c073a29411fc44ad20ec1b6bb970e5d5f5ae9b17f1d8dd74b03dabeb279d91ec",
+      "compiler_version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone\n",
+      "build_status": 0,
+      "build_log": "",
+      "native_status": 0,
+      "stdout": "d3a1ee5f\n",
+      "memcheck_status": 0,
+      "memcheck_log": "==652784== Memcheck, a memory error detector\n==652784== Copyright (C) 2002-2024, and GNU GPL'd, by Julian Seward et al.\n==652784== Using Valgrind-3.24.0 and LibVEX; rerun with -h for copyright info\n==652784== Command: /tmp/lccc-readonly-guard-a9yu1mxt/lccc-O3-i686-SSE2\n==652784== \n==652784== \n==652784== HEAP SUMMARY:\n==652784==     in use at exit: 0 bytes in 0 blocks\n==652784==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==652784== \n==652784== All heap blocks were freed -- no leaks are possible\n==652784== \n==652784== For lists of detected and suppressed errors, rerun with: -s\n==652784== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n"
+    },
+    {
+      "label": "no-readonly",
+      "abi": "x86-64-v3",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-march=x86-64-v3",
+        "/home/user/.cache/lccc/tests/regression/readonly_reduction_guard.c",
+        "-o",
+        "/tmp/lccc-readonly-guard-a9yu1mxt/no-readonly-x86-64-v3"
+      ],
+      "environment": {
+        "CCC_DISABLE_PASSES": "readonly_reduction_unroll"
+      },
+      "compiler_sha256": "c073a29411fc44ad20ec1b6bb970e5d5f5ae9b17f1d8dd74b03dabeb279d91ec",
+      "compiler_version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone\n",
+      "build_status": 0,
+      "build_log": "",
+      "native_status": 0,
+      "stdout": "d3a1ee5f\n",
+      "memcheck_status": 0,
+      "memcheck_log": "==652790== Memcheck, a memory error detector\n==652790== Copyright (C) 2002-2024, and GNU GPL'd, by Julian Seward et al.\n==652790== Using Valgrind-3.24.0 and LibVEX; rerun with -h for copyright info\n==652790== Command: /tmp/lccc-readonly-guard-a9yu1mxt/no-readonly-x86-64-v3\n==652790== \n==652790== \n==652790== HEAP SUMMARY:\n==652790==     in use at exit: 0 bytes in 0 blocks\n==652790==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==652790== \n==652790== All heap blocks were freed -- no leaks are possible\n==652790== \n==652790== For lists of detected and suppressed errors, rerun with: -s\n==652790== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n"
+    },
+    {
+      "label": "no-readonly",
+      "abi": "i686-SSE2",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-m32",
+        "-march=i686",
+        "-msse2",
+        "/home/user/.cache/lccc/tests/regression/readonly_reduction_guard.c",
+        "-o",
+        "/tmp/lccc-readonly-guard-a9yu1mxt/no-readonly-i686-SSE2"
+      ],
+      "environment": {
+        "CCC_DISABLE_PASSES": "readonly_reduction_unroll"
+      },
+      "compiler_sha256": "c073a29411fc44ad20ec1b6bb970e5d5f5ae9b17f1d8dd74b03dabeb279d91ec",
+      "compiler_version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone\n",
+      "build_status": 0,
+      "build_log": "",
+      "native_status": 0,
+      "stdout": "d3a1ee5f\n",
+      "memcheck_status": 0,
+      "memcheck_log": "==652794== Memcheck, a memory error detector\n==652794== Copyright (C) 2002-2024, and GNU GPL'd, by Julian Seward et al.\n==652794== Using Valgrind-3.24.0 and LibVEX; rerun with -h for copyright info\n==652794== Command: /tmp/lccc-readonly-guard-a9yu1mxt/no-readonly-i686-SSE2\n==652794== \n==652794== \n==652794== HEAP SUMMARY:\n==652794==     in use at exit: 0 bytes in 0 blocks\n==652794==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==652794== \n==652794== All heap blocks were freed -- no leaks are possible\n==652794== \n==652794== For lists of detected and suppressed errors, rerun with: -s\n==652794== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n"
+    },
+    {
+      "label": "no-pre-fold",
+      "abi": "x86-64-v3",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-march=x86-64-v3",
+        "/home/user/.cache/lccc/tests/regression/readonly_reduction_guard.c",
+        "-o",
+        "/tmp/lccc-readonly-guard-a9yu1mxt/no-pre-fold-x86-64-v3"
+      ],
+      "environment": {
+        "CCC_DISABLE_PASSES": "byte_load_pre_unroll"
+      },
+      "compiler_sha256": "c073a29411fc44ad20ec1b6bb970e5d5f5ae9b17f1d8dd74b03dabeb279d91ec",
+      "compiler_version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone\n",
+      "build_status": 0,
+      "build_log": "",
+      "native_status": 0,
+      "stdout": "d3a1ee5f\n",
+      "memcheck_status": 0,
+      "memcheck_log": "==652800== Memcheck, a memory error detector\n==652800== Copyright (C) 2002-2024, and GNU GPL'd, by Julian Seward et al.\n==652800== Using Valgrind-3.24.0 and LibVEX; rerun with -h for copyright info\n==652800== Command: /tmp/lccc-readonly-guard-a9yu1mxt/no-pre-fold-x86-64-v3\n==652800== \n==652800== \n==652800== HEAP SUMMARY:\n==652800==     in use at exit: 0 bytes in 0 blocks\n==652800==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==652800== \n==652800== All heap blocks were freed -- no leaks are possible\n==652800== \n==652800== For lists of detected and suppressed errors, rerun with: -s\n==652800== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n"
+    },
+    {
+      "label": "no-pre-fold",
+      "abi": "i686-SSE2",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-m32",
+        "-march=i686",
+        "-msse2",
+        "/home/user/.cache/lccc/tests/regression/readonly_reduction_guard.c",
+        "-o",
+        "/tmp/lccc-readonly-guard-a9yu1mxt/no-pre-fold-i686-SSE2"
+      ],
+      "environment": {
+        "CCC_DISABLE_PASSES": "byte_load_pre_unroll"
+      },
+      "compiler_sha256": "c073a29411fc44ad20ec1b6bb970e5d5f5ae9b17f1d8dd74b03dabeb279d91ec",
+      "compiler_version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone\n",
+      "build_status": 0,
+      "build_log": "",
+      "native_status": 0,
+      "stdout": "d3a1ee5f\n",
+      "memcheck_status": 0,
+      "memcheck_log": "==652804== Memcheck, a memory error detector\n==652804== Copyright (C) 2002-2024, and GNU GPL'd, by Julian Seward et al.\n==652804== Using Valgrind-3.24.0 and LibVEX; rerun with -h for copyright info\n==652804== Command: /tmp/lccc-readonly-guard-a9yu1mxt/no-pre-fold-i686-SSE2\n==652804== \n==652804== \n==652804== HEAP SUMMARY:\n==652804==     in use at exit: 0 bytes in 0 blocks\n==652804==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==652804== \n==652804== All heap blocks were freed -- no leaks are possible\n==652804== \n==652804== For lists of detected and suppressed errors, rerun with: -s\n==652804== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n"
+    },
+    {
+      "label": "gcc",
+      "abi": "x86-64-v3",
+      "command": [
+        "/home/user/.cache/oracles/gcc-16.2.0/bin/gcc",
+        "-O2",
+        "-fwrapv",
+        "-march=x86-64-v3",
+        "/home/user/.cache/lccc/tests/regression/readonly_reduction_guard.c",
+        "-o",
+        "/tmp/lccc-readonly-guard-a9yu1mxt/gcc-x86-64-v3"
+      ],
+      "environment": {},
+      "compiler_sha256": "c9956b02c551225a721b994bda8eca1813770ed6d9eada4a1f16a765d1bc782e",
+      "compiler_version": "gcc (Compiler-Explorer-Build-gcc--binutils-2.44) 16.2.0\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+      "build_status": 0,
+      "build_log": "",
+      "native_status": 0,
+      "stdout": "d3a1ee5f\n",
+      "memcheck_status": 0,
+      "memcheck_log": "==652812== Memcheck, a memory error detector\n==652812== Copyright (C) 2002-2024, and GNU GPL'd, by Julian Seward et al.\n==652812== Using Valgrind-3.24.0 and LibVEX; rerun with -h for copyright info\n==652812== Command: /tmp/lccc-readonly-guard-a9yu1mxt/gcc-x86-64-v3\n==652812== \n==652812== \n==652812== HEAP SUMMARY:\n==652812==     in use at exit: 0 bytes in 0 blocks\n==652812==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==652812== \n==652812== All heap blocks were freed -- no leaks are possible\n==652812== \n==652812== For lists of detected and suppressed errors, rerun with: -s\n==652812== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n"
+    },
+    {
+      "label": "gcc",
+      "abi": "i686-SSE2",
+      "command": [
+        "/home/user/.cache/oracles/gcc-16.2.0/bin/gcc",
+        "-O2",
+        "-fwrapv",
+        "-m32",
+        "-march=i686",
+        "-msse2",
+        "/home/user/.cache/lccc/tests/regression/readonly_reduction_guard.c",
+        "-o",
+        "/tmp/lccc-readonly-guard-a9yu1mxt/gcc-i686-SSE2"
+      ],
+      "environment": {},
+      "compiler_sha256": "c9956b02c551225a721b994bda8eca1813770ed6d9eada4a1f16a765d1bc782e",
+      "compiler_version": "gcc (Compiler-Explorer-Build-gcc--binutils-2.44) 16.2.0\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+      "build_status": 0,
+      "build_log": "",
+      "native_status": 0,
+      "stdout": "d3a1ee5f\n",
+      "memcheck_status": 0,
+      "memcheck_log": "==652820== Memcheck, a memory error detector\n==652820== Copyright (C) 2002-2024, and GNU GPL'd, by Julian Seward et al.\n==652820== Using Valgrind-3.24.0 and LibVEX; rerun with -h for copyright info\n==652820== Command: /tmp/lccc-readonly-guard-a9yu1mxt/gcc-i686-SSE2\n==652820== \n==652820== \n==652820== HEAP SUMMARY:\n==652820==     in use at exit: 0 bytes in 0 blocks\n==652820==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==652820== \n==652820== All heap blocks were freed -- no leaks are possible\n==652820== \n==652820== For lists of detected and suppressed errors, rerun with: -s\n==652820== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n"
+    },
+    {
+      "label": "clang",
+      "abi": "x86-64-v3",
+      "command": [
+        "/home/user/.cache/oracles/clang-23.1.0/bin/clang-23",
+        "-O2",
+        "-fwrapv",
+        "-march=x86-64-v3",
+        "/home/user/.cache/lccc/tests/regression/readonly_reduction_guard.c",
+        "-o",
+        "/tmp/lccc-readonly-guard-a9yu1mxt/clang-x86-64-v3"
+      ],
+      "environment": {},
+      "compiler_sha256": "d9d167ada281dfaeb1fe996ecb26fe69d70684e4b2a3278759f7152123774793",
+      "compiler_version": "clang version 23.1.0 (https://github.com/llvm/llvm-project.git ea7d852a70e8bdfaf601d6626a760f9771b2c4b4)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /home/user/.cache/oracles/clang-23.1.0/bin\n",
+      "build_status": 0,
+      "build_log": "",
+      "native_status": 0,
+      "stdout": "d3a1ee5f\n",
+      "memcheck_status": 0,
+      "memcheck_log": "==652826== Memcheck, a memory error detector\n==652826== Copyright (C) 2002-2024, and GNU GPL'd, by Julian Seward et al.\n==652826== Using Valgrind-3.24.0 and LibVEX; rerun with -h for copyright info\n==652826== Command: /tmp/lccc-readonly-guard-a9yu1mxt/clang-x86-64-v3\n==652826== \n==652826== \n==652826== HEAP SUMMARY:\n==652826==     in use at exit: 0 bytes in 0 blocks\n==652826==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==652826== \n==652826== All heap blocks were freed -- no leaks are possible\n==652826== \n==652826== For lists of detected and suppressed errors, rerun with: -s\n==652826== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n"
+    },
+    {
+      "label": "clang",
+      "abi": "i686-SSE2",
+      "command": [
+        "/home/user/.cache/oracles/clang-23.1.0/bin/clang-23",
+        "-O2",
+        "-fwrapv",
+        "-m32",
+        "-march=i686",
+        "-msse2",
+        "/home/user/.cache/lccc/tests/regression/readonly_reduction_guard.c",
+        "-o",
+        "/tmp/lccc-readonly-guard-a9yu1mxt/clang-i686-SSE2"
+      ],
+      "environment": {},
+      "compiler_sha256": "d9d167ada281dfaeb1fe996ecb26fe69d70684e4b2a3278759f7152123774793",
+      "compiler_version": "clang version 23.1.0 (https://github.com/llvm/llvm-project.git ea7d852a70e8bdfaf601d6626a760f9771b2c4b4)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /home/user/.cache/oracles/clang-23.1.0/bin\n",
+      "build_status": 0,
+      "build_log": "",
+      "native_status": 0,
+      "stdout": "d3a1ee5f\n",
+      "memcheck_status": 0,
+      "memcheck_log": "==652831== Memcheck, a memory error detector\n==652831== Copyright (C) 2002-2024, and GNU GPL'd, by Julian Seward et al.\n==652831== Using Valgrind-3.24.0 and LibVEX; rerun with -h for copyright info\n==652831== Command: /tmp/lccc-readonly-guard-a9yu1mxt/clang-i686-SSE2\n==652831== \n==652831== \n==652831== HEAP SUMMARY:\n==652831==     in use at exit: 0 bytes in 0 blocks\n==652831==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==652831== \n==652831== All heap blocks were freed -- no leaks are possible\n==652831== \n==652831== For lists of detected and suppressed errors, rerun with: -s\n==652831== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n"
+    }
+  ]
+}

@@ -1,0 +1,163 @@
+name: Debian exact-version oracle
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: debian-oracle-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  corpus:
+    name: Debian GCC 16.2 / Rust 1.99 corpus
+    runs-on: ubuntu-24.04
+    container: debian:sid-slim
+    timeout-minutes: 30
+    env:
+      RUSTUP_TOOLCHAIN: 1.99.0
+      CARGO_BUILD_JOBS: "2"
+      RUSTFLAGS: -D warnings
+    steps:
+      # Use actual Debian packages, not Ubuntu's PPA or a CE alias. Refuse a
+      # changed version rather than labelling a rolling package as GCC 16.2.
+      - name: Install Debian toolchain and report package identity
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends gcc-16 g++-16 gcc binutils libc6-dev valgrind python3 ca-certificates curl git
+          test "$(gcc-16 -dumpfullversion)" = 16.2.0
+          dpkg-query -W gcc-16 g++-16 libc6-dev binutils
+          gcc-16 --version
+
+      - uses: actions/checkout@v7
+
+      - name: Verify checkout identity in the container
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Verify architectural controls with Debian GCC
+        env:
+          GCC: gcc-16
+        run: bash tests/regression/check_vex_flag_reads.sh
+
+      - name: Install exact Rust compiler, formatter and linter
+        uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Verify exact Rust release
+        run: |
+          rustc -Vv
+          cargo --version
+          rustfmt --version
+          cargo clippy --version
+          test "$(rustc --version | cut -d' ' -f2)" = 1.99.0
+          test "$(cargo --version | cut -d' ' -f2)" = 1.99.0
+
+      - name: Build compiler from this checkout
+        run: cargo build --profile fastbuild --locked --bin lccc -j 2
+
+      # The normal benchmark workflow supplies paired timing. This lane is
+      # independent distribution/exact-toolchain correctness evidence, not a
+      # second runtime ranking. No --only: the registry defines coverage.
+      - name: Execute every registered workload against Debian GCC
+        run: |
+          python3 tests/benchmark/run_benchmarks.py \
+            --lccc target/fastbuild/lccc --gcc gcc-16 --compilers lccc,gcc \
+            --skip-perf --no-pmu-probe --strict \
+            --artifact-dir debian-artifacts --json debian-results.json \
+            --markdown debian-summary.md
+
+      - name: Screen every registered workload with Callgrind
+        run: |
+          valgrind --version
+          python3 scripts/callgrind_corpus.py \
+            --mine target/fastbuild/lccc --ref gcc-16 \
+            --gcc-include-command gcc-16 --out debian-callgrind
+
+      - name: Surface per-workload evidence through the checks API
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          path = Path('debian-results.json')
+          if path.exists():
+              data = json.loads(path.read_text())
+              def notice(title, payload):
+                  text = json.dumps(payload, separators=(',', ':'))
+                  assert len(text.encode()) <= 3900, 'annotation exceeds observed checks-API budget'
+                  text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+                  print(f'::notice title={title}::{text}')
+              from tests.benchmark.run_benchmarks import BENCHMARKS
+              expected = {row.name for row in BENCHMARKS}
+              rows = data['benchmarks']
+              actual = [row['name'] for row in rows]
+              assert len(actual) == len(expected) and set(actual) == expected, 'incomplete corpus evidence'
+              notice('Debian oracle identity', {
+                  'compiler_versions': data['metadata']['compiler_versions'],
+                  'git': data['metadata']['git'], 'settings': data['settings'],
+                  'complete_registry': sorted(expected), 'workloads': len(rows),
+                  'report_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                  'artifact': 'debian-exact-oracle/debian-results.json',
+              })
+              def digest(value):
+                  return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+              # API annotations were empirically truncated at 4096 bytes,
+              # independently of the ten-notice limit. Publish bounded hashes
+              # and verdicts here; complete outputs/commands stay in artifacts.
+              compact = []
+              for row in rows:
+                  compact.append({
+                      'name': row['name'],
+                      'source_sha256': row['compile']['lccc']['source_sha256'],
+                      'matches': row['correctness']['lccc']['matches_baseline'],
+                      'compile_ok': {key: value['ok'] for key, value in row['compile'].items()},
+                      'output_sha256': {key: digest(value['output']) for key, value in row['correctness'].items()},
+                      'command_sha256': {key: digest(value['command']) for key, value in row['compile'].items()},
+                  })
+              batch_size = max(1, (len(compact) + 6) // 7)
+              for start in range(0, len(compact), batch_size):
+                  group = compact[start:start + batch_size]
+                  notice(f'Debian workloads {start + 1}-{start + len(group)}', group)
+              screen_path = Path('debian-callgrind/index.json')
+              if screen_path.exists():
+                  screen = json.loads(screen_path.read_text())
+                  assert screen['complete'] and not screen['failures'], 'incomplete Callgrind screen'
+                  assert set(screen['results']) == expected, 'incomplete Callgrind corpus'
+                  compact = []
+                  for name, row in screen['results'].items():
+                      m = row['metrics']
+                      compact.append([name, m['ir_mine'], m['ir_ref'],
+                                      *m['d1_misses'], *m['ll_misses']])
+                  for start in range(0, len(compact), 23):
+                      notice(f'Debian Callgrind {start + 1}-{min(start + 23, len(compact))}', {
+                          'metric': 'bounded whole-program simulated counters, NOT runtime',
+                          'columns': ['case', 'Ir_lccc', 'Ir_gcc', 'D1miss_lccc', 'D1miss_gcc',
+                                      'LLmiss_lccc', 'LLmiss_gcc'],
+                          'index_sha256': hashlib.sha256(screen_path.read_bytes()).hexdigest(),
+                          'rows': compact[start:start + 23],
+                      })
+          PY
+          if [ -f debian-summary.md ]; then cat debian-summary.md >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - name: Retain complete commands, outputs and binary evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: debian-exact-oracle
+          path: |
+            debian-results.json
+            debian-summary.md
+            debian-artifacts/
+            debian-callgrind/
+          if-no-files-found: warn
