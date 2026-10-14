@@ -1,0 +1,1 @@
+map-i64-two-lane: x86-64 AVX2/SSE2 runtime+GCC+scalar, i686 scalar assembly PASS

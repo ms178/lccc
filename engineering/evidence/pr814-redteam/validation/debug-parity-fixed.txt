@@ -1,0 +1,1 @@
+PASS debug .text parity and size threading policy: 58 programs

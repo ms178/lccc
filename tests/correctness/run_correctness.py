@@ -21,13 +21,14 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 LCCC = Path(os.environ.get("LCCC_BIN", REPO_ROOT / "target" / "release" / "lccc"))
+GCC_COMPILER = os.environ.get("GCC_BIN", "/usr/bin/gcc")
 GCC_INC = subprocess.check_output(
-    ["gcc", "-print-file-name=include"], text=True
+    [GCC_COMPILER, "-print-file-name=include"], text=True
 ).strip()
 
 COMPILERS = {
     "LCCC": (str(LCCC), [f"-I{GCC_INC}", "-O2"]),
-    "GCC": ("/usr/bin/gcc", ["-O2"]),
+    "GCC": (GCC_COMPILER, ["-O2"]),
 }
 
 BOLD = "\033[1m"; DIM = "\033[2m"; RED = "\033[31m"

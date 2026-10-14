@@ -527,6 +527,50 @@ pub(super) fn next_insn(store: &LineStore, infos: &[LineInfo], mut j: usize, len
     j
 }
 
+/// Try the adjacent commuted form `mov MEM, %T; OP %S, %T` by writing the
+/// product into `%S` and safely renaming its live range from `%T`.
+fn try_fuse_commuted_adjacent_load(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    lv: &mut FileLiveness,
+    load_idx: usize,
+    consumer_idx: usize,
+    mem: &str,
+    load_q: bool,
+    op: &str,
+    op_q: bool,
+    scratch: RegId,
+    source: RegId,
+    dest: RegId,
+    gap: usize,
+) -> Option<usize> {
+    // This is legal only for an adjacent, same-width commutative RMW whose
+    // old source value dies there. The result-family rename is fail-closed:
+    // it rejects stale reads, unsafe writes, barriers, and high-byte aliases.
+    if op_q != load_q
+        || dest != scratch
+        || source == scratch
+        || gap != 0
+        || source == 4
+        || dest == 4
+        || !COMMUTATIVE_OPS.contains(&op)
+        || lv.live_after(consumer_idx, source) != Some(false)
+    {
+        return None;
+    }
+    let span_end = rename_product_range(store, infos, consumer_idx, dest, source, lv)?;
+    let suffix = if load_q { "q" } else { "l" };
+    let width = if load_q { 0 } else { 1 };
+    let new_line = format!(
+        "    {op}{suffix} {mem}, {}",
+        REG_NAMES[width][source as usize]
+    );
+    mark_nop(&mut infos[load_idx]);
+    replace_line(store, &mut infos[consumer_idx], consumer_idx, new_line);
+    lv.refresh_span(store, infos, load_idx, span_end);
+    Some(span_end)
+}
+
 /// Fuse `mov MEM, %T ... OP %T, %D` into `OP MEM, %D` (see module docs).
 pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
@@ -638,6 +682,13 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) 
                 lv.refresh_span(store, infos, i, j);
                 changed = true;
                 i = j + 1;
+                continue;
+            }
+            if let Some(span_end) = try_fuse_commuted_adjacent_load(
+                store, infos, &mut lv, i, j, mem, load_q, op, op_q, t_fam, src, dst, gap,
+            ) {
+                changed = true;
+                i = span_end + 1;
                 continue;
             }
             i += 1;
@@ -1299,6 +1350,355 @@ fn rename_family(text: &str, from: RegId, to: RegId) -> Option<String> {
     Some(out)
 }
 
+/// `%rsp`'s family id (REG_NAMES[0] index 4): renaming it is never sane.
+const RSP_FAM: RegId = 4;
+
+/// True when `t`'s mentions of `fam` include a partial-width spelling
+/// (16-bit, 8-bit or a high-byte alias) — those do not kill the family.
+fn fam_mentions_partial_width(t: &str, fam: RegId) -> bool {
+    const HIGH: [&str; 4] = ["%ah", "%ch", "%dh", "%bh"];
+    if HIGH.iter().any(|h| t.contains(h)) {
+        // Only the first four families even have high-byte spellings, and a
+        // high-byte touch is a partial-width touch of whichever family it
+        // belongs to; the exact owner does not matter for this predicate
+        // (rename_family independently vetoes these on renamed lines).
+        return true;
+    }
+    let mut rest = t;
+    while let Some(pct) = rest.find('%') {
+        let tok = &rest[pct..];
+        let end = tok[1..]
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .map(|e| e + 1)
+            .unwrap_or(tok.len());
+        let reg = &tok[..end];
+        for w in 2..4 {
+            if reg == REG_NAMES[w][fam as usize] {
+                return true;
+            }
+        }
+        rest = &rest[pct + end..];
+    }
+    false
+}
+
+/// Whether an apparent full-width definition also reads the old value of
+/// `fam` in its source operand.  `reg_refs` is deliberately only a mention
+/// bitmap, so `may_write_families` + `!is_read_modify_write` is not enough to
+/// prove a clean kill: `movl %edx, %edx` reads the old `%edx` and then
+/// zero-extends it, and `movq (%rdx), %rdx` reads it as an address before
+/// replacing it.  Treat an unparseable two-operand form as a read (fail
+/// closed); a destination-only definition may terminate the product's live
+/// range safely.
+fn source_reads_family(t: &str, fam: RegId) -> bool {
+    let mnemonic = t.split_whitespace().next().unwrap_or("");
+    if mnemonic.is_empty() {
+        return true;
+    }
+    let rest = t[mnemonic.len()..].trim();
+    let Some((src, dst)) = split_two_operands(rest) else {
+        // These explicit single-operand instructions overwrite their register
+        // destination without reading its old value. Other opaque/implicit
+        // forms stay conservative; in particular DIV/MUL-like operands must
+        // never be mistaken for clean kills.
+        return !((mnemonic.starts_with("pop")
+            || mnemonic.starts_with("rdrand")
+            || mnemonic.starts_with("rdseed"))
+            && plain_gp_operand(rest) == Some(fam));
+    };
+    if plain_gp_operand(dst) != Some(fam) {
+        return true;
+    }
+    plain_gp_operand(src) == Some(fam) || memory_operand_families(src) & (1u16 << fam) != 0
+}
+
+/// A full-width self-copy preserves the product, so it is a read-through,
+/// not a death of `from`; both register operands must follow the renamed value.
+fn is_full_width_self_move(t: &str, fam: RegId) -> bool {
+    parse_reg_copy(t).is_some_and(|(is_q, src, dst)| is_q && src == fam && dst == fam)
+}
+
+/// Does a two-operand instruction write the complete family named by `from`?
+/// In 64-bit mode, either a q-width write or a dword write (which zero-extends)
+/// does; byte and word writes do not.
+fn has_full_width_register_dest(t: &str, from: RegId) -> bool {
+    let Some(mnemonic) = t.split_whitespace().next() else {
+        return false;
+    };
+    let rest = t[mnemonic.len()..].trim();
+    let Some((_, dst)) = split_two_operands(rest) else {
+        return false;
+    };
+    plain_gp_operand(dst) == Some(from)
+        && (dst == REG_NAMES[0][from as usize] || dst == REG_NAMES[1][from as usize])
+}
+
+/// `is_read_modify_write` intentionally defaults to true for opaque mnemonics.
+/// Rehoming a product is safe only for familiar explicit GP operations whose
+/// complete write set is the destination family. Keep this allowlist separate
+/// from the broader helper so an unknown instruction cannot acquire an
+/// unmodelled implicit read/write merely because its last operand looks like
+/// `%from`.
+fn is_rehomeable_full_width_rmw(t: &str, from: RegId) -> bool {
+    if !super::helpers::is_read_modify_write(t) || fam_mentions_partial_width(t, from) {
+        return false;
+    }
+    let Some(mnemonic) = t.split_whitespace().next() else {
+        return false;
+    };
+    let rest = t[mnemonic.len()..].trim();
+    let Some((base, width)) = mnemonic.split_at_checked(mnemonic.len().saturating_sub(1)) else {
+        return false;
+    };
+    let (suffix_width, valid_width) = match width {
+        "q" => (0, true),
+        "l" => (1, true),
+        _ => (0, false),
+    };
+    if !valid_width {
+        return false;
+    }
+
+    if base == "lea" {
+        if super::helpers::count_top_level_operands(rest) != 2 {
+            return false;
+        }
+        let Some((_, dst)) = split_two_operands(rest) else {
+            return false;
+        };
+        return plain_gp_operand(dst) == Some(from)
+            && dst == REG_NAMES[suffix_width][from as usize];
+    }
+
+    let unary = matches!(base, "inc" | "dec" | "neg" | "not" | "bswap");
+    let binary = matches!(
+        base,
+        "add"
+            | "adc"
+            | "and"
+            | "or"
+            | "sbb"
+            | "sub"
+            | "xor"
+            | "imul"
+            | "shl"
+            | "sal"
+            | "shr"
+            | "sar"
+            | "rol"
+            | "ror"
+            | "rcl"
+            | "rcr"
+            | "shld"
+            | "shrd"
+            | "bts"
+            | "btr"
+            | "btc"
+    );
+    let conditional_move = base.strip_prefix("cmov").is_some_and(|cc| {
+        matches!(
+            cc,
+            "o" | "no"
+                | "b"
+                | "c"
+                | "nae"
+                | "ae"
+                | "nb"
+                | "nc"
+                | "e"
+                | "z"
+                | "ne"
+                | "nz"
+                | "be"
+                | "na"
+                | "a"
+                | "nbe"
+                | "s"
+                | "ns"
+                | "p"
+                | "pe"
+                | "np"
+                | "po"
+                | "l"
+                | "nge"
+                | "ge"
+                | "nl"
+                | "le"
+                | "ng"
+                | "g"
+                | "nle"
+        )
+    });
+    if !unary && !binary && !conditional_move {
+        return false;
+    }
+    let operand_count = super::helpers::count_top_level_operands(rest);
+    let valid_count = if unary {
+        operand_count == 1
+    } else if base == "shld" || base == "shrd" {
+        operand_count == 3
+    } else {
+        operand_count == 2
+    };
+    if !valid_count {
+        return false;
+    }
+    let dst = if unary {
+        rest
+    } else {
+        let Some((_, dst)) = split_two_operands(rest) else {
+            return false;
+        };
+        dst
+    };
+    plain_gp_operand(dst) == Some(from) && dst == REG_NAMES[suffix_width][from as usize]
+}
+
+/// For an unconditional pure definition of `from` whose source depends on
+/// the old product, retarget only that source and leave the fresh result in
+/// `from`. This covers memory addresses (`movq (%rdx), %rdx`), register
+/// self-copies at widths that change the family (`movl %edx, %edx`), and the
+/// two-operand count instructions; the old product's range ends at this line.
+fn rename_full_def_source(t: &str, from: RegId, to: RegId) -> Option<String> {
+    let mnemonic = t.split_whitespace().next()?;
+    if !(mnemonic.starts_with("mov")
+        || mnemonic.starts_with("popcnt")
+        || mnemonic.starts_with("lzcnt")
+        || mnemonic.starts_with("tzcnt"))
+    {
+        return None;
+    }
+    let rest = t[mnemonic.len()..].trim();
+    let (src, dst) = split_two_operands(rest)?;
+    if plain_gp_operand(dst) != Some(from)
+        || !has_full_width_register_dest(t, from)
+        || !source_reads_family(t, from)
+    {
+        return None;
+    }
+    let renamed_src = rename_family(src, from, to)?;
+    Some(format!("    {mnemonic} {renamed_src}, {dst}"))
+}
+
+/// Rename every read of `from` to `to` over `from`'s live range starting just
+/// after `start`, for the commuted-adjacent fuse (the fused RMW wrote the
+/// product into `to`, so `from`'s old value is that same product).
+///
+/// Two-phase (verify the whole span before mutating anything — a late veto
+/// must leave the file untouched). The walk covers exactly the lines the
+/// product is live over and stops at its death:
+///   * a line that touches `to` while the product is live is a stale read or
+///     a clobber → veto;
+///   * a destination-only full-width def of `from` ends the range; the
+///     recognized q-width self-move is effectless and may be crossed, while
+///     pure source-dependent definitions retarget their source and leave the
+///     fresh result in `from`; a single-family full-width RMW is renamed as a
+///     continuing product update; partial-width or multi/opaque writes → veto;
+///   * any other line reading `from` is renamed with `rename_family`
+///     (which vetoes `%ah`-class spellings);
+///   * once `from` is dead after a line, the range is over — later touches
+///     of `to` are fresh values and none of this walk's business;
+///   * a barrier (label, jump, call, ret, pinned line) met while the product
+///     is still live → veto: a call could consume the product as an argument
+///     without a text mention, so textual checks cannot save a live crossing;
+///   * `%rsp` may never be renamed.
+///
+/// Returns the last index whose text is part of the product's range (the
+/// consumer `start` when nothing needed renaming), or `None` on veto.
+fn rename_product_range(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    start: usize,
+    from: RegId,
+    to: RegId,
+    lv: &FileLiveness,
+) -> Option<usize> {
+    if from == RSP_FAM || to == RSP_FAM {
+        return None;
+    }
+    let len = store.len();
+    let d_bit = 1u16 << from;
+    let t_bit = 1u16 << to;
+    let mut renames: Vec<(usize, String)> = Vec::new();
+    let mut end = start;
+    let mut k = next_insn(store, infos, start + 1, len);
+    while k < len {
+        let info = &infos[k];
+        if !(is_window_kind(info.kind) || matches!(info.kind, LineKind::SelfMove)) || info.pinned {
+            // `SelfMove` is preclassified with no GP effects, but
+            // `is_window_kind` excludes it. A q-width self-move is a semantic
+            // no-op, so admit it locally; the following real product reads
+            // still have to follow the renamed value. Other barriers cannot be
+            // crossed while the product is live.
+            return None;
+        }
+        let t = info.trimmed(store.get(k));
+        if info.reg_refs & t_bit != 0 {
+            return None;
+        }
+        if info.reg_refs & d_bit != 0 {
+            let writes_from = may_write_families(t, info) & d_bit;
+            if writes_from != 0 {
+                if is_full_width_self_move(t, from) {
+                    // A q-width self-move is a read-through, not a kill.
+                    // Rename both operands and continue looking for the true
+                    // end of the product's live range.
+                    let new_text = rename_family(store.get(k), from, to)?;
+                    renames.push((k, new_text));
+                    end = k;
+                } else if super::helpers::is_read_modify_write(t) {
+                    // A supported single-family full-width RMW keeps the
+                    // product live in `to`. Multi-output, partial-width, and
+                    // opaque forms are not a local register substitution.
+                    if may_write_families(t, info) != d_bit
+                        || !is_rehomeable_full_width_rmw(t, from)
+                    {
+                        return None;
+                    }
+                    let new_text = rename_family(store.get(k), from, to)?;
+                    renames.push((k, new_text));
+                    end = k;
+                } else if source_reads_family(t, from) {
+                    if let Some(new_text) = rename_full_def_source(t, from, to) {
+                        // This is a pure definition whose new value depends
+                        // on the old product (including a memory address or a
+                        // zero-extending self-move). Retarget only the source;
+                        // leave the fresh result in `from` and end the old
+                        // product range at this instruction.
+                        renames.push((k, new_text));
+                        end = k;
+                        break;
+                    } else {
+                        return None;
+                    }
+                } else {
+                    // Only a full-family, destination-only definition is a
+                    // clean kill. Byte/word writes leave old product bits live.
+                    if fam_mentions_partial_width(t, from) {
+                        return None;
+                    }
+                    break;
+                }
+            } else {
+                // Pure read of the product: rename (vetoes `%ah` spellings).
+                let new_text = rename_family(store.get(k), from, to)?;
+                renames.push((k, new_text));
+                end = k;
+            }
+        }
+        if lv.live_after(k, from) == Some(false) {
+            // Product dead: the range is over. Later `to` touches are fresh
+            // values outside this transform's scope.
+            break;
+        }
+        k = next_insn(store, infos, k + 1, len);
+    }
+    for (r, new_text) in renames {
+        replace_line(store, &mut infos[r], r, new_text);
+    }
+    Some(end)
+}
+
 /// ```text
 ///     movl %ebp, %eax          xorl %ebp, %edi
 ///     xorl %edi, %eax     ->   movzbl %dil, %esi
@@ -1556,6 +1956,155 @@ mod tests {
         let out = body(&run(&asm, fuse_load_into_alu));
         assert!(has(&out, "xorl (%r12,%rsi,4), %ebp"), "{out:?}");
         assert!(!out.iter().any(|l| l.starts_with("movl (%r12")), "{out:?}");
+    }
+
+    #[test]
+    fn fuses_commuting_adjacent_load_with_product_rename() {
+        // The dot-product pair GCC writes as `imulq (b,%i,8), %rax`:
+        // `movq (a), %rax; movq (b), %rdx; imulq %rax, %rdx` commutes and
+        // folds to `imulq (b), %rax`; the product's later uses rename
+        // %rdx→%rax.
+        let asm = format!(
+            "{PRO}    movq (%rsi,%r11,8), %rax\n    movq (%rdi,%r11,8), %rdx\n    imulq %rax, %rdx\n    addq %rdx, %rcx\n    movq $0, %rdx\n    movq %rcx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "imulq (%rdi,%r11,8), %rax"), "{out:?}");
+        assert!(
+            !out.iter().any(|l| l.starts_with("movq (%rdi,%r11,8)")),
+            "{out:?}"
+        );
+        assert!(has(&out, "addq %rax, %rcx"), "{out:?}");
+        assert!(!has(&out, "addq %rdx, %rcx"), "{out:?}");
+        assert!(has(&out, "movq $0, %rdx"), "{out:?}");
+    }
+
+    #[test]
+    fn commuting_adjacent_fuse_refused_when_other_operand_stays_live() {
+        // %rax (the fused RMW's destination) is still used after the
+        // consumer: the product would clobber that value. Refuse.
+        let asm = format!(
+            "{PRO}    movq (%rsi), %rax\n    movq (%rdi), %rdx\n    imulq %rax, %rdx\n    addq %rdx, %rcx\n    addq %rax, %rcx\n    movq %rcx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(!out.iter().any(|l| l == "imulq (%rdi), %rax"), "{out:?}");
+        assert!(has(&out, "movq (%rdi), %rdx"), "{out:?}");
+        assert!(has(&out, "imulq %rax, %rdx"), "{out:?}");
+    }
+
+    #[test]
+    fn commuting_adjacent_fuse_refused_on_high_byte_in_product_range() {
+        // %dh is the product's high byte: renaming it to %ah would change
+        // the REX encoding contract. Refuse the whole fold.
+        let asm = format!(
+            "{PRO}    movq (%rsi), %rax\n    movq (%rdi), %rdx\n    imulq %rax, %rdx\n    addb %dh, %cl\n    movq %rcx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(!out.iter().any(|l| l == "imulq (%rdi), %rax"), "{out:?}");
+        assert!(has(&out, "movq (%rdi), %rdx"), "{out:?}");
+    }
+
+    #[test]
+    fn commuting_adjacent_fuse_stops_rename_at_clean_kill() {
+        // `movq $0, %rdx` is a clean full-width kill: the fresh %rdx value
+        // stays in %rdx while the product's uses before it rename to %rax.
+        let asm = format!(
+            "{PRO}    movq (%rsi), %rax\n    movq (%rdi), %rdx\n    imulq %rax, %rdx\n    addq %rdx, %rcx\n    movq $0, %rdx\n    movq %rdx, (%r8)\n    movq %rcx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "imulq (%rdi), %rax"), "{out:?}");
+        assert!(has(&out, "addq %rax, %rcx"), "{out:?}");
+        assert!(has(&out, "movq $0, %rdx"), "{out:?}");
+        assert!(has(&out, "movq %rdx, (%r8)"), "{out:?}");
+    }
+
+    #[test]
+    fn commuting_adjacent_fuse_retargets_a_zero_extending_self_move_source() {
+        // A 32-bit self move reads the old product and zero-extends it into
+        // the full %rdx family. Retarget only its source to the fused product;
+        // keep the fresh zero-extended result in %edx for subsequent users.
+        let asm = format!(
+            "{PRO}    movq (%rsi), %rax\n    movq (%rdi), %rdx\n    imulq %rax, %rdx\n    addq %rdx, %rcx\n    movl %edx, %edx\n    movq %rdx, (%r8)\n    movq %rcx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "imulq (%rdi), %rax"), "{out:?}");
+        assert!(has(&out, "addq %rax, %rcx"), "{out:?}");
+        assert!(has(&out, "movl %eax, %edx"), "{out:?}");
+        assert!(has(&out, "movq %rdx, (%r8)"), "{out:?}");
+    }
+
+    #[test]
+    fn commuting_adjacent_fuse_retargets_a_partial_source_of_full_width_definition() {
+        // The destination is a complete qword definition even though the
+        // source reads only the low byte of the old product. Redirect that
+        // source to the fused product, and leave the new zero-extended byte
+        // result in %rdx.
+        let asm = format!(
+            "{PRO}    movq (%rsi), %rax\n    movq (%rdi), %rdx\n    imulq %rax, %rdx\n    addq %rdx, %rcx\n    movzbq %dl, %rdx\n    movq %rdx, (%r8)\n    movq %rcx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "imulq (%rdi), %rax"), "{out:?}");
+        assert!(has(&out, "addq %rax, %rcx"), "{out:?}");
+        assert!(has(&out, "movzbq %al, %rdx"), "{out:?}");
+        assert!(has(&out, "movq %rdx, (%r8)"), "{out:?}");
+    }
+
+    #[test]
+    fn commuting_adjacent_fuse_steps_over_full_width_self_move() {
+        // This one-register return marks %rdx dead at ret; without that ABI
+        // fact the product in %rdx is observable and the fold must be refused.
+        // The q-width self-move is effectless, not a kill: leave it in place
+        // and still rename the following real product consumer.
+        let asm = format!(
+            "{PRO}    # LCCC_RET_RDX 0\n    movq (%rsi), %rax\n    movq (%rdi), %rdx\n    imulq %rax, %rdx\n    addq %rdx, %rcx\n    movq %rdx, %rdx\n    movq %rdx, (%r8)\n    movq %rcx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "imulq (%rdi), %rax"), "{out:?}");
+        assert!(has(&out, "addq %rax, %rcx"), "{out:?}");
+        assert!(has(&out, "movq %rdx, %rdx"), "{out:?}");
+        assert!(has(&out, "movq %rax, (%r8)"), "{out:?}");
+    }
+
+    #[test]
+    fn commuting_adjacent_fuse_refuses_when_product_is_returned_in_rdx() {
+        // Without a return marker the raw assembly model keeps both integer
+        // return registers live. Moving the product to %rax would lose the
+        // original %rdx return value, so the whole fusion must be refused.
+        let asm = format!(
+            "{PRO}    movq (%rsi), %rax\n    movq (%rdi), %rdx\n    imulq %rax, %rdx\n    addq %rdx, %rcx\n    movq %rdx, %rdx\n    movq %rdx, (%r8)\n    movq %rcx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(!has(&out, "imulq (%rdi), %rax"), "{out:?}");
+        assert_eq!(out, body(&asm), "refusal must preserve every input line");
+    }
+
+    #[test]
+    fn commuting_adjacent_fuse_retargets_a_full_width_load_address() {
+        // This full-width definition consumes the old product as its memory
+        // address before replacing %rdx. Retarget just that address to the
+        // fused product in %rax and keep the fresh loaded result in %rdx.
+        let asm = format!(
+            "{PRO}    movq (%rsi), %rax\n    movq (%rdi), %rdx\n    imulq %rax, %rdx\n    addq %rdx, %rcx\n    movq (%rdx), %rdx\n    movq %rdx, (%r8)\n    movq %rcx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "imulq (%rdi), %rax"), "{out:?}");
+        assert!(has(&out, "addq %rax, %rcx"), "{out:?}");
+        assert!(has(&out, "movq (%rax), %rdx"), "{out:?}");
+        assert!(has(&out, "movq %rdx, (%r8)"), "{out:?}");
+    }
+
+    #[test]
+    fn commuting_adjacent_fuse_rehomes_a_single_family_rmw_product_update() {
+        // This one-register return marks %rdx dead at ret. The RMW reads the
+        // product and produces its next value, so rehome the whole update to
+        // the fused destination rather than treating it as a clean kill.
+        let asm = format!(
+            "{PRO}    # LCCC_RET_RDX 0\n    movq (%rsi), %rax\n    movq (%rdi), %rdx\n    imulq %rax, %rdx\n    addq %rdx, %rcx\n    addq %r8, %rdx\n    movq %rdx, (%r9)\n    movq %rcx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "imulq (%rdi), %rax"), "{out:?}");
+        assert!(has(&out, "addq %rax, %rcx"), "{out:?}");
+        assert!(has(&out, "addq %r8, %rax"), "{out:?}");
+        assert!(has(&out, "movq %rax, (%r9)"), "{out:?}");
     }
 
     #[test]

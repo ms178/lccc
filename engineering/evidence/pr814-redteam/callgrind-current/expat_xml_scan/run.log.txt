@@ -1,0 +1,5 @@
+| benchmark | Ir ref | Ir mine | Ir m/r | I1miss m/r | D1miss r+w m/r | LLmiss r+w m/r | Bcm m/r | Bim m/r |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| expat_xml_scan | 1434344 | 1666645 | 1.16196 | 1364/1359 | 2185/2198 | 3159/3173 | 25493/31843 | 232/239 |
+geomean simulated Ir mine/ref = 1.1619562671158383 (not measured speedup)
+manifest -> /home/user/artifacts/pr814-callgrind-current/expat_xml_scan/manifest.json

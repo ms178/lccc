@@ -1,0 +1,1 @@
+/home/user/.cache/lccc-expat.WzvEgx/bad-entity.xml:1:3: undefined entity

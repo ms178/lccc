@@ -1,0 +1,2 @@
+PRESERVED /tmp/lnk.script_tls_gd_ld_relaxation.320zn_2r
+{'name': 'script_tls_gd_ld_relaxation', 'status': 'FAIL', 'detail': "local-dynamic: relaxed TLS wrong at runtime: (-11, '') (want (0, '1\\n'))"}

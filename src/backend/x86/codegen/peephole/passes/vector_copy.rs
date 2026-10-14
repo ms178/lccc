@@ -666,10 +666,32 @@ pub(super) fn propagate_vector_copies(store: &mut LineStore, infos: &mut [LineIn
                 break;
             }
             let touches_src = mentions_family(t.as_bytes(), src_fam);
+            // A write to the copy's DESTINATION ends the range. A true
+            // full-def write (`vmulsd %xmmA, %xmmB, %xmmD`) may still be
+            // renamed THROUGH — its reads are explicit operands and stay
+            // textually visible — but a destination-reading write
+            // (`shufps $0x00, %xmm0, %xmm0`) may not: renaming its explicit
+            // operands (`shufps $0x00, %xmm1, %xmm0`) hides the implicit
+            // destination read, every later textual pass believes %xmm0's
+            // old value is dead, and that exact chain deleted the `vmovss`
+            // reset feeding a splat and shipped [s, s, t, t]
+            // (bb_slp_v8 C2). The FP full-def model tells the two apart.
+            if writes_vec(&t, copy.dst) {
+                if !super::fp_liveness::is_full_xmm_def_line(&t) {
+                    break;
+                }
+                let width = vec_mention_width(&t, copy.dst);
+                if width != 0 && width <= copy.width {
+                    if let Some(rewritten) = replace_vec_reads(&t, copy.dst, copy.src) {
+                        if rewritten != t {
+                            replace_line(store, &mut infos[j], j, format!("    {rewritten}"));
+                            changed = true;
+                        }
+                    }
+                }
+                break;
+            }
             let width = vec_mention_width(&t, copy.dst);
-            // A write to the source ends the relation whatever else this line
-            // does; a read of it does not (substituting into a line that also
-            // reads the source is value-identical).
             if width != 0 && width <= copy.width {
                 if let Some(rewritten) = replace_vec_reads(&t, copy.dst, copy.src) {
                     if rewritten != t {
@@ -679,7 +701,7 @@ pub(super) fn propagate_vector_copies(store: &mut LineStore, infos: &mut [LineIn
                 }
             }
             let t_after = infos[j].trimmed(store.get(j)).to_string();
-            if writes_vec(&t_after, copy.dst) || writes_vec(&t_after, copy.src) || touches_src {
+            if writes_vec(&t_after, copy.src) || touches_src {
                 break;
             }
             j += 1;
@@ -1293,6 +1315,25 @@ mod tests {
             })
             .map(|l| l.trim().to_string())
             .collect()
+    }
+
+    #[test]
+    fn propagate_stops_before_a_destination_write() {
+        // The C2 chain (bb_slp_v8): `vmovss` resets %xmm0, then `shufps`
+        // reads %xmm0's old lanes. Propagating the copy's source into the
+        // shufps source operand (`shufps $0x00, %xmm1, %xmm0`) leaves the
+        // destination read with NO operand mention, and dead-FP-move
+        // elimination then deletes the reset — the shipped [s, s, t, t]
+        // miscompile. A destination write ends the range BEFORE any rename.
+        let asm = body(
+            "    vmovss %xmm1, %xmm1, %xmm0\n    shufps $0x00, %xmm0, %xmm0\n    movdqa %xmm0, %xmm14\n",
+        );
+        let out = run(&asm);
+        let lines = insns(&out);
+        assert!(
+            lines.iter().any(|l| l == "shufps $0x00, %xmm0, %xmm0"),
+            "the shufps must not be renamed at its own destination write:\n{lines:?}"
+        );
     }
 
     const PRO: &str = "f:\n.cfi_startproc\n";

@@ -1,0 +1,5 @@
+| benchmark | Ir ref | Ir mine | Ir m/r | I1miss m/r | D1miss r+w m/r | LLmiss r+w m/r | Bcm m/r | Bim m/r |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| gzip_crc32 | 808129 | 800966 | 0.99114 | 1367/1366 | 2213/2218 | 3179/3196 | 3337/3438 | 233/240 |
+geomean simulated Ir mine/ref = 0.9911363161079482 (not measured speedup)
+manifest -> /home/user/artifacts/pr814-callgrind-current/gzip_crc32/manifest.json
