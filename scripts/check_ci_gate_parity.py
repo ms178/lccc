@@ -622,9 +622,16 @@ INVOCATION_CONTRACTS: tuple[InvocationContract, ...] = (
     InvocationContract(
         program="tests/regression/check_arm_popcount_contract.py",
         name="arm-popcount-contract",
-        sides=_BOTH,
+        sides=frozenset({"local"}),
         env_spec=("CCC_ARM=target/fastbuild/lccc-arm",),
         local_gate=("arm-popcount-contract", "fast"),
+    ),
+    InvocationContract(
+        program="tests/regression/check_arm_popcount_contract.py",
+        name="arm-popcount-runtime",
+        sides=frozenset({"hosted"}),
+        rest_spec=("--run",),
+        env_spec=("CCC_ARM=target/fastbuild/lccc-arm",),
     ),
     InvocationContract(
         program="scripts/test_asmdiff.py",
