@@ -2904,9 +2904,9 @@ seven parity-check unit tests.
   explained by the v3 default, and a single ISA-matched leg silently loses it.
   Files that need `csmith.h` are *declared* (checked in both directions, so the
   list cannot rot into a skip list), never skipped. Wired into `ci_local.sh`
-  (fast) and CI with a `--self-test`. The single-leg `scripts/repros_replay.py`
-  from the parallel audit line was consolidated into this one: two harnesses
-  replaying one corpus is two maintenance surfaces for one contract.
+  (fast) and CI with a `--self-test`. The single-leg replay harness from the
+  parallel audit line was consolidated into this one: two harnesses replaying
+  one corpus is two maintenance surfaces for one contract.
 - `scripts/audit_census.py` (+ `audit_census_baseline.json`) ratchets the
   audit's debt numbers: panic-class sites, `unsafe`, functions over
   300/500/1000 lines, distinct `CCC_*`/`LCCC_*` knobs and undocumented knobs,

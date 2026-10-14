@@ -28,3 +28,14 @@ generic_selected_addr	accept	-	int g; int *p = _Generic(0, int: &g, default: 0);
 generic_unselected_addr	accept	-	int g; int *p = _Generic(1.0, int: &g, default: 0);
 compound_literal_addr	accept	-	int *p = (int[]){1, 2, 3};
 offsetof_addr	accept	-	int *r = &((struct s2 *)0)->b;
+# A `const` object with a constant initializer may be READ in a static
+# initializer (GCC's folding rule); a non-const or volatile object may not.
+const_bare_read	accept	-	const int cc = 5; int v = cc;
+const_static_bare_read	accept	-	static const int sc = 5; int v = sc;
+const_chain_read	accept	-	const int a = 5; const int b = a; int v = b;
+const_braced_read	accept	-	const int cb = {7}; int v = cb;
+const_double_read	accept	-	const double dd = 1.5; double v = dd;
+const_conv_read	accept	-	const unsigned char uc = 300; int v = uc;
+const_bool_read	accept	-	const _Bool bb = 5; int v = bb;
+const_volatile_read	reject	not constant	const volatile int cvc = 5; int v = cvc;
+volatile_ptr_read	reject	not constant	int g; int *volatile p = &g; int *q = p;

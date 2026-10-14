@@ -142,7 +142,24 @@ impl Lowerer {
         }
 
         // Scalar constant
-        if let Some(val) = self.eval_const_expr(expr) {
+        //
+        // A *bare* read of a folded const object is answered from sema's map
+        // here: `const int cc = 5; int v = cc;` is a constant initializer
+        // under GCC's folding rule (C11 6.7.9p4 would want an integer constant
+        // expression), and GCC rejects the same read of a non-const or
+        // volatile object.  `eval_const_expr` deliberately declines
+        // identifiers -- it resolves them by name so that a lowering-local
+        // scope wins -- which is why `cc * 2` was folded and `cc` was not, and
+        // why the read was diagnosed as non-constant (measured: GCC accepts
+        // all six scalar shapes in tests/regression/file_scope_init/values.c).
+        // Sema answers exactly GCC's rule: `annotate_const_value` records the
+        // value under the read's expression id, and `declares_const_object`
+        // refuses to record a volatile object (C11 6.7.3p7).
+        let scalar = self.eval_const_expr(expr).or_else(|| match expr {
+            Expr::Identifier(_, _) => self.lookup_sema_const(expr),
+            _ => None,
+        });
+        if let Some(val) = scalar {
             // C23 decimals: the initializer must become exact BID bits via
             // the master const conversion (integers convert by value with
             // half-even rounding, binary floats through their exact

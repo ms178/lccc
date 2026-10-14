@@ -134,7 +134,7 @@ prerequisite for it. Next concrete steps:
 
 * **Compare against the *same* target.** LCCC's absent-`-march` default is
   x86-64-v3; a GCC arm without `-march=x86-64-v3` will report every FMA/AVX2
-  difference as a miscompile. `scripts/repros_replay.py` encoded this
+  difference as a miscompile. The single-leg replay harness encoded this
   (`GCC_ISA`), and it is why 26 "miscompiles" turned out to be an -O0
   contraction mismatch. That harness was later consolidated into
   `scripts/check_repro_replay.py`, which pins both legs

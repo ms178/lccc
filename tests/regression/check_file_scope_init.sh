@@ -6,6 +6,12 @@
 #   * tests/regression/file_scope_init/cases.tsv: each row is one translation
 #     unit. The oracle must still give the recorded verdict (drift check), lccc
 #     must give the same verdict, and a rejection must carry the diagnostic.
+#     An `accept` row is ALSO compiled (`-c`): the non-constant diagnostic can
+#     be emitted during IR lowering, which `-fsyntax-only` never reaches, so a
+#     bad `accept` row would otherwise only fail the runtime values below --
+#     and only for the shapes that happen to appear there (measured: the bare
+#     read `const int cc = 5; int v = cc;` was rejected by lowering while every
+#     syntax-only verdict agreed).
 #   * values.c: lccc and the oracle are linked and run; the printed values must
 #     match. A form accepted but zeroed would pass the verdict check and fail
 #     here.
@@ -46,6 +52,11 @@ while IFS=$'\t' read -r id expect diag decl; do
     fi
     if [[ $expect == reject && $diag != - ]] && ! grep -q -- "$diag" "$lerr"; then
         echo "FAIL $id: rejected, but without '$diag'" >&2
+        sed -n '1,3p' "$lerr" >&2
+        fail=$((fail + 1)); continue
+    fi
+    if [[ $expect == accept ]] && ! "$CCC" -c "$tu" -o "$tmp/$id.o" 2>"$lerr"; then
+        echo "FAIL $id: accepted by the front end but rejected by lowering" >&2
         sed -n '1,3p' "$lerr" >&2
         fail=$((fail + 1)); continue
     fi

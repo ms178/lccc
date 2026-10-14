@@ -22,7 +22,13 @@ impl Lowerer {
     /// Look up a pre-computed constant value from sema's ConstMap.
     /// Returns Some(IrConst) if sema successfully evaluated this expression
     /// at compile time during its pass.
-    fn lookup_sema_const(&self, expr: &Expr) -> Option<IrConst> {
+    ///
+    /// Also the way a *bare* read of a folded const object is answered (see
+    /// `lower_global_init_expr`): sema records the folded value under the
+    /// read's own expression id, and `eval_const_expr` declines identifiers
+    /// (it resolves them by name so lowering-local scopes win), so the
+    /// initializer path consults the map directly.
+    pub(super) fn lookup_sema_const(&self, expr: &Expr) -> Option<IrConst> {
         self.sema_const_values.get(&expr.id()).cloned()
     }
 
