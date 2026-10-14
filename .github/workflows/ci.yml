@@ -1301,6 +1301,9 @@ jobs:
           CCC: target/fastbuild/lccc
         run: |
           set -euo pipefail
+          # Preserve the failing command in Checks because these independent
+          # gates share one shell step.
+          trap 'rc=$?; printf "::error title=Fast contract failed::%s (exit %s)\n" "$BASH_COMMAND" "$rc"; exit "$rc"' ERR
           python3 scripts/check_ci_gate_parity.py
           # A `run: |` block is shell, not YAML. Step scaffolding pasted
           # into one is valid YAML that dies with exit 127 on the runner
