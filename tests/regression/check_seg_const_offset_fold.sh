@@ -37,7 +37,7 @@
 set -euo pipefail
 
 CCC=${CCC:-./target/fastbuild/lccc}
-REPO=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+REPO=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 tmp=${TMPDIR:-/tmp}/lccc-seg-const-offset-fold.$$
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp"
@@ -129,64 +129,64 @@ expect acc_b  'addq %gs:8(%rdi)'   'ALU-fused per-CPU field read (add)'
 reject acc_b  'movq %gs:'          'unfused segment load in an add consumer'
 reject cmp_c3 'movq %gs:'          'unfused segment load in a compare consumer'
 
-# Cross-check against GCC when it is available: same instruction count for the
-# folded shape. gcc is an oracle here, never a dependency.
-if command -v gcc >/dev/null 2>&1; then
-    gcc -O2 -S -o "$tmp/fold_gcc.s" "$tmp/fold.c"
-    count_body() { # count_body <file> <symbol>
-        awk -v fn="^$1:" '
-            $0 ~ fn { inb = 1; next }
-            inb && /^\.size/ { exit }
-            inb && /^[[:space:]]*\./ { next }
-            inb && /^[[:space:]]*#/ { next }
-            inb { n++ }
-            END { print n + 0 }
-        ' "$2"
-    }
-    # `cmp_c3` is deliberately absent here: its one extra instruction is the
-    # boolean-materialisation tail (`sete %r9b; movzbl %r9b, %r9d; movl
-    # %r9d, %eax` where GCC zeroes %eax and does `sete %al`), which the SAME
-    # function shows without any segment override (`cmpq %rsi, 40(%rdi)`) —
-    # it is a return-register coalescing gap, not a segment-fold gap.
-    # docs/FOLLOWUP-2026-10-11-kernel-percpu-segment-fold.md §5.4 carries the
-    # reproducer; the folded OPERAND of cmp_c3 is still pinned by the loop
-    # below, so the segment half of the contract stays checked here.
-    for fn in read_b read_c3 read_a acc_b; do
-        ours=$(count_body "$fn" "$tmp/fold.s")
-        theirs=$(count_body "$fn" "$tmp/fold_gcc.s")
-        if [ "$ours" -gt "$theirs" ]; then
-            echo "FAIL: $fn: lccc $ours instructions vs GCC $theirs" >&2
-            fail=1
-        fi
-    done
-    # Exact-operand cross-check: the segment operand GCC folds must be the
-    # operand lccc emits, character for character.  Instruction counts alone
-    # cannot see a wrong constant — this gate itself once expected +32 for a
-    # +40 field (`c[3]` after `long a, b`), so the oracle compares the operand
-    # text, not just the count.  GCC spells a zero displacement the same way
-    # (`%gs:(%rdi)`), so all four shapes are compared.
-    for fn in read_b read_c3 read_a fold_after_call read_d read_f acc_b cmp_c3; do
-        want=$(awk -v fn="^$fn:" '
-            $0 ~ fn { inb = 1; next }
-            inb && /^\.size/ { exit }
-            inb && /%gs:[^,)]*\(%r[a-z0-9]+\)/ {
-                match($0, /%gs:[^,)]*\(%r[a-z0-9]+\)/)
-                print substr($0, RSTART, RLENGTH)
-                exit
-            }
-        ' "$tmp/fold_gcc.s")
-        if [ -z "$want" ]; then
-            # A vacuous oracle would silently pass: every shape listed here is
-            # expected to make GCC emit a folded segment operand.
-            echo "FAIL: $fn: GCC emitted no folded segment operand to compare against" >&2
-            fail=1
-        elif ! body_of "$fn" | grep -cF -- "$want" >/dev/null; then
-            echo "FAIL: $fn: GCC folds '$want' but lccc emits:" >&2
-            body_of "$fn" >&2
-            fail=1
-        fi
-    done
-fi
+# Cross-check against the GCC 14 oracle (required, see lib/gcc_oracle.sh): the
+# same instruction count and the same folded segment operand for each shape.
+. tests/regression/lib/gcc_oracle.sh
+require_gcc_oracle "check_seg_const_offset_fold" || exit 1
+"$GCC_ORACLE_BIN" -O2 -S -o "$tmp/fold_gcc.s" "$tmp/fold.c"
+count_body() { # count_body <file> <symbol>
+    awk -v fn="^$1:" '
+        $0 ~ fn { inb = 1; next }
+        inb && /^\.size/ { exit }
+        inb && /^[[:space:]]*\./ { next }
+        inb && /^[[:space:]]*#/ { next }
+        inb { n++ }
+        END { print n + 0 }
+    ' "$2"
+}
+# `cmp_c3` is deliberately absent here: its one extra instruction is the
+# boolean-materialisation tail (`sete %r9b; movzbl %r9b, %r9d; movl
+# %r9d, %eax` where GCC zeroes %eax and does `sete %al`), which the SAME
+# function shows without any segment override (`cmpq %rsi, 40(%rdi)`) —
+# it is a return-register coalescing gap, not a segment-fold gap.
+# docs/FOLLOWUP-2026-10-11-kernel-percpu-segment-fold.md §5.4 carries the
+# reproducer; the folded OPERAND of cmp_c3 is still pinned by the loop
+# below, so the segment half of the contract stays checked here.
+for fn in read_b read_c3 read_a acc_b; do
+    ours=$(count_body "$fn" "$tmp/fold.s")
+    theirs=$(count_body "$fn" "$tmp/fold_gcc.s")
+    if [ "$ours" -gt "$theirs" ]; then
+        echo "FAIL: $fn: lccc $ours instructions vs GCC $theirs" >&2
+        fail=1
+    fi
+done
+# Exact-operand cross-check: the segment operand GCC folds must be the
+# operand lccc emits, character for character.  Instruction counts alone
+# cannot see a wrong constant — this gate itself once expected +32 for a
+# +40 field (`c[3]` after `long a, b`), so the oracle compares the operand
+# text, not just the count.  GCC spells a zero displacement the same way
+# (`%gs:(%rdi)`), so all four shapes are compared.
+for fn in read_b read_c3 read_a fold_after_call read_d read_f acc_b cmp_c3; do
+    want=$(awk -v fn="^$fn:" '
+        $0 ~ fn { inb = 1; next }
+        inb && /^\.size/ { exit }
+        inb && /%gs:[^,)]*\(%r[a-z0-9]+\)/ {
+            match($0, /%gs:[^,)]*\(%r[a-z0-9]+\)/)
+            print substr($0, RSTART, RLENGTH)
+            exit
+        }
+    ' "$tmp/fold_gcc.s")
+    if [ -z "$want" ]; then
+        # A vacuous oracle would silently pass: every shape listed here is
+        # expected to make GCC emit a folded segment operand.
+        echo "FAIL: $fn: GCC emitted no folded segment operand to compare against" >&2
+        fail=1
+    elif ! body_of "$fn" | grep -cF -- "$want" >/dev/null; then
+        echo "FAIL: $fn: GCC folds '$want' but lccc emits:" >&2
+        body_of "$fn" >&2
+        fail=1
+    fi
+done
 
 if [ "$fail" -ne 0 ]; then
     echo "FAIL: segment constant-displacement fold gate" >&2

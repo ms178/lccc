@@ -33,6 +33,27 @@ struct Scope {
     /// Block-scope names declared `extern` in this scope: they denote an
     /// object with linkage (C11 6.2.2p4), like every file-scope object.
     linked: FxHashSet<String>,
+    /// Block-scope or parameter objects without linkage and without `static`
+    /// (C11 6.2.4p5): their address is not a link-time constant.
+    automatic: FxHashSet<String>,
+    /// Const-qualified objects whose initializer is a constant expression.
+    /// GCC folds their value in constant contexts (`const int c = 5;
+    /// static int v = c;` is accepted); their address is still not constant
+    /// unless the object has static storage.
+    folded: FxHashSet<String>,
+    /// The value of a folded const object, converted to its type, so that
+    /// `int a = cc;` can be evaluated for `const int cc = 5;`.
+    folded_values: FxHashMap<String, FoldedValue>,
+}
+
+/// The value of a folded const object (see `Scope::folded_values`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FoldedValue {
+    /// An integer object, converted to its type and sign-extended to 64 bits.
+    Int(i64),
+    /// A `float` or `double` object, rounded to its type (a `float` value is
+    /// exactly representable as an `f64`).
+    Float(f64),
 }
 
 impl Scope {
@@ -40,6 +61,9 @@ impl Scope {
         Self {
             symbols: FxHashMap::default(),
             linked: FxHashSet::default(),
+            automatic: FxHashSet::default(),
+            folded: FxHashSet::default(),
+            folded_values: FxHashMap::default(),
         }
     }
 }
@@ -97,6 +121,56 @@ impl SymbolTable {
         if let Some(scope) = self.scopes.last_mut() {
             scope.linked.insert(name.to_string());
         }
+    }
+
+    /// Record that the innermost scope's `name` is an automatic object.
+    pub fn mark_automatic(&mut self, name: &str) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.automatic.insert(name.to_string());
+        }
+    }
+
+    /// Record that the innermost scope's const-qualified `name` has a
+    /// constant initializer, so its value may be folded (see `Scope::folded`).
+    /// `value` is the converted value of an integer object, when it is known.
+    pub fn mark_folded(&mut self, name: &str, value: Option<FoldedValue>) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.folded.insert(name.to_string());
+            if let Some(v) = value {
+                scope.folded_values.insert(name.to_string(), v);
+            }
+        }
+    }
+
+    /// Whether the innermost visible declaration of `name` is an automatic
+    /// object. Enumerators, functions and typedefs are never recorded, so
+    /// they answer `false`.
+    pub fn is_automatic_object(&self, name: &str) -> bool {
+        self.scopes
+            .iter()
+            .rev()
+            .find(|scope| scope.symbols.contains_key(name))
+            .is_some_and(|scope| scope.automatic.contains(name))
+    }
+
+    /// Whether the innermost visible declaration of `name` is a const object
+    /// whose value folds (see `mark_folded`).
+    pub fn is_folded(&self, name: &str) -> bool {
+        self.scopes
+            .iter()
+            .rev()
+            .find(|scope| scope.symbols.contains_key(name))
+            .is_some_and(|scope| scope.folded.contains(name))
+    }
+
+    /// The folded value of the innermost visible declaration of `name`, if it
+    /// is a folded integer const object (see `mark_folded`).
+    pub fn folded_value(&self, name: &str) -> Option<FoldedValue> {
+        self.scopes
+            .iter()
+            .rev()
+            .find(|scope| scope.symbols.contains_key(name))
+            .and_then(|scope| scope.folded_values.get(name).copied())
     }
 
     /// The innermost visible declaration of `name`, but only if it denotes an

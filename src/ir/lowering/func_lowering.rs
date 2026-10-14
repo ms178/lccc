@@ -611,6 +611,8 @@ impl Lowerer {
                 cleanup_fn: None,
                 is_const: orig_param.is_const,
                 base_type_volatile: orig_param.is_volatile,
+                // Parameter declarators do not record the object qualifier yet.
+                object_volatile: false,
                 fptr_sig: None,
             },
         );
@@ -693,6 +695,8 @@ impl Lowerer {
                 cleanup_fn: None,
                 is_const: orig_param.is_const,
                 base_type_volatile: orig_param.is_volatile,
+                // Parameter declarators do not record the object qualifier yet.
+                object_volatile: false,
                 fptr_sig: None,
             },
         );
@@ -729,6 +733,8 @@ impl Lowerer {
                 cleanup_fn: None,
                 is_const: orig_param.is_const,
                 base_type_volatile: orig_param.is_volatile,
+                // Parameter declarators do not record the object qualifier yet.
+                object_volatile: false,
                 fptr_sig: None,
             },
         );
@@ -823,6 +829,8 @@ impl Lowerer {
                 cleanup_fn: None,
                 is_const: orig_param.is_const,
                 base_type_volatile: orig_param.is_volatile,
+                // Parameter declarators do not record the object qualifier yet.
+                object_volatile: false,
                 fptr_sig: None,
             },
         );

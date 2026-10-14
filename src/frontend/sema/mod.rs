@@ -2,6 +2,7 @@ pub(crate) mod analysis;
 pub(crate) mod builtins;
 pub(crate) mod const_eval;
 pub(crate) mod intrinsic_arity;
+pub(crate) mod static_init;
 pub(crate) mod type_checker;
 pub(crate) mod type_context;
 

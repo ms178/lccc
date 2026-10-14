@@ -23,7 +23,7 @@ use super::type_context::TypeContext;
 use crate::common::const_arith;
 use crate::common::const_eval as shared_const_eval;
 use crate::common::fx_hash::FxHashMap;
-use crate::common::symbol_table::SymbolTable;
+use crate::common::symbol_table::{FoldedValue, SymbolTable};
 use crate::common::types::AddressSpace;
 use crate::common::types::CType;
 use crate::frontend::parser::ast::{
@@ -225,7 +225,7 @@ impl<'a> SemaConstEval<'a> {
             }
 
             // Cast expressions with proper bit-width tracking
-            Expr::Cast(target_type, inner, _) => {
+            Expr::Cast(target_type, inner, _, _) => {
                 let target_ctype = self.type_spec_to_ctype(target_type);
                 let src_val = self.eval_const_expr(inner)?;
 
@@ -307,6 +307,14 @@ impl<'a> SemaConstEval<'a> {
 
             // Identifier: enum constants
             Expr::Identifier(name, _) => {
+                // A folded const object's value: the innermost declaration
+                // decides, so a shadowing object or enumerator is not used.
+                if let Some(val) = self.symbols.folded_value(name) {
+                    return Some(match val {
+                        FoldedValue::Int(v) => IrConst::I64(v),
+                        FoldedValue::Float(v) => IrConst::F64(v),
+                    });
+                }
                 if let Some(&val) = self.types.enum_constants.get(name) {
                     return Some(IrConst::I64(val));
                 }
@@ -451,7 +459,7 @@ impl<'a> SemaConstEval<'a> {
     /// Preserves signedness through cast chains for proper widening.
     fn eval_const_expr_as_bits(&self, expr: &Expr) -> Option<(u64, bool)> {
         match expr {
-            Expr::Cast(target_type, inner, _) => {
+            Expr::Cast(target_type, inner, _, _) => {
                 let (bits, _src_signed) = self.eval_const_expr_as_bits(inner)?;
                 let target_ctype = self.type_spec_to_ctype(target_type);
                 let target_width = self.ctype_size(&target_ctype) * 8;
@@ -533,7 +541,7 @@ impl<'a> SemaConstEval<'a> {
     /// Extract the struct type from a (type*)0 pattern.
     fn extract_null_pointer_cast_with_offset(&self, expr: &Expr) -> Option<(TypeSpecifier, usize)> {
         match expr {
-            Expr::Cast(type_spec, inner, _) => {
+            Expr::Cast(type_spec, inner, _, _) => {
                 if let TypeSpecifier::Pointer(inner_ts, _) = type_spec {
                     if const_arith::is_zero_expr(inner) {
                         return Some((*inner_ts.clone(), 0));
@@ -613,7 +621,7 @@ impl<'a> SemaConstEval<'a> {
         // Handle typeof(expr) which requires expression type inference - the
         // standalone ctype_from_type_spec function can't handle this because it
         // lacks access to the symbol table and expression type checker.
-        if let TypeSpecifier::Typeof(expr) = spec {
+        if let TypeSpecifier::Typeof(expr, _) = spec {
             return self.infer_expr_ctype(expr).unwrap_or(CType::Int);
         }
         // Delegate to a simple inline conversion for all other cases.
@@ -644,7 +652,7 @@ impl<'a> SemaConstEval<'a> {
             return ctype.is_unsigned();
         }
         // For cast expressions, check the target type directly
-        if let Expr::Cast(target_type, _, _) = expr {
+        if let Expr::Cast(target_type, _, _, _) = expr {
             let ctype = self.type_spec_to_ctype(target_type);
             return ctype.is_unsigned();
         }
@@ -1045,7 +1053,7 @@ impl<'a> SemaConstEval<'a> {
                 }
             }
             TypeSpecifier::TypeofType(inner) => self.sizeof_type_spec(inner),
-            TypeSpecifier::Typeof(expr) => {
+            TypeSpecifier::Typeof(expr, _) => {
                 let ctype = self.infer_expr_ctype(expr)?;
                 Some(ctype.size_ctx(&*self.types.borrow_struct_layouts()))
             }
@@ -1221,7 +1229,7 @@ impl<'a> SemaConstEval<'a> {
                 }
             }
             TypeSpecifier::TypeofType(inner) => self.alignof_type_spec(inner),
-            TypeSpecifier::Typeof(expr) => {
+            TypeSpecifier::Typeof(expr, _) => {
                 if let Some(ctype) = self.infer_expr_ctype(expr) {
                     ctype.align_ctx(&*self.types.borrow_struct_layouts())
                 } else {
@@ -1256,7 +1264,7 @@ impl<'a> SemaConstEval<'a> {
                 }
             }
             TypeSpecifier::TypeofType(inner) => self.preferred_alignof_type_spec(inner),
-            TypeSpecifier::Typeof(expr) => {
+            TypeSpecifier::Typeof(expr, _) => {
                 if let Some(ctype) = self.infer_expr_ctype(expr) {
                     ctype.preferred_align_ctx(&*self.types.borrow_struct_layouts())
                 } else {
@@ -1309,6 +1317,8 @@ impl<'a> SemaConstEval<'a> {
                     bit_width,
                     alignment: field_alignment,
                     is_packed: f.is_packed,
+                    base_volatile: f.base_volatile,
+                    object_volatile: f.object_volatile,
                 })
             })
             .collect()
@@ -1323,7 +1333,7 @@ impl<'a> SemaConstEval<'a> {
             Expr::StringLiteral(..)
             | Expr::WideStringLiteral(..)
             | Expr::Char16StringLiteral(..) => true,
-            Expr::Cast(_, inner, _) => Self::expr_is_always_nonzero(inner),
+            Expr::Cast(_, inner, _, _) => Self::expr_is_always_nonzero(inner),
             _ => false,
         }
     }

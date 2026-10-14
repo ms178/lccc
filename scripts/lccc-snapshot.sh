@@ -439,7 +439,14 @@ delivery_excludes=()
 for d in "${harness_excluded_dirs[@]}"; do
   delivery_excludes+=(--exclude-dir "$d")
 done
+# The persisted Rust toolchains live at $HOME/.cargo and $HOME/.rustup on
+# purpose (`.cache` is harness-wiped, the toolchain must survive), so they can
+# never move into an excluded name.  They are not deliverables of a snapshot
+# either, so they are excluded from the budget census by path.
 delivery_excludes+=(--exclude-path "$REPO" --exclude-path "$ART")
+for toolchain_dir in "${HOME}/.cargo" "${HOME}/.rustup"; do
+  [[ -e "$toolchain_dir" ]] && delivery_excludes+=(--exclude-path "$toolchain_dir")
+done
 if [[ "$BULK" != "$ART" ]]; then
   delivery_excludes+=(--exclude-path "$BULK")
 fi

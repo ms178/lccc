@@ -571,7 +571,7 @@ impl Lowerer {
         // For typeof(expr), resolve through the expression's CType.
         // This handles patterns like typeof(*ptr) where ptr is a struct pointer,
         // which appear in offsetof patterns: &((typeof(*ptr) *)0)->member
-        if let TypeSpecifier::Typeof(expr) = ts {
+        if let TypeSpecifier::Typeof(expr, _) = ts {
             if let Some(ctype) = self.get_expr_ctype(expr) {
                 return self.struct_layout_from_ctype(&ctype);
             }
@@ -1073,6 +1073,27 @@ impl Lowerer {
         }
     }
 
+    /// Whether the access `base.field` (or `base->field`) is a volatile access
+    /// because the member was declared volatile (`volatile u32 ctrl;`,
+    /// `int *volatile p;`, or a typedef'd volatile array element).
+    pub(super) fn member_is_volatile(
+        &self,
+        base_expr: &Expr,
+        is_pointer_access: bool,
+        field_name: &str,
+    ) -> bool {
+        let Some(layout) = self.get_member_layout(base_expr, is_pointer_access) else {
+            return false;
+        };
+        let layouts = self.types.borrow_struct_layouts();
+        match layout.field_volatility(field_name, &*layouts) {
+            Some((base, object, ty)) => {
+                super::definitions::object_access_is_volatile(base, object, Some(&ty))
+            }
+            None => false,
+        }
+    }
+
     /// Resolve member access: returns (byte_offset, ir_type_of_field).
     /// Works for both direct (s.field) and pointer (p->field) access.
     pub(super) fn resolve_member_access(
@@ -1254,7 +1275,7 @@ impl Lowerer {
                 }
                 None
             }
-            Expr::Cast(type_spec, inner, _) => {
+            Expr::Cast(type_spec, inner, _, _) => {
                 // Cast to struct pointer type
                 if let Some(layout) = self.get_struct_layout_for_pointer_type(type_spec) {
                     return Some(layout);
@@ -1439,7 +1460,7 @@ impl Lowerer {
                 // (*ptr) where ptr points to a struct
                 self.get_pointed_struct_layout(inner)
             }
-            Expr::Cast(type_spec, inner, _) => {
+            Expr::Cast(type_spec, inner, _, _) => {
                 // Cast to struct type, or cast wrapping a compound literal
                 self.get_struct_layout_for_type(type_spec)
                     .or_else(|| self.get_layout_for_expr(inner))
@@ -1938,7 +1959,7 @@ impl Lowerer {
                 }
                 self.probe_vla_size_from_type_spec(&f.type_spec)
             }),
-            TypeSpecifier::Typeof(expr) => {
+            TypeSpecifier::Typeof(expr, _) => {
                 // Mirror compute_vla_size_from_type_spec: typeof(vla_local)
                 // is dynamic iff the local is a VLA with a runtime size.
                 if let Expr::Identifier(name, _) = &**expr {

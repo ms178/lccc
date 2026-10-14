@@ -7352,6 +7352,13 @@ impl ArchCodegen for X86Codegen {
         self.flush_pending_widen_impl();
     }
 
+    fn mark_volatile_access(&mut self, begin: bool) {
+        self.state.emit_fmt(format_args!(
+            "    # LCCC_VOLATILE_{}",
+            if begin { "BEGIN" } else { "END" }
+        ));
+    }
+
     fn narrow_cmp_operands(
         &mut self,
         dest: u32,
@@ -7471,6 +7478,16 @@ impl ArchCodegen for X86Codegen {
         inst: &crate::ir::reexports::Instruction,
         folded_global_addrs: &crate::common::fx_hash::FxHashSet<u32>,
     ) -> bool {
+        // A volatile load or store is one observable access and is emitted in
+        // place inside its marked region; the MachInst buffer defers emission,
+        // which would move the access out of its region.
+        if matches!(
+            inst,
+            crate::ir::reexports::Instruction::Load { volatile: true, .. }
+                | crate::ir::reexports::Instruction::Store { volatile: true, .. }
+        ) {
+            return false;
+        }
         if !self.machinst_enabled
             || !self.machinst_function_enabled
             || self.machinst_disabled_kinds & machinst_kind_bit(inst) != 0

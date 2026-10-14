@@ -1833,7 +1833,7 @@ impl Lowerer {
                 !matches!(op, UnaryOp::PreInc | UnaryOp::PreDec)
                     && self.constant_query_can_lower(inner)
             }
-            Expr::Cast(_, inner, _) => self.constant_query_can_lower(inner),
+            Expr::Cast(_, inner, _, _) => self.constant_query_can_lower(inner),
             Expr::Conditional(cond, yes, no, _) => {
                 self.constant_query_can_lower(cond)
                     && self.constant_query_can_lower(yes)

@@ -1,0 +1,30 @@
+# File-scope initializers: static storage needs a constant (C11 6.7.9p4).
+# id<TAB>expect(accept|reject)<TAB>diag-substring-or-dash<TAB>declaration
+# Each declaration is one translation unit, after a prelude with one struct.
+# Verdicts are measured against GCC 16.2 and re-checked by the gate.
+nonconst_var	reject	not constant	int n; int y = n;
+call_init	reject	not constant	int h(void); int x = h();
+int_cast_addr	reject	not constant	int g; int c = (int)&g;
+char_cast_addr	reject	not constant	int g; char c = (char)&g;
+double_cast_addr	reject	not constant	int g; double d = (double)&g;
+lt_distinct_objects	reject	not constant	int g, h; int c = &g < &h;
+lt_int_cast_null	reject	not constant	int arr[2]; long c = (long)&arr[1] > 0;
+deref_string	reject	not constant	char c = *"abc";
+addr_long_cast	accept	-	int g; long l = (long)&g;
+addr_eq_same	accept	-	int g; int c = &g == &g;
+addr_ne_distinct	accept	-	int g, h; int c = &g != &h;
+addr_eq_distinct	accept	-	int g, h; int c = &g == &h;
+addr_null_ne	accept	-	int g; int c = &g != 0;
+addr_null_gt	accept	-	int g; int c = &g > (int *)0;
+null_lt_addr	accept	-	int g; int c = 0 < &g;
+addr_not	accept	-	int g; int c = !&g;
+addr_and	accept	-	int g; int c = &g && 1;
+addr_or_zero	accept	-	int g; int c = 0 || &g;
+addr_ord_same_array	accept	-	int arr[4]; int c = &arr[1] > &arr[0];
+addr_ord_long_same_array	accept	-	int arr[4]; int c = (long)&arr[1] > (long)&arr[0];
+string_subscript	accept	-	char c = "abc"[1];
+string_subscript_nul	accept	-	char c = "abc"[3];
+generic_selected_addr	accept	-	int g; int *p = _Generic(0, int: &g, default: 0);
+generic_unselected_addr	accept	-	int g; int *p = _Generic(1.0, int: &g, default: 0);
+compound_literal_addr	accept	-	int *p = (int[]){1, 2, 3};
+offsetof_addr	accept	-	int *r = &((struct s2 *)0)->b;

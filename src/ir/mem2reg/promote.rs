@@ -317,7 +317,17 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
     for (block_idx, block) in func.blocks.iter().enumerate() {
         for inst in &block.instructions {
             match inst {
-                Instruction::Load { ptr, ty, .. } => {
+                // A volatile access is an observable side effect of its own (C11
+                // 5.1.2.3), even when the object is not volatile: `volatile int *p
+                // = &a; *p = 1;` writes `a` through a volatile lvalue. Such an
+                // alloca stays in memory, so the access is neither removed nor
+                // forwarded.
+                Instruction::Load {
+                    ptr, ty, volatile, ..
+                } => {
+                    if *volatile {
+                        disqualified.insert(ptr.0);
+                    }
                     if let Some(&expected_ty) = alloca_types.get(&ptr.0) {
                         if *ty != expected_ty {
                             disqualified.insert(ptr.0);
@@ -326,7 +336,16 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
                         }
                     }
                 }
-                Instruction::Store { val, ptr, ty, .. } => {
+                Instruction::Store {
+                    val,
+                    ptr,
+                    ty,
+                    volatile,
+                    ..
+                } => {
+                    if *volatile {
+                        disqualified.insert(ptr.0);
+                    }
                     if let Some(&expected_ty) = alloca_types.get(&ptr.0) {
                         if *ty != expected_ty {
                             disqualified.insert(ptr.0);

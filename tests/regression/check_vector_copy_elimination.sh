@@ -1095,13 +1095,22 @@ fi
 # regression must fail with the benchmark named.  A ratchet over an empty corpus
 # is a passing test that measured nothing, so the number of sources actually
 # compiled is asserted too.
+# Budget move, 2026-10-13 (volatile-access pinning): reduction_vecreg
+# 103 -> 104. The benchmark's `static volatile float sink` is written and
+# re-read across calls; the peephole's redundant-load reuse used to turn
+# one of those volatile reads into a register copy, so the 103 measured
+# on main priced in a miscompile. Volatile accesses are now pinned
+# against every text pass (pin_volatile_access_regions), the reload is
+# emitted, and the count is honestly 104. This is the explicit budget
+# conversation the ratchet exists to force: the instruction was bought
+# with correctness, not lost to a regression.
 declare -A BUDGET=(
     [chacha20_block]=258
     [double_reduction]=135
     [libm_round_family]=207
     [matmul]=126
     [nbody]=312
-    [reduction_vecreg]=103
+    [reduction_vecreg]=104
     [sha256_transform]=355
     [spectral_norm]=287
     [struct_copy]=136

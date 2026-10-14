@@ -240,12 +240,54 @@ impl Parser {
         r
     }
 
+    /// Does the type name starting at the current token qualify its POINTEE
+    /// with `const` or `volatile`? Only qualifiers written before the first `*`
+    /// of the type name qualify the pointee: `const void *` does, while
+    /// `void *const` and `void *volatile` qualify the pointer itself, and the
+    /// cast type `void *` stays unqualified (C23 6.3.2.3p3, GCC 14). The scan
+    /// stops at that `*` or at the type name's closing `)`.
+    fn type_name_qualifiers(&self) -> CastQualifiers {
+        let mut q = CastQualifiers::default();
+        let mut depth = 0usize;
+        let mut stars = 0usize;
+        let mut before_first_star = true;
+        let mut volatile_before_star = false;
+        for n in 0..64 {
+            match self.peek_nth(n) {
+                TokenKind::Const if before_first_star => q.pointee_qualified = true,
+                TokenKind::Volatile if before_first_star => {
+                    q.pointee_qualified = true;
+                    if depth == 0 {
+                        volatile_before_star = true;
+                    }
+                }
+                TokenKind::LParen => depth += 1,
+                TokenKind::RParen => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                TokenKind::Star if depth == 0 => {
+                    stars += 1;
+                    before_first_star = false;
+                }
+                _ => {}
+            }
+        }
+        // `volatile` must qualify the pointee of a single-level pointer:
+        // `(volatile T **)` has a plain `T *` pointee, not a volatile one.
+        q.pointee_volatile = volatile_before_star && stars == 1;
+        q
+    }
+
     #[inline(always)]
     fn parse_cast_expr_inner(&mut self) -> Expr {
         if matches!(self.peek(), TokenKind::LParen) {
             let save = self.pos;
             let save_typedef = self.attrs.parsing_typedef();
             let save_const = self.attrs.parsing_const();
+            let save_volatile = self.attrs.parsing_volatile();
             let save_vector_size = self.attrs.parsing_vector_size.take();
             let save_ext_vector = self.attrs.parsing_ext_vector_nelem.take();
             self.advance();
@@ -257,6 +299,9 @@ impl Parser {
                 // declaration's qualifier is restored untouched for its
                 // own declarator, and the restore runs before any of the
                 // exits below — including the `self.pos = save` backtrack.
+                // Read from the tokens, not the parsed flags: `parse_cast_expr`'s
+                // declarator path sets the flags for pointer-level qualifiers too.
+                let qualifiers = self.type_name_qualifiers();
                 if let Some(mut result_type) = self.parse_nested_type_name() {
                     // If __attribute__((vector_size(N))) was parsed, wrap the type
                     result_type = self.apply_pending_vector_attr(result_type);
@@ -268,6 +313,7 @@ impl Parser {
                             let init = self.parse_initializer();
                             let lit = Expr::CompoundLiteral(result_type, Box::new(init), span);
                             self.attrs.set_const(save_const);
+                            self.attrs.set_volatile(save_volatile);
                             // Restore outer vector attrs so the enclosing declaration can use them
                             self.attrs.parsing_vector_size = save_vector_size;
                             self.attrs.parsing_ext_vector_nelem = save_ext_vector;
@@ -275,16 +321,18 @@ impl Parser {
                         }
                         let expr = self.parse_cast_expr();
                         self.attrs.set_const(save_const);
+                        self.attrs.set_volatile(save_volatile);
                         // Restore outer vector attrs so the enclosing declaration can use them
                         self.attrs.parsing_vector_size = save_vector_size;
                         self.attrs.parsing_ext_vector_nelem = save_ext_vector;
-                        return Expr::Cast(result_type, Box::new(expr), span);
+                        return Expr::Cast(result_type, Box::new(expr), span, qualifiers);
                     }
                 }
             }
             self.pos = save;
             self.attrs.set_typedef(save_typedef);
             self.attrs.set_const(save_const);
+            self.attrs.set_volatile(save_volatile);
             self.attrs.parsing_vector_size = save_vector_size;
             self.attrs.parsing_ext_vector_nelem = save_ext_vector;
         }
@@ -799,7 +847,7 @@ impl Parser {
                 self.expect_closing(&TokenKind::RParen, open);
                 Expr::BuiltinTypesCompatibleP(type1, type2, qualifiers1, qualifiers2, span)
             }
-            TokenKind::Typeof => {
+            TokenKind::Typeof | TokenKind::TypeofUnqual => {
                 let span = self.peek_span();
                 self.advance();
                 if matches!(self.peek(), TokenKind::LParen) {

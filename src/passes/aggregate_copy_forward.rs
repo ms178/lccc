@@ -114,7 +114,11 @@ fn eliminate_dead_aggregate_field_stores(func: &mut IrFunction) -> usize {
             break;
         }
     }
-    let volatile_roots: FxHashSet<u32> = func
+    // An aggregate is a volatile root when the object itself is volatile, or
+    // when a volatile load or store reaches it through a field path (`volatile
+    // int *p = &s.f; *p = 1;`): such an access is an observable side effect
+    // (C11 5.1.2.3), so no store into the aggregate may be removed.
+    let mut volatile_roots: FxHashSet<u32> = func
         .blocks
         .iter()
         .flat_map(|b| &b.instructions)
@@ -127,6 +131,24 @@ fn eliminate_dead_aggregate_field_stores(func: &mut IrFunction) -> usize {
             _ => None,
         })
         .collect();
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        let (Instruction::Load {
+            ptr,
+            volatile: true,
+            ..
+        }
+        | Instruction::Store {
+            ptr,
+            volatile: true,
+            ..
+        }) = inst
+        else {
+            continue;
+        };
+        if let Some((root, _)) = root_suffix.get(&ptr.0) {
+            volatile_roots.insert(*root);
+        }
+    }
     let mut escaping = FxHashSet::default();
     let mut loaded: FxHashMap<u32, Vec<(i64, i64)>> = FxHashMap::default();
     for block in &func.blocks {

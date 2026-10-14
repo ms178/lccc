@@ -534,7 +534,7 @@ impl Target {
                 // Escape hatch for bisecting a suspected peephole miscompile:
                 // LCCC_NO_PEEPHOLE=1 emits the pre-peephole assembly verbatim.
                 let asm = if std::env::var_os("LCCC_NO_PEEPHOLE").is_some() {
-                    raw
+                    x86::codegen::peephole::strip_volatile_markers(raw)
                 } else {
                     x86::codegen::peephole::peephole_optimize_with_config(
                         raw,

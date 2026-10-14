@@ -292,6 +292,14 @@ fn can_seg_const_addr_fold(cg: &dyn ArchCodegen, info: &GepFoldInfo) -> bool {
 }
 
 fn can_const_addr_fold_for(cg: &dyn ArchCodegen, info: &GepFoldInfo, seg: bool) -> bool {
+    // The displacement must be an x86 sign-extended 32-bit immediate for every
+    // fold, alloca bases included. This is the same predicate the emitters
+    // check (`i32::try_from`), so a fold this function accepts is one the
+    // emitter cannot refuse, and a refused emitter never falls back to a
+    // truncated displacement.
+    if !is_i32_disp(info.offset) {
+        return false;
+    }
     // A/B gate: force the pre-session-25 alloca-only contract.
     if env_flag_set("CCC_NO_REGBASE_FOLD") {
         return cg.state_ref().is_alloca(info.base.0);
@@ -5801,6 +5809,55 @@ pub(super) fn generate_instruction(
     remat_global_addrs: &FxHashSet<u32>,
     const_addr_vals: &FxHashMap<u32, i64>,
 ) {
+    // A volatile access must survive the text peepholes (they cannot see the
+    // IR's volatility). Its emitted lines are bracketed by markers that the
+    // peephole pins; the buffered MachInst path is flushed first so earlier
+    // code stays outside the region.
+    if matches!(
+        inst,
+        Instruction::Load { volatile: true, .. } | Instruction::Store { volatile: true, .. }
+    ) {
+        cg.flush_machinst();
+        cg.mark_volatile_access(true);
+        generate_instruction_body(
+            cg,
+            inst,
+            gep_fold_map,
+            indexed_gep_map,
+            global_addr_map,
+            global_addr_ptr_set,
+            dead_global_addrs,
+            remat_global_addrs,
+            const_addr_vals,
+        );
+        cg.flush_machinst();
+        cg.mark_volatile_access(false);
+    } else {
+        generate_instruction_body(
+            cg,
+            inst,
+            gep_fold_map,
+            indexed_gep_map,
+            global_addr_map,
+            global_addr_ptr_set,
+            dead_global_addrs,
+            remat_global_addrs,
+            const_addr_vals,
+        );
+    }
+}
+
+fn generate_instruction_body(
+    cg: &mut dyn ArchCodegen,
+    inst: &Instruction,
+    gep_fold_map: &FxHashMap<u32, GepFoldInfo>,
+    indexed_gep_map: &FxHashMap<u32, IndexedGepInfo>,
+    global_addr_map: &FxHashMap<u32, String>,
+    global_addr_ptr_set: &FxHashSet<u32>,
+    dead_global_addrs: &FxHashSet<u32>,
+    remat_global_addrs: &FxHashSet<u32>,
+    const_addr_vals: &FxHashMap<u32, i64>,
+) {
     // PF-15 deferred narrowing widens: every instruction other than the
     // two self-managing kinds flushes the recorded moves first, so the
     // defer is invisible to all non-matching consumers. A Cast records or
@@ -7286,5 +7343,51 @@ mod remat_call_arg_tests {
         function.next_value_id = 8;
         let set = build_rematerializable_global_addr_set_for(&function, &global_addr_map());
         assert!(!set.contains(&0));
+    }
+}
+
+#[cfg(test)]
+mod seg_fold_displacement_tests {
+    use super::{foldable_const_disp, is_i32_disp};
+    use crate::ir::constants::IrConst;
+
+    /// Every fold site and emitter must agree on one displacement width:
+    /// `can_const_addr_fold_for` tests `is_i32_disp`, the emitters test
+    /// `i32::try_from`. A fold accepted by the decider must never be refused
+    /// by the emitter, so the two predicates are pinned at the boundaries.
+    #[test]
+    fn decider_and_emitter_agree_on_displacement_width() {
+        let edges = [
+            i64::from(i32::MIN) - 1,
+            i64::from(i32::MIN),
+            -1,
+            0,
+            i64::from(i32::MAX),
+            i64::from(i32::MAX) + 1,
+            i64::from(u32::MAX),
+            i64::MIN,
+            i64::MAX,
+        ];
+        for v in edges {
+            assert_eq!(
+                is_i32_disp(v),
+                i32::try_from(v).is_ok(),
+                "decider and emitter disagree at {v}"
+            );
+        }
+    }
+
+    /// A segment fold of a constant too wide for a displacement is never built
+    /// into the fold map (`foldable_const_disp` refuses it), so the decider
+    /// never sees it.
+    #[test]
+    fn wide_constant_never_becomes_a_fold() {
+        let wide = IrConst::I64(i64::from(i32::MAX) + 1);
+        assert_eq!(foldable_const_disp(&wide, false), None);
+        let narrow = IrConst::I64(i64::from(i32::MAX));
+        assert_eq!(
+            foldable_const_disp(&narrow, false),
+            Some(i64::from(i32::MAX))
+        );
     }
 }

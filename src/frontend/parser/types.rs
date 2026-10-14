@@ -7,6 +7,7 @@
 
 use super::ast::*;
 use super::parse::{ModeKind, Parser};
+use crate::common::source::Span;
 use crate::common::types::AddressSpace;
 use crate::frontend::lexer::token::TokenKind;
 
@@ -32,6 +33,8 @@ struct TypeSpecFlags {
     has_union: bool,
     has_enum: bool,
     has_typeof: bool,
+    /// `typeof_unqual`: the expression type drops the named address space.
+    typeof_unqual: bool,
     long_count: u32,
     typedef_name: Option<String>,
 }
@@ -318,7 +321,8 @@ impl Parser {
                     any_base_specifier = true;
                     break;
                 }
-                TokenKind::Typeof => {
+                TokenKind::Typeof | TokenKind::TypeofUnqual => {
+                    flags.typeof_unqual = matches!(self.peek(), TokenKind::TypeofUnqual);
                     self.advance();
                     flags.has_typeof = true;
                     any_base_specifier = true;
@@ -369,7 +373,30 @@ impl Parser {
                     if self.typedefs.contains(name) && !self.shadowed_typedefs.contains(name) =>
                 {
                     if !any_base_specifier {
-                        flags.typedef_name = Some(name.clone());
+                        let name = name.clone();
+                        // A typedef carrying a named space qualifies its uses
+                        // as if `__seg_gs` were written there (C: the qualifier
+                        // of `typedef int __seg_gs T` is part of T). An explicit
+                        // keyword qualifier on the same declaration wins.
+                        if self.attrs.parsing_address_space == AddressSpace::Default {
+                            if let Some(&space) = self.typedef_object_spaces.get(&name) {
+                                self.attrs.parsing_address_space = space;
+                            }
+                        }
+                        // A typedef name is a synonym for its declarator text
+                        // (C 6.7.8), so its qualifiers apply to the use. The base
+                        // qualifier (`typedef volatile int *VPI`: the pointee) is
+                        // the specifier's; the object qualifier (`typedef int
+                        // *volatile VIP`) belongs to the declared object and is
+                        // applied by the declarator.
+                        self.attrs.set_typedef_use(true);
+                        if self.typedef_base_volatile.contains(&name) {
+                            self.attrs.set_volatile(true);
+                        }
+                        self.attrs.set_typedef_object_volatile(
+                            self.typedef_object_volatile.contains(&name),
+                        );
+                        flags.typedef_name = Some(name);
                         self.advance();
                         any_base_specifier = true;
                         break;
@@ -652,6 +679,7 @@ impl Parser {
             has_union,
             has_enum,
             has_typeof,
+            typeof_unqual,
             long_count,
             ref typedef_name,
         } = *flags;
@@ -687,7 +715,7 @@ impl Parser {
         } else if has_enum {
             self.parse_enum_specifier()
         } else if has_typeof {
-            self.parse_typeof_specifier()
+            self.parse_typeof_specifier(typeof_unqual)
         } else if let Some(name) = typedef_name {
             TypeSpecifier::TypedefName(name.clone())
         } else if has_char {
@@ -870,7 +898,7 @@ impl Parser {
     }
 
     /// Parse typeof(expr) or typeof(type-name).
-    fn parse_typeof_specifier(&mut self) -> TypeSpecifier {
+    fn parse_typeof_specifier(&mut self, unqual: bool) -> TypeSpecifier {
         let open = self.peek_span();
         self.expect_context(&TokenKind::LParen, "after 'typeof'");
         // Save attrs.flags so that storage-class specifiers from declarations
@@ -903,7 +931,7 @@ impl Parser {
         let expr = self.parse_expr();
         self.expect_closing(&TokenKind::RParen, open);
         self.attrs.flags = saved_flags;
-        TypeSpecifier::Typeof(Box::new(expr))
+        TypeSpecifier::Typeof(Box::new(expr), unqual)
     }
 
     /// Consume trailing qualifiers and _Complex that may follow a resolved base type.
@@ -985,6 +1013,9 @@ impl Parser {
     pub(super) fn parse_struct_fields(&mut self) -> Vec<StructFieldDecl> {
         let mut fields = Vec::with_capacity(8);
         let open = self.peek_span();
+        // The members' `volatile` qualifiers must not outlive the body:
+        // `struct S { volatile int a; } s;` leaves `s` non-volatile.
+        let outer_volatile = self.attrs.parsing_volatile();
         self.expect_context(&TokenKind::LBrace, "for struct/union body");
         while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
             // Budget termination guarantee: once the nesting budget is
@@ -1000,6 +1031,9 @@ impl Parser {
             // for one field must not leak into the next (fields without a
             // declarator — anonymous/bitfield arms — never snapshot it).
             self.attrs.parsing_address_space = AddressSpace::Default;
+            // Likewise `volatile`: a previous member's qualifier must not
+            // make this member volatile (`volatile int a; int b;`).
+            self.attrs.set_volatile(false);
             if matches!(self.peek(), TokenKind::Semicolon) {
                 self.advance();
                 continue;
@@ -1020,6 +1054,8 @@ impl Parser {
                         derived: Vec::new(),
                         alignment,
                         is_packed: false,
+                        base_volatile: false,
+                        object_volatile: false,
                     });
                 } else {
                     self.parse_struct_field_declarators(&type_spec, &mut fields);
@@ -1037,7 +1073,54 @@ impl Parser {
             }
         }
         self.expect_closing(&TokenKind::RBrace, open);
+        self.attrs.set_volatile(outer_volatile);
         fields
+    }
+
+    /// Reject a named address space on a struct or union field object, as GCC
+    /// 14 does (`'__seg_gs' specified for structure field 'f'`). Such a field
+    /// would need per-object storage that a record cannot give it, so lccc
+    /// used to drop the qualifier silently and the field read generic memory.
+    ///
+    /// A qualifier is legal only where it reaches the field through an
+    /// indirection: `int __seg_gs *p`, `int __seg_gs *arr[4]`,
+    /// `int __seg_gs (*fp)(void)` qualify the pointee or the return type, not
+    /// the field object. `int __seg_gs f`, `int __seg_gs a[4]`, and a bit-field
+    /// all qualify the field object itself. A qualifier written after the
+    /// declarator's last `*` (`int *__seg_gs p`) names the pointer object and
+    /// is always rejected.
+    fn check_struct_field_space(
+        &mut self,
+        base_space: AddressSpace,
+        object_space: AddressSpace,
+        name: Option<&str>,
+        derived: &[DerivedDeclarator],
+        field_type: &TypeSpecifier,
+        span: Span,
+    ) {
+        let has_indirection = matches!(
+            field_type,
+            TypeSpecifier::Pointer(..) | TypeSpecifier::FunctionPointer(..)
+        ) || derived.iter().any(|d| {
+            matches!(
+                d,
+                DerivedDeclarator::Pointer(_)
+                    | DerivedDeclarator::Function(..)
+                    | DerivedDeclarator::FunctionPointer(..)
+            )
+        });
+        let offending = if object_space != AddressSpace::Default {
+            object_space
+        } else if base_space != AddressSpace::Default && !has_indirection {
+            base_space
+        } else {
+            return;
+        };
+        let message = match name {
+            Some(n) => format!("'{}' specified for structure field '{}'", offending, n),
+            None => format!("'{}' specified for structure field", offending),
+        };
+        self.emit_error(message, span);
     }
 
     /// Parse one or more declarators for a struct field using the general
@@ -1065,14 +1148,29 @@ impl Parser {
         // (a `__seg_gs int *`) trips "incompatible pointer types".
         let field_addr_space = self.attrs.parsing_address_space;
         self.attrs.parsing_address_space = AddressSpace::Default;
+        // `volatile` written in the specifier applies to every declarator. A
+        // star's `volatile` in an earlier declarator (`volatile int *a, b;`
+        // style) must not leak into the next one, so each declarator restarts
+        // from the specifier's flag.
+        let spec_volatile = self.attrs.parsing_volatile();
 
         loop {
+            self.attrs.set_volatile(spec_volatile);
             // Handle unnamed bitfield: `: constant-expr`
             if matches!(self.peek(), TokenKind::Colon) {
                 self.advance();
                 // Use parse_assignment_expr to avoid consuming comma as comma-operator.
                 // Bitfield width is a constant expression (no comma operator at top level).
                 let bit_width = Some(Box::new(self.parse_assignment_expr()));
+                let colon_span = self.peek_span();
+                self.check_struct_field_space(
+                    field_addr_space,
+                    AddressSpace::Default,
+                    None,
+                    &[],
+                    &TypeSpecifier::Void,
+                    colon_span,
+                );
                 fields.push(StructFieldDecl {
                     type_spec: type_spec.clone(),
                     name: None,
@@ -1080,6 +1178,8 @@ impl Parser {
                     derived: Vec::new(),
                     alignment: alignas_from_type,
                     is_packed: false,
+                    base_volatile: false,
+                    object_volatile: false,
                 });
                 if !self.consume_if(&TokenKind::Comma) {
                     break;
@@ -1092,8 +1192,17 @@ impl Parser {
             // pointer declarators of arbitrary depth.
             // parse_declarator_with_attrs also consumes trailing __attribute__ and
             // returns the aligned value from __attribute__((aligned(N))).
+            let declarator_span = self.peek_span();
+            self.attrs.declarator_object_space = AddressSpace::Default;
             let (name, derived, _, _, decl_aligned, decl_packed) =
                 self.parse_declarator_with_attrs();
+            // The declarator's volatile qualifiers (see `declarator_base_volatile`).
+            let decl_base_volatile = self.attrs.declarator_base_volatile;
+            let decl_object_volatile = self.attrs.declarator_object_volatile;
+            let declarator_object_space = std::mem::replace(
+                &mut self.attrs.declarator_object_space,
+                AddressSpace::Default,
+            );
 
             // Parse optional bitfield width (constant-expression, not full expr with comma)
             let bit_width = if self.consume_if(&TokenKind::Colon) {
@@ -1115,6 +1224,14 @@ impl Parser {
             // type_spec. Only use the derived field for complex cases with function
             // pointers that require build_full_ctype().
             let (mut field_type, field_derived) = Self::fold_simple_derived(type_spec, &derived);
+            self.check_struct_field_space(
+                field_addr_space,
+                declarator_object_space,
+                name.as_deref(),
+                &derived,
+                &field_type,
+                declarator_span,
+            );
             // Attach the address-space qualifier (e.g. `__percpu`) to the
             // outermost pointer: `unsigned int __percpu *read_count` declares a
             // %gs-qualified POINTER, and the load through it must use %gs:.
@@ -1131,6 +1248,8 @@ impl Parser {
                 derived: field_derived,
                 alignment,
                 is_packed,
+                base_volatile: decl_base_volatile,
+                object_volatile: decl_object_volatile,
             });
 
             if !self.consume_if(&TokenKind::Comma) {
@@ -1517,6 +1636,14 @@ impl Parser {
         // Also handles nested function pointers: (*(*)(params))(params)
         if matches!(self.peek(), TokenKind::LParen) {
             let save = self.pos;
+            // A qualifier still pending here came from the base specifier
+            // (`long __seg_gs (*)[4]`): it names the storage the pointer
+            // addresses, so it belongs on the innermost pointer layer, exactly
+            // as a declaration's base qualifier does through
+            // `apply_declaration_address_space`. Star arms above have already
+            // taken their own qualifiers, so nothing is applied twice.
+            // Read, not taken: the slot stays with the declaration's snapshot.
+            let base_space = self.attrs.parsing_address_space;
             if let Some(paren_decl) = self.try_parse_paren_abstract_declarator() {
                 use super::declarators::ParenAbstractDecl;
                 match paren_decl {
@@ -1562,21 +1689,25 @@ impl Parser {
                             for dim in outer_dims.into_iter().rev() {
                                 result_type = TypeSpecifier::Array(Box::new(result_type), dim);
                             }
-                            for _ in 0..ptr_depth {
-                                result_type = TypeSpecifier::Pointer(
-                                    Box::new(result_type),
-                                    AddressSpace::Default,
-                                );
+                            for level in 0..ptr_depth {
+                                let space = if level == 0 {
+                                    base_space
+                                } else {
+                                    AddressSpace::Default
+                                };
+                                result_type = TypeSpecifier::Pointer(Box::new(result_type), space);
                             }
                             for dim in inner_array_dims.into_iter().rev() {
                                 result_type = TypeSpecifier::Array(Box::new(result_type), dim);
                             }
                         } else {
-                            for _ in 0..ptr_depth {
-                                result_type = TypeSpecifier::Pointer(
-                                    Box::new(result_type),
-                                    AddressSpace::Default,
-                                );
+                            for level in 0..ptr_depth {
+                                let space = if level == 0 {
+                                    base_space
+                                } else {
+                                    AddressSpace::Default
+                                };
+                                result_type = TypeSpecifier::Pointer(Box::new(result_type), space);
                             }
                         }
                     }

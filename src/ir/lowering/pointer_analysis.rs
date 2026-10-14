@@ -149,7 +149,7 @@ impl Lowerer {
                 }
                 false
             }
-            Expr::Cast(type_spec, _, _) => {
+            Expr::Cast(type_spec, _, _, _) => {
                 match type_spec {
                     TypeSpecifier::Pointer(_, _) => true,
                     // Resolve typedef names to check if the resolved type is a pointer
@@ -368,7 +368,7 @@ impl Lowerer {
                 // struct/union types (since they map to IrType::Ptr in the IR).
                 self.sizeof_expr(inner).max(1)
             }
-            Expr::Cast(type_spec, _, _) => {
+            Expr::Cast(type_spec, _, _, _) => {
                 if let TypeSpecifier::Pointer(inner, _) = type_spec {
                     self.sizeof_type(inner)
                 } else {
@@ -433,7 +433,7 @@ impl Lowerer {
                 }
                 self.get_pointee_type_of_expr(rhs)
             }
-            Expr::Cast(type_spec, inner, _) => {
+            Expr::Cast(type_spec, inner, _, _) => {
                 if let TypeSpecifier::Pointer(pointee_ts, _) = type_spec {
                     let pt = self.type_spec_to_ir(pointee_ts);
                     return Some(pt);
@@ -496,13 +496,13 @@ impl Lowerer {
             }
         }
         match expr {
-            Expr::Cast(TypeSpecifier::Pointer(_, addr_space), inner, _) => {
+            Expr::Cast(TypeSpecifier::Pointer(_, addr_space), inner, _, _) => {
                 if *addr_space != AddressSpace::Default {
                     return *addr_space;
                 }
                 self.get_addr_space_of_ptr_expr(inner)
             }
-            Expr::Cast(_, inner, _) => self.get_addr_space_of_ptr_expr(inner),
+            Expr::Cast(_, inner, _, _) => self.get_addr_space_of_ptr_expr(inner),
             Expr::AddressOf(inner, _) => self.get_addr_space_of_struct_expr(inner),
             _ => AddressSpace::Default,
         }
@@ -589,7 +589,7 @@ impl Lowerer {
             // Dereference of a __seg_gs pointer: (*p).field
             Expr::Deref(inner, _) => self.get_addr_space_of_ptr_expr(inner),
             // Cast expression: check if the cast target has an address space
-            Expr::Cast(type_spec, _, _) => {
+            Expr::Cast(type_spec, _, _, _) => {
                 if let TypeSpecifier::Pointer(_, addr_space) = type_spec {
                     return *addr_space;
                 }

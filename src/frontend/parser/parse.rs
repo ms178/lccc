@@ -106,6 +106,11 @@ pub(super) mod parsed_attr_flag {
     /// the type may be identical, which is exactly what a basename collision looks
     /// like before any name lookup.
     pub const NESTED_FN: u32 = 1 << 24;
+    /// The declaration's specifiers name a typedef (its qualifiers apply here).
+    pub const TYPEDEF_USE: u32 = 1 << 25;
+    /// The typedef named by the specifiers has a volatile object qualifier
+    /// (`typedef int *volatile P`): the object declared through it is volatile.
+    pub const TYPEDEF_OBJECT_VOLATILE: u32 = 1 << 26;
 
     // --- Type qualifiers ---
     /// `const` qualifier encountered.
@@ -181,6 +186,13 @@ pub(super) struct ParsedDeclAttrs {
     /// after its last `*` (see `DeclAttributes::object_space`). Set by
     /// `parse_declarator_with_attrs`, read right after it.
     pub(super) declarator_object_space: AddressSpace,
+    /// `volatile` of the object the last declarator names (see
+    /// `DeclAttributes::object_volatile`). Set by `parse_declarator_with_attrs`.
+    pub(super) declarator_object_volatile: bool,
+    /// `volatile` written in the declaration's specifiers (the base type's
+    /// qualifier: the object for a non-pointer, the pointee for a pointer).
+    /// Set by `parse_declarator_with_attrs`; read by the typedef registration.
+    pub(super) declarator_base_volatile: bool,
 
     /// Named address space of the declaration being parsed, moved out of
     /// `parsing_address_space` right after its type specifier. Parameter
@@ -263,6 +275,14 @@ impl ParsedDeclAttrs {
     #[inline]
     pub fn parsing_volatile(&self) -> bool {
         self.flags & parsed_attr_flag::VOLATILE != 0
+    }
+    #[inline]
+    pub fn parsing_typedef_use(&self) -> bool {
+        self.flags & parsed_attr_flag::TYPEDEF_USE != 0
+    }
+    #[inline]
+    pub fn parsing_typedef_object_volatile(&self) -> bool {
+        self.flags & parsed_attr_flag::TYPEDEF_OBJECT_VOLATILE != 0
     }
     #[inline]
     pub fn parsing_constructor(&self) -> bool {
@@ -366,6 +386,14 @@ impl ParsedDeclAttrs {
     #[inline]
     pub fn set_volatile(&mut self, v: bool) {
         self.set_flag(parsed_attr_flag::VOLATILE, v)
+    }
+    #[inline]
+    pub fn set_typedef_use(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::TYPEDEF_USE, v)
+    }
+    #[inline]
+    pub fn set_typedef_object_volatile(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::TYPEDEF_OBJECT_VOLATILE, v)
     }
     #[inline]
     pub fn set_constructor(&mut self, v: bool) {
@@ -510,6 +538,20 @@ pub struct Parser {
     /// `__attribute__((vector_size(16 * sizeof(int64_t))))`).  Chained
     /// typedefs, pointers and arrays fold into the stored spec recursively.
     pub(super) typedef_type_specs: FxHashMap<String, TypeSpecifier>,
+    /// Named address space an object declared through a typedef name gets
+    /// (`typedef int __seg_gs sint;` records `sint -> SegGs`). A use of the
+    /// typedef name then sets `parsing_address_space` exactly as the
+    /// `__seg_gs` keyword would, so the object, pointer, cast and parameter
+    /// paths all see one qualifier. Absent means the typedef adds no space.
+    pub(super) typedef_object_spaces: FxHashMap<String, AddressSpace>,
+    /// Typedef names whose objects are volatile (`typedef volatile int VI;`,
+    /// `typedef int *volatile VP;`). A use of the name applies `volatile` as
+    /// its written text would. Same scoping as `typedef_object_spaces`.
+    pub(super) typedef_object_volatile: FxHashSet<String>,
+    /// Typedefs whose specifiers are `volatile`-qualified (`typedef volatile
+    /// int VI;`, `typedef volatile int *VPI;`). Their base qualifier applies
+    /// to each use, separately from the object qualifier above.
+    pub(super) typedef_base_volatile: FxHashSet<String>,
     /// Typedef names shadowed by local variable declarations in the current scope.
     pub(super) shadowed_typedefs: FxHashSet<String>,
     /// Accumulated declaration attributes from the current parse_type_specifier pass.
@@ -565,6 +607,9 @@ impl Parser {
             pos: 0,
             typedefs: Self::builtin_typedefs_cached(),
             typedef_type_specs: FxHashMap::default(),
+            typedef_object_spaces: FxHashMap::default(),
+            typedef_object_volatile: FxHashSet::default(),
+            typedef_base_volatile: FxHashSet::default(),
             shadowed_typedefs: FxHashSet::default(),
             attrs: ParsedDeclAttrs::default(),
             pragma_pack_stack: Vec::with_capacity(4),
@@ -1172,6 +1217,7 @@ impl Parser {
             | TokenKind::Inline
             | TokenKind::Bool
             | TokenKind::Typeof
+            | TokenKind::TypeofUnqual
             | TokenKind::Attribute
             | TokenKind::Extension
             | TokenKind::Noreturn

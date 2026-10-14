@@ -1696,6 +1696,7 @@ mod tests {
                     reg_refs: u16::MAX,
                     pinned: true,
                     inert_dir: false,
+                    volatile_access: false,
                 };
             }
         }

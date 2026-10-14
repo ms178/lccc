@@ -6,6 +6,7 @@
 
 use super::definitions::{DeclAnalysis, FuncSig, GlobalInfo};
 use super::lower::Lowerer;
+use crate::common::type_builder::TypeConvertContext;
 use crate::common::types::{AddressSpace, CType, IrType};
 use crate::frontend::parser::ast::{
     Declaration, DerivedDeclarator, Designator, Expr, InitDeclarator, Initializer, InitializerItem,
@@ -64,7 +65,7 @@ impl Lowerer {
             let mut ginfo = GlobalInfo::from_analysis(&ext_da);
             ginfo.var.address_space = crate::common::type_builder::place_declared_space(
                 ginfo.var.c_type.as_mut(),
-                decl.address_space,
+                self.declaration_address_space(decl.address_space, &decl.type_spec),
                 &decl.type_spec,
                 &declarator.derived,
                 declarator.attrs.object_space,

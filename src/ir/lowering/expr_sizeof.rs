@@ -320,7 +320,7 @@ impl Lowerer {
             | Expr::GnuAlignofExpr(_, _) => crate::common::types::target_ptr_size(),
 
             // Cast: size of the target type
-            Expr::Cast(target_type, _, _) => self.sizeof_type(target_type),
+            Expr::Cast(target_type, _, _, _) => self.sizeof_type(target_type),
 
             // Member access: member field size (use CType for accurate array/struct sizes)
             Expr::MemberAccess(base_expr, field_name, _) => {

@@ -4509,7 +4509,13 @@ pub(super) fn fold_memory_rmw(store: &mut LineStore, infos: &mut [LineInfo]) -> 
     let mut changed = false;
     let mut i = 0;
     while i < len {
-        if infos[i].is_nop() || infos[i].pinned {
+        // A volatile load is pinned, but it is the one pinned line this
+        // fold may start from: fusing a volatile load/op/store into a
+        // single memory RMW preserves the access contract exactly (one
+        // read, one write, same address, same width), so the pin's
+        // purpose is served, not violated. Every other pinned line --
+        // user inline asm above all -- stays untouchable.
+        if infos[i].is_nop() || (infos[i].pinned && !infos[i].volatile_access) {
             i += 1;
             continue;
         }
@@ -4523,18 +4529,49 @@ pub(super) fn fold_memory_rmw(store: &mut LineStore, infos: &mut [LineInfo]) -> 
             i += 1;
             continue;
         }
-        // The increment sits on the next real line.
-        let j = next_non_nop(infos, i + 1, len);
+        // The increment sits on the next real line, possibly behind ONE
+        // same-width register copy: the backend loads a global into a
+        // scratch register and only then moves it into the accumulator
+        // (`movq h(%rip), %rdi; movq %rdi, %rax; addq $3, %rax`), a shape
+        // copy coalescing used to canonicalize away -- and still does,
+        // except where the load or store is pinned (volatile accesses,
+        // which coalescing must not rename into). The copy is accepted
+        // only at the load's full register width, so the incremented
+        // value is bit-identical to the loaded one.
+        let mut copy_idx: Option<usize> = None;
+        let mut j = next_non_nop(infos, i + 1, len);
         if j >= len || infos[j].is_barrier() {
             i += 1;
             continue;
         }
-        let lj = infos[j].trimmed(store.get(j)).to_string();
-        let Some((value_reg, imm_text)) = parse_const_increment(&lj, reg_width, loaded_reg) else {
-            i += 1;
-            continue;
-        };
-        let value_fam = register_family_fast(value_reg);
+        let mut lj = infos[j].trimmed(store.get(j)).to_string();
+        // Owned copies of the increment's register and immediate: the
+        // copy parse borrows `lj`, which the copy arm then replaces with
+        // the increment's own line text.
+        let (value_reg, imm_text): (String, String) =
+            match parse_const_increment(&lj, reg_width, loaded_reg) {
+                Some((reg, imm)) => (reg.to_string(), imm.to_string()),
+                None => {
+                    let Some(copy_dest) = parse_same_width_copy(&lj, reg_width, loaded_reg) else {
+                        i += 1;
+                        continue;
+                    };
+                    let copy_dest = copy_dest.to_string();
+                    copy_idx = Some(j);
+                    j = next_non_nop(infos, j + 1, len);
+                    if j >= len || infos[j].is_barrier() {
+                        i += 1;
+                        continue;
+                    }
+                    lj = infos[j].trimmed(store.get(j)).to_string();
+                    let Some((reg, imm)) = parse_const_increment(&lj, reg_width, &copy_dest) else {
+                        i += 1;
+                        continue;
+                    };
+                    (reg.to_string(), imm.to_string())
+                }
+            };
+        let value_fam = register_family_fast(&value_reg);
         if value_fam == REG_NONE || value_fam > REG_GP_MAX {
             i += 1;
             continue;
@@ -4561,6 +4598,9 @@ pub(super) fn fold_memory_rmw(store: &mut LineStore, infos: &mut [LineInfo]) -> 
         // deletes its definition too.
         let lk = infos[k].trimmed(store.get(k)).to_string();
         let mut owned_vec: Vec<usize> = vec![i, j, k];
+        if let Some(copy_line) = copy_idx {
+            owned_vec.push(copy_line);
+        }
         // Family whose low `mem_width` bits hold exactly the value the fused
         // `add` computes.
         let mut store_fam = value_fam;
@@ -4636,7 +4676,15 @@ pub(super) fn fold_memory_rmw(store: &mut LineStore, infos: &mut [LineInfo]) -> 
             i += 1;
             continue;
         }
-        if !all_editable(infos, owned) {
+        // Pinned lines are normally untouchable (`all_editable`), but a
+        // pinned VOLATILE load/store in this exact sequence is the fold's
+        // reason to exist: the fused instruction performs the same single
+        // read and single write, and it is re-pinned below. Any other
+        // pinned line in the window still refuses the fold.
+        if !owned
+            .iter()
+            .all(|&l| !infos[l].pinned || infos[l].volatile_access)
+        {
             i += 1;
             continue;
         }
@@ -4663,9 +4711,23 @@ pub(super) fn fold_memory_rmw(store: &mut LineStore, infos: &mut [LineInfo]) -> 
         }
         let suffix = mem_width.mnemonic_suffix();
         let new_line = format!("    add{} ${}, {}", suffix, imm_text, mem);
+        // A volatile store fuses into a volatile RMW: the fused line must
+        // stay pinned, or a later pass could reuse or delete the access
+        // the fold just preserved. `replace_line` re-classifies, so the
+        // flags are re-applied explicitly. The consumed lines are
+        // unpinned first, because `mark_nop` refuses pinned lines -- by
+        // the time we get here the fold has already proven (deadness,
+        // address identity, flags) that consuming them is sound.
+        let store_volatile = infos[k].volatile_access;
         replace_line(store, &mut infos[k], k, new_line);
-        mark_nop(&mut infos[i]);
-        mark_nop(&mut infos[j]);
+        if store_volatile {
+            infos[k].pinned = true;
+            infos[k].volatile_access = true;
+        }
+        for &consumed in owned_vec.iter().filter(|&&l| l != k) {
+            infos[consumed].pinned = false;
+            mark_nop(&mut infos[consumed]);
+        }
         dead.invalidate(store, infos, k);
         changed = true;
         i = k + 1;
@@ -4829,6 +4891,30 @@ fn parse_plain_imm(s: &str) -> Option<i64> {
 /// exact spelling of the family at `mem_width` is accepted (see the call site):
 /// a wider read would drag the incremented high bits into the value the fused
 /// read-modify-write never sees.
+/// A plain same-width register copy of the loaded value: `movq %rdi, %rax`
+/// where the load produced `%rdi` at register width `width`. Returns the
+/// copy's destination register text. Only the exact width-matched plain
+/// `mov` is accepted: the copied value must be bit-identical to the loaded
+/// value, which is what makes incrementing the copy equivalent to
+/// incrementing the load's own register.
+fn parse_same_width_copy<'a>(t: &'a str, width: RmwWidth, loaded_reg: &str) -> Option<&'a str> {
+    let (mnemonic, rest) = t.split_once(' ')?;
+    let want = match width {
+        RmwWidth::Q => "movq",
+        RmwWidth::L => "movl",
+        RmwWidth::W => "movw",
+        RmwWidth::B => "movb",
+    };
+    if mnemonic != want {
+        return None;
+    }
+    let (src, dst) = split_two_operands(rest.trim_start())?;
+    if src != loaded_reg || !dst.starts_with('%') || dst.contains('(') || dst == loaded_reg {
+        return None;
+    }
+    Some(dst)
+}
+
 fn parse_narrow_copy(t: &str, mem_width: RmwWidth) -> Option<RegId> {
     let (mnemonic, rest) = t.split_once(' ')?;
     let (mem_w, _dst_w) = {

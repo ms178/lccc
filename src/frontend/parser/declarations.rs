@@ -189,6 +189,8 @@ impl Parser {
         let (name, derived, decl_mode, decl_common, decl_aligned, _) =
             self.parse_declarator_with_attrs();
         let declarator_object_space = self.attrs.declarator_object_space;
+        let declarator_object_volatile = self.attrs.declarator_object_volatile;
+        let declarator_base_volatile = self.attrs.declarator_base_volatile;
         let (post_ctor, post_dtor, post_mode, post_common, post_aligned, first_asm_reg) =
             self.parse_asm_and_attributes();
         let mode_kind = decl_mode.or(post_mode);
@@ -232,6 +234,8 @@ impl Parser {
         // Build per-declarator attributes struct from the collected flags
         let mut decl_attrs = DeclAttributes::default();
         decl_attrs.object_space = declarator_object_space;
+        decl_attrs.object_volatile = declarator_object_volatile;
+        decl_attrs.base_volatile = declarator_base_volatile;
         decl_attrs.set_constructor(is_constructor);
         decl_attrs.set_destructor(is_destructor);
         decl_attrs.set_weak(is_weak);
@@ -748,6 +752,8 @@ impl Parser {
         while self.consume_if(&TokenKind::Comma) {
             let (dname, dderived) = self.parse_declarator();
             let d_object_space = self.attrs.declarator_object_space;
+            let d_object_volatile = self.attrs.declarator_object_volatile;
+            let d_base_volatile = self.attrs.declarator_base_volatile;
             let (d_ctor, d_dtor, _, d_common, _, d_asm_reg) = self.parse_asm_and_attributes();
             ctx.is_common = ctx.is_common || d_common;
             let d_weak = self.attrs.parsing_weak();
@@ -807,6 +813,8 @@ impl Parser {
                     da.visibility = d_vis;
                     da.section = d_section;
                     da.object_space = d_object_space;
+                    da.object_volatile = d_object_volatile;
+                    da.base_volatile = d_base_volatile;
                     da.asm_register = d_asm_reg;
                     da.cleanup_fn = d_cleanup_fn;
                     da
@@ -830,7 +838,7 @@ impl Parser {
         let is_typedef = self.attrs.parsing_typedef();
         let is_transparent_union = self.attrs.parsing_transparent_union();
         self.attrs.set_transparent_union(false);
-        self.register_typedefs(&type_spec, &declarators);
+        self.register_typedefs(&type_spec, &declarators, decl_addr_space);
 
         self.expect_after(&TokenKind::Semicolon, "after declaration");
         let mut d = Declaration::new(
@@ -872,6 +880,8 @@ impl Parser {
         self.attrs.set_inline(false);
         self.attrs.set_const(false);
         self.attrs.set_volatile(false);
+        self.attrs.set_typedef_use(false);
+        self.attrs.set_typedef_object_volatile(false);
         self.attrs.set_pointer_const(false);
         self.attrs.parsing_address_space = AddressSpace::Default;
         let type_spec = self.parse_type_specifier()?;
@@ -922,6 +932,8 @@ impl Parser {
         loop {
             let (name, derived, decl_mode, _, decl_aligned, _) = self.parse_declarator_with_attrs();
             let l_object_space = self.attrs.declarator_object_space;
+            let l_object_volatile = self.attrs.declarator_object_volatile;
+            let l_base_volatile = self.attrs.declarator_base_volatile;
             let (skip_mode, skip_aligned, skip_asm_reg) = self.skip_asm_and_attributes();
             let local_cleanup_fn = self.attrs.parsing_cleanup_fn.take();
             let local_section = self.attrs.parsing_section.take();
@@ -942,6 +954,8 @@ impl Parser {
                 attrs: {
                     let mut da = DeclAttributes::default();
                     da.object_space = l_object_space;
+                    da.object_volatile = l_object_volatile;
+                    da.base_volatile = l_base_volatile;
                     da.section = local_section;
                     da.asm_register = skip_asm_reg;
                     da.cleanup_fn = local_cleanup_fn;
@@ -987,6 +1001,7 @@ impl Parser {
         // Register typedef names or shadow them for variable declarations
         let is_typedef = self.attrs.parsing_typedef();
         if self.attrs.parsing_typedef() {
+            self.record_typedef_object_spaces(&declarators, decl_addr_space);
             for decl in &declarators {
                 if !decl.name.is_empty() {
                     self.typedefs.insert(decl.name.clone());
@@ -1281,7 +1296,7 @@ impl Parser {
                     Self::eval_const_int_expr_with_enums(else_expr, enum_consts, tag_aligns)
                 }
             }
-            Expr::Cast(target_type, inner, _) => {
+            Expr::Cast(target_type, inner, _, _) => {
                 let val = Self::eval_const_int_expr_with_enums(inner, enum_consts, tag_aligns)?;
                 // Apply the cast: truncate to target type's bit width
                 if let Some(size) = Self::try_sizeof_type_spec(target_type) {
@@ -1351,7 +1366,7 @@ impl Parser {
     fn is_unsigned_int_expr(expr: &Expr) -> bool {
         match expr {
             Expr::UIntLiteral(..) | Expr::ULongLiteral(..) | Expr::ULongLongLiteral(..) => true,
-            Expr::Cast(ts, _, _) => Self::is_unsigned_type_spec(ts),
+            Expr::Cast(ts, _, _, _) => Self::is_unsigned_type_spec(ts),
             // Unary +/- preserve the signedness of the operand.
             // In C, -size_t still has type size_t (unsigned wraparound).
             Expr::UnaryOp(UnaryOp::Plus, inner, _) | Expr::UnaryOp(UnaryOp::Neg, inner, _) => {
@@ -1456,8 +1471,51 @@ impl Parser {
     }
 
     /// Register typedef names from declarators, if parsing_typedef is set.
-    fn register_typedefs(&mut self, type_spec: &TypeSpecifier, declarators: &[InitDeclarator]) {
+    /// Record the named address space each typedef object gets. The object
+    /// space is the declaration's space unless a declarator pointer absorbed
+    /// it (`typedef int __seg_gs *P;` makes P's objects generic; P's pointees
+    /// keep the space through the typedef's CType). A typedef with no space
+    /// clears any earlier record of the same name (redefinition or shadowing).
+    fn record_typedef_object_spaces(
+        &mut self,
+        declarators: &[InitDeclarator],
+        decl_space: AddressSpace,
+    ) {
+        for decl in declarators {
+            if decl.name.is_empty() {
+                continue;
+            }
+            let space = crate::common::type_builder::object_storage_address_space_with_object(
+                decl_space,
+                &decl.derived,
+                decl.attrs.object_space,
+            );
+            if space == AddressSpace::Default {
+                self.typedef_object_spaces.remove(&decl.name);
+            } else {
+                self.typedef_object_spaces.insert(decl.name.clone(), space);
+            }
+            if decl.attrs.object_volatile {
+                self.typedef_object_volatile.insert(decl.name.clone());
+            } else {
+                self.typedef_object_volatile.remove(&decl.name);
+            }
+            if decl.attrs.base_volatile {
+                self.typedef_base_volatile.insert(decl.name.clone());
+            } else {
+                self.typedef_base_volatile.remove(&decl.name);
+            }
+        }
+    }
+
+    fn register_typedefs(
+        &mut self,
+        type_spec: &TypeSpecifier,
+        declarators: &[InitDeclarator],
+        decl_space: AddressSpace,
+    ) {
         if self.attrs.parsing_typedef() {
+            self.record_typedef_object_spaces(declarators, decl_space);
             for decl in declarators {
                 if !decl.name.is_empty() {
                     self.typedefs.insert(decl.name.clone());
@@ -1542,7 +1600,7 @@ impl Parser {
                         unevaluable_consts,
                     )
             }
-            Expr::Cast(_, inner, _) => {
+            Expr::Cast(_, inner, _, _) => {
                 Self::expr_has_non_const_identifier(inner, enum_consts, unevaluable_consts)
             }
             Expr::Comma(lhs, rhs, _) => {

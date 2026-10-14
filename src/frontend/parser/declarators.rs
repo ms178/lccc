@@ -89,6 +89,13 @@ impl Parser {
         // is the declared object (`long *__seg_gs p` puts `p` in %gs), while a
         // qualifier on an earlier `*` belongs to the pointee (`long *__seg_gs *p`).
         let mut object_space = AddressSpace::Default;
+        // `volatile` written before the first `*` belongs to the specifier.
+        let spec_volatile = self.attrs.parsing_volatile();
+        let typedef_use = self.attrs.parsing_typedef_use();
+        let typedef_object_volatile = self.attrs.parsing_typedef_object_volatile();
+        // `volatile` written after the most recent `*` (the last one is the
+        // object's own qualifier).
+        let mut last_star_volatile: Option<bool> = None;
         loop {
             let star_span = self.peek_span();
             if !self.consume_if(&TokenKind::Star) {
@@ -104,7 +111,14 @@ impl Parser {
             // collect only the qualifier written after this `*`.
             let base_space =
                 std::mem::replace(&mut self.attrs.parsing_address_space, AddressSpace::Default);
+            // Isolate this star's `volatile` so the last star's can be read
+            // back; the declaration-wide flag keeps the union, as before.
+            let outer_volatile = self.attrs.parsing_volatile();
+            self.attrs.set_volatile(false);
             self.skip_cv_qualifiers();
+            let star_volatile = self.attrs.parsing_volatile();
+            self.attrs.set_volatile(outer_volatile || star_volatile);
+            last_star_volatile = Some(star_volatile);
             let star_space = std::mem::replace(&mut self.attrs.parsing_address_space, base_space);
             // Each star keeps its own qualifier (see `DerivedDeclarator::Pointer`).
             // The last star's is also the declared object's space.
@@ -186,6 +200,36 @@ impl Parser {
 
         // The outermost stars name the object when present; otherwise the
         // parenthesised declarator's object space stands.
+        // The object is volatile by its last declarator part only: a pointer
+        // level's qualifier, or the specifier's when nothing is derived. An
+        // array or function object is not itself volatile.
+        // A typedef'd volatile pointer declared as an array (`VIP arr[2]`, with
+        // `typedef int *volatile VIP`) makes every element a volatile object.
+        // For an array the base flag is the element qualifier, so it carries
+        // the typedef's object qualifier here. Pointer derivations (`VIP *pp`)
+        // are not widened: their pointee qualifier cannot be expressed by this
+        // single bit (see `pointee_expr_is_volatile`).
+        let typedef_element_volatile = typedef_use
+            && typedef_object_volatile
+            && !combined.is_empty()
+            && combined
+                .iter()
+                .all(|d| matches!(d, DerivedDeclarator::Array(_)));
+        self.attrs.declarator_base_volatile = spec_volatile || typedef_element_volatile;
+        // Locals and globals read the declaration-wide flag (see
+        // `d.set_volatile(attrs.parsing_volatile())` in declarations.rs), so the
+        // element qualifier must also be carried there.
+        if typedef_element_volatile {
+            self.attrs.set_volatile(true);
+        }
+        self.attrs.declarator_object_volatile = match combined.last() {
+            // A typedef name's object qualifier is the typedef's own; the base
+            // qualifier (`spec_volatile` on a typedef use) is the pointee/element.
+            None if typedef_use => typedef_object_volatile,
+            None => spec_volatile,
+            Some(DerivedDeclarator::Pointer(_)) => last_star_volatile.unwrap_or(false),
+            Some(_) => false,
+        };
         self.attrs.declarator_object_space = if object_space == AddressSpace::Default {
             inner_object_space
         } else {
@@ -229,6 +273,7 @@ impl Parser {
             | TokenKind::Inline
             | TokenKind::Bool
             | TokenKind::Typeof
+            | TokenKind::TypeofUnqual
             | TokenKind::Noreturn
             | TokenKind::Restrict
             | TokenKind::Complex
@@ -505,12 +550,21 @@ impl Parser {
     pub(super) fn parse_param_list(&mut self) -> (Vec<ParamDecl>, bool) {
         let decl_alignas = self.attrs.parsed_alignas.take();
         let decl_alignas_type = self.attrs.parsed_alignas_type.take();
+        // The enclosing declaration's volatile and typedef-use state is read
+        // after its declarator (`volatile int f(int a)`), so a parameter's
+        // own specifiers must not leave it behind.
+        let decl_volatile = self.attrs.parsing_volatile();
+        let decl_typedef_use = self.attrs.parsing_typedef_use();
+        let decl_typedef_object = self.attrs.parsing_typedef_object_volatile();
         let result = self.parse_param_list_inner();
         // Single restore point, deliberately: every exit from the list --
         // including the K&R identifier-list path -- goes through here, so no
         // early return can drop an enclosing declaration's alignment.
         self.attrs.parsed_alignas = decl_alignas;
         self.attrs.parsed_alignas_type = decl_alignas_type;
+        self.attrs.set_volatile(decl_volatile);
+        self.attrs.set_typedef_use(decl_typedef_use);
+        self.attrs.set_typedef_object_volatile(decl_typedef_object);
         result
     }
 
@@ -570,6 +624,12 @@ impl Parser {
             // Save and reset parsing_const to detect if this parameter's base type is const.
             let saved_const = self.attrs.parsing_const();
             self.attrs.set_const(false);
+            // Each parameter's volatile and typedef qualifiers are its own
+            // (`VI p, int y`: `y` is not volatile), so clear them before its
+            // specifiers are parsed.
+            self.attrs.set_volatile(false);
+            self.attrs.set_typedef_use(false);
+            self.attrs.set_typedef_object_volatile(false);
             self.attrs.set_noreturn(saved_noreturn);
             // Each parameter's named address space is its own: clear the slot so
             // a qualifier left over from the enclosing declaration cannot be

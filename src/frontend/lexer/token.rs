@@ -91,6 +91,8 @@ pub enum TokenKind {
 
     // GCC extensions
     Typeof,
+    /// C23 `typeof_unqual`: like `Typeof`, but drops the named address space too.
+    TypeofUnqual,
     Asm,
     Attribute,
     Extension,
@@ -294,6 +296,7 @@ impl std::fmt::Display for TokenKind {
 
             // GCC extensions
             TokenKind::Typeof => write!(f, "'typeof'"),
+            TokenKind::TypeofUnqual => write!(f, "'typeof_unqual'"),
             TokenKind::Asm => write!(f, "'asm'"),
             TokenKind::Attribute => write!(f, "'__attribute__'"),
             TokenKind::Extension => write!(f, "'__extension__'"),
@@ -477,8 +480,8 @@ impl TokenKind {
             // Required by the kernel: arch/x86/include/asm/percpu.h uses
             // TYPEOF_UNQUAL() in every per-CPU accessor, so without it nothing
             // including <asm/current.h> or <asm/preempt.h> parses.
-            "typeof_unqual" if gnu_extensions => Some(TokenKind::Typeof),
-            "__typeof_unqual__" | "__typeof_unqual" => Some(TokenKind::Typeof),
+            "typeof_unqual" if gnu_extensions => Some(TokenKind::TypeofUnqual),
+            "__typeof_unqual__" | "__typeof_unqual" => Some(TokenKind::TypeofUnqual),
             "asm" if gnu_extensions => Some(TokenKind::Asm),
             "__asm__" | "__asm" => Some(TokenKind::Asm),
             "__attribute__" | "__attribute" => Some(TokenKind::Attribute),

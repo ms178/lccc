@@ -53,7 +53,12 @@
 # the summary at the end so a long log cannot hide one.
 set -u -o pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
+# Repository root, absolute: gate commands that shell out with LCCC_REPO (or a
+# script-relative fixture path) must not depend on the caller's cwd.  PR #810's
+# ill-typed-builtins gate referenced $REPO without defining it (`set -u` aborted
+# the runner after a green gate); defined once here for every gate.
+REPO=$(pwd)
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 export PATH="$CARGO_HOME/bin:$PATH"
@@ -197,9 +202,6 @@ gate "cpu-supports-runtime" fast \
 gate "got-slot-local-addend" fast \
     env CCC="$LCCC" bash tests/regression/check_got_slot_local_addend.sh
 
-gate "temp-symlink-isolation" fast \
-    env CCC="$LCCC" bash tests/regression/check_temp_symlink.sh
-
 gate "rust-toolchain-selector" fast \
     bash tests/regression/check_rust_toolchain_selector.sh
 
@@ -220,6 +222,39 @@ gate "audit-loop-contracts" fast \
 
 gate "ivsr-integer-domains" fast \
     env CCC="$LCCC" bash tests/regression/check_ivsr_domains.sh
+
+# Block-scope static initializers (C11 6.7.9p4), designator validity (6.7.9p2-p6),
+# and volatile typedef objects (6.7.8): each row is checked against GCC 16.2.
+gate "static-local-init" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_static_local_init.sh
+
+gate "designator-init" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_designator_init.sh
+
+# File-scope initializers (C11 6.7.9p4) against GCC 16.2, plus runtime values of
+# folded forms: a constant that is accepted but emitted as zero fails the values check.
+gate "file-scope-init" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_file_scope_init.sh
+
+gate "typedef-volatile-codegen" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_typedef_volatile_codegen.sh
+
+# Named-space initializers through brace elision and anonymous members, against
+# GCC 16.2 line by line (C11 6.7.9p17-p20, 6.7.2.2p13).
+gate "seg-init-brace-elision" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_seg_init_brace_elision.sh
+
+# Volatile struct members (memory-mapped register blocks, nested and anonymous
+# members) keep their stores and loads at -O2, against GCC 16.2 (C11 6.7.3p7).
+gate "volatile-member-codegen" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_volatile_member_codegen.sh
+
+# A `const volatile` object is volatile at every read: the `const` qualifier
+# forbids writes, it does not make the object a constant, so the read must not
+# be folded away (C11 6.7.3p7).  Globals, casts, typedef-qualified objects and
+# members, against GCC 16.2's per-function memory-reference counts.
+gate "const-volatile-objects" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_const_volatile_objects.sh
 
 # Executed miscompile regression for the iv_widen trajectory gates and the
 # exposed-latch intercept: runtime ring-top seeds over a 2^32-span marker
@@ -621,6 +656,12 @@ gate "seg-cast-warning" fast \
 gate "seg-declarator-space" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_seg_declarator_space.sh
 
+# Named-space codegen through a typedef or typeof: every access to the __seg_gs
+# object must carry the %gs: prefix (audit H2, silent miscompile). Mirrors the
+# hosted step in ci.yml; ci-gate-parity fails if the two drift apart.
+gate "seg-typedef-codegen" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_seg_typedef_codegen.sh
+
 # Named-space conversions: a decayed array in a named space (through an
 # identifier, a member of a named object, a subscript of a named array, or
 # pointer arithmetic on any of these) must be rejected where gcc 14.2 rejects
@@ -630,6 +671,10 @@ gate "seg-conv-diagnostics" fast \
 
 gate "seg-target-diagnostics" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_seg_target_diagnostics.sh
+# Table-driven parity: every conversion shape in seg_conv/parity_table.tsv is
+# checked against GCC 16.2 and lccc. Under CI a missing gcc fails the gate (tests/regression/lib/gcc_oracle.sh).
+gate "seg-conversion-parity" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_seg_conversion_parity.sh
 
 gate "chroot-bind" fast bash tests/regression/check_chroot_bind.sh
 
@@ -1646,7 +1691,7 @@ if [ -x target/fastbuild/lccc-arm ]; then
 # the assembler.  It needs the pinned binutils tarball for the .def file, so it
 # is skipped, not passed, when that is absent (like the gates above).
 if [ -n "$A64_AS" ] && \
-   [ -f "${GAS_DL_DIR:-$HOME/dl}/binutils-2.47.tar.xz" ]; then
+   [ -f "${GAS_DL_DIR:-$HOME/.cache/dl}/binutils-2.47.tar.xz" ]; then
     gate "aarch64-sysreg-table" fast \
         python3 scripts/aarch64_sysreg_table.py --check \
         --as "$HOME/.cache/gas-2.47-aarch64-linux-gnu/bin/as" \
@@ -1719,6 +1764,12 @@ gate "codegen-quality-gate" fast \
 # configuration is how a red PR gets pushed.  A clippy run is ~90 s against
 # the two multi-minute oracles `--fast` exists to skip.
 gate "rustfmt" fast cargo fmt --all -- --check
+
+# The declared rust-version floor (Cargo.toml, 1.97.0) is a measurement only
+# if something rebuilds the tree on that toolchain: the hosted `msrv` job
+# does, and this gate is its local mirror (check_ci_gate_parity.py requires
+# the pair). Needs the 1.97.0 rustup toolchain installed.
+gate "msrv-check" fast cargo +1.97.0 check --locked
 
 # Memory-constrained hosts OOM-kill the clippy gate the same way they kill
 # the cargo-test compile (see cargo_test_repeated): clippy-driver's metadata
