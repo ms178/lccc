@@ -616,12 +616,14 @@ INVOCATION_CONTRACTS: tuple[InvocationContract, ...] = (
         program="tests/regression/check_arm_address_contract.py",
         name="arm-address-contract",
         sides=_BOTH,
+        env_spec=("CCC_ARM=target/fastbuild/lccc-arm",),
         local_gate=("arm-address-contract", "fast"),
     ),
     InvocationContract(
         program="tests/regression/check_arm_popcount_contract.py",
         name="arm-popcount-contract",
         sides=_BOTH,
+        env_spec=("CCC_ARM=target/fastbuild/lccc-arm",),
         local_gate=("arm-popcount-contract", "fast"),
     ),
     InvocationContract(
@@ -695,6 +697,10 @@ GUARDED_PROGRAMS = tuple(sorted({c.program for c in INVOCATION_CONTRACTS}))
 # (where a shell assignment prefix wins over any exported value) so that a
 # step env of the same name can only ever be dead weight.
 PROGRAM_ENV_CHANNELS: dict[str, frozenset[str]] = {
+    "tests/regression/check_arm_address_contract.py": frozenset(
+        {"CCC_ARM", "PYTHONOPTIMIZE"}),
+    "tests/regression/check_arm_popcount_contract.py": frozenset(
+        {"CCC_ARM", "PYTHONOPTIMIZE"}),
     "scripts/asmdiff.py": frozenset(
         {"LCCC", "LCCC_GAS", "LCCC_OBJCOPY", "LCCC_OBJDUMP"}),
     "scripts/encdiff.py": frozenset(

@@ -12,6 +12,11 @@ import struct
 import subprocess
 import tempfile
 
+# Assertions are the gate verdicts, not optional debugging checks. Refuse
+# -O/-OO and PYTHONOPTIMIZE before any compiler or runtime can be invoked.
+if not __debug__:
+    raise SystemExit("AArch64 contract checks require Python assertions; disable -O/-OO and PYTHONOPTIMIZE")
+
 ROOT = Path(__file__).resolve().parents[2]
 CC = os.environ.get("CCC_ARM", str(ROOT / "target/fastbuild/lccc-arm"))
 
