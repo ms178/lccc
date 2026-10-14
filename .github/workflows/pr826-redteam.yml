@@ -151,7 +151,20 @@ jobs:
           toolchain: 1.99.0
           components: rustfmt, clippy
       - name: Build immutable baselines and execute causal comparison
-        run: bash tests/linker/check_pr827_comparison.sh
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          import sys
+          result = subprocess.run(["bash", "-x", "tests/linker/check_pr827_comparison.sh"], capture_output=True, text=True)
+          print(result.stdout)
+          print(result.stderr, file=sys.stderr)
+          if result.returncode:
+              detail = result.stderr[-15000:]
+              for offset in range(0, len(detail), 3000):
+                  escaped = detail[offset:offset + 3000].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+                  print(f"::error title=comparison bootstrap chunk {offset}::" + escaped)
+          sys.exit(result.returncode)
+          PY
       - name: Retain causal comparison evidence
         if: always()
         uses: actions/upload-artifact@v7
