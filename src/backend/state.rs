@@ -287,8 +287,9 @@ pub struct CodegenState {
     pub pending_vec_store: Option<(u32, &'static str, bool)>,
     /// i686 x87 top-of-stack cache (the FP twin of `pending_vec_store`).
     /// `x87_pending == Some(v)` means: st(0) holds a copy of the F64 value
-    /// `v`, its slot was already written by a non-popping `fstl`, and no
-    /// other x87 instruction has executed since. `emit_float_binop` sets it
+    /// `v`, rounded through `fstpl; fldl` so the register equals the F64
+    /// slot (a bare `fstl` does not round ST(0)). No foreign x87 instruction
+    /// has executed since. `emit_float_binop` sets it
     /// so the next consumer of `v` can dup the register copy (`fld %st(0)`)
     /// or consume it in place (non-popping `fsub %st(1), %st` forms)
     /// instead of reloading from the slot. Flushed (`fstp %st(0)`) by the
@@ -299,12 +300,12 @@ pub struct CodegenState {
     pub x87_pending: Option<u32>,
     /// F64 binop results whose single use is the operand of the
     /// immediately-following F64 binop (`compute_x87_defer_values`). Only
-    /// these may leave their result on the x87 stack with a non-popping
-    /// `fstl`, because the adjacency guarantee means no other instruction
+    /// these may leave a rounded copy on the x87 stack via `fstpl; fldl`,
+    /// because the adjacency guarantee means no other instruction
     /// can observe or clobber the window between store and consumption.
     pub x87_defer_values: FxHashSet<u32>,
     /// Suppresses the central x87-pending flush while `emit_float_binop`
-    /// emits its own controlled x87 sequences (dup / in-place arith / fstl).
+    /// emits its own controlled x87 sequences (dup / arith / store/reload).
     /// Never set across an early-return boundary without being reset.
     pub x87_suppress: bool,
     /// Scalar FP value already resident in the SysV return register xmm0.

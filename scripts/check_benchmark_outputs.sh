@@ -39,11 +39,15 @@ if [[ ! -x $LCCC_BIN ]]; then
     exit 2
 fi
 
-# Match what run_benchmarks.py passes, so a failure here reproduces there.
-GCC_INC=""
-for d in /usr/lib/gcc/x86_64-linux-gnu/*/include; do
-    [[ -d $d ]] && GCC_INC="-I$d"
-done
+# Match the selected reference compiler exactly, so this correctness-only
+# gate uses the same builtin headers as run_benchmarks.py (including when CI
+# selects gcc-16 explicitly).
+if ! gcc_include=$("$GCC_BIN" -print-file-name=include 2>/dev/null) ||
+   [[ ! -d $gcc_include ]]; then
+    echo "error: cannot find builtin include directory for GCC_BIN=$GCC_BIN" >&2
+    exit 2
+fi
+GCC_INC="-I$gcc_include"
 
 WORK=$(mktemp -d -t lccc-benchcheck-XXXXXX)
 trap 'rm -rf "$WORK"' EXIT

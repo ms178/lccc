@@ -63,6 +63,46 @@ class CompileEvidence(unittest.TestCase):
                 patch.object(godbolt, "_request_json", return_value={**ASM, "stderr": IGNORED}):
             self.assertIsNone(godbolt.compile_on_godbolt("icc", "int f(void){return 0;}", "-O2"))
 
+    def test_structured_producer_keeps_the_actual_rejection(self):
+        with patch.object(godbolt, "resolve_compiler", return_value="cicc2021100"), \
+                patch.object(godbolt, "_request_json", return_value={**ASM, "stderr": IGNORED}):
+            with self.assertRaisesRegex(godbolt.GodboltError, "10148.*not supported"):
+                godbolt.compile_on_godbolt("icc", "int f(void){return 0;}", "-O2",
+                                           raise_on_error=True)
+
+    def test_structured_producer_keeps_transport_errors(self):
+        with patch.object(godbolt, "resolve_compiler", return_value="g162"), \
+                patch.object(godbolt, "_request_json", side_effect=godbolt.GodboltError("HTTP 503")):
+            with self.assertRaisesRegex(godbolt.GodboltError, "HTTP 503"):
+                godbolt.compile_on_godbolt("gcc16.2", "int f(void){return 0;}", "-O2",
+                                           raise_on_error=True)
+
+    def test_classic_icc_uses_an_explicit_common_cpu_dialect_only(self):
+        flags = "-O2 -march=haswell -fwrapv -DN=128 -lm"
+        actual = godbolt.compiler_flags("cicc2021100", flags)
+        self.assertIn("-xCORE-AVX2", actual)
+        self.assertIn("-fwrapv -DN=128 -lm", actual)
+        self.assertNotIn("-march=", actual)
+        for compiler in ("g162", "cclang2310", "icx-latest"):
+            self.assertEqual(godbolt.compiler_flags(compiler, flags), flags)
+        self.assertEqual(godbolt.compiler_flags("cicc2021100", "-O2 -march=x86-64-v3"),
+                         "-O2 -march=x86-64-v3")
+        self.assertEqual(godbolt.compiler_flags("cicc2021100", "-O2 -DN='-march=haswell'"),
+                         "-O2 -DN='-march=haswell'")
+        for extra in ("-march=skylake", "-xAVX", "-axCORE-AVX2"):
+            with self.subTest(extra=extra), self.assertRaises(godbolt.GodboltError):
+                godbolt.compiler_flags("cicc2021100", flags + " " + extra)
+
+    def test_response_records_requested_and_effective_cpu_options(self):
+        flags = "-O2 -march=haswell -fwrapv"
+        with patch.object(godbolt, "resolve_compiler", return_value="cicc2021100"), \
+                patch.object(godbolt, "_request_json", return_value={**ASM}) as request:
+            result = godbolt.compile_on_godbolt("icc", "int f(void){return 0;}", flags)
+            self.assertEqual(result["lcccOracleOptions"]["requested"], flags)
+            self.assertEqual(request.call_args.kwargs["body"]["options"]["userArguments"],
+                             "-O2 -xCORE-AVX2 -fwrapv")
+            self.assertIn("-xCORE-AVX2", result["lcccOracleOptions"]["effective"])
+
     def test_old_unvalidated_cache_namespaces_are_not_reused(self):
         self.assertNotEqual(godbolt_cache.NS_ASM, "att-v3")
         self.assertNotEqual(godbolt_cache.NS_ORACLE, "oracle-v2")

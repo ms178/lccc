@@ -26,6 +26,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--mine", required=True)
     parser.add_argument("--ref", default="gcc")
+    parser.add_argument("--gcc-include-command", default="gcc",
+                        help="GCC driver supplying matching builtin headers")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--only", help="comma-separated corpus ids")
     args = parser.parse_args(argv)
@@ -50,7 +52,8 @@ def main(argv=None):
             directory.mkdir(exist_ok=True)
             flags = "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm " + sizes[item.name]
             command = [args.mine, args.ref, "--opt=" + flags, bench.source_for(item).stem,
-                       "--out-root", str(directory), "--instrument-timeout", "60"]
+                       "--out-root", str(directory), "--instrument-timeout", "60",
+                       "--gcc-include-command", args.gcc_include_command]
             print(item.name, flush=True)
             try:
                 with (directory / "run.log").open("w") as log, contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):

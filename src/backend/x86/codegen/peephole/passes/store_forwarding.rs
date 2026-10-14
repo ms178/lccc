@@ -9,7 +9,7 @@
 //! jump source may have different register values.
 
 use super::super::types::*;
-use super::fp_liveness::FpLiveness;
+use super::fp_liveness::{FpLiveness, has_implicit_vector_effects_line};
 use super::helpers::*;
 use super::liveness::FileLiveness;
 
@@ -1178,6 +1178,32 @@ fn gsf_handle_other(
     reg_offsets: &mut RegHomes,
     rbp_is_frame: bool,
 ) {
+    // Slot/register equalities require MAY-write effects, not just the last
+    // operand: string-index outputs, xchg's first operand and unknown GP
+    // effects can invalidate backing homes without a classified destination.
+    let text = infos[i].trimmed(store.get(i));
+    let mut writes = super::load_op_fuse::may_write_families(text, &infos[i]);
+    while writes != 0 {
+        let reg = writes.trailing_zeros() as RegId;
+        if reg == 4 {
+            invalidate_all_mappings(slot_entries, reg_offsets);
+            break;
+        }
+        invalidate_reg_flat(slot_entries, reg_offsets, reg);
+        writes &= writes - 1;
+    }
+    // Scalar homes represent only low XMM bits, preserved by VZEROUPPER.
+    if has_implicit_vector_effects_line(text)
+        && text.split_whitespace().next() != Some("vzeroupper")
+    {
+        // Mask results and unknown vector writes need not name their outputs.
+        // A hidden reader alone would not invalidate equality, but refusing
+        // across unmodelled effects is conservative and shares the copy proof.
+        for reg in VEC_FAMILY_BASE..=VEC_FAMILY_BASE + 15 {
+            invalidate_reg_flat(slot_entries, reg_offsets, reg);
+        }
+    }
+
     // SOUNDNESS: any write to %rsp reshuffles every %rsp-relative slot
     // offset, so every offset-keyed mapping is stale afterwards. Mappings
     // here are keyed by raw offset with no (base, offset) distinction and
@@ -1224,21 +1250,7 @@ fn gsf_handle_other(
         invalidate_all_mappings(slot_entries, reg_offsets);
     }
 
-    if is_valid_gp_reg(dest_reg) {
-        invalidate_reg_flat(slot_entries, reg_offsets, dest_reg);
-        if dest_reg == 0 {
-            let trimmed = infos[i].trimmed(store.get(i));
-            if trimmed.starts_with("div")
-                || trimmed.starts_with("idiv")
-                || trimmed.starts_with("mul")
-                || trimmed == "cqto"
-                || trimmed == "cqo"
-                || trimmed == "cdq"
-            {
-                invalidate_reg_flat(slot_entries, reg_offsets, 2);
-            }
-        }
-    } else if is_xmm_family(dest_reg) {
+    if is_xmm_family(dest_reg) {
         // The line's AT&T destination is an XMM register (vmulsd, cvtsi2sd,
         // movq %rax, %xmmN, …): that register no longer holds the value any
         // XMM-backed mapping recorded, so every mapping it backs dies. The
@@ -1253,6 +1265,27 @@ fn gsf_handle_other(
     }
 
     if infos[i].has_indirect_mem {
+        // A pure memory READ through an unknown pointer cannot change the
+        // contents of a frame slot: the store→load mapping survives ordinary
+        // base-displacement loads and memory-source arithmetic. Only an
+        // actual (or RMW / implicit) memory WRITE may alias the slot, so
+        // `line_writes_memory` — the shared conservative classifier the dead-
+        // writes pass maintains (unrecognized shapes report `true` and stay
+        // barriers) — decides, instead of the old blanket `has_indirect_mem`
+        // kill. That blanket rule kept the scalar-FP square chains of numeric
+        // kernels out of the forwarding window: the nbody d² loop stores its
+        // `dx`/`dy` extracts to spill slots, interleaves plain loads of the
+        // pair coordinates (`movsd (%r11), %xmm4`, `vsubsd 16(%r10), ...`),
+        // and then reloads the slots — reads in between, and the forwarding
+        // never fired, costing two extra slot round-trips in the inner loop.
+        if super::dead_writes::line_writes_memory(infos[i].trimmed(store.get(i))) {
+            invalidate_all_mappings(slot_entries, reg_offsets);
+        }
+    } else if super::dead_writes::line_writes_memory(infos[i].trimmed(store.get(i))) {
+        // Implicit memory writers with NO memory operand at all (`stosq`,
+        // `maskmovq %xmm0, %xmm1`) never set `has_indirect_mem`, but they
+        // can write any address a pointer names — including a frame slot.
+        // `line_writes_memory` knows them; keep them barriers too.
         invalidate_all_mappings(slot_entries, reg_offsets);
     } else if infos[i].rbp_offset != RBP_OFFSET_NONE {
         // A folded memory operand is a RANGE access, not a point: x87
@@ -1966,6 +1999,81 @@ mod tests {
     }
 
     #[test]
+    fn fp_slot_forward_survives_read_only_indirect_lines() {
+        // The nbody d² shape: the extract is spilled to a slot, PLAIN READS
+        // through other pointers follow, and the slot is reloaded. A read
+        // cannot change the slot contents, so the mapping must survive and
+        // the reload must forward — the old blanket `has_indirect_mem` kill
+        // made every such round-trip a double memory stall.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movsd %xmm15, 24(%rsp)\n",
+            "    movsd (%r11), %xmm4\n",
+            "    vsubsd 16(%r10), %xmm4, %xmm4\n",
+            "    movsd 24(%rsp), %xmm6\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (mut store, mut infos) = build_pinned(asm);
+        assert!(global_store_forwarding(&mut store, &mut infos));
+        assert!(
+            (0..store.len()).any(|i| store.get(i).contains("movsd %xmm15, %xmm6")),
+            "the reload must forward to a reg-reg move across read-only loads"
+        );
+        assert!(
+            !(0..store.len()).any(|i| store.get(i).contains("movsd 24(%rsp), %xmm6")),
+            "the memory reload must be gone"
+        );
+    }
+
+    #[test]
+    fn fp_slot_mapping_killed_by_indirect_write() {
+        // Soundness twin of the test above: an unknown-pointer STORE may
+        // alias the frame slot, so the mapping must die and the reload must
+        // stay a real memory load.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movsd %xmm15, 24(%rsp)\n",
+            "    movsd %xmm0, (%rax)\n",
+            "    movsd 24(%rsp), %xmm6\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (mut store, mut infos) = build_pinned(asm);
+        global_store_forwarding(&mut store, &mut infos);
+        assert!(
+            (0..store.len()).any(|i| store.get(i).contains("movsd 24(%rsp), %xmm6")),
+            "the reload must NOT forward across an unknown-pointer store"
+        );
+    }
+
+    #[test]
+    fn pr814_fp_slot_mapping_killed_by_rmw_string_writers() {
+        // Implicit memory writers (stos*, maskmov*, xchg with the memory
+        // operand FIRST) have no dst-is-memory shape; `line_writes_memory`
+        // classifies them as writers and they stay barriers.
+        for writer in [
+            "    stosq\n",
+            "    xchg (%rax), %rbx\n",
+            "    maskmovq %mm0, %mm1\n",
+            "    maskmovdqu %xmm0, %xmm1\n",
+            "    vmaskmovdqu %xmm0, %xmm1\n",
+        ] {
+            let asm = format!(
+                "f:\n.cfi_startproc\n    movsd %xmm15, 24(%rsp)\n{writer}    movsd 24(%rsp), %xmm6\n    ret\n.cfi_endproc\n"
+            );
+            let (mut store, mut infos) = build_pinned(&asm);
+            global_store_forwarding(&mut store, &mut infos);
+            assert!(
+                (0..store.len()).any(|i| store.get(i).contains("movsd 24(%rsp), %xmm6")),
+                "the reload must NOT forward across `{writer:?}`"
+            );
+        }
+    }
+
+    #[test]
     fn fp_load_store_relay_fuses_to_direct_store() {
         // The struct_copy money shape: load into a scratch XMM then store it
         // to another slot collapses to a single store from the mapping's
@@ -2104,6 +2212,60 @@ mod tests {
         assert!(
             (0..store.len()).any(|i| store.get(i).contains("movsd 72(%rsp), %xmm0")),
             "the merge-point reload must survive verbatim"
+        );
+    }
+
+    #[test]
+    fn implicit_vector_outputs_invalidate_backing_spill_homes() {
+        for effect in [
+            "pcmpistrm $0, %xmm5, %xmm7",
+            "vpcmpestrm $0, %xmm5, %xmm7",
+            "vfutureop %xmm5, %xmm7",
+        ] {
+            let asm = format!(
+                "f:\n.cfi_startproc\n    movsd %xmm0, 72(%rsp)\n    {effect}\n    movsd 72(%rsp), %xmm6\n    ret\n.cfi_endproc\n"
+            );
+            let (mut store, mut infos) = build_pinned(&asm);
+            assert!(
+                !global_store_forwarding(&mut store, &mut infos),
+                "a hidden vector clobber retired the backing home: {effect}"
+            );
+        }
+    }
+
+    #[test]
+    fn implicit_gp_outputs_invalidate_backing_spill_homes() {
+        for effect in [
+            "pcmpistri $0, %xmm5, %xmm7",
+            "vpcmpestri $0, %xmm5, %xmm7",
+            "xchgq %rcx, %rdx",
+        ] {
+            let asm = format!(
+                "f:\n.cfi_startproc\n    movq %rcx, 72(%rsp)\n    {effect}\n    movq 72(%rsp), %r10\n    ret\n.cfi_endproc\n"
+            );
+            let (mut store, mut infos) = build_pinned(&asm);
+            assert!(
+                !global_store_forwarding(&mut store, &mut infos),
+                "a hidden/nontrailing GP clobber retired the backing home: {effect}"
+            );
+        }
+    }
+
+    #[test]
+    fn spill_homes_recover_after_local_opaque_vector_effects() {
+        let asm = concat!(
+            "f:\n.cfi_startproc\n",
+            "    vpcmpistrm $0, %xmm5, %xmm7\n",
+            "    movsd %xmm0, 72(%rsp)\n",
+            "    vptest %xmm5, %xmm7\n",
+            "    movsd 72(%rsp), %xmm6\n",
+            "    ret\n.cfi_endproc\n",
+        );
+        let (mut store, mut infos) = build_pinned(asm);
+        assert!(global_store_forwarding(&mut store, &mut infos));
+        assert!(
+            (0..store.len())
+                .any(|i| { !infos[i].is_nop() && store.get(i).trim() == "movsd %xmm0, %xmm6" })
         );
     }
 

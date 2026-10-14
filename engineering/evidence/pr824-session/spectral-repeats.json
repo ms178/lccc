@@ -1,0 +1,81 @@
+{
+  "metric": "simulated whole-program Ir, not timing",
+  "repeats": [
+    {
+      "conditional_mispredicts": [
+        8568,
+        8568
+      ],
+      "d1_misses": [
+        1938,
+        1938
+      ],
+      "i1_misses": [
+        1422,
+        1421
+      ],
+      "indirect_mispredicts": [
+        233,
+        233
+      ],
+      "ir_mine": 5161229,
+      "ir_ratio": 0.6249438017491595,
+      "ir_ref": 8258709,
+      "ll_misses": [
+        2971,
+        2969
+      ]
+    },
+    {
+      "conditional_mispredicts": [
+        8568,
+        8568
+      ],
+      "d1_misses": [
+        1938,
+        1938
+      ],
+      "i1_misses": [
+        1422,
+        1421
+      ],
+      "indirect_mispredicts": [
+        233,
+        233
+      ],
+      "ir_mine": 5161229,
+      "ir_ratio": 0.6249438017491595,
+      "ir_ref": 8258709,
+      "ll_misses": [
+        2971,
+        2969
+      ]
+    },
+    {
+      "conditional_mispredicts": [
+        8568,
+        8568
+      ],
+      "d1_misses": [
+        1938,
+        1938
+      ],
+      "i1_misses": [
+        1422,
+        1421
+      ],
+      "indirect_mispredicts": [
+        233,
+        233
+      ],
+      "ir_mine": 5161229,
+      "ir_ratio": 0.6249438017491595,
+      "ir_ref": 8258709,
+      "ll_misses": [
+        2971,
+        2969
+      ]
+    }
+  ],
+  "median_ratio": 0.6249438017491595
+}

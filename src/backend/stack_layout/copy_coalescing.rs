@@ -2107,9 +2107,11 @@ fn is_user_store_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
 /// i686 x87 top-of-stack deferral (`state.x87_defer_values`): an F64 binop
 /// result whose ONLY use is as an operand of the immediately-following F64
 /// binop, in the same block. The emitter may then store the result with a
-/// non-popping `fstl` and let the consumer take it from st(0) (`fld %st(0)`
-/// dup or an in-place non-popping arith form) instead of reloading the slot.
-/// Sound because adjacency + single-use means no other instruction can run
+/// rounding `fstpl; fldl` and let the consumer take that F64 copy from st(0)
+/// (`fld %st(0)` dup or an in-place non-popping arith form). A non-popping
+/// `fstl` alone is NOT a rounding barrier for ST(0): its excess precision
+/// cannot be forwarded to an F64 consumer. The depth-one cache is safe
+/// because adjacency + single-use means no other instruction can run
 /// between the store and the consumption: nothing can clobber the slot or
 /// push/pop x87 within the window (any such instruction would be a second
 /// use or would break adjacency). The emitter still flushes defensively at

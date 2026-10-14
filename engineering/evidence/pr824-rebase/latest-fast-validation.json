@@ -1,0 +1,33 @@
+{
+  "mode": "fast only; no full/slow local CI",
+  "entry_commit": "615474667632dc975acc0fa146d0502e78e0caae",
+  "immutable_final_tree_pass": false,
+  "exit": 1,
+  "summary": {
+    "passed": 202,
+    "failed": 42,
+    "skipped": 15
+  },
+  "rust": {
+    "passed": 4714,
+    "failed": 0,
+    "ignored": 8
+  },
+  "rustfmt": "PASS on Rust 1.99",
+  "clippy": "PASS; 76 lint names, 0 unknown compatibility names",
+  "python_final": {
+    "tests": 455,
+    "skipped": 4,
+    "status": "PASS"
+  },
+  "gcc_provisioning_mocks": "7 PASS; root and nonroot tested",
+  "swap_provisioning_mocks": "7 PASS; root and nonroot, idempotency, activation confirmation and failures tested",
+  "followup_files_changed_during_run": [
+    "tests/regression/check_ci_gcc16_provisioning.py",
+    "scripts/nbody_mass_loads.py",
+    "tests/corpus/test_nbody_mass_loads.py"
+  ],
+  "followup_revalidated": "All 455 Python corpus tests; both provisioning mock suites; real canonical nbody gate and x64 AVX2/SSE2 native map gate; CI workflow shell/parity",
+  "failure_details": "latest-fast-failure-excerpts.json",
+  "acceptance": "NOT GREEN; no waiver of GCC16, multilib, MSRV or pinned external oracle requirements"
+}
