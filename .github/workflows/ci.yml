@@ -35,6 +35,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # stable (2026-10)
+        with:
+          toolchain: stable
 
       # The regression corpus includes executable i686 cases.  ubuntu-latest
       # can provide /lib/ld-linux.so.2 without the 32-bit development/startup
@@ -1690,6 +1692,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # stable (2026-10)
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
       - name: Check Rust formatting
@@ -1748,6 +1751,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # stable (2026-10)
+        with:
+          toolchain: stable
 
       - name: Build LCCC (fastbuild)
         env:
