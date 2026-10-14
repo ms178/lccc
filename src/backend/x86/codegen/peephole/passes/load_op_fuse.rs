@@ -2074,9 +2074,7 @@ mod tests {
         );
         let out = body(&run(&asm, fuse_load_into_alu));
         assert!(!has(&out, "imulq (%rdi), %rax"), "{out:?}");
-        assert!(has(&out, "movq (%rdi), %rdx"), "{out:?}");
-        assert!(has(&out, "imulq %rax, %rdx"), "{out:?}");
-        assert!(has(&out, "movq %rdx, (%r8)"), "{out:?}");
+        assert_eq!(out, body(&asm), "refusal must preserve every input line");
     }
 
     #[test]
