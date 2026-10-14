@@ -21,11 +21,13 @@ rustc +1.99.0 --version >> target/contrast/sources.txt
 gcc-16 --version >> target/contrast/sources.txt
 strace --version >> target/contrast/sources.txt
 valgrind --version >> target/contrast/sources.txt
-export CARGO_TARGET_DIR="$root/target/contrast/build"
 export CARGO_BUILD_JOBS=2
 export CARGO_INCREMENTAL=0
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc-16
 for label in agent-b prior-ours candidate; do
+    # Cargo's mtime fingerprints can reuse an archive's older files across
+    # identical package IDs. Each causal arm requires its OWN build directory.
+    export CARGO_TARGET_DIR="$root/target/contrast/build-$label"
     source="$scratch/$label"
     if [[ "$label" == candidate ]]; then source="$root"; fi
     cargo +1.99.0 build --manifest-path "$source/Cargo.toml" --profile fastbuild --locked -j 2 --bin lccc --bin lccc-riscv

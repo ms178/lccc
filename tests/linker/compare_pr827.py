@@ -54,6 +54,14 @@ def main():
            and k not in ("LCCC_PROFILE_FILE", "LLVM_PROFILE_FILE", "LD_PRELOAD")}
     failures = []
     try:
+        linker_hashes = []
+        for label, directory in versions.items():
+            for binary in (directory / "lccc", directory / "lccc-riscv"):
+                if not binary.is_file() or not os.access(binary, os.X_OK):
+                    raise RuntimeError(f"{label}: missing/non-executable compiler {binary}")
+            linker_hashes.append(digest(directory / "lccc-riscv"))
+        if len(set(linker_hashes)) != 3:
+            raise RuntimeError("causal arms reused identical linker binaries; reject stale/cross-source build fingerprints")
         with tempfile.TemporaryDirectory(prefix="lccc-pr827-compare-") as tmp:
             root = Path(tmp)
             strict, diagnostic = root / "strict.so", root / "diagnostic.so"
