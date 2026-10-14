@@ -4545,34 +4545,33 @@ pub(super) fn fold_memory_rmw(store: &mut LineStore, infos: &mut [LineInfo]) -> 
             continue;
         }
         let mut lj = infos[j].trimmed(store.get(j)).to_string();
-        // Owned copy of the register the increment must name: the load's
-        // own register, or the same-width copy's destination. Owned
-        // because the copy parse borrows `lj`, which is then replaced by
+        // Owned copies of the increment's register and immediate: the
+        // copy parse borrows `lj`, which the copy arm then replaces with
         // the increment's own line text.
-        let mut value_reg_text = loaded_reg.to_string();
-        let (value_reg, imm_text) = match parse_const_increment(&lj, reg_width, loaded_reg) {
-            Some(parsed) => parsed,
-            None => {
-                let Some(copy_dest) = parse_same_width_copy(&lj, reg_width, loaded_reg) else {
-                    i += 1;
-                    continue;
-                };
-                value_reg_text = copy_dest.to_string();
-                copy_idx = Some(j);
-                j = next_non_nop(infos, j + 1, len);
-                if j >= len || infos[j].is_barrier() {
-                    i += 1;
-                    continue;
+        let (value_reg, imm_text): (String, String) =
+            match parse_const_increment(&lj, reg_width, loaded_reg) {
+                Some((reg, imm)) => (reg.to_string(), imm.to_string()),
+                None => {
+                    let Some(copy_dest) = parse_same_width_copy(&lj, reg_width, loaded_reg) else {
+                        i += 1;
+                        continue;
+                    };
+                    let copy_dest = copy_dest.to_string();
+                    copy_idx = Some(j);
+                    j = next_non_nop(infos, j + 1, len);
+                    if j >= len || infos[j].is_barrier() {
+                        i += 1;
+                        continue;
+                    }
+                    lj = infos[j].trimmed(store.get(j)).to_string();
+                    let Some((reg, imm)) = parse_const_increment(&lj, reg_width, &copy_dest) else {
+                        i += 1;
+                        continue;
+                    };
+                    (reg.to_string(), imm.to_string())
                 }
-                lj = infos[j].trimmed(store.get(j)).to_string();
-                let Some(parsed) = parse_const_increment(&lj, reg_width, &value_reg_text) else {
-                    i += 1;
-                    continue;
-                };
-                parsed
-            }
-        };
-        let value_fam = register_family_fast(value_reg);
+            };
+        let value_fam = register_family_fast(&value_reg);
         if value_fam == REG_NONE || value_fam > REG_GP_MAX {
             i += 1;
             continue;
