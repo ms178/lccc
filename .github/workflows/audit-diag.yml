@@ -155,5 +155,5 @@ jobs:
       - name: Build
         run: ./scripts/build_lccc_fast.sh
 
-      - name: Replay step 143 only
-        run: python3 scripts/audit_diag_replay.py 143 143
+      - name: Replay steps 13-143
+        run: python3 scripts/audit_diag_replay.py 13 143

@@ -44,6 +44,12 @@ def main() -> int:
                 break
             env[key] = value
         else:
+            if "check_ci_gate_parity" in run:
+                # The diagnostic harness itself is not part of the tree
+                # under test; remove it so parity scans the real tree.
+                for junk in (".github/workflows/audit-diag.yml",
+                             "scripts/audit_diag_replay.py"):
+                    Path(junk).unlink(missing_ok=True)
             print(f"::group::STEP {idx} {name}", flush=True)
             log = Path(f"/tmp/diag-step-{idx}.log")
             with log.open("w") as fh:
