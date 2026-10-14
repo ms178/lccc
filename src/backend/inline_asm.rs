@@ -469,7 +469,6 @@ pub fn expand_dialect_alternatives(template: &str) -> Cow<'_, str> {
 /// Shared inline assembly emission logic. All four backends call this from their
 /// `emit_inline_asm` implementation, providing an `InlineAsmEmitter` to handle
 /// arch-specific details.
-#[allow(clippy::type_complexity)]
 pub fn emit_inline_asm_common(
     emitter: &mut dyn InlineAsmEmitter,
     template: &str,
@@ -545,7 +544,6 @@ pub fn emit_inline_asm_common_impl(
     // First, expand GCC dialect alternatives {att|intel} -> att
     let expanded = expand_dialect_alternatives(template);
     let lines: Vec<&str> = expanded.split('\n').collect();
-    let markers = markers;
     let body_nonempty = !lines.iter().all(|l| l.trim().is_empty());
     if let Some((open, _)) = markers {
         if body_nonempty {

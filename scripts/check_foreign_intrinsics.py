@@ -50,8 +50,8 @@ INSERT_RE = re.compile(
 
 def x86_builtin_names() -> list[str]:
     """Every registered builtin name that maps to a BuiltinIntrinsic::X86*."""
-    names = sorted(set(INSERT_RE.findall(BUILTINS_SRC.read_text(errors="replace")) and
-                       [n for n, _ in INSERT_RE.findall(BUILTINS_SRC.read_text(errors="replace"))]))
+    text = BUILTINS_SRC.read_text(errors="replace")
+    names = sorted({n for n, _ in INSERT_RE.findall(text)})
     return names
 
 
