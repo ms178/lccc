@@ -5,9 +5,10 @@
 Session base: `e047aa1eb2ae59b3943a64ab7ec5e5dddb89a3ff` (ms178/lccc main).
 The workspace initially had no previous patch or restored worktree. This patch
 is cumulative against that main, not a reconstruction of an unavailable patch.
-Changes, evidence and this handoff are in the source archive and cumulative
-`ms178-1.patch`. The exact final base/head and fast-CI gate status are in the
-snapshot receipt and ledger; an intermediate UNGATED checkpoint is not CI proof.
+Changes, evidence and this handoff are in the source archive and this
+cumulative follow-up commit. The exact final base/head and fast-CI gate status
+are in the snapshot receipt and ledger; an intermediate UNGATED checkpoint is
+not CI proof.
 
 This is a bounded correctness iteration, **not** completion of the whole backlog,
 a line-by-line audit of every subsystem, or proof that every compiler function

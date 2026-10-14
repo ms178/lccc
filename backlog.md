@@ -188,7 +188,7 @@ unproven; **H** hypothesis requiring an experiment.
 
 **Final base:** `1e83776f41529e2d754380d1d934ff901e25a097`. A14-05 is now
 closed upstream; A14-01 is partially repaired. A14-29 and A14-30 were closed
-in the follow-up based on `e047aa1` (see their entries). The queue contains
+in the follow-up (see their entries). The queue contains
 **34 entries, 31 still open** (including residual A14-01). Original evidence is retained
 with its original base rather than misrepresented as a final-main execution.
 
