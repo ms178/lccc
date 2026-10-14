@@ -5,6 +5,8 @@
 > oracle-agreement recommendation, narrows NONE compatibility claims, and records
 > the implemented fixes and real test results. Do not apply this old grade or
 > merge checklist to the current branch without reading that follow-up.
+> [The newer upstream/three-way audit](PR827-COMPARISON.md) supersedes both older
+> snapshots for the reconciled implementation and its actual compiled findings.
 
 ## Decision
 

@@ -1,0 +1,14 @@
+[
+  {
+    "python_optimized": false,
+    "exit": 1,
+    "failure": "comparison infrastructure: RuntimeError: causal arms reused identical linker binaries; reject stale/cross-source build fingerprints",
+    "codegen_count": 0
+  },
+  {
+    "python_optimized": true,
+    "exit": 2,
+    "failure": "usage: compare_pr827.py [-h] --agent-b AGENT_B --prior-ours PRIOR_OURS\n                        --candidate CANDIDATE [--cc CC] --output OUTPUT\ncompare_pr827.py: error: optimized Python disables test assertions",
+    "codegen_count": 0
+  }
+]

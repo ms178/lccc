@@ -1,0 +1,172 @@
+{
+  "failures": [],
+  "identical_object_pairs": 90,
+  "object_pairs": 90,
+  "runtime_probes": [
+    {
+      "passed": false,
+      "probe": "close-on-exec",
+      "returncode": 99,
+      "stderr": "",
+      "stdout": "",
+      "version": "agent-b"
+    },
+    {
+      "passed": false,
+      "probe": "ferror-zero",
+      "returncode": 23,
+      "stderr": "lccc: PGO: profile write failed: Success\n",
+      "stdout": "-4464\n",
+      "version": "agent-b"
+    },
+    {
+      "passed": false,
+      "probe": "ferror-stale",
+      "returncode": 23,
+      "stderr": "lccc: PGO: profile write failed: No such file or directory\n",
+      "stdout": "-4464\n",
+      "version": "agent-b"
+    },
+    {
+      "passed": true,
+      "probe": "close-on-exec",
+      "returncode": 23,
+      "stderr": "",
+      "stdout": "-4464\n",
+      "version": "prior-ours"
+    },
+    {
+      "passed": true,
+      "probe": "ferror-zero",
+      "returncode": 23,
+      "stderr": "lccc: PGO: profile write failed\n",
+      "stdout": "-4464\n",
+      "version": "prior-ours"
+    },
+    {
+      "passed": true,
+      "probe": "ferror-stale",
+      "returncode": 23,
+      "stderr": "lccc: PGO: profile write failed\n",
+      "stdout": "-4464\n",
+      "version": "prior-ours"
+    },
+    {
+      "passed": true,
+      "probe": "close-on-exec",
+      "returncode": 23,
+      "stderr": "",
+      "stdout": "-4464\n",
+      "version": "candidate"
+    },
+    {
+      "passed": true,
+      "probe": "ferror-zero",
+      "returncode": 23,
+      "stderr": "lccc: PGO: profile write failed\n",
+      "stdout": "-4464\n",
+      "version": "candidate"
+    },
+    {
+      "passed": true,
+      "probe": "ferror-stale",
+      "returncode": 23,
+      "stderr": "lccc: PGO: profile write failed\n",
+      "stdout": "-4464\n",
+      "version": "candidate"
+    }
+  ],
+  "timing_claim": false,
+  "versions": {
+    "agent-b": {
+      "compiler_sha256": "11e49bac12ccbbccec71822d5a920d98399d3e927a6d5c5028a1efc950a2199e",
+      "failed": 102,
+      "groups": {
+        "bad-range-": {
+          "passed": 0,
+          "total": 64
+        },
+        "bad-uleb-": {
+          "passed": 0,
+          "total": 16
+        },
+        "valid-none-empty": {
+          "passed": 0,
+          "total": 2
+        },
+        "valid-range-": {
+          "passed": 192,
+          "total": 192
+        },
+        "valid-uleb-": {
+          "passed": 0,
+          "total": 20
+        }
+      },
+      "linker_sha256": "6ac95970614f6cee433a6d1de7b276eda27b97e82d5e15afd45df62a1f87b31d",
+      "passed": 364,
+      "report_sha256": "3802ac5d670efdc8b84066b867073c460fdf3a93794a87213210f6846f532818",
+      "total": 466
+    },
+    "candidate": {
+      "compiler_sha256": "00263848eb852cd0b2f26458a6372d7d3ea27a0a41df177aca310cd36002c622",
+      "failed": 0,
+      "groups": {
+        "bad-range-": {
+          "passed": 64,
+          "total": 64
+        },
+        "bad-uleb-": {
+          "passed": 16,
+          "total": 16
+        },
+        "valid-none-empty": {
+          "passed": 2,
+          "total": 2
+        },
+        "valid-range-": {
+          "passed": 192,
+          "total": 192
+        },
+        "valid-uleb-": {
+          "passed": 20,
+          "total": 20
+        }
+      },
+      "linker_sha256": "a6898879bbd858640842b8f68c1e058de6e0730419e0fcbbe14c5ff5b6309df6",
+      "passed": 466,
+      "report_sha256": "aa801a12cd86921f490943677aa88e1045a0077c45e125c03861495d60ac6ab2",
+      "total": 466
+    },
+    "prior-ours": {
+      "compiler_sha256": "c9b1db8dcee4e474b6594ed96b69374eda79156fda4361bd1fc48102af88ac2c",
+      "failed": 64,
+      "groups": {
+        "bad-range-": {
+          "passed": 0,
+          "total": 64
+        },
+        "bad-uleb-": {
+          "passed": 16,
+          "total": 16
+        },
+        "valid-none-empty": {
+          "passed": 2,
+          "total": 2
+        },
+        "valid-range-": {
+          "passed": 192,
+          "total": 192
+        },
+        "valid-uleb-": {
+          "passed": 20,
+          "total": 20
+        }
+      },
+      "linker_sha256": "1e8244fb4f0c356dfa6be85c939ea7a47c841f09c3651a620d25219497462cc7",
+      "passed": 402,
+      "report_sha256": "1aa61146a20b722a843b4e21a800ce980cffea991a3f0d28a88375cda9ecaeff",
+      "total": 466
+    }
+  }
+}

@@ -99,7 +99,7 @@ register preservation, complete prefix/suffix preservation, and neighboring data
 Totals are **233 fixtures: 115 accept, 118 reject; 466 executable/shared
 invocations**. The 9 positive kind numbers are 0, 2, 16, 17, 44, 45, 51, 60, 61.
 
-## Executed evidence versus scheduled measurements
+## Executed evidence and compiled causal measurements
 
 Raw local results are in `engineering/evidence/pr827-comparison/`.
 
@@ -132,7 +132,7 @@ The prior PR826 production head passed its exact-toolchain 210-relocation/
 72-PGO/45-workload-O2-and-O3 gates before reconciliation. Those successes are
 historical, not validation of the new displacement implementation.
 
-### Three-way compiled comparison (results pending at publication)
+### Three-way compiled comparison: observed results
 
 `tests/linker/check_pr827_comparison.sh` builds immutable PR827, pre-range PR826,
 and candidate sources into separate binaries without checking out another
@@ -161,8 +161,41 @@ or a measured runtime ratio. Current strict runtime corpus screening remains a
 separate gate against GCC/Clang. Missing tools, empty or partial comparisons and
 optimized-Python assertion disablement fail closed.
 
-Do not replace pending compiled measurements with predicted pass/fail totals.
-The workflow's API-readable causal summary and raw artifacts will supply them.
+The corrected hosted run **38603881290** completed successfully on the tested
+implementation head. Every causal arm had an independent Cargo target directory
+and a distinct linker binary hash. These are measured outcomes, not predictions:
+
+| Actual contract / probe | PR827 | Pre-range PR826 | Candidate |
+|---|---:|---:|---:|
+| All relocation invocations passing | 364/466 | 402/466 | **466/466** |
+| Valid range/ISA controls | 192/192 | 192/192 | **192/192** |
+| Invalid range/alignment controls rejected | 0/64 | 0/64 | **64/64** |
+| Valid padded ULEB controls | 0/20 | 20/20 | **20/20** |
+| Invalid ULEB controls rejected | 0/16 | 16/16 | **16/16** |
+| Empty NONE controls | 0/2 | 2/2 | **2/2** |
+| Targeted actual PGO-runtime probes | 0/3 | 3/3 | **3/3** |
+
+The nine runtime rows preserve actual status/stdout/stderr. PR827's strict
+close-on-exec probe exits 99 before producing output; zero/stale-errno probes
+produce respectively `Success` and an unrelated `No such file or directory`.
+Both later implementations preserve status 23/stdout -4464 and generic errors.
+The comparison succeeded with all three actual strace executions and Valgrind
+checks (application status/output preserved; zero reported memory errors).
+
+All **90/90** workload/optimization combinations had identical object hashes
+across the three independently built compilers: **270 object compilations**.
+This is tested non-PGO codegen identity, not throughput superiority or proof of
+all program semantics. Full GCC16.2 integration independently passed **466
+relocation / 72 PGO / 9 reference-harness checks**, **230 valid LLD21 controls**,
+and **45/45 output checks at each O2 and O3**. The eleven Rust production-module
+and formatting checks, Clippy, MSRV and CE delta job also passed on this tested
+head. The general full Test Suite and timing benchmark were still running at
+this evidence snapshot; final-head required CI remains the merge gate.
+
+Compact API notices, job IDs/source head and the stale-binary negative preflight
+are persisted under `engineering/evidence/pr827-comparison/`. Full syscall,
+Valgrind, per-fixture and object records are retained in hosted artifacts
+11914488320 and 11914433303; they are not claimed downloaded locally.
 
 The first new hosted attempt executed all 11 direct production-module tests
 successfully, then failed formatting. Actual Rust 1.99 formatting annotations
@@ -174,6 +207,15 @@ A subsequent actual bootstrap trace identified Git's dubious-ownership rejection
 in the container. Archive/rev-parse calls now trust only the known checkout with
 per-command safe.directory; there is no global wildcard exception. The trace,
 not a guessed exit-code interpretation, motivated this correction.
+The first archive-enabled run exposed another error in our own experiment:
+shared Cargo target fingerprints reused the first source's binaries. Later
+builds finished in 0.00 seconds and every binary hash matched. The apparent
+prior/candidate failures and object identity from that run were invalid and
+are discarded. Per-arm target directories and an early distinct-linker-hash
+check prevent that reuse; a deliberate /bin/true duplicate preflight exits 1
+without running any comparisons. Optimized Python exits 2 before disabling
+assertion-based verification. Only the subsequent isolated run above supplies
+the accepted three-way findings.
 
 ## Performance laboratory interpretation
 

@@ -1,5 +1,9 @@
 # PR826: empirical red-team follow-up and corrections to the first review
 
+> **Historical follow-up:** [The reconciled upstream comparison](PR827-COMPARISON.md)
+> supersedes its pre-range coverage counts and records the shared displacement
+> gap, the actual three-way compiled results, and our experiment corrections.
+
 ## Executive decision
 
 The original PGO close-under-lock and fixed-width relocation validation choices
