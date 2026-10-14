@@ -4488,12 +4488,15 @@ mod movslq_relay_call_tests {
 /// a device register or a value shared with an interrupt handler, `_Atomic` (or
 /// a `volatile` access in a separately compiled translation unit) is the
 /// supported spelling and neither this fold nor this compiler promises
-/// anything about the sequence of bus accesses.  It is the reason the shape is
-/// emitted at all: `h += 3` on a `volatile long`
-/// already reaches this pass as `addq $3, h(%rip)` from the IR lowering, at
-/// `-O0` as well as `-O2` (verified on the tree that added this note).  The
-/// DECISION therefore lives where volatility is visible -- the IR/isel layer --
-/// and not here: this pass matches assembly TEXT, in which a volatile load is
+/// anything about the sequence of bus accesses.  A volatile access does not
+/// reach this fold at all: `h += 3` on a `volatile long` arrives as the
+/// load / modify / store trio, and `pin_volatile_access_regions` in the pass
+/// driver marks those lines `pinned` -- the same no-rewrite contract every pass
+/// honours -- so the trio is emitted unchanged, which is the shape GCC emits at
+/// -O0/-O2/-O3 (measured against GCC 12.2 and GCC 16.2).  The DECISION
+/// therefore lives where volatility is visible -- the codegen that brackets
+/// each access with `# LCCC_VOLATILE_BEGIN`/`END` -- and
+/// not here: this pass matches assembly TEXT, in which a volatile load is
 /// indistinguishable from any other load, so a volatility test here could only
 /// be a claim about something this layer cannot see.  The residual is recorded
 /// rather than hidden: a fused RMW is not a substitute for `_Atomic`, and code

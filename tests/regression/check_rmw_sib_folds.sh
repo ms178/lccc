@@ -128,13 +128,19 @@ grep -qE "movzbl" <<< "$body" \
     || bad "the byte load vanished: a dead-write pass mistook the index for unread"
 
 # ── contract 4: the volatile policy, pinned as an observable ─────────────────
-# A volatile read-modify-write must touch its object exactly once for the read
-# and once for the write -- never more (a redundant access is a wrong-code
-# defect: it can pop a FIFO or clear a status register twice) and never fewer
-# than the abstract machine performs.  This is asserted on the emitted code AND
-# on the runtime result, so the policy cannot drift silently: the count is one
-# instruction today, and if that ever becomes two the gate fails and the change
-# gets the review this note describes.
+# A volatile read-modify-write must perform exactly ONE read and ONE write of
+# its object -- never more (a redundant access is a wrong-code defect: it can
+# pop a FIFO or clear a status register twice) and never fewer than the abstract
+# machine performs.  The count is therefore TWO memory accesses, in the
+# load / modify / store shape GCC emits at every optimisation level (-O0/-O2/
+# -O3 all keep the trio).  The single fused instruction (`addq $3, h(%rip)`)
+# performs the same one read and one write for a single-threaded observer, but
+# it makes the pair indivisible, which PR #716's review flagged as a behaviour
+# change for observers outside the abstract machine (an ISR or an MMIO
+# register).  `pin_volatile_access_regions` in the backend refuses that fusion
+# -- volatile access lines are `pinned`, so no text pass rewrites them -- and
+# this gate asserts the count, the shape and the runtime result, so the policy
+# cannot drift silently.
 cat > "$work/vol_rmw.c" <<'EOF'
 #include <stdio.h>
 volatile long h;
@@ -145,16 +151,23 @@ EOF
     || bad "volatile probe: compile failed"
 k_body=$(awk '/^k:/{inside=1} inside{print} inside && /^[[:space:]]*\.size/{exit}' "$work/vol_rmw.s")
 touches=$(grep -c "h(%rip)" <<< "$k_body" || true)
-[[ $touches -eq 1 ]] \
-    || bad "volatile += touches its object in $touches instructions inside k (want exactly 1: one read + one write); k body:\n$k_body"
+[[ $touches -eq 2 ]] \
+    || bad "volatile += touches its object in $touches instructions inside k (want exactly 2: one read + one write, GCC's shape); k body:\n$k_body"
+if grep -qE '^[[:space:]]*(add|sub|and|or|xor|inc|dec|neg|not|shl|shr|sal|sar|rol|ror)[qlwb]?[[:space:]]+.*h\(%rip\)' <<< "$k_body"; then
+    bad "volatile += is fused into a single read-modify-write instruction; k body:\n$k_body"
+fi
+grep -qE 'movq[[:space:]]+h\(%rip\),[[:space:]]*%' <<< "$k_body" \
+    || bad "the volatile read is not its own instruction in k (the read must not be folded into another access); k body:\n$k_body"
+grep -qE 'movq[[:space:]]+%[a-z0-9]+,[[:space:]]*h\(%rip\)' <<< "$k_body" \
+    || bad "the volatile write is not its own instruction in k (the write must not be folded into another access); k body:\n$k_body"
 "$CCC" -O2 -march=x86-64-v3 -o "$work/vol_rmw.bin" "$work/vol_rmw.c" \
     || bad "volatile probe: link failed"
 out=$("$work/vol_rmw.bin") || bad "volatile probe: exit status $? (wrong value)"
 [[ "$out" == "13" ]] || bad "volatile probe printed '$out', want 13"
-note "volatile RMW: one access to the object, result exact"
+note "volatile RMW: read and write stay separate (GCC's shape), result exact"
 
 if [[ $fail -ne 0 ]]; then
     echo "check_rmw_sib_folds: FAILED" >&2
     exit 1
 fi
-echo "check_rmw_sib_folds: PASS (oracle parity at -O1/-O2/-O3 x kill switches, RMW+SIB addressing, index definition intact)"
+echo "check_rmw_sib_folds: PASS (oracle parity at -O1/-O2/-O3 x kill switches, RMW+SIB addressing, index definition intact, volatile RMW pair preserved)"
