@@ -21,7 +21,9 @@ folds and the indexed reference census used by threading. They cannot silently
 disagree about whether a `.long` is an address or dispatch. Dispatch requires a
 contiguous run under a base proven by an actual indirect `jmp` or PIC `leal`;
 quoted text and data mentioning `@GOTOFF` do not prove a base. Both operands of
-unrecognized label differences are identity uses. Comments are not references.
+unrecognized label differences are identity uses. Comments are not references. Quoted GAS symbol operands retain identity; only
+literal string directives make quoted payloads non-symbolic. This distinction
+also applies inside opaque inline assembly.
 
 Each candidate must have a unique definition, a unique target in its function
 window, exactly one unconditional jump in its body, and no incoming physical
@@ -106,8 +108,13 @@ release is Rust 1.99.0, but the sandbox cannot reach `static.rust-lang.org`.
 The repository and hosted CI continue to select moving `stable` with rustfmt
 and Clippy; no MSRV or CI gate has been lowered to fit this sandbox.
 
-The supplementary Rust suite passed 38 tests (the manual timing test is ignored
-unless explicitly selected); Python checker self-tests passed all seven cases.
+The expanded supplementary source-only harness passed 377 Rust tests (the
+manual timing test is ignored unless explicitly selected). Five tests requiring
+crate-level assembler/environment support were excluded only from that harness;
+they remain enabled in normal hosted Cargo tests. Python checker self-tests
+passed all seven cases. The quoted-symbol regression was first demonstrated
+failing with the previous scanner; GNU `as --32` independently confirmed that
+a quoted jump operand is a real symbol reference.
 Shell syntax, whitespace, conflict markers and CI/local gate parity also passed.
 
 An older Rust 1.88.0 tool bundle, obtained through the allowed npm registry with

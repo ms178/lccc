@@ -10364,6 +10364,16 @@ fn rewrite_label_token(
 }
 
 fn each_local_symbol(text: &str, mut visit: impl FnMut(&str)) {
+    // GAS permits quoted symbol names in operands (jmp ".Ltarget", or
+    // .quad ".Ltarget"). Only literal string directives make their quoted
+    // payload non-symbolic; treating every quote as data can leave dangling
+    // references, including inside otherwise opaque inline assembly.
+    let string_payload = matches!(
+        text.split_whitespace().next(),
+        Some(
+            ".ascii" | ".asciz" | ".string" | ".string8" | ".string16" | ".string32" | ".string64"
+        )
+    );
     let bytes = text.as_bytes();
     let mut i = 0;
     let mut quote: Option<u8> = None;
@@ -10380,7 +10390,7 @@ fn each_local_symbol(text: &str, mut visit: impl FnMut(&str)) {
             continue;
         }
         match bytes[i] {
-            b'"' | b'\'' => {
+            b'"' | b'\'' if string_payload => {
                 quote = Some(bytes[i]);
                 i += 1;
             }
@@ -22728,6 +22738,37 @@ mod dispatch_and_pin_tests {
                 pins.contains(".Lcase") && pins.contains(".Ltable"),
                 "{bogus}"
             );
+        }
+    }
+
+    #[test]
+    fn quoted_symbol_operands_pin_labels_but_literal_strings_do_not() {
+        for reference in [
+            "#APP\n    jmp \".Lrelay\"\n#NO_APP",
+            ".quad \".Lrelay\"",
+            ".word \".Lrelay\" - \".Lend\"",
+        ] {
+            let text = format!(
+                "{reference}\nf:\n.cfi_startproc\n    jne .Lrelay\n    ret\n.Lrelay:\n    jmp .Lend\n.Lend:\n    ret\n.cfi_endproc"
+            );
+            let (store, infos) = make_store(&text);
+            assert!(identity_pinned_labels(&store, &infos).contains(".Lrelay"));
+            let out = thread(&text);
+            assert!(out.contains(reference) && out.contains(".Lrelay:"), "{out}");
+            assert!(out.contains("jne .Lend"), "{out}");
+        }
+        for directive in [
+            ".ascii",
+            ".asciz",
+            ".string",
+            ".string8",
+            ".string16",
+            ".string32",
+            ".string64",
+        ] {
+            let text = format!("{directive} \".Lrelay\"");
+            let (store, infos) = make_store(&text);
+            assert!(identity_pinned_labels(&store, &infos).is_empty(), "{text}");
         }
     }
 
