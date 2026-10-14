@@ -1,0 +1,6 @@
+{
+  "source": "#include <errno.h>\n#include <linux/perf_event.h>\n#include <stdio.h>\n#include <string.h>\n#include <sys/syscall.h>\n#include <unistd.h>\nint main(void) {\n    struct perf_event_attr a = {0};\n    a.type = PERF_TYPE_HARDWARE;\n    a.size = sizeof(a);\n    a.config = PERF_COUNT_HW_CPU_CYCLES;\n    a.disabled = 1;\n    a.exclude_kernel = 1;\n    a.exclude_hv = 1;\n    int fd = syscall(__NR_perf_event_open, &a, 0, -1, -1, 0);\n    if (fd < 0) { printf(\"hardware cycles unavailable: errno=%d (%s)\\n\", errno, strerror(errno)); return 1; }\n    close(fd); puts(\"hardware cycles event open succeeded\"); return 0;\n}\n",
+  "returncode": 1,
+  "stdout": "hardware cycles unavailable: errno=2 (No such file or directory)\n",
+  "stderr": ""
+}

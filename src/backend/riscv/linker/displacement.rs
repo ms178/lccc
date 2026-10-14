@@ -82,9 +82,11 @@ mod tests {
             }
             for delta in [-limit + 1, -1, 1, limit - 1] {
                 let symbol = place.wrapping_add(delta as u64);
-                assert!(checked_delta(encoding, symbol, 0, place)
-                    .unwrap_err()
-                    .contains("misaligned"));
+                assert!(
+                    checked_delta(encoding, symbol, 0, place)
+                        .unwrap_err()
+                        .contains("misaligned")
+                );
             }
         }
     }
@@ -95,7 +97,10 @@ mod tests {
             assert_eq!(checked_delta(encoding, 0, 0, u64::MAX - 1).unwrap(), 2);
             let backward = checked_delta(encoding, u64::MAX - 1, 0, 0).unwrap();
             assert_eq!(backward, (-2_i32) as u32);
-            assert_eq!(checked_delta(encoding, 1 << 63, 0, (1 << 63) - 2).unwrap(), 2);
+            assert_eq!(
+                checked_delta(encoding, 1 << 63, 0, (1 << 63) - 2).unwrap(),
+                2
+            );
             assert_eq!(checked_delta(encoding, 1 << 63, i64::MIN, 0).unwrap(), 0);
             let odd = checked_delta(encoding, 0, i64::MAX, i64::MAX as u64 - 1);
             assert!(odd.unwrap_err().contains("misaligned"));

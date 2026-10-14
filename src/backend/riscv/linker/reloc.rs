@@ -457,21 +457,13 @@ fn apply_one_reloc(
             }
         }
         R_RISCV_BRANCH => {
-            let offset_val = super::displacement::checked_delta(
-                super::displacement::Encoding::Branch,
-                s,
-                a,
-                p,
-            )?;
+            let offset_val =
+                super::displacement::checked_delta(super::displacement::Encoding::Branch, s, a, p)?;
             patch_b_type(data, off, offset_val);
         }
         R_RISCV_JAL => {
-            let offset_val = super::displacement::checked_delta(
-                super::displacement::Encoding::Jal,
-                s,
-                a,
-                p,
-            )?;
+            let offset_val =
+                super::displacement::checked_delta(super::displacement::Encoding::Jal, s, a, p)?;
             patch_j_type(data, off, offset_val);
         }
         R_RISCV_RVC_BRANCH => {

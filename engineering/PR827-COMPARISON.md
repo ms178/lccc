@@ -115,6 +115,13 @@ Raw local results are in `engineering/evidence/pr827-comparison/`.
 - Fresh codegen-oracle comparability logic **14 tests**, oracle-delta logic
   **7 tests**, benchmark-ranking logic **1 test**, workflow shell checks and
   **218-command/22-contract** core CI/local parity passed.
+- Encoding-diff self-tests on the unpinned local GNU objdump 2.40 ran 73
+  tests: 71 passed, two APX selector cases returned UNVERIFIED-BYTES. An actual
+  four-byte APX disassembly produces `(bad)`. This is not evidence of a compiler
+  encoding bug and is not relabeled a pass. The hosted core suite requires the
+  repository's provisioned 2.47 oracle pair. No fallback or skip was added.
+- A fresh compiled perf_event_open probe again returns ENOENT for hardware
+  cycles. There is no local hardware-counter basis for a speedup claim.
 - Local Rust is unavailable; no local Rust/Cargo compilation is claimed. GitHub's
   latest Rust release API reports **1.99.0**, published 2026-10-01. Hosted jobs
   explicitly install Rust/Cargo/rustfmt/Clippy 1.99 and require GCC 16.2.0.
@@ -156,6 +163,13 @@ optimized-Python assertion disablement fail closed.
 
 Do not replace pending compiled measurements with predicted pass/fail totals.
 The workflow's API-readable causal summary and raw artifacts will supply them.
+
+The first new hosted attempt executed all 11 direct production-module tests
+successfully, then failed formatting. Actual Rust 1.99 formatting annotations
+were applied, not an approximate style rewrite. The new comparison container
+also lacked curl, which the inspected rust-toolchain action invokes to bootstrap
+rustup; its explicit prerequisite list was corrected. Both are our harness/setup
+issues. The final push must execute its own corrected jobs.
 
 ## Performance laboratory interpretation
 

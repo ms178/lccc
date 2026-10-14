@@ -141,7 +141,7 @@ jobs:
       - name: Provision causal comparison tools
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends ca-certificates git python3 gcc-16 libc6-dev strace valgrind
+          apt-get install -y --no-install-recommends ca-certificates curl git python3 gcc-16 libc6-dev strace valgrind
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
