@@ -482,6 +482,26 @@ class LinkerContractTest(unittest.TestCase):
             path = f"tests/regression/check_arm_{name}_contract.py"
             self.assertEqual(parity.COMMAND.findall("python3 " + path), [path])
 
+    def test_hosted_popcount_cannot_drop_required_runtime(self) -> None:
+        block = _invocation_block(self.hosted, "tests/regression/check_arm_popcount_contract.py")
+        self.assertIn("--run", block)
+        mutated = self.hosted.replace(block, block.replace(" --run", ""), 1)
+        self.assertEqual(self.check(hosted=mutated), 1)
+
+    def test_popcount_missing_qemu_fails_before_compilation(self) -> None:
+        import runpy
+        from unittest.mock import patch
+        path = parity.ROOT / "tests/regression/check_arm_popcount_contract.py"
+        module = runpy.run_path(str(path))
+        with patch("sys.argv", [str(path), "--run"]), \
+             patch("shutil.which", return_value=None), \
+             patch("subprocess.run") as compiler, \
+             redirect_stderr(StringIO()):
+            with self.assertRaises(SystemExit) as result:
+                module["main"]()
+            self.assertEqual(result.exception.code, 2)
+            compiler.assert_not_called()
+
     def test_linker_scripts_are_path_tracked(self) -> None:
         self.assertEqual(parity.COMMAND.findall("python3 tests/linker/fuzz_ld.py"),
                          ["tests/linker/fuzz_ld.py"])
