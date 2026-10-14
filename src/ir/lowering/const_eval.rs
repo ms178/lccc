@@ -16,6 +16,7 @@ use crate::common::types::{CType, IrType};
 use crate::frontend::parser::ast::{
     BinOp, DerivedDeclarator, Expr, Initializer, SizeofArg, StructFieldDecl, TypeSpecifier, UnaryOp,
 };
+use crate::ir::lowering::const_object_images::{self, ConstObjectImage};
 use crate::ir::reexports::{GlobalInit, IrConst};
 
 impl Lowerer {
@@ -38,7 +39,7 @@ impl Lowerer {
     /// dimensions from initializers. For example, `sizeof(cases) / sizeof(cases[0]) + 1`
     /// contains Sizeof nodes in the division subtree, so the entire expression must
     /// be recomputed by the lowerer.
-    fn expr_contains_sizeof(expr: &Expr) -> bool {
+    pub(super) fn expr_contains_sizeof(expr: &Expr) -> bool {
         match expr {
             Expr::Sizeof(_, _) => true,
             Expr::BinaryOp(_, lhs, rhs, _) => {
@@ -369,6 +370,14 @@ impl Lowerer {
                 let selected = self.resolve_generic_selection_expr(controlling, associations)?;
                 self.eval_const_expr(selected)
             }
+            // A read of an element or member of a global object whose
+            // initializer is a constant byte image: `table[3]`,
+            // `config.limit`, `matrix[1][2]`.  sema decides whether such a
+            // read is a constant (`static_init.rs::folded_object_read`) and
+            // rejects the program otherwise; the value here comes from the
+            // bytes the initializer emits, so it cannot disagree with what the
+            // program loads.
+            Expr::ArraySubscript(..) | Expr::MemberAccess(..) => self.eval_const_object_read(expr),
             _ => None,
         }
     }
@@ -718,6 +727,109 @@ impl Lowerer {
             None
         } else {
             self.eval_const_initializer_scalar(init)
+        }
+    }
+
+    /// Fold a read of an element or member of a constant global object.
+    ///
+    /// The selectors are peeled off outermost-first, then applied
+    /// innermost-first against the object's declared type, accumulating a byte
+    /// offset into the object's image; the leaf is decoded from the image at
+    /// that offset -- the very bytes the program will load.
+    fn eval_const_object_read(&self, expr: &Expr) -> Option<IrConst> {
+        let mut selectors = Vec::new();
+        let mut cursor = expr;
+        loop {
+            match cursor {
+                Expr::ArraySubscript(base, _, _) | Expr::MemberAccess(base, _, _) => {
+                    selectors.push(cursor);
+                    cursor = base;
+                }
+                Expr::Identifier(name, _) => {
+                    let image = self.const_object_images.get(name.as_str())?;
+                    return self.read_const_object(image, &selectors);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Apply `selectors` (outermost first) to a constant object's image.
+    fn read_const_object(&self, image: &ConstObjectImage, selectors: &[&Expr]) -> Option<IrConst> {
+        let layouts = self.types.borrow_struct_layouts();
+        let mut ctype = image.ctype.clone();
+        let mut offset = 0usize;
+        for selector in selectors.iter().rev() {
+            match selector {
+                Expr::ArraySubscript(_, index, _) => {
+                    let element = match &ctype {
+                        CType::Array(element, _) => (**element).clone(),
+                        _ => return None,
+                    };
+                    let stride = self.resolve_ctype_size(&element);
+                    if stride == 0 {
+                        return None;
+                    }
+                    let index = self.eval_const_expr(index)?.to_i64()?;
+                    if index < 0 {
+                        return None;
+                    }
+                    offset = offset.checked_add((index as usize).checked_mul(stride)?)?;
+                    ctype = element;
+                }
+                Expr::MemberAccess(_, field_name, _) => {
+                    let key = match &ctype {
+                        CType::Struct(key) | CType::Union(key) => key.clone(),
+                        _ => return None,
+                    };
+                    let layout = layouts.get(&*key)?;
+                    let (field_offset, field_ty, bit_offset, bit_width) =
+                        layout.field_offset_with_bitfield(field_name, &*layouts)?;
+                    offset = offset.checked_add(field_offset)?;
+                    if let (Some(bit_offset), Some(bit_width)) = (bit_offset, bit_width) {
+                        // A bitfield leaf: its storage unit is the declared
+                        // type, and the value is the field's bits, signed by
+                        // the *field's* type (`int a : 4` of all ones is -1,
+                        // `unsigned a : 4` is 15).
+                        let unit = self.resolve_ctype_size(&field_ty);
+                        let raw = const_object_images::read_le(&image.bytes, offset, unit)?;
+                        return const_object_images::extract_bitfield(
+                            raw,
+                            bit_offset,
+                            bit_width,
+                            !field_ty.is_unsigned(),
+                        );
+                    }
+                    ctype = field_ty;
+                }
+                _ => return None,
+            }
+        }
+        // The whole leaf has to be inside the image: an offset that reaches
+        // past it means the layout and the initializer disagree, and a fold
+        // would invent a value.
+        let width = self.resolve_ctype_size(&ctype);
+        if offset.checked_add(width)? > image.bytes.len() {
+            return None;
+        }
+        self.read_const_scalar(&image.bytes, offset, &ctype)
+    }
+
+    /// Decode one scalar of `ctype` out of an object's byte image.
+    fn read_const_scalar(&self, bytes: &[u8], offset: usize, ctype: &CType) -> Option<IrConst> {
+        let width = self.resolve_ctype_size(ctype);
+        let raw = const_object_images::read_le(bytes, offset, width)?;
+        match ctype {
+            CType::Float => Some(IrConst::F32(f32::from_bits(raw as u32))),
+            CType::Double => Some(IrConst::F64(f64::from_bits(raw))),
+            _ if ctype.is_integer() => match width {
+                1 => Some(IrConst::I8(raw as i8)),
+                2 => Some(IrConst::I16(raw as i16)),
+                4 => Some(IrConst::I32(raw as i32)),
+                8 => Some(IrConst::I64(raw as i64)),
+                _ => None,
+            },
+            _ => None,
         }
     }
 

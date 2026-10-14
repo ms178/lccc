@@ -13,6 +13,7 @@ use crate::common::types::{CType, IrType};
 use crate::frontend::parser::ast::{
     Declaration, DerivedDeclarator, Expr, InitDeclarator, Initializer, TypeSpecifier,
 };
+use crate::ir::lowering::const_object_images::{ConstObjectImage, const_object_bytes};
 use crate::ir::reexports::{GlobalInit, IrGlobal};
 
 enum RedeclResult {
@@ -615,6 +616,19 @@ impl Lowerer {
             .or_else(|| declarator.attrs.asm_register.clone())
             .filter(|n| !crate::ir::lowering::lower::is_x86_register_name(n))
             .unwrap_or_else(|| declarator.name.clone());
+        // Keep a byte image of an object whose initializer is constant and
+        // relocation-free: a later read of one of its elements or members
+        // (`static const int t[2] = {1, 2}; static int v = t[1];`) folds to the
+        // value the program loads.  A volatile object never folds (C11 6.7.3p7),
+        // and an `extern` declaration has no initializer to image.
+        if !is_extern_decl && !da.base_type_volatile && !da.object_volatile {
+            if let Some(ctype) = da.c_type.clone() {
+                if let Some(bytes) = const_object_bytes(&init, final_size) {
+                    self.const_object_images
+                        .insert(declarator.name.clone(), ConstObjectImage { ctype, bytes });
+                }
+            }
+        }
         self.module.globals.push(IrGlobal {
             name: emit_name,
             ty: global_ty,

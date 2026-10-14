@@ -527,12 +527,8 @@ impl type_builder::TypeConvertContext for Lowerer {
                 let mut next_val: i64 = 0;
                 let mut result = false;
                 for v in vars {
-                    if let Some(ref expr) = v.value {
-                        if let Some(val) = self.eval_const_expr(expr) {
-                            if let Some(v) = self.const_to_i64(&val) {
-                                next_val = v;
-                            }
-                        }
+                    if let Some(val) = self.enum_variant_value(v) {
+                        next_val = val;
                     }
                     if next_val > i32::MAX as i64 {
                         result = true;
@@ -554,12 +550,8 @@ impl type_builder::TypeConvertContext for Lowerer {
             let mut values = Vec::new();
             let mut next_val: i64 = 0;
             for v in vars {
-                if let Some(ref expr) = v.value {
-                    if let Some(val) = self.eval_const_expr(expr) {
-                        if let Some(v) = self.const_to_i64(&val) {
-                            next_val = v;
-                        }
-                    }
+                if let Some(val) = self.enum_variant_value(v) {
+                    next_val = val;
                 }
                 values.push(next_val);
                 next_val += 1;

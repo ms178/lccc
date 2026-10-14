@@ -155,9 +155,24 @@ impl Lowerer {
         // Sema answers exactly GCC's rule: `annotate_const_value` records the
         // value under the read's expression id, and `declares_const_object`
         // refuses to record a volatile object (C11 6.7.3p7).
-        let scalar = self.eval_const_expr(expr).or_else(|| match expr {
-            Expr::Identifier(_, _) => self.lookup_sema_const(expr),
-            _ => None,
+        // sema's recorded value is the *contract*: every initializer this
+        // compiler accepts has a constant answer recorded under the
+        // initializer's own expression id, including the shapes the lowering
+        // evaluator declines on purpose (`eval_const_expr` resolves identifiers
+        // by name so a lowering-local scope wins) and the ones it cannot
+        // express (a constant folded out of a call or out of an element of a
+        // folded const object).  The lowering recomputes when it can -- its own
+        // answer reflects lowering-local scoping -- and otherwise consumes
+        // sema's, which is the answer the program was accepted on.  `sizeof` is
+        // the one exclusion: sema evaluates it against the *declared* type,
+        // before the lowerer has resolved unsized array dimensions from the
+        // initializer, so an expression containing one is recomputed here.
+        let scalar = self.eval_const_expr(expr).or_else(|| {
+            if Self::expr_contains_sizeof(expr) {
+                None
+            } else {
+                self.lookup_sema_const(expr)
+            }
         });
         if let Some(val) = scalar {
             // C23 decimals: the initializer must become exact BID bits via

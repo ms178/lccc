@@ -224,7 +224,10 @@ and `typedef_alignments`.
 
 ```rust
 pub struct TypeScopeFrame {
-    pub enums_added:                Vec<String>,
+    // Every write to enum_constants with the value it replaced (None when the
+    // name is new).  A single log, undone last-write-first, so shadowing and
+    // repeated writes in one scope both restore exactly.
+    pub enums_changed:              Vec<(String, Option<i64>)>,
     pub struct_layouts_added:       Vec<String>,
     pub struct_layouts_shadowed:    Vec<(String, RcLayout)>,
     pub ctype_cache_added:          Vec<String>,

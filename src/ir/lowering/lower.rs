@@ -20,10 +20,12 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::Span;
 use crate::common::types::{AddressSpace, CType, IrType, SsoMode};
 use crate::frontend::parser::ast::{
-    self, DerivedDeclarator, Expr, ExprId, ExternalDecl, ParamDecl, TranslationUnit, TypeSpecifier,
+    self, DerivedDeclarator, EnumVariant, Expr, ExprId, ExternalDecl, ParamDecl, TranslationUnit,
+    TypeSpecifier,
 };
 use crate::frontend::sema::type_context::TypeContext;
 use crate::frontend::sema::{ConstMap, ExprTypeMap, FunctionInfo};
+use crate::ir::lowering::const_object_images::ConstObjectImage;
 use crate::ir::reexports::{
     BasicBlock, BlockId, CallInfo, Instruction, IrBinOp, IrCmpOp, IrConst, IrModule, IrUnaryOp,
     Operand, Terminator, Value,
@@ -48,6 +50,11 @@ pub struct Lowerer {
     pub(super) fp_expr_tags: crate::common::fp_contract::FpExprTags,
     // Global variable tracking
     pub(super) globals: FxHashMap<String, GlobalInfo>,
+    /// Byte images of globals whose initializer is constant and
+    /// relocation-free, keyed by object name: a read of one of their elements
+    /// (`table[3]`, `config.limit`) folds to the value the program will load.
+    /// See [`mod@const_object_images`].
+    pub(super) const_object_images: FxHashMap<String, ConstObjectImage>,
     // Set of known function names
     pub(super) known_functions: FxHashSet<String>,
     // Set of already-defined function bodies
@@ -229,6 +236,7 @@ impl Lowerer {
             func_state: None,
             fp_expr_tags: Default::default(),
             globals: FxHashMap::default(),
+            const_object_images: FxHashMap::default(),
             known_functions,
             defined_functions: FxHashSet::default(),
             static_functions: FxHashSet::default(),
@@ -2553,6 +2561,28 @@ impl Lowerer {
 
     // --- Enum and label helpers ---
 
+    /// The value of one enum variant.
+    ///
+    /// sema computed and *verified* every enumerator's value -- it rejects the
+    /// program when a value is not an integer constant expression -- and
+    /// recorded it in the shared type context, so that is the authoritative
+    /// answer.  The lowerer's own evaluator is only a fallback: it cannot see a
+    /// file-scope `const` object by name, and treating "cannot evaluate" as
+    /// "keep the previous enumerator's value" silently turned
+    /// `static const int c = 5; enum { E = c };` into `E = 0` (GCC 16.2
+    /// rejects that program; the value of the enum must never be invented).
+    ///
+    /// `None` means the value is unknown, which for a program that passed sema
+    /// cannot happen.
+    pub(super) fn enum_variant_value(&self, variant: &EnumVariant) -> Option<i64> {
+        if let Some(&val) = self.types.enum_constants.get(&variant.name) {
+            return Some(val);
+        }
+        let expr = variant.value.as_ref()?;
+        self.eval_const_expr(expr)
+            .and_then(|v| self.const_to_i64(&v))
+    }
+
     /// Collect enum constants from a type specifier.
     fn collect_enum_constants_impl(&mut self, ts: &TypeSpecifier, scoped: bool) {
         match ts {
@@ -2560,12 +2590,8 @@ impl Lowerer {
                 let mut next_val: i64 = 0;
                 let mut variant_values = Vec::new();
                 for variant in variants {
-                    if let Some(ref expr) = variant.value {
-                        if let Some(val) = self.eval_const_expr(expr) {
-                            if let Some(v) = self.const_to_i64(&val) {
-                                next_val = v;
-                            }
-                        }
+                    if let Some(v) = self.enum_variant_value(variant) {
+                        next_val = v;
                     }
                     if scoped {
                         self.insert_enum_scoped(variant.name.clone(), next_val);

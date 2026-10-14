@@ -3,6 +3,7 @@ pub(crate) mod complex;
 pub(crate) mod const_eval;
 mod const_eval_global_addr;
 mod const_eval_init_size;
+mod const_object_images;
 pub(crate) mod definitions;
 pub(crate) mod expr;
 pub(crate) mod expr_access;

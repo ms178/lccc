@@ -1184,7 +1184,7 @@ impl SemanticAnalyzer {
                 functions: &self.result.functions,
                 expr_types: Some(&self.result.expr_types),
             };
-            let eval = |e: &Expr| self.eval_const_expr(e);
+            let eval = |e: &Expr| self.eval_const_expr_value(e);
             let ctype = |e: &Expr| type_checker.infer_expr_ctype(e);
             let select = |controlling: &Expr, associations: &[GenericAssociation]| {
                 type_checker.generic_selection_index(controlling, associations)
@@ -3689,21 +3689,33 @@ impl SemanticAnalyzer {
 
     // === Constant expression evaluation ===
 
-    /// Try to evaluate a constant expression at compile time.
-    /// Returns None if the expression cannot be evaluated.
-    ///
-    /// This delegates to the richer SemaConstEval which returns IrConst,
-    /// then extracts the i64 value. This ensures enum values, bitfield
-    /// widths, and array sizes all use the same evaluation logic.
-    fn eval_const_expr(&self, expr: &Expr) -> Option<i64> {
-        let evaluator = SemaConstEval {
+    /// The constant evaluator, as used by enum values, bitfield widths, array
+    /// sizes, `case` labels and static-initializer folding.
+    fn sema_const_eval(&self) -> SemaConstEval<'_> {
+        SemaConstEval {
             types: &self.result.type_context,
             symbols: &self.symbol_table,
             functions: &self.result.functions,
             const_values: Some(&self.result.const_values),
             expr_types: Some(&self.result.expr_types),
-        };
-        evaluator.eval_const_expr(expr)?.to_i64()
+        }
+    }
+
+    /// Try to evaluate a constant expression at compile time, keeping the
+    /// value in its own type: an integer, a `float`/`double`, or a long
+    /// double. Returns None if the expression cannot be evaluated.
+    ///
+    /// Every consumer that needs an integer -- enum values, bitfield widths,
+    /// array sizes, `case` labels -- narrows with [`IrConst::to_i64`]; a
+    /// consumer that only asks *whether* an expression is constant must not,
+    /// or it would see a floating constant as no constant at all.
+    fn eval_const_expr_value(&self, expr: &Expr) -> Option<IrConst> {
+        self.sema_const_eval().eval_const_expr(expr)
+    }
+
+    /// Evaluate a constant expression at compile time and narrow it to `i64`.
+    fn eval_const_expr(&self, expr: &Expr) -> Option<i64> {
+        self.eval_const_expr_value(expr)?.to_i64()
     }
 
     // === Implicit declarations ===
