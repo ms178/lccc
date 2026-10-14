@@ -1,79 +1,108 @@
 # CFG threading and asm-goto edge audit
 
-Independent red-team of the cumulative follow-up, rebased on
-`7e9444174f9b76181504329cd4ff8010b1a1483b`. This is not a correctness proof
-and not a claim that every function is optimal.
+Follow-up on `6733d68f41b00387a98d2a2658a86bbf49632c99` (PR #812,
+`6495e6eb6076d6ddf61dc92f3a0b9a7a3dd044cb`). That PR head's hosted Test
+Suite, Clippy, Compiler Explorer oracle, and LCCC-vs-GCC checks completed
+green. This note describes the additional i686 label-safety fix. It is not
+a hosted result for the follow-up head, and not a speedup claim.
 
-## Reproduced defects
+## What the review got right
 
-1. **Compound assembler statements.** `.cfi_*`, `.size`, `.loc` and alignment
-   predicates inspected only the first token. `.cfi_def_cfa_offset 8; .byte 0xf9`
-   was classified as harmless, so a window could step across executable bytes.
-   Prefix lookalikes such as `.p2alignment` were also accepted. Both predicates
-   now require one complete statement, with quotes and trailing comments
-   honored, and reject `;`. Unknown tokens fail closed. Witnesses failed
-   before the change and pass after it.
+The i686 text threader scanned only `fstart..fend`, and the first window
+starts at line 0. Module data is emitted before function bodies
+(`emit_data_sections`). A later function's static `&&label` (`.long .LBBn`
+in `.data`) is therefore outside the window that considers deleting that
+label. The same pass treated every in-window `.long`/`.quad` as a jump
+table and rewrote it. Those are different uses: a proven switch entry is
+dispatch, a static initializer is an address.
 
-2. **IR jump-chain mutation.** The old threader rewrote a terminator, then
-   tried to roll one edge back if a PHI was uncovered. Two rejected edges
-   wrapped the change count through zero (`18446744073709551615`) and left a
-   partial CFG edit. A second defect treated “a PHI arm for this predecessor
-   exists” as sufficient and could replace an asm-goto value with the normal
-   fallthrough value. A third rejected every sole-predecessor relay, including
-   ones whose PHI translation was available.
+`jecxz` is classified as `CondJmp` because its second character is `e`.
+The encoder and ELF writer have no long form (`E3 cb`, rel8). Retargeting
+it before layout can assemble only by accident. `jcxz` and `loop` were
+accidentally safe because they are not `CondJmp`; that is not a contract.
+Final rel8 range is not knowable in this pass: later folds and relaxation
+still change sizes. A text-distance guess would be a false proof. The
+relay stays. x86-64 already refuses `jcxz`/`jecxz`/`jrcxz` and never
+deletes labels.
 
-   The replacement plans every terminator and PHI addition from an immutable
-   snapshot and writes nothing unless the whole source is valid. Missing or
-   duplicated required arms reject the source. An existing arm is kept only
-   when the translated value is equal. Chain resolution is cycle-complete and
-   has no depth cap; PHI-arm growth is bounded by the original arm count.
-   A sole-predecessor relay that already feeds a PHI is not bypassed: that
-   relay is what keeps the arm alive, and removing it changed loop-header
-   rematerialization and miscompiled a vector map kernel. Multi-predecessor
-   relays remain threadable. Empty asm-goto sources are no longer fused into
-   their fallthrough, which had coalesced two different incoming values under
-   one predecessor label.
-   The pre-fix compiler returned 9 for an asm-goto fallthrough that must
-   return 1. After the fix, `-m32` and `-m64` at `-O0/-O1/-O2/-O3/-Os` all
-   print `fd6c281bebb77835`.
+## What the review overstated
 
-3. **i686 trivial-block deletion.** `thread_trivial_blocks` counted branch
-   references and then discarded the count. It deleted `.LBB5: jmp .LBB3`
-   while `#APP` still contained `jnz .LBB5`. The unresolved symbol became
-   address 0 and `-O0 -m32` segfaulted. The same bytes were produced by the
-   pre-audit compiler, so this was pre-existing, not caused by the IR change.
-   x86-64 does not delete labels. The i686 pass now keeps a trampoline when
-   any reference is not a retargetable branch or `.long`/`.quad` token,
-   including inline asm. Ordinary branches may still skip that trampoline.
-   Rewriting the asm text would be shorter by one jump on that edge, but
-   `%l[name]` can be address-taken; the opacity rule wins.
+Hosted CI on the merged PR head is no longer pending. A green result there
+does not cover this follow-up. The suggested split is rejected: the
+label census belongs in the pass this change already hardens.
+
+No corpus-wide non-debug O2 speedup is claimed. Prior four-arm Callgrind
+and Os text notes belong to the merged revision; they were not rerun here.
+Ir is not cycles. This machine is not an i7-14700KF.
+
+## What changed
+
+Reference classification is module-wide and use-based:
+
+- Relaxable `jmp`/`jcc` may skip a pure trampoline. The label address does
+  not change.
+- A short-only branch (`jecxz`, `jcxz`, `jrcxz`, `loop`, `loope`, `loopz`,
+  `loopne`, `loopnz`) keeps the relay. Ordinary edges may still skip it.
+- `.long`/`.quad` is rewritten only when it is a contiguous entry under a
+  symbol the module uses as `jmp *TABLE(, %reg, scale)` or `TABLE@GOTOFF`,
+  and the payload is `CASE` or `CASE - TABLE`. `static void *p = &&label`
+  and `&&a - &&b` do not match. An address pin also blocks dispatch
+  retargeting of that same label.
+- The label is deleted only when every reference was retargeted and the
+  name is defined once. Inline asm stays opaque (`%l[name]` can be
+  address-taken).
+- Jump-to-next folding still deletes a redundant `jmp` for dispatch-only
+  labels. It does not delete the jump that is the first instruction of an
+  address-observable label: that would make `&&mid == &&end`.
+- The pin scan and the rewrite skip GAS quotes. `.string ".LBB1"` and a
+  quoted comment are text, not a symbol use.
+- Fall-through elision is not address-preserving. An empty block whose
+  address is observable (`LabelAddr`, a static initializer, an asm-goto
+  target) still emits the jump when that jump is the only thing separating
+  it from the next label. A non-empty block still elides.
+
+A sole-predecessor empty relay that already feeds a PHI is still not
+bypassed. That relay is what keeps the arm alive; removing it miscompiled
+a vector map kernel. Multi-predecessor relays remain threadable. Empty
+asm-goto sources are not fused into their fallthrough.
 
 ## What was not copied from LLVM
 
-Current LLVM `JumpThreading.cpp` (`ca1dbb8ee2aa`, 2026-10-13) evaluates
-conditions on predecessor edges, duplicates blocks under a size threshold,
-and refuses loop headers, convergent calls, address-taken blocks and
-unprofitable copies. Its own history includes quadratic IR growth when
-zero-cost instructions bypass the threshold. LCCC already folds constant
-branches and threads bool-phi diamonds without duplication. Cloning that
-duplicating pass without LazyValueInfo, a dominator updater and a measured
-cost model would add compile-time and code-size risk without a demonstrated
-runtime win on this tree. The empty-block threader therefore stays
-duplication-free. That is a scope decision, not a claim that no further
-threading is profitable.
+LLVM's duplicating jump threader (`JumpThreading.cpp`, `ca1dbb8ee2aa`)
+evaluates conditions on predecessor edges and copies blocks under a size
+threshold. Its history includes quadratic IR growth when zero-cost
+instructions bypass that threshold. LCCC already folds constant branches
+and threads bool-phi diamonds without duplication. Cloning that pass
+without LazyValueInfo, a dominator updater, and a measured cost model
+would add compile time and code size without a demonstrated runtime win.
+The empty-block threader stays duplication-free. That is a scope decision,
+not a claim that no further threading is profitable.
 
 ## Oracle
 
-GCC 16.2.0, Clang 23.1.0, ICX 2024.0.0 and the catalog's ICC 2021.10.0 all
-printed the same hash at `-O2` and `-Os`, with no warnings under
-`-Wall -Wextra -Werror` (ICC deprecation diagnostic suppressed only for that
-probe). ICX's provider alias resolved to 2024.0.0, not a proof of Intel's
-newest 2026 release. No vendor-native timing was collected. This host is a
-2-vCPU Xeon family 6 model 106 KVM guest, not an i7-14700KF, so no desktop
-cycle claim is made.
+The asm-goto fallthrough oracle is unchanged: `fd6c281bebb77835` at
+`-m32`/`-m64`, `-O0` through `-Os`, matching GCC 16.2.0, Clang 23.1.0,
+ICX 2024.0.0, and catalog ICC 2021.10.0 at `-O2`/`-Os` on the merged
+revision. ICX's provider alias resolved to 2024.0.0, not a proof of
+Intel's newest 2026 release. No new vendor timing was collected.
 
-## Remaining limits
+## What was run
 
-Hosted checks have not run on this head. The fast local gate is the required
-local contract; it is not GitHub CI. No universal speedup is claimed. The
-retained asm-goto trampoline is one jump on that edge only.
+`origin/main` was still `6733d68f` (PR #812). No hosted check covers this
+follow-up. No O2 speedup was measured.
+
+`tests/regression/check_i686_label_ref_safety.sh` linked and ran with the
+fastbuild `-m32` compiler at `-O0`, `-O1`, `-O2`, and `-Os`. All four
+returned 0. GCC 14.2.0 `-m32` on the same source returned 0 at the same
+four levels. The corpus sidecar is `-m32 -O2`; without it the standalone
+corpus compiles the file as x86-64 and the `#error` fires. At `-O0` the two `.long` entries are `.LBB10` and `.LBB11`,
+and the compiler emits `.LBB10: jmp .LBB11`. Before that emitter fix the
+labels were adjacent and `hop(-1)` returned 14. The backward `jecxz`
+fixture enters past the far label; putting the far label at the function
+entry returns before the branch, which is a test bug, not a relay bug.
+
+The emitted `-O0` assembly assembles with `as --32`. Pointing `jecxz`,
+`jcxz`, and `loop` at the far labels instead of the relays does not:
+forward displacement 211 and backward `ffffff2c` are both too large for a
+1-byte field. The i686 peephole module tests passed: 341, including the
+quoted-text case.

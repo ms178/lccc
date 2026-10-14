@@ -125,6 +125,10 @@ for opt in -O0 -O2; do
         set -e
         [ "$rc" -eq 1 ] ||
             fail "lccc-$label $opt: x86-only intrinsic compiled with rc=$rc (expected 1)"
+        # The rejection must name the target architecture (GCC's own shape:
+        # "'_mm_add_ps' is not available on aarch64") — the wording itself is
+        # the compiler's, the contract is that the user learns both which
+        # builtin and which target.
         grep -qF "is not available on $arch" <<<"$err" ||
             { printf '%s\n' "$err" >&2;
               fail "lccc-$label $opt: diagnostic does not name the builtin's target ($arch)"; }

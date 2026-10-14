@@ -240,6 +240,20 @@ def offline_base(stage,artifacts,r,*,patch=None):
     return repo
 
 
+def ensure_base_ancestry(repo,upstream,base):
+    """Deepen BASE so a session range that merged upstream can verify.
+
+    A bundle whose range merges upstream lists the OLD fork point as a second
+    prerequisite beside BASE, which a `--depth=1` BASE cannot satisfy -- the
+    bundle restores perfectly from BASE *and its ancestry*, which is what an
+    upstream clone has.  Deepen instead of declaring a good bundle broken.
+    """
+    if git(repo,'rev-parse','--is-shallow-repository')=='true':
+        git(repo,'fetch','-q','--unshallow','--no-tags',upstream,base)
+    else:
+        git(repo,'fetch','-q','--no-tags',upstream,base)
+
+
 def exact_restore(stage,artifacts,b,recipe,upstream,offline,patch):
     bundle=artifacts/b['bundle'];require(bundle.is_file() and not bundle.is_symlink() and sha(bundle)==b['bundle_sha256'],'session bundle identity mismatch/missing')
     require(recipe is None or (recipe['head'],recipe['tree'],recipe['base'],recipe['branch'])==(b['head'],b['tree'],b['base'],b['branch']),'bundle/source generations differ; use latest verified source fallback')
@@ -251,7 +265,15 @@ def exact_restore(stage,artifacts,b,recipe,upstream,offline,patch):
     if offline or network_error:
         require(recipe is not None,'offline exact history requires the source/patch/BASE recipe')
         repo=offline_base(stage,artifacts,recipe,patch=patch);method='offline-reconstructed-base'
-    git(repo,'bundle','verify',str(bundle.resolve()))
+    try:
+        git(repo,'bundle','verify',str(bundle.resolve()))
+    except (OSError,ValueError,subprocess.SubprocessError):
+        # Reported as exact-history failure only when BASE's ancestry cannot
+        # help either: offline reconstruction has BASE alone by construction.
+        require(method=='upstream-base' and not offline,
+                'session bundle needs BASE ancestry; the offline recipe has BASE alone')
+        ensure_base_ancestry(repo,upstream,b['base'])
+        git(repo,'bundle','verify',str(bundle.resolve()))
     git(repo,'fetch','-q',str(bundle.resolve()),'refs/heads/'+b['branch'])
     git(repo,'checkout','-q','-B',b['branch'],'FETCH_HEAD')
     require(git(repo,'rev-parse','HEAD')==b['head'] and git(repo,'rev-parse','HEAD^{tree}')==b['tree'],'session history restore mismatch')

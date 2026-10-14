@@ -632,6 +632,16 @@ impl Lowerer {
             self.target,
             crate::backend::Target::X86_64 | crate::backend::Target::I686
         ) {
+            // AUD-CPU-1 (3): a name from the x86 feature set is a question this
+            // target cannot answer at all, and silently folding it to 0 turns
+            // `__builtin_cpu_supports("avx2") ? fast() : slow()` into a silent
+            // slow path (GCC diagnoses the name on every non-x86 target).  A
+            // name from another architecture's set keeps the conservative 0:
+            // LCCC does not model those sets yet, and rejecting them would turn
+            // accepted GCC code into a compile error.
+            if crate::common::x86_features::X86Feature::parse(name).is_some() {
+                return Err(format!("parameter to builtin not valid: {name}"));
+            }
             return Ok(CpuSupport::Unsupported);
         }
         match crate::common::cpu_probe::lookup(name) {
@@ -1326,6 +1336,7 @@ impl Lowerer {
             | BuiltinIntrinsic::X86MulloEpi32
             | BuiltinIntrinsic::X86Pcmpgtb256
             | BuiltinIntrinsic::X86CastReinterpret => {
+                self.check_x86_intrinsic_feature(intrinsic, name, args);
                 self.lower_x86_intrinsic(intrinsic, name, args)
             }
             // __builtin_shufflevector(v1, v2, i0, i1, i2, i3): 4-lane 32-bit
@@ -2058,6 +2069,14 @@ impl Lowerer {
     /// reduction and the out-of-range 2-argument case are oracle-measured in
     /// tests/regression/check_shuffle_diagnostics.sh.
     fn lower_shuffle(&mut self, args: &[Expr]) -> Option<Operand> {
+        // Every rejection below used to be a `panic!`, i.e. an ICE on input a
+        // user can write: a mask whose element count differs from the vector's
+        // (`v8si` mask for a `v4si`), a non-vector mask, a non-vector first
+        // operand. GCC diagnoses all three; so does this now. The returned
+        // `None` means "not lowered as this builtin", and the caller's
+        // ordinary-call fallback cannot panic. Reporting with the *operand's*
+        // span matters: `lower_shuffle` is reached from a nested expression,
+        // and a location-less error in a 50k-line TU is not actionable.
         let (vec_args, mask_expr): (&[Expr], &Expr) = match args.len() {
             2 => (&args[..1], &args[1]),
             3 => (&args[..2], &args[2]),
@@ -2096,6 +2115,7 @@ impl Lowerer {
                 args,
                 total_bytes.max(16),
             );
+            return None;
         }
         let n_elems: i64 = (total_bytes / elem_size) as i64;
         // Mask element class and width from the mask operand's CType.  GCC:
@@ -2121,6 +2141,18 @@ impl Lowerer {
                         args,
                         total_bytes,
                     );
+                    return None;
+                }
+                if es == 0 || bytes % es != 0 || (bytes / es) as i64 != n_elems {
+                    self.diagnostics.borrow_mut().error(
+                        format!(
+                            "__builtin_shuffle: mask element count must match the vector's ({} mask element(s) for {} vector element(s))",
+                            if es > 0 { bytes / es } else { 0 },
+                            n_elems
+                        ),
+                        mask_expr.span(),
+                    );
+                    return None;
                 }
                 es
             }
@@ -2352,6 +2384,7 @@ impl Lowerer {
                 args,
                 16,
             );
+            return None;
         }
         let v1 = self.vec128_arg_ptr(&args[0]);
         let v2 = self.vec128_arg_ptr(&args[1]);
@@ -2398,6 +2431,7 @@ impl Lowerer {
                     args,
                     16,
                 );
+                return None;
             };
             let src_ptr = self.fresh_value();
             self.emit(Instruction::GetElementPtr {
@@ -2456,6 +2490,16 @@ impl Lowerer {
             .first()
             .map(|a| a.span())
             .unwrap_or_else(|| crate::common::source::Span::new(0, 0, 0));
+        // AUD-SILENT-ZERO-1 / AUD-CPU-3: this function owns the *permission*
+        // half — on x86 the intrinsic exists, but the invocation may not have
+        // granted the extension it needs.  A foreign target is
+        // `lower_x86_intrinsic`'s rejection to make (it runs after this check
+        // and names the target: "'_mm_add_ps' is not available on aarch64");
+        // diagnosing it here as well would print two errors for one call.
+        // 3 = EM_386 (i686), 62 = EM_X86_64.
+        if !matches!(crate::common::types::target_elf_machine(), 3 | 62) {
+            return;
+        }
         let Some(requirement) = x86_intrinsic_required_feature(intrinsic) else {
             return;
         };
@@ -2473,6 +2517,7 @@ impl Lowerer {
             span,
         );
     }
+
     fn lower_x86_intrinsic(
         &mut self,
         intrinsic: &BuiltinIntrinsic,
@@ -2918,6 +2963,22 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
         | BuiltinIntrinsic::X86CmpPs256V => X86IntrinsicKind::Vec256,
         _ => X86IntrinsicKind::Vec128,
     }
+}
+
+/// One row of the AUD-CPU-3 permission table: what an intrinsic's instruction
+/// needs before the invocation may contain it.
+struct IntrinsicRequirement {
+    /// The feature whose bit in [`crate::common::x86_features::effective`] is
+    /// the permission (the fold for a conjunction is inside the fold, so one
+    /// lookup is enough).
+    feature: crate::common::x86_features::X86Feature,
+    /// The `-m` flag that grants `feature`, for the diagnostic.
+    flag: &'static str,
+    /// A conjunct the feature's own bit does not spell out.  The 256-bit
+    /// VAES/VPCLMULQDQ forms are the case: their permission is the extension
+    /// *and* the 256-bit vector class, and a user who passed `-mvaes` on a
+    /// target without AVX2 needs to be told the second half, not the first.
+    also: Option<&'static str>,
 }
 
 /// Map a BuiltinIntrinsic to its corresponding IntrinsicOp.

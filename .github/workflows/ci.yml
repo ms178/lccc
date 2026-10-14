@@ -110,11 +110,6 @@ jobs:
       - name: No merge conflict markers
         run: python3 scripts/check_no_conflict_markers.py
 
-      - name: Audit census ratchet
-        run: |
-          python3 scripts/audit_census.py --selftest
-          python3 scripts/audit_census.py --check
-
       - name: Verify manifest Rust-toolchain selection
         run: bash tests/regression/check_rust_toolchain_selector.sh
 
@@ -131,11 +126,6 @@ jobs:
 
       - name: Check FP-contraction parity with GCC
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_fp_contract_parity.sh
-
-      - name: Check ill-typed builtin diagnostics
-        run: |
-          python3 scripts/check_ill_typed_builtins.py --self-test
-          python3 scripts/check_ill_typed_builtins.py --compiler target/fastbuild/lccc
 
       - name: Check builtin_cpu_supports runtime semantics
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_cpu_supports_runtime.sh
@@ -216,6 +206,7 @@ jobs:
           python3 scripts/check_repro_replay.py --self-test
           env CCC=target/fastbuild/lccc python3 scripts/check_repro_replay.py
 
+      
       # AUD-ICE-1/AUD-DIAG-1: malformed `__builtin_shuffle` masks diagnose
       # instead of panicking, and the valid forms still lower (oracle-checked
       # against gcc).
@@ -237,13 +228,48 @@ jobs:
       - name: ISA-sensitive intrinsic feature gate
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_intrinsic_feature_gate.sh
 
+      # AUD-POS-1: positions after a #include, oracle-diffed against gcc.
+      - name: Diagnostic positions survive the preprocessor
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_diagnostic_positions.sh
+
+      # AUD-ICE-1: the argument counts the front end enforces for builtins are
+      # derived from include/*.h; this fails if the checked-in table drifts.
+      - name: Intrinsic arity table matches the headers
+        run: |
+          set -euo pipefail
+          python3 scripts/check_intrinsic_arity.py --self-test
+          python3 scripts/check_intrinsic_arity.py --check
+
+      # AUD-ICE-1: an ill-typed call to any builtin in the compiler's name
+      # table must diagnose, never panic; the ratchet baseline records the
+      # panics and silent accepts that exist today.
+      - name: Ill-typed builtin acceptance
+        run: |
+          set -euo pipefail
+          python3 scripts/check_ill_typed_builtins.py --self-test
+          env CCC=target/fastbuild/lccc LCCC_REPO=. python3 scripts/check_ill_typed_builtins.py
+
       - name: Run tests
         env:
           CARGO_BUILD_JOBS: "2"
           RUSTFLAGS: -D warnings
         # Keep every Rust compilation that produces LCCC code at the project
         # fastbuild policy: opt-level 1 and no more than two Cargo jobs.
-        run: cargo test --profile fastbuild --all-targets --locked -j 2
+        #
+        # The suite runs through scripts/ci_test_report.py because a red
+        # `cargo test` step is simultaneously the most common red in this
+        # repository and the least readable one: GitHub's own annotation for it
+        # is "Process completed with exit code 101", `actions/jobs/{id}/logs`
+        # answers HTTP 500 for a failed job, and the public job page carries no
+        # verdict text. The wrapper streams the output through unchanged and,
+        # on failure, republishes the verdict as one annotation per failing
+        # test -- placed on the panic's own file:line -- plus a Markdown job
+        # summary carrying the complete list. Its self-test runs first: a
+        # reporting tool that quietly stops reporting is worse than none.
+        run: |
+          set -euo pipefail
+          python3 scripts/ci_test_report.py --self-test
+          python3 scripts/ci_test_report.py -- cargo test --profile fastbuild --all-targets --locked -j 2
 
       # The fastbuild profile inherits `release`, which compiles every
       # debug_assert! OUT - and with them the mechanical enforcement this
@@ -263,6 +289,7 @@ jobs:
           CARGO_BUILD_JOBS: "2"
           RUSTFLAGS: -D warnings
         run: >-
+          python3 scripts/ci_test_report.py --
           cargo test --profile fastbuild --all-targets --locked -j 2
           --config 'profile.fastbuild.debug-assertions=true'
           --config 'profile.fastbuild.incremental=false'
@@ -392,7 +419,12 @@ jobs:
 
           path = Path("regression-results.json")
           if not path.is_file():
-              print("::error title=Regression harness::no regression-results.json was written")
+              print(
+                  "::error title=Regression harness::"
+                  "the corpus gate did not run, so no regression-results.json exists"
+                  " (an earlier step in this job failed first; that step's own"
+                  " annotations name it)"
+              )
           else:
               report = json.loads(path.read_text(encoding="utf-8"))
               failures = report.get("failures", [])
@@ -1403,6 +1435,11 @@ jobs:
           bash tests/regression/check_redundant_test_elimination.sh
           python3 tests/regression/verify_pr713_audit.py --quiet
           python3 scripts/check_doc_links.py
+          # AUD-RATCHET-1: the audit census (scripts/audit_census.py) is the
+          # only place the audit's site counts are measurable; the ratchet is
+          # what stops them growing back.  Runs in ci_local.sh too.
+          python3 scripts/audit_census.py --selftest
+          python3 scripts/audit_census.py --check
           python3 scripts/check_peephole_directive_step.py
           python3 scripts/check_pr_claim_fidelity.py
           bash tests/regression/check_ra_web_inloop_use.sh
@@ -1421,6 +1458,7 @@ jobs:
           bash tests/regression/check_dep_files.sh
           bash tests/regression/check_i686_boot_asm.sh
           bash tests/regression/check_asm_goto_phi_edge.sh
+          bash tests/regression/check_i686_label_ref_safety.sh
           bash tests/regression/check_narrow_cmp_flag_law.sh
           bash tests/regression/check_zero_ext_cmp_fold.sh
           bash tests/regression/check_boot_size_measurement.sh

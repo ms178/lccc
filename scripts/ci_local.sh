@@ -177,15 +177,8 @@ fi
 # panic-class sites (AUD-ICE-1) overall and in the user-input pipeline,
 # `unsafe` sites, giant functions over 300/500/1000 lines (AUD-MONO-1),
 # undeclared CCC_*/LCCC_* knobs (AUD-KNOB-1) and unannotated #[ignore]s
-# (AUD-ARM-GSF-1).  --check refuses any metric that grew past
-# scripts/audit_census_baseline.json; a count may only be re-baselined in
-# the commit that adds the sites, and lowering the baseline belongs to the
-# commit that removes them.  Pure static scan -- it needs no compiler, and
-# it must run before the build so a regression is reported as itself.
-gate "audit-census-selftest" fast \
-    python3 scripts/audit_census.py --selftest
-gate "audit-census" fast \
-    python3 scripts/audit_census.py --check
+# (AUD-ARM-GSF-1). Pure static scan -- it needs no compiler, and it must run
+# before the build so a regression is reported as itself.
 
 gate "rec2iter" fast \
     env CCC="$LCCC" bash tests/regression/check_rec2iter.sh
@@ -193,11 +186,8 @@ gate "rec2iter" fast \
 gate "fp-contract-parity" fast \
     env CCC="$LCCC" bash tests/regression/check_fp_contract_parity.sh
 
-gate "ill-typed-builtins-selftest" fast \
-    python3 scripts/check_ill_typed_builtins.py --self-test
-gate "ill-typed-builtins" fast \
-    env CCC="$LCCC" python3 scripts/check_ill_typed_builtins.py --compiler "$LCCC"
-
+# ~97 compiles per arm plus the runs: seconds, not minutes -- and it is the
+# only gate that exercises the historical crash/miscompile corpus end to end.
 gate "cpu-supports-runtime" fast \
     env CCC="$LCCC" bash tests/regression/check_cpu_supports_runtime.sh
 
@@ -285,6 +275,7 @@ gate "compat-suite" fast \
 gate "ivsr-reproducers" fast \
     env CCC="$LCCC" bash tests/regression/check_ivsr_reproducers.sh
 
+
 # AUD-ICE-1/AUD-DIAG-1: a malformed `__builtin_shuffle` mask must produce a
 # diagnostic, not a Rust panic (and the valid forms must still lower).  The
 # gate is oracle-checked against gcc, so it cannot pass by rejecting more than
@@ -310,6 +301,29 @@ gate "cross-target-intrinsic-trap" fast \
 # gcc wherever gcc ships the same intrinsic.
 gate "intrinsic-feature-gate" fast \
     env CCC="$LCCC" bash tests/regression/check_intrinsic_feature_gate.sh
+
+# AUD-POS-1: a diagnostic's file:line:col must survive the preprocessor -- the
+# case that regressed was "every position after a #include is one line high".
+# Oracle-diffed against gcc on positions, not wording.
+gate "diagnostic-positions" fast \
+    env CCC="$LCCC" bash tests/regression/check_diagnostic_positions.sh
+
+# AUD-ICE-1: an ill-typed builtin call is a diagnostic, never a panic.  The
+# worklist is the compiler's own name table, so a builtin added tomorrow is
+# covered tomorrow; the baseline ratchets the panics and silently-accepted
+# calls that exist today and fails the moment either list grows.
+gate "ill-typed-builtins-selftest" fast \
+    python3 scripts/check_ill_typed_builtins.py --self-test
+
+# AUD-ICE-1: the argument counts the front end enforces for builtins come from
+# include/*.h; the checked-in table is regenerated, never hand-edited, and this
+# gate fails if it stops matching the headers it was derived from.
+gate "intrinsic-arity-selftest" fast \
+    python3 scripts/check_intrinsic_arity.py --self-test
+gate "intrinsic-arity" fast \
+    python3 scripts/check_intrinsic_arity.py --check
+gate "ill-typed-builtins" fast \
+    env CCC="$LCCC" LCCC_REPO=. python3 scripts/check_ill_typed_builtins.py
 
 # The unit-test gate is what GitHub's required check runs on every PR, so it
 # belongs in the fast set: a red PR has to be reproducible with --fast.
@@ -362,6 +376,10 @@ cargo_test_repeated() {
         incr=0
     fi
     n="${LCCC_TEST_REPEATS:-1}"
+    # The reporter's own test corpus runs first: it is what fails when the
+    # reporter quietly stops reporting, and the suite below is exactly the log
+    # it exists to explain (see scripts/ci_test_report.py).
+    python3 scripts/ci_test_report.py --self-test
     for ((i = 1; i <= n; i++)); do
         if [ -n "$dbg" ]; then
             export CARGO_PROFILE_FASTBUILD_DEBUG="$dbg"
@@ -373,7 +391,8 @@ cargo_test_repeated() {
         else
             unset CARGO_INCREMENTAL
         fi
-        if ! RUSTFLAGS="$flags" cargo test --profile fastbuild --all-targets --locked -j "$jobs"; then
+        if ! RUSTFLAGS="$flags" python3 scripts/ci_test_report.py -- \
+            cargo test --profile fastbuild --all-targets --locked -j "$jobs"; then
             printf 'cargo-test: FAILED on repeat %d/%d\n' "$i" "$n" >&2
             return 1
         fi
@@ -394,7 +413,8 @@ DBGASSERT_CONFIG=(--config 'profile.fastbuild.debug-assertions=true'
 cargo_test_dbgassert() {
     local flags="" jobs="${CI_LOCAL_JOBS:-2}"
     [ -r target/lccc-rustflags ] && flags="$(cat target/lccc-rustflags)"
-    CARGO_INCREMENTAL=0 RUSTFLAGS="$flags" cargo test --profile fastbuild \
+    CARGO_INCREMENTAL=0 RUSTFLAGS="$flags" python3 scripts/ci_test_report.py -- \
+        cargo test --profile fastbuild \
         --all-targets --locked -j "$jobs" "${DBGASSERT_CONFIG[@]}"
 }
 gate "cargo-test-debug-assertions" slow cargo_test_dbgassert
@@ -860,6 +880,19 @@ gate "phi-acyclic-copy-order" fast \
 gate "doc-link-integrity" fast \
     python3 scripts/check_doc_links.py
 
+# AUD-RATCHET-1: the audit's site counts are a ratchet, not a snapshot.  The
+# scanner self-tests first (its tokenizer is what every number rests on), then
+# --check refuses any metric that grew past scripts/audit_census_baseline.json:
+# panic-class sites overall and in the user-input pipeline, `unsafe` sites,
+# unannotated `#[ignore]`, functions over 300/500/1000 lines, and CCC_*/LCCC_*
+# literals without documentation.  A count may only be re-baselined in the
+# commit that adds the sites; lowering the baseline belongs to the commit that
+# removes them.
+gate "audit-census-selftest" fast \
+    python3 scripts/audit_census.py --selftest
+gate "audit-census-ratchet" fast \
+    python3 scripts/audit_census.py --check
+
 # The Expat differential is only a differential if both compilers ran the SAME
 # tests under the SAME feature configuration.  `junit_check.py` compares testcase
 # identity multisets and the CMake cache, and this gate runs its compiler-free
@@ -1002,6 +1035,8 @@ gate "i686-boot-asm" fast \
 
 gate "asm-goto-phi-edge" fast \
     bash tests/regression/check_asm_goto_phi_edge.sh
+gate "i686-label-ref-safety" fast \
+    bash tests/regression/check_i686_label_ref_safety.sh
 
 # ci.yml "Verify inline-asm UTF-8 assembly text".
 gate "inline-asm-utf8" fast \

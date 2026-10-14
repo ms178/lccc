@@ -463,6 +463,8 @@ impl Preprocessor {
                 // Column of the directive keyword (1-based, after '#')
                 let hash_col = line.find('#').map(|i| i + 2).unwrap_or(1);
                 let include_result = self.process_directive(trimmed, source_line_num + 1, hash_col);
+                let emitted_include_content =
+                    include_result.as_deref().is_some_and(|c| !c.is_empty());
                 if let Some(included_content) = include_result {
                     output.push_str(&included_content);
                     // After included content, emit a return-to-parent line marker
@@ -489,10 +491,20 @@ impl Preprocessor {
                 }
                 // Preserve line numbering during multi-line accumulation
                 if !is_include {
-                    if !pending_line.is_empty() {
-                        pending_newlines += 1;
-                    } else {
-                        output.push('\n');
+                    // ...unless the directive already preserved it.  A
+                    // #include writes the included text plus a
+                    // return-to-parent marker, and that marker names the
+                    // parent's NEXT line -- so the directive's own line is
+                    // accounted for.  Emitting a newline as well inserted a
+                    // phantom line after every include, and every diagnostic
+                    // in the rest of the file was then reported one line too
+                    // high (`#include <stddef.h>\nint bad = ;` blamed line 3).
+                    if !emitted_include_content {
+                        if !pending_line.is_empty() {
+                            pending_newlines += 1;
+                        } else {
+                            output.push('\n');
+                        }
                     }
                     // Update pp_output_line for directive path
                     let added = &output.as_bytes()[output_len_before_directive..];

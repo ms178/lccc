@@ -37,8 +37,14 @@
 //! VEX/xmm classes, `resolved_bmi1`/`resolved_bmi2`/`resolved_lzcnt`/
 //! `resolved_movbe`/`resolved_popcnt` for the integer features, and the
 //! `__<FEAT>__` macro predicates for the rungs that have no codegen bit of
-//! their own. Consequences that are deliberately pinned by
-//! `tests/regression/check_cpu_supports_fold.sh`:
+//! their own. What the set is used for, and what is deliberately pinned:
+//!
+//! * the **intrinsic** permission gate (AUD-CPU-3): an x86 intrinsic whose
+//!   extension this set does not contain is diagnosed rather than emitted
+//!   (`tests/regression/check_intrinsic_feature_gate.sh`).  It is *not* the
+//!   `__builtin_cpu_supports` answer — that builtin probes CPUID at run time,
+//!   matching GCC (AUD-CPU-1, `common::cpu_probe`; see
+//!   `tests/regression/check_cpu_supports_runtime.sh`).
 //!
 //! * no `-march=` → the project code-generation baseline, **x86-64-v3**
 //!   (`backend::x86::isa` documents it: every benchmark number in

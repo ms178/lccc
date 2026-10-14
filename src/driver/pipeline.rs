@@ -1256,7 +1256,7 @@ impl Driver {
                 // to -Wl, and -l flags. This is critical for --whole-archive support.
             } else if Self::is_assembly_source(input_file) || self.is_explicit_assembly() {
                 // .s/.S files (or -x assembler): pass to assembler, then link
-                let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o")?;
+                let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o");
                 self.assemble_source_file(input_file, tmp.to_str())?;
                 temp_guards.push(tmp);
             } else if !Self::is_c_source(input_file) && Self::looks_like_binary_object(input_file) {
@@ -1269,7 +1269,7 @@ impl Driver {
                 #[cfg(feature = "gcc_m16")]
                 if self.code16gcc {
                     use super::external_tools::GccM16Mode;
-                    let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o")?;
+                    let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o");
                     self.compile_with_gcc_m16(input_file, tmp.to_str(), GccM16Mode::Object)?;
                     if self.verbose {
                         eprintln!("Compiled (GCC -m16): {}", input_file);
@@ -1281,7 +1281,7 @@ impl Driver {
                 // Compile .c files to .o (handles .code16gcc prepend via internal codegen)
                 let asm = self.compile_to_assembly(input_file)?;
 
-                let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o")?;
+                let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o");
                 let extra = self.build_asm_extra_args();
                 self.target
                     .assemble_with_extra(&asm, tmp.to_str(), &extra)?;

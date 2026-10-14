@@ -6,7 +6,13 @@ Compiler-free corpus audit entrypoint: `bash scripts/ci_corpus_tools.sh` (not
 `ci_local.sh --fast`). It is a tooling/contract gate, not compiler CI or runtime
 performance validation. Compact recovery: `python3 scripts/lccc_recover.py
 --repo /opt/lccc-work/lccc --offline --require-exact-history`; the published
-standalone `LCCC-RECOVER.py` survives a worktree reset. See the
+standalone `LCCC-RECOVER.py` survives a worktree reset. A session range that
+*merged* upstream is proved and restored against BASE **and its ancestry** (the
+receipt records which proof ran, `base_fetch`): the merged range's second
+prerequisite is the old fork point, which a `--depth=1` BASE cannot satisfy, so
+both the snapshot proof and the recovery tool deepen BASE instead of rejecting
+a bundle that restores perfectly. Offline recovery, which has BASE alone by
+construction, reports the honest source fallback for that shape. See the
 [audit and recovery instructions](../engineering/PR724-AUDIT-2026-10-02.md).
 
 | Script | Purpose |
@@ -37,6 +43,7 @@ standalone `LCCC-RECOVER.py` survives a worktree reset. See the
 | `ci_ubuntu_chroot.sh` | Runs a command -- normally `ci_local.sh --fast` -- in an Ubuntu 24.04 debootstrap (the GitHub runner's userland: GCC 13.2, glibc, binutils) with `$HOME` bound at the same path. The system GCC is an oracle for several gates; PR #638 passed ci_local on Debian's GCC 14.2 and failed CI on Ubuntu's 13.2. `--setup-only` builds the chroot; `LCCC_CI_CHROOT`/`LCCC_CI_MIRROR` override its path and mirror. |
 | `torture_evidence.py` | Summarizes native torture reports without conflating compile and execute legs. Schema-2 incomplete/fatal/cardinality-mismatched reports are refused; filtered selections are labelled explicitly. |
 | `check_ci_gate_parity.py` | Both directions of the ci_local.sh / workflow mirror: every local gate runs in hosted CI, every hosted script, cargo subcommand and `--config` build mode runs locally (comments do not count on either side), and no `tests/regression/check_*.sh` is wired into nothing. Exceptions: `ci_gate_allowlist.txt` (orphans) and `ci_hosted_only.txt` (hosted-only measurements); both may only shrink. Self-test: `test_ci_gate_parity.py`. |
+| `ci_test_report.py` | Failure observability for the suite GitHub runs on every PR. Runs a command with stdout/stderr merged and streamed byte-for-byte unchanged (exit status preserved, `128+n` when the child dies by signal) and, on failure, republishes the verdict where a triager can read it: one `::error` annotation per failing test placed on the panic's own `file:line`, a summary annotation naming every failure first (GitHub displays only a bounded number of annotations per step, and the list is what must survive the cut), and a Markdown `$GITHUB_STEP_SUMMARY` carrying the complete failure list, the panic messages and the log tail. `--parse-log FILE` runs the same parser over a saved log. It exists because `actions/jobs/{id}/logs` answers HTTP 500 for a failed job and the public job page carries no verdict text, so a red `cargo test` step used to be diagnosable only by coincidence; its `--self-test` covers the escaping rules, both panic spellings, rustc diagnostics, `-D warnings` promotions, ANSI/CRLF/invalid UTF-8 input, the annotation cap and run-mode exit codes. Wired into both mirrors (`ci_local.sh` cargo-test gates and the two `Run tests` steps). |
 | `bench_kernels.py` | Separate-TU kernel timing harness. Supports a CPU-pinned, AB/BA-balanced `lccc-alt` compiler arm via `--lccc-alt-env NAME=VALUE`, verifies checksums, and hashes only the timed function. |
 | `fuzz_diff.py` | Unified differential-testing harness and single entry point for every differential engine (`synthetic`, `csmith`, `yarpgen`, `stress_suite` + the nine absorbed `tests/fuzz` engines `differential`, `phi_cfg`, `intcmp_thread`, `m32`, `regparm`, `slot_rmw`, `alias_m32`, `alu_torture`, `aarch64`). Compiles every generated program with LCCC **and all selected references** across the requested `-O` levels, compares stdout/stderr/exit status, and saves miscompile reproducers. The `stress_suite` engine sweeps `--count` seeds per generator and evaluates every case under the cartesian product of repeatable `--config-env KEY=VALUE` axes; a case where the reference AND lccc die by the same signal is a GEN-BUG failure (generator bug, never a silent skip). The generator-config engines import the historical `tests/fuzz` generators (historical flags, seeds, and gcc oracle preserved; `Oz` maps to `-Os` on references); the standalone-pipeline engines (nostdlib int80 or cross-compilation) are forwarded to their `tests/fuzz` script and adopt its exit code, SKIPping cleanly when the host lacks ELF32/int80 or the cross toolchain (int80-blocked hosts fall back to compile-only validation). `--check-engines` is the CI wiring guard against stub engines. |
 | `ensure_gcc_torture.sh` | Idempotently (re)provisions `gcc.c-torture/{execute,compile}` + `gcc.dg` from the GCC release tarball (default **16.2.0**, `GCC_TORTURE_VERSION`) into the snapshot-excluded `~/.cache` zone — the ~22k-file corpus and the 107 MB tarball would each blow the workspace snapshot cap. The tarball must match a sha512 pin (cross-checked against the GNU release signature when added; `GCC_TORTURE_SHA512` for unpinned versions). The stamp is trusted only after the manifest hash, the required directories (`gcc.c-torture/{execute,compile}`, `gcc.dg`), the exact file set and every file's sha256 check out; any failure auto-repairs. Re-provisioning drops the stamp first and writes it only after the new tree validates. `--force` re-extracts; `tests/regression/check_ensure_gcc_torture.sh` is the contract test. |
@@ -326,3 +333,32 @@ each one is a contract build systems rely on, and each now has a gate:
 | `check_repro_replay.py` | replays every `artifacts/repros/*.c` against GCC, two ISA-pinned legs, `--self-test` | `ci_local.sh` (fast), CI |
 | `verify_fib_perf.sh` | Fibonacci rec2iter perf probe (moved from `tests/`) | manual |
 | `../tools/workspace_dirs.sh` | resolves the persisted workspace dir (`LCCC_WORKSPACE`, `/home/user`, `/mnt/user-data/outputs`) | sourced by the snapshot tool |
+
+
+## Whole-tree audit replay (2026-10-14)
+
+These tools support the A14 queue in root `backlog.md`; they do not certify
+that a static inventory is a semantic audit.
+
+- `python3 scripts/audit_tree_inventory.py --revision COMMIT --output REPORT`
+  records every tracked blob by subsystem and exact source/tool identities,
+  independent of build products and uncommitted changes. `--selftest` checks
+  immutability and whitespace-bearing filenames as well as subsystem grouping.
+- `python3 scripts/audit_contract_probes.py --compiler-probes --extended --check`
+  replays the new census/type/ISA/assembler/linker/PGO/debug contracts. Requires
+  already-built fastbuild target binaries, Clang, ld.lld, readelf and strace;
+  no hidden compiler build or download. `--json REPORT` preserves observations.
+  **Expected to exit nonzero on the audit baseline**: these are open defects,
+  not a passing CI gate. `--selftest` validates process classification without
+  requiring compiler tools. Unknown tools/timeouts/panics cannot count as a
+  successful negative compiler test.
+- `tests/workloads/zlib-ng-2.3.3/isolate_maketrees.py` replays actual Ninja
+  compile flags on an existing configured source tree, mixing GCC/LCCC TUs
+  and optimization levels. It creates only its own private scratch directory;
+  output must be a fresh directory. Consult `--help` and the standalone
+  reproducer under `engineering/evidence/2026-10-14-audit/zlib-maketrees/`.
+
+The evidence directory retains commands, exact source hashes, raw original
+reports, licenses and known-wrong outputs as **negative evidence**. Do not
+update expected outputs to the wrong result or remove fail-closed checks to
+make an audit replay appear green.

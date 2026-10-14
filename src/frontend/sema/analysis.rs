@@ -32,6 +32,7 @@ use crate::frontend::parser::ast::{
 };
 use crate::frontend::sema::builtins;
 use crate::ir::reexports::IrConst;
+use crate::frontend::sema::intrinsic_arity;
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
@@ -2260,7 +2261,43 @@ impl SemanticAnalyzer {
                 // Check for builtin calls
                 if let Expr::Identifier(name, callee_span) = callee.as_ref() {
                     if builtins::is_builtin(name) {
-                        // Valid builtin call - will be resolved during lowering
+                        // A builtin under its own name carries no prototype, so
+                        // nothing below could check the call and lowering used
+                        // to pass whatever the user wrote straight through to
+                        // the backend's operand indexing -- `_mm_add_ps()` was
+                        // a compiler ICE (AUD-ICE-1) where GCC says "too few
+                        // arguments to function '_mm_add_ps'".  The arity comes
+                        // from the bundled headers
+                        // (scripts/check_intrinsic_arity.py keeps that table in
+                        // step with include/*.h); a builtin whose headers do not
+                        // pin the count down stays unconstrained.
+                        //
+                        // Only undeclared names: once a header is included the
+                        // name has a prototype, the ordinary argument check
+                        // below already reports the mismatch, and reporting it
+                        // twice would be noise.
+                        if self.symbol_table.lookup(name).is_none()
+                            && !self.result.functions.contains_key(name)
+                        {
+                            if let Some(expected) = intrinsic_arity::builtin_intrinsic_arity(name) {
+                                if args.len() != expected {
+                                    self.diagnostics.borrow_mut().error(
+                                        format!(
+                                            "{} arguments to function '{}' (expected {}, have {})",
+                                            if args.len() < expected {
+                                                "too few"
+                                            } else {
+                                                "too many"
+                                            },
+                                            name,
+                                            expected,
+                                            args.len()
+                                        ),
+                                        *callee_span,
+                                    );
+                                }
+                            }
+                        }
                     } else if !self.result.functions.contains_key(name)
                         && self.symbol_table.lookup(name).is_none()
                     {
