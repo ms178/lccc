@@ -10186,6 +10186,11 @@ fn label_diff(payload: &str) -> Option<(&str, &str)> {
     (bare_local_label(left) && bare_local_label(right)).then_some((left, right))
 }
 
+struct DispatchCase<'a> {
+    target: &'a str,
+    relative_base: Option<&'a str>,
+}
+
 /// A data line is a dispatch entry only when it sits in the contiguous run
 /// under a symbol the module actually uses as a jump-table base, and the
 /// payload is either that table's absolute case label or `CASE - TABLE`.
@@ -10195,16 +10200,22 @@ fn dispatch_case<'a>(
     text: &'a str,
     owning: &str,
     bases: &std::collections::HashSet<String>,
-) -> Option<&'a str> {
+) -> Option<DispatchCase<'a>> {
     if owning.is_empty() || !bases.contains(owning) {
         return None;
     }
     let payload = data_payload(text)?;
     if bare_local_label(payload) {
-        return Some(payload);
+        return Some(DispatchCase {
+            target: payload,
+            relative_base: None,
+        });
     }
     let (left, right) = label_diff(payload)?;
-    (right == owning).then_some(left)
+    (right == owning).then_some(DispatchCase {
+        target: left,
+        relative_base: Some(right),
+    })
 }
 
 fn table_run_transparent(text: &str) -> bool {
@@ -10283,11 +10294,11 @@ fn visit_label_uses(
         }
         if run_open {
             if let Some(case) = dispatch_case(text, owning, &bases) {
-                visit(case, i, LabelUse::Dispatch);
+                visit(case.target, i, LabelUse::Dispatch);
                 // The table's own address remains observable even in the
                 // degenerate CASE == TABLE difference expression.
-                if label_diff(data_payload(text).unwrap()).is_some() {
-                    visit(owning, i, LabelUse::Identity);
+                if let Some(base) = case.relative_base {
+                    visit(base, i, LabelUse::Identity);
                 }
                 continue;
             }

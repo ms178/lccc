@@ -19,7 +19,9 @@ pub(super) fn has_separating_instruction(body: &str) -> bool {
         if text.is_empty() || text.starts_with('#') || text.starts_with("//") {
             continue;
         }
-        let token = text.split_whitespace().next().unwrap();
+        let Some(token) = text.split_whitespace().next() else {
+            continue;
+        };
         if token.ends_with(':') {
             // Includes labels with trailing comments and numeric local labels.
             continue;
