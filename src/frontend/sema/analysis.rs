@@ -31,8 +31,8 @@ use crate::frontend::parser::ast::{
     InitializerItem, SizeofArg, Stmt, StructFieldDecl, TranslationUnit, TypeSpecifier,
 };
 use crate::frontend::sema::builtins;
-use crate::ir::reexports::IrConst;
 use crate::frontend::sema::intrinsic_arity;
+use crate::ir::reexports::IrConst;
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
