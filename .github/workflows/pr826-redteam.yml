@@ -23,6 +23,8 @@ jobs:
         with:
           toolchain: 1.99.0
           components: rustfmt, clippy
+      - name: Ubuntu reference harness (different libc/compiler environment)
+        run: python3 tests/linker/test_pr826_redteam.py
       - name: Test the production module independently
         run: |
           set -euo pipefail

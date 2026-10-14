@@ -193,6 +193,11 @@ def main():
     CC = args.cc
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(RedTeam)
     result = unittest.TextTestRunner(verbosity=2).run(suite)
+    for case, trace in result.failures + result.errors:
+        for offset in range(0, len(trace), 3000):
+            chunk = trace[offset:offset + 3000]
+            escaped = chunk.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+            print(f"::error title=redteam {case.id()} chunk {offset}::" + escaped)
     if args.json:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         version = subprocess.run([CC, "--version"], capture_output=True, text=True, timeout=10)
