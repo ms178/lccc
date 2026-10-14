@@ -2111,6 +2111,7 @@ impl Lowerer {
                 args,
                 total_bytes.max(16),
             );
+            return None;
         }
         let n_elems: i64 = (total_bytes / elem_size) as i64;
         // Mask element class and width from the mask operand's CType.  GCC:
@@ -2136,6 +2137,18 @@ impl Lowerer {
                         args,
                         total_bytes,
                     );
+                    return None;
+                }
+                if es == 0 || bytes % es != 0 || (bytes / es) as i64 != n_elems {
+                    self.diagnostics.borrow_mut().error(
+                        format!(
+                            "__builtin_shuffle: mask element count must match the vector's ({} mask element(s) for {} vector element(s))",
+                            if es > 0 { bytes / es } else { 0 },
+                            n_elems
+                        ),
+                        mask_expr.span(),
+                    );
+                    return None;
                 }
                 es
             }

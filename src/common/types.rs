@@ -60,6 +60,7 @@ pub fn set_target_elf_machine(machine: u16) {
     TARGET_ELF_MACHINE.with(|c| c.set(machine));
 }
 
+/// ELF e_machine of the current target.
 /// Human-readable name of the compilation target, for diagnostics that must
 /// name the architecture ("`__builtin_ia32_aesenc128` is not available on
 /// aarch64").  Mirrors the backend's own `elf_machine_name`, but lives in the

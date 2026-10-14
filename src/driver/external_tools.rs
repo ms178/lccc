@@ -295,31 +295,34 @@ impl Driver {
             Self::read_source(input_file)?
         };
 
-        // Debug dumps use the same private reservation as temporary
-        // objects (AUD-TMP-1): a unique path inside a fresh 0700 private
-        // directory, so no local user can pre-place a symlink and parallel
-        // compiles cannot overwrite each other's dumps. The dump survives
-        // process exit by design (that is the point of a debug dump).
+        // Debug: dump preprocessed assembly next to the other temp files.
+        //
+        // AUD-TMP-1: the path used to be the *fixed* `/tmp/asm_debug_<stem>.s`,
+        // which another local user could pre-create as a symlink to any file
+        // the invoking user may write (and which parallel compiles of the same
+        // stem silently overwrote, so the dump was frequently not the assembly
+        // of the unit being debugged either). The dump now gets a unique,
+        // never-reused name inside the process-private 0700 temp directory and
+        // is created with O_CREAT|O_EXCL, so it can neither follow a symlink
+        // nor collide with another run. It survives process exit by design
+        // (that is the point of a debug dump), and its path is reported so it
+        // can actually be found.
         if std::env::var("CCC_ASM_DEBUG").is_ok() {
             let basename = std::path::Path::new(input_file)
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown");
-            // A failed debug dump must not fail the compilation: report and
-            // continue. `set_keep` retains the private directory's file for
-            // post-mortem inspection.
-            match crate::common::temp_files::TempFile::new("asm_debug", basename, "s") {
-                Ok(mut dump) => {
-                    if let Err(e) = std::fs::write(dump.path(), &asm_text) {
-                        eprintln!("[ccc] CCC_ASM_DEBUG: could not write the assembly dump: {e}");
-                    } else {
-                        dump.set_keep(true);
-                        eprintln!("[ccc] CCC_ASM_DEBUG: wrote {dump}");
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[ccc] CCC_ASM_DEBUG: could not reserve a dump path: {e}");
-                }
+            match crate::common::temp_files::write_debug_dump(
+                "ccc_asm_debug",
+                basename,
+                "s",
+                asm_text.as_bytes(),
+            ) {
+                Some(path) => eprintln!("[ccc] CCC_ASM_DEBUG: wrote {}", path.display()),
+                None => eprintln!(
+                    "[ccc] CCC_ASM_DEBUG: could not write the assembly dump for {}",
+                    input_file
+                ),
             }
         }
 
@@ -471,11 +474,10 @@ impl Driver {
                 }
             }
             if dep_path == "-" {
-                // GCC: `-MF -` (and `-Wp,-MMD,-`) writes the make rule to the
-                // standard output (AUD-DRV-1), which is how `-M`-style consumers
-                // read deps without a temp file. Writes go through the locked
-                // handle with errors reported (a closed pipe must not panic the
-                // driver the way `print!` would).
+                // `-MF -` (and `-Wp,-MMD,-`) asks GCC to print the rules to
+                // standard output, which is how build systems capture
+                // dependencies without a temp file. It was previously treated
+                // as a literal file named `-`.
                 use std::io::Write;
                 let stdout = std::io::stdout();
                 let mut lock = stdout.lock();

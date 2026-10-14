@@ -2815,6 +2815,32 @@ seven parity-check unit tests.
 
 ## 2026-10-13 — AUD-CPU-1: `__builtin_cpu_supports` folds against the effective target
 
+**SUPERSEDED the same day** by the merge with upstream PR #815, which lowered
+the same builtin to a runtime CPUID probe (`src/common/cpu_probe.rs`,
+libgcc-compatible `__cpu_model` words, lazy per-function init). Upstream
+measured the competition before choosing: GCC 16.2, Clang 23.1 and ICX all
+compile `!!__builtin_cpu_supports("sse2")` into a load from `__cpu_model`
+*even when the effective target enables `sse2`*, and probe `avxvnni` under
+`-march=raptorlake` while emitting AVX-VNNI code elsewhere. The contract is
+about the CPU that executes the program, so the fold below was answering a
+different question than the reference compilers answer — and a
+`-march=x86-64-v3` binary that folds `"avx2"` to `1` claims AVX2 on hardware
+that lacks it, which is the one answer none of them gives. The fold's partial
+value (constant-folding statically guaranteed features) is what upstream's
+probe trades away, for the same answer at the same cost as GCC. What survives
+from this entry as *policy*: the default target stays a **feature set**
+(x86-64-v3, `cli.rs`), never a CPU table, and the AUD-CPU-3 permission gate
+(`x86_features::effective()`) still decides which intrinsics may be emitted.
+What this branch adds to the merged implementation is the audit's third
+requirement: an x86 feature name is *diagnosed* on a non-x86 target instead of
+silently answering 0 (a name from another architecture's set still answers the
+conservative 0, because those sets are GCC's per-architecture space which LCCC
+does not model yet). The gate is `check_cpu_supports_runtime.sh`, differential
+against GCC in every row; `check_cpu_supports_fold.sh` is deleted with the
+fold it verified.
+
+### The superseded entry, kept for the reasoning it contains
+
 - **Semantics change (deliberate).** `__builtin_cpu_supports("f")` now folds to
   `1` **iff the feature is statically guaranteed by the code-generation target
   of this translation unit** — the same
@@ -2836,8 +2862,9 @@ seven parity-check unit tests.
 - **Known cost, accepted with the fix:** the fold is now *more* conservative
   than GCC, which answers from runtime CPUID (`__cpu_model`). Dispatchers lose
   the widest path on hosts that do have the feature.
-- **Follow-up (FE-25, still open):** lower the unresolved cases to a real
-  runtime test (libgcc `__cpu_model` when the symbol is available, else an
+- **Follow-up (FE-25) — closed by the merge above:** lower the unresolved
+  cases to a real runtime test (libgcc `__cpu_model` when the symbol is
+  available, else an
   inline CPUID+XGETBV helper) and make `__builtin_cpu_init()` call
   `__cpu_indicator_init`; add `sha`/`adx`/`rdseed` to the ISA applicator so they
   can be statically guaranteed when the target implies them. Gates:
@@ -2927,3 +2954,35 @@ seven parity-check unit tests.
   `lccc-harness-snapshot.sh` carry deprecation headers pointing at the
   canonical snapshot tool; `scripts/README.md` documents the `-o -`, private
   temp directory and cpu-supports contracts.
+
+## 2026-10-13 — CI failure observability (CI-DIAG-1)
+
+- **Decision:** a red run must name its own cause.  Both mirrors now run the
+  suite through `scripts/ci_test_report.py`, which streams the command's output
+  through unchanged and, on failure, publishes one check annotation per failing
+  test *on the panic's own `file:line`*, a summary annotation naming every
+  failure first, and a complete Markdown `$GITHUB_STEP_SUMMARY`.
+- **Why it was needed:** for a failed job, `actions/jobs/{id}/logs` answers
+  HTTP 500, `check-runs/{id}` carries no title/summary/text, and the only
+  annotation a bare `cargo test` step produces is `Process completed with exit
+  code 101`.  On 2026-10-13 a branch sat red with ten failing tests that were
+  recoverable only because that branch had wrapped `cargo test` in a
+  re-annotating script of its own (absent from `main`).  An unreadable red
+  costs hours per occurrence and invites fixing the wrong side.
+- **Not a substitute for a gate:** the wrapper changes no verdict — the exit
+  status is preserved exactly, including `128+n` for a signalled child — so it
+  cannot turn a red run green; it only makes a red run legible.
+- **Mirror doctrine unchanged:** the tool is invoked by both mirrors, so
+  `check_ci_gate_parity.py` two-way parity holds without an allowlist entry,
+  and its `--self-test` runs on both sides before the suite it explains.
+- **Honest-annotation rule:** the corpus-failure surfacing step no longer
+  prints `no regression-results.json was written` when an unrelated earlier
+  step failed; it states that the corpus gate never ran and points at the step
+  that did fail.  An annotation that misnames the cause is worse than none.
+- **Forensic record:** the same pass proved the four other red branches are
+  branch-local (`a615b49b` breaks six pre-existing `map_fp_select_tests` plus
+  its own four new tests; `074efb69` fails its own GCC-16 provisioning step;
+  `24fe00ee` fails its own `__seg_gs conversion diagnostics` gate while its
+  hand-maintained diagnostic replay reports `fail flag=0`).  Detail and the
+  exact failing test names: `docs/FOLLOWUP-2026-10-13-audit-sweep.md`,
+  section CI-DIAG-1.

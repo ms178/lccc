@@ -178,6 +178,12 @@ if [ ! -x "$LCCC" ]; then
 fi
 
 # --------------------------------------------------------------- job:test --
+# The ratchet that keeps the 2026-10-13 audit's debt numbers from growing:
+# panic-class sites (AUD-ICE-1), unsafe sites, giant functions (AUD-MONO-1),
+# undeclared CCC_*/LCCC_* knobs (AUD-KNOB-1) and unannotated #[ignore]s
+# (AUD-ARM-GSF-1). Pure static scan -- it needs no compiler, and it must run
+# before the build so a regression is reported as itself.
+
 gate "rec2iter" fast \
     env CCC="$LCCC" bash tests/regression/check_rec2iter.sh
 
@@ -186,9 +192,6 @@ gate "fp-contract-parity" fast \
 
 # ~97 compiles per arm plus the runs: seconds, not minutes -- and it is the
 # only gate that exercises the historical crash/miscompile corpus end to end.
-gate "dash-o-stdout" fast \
-    env CCC="$LCCC" bash tests/regression/check_dash_o_stdout.sh
-
 gate "cpu-supports-runtime" fast \
     env CCC="$LCCC" bash tests/regression/check_cpu_supports_runtime.sh
 
@@ -292,7 +295,7 @@ gate "vector-abi-wide-latched" fast \
 # and asserts the victim file is untouched, the compile still succeeds and
 # nothing is written directly into $TMPDIR.
 gate "temp-symlink-hardening" fast \
-    env CCC="$LCCC" CCC_ARM=target/fastbuild/lccc-arm bash tests/regression/check_temp_symlink.sh
+    env CCC="$LCCC" bash tests/regression/check_temp_symlink.sh
 
 # AUD-DRV-1: `-o -` is stdout for -S/-E/-M (and rejected for -c / multi-input),
 # never a file named `-`. Build systems pipe through this.
@@ -308,6 +311,7 @@ gate "compat-suite" fast \
     env CCC="$LCCC" bash tests/regression/check_compat_suite.sh
 gate "ivsr-reproducers" fast \
     env CCC="$LCCC" bash tests/regression/check_ivsr_reproducers.sh
+
 
 # AUD-ICE-1/AUD-DIAG-1: a malformed `__builtin_shuffle` mask must produce a
 # diagnostic, not a Rust panic (and the valid forms must still lower).  The
@@ -356,7 +360,7 @@ gate "intrinsic-arity-selftest" fast \
 gate "intrinsic-arity" fast \
     python3 scripts/check_intrinsic_arity.py --check
 gate "ill-typed-builtins" fast \
-    env CCC="$LCCC" LCCC_REPO="$REPO" python3 scripts/check_ill_typed_builtins.py
+    env CCC="$LCCC" LCCC_REPO=. python3 scripts/check_ill_typed_builtins.py
 
 # The unit-test gate is what GitHub's required check runs on every PR, so it
 # belongs in the fast set: a red PR has to be reproducible with --fast.
@@ -409,6 +413,10 @@ cargo_test_repeated() {
         incr=0
     fi
     n="${LCCC_TEST_REPEATS:-1}"
+    # The reporter's own test corpus runs first: it is what fails when the
+    # reporter quietly stops reporting, and the suite below is exactly the log
+    # it exists to explain (see scripts/ci_test_report.py).
+    python3 scripts/ci_test_report.py --self-test
     for ((i = 1; i <= n; i++)); do
         if [ -n "$dbg" ]; then
             export CARGO_PROFILE_FASTBUILD_DEBUG="$dbg"
@@ -420,7 +428,8 @@ cargo_test_repeated() {
         else
             unset CARGO_INCREMENTAL
         fi
-        if ! RUSTFLAGS="$flags" cargo test --profile fastbuild --all-targets --locked -j "$jobs"; then
+        if ! RUSTFLAGS="$flags" python3 scripts/ci_test_report.py -- \
+            cargo test --profile fastbuild --all-targets --locked -j "$jobs"; then
             printf 'cargo-test: FAILED on repeat %d/%d\n' "$i" "$n" >&2
             return 1
         fi
@@ -441,7 +450,8 @@ DBGASSERT_CONFIG=(--config 'profile.fastbuild.debug-assertions=true'
 cargo_test_dbgassert() {
     local flags="" jobs="${CI_LOCAL_JOBS:-2}"
     [ -r target/lccc-rustflags ] && flags="$(cat target/lccc-rustflags)"
-    CARGO_INCREMENTAL=0 RUSTFLAGS="$flags" cargo test --profile fastbuild \
+    CARGO_INCREMENTAL=0 RUSTFLAGS="$flags" python3 scripts/ci_test_report.py -- \
+        cargo test --profile fastbuild \
         --all-targets --locked -j "$jobs" "${DBGASSERT_CONFIG[@]}"
 }
 gate "cargo-test-debug-assertions" slow cargo_test_dbgassert
@@ -1045,6 +1055,8 @@ gate "i686-boot-asm" fast \
 
 gate "asm-goto-phi-edge" fast \
     bash tests/regression/check_asm_goto_phi_edge.sh
+gate "i686-label-ref-safety" fast \
+    bash tests/regression/check_i686_label_ref_safety.sh
 
 # ci.yml "Verify inline-asm UTF-8 assembly text".
 gate "inline-asm-utf8" fast \

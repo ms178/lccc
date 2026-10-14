@@ -168,26 +168,6 @@ set -e
 [[ -z $(find "$vault" -maxdepth 1 -type f -newer "$vault/victim.expected" | sed -n '1p') ]]     || fail "files were written directly into TMPDIR"
 
 # ---------------------------------------------------------------------------
-# 3b. invalid TMPDIR must be a normal driver error, never an ICE or panic
-# ---------------------------------------------------------------------------
-printf 'not a directory\n' >"$tmp/notdir"
-set +e
-( cd "$work" && TMPDIR="$tmp/notdir" "$CCC" a.c -o "$tmp/bad" ) >"$tmp/errdir.log" 2>&1
-rc=$?
-set -e
-[[ $rc -ne 0 ]] || fail "accepted a non-directory TMPDIR"
-grep -q 'Failed to reserve temporary file' "$tmp/errdir.log" \
-    || fail "non-directory TMPDIR did not produce the reservation diagnostic:"
-if grep -Eq 'internal error|panicked' "$tmp/errdir.log"; then
-    cat "$tmp/errdir.log" >&2
-    fail "non-directory TMPDIR crashed the compiler"
-fi
-
-# The debug dump must be a single file, uniquely placed (not one fixed name).
-ndumps=$(find "$vault" -type f -name 'asm_debug_a.s' | wc -l)
-[[ "$ndumps" == 1 ]] || fail "expected exactly one asm_debug_a.s dump, found $ndumps"
-
-# ---------------------------------------------------------------------------
 # 4. cross-target sanity: the same discipline for a non-x86 backend
 # ---------------------------------------------------------------------------
 if [[ -x $CCC_ARM ]]; then

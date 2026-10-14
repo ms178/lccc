@@ -286,11 +286,16 @@ and never keep two copies of the same thing.
   This branch had folded the builtin to a compile-time constant from the
   invocation's permission; upstream probes CPUID at run time through a
   libgcc-compatible `__cpu_model` (`src/common/cpu_probe.rs`, lazy per-function
-  init, GCC's own error wording, constant-context diagnosis). Runtime is what
-  GCC, Clang and ICX do, and it is what runtime-dispatch code (zlib-ng, zstd,
-  xz, OpenSSL, FFmpeg) needs: a `-march=x86-64` build must still be able to
-  take an AVX2 path on hardware that has AVX2. The permission fold would have
-  pinned those builds to the slow path. Consequently the audit's named gate
+  init, GCC's own error wording, constant-context diagnosis). Upstream measured
+  the competition before choosing: GCC 16.2, Clang 23.1 and ICX all compile
+  `!!__builtin_cpu_supports("sse2")` into a load from `__cpu_model` *even when
+  the effective target enables `sse2`*, because the question is about the CPU
+  that executes the program. The fold answers a different question: a
+  `-march=x86-64-v3` binary that folded `"avx2"` to `1` claims AVX2 on hardware
+  that lacks it — the one answer none of the three gives — and it is also what
+  runtime-dispatch code needs the other way round, since a `-march=x86-64`
+  build must still be able to take an AVX2 path where AVX2 exists.
+  Consequently the audit's named gate
   `check_cpu_supports_fold.sh` and the `.env` file that suppressed the GCC
   comparison are **deleted**, and `check_cpu_supports_runtime.sh` (upstream's,
   differential in every row) is the gate. What this branch adds on top of
@@ -315,6 +320,33 @@ and never keep two copies of the same thing.
   a fallible constructor were adapted to the infallible one.
 * **`-o -` / `-M -o -` stay ours** (AUD-DRV-1): every text producer funnels
   through the single `write_text_output`, and `check_o_stdout.sh` pins it.
+* **`-o -` has one guard and one gate after the merge.** Both sides added the
+  same refusal on different code paths (this branch in
+  `Pipeline::validate_output_destination`, upstream inline in `run()`), and
+  both sides had a gate asserting *its own* message — so the tree carried two
+  rejection messages for `-c -o -` and upstream's gate failed on ours (this
+  branch's guard fires first). The validator now also refuses a link
+  (`Cannot write an executable to standard output ('-o -')`), upstream's inline
+  check is gone, and `tests/regression/check_o_stdout.sh` is the single gate:
+  its rows are the union of both (upstream's pipe-shaped streaming rows,
+  `-dM`, `-MF -` and the real-path negative control were folded in).
+* **Re-anchoring onto a newer main broke the snapshot's proof, not the
+  bundle.** `scripts/session_bundle.py` proved each bundle in an isolated
+  clone that fetched BASE with `--depth=1`. A range that *merges* upstream
+  records the old fork point as a second prerequisite beside BASE, so the
+  proof rejected a bundle that restores perfectly (`Repository lacks these
+  prerequisite commits: 7e94441…`), and `scripts/lccc_recover.py` would have
+  done the same to the delivered artifact on the user's side. Both now retry
+  against BASE **and its ancestry** (the receipt records `base_fetch`), and
+  `tests/corpus/test_recovery_contracts.py` has a miniature merged-range repo
+  that proves the bundle, restores it, and pins the offline answer. Without the
+  fix the same test reproduces the reported error; the recovery half fails
+  identically on the pre-fix tool.
+* **`ci_local.sh`'s ill-typed-builtin gate passed an undefined `$REPO`** to the
+  checker. Under `set -u` that killed the whole local suite mid-run — the
+  reason no `--fast` stamp could ever be obtained on this branch — while the
+  hosted CI step (which spells `LCCC_REPO=.`) stayed green. It is `LCCC_REPO=.`
+  now, the same value CI uses; the script `cd`s to the repo root first.
 * **`__builtin_shuffle*` diagnostics take upstream's wording**: both sides
   fixed the panic (AUD-ICE-1/AUD-DIAG-1), upstream's messages are GCC's own
   ("number of elements …", "must be an integer vector", "invalid element
@@ -682,3 +714,203 @@ Ordered by value ÷ cost, with the entry point each one needs.
 * `tests/regression/*.c` is globbed **non-recursively** and each file must be a
   self-contained program; multi-file fixtures belong in a subdirectory (this
   is also what `run_regression.py`'s own failure text says).
+
+## AUD-ICE-1 residual — measured composition and the design for the next slice
+
+The arity half of AUD-ICE-1 pinned 303 names from `include/*.h` and took the
+ratchet from 650 ICE / 380 silent to **174 ICE / 294 silent**
+(`tests/regression/ill_typed_builtins_baseline.json`). The remaining 174 are
+87 names x 2 optimisation levels, and every one of them is a name whose
+argument count the headers do **not** pin, so the ill-typed call still reaches
+codegen. Measured this session, not inferred:
+
+* The panics come from two shapes, both reached with **zero** arguments: the
+  five `assert!(args.len() >= N, "malformed intrinsic …")` guards in
+  `src/backend/x86/codegen/intrinsics.rs` (lines 614, 8462, 9381, 9506, 10180)
+  and direct `args[i]` indexing at other sites (883, 2768, 3325, …). Example:
+  `__builtin_ia32_pxor128()` → `emit_sse_binary_128: malformed intrinsic pxor
+  (0 args)`; `_mm_insert_epi16()` → `index out of bounds: the len is 0`.
+* Why the count is unknown for these names, in two parts:
+  `_mm_slli_epi32`, `_mm_shuffle_epi32`, `_mm_and_si128` and their 256-bit
+  siblings are **function-like macros** in `include/*.h`, and the derivation
+  only read *declarations* (its regex excludes `#` deliberately); and the
+  `__builtin_ia32_*` primitives they expand to have **no call site at all** in
+  the headers, because many wrappers are written with vector operators.
+* Two measured levers, in increasing order of coverage:
+  1. **Macro-aware derivation** — read `#define _mm_x(a, b)` parameter lists
+     too (skipping variadic ones): 303 → **332** names, which pins 22 of the
+     87 ICE names.
+  2. **Variant propagation** — the front end's own name table (`builtins.rs`)
+     maps both spellings of an intrinsic to one `BuiltinIntrinsic` variant
+     (`_mm_and_si128` and `__builtin_ia32_pand128` are both `X86Pand128`).
+     Propagating the header-derived arity along that mapping gives **216
+     variants** an arity (4 dropped as conflicting) and covers **72 of the 87**
+     ICE names. The 15 left over are variants with no header-derived public
+     name at all (`X86Cmpps256`, `X86Rdtscp`, …): they need a different source
+     (the emitter's own contract, or GCC's prototypes for the
+     `__builtin_ia32_*` primitives).
+* Design note for the slice: (2) wants a *variant*-keyed lookup, i.e. the
+  generated file grows a `match variant { … }` beside the name-keyed table, and
+  the sema hook in `analysis.rs` — which already holds the variant — asks for
+  the variant's arity when the name is unknown. The backend asserts stay where
+  they are: the audit's criterion is that they are unreachable from any
+  ill-typed source, not that they are deleted, and they are the last line of
+  defence behind the front end.
+
+## CI-DIAG-1 — a red run must name its own cause (2026-10-13, evening)
+
+### What was red, and what it actually was
+
+An instructed "CI IS RED, fix it properly" opened a forensic pass over every
+red run in `ms178/lccc`.  The finding is that **no red run was ours and none
+was shared**: they are three other Arena branches, each failing for a
+branch-local reason, on top of a repository-wide *observability* defect that
+this branch now fixes.  The evidence, per branch (branch tip, failing job,
+failing step, cause):
+
+| Branch | Failing step | Cause | Verdict |
+|---|---|---|---|
+| `arena/a615b49b-lccc` #814 @`0a72c107` | Test Suite step 34 `Run tests` | 10 failing tests: 6 **pre-existing** (`passes::vectorize::map_fp_select_tests::{fold_max_from_sgt, fold_max_from_slt_swapped_arms, fold_min_from_sgt_swapped_arms, fold_min_from_slt, nested_clamp_parses, sle_select_does_not_fold}`) broken by that branch's vectorize/peephole edits, plus 4 tests that exist **only** on that branch (`load_op_fuse::tests::commuting_adjacent_fuse_{rehomes_a_single_family_rmw_product_update, keeps_full_width_self_move_reads_live}`, `minmax_reduction_legality_tests::marching_pointer_{preflight_tracks_only_the_exact_latch_step, scaling_changes_only_the_preflighted_step_definition}`) | Branch-local |
+| `arena/074efb69-lccc` #816 @`727c3465` | Test Suite step 6 `Install the GCC 16 oracle` | Its own provisioning step fails before a single test runs (that workflow carries 17 `gcc-16` references where `main` has one comment) | Branch-local |
+| `arena/24fe00ee-lccc` #817 @`ee247ff` | Test Suite step 96 `Run __seg_gs conversion diagnostics check` | Steps 52/53 `Run tests` **pass** there now; the surviving red is that branch's own segment-space gate.  Its paired `Audit diagnostics (temporary)` run 38476873196 reports success with `fail flag=0` because that workflow replays a **hand-maintained** gate list which does not contain the failing gate — a parity gap in the replay, not evidence of green | Branch-local |
+| `arena/e588143d-lccc` #818 @`00394a81` | — | Runs were still in flight at the time of writing; nothing on that branch descends from ours | Unknown |
+
+Measurements that make "branch-local" a fact rather than a reading:
+
+* `main` @`3b66cd1d` and **this branch** @`299d89a2` are green in every
+  workflow (`CI`, `Benchmarks`), and `Test Suite` on our head is 45/45 steps.
+* The six shared tests #814 fails pass here: `cargo test --profile fastbuild
+  --lib -j2 -- map_fp_select_tests` → `6 passed; 0 failed`.  They also pass on
+  `main`, whose CI is green at that commit, so the break is inside that
+  branch's diff, not in the base it started from.
+* #814 does not descend from this branch and this branch does not descend from
+  it (`git merge-base` = `3b66cd1d` for both), so no fix of ours can reach it.
+* Our own earlier red, run 38464961178 @`ddb127bf`, was step 15 `Check -o -
+  stdout semantics` — the merged `-o -` pair, already fixed by collapsing it to
+  one guard plus one union gate; it is not part of this thread.
+
+### Why a failing `cargo test` step was unreadable
+
+Three facts, all re-verified this session:
+
+1. `GET /repos/ms178/lccc/actions/jobs/{id}/logs` answers **HTTP 500** for a
+   failed job (and 404 for the `commit/<sha>/checks/<id>/logs` HTML path); the
+   public job page (≈286 KB of HTML) contains no verdict text.
+2. `check-runs/{id}` returns `title`/`summary`/`text` = null even for a
+   *successful* job, and the annotations a failed `cargo test` step produces
+   are GitHub's own `Process completed with exit code 101` plus the artifact
+   upload warning.
+3. The one thing that *was* readable on #814 was an annotation emitted by a
+   re-annotating wrapper that branch happened to write (`cargo test` piped
+   through a shell helper; absent from `main`), which re-emitted the log tail.
+   Without it, ten failing tests were invisible from the run page.
+
+Consequence: hours of triage per red, and a real risk of "fixing" the wrong
+side.  That is the defect this branch fixes.
+
+### What landed
+
+* **`scripts/ci_test_report.py`** — runs a command with stdout/stderr merged
+  and streamed through byte-for-byte unchanged (exit status preserved,
+  `128+n` on a signal), and on failure republishes the verdict as (a) one
+  `::error` check annotation per failing test, placed on the panic's own
+  `file:line`, (b) a summary annotation naming every failure **first** (GitHub
+  shows only a bounded number of annotations per step, and the names are what
+  must survive the cut), (c) a Markdown `$GITHUB_STEP_SUMMARY` with the
+  complete list, the panic messages and the log tail, and (d) a local stderr
+  digest so `ci_local.sh` prints the same verdict without a browser.  The
+  parser understands libtest's `---- <name> stdout ----` sections, both
+  `panicked at` spellings (including the `thread 'name' (15824) panicked at
+  file:line:col:` form the real 2026-10-13 log used), the `test ... FAILED`
+  marks and trailing `failures:` list, and rustc's `error[EXXXX]` / `error:`
+  diagnostics with their `--> file:line:col` spans (including `-D warnings`
+  promotions).  It never invents a cause: when nothing parsed, the tail is
+  published verbatim.  `--parse-log FILE` replays a saved log.
+* **Both mirrors wired**: the two `Run tests` steps in
+  `.github/workflows/ci.yml` and the two cargo-test gates in
+  `scripts/ci_local.sh` run through the wrapper, and the self-test runs first
+  on each side (a reporting tool that quietly stops reporting is worse than
+  none).  `check_ci_gate_parity.py` two-way parity stays green — no allowlist
+  entry was added, on either side.
+* **One misleading annotation removed**: the corpus-failure surfacing step
+  printed `no regression-results.json was written` whenever *any* earlier step
+  failed, which reads like a broken harness rather than "the corpus gate never
+  ran"; it now says what is true and points at the failing step.
+
+### Validation
+
+* `python3 scripts/ci_test_report.py --self-test` — green; covers the escaping
+  rules, a verbatim fixture of the real 2026-10-13 failure (thread-id panic
+  header, assembly-dump message, both `failures:` blocks), both panic
+  spellings, build diagnostics with two distinct spans and a `-D warnings`
+  promotion, a diagnostic printed *inside* a test section (must not be read as
+  a build error), CRLF + ANSI + invalid UTF-8 input, the annotation cap, the
+  "nothing named itself" fallback, run-mode output passthrough and exit-code
+  preservation (101 and 143-by-signal), and `--parse-log`.
+* **Real libtest binary**, not a fixture: `rustc --test` on a three-test probe
+  (one pass, one assertion with a debug dump containing `%`, one bare panic),
+  run through the wrapper with `GITHUB_ACTIONS=true` → exit `101`, two
+  annotations on the probe's real `file:line`, complete job summary.
+* **The real suite through the same path**:
+  `bash scripts/ci_local.sh --only cargo-test` → `PASS cargo-test` and `PASS
+  cargo-test-debug-assertions` (329 s), 0 failed.
+* Gates: `check_ci_gate_parity.py`, `test_ci_gate_parity.py` (66 tests),
+  `check_ci_workflow_shell.py`, `check_script_imports.py`,
+  `check_no_conflict_markers.py`, `check_doc_links.py` — all green.
+
+#### Addendum — the reporter's own first hosted run was red
+
+The first hosted run of this work (`a7869d79`) failed `Run tests` with exit
+code 1 and produced **no** annotation from the new tool.  The cause was the
+tool's own corpus, not the tool: one assertion exercised the local-digest path
+while the runner exported `GITHUB_ACTIONS=true`, which turns the identical call
+into the annotation path.  Reproduced locally against that commit
+(`GITHUB_ACTIONS=true python3 <a7869d79 version> --self-test` →
+`local digest missing: ''`, exit 1), because the only surviving evidence was
+the step's exit status — the job log is unreachable by the three facts above,
+which is the whole reason this work exists.
+
+Four structural fixes, not a patch to one assertion:
+
+* the annotation/local-digest decision is the pure predicate
+  `annotations_enabled(mode)`, tested directly for `auto`/`always`/`never` under
+  both settings of `GITHUB_ACTIONS`; the end-to-end digest case passes
+  `--annotate never`, so no assertion inherits a runner variable;
+* `_clean_span` takes an injectable `root` instead of reading `os.getcwd()`,
+  and the filesystem root is no longer treated as "the tree" (from `/`, every
+  absolute path was being rewritten);
+* `--self-test` re-runs the whole file as a child process under
+  `GITHUB_ACTIONS=true`, under that plus an ASCII stdout
+  (`PYTHONIOENCODING=ascii`, `LC_ALL=C`), and under a scrubbed environment — the
+  defect class is now a permanent probe, not a lesson;
+* a tool that stops reporting has no exemption: `--self-test` publishes each
+  failing assertion as a Checks annotation when annotations are enabled, and an
+  internal crash publishes its traceback the same way (exit 70) instead of
+  disappearing into a step exit code.
+
+One parsing defect was found while fixing this and is pinned by its own test:
+`read1` can split a line across reads, and decoding each chunk independently
+would have presented two half-lines to the state machine and lost the panic
+location.  The scanner now carries the incomplete tail as bytes (so a
+multi-byte character split across reads survives too).
+
+Re-validated after the fix: `--self-test` green in every environment of the
+matrix (including `GITHUB_ACTIONS=true`, `LC_ALL=C`, `cwd=/`, and an empty
+environment); the real `rustc --test` probe still exits 101 with three
+annotations; the real suite through the wrapper is green (`4556 passed`); and
+the parity, workflow-shell, script-imports, conflict-marker and doc-link gates
+pass.
+
+### ToDo for the red branches (this branch cannot push to them)
+
+1. `arena/a615b49b-lccc`: fix the ten failing tests listed above — six are
+   pre-existing contracts that its own changes broke.  Nothing in `main` or in
+   this branch needs a change for them.
+2. `arena/074efb69-lccc`: repair or drop the failing GCC-16 provision step; a
+   gate whose provisioning fails is not evidence about the compiler.
+3. `arena/24fe00ee-lccc`: fix `__seg_gs conversion diagnostics`, and make the
+   `Audit diagnostics (temporary)` workflow derive its gate list from
+   `ci.yml` — a replay that reports `fail flag=0` while the real suite is red
+   assumes the very parity it is supposed to prove.
+4. Any of them: rebase on this branch once it merges, and the next red names
+   its own failing tests on the run page.

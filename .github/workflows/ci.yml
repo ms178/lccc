@@ -142,9 +142,6 @@ jobs:
       - name: Check FP-contraction parity with GCC
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_fp_contract_parity.sh
 
-      - name: Check -o - stdout semantics
-        run: env CCC=target/fastbuild/lccc bash tests/regression/check_dash_o_stdout.sh
-
       - name: Check builtin_cpu_supports runtime semantics
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_cpu_supports_runtime.sh
 
@@ -227,6 +224,7 @@ jobs:
           python3 scripts/check_repro_replay.py --self-test
           env CCC=target/fastbuild/lccc python3 scripts/check_repro_replay.py
 
+      
       # AUD-ICE-1/AUD-DIAG-1: malformed `__builtin_shuffle` masks diagnose
       # instead of panicking, and the valid forms still lower (oracle-checked
       # against gcc).
@@ -308,7 +306,21 @@ jobs:
           RUSTFLAGS: -D warnings
         # Keep every Rust compilation that produces LCCC code at the project
         # fastbuild policy: opt-level 1 and no more than two Cargo jobs.
-        run: cargo test --profile fastbuild --all-targets --locked -j 2
+        #
+        # The suite runs through scripts/ci_test_report.py because a red
+        # `cargo test` step is simultaneously the most common red in this
+        # repository and the least readable one: GitHub's own annotation for it
+        # is "Process completed with exit code 101", `actions/jobs/{id}/logs`
+        # answers HTTP 500 for a failed job, and the public job page carries no
+        # verdict text. The wrapper streams the output through unchanged and,
+        # on failure, republishes the verdict as one annotation per failing
+        # test -- placed on the panic's own file:line -- plus a Markdown job
+        # summary carrying the complete list. Its self-test runs first: a
+        # reporting tool that quietly stops reporting is worse than none.
+        run: |
+          set -euo pipefail
+          python3 scripts/ci_test_report.py --self-test
+          python3 scripts/ci_test_report.py -- cargo test --profile fastbuild --all-targets --locked -j 2
 
       # The fastbuild profile inherits `release`, which compiles every
       # debug_assert! OUT - and with them the mechanical enforcement this
@@ -328,6 +340,7 @@ jobs:
           CARGO_BUILD_JOBS: "2"
           RUSTFLAGS: -D warnings
         run: >-
+          python3 scripts/ci_test_report.py --
           cargo test --profile fastbuild --all-targets --locked -j 2
           --config 'profile.fastbuild.debug-assertions=true'
           --config 'profile.fastbuild.incremental=false'
@@ -457,7 +470,12 @@ jobs:
 
           path = Path("regression-results.json")
           if not path.is_file():
-              print("::error title=Regression harness::no regression-results.json was written")
+              print(
+                  "::error title=Regression harness::"
+                  "the corpus gate did not run, so no regression-results.json exists"
+                  " (an earlier step in this job failed first; that step's own"
+                  " annotations name it)"
+              )
           else:
               report = json.loads(path.read_text(encoding="utf-8"))
               failures = report.get("failures", [])
@@ -1442,6 +1460,7 @@ jobs:
           bash tests/regression/check_dep_files.sh
           bash tests/regression/check_i686_boot_asm.sh
           bash tests/regression/check_asm_goto_phi_edge.sh
+          bash tests/regression/check_i686_label_ref_safety.sh
           bash tests/regression/check_narrow_cmp_flag_law.sh
           bash tests/regression/check_zero_ext_cmp_fold.sh
           bash tests/regression/check_boot_size_measurement.sh

@@ -329,4 +329,91 @@ class MetadataContractTests(unittest.TestCase):
                         (ref.mode,ref.uid,ref.gid,ref.uname,ref.gname))
 
 
-if __name__=='__main__':unittest.main()
+class MergedRangeBundleContract(unittest.TestCase):
+    """A session range that merged upstream must still prove against BASE.
+
+    2026-10-13, found while snapshotting the branch right after it had been
+    merged with upstream main and re-anchored onto it: `build` failed with
+    "Repository lacks these prerequisite commits: <old fork point>".  The proof
+    fetched BASE with --depth=1, but git records the OLD fork point as a second
+    prerequisite of a merged range, and a depth-1 BASE cannot satisfy it, so a
+    bundle that restores perfectly was rejected.  This is that shape, in
+    miniature: session branch, an upstream line, a merge of the two, and the
+    bundle proved from the new BASE.
+    """
+
+    def test_merged_range_verifies_against_base_ancestry(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); repo = root / 'repo'; repo.mkdir()
+            git(repo, 'init', '-q'); git(repo, 'config', 'user.name', 'test')
+            git(repo, 'config', 'user.email', 'test@example.invalid')
+            (repo / 'a.txt').write_text('base\n'); git(repo, 'add', '.')
+            git(repo, 'commit', '-qm', 'base'); fork = git(repo, 'rev-parse', 'HEAD')
+            git(repo, 'checkout', '-qb', 'arena/synthetic')
+            (repo / 'a.txt').write_text('session\n'); git(repo, 'commit', '-qam', 'session')
+            # the upstream line, and the merge of it into the session branch
+            git(repo, 'checkout', '-q', '-b', 'main', fork)
+            (repo / 'b.txt').write_text('upstream\n'); git(repo, 'add', '.')
+            git(repo, 'commit', '-qm', 'upstream'); upstream = git(repo, 'rev-parse', 'HEAD')
+            git(repo, 'checkout', '-q', 'arena/synthetic')
+            git(repo, 'merge', '-q', '--no-ff', '-m', 'Merge upstream', 'main')
+            head = git(repo, 'rev-parse', 'HEAD')
+
+            meta = bundle.build(repo, upstream, root / 'lccc-session.bundle')
+
+            self.assertEqual(meta['base'], upstream); self.assertEqual(meta['head'], head)
+            self.assertTrue(meta['isolated_restore_verified'])
+            # The cheap BASE-only proof cannot satisfy the merged range's second
+            # prerequisite; the receipt has to say which proof actually ran.
+            self.assertEqual(meta['base_fetch'], 'base-with-ancestry')
+            restored = root / 'restored'; restored.mkdir()
+            git(restored, 'init', '-q')
+            git(restored, 'fetch', '-q', '--no-tags', str(repo), upstream)
+            git(restored, 'fetch', '-q', str(root / 'lccc-session.bundle'), 'arena/synthetic')
+            git(restored, 'checkout', '-q', 'FETCH_HEAD')
+            self.assertEqual(git(restored, 'rev-parse', 'HEAD'), head)
+            self.assertEqual(git(restored, 'rev-parse', 'HEAD^{tree}'),
+                             git(repo, 'rev-parse', 'HEAD^{tree}'))
+
+    def test_recovery_of_merged_range_bundle_is_exact(self):
+        """The delivered bundle of a merged session must restore exactly.
+
+        Same shape as above, but through the user-facing entry point: the
+        recovery tool fetches BASE `--depth=1`, so it needs the same fallback
+        (deepen BASE) that the bundle proof needed, and it must not silently
+        degrade to the source fallback while an exact restore is possible.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); repo = root / 'repo'; repo.mkdir()
+            art = root / 'art'; art.mkdir()
+            git(repo, 'init', '-q'); git(repo, 'config', 'user.name', 'test')
+            git(repo, 'config', 'user.email', 'test@example.invalid')
+            (repo / 'a.txt').write_text('base\n'); git(repo, 'add', '.')
+            git(repo, 'commit', '-qm', 'base'); fork = git(repo, 'rev-parse', 'HEAD')
+            git(repo, 'checkout', '-qb', 'arena/synthetic')
+            (repo / 'a.txt').write_text('session\n'); git(repo, 'commit', '-qam', 'session')
+            git(repo, 'checkout', '-q', '-b', 'main', fork)
+            (repo / 'b.txt').write_text('upstream\n'); git(repo, 'add', '.')
+            git(repo, 'commit', '-qm', 'upstream'); upstream = git(repo, 'rev-parse', 'HEAD')
+            git(repo, 'checkout', '-q', 'arena/synthetic')
+            git(repo, 'merge', '-q', '--no-ff', '-m', 'Merge upstream', 'main')
+            head = git(repo, 'rev-parse', 'HEAD'); tree = git(repo, 'rev-parse', 'HEAD^{tree}')
+            meta = bundle.build(repo, upstream, art / 'lccc-session.bundle')
+            (art / 'SESSION_BUNDLE.json').write_text(json.dumps(meta))
+
+            dest = root / 'restored'
+            result = recovery.recover(dest, art, upstream=str(repo))
+            self.assertTrue(result['exact_history'], result)
+            self.assertEqual(result['head'], head); self.assertEqual(result['tree'], tree)
+            self.assertEqual((dest / 'a.txt').read_text(), 'session\n')
+            self.assertEqual((dest / 'b.txt').read_text(), 'upstream\n')
+
+            # Offline has BASE alone by construction, so the honest answer is
+            # the verified source fallback -- never an invented exact history.
+            # (No source recipe here, so the offline attempt must fail loudly.)
+            with self.assertRaises(ValueError):
+                recovery.recover(root / 'offline', art, upstream=str(repo), offline=True)
+
+
+if __name__ == '__main__':
+    unittest.main()

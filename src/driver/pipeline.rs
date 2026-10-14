@@ -685,10 +685,6 @@ impl Driver {
     /// * `-c`: the object is a binary; `as` cannot emit one on stdout, so GCC
     ///   aborts — we say so once, up front, instead of letting the assembler
     ///   write a file called `-` (the pre-fix behaviour) or fail obscurely.
-    /// * linking: a streamed ELF is not a thing any consumer can use.  GCC 12
-    ///   here silently writes a *file named `-`* for `t.c -o -` (measured); we
-    ///   reject it with the same wording as `-c`, because a build system that
-    ///   asked for stdout wants stdout or a hard error, never a surprise file.
     /// * several inputs: GCC refuses `-o` outright because one output cannot
     ///   hold several translation units, and for `-S -o -` concatenating them
     ///   on stdout would produce unusable output.
@@ -697,11 +693,14 @@ impl Driver {
             return Ok(());
         }
         match self.mode {
-            CompileMode::ObjectOnly | CompileMode::Full => {
-                Err("cannot write an object file or executable to stdout \
-                 (standard output); '-o -' is only valid with -S, -E, -M/-MM or -dM"
+            CompileMode::ObjectOnly => {
+                Err("Cannot write an object file to standard output ('-o -'); \
+                 use -S -o - for assembly or -E -o - for preprocessed source"
                     .to_string())
             }
+            CompileMode::Full => Err("Cannot write an executable to standard output ('-o -'); \
+                 use -S -o - for assembly or -E -o - for preprocessed source"
+                .to_string()),
             CompileMode::AssemblyOnly | CompileMode::PreprocessOnly
                 if self.input_files.len() > 1 =>
             {
@@ -1262,7 +1261,7 @@ impl Driver {
                 // to -Wl, and -l flags. This is critical for --whole-archive support.
             } else if Self::is_assembly_source(input_file) || self.is_explicit_assembly() {
                 // .s/.S files (or -x assembler): pass to assembler, then link
-                let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o")?;
+                let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o");
                 self.assemble_source_file(input_file, tmp.to_str())?;
                 temp_guards.push(tmp);
             } else if !Self::is_c_source(input_file) && Self::looks_like_binary_object(input_file) {
@@ -1275,7 +1274,7 @@ impl Driver {
                 #[cfg(feature = "gcc_m16")]
                 if self.code16gcc {
                     use super::external_tools::GccM16Mode;
-                    let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o")?;
+                    let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o");
                     self.compile_with_gcc_m16(input_file, tmp.to_str(), GccM16Mode::Object)?;
                     if self.verbose {
                         eprintln!("Compiled (GCC -m16): {}", input_file);
@@ -1287,7 +1286,7 @@ impl Driver {
                 // Compile .c files to .o (handles .code16gcc prepend via internal codegen)
                 let asm = self.compile_to_assembly(input_file)?;
 
-                let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o")?;
+                let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o");
                 let extra = self.build_asm_extra_args();
                 self.target
                     .assemble_with_extra(&asm, tmp.to_str(), &extra)?;
