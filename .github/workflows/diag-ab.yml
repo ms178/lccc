@@ -1,0 +1,25 @@
+name: Diag AB (temporary)
+on:
+  push:
+    branches: [arena/24fe00ee-lccc]
+  workflow_dispatch:
+jobs:
+  ab:
+    name: AB volatile RMW fold
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build fastbuild (shipped configuration)
+        run: cargo build --profile fastbuild --locked -j 2 --bin lccc
+      - name: Gate with shipped binary
+        run: |
+          env CCC=target/fastbuild/lccc bash tests/regression/check_rmw_sib_folds.sh > /tmp/ab1.log 2>&1 && echo "::notice title=AB1::PASS shipped" || { echo "::error title=AB1-FAIL::shipped binary fails"; tail -5 /tmp/ab1.log; }
+          printf '#include <stdio.h>\nvolatile long h;\nvoid k(void) { h += 3; }\nint main(void){h=10;k();printf("%%ld\\n",h);return 0;}\n' > /tmp/vol.c
+          target/fastbuild/lccc -O2 -march=x86-64-v3 -S -o /tmp/vol1.s /tmp/vol.c; sed -n '/^k:/,/\.size/p' /tmp/vol1.s | tr '\n' '|' | cut -c1-400 | sed 's/^/::notice title=AB1-ASM::/'
+      - name: Rebuild with debug assertions (CI mid-suite configuration)
+        run: cargo build --profile fastbuild --locked -j 2 --bin lccc --config 'profile.fastbuild.debug-assertions=true' --config 'profile.fastbuild.incremental=false' --config 'profile.fastbuild.debug=0'
+      - name: Gate with debug-assertions binary
+        run: |
+          env CCC=target/fastbuild/lccc bash tests/regression/check_rmw_sib_folds.sh > /tmp/ab2.log 2>&1 && echo "::notice title=AB2::PASS debug-assertions" || { echo "::error title=AB2-FAIL::debug binary fails"; grep FAIL /tmp/ab2.log | head -3; }
+          target/fastbuild/lccc -O2 -march=x86-64-v3 -S -o /tmp/vol2.s /tmp/vol.c; sed -n '/^k:/,/\.size/p' /tmp/vol2.s | tr '\n' '|' | cut -c1-400 | sed 's/^/::notice title=AB2-ASM::/'
