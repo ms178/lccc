@@ -85,19 +85,23 @@ def instruction_diff(before_obj: Path, after_obj: Path) -> str:
     ]
     if not opcodes:
         return "normalized instruction sequences match"
-    tag, i1, i2, j1, j2 = opcodes[0]
-    before_start, before_end = max(0, i1 - 2), min(len(before), i2 + 2)
-    after_start, after_end = max(0, j1 - 2), min(len(after), j2 + 2)
 
     def render(items, start, end):
         if start == end:
             return "(none)"
         return " | ".join(f"{addr:x}:{asm}" for addr, asm, _ in items[start:end])
 
-    return (
-        f"{tag}; before={render(before, before_start, before_end)}; "
-        f"after={render(after, after_start, after_end)}"
-    )
+    hunks = []
+    for tag, i1, i2, j1, j2 in opcodes[:4]:
+        before_start, before_end = max(0, i1 - 2), min(len(before), i2 + 3)
+        after_start, after_end = max(0, j1 - 2), min(len(after), j2 + 3)
+        hunks.append(
+            f"{tag}; before={render(before, before_start, before_end)}; "
+            f"after={render(after, after_start, after_end)}"
+        )
+    if len(opcodes) > len(hunks):
+        hunks.append(f"and {len(opcodes) - len(hunks)} more instruction hunks")
+    return " || ".join(hunks)
 
 
 def report_mismatch(
