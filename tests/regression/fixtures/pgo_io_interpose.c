@@ -47,6 +47,8 @@ FILE *fopen(const char *path, const char *mode) {
         int (*fd_of)(FILE *) = dlsym(RTLD_NEXT, "fileno");
         profile = f;
         profile_fd = fd_of(f);
+        int flags = fcntl(profile_fd, F_GETFD);
+        if (flags < 0 || !(flags & FD_CLOEXEC)) _exit(99);
     }
     return f;
 }
@@ -58,7 +60,18 @@ int fileno(FILE *f) {
 int flock(int fd, int op) {
     int (*real)(int, int) = dlsym(RTLD_NEXT, "flock");
     if (fd == profile_fd && op == LOCK_EX) {
-        if (role("B")) marker("B-attempting", 0);
+        if (role("B")) {
+            marker("B-attempting", 0);
+            /* A waits for a KERNEL-observed refusal, not merely a marker
+               before this call (which leaves a scheduling window). */
+            int probe = real(fd, LOCK_EX | LOCK_NB);
+            if (!probe) {
+                real(fd, LOCK_UN);
+                _exit(95);
+            }
+            if (errno != EWOULDBLOCK && errno != EAGAIN) _exit(94);
+            marker("B-blocked", 0);
+        }
         if (fault("flock")) { errno = ENOLCK; return -1; }
         if (fault("eintr")) { errno = EINTR; return -1; }
     }
@@ -68,7 +81,7 @@ int flock(int fd, int op) {
             locked = 1;
             if (role("A")) {
                 marker("A-held", 0);
-                marker("B-attempting", 1);
+                marker("B-blocked", 1);
             }
         }
         if (op == LOCK_UN) {

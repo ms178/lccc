@@ -30,7 +30,8 @@ DRIVER = r'''
 #include <sys/file.h>
 #include <unistd.h>
 int main(void) {
-    FILE *f = fopen(getenv("LCCC_PROFILE_FILE"), "a");
+    const char *mode = getenv("DRIVER_NO_CLOEXEC") ? "a" : "ae";
+    FILE *f = fopen(getenv("LCCC_PROFILE_FILE"), mode);
     if (!f) { perror("lccc: PGO: cannot open profile"); return 23; }
     int fd = fileno(f);
     if (fd < 0 || flock(fd, LOCK_EX)) {
@@ -152,6 +153,9 @@ class RedTeam(unittest.TestCase):
             self.assertEqual((p.returncode, p.stderr), (23, b""))
             raw = golden.read_bytes()
             self.assertGreater(len(raw), 8192)
+            p = subprocess.run([str(exe)], env=dict(env, LCCC_PROFILE_FILE=str(root / "inherited"),
+                                                  DRIVER_NO_CLOEXEC="1"), capture_output=True, timeout=10)
+            self.assertEqual(p.returncode, 99, "oracle failed to detect inheritable profile descriptor")
             for fault in ("fopen", "fileno", "flock", "eintr", "ferror", "ferror-zero", "ferror-stale", "fclose"):
                 path = root / fault
                 p = subprocess.run([str(exe)], env=dict(env, LCCC_PROFILE_FILE=str(path), PGO_IO_FAULT=fault),
@@ -193,6 +197,7 @@ class RedTeam(unittest.TestCase):
                 self.assertEqual((sync / "unlocked-close").exists(), mutant)
                 self.assertEqual(path.read_bytes() == raw * 2, not mutant)
                 self.assertTrue((sync / "B-attempting").exists())
+                self.assertTrue((sync / "B-blocked").exists())
 
 
 def main():

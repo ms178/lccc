@@ -884,7 +884,9 @@ fn dump_helper(
     let vp_fmt = format!("__lccc_pgo_vp_fmt_{}", m.functions.len());
     m.string_literals
         .push((tag.clone(), path.display().to_string()));
-    m.string_literals.push((mode.clone(), "a".into()));
+    // Linux libc's 'e' requests atomic close-on-exec at open time. A
+    // concurrent exec must not inherit the descriptor and prolong its flock.
+    m.string_literals.push((mode.clone(), "ae".into()));
     // Header is written as ONE line by two <=2-vararg calls (the backend's
     // variadic codegen drops register args 3+ — observed: 4-vararg fprintf
     // wrote uid=0). fmt1 ends with a space so fmt2 continues the line.

@@ -129,6 +129,7 @@ def run_checks(args, checks):
                         p.wait()
                 assert shared.read_bytes() == raw * 2, "interleaved profile records"
                 assert not (sync / "unlocked-close").exists(), "final flush outside lock"
+                assert (sync / "B-blocked").exists(), "no kernel-observed lock contention"
                 assert counters(shared.read_text()) == {key: value * 2 for key, value in baseline_counts.items()}
                 checks.append(f"{opt}/{count}: deterministic two writers, exact counts")
                 # Exercise the production reader and optimization pipeline,

@@ -188,11 +188,26 @@ point is explicitly x86-64-only, so its size_t/ssize_t call ABI is 64-bit. This
 remains best-effort error reporting and does not roll back partially written
 records or override application status.
 
-The preload oracle's A/B barrier now creates actual acquisition contention. Its
+The preload oracle's A/B barrier now waits for a nonblocking kernel acquisition
+refusal while A is locked, not just a marker before B's acquisition call. A
+marker alone leaves a scheduling window in which A could close before B calls
+the kernel. The corrected barrier proves observed lock contention. Its
 reference mutant demonstrates that the test rejects the old ordering. Counter
 parsing validates shape/ranges and resets per-record function state. Failures
 produce JSON instead of disappearing before summary publication. Assertions
 cannot be silently disabled by an optimized interpreter invocation.
+
+### Descriptor lifetime and exec
+
+Close-under-lock requires considering descriptor aliases: closing one reference
+is not sufficient if a concurrent exec inherits another reference. The original
+`fopen("a")` mode did not request close-on-exec. The Linux runtime now uses `ae`
+to request atomic close-on-exec during opening, rather than a racy later fcntl.
+The preload oracle checks actual FD_CLOEXEC flags, and a deliberately inheritable
+reference descriptor is detected with status 99. This prevents exec inheritance;
+it does **not** solve every fork-without-exec scenario or claim universal libc
+portability. Fork/exec and multi-threaded termination belong in the remaining
+concurrency matrix.
 
 ## Toolchain, swap, and measurement limitations
 
