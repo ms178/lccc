@@ -8,9 +8,9 @@
  * any assignment/global path is correct -- only the by-value return of a
  * computed vector rvalue is wrong.
  *
- *   lccc -O2 miscompile_vec_return_by_value_O2.c && ./a.out
+ *   lccc -O2 miscompile_vec_return_by_value_-O2.c && ./a.out
  *     passret: <stackaddr-low> <0x7fff-high> 0 0     (wrong; gcc: 4 3 2 1)
- *   gcc  -O2 miscompile_vec_return_by_value_O2.c && ./a.out
+ *   gcc  -O2 miscompile_vec_return_by_value_-O2.c && ./a.out
  *     passret: 4 3 2 1
  */
 #include <stdio.h>

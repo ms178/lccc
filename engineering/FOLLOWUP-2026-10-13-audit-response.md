@@ -45,7 +45,7 @@ for reading every result below):
 ## 2. NEW findings this session (with reproducers — they belong in the backlog)
 
 * **VECRET-1 (miscompile, filed in `backlog.md` + `artifacts/repros/`)** —
-  `artifacts/repros/miscompile_vec_return_by_value_O2.c`: a 16-byte vector
+  `artifacts/open_bugs/miscompile_vec_return_by_value_-O2.c`: a 16-byte vector
   returned by value from a COMPUTING function reads the result's alloca
   pointer as data (the printed high halves are a stack address) at -O0 and
   -O2, while identity returns and assignment/global flows are correct.  GCC

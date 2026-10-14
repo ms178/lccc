@@ -860,7 +860,7 @@ linker. Cover static/dynamic/shared paths without a one-emitter special case.
 
 Found during the AUD-ICE-1 spot-checks (the ill-typed sweep only proves no
 ICE; the behavior spot-check caught this).  Reproducer:
-`artifacts/repros/miscompile_vec_return_by_value_O2.c`.
+`artifacts/open_bugs/miscompile_vec_return_by_value_-O2.c`.
 
 `v4 passret(v4 a, v4 b){ return __builtin_shuffle(a, b); }` — the return
 path copies the result's alloca POINTER (the printed high halves are a
