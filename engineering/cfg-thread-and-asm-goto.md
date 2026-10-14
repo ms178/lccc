@@ -123,3 +123,24 @@ It measures only the threading pass on independent relays and chains at three
 sizes, reports the median of five runs, and checks each output. Parsing and
 fixture construction are outside the timed region. No corpus-wide runtime
 speedup, vendor comparison, or hardware-independent timing guarantee is claimed.
+
+### Local A/B measurements
+
+Same x86-64 sandbox (two logical CPUs, reported Xeon 2.60 GHz), same Rust 1.88.0
+`rustc --test -C opt-level=1`, same classifier/LineStore and benchmark fixture.
+The before/after harnesses extracted the respective production pass bodies;
+neither timed fixture parsing. Each cell is a five-run median in microseconds.
+
+| Shape | Candidates | Before | After |
+|---|---:|---:|---:|
+| Independent relays | 128 | 7,043 | 158 |
+| Independent relays | 512 | 67,517 | 816 |
+| Independent relays | 2,048 | 1,070,646 | 3,021 |
+| Chain | 128 | 4,349 | 182 |
+| Chain | 512 | 66,816 | 561 |
+| Chain | 2,048 | 1,304,722 | 2,271 |
+
+Both versions' benchmark outputs passed the same structural assertions. These
+synthetic pass-level measurements support the complexity improvement; they are
+not whole-compiler throughput or generated-code runtime measurements. Shared
+host noise, allocator/hash costs and the older local toolchain limit generality.
