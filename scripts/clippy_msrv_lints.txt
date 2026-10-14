@@ -1,0 +1,12 @@
+# Clippy lints referenced by the crate-root policy list in src/lib.rs that do
+# not exist on every toolchain able to build this crate.
+#
+# `#![allow(unknown_lints)]` at the crate root keeps such a toolchain's
+# `-D warnings` build green (an unknown name is a warning there, and a warning
+# is an error under `-D warnings`). Every name below is audited by
+# scripts/check_clippy_policy.py: an unknown lint reported by Clippy that is
+# NOT in this file fails the `clippy` gate, so a typo in the policy list can
+# never hide here.
+#
+# name                       introduced in
+chunks_exact_to_as_chunks    Clippy 1.98 (declared MSRV in Cargo.toml is 1.97.0)

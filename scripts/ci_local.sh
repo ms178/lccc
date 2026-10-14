@@ -178,10 +178,6 @@ fi
 # undeclared CCC_*/LCCC_* knobs (AUD-KNOB-1) and unannotated #[ignore]s
 # (AUD-ARM-GSF-1). Pure static scan -- it needs no compiler, and it must run
 # before the build so a regression is reported as itself.
-gate "audit-census-selftest" fast \
-    python3 scripts/audit_census.py --selftest
-gate "audit-census" fast \
-    python3 scripts/audit_census.py --check
 
 gate "rec2iter" fast \
     env CCC="$LCCC" bash tests/regression/check_rec2iter.sh
@@ -189,21 +185,8 @@ gate "rec2iter" fast \
 gate "fp-contract-parity" fast \
     env CCC="$LCCC" bash tests/regression/check_fp_contract_parity.sh
 
-gate "repros-replay-selftest" fast \
-    python3 scripts/repros_replay.py --selftest
 # ~97 compiles per arm plus the runs: seconds, not minutes -- and it is the
 # only gate that exercises the historical crash/miscompile corpus end to end.
-gate "repros-replay" fast \
-    python3 scripts/repros_replay.py --lccc "$LCCC" --check
-
-gate "dash-o-stdout" fast \
-    env CCC="$LCCC" bash tests/regression/check_dash_o_stdout.sh
-
-gate "ill-typed-builtins-selftest" fast \
-    python3 scripts/check_ill_typed_builtins.py --self-test
-gate "ill-typed-builtins" fast \
-    env CCC="$LCCC" python3 scripts/check_ill_typed_builtins.py --compiler "$LCCC"
-
 gate "cpu-supports-runtime" fast \
     env CCC="$LCCC" bash tests/regression/check_cpu_supports_runtime.sh
 
@@ -256,6 +239,94 @@ gate "empty-aggregate-abi" fast \
 gate "aggregate-call-abi" fast \
     env CCC="$LCCC" bash tests/regression/check_aggregate_call_abi.sh
 
+# AUD-VABI-1: a 16-byte vector is ONE %xmm (SSE + SSEUP), not an INTEGER pair,
+# in BOTH directions and through function pointers. Same-compiler agreement
+# cannot show this -- the gate links each side against a GCC-compiled TU.
+gate "vector-abi-boundary" fast \
+    env CCC="$LCCC" bash tests/regression/check_vector_abi_boundary.sh
+
+# AUD-VABI-2: the 32-byte case of the same rule (WHOLE %ymm with AVX on).  Not
+# fixable like the 16-byte one -- it needs a %ymm carrier through return and
+# argument classification, the prologue, location allocation and the call
+# sequence -- so the gate measures and LATCHES the debt: the two working
+# configurations are asserted to stay correct, and the two broken cross legs
+# must show exactly the recorded verdict, so the bug cannot silently change
+# shape or be declared fixed without the fix.
+gate "vector-abi-wide-latched" fast \
+    env CCC="$LCCC" bash tests/regression/check_vector_abi_wide.sh
+
+# AUD-TMP-1: temp files must be symlink-proof. Drives the pre-placed-symlink
+# reproducer (and its pre-placed-directory variant) against the built compiler
+# and asserts the victim file is untouched, the compile still succeeds and
+# nothing is written directly into $TMPDIR.
+gate "temp-symlink-hardening" fast \
+    env CCC="$LCCC" bash tests/regression/check_temp_symlink.sh
+
+# AUD-DRV-1: `-o -` is stdout for -S/-E/-M (and rejected for -c / multi-input),
+# never a file named `-`. Build systems pipe through this.
+gate "o-stdout" fast \
+    env CCC="$LCCC" bash tests/regression/check_o_stdout.sh
+
+# AUD-HYGIENE-1: the loose `tests/*.c`/`*.sh` scratch (compat_test.sh and the
+# IVSR/univsr probes) are gates now instead of unreferenced files.  The compat
+# suite is a 20-program run-and-compare differential against GCC; the probe
+# gate is metamorphic -- the same programs must produce the same numbers with
+# the strength-reduction pass on, off, and at -O3.
+gate "compat-suite" fast \
+    env CCC="$LCCC" bash tests/regression/check_compat_suite.sh
+gate "ivsr-reproducers" fast \
+    env CCC="$LCCC" bash tests/regression/check_ivsr_reproducers.sh
+
+
+# AUD-ICE-1/AUD-DIAG-1: a malformed `__builtin_shuffle` mask must produce a
+# diagnostic, not a Rust panic (and the valid forms must still lower).  The
+# gate is oracle-checked against gcc, so it cannot pass by rejecting more than
+# GCC does.
+gate "shuffle-diagnostics" fast \
+    env CCC="$LCCC" bash tests/regression/check_shuffle_diagnostics.sh
+
+# AUD-SILENT-ZERO-1: a target that cannot execute an x86-only intrinsic must
+# trap at the first execution, not silently compute zeros (and must not trap
+# anything it CAN compute).  The host cannot execute AArch64/RISC-V, so the
+# gate asserts on the instruction stream AND on the trap's encoding in the
+# object.
+gate "cross-target-intrinsic-trap" fast \
+    env CCC="$LCCC" \
+    CCC_ARM=target/fastbuild/lccc-arm \
+    CCC_RISCV=target/fastbuild/lccc-riscv \
+    CCC_I686=target/fastbuild/lccc-i686 \
+    bash tests/regression/check_cross_target_intrinsic_trap.sh
+
+# AUD-CPU-3: an intrinsic whose instruction-set extension the invocation does
+# not permit must be diagnosed (GCC/Clang reject it too), and the invocation
+# that does permit it must still emit the instruction.  Oracle-checked against
+# gcc wherever gcc ships the same intrinsic.
+gate "intrinsic-feature-gate" fast \
+    env CCC="$LCCC" bash tests/regression/check_intrinsic_feature_gate.sh
+
+# AUD-POS-1: a diagnostic's file:line:col must survive the preprocessor -- the
+# case that regressed was "every position after a #include is one line high".
+# Oracle-diffed against gcc on positions, not wording.
+gate "diagnostic-positions" fast \
+    env CCC="$LCCC" bash tests/regression/check_diagnostic_positions.sh
+
+# AUD-ICE-1: an ill-typed builtin call is a diagnostic, never a panic.  The
+# worklist is the compiler's own name table, so a builtin added tomorrow is
+# covered tomorrow; the baseline ratchets the panics and silently-accepted
+# calls that exist today and fails the moment either list grows.
+gate "ill-typed-builtins-selftest" fast \
+    python3 scripts/check_ill_typed_builtins.py --self-test
+
+# AUD-ICE-1: the argument counts the front end enforces for builtins come from
+# include/*.h; the checked-in table is regenerated, never hand-edited, and this
+# gate fails if it stops matching the headers it was derived from.
+gate "intrinsic-arity-selftest" fast \
+    python3 scripts/check_intrinsic_arity.py --self-test
+gate "intrinsic-arity" fast \
+    python3 scripts/check_intrinsic_arity.py --check
+gate "ill-typed-builtins" fast \
+    env CCC="$LCCC" LCCC_REPO=. python3 scripts/check_ill_typed_builtins.py
+
 # The unit-test gate is what GitHub's required check runs on every PR, so it
 # belongs in the fast set: a red PR has to be reproducible with --fast.
 #
@@ -307,6 +378,10 @@ cargo_test_repeated() {
         incr=0
     fi
     n="${LCCC_TEST_REPEATS:-1}"
+    # The reporter's own test corpus runs first: it is what fails when the
+    # reporter quietly stops reporting, and the suite below is exactly the log
+    # it exists to explain (see scripts/ci_test_report.py).
+    python3 scripts/ci_test_report.py --self-test
     for ((i = 1; i <= n; i++)); do
         if [ -n "$dbg" ]; then
             export CARGO_PROFILE_FASTBUILD_DEBUG="$dbg"
@@ -318,7 +393,8 @@ cargo_test_repeated() {
         else
             unset CARGO_INCREMENTAL
         fi
-        if ! RUSTFLAGS="$flags" cargo test --profile fastbuild --all-targets --locked -j "$jobs"; then
+        if ! RUSTFLAGS="$flags" python3 scripts/ci_test_report.py -- \
+            cargo test --profile fastbuild --all-targets --locked -j "$jobs"; then
             printf 'cargo-test: FAILED on repeat %d/%d\n' "$i" "$n" >&2
             return 1
         fi
@@ -339,7 +415,8 @@ DBGASSERT_CONFIG=(--config 'profile.fastbuild.debug-assertions=true'
 cargo_test_dbgassert() {
     local flags="" jobs="${CI_LOCAL_JOBS:-2}"
     [ -r target/lccc-rustflags ] && flags="$(cat target/lccc-rustflags)"
-    CARGO_INCREMENTAL=0 RUSTFLAGS="$flags" cargo test --profile fastbuild \
+    CARGO_INCREMENTAL=0 RUSTFLAGS="$flags" python3 scripts/ci_test_report.py -- \
+        cargo test --profile fastbuild \
         --all-targets --locked -j "$jobs" "${DBGASSERT_CONFIG[@]}"
 }
 gate "cargo-test-debug-assertions" slow cargo_test_dbgassert
@@ -376,6 +453,18 @@ gate "loop-alignment-contract" fast \
 # empty sweep a pass.
 gate "i386-small-struct-abi-debt" fast \
     bash tests/regression/check_i386_regparm_small_struct_abi.sh
+
+# AUD-HYGIENE-1: the crash/miscompile reproducers in artifacts/repros/ are the
+# compiler's scar tissue and used to be replayed by nobody. Two legs with the
+# ISA pinned on BOTH compilers (an unpinned replay measures the difference
+# between lccc's x86-64-v3 baseline and gcc's x86-64 default, i.e. FMA
+# contraction, and reports 29 phantom failures); the declared
+# not-self-contained csmith files are checked in both directions so the list
+# cannot become a skip list.  See artifacts/repros/README.md.
+gate "repro-replay-selftest" fast \
+    python3 scripts/check_repro_replay.py --self-test
+gate "repro-replay" fast \
+    env CCC="$LCCC" python3 scripts/check_repro_replay.py
 
 # Same predicate, three consumers (-Wreturn-type, switch fallthrough, statement
 # expression value) and two ways to get it wrong: resolving a call's entity by
@@ -765,6 +854,19 @@ gate "phi-acyclic-copy-order" fast \
 
 gate "doc-link-integrity" fast \
     python3 scripts/check_doc_links.py
+
+# AUD-RATCHET-1: the audit's site counts are a ratchet, not a snapshot.  The
+# scanner self-tests first (its tokenizer is what every number rests on), then
+# --check refuses any metric that grew past scripts/audit_census_baseline.json:
+# panic-class sites overall and in the user-input pipeline, `unsafe` sites,
+# unannotated `#[ignore]`, functions over 300/500/1000 lines, and CCC_*/LCCC_*
+# literals without documentation.  A count may only be re-baselined in the
+# commit that adds the sites; lowering the baseline belongs to the commit that
+# removes them.
+gate "audit-census-selftest" fast \
+    python3 scripts/audit_census.py --selftest
+gate "audit-census-ratchet" fast \
+    python3 scripts/audit_census.py --check
 
 # The Expat differential is only a differential if both compilers ran the SAME
 # tests under the SAME feature configuration.  `junit_check.py` compares testcase
@@ -1657,8 +1759,14 @@ clippy_gate() {
     fi
     # RUSTFLAGS reuses the build gate's resolved flags (see cargo_test_repeated):
     # without them clippy recompiles the whole crate under a different flag set.
-    RUSTFLAGS="$flags" cargo clippy --all-targets --profile fastbuild \
-        --locked -j "$jobs" -- -D warnings
+    #
+    # The wrapper (not bare `cargo clippy`) is load-bearing: the crate root
+    # carries `#![allow(unknown_lints)]` so that a Clippy newer than the
+    # declared MSRV cannot break `-D warnings` on a lint name that does not
+    # exist yet, and the wrapper re-probes every name in the policy list under
+    # `#![deny(unknown_lints)]` to keep typos from hiding behind that allow.
+    RUSTFLAGS="$flags" CARGO_BUILD_JOBS="$jobs" \
+        python3 scripts/check_clippy_policy.py
 }
 gate "clippy" fast clippy_gate
 

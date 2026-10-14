@@ -165,8 +165,31 @@ impl Lowerer {
                     | "__builtin_ia32_minps"
                     | "__builtin_ia32_shufps"
                     | "__builtin_shufflevector"
-                    | "__builtin_shuffle"
                     | "__builtin_ia32_vextractf128_ps256" => return None,
+                    // __builtin_shuffle is the one raw vector builtin whose
+                    // value is NOT packed by value: its lowering hands back
+                    // the result alloca POINTER for every result wider than 8
+                    // bytes and only packs ≤8-byte results. Reporting None
+                    // here (the packed answer) made the consumers read that
+                    // POINTER as if it were the vector data —
+                    // `return __builtin_shuffle(v, m);` returned the alloca's
+                    // ADDRESS to a caller that stored it as the 16 bytes, and
+                    // a 32-byte result dereferenced the address as data and
+                    // faulted. The geometry is known because sema types the
+                    // call (see ExprTypeChecker::infer_expr_ctype), so the
+                    // size can be answered here instead of asserted.
+                    "__builtin_shuffle" => {
+                        let bytes = match self.get_expr_ctype(expr) {
+                            Some(CType::Vector(_, bytes)) => bytes,
+                            // Not resolvable: keep the historical packed
+                            // answer rather than inventing a size.
+                            _ => return None,
+                        };
+                        if bytes > 8 {
+                            return Some(bytes);
+                        }
+                        return None;
+                    }
                     _ => {}
                 }
             }

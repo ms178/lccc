@@ -61,6 +61,22 @@ pub fn set_target_elf_machine(machine: u16) {
 }
 
 /// ELF e_machine of the current target.
+/// Human-readable name of the compilation target, for diagnostics that must
+/// name the architecture ("`__builtin_ia32_aesenc128` is not available on
+/// aarch64").  Mirrors the backend's own `elf_machine_name`, but lives in the
+/// common layer so the lowering pipeline can name the target without depending
+/// on a backend.
+pub fn target_arch_name() -> &'static str {
+    match target_elf_machine() {
+        3 => "i686",
+        40 => "arm",
+        62 => "x86-64",
+        183 => "aarch64",
+        243 => "riscv64",
+        _ => "the target architecture",
+    }
+}
+
 pub fn target_elf_machine() -> u16 {
     TARGET_ELF_MACHINE.with(|c| c.get())
 }
@@ -1999,6 +2015,35 @@ impl CType {
     }
 
     /// Whether this is a GCC vector extension type.
+    /// SysV AMD64 classification of a VECTOR type, as the pair
+    /// `(eightbyte classes, occupies ONE xmm register)`.
+    ///
+    /// The psABI classifies the FIRST eightbyte of a vector as SSE and every
+    /// further eightbyte as SSEUP -- "the upper half of the same vector
+    /// register" -- which is why `<4 x i32>` occupies exactly ONE `%xmm`
+    /// register while a `{double, double}` struct, whose two eightbytes are
+    /// both plain SSE, takes two.  LCCC already models "one 16-byte XMM" with
+    /// the carrier `_Float128` uses (`is_f128_sse` in the call ABI), so a
+    /// 16-byte vector is described by the same flag.
+    ///
+    /// Returns `None` for anything that is not a vector, and for 32-byte
+    /// vectors, whose SysV treatment (two SSEUP eightbytes in ONE `%ymm`) is a
+    /// per-invocation ABI decision the caller has to make with `-mavx` in
+    /// hand -- returning `None` keeps the existing by-value behaviour there
+    /// instead of promising a convention the backend may not emit.
+    pub fn sysv_vector_carrier(&self) -> Option<(Vec<EightbyteClass>, bool)> {
+        if !self.is_vector() {
+            return None;
+        }
+        match self.size() {
+            // One SSE eightbyte: the low 64 bits of ONE xmm register.
+            1..=8 => Some((vec![EightbyteClass::Sse], false)),
+            // SSE + SSEUP: the full 128 bits of ONE xmm register.
+            16 => Some((vec![EightbyteClass::Sse, EightbyteClass::Sse], true)),
+            _ => None,
+        }
+    }
+
     pub fn is_vector(&self) -> bool {
         matches!(self, CType::Vector(_, _))
     }

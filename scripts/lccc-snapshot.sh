@@ -421,9 +421,32 @@ PYKEEP
 # Avoid previewing hundreds of thousands of diff lines. The ZIP carries the
 # exact canonical patch plus base/head/hash/status and is opened as a download.
 # This is a transport receipt, NOT a compiler-correctness or CI certificate.
+#
+# Census scope: the delivery budget bounds what this publication ADDS to the
+# visible workspace. The checkout ($REPO), the recovery-artifact zone ($ART,
+# which carries the source tarball/bundle/checkpoints) and the harness-excluded
+# build/cache directory names are not deliverables of this step - they are
+# reconstructed from the patch/bundle or are dropped by the harness snapshot
+# itself - so they are excluded from the census. Without the exclusions a
+# workspace that legitimately contains a checkout can never satisfy a 64 MiB
+# budget and every snapshot would fail at the very last step.
+harness_excluded_dirs=(
+  target node_modules .cache .local .npm .venv __pycache__ build dist out
+  coverage .next .nuxt .output .parcel-cache .pytest_cache .ruff_cache
+  .svelte-kit .tox .turbo .mypy_cache .nox .arena
+)
+delivery_excludes=()
+for d in "${harness_excluded_dirs[@]}"; do
+  delivery_excludes+=(--exclude-dir "$d")
+done
+delivery_excludes+=(--exclude-path "$REPO" --exclude-path "$ART")
+if [[ "$BULK" != "$ART" ]]; then
+  delivery_excludes+=(--exclude-path "$BULK")
+fi
 python3 "$REPO/scripts/lccc_delivery.py" \
   --patch "$DELIVERABLE" --workspace "$(dirname "$DELIVERABLE")" \
-  --base "$BASE" --head "$HEAD_SHA" --snapshot "$tag" --ci-gate "$ci_gate"
+  --base "$BASE" --head "$HEAD_SHA" --snapshot "$tag" --ci-gate "$ci_gate" \
+  "${delivery_excludes[@]}"
 
 # ---- 7. Atomically extend the ledger ------------------------------------------
 ledger_tmp=$(mktemp "$ART/.SNAPSHOT_LEDGER.md.tmp.XXXXXX")

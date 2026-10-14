@@ -283,19 +283,34 @@ impl Lowerer {
                 };
                 // Compute struct alignment, per-eightbyte SysV ABI classification,
                 // and RISC-V LP64D float field classification
-                let (struct_align, struct_eightbyte_classes, riscv_float_class) =
-                    if struct_size.is_some() {
-                        if let Some(layout) = self.get_struct_layout_for_type(&param.type_spec) {
-                            let ctx = &*self.types.borrow_struct_layouts();
-                            let classes = layout.classify_sysv_eightbytes(ctx);
-                            let rv_class = layout.classify_riscv_float_fields(ctx);
-                            (Some(layout.align), classes, rv_class)
-                        } else {
-                            (None, Vec::new(), None)
-                        }
+                // AUD-VABI-1: a VECTOR is not a struct.  Its eightbytes are
+                // SSE + SSEUP (the upper half of the SAME register), so a
+                // 16-byte vector arrives in ONE %xmm -- not in the GP pair the
+                // layout classifier would pick (it has no notion of a "vector
+                // element", so it falls back to INTEGER).  Measured: an
+                // lccc-compiled callee read %rdi/%rsi/%rdx/%rcx and returned
+                // garbage where gcc had passed the two vectors in %xmm0/%xmm1.
+                let vector_carrier = if crate::common::types::target_elf_machine() == 62 {
+                    param_ctype.sysv_vector_carrier()
+                } else {
+                    None
+                };
+                let (struct_align, struct_eightbyte_classes, riscv_float_class) = if struct_size
+                    .is_some()
+                {
+                    if let Some((classes, _)) = vector_carrier.clone() {
+                        (Some(self.ctype_align(&param_ctype)), classes, None)
+                    } else if let Some(layout) = self.get_struct_layout_for_type(&param.type_spec) {
+                        let ctx = &*self.types.borrow_struct_layouts();
+                        let classes = layout.classify_sysv_eightbytes(ctx);
+                        let rv_class = layout.classify_riscv_float_fields(ctx);
+                        (Some(layout.align), classes, rv_class)
                     } else {
                         (None, Vec::new(), None)
-                    };
+                    }
+                } else {
+                    (None, Vec::new(), None)
+                };
                 // Struct params carry alignment through `struct_align`.
                 // The struct LAYOUT's natural alignment (layout.align) is not
                 // enough: a typedef override (`typedef S7 AS32
@@ -324,7 +339,8 @@ impl Lowerer {
                     param_align: None,
                     struct_eightbyte_classes,
                     riscv_float_class,
-                    is_f128_sse: false,
+                    // "ONE 16-byte %xmm" -- the same carrier _Float128 uses.
+                    is_f128_sse: vector_carrier.is_some_and(|(_, one_xmm)| one_xmm),
                 });
                 param_kinds.push(ParamKind::Struct(ir_idx));
                 continue;

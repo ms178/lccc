@@ -105,10 +105,15 @@ run_case "no-zerorem-O2" "-O2 -march=$arch" "CCC_NO_MAP_ZERO_REM=1"
 # ---------------------------------------------------------------- contract 2
 note "contract 2: one broadcast per packed loop in the object code (fma == 4*bc / fma == bc)"
 count_sym() { # binary symbol insn-regex
+    # The reader must consume every line objdump writes: `exit`-ing out of the
+    # symbol body sends SIGPIPE to objdump, and under `set -o pipefail` that
+    # pipeline status (141) aborts the whole gate — measured with binutils
+    # 2.40, where objdump keeps writing past the blank line that ends a
+    # symbol. Leave the symbol on the blank line instead of leaving the loop.
     objdump -d --no-show-raw-insn "$1" \
         | awk -v sym="<$2>:" -v pat="$3" '
             $0 ~ "^[0-9a-f]+ " sym { inside=1; next }
-            inside && /^$/ { exit }
+            inside && /^$/ { inside=0; next }
             inside && $0 ~ pat { n++ }
             END { print n+0 }'
 }

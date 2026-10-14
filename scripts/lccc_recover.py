@@ -60,6 +60,30 @@ def extractall_takes_filter():
         return False
 
 
+def chmod_ignores_a_none_mode():
+    """True when TarFile.chmod tolerates the filter's mode=None.
+
+    PEP 706 landed the filter in 3.12 and 3.11.4 and *with it* an early return
+    for `tarinfo.mode is None` in `TarFile.chmod`.  A 3.11.3-or-older
+    interpreter therefore crashes with `TypeError: 'NoneType' object cannot be
+    interpreted as an integer` on every DIRECTORY member whose mode the filter
+    cleared — measured on Debian 12's 3.11.2 with this module's own unit tests
+    (20 errors, all `tarfile.py: self.chmod(tarinfo, dirpath)`), i.e. on
+    exactly the interpreters the documented 3.9+ floor covers and which cannot
+    use the filter branch at all.
+
+    Probed by calling the unbound method rather than by version number: a
+    distro backport can move either half of PEP 706 independently, and
+    `chmod` never reads `self` on ANY version, so `None` is a safe receiver.
+    """
+    member=tarfile.TarInfo('probe');member.type=tarfile.DIRTYPE;member.mode=None
+    try:
+        tarfile.TarFile.chmod(None,member,os.devnull)
+    except TypeError:
+        return False
+    return True
+
+
 def read_json(path):
     def pairs(values):
         r={}
@@ -170,7 +194,22 @@ def extract(archive,stage,r):
         if extractall_takes_filter():
             t.extractall(stage,filter='data')
         else:
-            for member in members:neutralize_archive_attrs(member)
+            guarded=chmod_ignores_a_none_mode()
+            umask=os.umask(0);os.umask(umask)
+            for member in members:
+                neutralize_archive_attrs(member)
+                if member.isdir() and member.mode is None and not guarded:
+                    # The neutralizer mirrors the data filter, which expresses
+                    # "ignore this member's mode" as mode=None.  An interpreter
+                    # whose chmod predates PEP 706's None guard passes that
+                    # straight to os.chmod() and dies on every directory, so
+                    # give the directory the mode the guard-era interpreter
+                    # ends up with after its own unfiltered `_extract_member`:
+                    # os.mkdir's default (`0o777 & ~umask`) — the filter never
+                    # puts a directory back to the archive's mode, and the
+                    # group/other-write clamp this helper exists for is
+                    # unaffected because the umask can only CLEAR bits.
+                    member.mode=0o777&~umask
             t.extractall(stage)
     repo=stage/'lccc';require(repo.is_dir(),'source root missing');return repo
 
@@ -201,6 +240,20 @@ def offline_base(stage,artifacts,r,*,patch=None):
     return repo
 
 
+def ensure_base_ancestry(repo,upstream,base):
+    """Deepen BASE so a session range that merged upstream can verify.
+
+    A bundle whose range merges upstream lists the OLD fork point as a second
+    prerequisite beside BASE, which a `--depth=1` BASE cannot satisfy -- the
+    bundle restores perfectly from BASE *and its ancestry*, which is what an
+    upstream clone has.  Deepen instead of declaring a good bundle broken.
+    """
+    if git(repo,'rev-parse','--is-shallow-repository')=='true':
+        git(repo,'fetch','-q','--unshallow','--no-tags',upstream,base)
+    else:
+        git(repo,'fetch','-q','--no-tags',upstream,base)
+
+
 def exact_restore(stage,artifacts,b,recipe,upstream,offline,patch):
     bundle=artifacts/b['bundle'];require(bundle.is_file() and not bundle.is_symlink() and sha(bundle)==b['bundle_sha256'],'session bundle identity mismatch/missing')
     require(recipe is None or (recipe['head'],recipe['tree'],recipe['base'],recipe['branch'])==(b['head'],b['tree'],b['base'],b['branch']),'bundle/source generations differ; use latest verified source fallback')
@@ -212,7 +265,15 @@ def exact_restore(stage,artifacts,b,recipe,upstream,offline,patch):
     if offline or network_error:
         require(recipe is not None,'offline exact history requires the source/patch/BASE recipe')
         repo=offline_base(stage,artifacts,recipe,patch=patch);method='offline-reconstructed-base'
-    git(repo,'bundle','verify',str(bundle.resolve()))
+    try:
+        git(repo,'bundle','verify',str(bundle.resolve()))
+    except (OSError,ValueError,subprocess.SubprocessError):
+        # Reported as exact-history failure only when BASE's ancestry cannot
+        # help either: offline reconstruction has BASE alone by construction.
+        require(method=='upstream-base' and not offline,
+                'session bundle needs BASE ancestry; the offline recipe has BASE alone')
+        ensure_base_ancestry(repo,upstream,b['base'])
+        git(repo,'bundle','verify',str(bundle.resolve()))
     git(repo,'fetch','-q',str(bundle.resolve()),'refs/heads/'+b['branch'])
     git(repo,'checkout','-q','-B',b['branch'],'FETCH_HEAD')
     require(git(repo,'rev-parse','HEAD')==b['head'] and git(repo,'rev-parse','HEAD^{tree}')==b['tree'],'session history restore mismatch')

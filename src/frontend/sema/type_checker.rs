@@ -308,6 +308,39 @@ impl<'a> ExprTypeChecker<'a> {
                             self.infer_expr_ctype(&args[2])
                         };
                     }
+
+                    // `__builtin_shuffle` (GCC vector extension): the result
+                    // is the FIRST vector operand's type — verified against
+                    // gcc -O0 with _Generic (a `v4si` shuffle is a `v4si`, an
+                    // `v8hi` shuffle an `v8hi`, in the 2- and 3-argument
+                    // forms).  The name is not in `builtin_return_ctype`,
+                    // which is keyed by name alone and cannot express an
+                    // argument-dependent result, so before this arm the call
+                    // had NO CType at all and every consumer that needs one
+                    // treated a 16-byte vector as an untyped scalar:
+                    // sizeof(__builtin_shuffle(v, m)) was 8, _Generic matched
+                    // nothing, subscripting read the wrong lane, and — the
+                    // miscompile — the lowering's by-value return path handed
+                    // back the shuffle alloca's ADDRESS where the caller
+                    // expected the 16 bytes of data.
+                    //
+                    // `__builtin_shufflevector` is deliberately NOT annotated
+                    // here.  It shares this builtin's semantics but not its
+                    // value convention: its lowering returns the result as a
+                    // PACKED I128 by value (struct_value_size reports None for
+                    // it, and the four name-keyed conventions in expr_types /
+                    // expr_calls / vec128_arg_ptr are written against that),
+                    // while the CType is likewise what makes
+                    // vector_temp_promotion treat the result alloca as a
+                    // promotable vector temporary.  Annotating it made
+                    // `return __builtin_shufflevector(a, b, 3, 2, 1, 0)` read
+                    // a stale slot at -O2 (lanes 2-3 duplicated lanes 0-1).
+                    // Typing it correctly needs that convention rework first.
+                    if name == "__builtin_shuffle" && !args.is_empty() {
+                        if let Some(ct @ CType::Vector(_, _)) = self.infer_expr_ctype(&args[0]) {
+                            return Some(ct);
+                        }
+                    }
                 }
                 self.infer_call_return_ctype(func)
             }

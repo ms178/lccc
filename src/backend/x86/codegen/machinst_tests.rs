@@ -2069,8 +2069,15 @@ fn div64_width_bypass_is_emitted_only_where_the_tuning_row_asks_and_runs_correct
         // Execute the guarded form: quotient for the fast path (both operands
         // below 2^32), the slow path (either operand at or above it), and the
         // boundary values themselves.
+        // The divisor must be in %r10 *before* the emitted sequence runs: the
+        // MachInst form names the allocated operand directly (`orq %r10,%rdx`
+        // / `divl %r10d` / `divq %r10`), unlike the direct-codegen path in
+        // `alu.rs`, which stages it through %rcx. Loading it after the divide
+        // (the shape this harness had) executed the guard against whatever
+        // %r10 the caller left behind: the first input, 0xFFFF_FFFF/7, was
+        // reported as 0 for exactly that reason.
         let body = format!(
-            "    movq %rdi, %rax\n{}{}    movq %rsi, %r10\n    movq %rdx, %rsi\n",
+            "    movq %rdi, %rax\n    movq %rsi, %r10\n{}{}    movq %rdx, %rsi\n",
             if signed {
                 "    cqto\n"
             } else {
