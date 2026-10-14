@@ -339,37 +339,23 @@ fn can_const_addr_fold_for(cg: &dyn ArchCodegen, info: &GepFoldInfo, seg: bool) 
     }
 }
 
-/// Whether a memory access is addressed by a GEP represented in the
-/// function-wide indexed-address map.  MachInst only sees the pointer's RA
-/// home; it has no access to this map and can therefore bypass the indexed
-/// emitter when CFG block emission order reaches a consumer before its
-/// dominating GEP definition.  Such accesses must stay on `generate_load` /
-/// `generate_store`, which consult the map independently of that order.
+/// Map-managed pointers may never have a materialized RA home. The producer's
+/// `folded_gep_values` marker is emission-order dependent: a dominating block
+/// can appear AFTER its consumer in the block vector (e.g. a LICM preheader).
+/// Gate on the complete function maps, not that incremental marker, for BOTH
+/// constant-offset and indexed folds. The classic load/store generators know
+/// these maps and either fold the address or materialize it safely.
 ///
-/// EXCLUSION LIST — why no other pointer-bearing `Instruction` variant is
-/// gated here. The map can only ever contain GEPs whose every use is a
-/// foldable Load/Store (or a Copy/Cast alias chain into one): the builder
-/// runs `retain_indexed_ptr_only_uses` (twice, around
-/// `propagate_stable_aliases`), which marks any GEP dest consumed by any
-/// other instruction — `AtomicRmw`/`AtomicInc`/`AtomicCmpxchg`/
-/// `AtomicLoad`/`AtomicStore` (their ptr operand), `VaArg`/`VaArgStruct`/
-/// `VaStart`/`VaEnd`/`VaCopy`, `Memcpy`, calls, terminators — and REMOVES
-/// it from the map, so the GEP is materialized normally and its home is
-/// written before any such consumer reads it. `try_lower_machinst`
-/// likewise only ever lowers Load/Store (plus Call/CallIndirect/BinOp/
-/// Cast/Cmp/ParamRef, none of which dereference a map-managed pointer);
-/// the atomic and va_list emitters dispatch through `generate_instruction`
-/// with the raw operand and are covered by the retention gate, not by
-/// this one. `CallIndirect.func_ptr` consumes the pointer's VALUE (an
-/// ordinary operand materialization), a different — and already-sound —
-/// class.
-fn indexed_gep_memory_access(
+/// Non-memory consumers are handled by the map builders' use filters and the
+/// normal operand-materialization path; this gate covers MachInst dereferences.
+fn mapped_gep_memory_access(
     inst: &Instruction,
+    gep_fold_map: &FxHashMap<u32, GepFoldInfo>,
     indexed_gep_map: &FxHashMap<u32, IndexedGepInfo>,
 ) -> bool {
     match inst {
         Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } => {
-            indexed_gep_map.contains_key(&ptr.0)
+            gep_fold_map.contains_key(&ptr.0) || indexed_gep_map.contains_key(&ptr.0)
         }
         _ => false,
     }
@@ -5598,8 +5584,8 @@ fn generate_function(
             // dominance order.  A MachInst load/store can therefore see a
             // consumer before that marker exists, then read the never-written
             // pointer home instead of using the indexed-address map.  Route
-            // every map-managed access through the indexed-aware generator.
-            if !indexed_gep_memory_access(inst, &indexed_gep_map)
+            // every map-managed access through the address-aware generator.
+            if !mapped_gep_memory_access(inst, &gep_fold_map, &indexed_gep_map)
                 && cg.try_lower_machinst(inst, &dead_global_addrs)
             {
                 cg.state().current_program_point += 1;
@@ -7129,6 +7115,43 @@ mod indexed_gep_machinst_gate_tests {
     }
 
     #[test]
+    fn constant_access_bypasses_machinst_before_producer_is_emitted() {
+        for offset in [-16, 0, 16, i32::MAX as i64] {
+            let mut function = late_gep_function();
+            if let Instruction::GetElementPtr { offset: op, .. } =
+                &mut function.blocks[2].instructions[0]
+            {
+                *op = Operand::Const(IrConst::I64(offset));
+            }
+            let uses = count_value_uses(&function);
+            let stability = analyze_base_stability(&function);
+            let folds = build_gep_fold_map(&function, &uses, &stability);
+            assert_eq!(folds.get(&3).unwrap().offset, offset);
+            let indexed = FxHashMap::default();
+            assert!(mapped_gep_memory_access(
+                &function.blocks[1].instructions[0],
+                &folds,
+                &indexed
+            ));
+            for volatile in [false, true] {
+                let store = Instruction::Store {
+                    val: Operand::Const(IrConst::I32(1)),
+                    ptr: Value(3),
+                    ty: IrType::U16,
+                    seg_override: AddressSpace::Default,
+                    volatile,
+                };
+                assert!(mapped_gep_memory_access(&store, &folds, &indexed));
+            }
+            assert!(!mapped_gep_memory_access(
+                &function.blocks[2].instructions[0],
+                &folds,
+                &indexed
+            ));
+        }
+    }
+
+    #[test]
     fn indexed_access_bypasses_machinst_when_consumer_precedes_gep_in_emission_order() {
         let function = late_gep_function();
         let use_counts = count_value_uses(&function);
@@ -7150,8 +7173,9 @@ mod indexed_gep_machinst_gate_tests {
                     .position(|b| b.label == gep_block.label)
                     .unwrap()
         );
-        assert!(indexed_gep_memory_access(
+        assert!(mapped_gep_memory_access(
             &consumer_block.instructions[0],
+            &FxHashMap::default(),
             &indexed_gep_map
         ));
         let indexed_store = Instruction::Store {
@@ -7161,7 +7185,11 @@ mod indexed_gep_machinst_gate_tests {
             seg_override: AddressSpace::Default,
             volatile: false,
         };
-        assert!(indexed_gep_memory_access(&indexed_store, &indexed_gep_map));
+        assert!(mapped_gep_memory_access(
+            &indexed_store,
+            &FxHashMap::default(),
+            &indexed_gep_map
+        ));
 
         let unrelated_load = Instruction::Load {
             dest: Value(5),
@@ -7170,8 +7198,9 @@ mod indexed_gep_machinst_gate_tests {
             seg_override: AddressSpace::Default,
             volatile: false,
         };
-        assert!(!indexed_gep_memory_access(
+        assert!(!mapped_gep_memory_access(
             &unrelated_load,
+            &FxHashMap::default(),
             &indexed_gep_map
         ));
     }

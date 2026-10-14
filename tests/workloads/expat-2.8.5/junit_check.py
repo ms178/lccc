@@ -124,28 +124,60 @@ _ATTR_STATUS = {
 
 
 def _status_of(element: ET.Element) -> str:
-    """The status of one testcase, from child elements or from attributes.
+    """Separate execution state from outcome, validating every channel.
 
-    CTest's `--output-junit` records a problem as a child element
-    (`<failure/>`, `<error/>`, `<skipped/>`); other JUnit writers -- and CTest's
-    own `<Test status="notrun">` style -- use an attribute.  Reading only the
-    children would call an attribute-flagged failure a pass, which is the exact
-    inversion this module must never perform, so both are consulted and an
-    unrecognised attribute value is refused instead of defaulted.
+    CTest's status="run" says the test executed; success is the absence of
+    failure/error/skipped records, not an early return from that attribute.
+    Never let one known attribute hide another unknown or conflicting one.
     """
-    for tag, status in (("failure", "failure"), ("error", "error"), ("skipped", "skipped")):
-        if element.find(tag) is not None:
-            return status
+    outcomes = {tag for tag in ("failure", "error", "skipped")
+                if element.find(tag) is not None}
+    executed = False
     for attribute in ("status", "result"):
         value = element.get(attribute)
         if value is None:
             continue
-        normalized = _ATTR_STATUS.get(value.strip().lower())
+        token = value.strip().lower()
+        if attribute == "status" and token == "run":
+            executed = True
+            continue
+        normalized = _ATTR_STATUS.get(token)
         if normalized is None:
             raise ReportError(f"unrecognised {attribute}={value!r} on a <testcase>; "
                               f"refusing to read an unknown status as a pass")
-        return normalized
-    return "pass"
+        outcomes.add(normalized)
+    if len(outcomes) > 1 or (executed and "skipped" in outcomes):
+        raise ReportError(f"contradictory testcase status: executed={executed}, "
+                          f"outcomes={sorted(outcomes)}")
+    return next(iter(outcomes), "pass")
+
+
+def _validate_counts(root: ET.Element) -> None:
+    """Suite summaries must agree with the records they claim to summarize.
+
+    Counters are optional in JUnit. When present, validate each suite against
+    its own subtree, including nested suites; an aggregate failure must not
+    disappear simply because a truncated report omitted its failing testcase.
+    Disabled is a subset of skipped, not an additional set of executed tests.
+    """
+    for suite in root.iter():
+        if suite.tag not in ALLOWED_ROOTS:
+            continue
+        cases = list(suite.iter("testcase"))
+        counts = Counter(_status_of(case) for case in cases)
+        expected = {"tests": len(cases), "failures": counts["failure"],
+                    "errors": counts["error"], "skipped": counts["skipped"]}
+        for attribute in (*expected, "disabled"):
+            value = suite.get(attribute)
+            if value is None:
+                continue
+            if re.fullmatch(r"[0-9]+", value) is None:
+                raise ReportError(f"invalid suite {attribute}={value!r}")
+            actual = int(value)
+            valid = (actual <= counts["skipped"] if attribute == "disabled"
+                     else actual == expected[attribute])
+            if not valid:
+                raise ReportError(f"suite {attribute}={value} disagrees with testcase records")
 
 
 def parse_junit(path: Path) -> list[Case]:
@@ -174,6 +206,7 @@ def parse_junit(path: Path) -> list[Case]:
     if not cases:
         raise ReportError(f"{path}: contains no <testcase> elements; an empty CTest "
                           f"report is not a passing differential")
+    _validate_counts(root)
     return cases
 
 
@@ -305,16 +338,57 @@ def self_test() -> int:
         ok += 1
     else:
         raise AssertionError("a self-contradictory report must be refused, not compared")
-    for label, bad in (("empty report", "<testsuites></testsuites>"),
-                       ("unnamed testcase", '<testsuite><testcase classname="s"/></testsuite>'),
-                       ("wrong root", "<Foo/>")):
-        path = _fixture_text(label + ".xml", bad)
-        try:
-            parse_junit(path)
-        except ReportError:
+    # Parse-level controls exercise the same public API as the workload runner.
+    fixtures = [
+        ("run-pass", '<testcase name="a" status="run"/>', "pass"),
+        ("run-failure", '<testcase name="a" status="run"><failure/></testcase>', "failure"),
+        ("run-error", '<testcase name="a" status="run"><error/></testcase>', "error"),
+        ("run-result", '<testcase name="a" status="run" result="failed"/>', "failure"),
+        ("notrun", '<testcase name="a" status="notrun"/>', "skipped"),
+        ("conflicting-attrs", '<testcase name="a" status="passed" result="failed"/>', None),
+        ("conflicting-child", '<testcase name="a" status="passed"><failure/></testcase>', None),
+        ("conflicting-children", '<testcase name="a"><error/><failure/></testcase>', None),
+        ("run-skipped", '<testcase name="a" status="run"><skipped/></testcase>', None),
+        ("unknown-later-attr", '<testcase name="a" status="passed" result="mystery"/>', None),
+        ("unknown-with-child", '<testcase name="a" status="mystery"><failure/></testcase>', None),
+        ("run-is-not-an-outcome", '<testcase name="a" result="run"/>', None),
+        ("unnamed", '<testcase classname="s"/>', None),
+    ]
+    with tempfile.TemporaryDirectory(prefix="lccc-expat-junit-") as tmp:
+        path = Path(tmp) / "report.xml"
+        for label, body, outcome in fixtures:
+            path.write_text('<testsuite>' + body + '</testsuite>')
+            try:
+                cases = parse_junit(path)
+            except ReportError:
+                if outcome is not None:
+                    raise AssertionError(f"{label}: valid outcome rejected") from None
+            else:
+                if outcome is None or cases[0].status != outcome:
+                    raise AssertionError(f"{label}: unexpected result {cases}")
             ok += 1
-        else:
-            raise AssertionError(f"{label}: parse_junit accepted it")
+        for bad in ('<testsuites/>', '<Foo/>', '<testsuite>',
+                    '<testsuite failures="1"><testcase name="a" status="run"/></testsuite>',
+                    '<testsuite tests="2"><testcase name="a"/></testsuite>',
+                    '<testsuite errors="0"><testcase name="a"><error/></testcase></testsuite>',
+                    '<testsuite skipped="1"><testcase name="a"/></testsuite>',
+                    '<testsuite disabled="1"><testcase name="a"/></testsuite>',
+                    '<testsuite tests="-1"><testcase name="a"/></testsuite>',
+                    '<testsuite failures="unknown"><testcase name="a"/></testsuite>',
+                    '<testsuites failures="1"><testsuite><testcase name="a"/></testsuite></testsuites>'):
+            path.write_text(bad)
+            try:
+                parse_junit(path)
+            except ReportError:
+                ok += 1
+            else:
+                raise AssertionError(f"invalid report accepted: {bad}")
+        path.write_text('<testsuites tests="1" failures="1"><testsuite tests="1" failures="1">'
+                        '<testcase name="a" status="run"><failure/></testcase>'
+                        '</testsuite></testsuites>')
+        if parse_junit(path)[0].status != "failure":
+            raise AssertionError("nested matching failure counts lost")
+        ok += 1
     config_problems = compare_config({"EXPAT_BUILD_TESTS": "ON"}, {"EXPAT_BUILD_TESTS": "OFF"})
     if not config_problems:
         raise AssertionError("a feature switch that differs must be a problem")
@@ -354,13 +428,6 @@ def self_test() -> int:
     ok += 1
     print(f"expat JUnit contract: {ok} checks passed")
     return 0
-
-
-def _fixture_text(name: str, text: str) -> Path:
-    """A throwaway report file for the parse-level witnesses."""
-    path = Path(tempfile.mkdtemp(prefix="lccc-expat-junit-")) / name
-    path.write_text(text)
-    return path
 
 
 def main(argv: list[str] | None = None) -> int:

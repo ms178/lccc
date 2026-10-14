@@ -1,0 +1,1 @@
+{"base": "e047aa1eb2ae59b3943a64ab7ec5e5dddb89a3ff", "branch": "main", "exact_history": true, "head": "223c1cff03ad306a2935dedb1f572957914ce92c", "mode": "offline-reconstructed-base", "tree": "4d77bdee3cd5d7cad78fbdb7fae2ddf6e29d85d7", "upstream_fetch_error": null, "worktree_preserved": false}

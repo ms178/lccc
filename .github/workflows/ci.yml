@@ -173,6 +173,9 @@ jobs:
       - name: IV-widen exposed-latch trajectory gates
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_ivwiden_exposed_latch.sh
 
+      - name: zlib-ng complete Huffman table (late constant GEP)
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_zlib_maketrees.sh
+
       - name: Scalar lane types, stack boundaries and opt-in homes
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_fp_extract_homes.sh
 

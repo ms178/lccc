@@ -187,13 +187,14 @@ Evidence: **R** reproduced here; **S** direct source fact, runtime consequence
 unproven; **H** hypothesis requiring an experiment.
 
 **Final base:** `1e83776f41529e2d754380d1d934ff901e25a097`. A14-05 is now
-closed upstream; A14-01 is partially repaired. The queue contains **34 entries,
-33 still open** (including the residual A14-01). Original evidence is retained
+closed upstream; A14-01 is partially repaired. A14-29 and A14-30 were closed
+in the follow-up based on `e047aa1` (see their entries). The queue contains
+**34 entries, 31 still open** (including residual A14-01). Original evidence is retained
 with its original base rather than misrepresented as a final-main execution.
 
-**Implementation order:** A14-30 (real-workload miscompile), A14-17/19/14/15/13
+**Remaining implementation order:** A14-17/19/14/15/13
 (linker/ISA/encoding/type correctness), A14-20 (profile integrity), then
-A14-01/02/03/29 (evidence), before profitability work A14-24/25. Do not let a
+A14-01/02/03 (evidence), before profitability work A14-24/25. Do not let a
 green fast-CI stamp override the known failures in this queue. Locations refer to baseline
 `3b66cd1`; use function names if lines move. Do not close an item merely by
 removing its TODO/comment. Session scope and limitations:
@@ -649,7 +650,15 @@ from evidence; move closed narrative to the journal without deleting provenance.
 H with a concrete experiment; each CLOSED claim points to a passing current gate;
 no duplicate RA/IV/PGO tasks with contradictory status.
 
-### A14-29 · P1 · R — Expat's JUnit validator rejects CTest's successful status=run
+### A14-29 · CLOSED 2026-10-14B — Expat JUnit execution/outcome validation
+
+**Resolution:** execution marker `run` is distinct from outcome; every outcome
+attribute/child is checked, contradictions and unknowns fail closed, and suite
+counters must agree with the cases. 44 self-tests and the retained failing XML
+pass. The full Expat runner now completes: 4,932 checks in each arm plus all
+8 canonical/rejection XML cases. See
+[follow-up](engineering/FOLLOWUP-2026-10-14B-maketrees-junit.md) and its evidence.
+Original diagnosis and acceptance contract follow for provenance.
 
 **Where:** `tests/workloads/expat-2.8.5/junit_check.py::_ATTR_STATUS/_status_of`.
 **Reproducer:** the full pinned Expat runner built both arms and each CTest
@@ -667,7 +676,17 @@ passed+result=failed, missing/duplicate cases and unknown statuses; full runner
 reaches its XML workload comparison and writes a complete summary. Do not map
 all unrecognized values to pass just to make the environment green.
 
-### A14-30 · P0 · R — zlib-ng maketrees is miscompiled at -O2/-O3 (highest-impact new finding)
+### A14-30 · CLOSED 2026-10-14B — zlib-ng maketrees late constant-GEP miscompile
+
+**Resolution:** the defect was in backend dispatch, not an IV-widen theorem.
+MachInst read an unmaterialized constant-offset pointer before the dominating
+GEP's block had been emitted; its guard covered only indexed GEPs. Extend the
+function-wide map guard to constant offsets, retaining all IR optimizations.
+Full zlib-ng: 69/69 CTests and four round trips. New mutation-verified default CI
+gate checks the complete table at six optimization levels and three controls;
+two unit tests and a 348-case unchanged benchmark-assembly census pass. See
+[follow-up](engineering/FOLLOWUP-2026-10-14B-maketrees-junit.md).
+Original diagnosis and acceptance contract follow for provenance.
 
 **Where to start:** `passes/iv_widen.rs::{try_widen_loop,analyze_iv,apply_widen}`
 and its interaction with `passes/licm.rs` / `passes/gvn.rs`; precise faulty
