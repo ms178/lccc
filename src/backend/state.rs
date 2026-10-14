@@ -644,10 +644,10 @@ pub struct CodegenState {
     /// Label emitted immediately after the current block, if any. Used to
     /// elide unconditional jumps on the hot fall-through path.
     pub next_block_label: Option<BlockId>,
-    /// The block being emitted has an observable address (`&&label`, a
-    /// static initializer, or an asm-goto target). Fall-through elision of
-    /// an empty body's branch would make that address equal the next label.
-    pub preserve_label_identity: bool,
+    /// Output offset immediately after the current observable block's label.
+    /// `None` means its address is not observed. Owned by the shared block
+    /// driver; reset between functions, never inferred from assembly labels.
+    observable_block_start: Option<usize>,
 }
 
 impl CodegenState {
@@ -790,7 +790,7 @@ impl CodegenState {
             fp_const_pool: FxHashMap::default(),
             vec_const_pool: FxHashMap::default(),
             next_block_label: None,
-            preserve_label_identity: false,
+            observable_block_start: None,
         }
     }
 
@@ -798,42 +798,25 @@ impl CodegenState {
         self.out.next_label_id()
     }
 
-    /// True when eliding a branch to the physically next block would make
-    /// this block's observable address equal that next label. Directives
-    /// and debug locations do not occupy an address; an instruction does.
-    ///
-    /// Text heuristic: scans the buffer backwards from the current emission
-    /// point, skipping empty lines, comments, `.cfi_*`, `.loc ` (with space
-    /// or tab to exclude `.local`), and `.file`. Any other directive that
-    /// *can* emit bytes (`.p2align`, `.align`, `.balign`, `.space`) is
-    /// treated as address-occupying (fail-closed). A label line (`X:` with
-    /// no space) means the observable label sits directly above the next
-    /// one and elision would alias them.
+    /// Start the address-identity region AFTER emitting this block's label.
+    /// The shared driver owns this boundary; individual instruction emitters do
+    /// not maintain a parallel counter that can drift from the actual output.
+    pub fn begin_block_address_identity(&mut self, observable: bool) {
+        self.observable_block_start = observable.then_some(self.out.buf.len());
+    }
+
+    /// A fallthrough fold needs positive evidence of bytes in THIS block, not
+    /// a guess about the last label in the module. Padding may emit zero bytes;
+    /// unknown directives, inline assembly and a rewound buffer fail closed.
+    /// The common, non-address-taken case is O(1) and examines no assembly.
     pub fn fallthrough_would_alias_observable_label(&self) -> bool {
-        if !self.preserve_label_identity {
+        let Some(start) = self.observable_block_start else {
             return false;
-        }
-        for line in self.out.buf.lines().rev() {
-            let t = line.trim();
-            if t.is_empty()
-                || t.starts_with('#')
-                || t.starts_with(".cfi_")
-                || t.starts_with(".file")
-                || (t.starts_with(".loc") && t.as_bytes().get(4).is_some_and(|&b| b == b' ' || b == b'\t'))
-            {
-                continue;
-            }
-            // Directives that can emit bytes are address-occupying.
-            if t.starts_with(".p2align")
-                || t.starts_with(".align")
-                || t.starts_with(".balign")
-                || t.starts_with(".space")
-            {
-                return false;
-            }
-            return t.ends_with(':') && !t.contains(' ');
-        }
-        false
+        };
+        self.out
+            .buf
+            .get(start..)
+            .is_none_or(|body| !crate::backend::label_identity::has_separating_instruction(body))
     }
 
     /// Mark that a `.section` directive for a NON-TEXT section has just been
@@ -1066,7 +1049,7 @@ impl CodegenState {
         self.dirty_upper_ymm = false;
         self.uses_sret = false;
         self.next_block_label = None;
-        self.preserve_label_identity = false;
+        self.observable_block_start = None;
         // GEP-fold bookkeeping is function-local too: `folded_gep_values`
         // holds the value IDs of skipped address producers, and value IDs
         // restart at 0 in every function.  Without this clear, IDs leaked
@@ -1846,5 +1829,41 @@ mod switch_bounds_state_tests {
         state.reset_for_function();
         assert!(state.switch_bounds_enabled);
         assert!(state.switch_unsigned_bounds.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod block_address_identity_tests {
+    use super::CodegenState;
+
+    #[test]
+    fn proof_is_scoped_to_the_current_block_and_reset_per_function() {
+        let mut state = CodegenState::new();
+        state.emit("nop"); // Must not count towards the new block.
+        state.emit(".Lobservable: # comment");
+        state.begin_block_address_identity(true);
+        assert!(state.fallthrough_would_alias_observable_label());
+        state.emit(".p2align 4");
+        state.emit(".space 0");
+        assert!(state.fallthrough_would_alias_observable_label());
+        state.emit("nop");
+        assert!(!state.fallthrough_would_alias_observable_label());
+        state.emit(".Lnext:");
+        state.begin_block_address_identity(true);
+        assert!(state.fallthrough_would_alias_observable_label());
+        state.begin_block_address_identity(false);
+        assert!(!state.fallthrough_would_alias_observable_label());
+        state.begin_block_address_identity(true);
+        state.reset_for_function();
+        assert!(!state.fallthrough_would_alias_observable_label());
+    }
+
+    #[test]
+    fn output_rewind_fails_closed() {
+        let mut state = CodegenState::new();
+        state.emit(".Lobservable:");
+        state.begin_block_address_identity(true);
+        state.out.buf.clear();
+        assert!(state.fallthrough_would_alias_observable_label());
     }
 }
