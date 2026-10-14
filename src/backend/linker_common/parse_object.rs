@@ -9,8 +9,8 @@ use super::filemap::FileBacking;
 use super::secdata::SectionData;
 use super::types::{Elf64Object, Elf64Rela, Elf64Section, Elf64Symbol};
 use crate::backend::elf::{
-    ELF_MAGIC, ELFCLASS64, ELFDATA2LSB, ET_REL, SHT_NOBITS, SHT_RELA, SHT_SYMTAB, read_cstr,
-    read_cstr_ref, read_i64, read_u16, read_u32, read_u64, slice_at, table_entry,
+    ELF_MAGIC, ELFCLASS64, ELFDATA2LSB, EM_RISCV, ET_REL, SHT_NOBITS, SHT_RELA, SHT_SYMTAB,
+    read_cstr, read_cstr_ref, read_i64, read_u16, read_u32, read_u64, slice_at, table_entry,
 };
 
 /// Parse an ELF64 relocatable object file (.o).
@@ -345,7 +345,10 @@ fn parse_elf64_object_inner(
                 // needs the field width, which is architecture-specific, so that
                 // half lives in reloc_field::offset_in_section and is applied
                 // where the relocations are used.
-                if r_offset >= target_size {
+                // R_RISCV_NONE has no storage operation. Its offset is not a
+                // write index; keep the strict rule for all actual fields.
+                let riscv_none = read_u16(data, 18) == EM_RISCV && r_info as u32 == 0;
+                if !riscv_none && r_offset >= target_size {
                     return Err(format!(
                         "{source_name}: relocation {j} in {} has offset 0x{r_offset:x}, \
                          outside the section it patches (size 0x{target_size:x})",

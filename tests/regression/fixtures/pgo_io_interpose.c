@@ -47,6 +47,12 @@ FILE *fopen(const char *path, const char *mode) {
         int (*fd_of)(FILE *) = dlsym(RTLD_NEXT, "fileno");
         profile = f;
         profile_fd = fd_of(f);
+#ifndef PGO_IO_DIAGNOSTIC_ONLY
+        /* Comparative errno probes may isolate diagnostics with a separately
+           compiled oracle. The production gate NEVER defines this macro. */
+        int flags = fcntl(profile_fd, F_GETFD);
+        if (flags < 0 || !(flags & FD_CLOEXEC)) _exit(99);
+#endif
     }
     return f;
 }
@@ -58,6 +64,18 @@ int fileno(FILE *f) {
 int flock(int fd, int op) {
     int (*real)(int, int) = dlsym(RTLD_NEXT, "flock");
     if (fd == profile_fd && op == LOCK_EX) {
+        if (role("B")) {
+            marker("B-attempting", 0);
+            /* A waits for a KERNEL-observed refusal, not merely a marker
+               before this call (which leaves a scheduling window). */
+            int probe = real(fd, LOCK_EX | LOCK_NB);
+            if (!probe) {
+                real(fd, LOCK_UN);
+                _exit(95);
+            }
+            if (errno != EWOULDBLOCK && errno != EAGAIN) _exit(94);
+            marker("B-blocked", 0);
+        }
         if (fault("flock")) { errno = ENOLCK; return -1; }
         if (fault("eintr")) { errno = EINTR; return -1; }
     }
@@ -65,7 +83,10 @@ int flock(int fd, int op) {
     if (!rc && fd == profile_fd) {
         if (op == LOCK_EX) {
             locked = 1;
-            if (role("A")) marker("A-held", 0);
+            if (role("A")) {
+                marker("A-held", 0);
+                marker("B-blocked", 1);
+            }
         }
         if (op == LOCK_UN) {
             locked = 0;
@@ -78,7 +99,10 @@ int flock(int fd, int op) {
 }
 int ferror(FILE *f) {
     int (*real)(FILE *) = dlsym(RTLD_NEXT, "ferror");
-    if (f == profile && fault("ferror")) { errno = EIO; return 1; }
+    if (f == profile && (fault("ferror") || fault("ferror-zero") || fault("ferror-stale"))) {
+        errno = fault("ferror-zero") ? 0 : fault("ferror-stale") ? ENOENT : EIO;
+        return 1;
+    }
     return real(f);
 }
 int fclose(FILE *f) {

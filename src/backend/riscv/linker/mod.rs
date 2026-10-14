@@ -23,6 +23,7 @@
 //! - `emit_exec`: Executable emission (static and dynamic)
 //! - `emit_shared`: Shared library (.so) emission
 
+mod displacement;
 mod elf_read;
 mod emit_exec;
 mod emit_shared;
@@ -32,6 +33,7 @@ mod reloc;
 mod relocations;
 mod sections;
 mod symbols;
+mod uleb128;
 
 pub use link::link_builtin;
 pub use link::link_shared;

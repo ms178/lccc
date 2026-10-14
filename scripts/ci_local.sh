@@ -342,6 +342,9 @@ gate "pgo-io-contract" fast \
 gate "riscv-relocation-contract" fast \
     python3 tests/linker/check_riscv_relocation_contract.py --lccc target/fastbuild/lccc-riscv
 
+gate "pr826-harness-redteam" fast \
+    python3 tests/linker/test_pr826_redteam.py
+
 # AUD-CPU-3: an intrinsic whose instruction-set extension the invocation does
 # not permit must be diagnosed (GCC/Clang reject it too), and the invocation
 # that does permit it must still emit the instruction.  Oracle-checked against

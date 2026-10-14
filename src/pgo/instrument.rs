@@ -884,7 +884,9 @@ fn dump_helper(
     let vp_fmt = format!("__lccc_pgo_vp_fmt_{}", m.functions.len());
     m.string_literals
         .push((tag.clone(), path.display().to_string()));
-    m.string_literals.push((mode.clone(), "a".into()));
+    // Linux libc's 'e' requests atomic close-on-exec at open time. A
+    // concurrent exec must not inherit the descriptor and prolong its flock.
+    m.string_literals.push((mode.clone(), "ae".into()));
     // Header is written as ONE line by two <=2-vararg calls (the backend's
     // variadic codegen drops register args 3+ — observed: 4-vararg fprintf
     // wrote uid=0). fmt1 ends with a space so fmt2 continues the line.
@@ -1108,7 +1110,14 @@ fn dump_helper(
         ),
     ] {
         let text = format!("__lccc_pgo_io_error_{}_{}", m.functions.len(), label.0);
-        m.string_literals.push((text.clone(), message.into()));
+        let stream_error = label == write_error_l;
+        let message = if stream_error {
+            format!("{}\n", message)
+        } else {
+            message.into()
+        };
+        let message_len = message.len() as i64;
+        m.string_literals.push((text.clone(), message));
         let ptr = Value(next);
         next += 1;
         io_blocks.push(mk(
@@ -1119,14 +1128,30 @@ fn dump_helper(
                     name: text,
                 },
                 Instruction::Call {
-                    func: "perror".into(),
-                    info: ci(
-                        None,
-                        vec![Operand::Value(ptr)],
-                        vec![IrType::Ptr],
-                        IrType::Void,
-                        false,
-                    ),
+                    func: if stream_error { "write" } else { "perror" }.into(),
+                    info: if stream_error {
+                        // ferror is sticky and does not identify the original
+                        // errno. Emit a stable diagnostic without inventing it.
+                        ci(
+                            None,
+                            vec![
+                                Operand::Const(IrConst::I32(2)),
+                                Operand::Value(ptr),
+                                Operand::Const(IrConst::I64(message_len)),
+                            ],
+                            vec![IrType::I32, IrType::Ptr, IrType::I64],
+                            IrType::I64,
+                            false,
+                        )
+                    } else {
+                        ci(
+                            None,
+                            vec![Operand::Value(ptr)],
+                            vec![IrType::Ptr],
+                            IrType::Void,
+                            false,
+                        )
+                    },
                 },
             ],
             Terminator::Branch(successor),
@@ -1607,6 +1632,7 @@ fn dump_helper(
         ("fclose", IrType::I32, false),
         ("ferror", IrType::I32, false),
         ("perror", IrType::Void, false),
+        ("write", IrType::I64, false),
     ] {
         if !m.functions.iter().any(|f| f.name == n) {
             m.functions.push(IrFunction {

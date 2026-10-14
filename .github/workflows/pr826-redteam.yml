@@ -1,0 +1,176 @@
+name: Relocation and PGO red-team contracts
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: redteam-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bounded-uleb:
+    name: Rust 1.99 relocation value contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+          components: rustfmt, clippy
+      - name: Ubuntu reference harness (different libc/compiler environment)
+        run: python3 tests/linker/test_pr826_redteam.py
+      - name: Test the production module independently
+        run: |
+          set -euo pipefail
+          rustc +1.99.0 --version
+          cargo +1.99.0 --version
+          rustfmt +1.99.0 --version
+          rustup run 1.99.0 clippy-driver --version
+          mkdir -p target/redteam
+          rustc +1.99.0 --edition=2024 --test tests/linker/riscv_uleb128_unit.rs -D warnings -C opt-level=1 -C debug-assertions=true -o target/redteam/uleb-tests
+          target/redteam/uleb-tests
+      - name: Check formatting with API-visible failure detail
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          import sys
+          result = subprocess.run(["cargo", "+1.99.0", "fmt", "--all", "--", "--check"], capture_output=True, text=True)
+          output = result.stdout + result.stderr
+          print(output)
+          if result.returncode:
+              for offset in range(0, len(output), 3000):
+                  chunk = output[offset:offset + 3000]
+                  escaped = chunk.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+                  print(f"::error title=rustfmt chunk {offset}::" + escaped)
+          sys.exit(result.returncode)
+          PY
+
+  debian-exact:
+    name: Debian GCC 16.2 and Rust 1.99 contracts
+    runs-on: ubuntu-24.04
+    container: debian:unstable-slim
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: gcc-16
+    steps:
+      - name: Provision Debian tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git python3 gcc-16 libc6-dev clang lld
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+          components: rustfmt, clippy
+      - name: Require exact versions, never silently substitute
+        run: |
+          set -eu
+          test "$(gcc-16 -dumpfullversion)" = 16.2.0
+          rustc +1.99.0 --version | grep '^rustc 1\.99\.0 '
+          gcc-16 --version
+          clang --version
+          ld.lld --version
+          dpkg-query -W gcc-16 libc6-dev
+      - name: Oracle and preload harness checks
+        run: |
+          python3 tests/linker/test_pr826_redteam.py --cc gcc-16 --json target/redteam/harness.json
+          python3 tests/linker/check_riscv_relocation_contract.py --oracle-only --oracle ld.lld --only valid- --json target/redteam/valid-oracle.json
+      - name: Build the changed compiler and run Rust contract tests
+        run: |
+          cargo +1.99.0 build --profile fastbuild --locked -j 2 --bin lccc --bin lccc-riscv
+          cargo +1.99.0 test --profile fastbuild --locked -j 2 backend::riscv::linker
+      - name: Execute changed runtime and relocation contracts
+        run: |
+          python3 tests/regression/check_pgo_io.py --lccc target/fastbuild/lccc --cc gcc-16 --json target/redteam/pgo.json
+          python3 tests/linker/check_riscv_relocation_contract.py --lccc target/fastbuild/lccc-riscv --json target/redteam/relocations.json
+      - name: Screen every registered workload at O2 and O3
+        run: |
+          python3 tests/benchmark/run_benchmarks.py --compilers lccc,gcc,clang --gcc gcc-16 --opt=-O2 --skip-perf --strict --json target/redteam/corpus-o2.json
+          python3 tests/benchmark/run_benchmarks.py --compilers lccc,gcc,clang --gcc gcc-16 --opt=-O3 --skip-perf --strict --json target/redteam/corpus-o3.json
+      - name: Publish compact API-readable result provenance
+        if: always()
+        run: |
+          python3 - <<'PYCODE'
+          import hashlib
+          import json
+          from pathlib import Path
+          summary = {}
+          for name in ("harness", "valid-oracle", "pgo", "relocations", "corpus-o2", "corpus-o3"):
+              path = Path("target/redteam") / (name + ".json")
+              if not path.exists():
+                  summary[name] = {"status": "missing"}
+                  continue
+              data = json.loads(path.read_text())
+              if "benchmarks" in data:
+                  rows = data["benchmarks"]
+                  result = {"workloads": len(rows), "correct": sum(bool(row["correctness"]) and all(value["matches_baseline"] and value["stable_within_compiler"] for value in row["correctness"].values()) for row in rows), "timing_claim": False}
+              else:
+                  result = {key: data[key] for key in ("passed", "failed", "tests", "failures", "errors", "skipped", "compiler", "oracle_version") if key in data}
+              result["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+              summary[name] = result
+          text = json.dumps(summary, sort_keys=True)
+          print("::notice title=redteam result::" + text.replace("%", "%25"))
+          PYCODE
+      - name: Retain raw contract evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr826-redteam-contracts
+          path: target/redteam/
+          if-no-files-found: warn
+
+  causal-comparison:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.number == 826
+    name: Compiled PR827 vs prior PR826 vs candidate
+    runs-on: ubuntu-24.04
+    container: debian:unstable-slim
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: gcc-16
+    steps:
+      - name: Provision causal comparison tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git python3 gcc-16 libc6-dev strace valgrind
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+          components: rustfmt, clippy
+      - name: Build immutable baselines and execute causal comparison
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          import sys
+          result = subprocess.run(["bash", "-x", "tests/linker/check_pr827_comparison.sh"], capture_output=True, text=True)
+          print(result.stdout)
+          print(result.stderr, file=sys.stderr)
+          if result.returncode:
+              detail = result.stderr[-15000:]
+              for offset in range(0, len(detail), 3000):
+                  escaped = detail[offset:offset + 3000].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+                  print(f"::error title=comparison bootstrap chunk {offset}::" + escaped)
+          sys.exit(result.returncode)
+          PY
+      - name: Retain causal comparison evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr827-causal-comparison
+          path: |
+            target/contrast/sources.txt
+            target/contrast/results/
+          if-no-files-found: warn

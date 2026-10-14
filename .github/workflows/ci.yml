@@ -252,6 +252,9 @@ jobs:
       - name: RISC-V relocation rejection and positive controls
         run: python3 tests/linker/check_riscv_relocation_contract.py --lccc target/fastbuild/lccc-riscv
 
+      - name: Relocation and PGO harness red-team tests
+        run: python3 tests/linker/test_pr826_redteam.py
+
       - name: ISA-sensitive intrinsic feature gate
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_intrinsic_feature_gate.sh
 
