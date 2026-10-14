@@ -1,0 +1,65 @@
+[
+  {
+    "source": "engineering/evidence/pr824-final-audit/callgrind/compiler-cost-S28-raw.tar.gz",
+    "target": "engineering/evidence/pr824-final-audit/callgrind/compiler-cost-S28-raw.tar.xz",
+    "gzip_sha256": "d4ec710d537f16ffab9032f7ad64026fd1b580d01cad530fe5637375b166615f",
+    "tar_sha256": "8eb066967f2b7ef24af87cf063223dcadb661f84ee7436a99fb41f51032590f3",
+    "xz_sha256": "0ae2ab08092db8abfa77120edd494157b13538c9c12edde99ece7b5fdba53cd1",
+    "before_bytes": 3643182,
+    "after_bytes": 2366828
+  },
+  {
+    "source": "engineering/evidence/pr824-final-audit/callgrind/early-byte-raw.tar.gz",
+    "target": "engineering/evidence/pr824-final-audit/callgrind/early-byte-raw.tar.xz",
+    "gzip_sha256": "b4d64b58ea9f5ac6026ddaab3304365eab820ac49d2e23212b9c6b6edecf4e35",
+    "tar_sha256": "e88f72be80ec1ff68324afdf199af51a910fb681ebd2c67cf35e3ad0579a1a88",
+    "xz_sha256": "efa53a197beeae67a4d5e189938ccbe989a5b391bfd8772675865137ed4f786d",
+    "before_bytes": 1073550,
+    "after_bytes": 111192
+  },
+  {
+    "source": "engineering/evidence/pr824-final-audit/callgrind/loop-bound-raw.tar.gz",
+    "target": "engineering/evidence/pr824-final-audit/callgrind/loop-bound-raw.tar.xz",
+    "gzip_sha256": "4433d7179ecdbe45a2b95b1f5882e315aca0f5c09260fbae3c6439cc7678bad2",
+    "tar_sha256": "051a9e7c1466ac5d1624d356186fff1e2fbbc908fe668c61f1d28d6085610bf1",
+    "xz_sha256": "a6b359231d97f8a1cd641cf9a15cc01d38d2a4802cfd8d5ce043351336a62ffd",
+    "before_bytes": 1074302,
+    "after_bytes": 111972
+  },
+  {
+    "source": "engineering/evidence/pr824-final-audit/callgrind/main-gcc16-raw.tar.gz",
+    "target": "engineering/evidence/pr824-final-audit/callgrind/main-gcc16-raw.tar.xz",
+    "gzip_sha256": "f47acd87c81fb5648155c09ab32471f1bf24f1216c0e2b09957654939da118cb",
+    "tar_sha256": "bcc70db6377579a269394200b9c007f0ae611a10b629402282ae33a05ff3c57f",
+    "xz_sha256": "6fe844371f68f52caaecc968d9931d7935e5c39d0789b21ad972146efd5a4688",
+    "before_bytes": 1062979,
+    "after_bytes": 172796
+  },
+  {
+    "source": "engineering/evidence/pr824-final-audit/callgrind/pr-main-raw.tar.gz",
+    "target": "engineering/evidence/pr824-final-audit/callgrind/pr-main-raw.tar.xz",
+    "gzip_sha256": "06984f6b09182937e559ddfd8d7e6cbd1f43e9283e6944fd93ed0289b45835bb",
+    "tar_sha256": "00c687fededeef14abb5c4ba23041a82c482e88f3b204eb5de2a78d93bcf6183",
+    "xz_sha256": "a38ccdac579702624e3e9d960b04be605821526ab6305b4963cbc71e13f83104",
+    "before_bytes": 1078809,
+    "after_bytes": 124156
+  },
+  {
+    "source": "engineering/evidence/pr824-final-audit/callgrind/wrap-range-raw.tar.gz",
+    "target": "engineering/evidence/pr824-final-audit/callgrind/wrap-range-raw.tar.xz",
+    "gzip_sha256": "9a98cbac1fc4996fdcd978a08af2fec1a96941d59be34d216d133c07b0f52bf3",
+    "tar_sha256": "2b70a6719adc3fb7fbc924604e96d1c880bbac09e9fa4cf63b427e90631f74e4",
+    "xz_sha256": "04df02fcc1d16d4678098746c3a54f68e10b6db7dd9f41f5094b472af94904b8",
+    "before_bytes": 1074380,
+    "after_bytes": 122600
+  },
+  {
+    "source": "engineering/evidence/pr824-final-audit/packed-callgrind-raw.tar.gz",
+    "target": "engineering/evidence/pr824-final-audit/packed-callgrind-raw.tar.xz",
+    "gzip_sha256": "b3d8cd0c6ed5d7f443018474139559a42c844b52a9275fd24c462d4841ca9989",
+    "tar_sha256": "19008ed074d527bb21d040bfbfe3c823a382cbf9a1d1f517c01c5c0220a246ab",
+    "xz_sha256": "2769042348b36e0f6ab6a53ddd7fa9e4985c04241dda6b0dc43ecaf6896d36a5",
+    "before_bytes": 214708,
+    "after_bytes": 48012
+  }
+]

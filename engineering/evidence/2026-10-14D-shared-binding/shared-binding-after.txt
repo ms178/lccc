@@ -1,0 +1,1 @@
+RISC-V shared binding: 432 PASS / 0 FAIL / 0 SKIP

@@ -1,0 +1,33 @@
+[
+  [
+    "-O0",
+    {},
+    0
+  ],
+  [
+    "-O1",
+    {},
+    0
+  ],
+  [
+    "-O2",
+    {
+      "CCC_DISABLE_PASSES": "vectorize"
+    },
+    0
+  ],
+  [
+    "-O2",
+    {
+      "CCC_DISABLE_PASSES": "strict_recip_pack"
+    },
+    43
+  ],
+  [
+    "-O2",
+    {
+      "CCC_NO_XMM_REGALLOC": "1"
+    },
+    43
+  ]
+]

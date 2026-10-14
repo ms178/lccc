@@ -2004,7 +2004,12 @@ impl Driver {
                 // of these flags permits it. Keep a deliberately narrow bit
                 // rather than pretending that every GCC fast-math sub-option is
                 // implemented.
+                "-ftrapping-math" => self.fp_trapping_math = true,
+                "-fno-trapping-math" => self.fp_trapping_math = false,
+                "-fwrapv" => self.wrap_signed_overflow = true,
+                "-fno-wrapv" => self.wrap_signed_overflow = false,
                 "-ffast-math" => {
+                    self.fp_trapping_math = false;
                     self.fast_math = true;
                     self.fp_reassoc = true;
                     // GCC: fast-math implies contract=fast only when no
@@ -2628,6 +2633,48 @@ mod cli_tests {
         assert!(d.parse_cli_args(&args).is_ok());
         let isa = d.x86_isa();
         assert!(!isa.fma && !isa.avx && !isa.ymm);
+    }
+
+    #[test]
+    fn fp_trapping_option_has_explicit_last_option_precedence() {
+        for (flags, expected) in [
+            (vec!["-O3"], false),
+            (vec!["-ftrapping-math"], true),
+            (vec!["-ftrapping-math", "-fno-trapping-math"], false),
+            (vec!["-fno-trapping-math", "-ftrapping-math"], true),
+            (vec!["-ffast-math", "-ftrapping-math"], true),
+            (vec!["-ftrapping-math", "-ffast-math"], false),
+            (vec!["-ffast-math", "-fno-fast-math"], false),
+        ] {
+            let mut driver = Driver::new();
+            let args = std::iter::once("lccc")
+                .chain(flags)
+                .chain(["x.c"])
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            driver.parse_cli_args(&args).unwrap();
+            assert_eq!(driver.fp_trapping_math, expected, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn signed_wrap_option_is_explicit_and_last_wins() {
+        for (flags, expected) in [
+            (vec!["-O3"], false),
+            (vec!["-fwrapv"], true),
+            (vec!["-fwrapv", "-fno-wrapv"], false),
+            (vec!["-fno-wrapv", "-fwrapv"], true),
+            (vec!["-fwrapv", "-ffast-math"], true),
+        ] {
+            let mut driver = Driver::new();
+            let args = std::iter::once("lccc")
+                .chain(flags)
+                .chain(["x.c"])
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            driver.parse_cli_args(&args).unwrap();
+            assert_eq!(driver.wrap_signed_overflow, expected, "{args:?}");
+        }
     }
 
     #[test]

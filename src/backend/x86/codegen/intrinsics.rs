@@ -6557,8 +6557,17 @@ impl X86Codegen {
                     self.flush_pending_vec_store_impl();
                     self.state.invalidate_vec_peephole();
                     self.operand_to_reg(&args[0], "rax");
-                    self.state.emit("    movd %eax, %xmm0");
-                    self.state.emit("    pshufd $0x00, %xmm0, %xmm0");
+                    if self.avx2_enabled {
+                        // This intrinsic owns scratch xmm0. Its upper half
+                        // is dead after the pending-store flush: emit VEX at
+                        // source instead of hoping a later text pass can
+                        // prove the kill across a packed conversion/backedge.
+                        self.state.emit("    vmovd %eax, %xmm0");
+                        self.state.emit("    vpshufd $0x00, %xmm0, %xmm0");
+                    } else {
+                        self.state.emit("    movd %eax, %xmm0");
+                        self.state.emit("    pshufd $0x00, %xmm0, %xmm0");
+                    }
                     if let Some(d) = dest {
                         self.state.vector_values.insert(d.0);
                         self.sse_store_dest(d, "xmm0");
@@ -6970,7 +6979,7 @@ impl X86Codegen {
                 self.state.invalidate_vec_peephole();
                 self.emit_vec_store_addr(args, dest_ptr, "movupd", "xmm0");
             }
-            IntrinsicOp::StrictRecipMulAddF64x4 => {
+            IntrinsicOp::StrictRecipMulAddF64x4 | IntrinsicOp::StrictPackedRecipMulAddF64x4 => {
                 // Strict computed-expression reduction, four elements at a
                 // time.  This is intentionally NOT a horizontal reduction:
                 // binary64 addition is observable under ordinary (non-fast)
@@ -6981,9 +6990,13 @@ impl X86Codegen {
                 // scratch].  The scalar denominator DAG is cloned by the pass
                 // for each lane; packing only its already-computed I32 leaves
                 // C's signed-div/mod semantics to the ordinary scalar IR.
-                if args.len() != 8 {
-                    panic!("StrictRecipMulAddF64x4 expects 8 args, got {}", args.len());
-                }
+                let packed = matches!(op, IntrinsicOp::StrictPackedRecipMulAddF64x4);
+                assert_eq!(
+                    args.len(),
+                    if packed { 5 } else { 8 },
+                    "strict reciprocal argument contract"
+                );
+                let base_index = if packed { 2 } else { 5 };
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
 
@@ -6995,17 +7008,40 @@ impl X86Codegen {
                 // an AVX/SSE transition on every iteration. The VEX.128
                 // upper-zero rule is safe here: only the low 128 bits feed
                 // vcvtdq2pd, which fully overwrites ymm0 before its next read.
-                self.operand_to_eax(&args[1]);
-                self.state.emit("    vmovd %eax, %xmm0");
-                for (lane, denom) in args[2..5].iter().enumerate() {
-                    self.operand_to_eax(denom);
-                    self.state.emit_fmt(format_args!(
-                        "    vpinsrd ${}, %eax, %xmm0, %xmm0",
-                        lane + 1
-                    ));
+                if packed {
+                    // Consume exactly XMM/m128. Do not use avx_load_arg
+                    // (it would overread) or a legacy scratch move inside the
+                    // AVX loop. Deferred stores were flushed above.
+                    let source = if let Operand::Value(v) = args[1] {
+                        if let Some(name) = self
+                            .vec_operand_reg(&v)
+                            .filter(|name| name.starts_with("xmm"))
+                        {
+                            format!("%{}", name)
+                        } else if let Some(mem) = self.value_ptr_mem_operand(v.0) {
+                            mem
+                        } else {
+                            self.operand_to_reg(&args[1], "rax");
+                            "(%rax)".to_string()
+                        }
+                    } else {
+                        unreachable!("packed denominator must be a vector SSA value");
+                    };
+                    self.state
+                        .emit_fmt(format_args!("    vcvtdq2pd {}, %ymm0", source));
+                } else {
+                    self.operand_to_eax(&args[1]);
+                    self.state.emit("    vmovd %eax, %xmm0");
+                    for (lane, denom) in args[2..5].iter().enumerate() {
+                        self.operand_to_eax(denom);
+                        self.state.emit_fmt(format_args!(
+                            "    vpinsrd ${}, %eax, %xmm0, %xmm0",
+                            lane + 1
+                        ));
+                    }
+                    self.state.emit("    vcvtdq2pd %xmm0, %ymm0");
                 }
                 self.state.dirty_upper_ymm = true;
-                self.state.emit("    vcvtdq2pd %xmm0, %ymm0");
                 let one = self.vec_const_rip_operand(1.0f64.to_bits(), 8);
                 self.state
                     .emit_fmt(format_args!("    vbroadcastsd {}, %ymm1", one));
@@ -7015,7 +7051,7 @@ impl X86Codegen {
                 // Form the contiguous source address before using rax for a
                 // fallback scratch pointer; vec_mem_operand may materialize
                 // non-register base/offset operands through rax/rcx.
-                let source = self.vec_mem_operand(&args[5], &args[6], 0);
+                let source = self.vec_mem_operand(&args[base_index], &args[base_index + 1], 0);
                 // Preserve the source expression's multiplication order:
                 // original scalar IR is reciprocal * load, hence src1=ymm0
                 // and src2=the memory operand in this AT&T VEX form.
@@ -7058,7 +7094,7 @@ impl X86Codegen {
                     // The transform supplies a private aligned alloca so the
                     // packed product can be spilled once and read lane-by-lane
                     // without clobbering an allocator-owned XMM register.
-                    self.operand_to_reg(&args[7], "rax");
+                    self.operand_to_reg(&args[base_index + 2], "rax");
                     self.state.emit("    vmovupd %ymm0, (%rax)");
                     self.state.reg_cache.invalidate_acc();
                     self.emit_fp_operand_to_xmm(&args[0], IrType::F64, "xmm0");

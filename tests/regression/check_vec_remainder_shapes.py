@@ -85,6 +85,10 @@ EXPECT_LOOPS: dict[str, int] = {
     "shape_u64_tail": 2,
     "shape_f32_tail": 2,
     "shape_u16_tail": 2,
+    # 16-bit elements spelled `i + i` (the SIB-preserved doubling of `i * 2`):
+    # the map matcher now recognizes the doubled-add offset form, so the
+    # 32-element exact shape packs into a single vector loop.
+    "shape_u16_exact": 1,
     # May-alias: the runtime dependence guard re-enters the mirror.
     "shape_alias_exact": 2,
 }
@@ -92,11 +96,6 @@ EXPECT_LOOPS: dict[str, int] = {
 # Shapes the map vectorizer does not handle (pre-existing, unrelated to this
 # transform).  They are asserted to stay scalar so that the table cannot rot.
 EXPECT_SCALAR = {
-    # 16-bit elements: the map analyzer declines the 32-element shape (it is
-    # left to the scalar unroller) while the 35-element one is vectorized with
-    # a live tail.  The asymmetry predates this transform and is pinned here so
-    # it cannot change unnoticed.
-    "shape_u16_exact",
     # `s[i + 1]` is not a unit-stride stream, so the map pattern never matches.
     "shape_alias_fwd",
 }

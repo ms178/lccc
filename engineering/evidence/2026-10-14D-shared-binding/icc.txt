@@ -1,0 +1,30 @@
+
+tests/benchmark/programs/gzip_crc32.c :: <all functions>
+compiler       insns  loads  stores   stack  branch   best-x  name
+--------------------------------------------------------------------------------------------
+icc               60      7       6       3       6    1.00x  x86-64 icc 2021.10.0
+
+tests/benchmark/programs/zlib_ng_adler32.c :: <all functions>
+compiler       insns  loads  stores   stack  branch   best-x  name
+--------------------------------------------------------------------------------------------
+icc              244     35      10      11      23    1.00x  x86-64 icc 2021.10.0
+
+tests/benchmark/programs/expat_xml_scan.c :: <all functions>
+compiler       insns  loads  stores   stack  branch   best-x  name
+--------------------------------------------------------------------------------------------
+icc              322     20       7       3      95    1.00x  x86-64 icc 2021.10.0
+
+tests/benchmark/programs/sqlite_varint.c :: <all functions>
+compiler       insns  loads  stores   stack  branch   best-x  name
+--------------------------------------------------------------------------------------------
+icc              461     32      52      27      63    1.00x  x86-64 icc 2021.10.0
+
+tests/benchmark/programs/linux_find_bit.c :: <all functions>
+compiler       insns  loads  stores   stack  branch   best-x  name
+--------------------------------------------------------------------------------------------
+icc              187     17      12      11      25    1.00x  x86-64 icc 2021.10.0
+
+tests/benchmark/programs/glibc_memcmp.c :: <all functions>
+compiler       insns  loads  stores   stack  branch   best-x  name
+--------------------------------------------------------------------------------------------
+icc              315     72      39      75      61    1.00x  x86-64 icc 2021.10.0

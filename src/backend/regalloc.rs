@@ -7240,6 +7240,7 @@ fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool) -> FxHashSet<u32> {
                             // AVX2 work internally; its ordered accumulator
                             // must use the normal XMM scalar allocation path.
                             | IntrinsicOp::StrictRecipMulAddF64x4
+                            | IntrinsicOp::StrictPackedRecipMulAddF64x4
                             | IntrinsicOp::VecHorizontalAddF32x8
                             | IntrinsicOp::VecHorizontalAddF32x4
                     ) || op.produces_vector_value()
@@ -7618,6 +7619,7 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 // poison an unrelated mature vector
                                 // accumulator web in the same function.
                                 | O::StrictRecipMulAddF64x4
+                                | O::StrictPackedRecipMulAddF64x4
                                 // v12 Fix C: broadcast/store intrinsics do
                                 // not themselves need an accumulator, but
                                 // they appear in the SAME function as
@@ -8660,6 +8662,7 @@ fn collect_f64_values(func: &IrFunction, fp_extract_homes: bool) -> FxHashSet<u3
                         | O::VecHorizontalAddF64x4
                         | O::VecHorizontalAddF64x2
                         | O::StrictRecipMulAddF64x4
+                                | O::StrictPackedRecipMulAddF64x4
                         | O::VecHorizontalAddF32x8
                         | O::VecHorizontalAddF32x4
                 ) || (fp_extract_homes

@@ -1200,8 +1200,11 @@ fn analyze_iv(
     let wide_ty = wide_ty_for(phi_ty);
     let step = plan_step_operand(func, phi_dest, latch_dest)?;
 
-    // Unsigned IVs need a provable counted-loop bound (theorems 5/5′).
-    let (seed_range, intercept): (Option<Range>, bool) = if ext == ExtKind::Ze {
+    // Wrapping signed IVs also need a real counted-range proof. The first
+    // supported subset has a nonnegative constant seed, positive constant
+    // stride and a nonnegative constant signed bound. No signed UB is used.
+    let signed_wrapping = ext == ExtKind::Se && super::signed_overflow_wraps();
+    let (seed_range, intercept): (Option<Range>, bool) = if ext == ExtKind::Ze || signed_wrapping {
         let proof = prove_counted_bound(
             func,
             lp,
@@ -1242,6 +1245,9 @@ fn analyze_iv(
         } else {
             true
         };
+        if signed_wrapping && !wrap_closed {
+            return None;
+        }
         (Some(proof.range), proof.latch_exposed && !wrap_closed)
     } else {
         (None, false)
@@ -1384,6 +1390,11 @@ fn analyze_iv(
                         continue;
                     }
 
+                    if super::signed_overflow_wraps() && ext_kind_for(*ty) != cur_ext {
+                        narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
+                        continue;
+                    }
+
                     // Narrow binop on a member: the closure. Membership is
                     // restricted to instructions *inside the loop body*: a
                     // post-loop op gains nothing from widening and would only
@@ -1399,7 +1410,7 @@ fn analyze_iv(
                                 // Signed members: UB theorem, no range needed.
                                 // Unsigned members: need the op provably
                                 // non-wrapping over the member's range.
-                                if cur_is_unsigned {
+                                if cur_is_unsigned || super::signed_overflow_wraps() {
                                     let Some(r) = member_range(&members, cur) else {
                                         narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
                                         continue;
@@ -1408,7 +1419,11 @@ fn analyze_iv(
                                         narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
                                         continue;
                                     };
-                                    let Some(nr) = binop_range(*op, r, cr) else {
+                                    let Some(nr) = (if cur_lhs {
+                                        binop_range(*op, r, cr)
+                                    } else {
+                                        binop_range(*op, cr, r)
+                                    }) else {
                                         narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
                                         continue;
                                     };
@@ -1439,7 +1454,13 @@ fn analyze_iv(
                                 // arithmetic op sound.
                                 let nr =
                                     match (member_range(&members, cur), const_as_range(*c, *ty)) {
-                                        (Some(r), Some(cr)) => binop_range(*op, r, cr),
+                                        (Some(r), Some(cr)) => {
+                                            if cur_lhs {
+                                                binop_range(*op, r, cr)
+                                            } else {
+                                                binop_range(*op, cr, r)
+                                            }
+                                        }
                                         _ => None,
                                     };
                                 members.push(Member::of(
@@ -1462,7 +1483,10 @@ fn analyze_iv(
                             // admitted member.
                             if let Operand::Value(ov) = other {
                                 let other_is_member = members.iter().any(|m| m.value.0 == ov.0);
-                                if !cur_is_unsigned && other_is_member {
+                                if !cur_is_unsigned
+                                    && !super::signed_overflow_wraps()
+                                    && other_is_member
+                                {
                                     members.push(Member::of(
                                         *dest,
                                         MemberKind::BinOpMember {
@@ -1584,7 +1608,7 @@ fn analyze_iv(
                             // Shl on an unsigned member needs a non-wrapping
                             // range proof over the member's proven range.
                             let nr = if *op == IrBinOp::Shl {
-                                if cur_is_unsigned {
+                                if cur_is_unsigned || super::signed_overflow_wraps() {
                                     let r = match member_range(&members, cur) {
                                         Some(r) => r,
                                         None => {
@@ -2302,8 +2326,11 @@ fn prove_counted_bound(
         return None;
     }
     let mag: i128 = delta.abs();
-    let w = narrow_bit_width(defining_type(func, phi_dest)?);
-    let max = (1i128 << w) - 1;
+    let signed = !is_unsigned_ty(phi_ty);
+    if signed && (delta <= 0 || resolve_init_const(func, init, phi_ty)? < 0) {
+        return None;
+    }
+    let max = type_max_i128(defining_type(func, phi_dest)?);
 
     // Theorem 5′ structural trajectory gates.
     if !body_entry_closed(lp, preds) {
@@ -2332,7 +2359,7 @@ fn prove_counted_bound(
             op,
             lhs,
             rhs,
-            ty: _,
+            ty: cmp_ty,
         } = &func.blocks[bi].instructions[ii]
         else {
             continue;
@@ -2370,19 +2397,41 @@ fn prove_counted_bound(
         if !operand_is_const_or_loop_invariant(other, lp, func, phi_dest) {
             continue;
         }
-        // A signed predicate over an unsigned phi confines it to no interval
-        // (0xFFFFFFFF <s 64 is true): decline the whole proof.
-        if matches!(
-            op,
-            IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge
-        ) {
-            return None;
-        }
-        // Normalise to the CONTINUE condition (an exit-on-true arm negates).
-        let cont_op = if exits_on_true {
-            negated_unsigned_pred(*op)?
+        // For the signed subset, the nonnegative seed/positive step and
+        // final signed-domain room proof make signed and unsigned order
+        // identical throughout the trajectory. Require the original signed
+        // typed comparison and a constant nonnegative threshold; never infer
+        // an unsigned range from an arbitrary signed predicate.
+        let bound_op = if signed {
+            if *cmp_ty != phi_ty {
+                return None;
+            }
+            let Operand::Const(c) = *other else {
+                return None;
+            };
+            if const_as_range(c, phi_ty)?.lo < 0 {
+                return None;
+            }
+            match op {
+                IrCmpOp::Slt => IrCmpOp::Ult,
+                IrCmpOp::Sle => IrCmpOp::Ule,
+                IrCmpOp::Sgt => IrCmpOp::Ugt,
+                IrCmpOp::Sge => IrCmpOp::Uge,
+                _ => return None,
+            }
         } else {
+            if matches!(
+                op,
+                IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge
+            ) {
+                return None;
+            }
             *op
+        };
+        let cont_op = if exits_on_true {
+            negated_unsigned_pred(bound_op)?
+        } else {
+            bound_op
         };
         let Some((is_upper, thr)) = normalise_bound_threshold(cont_op, lhs_is_phi, *other, phi_ty)
         else {
@@ -3647,6 +3696,106 @@ mod tests {
             base: Value(50),
             offset: Operand::Value(Value(offset)),
             ty,
+        }
+    }
+
+    struct WrappingGuard(bool);
+    impl WrappingGuard {
+        fn new() -> Self {
+            Self(crate::passes::SIGNED_OVERFLOW_WRAPS.with(|cell| cell.replace(true)))
+        }
+    }
+    impl Drop for WrappingGuard {
+        fn drop(&mut self) {
+            crate::passes::SIGNED_OVERFLOW_WRAPS.with(|cell| cell.set(self.0));
+        }
+    }
+
+    #[test]
+    fn wrapping_signed_widening_requires_a_range_for_the_whole_closure() {
+        let _guard = WrappingGuard::new();
+        for (init, bound, cmp_op, multiplier, expected) in [
+            (3, 64, IrCmpOp::Slt, 4, 1),
+            (1073741824, 1073741828, IrCmpOp::Slt, 4, 0),
+            (3, i32::MAX, IrCmpOp::Sle, 1, 0),
+            (-1, 64, IrCmpOp::Slt, 4, 0),
+            (3, 64, IrCmpOp::Ult, 4, 0),
+        ] {
+            let mut f = counting_loop(
+                "signed_wrap_range",
+                IrType::I32,
+                IrBinOp::Add,
+                vec![
+                    Instruction::BinOp {
+                        dest: Value(9),
+                        op: IrBinOp::Mul,
+                        lhs: Operand::Value(Value(1)),
+                        rhs: Operand::Const(IrConst::I32(multiplier)),
+                        ty: IrType::I32,
+                    },
+                    Instruction::Cast {
+                        dest: Value(10),
+                        src: Operand::Value(Value(9)),
+                        from_ty: IrType::I32,
+                        to_ty: IrType::I64,
+                    },
+                    gep_inst(11, 10, IrType::I8),
+                ],
+                Some(Instruction::Cmp {
+                    dest: Value(99),
+                    op: cmp_op,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(bound)),
+                    ty: IrType::I32,
+                }),
+            );
+            f.blocks[0].instructions[0] = Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(init)),
+            };
+            check(&mut f, expected);
+        }
+    }
+
+    #[test]
+    fn constant_minus_member_range_keeps_operand_order() {
+        for (limit, cmp_op, latch, constant, expected) in [
+            (10, IrCmpOp::Ugt, IrBinOp::Sub, 5, 0),
+            (64, IrCmpOp::Ult, IrBinOp::Add, 64, 1),
+        ] {
+            let mut f = counting_loop(
+                "constant_minus",
+                IrType::U32,
+                latch,
+                vec![
+                    Instruction::BinOp {
+                        dest: Value(9),
+                        op: IrBinOp::Sub,
+                        lhs: Operand::Const(IrConst::I32(constant)),
+                        rhs: Operand::Value(Value(1)),
+                        ty: IrType::U32,
+                    },
+                    Instruction::Cast {
+                        dest: Value(10),
+                        src: Operand::Value(Value(9)),
+                        from_ty: IrType::U32,
+                        to_ty: IrType::U64,
+                    },
+                    gep_inst(11, 10, IrType::I8),
+                ],
+                Some(Instruction::Cmp {
+                    dest: Value(99),
+                    op: cmp_op,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(limit)),
+                    ty: IrType::U32,
+                }),
+            );
+            f.blocks[0].instructions[0] = Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(20)),
+            };
+            check(&mut f, expected);
         }
     }
 

@@ -1,0 +1,578 @@
+{
+  "metric": "simulated compiler work; NOT compilation wall-clock speedup",
+  "baseline_commit": "fb02007bd02d0eb30d8f956a2a5bd44f44ddaa23",
+  "geometry": {
+    "I1": "32768,8,64",
+    "D1": "32768,8,64",
+    "LL": "33554432,16,64"
+  },
+  "valgrind": {
+    "command": [
+      "valgrind"
+    ],
+    "executable": "/home/user/.local/valgrind/bin/valgrind",
+    "sha256": "a698e3b1c336f33570da8400ac167a85209caa77946c380607762940f6138fa5",
+    "version": "valgrind-3.16.0.GIT"
+  },
+  "binaries": {
+    "candidate": {
+      "original_sha256": "f74774870778ae6b8a58f0bba97652e07d5deabc0d2a77981efbb0a806e37d4c",
+      "stripped_sha256": "4d1e9605b8aab1ac813f3d9be99afbe92db3a5fcb469e94054877f2a7f17463c",
+      "text_sha256": "61be36c3484e466cd605532efa1ef01b1ea30a9a6f006913f8e461cf3289ea64"
+    },
+    "main": {
+      "original_sha256": "78fed04f48a797d26b8025a634b8df039f3cffe18e808e728a0b9549cf588cfa",
+      "stripped_sha256": "7cc91dbe643a5d1f722798dfd15edb05b660623dbfc2fbb506d89590d117989b",
+      "text_sha256": "4b7421a9e0707e789584a5b80496d02fc18d4c5a288cf2787f1adfeb3472f1ed"
+    }
+  },
+  "results": {
+    "minmax": {
+      "source_sha256": "7b4ad1b6237a347a2a0f62618ee75f52a2b8a9a485efdcedad59259f449bfe77",
+      "rounds": [
+        {
+          "order": [
+            "candidate",
+            "main"
+          ],
+          "arms": {
+            "candidate": {
+              "events": {
+                "Ir": 956288587,
+                "Dr": 212564608,
+                "Dw": 107612562,
+                "I1mr": 2356128,
+                "D1mr": 1659323,
+                "D1mw": 524808,
+                "ILmr": 45219,
+                "DLmr": 17745,
+                "DLmw": 27884,
+                "Bc": 159474266,
+                "Bcm": 7839820,
+                "Bi": 24895775,
+                "Bim": 1378610
+              },
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/lccc/results/pr824-rebased/compiler-work/aa/minmax-0.cg",
+                "/home/user/lccc/results/pr824-rebased/compiler-work/aa/compiler",
+                "-O3",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/regression/minmax_shapes/minmax_shapes.c",
+                "-o",
+                "/home/user/lccc/results/pr824-rebased/compiler-work/aa/minmax.s"
+              ],
+              "profile_sha256": "beff7d80a50af7831aefb897dd6408646d8d2dce2af306d13f1e451a6be7190c",
+              "assembly_sha256": "295f7ca506dc66f244f49b4492ed4287dc4879a223d94b8ef6439e0f31a15c1b",
+              "stderr_sha256": "c51a8b1d532af917e0110b4ee4c3a1348b0ebd90c0e11bb09765259d7ec0e3c4",
+              "stderr_excerpt": "g non-Dwarf2/3/4 block in .debug_info\n--120023-- WARNING: Serious error when reading debug info\n--120023-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--120023-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--120023-- WARNING: Serious error when reading debug info\n--120023-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--120023-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--120023-- WARNING: Serious error when reading debug info\n--120023-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--120023-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--120023-- WARNING: Serious error when reading debug info\n--120023-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--120023-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--120023-- WARNING: unhandled amd64-linux syscall: 334\n--120023-- You may be able to write your own handler.\n--120023-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--120023-- Nevertheless we consider this a bug.  Please report\n--120023-- it at http://valgrind.org/support/bug_reports.html.\n--120023-- WARNING: unhandled amd64-linux syscall: 435\n--120023-- You may be able to write your own handler.\n--120023-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--120023-- Nevertheless we consider this a bug.  Please report\n--120023-- it at http://valgrind.org/support/bug_reports.html.\n"
+            },
+            "main": {
+              "events": {
+                "Ir": 965652425,
+                "Dr": 216690041,
+                "Dw": 107568252,
+                "I1mr": 2265789,
+                "D1mr": 1756382,
+                "D1mw": 587339,
+                "ILmr": 45015,
+                "DLmr": 17739,
+                "DLmw": 28287,
+                "Bc": 159014406,
+                "Bcm": 7066463,
+                "Bi": 26496295,
+                "Bim": 1485468
+              },
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/lccc/results/pr824-rebased/compiler-work/bb/minmax-0.cg",
+                "/home/user/lccc/results/pr824-rebased/compiler-work/bb/compiler",
+                "-O3",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/regression/minmax_shapes/minmax_shapes.c",
+                "-o",
+                "/home/user/lccc/results/pr824-rebased/compiler-work/bb/minmax.s"
+              ],
+              "profile_sha256": "f8a013f884b94c50781f1df505e85eddd103848e410364bbbea58824e7987de9",
+              "assembly_sha256": "357249a6245569c77167e3f603744810600990e940904abee9796421367628aa",
+              "stderr_sha256": "9c18ed28e3f5d550977fbc2b5d2aaf6f4df798eb3917a617dd40ea5eb230694a",
+              "stderr_excerpt": "g non-Dwarf2/3/4 block in .debug_info\n--121742-- WARNING: Serious error when reading debug info\n--121742-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--121742-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--121742-- WARNING: Serious error when reading debug info\n--121742-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--121742-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--121742-- WARNING: Serious error when reading debug info\n--121742-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--121742-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--121742-- WARNING: Serious error when reading debug info\n--121742-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--121742-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--121742-- WARNING: unhandled amd64-linux syscall: 334\n--121742-- You may be able to write your own handler.\n--121742-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--121742-- Nevertheless we consider this a bug.  Please report\n--121742-- it at http://valgrind.org/support/bug_reports.html.\n--121742-- WARNING: unhandled amd64-linux syscall: 435\n--121742-- You may be able to write your own handler.\n--121742-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--121742-- Nevertheless we consider this a bug.  Please report\n--121742-- it at http://valgrind.org/support/bug_reports.html.\n"
+            }
+          },
+          "ir_ratio": 0.990303096893274
+        },
+        {
+          "order": [
+            "main",
+            "candidate"
+          ],
+          "arms": {
+            "main": {
+              "events": {
+                "Ir": 965652134,
+                "Dr": 216690056,
+                "Dw": 107568265,
+                "I1mr": 2265828,
+                "D1mr": 1756383,
+                "D1mw": 587328,
+                "ILmr": 45016,
+                "DLmr": 17739,
+                "DLmw": 28283,
+                "Bc": 159014356,
+                "Bcm": 7066397,
+                "Bi": 26496300,
+                "Bim": 1485469
+              },
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/lccc/results/pr824-rebased/compiler-work/bb/minmax-1.cg",
+                "/home/user/lccc/results/pr824-rebased/compiler-work/bb/compiler",
+                "-O3",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/regression/minmax_shapes/minmax_shapes.c",
+                "-o",
+                "/home/user/lccc/results/pr824-rebased/compiler-work/bb/minmax.s"
+              ],
+              "profile_sha256": "e3acbeee5893514d0b9b839e6b68ac78413c8dca14be7243cd5a9d681947f8c7",
+              "assembly_sha256": "357249a6245569c77167e3f603744810600990e940904abee9796421367628aa",
+              "stderr_sha256": "f0369233720a57b20878b25f069afe142fae08a35024505bb362bd49948f0bca",
+              "stderr_excerpt": "g non-Dwarf2/3/4 block in .debug_info\n--122324-- WARNING: Serious error when reading debug info\n--122324-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--122324-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--122324-- WARNING: Serious error when reading debug info\n--122324-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--122324-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--122324-- WARNING: Serious error when reading debug info\n--122324-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--122324-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--122324-- WARNING: Serious error when reading debug info\n--122324-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--122324-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--122324-- WARNING: unhandled amd64-linux syscall: 334\n--122324-- You may be able to write your own handler.\n--122324-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--122324-- Nevertheless we consider this a bug.  Please report\n--122324-- it at http://valgrind.org/support/bug_reports.html.\n--122324-- WARNING: unhandled amd64-linux syscall: 435\n--122324-- You may be able to write your own handler.\n--122324-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--122324-- Nevertheless we consider this a bug.  Please report\n--122324-- it at http://valgrind.org/support/bug_reports.html.\n"
+            },
+            "candidate": {
+              "events": {
+                "Ir": 956288459,
+                "Dr": 212564596,
+                "Dw": 107612567,
+                "I1mr": 2356122,
+                "D1mr": 1659329,
+                "D1mw": 524803,
+                "ILmr": 45215,
+                "DLmr": 17745,
+                "DLmw": 27883,
+                "Bc": 159474243,
+                "Bcm": 7839798,
+                "Bi": 24895776,
+                "Bim": 1378614
+              },
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/lccc/results/pr824-rebased/compiler-work/aa/minmax-1.cg",
+                "/home/user/lccc/results/pr824-rebased/compiler-work/aa/compiler",
+                "-O3",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/regression/minmax_shapes/minmax_shapes.c",
+                "-o",
+                "/home/user/lccc/results/pr824-rebased/compiler-work/aa/minmax.s"
+              ],
+              "profile_sha256": "e9e8b39f0b68216b38cbe1cfc974de9616f1a0e324a00c4931c55bb44ed3e4ee",
+              "assembly_sha256": "295f7ca506dc66f244f49b4492ed4287dc4879a223d94b8ef6439e0f31a15c1b",
+              "stderr_sha256": "e11e87c9c0df391315702fb32153f5e98d9d6fb822e3fff22fbe9e88cf5016fc",
+              "stderr_excerpt": "g non-Dwarf2/3/4 block in .debug_info\n--126521-- WARNING: Serious error when reading debug info\n--126521-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--126521-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--126521-- WARNING: Serious error when reading debug info\n--126521-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--126521-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--126521-- WARNING: Serious error when reading debug info\n--126521-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--126521-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--126521-- WARNING: Serious error when reading debug info\n--126521-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--126521-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--126521-- WARNING: unhandled amd64-linux syscall: 334\n--126521-- You may be able to write your own handler.\n--126521-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--126521-- Nevertheless we consider this a bug.  Please report\n--126521-- it at http://valgrind.org/support/bug_reports.html.\n--126521-- WARNING: unhandled amd64-linux syscall: 435\n--126521-- You may be able to write your own handler.\n--126521-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--126521-- Nevertheless we consider this a bug.  Please report\n--126521-- it at http://valgrind.org/support/bug_reports.html.\n"
+            }
+          },
+          "ir_ratio": 0.9903032627689508
+        },
+        {
+          "order": [
+            "candidate",
+            "main"
+          ],
+          "arms": {
+            "candidate": {
+              "events": {
+                "Ir": 956288751,
+                "Dr": 212564631,
+                "Dw": 107612568,
+                "I1mr": 2356123,
+                "D1mr": 1659340,
+                "D1mw": 524807,
+                "ILmr": 45215,
+                "DLmr": 17745,
+                "DLmw": 27888,
+                "Bc": 159474284,
+                "Bcm": 7839833,
+                "Bi": 24895776,
+                "Bim": 1378614
+              },
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/lccc/results/pr824-rebased/compiler-work/aa/minmax-2.cg",
+                "/home/user/lccc/results/pr824-rebased/compiler-work/aa/compiler",
+                "-O3",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/regression/minmax_shapes/minmax_shapes.c",
+                "-o",
+                "/home/user/lccc/results/pr824-rebased/compiler-work/aa/minmax.s"
+              ],
+              "profile_sha256": "0918b4929a663a1ca8a6a5371a166fcc3c86879e6d263f60c6240ace07b8bdb0",
+              "assembly_sha256": "295f7ca506dc66f244f49b4492ed4287dc4879a223d94b8ef6439e0f31a15c1b",
+              "stderr_sha256": "a22e732714e6fd743fbf35c5570404eab4e4bc6a73d7232cc5c657bfa511e13e",
+              "stderr_excerpt": "g non-Dwarf2/3/4 block in .debug_info\n--127876-- WARNING: Serious error when reading debug info\n--127876-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--127876-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--127876-- WARNING: Serious error when reading debug info\n--127876-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--127876-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--127876-- WARNING: Serious error when reading debug info\n--127876-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--127876-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--127876-- WARNING: Serious error when reading debug info\n--127876-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--127876-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--127876-- WARNING: unhandled amd64-linux syscall: 334\n--127876-- You may be able to write your own handler.\n--127876-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--127876-- Nevertheless we consider this a bug.  Please report\n--127876-- it at http://valgrind.org/support/bug_reports.html.\n--127876-- WARNING: unhandled amd64-linux syscall: 435\n--127876-- You may be able to write your own handler.\n--127876-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--127876-- Nevertheless we consider this a bug.  Please report\n--127876-- it at http://valgrind.org/support/bug_reports.html.\n"
+            },
+            "main": {
+              "events": {
+                "Ir": 965652247,
+                "Dr": 216690057,
+                "Dw": 107568279,
+                "I1mr": 2265831,
+                "D1mr": 1756374,
+                "D1mw": 587326,
+                "ILmr": 45021,
+                "DLmr": 17739,
+                "DLmw": 28284,
+                "Bc": 159014380,
+                "Bcm": 7066416,
+                "Bi": 26496299,
+                "Bim": 1485469
+              },
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/lccc/results/pr824-rebased/compiler-work/bb/minmax-2.cg",
+                "/home/user/lccc/results/pr824-rebased/compiler-work/bb/compiler",
+                "-O3",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/regression/minmax_shapes/minmax_shapes.c",
+                "-o",
+                "/home/user/lccc/results/pr824-rebased/compiler-work/bb/minmax.s"
+              ],
+              "profile_sha256": "8c63445f24ecb02f9c487af35dd0fdb03f1d6f04293919346437d4c896c3ddb7",
+              "assembly_sha256": "357249a6245569c77167e3f603744810600990e940904abee9796421367628aa",
+              "stderr_sha256": "3e99623b976b001faae1eda271998832120364e7adff1c8a72f7b735b239d96d",
+              "stderr_excerpt": "g non-Dwarf2/3/4 block in .debug_info\n--130923-- WARNING: Serious error when reading debug info\n--130923-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--130923-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--130923-- WARNING: Serious error when reading debug info\n--130923-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--130923-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--130923-- WARNING: Serious error when reading debug info\n--130923-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--130923-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--130923-- WARNING: Serious error when reading debug info\n--130923-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--130923-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--130923-- WARNING: unhandled amd64-linux syscall: 334\n--130923-- You may be able to write your own handler.\n--130923-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--130923-- Nevertheless we consider this a bug.  Please report\n--130923-- it at http://valgrind.org/support/bug_reports.html.\n--130923-- WARNING: unhandled amd64-linux syscall: 435\n--130923-- You may be able to write your own handler.\n--130923-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--130923-- Nevertheless we consider this a bug.  Please report\n--130923-- it at http://valgrind.org/support/bug_reports.html.\n"
+            }
+          },
+          "ir_ratio": 0.9903034492705944
+        }
+      ],
+      "median_ir_ratio": 0.9903032627689508
+    },
+    "libm": {
+      "source_sha256": "b70c5bacd90081c28ea74dc1142f9eacc64278d539f258da5bd1614ebc503668",
+      "rounds": [
+        {
+          "order": [
+            "candidate",
+            "main"
+          ],
+          "arms": {
+            "candidate": {
+              "events": {
+                "Ir": 299283075,
+                "Dr": 65407991,
+                "Dw": 34451997,
+                "I1mr": 852447,
+                "D1mr": 466902,
+                "D1mw": 222463,
+                "ILmr": 49783,
+                "DLmr": 19296,
+                "DLmw": 37521,
+                "Bc": 49162051,
+                "Bcm": 2550217,
+                "Bi": 7489336,
+                "Bim": 402495
+              },
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/lccc/results/pr824-rebased/compiler-work/aa/libm-0.cg",
+                "/home/user/lccc/results/pr824-rebased/compiler-work/aa/compiler",
+                "-O3",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/benchmark/programs/libm_round_family.c",
+                "-o",
+                "/home/user/lccc/results/pr824-rebased/compiler-work/aa/libm.s"
+              ],
+              "profile_sha256": "ae1527661fa13931c2c78360dcc7f50570daeea36a6e0416047ee2ca73f7c784",
+              "assembly_sha256": "7b8d09df2490c0a5aa3feaa9d6c045bf91ded30452d8c284b1e1d58bc8143b70",
+              "stderr_sha256": "03dc27f0be11b755d1deffd74df3cd05b6348fee8f4cb75f63522df7b3d071c2",
+              "stderr_excerpt": "g non-Dwarf2/3/4 block in .debug_info\n--132162-- WARNING: Serious error when reading debug info\n--132162-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--132162-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--132162-- WARNING: Serious error when reading debug info\n--132162-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--132162-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--132162-- WARNING: Serious error when reading debug info\n--132162-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--132162-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--132162-- WARNING: Serious error when reading debug info\n--132162-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--132162-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--132162-- WARNING: unhandled amd64-linux syscall: 334\n--132162-- You may be able to write your own handler.\n--132162-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--132162-- Nevertheless we consider this a bug.  Please report\n--132162-- it at http://valgrind.org/support/bug_reports.html.\n--132162-- WARNING: unhandled amd64-linux syscall: 435\n--132162-- You may be able to write your own handler.\n--132162-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--132162-- Nevertheless we consider this a bug.  Please report\n--132162-- it at http://valgrind.org/support/bug_reports.html.\n"
+            },
+            "main": {
+              "events": {
+                "Ir": 300771161,
+                "Dr": 66703748,
+                "Dw": 34025691,
+                "I1mr": 777656,
+                "D1mr": 485082,
+                "D1mw": 225878,
+                "ILmr": 49917,
+                "DLmr": 19251,
+                "DLmw": 37458,
+                "Bc": 49026721,
+                "Bcm": 2346558,
+                "Bi": 8066565,
+                "Bim": 433481
+              },
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/lccc/results/pr824-rebased/compiler-work/bb/libm-0.cg",
+                "/home/user/lccc/results/pr824-rebased/compiler-work/bb/compiler",
+                "-O3",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/benchmark/programs/libm_round_family.c",
+                "-o",
+                "/home/user/lccc/results/pr824-rebased/compiler-work/bb/libm.s"
+              ],
+              "profile_sha256": "fe9155e45c184089095ca980cf8367ab8bec71c2f3f0b94fef073ab896bdf109",
+              "assembly_sha256": "3550fea507eb5310aea045e72f3ded8ba9d3aece0bf84d8c19659550dd73b1b0",
+              "stderr_sha256": "d6ff7abc676fa6066370422ff1b909625c41781c45ffc2c96394e56bde6cbfd8",
+              "stderr_excerpt": "g non-Dwarf2/3/4 block in .debug_info\n--132574-- WARNING: Serious error when reading debug info\n--132574-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--132574-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--132574-- WARNING: Serious error when reading debug info\n--132574-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--132574-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--132574-- WARNING: Serious error when reading debug info\n--132574-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--132574-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--132574-- WARNING: Serious error when reading debug info\n--132574-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--132574-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--132574-- WARNING: unhandled amd64-linux syscall: 334\n--132574-- You may be able to write your own handler.\n--132574-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--132574-- Nevertheless we consider this a bug.  Please report\n--132574-- it at http://valgrind.org/support/bug_reports.html.\n--132574-- WARNING: unhandled amd64-linux syscall: 435\n--132574-- You may be able to write your own handler.\n--132574-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--132574-- Nevertheless we consider this a bug.  Please report\n--132574-- it at http://valgrind.org/support/bug_reports.html.\n"
+            }
+          },
+          "ir_ratio": 0.9950524312402411
+        },
+        {
+          "order": [
+            "main",
+            "candidate"
+          ],
+          "arms": {
+            "main": {
+              "events": {
+                "Ir": 300771023,
+                "Dr": 66703750,
+                "Dw": 34025697,
+                "I1mr": 777644,
+                "D1mr": 485079,
+                "D1mw": 225904,
+                "ILmr": 49916,
+                "DLmr": 19251,
+                "DLmw": 37464,
+                "Bc": 49026697,
+                "Bcm": 2346550,
+                "Bi": 8066566,
+                "Bim": 433481
+              },
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/lccc/results/pr824-rebased/compiler-work/bb/libm-1.cg",
+                "/home/user/lccc/results/pr824-rebased/compiler-work/bb/compiler",
+                "-O3",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/benchmark/programs/libm_round_family.c",
+                "-o",
+                "/home/user/lccc/results/pr824-rebased/compiler-work/bb/libm.s"
+              ],
+              "profile_sha256": "64169f8679aae59b9b6274147ac56304dd18b5d0c454c6b4af56080a8470eb4e",
+              "assembly_sha256": "3550fea507eb5310aea045e72f3ded8ba9d3aece0bf84d8c19659550dd73b1b0",
+              "stderr_sha256": "e74683fb5b07aa6f18126928957439e781212953405870a960972236c3b6c7c4",
+              "stderr_excerpt": "g non-Dwarf2/3/4 block in .debug_info\n--133280-- WARNING: Serious error when reading debug info\n--133280-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--133280-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--133280-- WARNING: Serious error when reading debug info\n--133280-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--133280-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--133280-- WARNING: Serious error when reading debug info\n--133280-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--133280-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--133280-- WARNING: Serious error when reading debug info\n--133280-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--133280-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--133280-- WARNING: unhandled amd64-linux syscall: 334\n--133280-- You may be able to write your own handler.\n--133280-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--133280-- Nevertheless we consider this a bug.  Please report\n--133280-- it at http://valgrind.org/support/bug_reports.html.\n--133280-- WARNING: unhandled amd64-linux syscall: 435\n--133280-- You may be able to write your own handler.\n--133280-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--133280-- Nevertheless we consider this a bug.  Please report\n--133280-- it at http://valgrind.org/support/bug_reports.html.\n"
+            },
+            "candidate": {
+              "events": {
+                "Ir": 299283757,
+                "Dr": 65408112,
+                "Dw": 34452047,
+                "I1mr": 852460,
+                "D1mr": 466891,
+                "D1mw": 222461,
+                "ILmr": 49789,
+                "DLmr": 19296,
+                "DLmw": 37522,
+                "Bc": 49162139,
+                "Bcm": 2550307,
+                "Bi": 7489346,
+                "Bim": 402496
+              },
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/lccc/results/pr824-rebased/compiler-work/aa/libm-1.cg",
+                "/home/user/lccc/results/pr824-rebased/compiler-work/aa/compiler",
+                "-O3",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/benchmark/programs/libm_round_family.c",
+                "-o",
+                "/home/user/lccc/results/pr824-rebased/compiler-work/aa/libm.s"
+              ],
+              "profile_sha256": "5dc974956bea5a20cfd83bc5a3384edc736d1d1e15f302e3ea9dde09c722ee31",
+              "assembly_sha256": "7b8d09df2490c0a5aa3feaa9d6c045bf91ded30452d8c284b1e1d58bc8143b70",
+              "stderr_sha256": "d350f1810780db91a6876f1e366e434fb12a640be169904bcb40ecf975b1946d",
+              "stderr_excerpt": "g non-Dwarf2/3/4 block in .debug_info\n--134804-- WARNING: Serious error when reading debug info\n--134804-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--134804-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--134804-- WARNING: Serious error when reading debug info\n--134804-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--134804-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--134804-- WARNING: Serious error when reading debug info\n--134804-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--134804-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--134804-- WARNING: Serious error when reading debug info\n--134804-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--134804-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--134804-- WARNING: unhandled amd64-linux syscall: 334\n--134804-- You may be able to write your own handler.\n--134804-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--134804-- Nevertheless we consider this a bug.  Please report\n--134804-- it at http://valgrind.org/support/bug_reports.html.\n--134804-- WARNING: unhandled amd64-linux syscall: 435\n--134804-- You may be able to write your own handler.\n--134804-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--134804-- Nevertheless we consider this a bug.  Please report\n--134804-- it at http://valgrind.org/support/bug_reports.html.\n"
+            }
+          },
+          "ir_ratio": 0.995055155296659
+        },
+        {
+          "order": [
+            "candidate",
+            "main"
+          ],
+          "arms": {
+            "candidate": {
+              "events": {
+                "Ir": 299283882,
+                "Dr": 65408092,
+                "Dw": 34452021,
+                "I1mr": 852450,
+                "D1mr": 466885,
+                "D1mw": 222455,
+                "ILmr": 49783,
+                "DLmr": 19296,
+                "DLmw": 37523,
+                "Bc": 49162155,
+                "Bcm": 2550349,
+                "Bi": 7489340,
+                "Bim": 402495
+              },
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/lccc/results/pr824-rebased/compiler-work/aa/libm-2.cg",
+                "/home/user/lccc/results/pr824-rebased/compiler-work/aa/compiler",
+                "-O3",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/benchmark/programs/libm_round_family.c",
+                "-o",
+                "/home/user/lccc/results/pr824-rebased/compiler-work/aa/libm.s"
+              ],
+              "profile_sha256": "e09c9c79d272839ad5df613a2f7de0a8da4a712b261309c80b7c8a012fb8f57c",
+              "assembly_sha256": "7b8d09df2490c0a5aa3feaa9d6c045bf91ded30452d8c284b1e1d58bc8143b70",
+              "stderr_sha256": "0abd661d2892eef7e08e2678479f51699c6d2056924e03a641ecf06506bbcf76",
+              "stderr_excerpt": "g non-Dwarf2/3/4 block in .debug_info\n--135637-- WARNING: Serious error when reading debug info\n--135637-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--135637-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--135637-- WARNING: Serious error when reading debug info\n--135637-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--135637-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--135637-- WARNING: Serious error when reading debug info\n--135637-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--135637-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--135637-- WARNING: Serious error when reading debug info\n--135637-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--135637-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--135637-- WARNING: unhandled amd64-linux syscall: 334\n--135637-- You may be able to write your own handler.\n--135637-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--135637-- Nevertheless we consider this a bug.  Please report\n--135637-- it at http://valgrind.org/support/bug_reports.html.\n--135637-- WARNING: unhandled amd64-linux syscall: 435\n--135637-- You may be able to write your own handler.\n--135637-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--135637-- Nevertheless we consider this a bug.  Please report\n--135637-- it at http://valgrind.org/support/bug_reports.html.\n"
+            },
+            "main": {
+              "events": {
+                "Ir": 300771276,
+                "Dr": 66703747,
+                "Dw": 34025685,
+                "I1mr": 777642,
+                "D1mr": 485059,
+                "D1mw": 225888,
+                "ILmr": 49916,
+                "DLmr": 19251,
+                "DLmw": 37471,
+                "Bc": 49026741,
+                "Bcm": 2346606,
+                "Bi": 8066561,
+                "Bim": 433480
+              },
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/lccc/results/pr824-rebased/compiler-work/bb/libm-2.cg",
+                "/home/user/lccc/results/pr824-rebased/compiler-work/bb/compiler",
+                "-O3",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/benchmark/programs/libm_round_family.c",
+                "-o",
+                "/home/user/lccc/results/pr824-rebased/compiler-work/bb/libm.s"
+              ],
+              "profile_sha256": "fd8d00fb1f098fe0660d4e745b43765fd5bdec508a5a90d099c3e1b4b39ebb3b",
+              "assembly_sha256": "3550fea507eb5310aea045e72f3ded8ba9d3aece0bf84d8c19659550dd73b1b0",
+              "stderr_sha256": "ee10941c7af1dc530401187f0581fe94b61b3bb06fc43c3f7feee9d716509c79",
+              "stderr_excerpt": "g non-Dwarf2/3/4 block in .debug_info\n--136273-- WARNING: Serious error when reading debug info\n--136273-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--136273-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--136273-- WARNING: Serious error when reading debug info\n--136273-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--136273-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--136273-- WARNING: Serious error when reading debug info\n--136273-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/callgrind-amd64-linux:\n--136273-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--136273-- WARNING: Serious error when reading debug info\n--136273-- When reading debug info from /home/user/.local/valgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--136273-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--136273-- WARNING: unhandled amd64-linux syscall: 334\n--136273-- You may be able to write your own handler.\n--136273-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--136273-- Nevertheless we consider this a bug.  Please report\n--136273-- it at http://valgrind.org/support/bug_reports.html.\n--136273-- WARNING: unhandled amd64-linux syscall: 435\n--136273-- You may be able to write your own handler.\n--136273-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--136273-- Nevertheless we consider this a bug.  Please report\n--136273-- it at http://valgrind.org/support/bug_reports.html.\n"
+            }
+          },
+          "ir_ratio": 0.995054733883564
+        }
+      ],
+      "median_ir_ratio": 0.995054733883564
+    }
+  },
+  "complete": true
+}

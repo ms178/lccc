@@ -2,11 +2,12 @@
 # Worst-15 follow-up codegen gate — pins the load-class wins of the
 # session586 perf campaign so they cannot silently regress:
 #
-#   A. nbody pair-loop load CSE (alias: copy-web leaves + stride-period
-#      field disjointness + VecStore modeling): exactly TWO mass loads
-#      (48-offset fields) in the whole inlined advance — one per body of
-#      the pair.  Pre-fix, each body's mass was re-loaded for the scalar
-#      vz tail after the packed vx/vy stores (4+ loads).
+#   A. nbody pair-loop load CSE: at most two proven mass-read operands
+#      in the actual natural velocity-update loop. Track Body+48 through
+#      hoisted pointers/copies/frame spills and count folded operands too.
+#      Missing workloads, unknown addresses and ambiguous CFG facts fail;
+#      zero displacement-form matches cannot manufacture a pass.
+#      This is a workload-specific codegen contract, not a runtime metric.
 #   B. same-value FP squares: no `movsd SLOT, %rX` immediately followed by
 #      `vmulsd SLOT, %rX, %rX` reading the SAME slot twice (the register
 #      already holds it — nbody's d² chain shape).
@@ -32,8 +33,8 @@ bad()  { note "FAIL: $*"; fails=$((fails+1)); }
 
 # ── A + B: nbody ────────────────────────────────────────────────────
 "$CCC" -O2 -S "$NB" -o "$TMP/nb.s" 2>/dev/null || { echo "FAIL: nbody compile"; exit 1; }
-N=$(grep -cE 'movsd +48\(' "$TMP/nb.s" || true)
-[ "$N" -eq 2 ] || bad "nbody: expected exactly 2 mass loads (pair-loop CSE), got $N"
+python3 "$(dirname "$0")/../../scripts/nbody_mass_loads.py" "$TMP/nb.s" \
+    || bad "nbody: semantic mass-read proof failed"
 
 # Same-value double-read: `movsd SLOT, %rX` then `vmulsd SLOT, %rX, %rX`
 # (or the fma spelling) with the SAME slot — python for the two-line window.

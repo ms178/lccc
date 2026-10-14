@@ -1,0 +1,10 @@
+FAIL {'case': 'undefined-strength-v0-reverseFalse', 'tool': 'lccc', 'passed': False, 'error': "{'index': 3, 'binding': 2, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}"}
+FAIL {'case': 'undefined-strength-v1-reverseFalse', 'tool': 'lccc', 'passed': False, 'error': "(0, '')"}
+FAIL {'case': 'undefined-strength-v2-reverseFalse', 'tool': 'lccc', 'passed': False, 'error': "(0, '')"}
+FAIL {'case': 'undefined-strength-v3-reverseFalse', 'tool': 'lccc', 'passed': False, 'error': "(0, '')"}
+FAIL {'case': 'definition-strength-absTrue-v0-reverseFalse', 'tool': 'lccc', 'passed': False, 'error': "{'index': 3, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4352, 'size': 0}"}
+FAIL {'case': 'definition-strength-absTrue-v2-reverseFalse', 'tool': 'lccc', 'passed': False, 'error': '([(3, 4363)], 4363, 256, 11)'}
+FAIL {'case': 'definition-strength-absTrue-v3-reverseFalse', 'tool': 'lccc', 'passed': False, 'error': "{'index': 3, 'binding': 1, 'visibility': 3, 'shndx': 4, 'value': 4352, 'size': 0}"}
+FAIL {'case': 'got-key-collision-reverseFalse', 'tool': 'lccc', 'passed': False, 'error': "([(4294967298, 0)], {'binding': 0, 'visibility': 0, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 20, 'addend': 0})"}
+FAIL {'case': 'got-key-collision-reverseTrue', 'tool': 'lccc', 'passed': False, 'error': "([(4294967298, 0)], {'binding': 0, 'visibility': 0, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 20, 'addend': 0})"}
+RISC-V shared binding: 467 PASS / 9 FAIL / 0 SKIP

@@ -784,6 +784,11 @@ pub enum IntrinsicOp {
     /// 32-byte alloca used only if the scalar result cannot remain XMM-homed.
     /// x86-64 AVX2-only; emitted solely by the strict computed-reduction pass.
     StrictRecipMulAddF64x4,
+    /// Same ordered FP contract, with four already-packed signed I32 lanes.
+    /// Args: [acc, packed_denominator, base, byte_offset, scratch]. The vector
+    /// input is exactly 128 bits, never a 256-bit load. Scalar F64 result;
+    /// only xmm0/ymm0 and xmm1/ymm1 are scratch. AVX2 + SSE4.1, x86-64 only.
+    StrictPackedRecipMulAddF64x4,
     /// Horizontal reduction: %scalar = horizontal_add(%vec) - AVX2 8×I32 → I32
     /// args[0] = source vector value; dest = scalar I32 result
     VecHorizontalAddI32x8,

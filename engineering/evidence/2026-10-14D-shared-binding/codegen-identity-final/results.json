@@ -1,0 +1,1626 @@
+{
+  "tests/benchmark/programs/aarch64_select_patterns.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/aarch64_select_patterns.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/aarch64_select_patterns.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/aarch64_select_patterns.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/ackermann.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/ackermann.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/ackermann.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/ackermann.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/adler32_do8_hot.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/adler32_do8_hot.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/adler32_do8_hot.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/adler32_do8_hot.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/affine_countdown.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/affine_countdown.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/affine_countdown.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/affine_countdown.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/arith_loop.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/arith_loop.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/arith_loop.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/arith_loop.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/ascii_case_fold.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/ascii_case_fold.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/ascii_case_fold.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/ascii_case_fold.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/base64_enc.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/base64_enc.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/base64_enc.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/base64_enc.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/binary_search.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/binary_search.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/binary_search.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/binary_search.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/binary_trees.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/binary_trees.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/binary_trees.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/binary_trees.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/bitops.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/bitops.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/bitops.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/bitops.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/byte_load_reassembly.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/byte_load_reassembly.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/byte_load_reassembly.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/byte_load_reassembly.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/chacha20_block.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/chacha20_block.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/chacha20_block.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/chacha20_block.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/constant_recursion.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/constant_recursion.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/constant_recursion.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/constant_recursion.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/conv_u8_3x3.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/conv_u8_3x3.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/conv_u8_3x3.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/conv_u8_3x3.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/crc32_nibble_hot.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/crc32_nibble_hot.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/crc32_nibble_hot.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/crc32_nibble_hot.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/csv_field_sum.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/csv_field_sum.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/csv_field_sum.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/csv_field_sum.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/double_reduction.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/double_reduction.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/double_reduction.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/double_reduction.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/expat_siphash24.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/expat_siphash24.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/expat_siphash24.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/expat_siphash24.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/expat_xml_scan.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/expat_xml_scan.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/expat_xml_scan.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/expat_xml_scan.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/fannkuch.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/fannkuch.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/fannkuch.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/fannkuch.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/fib.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/fib.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/fib.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/fib.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/fir_filter.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/fir_filter.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/fir_filter.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/fir_filter.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/fp_memfold_stencil5.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/fp_memfold_stencil5.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/fp_memfold_stencil5.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/fp_memfold_stencil5.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/glibc_memcmp.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/glibc_memcmp.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/glibc_memcmp.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/glibc_memcmp.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/glibc_strstr.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/glibc_strstr.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/glibc_strstr.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/glibc_strstr.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/global_addr_pressure.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/global_addr_pressure.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/global_addr_pressure.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/global_addr_pressure.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/gzip_crc32.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/gzip_crc32.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/gzip_crc32.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/gzip_crc32.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/hash_table.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/hash_table.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/hash_table.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/hash_table.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/histogram.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/histogram.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/histogram.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/histogram.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/i686_alu_chains.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/i686_alu_chains.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/i686_alu_chains.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/i686_alu_chains.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/libm_round_family.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/libm_round_family.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/libm_round_family.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/libm_round_family.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/linux_find_bit.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/linux_find_bit.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/linux_find_bit.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/linux_find_bit.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/linux_rbtree.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/linux_rbtree.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/linux_rbtree.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/linux_rbtree.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/loop_patterns.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/loop_patterns.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/loop_patterns.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/loop_patterns.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/lz4_compress.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/lz4_compress.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/lz4_compress.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/lz4_compress.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/mandelbrot.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/mandelbrot.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/mandelbrot.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/mandelbrot.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/matmul.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/matmul.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/matmul.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/matmul.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/moving_stats.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/moving_stats.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/moving_stats.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/moving_stats.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/nbody.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/nbody.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/nbody.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/nbody.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/percpu_ptr_walk.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/percpu_ptr_walk.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/percpu_ptr_walk.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/percpu_ptr_walk.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/prefix_scan.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/prefix_scan.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/prefix_scan.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/prefix_scan.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/qsort.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/qsort.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/qsort.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/qsort.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/reduction_vecreg.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/reduction_vecreg.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/reduction_vecreg.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/reduction_vecreg.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/ring_fifo.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/ring_fifo.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/ring_fifo.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/ring_fifo.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/sha256_transform.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/sha256_transform.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/sha256_transform.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/sha256_transform.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/sieve.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/sieve.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/sieve.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/sieve.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/spectral_norm.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/spectral_norm.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/spectral_norm.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/spectral_norm.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/sqlite_varint.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/sqlite_varint.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/sqlite_varint.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/sqlite_varint.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/strlen_bench.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/strlen_bench.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/strlen_bench.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/strlen_bench.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/struct_copy.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/struct_copy.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/struct_copy.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/struct_copy.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/switch_dispatch.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/switch_dispatch.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/switch_dispatch.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/switch_dispatch.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/tce_sum.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/tce_sum.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/tce_sum.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/tce_sum.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/tls_seg_access.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/tls_seg_access.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/tls_seg_access.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/tls_seg_access.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/vecreg_new_ops.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/vecreg_new_ops.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/vecreg_new_ops.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/vecreg_new_ops.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/vector_remainder.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/vector_remainder.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/vector_remainder.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/vector_remainder.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/zlib_ng_adler32.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/zlib_ng_adler32.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/zlib_ng_adler32.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/zlib_ng_adler32.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/zlib_ng_adler32_combine.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/zlib_ng_adler32_combine.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/zlib_ng_adler32_combine.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/zlib_ng_adler32_combine.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/zstd_count.c|-O0": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/zstd_count.c|-O1": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/zstd_count.c|-O2": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  },
+  "tests/benchmark/programs/zstd_count.c|-O3": {
+    "bucket": "identical",
+    "base_rc": 0,
+    "new_rc": 0,
+    "base_diag": "",
+    "new_diag": ""
+  }
+}

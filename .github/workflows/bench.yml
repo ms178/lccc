@@ -32,6 +32,21 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Enable temporary CI swap file
+        run: bash scripts/ci_enable_swap.sh
+
+      - name: Report stable Rust toolchain versions
+        run: |
+          rustc -Vv
+          cargo --version
+          rustfmt --version
+          cargo clippy --version
+
+      - name: Install GCC 16
+        run: bash scripts/ci_install_gcc16.sh --base
 
       # Cache downloaded dependencies, not `target/`: benchmark results must
       # come from a compiler rebuilt from the checked-out source, never a
@@ -60,10 +75,10 @@ jobs:
       - name: Detect GCC include path
         id: gcc
         run: |
-          GCC_INC="$(gcc -print-file-name=include)"
+          GCC_INC="$(gcc-16 -print-file-name=include)"
           echo "inc=$GCC_INC" >> "$GITHUB_OUTPUT"
-          echo "GCC include: $GCC_INC"
-          gcc --version | head -1
+          echo "GCC 16 include: $GCC_INC"
+          gcc-16 --version | head -1
 
       - name: Verify Fibonacci rec2iter optimization
         env:
@@ -95,10 +110,13 @@ jobs:
         run: python3 .github/scripts/test_ci_codegen_gate.py
 
       - name: Codegen quality gate (golden workloads)
+        env:
+          GCC_INC: ${{ steps.gcc.outputs.inc }}
         run: |
           set -o pipefail
           python3 .github/scripts/ci-codegen-gate.py \
-            --lccc target/fastbuild/lccc 2>&1 | tee codegen-gate.txt
+            --lccc target/fastbuild/lccc \
+            --gcc-inc "$GCC_INC" 2>&1 | tee codegen-gate.txt
 
       - name: Run complete benchmark corpus
         run: |
@@ -115,6 +133,7 @@ jobs:
           python3 .github/scripts/ci-bench.py \
             --lccc target/fastbuild/lccc \
             --compilers lccc,gcc \
+            --gcc gcc-16 \
             --reps 9 \
             --warmup 1 \
             --artifact-dir bench-artifacts \

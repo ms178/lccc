@@ -39,6 +39,9 @@ use crate::ir::reexports::{Instruction, IrFunction, Operand, Terminator, Value};
 /// Run LICM using pre-computed CFG analysis (avoids redundant analysis when
 /// called from a pipeline that shares analysis across GVN, LICM, IVSR).
 pub(crate) fn licm_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAnalysis) -> usize {
+    if super::fp_environment_blocks_reordering(func) {
+        return 0;
+    }
     if cfg.num_blocks < 2 {
         return 0;
     }

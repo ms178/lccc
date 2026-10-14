@@ -285,15 +285,34 @@ def compilation_error(data: Any) -> str | None:
     return None
 
 
+def compiler_flags(compiler_id: str, flags: str) -> str:
+    """Spell an explicitly requested Haswell CPU in ICC classic's dialect.
+
+    No x86-64-v3 or arbitrary CPU translation: classic ICC rejected that flag
+    in the actual hosted survey. Callers choose the common Haswell profile,
+    and must retain requested/effective options and validate the response.
+    All workload macros, optimization and overflow options remain unchanged.
+    """
+    cid = resolve_compiler(compiler_id)
+    tokens = shlex.split(flags)
+    if re.fullmatch(r"cicc[0-9]+", cid) and "-march=haswell" in tokens:
+        if sum(t.startswith(("-march=", "-x", "-ax")) for t in tokens) != 1:
+            raise GodboltError("ambiguous ICC target options; refusing profile translation")
+        return shlex.join(["-xCORE-AVX2" if t == "-march=haswell" else t for t in tokens])
+    return flags
+
+
 def compile_on_godbolt(compiler_id: str, source: str, flags: str,
                         *, intel: bool = False, timeout: int = 120,
                         keep_directives: bool = False,
-                        execute: bool = False) -> dict[str, Any] | None:
+                        execute: bool = False,
+                        raise_on_error: bool = False) -> dict[str, Any] | None:
     """Compile C source on CE and return its JSON result.
 
     ``None`` is retained for backward compatibility with the original helper;
-    diagnostics are emitted to stderr. New code should generally use the
-    returned ``code``/``stderr`` fields or the higher-level CLI.
+    diagnostics are emitted to stderr. ``raise_on_error`` preserves the exact
+    failure in a GodboltError for structured report producers instead of losing
+    it behind None. Failed/ignored-option responses remain uncacheable.
 
     ``keep_directives`` keeps assembler directives (``.p2align``/``.p2alignr``
     and friends) in the returned ``asm`` lines; the default follows the
@@ -305,12 +324,13 @@ def compile_on_godbolt(compiler_id: str, source: str, flags: str,
     never a performance one.
     """
     cid = resolve_compiler(compiler_id)
+    effective_flags = compiler_flags(cid, flags)
     body = {
         "source": source,
         "lang": "c",
         "allowStoreCodeDebug": False,
         "options": {
-            "userArguments": flags,
+            "userArguments": effective_flags,
             "filters": {
                 "binary": False,
                 "binaryObject": False,
@@ -338,14 +358,19 @@ def compile_on_godbolt(compiler_id: str, source: str, flags: str,
     try:
         data = _request_json(f"{API}/compiler/{cid}/compile", body=body, timeout=timeout)
     except GodboltError as error:
+        if raise_on_error:
+            raise
         print(f"godbolt: {cid}: {error}", file=sys.stderr)
         return None
     # Executor responses may put the PROGRAM status at the top level.
     build = data.get("buildResult", data) if isinstance(data, dict) else data
     error = compilation_error(build)
     if error:
+        if raise_on_error:
+            raise GodboltError(f"{cid}: {error}")
         print(f"godbolt: {cid}: {error}", file=sys.stderr)
         return None
+    data["lcccOracleOptions"] = {"requested": flags, "effective": effective_flags}
     return data
 
 

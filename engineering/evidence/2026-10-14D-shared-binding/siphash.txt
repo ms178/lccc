@@ -1,0 +1,6 @@
+compiler      insns  load  stor  spill  brnch  vec
+----------------------------------------------------
+lccc            216    18    19     15     12    3
+gcc16.2      ERROR: function not emitted
+clang            76    11    12     18      8    4
+icx             118    14    16     22     13    7

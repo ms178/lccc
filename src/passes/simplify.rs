@@ -93,6 +93,9 @@ pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
 }
 
 fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -> usize {
+    if super::fp_environment_blocks_reordering(func) {
+        return 0;
+    }
     let mut total = 0;
 
     // Build def maps for chain optimizations: Value -> defining instruction
@@ -3264,6 +3267,9 @@ fn simplify_math_call(
 /// Semantics-preserving: the fold is a rename to the backend's own intrinsic.
 pub fn fold_math_intrinsic_calls(module: &mut IrModule) {
     for func in &mut module.functions {
+        if super::fp_environment_blocks_reordering(func) {
+            continue;
+        }
         for block in &mut func.blocks {
             for inst in &mut block.instructions {
                 if let Instruction::Call { func: callee, info } = inst {

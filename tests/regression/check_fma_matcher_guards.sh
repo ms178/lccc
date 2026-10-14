@@ -56,7 +56,7 @@
 #      The pre-fix compiler SEGFAULTED on the guard-page probe below (n = 63,
 #      array placed against a PROT_NONE page, so an over-read faults instead of
 #      quietly reading a neighbour).  A non-canonical comparison is refused
-#      now; the canonical `<` / `!=` shapes stay vectorized and must read only
+#      now; the strict canonical `<` shape stays vectorized and must read only
 #      the array they were given.  The guard-page probe is deliberate: an
 #      over-read that stays inside a big array is invisible to a plain run.
 # ============================================================================
@@ -92,14 +92,15 @@ bad() { printf '  FAIL: %s\n' "$*" >&2; fail=1; }
 run_case() {
     local name=$1 src=$2 want=${3:-}
     local ref got
-    "$GCC" -O0 -w "$src" -o "$work/$name.ref" || { bad "$name: gcc oracle failed to build"; return; }
-    "$CCC" $flags -w "$src" -o "$work/$name.got" || { bad "$name: lccc failed to build"; return; }
-    ref=$(timeout 300 "$work/$name.ref") || bad "$name: oracle exited non-zero"
-    got=$(timeout 300 "$work/$name.got") || bad "$name: lccc exited non-zero"
+    "$GCC" -O0 -w "$src" -o "$work/$name.ref" || { bad "$name: gcc oracle failed to build"; return 1; }
+    "$CCC" $flags -w "$src" -o "$work/$name.got" || { bad "$name: lccc failed to build"; return 1; }
+    ref=$(timeout 300 "$work/$name.ref") || { bad "$name: oracle exited non-zero"; return 1; }
+    got=$(timeout 300 "$work/$name.got") || { bad "$name: lccc exited non-zero"; return 1; }
     if [[ -n $want ]]; then
-        [[ "$got" == "$want" ]] || bad "$name: lccc printed '$got', want '$want'"
+        [[ "$got" == "$want" ]] || { bad "$name: lccc printed '$got', want '$want'"; return 1; }
     elif [[ "$ref" != "$got" ]]; then
         bad "$name: lccc='$got' oracle='$ref'"
+        return 1
     fi
     echo "$got"
 }
@@ -203,9 +204,9 @@ cat > "$work/red_gp.c" <<'EOF'
 #include <stdio.h>
 #include <sys/mman.h>
 static int src[64];
-static long sum_lt(int *a,int n){ long s=0; for(int i=0;i<n;i++) s+=a[i]; return s; }
-static long sum_le(int *a,int n){ long s=0; for(int i=0;i<=n-1;i++) s+=a[i]; return s; }
-static long sum_ne(int *a,int n){ long s=0; for(int i=0;i!=n;i++) s+=a[i]; return s; }
+__attribute__((noinline)) static long sum_lt(int *a,int n){ long s=0; for(int i=0;i<n;i++) s+=a[i]; return s; }
+__attribute__((noinline)) static long sum_le(int *a,int n){ long s=0; for(int i=0;i<=n-1;i++) s+=a[i]; return s; }
+__attribute__((noinline)) static long sum_ne(int *a,int n){ long s=0; for(int i=0;i!=n;i++) s+=a[i]; return s; }
 int main(void){ long pg=4096; int n=63;
   for(int i=0;i<64;i++) src[i]=i;
   char *base=mmap(0,pg*2,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
@@ -219,16 +220,26 @@ EOF
 run_case "red_guardpage" "$work/red_gp.c" "1953 1953 1953" >/dev/null
 # Capture instead of piping into `grep -q`: under `pipefail` the compiler's
 # SIGPIPE on the closed pipe would fail the check even when the message matched.
-vec_msgs=$(LCCC_DEBUG_VECTORIZE=1 "$CCC" $flags -w -S -o "$work/red_gp.dbg.s" "$work/red_gp.c" 2>&1 || true)
-if grep -q "exit comparison is not the canonical exclusive IV test" <<<"$vec_msgs"; then
+vec_msgs=$(LCCC_DEBUG_VECTORIZE=1 "$CCC" $flags -w -S -o "$work/red_gp.dbg.s" "$work/red_gp.c" 2>&1) || { bad "reduction debug compile failed: $vec_msgs"; exit 1; }
+# The typed preflight now rejects this before the later canonical-exit guard.
+if grep -qE "Unsupported reduction exit comparison/branch shape:.*op: Sle|exit comparison is not the canonical exclusive IV test" <<<"$vec_msgs"; then
     note "  inclusive exit comparison: refused (was the over-read)"
 else
     bad "inclusive reduction: refusal not reported -- the guard is gone"
 fi
 "$CCC" $flags -w -S -o "$work/red_gp.s" "$work/red_gp.c"
-packed=$(grep -cE 'vpadd|padd' "$work/red_gp.s" || true)
-[[ $packed -gt 0 ]] || bad "reduction arm: no packed add left -- contract 6 must not cost the reach"
-note "  canonical < / != reductions: $packed packed adds (reach intact)"
+# Pin each function, not the aggregate TU (the initializer also has packed adds).
+for shape in lt le ne; do
+    awk "/^sum_${shape}:/,/^[[:space:]]*\\.size sum_${shape},/" "$work/red_gp.s" > "$work/sum_${shape}.s"
+    grep -q "^sum_${shape}:" "$work/sum_${shape}.s" || bad "reduction $shape: missing noinline function"
+    packed=$(grep -cE '^[[:space:]]+v?padd' "$work/sum_${shape}.s" || true)
+    if [[ $shape == lt ]]; then
+        [[ $packed -gt 0 ]] || bad "strict reduction: no packed add left -- reach lost"
+    else
+        [[ $packed -eq 0 ]] || bad "non-strict reduction $shape: unexpected packed adds ($packed)"
+    fi
+    note "  reduction $shape: $packed packed adds (strict-only admission)"
+done
 
 if [[ $fail -ne 0 ]]; then
     echo "check_fma_matcher_guards: FAILED" >&2

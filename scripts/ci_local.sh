@@ -202,6 +202,18 @@ gate "cpu-supports-runtime" fast \
 gate "got-slot-local-addend" fast \
     env CCC="$LCCC" bash tests/regression/check_got_slot_local_addend.sh
 
+gate "vex-flag-reads" fast \
+    bash tests/regression/check_vex_flag_reads.sh
+
+gate "benchmark-codegen-registry" fast \
+    python3 tests/regression/check_benchmark_codegen_registry.py
+
+gate "gcc-provisioning-mocks" fast \
+    python3 tests/regression/check_ci_gcc16_provisioning.py
+
+gate "swap-provisioning-mocks" fast \
+    python3 tests/regression/check_ci_swap_provisioning.py
+
 gate "rust-toolchain-selector" fast \
     bash tests/regression/check_rust_toolchain_selector.sh
 
@@ -255,6 +267,13 @@ gate "volatile-member-codegen" fast \
 # members, against GCC 16.2's per-function memory-reference counts.
 gate "const-volatile-objects" fast \
     env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_const_volatile_objects.sh
+# nbody pair-loop family: vector-memory `(base, index, disp)` triples and
+# GEP offsets through GVN Copy glue join one pointer recurrence, affine
+# siblings chain (no second recurrence).  Pins the SHAPE (zero stride
+# multiplies, one hoisted base materialisation) and the correctness of the
+# transform at every opt level, ILP32, and under the ptr-add kill switch.
+gate "ivsr-vecaddr-struct-walk" fast \
+    env CCC="$LCCC" bash tests/regression/check_ivsr_vecaddr_struct_walk.sh
 
 # Executed miscompile regression for the iv_widen trajectory gates and the
 # exposed-latch intercept: runtime ring-top seeds over a 2^32-span marker
@@ -337,6 +356,12 @@ gate "cross-target-intrinsic-trap" fast \
 # A14-20: libc buffering must remain inside the profile-file lock.
 gate "pgo-io-contract" fast \
     python3 tests/regression/check_pgo_io.py --lccc "$LCCC"
+
+# Shared binding must preserve symbol preemption, visibility and RELA addends.
+gate "riscv-shared-binding-selftest" fast \
+    python3 tests/linker/test_riscv_shared_binding.py
+gate "riscv-shared-binding" fast \
+    python3 tests/linker/check_riscv_shared_binding.py --lccc target/fastbuild/lccc-riscv
 
 # A14-17: shared linking must not silently consume unknown relocation kinds.
 gate "riscv-relocation-contract" fast \
@@ -479,6 +504,14 @@ gate "regression-corpus-ssa" slow \
 gate "benchmark-output-oracle" slow \
     bash scripts/check_benchmark_outputs.sh
 
+# Bounded native Callgrind surveys remain measurements, not fast smoke gates.
+# Live Compiler Explorer research is not part of either CI mode.
+gate "bounded-callgrind-corpus" slow \
+    python3 scripts/callgrind_corpus.py --mine "$LCCC" --ref "${GCC:-gcc-16}" \
+        --gcc-include-command "${GCC:-gcc-16}" --out results/callgrind-corpus
+
+# Live Compiler Explorer surveys are explicitly invoked research tools, not CI gates.
+
 gate "differential-correctness-oracle" fast \
     env LCCC_BIN="$LCCC" python3 tests/correctness/run_correctness.py
 
@@ -546,6 +579,12 @@ gate "differential-fuzz-smoke" fast \
 
 gate "strict-computed-recip-codegen" fast \
     bash tests/regression/check_strict_computed_recip_codegen.sh
+
+gate "strict-packed-recip-bitwise" fast \
+    python3 scripts/check_strict_packed_recip.py
+
+gate "fp-environment-trap-order" fast \
+    bash tests/regression/check_fp_environment.sh
 
 gate "machinst-window-alloc" fast \
     bash tests/regression/check_machinst_window_alloc_wide_copy.sh
@@ -1840,6 +1879,9 @@ clippy_gate() {
     # declared MSRV cannot break `-D warnings` on a lint name that does not
     # exist yet, and the wrapper re-probes every name in the policy list under
     # `#![deny(unknown_lints)]` to keep typos from hiding behind that allow.
+    # Match hosted CI's toolchain report; this also confirms the Clippy
+    # component is installed before the policy wrapper invokes it.
+    cargo clippy --version
     RUSTFLAGS="$flags" CARGO_BUILD_JOBS="$jobs" \
         python3 scripts/check_clippy_policy.py
 }

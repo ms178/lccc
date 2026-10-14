@@ -68,6 +68,13 @@ unsigned long k_count_rhs(const unsigned char *restrict s, unsigned long n) {
     for (unsigned long i = 0; i < n; ++i) c = (s[i] == 0x5A) + c;
     return c;
 }
+/* Signed dynamic trip limit: vector-bound formation must use truncation
+ * toward zero, so negative limits produce no packed or scalar iterations. */
+unsigned long k_count_signed_limit(const unsigned char *restrict s, int n) {
+    unsigned long c = 0;
+    for (int i = 0; i < n; ++i) c += (s[i] == 0x5A);
+    return c;
+}
 
 /* ---- kernels the transform must REFUSE (wrong elements if packed) ---- */
 unsigned long k_refuse_stride(const unsigned char *restrict s, unsigned long n) {
@@ -127,6 +134,11 @@ static unsigned long v_count_rhs(const unsigned char *s, unsigned long n) {
     for (unsigned long i = 0; i < n; ++i) { volatile unsigned char v = s[i]; c = (v == 0x5A) + c; }
     return c;
 }
+static unsigned long v_count_signed_limit(const unsigned char *s, int n) {
+    unsigned long c = 0;
+    for (int i = 0; i < n; ++i) { volatile unsigned char v = s[i]; c += (v == 0x5A); }
+    return c;
+}
 static unsigned long v_refuse_stride(const unsigned char *s, unsigned long n) {
     unsigned long c = 0;
     for (unsigned long i = 0; i < n / 2; ++i) { volatile unsigned char v = s[2 * i]; c += (v == 0x5A); }
@@ -172,6 +184,15 @@ int main(void) {
         CHECK(k_refuse_shift(usrc, n), v_refuse_shift(usrc, n), "refuse_shift");
         CHECK(k_refuse_start7(usrc, n), v_refuse_start7(usrc, n), "refuse_start7");
         CHECK(k_refuse_step2(usrc, n), v_refuse_step2(usrc, n), "refuse_step2");
+    }
+    /* A signed dynamic limit can be negative; every such case must be an
+     * empty loop even after the vector bound is hoisted out of the loop. */
+    {
+        static const int signed_limits[] = { -1031, -65, -33, -32, -31, -1, 0, 1, 31, 32, 33, N };
+        for (size_t i = 0; i < sizeof(signed_limits) / sizeof(signed_limits[0]); ++i) {
+            const int n = signed_limits[i];
+            CHECK(k_count_signed_limit(usrc, n), v_count_signed_limit(usrc, n), "count_signed_limit");
+        }
     }
     /* The exact historical remainder-drop shape. */
     {
