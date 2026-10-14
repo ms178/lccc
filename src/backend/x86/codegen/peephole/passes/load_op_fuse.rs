@@ -2065,6 +2065,21 @@ mod tests {
     }
 
     #[test]
+    fn commuting_adjacent_fuse_refuses_when_product_is_returned_in_rdx() {
+        // Without a return marker the raw assembly model keeps both integer
+        // return registers live. Moving the product to %rax would lose the
+        // original %rdx return value, so the whole fusion must be refused.
+        let asm = format!(
+            "{PRO}    movq (%rsi), %rax\n    movq (%rdi), %rdx\n    imulq %rax, %rdx\n    addq %rdx, %rcx\n    movq %rdx, %rdx\n    movq %rdx, (%r8)\n    movq %rcx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(!has(&out, "imulq (%rdi), %rax"), "{out:?}");
+        assert!(has(&out, "movq (%rdi), %rdx"), "{out:?}");
+        assert!(has(&out, "imulq %rax, %rdx"), "{out:?}");
+        assert!(has(&out, "movq %rdx, (%r8)"), "{out:?}");
+    }
+
+    #[test]
     fn commuting_adjacent_fuse_retargets_a_full_width_load_address() {
         // This full-width definition consumes the old product as its memory
         // address before replacing %rdx. Retarget just that address to the
