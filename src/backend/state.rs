@@ -801,6 +801,14 @@ impl CodegenState {
     /// True when eliding a branch to the physically next block would make
     /// this block's observable address equal that next label. Directives
     /// and debug locations do not occupy an address; an instruction does.
+    ///
+    /// Text heuristic: scans the buffer backwards from the current emission
+    /// point, skipping empty lines, comments, `.cfi_*`, `.loc ` (with space
+    /// or tab to exclude `.local`), and `.file`. Any other directive that
+    /// *can* emit bytes (`.p2align`, `.align`, `.balign`, `.space`) is
+    /// treated as address-occupying (fail-closed). A label line (`X:` with
+    /// no space) means the observable label sits directly above the next
+    /// one and elision would alias them.
     pub fn fallthrough_would_alias_observable_label(&self) -> bool {
         if !self.preserve_label_identity {
             return false;
@@ -810,10 +818,18 @@ impl CodegenState {
             if t.is_empty()
                 || t.starts_with('#')
                 || t.starts_with(".cfi_")
-                || t.starts_with(".loc")
                 || t.starts_with(".file")
+                || (t.starts_with(".loc") && t.as_bytes().get(4).is_some_and(|&b| b == b' ' || b == b'\t'))
             {
                 continue;
+            }
+            // Directives that can emit bytes are address-occupying.
+            if t.starts_with(".p2align")
+                || t.starts_with(".align")
+                || t.starts_with(".balign")
+                || t.starts_with(".space")
+            {
+                return false;
             }
             return t.ends_with(':') && !t.contains(' ');
         }

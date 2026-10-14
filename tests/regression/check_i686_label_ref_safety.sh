@@ -22,9 +22,12 @@ import re, sys
 asm = open(sys.argv[1]).read()
 defined = set(re.findall(r"(?m)^(\.L[\w.$]+):", asm))
 missing = []
-for kind, name in re.findall(r"(?m)^\s*\.(long|quad|word|short|byte|hword|value)\s+(\.L[\w.$]+)\b", asm):
-    if name not in defined:
-        missing.append(f".{kind} {name}")
+# Check EVERY .L token in a data payload, not just the first operand.
+# `.long A - B` references both A and B; both must be defined.
+for kind, payload in re.findall(r"(?m)^\s*\.(long|quad|word|short|byte|hword|value)\s+(.+)$", asm):
+    for label in re.findall(r"\.L[\w.$]+", payload):
+        if label not in defined:
+            missing.append(f".{kind} {label}")
 if missing:
     sys.exit("undefined data label(s): " + ", ".join(missing))
 for insn, relay in (

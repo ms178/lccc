@@ -1,10 +1,92 @@
 # CFG threading and asm-goto edge audit
 
-Follow-up on `6733d68f41b00387a98d2a2658a86bbf49632c99` (PR #812,
-`6495e6eb6076d6ddf61dc92f3a0b9a7a3dd044cb`). That PR head's hosted Test
-Suite, Clippy, Compiler Explorer oracle, and LCCC-vs-GCC checks completed
-green. This note describes the additional i686 label-safety fix. It is not
-a hosted result for the follow-up head, and not a speedup claim.
+Follow-up on `2bee471007394a81` (PR #818, `00394a81`). That PR merged the
+module-wide label census and address-observable fold protection. This note
+describes the Review AI audit response (PR #818 review, 8.9/10 score).
+It is not a hosted result for the follow-up head, and not a speedup claim.
+
+## Review AI audit response
+
+The Review AI audit identified four findings. Three were fixed; one was
+deferred as out-of-scope for this follow-up.
+
+### F1: `delete_redundant_cond_jumps` missing address-observable guard (FIXED)
+
+**Finding:** `delete_redundant_cond_jumps` (line 10787) deletes `jCC X` when
+the next line is `X:`, without the `jump_carries_observable_address` guard
+that Pattern 3 in `combined_local_pass` (line 2029) has for `Jmp`. Runs in
+the same pass sequence as `fold_reg_copy_idioms` (line 13536), which can
+remove the flags producer (`testl`/`cmp`) that normally separates an
+address-observable label from the `jCC`.
+
+**Fix:** Added the identity guard to the `LineKind::Label` arm only. The
+`LineKind::Jmp` arm (`jCC X; jmp X`) is safe because the `jmp` still
+occupies an address between any preceding observable label and `X:`. The
+guard uses lazily-cached `identity_pins`, exactly like `combined_local_pass`.
+
+**Verification:** A fixture with `static void *p = &&obs;` and a block
+reduced to `jCC X` + `X:` keeps the `jCC`, and `&&obs != &&X` on i686 at
+`-O0..-Os`.
+
+### F2: Emitter text heuristic fragility (HARDENED)
+
+**Finding:** `fallthrough_would_alias_observable_label` (state.rs:804) uses
+a text heuristic that scans the buffer backwards. Three fragilities:
+(a) alignment directives between an observable label and its elided
+terminator return `false` → possible aliasing if alignment emits 0 bytes;
+(b) a label emitted with a trailing comment would return `false` (silent
+aliasing); (c) `starts_with(".loc")` also swallows `.local`.
+
+**Hardening:** (1) Fail-closed for directives that *can* emit bytes
+(`.p2align`, `.align`, `.balign`, `.space`) — treated as address-occupying.
+(2) `.loc` tightened to `.loc ` / `.loc\t` (with space or tab) to exclude
+`.local`. The Review AI verified that "no trigger is reachable today" —
+all `.p2align`/`.align` emission sites precede a label, and labels are
+emitted alone — so this is robustness hardening, not a bug fix.
+
+**Not done:** Structural tracking (`emitted_since_label` flag) was
+considered but rejected as too invasive: it requires touching every emit
+site across all backends. The text heuristic is now fail-closed and
+documented.
+
+### F3: `test_inline_asm_region_is_never_rewritten` missing `#[test]` (FIXED)
+
+**Finding:** The test function at line 18464 had no `#[test]` attribute and
+never executed.
+
+**Fix:** Added `#[test]`. The test now runs and passes.
+
+### F4: `thread_trivial_blocks` O(candidates × M) complexity (DEFERRED)
+
+**Finding:** `thread_trivial_blocks` (line 10663) calls `label_defined_once`
+×2, `trampoline_pins`, and `retarget_proven_refs` per candidate. All scan
+O(M). At ~1k candidates and ~50k lines: ~50M scans per invocation × 4
+fixpoint iterations = ~200M scans. `combined_local_pass` shows the pattern:
+lazily cached `identity_pins`.
+
+**Decision:** Deferred. The Review AI rates this "Low, unmeasured" — no
+compile-time regression was demonstrated. The fix requires significant
+refactoring: precomputing label-definition counts, trampoline-pin sets, and
+retarget counts once per invocation and passing them into
+`thread_resolved_trampoline`. The risk of introducing a correctness bug
+outweighs the unmeasured performance gain. This is a compile-time
+optimization, not a correctness fix, and belongs in a dedicated performance
+PR with before/after measurements.
+
+### F5/F6/F7: Test coverage gaps (FIXED)
+
+**Finding:** (F5) `.quad` dispatch run not tested as dispatch (only as
+address pin); (F6) `.word`/`.short` label differences safe via fallback pin
+but untested; (F7) harness's dangling-label check validates only the first
+operand of `.long A - B`, never checking `B`.
+
+**Fix:** Added two unit tests in `dispatch_and_pin_tests` module:
+(1) `quad_dispatch_run_under_proven_base_is_rewritten` — verifies
+`jmp *T(,%rax,8)` proves `T` as a base, and `.quad .L1 - T` entries under
+`T` are classified as dispatch. (2) `short_label_difference_pins_both_labels`
+— verifies `.word .L1 - .L2` without a proven base is not dispatch, so both
+labels are pinned. Extended the harness's Python block to check **every**
+`.L` token in a data payload, not just the first operand.
 
 ## What the review got right
 

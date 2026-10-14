@@ -10783,10 +10783,16 @@ fn thread_trivial_blocks(store: &mut LineStore, infos: &mut [LineInfo]) -> bool 
 /// paths reach the same target: `jCC X` immediately followed by `jmp X`
 /// (threading creates these), or `jCC X` immediately followed by `X:`.
 /// The jCC itself is flag-neutral and side-effect-free, so deleting it is
-/// unconditionally sound.
+/// control-flow sound. Address identity is not control flow: when the jCC
+/// is the only instruction after an address-observable label, deleting it
+/// makes `&&obs == &&X`. The `jmp X` variant is safe (the jmp still
+/// separates the labels); only the `X:` variant needs the guard.
 fn delete_redundant_cond_jumps(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = infos.len();
     let mut changed = false;
+    // Lazily computed: only passes that see a jCC + Label pair need the
+    // module-wide pin set. Most passes never touch it.
+    let mut identity_pins: Option<std::collections::HashSet<String>> = None;
     let mut i = 0;
     while i < len {
         if infos[i].is_nop() || infos[i].kind != LineKind::CondJmp {
@@ -10803,11 +10809,19 @@ fn delete_redundant_cond_jumps(store: &mut LineStore, infos: &mut [LineInfo]) ->
         let j = next_non_nop(infos, i + 1);
         if j < len {
             let redundant = match infos[j].kind {
+                // jCC X; jmp X → the jmp still occupies an address between
+                // any preceding observable label and X:, so deletion is safe.
                 LineKind::Jmp => trimmed(store, &infos[j], j)
                     .split_whitespace()
                     .next_back()
                     .is_some_and(|t| t == target),
-                LineKind::Label => trimmed(store, &infos[j], j) == format!("{}:", target),
+                // jCC X; X: → deletion moves X:'s address onto the jCC's
+                // address. If an observable label sits on the jCC, the two
+                // addresses collapse. Refuse in that case.
+                LineKind::Label => {
+                    trimmed(store, &infos[j], j) == format!("{}:", target)
+                        && !jump_carries_observable_address(store, infos, i, &mut identity_pins)
+                }
                 _ => false,
             };
             if redundant {
@@ -18461,6 +18475,7 @@ f:
         assert!(result.contains("jmp .LBB3"), "{result}");
     }
 
+    #[test]
     fn test_inline_asm_region_is_never_rewritten() {
         // User-authored asm between #APP/#NO_APP must survive byte-for-byte
         // even when its text matches a foldable store/load shape, and it
@@ -22655,5 +22670,78 @@ mod classify_law_tests {
             LineKind::Directive,
             "a quoted '#' is not a comment"
         );
+    }
+}
+
+#[cfg(test)]
+mod dispatch_and_pin_tests {
+    //! Dispatch classification and address-pin coverage for the module-wide
+    //! label census. The census classifies `.long`/`.quad` as dispatch only
+    //! when the line sits in a contiguous run under a proven jump-table base.
+    //! Everything else pins the label as an address.
+
+    use super::{collect_jump_table_bases, dispatch_case, syntax_of, LineInfo, LineStore};
+
+    fn make_store(text: &str) -> (LineStore, Vec<LineInfo>) {
+        let mut store = LineStore::new();
+        let mut infos = Vec::new();
+        for line in text.lines() {
+            let id = store.intern(line);
+            infos.push(LineInfo::new(id, super::classify_line(line)));
+        }
+        (store, infos)
+    }
+
+    #[test]
+    fn quad_dispatch_run_under_proven_base_is_rewritten() {
+        // `jmp *T(,%rax,8)` proves T is a jump-table base. The contiguous
+        // `.quad .LX - T` entries under T are dispatch, not addresses.
+        let text = "\
+T:
+    .quad .L1 - T
+    .quad .L2 - T
+    .quad .L3 - T
+f:
+    jmp *T(,%rax,8)
+.L1:
+    ret
+.L2:
+    ret
+.L3:
+    ret
+";
+        let (store, infos) = make_store(text);
+        let bases = collect_jump_table_bases(&store, &infos);
+        assert!(bases.contains("T"), "T must be a proven base");
+        // The first entry under T is dispatch.
+        let t_idx = infos.iter().position(|i| syntax_of(&store, &infos, 0) == "T:").unwrap();
+        let entry1 = t_idx + 1;
+        let case = dispatch_case(syntax_of(&store, &infos, entry1), "T", &bases);
+        assert_eq!(case, Some(".L1"), "first .quad entry must be dispatch");
+    }
+
+    #[test]
+    fn short_label_difference_pins_both_labels() {
+        // `.word .L1 - .L2` is not a dispatch entry (no proven base owns
+        // it). Both `.L1` and `.L2` are pinned as addresses.
+        let text = "\
+.data
+    .word .L1 - .L2
+.text
+.L1:
+    ret
+.L2:
+    ret
+";
+        let (store, infos) = make_store(text);
+        let bases = collect_jump_table_bases(&store, &infos);
+        assert!(bases.is_empty(), "no proven base");
+        // The .word line is not dispatch.
+        let word_idx = infos
+            .iter()
+            .position(|i| syntax_of(&store, &infos, 0).starts_with(".word"))
+            .unwrap_or(1);
+        let case = dispatch_case(syntax_of(&store, &infos, word_idx), "", &bases);
+        assert_eq!(case, None, ".word without proven base is not dispatch");
     }
 }
