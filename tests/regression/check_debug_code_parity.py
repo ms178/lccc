@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Debug attribution must not change emitted .text (all benchmark programs)."""
+import difflib
 import os
 from pathlib import Path
 import re
@@ -30,6 +31,75 @@ def disassembly_window(obj: Path, start: int, end: int) -> str:
     return " | ".join(lines) or "no instructions in byte window"
 
 
+def instruction_diff(before_obj: Path, after_obj: Path) -> str:
+    """Locate changed instructions, ignoring addresses of relative branches."""
+    def instructions(obj: Path):
+        try:
+            proc = subprocess.run(
+                ["objdump", "-d", "-j", ".text", str(obj)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError as exc:
+            return None, f"objdump unavailable: {exc}"
+        if proc.returncode != 0:
+            return None, f"objdump failed ({proc.returncode})"
+        result = []
+        for line in proc.stdout.splitlines():
+            fields = line.split("\t")
+            if len(fields) < 3:
+                continue
+            try:
+                address = int(fields[0].strip().rstrip(":"), 16)
+            except ValueError:
+                continue
+            encoded = fields[1].split()
+            if not encoded or any(not re.fullmatch(r"[0-9a-fA-F]{2}", byte) for byte in encoded):
+                continue
+            assembly = fields[2].strip()
+            if not assembly:
+                continue
+            branch = re.match(r"^(\S+)\s+([0-9a-fA-F]+)(?:\s+<[^>]+>)?$", assembly)
+            normalized = assembly
+            if branch and (
+                branch.group(1).startswith(("j", "loop"))
+                or branch.group(1) in {"call", "callq"}
+            ):
+                normalized = branch.group(1) + " <relative-target>"
+            result.append((address, assembly, normalized))
+        return result, None
+
+    before, before_error = instructions(before_obj)
+    after, after_error = instructions(after_obj)
+    if before_error or after_error:
+        return "; ".join(error for error in (before_error, after_error) if error)
+    before_norm = [item[2] for item in before]
+    after_norm = [item[2] for item in after]
+    opcodes = [
+        opcode
+        for opcode in difflib.SequenceMatcher(
+            a=before_norm, b=after_norm, autojunk=False
+        ).get_opcodes()
+        if opcode[0] != "equal"
+    ]
+    if not opcodes:
+        return "normalized instruction sequences match"
+    tag, i1, i2, j1, j2 = opcodes[0]
+    before_start, before_end = max(0, i1 - 2), min(len(before), i2 + 2)
+    after_start, after_end = max(0, j1 - 2), min(len(after), j2 + 2)
+
+    def render(items, start, end):
+        if start == end:
+            return "(none)"
+        return " | ".join(f"{addr:x}:{asm}" for addr, asm, _ in items[start:end])
+
+    return (
+        f"{tag}; before={render(before, before_start, before_end)}; "
+        f"after={render(after, after_start, after_end)}"
+    )
+
+
 def report_mismatch(
     title: str,
     source: Path,
@@ -47,7 +117,8 @@ def report_mismatch(
         f"first differing .text byte={first}; bytes[{start}:{end}] "
         f"before={before[start:end].hex()} after={after[start:end].hex()}; "
         f"before-insns={disassembly_window(before_obj, start, end)}; "
-        f"after-insns={disassembly_window(after_obj, start, end)}"
+        f"after-insns={disassembly_window(after_obj, start, end)}; "
+        f"instruction-diff={instruction_diff(before_obj, after_obj)}"
     )
     # The grouped CI step cannot expose runner logs in every environment;
     # publish the diagnostic as an Actions annotation as well as stdout.
