@@ -1,0 +1,14 @@
+{
+  "candidate_path": "engineering/evidence/2026-10-14-audit/ctest-lccc.xml",
+  "candidate_tests": 1,
+  "candidate_unique": 1,
+  "comparable": true,
+  "duplicate_identities": {
+    "candidate": 0,
+    "reference": 0
+  },
+  "problems": [],
+  "reference_path": "engineering/evidence/2026-10-14-audit/ctest-gcc.xml",
+  "reference_tests": 1,
+  "reference_unique": 1
+}

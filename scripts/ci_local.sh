@@ -261,6 +261,8 @@ gate "const-volatile-objects" fast \
 # buffer, gcc-parity matrix (-O0..-O3 x {default, kill switch, -m32 SKIP}).
 gate "ivwiden-exposed-latch" fast \
     env CCC="$LCCC" bash tests/regression/check_ivwiden_exposed_latch.sh
+gate "zlib-maketrees" fast \
+    env CCC="$LCCC" bash tests/regression/check_zlib_maketrees.sh
 gate "fp-extract-homes" fast \
     env CCC="$LCCC" bash tests/regression/check_fp_extract_homes.sh
 gate "va-arg-pack-len" fast \
