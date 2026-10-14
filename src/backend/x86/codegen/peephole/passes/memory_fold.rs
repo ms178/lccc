@@ -4545,6 +4545,11 @@ pub(super) fn fold_memory_rmw(store: &mut LineStore, infos: &mut [LineInfo]) -> 
             continue;
         }
         let mut lj = infos[j].trimmed(store.get(j)).to_string();
+        // Owned copy of the register the increment must name: the load's
+        // own register, or the same-width copy's destination. Owned
+        // because the copy parse borrows `lj`, which is then replaced by
+        // the increment's own line text.
+        let mut value_reg_text = loaded_reg.to_string();
         let (value_reg, imm_text) = match parse_const_increment(&lj, reg_width, loaded_reg) {
             Some(parsed) => parsed,
             None => {
@@ -4552,6 +4557,7 @@ pub(super) fn fold_memory_rmw(store: &mut LineStore, infos: &mut [LineInfo]) -> 
                     i += 1;
                     continue;
                 };
+                value_reg_text = copy_dest.to_string();
                 copy_idx = Some(j);
                 j = next_non_nop(infos, j + 1, len);
                 if j >= len || infos[j].is_barrier() {
@@ -4559,7 +4565,7 @@ pub(super) fn fold_memory_rmw(store: &mut LineStore, infos: &mut [LineInfo]) -> 
                     continue;
                 }
                 lj = infos[j].trimmed(store.get(j)).to_string();
-                let Some(parsed) = parse_const_increment(&lj, reg_width, copy_dest) else {
+                let Some(parsed) = parse_const_increment(&lj, reg_width, &value_reg_text) else {
                     i += 1;
                     continue;
                 };
