@@ -1773,6 +1773,9 @@ clippy_gate() {
     # declared MSRV cannot break `-D warnings` on a lint name that does not
     # exist yet, and the wrapper re-probes every name in the policy list under
     # `#![deny(unknown_lints)]` to keep typos from hiding behind that allow.
+    # Match hosted CI's toolchain report; this also confirms the Clippy
+    # component is installed before the policy wrapper invokes it.
+    cargo clippy --version
     RUSTFLAGS="$flags" CARGO_BUILD_JOBS="$jobs" \
         python3 scripts/check_clippy_policy.py
 }
