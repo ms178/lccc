@@ -170,6 +170,10 @@ were applied, not an approximate style rewrite. The new comparison container
 also lacked curl, which the inspected rust-toolchain action invokes to bootstrap
 rustup; its explicit prerequisite list was corrected. Both are our harness/setup
 issues. The final push must execute its own corrected jobs.
+A subsequent actual bootstrap trace identified Git's dubious-ownership rejection
+in the container. Archive/rev-parse calls now trust only the known checkout with
+per-command safe.directory; there is no global wildcard exception. The trace,
+not a guessed exit-code interpretation, motivated this correction.
 
 ## Performance laboratory interpretation
 
@@ -197,6 +201,18 @@ inventory.
   counts are not target-CPU PMU evidence.
 - `run_benchmarks.py`/`bench_rank.py`: strict output screening, paired samples,
   per-workload intervals and regressions; a geomean cannot conceal bad workloads.
+
+The shared oracle JSON contains six source reports, not a whole 45-workload
+fresh measurement. For example its SipHash whole-TU snapshot has 846 LCCC versus
+308 GCC static instructions, 54 versus 17 explicit stack references. Clang/ICX
+have six calls versus LCCC/GCC's ten, so even this scope is not uniformly matched.
+These counts are neither runtime ratios nor allocator-spill counts. ICX's
+recorded ID is a moving latest alias, not a certified release.
+
+Three direct parser counterexamples also distinguish the test harnesses:
+missing function after a new record header, negative count, and extra record
+fields are all accepted by PR827's parser and rejected by the current parser.
+These are actual Python execution results, not compiled-runtime claims.
 
 The checked-in older CE/density research is shared by both trees, not new
 independent evidence that PR827 beats PR826. We have not conducted a fresh

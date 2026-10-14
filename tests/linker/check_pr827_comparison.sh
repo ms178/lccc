@@ -12,9 +12,11 @@ mkdir -p work target/contrast
 scratch=$(mktemp -d "$root/work/pr827.XXXXXX")
 trap 'rm -rf "$scratch"' EXIT
 mkdir -p "$scratch/agent-b" "$scratch/prior-ours"
-git archive cf271b0 | tar -x -C "$scratch/agent-b"
-git archive fe84066 | tar -x -C "$scratch/prior-ours"
-printf 'agent-b=%s\nprior-ours=%s\ncandidate=%s\n' "$(git rev-parse cf271b0)" "$(git rev-parse fe84066)" "$(git rev-parse HEAD)" > target/contrast/sources.txt
+# Container UID differs from checkout's owner. Trust ONLY this known checkout
+# for these read-only commands; never use safe.directory='*' or global mutation.
+git -c "safe.directory=$root" archive cf271b0 | tar -x -C "$scratch/agent-b"
+git -c "safe.directory=$root" archive fe84066 | tar -x -C "$scratch/prior-ours"
+printf 'agent-b=%s\nprior-ours=%s\ncandidate=%s\n' "$(git -c "safe.directory=$root" rev-parse cf271b0)" "$(git -c "safe.directory=$root" rev-parse fe84066)" "$(git -c "safe.directory=$root" rev-parse HEAD)" > target/contrast/sources.txt
 rustc +1.99.0 --version >> target/contrast/sources.txt
 gcc-16 --version >> target/contrast/sources.txt
 strace --version >> target/contrast/sources.txt
