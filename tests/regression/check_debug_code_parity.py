@@ -8,6 +8,19 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def report_mismatch(title: str, source: Path, before: bytes, after: bytes) -> None:
+    first = next((i for i, pair in enumerate(zip(before, after)) if pair[0] != pair[1]),
+                 min(len(before), len(after)))
+    message = (
+        f"{source.name}: before={len(before)} bytes, after={len(after)} bytes, "
+        f"first differing .text byte={first}"
+    )
+    # The grouped CI step cannot expose runner logs in every environment;
+    # publish the diagnostic as an Actions annotation as well as stdout.
+    print(f"::error title={title}::{message}", flush=True)
+    print(f"FAIL {title}: {message}", flush=True)
+
+
 def main():
     compiler = os.environ.get("CCC", str(ROOT / "target/fastbuild/lccc"))
     failures = []
@@ -26,7 +39,7 @@ def main():
                 code.append(raw.read_bytes())
             if not code[0] or code[0] != code[1]:
                 failures.append(source.name)
-                print(f"FAIL debug .text parity: {source.name}", flush=True)
+                report_mismatch("debug .text parity", source, code[0], code[1])
         # Size policy is driver-owned, not a heuristic reconstructed by a
         # peephole. On every program, -Os must already disable retargeting;
         # the explicit bisection switch must therefore leave .text unchanged.
@@ -43,7 +56,7 @@ def main():
                 code.append(raw.read_bytes())
             if not code[0] or code[0] != code[1]:
                 failures.append("size-policy:" + source.name)
-                print(f"FAIL size threading policy: {source.name}", flush=True)
+                report_mismatch("size threading policy", source, code[0], code[1])
     assert not failures, f"debug changes machine code: {failures}"
     print(f"PASS debug .text parity and size threading policy: {len(sources)} programs")
 
