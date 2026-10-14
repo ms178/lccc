@@ -59,6 +59,18 @@ class RedTeam(unittest.TestCase):
             with self.subTest(record=record), self.assertRaises((AssertionError, ValueError)):
                 PGO["counters"](record)
 
+    def test_failure_produces_structured_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / "failure.json"
+            missing = Path(tmp) / "missing-compiler"
+            p = subprocess.run([sys.executable, str(ROOT / "tests/regression/check_pgo_io.py"),
+                                "--lccc", str(missing), "--cc", str(missing), "--json", str(report)],
+                               capture_output=True, text=True, timeout=10)
+            self.assertEqual(p.returncode, 1)
+            result = json.loads(report.read_text())
+            self.assertEqual((result["passed"], result["failed"], result["skipped"]), (0, 1, 0))
+            self.assertIn("missing-compiler", result["error"])
+
     def test_profile_counts_preserve_header_identity(self):
         one = "lccc-pgo-v1 1 2 3 4\nfunc f\nf 1\ne 0 1 1\n"
         counts = PGO["counters"](one * 2)

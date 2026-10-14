@@ -9,6 +9,7 @@ panic, signal, missing tool or malformed output is never a valid rejection.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import struct
@@ -56,8 +57,10 @@ def fixture(kind=2, offset=0, symidx=2, addend=0, binding=0, visibility=0,
         symbols += struct.pack("<IBBHQQ", 8, 0, 0, 1, sub_value, 0)
         symbols += struct.pack("<IBBHQQ", 1, 0x12, 0, 1, 0, 12)
         local_count = 3
-        rela = b"".join(struct.pack("<QQq", offset, ((1 if k == 60 else 2) << 32) | k, addend)
-                        for k in sequence)
+        rela = b""
+        for operation in sequence:
+            k, delta = (operation, 0) if isinstance(operation, int) else operation
+            rela += struct.pack("<QQq", offset + delta, ((1 if k == 60 else 2) << 32) | k, addend)
     if no_symbols:
         symbols = b""
     chunks = [b"", text, bytes(16) if payload is None else payload,
@@ -148,6 +151,12 @@ def cases():
            uleb=(0x1000, 0xfff, (60, 61))), False, "ULEB128")
     yield ("bad-uleb-capacity", dict(offset=15, payload=bytes(16),
            uleb=(0x1000, 0, (60, 61))), False, "ULEB128")
+    for label, sequence in (("set-only", (60,)), ("sub-only", (61,)),
+                            ("reversed", (61, 60)), ("different-offset", (60, (61, 1)))):
+        yield (f"bad-uleb-{label}", dict(uleb=(0x1000, 0xfff, sequence)), False, "unpaired")
+    yield ("bad-uleb-underflow", dict(uleb=(0xfff, 0x1000, (60, 61))), False, "ULEB128")
+    yield ("bad-uleb-oversized", dict(offset=6, payload=bytes(6) + b"\x80" * 9 + b"\x02",
+           uleb=(0x1000, 0xfff, (60, 61))), False, "ULEB128")
 
 
 def main():
@@ -174,7 +183,9 @@ def main():
         root = Path(tmp)
         for name, options, accept, expected in selected:
             src = root / (name + ".o")
-            src.write_bytes(fixture(**options))
+            fixture_data = fixture(**options)
+            src.write_bytes(fixture_data)
+            fixture_hash = hashlib.sha256(fixture_data).hexdigest()
             # Check the fixture's own structure; oracle runs also validate it.
             assert sections(src)[".rela.data"][0][5] % 24 == 0
             for shared in (False, True):
@@ -185,6 +196,7 @@ def main():
                                [args.oracle, "-m", "elf64lriscv", "--no-relax"] +
                                (["-shared"] if shared else []))
                     command += [str(src), "-o", str(out)]
+                    rc, diagnostic = None, ""
                     try:
                         rc, diagnostic = run(command)
                         assert (rc == 0) == accept, f"expected accept={accept}, exit={rc}: {diagnostic}"
@@ -226,12 +238,16 @@ def main():
                             adjacent = sec.get(".data.more", sec[".data"])[1][-16:]
                             assert adjacent == b"\xa5" * 16, "adjacent section overwritten"
                         records.append(dict(case=name, shared=shared, tool=tool, passed=True,
-                                            command=command, returncode=rc, diagnostic=diagnostic))
+                                            command=command, returncode=rc, diagnostic=diagnostic,
+                                            expected_accept=accept, fixture_sha256=fixture_hash))
                     except (AssertionError, OSError, subprocess.TimeoutExpired, ValueError,
                             struct.error, KeyError) as error:
                         records.append(dict(case=name, shared=shared, tool=tool, passed=False,
-                                            error=str(error), command=command))
-    summary = dict(oracle_version=(run([args.oracle, "--version"])[1].strip() if args.oracle else None),
+                                            error=str(error), command=command, returncode=rc,
+                                            diagnostic=diagnostic, expected_accept=accept,
+                                            fixture_sha256=fixture_hash))
+    summary = dict(fixture_generator_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                   oracle_version=(run([args.oracle, "--version"])[1].strip() if args.oracle else None),
                    passed=sum(r["passed"] for r in records),
                    failed=sum(not r["passed"] for r in records), skipped=0, records=records)
     if args.json:

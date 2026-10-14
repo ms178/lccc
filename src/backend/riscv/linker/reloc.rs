@@ -108,20 +108,39 @@ pub(super) fn validate_input_relocations(input_objs: &[(String, ElfObject)]) -> 
                         sub.rela_type == R_RISCV_SUB_ULEB128 && sub.offset == reloc.offset
                     });
                     if !paired {
-                        return Err(format!("unpaired RISC-V SET_ULEB128 in '{}' section {}", name, sec_idx));
+                        return Err(format!(
+                            "unpaired RISC-V SET_ULEB128 in '{}' section {}",
+                            name, sec_idx
+                        ));
                     }
-                    let off = usize::try_from(reloc.offset)
-                        .map_err(|_| format!("RISC-V ULEB128 offset exceeds host size in '{}'", name))?;
-                    let field = obj.section_data[sec_idx].as_slice().get(off..)
-                        .ok_or_else(|| format!("missing RISC-V ULEB128 input field in '{}'", name))?;
-                    super::uleb128::field_len(field)
-                        .map_err(|error| format!("{} in '{}' section {} at {:#x}", error, name, sec_idx, reloc.offset))?;
+                    let off = usize::try_from(reloc.offset).map_err(|_| {
+                        format!("RISC-V ULEB128 offset exceeds host size in '{}'", name)
+                    })?;
+                    let field =
+                        obj.section_data[sec_idx]
+                            .as_slice()
+                            .get(off..)
+                            .ok_or_else(|| {
+                                format!("missing RISC-V ULEB128 input field in '{}'", name)
+                            })?;
+                    super::uleb128::field_len(field).map_err(|error| {
+                        format!(
+                            "{} in '{}' section {} at {:#x}",
+                            error, name, sec_idx, reloc.offset
+                        )
+                    })?;
                 } else if reloc.rela_type == R_RISCV_SUB_ULEB128 {
-                    let paired = ri.checked_sub(1).and_then(|i| relocs.get(i)).is_some_and(|set| {
-                        set.rela_type == R_RISCV_SET_ULEB128 && set.offset == reloc.offset
-                    });
+                    let paired = ri
+                        .checked_sub(1)
+                        .and_then(|i| relocs.get(i))
+                        .is_some_and(|set| {
+                            set.rela_type == R_RISCV_SET_ULEB128 && set.offset == reloc.offset
+                        });
                     if !paired {
-                        return Err(format!("unpaired RISC-V SUB_ULEB128 in '{}' section {}", name, sec_idx));
+                        return Err(format!(
+                            "unpaired RISC-V SUB_ULEB128 in '{}' section {}",
+                            name, sec_idx
+                        ));
                     }
                 }
             }

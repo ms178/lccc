@@ -9,8 +9,8 @@ use super::filemap::FileBacking;
 use super::secdata::SectionData;
 use super::types::{Elf64Object, Elf64Rela, Elf64Section, Elf64Symbol};
 use crate::backend::elf::{
-    EM_RISCV, ELF_MAGIC, ELFCLASS64, ELFDATA2LSB, ET_REL, SHT_NOBITS, SHT_RELA, SHT_SYMTAB, read_cstr,
-    read_cstr_ref, read_i64, read_u16, read_u32, read_u64, slice_at, table_entry,
+    ELF_MAGIC, ELFCLASS64, ELFDATA2LSB, EM_RISCV, ET_REL, SHT_NOBITS, SHT_RELA, SHT_SYMTAB,
+    read_cstr, read_cstr_ref, read_i64, read_u16, read_u32, read_u64, slice_at, table_entry,
 };
 
 /// Parse an ELF64 relocatable object file (.o).

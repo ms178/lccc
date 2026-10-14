@@ -16,7 +16,8 @@ ROOT = Path(__file__).resolve().parents[2]
 def run(cmd, env=None, expected=0):
     p = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
     assert p.returncode == expected, (cmd, p.returncode, p.stdout, p.stderr)
-    assert "panicked at" not in p.stderr, p.stderr
+    assert not any(marker in p.stderr.lower() for marker in
+                   ("panicked at", "ccc: internal error", "internal compiler error")), p.stderr
     return p
 
 
@@ -43,23 +44,20 @@ def counters(text):
             function = fields[1]
         elif fields[0] in ("e", "f"):
             assert header and function, line
+            assert len(fields) == (2 if fields[0] == "f" else 4), line
+            value = int(fields[-1])
+            assert 0 <= value <= 0xffffffffffffffff, line
+            if fields[0] == "e":
+                assert all(0 <= int(x) <= 0xffffffff for x in fields[1:3]), line
             key = (header, function, tuple(fields[:-1]))
-            result[key] = result.get(key, 0) + int(fields[-1])
+            result[key] = result.get(key, 0) + value
         else:
             raise AssertionError(f"unexpected profile line: {line}")
     assert result
     return result
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--lccc", required=True)
-    ap.add_argument("--cc", default="gcc", help="host compiler for LD_PRELOAD oracle only")
-    ap.add_argument("--json", type=Path)
-    args = ap.parse_args()
-    if not __debug__:
-        ap.error("optimized Python disables test assertions")
-    checks = []
+def run_checks(args, checks):
     with tempfile.TemporaryDirectory(prefix="lccc-pgo-io-") as tmp:
         root = Path(tmp)
         so = root / "interpose.so"
@@ -143,12 +141,29 @@ def main():
                 assert counters(ingested.read_text()) == {key: value * 2 for key, value in baseline_counts.items()}
                 assert run([str(use)], env=base_env, expected=23).stdout == expected.stdout
                 checks.append(f"{opt}/{count}: production ingestion and use")
-    summary = dict(passed=len(checks), failed=0, skipped=0, checks=checks)
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--lccc", required=True)
+    ap.add_argument("--cc", default="gcc", help="host compiler for LD_PRELOAD oracle only")
+    ap.add_argument("--json", type=Path)
+    args = ap.parse_args()
+    if not __debug__:
+        ap.error("optimized Python disables test assertions")
+    checks = []
+    error = None
+    try:
+        run_checks(args, checks)
+    except (AssertionError, OSError, subprocess.TimeoutExpired, ValueError, IndexError) as failure:
+        error = str(failure)
+    summary = dict(passed=len(checks), failed=int(error is not None), skipped=0, checks=checks, error=error)
     if args.json:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(summary, indent=2) + "\n")
-    print(f"PGO I/O: {len(checks)} PASS / 0 FAIL / 0 SKIP")
-    return 0
+    if error is not None:
+        print("FAIL", error)
+    print(f"PGO I/O: {len(checks)} PASS / {summary['failed']} FAIL / 0 SKIP")
+    return int(error is not None)
 
 
 if __name__ == "__main__":
