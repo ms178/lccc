@@ -2982,23 +2982,6 @@ struct IntrinsicRequirement {
 }
 
 /// Map a BuiltinIntrinsic to its corresponding IntrinsicOp.
-/// One row of the AUD-CPU-3 permission table: what an intrinsic's instruction
-/// needs before the invocation may contain it.
-struct IntrinsicRequirement {
-    /// The feature whose bit in [`crate::common::x86_features::effective`] is
-    /// the permission (the fold for a conjunction is inside the fold, so one
-    /// lookup is enough).
-    feature: crate::common::x86_features::X86Feature,
-    /// The `-m` flag that grants `feature`, for the diagnostic.
-    flag: &'static str,
-    /// A conjunct the feature's own bit does not spell out.  The 256-bit
-    /// VAES/VPCLMULQDQ forms are the case: their permission is the extension
-    /// *and* the 256-bit vector class, and a user who passed `-mvaes` on a
-    /// target without AVX2 needs to be told the second half, not the first.
-    also: Option<&'static str>,
-}
-
-/// Map a BuiltinIntrinsic to its corresponding IntrinsicOp.
 /// AUD-CPU-3: the instruction-set extension an x86 intrinsic's instruction
 /// belongs to, for the families whose permission bit exists in
 /// [`crate::common::x86_features`].
