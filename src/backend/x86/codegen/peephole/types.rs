@@ -63,6 +63,14 @@ pub(super) struct LineInfo {
     /// at classification so the barrier test in the hot loop stays integer-only
     /// and no pass can re-derive the law -- or mis-derive it.
     pub(super) inert_dir: bool,
+    /// True when this line is (part of) a C `volatile` access, marked by
+    /// `pin_volatile_access_regions`. The line stays `pinned` (no pass may
+    /// delete, reuse, reorder or rewrite it), but the flag lets
+    /// `fold_memory_rmw` recognize a volatile load/op/store sequence and
+    /// fuse it into the single memory RMW instruction that performs
+    /// exactly the one read and one write the abstract machine requires --
+    /// the form GCC emits for `h += 3` on a volatile object.
+    pub(super) volatile_access: bool,
 }
 
 /// What kind of assembly line this is, with pre-extracted fields for the
@@ -336,6 +344,7 @@ pub(super) fn line_info(kind: LineKind, ts: u16) -> LineInfo {
         reg_refs: 0,
         pinned: false,
         inert_dir: false,
+        volatile_access: false,
     }
 }
 
@@ -362,6 +371,7 @@ pub(super) fn cmp_line_info(ts: u16, s: &str, sb: &[u8]) -> LineInfo {
         reg_refs,
         pinned: false,
         inert_dir: false,
+        volatile_access: false,
     }
 }
 
@@ -400,6 +410,7 @@ pub(super) fn xmm_slot_line_info(kind: LineKind, ts: u16, s: &str, sb: &[u8]) ->
         reg_refs: scan_register_refs(sb),
         pinned: false,
         inert_dir: false,
+        volatile_access: false,
     }
 }
 
@@ -415,6 +426,7 @@ pub(super) fn line_info_with_regs(kind: LineKind, ts: u16, reg_refs: u16) -> Lin
         reg_refs,
         pinned: false,
         inert_dir: false,
+        volatile_access: false,
     }
 }
 
@@ -430,6 +442,7 @@ pub(super) fn line_info_ext(kind: LineKind, ext: ExtKind, ts: u16) -> LineInfo {
         reg_refs: 0,
         pinned: false,
         inert_dir: false,
+        volatile_access: false,
     }
 }
 
@@ -586,6 +599,7 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
                 reg_refs,
                 pinned: false,
                 inert_dir: false,
+                volatile_access: false,
             };
         }
     }
@@ -739,6 +753,7 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
         reg_refs,
         pinned: false,
         inert_dir: false,
+        volatile_access: false,
     }
 }
 
@@ -1171,6 +1186,7 @@ pub(super) fn mark_nop(info: &mut LineInfo) {
         reg_refs: 0,
         pinned: false,
         inert_dir: false,
+        volatile_access: false,
     };
 }
 

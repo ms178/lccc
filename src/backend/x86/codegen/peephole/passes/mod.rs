@@ -166,6 +166,7 @@ fn pin_inline_asm_regions(store: &LineStore, infos: &mut [LineInfo]) {
                 // Not a directive line; the field is only read for
                 // `LineKind::Directive`, and false is the fail-closed value.
                 inert_dir: false,
+                volatile_access: false,
             };
         }
     }
@@ -178,10 +179,12 @@ fn pin_inline_asm_regions(store: &LineStore, infos: &mut [LineInfo]) {
 /// Text passes see only assembly, where a volatile load looks like any other
 /// load, so `reuse_redundant_loads` turned the second of two volatile reads of
 /// `*(volatile unsigned *)p` into a register copy, and one store of two
-/// consecutive volatile stores was folded away. Each line in the region gets the
-/// conservative `InlineAsm` classification (opaque, clobbers everything), which
-/// is the same fallback user inline asm uses, so no pass reorders, deletes, or
-/// reuses it. The markers are comments and reach the assembler harmlessly.
+/// consecutive volatile stores was folded away. Each line in the region is
+/// pinned (`pinned` + `volatile_access`), so no pass reorders, deletes,
+/// reuses or rewrites it; the one fold that preserves the contract --
+/// fusing the sequence into a single memory RMW instruction -- is taught
+/// to recognize the flag in `fold_memory_rmw`. The markers are comments
+/// and reach the assembler harmlessly.
 fn pin_volatile_access_regions(store: &LineStore, infos: &mut [LineInfo]) {
     let mut in_volatile = false;
     for i in 0..store.len() {
@@ -207,16 +210,18 @@ fn pin_volatile_access_regions(store: &LineStore, infos: &mut [LineInfo]) {
         {
             continue;
         }
-        infos[i] = LineInfo {
-            kind: LineKind::InlineAsm,
-            ext_kind: ExtKind::None,
-            trim_start: infos[i].trim_start,
-            has_indirect_mem: true,
-            rbp_offset: RBP_OFFSET_NONE,
-            reg_refs: u16::MAX,
-            pinned: true,
-            inert_dir: false,
-        };
+        // Keep the line's real classification and pin it in place. The
+        // earlier form reclassified the line as opaque inline asm
+        // (`reg_refs: u16::MAX`), which also blocked the one rewrite that
+        // PRESERVES the volatile contract: `fold_memory_rmw` fusing a
+        // volatile load/op/store into a single `add $imm, mem`, which is
+        // exactly one read and one write (and the form GCC emits). Every
+        // pass that deletes, reuses, reorders or rewrites a line checks
+        // `pinned`, so the access itself stays untouchable; the fold
+        // recognizes the sequence through `volatile_access`.
+        infos[i].pinned = true;
+        infos[i].has_indirect_mem = true;
+        infos[i].volatile_access = true;
     }
 }
 
