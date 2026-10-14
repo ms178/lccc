@@ -906,7 +906,7 @@ pub(super) fn src_mentions_family(trimmed: &str, fam: RegId) -> bool {
 
 /// Count AT&T operands in `ops`, honoring the balanced-paren scanner so a SIB
 /// address's internal commas (`disp(%base,%idx,4)`) never split an operand.
-fn count_top_level_operands(ops: &str) -> usize {
+pub(super) fn count_top_level_operands(ops: &str) -> usize {
     let mut n = 0usize;
     let mut rest = ops.trim();
     if rest.is_empty() {

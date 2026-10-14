@@ -1,0 +1,1868 @@
+{
+  "stage": "latest-main rebased combined-source candidate, targeted GCC12 comparison",
+  "candidate_sha256": "f74774870778ae6b8a58f0bba97652e07d5deabc0d2a77981efbb0a806e37d4c",
+  "source_commit_at_build": "4e3f6ef",
+  "metric": "bounded whole-program simulated Ir; not runtime",
+  "selected": [
+    "byte_load_reassembly",
+    "double_reduction",
+    "libm_round_family",
+    "linux_find_bit_scaled",
+    "lz4_match_extend",
+    "nbody",
+    "ring_fifo",
+    "spectral_norm",
+    "zlib_ng_adler32"
+  ],
+  "complete": true,
+  "failures": [],
+  "manifests": {
+    "nbody": {
+      "comparable": 1,
+      "compiler_environment": {},
+      "failures": {},
+      "geomean_ir_mine_over_ref": 1.1346784737290563,
+      "geometry": {
+        "D1": "32768,8,64",
+        "I1": "32768,8,64",
+        "LL": "33554432,16,64"
+      },
+      "geometry_env_overrides": {},
+      "heavy_opt_in": true,
+      "host": {
+        "libc": [
+          "glibc",
+          "2.36"
+        ],
+        "machine": "x86_64",
+        "platform": "Linux-6.1.158+-x86_64-with-glibc2.36"
+      },
+      "include": "-I/usr/lib/gcc/x86_64-linux-gnu/12/include",
+      "instrument_timeout_s": 60,
+      "model": "simulated instructions/I1/D1/LL/branch predictor; not PMU/uops/cycles/speedup",
+      "opt": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSTEPS=1000",
+      "opt_tokens": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-Wl,--no-as-needed",
+        "-lm",
+        "-DSTEPS=1000"
+      ],
+      "paths": {
+        "equal_byte_length": true,
+        "mine": "results/pr824-rebased/callgrind-gcc12/nbody/aa",
+        "ref": "results/pr824-rebased/callgrind-gcc12/nbody/bb"
+      },
+      "results": {
+        "nbody": {
+          "binary_sha256": {
+            "mine": "be25de65b7175bdd2c965915bd356e16fb68bddf85a0a0da4d63b1f03d9cfa1c",
+            "ref": "6125f60af01fe56621dd23ac914edb5a8addf6ecb611c4187a17df172c37c36b"
+          },
+          "correctness": {
+            "mine": {
+              "elapsed": 0.014076303000365442,
+              "failure": null,
+              "returncode": 0,
+              "stderr_excerpt": "",
+              "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdout_sha256": "76de83d6d51a74f82828547423f516e7815cfe8cfea6290a2831aa173f806de7"
+            },
+            "ref": {
+              "elapsed": 0.016234719999829395,
+              "failure": null,
+              "returncode": 0,
+              "stderr_excerpt": "",
+              "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdout_sha256": "76de83d6d51a74f82828547423f516e7815cfe8cfea6290a2831aa173f806de7"
+            }
+          },
+          "instrumentation": {
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=results/pr824-rebased/callgrind-gcc12/nbody/aa/nbody.cg",
+                "results/pr824-rebased/callgrind-gcc12/nbody/aa/nbody"
+              ],
+              "counter_file_sha256": "6e4d647d809da123e6dfe4ad77dacee07bc334e14a0d6c030b277f54aa7474ba",
+              "process": {
+                "elapsed": 0.3552012349996403,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "lgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--103945-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--103945-- WARNING: unhandled amd64-linux syscall: 334\n--103945-- You may be able to write your own handler.\n--103945-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--103945-- Nevertheless we consider this a bug.  Please report\n--103945-- it at http://valgrind.org/support/bug_reports.html.\n",
+                "stderr_sha256": "a4bfd4e3a6bc5a2b5d59032bada83f506ae30972d7b6d2134fdedd6bb31cbf48",
+                "stdout_sha256": "76de83d6d51a74f82828547423f516e7815cfe8cfea6290a2831aa173f806de7"
+              }
+            },
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=results/pr824-rebased/callgrind-gcc12/nbody/bb/nbody.cg",
+                "results/pr824-rebased/callgrind-gcc12/nbody/bb/nbody"
+              ],
+              "counter_file_sha256": "7262f024a07d45051d14364c8e541dc53f637a0437bafa39b15c8942c3fc725c",
+              "process": {
+                "elapsed": 0.175372052000057,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "lgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--103960-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--103960-- WARNING: unhandled amd64-linux syscall: 334\n--103960-- You may be able to write your own handler.\n--103960-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--103960-- Nevertheless we consider this a bug.  Please report\n--103960-- it at http://valgrind.org/support/bug_reports.html.\n",
+                "stderr_sha256": "1525d81981d75d9d3344740d26e444fd566be545cb3e12cf2501120ed2cecef9",
+                "stdout_sha256": "76de83d6d51a74f82828547423f516e7815cfe8cfea6290a2831aa173f806de7"
+              }
+            }
+          },
+          "metrics": {
+            "conditional_mispredicts": [
+              3374,
+              6447
+            ],
+            "d1_misses": [
+              1808,
+              1844
+            ],
+            "i1_misses": [
+              1357,
+              1363
+            ],
+            "indirect_mispredicts": [
+              201,
+              208
+            ],
+            "ir_mine": 657848,
+            "ir_ratio": 1.1346784737290563,
+            "ir_ref": 579766,
+            "ll_misses": [
+              2816,
+              2839
+            ]
+          },
+          "mine": {
+            "Bc": 47340,
+            "Bcm": 3374,
+            "Bi": 375,
+            "Bim": 201,
+            "D1mr": 1158,
+            "D1mw": 650,
+            "DLmr": 873,
+            "DLmw": 612,
+            "Dr": 197528,
+            "Dw": 89427,
+            "I1mr": 1357,
+            "ILmr": 1331,
+            "Ir": 657848
+          },
+          "ref": {
+            "Bc": 56575,
+            "Bcm": 6447,
+            "Bi": 394,
+            "Bim": 208,
+            "D1mr": 1185,
+            "D1mw": 659,
+            "DLmr": 891,
+            "DLmw": 617,
+            "Dr": 176468,
+            "Dw": 63935,
+            "I1mr": 1363,
+            "ILmr": 1331,
+            "Ir": 579766
+          },
+          "source_sha256": "45db2f21add3645a945f1a6635d642f1aad5caecfa4c7b47da4943331a321837",
+          "status": "COMPARABLE-SIMULATION"
+        }
+      },
+      "schema": "lccc-callgrind-ab-v2",
+      "selected": 1,
+      "tools": {
+        "include_discovery": {
+          "command": [
+            "gcc"
+          ],
+          "executable": "/usr/bin/x86_64-linux-gnu-gcc-12",
+          "sha256": "75e997ec62297a6484f491bae28ab0ccb489daba23e398fd10fe68e9e6f0def8",
+          "version": "gcc (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+        },
+        "mine": {
+          "command": [
+            "target/fastbuild/lccc"
+          ],
+          "executable": "/home/user/lccc/target/fastbuild/lccc",
+          "sha256": "f74774870778ae6b8a58f0bba97652e07d5deabc0d2a77981efbb0a806e37d4c",
+          "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone"
+        },
+        "ref": {
+          "command": [
+            "gcc"
+          ],
+          "executable": "/usr/bin/x86_64-linux-gnu-gcc-12",
+          "sha256": "75e997ec62297a6484f491bae28ab0ccb489daba23e398fd10fe68e9e6f0def8",
+          "version": "gcc (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+        },
+        "valgrind": {
+          "command": [
+            "valgrind"
+          ],
+          "executable": "/home/user/.local/valgrind/bin/valgrind",
+          "sha256": "a698e3b1c336f33570da8400ac167a85209caa77946c380607762940f6138fa5",
+          "version": "valgrind-3.16.0.GIT"
+        }
+      }
+    },
+    "spectral_norm": {
+      "comparable": 1,
+      "compiler_environment": {},
+      "failures": {},
+      "geomean_ir_mine_over_ref": 1.1152461673203775,
+      "geometry": {
+        "D1": "32768,8,64",
+        "I1": "32768,8,64",
+        "LL": "33554432,16,64"
+      },
+      "geometry_env_overrides": {},
+      "heavy_opt_in": false,
+      "host": {
+        "libc": [
+          "glibc",
+          "2.36"
+        ],
+        "machine": "x86_64",
+        "platform": "Linux-6.1.158+-x86_64-with-glibc2.36"
+      },
+      "include": "-I/usr/lib/gcc/x86_64-linux-gnu/12/include",
+      "instrument_timeout_s": 60,
+      "model": "simulated instructions/I1/D1/LL/branch predictor; not PMU/uops/cycles/speedup",
+      "opt": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=128",
+      "opt_tokens": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-Wl,--no-as-needed",
+        "-lm",
+        "-DN=128"
+      ],
+      "paths": {
+        "equal_byte_length": true,
+        "mine": "results/pr824-rebased/callgrind-gcc12/spectral_norm/aa",
+        "ref": "results/pr824-rebased/callgrind-gcc12/spectral_norm/bb"
+      },
+      "results": {
+        "spectral_norm": {
+          "binary_sha256": {
+            "mine": "2f9e37ede36183ecff6fecdf1f5ac944ee25a83c0aaa3cfd7f8a916552a40949",
+            "ref": "41c5cbe512114640d21e3d44e0a56c5114b54482f3fe1f7d2926591461556ac8"
+          },
+          "correctness": {
+            "mine": {
+              "elapsed": 0.003967797999848699,
+              "failure": null,
+              "returncode": 0,
+              "stderr_excerpt": "",
+              "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdout_sha256": "dd1b53e3a8f641316d8c512483fcedd74d0243359a2dca66cc399429ef323d1e"
+            },
+            "ref": {
+              "elapsed": 0.014340027999878657,
+              "failure": null,
+              "returncode": 0,
+              "stderr_excerpt": "",
+              "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdout_sha256": "dd1b53e3a8f641316d8c512483fcedd74d0243359a2dca66cc399429ef323d1e"
+            }
+          },
+          "instrumentation": {
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=results/pr824-rebased/callgrind-gcc12/spectral_norm/aa/spectral_norm.cg",
+                "results/pr824-rebased/callgrind-gcc12/spectral_norm/aa/spectral_norm"
+              ],
+              "counter_file_sha256": "b1e65d768f21094f36d443817f1eceb57381f6784152de91157e6f5db29d061f",
+              "process": {
+                "elapsed": 0.3440896229999453,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "lgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--104017-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--104017-- WARNING: unhandled amd64-linux syscall: 334\n--104017-- You may be able to write your own handler.\n--104017-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--104017-- Nevertheless we consider this a bug.  Please report\n--104017-- it at http://valgrind.org/support/bug_reports.html.\n",
+                "stderr_sha256": "2b31bbb5413e9d0bf0d36781665aae85bc94f78233cf3050bead087b4192762d",
+                "stdout_sha256": "dd1b53e3a8f641316d8c512483fcedd74d0243359a2dca66cc399429ef323d1e"
+              }
+            },
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=results/pr824-rebased/callgrind-gcc12/spectral_norm/bb/spectral_norm.cg",
+                "results/pr824-rebased/callgrind-gcc12/spectral_norm/bb/spectral_norm"
+              ],
+              "counter_file_sha256": "39e318229c720ce54d2c8595b75090dc6c5f6447fd4b9e4a68de799c456f7c74",
+              "process": {
+                "elapsed": 0.5529906510000728,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "lgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--104035-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--104035-- WARNING: unhandled amd64-linux syscall: 334\n--104035-- You may be able to write your own handler.\n--104035-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--104035-- Nevertheless we consider this a bug.  Please report\n--104035-- it at http://valgrind.org/support/bug_reports.html.\n",
+                "stderr_sha256": "43fa43e2d8bbfb97a3401476ebfcaff72e9c40d75798268066168e95fa7fd0d7",
+                "stdout_sha256": "dd1b53e3a8f641316d8c512483fcedd74d0243359a2dca66cc399429ef323d1e"
+              }
+            }
+          },
+          "metrics": {
+            "conditional_mispredicts": [
+              8478,
+              8550
+            ],
+            "d1_misses": [
+              1825,
+              1879
+            ],
+            "i1_misses": [
+              1333,
+              1335
+            ],
+            "indirect_mispredicts": [
+              199,
+              207
+            ],
+            "ir_mine": 8241232,
+            "ir_ratio": 1.1152461673203775,
+            "ir_ref": 7389608,
+            "ll_misses": [
+              2780,
+              2806
+            ]
+          },
+          "mine": {
+            "Bc": 204430,
+            "Bcm": 8478,
+            "Bi": 365,
+            "Bim": 199,
+            "D1mr": 1146,
+            "D1mw": 679,
+            "DLmr": 861,
+            "DLmw": 612,
+            "Dr": 357060,
+            "Dw": 18465,
+            "I1mr": 1333,
+            "ILmr": 1307,
+            "Ir": 8241232
+          },
+          "ref": {
+            "Bc": 686701,
+            "Bcm": 8550,
+            "Bi": 384,
+            "Bim": 207,
+            "D1mr": 1172,
+            "D1mw": 707,
+            "DLmr": 878,
+            "DLmw": 621,
+            "Dr": 686327,
+            "Dw": 18796,
+            "I1mr": 1335,
+            "ILmr": 1307,
+            "Ir": 7389608
+          },
+          "source_sha256": "21a48dccebcbc3b9496263f62df260d278051c3cd1a528ed99c8b66bef481e6a",
+          "status": "COMPARABLE-SIMULATION"
+        }
+      },
+      "schema": "lccc-callgrind-ab-v2",
+      "selected": 1,
+      "tools": {
+        "include_discovery": {
+          "command": [
+            "gcc"
+          ],
+          "executable": "/usr/bin/x86_64-linux-gnu-gcc-12",
+          "sha256": "75e997ec62297a6484f491bae28ab0ccb489daba23e398fd10fe68e9e6f0def8",
+          "version": "gcc (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+        },
+        "mine": {
+          "command": [
+            "target/fastbuild/lccc"
+          ],
+          "executable": "/home/user/lccc/target/fastbuild/lccc",
+          "sha256": "f74774870778ae6b8a58f0bba97652e07d5deabc0d2a77981efbb0a806e37d4c",
+          "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone"
+        },
+        "ref": {
+          "command": [
+            "gcc"
+          ],
+          "executable": "/usr/bin/x86_64-linux-gnu-gcc-12",
+          "sha256": "75e997ec62297a6484f491bae28ab0ccb489daba23e398fd10fe68e9e6f0def8",
+          "version": "gcc (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+        },
+        "valgrind": {
+          "command": [
+            "valgrind"
+          ],
+          "executable": "/home/user/.local/valgrind/bin/valgrind",
+          "sha256": "a698e3b1c336f33570da8400ac167a85209caa77946c380607762940f6138fa5",
+          "version": "valgrind-3.16.0.GIT"
+        }
+      }
+    },
+    "double_reduction": {
+      "comparable": 1,
+      "compiler_environment": {},
+      "failures": {},
+      "geomean_ir_mine_over_ref": 1.1259634656634798,
+      "geometry": {
+        "D1": "32768,8,64",
+        "I1": "32768,8,64",
+        "LL": "33554432,16,64"
+      },
+      "geometry_env_overrides": {},
+      "heavy_opt_in": false,
+      "host": {
+        "libc": [
+          "glibc",
+          "2.36"
+        ],
+        "machine": "x86_64",
+        "platform": "Linux-6.1.158+-x86_64-with-glibc2.36"
+      },
+      "include": "-I/usr/lib/gcc/x86_64-linux-gnu/12/include",
+      "instrument_timeout_s": 60,
+      "model": "simulated instructions/I1/D1/LL/branch predictor; not PMU/uops/cycles/speedup",
+      "opt": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DREDUCTION_PASSES=1",
+      "opt_tokens": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-Wl,--no-as-needed",
+        "-lm",
+        "-DREDUCTION_PASSES=1"
+      ],
+      "paths": {
+        "equal_byte_length": true,
+        "mine": "results/pr824-rebased/callgrind-gcc12/double_reduction/aa",
+        "ref": "results/pr824-rebased/callgrind-gcc12/double_reduction/bb"
+      },
+      "results": {
+        "double_reduction": {
+          "binary_sha256": {
+            "mine": "bad62d5af3ba7ba9a93825cbc9b5a93d054caefde9c9e3f893d246790f1dd85f",
+            "ref": "8ce47de33315c0382751bd43700d3e0f4482fa06d89c3f71cc5c00455d1505fb"
+          },
+          "correctness": {
+            "mine": {
+              "elapsed": 0.03712325200012856,
+              "failure": null,
+              "returncode": 0,
+              "stderr_excerpt": "",
+              "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdout_sha256": "b02bb09e89c66c2a3737663a4760a352511e641827a52ffaf1237598cc53043d"
+            },
+            "ref": {
+              "elapsed": 0.04810087800024121,
+              "failure": null,
+              "returncode": 0,
+              "stderr_excerpt": "",
+              "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdout_sha256": "b02bb09e89c66c2a3737663a4760a352511e641827a52ffaf1237598cc53043d"
+            }
+          },
+          "instrumentation": {
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=results/pr824-rebased/callgrind-gcc12/double_reduction/aa/double_reduction.cg",
+                "results/pr824-rebased/callgrind-gcc12/double_reduction/aa/double_reduction"
+              ],
+              "counter_file_sha256": "5cdc3a8ced747e98b4dc77311cbe8906f644124360aa7f9cab633b5a97de6885",
+              "process": {
+                "elapsed": 0.5721417400000064,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "lgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--104103-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--104103-- WARNING: unhandled amd64-linux syscall: 334\n--104103-- You may be able to write your own handler.\n--104103-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--104103-- Nevertheless we consider this a bug.  Please report\n--104103-- it at http://valgrind.org/support/bug_reports.html.\n",
+                "stderr_sha256": "987fc7a2a8673a9ff5b81393d8516fa4dc22488cf48299f014c64b94a2af607f",
+                "stdout_sha256": "b02bb09e89c66c2a3737663a4760a352511e641827a52ffaf1237598cc53043d"
+              }
+            },
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=results/pr824-rebased/callgrind-gcc12/double_reduction/bb/double_reduction.cg",
+                "results/pr824-rebased/callgrind-gcc12/double_reduction/bb/double_reduction"
+              ],
+              "counter_file_sha256": "b5a049220f9ae08f20ae8b85c5d54cacc2855553659e5a7716ef07d15df79e97",
+              "process": {
+                "elapsed": 0.5586600940000608,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "lgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--104132-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--104132-- WARNING: unhandled amd64-linux syscall: 334\n--104132-- You may be able to write your own handler.\n--104132-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--104132-- Nevertheless we consider this a bug.  Please report\n--104132-- it at http://valgrind.org/support/bug_reports.html.\n",
+                "stderr_sha256": "3ba02d994f7b23ecf2b44e4741a8033f08a430cfb9ebb34636bfb2da1865ab00",
+                "stdout_sha256": "b02bb09e89c66c2a3737663a4760a352511e641827a52ffaf1237598cc53043d"
+              }
+            }
+          },
+          "metrics": {
+            "conditional_mispredicts": [
+              3219,
+              3276
+            ],
+            "d1_misses": [
+              526201,
+              526229
+            ],
+            "i1_misses": [
+              1263,
+              1270
+            ],
+            "indirect_mispredicts": [
+              200,
+              201
+            ],
+            "ir_mine": 30405603,
+            "ir_ratio": 1.1259634656634798,
+            "ir_ref": 27004076,
+            "ll_misses": [
+              199315,
+              199347
+            ]
+          },
+          "mine": {
+            "Bc": 1335470,
+            "Bcm": 3219,
+            "Bi": 365,
+            "Bim": 200,
+            "D1mr": 328905,
+            "D1mw": 197296,
+            "DLmr": 856,
+            "DLmw": 197219,
+            "Dr": 683956,
+            "Dw": 3158666,
+            "I1mr": 1263,
+            "ILmr": 1240,
+            "Ir": 30405603
+          },
+          "ref": {
+            "Bc": 1336597,
+            "Bcm": 3276,
+            "Bi": 372,
+            "Bim": 201,
+            "D1mr": 328929,
+            "D1mw": 197300,
+            "DLmr": 874,
+            "DLmw": 197225,
+            "Dr": 685829,
+            "Dw": 3159132,
+            "I1mr": 1270,
+            "ILmr": 1248,
+            "Ir": 27004076
+          },
+          "source_sha256": "cad8a08bc76c767ac184e222570f4311d2e1ddab072f59119d737c87fbc1eaf7",
+          "status": "COMPARABLE-SIMULATION"
+        }
+      },
+      "schema": "lccc-callgrind-ab-v2",
+      "selected": 1,
+      "tools": {
+        "include_discovery": {
+          "command": [
+            "gcc"
+          ],
+          "executable": "/usr/bin/x86_64-linux-gnu-gcc-12",
+          "sha256": "75e997ec62297a6484f491bae28ab0ccb489daba23e398fd10fe68e9e6f0def8",
+          "version": "gcc (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+        },
+        "mine": {
+          "command": [
+            "target/fastbuild/lccc"
+          ],
+          "executable": "/home/user/lccc/target/fastbuild/lccc",
+          "sha256": "f74774870778ae6b8a58f0bba97652e07d5deabc0d2a77981efbb0a806e37d4c",
+          "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone"
+        },
+        "ref": {
+          "command": [
+            "gcc"
+          ],
+          "executable": "/usr/bin/x86_64-linux-gnu-gcc-12",
+          "sha256": "75e997ec62297a6484f491bae28ab0ccb489daba23e398fd10fe68e9e6f0def8",
+          "version": "gcc (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+        },
+        "valgrind": {
+          "command": [
+            "valgrind"
+          ],
+          "executable": "/home/user/.local/valgrind/bin/valgrind",
+          "sha256": "a698e3b1c336f33570da8400ac167a85209caa77946c380607762940f6138fa5",
+          "version": "valgrind-3.16.0.GIT"
+        }
+      }
+    },
+    "ring_fifo": {
+      "comparable": 1,
+      "compiler_environment": {},
+      "failures": {},
+      "geomean_ir_mine_over_ref": 2.6193647119007055,
+      "geometry": {
+        "D1": "32768,8,64",
+        "I1": "32768,8,64",
+        "LL": "33554432,16,64"
+      },
+      "geometry_env_overrides": {},
+      "heavy_opt_in": false,
+      "host": {
+        "libc": [
+          "glibc",
+          "2.36"
+        ],
+        "machine": "x86_64",
+        "platform": "Linux-6.1.158+-x86_64-with-glibc2.36"
+      },
+      "include": "-I/usr/lib/gcc/x86_64-linux-gnu/12/include",
+      "instrument_timeout_s": 60,
+      "model": "simulated instructions/I1/D1/LL/branch predictor; not PMU/uops/cycles/speedup",
+      "opt": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+      "opt_tokens": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-Wl,--no-as-needed",
+        "-lm"
+      ],
+      "paths": {
+        "equal_byte_length": true,
+        "mine": "results/pr824-rebased/callgrind-gcc12/ring_fifo/aa",
+        "ref": "results/pr824-rebased/callgrind-gcc12/ring_fifo/bb"
+      },
+      "results": {
+        "ring_fifo": {
+          "binary_sha256": {
+            "mine": "db59625b9310360b504210284d04e1993ded654f712fc6dbefc6a1e6cad84dc2",
+            "ref": "97853fc4674b1876d9974f7fe3fe5d76487563390e5732875a57c443ffa8f0d7"
+          },
+          "correctness": {
+            "mine": {
+              "elapsed": 0.027780437999808782,
+              "failure": null,
+              "returncode": 0,
+              "stderr_excerpt": "",
+              "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            "ref": {
+              "elapsed": 0.031958486000348785,
+              "failure": null,
+              "returncode": 0,
+              "stderr_excerpt": "",
+              "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            }
+          },
+          "instrumentation": {
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=results/pr824-rebased/callgrind-gcc12/ring_fifo/aa/ring_fifo.cg",
+                "results/pr824-rebased/callgrind-gcc12/ring_fifo/aa/ring_fifo"
+              ],
+              "counter_file_sha256": "99ecac75cdb9fef1a91ffc936777f4c6cedb3841c40a216f8da1fa4d3ef3690b",
+              "process": {
+                "elapsed": 0.32492864499999996,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "lgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--104192-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--104192-- WARNING: unhandled amd64-linux syscall: 334\n--104192-- You may be able to write your own handler.\n--104192-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--104192-- Nevertheless we consider this a bug.  Please report\n--104192-- it at http://valgrind.org/support/bug_reports.html.\n",
+                "stderr_sha256": "e708399cce8d51794c3be402ddbc5bf56bd33dda152b4e348b5a8687bf30ca1c",
+                "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+              }
+            },
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=results/pr824-rebased/callgrind-gcc12/ring_fifo/bb/ring_fifo.cg",
+                "results/pr824-rebased/callgrind-gcc12/ring_fifo/bb/ring_fifo"
+              ],
+              "counter_file_sha256": "5451104e2504e976f74cd06e2eeff9241743fb54d86c65b08b508e33187863ae",
+              "process": {
+                "elapsed": 0.2489003059999959,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "lgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--104207-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--104207-- WARNING: unhandled amd64-linux syscall: 334\n--104207-- You may be able to write your own handler.\n--104207-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--104207-- Nevertheless we consider this a bug.  Please report\n--104207-- it at http://valgrind.org/support/bug_reports.html.\n",
+                "stderr_sha256": "a795dc5a892c1f2ffc80db7ac05162715d294a4ef84270fe08617af5971dd80d",
+                "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+              }
+            }
+          },
+          "metrics": {
+            "conditional_mispredicts": [
+              3062,
+              3129
+            ],
+            "d1_misses": [
+              1743,
+              1708
+            ],
+            "i1_misses": [
+              1086,
+              1091
+            ],
+            "indirect_mispredicts": [
+              181,
+              183
+            ],
+            "ir_mine": 604201,
+            "ir_ratio": 2.6193647119007055,
+            "ir_ref": 230667,
+            "ll_misses": [
+              2528,
+              2492
+            ]
+          },
+          "mine": {
+            "Bc": 84140,
+            "Bcm": 3062,
+            "Bi": 332,
+            "Bim": 181,
+            "D1mr": 1082,
+            "D1mw": 661,
+            "DLmr": 830,
+            "DLmw": 630,
+            "Dr": 47875,
+            "Dw": 32286,
+            "I1mr": 1086,
+            "ILmr": 1068,
+            "Ir": 604201
+          },
+          "ref": {
+            "Bc": 45274,
+            "Bcm": 3129,
+            "Bi": 345,
+            "Bim": 183,
+            "D1mr": 1102,
+            "D1mw": 606,
+            "DLmr": 845,
+            "DLmw": 574,
+            "Dr": 29756,
+            "Dw": 12757,
+            "I1mr": 1091,
+            "ILmr": 1073,
+            "Ir": 230667
+          },
+          "source_sha256": "e5c01f13f9472d27106f37b76e0076f2d3e4cb71109c38344688e4e8f6e6db03",
+          "status": "COMPARABLE-SIMULATION"
+        }
+      },
+      "schema": "lccc-callgrind-ab-v2",
+      "selected": 1,
+      "tools": {
+        "include_discovery": {
+          "command": [
+            "gcc"
+          ],
+          "executable": "/usr/bin/x86_64-linux-gnu-gcc-12",
+          "sha256": "75e997ec62297a6484f491bae28ab0ccb489daba23e398fd10fe68e9e6f0def8",
+          "version": "gcc (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+        },
+        "mine": {
+          "command": [
+            "target/fastbuild/lccc"
+          ],
+          "executable": "/home/user/lccc/target/fastbuild/lccc",
+          "sha256": "f74774870778ae6b8a58f0bba97652e07d5deabc0d2a77981efbb0a806e37d4c",
+          "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone"
+        },
+        "ref": {
+          "command": [
+            "gcc"
+          ],
+          "executable": "/usr/bin/x86_64-linux-gnu-gcc-12",
+          "sha256": "75e997ec62297a6484f491bae28ab0ccb489daba23e398fd10fe68e9e6f0def8",
+          "version": "gcc (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+        },
+        "valgrind": {
+          "command": [
+            "valgrind"
+          ],
+          "executable": "/home/user/.local/valgrind/bin/valgrind",
+          "sha256": "a698e3b1c336f33570da8400ac167a85209caa77946c380607762940f6138fa5",
+          "version": "valgrind-3.16.0.GIT"
+        }
+      }
+    },
+    "libm_round_family": {
+      "comparable": 1,
+      "compiler_environment": {},
+      "failures": {},
+      "geomean_ir_mine_over_ref": 0.9667035083841222,
+      "geometry": {
+        "D1": "32768,8,64",
+        "I1": "32768,8,64",
+        "LL": "33554432,16,64"
+      },
+      "geometry_env_overrides": {},
+      "heavy_opt_in": false,
+      "host": {
+        "libc": [
+          "glibc",
+          "2.36"
+        ],
+        "machine": "x86_64",
+        "platform": "Linux-6.1.158+-x86_64-with-glibc2.36"
+      },
+      "include": "-I/usr/lib/gcc/x86_64-linux-gnu/12/include",
+      "instrument_timeout_s": 60,
+      "model": "simulated instructions/I1/D1/LL/branch predictor; not PMU/uops/cycles/speedup",
+      "opt": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=256 -DPASSES=4",
+      "opt_tokens": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-Wl,--no-as-needed",
+        "-lm",
+        "-DN=256",
+        "-DPASSES=4"
+      ],
+      "paths": {
+        "equal_byte_length": true,
+        "mine": "results/pr824-rebased/callgrind-gcc12/libm_round_family/aa",
+        "ref": "results/pr824-rebased/callgrind-gcc12/libm_round_family/bb"
+      },
+      "results": {
+        "libm_round_family": {
+          "binary_sha256": {
+            "mine": "b8af8c3ce78615c1a6b04574fb6931112efcadf07163e68bd871e3a4dee6a268",
+            "ref": "1efa56bf684226c886f8be742b59ae70c62319abcbffc5e6c02e0902712873ea"
+          },
+          "correctness": {
+            "mine": {
+              "elapsed": 0.02329026300003534,
+              "failure": null,
+              "returncode": 0,
+              "stderr_excerpt": "",
+              "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdout_sha256": "0867beb6c9a7c41a5760461d23488796a06bdff150a8789c49dbd64a2397968a"
+            },
+            "ref": {
+              "elapsed": 0.015901543999916612,
+              "failure": null,
+              "returncode": 0,
+              "stderr_excerpt": "",
+              "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdout_sha256": "0867beb6c9a7c41a5760461d23488796a06bdff150a8789c49dbd64a2397968a"
+            }
+          },
+          "instrumentation": {
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=results/pr824-rebased/callgrind-gcc12/libm_round_family/aa/libm_round_family.cg",
+                "results/pr824-rebased/callgrind-gcc12/libm_round_family/aa/libm_round_family"
+              ],
+              "counter_file_sha256": "3bdf61f45fbaaf2354b868d7bb576e3b07bd00e63cd320dc14050492fa315f99",
+              "process": {
+                "elapsed": 0.2039778949997526,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "lgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--104261-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--104261-- WARNING: unhandled amd64-linux syscall: 334\n--104261-- You may be able to write your own handler.\n--104261-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--104261-- Nevertheless we consider this a bug.  Please report\n--104261-- it at http://valgrind.org/support/bug_reports.html.\n",
+                "stderr_sha256": "61f8ad32c13e6a6d71adeec39eb70332e4489ff2953fb88879ae1478c0b86970",
+                "stdout_sha256": "0867beb6c9a7c41a5760461d23488796a06bdff150a8789c49dbd64a2397968a"
+              }
+            },
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=results/pr824-rebased/callgrind-gcc12/libm_round_family/bb/libm_round_family.cg",
+                "results/pr824-rebased/callgrind-gcc12/libm_round_family/bb/libm_round_family"
+              ],
+              "counter_file_sha256": "4adcd22894bcf81fa7597182b4fd05f8d64e88f6bae613930cadfa75277de570",
+              "process": {
+                "elapsed": 0.29794916700029717,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "lgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--104271-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--104271-- WARNING: unhandled amd64-linux syscall: 334\n--104271-- You may be able to write your own handler.\n--104271-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--104271-- Nevertheless we consider this a bug.  Please report\n--104271-- it at http://valgrind.org/support/bug_reports.html.\n",
+                "stderr_sha256": "bb7b2d457cdf5d2e9cfa3c49c2f3ce29354d4f747ab78cfa7d240e4c6d0b6d14",
+                "stdout_sha256": "0867beb6c9a7c41a5760461d23488796a06bdff150a8789c49dbd64a2397968a"
+              }
+            }
+          },
+          "metrics": {
+            "conditional_mispredicts": [
+              3355,
+              3451
+            ],
+            "d1_misses": [
+              1840,
+              1870
+            ],
+            "i1_misses": [
+              1365,
+              1375
+            ],
+            "indirect_mispredicts": [
+              200,
+              213
+            ],
+            "ir_mine": 153063,
+            "ir_ratio": 0.9667035083841222,
+            "ir_ref": 158335,
+            "ll_misses": [
+              2853,
+              2883
+            ]
+          },
+          "mine": {
+            "Bc": 25875,
+            "Bcm": 3355,
+            "Bi": 367,
+            "Bim": 200,
+            "D1mr": 1162,
+            "D1mw": 678,
+            "DLmr": 872,
+            "DLmw": 643,
+            "Dr": 33313,
+            "Dw": 13564,
+            "I1mr": 1365,
+            "ILmr": 1338,
+            "Ir": 153063
+          },
+          "ref": {
+            "Bc": 27363,
+            "Bcm": 3451,
+            "Bi": 399,
+            "Bim": 213,
+            "D1mr": 1187,
+            "D1mw": 683,
+            "DLmr": 890,
+            "DLmw": 647,
+            "Dr": 32094,
+            "Dw": 13836,
+            "I1mr": 1375,
+            "ILmr": 1346,
+            "Ir": 158335
+          },
+          "source_sha256": "b70c5bacd90081c28ea74dc1142f9eacc64278d539f258da5bd1614ebc503668",
+          "status": "COMPARABLE-SIMULATION"
+        }
+      },
+      "schema": "lccc-callgrind-ab-v2",
+      "selected": 1,
+      "tools": {
+        "include_discovery": {
+          "command": [
+            "gcc"
+          ],
+          "executable": "/usr/bin/x86_64-linux-gnu-gcc-12",
+          "sha256": "75e997ec62297a6484f491bae28ab0ccb489daba23e398fd10fe68e9e6f0def8",
+          "version": "gcc (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+        },
+        "mine": {
+          "command": [
+            "target/fastbuild/lccc"
+          ],
+          "executable": "/home/user/lccc/target/fastbuild/lccc",
+          "sha256": "f74774870778ae6b8a58f0bba97652e07d5deabc0d2a77981efbb0a806e37d4c",
+          "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone"
+        },
+        "ref": {
+          "command": [
+            "gcc"
+          ],
+          "executable": "/usr/bin/x86_64-linux-gnu-gcc-12",
+          "sha256": "75e997ec62297a6484f491bae28ab0ccb489daba23e398fd10fe68e9e6f0def8",
+          "version": "gcc (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+        },
+        "valgrind": {
+          "command": [
+            "valgrind"
+          ],
+          "executable": "/home/user/.local/valgrind/bin/valgrind",
+          "sha256": "a698e3b1c336f33570da8400ac167a85209caa77946c380607762940f6138fa5",
+          "version": "valgrind-3.16.0.GIT"
+        }
+      }
+    },
+    "byte_load_reassembly": {
+      "comparable": 1,
+      "compiler_environment": {},
+      "failures": {},
+      "geomean_ir_mine_over_ref": 3.9380864688504484,
+      "geometry": {
+        "D1": "32768,8,64",
+        "I1": "32768,8,64",
+        "LL": "33554432,16,64"
+      },
+      "geometry_env_overrides": {},
+      "heavy_opt_in": false,
+      "host": {
+        "libc": [
+          "glibc",
+          "2.36"
+        ],
+        "machine": "x86_64",
+        "platform": "Linux-6.1.158+-x86_64-with-glibc2.36"
+      },
+      "include": "-I/usr/lib/gcc/x86_64-linux-gnu/12/include",
+      "instrument_timeout_s": 60,
+      "model": "simulated instructions/I1/D1/LL/branch predictor; not PMU/uops/cycles/speedup",
+      "opt": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+      "opt_tokens": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-Wl,--no-as-needed",
+        "-lm"
+      ],
+      "paths": {
+        "equal_byte_length": true,
+        "mine": "results/pr824-rebased/callgrind-gcc12/byte_load_reassembly/aa",
+        "ref": "results/pr824-rebased/callgrind-gcc12/byte_load_reassembly/bb"
+      },
+      "results": {
+        "byte_load_reassembly": {
+          "binary_sha256": {
+            "mine": "3292b706bd59faee990bcd37d7bcb32a680deda44ef88e2bf29a14846a4a408b",
+            "ref": "9980a5bb1f9242413c32181f7adfa0e90cfbcae72608bbca8026fe999a4b930a"
+          },
+          "correctness": {
+            "mine": {
+              "elapsed": 0.034470482999950036,
+              "failure": null,
+              "returncode": 0,
+              "stderr_excerpt": "",
+              "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdout_sha256": "e00fbb6925a5012f0ad96c8639540887d1c5b55565e9ee7a7b18525863f5056c"
+            },
+            "ref": {
+              "elapsed": 0.01968616900012421,
+              "failure": null,
+              "returncode": 0,
+              "stderr_excerpt": "",
+              "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdout_sha256": "e00fbb6925a5012f0ad96c8639540887d1c5b55565e9ee7a7b18525863f5056c"
+            }
+          },
+          "instrumentation": {
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=results/pr824-rebased/callgrind-gcc12/byte_load_reassembly/aa/byte_load_reassembly.cg",
+                "results/pr824-rebased/callgrind-gcc12/byte_load_reassembly/aa/byte_load_reassembly"
+              ],
+              "counter_file_sha256": "4bb4e0b9148b09719ed4d402312a251e4aca768e67d6db5ea976dcc41ffdef8d",
+              "process": {
+                "elapsed": 1.609599333999995,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "lgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--104319-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--104319-- WARNING: unhandled amd64-linux syscall: 334\n--104319-- You may be able to write your own handler.\n--104319-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--104319-- Nevertheless we consider this a bug.  Please report\n--104319-- it at http://valgrind.org/support/bug_reports.html.\n",
+                "stderr_sha256": "52eaa707d3538fb4bbccd0aa321f5fe45757a291c14fbe04f0b596cdf0cf1734",
+                "stdout_sha256": "e00fbb6925a5012f0ad96c8639540887d1c5b55565e9ee7a7b18525863f5056c"
+              }
+            },
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=results/pr824-rebased/callgrind-gcc12/byte_load_reassembly/bb/byte_load_reassembly.cg",
+                "results/pr824-rebased/callgrind-gcc12/byte_load_reassembly/bb/byte_load_reassembly"
+              ],
+              "counter_file_sha256": "f7e747cddcd704fb684d216cd602a3d97a207238296013bd48cee258320ab680",
+              "process": {
+                "elapsed": 0.5575522780000028,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "lgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--104351-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--104351-- WARNING: unhandled amd64-linux syscall: 334\n--104351-- You may be able to write your own handler.\n--104351-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--104351-- Nevertheless we consider this a bug.  Please report\n--104351-- it at http://valgrind.org/support/bug_reports.html.\n",
+                "stderr_sha256": "15f95b61bc1d630adec0ee7a1ae5f4dd5b0c4cb9258f1941780e6b7790dd8192",
+                "stdout_sha256": "e00fbb6925a5012f0ad96c8639540887d1c5b55565e9ee7a7b18525863f5056c"
+              }
+            }
+          },
+          "metrics": {
+            "conditional_mispredicts": [
+              23258,
+              23312
+            ],
+            "d1_misses": [
+              1855,
+              1894
+            ],
+            "i1_misses": [
+              1282,
+              1289
+            ],
+            "indirect_mispredicts": [
+              204,
+              204
+            ],
+            "ir_mine": 82393224,
+            "ir_ratio": 3.9380864688504484,
+            "ir_ref": 20922147,
+            "ll_misses": [
+              2794,
+              2830
+            ]
+          },
+          "mine": {
+            "Bc": 10308935,
+            "Bcm": 23258,
+            "Bi": 375,
+            "Bim": 204,
+            "D1mr": 1147,
+            "D1mw": 708,
+            "DLmr": 861,
+            "DLmw": 675,
+            "Dr": 10308717,
+            "Dw": 37129,
+            "I1mr": 1282,
+            "ILmr": 1258,
+            "Ir": 82393224
+          },
+          "ref": {
+            "Bc": 1326099,
+            "Bcm": 23312,
+            "Bi": 382,
+            "Bim": 204,
+            "D1mr": 1178,
+            "D1mw": 716,
+            "DLmr": 884,
+            "DLmw": 680,
+            "Dr": 2590595,
+            "Dw": 13623,
+            "I1mr": 1289,
+            "ILmr": 1266,
+            "Ir": 20922147
+          },
+          "source_sha256": "d98d60eefd244df93fd9f4a828806ce2e32be56aad4872a2672d172b14dda562",
+          "status": "COMPARABLE-SIMULATION"
+        }
+      },
+      "schema": "lccc-callgrind-ab-v2",
+      "selected": 1,
+      "tools": {
+        "include_discovery": {
+          "command": [
+            "gcc"
+          ],
+          "executable": "/usr/bin/x86_64-linux-gnu-gcc-12",
+          "sha256": "75e997ec62297a6484f491bae28ab0ccb489daba23e398fd10fe68e9e6f0def8",
+          "version": "gcc (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+        },
+        "mine": {
+          "command": [
+            "target/fastbuild/lccc"
+          ],
+          "executable": "/home/user/lccc/target/fastbuild/lccc",
+          "sha256": "f74774870778ae6b8a58f0bba97652e07d5deabc0d2a77981efbb0a806e37d4c",
+          "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone"
+        },
+        "ref": {
+          "command": [
+            "gcc"
+          ],
+          "executable": "/usr/bin/x86_64-linux-gnu-gcc-12",
+          "sha256": "75e997ec62297a6484f491bae28ab0ccb489daba23e398fd10fe68e9e6f0def8",
+          "version": "gcc (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+        },
+        "valgrind": {
+          "command": [
+            "valgrind"
+          ],
+          "executable": "/home/user/.local/valgrind/bin/valgrind",
+          "sha256": "a698e3b1c336f33570da8400ac167a85209caa77946c380607762940f6138fa5",
+          "version": "valgrind-3.16.0.GIT"
+        }
+      }
+    },
+    "zlib_ng_adler32": {
+      "comparable": 1,
+      "compiler_environment": {},
+      "failures": {},
+      "geomean_ir_mine_over_ref": 0.9063256437332466,
+      "geometry": {
+        "D1": "32768,8,64",
+        "I1": "32768,8,64",
+        "LL": "33554432,16,64"
+      },
+      "geometry_env_overrides": {},
+      "heavy_opt_in": false,
+      "host": {
+        "libc": [
+          "glibc",
+          "2.36"
+        ],
+        "machine": "x86_64",
+        "platform": "Linux-6.1.158+-x86_64-with-glibc2.36"
+      },
+      "include": "-I/usr/lib/gcc/x86_64-linux-gnu/12/include",
+      "instrument_timeout_s": 60,
+      "model": "simulated instructions/I1/D1/LL/branch predictor; not PMU/uops/cycles/speedup",
+      "opt": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DDATA_SIZE=16384 -DPASSES=4",
+      "opt_tokens": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-Wl,--no-as-needed",
+        "-lm",
+        "-DDATA_SIZE=16384",
+        "-DPASSES=4"
+      ],
+      "paths": {
+        "equal_byte_length": true,
+        "mine": "results/pr824-rebased/callgrind-gcc12/zlib_ng_adler32/aa",
+        "ref": "results/pr824-rebased/callgrind-gcc12/zlib_ng_adler32/bb"
+      },
+      "results": {
+        "zlib_ng_adler32": {
+          "binary_sha256": {
+            "mine": "671183b74a8a772cca41254f043608ece6ee5ea4d6ad5a97e6ba1f1dec07d8d9",
+            "ref": "532309042529af627b659bcb3a14fcd64754127d40f3c8c93d69b9304e7ca1d0"
+          },
+          "correctness": {
+            "mine": {
+              "elapsed": 0.018423130999963178,
+              "failure": null,
+              "returncode": 0,
+              "stderr_excerpt": "",
+              "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdout_sha256": "e2d85427db40575f8612c64ea07de196695cc5696c1cd0350adc07b9d0ba888c"
+            },
+            "ref": {
+              "elapsed": 0.015903323000202363,
+              "failure": null,
+              "returncode": 0,
+              "stderr_excerpt": "",
+              "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdout_sha256": "e2d85427db40575f8612c64ea07de196695cc5696c1cd0350adc07b9d0ba888c"
+            }
+          },
+          "instrumentation": {
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=results/pr824-rebased/callgrind-gcc12/zlib_ng_adler32/aa/zlib_ng_adler32.cg",
+                "results/pr824-rebased/callgrind-gcc12/zlib_ng_adler32/aa/zlib_ng_adler32"
+              ],
+              "counter_file_sha256": "0734fbc838f07aaaf23ebb48297d5c8de65e990380a3819bc92c8fe909ae2542",
+              "process": {
+                "elapsed": 0.2748601430002964,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "lgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--104383-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--104383-- WARNING: unhandled amd64-linux syscall: 334\n--104383-- You may be able to write your own handler.\n--104383-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--104383-- Nevertheless we consider this a bug.  Please report\n--104383-- it at http://valgrind.org/support/bug_reports.html.\n",
+                "stderr_sha256": "ad843eb2598a7cf7a537706306e03dfd5a4f5803833f5b97307492f3e20dccca",
+                "stdout_sha256": "e2d85427db40575f8612c64ea07de196695cc5696c1cd0350adc07b9d0ba888c"
+              }
+            },
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=results/pr824-rebased/callgrind-gcc12/zlib_ng_adler32/bb/zlib_ng_adler32.cg",
+                "results/pr824-rebased/callgrind-gcc12/zlib_ng_adler32/bb/zlib_ng_adler32"
+              ],
+              "counter_file_sha256": "a473300b6e4999fe1bd78ef6e489a6530aaa7eddfdeddda9d83c49f88f74a712",
+              "process": {
+                "elapsed": 0.3428959429998031,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "lgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--104392-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--104392-- WARNING: unhandled amd64-linux syscall: 334\n--104392-- You may be able to write your own handler.\n--104392-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--104392-- Nevertheless we consider this a bug.  Please report\n--104392-- it at http://valgrind.org/support/bug_reports.html.\n",
+                "stderr_sha256": "fc618eb463de2cd1ea8978b7b249aea5cb77eccd1bdd7d399fc85f55122497a7",
+                "stdout_sha256": "e2d85427db40575f8612c64ea07de196695cc5696c1cd0350adc07b9d0ba888c"
+              }
+            }
+          },
+          "metrics": {
+            "conditional_mispredicts": [
+              3276,
+              3312
+            ],
+            "d1_misses": [
+              2083,
+              2114
+            ],
+            "i1_misses": [
+              1280,
+              1279
+            ],
+            "indirect_mispredicts": [
+              200,
+              201
+            ],
+            "ir_mine": 446311,
+            "ir_ratio": 0.9063256437332466,
+            "ir_ref": 492440,
+            "ll_misses": [
+              2979,
+              3004
+            ]
+          },
+          "mine": {
+            "Bc": 47390,
+            "Bcm": 3276,
+            "Bi": 365,
+            "Bim": 200,
+            "D1mr": 1173,
+            "D1mw": 910,
+            "DLmr": 859,
+            "DLmw": 865,
+            "Dr": 74384,
+            "Dw": 30660,
+            "I1mr": 1280,
+            "ILmr": 1255,
+            "Ir": 446311
+          },
+          "ref": {
+            "Bc": 50481,
+            "Bcm": 3312,
+            "Bi": 372,
+            "Bim": 201,
+            "D1mr": 1196,
+            "D1mw": 918,
+            "DLmr": 875,
+            "DLmw": 873,
+            "Dr": 101595,
+            "Dw": 29823,
+            "I1mr": 1279,
+            "ILmr": 1256,
+            "Ir": 492440
+          },
+          "source_sha256": "bca7938ef542270a06d734bf814b3f1806ab1796e8f53d5c53d1b5ccd6b08486",
+          "status": "COMPARABLE-SIMULATION"
+        }
+      },
+      "schema": "lccc-callgrind-ab-v2",
+      "selected": 1,
+      "tools": {
+        "include_discovery": {
+          "command": [
+            "gcc"
+          ],
+          "executable": "/usr/bin/x86_64-linux-gnu-gcc-12",
+          "sha256": "75e997ec62297a6484f491bae28ab0ccb489daba23e398fd10fe68e9e6f0def8",
+          "version": "gcc (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+        },
+        "mine": {
+          "command": [
+            "target/fastbuild/lccc"
+          ],
+          "executable": "/home/user/lccc/target/fastbuild/lccc",
+          "sha256": "f74774870778ae6b8a58f0bba97652e07d5deabc0d2a77981efbb0a806e37d4c",
+          "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone"
+        },
+        "ref": {
+          "command": [
+            "gcc"
+          ],
+          "executable": "/usr/bin/x86_64-linux-gnu-gcc-12",
+          "sha256": "75e997ec62297a6484f491bae28ab0ccb489daba23e398fd10fe68e9e6f0def8",
+          "version": "gcc (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+        },
+        "valgrind": {
+          "command": [
+            "valgrind"
+          ],
+          "executable": "/home/user/.local/valgrind/bin/valgrind",
+          "sha256": "a698e3b1c336f33570da8400ac167a85209caa77946c380607762940f6138fa5",
+          "version": "valgrind-3.16.0.GIT"
+        }
+      }
+    },
+    "linux_find_bit_scaled": {
+      "comparable": 1,
+      "compiler_environment": {},
+      "failures": {},
+      "geomean_ir_mine_over_ref": 1.1031436758068565,
+      "geometry": {
+        "D1": "32768,8,64",
+        "I1": "32768,8,64",
+        "LL": "33554432,16,64"
+      },
+      "geometry_env_overrides": {},
+      "heavy_opt_in": false,
+      "host": {
+        "libc": [
+          "glibc",
+          "2.36"
+        ],
+        "machine": "x86_64",
+        "platform": "Linux-6.1.158+-x86_64-with-glibc2.36"
+      },
+      "include": "-I/usr/lib/gcc/x86_64-linux-gnu/12/include",
+      "instrument_timeout_s": 60,
+      "model": "simulated instructions/I1/D1/LL/branch predictor; not PMU/uops/cycles/speedup",
+      "opt": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=128",
+      "opt_tokens": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-Wl,--no-as-needed",
+        "-lm",
+        "-DPASSES=128"
+      ],
+      "paths": {
+        "equal_byte_length": true,
+        "mine": "results/pr824-rebased/callgrind-gcc12/linux_find_bit_scaled/aa",
+        "ref": "results/pr824-rebased/callgrind-gcc12/linux_find_bit_scaled/bb"
+      },
+      "results": {
+        "linux_find_bit": {
+          "binary_sha256": {
+            "mine": "b44527fded3bc005757d4267268970fd8c05141cc1ae096aba19b9bf89449fec",
+            "ref": "d58e2094162e408362e87a9febc8da823eac9be44a7810bd172da71f32dd1990"
+          },
+          "correctness": {
+            "mine": {
+              "elapsed": 0.018562297000244143,
+              "failure": null,
+              "returncode": 0,
+              "stderr_excerpt": "",
+              "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdout_sha256": "a9a00dfc64160f0b435e01ee3fd89ece60647cdf9c380b058fbe787ee3d50d12"
+            },
+            "ref": {
+              "elapsed": 0.0188033730000825,
+              "failure": null,
+              "returncode": 0,
+              "stderr_excerpt": "",
+              "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdout_sha256": "a9a00dfc64160f0b435e01ee3fd89ece60647cdf9c380b058fbe787ee3d50d12"
+            }
+          },
+          "instrumentation": {
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=results/pr824-rebased/callgrind-gcc12/linux_find_bit_scaled/aa/linux_find_bit.cg",
+                "results/pr824-rebased/callgrind-gcc12/linux_find_bit_scaled/aa/linux_find_bit"
+              ],
+              "counter_file_sha256": "5d09f1cdd9a6d0ecd66666a56fa92ad8a2990b5d6aafde960d745bf10e770a76",
+              "process": {
+                "elapsed": 0.6916721380002855,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "lgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--104428-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--104428-- WARNING: unhandled amd64-linux syscall: 334\n--104428-- You may be able to write your own handler.\n--104428-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--104428-- Nevertheless we consider this a bug.  Please report\n--104428-- it at http://valgrind.org/support/bug_reports.html.\n",
+                "stderr_sha256": "f7c513b45c5183917960f0a4a4b1a3c767ac4b0004472a79ef46fc41c2e20ea5",
+                "stdout_sha256": "a9a00dfc64160f0b435e01ee3fd89ece60647cdf9c380b058fbe787ee3d50d12"
+              }
+            },
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=results/pr824-rebased/callgrind-gcc12/linux_find_bit_scaled/bb/linux_find_bit.cg",
+                "results/pr824-rebased/callgrind-gcc12/linux_find_bit_scaled/bb/linux_find_bit"
+              ],
+              "counter_file_sha256": "567d36fd2c26abc8cb1eb50b4b3934fa842a276891dfb49b9d97d242bf8dd45f",
+              "process": {
+                "elapsed": 0.5924295160002657,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "lgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--104456-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--104456-- WARNING: unhandled amd64-linux syscall: 334\n--104456-- You may be able to write your own handler.\n--104456-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--104456-- Nevertheless we consider this a bug.  Please report\n--104456-- it at http://valgrind.org/support/bug_reports.html.\n",
+                "stderr_sha256": "0d2b0cde10479ba7be99a959e6a318f5b26b6ae51e69aa6d92c35563edfeb713",
+                "stdout_sha256": "a9a00dfc64160f0b435e01ee3fd89ece60647cdf9c380b058fbe787ee3d50d12"
+              }
+            }
+          },
+          "metrics": {
+            "conditional_mispredicts": [
+              36463,
+              36403
+            ],
+            "d1_misses": [
+              530516,
+              530945
+            ],
+            "i1_misses": [
+              1261,
+              1269
+            ],
+            "indirect_mispredicts": [
+              199,
+              205
+            ],
+            "ir_mine": 22924314,
+            "ir_ratio": 1.1031436758068565,
+            "ir_ref": 20780896,
+            "ll_misses": [
+              6804,
+              6839
+            ]
+          },
+          "mine": {
+            "Bc": 4350288,
+            "Bcm": 36463,
+            "Bi": 364,
+            "Bim": 199,
+            "D1mr": 525735,
+            "D1mw": 4781,
+            "DLmr": 860,
+            "DLmw": 4706,
+            "Dr": 4386873,
+            "Dw": 144806,
+            "I1mr": 1261,
+            "ILmr": 1238,
+            "Ir": 22924314
+          },
+          "ref": {
+            "Bc": 4777008,
+            "Bcm": 36403,
+            "Bi": 382,
+            "Bim": 205,
+            "D1mr": 525534,
+            "D1mw": 5411,
+            "DLmr": 880,
+            "DLmw": 4711,
+            "Dr": 4323226,
+            "Dw": 309148,
+            "I1mr": 1269,
+            "ILmr": 1248,
+            "Ir": 20780896
+          },
+          "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a",
+          "status": "COMPARABLE-SIMULATION"
+        }
+      },
+      "schema": "lccc-callgrind-ab-v2",
+      "selected": 1,
+      "tools": {
+        "include_discovery": {
+          "command": [
+            "gcc"
+          ],
+          "executable": "/usr/bin/x86_64-linux-gnu-gcc-12",
+          "sha256": "75e997ec62297a6484f491bae28ab0ccb489daba23e398fd10fe68e9e6f0def8",
+          "version": "gcc (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+        },
+        "mine": {
+          "command": [
+            "target/fastbuild/lccc"
+          ],
+          "executable": "/home/user/lccc/target/fastbuild/lccc",
+          "sha256": "f74774870778ae6b8a58f0bba97652e07d5deabc0d2a77981efbb0a806e37d4c",
+          "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone"
+        },
+        "ref": {
+          "command": [
+            "gcc"
+          ],
+          "executable": "/usr/bin/x86_64-linux-gnu-gcc-12",
+          "sha256": "75e997ec62297a6484f491bae28ab0ccb489daba23e398fd10fe68e9e6f0def8",
+          "version": "gcc (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+        },
+        "valgrind": {
+          "command": [
+            "valgrind"
+          ],
+          "executable": "/home/user/.local/valgrind/bin/valgrind",
+          "sha256": "a698e3b1c336f33570da8400ac167a85209caa77946c380607762940f6138fa5",
+          "version": "valgrind-3.16.0.GIT"
+        }
+      }
+    },
+    "lz4_match_extend": {
+      "comparable": 1,
+      "compiler_environment": {},
+      "failures": {},
+      "geomean_ir_mine_over_ref": 1.1029058909858946,
+      "geometry": {
+        "D1": "32768,8,64",
+        "I1": "32768,8,64",
+        "LL": "33554432,16,64"
+      },
+      "geometry_env_overrides": {},
+      "heavy_opt_in": false,
+      "host": {
+        "libc": [
+          "glibc",
+          "2.36"
+        ],
+        "machine": "x86_64",
+        "platform": "Linux-6.1.158+-x86_64-with-glibc2.36"
+      },
+      "include": "-I/usr/lib/gcc/x86_64-linux-gnu/12/include",
+      "instrument_timeout_s": 60,
+      "model": "simulated instructions/I1/D1/LL/branch predictor; not PMU/uops/cycles/speedup",
+      "opt": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSRC_SIZE=16384 -DPASSES=2 -DMATCH_RICH=1",
+      "opt_tokens": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-Wl,--no-as-needed",
+        "-lm",
+        "-DSRC_SIZE=16384",
+        "-DPASSES=2",
+        "-DMATCH_RICH=1"
+      ],
+      "paths": {
+        "equal_byte_length": true,
+        "mine": "results/pr824-rebased/callgrind-gcc12/lz4_match_extend/aa",
+        "ref": "results/pr824-rebased/callgrind-gcc12/lz4_match_extend/bb"
+      },
+      "results": {
+        "lz4_compress": {
+          "binary_sha256": {
+            "mine": "0caee9066d5bd4d30cd32d5036194790e77409ae79fcc2185d274eb2beafba20",
+            "ref": "68f16cc03a94ad00b040199bcee691ad21912590e9a2a8b40739eb08aff76c35"
+          },
+          "correctness": {
+            "mine": {
+              "elapsed": 0.015790365999691858,
+              "failure": null,
+              "returncode": 0,
+              "stderr_excerpt": "",
+              "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdout_sha256": "ecf64ab72ccf80f0fd44db7d2a229b71503f57f186f932703671f665879fab08"
+            },
+            "ref": {
+              "elapsed": 0.01586526600021898,
+              "failure": null,
+              "returncode": 0,
+              "stderr_excerpt": "",
+              "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdout_sha256": "ecf64ab72ccf80f0fd44db7d2a229b71503f57f186f932703671f665879fab08"
+            }
+          },
+          "instrumentation": {
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=results/pr824-rebased/callgrind-gcc12/lz4_match_extend/aa/lz4_compress.cg",
+                "results/pr824-rebased/callgrind-gcc12/lz4_match_extend/aa/lz4_compress"
+              ],
+              "counter_file_sha256": "ab2865034045d1c427eae15c71bdbb094be11a82cb0683f88ef7b0d7079265c3",
+              "process": {
+                "elapsed": 0.3846365770000375,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "lgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--104484-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--104484-- WARNING: unhandled amd64-linux syscall: 334\n--104484-- You may be able to write your own handler.\n--104484-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--104484-- Nevertheless we consider this a bug.  Please report\n--104484-- it at http://valgrind.org/support/bug_reports.html.\n",
+                "stderr_sha256": "252f0cafb1d2bdf9230ed4815b8b92cc6a2fc532d9c4193afce59e943fd4a5e8",
+                "stdout_sha256": "ecf64ab72ccf80f0fd44db7d2a229b71503f57f186f932703671f665879fab08"
+              }
+            },
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=results/pr824-rebased/callgrind-gcc12/lz4_match_extend/bb/lz4_compress.cg",
+                "results/pr824-rebased/callgrind-gcc12/lz4_match_extend/bb/lz4_compress"
+              ],
+              "counter_file_sha256": "b34a8d928d03e15978c064020778165f054611cad716986714e2228c568a709b",
+              "process": {
+                "elapsed": 0.3128815869999926,
+                "failure": null,
+                "returncode": 0,
+                "stderr_excerpt": "lgrind/lib/valgrind/vgpreload_core-amd64-linux.so:\n--104488-- Ignoring non-Dwarf2/3/4 block in .debug_info\n--104488-- WARNING: unhandled amd64-linux syscall: 334\n--104488-- You may be able to write your own handler.\n--104488-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--104488-- Nevertheless we consider this a bug.  Please report\n--104488-- it at http://valgrind.org/support/bug_reports.html.\n",
+                "stderr_sha256": "03d26f763d3a347ae1f6cd9e0c0f6b73b000df5d0b4248dc110b73571944ab52",
+                "stdout_sha256": "ecf64ab72ccf80f0fd44db7d2a229b71503f57f186f932703671f665879fab08"
+              }
+            }
+          },
+          "metrics": {
+            "conditional_mispredicts": [
+              8144,
+              8329
+            ],
+            "d1_misses": [
+              14051,
+              13868
+            ],
+            "i1_misses": [
+              1309,
+              1291
+            ],
+            "indirect_mispredicts": [
+              212,
+              209
+            ],
+            "ir_mine": 1136271,
+            "ir_ratio": 1.1029058909858946,
+            "ir_ref": 1030252,
+            "ll_misses": [
+              4213,
+              4214
+            ]
+          },
+          "mine": {
+            "Bc": 262233,
+            "Bcm": 8144,
+            "Bi": 505,
+            "Bim": 212,
+            "D1mr": 10796,
+            "D1mw": 3255,
+            "DLmr": 871,
+            "DLmw": 2060,
+            "Dr": 169980,
+            "Dw": 219448,
+            "I1mr": 1309,
+            "ILmr": 1282,
+            "Ir": 1136271
+          },
+          "ref": {
+            "Bc": 316153,
+            "Bcm": 8329,
+            "Bi": 387,
+            "Bim": 209,
+            "D1mr": 10647,
+            "D1mw": 3221,
+            "DLmr": 881,
+            "DLmw": 2065,
+            "Dr": 126459,
+            "Dw": 196616,
+            "I1mr": 1291,
+            "ILmr": 1268,
+            "Ir": 1030252
+          },
+          "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4",
+          "status": "COMPARABLE-SIMULATION"
+        }
+      },
+      "schema": "lccc-callgrind-ab-v2",
+      "selected": 1,
+      "tools": {
+        "include_discovery": {
+          "command": [
+            "gcc"
+          ],
+          "executable": "/usr/bin/x86_64-linux-gnu-gcc-12",
+          "sha256": "75e997ec62297a6484f491bae28ab0ccb489daba23e398fd10fe68e9e6f0def8",
+          "version": "gcc (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+        },
+        "mine": {
+          "command": [
+            "target/fastbuild/lccc"
+          ],
+          "executable": "/home/user/lccc/target/fastbuild/lccc",
+          "sha256": "f74774870778ae6b8a58f0bba97652e07d5deabc0d2a77981efbb0a806e37d4c",
+          "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone"
+        },
+        "ref": {
+          "command": [
+            "gcc"
+          ],
+          "executable": "/usr/bin/x86_64-linux-gnu-gcc-12",
+          "sha256": "75e997ec62297a6484f491bae28ab0ccb489daba23e398fd10fe68e9e6f0def8",
+          "version": "gcc (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+        },
+        "valgrind": {
+          "command": [
+            "valgrind"
+          ],
+          "executable": "/home/user/.local/valgrind/bin/valgrind",
+          "sha256": "a698e3b1c336f33570da8400ac167a85209caa77946c380607762940f6138fa5",
+          "version": "valgrind-3.16.0.GIT"
+        }
+      }
+    }
+  }
+}

@@ -15,15 +15,23 @@
 # SEGMENT CAP is the binding rejector under the default policy. This
 # script pins the current facts:
 #
-#   default (reach=6, cap=1):   v94 is band-admitted (covers_reachable=
-#     true) but the one-segment cap rejects it ("2 segments > 1") — nothing
-#     is applied;
-#   reach=999, cap=1:           same rejection (the cap is reach-
-#     independent);
-#   reach=6, cap=2:             BOTH gates open -> exactly one remat
-#     applies (the band admits it at the default reach — the independent
-#     band rejection is gone with the old pressure profile);
-#   reach=999, cap=2:           same application.
+#   default (reach=6, cap=1):   v94 is rejected by BOTH gates — the
+#     pressure profile shifted again with the IVSR marching-pointer
+#     recurrence (2026-10-12: the pair loop's two loop-carried pointer
+#     webs push the covered blocks to a 23/12 peak, so the reach band now
+#     rejects too, `covers_reachable=false`), and the one-segment cap
+#     rejects independently ("2 segments > 1") — nothing is applied;
+#   reach=999, cap=1:           the band admits at wide reach
+#     (covers_reachable=true) but the cap still rejects (the cap is
+#     reach-independent);
+#   reach=6, cap=2:             the band is now the BINDING rejector
+#     (`covers_reachable=false`, silent — no rejected line) — nothing is
+#     applied at the default reach.  (Historical: before the 2026-10-12
+#     pressure shift this cell ADMITTED and applied exactly one remat;
+#     the machinery's positive path is still pinned by the `open` cell
+#     below, so application coverage is not lost.)
+#   reach=999, cap=2:           BOTH gates open -> exactly one remat
+#     applies.
 #
 # Master gate contract (RA-GLA-02): unset == ON; every documented off token
 # (0/off/no/false, case-insensitive, empty) silences the pass; an unset
@@ -92,10 +100,10 @@ must_not_grep() { # must_not_grep PAT FILE [description]
   fi
 }
 
-# --- default policy: the one-segment cap rejects the two-segment candidate
+# --- default policy: BOTH gates reject (band + one-segment cap) --------
 run_trace default
 must_grep 'v94' "$tmp/default.log"
-must_grep 'v94 .*segments=2 covers_reachable=true' "$tmp/default.log"
+must_grep 'v94 .*segments=2 covers_reachable=false' "$tmp/default.log"
 must_grep 'rejected: 2 segments > 1' "$tmp/default.log"
 must_not_grep '\[GLA\] main applied:' "$tmp/default.log" \
   "default policy edited nbody"
@@ -107,10 +115,11 @@ must_grep 'rejected: 2 segments > 1' "$tmp/capshut.log"
 must_not_grep '\[GLA\] main applied:' "$tmp/capshut.log" \
   "segment cap did not reject nbody"
 
-# --- segment cap open, default reach: the band ADMITS (profile shifted) --
+# --- segment cap open, default reach: the BAND is the binding rejector --
 run_trace bandadmits CCC_GLA_REMAT_MAX_SEGMENTS=2
-must_grep 'v94 .*segments=2 covers_reachable=true' "$tmp/bandadmits.log"
-must_grep '\[GLA\] main applied: 1 values \(1 remat' "$tmp/bandadmits.log"
+must_grep 'v94 .*segments=2 covers_reachable=false' "$tmp/bandadmits.log"
+must_not_grep '\[GLA\] main applied:' "$tmp/bandadmits.log" \
+  "default reach must not apply a two-segment remat"
 
 # --- both gates open: the candidate applies -----------------------------
 run_trace open CCC_GLA_REACH=999 CCC_GLA_REMAT_MAX_SEGMENTS=2
