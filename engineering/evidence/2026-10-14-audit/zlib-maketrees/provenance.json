@@ -1,0 +1,15 @@
+{
+  "project": "zlib-ng",
+  "tag": "2.3.3",
+  "commit": "12731092979c6d07f42da27da673a9f6c7b13586",
+  "recipe_commit": "0533f5f714381744cad35ace14b74e37d3caa137",
+  "recipe_patch_sha256": "40a317e1ac64e458bab6133ef259288edeab1a9054249dece3c7048fade3c2cc",
+  "selected_files_after_recipe_patch": {
+    "tools/maketrees.c": "d83b14632b734af33bc1b06a70803ec2584c3a8c08ba191cd6b62cdabdbb20c9",
+    "trees.c": "6872fb34e2f5361e23884263d0cbd1a6b77f43989cc30dff37baa422dcb1c302",
+    "trees.h": "24174f3543b01ee1ef370bbf6d15551a21871cded18b2aadf09a71e7904b6f99",
+    "deflate.h": "8c5d55b27d489b64ac3405dedafd246a8a74d301a20ed05a3f2846134a07cd4d",
+    "deflate_p.h": "1fd9f6269189dcf23bbefbedaf2caeef7bc0787e4271814b1b3c33ea975cfb6e",
+    "LICENSE.md": "6c9f0d975b41afaa34d22f55bb8986ce69e5cb7ad327cb2b28820cd425edf5ee"
+  }
+}

@@ -1,0 +1,848 @@
+{
+  "note": "Observations, not a CI pass or performance result.",
+  "records": [
+    {
+      "contract_ok": false,
+      "id": "A14-01-production-after-tests",
+      "observed": "",
+      "source": "#[cfg(test)]\nmod tests {}\nfn production() { panic!(\"x\"); }\n"
+    },
+    {
+      "contract_ok": false,
+      "id": "A14-01-raw-string",
+      "observed": "fn f() { let s=r#\"\" panic!() \"\"",
+      "source": "fn f() { let s=r#\"a\" panic!() \"#; }"
+    },
+    {
+      "contract_ok": false,
+      "id": "A14-01-line-preservation",
+      "observed": "fn f() { let s=\"\";\n}",
+      "source": "fn f() { let s=\"a\nb\nc\";\n}"
+    },
+    {
+      "build": {
+        "argv": [
+          "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+          "-m32",
+          "-O0",
+          "/tmp/lccc-audit-contracts-ek6de8jw/vector.c",
+          "-o",
+          "/tmp/lccc-audit-contracts-ek6de8jw/vector-lccc-O0"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "compiler": "lccc",
+      "contract_ok": false,
+      "execution": {
+        "argv": [
+          "/tmp/lccc-audit-contracts-ek6de8jw/vector-lccc-O0"
+        ],
+        "infrastructure_error": false,
+        "returncode": 1,
+        "stderr": "",
+        "stdout": ""
+      },
+      "id": "A14-13-vector-size",
+      "opt": "-O0",
+      "source": "typedef long v4l __attribute__((ext_vector_type(4)));\nint main(void) {\n return !(sizeof(v4l) == 16 &&\n sizeof((long __attribute__((ext_vector_type(4)))){0}) == 16);\n}\n"
+    },
+    {
+      "build": {
+        "argv": [
+          "clang",
+          "-m32",
+          "-O0",
+          "/tmp/lccc-audit-contracts-ek6de8jw/vector.c",
+          "-o",
+          "/tmp/lccc-audit-contracts-ek6de8jw/vector-clang-O0"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "compiler": "clang",
+      "contract_ok": true,
+      "execution": {
+        "argv": [
+          "/tmp/lccc-audit-contracts-ek6de8jw/vector-clang-O0"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "id": "A14-13-vector-size",
+      "opt": "-O0",
+      "source": "typedef long v4l __attribute__((ext_vector_type(4)));\nint main(void) {\n return !(sizeof(v4l) == 16 &&\n sizeof((long __attribute__((ext_vector_type(4)))){0}) == 16);\n}\n"
+    },
+    {
+      "build": {
+        "argv": [
+          "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+          "-m32",
+          "-O2",
+          "/tmp/lccc-audit-contracts-ek6de8jw/vector.c",
+          "-o",
+          "/tmp/lccc-audit-contracts-ek6de8jw/vector-lccc-O2"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "compiler": "lccc",
+      "contract_ok": false,
+      "execution": {
+        "argv": [
+          "/tmp/lccc-audit-contracts-ek6de8jw/vector-lccc-O2"
+        ],
+        "infrastructure_error": false,
+        "returncode": 1,
+        "stderr": "",
+        "stdout": ""
+      },
+      "id": "A14-13-vector-size",
+      "opt": "-O2",
+      "source": "typedef long v4l __attribute__((ext_vector_type(4)));\nint main(void) {\n return !(sizeof(v4l) == 16 &&\n sizeof((long __attribute__((ext_vector_type(4)))){0}) == 16);\n}\n"
+    },
+    {
+      "build": {
+        "argv": [
+          "clang",
+          "-m32",
+          "-O2",
+          "/tmp/lccc-audit-contracts-ek6de8jw/vector.c",
+          "-o",
+          "/tmp/lccc-audit-contracts-ek6de8jw/vector-clang-O2"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "compiler": "clang",
+      "contract_ok": true,
+      "execution": {
+        "argv": [
+          "/tmp/lccc-audit-contracts-ek6de8jw/vector-clang-O2"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "id": "A14-13-vector-size",
+      "opt": "-O2",
+      "source": "typedef long v4l __attribute__((ext_vector_type(4)));\nint main(void) {\n return !(sizeof(v4l) == 16 &&\n sizeof((long __attribute__((ext_vector_type(4)))){0}) == 16);\n}\n"
+    },
+    {
+      "build": {
+        "argv": [
+          "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc-arm",
+          "-c",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-14-adr-overflow.s",
+          "-o",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-14-adr-overflowlccc.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "compiler": "lccc",
+      "contract_ok": false,
+      "elf": {
+        "argv": [
+          "readelf",
+          "-r",
+          "-x",
+          ".text",
+          "-x",
+          ".data",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-14-adr-overflowlccc.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "readelf: Warning: Section '.data' was not dumped because it does not exist\n",
+        "stdout": "\nThere are no relocations in this file.\n\nHex dump of section '.text':\n  0x00000000 00008010                            ....\n\n"
+      },
+      "expected_accept": false,
+      "id": "A14-14-adr-overflow",
+      "object_sha256": "4ae478a5d14c8c84b2dcc81b9f86fae6ff5721c720b8dcb8ad31bd51bc751fa3",
+      "source": ".text\nadr x0, #1048576\n"
+    },
+    {
+      "build": {
+        "argv": [
+          "clang",
+          "--target=aarch64-linux-gnu",
+          "-c",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-14-adr-overflow.s",
+          "-o",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-14-adr-overflowclang.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 1,
+        "stderr": "/tmp/lccc-audit-contracts-ek6de8jw/A14-14-adr-overflow.s:2:9: error: expected label or encodable integer pc offset\nadr x0, #1048576\n        ^\n",
+        "stdout": ""
+      },
+      "compiler": "clang",
+      "contract_ok": true,
+      "expected_accept": false,
+      "id": "A14-14-adr-overflow",
+      "source": ".text\nadr x0, #1048576\n"
+    },
+    {
+      "build": {
+        "argv": [
+          "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc-arm",
+          "-c",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-14-adr-underflow.s",
+          "-o",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-14-adr-underflowlccc.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "compiler": "lccc",
+      "contract_ok": false,
+      "elf": {
+        "argv": [
+          "readelf",
+          "-r",
+          "-x",
+          ".text",
+          "-x",
+          ".data",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-14-adr-underflowlccc.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "readelf: Warning: Section '.data' was not dumped because it does not exist\n",
+        "stdout": "\nThere are no relocations in this file.\n\nHex dump of section '.text':\n  0x00000000 e0ff7f70                            ...p\n\n"
+      },
+      "expected_accept": false,
+      "id": "A14-14-adr-underflow",
+      "object_sha256": "0e42c341b8e8e2823f08bd592368e424c11ea67f0badc7aa5e8c3bb2e30cb513",
+      "source": ".text\nadr x0, #-1048577\n"
+    },
+    {
+      "build": {
+        "argv": [
+          "clang",
+          "--target=aarch64-linux-gnu",
+          "-c",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-14-adr-underflow.s",
+          "-o",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-14-adr-underflowclang.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 1,
+        "stderr": "/tmp/lccc-audit-contracts-ek6de8jw/A14-14-adr-underflow.s:2:9: error: expected label or encodable integer pc offset\nadr x0, #-1048577\n        ^\n",
+        "stdout": ""
+      },
+      "compiler": "clang",
+      "contract_ok": true,
+      "expected_accept": false,
+      "id": "A14-14-adr-underflow",
+      "source": ".text\nadr x0, #-1048577\n"
+    },
+    {
+      "build": {
+        "argv": [
+          "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc-arm",
+          "-c",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-14-adr-max-control.s",
+          "-o",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-14-adr-max-controllccc.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "compiler": "lccc",
+      "contract_ok": true,
+      "elf": {
+        "argv": [
+          "readelf",
+          "-r",
+          "-x",
+          ".text",
+          "-x",
+          ".data",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-14-adr-max-controllccc.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "readelf: Warning: Section '.data' was not dumped because it does not exist\n",
+        "stdout": "\nThere are no relocations in this file.\n\nHex dump of section '.text':\n  0x00000000 e0ff7f70                            ...p\n\n"
+      },
+      "expected_accept": true,
+      "id": "A14-14-adr-max-control",
+      "object_sha256": "0e42c341b8e8e2823f08bd592368e424c11ea67f0badc7aa5e8c3bb2e30cb513",
+      "source": ".text\nadr x0, #1048575\n"
+    },
+    {
+      "build": {
+        "argv": [
+          "clang",
+          "--target=aarch64-linux-gnu",
+          "-c",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-14-adr-max-control.s",
+          "-o",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-14-adr-max-controlclang.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "compiler": "clang",
+      "contract_ok": true,
+      "elf": {
+        "argv": [
+          "readelf",
+          "-r",
+          "-x",
+          ".text",
+          "-x",
+          ".data",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-14-adr-max-controlclang.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "readelf: Warning: Section '.data' was not dumped because it does not exist\n",
+        "stdout": "\nThere are no relocations in this file.\n\nHex dump of section '.text':\n  0x00000000 e0ff7f70                            ...p\n\n"
+      },
+      "expected_accept": true,
+      "id": "A14-14-adr-max-control",
+      "object_sha256": "a5177d6f3247f8c7fcbbc01ffe2a31c997a8b7d8d05381374c6ce37837a0df2e",
+      "source": ".text\nadr x0, #1048575\n"
+    },
+    {
+      "build": {
+        "argv": [
+          "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc-arm",
+          "-c",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-14-adr-min-control.s",
+          "-o",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-14-adr-min-controllccc.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "compiler": "lccc",
+      "contract_ok": true,
+      "elf": {
+        "argv": [
+          "readelf",
+          "-r",
+          "-x",
+          ".text",
+          "-x",
+          ".data",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-14-adr-min-controllccc.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "readelf: Warning: Section '.data' was not dumped because it does not exist\n",
+        "stdout": "\nThere are no relocations in this file.\n\nHex dump of section '.text':\n  0x00000000 00008010                            ....\n\n"
+      },
+      "expected_accept": true,
+      "id": "A14-14-adr-min-control",
+      "object_sha256": "4ae478a5d14c8c84b2dcc81b9f86fae6ff5721c720b8dcb8ad31bd51bc751fa3",
+      "source": ".text\nadr x0, #-1048576\n"
+    },
+    {
+      "build": {
+        "argv": [
+          "clang",
+          "--target=aarch64-linux-gnu",
+          "-c",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-14-adr-min-control.s",
+          "-o",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-14-adr-min-controlclang.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "compiler": "clang",
+      "contract_ok": true,
+      "elf": {
+        "argv": [
+          "readelf",
+          "-r",
+          "-x",
+          ".text",
+          "-x",
+          ".data",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-14-adr-min-controlclang.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "readelf: Warning: Section '.data' was not dumped because it does not exist\n",
+        "stdout": "\nThere are no relocations in this file.\n\nHex dump of section '.text':\n  0x00000000 00008010                            ....\n\n"
+      },
+      "expected_accept": true,
+      "id": "A14-14-adr-min-control",
+      "object_sha256": "bc7cd15bf39fd61907f2520a8ed86522667a0d94d900f165c653905e2c10d721",
+      "source": ".text\nadr x0, #-1048576\n"
+    },
+    {
+      "build": {
+        "argv": [
+          "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc-riscv",
+          "-c",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-15-unresolved-product.s",
+          "-o",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-15-unresolved-productlccc.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "compiler": "lccc",
+      "contract_ok": false,
+      "elf": {
+        "argv": [
+          "readelf",
+          "-r",
+          "-x",
+          ".text",
+          "-x",
+          ".data",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-15-unresolved-productlccc.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "readelf: Warning: Section '.text' was not dumped because it does not exist\n",
+        "stdout": "\nThere are no relocations in this file.\n\nHex dump of section '.data':\n  0x00000000 00000000                            ....\n\n"
+      },
+      "expected_accept": false,
+      "id": "A14-15-unresolved-product",
+      "object_sha256": "13ffa1ad49e45df014e0b5fbf44c4d8932a62eb55be6df767c1ba598b3018791",
+      "source": ".data\n.word missing*2\n"
+    },
+    {
+      "build": {
+        "argv": [
+          "clang",
+          "--target=riscv64-linux-gnu",
+          "-c",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-15-unresolved-product.s",
+          "-o",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-15-unresolved-productclang.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 1,
+        "stderr": "/tmp/lccc-audit-contracts-ek6de8jw/A14-15-unresolved-product.s:2:7: error: expected relocatable expression\n.word missing*2\n      ^\n",
+        "stdout": ""
+      },
+      "compiler": "clang",
+      "contract_ok": true,
+      "expected_accept": false,
+      "id": "A14-15-unresolved-product",
+      "source": ".data\n.word missing*2\n"
+    },
+    {
+      "build": {
+        "argv": [
+          "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc-riscv",
+          "-c",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-15-two-symbol-sum.s",
+          "-o",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-15-two-symbol-sumlccc.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "compiler": "lccc",
+      "contract_ok": false,
+      "elf": {
+        "argv": [
+          "readelf",
+          "-r",
+          "-x",
+          ".text",
+          "-x",
+          ".data",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-15-two-symbol-sumlccc.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "readelf: Warning: Section '.text' was not dumped because it does not exist\n",
+        "stdout": "\nRelocation section '.rela.data' at offset 0x48 contains 1 entry:\n  Offset          Info           Type           Sym. Value    Sym. Name + Addend\n000000000000  000200000001 R_RISCV_32        0000000000000000 missing + 0\n\nHex dump of section '.data':\n NOTE: This section has relocations against it, but these have NOT been applied to this dump.\n  0x00000000 00000000                            ....\n\n"
+      },
+      "expected_accept": false,
+      "id": "A14-15-two-symbol-sum",
+      "object_sha256": "0b7a08a522d80d70f642e6c9c438b64acb1f1c859c5ba9bad0e76f63e016fcc2",
+      "source": ".data\n.word missing+other\n"
+    },
+    {
+      "build": {
+        "argv": [
+          "clang",
+          "--target=riscv64-linux-gnu",
+          "-c",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-15-two-symbol-sum.s",
+          "-o",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-15-two-symbol-sumclang.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 1,
+        "stderr": "/tmp/lccc-audit-contracts-ek6de8jw/A14-15-two-symbol-sum.s:2:7: error: expected relocatable expression\n.word missing+other\n      ^\n",
+        "stdout": ""
+      },
+      "compiler": "clang",
+      "contract_ok": true,
+      "expected_accept": false,
+      "id": "A14-15-two-symbol-sum",
+      "source": ".data\n.word missing+other\n"
+    },
+    {
+      "build": {
+        "argv": [
+          "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc-riscv",
+          "-c",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-15-symbol-difference-control.s",
+          "-o",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-15-symbol-difference-controllccc.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "compiler": "lccc",
+      "contract_ok": true,
+      "elf": {
+        "argv": [
+          "readelf",
+          "-r",
+          "-x",
+          ".text",
+          "-x",
+          ".data",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-15-symbol-difference-controllccc.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "readelf: Warning: Section '.text' was not dumped because it does not exist\n",
+        "stdout": "\nRelocation section '.rela.data' at offset 0x48 contains 2 entries:\n  Offset          Info           Type           Sym. Value    Sym. Name + Addend\n000000000000  000200000023 R_RISCV_ADD32     0000000000000000 missing_end + 0\n000000000000  000300000027 R_RISCV_SUB32     0000000000000000 missing_start + 0\n\nHex dump of section '.data':\n NOTE: This section has relocations against it, but these have NOT been applied to this dump.\n  0x00000000 00000000                            ....\n\n"
+      },
+      "expected_accept": true,
+      "id": "A14-15-symbol-difference-control",
+      "object_sha256": "0fc2aeb7f0844392103bcbdf21bc41e02e482bdba4000dcdfa380d0aa7d539e2",
+      "source": ".data\n.word missing_end-missing_start\n"
+    },
+    {
+      "build": {
+        "argv": [
+          "clang",
+          "--target=riscv64-linux-gnu",
+          "-c",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-15-symbol-difference-control.s",
+          "-o",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-15-symbol-difference-controlclang.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "compiler": "clang",
+      "contract_ok": true,
+      "elf": {
+        "argv": [
+          "readelf",
+          "-r",
+          "-x",
+          ".text",
+          "-x",
+          ".data",
+          "/tmp/lccc-audit-contracts-ek6de8jw/A14-15-symbol-difference-controlclang.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "\nRelocation section '.rela.data' at offset 0x108 contains 2 entries:\n  Offset          Info           Type           Sym. Value    Sym. Name + Addend\n000000000000  000300000023 R_RISCV_ADD32     0000000000000000 missing_end + 0\n000000000000  000400000027 R_RISCV_SUB32     0000000000000000 missing_start + 0\nSection '.text' has no data to dump.\n\nHex dump of section '.data':\n NOTE: This section has relocations against it, but these have NOT been applied to this dump.\n  0x00000000 00000000                            ....\n\n"
+      },
+      "expected_accept": true,
+      "id": "A14-15-symbol-difference-control",
+      "object_sha256": "17199ce64249f3ff07697985454fe9b9a6e374df3f3c235211f229265f454624",
+      "source": ".data\n.word missing_end-missing_start\n"
+    },
+    {
+      "build": {
+        "argv": [
+          "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+          "-fdefinitely-not-a-real-option",
+          "-c",
+          "/tmp/lccc-audit-contracts-ek6de8jw/flag.c",
+          "-o",
+          "/tmp/lccc-audit-contracts-ek6de8jw/lccc-flag.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "compiler": "lccc",
+      "contract_ok": false,
+      "id": "A14-16-unknown-flag",
+      "source": "int f(void) { return 42; }\n"
+    },
+    {
+      "build": {
+        "argv": [
+          "clang",
+          "-fdefinitely-not-a-real-option",
+          "-c",
+          "/tmp/lccc-audit-contracts-ek6de8jw/flag.c",
+          "-o",
+          "/tmp/lccc-audit-contracts-ek6de8jw/clang-flag.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 1,
+        "stderr": "clang: error: unknown argument: '-fdefinitely-not-a-real-option'\n",
+        "stdout": ""
+      },
+      "compiler": "clang",
+      "contract_ok": true,
+      "id": "A14-16-unknown-flag",
+      "source": "int f(void) { return 42; }\n"
+    },
+    {
+      "assembly": ".text\n.globl pc\n.type pc, %function\npc:\n.cfi_startproc\n    stp x29, x30, [sp, #-32]!\n    .cfi_def_cfa_offset 32\n    .cfi_offset x29, -32\n    .cfi_offset x30, -24\n    mov x29, sp\n    .cfi_def_cfa_register x29\n    str x19, [sp, #16]\n    mov x19, x0\n    mov x0, x19\n    fmov d0, x19\n    cnt v0.8b, v0.8b\n    uaddlv h0, v0.8b\n    fmov w0, s0\n    ldr x19, [sp, #16]\n    ldp x29, x30, [sp], #32\n    ret\n.cfi_endproc\n.size pc, .-pc\n.section .note.GNU-stack,\"\",@progbits\n",
+      "build": {
+        "argv": [
+          "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc-arm",
+          "-O2",
+          "-mgeneral-regs-only",
+          "-S",
+          "/tmp/lccc-audit-extended-iay7yjmt/popcount.c",
+          "-o",
+          "/tmp/lccc-audit-extended-iay7yjmt/lccc.s"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "compiler": "lccc",
+      "contract_ok": false,
+      "id": "A14-19-general-regs-only",
+      "source": "int pc(unsigned long x) { return __builtin_popcountl(x); }\n"
+    },
+    {
+      "assembly": "\t.text\n\t.file\t\"popcount.c\"\n\t.globl\tpc                              // -- Begin function pc\n\t.p2align\t2\n\t.type\tpc,@function\npc:                                     // @pc\n\t.cfi_startproc\n// %bb.0:\n\tlsr\tx9, x0, #1\n\tmov\tx8, #72340172838076673          // =0x101010101010101\n\tand\tx9, x9, #0x5555555555555555\n\tsub\tx9, x0, x9\n\tlsr\tx10, x9, #2\n\tand\tx9, x9, #0x3333333333333333\n\tand\tx10, x10, #0x3333333333333333\n\tadd\tx9, x9, x10\n\tadd\tx9, x9, x9, lsr #4\n\tand\tx9, x9, #0xf0f0f0f0f0f0f0f\n\tmul\tx8, x9, x8\n\tlsr\tx0, x8, #56\n                                        // kill: def $w0 killed $w0 killed $x0\n\tret\n.Lfunc_end0:\n\t.size\tpc, .Lfunc_end0-pc\n\t.cfi_endproc\n                                        // -- End function\n\t.ident\t\"Debian clang version 19.1.7 (3+b1)\"\n\t.section\t\".note.GNU-stack\",\"\",@progbits\n\t.addrsig\n",
+      "build": {
+        "argv": [
+          "clang",
+          "--target=aarch64-linux-gnu",
+          "-O2",
+          "-mgeneral-regs-only",
+          "-S",
+          "/tmp/lccc-audit-extended-iay7yjmt/popcount.c",
+          "-o",
+          "/tmp/lccc-audit-extended-iay7yjmt/clang.s"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "compiler": "clang",
+      "contract_ok": true,
+      "id": "A14-19-general-regs-only",
+      "source": "int pc(unsigned long x) { return __builtin_popcountl(x); }\n"
+    },
+    {
+      "compiler": "lccc",
+      "contract_ok": false,
+      "elf": {
+        "argv": [
+          "readelf",
+          "-r",
+          "-x",
+          ".data",
+          "/tmp/lccc-audit-extended-iay7yjmt/lccc.so"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "\nThere are no relocations in this file.\n\nHex dump of section '.data':\n  0x00002000 00000000 00000000                   ........\n\n"
+      },
+      "fixture_build": {
+        "argv": [
+          "clang",
+          "--target=riscv64-linux-gnu",
+          "-c",
+          "/tmp/lccc-audit-extended-iay7yjmt/reloc.s",
+          "-o",
+          "/tmp/lccc-audit-extended-iay7yjmt/reloc.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "id": "A14-17-unknown-shared-relocation",
+      "link": {
+        "argv": [
+          "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc-riscv",
+          "-shared",
+          "-nostdlib",
+          "/tmp/lccc-audit-extended-iay7yjmt/reloc.o",
+          "-o",
+          "/tmp/lccc-audit-extended-iay7yjmt/lccc.so"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "mutation": {
+        "r_info_offset": 248,
+        "reloc_type": 255
+      },
+      "source": ".data\n.quad missing\n"
+    },
+    {
+      "compiler": "lld",
+      "contract_ok": true,
+      "fixture_build": {
+        "argv": [
+          "clang",
+          "--target=riscv64-linux-gnu",
+          "-c",
+          "/tmp/lccc-audit-extended-iay7yjmt/reloc.s",
+          "-o",
+          "/tmp/lccc-audit-extended-iay7yjmt/reloc.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "id": "A14-17-unknown-shared-relocation",
+      "link": {
+        "argv": [
+          "ld.lld",
+          "-m",
+          "elf64lriscv",
+          "-shared",
+          "/tmp/lccc-audit-extended-iay7yjmt/reloc.o",
+          "-o",
+          "/tmp/lccc-audit-extended-iay7yjmt/lld.so"
+        ],
+        "infrastructure_error": false,
+        "returncode": 1,
+        "stderr": "ld.lld: error: /tmp/lccc-audit-extended-iay7yjmt/reloc.o:(.data+0x0): unknown relocation (255) against symbol missing\n",
+        "stdout": ""
+      },
+      "mutation": {
+        "r_info_offset": 248,
+        "reloc_type": 255
+      },
+      "source": ".data\n.quad missing\n"
+    },
+    {
+      "build": {
+        "argv": [
+          "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+          "-O2",
+          "-fprofile-generate=/tmp/lccc-audit-extended-iay7yjmt/profile",
+          "/tmp/lccc-audit-extended-iay7yjmt/pgo.c",
+          "-o",
+          "/tmp/lccc-audit-extended-iay7yjmt/pgo"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "lccc: PGO: instrumented 1 functions (0 value-profile sites) into /tmp/lccc-audit-extended-iay7yjmt/profile/lccc-08cac795ec1be0db-pgo_c_90a7ef1880ac07c7-98723.profraw\n",
+        "stdout": ""
+      },
+      "contract_ok": false,
+      "execution": {
+        "argv": [
+          "strace",
+          "-e",
+          "trace=flock,write,close",
+          "-o",
+          "/tmp/lccc-audit-extended-iay7yjmt/trace.txt",
+          "/tmp/lccc-audit-extended-iay7yjmt/pgo"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "id": "A14-20-profile-flush-lock",
+      "source": "int main(void) { return 0; }\n",
+      "trace": "close(3)                                = 0\nclose(3)                                = 0\nflock(3, LOCK_EX)                       = 0\nflock(3, LOCK_UN)                       = 0\nwrite(3, \"lccc-pgo-v1 15523247760208929793\"..., 106) = 106\nclose(3)                                = 0\n+++ exited with 0 +++\n"
+    },
+    {
+      "assembly": ".file 1 \"/tmp/lccc-audit-extended-iay7yjmt/debug.c\"\n.text\n.globl f\n.type f, @function\nf:\n.cfi_startproc\n    pushq %rbp\n    .cfi_def_cfa_offset 16\n    .cfi_offset %rbp, -16\n    movq %rsp, %rbp\n    .cfi_def_cfa_register %rbp\n    subq $16, %rsp\n    # LCCC_RET_XMM 0\n    # LCCC_RET_RDX 0\n    # LCCC_RET_RAX 1\n.loc 1 1 15\n    movl $42, %eax\n    cltq\n    movl %eax, -4(%rbp)\n    movq %rbp, %rsp\n    popq %rbp\n    .cfi_def_cfa %rsp, 8\n    ret\n.cfi_endproc\n.size f, .-f\n\n\n.section .note.GNU-stack,\"\",@progbits\n",
+      "assembly_build": {
+        "argv": [
+          "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+          "-g",
+          "-O0",
+          "-S",
+          "/tmp/lccc-audit-extended-iay7yjmt/debug.c",
+          "-o",
+          "/tmp/lccc-audit-extended-iay7yjmt/debug.s"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "contract_ok": false,
+      "id": "A14-21-debug-object",
+      "object_build": {
+        "argv": [
+          "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+          "-g",
+          "-O0",
+          "-c",
+          "/tmp/lccc-audit-extended-iay7yjmt/debug.c",
+          "-o",
+          "/tmp/lccc-audit-extended-iay7yjmt/debug.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": ""
+      },
+      "sections": {
+        "argv": [
+          "readelf",
+          "-SW",
+          "/tmp/lccc-audit-extended-iay7yjmt/debug.o"
+        ],
+        "infrastructure_error": false,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "There are 10 section headers, starting at offset 0x1d8:\n\nSection Headers:\n  [Nr] Name              Type            Address          Off    Size   ES Flg Lk Inf Al\n  [ 0]                   NULL            0000000000000000 000000 000000 00      0   0  0\n  [ 1] .text             PROGBITS        0000000000000000 000040 000017 00  AX  0   0  1\n  [ 2] .data             PROGBITS        0000000000000000 000057 000000 00  WA  0   0  1\n  [ 3] .bss              NOBITS          0000000000000000 000057 000000 00  WA  0   0  1\n  [ 4] .note.GNU-stack   PROGBITS        0000000000000000 000057 000000 00      0   0  1\n  [ 5] .eh_frame         PROGBITS        0000000000000000 000058 000038 00   A  0   0  8\n  [ 6] .rela.eh_frame    RELA            0000000000000000 000090 000018 18   I  7   5  8\n  [ 7] .symtab           SYMTAB          0000000000000000 0000a8 0000a8 18      8   6  8\n  [ 8] .strtab           STRTAB          0000000000000000 000150 00002e 00      0   0  1\n  [ 9] .shstrtab         STRTAB          0000000000000000 00017e 000055 00      0   0  1\nKey to Flags:\n  W (write), A (alloc), X (execute), M (merge), S (strings), I (info),\n  L (link order), O (extra OS processing required), G (group), T (TLS),\n  C (compressed), x (unknown), o (OS specific), E (exclude),\n  D (mbind), l (large), p (processor specific)\n"
+      },
+      "source": "int f(void) { return 42; }\n"
+    }
+  ],
+  "schema": "lccc-audit-contracts-v1",
+  "violations": 14
+}

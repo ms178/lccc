@@ -331,3 +331,32 @@ each one is a contract build systems rely on, and each now has a gate:
 | `check_repro_replay.py` | replays every `artifacts/repros/*.c` against GCC with the ISA pinned on BOTH compilers (see `artifacts/repros/README.md`); `repros_replay.py` was the pre-merge variant and is gone | `ci_local.sh` (fast), CI |
 | `verify_fib_perf.sh` | Fibonacci rec2iter perf probe (moved from `tests/`) | manual |
 | `../tools/workspace_dirs.sh` | resolves the persisted workspace dir (`LCCC_WORKSPACE`, `/home/user`, `/mnt/user-data/outputs`) | sourced by the snapshot tool |
+
+
+## Whole-tree audit replay (2026-10-14)
+
+These tools support the A14 queue in root `backlog.md`; they do not certify
+that a static inventory is a semantic audit.
+
+- `python3 scripts/audit_tree_inventory.py --revision COMMIT --output REPORT`
+  records every tracked blob by subsystem and exact source/tool identities,
+  independent of build products and uncommitted changes. `--selftest` checks
+  immutability and whitespace-bearing filenames as well as subsystem grouping.
+- `python3 scripts/audit_contract_probes.py --compiler-probes --extended --check`
+  replays the new census/type/ISA/assembler/linker/PGO/debug contracts. Requires
+  already-built fastbuild target binaries, Clang, ld.lld, readelf and strace;
+  no hidden compiler build or download. `--json REPORT` preserves observations.
+  **Expected to exit nonzero on the audit baseline**: these are open defects,
+  not a passing CI gate. `--selftest` validates process classification without
+  requiring compiler tools. Unknown tools/timeouts/panics cannot count as a
+  successful negative compiler test.
+- `tests/workloads/zlib-ng-2.3.3/isolate_maketrees.py` replays actual Ninja
+  compile flags on an existing configured source tree, mixing GCC/LCCC TUs
+  and optimization levels. It creates only its own private scratch directory;
+  output must be a fresh directory. Consult `--help` and the standalone
+  reproducer under `engineering/evidence/2026-10-14-audit/zlib-maketrees/`.
+
+The evidence directory retains commands, exact source hashes, raw original
+reports, licenses and known-wrong outputs as **negative evidence**. Do not
+update expected outputs to the wrong result or remove fail-closed checks to
+make an audit replay appear green.
