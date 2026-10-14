@@ -114,7 +114,7 @@ jobs:
 
 
   diag4:
-    name: Audit diagnostics (step 151)
+    name: Audit diagnostics (full replay)
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
@@ -155,5 +155,5 @@ jobs:
       - name: Build
         run: ./scripts/build_lccc_fast.sh
 
-      - name: Replay step 151
-        run: python3 scripts/audit_diag_replay.py 151 151
+      - name: Replay steps 13-151
+        run: python3 scripts/audit_diag_replay.py 13 151
