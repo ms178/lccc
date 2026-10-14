@@ -1100,7 +1100,9 @@ fn trimmed<'a>(store: &'a LineStore, info: &LineInfo, idx: usize) -> &'a str {
 /// same peepholes that run without debug information.
 #[inline]
 fn is_debug_location(store: &LineStore, infos: &[LineInfo], idx: usize) -> bool {
-    infos[idx].kind == LineKind::Directive && trimmed(store, &infos[idx], idx).starts_with(".loc ")
+    infos[idx].kind == LineKind::Directive
+        && infos[idx].inert_dir
+        && syntax_of(store, infos, idx).split_whitespace().next() == Some(".loc")
 }
 
 /// Check if the next instruction reads the carry flag (CF).
@@ -10650,13 +10652,12 @@ fn thread_trivial_blocks(store: &mut LineStore, infos: &mut [LineInfo]) -> bool 
             if !trivial {
                 continue;
             }
-            let target = match syntax_of(store, infos, jmp_idx)
-                .split_whitespace()
-                .next_back()
-            {
-                Some(t) => t.to_string(),
-                None => continue,
+            let Some((_, target)) =
+                direct_branch(infos[jmp_idx].kind, syntax_of(store, infos, jmp_idx))
+            else {
+                continue;
             };
+            let target = target.to_string();
             if !labels.contains_key(&target)
                 || census.get(&target).is_none_or(|refs| refs.definitions != 1)
             {
@@ -10743,27 +10744,22 @@ fn delete_redundant_cond_jumps(store: &mut LineStore, infos: &mut [LineInfo]) ->
             i += 1;
             continue;
         }
-        let target = match trimmed(store, &infos[i], i).split_whitespace().next_back() {
-            Some(t) => t.to_string(),
-            None => {
-                i += 1;
-                continue;
-            }
+        let Some((_, target)) = direct_branch(infos[i].kind, syntax_of(store, infos, i)) else {
+            i += 1;
+            continue;
         };
         let j = next_non_nop(infos, i + 1);
         if j < len {
             let redundant = match infos[j].kind {
                 // jCC X; jmp X → the jmp still occupies an address between
                 // any preceding observable label and X:, so deletion is safe.
-                LineKind::Jmp => trimmed(store, &infos[j], j)
-                    .split_whitespace()
-                    .next_back()
-                    .is_some_and(|t| t == target),
+                LineKind::Jmp => direct_branch(infos[j].kind, syntax_of(store, infos, j))
+                    .is_some_and(|(_, t)| t == target),
                 // jCC X; X: → deletion moves X:'s address onto the jCC's
                 // address. If an observable label sits on the jCC, the two
                 // addresses collapse. Refuse in that case.
                 LineKind::Label => {
-                    syntax_of(store, infos, j).strip_suffix(':') == Some(target.as_str())
+                    syntax_of(store, infos, j).strip_suffix(':') == Some(target)
                         && !jump_carries_observable_address(store, infos, i, &mut identity_pins)
                 }
                 _ => false,
@@ -22795,6 +22791,47 @@ mod dispatch_and_pin_tests {
                 "{text}"
             );
             assert!(!output(&store, &infos).contains("je .Lnext"));
+        }
+    }
+
+    #[test]
+    fn branch_comments_cannot_supply_a_different_control_flow_target() {
+        for text in [
+            "f:\n    je .Lother # .Lnext\n.Lnext:\n    ret\n.Lother:\n    ret\n",
+            "f:\n    je .Lother\n    jmp .Lnext # .Lother\n.Lnext:\n    ret\n.Lother:\n    ret\n",
+        ] {
+            let (mut store, mut infos) = make_store(text);
+            assert!(
+                !delete_redundant_cond_jumps(&mut store, &mut infos),
+                "{text}"
+            );
+        }
+        let (mut store, mut infos) =
+            make_store("f:\n    je .Lnext # actual target\n.Lnext: # label\n    ret\n");
+        assert!(delete_redundant_cond_jumps(&mut store, &mut infos));
+    }
+
+    #[test]
+    fn debug_locations_require_an_inert_exact_directive_token() {
+        for (text, expected) in [
+            (".loc 1 2 0", true),
+            (".loc\t1 2 0", true),
+            (".local symbol", false),
+            (".location 1", false),
+            (".loc 1 2 0; nop", false),
+        ] {
+            let (store, infos) = make_store(text);
+            assert_eq!(is_debug_location(&store, &infos, 0), expected, "{text}");
+        }
+        for body in ["    jmp .Lend; jmp .Lend", ".loc 1 2 0; nop\n    jmp .Lend"] {
+            let text = format!(
+                "f:\n.cfi_startproc\n    jne .Lrelay\n    ret\n.Lrelay:\n{body}\n.Lend:\n    ret\n.cfi_endproc"
+            );
+            assert_eq!(
+                thread(&text),
+                text,
+                "a compound statement is not a pure relay"
+            );
         }
     }
 

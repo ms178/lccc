@@ -86,7 +86,8 @@ to erase the last separating instruction. Conditional jumps use the same guard.
 - Address-pinned dispatch versus relaxable branches; all short-only mnemonics.
 - Fake jump-table evidence in strings, data and inline asm; broken dispatch runs.
 - Duplicate definitions, unchanged inline asm/comments, zero-size directives,
-  positive/negative conditional-jump folds, cycles and paths into cycles.
+  positive/negative conditional-jump folds, misleading target comments, compound
+  statement rejection, cycles and paths into cycles.
 - A 4,096-link chain resolved in one invocation, deterministic and idempotent.
 - All 625 four-node functional graphs, every start node, compared with an
   independent cycle-detecting oracle.
@@ -104,6 +105,10 @@ Local provisioning activated a 2 GiB swap file. The official latest stable
 release is Rust 1.99.0, but the sandbox cannot reach `static.rust-lang.org`.
 The repository and hosted CI continue to select moving `stable` with rustfmt
 and Clippy; no MSRV or CI gate has been lowered to fit this sandbox.
+
+The supplementary Rust suite passed 38 tests (the manual timing test is ignored
+unless explicitly selected); Python checker self-tests passed all seven cases.
+Shell syntax, whitespace, conflict markers and CI/local gate parity also passed.
 
 An older Rust 1.88.0 tool bundle, obtained through the allowed npm registry with
 registry integrity verification, supports supplementary isolated tests of the
