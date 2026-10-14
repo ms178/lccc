@@ -12,15 +12,15 @@ jobs:
       - uses: actions/checkout@v7
       - name: Build fastbuild (shipped configuration)
         run: |
-          cargo build --profile fastbuild --locked -j 2 --bin lccc > /tmp/build.log 2>&1 || { grep -E '^error' -A 6 /tmp/build.log | head -60 | sed 's/%/%25/g; s/\r//g' | tr '\n' '|' | cut -c1-3000 | sed 's/^/::error title=BUILD-FAIL::/'; exit 1; }
+          cargo build --profile fastbuild --locked -j 2 --bin lccc > /tmp/build.log 2>&1 || { grep -E '^error' -A 6 /tmp/build.log | head -60 | sed 's/%/%25/g' | tr '\n' '|' | cut -c1-3000 | sed 's/^/::error title=BUILD-FAIL::/'; exit 1; }
       - name: Gate with shipped binary
         run: |
-          env CCC=target/fastbuild/lccc bash tests/regression/check_rmw_sib_folds.sh > /tmp/ab1.log 2>&1 && echo "::notice title=AB1::PASS shipped" || { echo "::error title=AB1-FAIL::shipped binary fails"; tail -5 /tmp/ab1.log; }
-          printf '#include <stdio.h>\nvolatile long h;\nvoid k(void) { h += 3; }\nint main(void){h=10;k();printf("%%ld\\n",h);return 0;}\n' > /tmp/vol.c
+          env CCC=target/fastbuild/lccc bash tests/regression/check_rmw_sib_folds.sh > /tmp/ab1.log 2>&1 && echo "::notice title=AB1::PASS shipped" || { echo "::error title=AB1-FAIL::shipped binary fails"; grep FAIL /tmp/ab1.log | head -3; }
+          printf '#include <stdio.h>\nvolatile long h;\nvoid k(void) { h += 3; }\nint main(void){h=10;k();printf("%%ld\n",h);return 0;}\n' > /tmp/vol.c
           target/fastbuild/lccc -O2 -march=x86-64-v3 -S -o /tmp/vol1.s /tmp/vol.c; sed -n '/^k:/,/\.size/p' /tmp/vol1.s | tr '\n' '|' | cut -c1-400 | sed 's/^/::notice title=AB1-ASM::/'
       - name: Rebuild with debug assertions (CI mid-suite configuration)
         run: |
-          cargo build --profile fastbuild --locked -j 2 --bin lccc > /tmp/build.log 2>&1 || { grep -E '^error' -A 6 /tmp/build.log | head -60 | sed 's/%/%25/g; s/\r//g' | tr '\n' '|' | cut -c1-3000 | sed 's/^/::error title=BUILD-FAIL::/'; exit 1; } --config 'profile.fastbuild.debug-assertions=true' --config 'profile.fastbuild.incremental=false' --config 'profile.fastbuild.debug=0'
+          cargo build --profile fastbuild --locked -j 2 --bin lccc --config 'profile.fastbuild.debug-assertions=true' --config 'profile.fastbuild.incremental=false' --config 'profile.fastbuild.debug=0' > /tmp/build2.log 2>&1 || { grep -E '^error' -A 6 /tmp/build2.log | head -60 | sed 's/%/%25/g' | tr '\n' '|' | cut -c1-3000 | sed 's/^/::error title=BUILD2-FAIL::/'; exit 1; }
       - name: Gate with debug-assertions binary
         run: |
           env CCC=target/fastbuild/lccc bash tests/regression/check_rmw_sib_folds.sh > /tmp/ab2.log 2>&1 && echo "::notice title=AB2::PASS debug-assertions" || { echo "::error title=AB2-FAIL::debug binary fails"; grep FAIL /tmp/ab2.log | head -3; }
