@@ -15,7 +15,12 @@ there, not here.
 - Deep research: [`engineering/DECISIONS.md`](engineering/DECISIONS.md) (measured
   negative-space, do-not-retry grounds), [`ideas/`](ideas/README.md).
 
-Current audit adjudication: **2026-10-06**, upstream
+Latest whole-tree audit: **2026-10-14**, baseline `3b66cd1d73743a7a79f912c01df48ac15cc646ef`.
+See the **A14 queue** below and [scope/evidence](engineering/AUDIT-2026-10-14-whole-tree.md).
+Evidence is classified as reproduced (R), source-confirmed (S), or hypothesis (H);
+this is not a claim that every line or all target runtimes have been verified.
+
+Previous audit adjudication: **2026-10-06**, upstream
 `66c2452838eedef2322fbad44d242e3b990e6c10` (PR #771; contains
 `6051e87304c6b07a2ed1a9a516aa5744d8110955`, `08f4e1a124d753e9eeddb1c43ce68b54d4d95f68`
 and the merged `dd0127998aae32a0a56626091bd9c93b597d2aff`). See
@@ -173,6 +178,614 @@ scripts (`scripts/repro_claims.sh` 12, `tests/linker/setup_oracles.sh` 12,
 `tools/linker/setup_oracles.sh` 7, `tests/regression/check_global_addr_cse.sh` 6,
 …). `python3 scripts/check_pipefail_sigpipe.py --census` prints the list. These
 are not CI reds, which is why they are a list rather than a gate.
+
+## 2026-10-14 whole-tree audit — implementation queue (A14)
+
+Priority: **P0 correctness/evidence integrity**, **P1 high-leverage code quality**,
+**P2 architecture/maintenance**. Priority is not a measured speedup prediction.
+Evidence: **R** reproduced here; **S** direct source fact, runtime consequence
+unproven; **H** hypothesis requiring an experiment.
+
+**Final base:** `1e83776f41529e2d754380d1d934ff901e25a097`. A14-05 is now
+closed upstream; A14-01 is partially repaired. The queue contains **34 entries,
+33 still open** (including the residual A14-01). Original evidence is retained
+with its original base rather than misrepresented as a final-main execution.
+
+**Implementation order:** A14-30 (real-workload miscompile), A14-17/19/14/15/13
+(linker/ISA/encoding/type correctness), A14-20 (profile integrity), then
+A14-01/02/03/29 (evidence), before profitability work A14-24/25. Do not let a
+green fast-CI stamp override the known failures in this queue. Locations refer to baseline
+`3b66cd1`; use function names if lines move. Do not close an item merely by
+removing its TODO/comment. Session scope and limitations:
+[whole-tree audit](engineering/AUDIT-2026-10-14-whole-tree.md).
+
+### A14-01 · P0 · R — the audit census can hide production code and miscount strings
+
+**Initial evidence:** on 3b66cd1, stripping could lose production after a test
+module, mis-tokenize raw strings, destroy line offsets and throw on a lone quote.
+**Revalidated on final main 1e83776:** the raw-string and line-preservation probes
+now pass, ignore-with-reason recognition and Markdown-only documentation lookup
+have improved. Do **not** reimplement these repaired pieces from the old report.
+The remaining `without_tests` still blanks the whole suffix from the first
+`#[cfg(test)]`, including subsequent production. `scan_functions` treats an
+unclosed body as ending at EOF rather than returning a parse failure. A new
+multiline-string-body control also shows `strip_rust` exposing `panic!()` from
+inside a valid multiline Rust string: preserving newlines alone is insufficient.
+The new
+public API names are `strip_rust/without_tests/scan_functions/census`.
+**Implement:** remove only matched test-module spans, preserve later production,
+and report malformed/incomplete function spans explicitly. Cover raw/byte strings,
+Unicode character literals and lifetimes before declaring the scanner complete.
+The documentation sweep uses rglob rather than a tracked-file manifest: make
+its intended scope explicit so untracked notes cannot silently discharge debt.
+**Accept:** production-before/between/after two test modules, nested cfgs, partial
+functions, Unicode chars, stable line offsets; explained old/new census diff.
+The replay script supports both original and current upstream scanner APIs.
+**Relation:** extends AUD-RATCHET-1; partially improved upstream, residual OPEN.
+
+### A14-02 · P0 · S — benchmark correctness is not checked for every measured sample
+
+**Where:** `scripts/bench_kernels.py` around `checksums`, `distinct`, `results`;
+`scripts/ab_interleaved.py::main`; `scripts/paired_ab.py::{main,time_run}`.
+`bench_kernels` records a *set* of checksums but compares only
+`next(iter(v))` per arm, never requiring each set to contain exactly one value.
+`ab_interleaved` discards timed checksums and compares one extra run afterwards.
+`paired_ab` compares a preflight pair, not the outputs of each timed pair.
+**Implement:** central sample record `(round, arm, order, rc, stdout hash, time)`;
+require expected successful rc and exact checksum agreement for *every* warmup
+and measured sample. Reject missing/partial arms, inconsistent within-arm
+checksums and parse failures before writing a performance verdict.
+**Accept:** deterministic fake drivers that alternate checksums, fail only on the
+third run, produce no time, and both fail identically; each must produce a
+correctness/infrastructure verdict, not a speed ratio. Keep real output gates.
+
+### A14-03 · P0 · S — normalized function hashes wrongly suppress layout regressions
+
+**Where:** `scripts/bench_kernels.py::{timed_function_hash,main}` baseline filter.
+The hash ignores call/branch destinations, RIP displacements and all code outside
+`bench_run`; identical hashes are then labelled `NOISE` and excluded from the
+regression count. Changed callees, data, relocation targets, alignment or hot
+function placement can change runtime even with the same normalized body.
+**Implement:** retain this hash as a diagnostic only. Record linked ELF executable
+sections, relocations/resolved callees, timed function address/alignment and data
+identity. Never auto-waive a regression solely because normalized hashes match.
+Use matched-layout controls and independent paired reruns to distinguish noise
+from a reproducible layout effect. Extend `paired_ab`'s identical-file guard to
+consider differing execution environment/dynamic dependencies when used as a
+causality claim.
+**Accept:** same `bench_run`, different out-of-line callee; changed aligned layout;
+changed constant table; all must remain eligible for investigation. Byte-identical
+binaries with identical environments are a noise-floor control, not a win.
+
+### A14-04 · P1 · S — benchmark records lose the evidence needed for significance
+
+**Where:** `scripts/bench_kernels.py` records only each arm's `min(samples)` in
+`--save` JSON; unlike `paired_ab`, it cannot reconstruct paired differences.
+**Implement:** versioned records containing raw rounds, order, warmups, calibration,
+source/compiler/binary hashes, full argv/environment, CPU/affinity/kernel/libc
+identity and observed PMU availability. Preserve minimum, paired median,
+arithmetic/geometric means, worst cases and every regression; report uncertainty
+with paired resampling or a predeclared paired test, and account for multiple
+workloads. Require stable duration (e.g. >=200 ms/arm) before a small-delta claim.
+**Accept:** re-analysis from JSON reproduces the table without rerunning binaries;
+identical-arm controls do not routinely claim >1% wins. Missing PMU remains N/A.
+**Relation:** INF-HARNESS-1; keep VM screen distinct from 14700KF acceptance.
+
+### A14-05 · CLOSED UPSTREAM on final rebase — tracked hygiene
+
+The original 3b66cd1 audit correctly found tracked `.base_ref`,
+`.claude/settings.local.json` with `Bash(*)` and `work/` scratch artifacts despite
+an earlier FIXED claim. Main 1e83776 removes these paths. Revalidation:
+`git ls-files work .base_ref .claude` returns no paths. **No removal task remains
+for the implementation agent.** Keep the historical evidence dated; the related
+upstream diagnostic fixtures were renamed rather than indiscriminately erased.
+
+### A14-06 · P1 · S — glibc runner records, but does not verify, patch identity
+
+**Where:** `tests/workloads/glibc-2.44/build_lccc.sh`: empty `PATCH_SHA256`,
+computed `patch_sha` without comparison, weak `readelf --version | grep 2.47`,
+`GLIBC_REUSE_BUILD=1` bypassing extraction/configuration identity checks.
+**Implement:** pin the recipe revision, patch URL/blob and digest; verify before
+applying or reusing. Verify *every invoked* binutils binary with shared
+`tools/linker/oracle_versions.sh`, not substring matching one program. Reuse must
+compare a source/patch/compiler/flags/sysroot manifest and fail on mismatch.
+Resolve host headers and work/cache directories rather than hardcoding GCC 14
+and `/home/user/lccc` paths. Preserve bounded builds and isolated installation.
+**Accept:** one-byte patch mutation, fake `2.470` banner, changed compiler and
+changed reuse flags each fail before build; supported clean/reuse runs agree.
+**Relation:** INF-LINK-1 / workload provenance, not a demonstrated glibc miscompile.
+
+### A14-07 · P1 · S — hosted linker oracles do not obey the research pin contract
+
+**Where:** `.github/workflows/ci.yml` step `Install differential linker oracles`
+installs distro `mold lld`; `tools/linker/setup_oracles.sh` pins mold 2.42.1 /
+lld 23.1.x / bfd 2.47. `scripts/build_lccc_fast.sh` still describes committed
+clang+mold settings although `.cargo/config.toml` selects gcc.
+**Implement:** make CI explicitly distinguish portability smoke tools from pinned
+research oracles; consume verified setup/manifest for the latter. Keep the exact
+mold `-DMOLD_TARGETS='X86_64;I386'` setting already verified against v2.42.1.
+Centralize identities/version checks and report unavailable pins as blocked, never
+as successful substitutes. Align build-wrapper comments and actual linker choice;
+record resolved linker in build receipts. Pin third-party CI actions by SHA.
+**Accept:** fake old binaries cannot enter a pinned comparison; same manifest used
+by local and hosted differential suites. Update CI parity tests if wiring changes.
+
+### A14-08 · P1 · S — PGO per-unit data is deliberately leaked; session state is global
+
+**Where:** `src/pgo/mod.rs`: `ACTIVE: OnceLock<ProfileData>`, ignored result of
+`ACTIVE.set(d)`, `DERIVED_PTR`, `Box::leak` in `propagate_profile`, `PRE_HASHES`,
+`POST_HASHES`, `PROMOTED_HOT` and pending switch/fallthrough hints.
+**Implement:** first specify supported lifetime (one driver, many TUs, repeated
+library invocations). Replace leaked maps/raw static references with owned
+per-compilation context and borrow-scoped accessors; profile initialization must
+return an error or intentionally replace data rather than silently ignore a
+second profile. Do not introduce parallel TU compilation before globals are
+isolated. Clear promoted-function state on session end.
+**Accept:** repeated same-process compilations using two different profiles,
+duplicate static function names in two TUs, bounded RSS over 1,000 small TUs,
+and unchanged single-TU PGO assembly/output. Concurrency race is a hypothesis,
+not asserted for today's sequential driver.
+
+### A14-09 · P1 · S — typed AST identity and silent type fallbacks remain structural debt
+
+**Where:** `frontend/parser/ast.rs::ExprId`,
+`ir/lowering/expr_types.rs::get_expr_ctype` discriminant-only address-reuse guard;
+`frontend/sema/type_checker.rs::resolve_type_spec` wildcard `CType::Int` and
+`resolve_type_spec_with_scope` unresolved typeof fallback.
+**Implement:** stable parser/arena IDs with generations or monotonic counters;
+explicitly distinguish unknown/error type from a real `int`. Make the remaining
+TypeSpecifier match exhaustive and propagate diagnostics without inventing a
+valid type. Do not blindly change every `expect` to a default.
+**Accept:** allocator-reuse stress of two same-variant/different-type nodes;
+nested typeof/statement-expression/_Generic suites; invalid operands diagnose
+without ICE; valid GCC torture and mixed-compiler ABI corpus unchanged.
+**Relation:** AUD-EXPRID-1 and typed-AST plan; no new ABA miscompile claimed here.
+
+### A14-10 · P1 · S — IR memory facts need explicit end-to-end contracts
+
+**Where:** `src/ir/instruction.rs::{Load,Store}` carries width, address space,
+volatile, but no per-access alignment or alias-scope metadata;
+`src/passes/alias.rs::LoopFrames` wraps the loop-memory linear-form engine.
+**Implement:** inventory existing alloca/global/parameter facts before adding
+fields; document which survive lowering, cloning/inlining, vectorization and
+phi elimination. Design conservative access metadata for proven alignment and
+object/alias identity; connect actual consumers (vector legality, LICM, DSE).
+Never infer `noalias` merely from unequal pointer SSA IDs or TBAA across unions/
+character accesses. Versioned runtime disambiguation is a separate costed task.
+**Accept:** same-object subranges/overlap, restrict scope, escaped allocas,
+volatile/atomics/FS/GS and unknown-call negative tests; a targeted missed-vector
+or missed-load-elimination reproducer plus whole-workload output agreement.
+**Relation:** existing alias/loop tasks; this is an architecture gap, not a claim
+that LCCC has no alias analysis.
+
+### A14-11 · P1 · S — stale use-def detection is not an invalidation protocol
+
+**Where:** `src/passes/use_def.rs` documents any positional IR mutation as
+invalidating `UseDefInfo`; `src/passes/mod.rs` manually sequences many analyses
+and transformations. Existing CFG caching must not be discarded blindly.
+**Implement:** enumerate each pass's mutations and preserved analyses; attach
+function mutation epochs to use-def/CFG/loop/alias facts, assert on stale queries
+in validation builds, then selectively cache only proven-preserved results.
+`is_stale_for` is a cheap sanity check, not proof that equal-size IR is unchanged.
+**Accept:** operand replacement and same-length instruction reorder invalidate
+use-def; CFG edge retargeting invalidates dom/loop facts; existing verifier and
+`ir_verify_sweep.py` stay green. Benchmark compile-time separately from codegen.
+
+### A14-12 · P2 · S/H — decompose the largest functions behind identity gates
+
+**Where:** census leaders: x86 intrinsic emitter/linker emitters/assembler decoder,
+`backend/regalloc.rs::allocate_registers`, `passes/slp_vectorizer.rs::build_pack`.
+**Implement:** extract semantic suboperations with explicit pre/postconditions,
+not arbitrary line-count cuts. Separate legality, planning, costing and mutation
+for vector packs; checked layout planning from ELF byte emission; register-home
+contracts from instruction formatting. One subsystem per behavior-preserving PR.
+**Accept:** `check_codegen_refactor_identity.py`, encdiff/asmdiff, linker fixtures,
+full regression and fast CI; identical outputs for deterministic test inputs,
+with compile-time/RSS reported. No promised performance gain from refactoring.
+**Relation:** AUD-MONO-1; fix evidence integrity before using its ratchet as proof.
+
+### A14-13 · P0 · R — i686 ext_vector_type type-name path doubles long-vector size
+
+**Where:** `src/frontend/parser/expressions.rs::{apply_pending_vector_attr,estimate_type_size}`
+hardcodes `Long`/`UnsignedLong` to 8 bytes and `LongDouble` to 16.
+**Reproducer:** `scripts/audit_contract_probes.py --compiler-probes --check`,
+records `A14-13-vector-size`. `typedef long v4l __attribute__((ext_vector_type(4)))`
+has correct size 16, but `sizeof((long __attribute__((ext_vector_type(4)))){0})`
+is 32 on `lccc -m32`, versus 16 on Clang. Executables fail the size check at
+both -O0 and -O2; this is not only a pretty-printing discrepancy.
+**Implement:** resolve element type and target data layout consistently in
+attribute/type-name and declaration paths. Replace the rough-size fallback with
+semantic type resolution, checked multiplication and supported-element diagnostics.
+**Accept:** m32/m64, signed/unsigned long, typedef aliases, casts, compound
+literals and sizeof all agree with Clang; illegal element types fail cleanly.
+Do not globally shrink vector_size bytes, which already has a different contract.
+
+### A14-14 · P0 · R — AArch64 ADR silently truncates out-of-range immediate offsets
+
+**Where:** `src/backend/arm/assembler/encoder/load_store.rs::encode_adr`, lines
+around 1513–1531: direct immediate casts/masks without signed-21 range check.
+**Reproducer:** same probe script, `A14-14-*`: `adr x0, #1048576` and
+`adr x0, #-1048577` succeed locally, fail in Clang; both valid endpoints
+[-1048576,1048575] succeed on both. The first emits `.text` bytes `00008010`,
+encoding the wrapped negative offset rather than the requested positive one.
+**Implement:** checked signed byte-displacement validation before encoding;
+inspect other immediate-only vs relocation-backed forms for the same split.
+**Accept:** boundary sweeps including i64 extremes and all destination-register
+legality classes, positive bytes against GAS 2.47/LLVM MC, object relocation
+path remains tested separately. No QEMU required for this encoding contract.
+
+### A14-15 · P0 · R — RISC-V data expressions can fabricate successful objects
+
+**Where:** `src/backend/riscv/assembler/elf_writer.rs::resolve_deferred_exprs`
+uses `parse_integer_expr(...).unwrap_or_default()`; audit also the parser's
+symbol+addend classification (the two-symbol case does not use that fallback).
+**Reproducer:** `A14-15-*` in the probe script. `.word missing*2` emits four zero
+bytes with **no relocation**; `.word missing+other` emits only an R_RISCV_32
+relocation to `missing`, losing `other`. Clang rejects both. The valid symbolic
+difference control emits ADD32/SUB32 on both; do not reject that legal case.
+**Implement:** preserve unresolved expressions until classified as a supported
+relocation algebra or reject with source location and expression. Never turn an
+expression error into zero. Test all byte/half/word/quad directive paths and
+macro-expanded/numeric-label expressions.
+**Accept:** error for unrepresentable expressions; correct addends and paired
+relocations for supported expressions, including forward/cross-section labels.
+GAS warning-and-value semantics for division by zero/out-of-range shifts are
+already intentional in `backend/asm_expr.rs`; do NOT infer a defect merely
+because Clang rejects those (they are excluded from this item).
+
+### A14-16 · P0 · R/S — unsupported driver options silently promise capabilities
+
+**Where:** `src/driver/cli.rs` unknown-option arm (around 2219): warning only
+with `verbose`; module comment incorrectly says GCC ignores unknown -f/-m.
+**Reproducer:** `A14-16-unknown-flag` in the probe script: LCCC accepts
+`-fdefinitely-not-a-real-option`, Clang/GCC reject. Separately, `-flto` and
+`-fsanitize=address` were accepted locally; acceptance alone does not demonstrate
+LTO or ASan instrumentation. Audit their capability handling explicitly.
+**Implement:** classify options into implemented, documented benign compatibility
+no-op and unsupported semantics-affecting request. Unsupported sanitizer/LTO/
+ABI/security requests must diagnose by default; if a compatibility escape hatch
+is required it must be explicit and recorded. Do not solve this by rejecting
+all -f flags indiscriminately, breaking legitimate build-system probes.
+**Accept:** unknown typo diagnostic at any -v order; options table tests;
+`-fsanitize=address` either instruments and catches a seeded OOB or rejects;
+`-flto` either round-trips IR and demonstrates cross-TU behavior or rejects.
+
+### A14-17 · P0 · R — RISC-V shared linker silently drops unknown relocations
+
+**Where:** `src/backend/riscv/linker/reloc.rs::apply_relocation` default arm:
+error only when `!ctx.collect_relatives`; shared mode explicitly skips unknowns.
+**Reproducer:** assemble `.data; .quad missing` with Clang's RISC-V target;
+replace the sole ELF64 RELA entry's low 32-bit `r_info` type with 255, leaving
+its valid offset and symbol index untouched. `lccc-riscv -shared -nostdlib
+unknown.o -o shared.so` exits zero; `.data` remains zero and there are no
+relocations in the resulting DSO. `ld.lld -m elf64lriscv -shared unknown.o`
+rejects the unknown relocation. `lccc-ld -m elf64lriscv` is unsupported;
+use the target driver's integrated linker for this reproducer.
+**Implement:** enumerate relocations that are fully applied, preserved as dynamic
+relocations, or deliberately consumed by a valid relaxation. All others error
+regardless of executable/shared mode; never use collect-relatives as a bypass.
+**Accept:** mutated relocation fixtures with correct ELF structure, valid supported
+relocs retained, malformed offsets/symbol indices rejected; ET_EXEC/ET_DYN and
+preemptible/local symbol matrix. Extend the same audit to AArch64/i686/x86.
+
+### A14-18 · P1 · R — ICC cannot participate with the oracle's default v3 spelling
+
+**Where:** `scripts/codegen_oracle.py::DEFAULT_FLAGS/DEFAULT_ORACLES`,
+`scripts/godbolt.py` unsupported-option diagnostic handling.
+**Reproducer:** all-functions comparison of gzip_crc32, zlib_ng_adler32 and
+expat_siphash24 with `--oracles gcc16.2,clang,icc,icx --flags
+'-O2 -march=x86-64-v3'`: ICC 2021.10 emits warning #10148 that it ignores the
+march option; the existing fail-closed API correctly refuses all three ICC arms.
+**Implement:** explicit per-compiler target-option mapping with a recorded feature
+contract (e.g. investigate ICC -march=core-avx2 / -xCORE-AVX2 rather than silently
+substituting). Preserve FP-model, ISA and tuning differences in the manifest;
+expose an override for controlled research, never suppress unsupported warnings.
+**Accept:** all four arms compile under verified effective features; unsupported
+options remain fatal to comparable results; unit tests for vendor-specific argv
+and no claim that a narrower ICC target is identical to x86-64-v3 by name alone.
+**Identity correction:** CE's `cicxlatest` actually reports Intel oneAPI
+2024.0.0 (build 20231017) on this run. The fresh CE inventory lists no newer
+ICX. Record the effective banner, not just the alias; this is the latest
+*available CE alias*, not proof of the latest Intel release. Retain version JSON.
+Static TU instruction totals are triage, NOT runtime or hot-loop work-normalized
+rankings; ICC absence must remain visible in the competition matrix.
+
+### A14-19 · P0 · R — AArch64 -mgeneral-regs-only still emits NEON for integer popcount
+
+**Where:** `src/backend/arm/codegen/emit.rs` popcount path and
+`src/driver/pipeline.rs` final ISA guard (currently x86-only).
+**Reproducer:** `audit_contract_probes.py --extended`, `A14-19`: pure integer
+`int pc(unsigned long x){return __builtin_popcountl(x);}` with -O2
+-mgeneral-regs-only emits `fmov d0`, `cnt v0.8b`, `uaddlv h0` and `fmov w0,s0`.
+Clang emits general-register arithmetic. This violates a kernel-facing target
+constraint even though the C source has no floating-point type.
+**Implement:** GPR-only SWAR or a legal helper lowering for integer intrinsics;
+propagate capability to every backend path (copies, casts, atomics, spills,
+inline asm policy). Add a final AArch64 forbidden-register/instruction check as
+defense in depth, without rejecting legal GPR code. Fix the comment claiming
+kernel code does not use popcount builtins as a correctness justification.
+**Accept:** exact integer popcount results for zeros/all-ones/randoms, no FP/NEON
+references under the flag, default NEON path unchanged, cross-assembler legality.
+
+### A14-20 · P0 · R/S — PGO releases the file lock before stdio flush
+
+**Where:** `src/pgo/instrument.rs::dump_helper`, LOCK_EX around 1098,
+LOCK_UN around 1433, `fclose` afterwards; no intervening `fflush`.
+**Reproducer:** `audit_contract_probes.py --extended`, `A14-20`. Build
+`int main(void){return 0;}` with -O2 -fprofile-generate=DIR and strace
+`flock,write,close`. Observed: LOCK_EX → LOCK_UN → `write(...lccc-pgo-v1...,106)`
+→ close. The protected region does not include the actual profile write.
+The trace proves bad lock coverage, **not** a reproduced corrupt profile yet.
+**Implement:** flush while still holding the lock (check return values), then
+unlock and close, or use a single checked write transaction under the lock.
+Check flock/fileno/fprintf failures and define behavior on full disk/EINTR.
+**Accept:** deterministic two-writer test with records crossing the stdio buffer
+boundary; no interleaved records, exact summed counts after ingestion; injected
+write/lock failures diagnosed. Retain the single-process PGO round-trip gate.
+**Relation:** separate from INF-PGOPID-1 (compile-time PID nondeterminism).
+
+### A14-21 · P1 · R — -g honesty check stops at assembly, native objects lose line tables
+
+**Where:** `src/driver/pipeline.rs::asm_contains_debug_records` check;
+`src/backend/x86/assembler/parser.rs::AsmItem::{File,Loc}` are explicitly
+"parsed but skipped during encoding". This is earlier than the known missing
+DWARF type/DIE support (AUD-DEBUG-1).
+**Reproducer:** `audit_contract_probes.py --extended`, `A14-21`.
+For `int f(void){return 42;}`, `lccc -g -O0 -S` contains `.file`/`.loc`, but
+`-g -O0 -c` emits no `.debug_line` or `.debug_info` section and no warning.
+**Implement:** emit a relocation-correct DWARF line program in native assemblers,
+or explicitly diagnose that the selected object path drops requested debug data.
+Validate the final artifact, not mere presence of directives in intermediate text.
+Implement minimal DIE/types as a subsequent BTF/GDB capability milestone.
+**Accept:** decoded line rows and addr2line map back to source after linking;
+-g0 no debug; stripped/optimized-away functions classified honestly; cross-target
+line-table tests and external-assembler positive control.
+
+### A14-22 · P1 · S — workload cleanup can remove a caller-owned directory
+
+**Where:** `tests/workloads/zlib-ng-2.3.3/run.sh`, `WORK_DIR=${WORK_DIR:-$(mktemp -d)}`
+and EXIT/INT/TERM trap `rm -rf "$WORK_DIR"` even when supplied by the caller.
+This was identified by inspection; no destructive experiment was run.
+**Implement:** treat the override as a parent and create a private mktemp child,
+as Expat's runner does, or track ownership explicitly and never delete a
+pre-existing caller directory. Bound clone/configure/build as well as tests;
+add per-artifact writer lock and atomic complete/incomplete summary.
+**Accept:** sentinel file in supplied parent survives success, failure, timeout and
+SIGTERM; own child cleaned unless KEEP_WORK; two concurrent sessions cannot mix
+logs or delete each other's inputs. Snapshot/source paths must never be eligible
+cleanup roots.
+
+### A14-23 · P1 · S — benchmark gate can pass an empty/partially unavailable corpus
+
+**Where:** `scripts/check_benchmark_outputs.sh`: GCC compile failure/reference
+timeout increment SKIP and continue; filter with no matches gives no executions;
+flags omit an explicit common ISA despite LCCC's x86-64-v3 default.
+**Implement:** declared expected case set, explicit eligibility reasons and
+minimum required coverage; require successful baseline execution before a timing
+or correctness comparison. Match ISA/FP semantics and compiler identity between
+arms. Unexpected reference failure is infrastructure/unsupported, not a pass.
+Represent crashes/timeouts as distinct statuses, never agreement on wrong output.
+**Accept:** empty filter, failing reference wrapper and timed-out reference cannot
+exit as an all-green required suite; legitimate unsupported cases are listed and
+counted independently. `--fast` continues to disclose that it skips this gate.
+
+### A14-24 · P1 · S/H — prioritize existing RA work using fresh scoped evidence
+
+**Where:** `backend/live_range.rs::calculate_spill_weight` still divides by the
+fat interval `live_span`; `occupancy_len` exists. Current catalog already has
+RA-30 for this exact change; do not open another allocator-rewrite epic.
+**Implement:** revalidate RA-01/RA-02/RA-06/RA-30 on today's gzip matching,
+Adler and Expat functions; collect actual reload/store provenance, not every
+stack access called a spill. Prototype occupied-points density with an isolated
+kill switch; account for folded memory operands, rematerialization and call
+clobbers. Reject if added live ranges increase critical-path spill traffic.
+**Accept:** same-window same-target codegen + deterministic outputs + Callgrind
+Ir as a screen + controlled runtime; full per-workload regressions, not just
+geomean. Retain existing allocator policies as the baseline. No runtime gain has
+been measured in this audit.
+
+### A14-25 · P1 · S/H — CPU cost models need a target-hardware calibration boundary
+
+**Where:** `passes/reassoc_latency.rs`, `passes/inline.rs`, `passes/loop_unroll.rs`,
+`passes/vectorize.rs`, x86 codegen/peepholes; existing `uops_xml.py`,
+`uops_info_probe.py`, `loop_latency.py`, `stack_census.py` and `cpu_model_audit.py`.
+**Implement:** inventory which costs are target-specific, generic constants or
+VM-trained knobs; centralize a versioned model of latency/throughput/resources
+and register pressure without replacing all heuristics at once. Separate
+Raptor-Lake P-core and E-core tables and enforce feature validation. Start with
+one isolated dependency-chain/LEA/shift or spill-placement hypothesis selected by
+the fresh oracle, then measure on bare metal before making target claims.
+**Accept:** model version and feature set in reports; no PMU means no claimed IPC/
+port bottleneck; held-out workloads and per-core-type runs validate any calibration.
+Instruction count alone may rank research leads, never crown a fastest compiler.
+
+### A14-26 · P2 · S/H — preprocessing stress coverage needs phase-specific accounting
+
+**Where:** `frontend/preprocessor/includes.rs::read_embed_bounded`,
+`macro_defs.rs::expand_text`, `pipeline.rs`, and
+`scripts/check_deep_nesting_robustness.py`. Existing include-depth, parser-depth
+and bounded-embed protections are real; do not claim they are absent.
+**Revalidation:** chains of 512, 4,096 and 8,192 distinct object-like macros
+preprocessed successfully here with LCCC and GCC. That is not coverage of
+exponential token replication, very large string literals or include graphs.
+**Implement:** add bounded generated fixtures for those classes; record time/RSS,
+exit class and diagnostic size separately for preprocessing, parsing and lowering.
+Use existing GCC torture `pr46534.c` (catalogued 20-MB string issue), not an
+unbounded in-CI allocation attack. For large embed offsets, investigate seeking
+regular files rather than reading offset+limit bytes; preserve non-seekable
+semantics and do not call a portability difference a C miscompile.
+**Accept:** graceful configured resource-limit diagnostics or bounded completion,
+no unbounded CI hang; old deep-but-valid and embed edge controls remain valid.
+
+### A14-27 · P2 · S — bootstrap/self-hosting terminology exceeds actual compiler scope
+
+**Where:** Cargo manifest and all `src/*.rs` compiler implementation;
+`tests/bootstrap/compiler_smoke.c` is a C program, not the compiler itself;
+`scripts/lccc-bootstrap.sh` restores an environment, not a self-hosted compiler.
+**Implement:** document distinct metrics: Rust host compiler build time/RSS,
+LCCC runtime while compiling fixed C workloads, produced C binary performance,
+and optional C-based compiler bootstrap workloads. Do not advertise LCCC
+self-hosting its Rust implementation. A true self-hosting route requires a
+separate language/translation architecture decision, below codegen correctness.
+**Accept:** benchmark names/receipts distinguish all stages and their compilers;
+no C smoke test is reported as stage2/stage3 LCCC bootstrap equivalence.
+
+### A14-28 · P1 · S — reconcile capability and backlog documents against artifacts
+
+**Where:** root `backlog.md`, `engineering/agent/BACKLOG.md`, `engineering/STATE.md`,
+`engineering/FOLLOWUP-2026-10-13-audit-fix-session.md`,
+`tests/workloads/glibc-2.44/build_lccc.sh`, and `include/xmmintrin.h` stale TODOs.
+Examples: hygiene marked FIXED but files remain (A14-05); glibc script says the
+linker has no IFUNC emission although x86 executable/shared emitters contain
+IFUNC support; sema's module comment says it does not reject type errors, but a
+struct-to-int return is correctly rejected in this session. A TODO describing
+rounding via cast remains where actual intrinsic definitions have moved.
+**Implement:** one canonical open-item index linking retained historical IDs;
+capability matrix names target, mode, artifact proof and revision. Revalidate
+restricted glibc configuration before lifting any gates—IFUNC code presence alone
+is not proof of full glibc multiarch compatibility. Generate links/status checks
+from evidence; move closed narrative to the journal without deleting provenance.
+**Accept:** each open implementation task has a real reproducer or is explicitly
+H with a concrete experiment; each CLOSED claim points to a passing current gate;
+no duplicate RA/IV/PGO tasks with contradictory status.
+
+### A14-29 · P1 · R — Expat's JUnit validator rejects CTest's successful status=run
+
+**Where:** `tests/workloads/expat-2.8.5/junit_check.py::_ATTR_STATUS/_status_of`.
+**Reproducer:** the full pinned Expat runner built both arms and each CTest
+`runtests` passed **4,932 checks**, but report comparison raises
+`ReportError: unrecognised status='run'`. Retained GCC/LCCC XML in
+`engineering/evidence/2026-10-14-audit/` is the exact failing input. Local CMake
+is identified in environment.json; do not call this a compiler test failure.
+**Implement:** model CTest/JUnit *execution* status separately from outcome;
+`run` means executed, not by itself a success assertion. Inspect failure/error/
+skipped children and all outcome attributes, reject contradictions, unknowns and
+nonzero suite failure counts inconsistent with children. The current early
+return can ignore a later contradictory `result` attribute; cover that too.
+**Accept:** replay the real XML; fixtures for run+failure, run+error,
+passed+result=failed, missing/duplicate cases and unknown statuses; full runner
+reaches its XML workload comparison and writes a complete summary. Do not map
+all unrecognized values to pass just to make the environment green.
+
+### A14-30 · P0 · R — zlib-ng maketrees is miscompiled at -O2/-O3 (highest-impact new finding)
+
+**Where to start:** `passes/iv_widen.rs::{try_widen_loop,analyze_iv,apply_widen}`
+and its interaction with `passes/licm.rs` / `passes/gvn.rs`; precise faulty
+rewrite is **not yet isolated**. A kill switch removing a symptom is not proof
+that its named pass is solely responsible.
+**Reproducer and provenance:**
+`engineering/evidence/2026-10-14-audit/zlib-maketrees/README.md` contains a
+standalone two-TU extraction with license, pinned source hashes, expected and
+wrong output, optimization matrix and sanitizer evidence. The full pinned
+`tests/workloads/zlib-ng-2.3.3/run.sh` reproduces on two independent builds:
+68/69 CTests pass; `maketrees` produces incorrect Huffman tables. Compression
+round trips at levels 1/2/6/9 still pass, which must not hide this failure.
+**Isolation already done:** GCC and Clang -O2 and LCCC -O0/-O1 reproduce the
+checked-in table exactly; LCCC -O2/-O3 do not. Replacing only maketrees.c with
+LCCC code reproduces with GCC-compiled trees.c/zutil.c and the GCC linker.
+Replacing only trees.c or zutil.c does not. Thus it is not just a lccc-ld error
+or a bad upstream golden. GCC ASan+UBSan passes the standalone extraction.
+`CCC_NO_IV_WIDEN=1`, disabling `licm`, or disabling `gvn` independently restores
+the full table. Broad gate status and Adler/CRC microbenchmarks did not catch it.
+**Implement:** retain this reproducer first; dump IR at each named pass with
+`CCC_DUMP_EACH_PASS=1 CCC_DUMP_FUNC=main,tr_static_init`, validate SSA and
+compare the first changed store/address/count. Audit cross-loop escaping values,
+cast/copy alias replacement and scope freshness before rewriting legality rules.
+Minimize further while preserving the three-pass interaction, not by guessing an
+IV theorem. Guard the bad shape if proof is incomplete; do not permanently
+turn off all widening and claim optimization is fixed.
+**Accept:** exact golden table across -O0/-O1/-O2/-O3/-Os, kill-switch parity,
+full 69/69 upstream tests and independent round trips; regression test runs by
+default after the fix, plus SQLite/Expat/IV-widen gates and measured codegen
+trade-off. This audit intentionally quarantines the failing reproducer in
+engineering evidence rather than falsely adding a green regression test.
+
+### A14-31 · P1 · R — lossy ELF string decoding merges distinct legal symbol names
+
+**Where:** `src/backend/elf/io.rs::{read_cstr,read_cstr_ref}` and
+`src/backend/linker_common/symstr.rs`; inspect all four backends' symbol maps.
+**Reproducer:** assemble an x86 object defining `symA` and `symB`, then replace
+only those two string-table entries (same lengths) by `sym\xff` and `sym\xfe`.
+They are distinct NUL-terminated ELF names. Bfd and lld link and execute the
+exit-code check correctly. LCCC rejects with `multiple definition of 'sym�'`.
+The lossy Unicode conversion makes the two names equal. Source/recipe lives in
+`engineering/evidence/2026-10-14-audit/nonutf8-symbols/`.
+**Implement:** keep raw byte identity for ELF symbol/section names and interning;
+escape bytes only for diagnostics. Preserve convenient UTF-8 APIs where proven,
+not as a lossy key. A scope-limited explicit rejection is safer than coalescing
+names but still does not implement the full ELF contract.
+**Accept:** invalid UTF-8 distinct names, valid Unicode, archives, weak/strong
+resolution, versioned names and cross-object references preserve byte identity;
+no allocation/code-quality regression on the current symbol benchmark corpus.
+
+### A14-32 · P1 · R — late snapshot budget refusal leaves mixed-generation public artifacts
+
+**Where:** `scripts/lccc-snapshot.sh` publication order and
+`lccc_delivery.py::publish/check_budget`. **Red-team correction:** the snapshot
+script already holds `flock -n` across sequence allocation, commit and
+publication; there is no demonstrated missing-writer-lock defect.
+**Reproduced:** S06 committed the audit, replaced canonical patch/source tar/
+bundle and wrote its named checkpoint. Only afterward did the ZIP publisher
+reject an 88 MB workspace (64 MiB guard) because CI had placed 68 MB of oracle
+downloads in `$HOME/dl`. ZIP/delivery receipt, sequence counter and ledger still
+named S05 while canonical patch/source represented S06. Each file was complete,
+but the visible set was mixed. Downloads were moved outside the workspace and
+linked back; the budget guard was retained unchanged.
+**Implement:** preflight the workspace/projected artifact set before any public
+replacement, then stage immutable generation artifacts/receipts and switch a
+final current-generation pointer atomically. Preserve the current whole-writer
+lock, hash/recovery checks and historical checkpoints. Keep the last *complete*
+generation usable when staging/publishing fails; do not swallow the failure.
+**Accept:** budget refusal and kill injection at each boundary leave a consistent
+last-complete set; restore via the normal recovery entrypoint without manually
+choosing among conflicting generations. Two writers remain mutually exclusive.
+**Final-main update:** 1e83776 adds publisher exclusions for checkout/cache and
+also the recovery-artifact zone. That reduces this original trigger but does not
+make the multi-file publication transactional. Recovery archives under
+`/home/user/artifacts` DO persist in this environment: excluding them from the
+publisher census must not be mistaken for exemption from the platform budget.
+Validate total persisted bytes independently, including archive/bundle/history;
+helper downloads must not silently fill the visible snapshot budget.
+
+### A14-33 · P1 · S — regression helpers still share fixed temporary names
+
+**Where:** `tests/regression/run_pgo_roundtrip.sh` removes `/tmp/pgd_roundtrip`,
+`/tmp/pgd_flat`, `/tmp/pgd_single` and writes fixed `/tmp/r7_pg`, `/tmp/r8_pg`,
+`/tmp/flat_*`; it defaults to target/release rather than the session fastbuild.
+**Implement:** allocate a private temp root per invocation, trap only owned
+paths, quote compiler/path expansion, bound compile/train/use processes and
+record full commands. Audit analogous shell fixtures using the whole-tree script
+inventory, not a global search/replace of every `/tmp` substring.
+**Accept:** two parallel PGO round trips with distinct inputs pass without file
+collisions or deletion; timeouts leave explicit failed/partial evidence; default
+compiler uses the already-built fastbuild binary, never silently triggers a
+release build. This is a concurrency/robustness gap, not a demonstrated race in
+this session's sequential CI.
+
+### A14-34 · P1 · R — CI memory heuristic leaks state between gates, then Clippy OOMs
+
+**Where:** `scripts/ci_local.sh::{cargo_test_repeated,clippy_gate}`.
+The test gate exports CARGO_PROFILE_FASTBUILD_DEBUG=0 / CARGO_INCREMENTAL=0 into
+the caller shell and never restores them. The later Clippy gate treats that
+inherited DEBUG=0 as an explicit caller override, skips its small-memory branch
+and reverts to two compiler processes on this 1,982 MiB host. The first full
+--fast run ended **216 passed / 1 failed / 5 skipped**, solely Clippy SIGKILL;
+kernel OOM diagnostics name concurrent clippy-driver processes, not a lint error.
+**Reproducer:** `engineering/evidence/2026-10-14-audit/ci-memory/replay.py`
+executes the actual functions with fake free/Cargo (no expensive OOM needed):
+fresh Clippy chooses -j1, but test→Clippy chooses -j2 on the identical machine.
+`observed.json` and `oom.txt` retain the deterministic control and real failure.
+**Implement:** scope per-gate environment in a subshell or restore the original
+set/unset state; derive memory budgeting separately from debug-info preference.
+Document explicit caller parallelism precedence and honor it consistently. Do
+not silently weaken linting or opt level; retain fastbuild/-O1 for the compiler.
+**Accept:** ordered and isolated gates choose identical automatic resources;
+explicit -j/debug/incremental overrides remain distinguishable from internal
+heuristics; fake-resource tests cover low/high memory and inherited variables.
+This audit adds 4 GiB swap (6 GiB total) for its explicit two-job final rerun,
+not a source fix or evidence that the state leak has disappeared.
+
+---
 
 ## P0 — largest measured gaps
 

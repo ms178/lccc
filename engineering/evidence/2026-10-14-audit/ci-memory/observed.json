@@ -1,0 +1,14 @@
+[
+  {
+    "arm": "fresh",
+    "returncode": 0,
+    "stdout": "cargo clippy --all-targets --profile fastbuild --locked -j 1 -- -D warnings\n",
+    "stderr": ""
+  },
+  {
+    "arm": "after-test",
+    "returncode": 0,
+    "stdout": "cargo test --profile fastbuild --all-targets --locked -j 1\ncargo clippy --all-targets --profile fastbuild --locked -j 2 -- -D warnings\n",
+    "stderr": ""
+  }
+]

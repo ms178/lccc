@@ -1,0 +1,23 @@
+[ 2195.322160] [    601]     0   601     2932      193    61440        0         -1000 socat
+[ 2195.322161] [    602]     0   602     2932      194    69632        0         -1000 socat
+[ 2195.322162] [    603]     0   603     2932      193    65536        0         -1000 socat
+[ 2195.322164] [   1902]  1000  1902     1014        1    49152       62           100 bash
+[ 2195.322165] [   1903]  1000  1903     1014        0    45056       68           100 bash
+[ 2195.322167] [   1906]  1000  1906     1047        1    49152      104           100 bash
+[ 2195.322168] [ 189520]  1000 189520    79472        0   233472     1177           100 cargo-clippy
+[ 2195.322170] [ 189525]  1000 189525    76044        0   131072      869           100 cargo
+[ 2195.322171] [ 189534]  1000 189534   702501   264263  4751360   208284           100 clippy-driver
+[ 2195.322173] [ 189535]  1000 189535   660826   181289  4726784   258978           100 clippy-driver
+[ 2195.322174] oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=envd.service,mems_allowed=0,global_oom,task_memcg=/user,task=clippy-driver,pid=189534,uid=1000
+[ 2195.322197] Out of memory: Killed process 189534 (clippy-driver) total-vm:2810004kB, anon-rss:1057052kB, file-rss:0kB, shmem-rss:0kB, UID:1000 pgtables:4640kB oom_score_adj:100
+[ 2326.035912] audit: type=1101 audit(1791935378.500:110): pid=192792 uid=1000 auid=4294967295 ses=4294967295 subj=kernel msg='op=PAM:accounting grantors=pam_permit acct="user" exe="/usr/bin/sudo" hostname=? addr=? terminal=? res=success'
+[ 2326.036638] audit: type=1123 audit(1791935378.500:111): pid=192792 uid=1000 auid=4294967295 ses=4294967295 subj=kernel msg='cwd="/opt/lccc-audit-cache/lccc" cmd=66616C6C6F63617465202D6C203447202F6C6363632D61756469742D65787472612E73776170 exe="/usr/bin/sudo" terminal=? res=success'
+[ 2326.036731] audit: type=1110 audit(1791935378.500:112): pid=192792 uid=1000 auid=4294967295 ses=4294967295 subj=kernel msg='op=PAM:setcred grantors=pam_permit acct="root" exe="/usr/bin/sudo" hostname=? addr=? terminal=? res=success'
+[ 2326.040350] audit: type=1105 audit(1791935378.508:113): pid=192792 uid=1000 auid=4294967295 ses=4294967295 subj=kernel msg='op=PAM:session_open grantors=pam_limits,pam_permit,pam_umask,pam_unix acct="root" exe="/usr/bin/sudo" hostname=? addr=? terminal=? res=success'
+[ 2326.052907] audit: type=1106 audit(1791935378.520:114): pid=192792 uid=1000 auid=4294967295 ses=4294967295 subj=kernel msg='op=PAM:session_close grantors=pam_limits,pam_permit,pam_umask,pam_unix acct="root" exe="/usr/bin/sudo" hostname=? addr=? terminal=? res=success'
+[ 2326.052941] audit: type=1104 audit(1791935378.520:115): pid=192792 uid=1000 auid=4294967295 ses=4294967295 subj=kernel msg='op=PAM:setcred grantors=pam_permit acct="root" exe="/usr/bin/sudo" hostname=? addr=? terminal=? res=success'
+[ 2326.062616] audit: type=1101 audit(1791935378.524:116): pid=192795 uid=1000 auid=4294967295 ses=4294967295 subj=kernel msg='op=PAM:accounting grantors=pam_permit acct="user" exe="/usr/bin/sudo" hostname=? addr=? terminal=? res=success'
+[ 2326.062733] audit: type=1123 audit(1791935378.524:117): pid=192795 uid=1000 auid=4294967295 ses=4294967295 subj=kernel msg='cwd="/opt/lccc-audit-cache/lccc" cmd=63686D6F6420363030202F6C6363632D61756469742D65787472612E73776170 exe="/usr/bin/sudo" terminal=? res=success'
+[ 2326.062799] audit: type=1110 audit(1791935378.524:118): pid=192795 uid=1000 auid=4294967295 ses=4294967295 subj=kernel msg='op=PAM:setcred grantors=pam_permit acct="root" exe="/usr/bin/sudo" hostname=? addr=? terminal=? res=success'
+[ 2326.062895] audit: type=1105 audit(1791935378.524:119): pid=192795 uid=1000 auid=4294967295 ses=4294967295 subj=kernel msg='op=PAM:session_open grantors=pam_limits,pam_permit,pam_umask,pam_unix acct="root" exe="/usr/bin/sudo" hostname=? addr=? terminal=? res=success'
+[ 2326.132135] Adding 4194300k swap on /lccc-audit-extra.swap.  Priority:-3 extents:3 across:4456444k FS
