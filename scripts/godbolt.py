@@ -31,6 +31,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -155,7 +156,10 @@ def list_compilers(language: str = "c", *, refresh: bool = False) -> list[dict[s
     value = _request_json(f"{API}/compilers/{language}", timeout=60)
     if not isinstance(value, list):
         raise GodboltError("unexpected compiler-list response")
-    tmp = cache.with_suffix(f".tmp.{os.getpid()}")
+    # Metadata lookup runs on the survey thread pool too. PID alone lets two
+    # cold readers overwrite/rename the same staging file. Match the shared
+    # payload cache's per-process, per-thread atomic-publication discipline.
+    tmp = cache.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}")
     tmp.write_text(json.dumps(value, indent=1))
     tmp.replace(cache)
     return value

@@ -43,8 +43,10 @@
 //!    every line.  Reads beyond a line that **fully overwrites** the upper
 //!    half (a VEX instruction with `%ymmN`/`%xmmN` as its destination, or
 //!    `vzeroupper`) do not count: the legacy merge would be dead.  (The
-//!    ABI makes the upper halves undefined across calls and at function
-//!    entry/return, so external readers do not count either.)
+//!    ABI's caller-saved rule does NOT make arguments dead before a call:
+//!    an external callee can consume a complete YMM/ZMM argument. Calls
+//!    therefore observe all tracked upper aliases until more precise ABI
+//!    argument-width evidence is available.)
 //! 3. Instructions without an XMM destination (stores, compares, GPR
 //!    destinations) are always exact and always rewritten.
 //! 4. Functions containing inline asm (`#APP`) are skipped wholesale.
@@ -418,10 +420,14 @@ fn allowed_masks(body: &[&str]) -> Vec<u32> {
         }
         let (mut reads, mut writes) = super::fp_liveness::upper_vector_access_line(text);
         let (mn, operand) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
-        if mn.starts_with('j')
-            && (operand.trim().starts_with('*') || !labels.contains_key(operand.trim()))
+        if matches!(mn, "call" | "callq")
+            || mn.starts_with('j')
+                && (operand.trim().starts_with('*') || !labels.contains_key(operand.trim()))
         {
             // A target outside this model may observe ANY upper register.
+            // Calls consume arguments BEFORE the ABI clobbers caller-saved
+            // registers. A textual absence of YMM operands proves nothing
+            // about the external callee (including a typed __m256 witness).
             // Reaching all local lines alone is not a proof about that target.
             reads = 0xffff;
             writes = 0;
@@ -545,6 +551,28 @@ mod tests {
         let mut s = src.to_string();
         let n = promote_legacy_sse_to_vex(&mut s);
         (s, n)
+    }
+
+    #[test]
+    fn pr834_calls_observe_staged_upper_arguments() {
+        for call in [
+            "call witness",
+            "call witness@PLT",
+            "call *%rax",
+            "callq *%rax",
+        ] {
+            let src = format!(
+                "f:\n    vmovupd (%rdi), %ymm0\n    addsd %xmm2, %xmm0\n    {call}\n    ret\n"
+            );
+            let (out, _) = run(&src);
+            assert!(out.contains("    addsd %xmm2, %xmm0\n"), "{call}: {out}");
+            let killed = src.replace(call, &format!("vxorps %ymm0, %ymm0, %ymm0\n    {call}"));
+            let (out, count) = run(&killed);
+            assert!(
+                count > 0 && out.contains("vaddsd"),
+                "full overwrite remains a positive control: {out}"
+            );
+        }
     }
 
     #[test]

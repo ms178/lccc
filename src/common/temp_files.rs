@@ -2,7 +2,7 @@
 //!
 //! Provides:
 //! - `temp_dir()`: returns the platform temp directory (respects $TMPDIR)
-//! - `private_temp_dir()`: a per-process 0700 directory owning every temp file
+//! - `private_temp_dir()`: a persistent 0700 directory for unmanaged/debug paths
 //! - `TempFile`: RAII guard that deletes the file on drop (even on panic/error)
 //! - `make_temp_path()`: generates a unique temp file path inside the private dir
 //! - `write_file_exclusive()`: symlink-safe write for fixed-purpose debug dumps
@@ -34,8 +34,8 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Global counter for generating unique temp file names within a process.
@@ -145,24 +145,42 @@ fn create_private_dir() -> Option<PathBuf> {
 
 /// The process-private temp directory, or `None` if it could not be created.
 ///
-/// Created lazily on first use and shared by every temp file of this process.
+/// Created lazily for unmanaged/debug paths. Managed `TempFile` guards use a
+/// separate leased directory and cannot invalidate these persistent paths.
 pub fn private_temp_dir() -> Option<&'static Path> {
     static PRIVATE_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     PRIVATE_DIR.get_or_init(create_private_dir).as_deref()
 }
 
-/// Remove the private temp directory if it is empty.
-///
-/// Called from `TempFile::drop` on every temp-file release: the last release of
-/// a compile therefore removes the directory, and an interrupted or
-/// `CCC_KEEP_*` run leaves it behind for inspection instead of deleting files
-/// a user asked to keep. Failures are ignored (a non-empty directory, a file
-/// another thread still holds, a transient EPERM) because cleanup must never
-/// turn into a compile failure.
-fn remove_private_dir_if_empty() {
-    if let Some(dir) = private_temp_dir() {
-        let _ = fs::remove_dir(dir);
+/// A managed directory's lifetime includes reserved-but-not-yet-written paths.
+/// Never recreate a removed pathname: a later generation uses a fresh exclusive
+/// mkdir, so it cannot adopt something planted at a previous directory's name.
+struct TempDirectory {
+    path: PathBuf,
+}
+
+impl Drop for TempDirectory {
+    fn drop(&mut self) {
+        // Only reap an empty directory we own. Kept files survive, and cleanup
+        // errors must not replace the original compiler diagnostic.
+        let _ = fs::remove_dir(&self.path);
     }
+}
+
+fn managed_temp_directory() -> Option<Arc<TempDirectory>> {
+    static DIRECTORY: OnceLock<Mutex<Weak<TempDirectory>>> = OnceLock::new();
+    let mut current = DIRECTORY
+        .get_or_init(|| Mutex::new(Weak::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(directory) = current.upgrade() {
+        return Some(directory);
+    }
+    let directory = Arc::new(TempDirectory {
+        path: create_private_dir()?,
+    });
+    *current = Arc::downgrade(&directory);
+    Some(directory)
 }
 
 /// Generate a unique temp file path with the given prefix and extension.
@@ -173,10 +191,14 @@ fn remove_private_dir_if_empty() {
 /// (`<prefix>_<pid>_<stem>.<n>.<ext>`) so diagnostics and `CCC_KEEP_*`
 /// workflows that read the name keep working; only the *directory* changed.
 pub fn make_temp_path(prefix: &str, stem: &str, extension: &str) -> PathBuf {
+    path_in(private_temp_dir(), prefix, stem, extension)
+}
+
+fn path_in(directory: Option<&Path>, prefix: &str, stem: &str, extension: &str) -> PathBuf {
     let pid = std::process::id();
     let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let filename = format!("{}_{}_{}.{}.{}", prefix, pid, stem, id, extension);
-    match private_temp_dir() {
+    match directory {
         Some(dir) => dir.join(filename),
         None => temp_dir().join(filename),
     }
@@ -231,6 +253,9 @@ pub struct TempFile {
     path: PathBuf,
     /// If true, the file will NOT be deleted on drop (for debugging).
     keep: bool,
+    // Dropped after file cleanup; unlike directory emptiness, this counts
+    // guards whose writers have not created their files yet.
+    _directory: Option<Arc<TempDirectory>>,
 }
 
 impl TempFile {
@@ -239,9 +264,17 @@ impl TempFile {
     /// The file is not created on disk — this just reserves the path and
     /// registers it for cleanup on drop.
     pub fn new(prefix: &str, stem: &str, extension: &str) -> Self {
+        let directory = managed_temp_directory();
+        let path = path_in(
+            directory.as_deref().map(|dir| dir.path.as_path()),
+            prefix,
+            stem,
+            extension,
+        );
         Self {
-            path: make_temp_path(prefix, stem, extension),
+            path,
             keep: false,
+            _directory: directory,
         }
     }
 
@@ -249,7 +282,11 @@ impl TempFile {
     /// controls the path but wants RAII cleanup).
     #[cfg_attr(not(feature = "gcc_assembler"), allow(dead_code))] // Used by gcc_assembler's CCC_KEEP_ASM path
     pub fn with_path(path: PathBuf) -> Self {
-        Self { path, keep: false }
+        Self {
+            path,
+            keep: false,
+            _directory: None,
+        }
     }
 
     /// Mark this temp file to be kept (not deleted on drop).
@@ -278,8 +315,8 @@ impl Drop for TempFile {
         if !self.keep {
             // Silently ignore errors (file may not have been created).
             let _ = fs::remove_file(&self.path);
-            // …and reap the shared directory when this was the last file in it.
-            remove_private_dir_if_empty();
+            // The last directory lease, not the last currently existing file,
+            // performs directory cleanup after this Drop body returns.
         }
     }
 }
@@ -287,5 +324,105 @@ impl Drop for TempFile {
 impl std::fmt::Display for TempFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.path.display())
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn directory_lease_reaps_empty_but_preserves_kept_files() {
+        // A private lease, not the global weak cache, makes this assertion
+        // independent of unrelated tests holding their own managed guards.
+        let directory = Arc::new(TempDirectory {
+            path: create_private_dir().unwrap(),
+        });
+        let parent = directory.path.clone();
+        let path = parent.join("owned");
+        fs::write(&path, b"owned").unwrap();
+        let file = TempFile {
+            path,
+            keep: false,
+            _directory: Some(directory),
+        };
+        drop(file);
+        assert!(!parent.exists());
+
+        let directory = Arc::new(TempDirectory {
+            path: create_private_dir().unwrap(),
+        });
+        let parent = directory.path.clone();
+        let path = parent.join("kept");
+        fs::write(&path, b"kept").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        let mut file = TempFile {
+            path: path.clone(),
+            keep: false,
+            _directory: Some(directory),
+        };
+        file.set_keep(true);
+        drop(file);
+        assert_eq!(fs::read(&path).unwrap(), b"kept");
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(parent).unwrap();
+    }
+
+    #[test]
+    fn managed_cleanup_does_not_invalidate_unmanaged_paths() {
+        let path = make_temp_path("lifecycle", "unmanaged", "tmp");
+        drop(TempFile::new("lifecycle", "managed", "tmp"));
+        write_file_exclusive(&path, b"unmanaged lifetime").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"unmanaged lifetime");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn pending_reservation_survives_sibling_drop() {
+        let first = TempFile::new("lifecycle", "first", "tmp");
+        let pending = TempFile::new("lifecycle", "pending", "tmp");
+        drop(first);
+        fs::write(pending.path(), b"still reserved").unwrap();
+        assert_eq!(fs::read(pending.path()).unwrap(), b"still reserved");
+    }
+
+    #[test]
+    fn sequential_lifetimes_create_writable_directories() {
+        for _ in 0..3 {
+            let file = TempFile::new("lifecycle", "sequential", "tmp");
+            fs::write(file.path(), b"next generation").unwrap();
+        }
+    }
+
+    #[test]
+    fn unrelated_explicit_path_cannot_reap_reserved_directory() {
+        let pending = TempFile::new("lifecycle", "pending", "tmp");
+        let explicit = TempFile::with_path(temp_dir().join(format!(
+            "lccc-unrelated-{}-{}",
+            std::process::id(),
+            unique_stamp()
+        )));
+        drop(explicit);
+        fs::write(pending.path(), b"not owned by the explicit guard").unwrap();
+    }
+
+    #[test]
+    fn parallel_pending_writers_survive_an_empty_sibling() {
+        let pending: Vec<_> = (0..8)
+            .map(|_| TempFile::new("lifecycle", "parallel", "tmp"))
+            .collect();
+        drop(TempFile::new("lifecycle", "empty", "tmp"));
+        std::thread::scope(|scope| {
+            for file in pending {
+                scope.spawn(move || fs::write(file.path(), b"parallel").unwrap());
+            }
+        });
     }
 }

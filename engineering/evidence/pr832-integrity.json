@@ -1,4 +1,5 @@
 {
+  "schema_version": 1,
   "capture_commit": "63e783b15586eca86f306bd75a52b82c57304bbb",
   "scope": "retained engineering files changed by merged PR832; no assertion of original execution or reproducibility",
   "raw_log_manifests": [

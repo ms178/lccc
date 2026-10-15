@@ -62,6 +62,158 @@ historical ratios.
 
 An item with no reproducer does not belong here.
 
+
+## PR834 follow-up queue — 2026-10-15 (delivery scope)
+
+**Immediate delivery:** fix the reproduced TempFile lifetime failure, retain all
+F1–F6 follow-ups, rebase and require whole FAST + rustfmt + strict Clippy. Do not
+run full/slow CI on the VM. Final verdict and hashes belong to the external
+acceptance/publication receipts; this queue is not itself a green-run receipt.
+The user prioritised this validated patch over completing the research below.
+
+### P0 — current-tree measurement boundary (R)
+
+The all45, five-round compiler/program datasets in
+[`engineering/pr834/MEASUREMENT-RESULTS.md`](engineering/pr834/MEASUREMENT-RESULTS.md)
+measure **b52a114434d446db5979bccf8d759aae619b6f2e**, not the later TempFile repair.
+The latter changes production compiler code, not just a test: do not relabel the
+old compiler hash or old all45 results as measurements of the delivery binary.
+`verify_corpus_receipts.py` still validates the historical capture;
+`--check-current-inputs` is expected to reject the newer TempFile source until a
+separate new capture is published. Do not alter the old fingerprint to make
+that check green. This is provenance drift, not corruption of the old evidence.
+
+Acceptance for closing this item: freeze latest-main and candidate independently
+(fastbuild/O1, exactly `-j 2`, no concurrent heavy build); record source/ELF/tool
+and header identities; all45 default compiler timings, five rounds of paired,
+order-balanced repetitions, per-form medians/ranges and child CPU time; fixed
+Callgrind geometry and retained counters, correctness, assembly and failures.
+Recompile the 225 bounded configurations and compare their ELF hashes with the
+old capture before reusing any program evidence. Prefer a fresh linked capture.
+Investigate reproducible >5% median regressions rather than increasing budgets.
+The historical stress improvement is pass-local, not a whole-compiler speedup.
+No new timing gate is justified by the currently noisy native samples.
+
+### P0 — worst15, fannkuch and target-hardware runtime (R / incomplete)
+
+The previously rejected **+4.2758% fannkuch Ir** tradeoff remains unaccepted;
+there is no waiver. Rerun all45 with per-form inputs/flags, including the worst15,
+against an immutable latest main and the final candidate. Retain output checks,
+Callgrind event geometry, compiler/executable hashes and hot-region assembly.
+For fannkuch use the recorded bounded macro consistently; compare the same
+permutation workload and hot region, not static function size alone. A reduction
+in static instructions, loop density or simulated Ir is not a cycles claim.
+Native paired runs and PMU evidence on **i7-14700KF / Raptor Lake** remain open;
+this two-vCPU Xeon VM cannot substitute for them. No claim of beating every
+compiler or universal optimality is warranted.
+
+### P0 — complete hosted validation and operational cohort (R / incomplete)
+
+Run full/slow CI only on GitHub after publication. The 13 green hosted checks
+belong to merged PR834, not these follow-ups. Collect 20 post-change merged-PR
+observations through `scripts/collect_ci_followup.py`, including duration,
+failure and flake classification; the last saved cohort has 0/20 observations.
+Retain failures and identify causes before changing benchmark-gate policy.
+Do not turn live Compiler Explorer into a merge gate or remove other red-team
+coverage. The six intentional `--fast` skips do not prove slow-mode coverage.
+
+### P1 — TempFile lifetime red-team and remaining security boundary (R / S)
+
+The second whole-FAST attempt was 252/1/6: the native YMM witness could not write
+its assembly file. `src/common/temp_files.rs` was byte-identical to merged main.
+Four deterministic lifecycle tests reproduced missing-directory failures:
+pending reservation after sibling drop, sequential lifetimes, parallel pending
+writers, and unrelated `with_path` cleanup. The repair uses Arc directory leases
+and a mutex-protected Weak cache. Reservations, not existing files, determine
+liveness; later generations use fresh exclusive mkdir rather than recreating a
+previous pathname. Explicit user paths own no directory lease. Debug/unmanaged
+paths remain separate and persistent. Six focused tests additionally cover
+0700 permissions, last-owner cleanup, kept output and unmanaged-path isolation.
+
+Before extending this design: test repeated in-process Compiler invocations,
+error/panic cleanup, feature-enabled external assembler consumers, and
+Windows/non-Unix behavior. Audit the inherited **warned flat-path fallback**
+when private-directory creation fails: it remains unchanged by this lifetime
+repair and is not a fail-closed security guarantee. Develop an adversarial
+allocation-failure/symlink reproducer, then design fallible allocation and
+caller diagnostics in a separate change; never silently recreate or adopt an
+attacker-controlled old directory. Do not solve the race by disabling the
+native witness, serialising the entire test suite or leaking every managed
+directory until process exit. Measure any lifecycle cost before claiming it
+negligible for tiny compilations.
+
+### P1 — Oracle procedure, hard data and tooling defects (S / incomplete)
+
+Required competition: GCC16.2, Clang23.1, latest ICX with resolved channel
+metadata, and ICC Classic where an actually supported equivalent target exists.
+Record exact requested/effective flags and reject ignored/unsupported options.
+The Haswell/CORE-AVX2 dialect canary is not identical x86-64-v3/Raptor-Lake proof.
+Use the shared cache and preserve raw errors; an unavailable oracle is missing
+data, never a win. The latest delivery repair is host-side lifecycle work, not
+a new oracle-tuned code-generation optimization.
+
+Research sequence and relevant scripts:
+1. `scripts/godbolt.py audit` and `scripts/oracle_profile.py`: resolve tool IDs
+   and prove flag/ISA admission; then compile/execute bounded witnesses.
+2. `scripts/codegen_oracle.py --rank` with all45 and explicit source/flags;
+   `scripts/oracle_survey_diagnostics.py` to count incomplete/error rows.
+3. `scripts/oracle_asm.py` for cached hot-function assembly;
+   `scripts/loop_density_oracle.py` plus `scripts/hot_loop_metric.py` for
+   manually matched loop phases, not unconditional performance verdicts.
+4. `scripts/tune_oracle.py` for CPU-cost choices;
+   `scripts/tight_loop_oracle.py` for alignment only after its flag mismatch is
+   repaired (below). Never tune solely to a static-instruction ranking.
+5. `tools/oracle/godbolt_oracle.py`, `tools/oracle/callgrind_compare.sh`,
+   `tools/oracle/callgrind_own_ir.py` and `tools/oracle/hot_instr.py` for
+   executable and dynamic-cost investigation. Keep fixed geometry and outputs.
+6. `scripts/oracle_delta_gate.py` and `scripts/godbolt_cache.py` offline
+   regression tests; do not update a baseline merely to hide a regression.
+   Boot/zstd-specific wrappers are relevant only when their corresponding
+   workload and exact flags are under investigation.
+
+A fresh two-thread live request reproduced a metadata-cache publication race:
+`godbolt.py::list_compilers` used only PID in its staging filename. One publisher
+renamed the other's file, raising FileNotFoundError and losing an oracle row.
+The surgical fix adds thread identity, matching the existing payload-cache
+policy. A barrier-controlled cold-publication test is RED before the fix and
+GREEN afterwards; remote failures are still reported, not swallowed. Keep this
+regression in the existing offline cache gate. The interrupted pre-FAST
+acceptance is retained separately; source changes occurred only after stopping
+it. This does not make a partial remote result a complete comparison.
+
+Source-confirmed follow-ups found while inspecting these tools:
+- `oracle_asm.py::main` currently returns 0 even when local compilation or
+  function extraction fails, despite its documented nonzero contract. Add a
+  mocked local-failure RED test and preserve explicit remote-error rows.
+- `tight_loop_oracle.py::lccc_decisions` hardcodes GCC14 headers and does not
+  propagate the CLI target march to local compilation. Do not use its default
+  local-vs-remote report as an equal-flags comparison. Add argv-contract RED
+  tests, configure headers explicitly and bind local/remote target flags.
+- `tune_oracle.py::cmd_compare` reports remote exceptions but returns success;
+  distinguish a partial research table from a complete four-vendor result.
+
+### P1 — warning disposition and ABI/effect coverage (R / S)
+
+Preserve first-attempt rustup provisioning warnings and the missing GCC16 i386
+libgcc failure; the exact matching development package repaired all seven
+mandatory i386 gates without oracle substitution. Host shared libgcc_s14 was
+not misrepresented as a complete GCC16 multilib runtime installation.
+
+The positive generic-vector shuffle fixture emits GCC psABI notices because
+its 256-bit signatures are compiled without AVX. This is not a demonstrated
+cross-compiler wide-vector ABI proof. Do not add AVX silently or suppress all
+warnings; separate expected diagnostics from unexpected ones with raw receipts.
+The COMDAT-signature, copy-alias-size and NOTYPE-routing handwritten assembly
+fixtures lack `.note.GNU-stack`, producing bfd executable-stack warnings.
+Add non-executable-stack notes with fatal-warning negative controls and retain
+all x86-64/i386 semantic checks. Intentional cast-warning tests remain intact.
+
+Broaden direct effect-table tests for movnt/pextr/extractps; xrstor's current
+upper-kill omission is conservative, not a proven miscompile. Wide-vector
+return interoperability and complete frontend vector ABI support remain open.
+Harden native assembly tests against GAS listing-format differences without
+weakening their positive controls or silently skipping required AVX coverage.
+
 ---
 
 ### ALIGN-1 · **CLOSED 2026-09-30** — the definition channel of `aligned()` now reaches codegen

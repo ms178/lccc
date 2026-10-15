@@ -923,7 +923,79 @@ class _RunStep:
         return loc
 
 
-def workflow_run_steps(path: Path, *, _called=None, _soft=False, _stack=()):
+def _continue_on_error(value) -> bool:
+    """Only literal booleans are modeled; Python bool('false') is wrong."""
+    if value is None:
+        return False
+    if type(value) is bool:
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith('${{') and text.endswith('}}'):
+            text = text[3:-2].strip()
+        if text.lower() in {'true', 'false'}:
+            return text.lower() == 'true'
+    raise _WorkflowError(f"unsupported continue-on-error expression: {value!r}")
+
+
+def _job_reachability(jobs: dict) -> dict:
+    """Green-path DAG evaluation, including transitive skipped dependencies.
+
+    `always()` overrides skipped needs. Unknown conditions grant no coverage;
+    matrix expansion and malformed/recursive dependencies are rejected, not
+    approximated as a successful job. This is not a general Actions evaluator.
+    """
+    states = {}
+    ancestor_skips = {}
+
+    def visit(name, stack=()):
+        if name in stack:
+            raise _WorkflowError(f"recursive job needs: {name}")
+        if name not in jobs:
+            raise _WorkflowError(f"unknown job dependency: {name}")
+        if name in states:
+            return states[name]
+        job = jobs[name]
+        if not isinstance(job, dict):
+            raise _WorkflowError(f"malformed job: {name}")
+        if 'strategy' in job:
+            raise _WorkflowError(f"unsupported job strategy/matrix: {name}")
+        needs = job.get('needs', [])
+        if isinstance(needs, str):
+            needs = [needs]
+        if not isinstance(needs, list) or any(not isinstance(n, str) for n in needs):
+            raise _WorkflowError(f"malformed job needs: {name}")
+        skipped = set()
+        for dependency in needs:
+            if not visit(dependency, (*stack, name))[0]:
+                skipped.add(dependency)
+            skipped.update(ancestor_skips[dependency])
+        # always() overrides this job's status check; it does not turn an
+        # earlier skipped job into a success for downstream default checks.
+        # https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-jobs#defining-prerequisite-jobs
+        ancestor_skips[name] = skipped
+        cond = job.get('if')
+        active = cond is None or cond is True or str(cond).strip() in _ACTIVE_IF
+        why = ''
+        if not active:
+            why = f"job `if: {cond}` keeps the whole job off the green-path run"
+        elif skipped and str(cond).strip() not in {'always()', '${{ always() }}'}:
+            active = False
+            why = f"skipped job dependencies prevent execution: {', '.join(sorted(skipped))}"
+        states[name] = (active, why)
+        return states[name]
+
+    for name in jobs:
+        visit(name)
+    return states
+
+
+def workflow_run_steps(path: Path):
+    """Public walker; recursion state is private, never caller-provided."""
+    yield from _workflow_run_steps(path, called=None, inherited_soft=False, stack=())
+
+
+def _workflow_run_steps(path: Path, *, called, inherited_soft, stack):
     """Yield one _RunStep record for every `run:` step.
 
     `active` is False when the WORKFLOW's `on:` triggers never run it on
@@ -935,16 +1007,23 @@ def workflow_run_steps(path: Path, *, _called=None, _soft=False, _stack=()):
     explains a non-active/non-soft verdict for diagnostics.
     """
     resolved = path.resolve()
-    if resolved in _stack:
+    if resolved in stack:
         raise _WorkflowError(f"recursive reusable workflow: {path.name}")
     doc = _load_workflow(path)
     triggers = _workflow_triggers(doc)
-    if _called is not None and "workflow_call" not in triggers:
+    if called is not None and "workflow_call" not in triggers:
         raise _WorkflowError(f"called workflow lacks workflow_call: {path.name}")
-    on_pr_path = bool(triggers & _PR_PATH_EVENTS) if _called is None else _called
+    on_pr_path = bool(triggers & _PR_PATH_EVENTS) if called is None else called
+    if called is not None:
+        events = doc.get('on', doc.get(True))
+        spec = events.get('workflow_call') if isinstance(events, dict) else None
+        if spec is not None:
+            if not isinstance(spec, dict) or spec.get('inputs') or spec.get('secrets'):
+                raise _WorkflowError(f"unsupported reusable inputs/secrets: {path.name}")
     jobs = doc.get("jobs") or {}
     if not isinstance(jobs, dict):
-        return
+        raise _WorkflowError(f"malformed jobs mapping: {path.name}")
+    reachability = _job_reachability(jobs)
     wf_env = _env_names(doc.get("env"))
     for job_id, job in jobs.items():
         if not isinstance(job, dict):
@@ -958,27 +1037,32 @@ def workflow_run_steps(path: Path, *, _called=None, _soft=False, _stack=()):
         if isinstance(runs, dict) and isinstance(runs.get("steps"), list):
             containers.append(runs["steps"])
         job_env = wf_env | _env_names(job.get("env"))
-        job_cond = job.get("if")
-        job_active = job_cond is None or str(job_cond).strip() in _ACTIVE_IF
-        job_soft = _soft or bool(job.get("continue-on-error"))
+        job_active, job_why = reachability[job_id]
+        job_soft = _continue_on_error(job.get("continue-on-error")) or inherited_soft
         # Reachability, not mere presence of workflow_call, grants coverage.
         # Caller conditions and soft-failure policy propagate; workflow env
         # does NOT propagate across reusable workflows in GitHub Actions.
         uses = job.get("uses", "")
-        if isinstance(uses, str) and uses.startswith("./"):
+        if uses:
+            if not isinstance(uses, str) or not uses.startswith("./"):
+                raise _WorkflowError(f"unsupported external reusable workflow: {uses}")
+            if job.get('with') or job.get('secrets'):
+                raise _WorkflowError(f"unsupported reusable arguments/secrets: {uses}")
+            if containers:
+                raise _WorkflowError(f"reusable job cannot also contain steps: {job_id}")
             if not re.fullmatch(r"\./\.github/workflows/[^/]+\.ya?ml", uses):
                 raise _WorkflowError(f"unsupported local workflow path: {uses}")
             child = path.parent / Path(uses).name
             if not child.is_file() or child.resolve().parent != path.resolve().parent:
                 raise _WorkflowError(f"missing/escaping reusable workflow: {uses}")
-            yield from workflow_run_steps(child, _called=on_pr_path and job_active,
-                                          _soft=job_soft, _stack=(*_stack, resolved))
+            yield from _workflow_run_steps(child, called=on_pr_path and job_active,
+                                           inherited_soft=job_soft, stack=(*stack, resolved))
         for steps in containers:
             for index, step in enumerate(steps):
                 if isinstance(step, dict) and isinstance(step.get("run"), str):
                     cond = step.get("if")
-                    active = cond is None or str(cond).strip() in _ACTIVE_IF
-                    soft = bool(step.get("continue-on-error"))
+                    active = cond is None or cond is True or str(cond).strip() in _ACTIVE_IF
+                    soft = _continue_on_error(step.get("continue-on-error"))
                     env = job_env | _env_names(step.get("env"))
                     why = ""
                     if not on_pr_path:
@@ -986,7 +1070,7 @@ def workflow_run_steps(path: Path, *, _called=None, _soft=False, _stack=()):
                         why = (f"workflow `on:' ({names}) never runs on"
                                " the push/pull_request path")
                     elif not job_active:
-                        why = f"job `if: {job_cond}` keeps the whole job off the green-path run"
+                        why = job_why
                     elif not active:
                         why = f"step `if: {cond}` keeps it off the green-path run"
                     elif job_soft:
