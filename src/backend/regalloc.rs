@@ -13147,18 +13147,35 @@ mod map_collector_tests {
                 Terminator::Return(None),
             );
             let sets = [
-                collect_x86_reduction_vector_values(&f),
                 collect_x86_map_broadcast_values(&f),
                 collect_x86_map_intermediate_values(&f),
             ];
             let admitted = sets.iter().any(|set| set.contains(&1));
             assert_eq!(admitted, expected, "{producer:?}: {sets:?}");
-            if matches!(producer, O::VecAddI32x4 | O::VecAddI32x8) {
-                assert_eq!(sets[0].contains(&1), expected);
-                assert_eq!(sets[2].contains(&1), expected);
-            }
             if matches!(producer, O::VecBroadcastI32x4 | O::VecBroadcastI32x8) {
+                assert_eq!(sets[0].contains(&1), expected);
+            } else {
                 assert_eq!(sets[1].contains(&1), expected);
+                // Reduction homes deliberately require a Copy web. A direct
+                // transient is not an accumulator, even at the correct width.
+                assert!(!collect_x86_reduction_vector_values(&f).contains(&1));
+                let mut instructions = f.blocks[0].instructions.clone();
+                instructions.insert(
+                    1,
+                    Instruction::Copy {
+                        dest: Value(3),
+                        src: Operand::Value(Value(1)),
+                    },
+                );
+                let Instruction::Intrinsic { args, .. } = &mut instructions[2] else {
+                    unreachable!();
+                };
+                args[1] = Operand::Value(Value(3));
+                let web = func(instructions, Terminator::Return(None));
+                let reduction = collect_x86_reduction_vector_values(&web);
+                for value in [1, 3] {
+                    assert_eq!(reduction.contains(&value), expected, "{producer:?}: {value}");
+                }
             }
         }
     }

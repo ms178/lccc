@@ -55,7 +55,7 @@ jobs:
     - name: Provision Debian tools
       run: |
         apt-get update
-        apt-get install -y --no-install-recommends ca-certificates curl git python3 gcc-16 libc6-dev clang lld
+        apt-get install -y --no-install-recommends ca-certificates curl git python3 gcc-16 libc6-dev clang lld qemu-user
     - uses: actions/checkout@v7
     - uses: dtolnay/rust-toolchain@stable
       with:
@@ -76,12 +76,14 @@ jobs:
         python3 tests/linker/check_riscv_relocation_contract.py --oracle-only --oracle ld.lld --only valid- --json target/redteam/valid-oracle.json
     - name: Build the changed compiler and run Rust contract tests
       run: |
-        cargo +1.99.0 build --profile fastbuild --locked -j 2 --bin lccc --bin lccc-riscv
+        cargo +1.99.0 build --profile fastbuild --locked -j 2 --bin lccc --bin lccc-riscv --bin lccc-arm --bin lccc-i686
         cargo +1.99.0 test --profile fastbuild --locked -j 2 backend::riscv::linker
     - name: Execute changed runtime and relocation contracts
       run: |
         python3 tests/regression/check_pgo_io.py --lccc target/fastbuild/lccc --cc gcc-16 --json target/redteam/pgo.json
         python3 tests/linker/check_riscv_relocation_contract.py --lccc target/fastbuild/lccc-riscv --json target/redteam/relocations.json
+    - name: PR824 boundary witnesses with the required exact GCC control
+      run: python3 tests/regression/check_pr824_boundaries.py --lccc target/fastbuild/lccc --cross
     - name: Screen every registered workload at O2 and O3
       run: |
         python3 tests/benchmark/run_benchmarks.py --compilers lccc,gcc,clang --gcc gcc-16 --opt=-O2 --skip-perf --strict --json target/redteam/corpus-o2.json

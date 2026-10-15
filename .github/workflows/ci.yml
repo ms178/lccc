@@ -764,8 +764,6 @@ jobs:
       env:
         CCC: target/fastbuild/lccc
       run: python3 scripts/check_strict_packed_recip.py
-    - name: PR824 boundary witnesses
-      run: python3 tests/regression/check_pr824_boundaries.py --lccc target/fastbuild/lccc --cross
     needs:
     - build
   backend:

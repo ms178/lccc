@@ -29,8 +29,8 @@ The regression authority is
 `tests/corpus/test_benchmark_comparison_safety.py`. The baseline Python corpus
 passed 545 tests with five skips; the competing tree passed 582 with four skips.
 Test counts are not interchangeable coverage or quality scores. The corrected
-tree's full corpus passed 574 tests in 76.448 seconds with five explicit skips;
-the focused comparison-report suite passed all 13 tests.
+tree's full corpus passed 576 tests in 79.628 seconds with five explicit skips;
+the focused comparison-report and workflow suite passed all 15 tests.
 
 A native GCC 12.2 smoke run of all 65 semantic cases is also informative:
 all 65 independent `-O0` controls passed, but the optimized GCC arm failed four
@@ -141,7 +141,9 @@ screening, never bare-metal performance or proof of universal superiority.
 The local sandbox is Debian 12 with GCC 12.2; Rust, Clang, Valgrind and hardware
 PMU access are unavailable. The repository swap script activated a real 2 GiB
 swap file. Network restrictions prevented installing local Debian GCC 16.2 or
-Rust; those exact tools must execute in hosted jobs. Old green checks and
+Rust; those exact tools must execute in hosted jobs. The cross-target boundary
+matrix, which requires GCC 16.2.0 explicitly, belongs in the exact Debian lane,
+not a rolling-major Ubuntu PPA lane. Old green checks and
 Python contracts do not validate the edited Rust.
 
 Before claiming completion, inspect current-head compiled tests, strict
