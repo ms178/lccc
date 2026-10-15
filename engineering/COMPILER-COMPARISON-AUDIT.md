@@ -29,8 +29,8 @@ The regression authority is
 `tests/corpus/test_benchmark_comparison_safety.py`. The baseline Python corpus
 passed 545 tests with five skips; the competing tree passed 582 with four skips.
 Test counts are not interchangeable coverage or quality scores. The corrected
-tree's full corpus passed 573 tests with five skips, followed by the additional
-bounded-notice packing test passing in its 13-test focused suite.
+tree's full corpus passed 574 tests in 76.448 seconds with five explicit skips;
+the focused comparison-report suite passed all 13 tests.
 
 A native GCC 12.2 smoke run of all 65 semantic cases is also informative:
 all 65 independent `-O0` controls passed, but the optimized GCC arm failed four
@@ -101,7 +101,8 @@ not justified by source size or by an old green check alone.
 
 ## Reproducible hosted comparison
 
-The opt-in `compiler-comparison` job in `pr826-redteam.yml` uses actual Debian
+The opt-in `compiler-comparison` job in `pr826-redteam.yml` is enabled either by
+its dispatch input or the `compiler-comparison` PR label. It uses actual Debian
 GCC 16.2.0 and the current stable Rust/cargo/rustfmt/clippy. It archives exact
 same-repository main/competing/prior trees, builds them with one toolchain, and
 records source IDs, executable hashes, versions, commands and raw outputs.

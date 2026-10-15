@@ -1482,9 +1482,12 @@ mod tests {
         }
         use crate::common::temp_files::TempFile;
         use std::process::Command;
-        let source = TempFile::try_new("pr824", "upper-witness", "c").expect("reserve architectural fixture");
-        let assembly = TempFile::try_new("pr824", "upper-witness", "s").expect("reserve architectural fixture");
-        let binary = TempFile::try_new("pr824", "upper-witness", "exe").expect("reserve architectural fixture");
+        let source = TempFile::try_new("pr824", "upper-witness", "c")
+            .expect("reserve architectural fixture");
+        let assembly = TempFile::try_new("pr824", "upper-witness", "s")
+            .expect("reserve architectural fixture");
+        let binary = TempFile::try_new("pr824", "upper-witness", "exe")
+            .expect("reserve architectural fixture");
         std::fs::write(source.path(), "extern void witness(void*); int main(void) { unsigned long long out[4]; witness(out); return out[2] != 0 || out[3] != 0; }\n").unwrap();
         for overwrite in [
             "pshufd $27, %xmm5, %xmm7",
@@ -1532,9 +1535,12 @@ mod tests {
         use std::process::Command;
         let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/regression/fixtures/peephole-vex-flags");
-        let assembly = TempFile::try_new("pr832", "pipeline", "s").expect("reserve architectural fixture");
-        let object = TempFile::try_new("pr832", "expanded", "o").expect("reserve architectural fixture");
-        let binary = TempFile::try_new("pr832", "pipeline", "exe").expect("reserve architectural fixture");
+        let assembly =
+            TempFile::try_new("pr832", "pipeline", "s").expect("reserve architectural fixture");
+        let object =
+            TempFile::try_new("pr832", "expanded", "o").expect("reserve architectural fixture");
+        let binary =
+            TempFile::try_new("pr832", "pipeline", "exe").expect("reserve architectural fixture");
         for (source, driver, functions) in [
             ("witness.s", "driver.c", 22),
             ("implicit-witness.s", "implicit-driver.c", 18),

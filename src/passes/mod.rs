@@ -3744,7 +3744,8 @@ mod signed_wrap_policy_tests {
     #[test]
     fn arithmetic_policies_reset_independently_for_every_translation_unit_and_level() {
         for level in [2, 0, 1, 3] {
-            for (wraps, observable) in [(true, false), (false, true), (true, true), (false, false)] {
+            for (wraps, observable) in [(true, false), (false, true), (true, true), (false, false)]
+            {
                 run_passes(
                     &mut IrModule::new(),
                     level,

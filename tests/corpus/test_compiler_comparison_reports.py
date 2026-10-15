@@ -112,6 +112,39 @@ class ComparisonReport(unittest.TestCase):
         self.assertEqual(recovered, rows)
 
 
+class HostedComparison(unittest.TestCase):
+    def workflow(self):
+        import yaml
+        return yaml.load((ROOT / '.github/workflows/pr826-redteam.yml').read_text(), Loader=yaml.BaseLoader)
+
+    def test_research_is_explicitly_opted_in_without_widening_token_permissions(self):
+        data = self.workflow()
+        job = data['jobs']['compiler-comparison']
+        self.assertIn("github.event_name == 'workflow_dispatch' && inputs.audit_compare", job['if'])
+        self.assertIn("contains(github.event.pull_request.labels.*.name, 'compiler-comparison')", job['if'])
+        self.assertEqual(data['permissions'], {'contents': 'read'})
+        self.assertIn('labeled', data['on']['pull_request']['types'])
+        self.assertEqual(data['on']['workflow_dispatch']['inputs']['audit_compare']['default'], 'false')
+
+    def test_failures_do_not_censor_independent_measurements_or_become_success(self):
+        job = self.workflow()['jobs']['compiler-comparison']
+        self.assertNotIn('continue-on-error', job)
+        steps = job['steps']
+        measures = [step for step in steps if step.get('if', '').startswith('${{ !cancelled()')]
+        self.assertEqual(len(measures), 6)
+        for step in measures:
+            self.assertIn("steps.comparison-build.outcome == 'success'", step['if'])
+            self.assertNotIn('continue-on-error', step)
+            self.assertIn('set -euo pipefail', step['run'])
+        runs = '\n'.join(step.get('run', '') for step in steps)
+        self.assertIn('git archive "$sha"', runs)
+        self.assertNotIn('git checkout', runs)
+        self.assertNotIn('git switch', runs)
+        self.assertIn('--ref gcc-16 --gcc-include-command gcc-16', runs)
+        self.assertIn("--oracles ''", runs)
+        self.assertEqual(steps[-1]['if'], 'always()')
+
+
 class NativeWitnesses(unittest.TestCase):
     def test_matrix_is_unique_and_semantics_are_explicit(self):
         cases = list(witness.cases())

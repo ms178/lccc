@@ -1325,7 +1325,11 @@ impl Driver {
         // for freshly compiled objects). Passthrough objects, -l flags, and -Wl, flags
         // follow in their original command-line order via linker_ordered_items.
         // Extra passthrough objects (detected by magic bytes at runtime) go after temps.
-        let mut all_objects: Vec<&str> = temp_guards.iter().map(|t| t.to_str()).collect();
+        let mut all_objects: Vec<&str> = temp_guards
+            .iter()
+            .map(TempFile::to_str)
+            .collect::<Result<_, _>>()
+            .map_err(|error| error.to_string())?;
         for obj in &extra_passthrough {
             all_objects.push(obj.as_str());
         }

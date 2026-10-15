@@ -1040,14 +1040,13 @@ pub(super) fn read_extent(mn: &str, operands: &str) -> Option<i32> {
         | "cvtsi2sdq" | "cvtsi2ssq" | "pushq" | "popq" | "cmpq" | "testq" | "addq" | "subq"
         | "andq" | "orq" | "xorq" | "imulq" | "leaq" | "incq" | "decq" | "negq" | "notq"
         | "shlq" | "shrq" | "sarq" => Some(8),
-        "ldmxcsr" | "stmxcsr" | "vldmxcsr" | "vstmxcsr"
-        | "movss" | "vmovss" | "addss" | "subss" | "mulss" | "divss" | "minss" | "maxss"
-        | "sqrtss" | "ucomiss" | "comiss" | "vaddss" | "vsubss" | "vmulss" | "vdivss"
-        | "vminss" | "vmaxss" | "vsqrtss" | "vucomiss" | "vcomiss" | "cvtss2sd" | "vcvtss2sd"
-        | "cvttss2si" | "cvtss2si" | "movd" | "vmovd" | "movl" | "cvtsi2sd" | "cvtsi2ss"
-        | "cvtsi2sdl" | "cvtsi2ssl" | "movslq" | "cmpl" | "testl" | "addl" | "subl" | "andl"
-        | "orl" | "xorl" | "imull" | "incl" | "decl" | "negl" | "notl" | "shll" | "shrl"
-        | "sarl" => Some(4),
+        "ldmxcsr" | "stmxcsr" | "vldmxcsr" | "vstmxcsr" | "movss" | "vmovss" | "addss"
+        | "subss" | "mulss" | "divss" | "minss" | "maxss" | "sqrtss" | "ucomiss" | "comiss"
+        | "vaddss" | "vsubss" | "vmulss" | "vdivss" | "vminss" | "vmaxss" | "vsqrtss"
+        | "vucomiss" | "vcomiss" | "cvtss2sd" | "vcvtss2sd" | "cvttss2si" | "cvtss2si" | "movd"
+        | "vmovd" | "movl" | "cvtsi2sd" | "cvtsi2ss" | "cvtsi2sdl" | "cvtsi2ssl" | "movslq"
+        | "cmpl" | "testl" | "addl" | "subl" | "andl" | "orl" | "xorl" | "imull" | "incl"
+        | "decl" | "negl" | "notl" | "shll" | "shrl" | "sarl" => Some(4),
         "movw" | "cmpw" | "testw" | "addw" | "subw" | "andw" | "orw" | "xorw" | "movzwl"
         | "movswl" | "movzwq" | "movswq" => Some(2),
         "movb" | "cmpb" | "testb" | "addb" | "subb" | "andb" | "orb" | "xorb" | "movzbl"
