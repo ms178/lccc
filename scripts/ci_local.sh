@@ -150,6 +150,7 @@ gate "no-conflict-markers" fast \
 # valid YAML that dies with exit 127 on the hosted runner. It is invisible
 # locally because no local gate parses the workflow, and it takes down every
 # gate sequenced below it.
+# Needs PyYAML (python3-yaml on Debian/Ubuntu); this is the first YAML parser.
 gate "ci-workflow-shell" fast \
     python3 scripts/check_ci_workflow_shell.py
 
@@ -980,10 +981,6 @@ gate "peephole-directive-step" fast \
 gate "pr-claim-fidelity" fast \
     python3 scripts/check_pr_claim_fidelity.py
 
-# Needs PyYAML (python3-yaml on Debian/Ubuntu). This gate is the FIRST
-# local consumer: on a box without it the checker fails cleanly (no
-# traceback) with a message naming the package and the install path, so
-# the failure is actionable without a separate preflight.
 # Read-only integrity check; exclusive by default (not in scheduler whitelist).
 gate "evidence-hash-integrity" fast python3 scripts/verify_evidence_hashes.py
 
@@ -1785,7 +1782,7 @@ gate "glibc-triage-cli-selftest" fast \
     python3 scripts/glibc_check_triage.py --self-test
 
 # MS-01: Compiler Explorer oracle delta gate logic (metrics, tolerance,
-# baseline handling). The networked run itself is hosted-only.
+# baseline handling). Networked surveys are opt-in research, not merge gates.
 gate "oracle-delta-selftest" fast \
     python3 scripts/test_oracle_delta_gate.py
 gate "oracle-delta-cli-selftest" fast \

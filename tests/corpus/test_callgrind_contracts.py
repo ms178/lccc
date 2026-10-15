@@ -123,7 +123,9 @@ class CallgrindContract(unittest.TestCase):
 
 class MainContract(unittest.TestCase):
     def mock_measurement(self,outroot,events):
-        def compiler(cmd,opt,src,out,**kw):out.write_bytes(b'dummy-not-a-compiler-output');out.chmod(0o755)
+        def compiler(cmd,opt,src,out,**kw):
+            out.write_bytes(b'dummy-not-a-compiler-output');out.chmod(0o755)
+            cg.run_recorded([cmd,str(src),'-o',str(out)],180,str(out)+'.compile')
         with mock.patch.object(cg,'compile_program',side_effect=compiler),mock.patch.object(cg,'tool_identity',return_value={'version':'mock','sha256':'a'*64}),mock.patch.object(cg,'gcc_include',return_value='-Ifake'),mock.patch.object(cg,'_run',return_value=result()),mock.patch.object(cg,'callgrind',return_value=(events,None,{'mock':True})):
             return cg.main(['mock-mine','mock-ref','-O2','fib','--out-root',str(outroot)])
     def test_success_manifest_equal_paths_geometry_and_hashes(self):
@@ -147,6 +149,48 @@ class MainContract(unittest.TestCase):
     def test_heavy_is_used_opt_in(self):
         with tempfile.TemporaryDirectory() as td,mock.patch.object(cg,'_measure',return_value=2) as measure:
             cg.main(['mock-a','mock-b','-O2','--heavy','--out-root',td]);self.assertTrue(cg.HEAVY<=set(measure.call_args.args[1]))
+
+class MeasurementReceiptContract(unittest.TestCase):
+    """Exercise _measure via main; mock subprocesses, not orchestration."""
+    def test_compile_and_native_receipts_survive_success_and_error_arms(self):
+        for failure in (None, 'compile-mine', 'compile-ref', 'native-mine', 'native-ref', 'infrastructure-ref', 'compile-infrastructure', 'flags'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as td:
+                root=Path(td)
+                def run(command, timeout):
+                    if '-o' in command:
+                        binary=Path(command[command.index('-o')+1])
+                        side='mine' if binary.parent.name=='aa' else 'ref'
+                        if failure=='compile-infrastructure':raise OSError('injected compiler launch error')
+                        if failure=='compile-'+side:return result(rc=1,stdout=b'compiler diagnostic')
+                        binary.write_bytes(b'fake executable');binary.chmod(0o755)
+                        return result(stdout=b'compiled')
+                    side='mine' if Path(command[0]).parent.name=='aa' else 'ref'
+                    if failure=='infrastructure-'+side:raise OSError('injected launch error')
+                    return result(rc=1 if failure=='native-'+side else 0)
+                with mock.patch.object(cg,'_run',side_effect=run),mock.patch.object(cg,'gcc_include',return_value='-Ifake'),mock.patch.object(cg,'tool_identity',return_value={'mock':True}),mock.patch.object(cg,'callgrind',return_value=(ev(),None,{'mock':True})):
+                    code=cg.main(['mock-mine','mock-ref','-O2 -Xlinker' if failure=='flags' else '-O2','fib','--out-root',str(root)])
+                self.assertEqual(code,0 if failure is None else 2)
+                entry=schema.loads((root/'manifest.json').read_text())['results']['fib']
+                for phase,suffix in (('compilation','compile'),('native','native')):
+                    receipts=list(root.glob('*/fib.'+suffix+'.json'))
+                    if not receipts:continue
+                    self.assertEqual(len(entry[phase]),len(receipts))
+                    for receipt in receipts:
+                        side='mine' if receipt.parent.name=='aa' else 'ref'
+                        info=entry[phase][side]
+                        self.assertEqual(Path(info['receipt']['path']),receipt)
+                        self.assertEqual(info['receipt']['sha256'],schema.file_hash(receipt))
+                        saved=schema.loads(receipt.read_text())
+                        for key in ('command','compiler','options'):
+                            if key in saved:self.assertEqual(info[key],saved[key])
+                        if 'infrastructure_error' in saved:
+                            self.assertEqual(info['raw_outputs'],{})
+                            self.assertIn('infrastructure_error',info)
+                        else:
+                            for stream in ('stdout','stderr'):
+                                raw=Path(info['raw_outputs'][stream]).read_bytes()
+                                self.assertEqual(hashlib.sha256(raw).hexdigest(),info['process'][stream+'_sha256'])
+
 
 class ArgumentVectorContract(unittest.TestCase):
     """The documented CLI parses identically on every supported CPython.
@@ -177,6 +221,7 @@ class ArgumentVectorContract(unittest.TestCase):
         """
         def compiler(cmd,opt,src,out,**kw):
             out.write_bytes(b'dummy-not-a-compiler-output');out.chmod(0o755)
+            cg.run_recorded([cmd,str(src),'-o',str(out)],180,str(out)+'.compile')
         with tempfile.TemporaryDirectory() as td:
             argv=[td if a=='OUTROOT' else a for a in argv]
             if '--out-root' not in argv:argv=argv+['--out-root',td]

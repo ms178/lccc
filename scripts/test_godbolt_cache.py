@@ -337,6 +337,37 @@ def test_path_is_namespaced() -> None:
           str(p))
 
 
+
+def test_compiler_metadata_concurrent_cold_publish() -> None:
+    """Two threads reach rename together: PID-only staging loses one writer."""
+    import threading
+    from unittest import mock
+    import godbolt
+
+    value = [{"id": "fixture", "name": "fixture compiler", "semver": "1.0"}]
+    barrier = threading.Barrier(2)
+    replace = Path.replace
+    with tempfile.TemporaryDirectory(prefix="metadata-publish.") as tmp:
+        root = Path(tmp)
+        def coordinated_replace(path, destination):
+            if Path(destination) == root / "compilers-c.json":
+                barrier.wait(timeout=10)
+            return replace(path, destination)
+        with mock.patch.object(godbolt, "CACHE", root), \
+             mock.patch.object(godbolt, "_request_json", return_value=value), \
+             mock.patch.object(Path, "replace", coordinated_replace):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(godbolt.list_compilers, "c", refresh=True) for _ in range(2)]
+                errors = [str(f.exception()) for f in futures if f.exception() is not None]
+                check("both metadata publishers succeed", not errors, repr(errors))
+                if not errors:
+                    check("both metadata publishers return the complete list",
+                          all(f.result() == value for f in futures))
+        check("published metadata is complete JSON", json.loads((root / "compilers-c.json").read_text()) == value)
+        check("successful metadata publication leaves no staging files",
+              sorted(p.name for p in root.iterdir()) == ["compilers-c.json"])
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
