@@ -1,7 +1,7 @@
 /* C2x __VA_OPT__ selection, commas, nesting, and token paste. */
 #define CALL(fn, ...) fn(1 __VA_OPT__(,) __VA_ARGS__)
 #define PLUS(...) 10 __VA_OPT__(+ (__VA_ARGS__))
-#define CAT(base, ...) base __VA_OPT__(## __VA_ARGS__)
+#define CAT(base, ...) base ## __VA_OPT__(__VA_ARGS__)
 #define NAMED(x, rest...) x __VA_OPT__(+ (rest))
 static int one(int a) { return a; }
 static int three(int a, int b, int c) { return a + b + c; }

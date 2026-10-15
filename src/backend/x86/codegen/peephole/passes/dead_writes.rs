@@ -1081,6 +1081,8 @@ pub(super) fn line_writes_memory(t: &str) -> bool {
         || t.starts_with("insd")
         || t.starts_with("maskmov")
         || t.starts_with("vmaskmovdqu")
+        || t.starts_with("movdir64b")
+        || t.starts_with("enqcmd")
         || t.starts_with("xchg")
         || t.starts_with("cmpxchg")
     {
@@ -2767,6 +2769,28 @@ mod tests {
     // through an indexed address. That let `reuse_redundant_loads` replace a
     // post-store reload with a copy of the pre-store value — the miscompile
     // behind tests/regression/pic_indexed_store_static_global.c.
+
+    #[test]
+    fn implicit_memory_writers_are_forwarding_barriers() {
+        for text in [
+            "vmaskmovdqu %xmm0, %xmm1",
+            "maskmovdqu %xmm0, %xmm1",
+            "maskmovq %mm0, %mm1",
+            "movdir64b (%rsi), %rdi",
+            "enqcmd (%rsi), %rdi",
+            "enqcmds (%rsi), %rdi",
+            "stosb",
+            "stosq",
+            "rep movsq",
+            "insb",
+            "insw",
+            "insl",
+            "xchgq (%rdi), %rax",
+            "cmpxchgq (%rdi), %rax",
+        ] {
+            assert!(line_writes_memory(text), "missed implicit writer {text}");
+        }
+    }
 
     #[test]
     fn line_writes_memory_detects_indexed_stores() {

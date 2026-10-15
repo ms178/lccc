@@ -306,7 +306,7 @@ pub(super) fn eliminate_dead_fp_moves(store: &LineStore, infos: &mut [LineInfo])
         let Some((_src, dst)) = parse_fp_reg_move(trimmed) else {
             continue;
         };
-        if fp.xmm_dead_after(store, infos, i, dst, &[i]) {
+        if fp.reg_move_dead_after(store, infos, i, dst) {
             mark_nop(&mut infos[i]);
             changed = true;
         }
@@ -1464,10 +1464,14 @@ mod tests {
         // degenerates to [s, s, t, t] (bb_slp_v8 C2 miscompile chain).
         let asm = concat!(
             "f:\n",
-            "    vmovss %xmm1, %xmm1, %xmm0\n",
-            "    shufps $0x00, %xmm0, %xmm0\n",
-            "    movdqa %xmm0, %xmm14\n",
-            "    ret\n",
+            "    vmovss %xmm1, %xmm1, %xmm0
+",
+            "    shufps $0x00, %xmm0, %xmm0
+",
+            "    movdqa %xmm0, %xmm14
+",
+            "    ret
+",
         );
         let (store, mut infos) = build(asm);
         let changed = eliminate_dead_fp_moves(&store, &mut infos);
@@ -1477,6 +1481,107 @@ mod tests {
             kept,
             "shufps reads its destination; the reset must stay (changed={changed})"
         );
+    }
+
+    #[test]
+    fn pr814_vex_upper_zero_survives_legacy_xmm_overwrite() {
+        for overwrite in [
+            "pshufd $0x1b, %xmm5, %xmm7",
+            "pshufhw $0x1b, %xmm5, %xmm7",
+            "movapd %xmm5, %xmm7",
+            "pxor %xmm7, %xmm7",
+        ] {
+            let asm = format!(
+                "f:\n.cfi_startproc\n    vmovapd %xmm6, %xmm7\n    {overwrite}\n    vmovupd %ymm7, (%rdi)\n    ret\n.cfi_endproc\n"
+            );
+            let (store, mut infos) = build(&asm);
+            eliminate_dead_fp_moves(&store, &mut infos);
+            assert!(!infos[2].is_nop(), "VEX upper-zero lost across {overwrite}");
+        }
+    }
+
+    #[test]
+    fn dead_vex_moves_require_all_architectural_regions_dead() {
+        // Observe each region, with both straight-line and CFG paths. A legacy
+        // XMM overwrite kills only the low 128 bits, never the VEX zeroing.
+        for width in ["ymm", "zmm"] {
+            for path in [
+                "    movapd %xmm5, %xmm7\n".to_string(),
+                "    testl %eax, %eax\n    je .Luse\n    movapd %xmm5, %xmm7\n.Luse:\n".to_string(),
+                "    jmp .Lbody\n.Luse:\n    vmovupd %ymm7, (%rdi)\n    ret\n.Lbody:\n    movapd %xmm5, %xmm7\n    jmp .Luse\n".to_string(),
+                format!("    vmovupd %{width}5, %{width}7{{%k1}}\n"),
+            ] {
+                let asm = format!("f:\n.cfi_startproc\n    vmovapd %xmm6, %xmm7\n{path}    vmovupd %{width}7, (%rdi)\n    ret\n.cfi_endproc\n");
+                let (store, mut infos) = build(&asm);
+                eliminate_dead_fp_moves(&store, &mut infos);
+                assert!(!infos[2].is_nop(), "lost upper {width} state across {path}");
+            }
+        }
+        for kill in [
+            "vmovapd %xmm5, %xmm7",
+            "vmovupd %ymm5, %ymm7",
+            "vmovupd %zmm5, %zmm7",
+            "vpxor %ymm7, %ymm7, %ymm7",
+            "vzeroall",
+            "vzeroupper\n    movapd %xmm5, %xmm7",
+        ] {
+            let asm = format!(
+                "f:\n.cfi_startproc\n    vmovapd %xmm6, %xmm7\n    {kill}\n    vmovupd %zmm7, (%rdi)\n    ret\n.cfi_endproc\n"
+            );
+            let (store, mut infos) = build(&asm);
+            assert!(
+                eliminate_dead_fp_moves(&store, &mut infos),
+                "missed full kill {kill}"
+            );
+            assert!(infos[2].is_nop(), "dead move retained across {kill}");
+        }
+    }
+
+    #[test]
+    fn low_width_legacy_moves_do_not_define_upper_regions() {
+        let (store, mut infos) = build(
+            "f:\n.cfi_startproc\n    movapd %xmm6, %xmm7\n    movapd %xmm5, %xmm7\n    vmovupd %zmm7, (%rdi)\n    ret\n.cfi_endproc\n",
+        );
+        assert!(eliminate_dead_fp_moves(&store, &mut infos));
+        assert!(
+            infos[2].is_nop(),
+            "upper observation must not block legacy low-only DCE"
+        );
+    }
+
+    #[test]
+    fn vex_flag_only_tests_read_both_vector_operands() {
+        for test in [
+            "vucomisd %xmm5, %xmm7",
+            "vucomiss %xmm5, %xmm7",
+            "vcomisd %xmm5, %xmm7",
+            "vcomiss %xmm5, %xmm7",
+            "vptest %ymm5, %ymm7",
+            "vtestpd %ymm5, %ymm7",
+            "vtestps %ymm5, %ymm7",
+            "vpcmpistri $0, %xmm5, %xmm7",
+            "vpcmpistrm $0, %xmm5, %xmm7",
+            "vpcmpestri $0, %xmm5, %xmm7",
+            "vpcmpestrm $0, %xmm5, %xmm7",
+        ] {
+            let asm = format!(
+                "f:\n.cfi_startproc\n    vmovapd %xmm6, %xmm7\n    {test}\n    setne %al\n    movzbl %al, %eax\n    ret\n.cfi_endproc\n"
+            );
+            let (store, mut infos) = build(&asm);
+            assert!(
+                !eliminate_dead_fp_moves(&store, &mut infos),
+                "flag input deleted before {test}"
+            );
+            assert!(!infos[2].is_nop(), "flag input deleted before {test}");
+        }
+    }
+
+    #[test]
+    fn pr814_pinned_dead_fp_move_is_not_changed() {
+        let (store, mut infos) = build("f:\n    vmovsd %xmm6, %xmm6, %xmm7\n    ret\n");
+        infos[1].pinned = true;
+        assert!(!eliminate_dead_fp_moves(&store, &mut infos));
+        assert!(infos[1].pinned && !infos[1].is_nop());
     }
 
     #[test]

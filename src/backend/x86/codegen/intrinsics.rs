@@ -6970,7 +6970,7 @@ impl X86Codegen {
                 self.state.invalidate_vec_peephole();
                 self.emit_vec_store_addr(args, dest_ptr, "movupd", "xmm0");
             }
-            IntrinsicOp::StrictRecipMulAddF64x4 => {
+            IntrinsicOp::StrictRecipMulAddF64x4 | IntrinsicOp::StrictRecipMulAddPackedF64x4 => {
                 // Strict computed-expression reduction, four elements at a
                 // time.  This is intentionally NOT a horizontal reduction:
                 // binary64 addition is observable under ordinary (non-fast)
@@ -6981,9 +6981,16 @@ impl X86Codegen {
                 // scratch].  The scalar denominator DAG is cloned by the pass
                 // for each lane; packing only its already-computed I32 leaves
                 // C's signed-div/mod semantics to the ordinary scalar IR.
-                if args.len() != 8 {
-                    panic!("StrictRecipMulAddF64x4 expects 8 args, got {}", args.len());
-                }
+                // The packed variant instead has [acc, I32x8, base, offset,
+                // scratch]; its low four lanes have already been computed by
+                // equivalent lane-wise modular integer operations.
+                let packed = matches!(op, IntrinsicOp::StrictRecipMulAddPackedF64x4);
+                assert_eq!(
+                    args.len(),
+                    if packed { 5 } else { 8 },
+                    "strict reciprocal arguments"
+                );
+                let base_arg = if packed { 2 } else { 5 };
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
 
@@ -6995,14 +7002,18 @@ impl X86Codegen {
                 // an AVX/SSE transition on every iteration. The VEX.128
                 // upper-zero rule is safe here: only the low 128 bits feed
                 // vcvtdq2pd, which fully overwrites ymm0 before its next read.
-                self.operand_to_eax(&args[1]);
-                self.state.emit("    vmovd %eax, %xmm0");
-                for (lane, denom) in args[2..5].iter().enumerate() {
-                    self.operand_to_eax(denom);
-                    self.state.emit_fmt(format_args!(
-                        "    vpinsrd ${}, %eax, %xmm0, %xmm0",
-                        lane + 1
-                    ));
+                if packed {
+                    self.avx_load_arg(&args[1]);
+                } else {
+                    self.operand_to_eax(&args[1]);
+                    self.state.emit("    vmovd %eax, %xmm0");
+                    for (lane, denom) in args[2..5].iter().enumerate() {
+                        self.operand_to_eax(denom);
+                        self.state.emit_fmt(format_args!(
+                            "    vpinsrd ${}, %eax, %xmm0, %xmm0",
+                            lane + 1
+                        ));
+                    }
                 }
                 self.state.dirty_upper_ymm = true;
                 self.state.emit("    vcvtdq2pd %xmm0, %ymm0");
@@ -7015,7 +7026,7 @@ impl X86Codegen {
                 // Form the contiguous source address before using rax for a
                 // fallback scratch pointer; vec_mem_operand may materialize
                 // non-register base/offset operands through rax/rcx.
-                let source = self.vec_mem_operand(&args[5], &args[6], 0);
+                let source = self.vec_mem_operand(&args[base_arg], &args[base_arg + 1], 0);
                 // Preserve the source expression's multiplication order:
                 // original scalar IR is reciprocal * load, hence src1=ymm0
                 // and src2=the memory operand in this AT&T VEX form.
@@ -7058,7 +7069,7 @@ impl X86Codegen {
                     // The transform supplies a private aligned alloca so the
                     // packed product can be spilled once and read lane-by-lane
                     // without clobbering an allocator-owned XMM register.
-                    self.operand_to_reg(&args[7], "rax");
+                    self.operand_to_reg(&args[base_arg + 2], "rax");
                     self.state.emit("    vmovupd %ymm0, (%rax)");
                     self.state.reg_cache.invalidate_acc();
                     self.emit_fp_operand_to_xmm(&args[0], IrType::F64, "xmm0");

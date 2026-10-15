@@ -117,7 +117,7 @@
 //! same place and ends the relation.
 
 use super::super::types::*;
-use super::fp_liveness::FpLiveness;
+use super::fp_liveness::{FpLiveness, has_implicit_vector_effects_line};
 use super::relay_and_lea::function_range;
 
 /// Bit widths a vector instruction can read or write.
@@ -242,6 +242,10 @@ fn vec_copy_mnemonic(mn: &str) -> Option<(Option<u16>, bool)> {
 /// Parse a line as a vector register-to-register copy.
 fn parse_vec_copy(t: &str) -> Option<VecCopy> {
     let (mn, operands) = split_mn(t);
+    // Merge/zero masks are conditional lane mappings, not unconditional copies.
+    if operands.contains(['{', '}']) {
+        return None;
+    }
     let (width_override, zeroes_above) = vec_copy_mnemonic(mn)?;
     let ops = operand_list(operands);
     // The three-operand `vmovsd %a, %b, %d` normally takes d's upper lane from
@@ -347,8 +351,18 @@ fn vec_write_width(mn: &str, spelling: u16) -> u16 {
 }
 
 /// The widest access `t` makes to vector register `n`, counting reads and
-/// writes; 0 when the line does not mention it.
+/// writes; 0 only when no explicit or unmodelled implicit access exists.
 fn vec_mention_width(t: &str, n: u8) -> u16 {
+    // Upper zeroing is a local copy barrier, not an observation of the old
+    // value or a definition of a narrow copy's preserved low-XMM upper lane.
+    if split_mn(t).0 == "vzeroupper" {
+        return 0;
+    }
+    // A hidden read, hidden write or unmodelled instruction cannot certify a
+    // private temporary or unobserved upper bits, even outside a local scan.
+    if has_implicit_vector_effects_line(t) {
+        return W512;
+    }
     let (mn, operands) = split_mn(t);
     let ops = operand_list(operands);
     if ops.is_empty() {
@@ -506,7 +520,8 @@ fn benign_directive(t: &str) -> bool {
 /// caller-saved under SysV, so it clobbers both sides of the relation, and it
 /// reads `%xmm0`–`%xmm7` as arguments. `vzeroupper` rewrites the upper half of
 /// every vector register without naming any of them, so no textual mention scan
-/// can see what it does.
+/// can see what it does. State images, string-mask outputs, implicit masks
+/// and unknown vector effects likewise cannot be treated as transparent.
 fn is_barrier(info: &LineInfo, t: &str) -> bool {
     matches!(
         info.kind,
@@ -518,8 +533,7 @@ fn is_barrier(info: &LineInfo, t: &str) -> bool {
             | LineKind::Ret
             | LineKind::InlineAsm
     ) || info.pinned
-        || t.starts_with("vzeroupper")
-        || t.starts_with("vzeroall")
+        || has_implicit_vector_effects_line(t)
         || (info.kind == LineKind::Directive && !benign_directive(t))
 }
 
@@ -556,7 +570,6 @@ pub(super) fn coalesce_vector_brackets(store: &mut LineStore, infos: &mut [LineI
             continue;
         };
         let src_fam = VEC_FAMILY_BASE + copy_in.src;
-        let dst_fam = VEC_FAMILY_BASE + copy_in.dst;
 
         // Walk to the copy-out, validating the interior as we go.
         let mut copy_out: Option<(usize, VecCopy)> = None;
@@ -599,8 +612,7 @@ pub(super) fn coalesce_vector_brackets(store: &mut LineStore, infos: &mut [LineI
         // outside it — the interior is where the temporary is SUPPOSED to be
         // mentioned, so the scan covers the function's head and tail only.
         let private = (fstart..i).chain(kout + 1..fend).all(|n| {
-            infos[n].is_nop()
-                || !mentions_family(infos[n].trimmed(store.get(n)).as_bytes(), dst_fam)
+            infos[n].is_nop() || vec_mention_width(infos[n].trimmed(store.get(n)), copy_in.dst) == 0
         });
         if !private {
             i += 1;
@@ -617,6 +629,7 @@ pub(super) fn coalesce_vector_brackets(store: &mut LineStore, infos: &mut [LineI
             continue;
         }
 
+        let dst_fam = VEC_FAMILY_BASE + copy_in.dst;
         for n in i + 1..kout {
             if infos[n].is_nop() {
                 continue;
@@ -756,12 +769,11 @@ pub(super) fn widen_private_vector_copies(store: &mut LineStore, infos: &mut [Li
         let Some((fstart, fend)) = function_range(store, infos, i) else {
             continue;
         };
-        let dst_fam = VEC_FAMILY_BASE + copy.dst;
         // Private: nothing before the copy in this function names the
-        // destination, so its upper bits are the caller's unspecified leftovers.
+        // destination, explicitly or implicitly, so its upper bits are the
+        // caller's unspecified leftovers.
         let dead_in = (fstart..i).all(|n| {
-            infos[n].is_nop()
-                || !mentions_family(infos[n].trimmed(store.get(n)).as_bytes(), dst_fam)
+            infos[n].is_nop() || vec_mention_width(infos[n].trimmed(store.get(n)), copy.dst) == 0
         });
         if !dead_in {
             continue;
@@ -1042,9 +1054,9 @@ pub(super) fn reassociate_fma_accumulator(store: &mut LineStore, infos: &mut [Li
             must_be_dead |= 1 << t;
         }
         let oracle = fp.get_or_insert_with(|| FpLiveness::new(store, infos));
-        let all_dead = (0u8..16)
-            .filter(|n| must_be_dead & (1 << n) != 0)
-            .all(|n| oracle.xmm_dead_after(store, infos, last, u32::from(n), &owned));
+        let all_dead = (0u8..16).filter(|n| must_be_dead & (1 << n) != 0).all(|n| {
+            oracle.deleted_write_regions_dead_after(store, infos, last, u32::from(n), &owned)
+        });
         if !all_dead {
             j += 1;
             continue;
@@ -1244,7 +1256,7 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
             continue;
         }
         let oracle = fp.get_or_insert_with(|| FpLiveness::new(store, infos));
-        if !oracle.xmm_dead_after(store, infos, k, u32::from(t), &[j, k]) {
+        if !oracle.deleted_write_regions_dead_after(store, infos, k, u32::from(t), &[j, k]) {
             j += 1;
             continue;
         }
@@ -1288,7 +1300,7 @@ pub(super) fn eliminate_dead_vector_copies(store: &LineStore, infos: &mut [LineI
         // `parse_vec_copy` has already declined self-copies: a VEX one is not a
         // no-op (it zeroes the bits above the lane it copies), so it is not this
         // pass's business.
-        if fp.xmm_dead_after(store, infos, i, u32::from(copy.dst), &[i]) {
+        if fp.deleted_write_regions_dead_after(store, infos, i, u32::from(copy.dst), &[i]) {
             mark_nop(&mut infos[i]);
             changed = true;
         }
@@ -1299,6 +1311,87 @@ pub(super) fn eliminate_dead_vector_copies(store: &LineStore, infos: &mut [LineI
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pr824_external_redteam_copy_preserves_architectural_zeros() {
+        for overwrite in [
+            "pshufd $27, %xmm5, %xmm7",
+            "pshufhw $27, %xmm5, %xmm7",
+            "movapd %xmm5, %xmm7",
+            "pxor %xmm7, %xmm7",
+        ] {
+            let asm = body(&format!(
+                "    vmovapd %xmm6, %xmm7\n    {overwrite}\n    vmovupd %ymm7, (%rdi)\n    ret\n"
+            ));
+            let store = LineStore::new(asm);
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            eliminate_dead_vector_copies(&store, &mut infos);
+            let i = (0..store.len())
+                .find(|&i| store.get(i).contains("vmovapd %xmm6"))
+                .unwrap();
+            assert!(
+                !infos[i].is_nop(),
+                "{overwrite}: upper zeros remain observed"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn pr824_external_redteam_pipeline_upper_zero_native_witness() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            eprintln!("SKIP native upper-zero witness: AVX2 unavailable");
+            return;
+        }
+        use crate::common::temp_files::TempFile;
+        use std::process::Command;
+        let source = TempFile::new("pr824", "upper-witness", "c");
+        let assembly = TempFile::new("pr824", "upper-witness", "s");
+        let binary = TempFile::new("pr824", "upper-witness", "exe");
+        std::fs::write(source.path(), "extern void witness(void*); int main(void) { unsigned long long out[4]; witness(out); return out[2] != 0 || out[3] != 0; }\n").unwrap();
+        for overwrite in [
+            "pshufd $27, %xmm5, %xmm7",
+            "pshufhw $27, %xmm5, %xmm7",
+            "movapd %xmm5, %xmm7",
+            "pxor %xmm7, %xmm7",
+        ] {
+            let original = format!(
+                ".text\n.globl witness\n.type witness,@function\nwitness:\n.cfi_startproc\n    vpcmpeqd %ymm7, %ymm7, %ymm7\n    vxorpd %xmm5, %xmm5, %xmm5\n    vxorpd %xmm6, %xmm6, %xmm6\n    vmovapd %xmm6, %xmm7\n    {overwrite}\n    vmovupd %ymm7, (%rdi)\n    ret\n.cfi_endproc\n.size witness,.-witness\n.section .note.GNU-stack,\"\",@progbits\n"
+            );
+            for (stage, code) in [
+                ("original", original.clone()),
+                ("optimized", run(&original)),
+            ] {
+                std::fs::write(assembly.path(), &code).unwrap();
+                let compiled = Command::new("gcc")
+                    .args(["-Werror", "-o"])
+                    .arg(binary.path())
+                    .arg(source.path())
+                    .arg(assembly.path())
+                    .output()
+                    .expect("GCC fixture assembler/driver");
+                assert!(
+                    compiled.status.success(),
+                    "{stage}: {}",
+                    String::from_utf8_lossy(&compiled.stderr)
+                );
+                let output = Command::new(binary.path()).output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{stage} {overwrite}: upper bytes are not zero\n{code}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pr824_external_redteam_masked_copy_is_not_an_unconditional_relation() {
+        assert!(parse_vec_copy("vmovapd %xmm6, %xmm7{%k1}").is_none());
+        assert!(parse_vec_copy("vmovapd %ymm6, %ymm7{%k1}{z}").is_none());
+        assert!(parse_vec_copy("vmovapd %xmm6, %xmm7").is_some());
+    }
 
     fn run(asm: &str) -> String {
         super::super::super::peephole_optimize(asm.to_string())
@@ -1318,6 +1411,67 @@ mod tests {
     }
 
     #[test]
+    fn propagation_does_not_cross_implicit_vector_outputs() {
+        for op in [
+            "vpcmpistrm $0, %xmm5, %xmm7",
+            "vpcmpestrm $0, %xmm5, %xmm7",
+            "pcmpistrm $0, %xmm5, %xmm7",
+            "pcmpestrm $0, %xmm5, %xmm7",
+            "fxrstor (%rdi)",
+            "fxrstor64 (%rdi)",
+            "xrstor (%rdi)",
+            "xrstors64 (%rdi)",
+        ] {
+            let asm = body(&format!(
+                "    movaps %xmm0, %xmm2\n    {op}\n    movaps %xmm2, %xmm3\n"
+            ));
+            let mut store = LineStore::new(asm);
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            propagate_vector_copies(&mut store, &mut infos);
+            assert!(
+                (0..store.len()).any(|i| store.get(i).trim() == "movaps %xmm2, %xmm3"),
+                "old XMM0 copy must not be replaced with the implicit output: {op}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_only_vector_operations_still_admit_propagation() {
+        let asm = body("    movaps %xmm0, %xmm2\n    vaddps %xmm2, %xmm5, %xmm7\n");
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(propagate_vector_copies(&mut store, &mut infos));
+        assert!((0..store.len()).any(|i| store.get(i).trim() == "vaddps %xmm0, %xmm5, %xmm7"));
+    }
+
+    #[test]
+    fn brackets_do_not_rename_implicit_vector_inputs() {
+        for op in [
+            "sha256rnds2 %xmm5, %xmm7",
+            "blendvpd %xmm5, %xmm7",
+            "blendvps %xmm5, %xmm7",
+            "pblendvb %xmm5, %xmm7",
+            "fxsave (%rdi)",
+        ] {
+            let asm = body(&format!(
+                "    movaps %xmm6, %xmm0\n    {op}\n    movaps %xmm0, %xmm6\n"
+            ));
+            let mut store = LineStore::new(asm);
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            assert!(
+                !coalesce_vector_brackets(&mut store, &mut infos),
+                "hidden input cannot be renamed: {op}"
+            );
+        }
+    }
+
+    #[test]
     fn propagate_stops_before_a_destination_write() {
         // The C2 chain (bb_slp_v8): `vmovss` resets %xmm0, then `shufps`
         // reads %xmm0's old lanes. Propagating the copy's source into the
@@ -1333,6 +1487,74 @@ mod tests {
         assert!(
             lines.iter().any(|l| l == "shufps $0x00, %xmm0, %xmm0"),
             "the shufps must not be renamed at its own destination write:\n{lines:?}"
+        );
+    }
+
+    #[test]
+    fn propagation_refuses_implicit_vector_clobbers() {
+        for effect in [
+            "pcmpistrm $0, %xmm5, %xmm7",
+            "vpcmpestrm $0, %xmm5, %xmm7",
+            "fxrstor (%rdi)",
+            "fxrstorq (%rdi)",
+            "xrstor64 (%rdi)",
+            "xrstorq (%rdi)",
+            "vfutureop %xmm5, %xmm7",
+            "futureop %xmm5, %xmm7",
+        ] {
+            // The mask forms overwrite xmm0 without naming it; restores and
+            // unknown instructions cannot certify either side of a relation.
+            let asm = body(&format!(
+                "    movapd %xmm0, %xmm2\n    {effect}\n    vaddpd %xmm2, %xmm3, %xmm4\n    ret\n"
+            ));
+            let mut store = LineStore::new(asm);
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            assert!(
+                !propagate_vector_copies(&mut store, &mut infos),
+                "stale copy relation propagated across {effect}"
+            );
+        }
+    }
+
+    #[test]
+    fn coalescing_refuses_implicit_state_observers() {
+        let asm = body(
+            "    movapd %xmm0, %xmm2\n    vaddpd %xmm3, %xmm2, %xmm2\n    fxsave (%rdi)\n    movapd %xmm2, %xmm0\n    ret\n",
+        );
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(
+            !coalesce_vector_brackets(&mut store, &mut infos),
+            "coalescing changed the vector state observed by FXSAVE"
+        );
+    }
+
+    #[test]
+    fn widening_refuses_implicit_earlier_definitions() {
+        let asm = body(
+            "    pcmpistrm $0, %xmm5, %xmm7\n    movsd %xmm3, %xmm0\n    vandpd %xmm4, %xmm0, %xmm0\n    ret\n",
+        );
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(
+            !widen_private_vector_copies(&mut store, &mut infos),
+            "the string mask already defined xmm0's upper lanes"
+        );
+    }
+
+    #[test]
+    fn retargeting_refuses_implicit_wide_observers() {
+        let text = "    vaddsd %xmm2, %xmm3, %xmm4\n    movsd %xmm4, %xmm0\n    blendvpd %xmm5, %xmm7\n    ret\n";
+        assert_eq!(
+            retarget_only(text),
+            insns(text),
+            "the legacy blend mask consumes the implicit upper lane of xmm0"
         );
     }
 

@@ -1261,6 +1261,13 @@ fn is_plain_symbol(sym: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$' | '@'))
 }
 
+/// Whether repeated materializations denote one stable relocatable address.
+/// Numeric RIP offsets, local numeric-label references and the assembler's
+/// current-location counter are position-dependent, even with identical text.
+pub(super) fn is_stable_symbol_expr(text: &str) -> bool {
+    matches!(parse_disp(text), Some((Some(symbol), _)) if symbol != ".")
+}
+
 /// Byte length of a leading segment-override prefix (`%gs:`, `%fs:`, `%es:`,
 /// `%ds:`, `%cs:`, `%ss:`) in operand text, if one is present.
 ///
@@ -1892,12 +1899,7 @@ fn parse_rip_symbol_lea(t: &str) -> Option<(String, RegId)> {
     let displacement = addr.strip_suffix("(%rip)")?;
     // `parse_disp` also accepts absolute numeric displacements. Only a true
     // relocatable symbol expression names a stable address across instructions.
-    let Some((Some(symbol), _)) = parse_disp(displacement) else {
-        return None;
-    };
-    // GAS's location counter is syntactically a symbol, but denotes this
-    // instruction's position, not a stable object. `. + K` has the same trap.
-    if symbol == "." {
+    if !is_stable_symbol_expr(displacement) {
         return None;
     }
     let fam = plain_gp_operand(dst)?;
@@ -1934,7 +1936,7 @@ pub(super) fn cse_symbol_lea(store: &mut LineStore, infos: &mut [LineInfo]) -> b
         if infos[i].is_nop() || infos[i].kind == LineKind::Empty {
             continue;
         }
-        if infos[i].is_barrier() || infos[i].pinned {
+        if infos[i].pinned || infos[i].is_barrier() {
             homes.clear();
             continue;
         }
@@ -1963,9 +1965,10 @@ pub(super) fn cse_symbol_lea(store: &mut LineStore, infos: &mut [LineInfo]) -> b
             continue;
         }
         // Any write to a home register retires that home.
+        let writes = super::load_op_fuse::may_write_families(&t, &infos[i]);
         let mut k = 0;
         while k < homes.len() {
-            if writes_family(&infos[i], &t, homes[k].1) {
+            if writes & (1u16 << homes[k].1) != 0 {
                 homes.swap_remove(k);
             } else {
                 k += 1;
@@ -3805,23 +3808,125 @@ mod tests {
     }
 
     #[test]
-    fn rip_lea_cse_rejects_location_relative_displacements() {
-        for displacement in ["8", "0x10", ".", ".+8", ".-8"] {
+    fn rip_lea_cse_rejects_location_relative_numeric_displacements() {
+        // A numeric RIP-relative displacement is relative to each LEA's own
+        // next instruction address. Reusing the first materialized value for
+        // the second identical spelling would therefore change the address.
+        let asm = concat!(
+            "f:\n.cfi_startproc\n",
+            "    leaq 8(%rip), %r9\n",
+            "    movq %r9, (%rdi)\n",
+            "    leaq 8(%rip), %r9\n",
+            "    movq %r9, (%rsi)\n",
+            "    ret\n.cfi_endproc\n",
+        );
+        let mut store = super::LineStore::new(asm.to_string());
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| super::classify_line(store.get(i)))
+            .collect();
+        assert!(
+            !super::cse_symbol_lea(&mut store, &mut infos),
+            "numeric RIP-relative expressions are position-dependent, not CSE-able"
+        );
+    }
+
+    #[test]
+    fn pr814_rip_lea_cse_preserves_current_location() {
+        for expr in [".", ".+8", ".-8"] {
             let asm = format!(
-                "f:\n.cfi_startproc\n    leaq {displacement}(%rip), %r9\n    movq %r9, (%rdi)\n    leaq {displacement}(%rip), %r9\n    movq %r9, (%rsi)\n    ret\n.cfi_endproc\n"
+                "f:\n.cfi_startproc\n    leaq {expr}(%rip), %r9\n    movq %r9, (%rdi)\n    leaq {expr}(%rip), %r9\n    movq %r9, (%rsi)\n    ret\n.cfi_endproc\n"
             );
-            let mut store = super::LineStore::new(asm.clone());
+            let mut store = super::LineStore::new(asm);
             let mut infos: Vec<_> = (0..store.len())
                 .map(|i| super::classify_line(store.get(i)))
                 .collect();
-            assert!(!super::cse_symbol_lea(&mut store, &mut infos), "{asm}");
-            assert!(infos.iter().all(|info| !info.is_nop()), "{asm}");
-        }
-        for displacement in ["bins", "bins+8", ".LC0", ".LC0-8"] {
             assert!(
-                super::parse_rip_symbol_lea(&format!("leaq {displacement}(%rip), %r9")).is_some(),
-                "stable-symbol positive control: {displacement}"
+                !super::cse_symbol_lea(&mut store, &mut infos),
+                "CSE of {expr}"
             );
+        }
+    }
+
+    #[test]
+    fn pr814_rip_lea_cse_preserves_pinned_materializations() {
+        let asm = "f:\n.cfi_startproc\n    leaq bins(%rip), %r9\n    leaq bins(%rip), %r10\n    ret\n.cfi_endproc\n";
+        let mut store = super::LineStore::new(asm.to_string());
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| super::classify_line(store.get(i)))
+            .collect();
+        infos[3].pinned = true;
+        assert!(!super::cse_symbol_lea(&mut store, &mut infos));
+        assert!(infos[3].pinned);
+        assert_eq!(store.get(3).trim(), "leaq bins(%rip), %r10");
+    }
+
+    #[test]
+    fn symbol_cse_invalidates_every_written_home() {
+        for writer in [
+            "xchgq %r9, %r8",
+            "xchgq %r8, %r9",
+            "xchgl %r9d, %r8d",
+            "xchgw %r9w, %r8w",
+            "xchgb %r9b, %r8b",
+            "mulxq %r8, %r9, %r10",
+            "popq %r9",
+            "incq %r9",
+            "movb $1, %r9b",
+            "unknown_effect %r8",
+        ] {
+            let asm = format!(
+                "f:\n.cfi_startproc\n    leaq bins(%rip), %r9\n    {writer}\n    leaq bins(%rip), %r10\n    ret\n.cfi_endproc\n"
+            );
+            let mut store = super::LineStore::new(asm);
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| super::classify_line(store.get(i)))
+                .collect();
+            assert!(
+                !super::cse_symbol_lea(&mut store, &mut infos),
+                "stale home after {writer}"
+            );
+            assert!(!infos[4].is_nop());
+            assert_eq!(store.get(4).trim(), "leaq bins(%rip), %r10");
+        }
+    }
+
+    #[test]
+    fn symbol_home_dies_on_implicit_string_comparison_outputs() {
+        for mnemonic in ["cmpsb", "cmpsw", "cmpsl", "cmpsq"] {
+            let asm = format!(
+                "f:\n.cfi_startproc\n    leaq bins(%rip), %rdi\n    {mnemonic}\n    leaq bins(%rip), %r9\n    ret\n.cfi_endproc\n"
+            );
+            let mut store = super::LineStore::new(asm);
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| super::classify_line(store.get(i)))
+                .collect();
+            assert!(
+                !super::cse_symbol_lea(&mut store, &mut infos),
+                "stale string home: {mnemonic}"
+            );
+        }
+    }
+
+    #[test]
+    fn stable_symbol_materializations_still_cse() {
+        for expr in ["bins", "bins+8", "bins-8", ".LC0"] {
+            let asm = format!(
+                "f:\n.cfi_startproc\n    leaq {expr}(%rip), %r9\n    testq %rdi, %rdi\n    leaq {expr}(%rip), %r10\n    ret\n.cfi_endproc\n"
+            );
+            let mut store = super::LineStore::new(asm);
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| super::classify_line(store.get(i)))
+                .collect();
+            assert!(
+                super::cse_symbol_lea(&mut store, &mut infos),
+                "missed {expr}"
+            );
+            assert_eq!(store.get(4).trim(), "movq %r9, %r10");
+        }
+        for expr in [
+            ".", ".+8", ".-8", "8", "-8", "0x10", "-0x10", "1f", "1b", ".+0x10",
+        ] {
+            assert!(!super::is_stable_symbol_expr(expr), "accepted {expr}");
         }
     }
 
@@ -6743,5 +6848,25 @@ mod tests {
             splice_lea_into_mem_operand("movq %gs:%fs:(%r9), %rax", "%r9", "8(%rdi)"),
             None
         );
+    }
+    #[test]
+    fn rip_lea_cse_rejects_location_relative_displacements() {
+        for displacement in ["8", "0x10", ".", ".+8", ".-8"] {
+            let asm = format!(
+                "f:\n.cfi_startproc\n    leaq {displacement}(%rip), %r9\n    movq %r9, (%rdi)\n    leaq {displacement}(%rip), %r9\n    movq %r9, (%rsi)\n    ret\n.cfi_endproc\n"
+            );
+            let mut store = super::LineStore::new(asm.clone());
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| super::classify_line(store.get(i)))
+                .collect();
+            assert!(!super::cse_symbol_lea(&mut store, &mut infos), "{asm}");
+            assert!(infos.iter().all(|info| !info.is_nop()), "{asm}");
+        }
+        for displacement in ["bins", "bins+8", ".LC0", ".LC0-8"] {
+            assert!(
+                super::parse_rip_symbol_lea(&format!("leaq {displacement}(%rip), %r9")).is_some(),
+                "stable-symbol positive control: {displacement}"
+            );
+        }
     }
 }

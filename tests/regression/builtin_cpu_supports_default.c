@@ -18,8 +18,7 @@
  * a diff.
  *
  * Host-independent invariants: SSE2 exists on every CPU this compiler can run
- * on (x86-64 baseline / i686 with SSE2), and the two spellings of a feature
- * must agree with each other, because GCC accepts both.
+ * on (x86-64 baseline / i686 with SSE2), and compiler-specific alias spellings are covered separately.
  */
 #include <stdio.h>
 
@@ -57,11 +56,11 @@ int main(void) {
     PROBE("vaes");
     PROBE("vpclmulqdq");
     PROBE("amx-tile");
-    PROBE("cx16");
+    PROBE("cmpxchg16b");
     PROBE("xsave");
 
     /* A compile-time answer would also fail these two. */
     if (!__builtin_cpu_supports("sse2")) return 1;
-    if (!!__builtin_cpu_supports("sse4_2") != !!__builtin_cpu_supports("sse4.2")) return 2;
+    /* Non-GCC alias spellings are checked in builtin_cpu_supports_aliases.c. */
     return 0;
 }

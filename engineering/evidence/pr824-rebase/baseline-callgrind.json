@@ -1,0 +1,2278 @@
+{
+  "stage": "rebased d9d0a2b baseline, before copy/spill follow-through",
+  "compiler_sha256": "2a30e91737832ab12cef3ef4ac460d9f3ba329c80390cbc053123962d06db6a2",
+  "reference": {
+    "command": [
+      "gcc"
+    ],
+    "executable": "/usr/bin/x86_64-linux-gnu-gcc-12",
+    "sha256": "75e997ec62297a6484f491bae28ab0ccb489daba23e398fd10fe68e9e6f0def8",
+    "version": "gcc (Debian 12.2.0-14+deb12u1) 12.2.0\nCopyright (C) 2022 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+  },
+  "valgrind": {
+    "command": [
+      "valgrind"
+    ],
+    "executable": "/home/user/.local/valgrind/bin/valgrind",
+    "sha256": "6c59f77b1829d4f36e4e4b47f376d48f3ad3e10f3533d7276d42aa084c73cfb5",
+    "version": "valgrind-3.16.0.GIT"
+  },
+  "valgrind_source_commit": "971c165fc4335bf04bedf58e0800a12776fce408",
+  "metric": "bounded simulated instructions/cache events, not runtime",
+  "complete": true,
+  "selected": 45,
+  "failures": [],
+  "whole_program_ir_geomean": 0.9514023748593867,
+  "cases": [
+    {
+      "case": "arith_loop",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DARITH_ITERS=20000",
+      "source_sha256": "154a39b6e98cf506bf0d62ed4ab44dad88f7d75923a4eb797b4c41e9339f662c",
+      "stdout_sha256": "810a29e17ad3e0970721e9be5ac63b6106132991e1d92f2642fb4adddc442ffc",
+      "whole_program": {
+        "conditional_mispredicts": [
+          3204,
+          3262
+        ],
+        "d1_misses": [
+          1778,
+          1816
+        ],
+        "i1_misses": [
+          1271,
+          1276
+        ],
+        "indirect_mispredicts": [
+          198,
+          199
+        ],
+        "ir_mine": 2168092,
+        "ir_ratio": 0.7871153808452999,
+        "ir_ref": 2754478,
+        "ll_misses": [
+          2713,
+          2743
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/arith_loop/aa/arith_loop",
+          "totals": {
+            "Ir": 2040138,
+            "D1mr": 1,
+            "DLmr": 1
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/arith_loop/bb/arith_loop",
+          "totals": {
+            "Ir": 2620159,
+            "D1mr": 1,
+            "DLmr": 0
+          }
+        },
+        "ir_ratio": 0.7786313731342258
+      }
+    },
+    {
+      "case": "fib",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DFIB_N=25",
+      "source_sha256": "983660d7782bcce1d90c389a5869452a6b055a399654ad63f34491245ed41379",
+      "stdout_sha256": "6e2769e5e19797e0e30eab88c08cfc1721b65b96d60875f96dcc358114350e4c",
+      "whole_program": {
+        "conditional_mispredicts": [
+          3212,
+          22266
+        ],
+        "d1_misses": [
+          1787,
+          1819
+        ],
+        "i1_misses": [
+          1255,
+          1279
+        ],
+        "indirect_mispredicts": [
+          199,
+          201
+        ],
+        "ir_mine": 128424,
+        "ir_ratio": 0.0525835867505936,
+        "ir_ref": 2442283,
+        "ll_misses": [
+          2703,
+          2750
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/fib/aa/fib",
+          "totals": {
+            "Ir": 208,
+            "D1mr": 0,
+            "DLmr": 0
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/fib/bb/fib",
+          "totals": {
+            "Ir": 2307697,
+            "D1mr": 1,
+            "DLmr": 0
+          }
+        },
+        "ir_ratio": 9.013315006259488e-05
+      }
+    },
+    {
+      "case": "matmul",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=48",
+      "source_sha256": "927478b18ee0aa0d118eea4d2a9d6bb1251fdf3c64c2619ab578463beba99560",
+      "stdout_sha256": "d700bdb5c2922a65f183b6d00a6ed655a1ec17bc85bf71900acd4d1d6572fa98",
+      "whole_program": {
+        "conditional_mispredicts": [
+          3430,
+          5731
+        ],
+        "d1_misses": [
+          3128,
+          3158
+        ],
+        "i1_misses": [
+          1360,
+          1369
+        ],
+        "indirect_mispredicts": [
+          200,
+          201
+        ],
+        "ir_mine": 292020,
+        "ir_ratio": 0.8976337290438396,
+        "ir_ref": 325322,
+        "ll_misses": [
+          3679,
+          3711
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/matmul/aa/matmul",
+          "totals": {
+            "Ir": 162316,
+            "D1mr": 625,
+            "DLmr": 289
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/matmul/bb/matmul",
+          "totals": {
+            "Ir": 189253,
+            "D1mr": 626,
+            "DLmr": 290
+          }
+        },
+        "ir_ratio": 0.8576667212672983
+      }
+    },
+    {
+      "case": "qsort",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=10000",
+      "source_sha256": "4b7916c27962da3a9cf71ce75b09910467449ce727a1fb2d3dbf75f5f011641a",
+      "stdout_sha256": "ab09e252732b30fa91bf9a75fb2c8f9b352d9bc948908ad7765588291c999fa3",
+      "whole_program": {
+        "conditional_mispredicts": [
+          79147,
+          79210
+        ],
+        "d1_misses": [
+          7548,
+          7620
+        ],
+        "i1_misses": [
+          1320,
+          1327
+        ],
+        "indirect_mispredicts": [
+          211,
+          206
+        ],
+        "ir_mine": 3625786,
+        "ir_ratio": 1.0325494398530082,
+        "ir_ref": 3511489,
+        "ll_misses": [
+          4017,
+          4047
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/qsort/aa/qsort",
+          "totals": {
+            "Ir": 561890,
+            "D1mr": 1457,
+            "DLmr": 0
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/qsort/bb/qsort",
+          "totals": {
+            "Ir": 441431,
+            "D1mr": 1475,
+            "DLmr": 0
+          }
+        },
+        "ir_ratio": 1.2728829647215534
+      }
+    },
+    {
+      "case": "sieve",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=100000",
+      "source_sha256": "2fd99e297a95711800c1bf4b2facd7e5e09efa740b113c86837e3d0cd22f069b",
+      "stdout_sha256": "29b1ed69a7537574cbf020c59648bd85ff0e1a047826e590fa60e638ede3d34a",
+      "whole_program": {
+        "conditional_mispredicts": [
+          3413,
+          3466
+        ],
+        "d1_misses": [
+          51753,
+          51790
+        ],
+        "i1_misses": [
+          1261,
+          1264
+        ],
+        "indirect_mispredicts": [
+          207,
+          203
+        ],
+        "ir_mine": 1604983,
+        "ir_ratio": 0.9421369183050043,
+        "ir_ref": 1703556,
+        "ll_misses": [
+          4270,
+          4300
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/sieve/aa/sieve",
+          "totals": {
+            "Ir": 1375677,
+            "D1mr": 1605,
+            "DLmr": 0
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/sieve/bb/sieve",
+          "totals": {
+            "Ir": 1468110,
+            "D1mr": 1607,
+            "DLmr": 0
+          }
+        },
+        "ir_ratio": 0.9370394588961317
+      }
+    },
+    {
+      "case": "tce_sum",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+      "source_sha256": "57ddb14e5fd945998d614fbe2bba64a9861b8a0f5153ce4fcd84a15348991eee",
+      "stdout_sha256": "02925b938be56a43232f201a3401446ed976f4f2fadd0836fd03a6b7247f941b",
+      "whole_program": {
+        "conditional_mispredicts": [
+          3195,
+          3250
+        ],
+        "d1_misses": [
+          1779,
+          1816
+        ],
+        "i1_misses": [
+          1252,
+          1262
+        ],
+        "indirect_mispredicts": [
+          199,
+          200
+        ],
+        "ir_mine": 128070,
+        "ir_ratio": 0.9526182683725082,
+        "ir_ref": 134440,
+        "ll_misses": [
+          2696,
+          2730
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/tce_sum/aa/tce_sum",
+          "totals": {
+            "Ir": 51,
+            "D1mr": 0,
+            "DLmr": 0
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/tce_sum/bb/tce_sum",
+          "totals": {
+            "Ir": 56,
+            "D1mr": 1,
+            "DLmr": 0
+          }
+        },
+        "ir_ratio": 0.9107142857142857
+      }
+    },
+    {
+      "case": "nbody",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSTEPS=1000",
+      "source_sha256": "45db2f21add3645a945f1a6635d642f1aad5caecfa4c7b47da4943331a321837",
+      "stdout_sha256": "76de83d6d51a74f82828547423f516e7815cfe8cfea6290a2831aa173f806de7",
+      "whole_program": {
+        "conditional_mispredicts": [
+          3375,
+          6448
+        ],
+        "d1_misses": [
+          1810,
+          1843
+        ],
+        "i1_misses": [
+          1357,
+          1363
+        ],
+        "indirect_mispredicts": [
+          201,
+          208
+        ],
+        "ir_mine": 657829,
+        "ir_ratio": 1.134682887535425,
+        "ir_ref": 579747,
+        "ll_misses": [
+          2816,
+          2839
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/nbody/aa/nbody",
+          "totals": {
+            "Ir": 526757,
+            "D1mr": 7,
+            "DLmr": 7
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/nbody/bb/nbody",
+          "totals": {
+            "Ir": 441657,
+            "D1mr": 7,
+            "DLmr": 6
+          }
+        },
+        "ir_ratio": 1.192683462505972
+      }
+    },
+    {
+      "case": "binary_trees",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DTREE_DEPTH=10",
+      "source_sha256": "0a19ef11ab58e32a6ef0ecb8703a856347ba295d2bca67bbe20dfa5243251dc0",
+      "stdout_sha256": "b7f92c56b5d8aeb0a4d698842d1d87a57b4909865c3c84e5e10313e16663c3cb",
+      "whole_program": {
+        "conditional_mispredicts": [
+          203710,
+          69393
+        ],
+        "d1_misses": [
+          54294,
+          54193
+        ],
+        "i1_misses": [
+          1275,
+          1367
+        ],
+        "indirect_mispredicts": [
+          204,
+          206
+        ],
+        "ir_mine": 31710482,
+        "ir_ratio": 1.1167573746774977,
+        "ir_ref": 28395140,
+        "ll_misses": [
+          4774,
+          4886
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/binary_trees/aa/binary_trees",
+          "totals": {
+            "Ir": 7134659,
+            "D1mr": 34527,
+            "DLmr": 1
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/binary_trees/bb/binary_trees",
+          "totals": {
+            "Ir": 3812734,
+            "D1mr": 34433,
+            "DLmr": 0
+          }
+        },
+        "ir_ratio": 1.871271114113914
+      }
+    },
+    {
+      "case": "spectral_norm",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=128",
+      "source_sha256": "21a48dccebcbc3b9496263f62df260d278051c3cd1a528ed99c8b66bef481e6a",
+      "stdout_sha256": "dd1b53e3a8f641316d8c512483fcedd74d0243359a2dca66cc399429ef323d1e",
+      "whole_program": {
+        "conditional_mispredicts": [
+          8479,
+          8551
+        ],
+        "d1_misses": [
+          1825,
+          1880
+        ],
+        "i1_misses": [
+          1333,
+          1335
+        ],
+        "indirect_mispredicts": [
+          199,
+          207
+        ],
+        "ir_mine": 8241223,
+        "ir_ratio": 1.1152463076819188,
+        "ir_ref": 7389599,
+        "ll_misses": [
+          2780,
+          2806
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/spectral_norm/aa/spectral_norm",
+          "totals": {
+            "Ir": 8112336,
+            "D1mr": 2,
+            "DLmr": 2
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/spectral_norm/bb/spectral_norm",
+          "totals": {
+            "Ir": 7253694,
+            "D1mr": 2,
+            "DLmr": 1
+          }
+        },
+        "ir_ratio": 1.118373066192205
+      }
+    },
+    {
+      "case": "mandelbrot",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DWIDTH=128 -DHEIGHT=128",
+      "source_sha256": "3f9d3a3e0da962e5a1840790ebf46fa09f38cd5e758645c8c65625fa9882555c",
+      "stdout_sha256": "ef96fec4c675230de2781e23421aa0bdf773029dd16fcc8ddb283a81cb4e49e9",
+      "whole_program": {
+        "conditional_mispredicts": [
+          15390,
+          15426
+        ],
+        "d1_misses": [
+          1783,
+          1818
+        ],
+        "i1_misses": [
+          1253,
+          1262
+        ],
+        "indirect_mispredicts": [
+          198,
+          199
+        ],
+        "ir_mine": 5988045,
+        "ir_ratio": 1.0889207690617895,
+        "ir_ref": 5499064,
+        "ll_misses": [
+          2700,
+          2731
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/mandelbrot/aa/mandelbrot",
+          "totals": {
+            "Ir": 5860215,
+            "D1mr": 4,
+            "DLmr": 2
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/mandelbrot/bb/mandelbrot",
+          "totals": {
+            "Ir": 5364869,
+            "D1mr": 3,
+            "DLmr": 2
+          }
+        },
+        "ir_ratio": 1.0923314250543676
+      }
+    },
+    {
+      "case": "hash_table",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DNUM_OPS=20000",
+      "source_sha256": "1c742684a0ea694fbeb95d249748488e89f9033c64d518cd1fafe27da24a2e5a",
+      "stdout_sha256": "58bbebb42d378c7d85fb6e40689b444bc29eba17b7c761272e75e3769c510406",
+      "whole_program": {
+        "conditional_mispredicts": [
+          19370,
+          19913
+        ],
+        "d1_misses": [
+          98305,
+          98174
+        ],
+        "i1_misses": [
+          1264,
+          1266
+        ],
+        "indirect_mispredicts": [
+          208,
+          204
+        ],
+        "ir_mine": 7966472,
+        "ir_ratio": 1.0395960039911023,
+        "ir_ref": 7663046,
+        "ll_misses": [
+          25841,
+          25870
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/hash_table/aa/hash_table",
+          "totals": {
+            "Ir": 2586441,
+            "D1mr": 81326,
+            "DLmr": 8135
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/hash_table/bb/hash_table",
+          "totals": {
+            "Ir": 2276875,
+            "D1mr": 81165,
+            "DLmr": 8135
+          }
+        },
+        "ir_ratio": 1.1359609113368103
+      }
+    },
+    {
+      "case": "strlen_bench",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DNSTRINGS=1000",
+      "source_sha256": "175202f59218fa62a3120f9f5202a005f5e234f2cbabd453048d933082e0dd44",
+      "stdout_sha256": "d9d3067cda75c2e83e4f6ac47d348ee578fbdc9e4c9b7c722023d6da84e04193",
+      "whole_program": {
+        "conditional_mispredicts": [
+          131911,
+          130584
+        ],
+        "d1_misses": [
+          221180,
+          221498
+        ],
+        "i1_misses": [
+          1289,
+          1290
+        ],
+        "indirect_mispredicts": [
+          218,
+          212
+        ],
+        "ir_mine": 9268051,
+        "ir_ratio": 1.1266874537818161,
+        "ir_ref": 8225929,
+        "ll_misses": [
+          5166,
+          5200
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/strlen_bench/aa/strlen_bench",
+          "totals": {
+            "Ir": 4847764,
+            "D1mr": 2392,
+            "DLmr": 0
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/strlen_bench/bb/strlen_bench",
+          "totals": {
+            "Ir": 3811207,
+            "D1mr": 2402,
+            "DLmr": 0
+          }
+        },
+        "ir_ratio": 1.2719760432849752
+      }
+    },
+    {
+      "case": "switch_dispatch",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=20000",
+      "source_sha256": "6a044523272024b733f4af8e5101d5bf2d72ba9d6e9362798f6149cd9265117a",
+      "stdout_sha256": "2cd8018a4435ffd0841ef4863412c0226a90f84e66077faab1cd6a42be6824c8",
+      "whole_program": {
+        "conditional_mispredicts": [
+          3198,
+          3253
+        ],
+        "d1_misses": [
+          1784,
+          1822
+        ],
+        "i1_misses": [
+          1255,
+          1266
+        ],
+        "indirect_mispredicts": [
+          18960,
+          18811
+        ],
+        "ir_mine": 535489,
+        "ir_ratio": 1.0861251006537167,
+        "ir_ref": 493027,
+        "ll_misses": [
+          2702,
+          2738
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/switch_dispatch/aa/switch_dispatch",
+          "totals": {
+            "Ir": 407557,
+            "D1mr": 2,
+            "DLmr": 2
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/switch_dispatch/bb/switch_dispatch",
+          "totals": {
+            "Ir": 358730,
+            "D1mr": 3,
+            "DLmr": 2
+          }
+        },
+        "ir_ratio": 1.136110723942798
+      }
+    },
+    {
+      "case": "struct_copy",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=2000",
+      "source_sha256": "b0ca8943fcfed56f7ae9bbd49e7e52a98f9780b4be8151c494fc12b05dcb2bfa",
+      "stdout_sha256": "eed31a917aeb336349b67c4cffda6c45e03c0f13adc1b7d5d14abd4b53dbcec5",
+      "whole_program": {
+        "conditional_mispredicts": [
+          3304,
+          3362
+        ],
+        "d1_misses": [
+          1803,
+          1836
+        ],
+        "i1_misses": [
+          1367,
+          1372
+        ],
+        "indirect_mispredicts": [
+          200,
+          201
+        ],
+        "ir_mine": 353680,
+        "ir_ratio": 0.8930320873438304,
+        "ir_ref": 396044,
+        "ll_misses": [
+          2820,
+          2847
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/struct_copy/aa/struct_copy",
+          "totals": {
+            "Ir": 224065,
+            "D1mr": 3,
+            "DLmr": 3
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/struct_copy/bb/struct_copy",
+          "totals": {
+            "Ir": 260064,
+            "D1mr": 3,
+            "DLmr": 2
+          }
+        },
+        "ir_ratio": 0.8615763811984742
+      }
+    },
+    {
+      "case": "loop_patterns",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSIZE=16384",
+      "source_sha256": "e56488201b8d9e8fc7ad17ec521f395232d4c66edcaf880876d2adccba28df88",
+      "stdout_sha256": "b32d3c1df1138719d7119b4bdd35e163d915f5289b85ff49a94cf063e2d3ef49",
+      "whole_program": {
+        "conditional_mispredicts": [
+          3342,
+          3393
+        ],
+        "d1_misses": [
+          10442,
+          10467
+        ],
+        "i1_misses": [
+          1281,
+          1283
+        ],
+        "indirect_mispredicts": [
+          202,
+          203
+        ],
+        "ir_mine": 690047,
+        "ir_ratio": 1.078124316453244,
+        "ir_ref": 640044,
+        "ll_misses": [
+          4773,
+          4801
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/loop_patterns/aa/loop_patterns",
+          "totals": {
+            "Ir": 559489,
+            "D1mr": 5960,
+            "DLmr": 0
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/loop_patterns/bb/loop_patterns",
+          "totals": {
+            "Ir": 503121,
+            "D1mr": 5956,
+            "DLmr": 0
+          }
+        },
+        "ir_ratio": 1.112036667123813
+      }
+    },
+    {
+      "case": "fannkuch",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DFANNKUCH_N=7",
+      "source_sha256": "2a78d670ab985384a3008ac031e7a478fdc790b627d011177dd528b7282d11e5",
+      "stdout_sha256": "2dc0a3cd4a547ba69389f97f3b447bd4d487fe6216c3cacd2f9bf8c908dc127f",
+      "whole_program": {
+        "conditional_mispredicts": [
+          22902,
+          23257
+        ],
+        "d1_misses": [
+          1788,
+          1827
+        ],
+        "i1_misses": [
+          1262,
+          1269
+        ],
+        "indirect_mispredicts": [
+          198,
+          205
+        ],
+        "ir_mine": 1273139,
+        "ir_ratio": 1.1414744841511064,
+        "ir_ref": 1115346,
+        "ll_misses": [
+          2709,
+          2744
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/fannkuch/aa/fannkuch",
+          "totals": {
+            "Ir": 1144680,
+            "D1mr": 2,
+            "DLmr": 0
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/fannkuch/bb/fannkuch",
+          "totals": {
+            "Ir": 866268,
+            "D1mr": 2,
+            "DLmr": 1
+          }
+        },
+        "ir_ratio": 1.321392455914336
+      }
+    },
+    {
+      "case": "ackermann",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DACK_N=6",
+      "source_sha256": "8f4443c46516743ca68886d1e882b9431d42ea812df71bf58236013193b790b9",
+      "stdout_sha256": "99072984481d4962769efba1577265a002f0d9ababffdcb38394132093342271",
+      "whole_program": {
+        "conditional_mispredicts": [
+          3204,
+          4464
+        ],
+        "d1_misses": [
+          1784,
+          1854
+        ],
+        "i1_misses": [
+          1250,
+          1273
+        ],
+        "indirect_mispredicts": [
+          198,
+          199
+        ],
+        "ir_mine": 128244,
+        "ir_ratio": 0.11265225235987864,
+        "ir_ref": 1138406,
+        "ll_misses": [
+          2695,
+          2741
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/ackermann/aa/ackermann",
+          "totals": {
+            "Ir": 49,
+            "D1mr": 0,
+            "DLmr": 0
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/ackermann/bb/ackermann",
+          "totals": {
+            "Ir": 1003846,
+            "D1mr": 1,
+            "DLmr": 0
+          }
+        },
+        "ir_ratio": 4.881226801720583e-05
+      }
+    },
+    {
+      "case": "constant_recursion",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DACK_N=6",
+      "source_sha256": "86d59c961c6c10e03a75dbb42b3c73f01d448bf6296c401bb960f6120dd985c9",
+      "stdout_sha256": "a57cf068a82994f39547a879a8d5e8f2bd0af669c3a2f40bfb89bce5d5e69190",
+      "whole_program": {
+        "conditional_mispredicts": [
+          3192,
+          4452
+        ],
+        "d1_misses": [
+          1786,
+          1857
+        ],
+        "i1_misses": [
+          1254,
+          1277
+        ],
+        "indirect_mispredicts": [
+          198,
+          199
+        ],
+        "ir_mine": 127981,
+        "ir_ratio": 0.11244730446640226,
+        "ir_ref": 1138142,
+        "ll_misses": [
+          2700,
+          2746
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/constant_recursion/aa/constant_recursion",
+          "totals": {
+            "Ir": 50,
+            "D1mr": 0,
+            "DLmr": 0
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/constant_recursion/bb/constant_recursion",
+          "totals": {
+            "Ir": 1003846,
+            "D1mr": 1,
+            "DLmr": 0
+          }
+        },
+        "ir_ratio": 4.980843675225084e-05
+      }
+    },
+    {
+      "case": "bitops",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=20000",
+      "source_sha256": "e1e97ac28dabf06df8859e6812a288f639c7f6f070478ebd6fe834a64ed9f7ea",
+      "stdout_sha256": "060ace810747246fc731ec42a2270514d9403b2db105212bebaa6dcbd0a22a56",
+      "whole_program": {
+        "conditional_mispredicts": [
+          3225,
+          9391
+        ],
+        "d1_misses": [
+          1782,
+          1820
+        ],
+        "i1_misses": [
+          1256,
+          1267
+        ],
+        "indirect_mispredicts": [
+          199,
+          200
+        ],
+        "ir_mine": 1249271,
+        "ir_ratio": 0.8521165284295537,
+        "ir_ref": 1466080,
+        "ll_misses": [
+          2703,
+          2739
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/bitops/aa/bitops",
+          "totals": {
+            "Ir": 1120065,
+            "D1mr": 0,
+            "DLmr": 0
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/bitops/bb/bitops",
+          "totals": {
+            "Ir": 1330509,
+            "D1mr": 1,
+            "DLmr": 0
+          }
+        },
+        "ir_ratio": 0.841831960550436
+      }
+    },
+    {
+      "case": "double_reduction",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DREDUCTION_PASSES=1",
+      "source_sha256": "cad8a08bc76c767ac184e222570f4311d2e1ddab072f59119d737c87fbc1eaf7",
+      "stdout_sha256": "b02bb09e89c66c2a3737663a4760a352511e641827a52ffaf1237598cc53043d",
+      "whole_program": {
+        "conditional_mispredicts": [
+          3220,
+          3277
+        ],
+        "d1_misses": [
+          526205,
+          526233
+        ],
+        "i1_misses": [
+          1267,
+          1274
+        ],
+        "indirect_mispredicts": [
+          200,
+          201
+        ],
+        "ir_mine": 30405654,
+        "ir_ratio": 1.1259632277688518,
+        "ir_ref": 27004127,
+        "ll_misses": [
+          199321,
+          199353
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/double_reduction/aa/double_reduction",
+          "totals": {
+            "Ir": 30277757,
+            "D1mr": 327685,
+            "DLmr": 0
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/double_reduction/bb/double_reduction",
+          "totals": {
+            "Ir": 26869865,
+            "D1mr": 327684,
+            "DLmr": 0
+          }
+        },
+        "ir_ratio": 1.1268295170072495
+      }
+    },
+    {
+      "case": "ascii_case_fold",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+      "source_sha256": "7a97d5091e4e166a63cb4d6dd80bb35014c4f9ccd77848b60bac357f3211a5dd",
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "whole_program": {
+        "conditional_mispredicts": [
+          3065,
+          18759
+        ],
+        "d1_misses": [
+          4825,
+          4856
+        ],
+        "i1_misses": [
+          1092,
+          1099
+        ],
+        "indirect_mispredicts": [
+          181,
+          183
+        ],
+        "ir_mine": 2221364,
+        "ir_ratio": 1.9889368407857744,
+        "ir_ref": 1116860,
+        "ll_misses": [
+          4517,
+          4550
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/ascii_case_fold/aa/ascii_case_fold",
+          "totals": {
+            "Ir": 2097230,
+            "D1mr": 1028,
+            "DLmr": 0
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/ascii_case_fold/bb/ascii_case_fold",
+          "totals": {
+            "Ir": 986247,
+            "D1mr": 1029,
+            "DLmr": 1
+          }
+        },
+        "ir_ratio": 2.1264754164017736
+      }
+    },
+    {
+      "case": "binary_search",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+      "source_sha256": "e53295433fcba1e277011bd4ae6860e38a1dc27934c36dc9b2de9c6d3d533422",
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "whole_program": {
+        "conditional_mispredicts": [
+          5126,
+          12062
+        ],
+        "d1_misses": [
+          1943,
+          1979
+        ],
+        "i1_misses": [
+          1089,
+          1094
+        ],
+        "indirect_mispredicts": [
+          181,
+          183
+        ],
+        "ir_mine": 586144,
+        "ir_ratio": 1.4239549499430315,
+        "ir_ref": 411631,
+        "ll_misses": [
+          2720,
+          2751
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/binary_search/aa/binary_search",
+          "totals": {
+            "Ir": 462010,
+            "D1mr": 0,
+            "DLmr": 0
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/binary_search/bb/binary_search",
+          "totals": {
+            "Ir": 281018,
+            "D1mr": 2,
+            "DLmr": 1
+          }
+        },
+        "ir_ratio": 1.644058387718936
+      }
+    },
+    {
+      "case": "ring_fifo",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+      "source_sha256": "e5c01f13f9472d27106f37b76e0076f2d3e4cb71109c38344688e4e8f6e6db03",
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "whole_program": {
+        "conditional_mispredicts": [
+          3061,
+          3128
+        ],
+        "d1_misses": [
+          1746,
+          1710
+        ],
+        "i1_misses": [
+          1086,
+          1091
+        ],
+        "indirect_mispredicts": [
+          181,
+          183
+        ],
+        "ir_mine": 604192,
+        "ir_ratio": 2.6194278975799667,
+        "ir_ref": 230658,
+        "ll_misses": [
+          2528,
+          2492
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/ring_fifo/aa/ring_fifo",
+          "totals": {
+            "Ir": 480063,
+            "D1mr": 0,
+            "DLmr": 0
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/ring_fifo/bb/ring_fifo",
+          "totals": {
+            "Ir": 100050,
+            "D1mr": 0,
+            "DLmr": 0
+          }
+        },
+        "ir_ratio": 4.7982308845577215
+      }
+    },
+    {
+      "case": "aarch64_select_patterns",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSELECT_ITERS=20000",
+      "source_sha256": "22b7e42c9de227a1b815878d95f3dc2e97630addaf6e3c19e77d2ce38c09c0b1",
+      "stdout_sha256": "4406e647fb50cbfcfd87d4edc73e905f6612c02e746a93b7574ab2a74b962d68",
+      "whole_program": {
+        "conditional_mispredicts": [
+          3217,
+          10799
+        ],
+        "d1_misses": [
+          1777,
+          1813
+        ],
+        "i1_misses": [
+          1255,
+          1264
+        ],
+        "indirect_mispredicts": [
+          198,
+          199
+        ],
+        "ir_mine": 848308,
+        "ir_ratio": 1.2211704008245665,
+        "ir_ref": 694668,
+        "ll_misses": [
+          2701,
+          2733
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/aarch64_select_patterns/aa/aarch64_select_patterns",
+          "totals": {
+            "Ir": 720072,
+            "D1mr": 1,
+            "DLmr": 1
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/aarch64_select_patterns/bb/aarch64_select_patterns",
+          "totals": {
+            "Ir": 560067,
+            "D1mr": 1,
+            "DLmr": 0
+          }
+        },
+        "ir_ratio": 1.285689033633476
+      }
+    },
+    {
+      "case": "histogram",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+      "source_sha256": "67bef36e96b93d37b36e85f02e991eda19cd759393ec104684edfde54c6a3806",
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "whole_program": {
+        "conditional_mispredicts": [
+          3077,
+          3148
+        ],
+        "d1_misses": [
+          9977,
+          10005
+        ],
+        "i1_misses": [
+          1088,
+          1097
+        ],
+        "indirect_mispredicts": [
+          181,
+          183
+        ],
+        "ir_mine": 3206182,
+        "ir_ratio": 1.906692730061295,
+        "ir_ref": 1681541,
+        "ll_misses": [
+          6593,
+          6627
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/histogram/aa/histogram",
+          "totals": {
+            "Ir": 3082053,
+            "D1mr": 4107,
+            "DLmr": 9
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/histogram/bb/histogram",
+          "totals": {
+            "Ir": 1550933,
+            "D1mr": 4100,
+            "DLmr": 1
+          }
+        },
+        "ir_ratio": 1.9872251090150252
+      }
+    },
+    {
+      "case": "gzip_crc32",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DDATA_SIZE=16384 -DPASSES=4",
+      "source_sha256": "9f9acac042ab580ce2137a9fb653a5b3db5e7015dbb49254944195ef5eb98f6a",
+      "stdout_sha256": "4140336ac73256f9c3ce7f1ae098c17b88cdac3d72595d3e8e8d57a6f2fedfcc",
+      "whole_program": {
+        "conditional_mispredicts": [
+          3239,
+          3281
+        ],
+        "d1_misses": [
+          2102,
+          2137
+        ],
+        "i1_misses": [
+          1266,
+          1272
+        ],
+        "indirect_mispredicts": [
+          200,
+          201
+        ],
+        "ir_mine": 783459,
+        "ir_ratio": 0.9920530304469221,
+        "ir_ref": 789735,
+        "ll_misses": [
+          2983,
+          3014
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/gzip_crc32/aa/gzip_crc32",
+          "totals": {
+            "Ir": 655621,
+            "D1mr": 18,
+            "DLmr": 17
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/gzip_crc32/bb/gzip_crc32",
+          "totals": {
+            "Ir": 655532,
+            "D1mr": 19,
+            "DLmr": 17
+          }
+        },
+        "ir_ratio": 1.000135767590293
+      }
+    },
+    {
+      "case": "libm_round_family",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=256 -DPASSES=4",
+      "source_sha256": "b70c5bacd90081c28ea74dc1142f9eacc64278d539f258da5bd1614ebc503668",
+      "stdout_sha256": "0867beb6c9a7c41a5760461d23488796a06bdff150a8789c49dbd64a2397968a",
+      "whole_program": {
+        "conditional_mispredicts": [
+          3355,
+          3451
+        ],
+        "d1_misses": [
+          1843,
+          1874
+        ],
+        "i1_misses": [
+          1369,
+          1379
+        ],
+        "indirect_mispredicts": [
+          200,
+          213
+        ],
+        "ir_mine": 153095,
+        "ir_ratio": 0.9667102363497446,
+        "ir_ref": 158367,
+        "ll_misses": [
+          2857,
+          2887
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/libm_round_family/aa/libm_round_family",
+          "totals": {
+            "Ir": 22928,
+            "D1mr": 2,
+            "DLmr": 2
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/libm_round_family/bb/libm_round_family",
+          "totals": {
+            "Ir": 21234,
+            "D1mr": 3,
+            "DLmr": 2
+          }
+        },
+        "ir_ratio": 1.0797777149854009
+      }
+    },
+    {
+      "case": "tls_seg_access",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=100",
+      "source_sha256": "02e6d2bcd07b2e1fc253b53d316d522e7b3d912ae634b6fad2c10dc93a1d4835",
+      "stdout_sha256": "0d4f3a3d2100dc3f622a768a07ee1401e14a506aa52b61c920447e5c9ed5006b",
+      "whole_program": {
+        "conditional_mispredicts": [
+          3334,
+          3388
+        ],
+        "d1_misses": [
+          1797,
+          1833
+        ],
+        "i1_misses": [
+          1257,
+          1258
+        ],
+        "indirect_mispredicts": [
+          203,
+          200
+        ],
+        "ir_mine": 193847,
+        "ir_ratio": 0.943579084687351,
+        "ir_ref": 205438,
+        "ll_misses": [
+          2711,
+          2738
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/tls_seg_access/aa/tls_seg_access",
+          "totals": {
+            "Ir": 65657,
+            "D1mr": 1,
+            "DLmr": 1
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/tls_seg_access/bb/tls_seg_access",
+          "totals": {
+            "Ir": 71070,
+            "D1mr": 2,
+            "DLmr": 0
+          }
+        },
+        "ir_ratio": 0.92383565498804
+      }
+    },
+    {
+      "case": "percpu_ptr_walk",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=1000",
+      "source_sha256": "8494442ce679590e5710d2f9594587190113d22a6ba5edb5414ba9e5eb85461c",
+      "stdout_sha256": "69f5bbb359c4be9067990bb66e94dc0d4162c70e4b82ddc64ec761b3e259631b",
+      "whole_program": {
+        "conditional_mispredicts": [
+          4233,
+          4287
+        ],
+        "d1_misses": [
+          1789,
+          1830
+        ],
+        "i1_misses": [
+          1268,
+          1263
+        ],
+        "indirect_mispredicts": [
+          203,
+          202
+        ],
+        "ir_mine": 267474,
+        "ir_ratio": 1.0027705400491125,
+        "ir_ref": 266735,
+        "ll_misses": [
+          2719,
+          2742
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/percpu_ptr_walk/aa/percpu_ptr_walk",
+          "totals": {
+            "Ir": 139161,
+            "D1mr": 1,
+            "DLmr": 1
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/percpu_ptr_walk/bb/percpu_ptr_walk",
+          "totals": {
+            "Ir": 132316,
+            "D1mr": 2,
+            "DLmr": 1
+          }
+        },
+        "ir_ratio": 1.051732216814293
+      }
+    },
+    {
+      "case": "byte_load_reassembly",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+      "source_sha256": "d98d60eefd244df93fd9f4a828806ce2e32be56aad4872a2672d172b14dda562",
+      "stdout_sha256": "e00fbb6925a5012f0ad96c8639540887d1c5b55565e9ee7a7b18525863f5056c",
+      "whole_program": {
+        "conditional_mispredicts": [
+          23257,
+          23311
+        ],
+        "d1_misses": [
+          1855,
+          1896
+        ],
+        "i1_misses": [
+          1278,
+          1285
+        ],
+        "indirect_mispredicts": [
+          204,
+          204
+        ],
+        "ir_mine": 82393173,
+        "ir_ratio": 3.938093630771984,
+        "ir_ref": 20922096,
+        "ll_misses": [
+          2792,
+          2827
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/byte_load_reassembly/aa/byte_load_reassembly",
+          "totals": {
+            "Ir": 82264751,
+            "D1mr": 1,
+            "DLmr": 0
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/byte_load_reassembly/bb/byte_load_reassembly",
+          "totals": {
+            "Ir": 20787309,
+            "D1mr": 5,
+            "DLmr": 4
+          }
+        },
+        "ir_ratio": 3.957450721495505
+      }
+    },
+    {
+      "case": "zlib_ng_adler32",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DDATA_SIZE=16384 -DPASSES=4",
+      "source_sha256": "bca7938ef542270a06d734bf814b3f1806ab1796e8f53d5c53d1b5ccd6b08486",
+      "stdout_sha256": "e2d85427db40575f8612c64ea07de196695cc5696c1cd0350adc07b9d0ba888c",
+      "whole_program": {
+        "conditional_mispredicts": [
+          3277,
+          3313
+        ],
+        "d1_misses": [
+          2086,
+          2118
+        ],
+        "i1_misses": [
+          1280,
+          1279
+        ],
+        "indirect_mispredicts": [
+          200,
+          201
+        ],
+        "ir_mine": 446302,
+        "ir_ratio": 0.9063239316777376,
+        "ir_ref": 492431,
+        "ll_misses": [
+          2981,
+          3006
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/zlib_ng_adler32/aa/zlib_ng_adler32",
+          "totals": {
+            "Ir": 318459,
+            "D1mr": 5,
+            "DLmr": 3
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/zlib_ng_adler32/bb/zlib_ng_adler32",
+          "totals": {
+            "Ir": 358223,
+            "D1mr": 3,
+            "DLmr": 1
+          }
+        },
+        "ir_ratio": 0.8889965189281537
+      }
+    },
+    {
+      "case": "zlib_ng_adler32_combine",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=10000",
+      "source_sha256": "5d9a2ade64019e993686dab352d67dbdc4a009e2e33dd8568beff5c9ac423940",
+      "stdout_sha256": "cb483dd6a82f24d49d3c375b787b0e36d537c17479f4769ac323315c7856162c",
+      "whole_program": {
+        "conditional_mispredicts": [
+          5406,
+          5458
+        ],
+        "d1_misses": [
+          1806,
+          1842
+        ],
+        "i1_misses": [
+          1279,
+          1289
+        ],
+        "indirect_mispredicts": [
+          200,
+          201
+        ],
+        "ir_mine": 21827004,
+        "ir_ratio": 1.023498301266039,
+        "ir_ref": 21325882,
+        "ll_misses": [
+          2745,
+          2782
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/zlib_ng_adler32_combine/aa/zlib_ng_adler32_combine",
+          "totals": {
+            "Ir": 21699140,
+            "D1mr": 2,
+            "DLmr": 2
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/zlib_ng_adler32_combine/bb/zlib_ng_adler32_combine",
+          "totals": {
+            "Ir": 21191653,
+            "D1mr": 3,
+            "DLmr": 2
+          }
+        },
+        "ir_ratio": 1.0239474947990135
+      }
+    },
+    {
+      "case": "expat_xml_scan",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DXML_SIZE=16384 -DPASSES=4",
+      "source_sha256": "a076b1823869765011658d56ec090b22102e2ba7a5bbdf4cd0b6bdd0d774cf35",
+      "stdout_sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+      "whole_program": {
+        "conditional_mispredicts": [
+          25401,
+          28444
+        ],
+        "d1_misses": [
+          2079,
+          2114
+        ],
+        "i1_misses": [
+          1265,
+          1267
+        ],
+        "indirect_mispredicts": [
+          199,
+          200
+        ],
+        "ir_mine": 1649166,
+        "ir_ratio": 1.3085275032888422,
+        "ir_ref": 1260322,
+        "ll_misses": [
+          2966,
+          2993
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/expat_xml_scan/aa/expat_xml_scan",
+          "totals": {
+            "Ir": 1521453,
+            "D1mr": 3,
+            "DLmr": 2
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/expat_xml_scan/bb/expat_xml_scan",
+          "totals": {
+            "Ir": 1126244,
+            "D1mr": 4,
+            "DLmr": 2
+          }
+        },
+        "ir_ratio": 1.3509088616676315
+      }
+    },
+    {
+      "case": "expat_siphash24",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=1000",
+      "source_sha256": "59c5dfbdf3f0d2e149a3681925c46b7b0aeb195f179c285f3b64a2daaf1fb663",
+      "stdout_sha256": "7cc845311001c6c19376592f0ded62f60647c9a47b814520e1df888c956b8f1d",
+      "whole_program": {
+        "conditional_mispredicts": [
+          116166,
+          116381
+        ],
+        "d1_misses": [
+          1803,
+          1839
+        ],
+        "i1_misses": [
+          1319,
+          1291
+        ],
+        "indirect_mispredicts": [
+          1396,
+          1268
+        ],
+        "ir_mine": 15191466,
+        "ir_ratio": 1.0064139947871593,
+        "ir_ref": 15094649,
+        "ll_misses": [
+          2775,
+          2773
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/expat_siphash24/aa/expat_siphash24",
+          "totals": {
+            "Ir": 15063456,
+            "D1mr": 10,
+            "DLmr": 10
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/expat_siphash24/bb/expat_siphash24",
+          "totals": {
+            "Ir": 14960274,
+            "D1mr": 11,
+            "DLmr": 10
+          }
+        },
+        "ir_ratio": 1.0068970661900978
+      }
+    },
+    {
+      "case": "sqlite_varint",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DVALUE_COUNT=2048 -DPASSES=4",
+      "source_sha256": "11c7e09b1507659fe44e678848c5e489268e4dd4aa385d3a542453caa400e1af",
+      "stdout_sha256": "01ca363da25837ba048b025644fceb4b2592e83284b425fbae5b39cc672e17f9",
+      "whole_program": {
+        "conditional_mispredicts": [
+          12234,
+          10454
+        ],
+        "d1_misses": [
+          2127,
+          2161
+        ],
+        "i1_misses": [
+          1278,
+          1280
+        ],
+        "indirect_mispredicts": [
+          2021,
+          2022
+        ],
+        "ir_mine": 805091,
+        "ir_ratio": 1.0500223675132412,
+        "ir_ref": 766737,
+        "ll_misses": [
+          3011,
+          3041
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/sqlite_varint/aa/sqlite_varint",
+          "totals": {
+            "Ir": 677154,
+            "D1mr": 4,
+            "DLmr": 3
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/sqlite_varint/bb/sqlite_varint",
+          "totals": {
+            "Ir": 632435,
+            "D1mr": 5,
+            "DLmr": 3
+          }
+        },
+        "ir_ratio": 1.070709242847091
+      }
+    },
+    {
+      "case": "linux_find_bit",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=32",
+      "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a",
+      "stdout_sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+      "whole_program": {
+        "conditional_mispredicts": [
+          11762,
+          11806
+        ],
+        "d1_misses": [
+          137133,
+          137659
+        ],
+        "i1_misses": [
+          1259,
+          1268
+        ],
+        "indirect_mispredicts": [
+          199,
+          205
+        ],
+        "ir_mine": 5940463,
+        "ir_ratio": 1.062109997770458,
+        "ir_ref": 5593077,
+        "ll_misses": [
+          6801,
+          6836
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/linux_find_bit/aa/linux_find_bit",
+          "totals": {
+            "Ir": 5812750,
+            "D1mr": 131133,
+            "DLmr": 2
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/linux_find_bit/bb/linux_find_bit",
+          "totals": {
+            "Ir": 5196042,
+            "D1mr": 131072,
+            "DLmr": 1
+          }
+        },
+        "ir_ratio": 1.1186880321598631
+      }
+    },
+    {
+      "case": "linux_find_bit_scaled",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=128",
+      "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a",
+      "stdout_sha256": "a9a00dfc64160f0b435e01ee3fd89ece60647cdf9c380b058fbe787ee3d50d12",
+      "whole_program": {
+        "conditional_mispredicts": [
+          36465,
+          36405
+        ],
+        "d1_misses": [
+          530520,
+          530949
+        ],
+        "i1_misses": [
+          1265,
+          1273
+        ],
+        "indirect_mispredicts": [
+          199,
+          205
+        ],
+        "ir_mine": 22924365,
+        "ir_ratio": 1.103143422674626,
+        "ir_ref": 20780947,
+        "ll_misses": [
+          6808,
+          6843
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/linux_find_bit_scaled/aa/linux_find_bit",
+          "totals": {
+            "Ir": 22796452,
+            "D1mr": 524517,
+            "DLmr": 2
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/linux_find_bit_scaled/bb/linux_find_bit",
+          "totals": {
+            "Ir": 20383712,
+            "D1mr": 524278,
+            "DLmr": 1
+          }
+        },
+        "ir_ratio": 1.1183660758158278
+      }
+    },
+    {
+      "case": "glibc_memcmp",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=16",
+      "source_sha256": "6fcec75ff20c60106d78db2013a646579ab4262750fe64eee99387f3c16b0870",
+      "stdout_sha256": "aeef0d661cb58b3f2236e068654e8d8a9a5dfd403a44284200dadbcecbac9c80",
+      "whole_program": {
+        "conditional_mispredicts": [
+          3283,
+          3323
+        ],
+        "d1_misses": [
+          25251,
+          25245
+        ],
+        "i1_misses": [
+          1263,
+          1271
+        ],
+        "indirect_mispredicts": [
+          199,
+          200
+        ],
+        "ir_mine": 705333,
+        "ir_ratio": 1.0150910919957918,
+        "ir_ref": 694847,
+        "ll_misses": [
+          4753,
+          4788
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/glibc_memcmp/aa/glibc_memcmp",
+          "totals": {
+            "Ir": 577547,
+            "D1mr": 21251,
+            "DLmr": 0
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/glibc_memcmp/bb/glibc_memcmp",
+          "totals": {
+            "Ir": 560696,
+            "D1mr": 21229,
+            "DLmr": 1
+          }
+        },
+        "ir_ratio": 1.0300537189493058
+      }
+    },
+    {
+      "case": "chacha20_block",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DBLOCK_COUNT=256 -DPASSES=2",
+      "source_sha256": "7f0b876dc4bbea778d85e2a30d55046207eb60abe8c5388857bb1207efdac85c",
+      "stdout_sha256": "b1b168e580489e412fa45f7b950f4a857d0c5ab20c2cb9330aa7a4416492fc3d",
+      "whole_program": {
+        "conditional_mispredicts": [
+          3748,
+          4329
+        ],
+        "d1_misses": [
+          1786,
+          1824
+        ],
+        "i1_misses": [
+          1278,
+          1287
+        ],
+        "indirect_mispredicts": [
+          202,
+          203
+        ],
+        "ir_mine": 401536,
+        "ir_ratio": 0.5207388511572594,
+        "ir_ref": 771089,
+        "ll_misses": [
+          2723,
+          2760
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/chacha20_block/aa/chacha20_block",
+          "totals": {
+            "Ir": 273526,
+            "D1mr": 2,
+            "DLmr": 2
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/chacha20_block/bb/chacha20_block",
+          "totals": {
+            "Ir": 636714,
+            "D1mr": 4,
+            "DLmr": 3
+          }
+        },
+        "ir_ratio": 0.4295900514202609
+      }
+    },
+    {
+      "case": "sha256_transform",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DBLOCK_COUNT=256 -DPASSES=2",
+      "source_sha256": "6f55a89cfd9d59eb9a8e115eef968295ec775fa63d0545dd33517c2fdf06bf5e",
+      "stdout_sha256": "0e523cbb977d032ed8fd23d81453205d6fa16640c6cc905d37a00d4c7ed67fca",
+      "whole_program": {
+        "conditional_mispredicts": [
+          4780,
+          4861
+        ],
+        "d1_misses": [
+          1798,
+          1830
+        ],
+        "i1_misses": [
+          1289,
+          1289
+        ],
+        "indirect_mispredicts": [
+          202,
+          203
+        ],
+        "ir_mine": 1804647,
+        "ir_ratio": 0.9624866132190995,
+        "ir_ref": 1874984,
+        "ll_misses": [
+          2742,
+          2766
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/sha256_transform/aa/sha256_transform",
+          "totals": {
+            "Ir": 1676591,
+            "D1mr": 6,
+            "DLmr": 6
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/sha256_transform/bb/sha256_transform",
+          "totals": {
+            "Ir": 1740563,
+            "D1mr": 6,
+            "DLmr": 5
+          }
+        },
+        "ir_ratio": 0.9632463748798521
+      }
+    },
+    {
+      "case": "linux_rbtree",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DNODE_COUNT=1024 -DLOOKUP_ROUNDS=2",
+      "source_sha256": "7c9c5ada20d8e32116ccbc1ca68690e92470ef7348b51842e49ffa2fa0480253",
+      "stdout_sha256": "0767252048d9e2e2a48ef68b54ae1992a5498187fd537660964016d8e266dc70",
+      "whole_program": {
+        "conditional_mispredicts": [
+          17889,
+          22342
+        ],
+        "d1_misses": [
+          2441,
+          2461
+        ],
+        "i1_misses": [
+          1283,
+          1289
+        ],
+        "indirect_mispredicts": [
+          203,
+          204
+        ],
+        "ir_mine": 497515,
+        "ir_ratio": 1.2358656014944207,
+        "ir_ref": 402564,
+        "ll_misses": [
+          3242,
+          3273
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/linux_rbtree/aa/linux_rbtree",
+          "totals": {
+            "Ir": 369471,
+            "D1mr": 15,
+            "DLmr": 0
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/linux_rbtree/bb/linux_rbtree",
+          "totals": {
+            "Ir": 268155,
+            "D1mr": 6,
+            "DLmr": 0
+          }
+        },
+        "ir_ratio": 1.3778262572019915
+      }
+    },
+    {
+      "case": "zstd_count",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DBUFFER_SIZE=16384 -DQUERY_COUNT=1024 -DPASSES=2",
+      "source_sha256": "cf01953477eadbebe46b07ede170a62ff41b62cf947dd12222a04ad93c985be6",
+      "stdout_sha256": "cdea7180a1ed204b5bb26b61605ea76b90263cd53dc55c5e6cbf9f518fb82d72",
+      "whole_program": {
+        "conditional_mispredicts": [
+          5308,
+          5331
+        ],
+        "d1_misses": [
+          2091,
+          2121
+        ],
+        "i1_misses": [
+          1278,
+          1284
+        ],
+        "indirect_mispredicts": [
+          203,
+          204
+        ],
+        "ir_mine": 439416,
+        "ir_ratio": 1.113640971574551,
+        "ir_ref": 394576,
+        "ll_misses": [
+          2983,
+          3011
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/zstd_count/aa/zstd_count",
+          "totals": {
+            "Ir": 311372,
+            "D1mr": 2,
+            "DLmr": 0
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/zstd_count/bb/zstd_count",
+          "totals": {
+            "Ir": 260167,
+            "D1mr": 2,
+            "DLmr": 0
+          }
+        },
+        "ir_ratio": 1.1968158913313371
+      }
+    },
+    {
+      "case": "lz4_compress",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSRC_SIZE=16384 -DPASSES=2",
+      "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4",
+      "stdout_sha256": "92d8155cc9d5443cd3e29d516a82eafd43caf7707529fde82d93af0cd8ef0951",
+      "whole_program": {
+        "conditional_mispredicts": [
+          10487,
+          10512
+        ],
+        "d1_misses": [
+          5802,
+          5710
+        ],
+        "i1_misses": [
+          1294,
+          1286
+        ],
+        "indirect_mispredicts": [
+          212,
+          209
+        ],
+        "ir_mine": 616753,
+        "ir_ratio": 0.8684496963433059,
+        "ir_ref": 710177,
+        "ll_misses": [
+          4287,
+          4298
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/lz4_compress/aa/lz4_compress",
+          "totals": {
+            "Ir": 323484,
+            "D1mr": 710,
+            "DLmr": 0
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/lz4_compress/bb/lz4_compress",
+          "totals": {
+            "Ir": 443895,
+            "D1mr": 922,
+            "DLmr": 0
+          }
+        },
+        "ir_ratio": 0.7287399047071943
+      }
+    },
+    {
+      "case": "lz4_match_extend",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSRC_SIZE=16384 -DPASSES=2 -DMATCH_RICH=1",
+      "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4",
+      "stdout_sha256": "ecf64ab72ccf80f0fd44db7d2a229b71503f57f186f932703671f665879fab08",
+      "whole_program": {
+        "conditional_mispredicts": [
+          8145,
+          8330
+        ],
+        "d1_misses": [
+          14060,
+          13879
+        ],
+        "i1_misses": [
+          1309,
+          1291
+        ],
+        "indirect_mispredicts": [
+          212,
+          209
+        ],
+        "ir_mine": 1136276,
+        "ir_ratio": 1.1029053915673468,
+        "ir_ref": 1030257,
+        "ll_misses": [
+          4213,
+          4214
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/lz4_match_extend/aa/lz4_compress",
+          "totals": {
+            "Ir": 872046,
+            "D1mr": 9506,
+            "DLmr": 0
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/lz4_match_extend/bb/lz4_compress",
+          "totals": {
+            "Ir": 763970,
+            "D1mr": 9386,
+            "DLmr": 0
+          }
+        },
+        "ir_ratio": 1.1414662879432438
+      }
+    },
+    {
+      "case": "glibc_strstr",
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DHAYSTACK_LEN=16384 -DQUERY_COUNT=32 -DPASSES=2",
+      "source_sha256": "17dcd48414c9eb254cc910905113b7ed8a3cedac3c0d41216305484a5a7cd344",
+      "stdout_sha256": "eecc127e9d2244b55fff9a8cd6a5d61da7d3f2ae6c66ae695060338b3858002d",
+      "whole_program": {
+        "conditional_mispredicts": [
+          9341,
+          9314
+        ],
+        "d1_misses": [
+          2091,
+          2122
+        ],
+        "i1_misses": [
+          1283,
+          1290
+        ],
+        "indirect_mispredicts": [
+          203,
+          204
+        ],
+        "ir_mine": 3626557,
+        "ir_ratio": 1.897008668615344,
+        "ir_ref": 1911724,
+        "ll_misses": [
+          2986,
+          3019
+        ]
+      },
+      "own_object": {
+        "aa": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/glibc_strstr/aa/glibc_strstr",
+          "totals": {
+            "Ir": 3498537,
+            "D1mr": 1,
+            "DLmr": 0
+          }
+        },
+        "bb": {
+          "object": "/home/user/lccc/results/pr824/callgrind-d9-vs-gcc12/glibc_strstr/bb/glibc_strstr",
+          "totals": {
+            "Ir": 1777339,
+            "D1mr": 2,
+            "DLmr": 0
+          }
+        },
+        "ir_ratio": 1.9684128914067602
+      }
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "before": {
+    "status": "SKIP",
+    "detail": "assembler without MOVRS: pg.s: Assembler messages:\npg.s:29: Error: no such instruction: `movrs dat@GOTPCREL(%rip),%eax'\n",
+    "controller_sha256": "1f9a7756f9dd071f5f3381208aad19f959e145a83bfc337dcb102e49bd941632"
+  },
+  "after": {
+    "status": "PASS",
+    "detail": "",
+    "controller_sha256": "f213fff5703391ba74d2f761a7de2c3e2ce9df759320396a4a28c1421771c8b8"
+  },
+  "setup": {
+    "private_as": "real GNU as 2.40 (Debian package 2.40-2), selected by GCC -B only for .s inputs",
+    "public_as": "pinned GNU as 2.47, on PATH",
+    "cc": "GCC16.2",
+    "lccc_sha256": "4b1ff5f73cf007e308a184ead4018061fc85de886b436aeb90985bf7bbea8e54",
+    "note": "real four-mode fixture execution, not Ubuntu runner replay; system GNU as 2.44 positive control passed both revisions"
+  }
+}

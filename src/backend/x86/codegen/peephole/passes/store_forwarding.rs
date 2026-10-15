@@ -9,7 +9,7 @@
 //! jump source may have different register values.
 
 use super::super::types::*;
-use super::fp_liveness::FpLiveness;
+use super::fp_liveness::{FpLiveness, has_implicit_vector_effects_line};
 use super::helpers::*;
 use super::liveness::FileLiveness;
 
@@ -950,7 +950,7 @@ fn try_pair_fuse_xmm_relay(
     if st_size != size {
         return false;
     }
-    if !fp.xmm_dead_after(store, infos, j, (load_xmm - 24) as u32, &[i, j]) {
+    if !fp.deleted_write_regions_dead_after(store, infos, j, (load_xmm - 24) as u32, &[i, j]) {
         return false;
     }
     let load_name = format!("%xmm{}", load_xmm - 24);
@@ -1011,7 +1011,7 @@ fn try_pair_fuse_gp_to_xmm_relay(
     if st_size != size {
         return false;
     }
-    if !fp.xmm_dead_after(store, infos, j, (load_xmm - 24) as u32, &[i, j]) {
+    if !fp.deleted_write_regions_dead_after(store, infos, j, (load_xmm - 24) as u32, &[i, j]) {
         return false;
     }
     let load_name = format!("%xmm{}", load_xmm - 24);
@@ -1178,6 +1178,32 @@ fn gsf_handle_other(
     reg_offsets: &mut RegHomes,
     rbp_is_frame: bool,
 ) {
+    // Slot/register equalities require MAY-write effects, not just the last
+    // operand: string-index outputs, xchg's first operand and unknown GP
+    // effects can invalidate backing homes without a classified destination.
+    let text = infos[i].trimmed(store.get(i));
+    let mut writes = super::load_op_fuse::may_write_families(text, &infos[i]);
+    while writes != 0 {
+        let reg = writes.trailing_zeros() as RegId;
+        if reg == 4 {
+            invalidate_all_mappings(slot_entries, reg_offsets);
+            break;
+        }
+        invalidate_reg_flat(slot_entries, reg_offsets, reg);
+        writes &= writes - 1;
+    }
+    // Scalar homes represent only low XMM bits, preserved by VZEROUPPER.
+    if has_implicit_vector_effects_line(text)
+        && text.split_whitespace().next() != Some("vzeroupper")
+    {
+        // Mask results and unknown vector writes need not name their outputs.
+        // A hidden reader alone would not invalidate equality, but refusing
+        // across unmodelled effects is conservative and shares the copy proof.
+        for reg in VEC_FAMILY_BASE..=VEC_FAMILY_BASE + 15 {
+            invalidate_reg_flat(slot_entries, reg_offsets, reg);
+        }
+    }
+
     // SOUNDNESS: any write to %rsp reshuffles every %rsp-relative slot
     // offset, so every offset-keyed mapping is stale afterwards. Mappings
     // here are keyed by raw offset with no (base, offset) distinction and
@@ -1224,21 +1250,7 @@ fn gsf_handle_other(
         invalidate_all_mappings(slot_entries, reg_offsets);
     }
 
-    if is_valid_gp_reg(dest_reg) {
-        invalidate_reg_flat(slot_entries, reg_offsets, dest_reg);
-        if dest_reg == 0 {
-            let trimmed = infos[i].trimmed(store.get(i));
-            if trimmed.starts_with("div")
-                || trimmed.starts_with("idiv")
-                || trimmed.starts_with("mul")
-                || trimmed == "cqto"
-                || trimmed == "cqo"
-                || trimmed == "cdq"
-            {
-                invalidate_reg_flat(slot_entries, reg_offsets, 2);
-            }
-        }
-    } else if is_xmm_family(dest_reg) {
+    if is_xmm_family(dest_reg) {
         // The line's AT&T destination is an XMM register (vmulsd, cvtsi2sd,
         // movq %rax, %xmmN, …): that register no longer holds the value any
         // XMM-backed mapping recorded, so every mapping it backs dies. The
@@ -2038,7 +2050,7 @@ mod tests {
     }
 
     #[test]
-    fn fp_slot_mapping_killed_by_rmw_string_writers() {
+    fn pr814_fp_slot_mapping_killed_by_rmw_string_writers() {
         // Implicit memory writers (stos*, maskmov*, xchg with the memory
         // operand FIRST) have no dst-is-memory shape; `line_writes_memory`
         // classifies them as writers and they stay barriers.
@@ -2200,6 +2212,60 @@ mod tests {
         assert!(
             (0..store.len()).any(|i| store.get(i).contains("movsd 72(%rsp), %xmm0")),
             "the merge-point reload must survive verbatim"
+        );
+    }
+
+    #[test]
+    fn implicit_vector_outputs_invalidate_backing_spill_homes() {
+        for effect in [
+            "pcmpistrm $0, %xmm5, %xmm7",
+            "vpcmpestrm $0, %xmm5, %xmm7",
+            "vfutureop %xmm5, %xmm7",
+        ] {
+            let asm = format!(
+                "f:\n.cfi_startproc\n    movsd %xmm0, 72(%rsp)\n    {effect}\n    movsd 72(%rsp), %xmm6\n    ret\n.cfi_endproc\n"
+            );
+            let (mut store, mut infos) = build_pinned(&asm);
+            assert!(
+                !global_store_forwarding(&mut store, &mut infos),
+                "a hidden vector clobber retired the backing home: {effect}"
+            );
+        }
+    }
+
+    #[test]
+    fn implicit_gp_outputs_invalidate_backing_spill_homes() {
+        for effect in [
+            "pcmpistri $0, %xmm5, %xmm7",
+            "vpcmpestri $0, %xmm5, %xmm7",
+            "xchgq %rcx, %rdx",
+        ] {
+            let asm = format!(
+                "f:\n.cfi_startproc\n    movq %rcx, 72(%rsp)\n    {effect}\n    movq 72(%rsp), %r10\n    ret\n.cfi_endproc\n"
+            );
+            let (mut store, mut infos) = build_pinned(&asm);
+            assert!(
+                !global_store_forwarding(&mut store, &mut infos),
+                "a hidden/nontrailing GP clobber retired the backing home: {effect}"
+            );
+        }
+    }
+
+    #[test]
+    fn spill_homes_recover_after_local_opaque_vector_effects() {
+        let asm = concat!(
+            "f:\n.cfi_startproc\n",
+            "    vpcmpistrm $0, %xmm5, %xmm7\n",
+            "    movsd %xmm0, 72(%rsp)\n",
+            "    vptest %xmm5, %xmm7\n",
+            "    movsd 72(%rsp), %xmm6\n",
+            "    ret\n.cfi_endproc\n",
+        );
+        let (mut store, mut infos) = build_pinned(asm);
+        assert!(global_store_forwarding(&mut store, &mut infos));
+        assert!(
+            (0..store.len())
+                .any(|i| { !infos[i].is_nop() && store.get(i).trim() == "movsd %xmm0, %xmm6" })
         );
     }
 

@@ -1276,10 +1276,16 @@ pub(super) fn collect_non_nop_indices<const N: usize>(
     count
 }
 
-/// Check if two byte ranges `[a, a+a_size)` and `[b, b+b_size)` overlap.
+/// Check if two nonempty byte ranges `[a, a+a_size)` and `[b, b+b_size)` overlap.
+/// Displacements fit i32, but a valid access's exclusive endpoint need not.
+/// Widen before addition: wrapping can hide a live read, while checked i32
+/// addition would reject representable addresses in the 64-bit address space.
 #[inline]
 pub(super) fn ranges_overlap(a: i32, a_size: i32, b: i32, b_size: i32) -> bool {
-    a < b + b_size && b < a + a_size
+    a_size > 0
+        && b_size > 0
+        && i64::from(a) < i64::from(b) + i64::from(b_size)
+        && i64::from(b) < i64::from(a) + i64::from(a_size)
 }
 
 // ── Helper functions ─────────────────────────────────────────────────────────
@@ -3162,6 +3168,52 @@ mod classify_directive_tests {
                 crate::backend::peephole_common::inert_directive(text.trim()),
                 "{text}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod range_overlap_boundary_tests {
+    use super::ranges_overlap;
+
+    #[test]
+    fn range_overlap_boundary_crosses_signed_displacement_end() {
+        assert!(ranges_overlap(i32::MAX - 7, 16, i32::MAX - 3, 4));
+        assert!(ranges_overlap(i32::MAX - 3, 4, i32::MAX - 7, 16));
+        assert!(!ranges_overlap(i32::MIN, 16, i32::MAX - 7, 16));
+    }
+
+    #[test]
+    fn range_overlap_boundary_matrix_matches_wide_interval_oracle() {
+        let offsets = [
+            i32::MIN,
+            i32::MIN + 1,
+            -64,
+            -1,
+            0,
+            1,
+            i32::MAX - 64,
+            i32::MAX - 16,
+            i32::MAX - 1,
+            i32::MAX,
+        ];
+        let sizes = [0, 1, 2, 4, 8, 16, 32, 64, i32::MAX];
+        for a in offsets {
+            for b in offsets {
+                for na in sizes {
+                    for nb in sizes {
+                        let start = i128::from(a).max(i128::from(b));
+                        let end =
+                            (i128::from(a) + i128::from(na)).min(i128::from(b) + i128::from(nb));
+                        let expected = na > 0 && nb > 0 && start < end;
+                        assert_eq!(
+                            ranges_overlap(a, na, b, nb),
+                            expected,
+                            "a={a}, size={na}, b={b}, size={nb}"
+                        );
+                    }
+                }
+            }
         }
     }
 }

@@ -25,6 +25,20 @@ static u64 fold_u64_of_ld(void) { return (u64)(f128)123.75L; }
 static double ident_f64(double a) { return (double)(double)a; }
 static f128 ident_f128(f128 a) { return (f128)(f128)a; }
 
+#if defined(__i386__) || defined(__x86_64__)
+static __inline__ void set_pc(unsigned short pc) {
+    unsigned short cw;
+    __asm__ volatile("fnstcw %0" : "=m"(cw));
+    cw = (unsigned short)((cw & ~0x0300u) | pc);
+    __asm__ volatile("fldcw %0" : : "m"(cw));
+}
+static __inline__ unsigned short get_pc(void) {
+    unsigned short cw;
+    __asm__ volatile("fnstcw %0" : "=m"(cw));
+    return cw;
+}
+#endif
+
 int main(void) {
     /* constant folding (regression: folded to 0 before the fix) */
     CHECK(fold_u32_of_int_of_ld() == 3);
@@ -101,17 +115,6 @@ int main(void) {
      * UINT64_MAX. The native-payload path performs no arithmetic.
      */
     {
-        static __inline__ void set_pc(unsigned short pc) {
-            unsigned short cw;
-            __asm__ volatile("fnstcw %0" : "=m"(cw));
-            cw = (unsigned short)((cw & ~0x0300u) | pc);
-            __asm__ volatile("fldcw %0" : : "m"(cw));
-        }
-        static __inline__ unsigned short get_pc(void) {
-            unsigned short cw;
-            __asm__ volatile("fnstcw %0" : "=m"(cw));
-            return cw;
-        }
         unsigned short save_pc = get_pc();
         static const unsigned short pcs[3] = { 0x0000, 0x0200, 0x0300 };
 

@@ -784,6 +784,10 @@ pub enum IntrinsicOp {
     /// 32-byte alloca used only if the scalar result cannot remain XMM-homed.
     /// x86-64 AVX2-only; emitted solely by the strict computed-reduction pass.
     StrictRecipMulAddF64x4,
+    /// Same ordered FP operation with an AVX2 I32x8 denominator input.
+    /// Only its low four lanes are observed. Args: [acc, packed, base,
+    /// byte_offset, scratch]. No horizontal reassociation or extra FP lanes.
+    StrictRecipMulAddPackedF64x4,
     /// Horizontal reduction: %scalar = horizontal_add(%vec) - AVX2 8×I32 → I32
     /// args[0] = source vector value; dest = scalar I32 result
     VecHorizontalAddI32x8,
@@ -2030,11 +2034,14 @@ impl IntrinsicOp {
     /// `dest_ptr` redundantly for the [`Instruction::may_write_memory`]
     /// contract; the BB-SLP vectorizer constructs the pure args form).
     /// This is the args-side supplement that contract's `dest_ptr` key
-    /// needs to classify every memory-writing vector store.
+    /// needs to classify every memory-writing vector store. Strict reciprocal
+    /// reductions also write their private scratch argument when spilled.
     pub fn writes_memory_via_args(&self) -> bool {
         matches!(
             self,
-            IntrinsicOp::VecStoreI32x4
+            IntrinsicOp::StrictRecipMulAddF64x4
+                | IntrinsicOp::StrictRecipMulAddPackedF64x4
+                | IntrinsicOp::VecStoreI32x4
                 | IntrinsicOp::VecStoreI32x8
                 | IntrinsicOp::VecStoreF32x8
                 | IntrinsicOp::VecStoreF32x4
@@ -2059,7 +2066,9 @@ impl IntrinsicOp {
     pub fn may_read_memory(&self) -> bool {
         matches!(
             self,
-            IntrinsicOp::LoadF64x4
+            IntrinsicOp::StrictRecipMulAddF64x4
+                | IntrinsicOp::StrictRecipMulAddPackedF64x4
+                | IntrinsicOp::LoadF64x4
                 | IntrinsicOp::LoadF64x2
                 | IntrinsicOp::LoadI32x8
                 | IntrinsicOp::LoadI32x4
@@ -2672,6 +2681,31 @@ mod vector_width_tests {
 #[cfg(test)]
 mod memory_classification_tests {
     use super::IntrinsicOp as O;
+
+    #[test]
+    fn strict_reciprocal_effects_and_scalar_result() {
+        use crate::common::types::IrType;
+        use crate::ir::reexports::{Instruction, Value};
+        for op in [O::StrictRecipMulAddF64x4, O::StrictRecipMulAddPackedF64x4] {
+            let inst = Instruction::Intrinsic {
+                dest: Some(Value(0)),
+                op,
+                dest_ptr: None,
+                args: vec![],
+            };
+            assert!(op.may_read_memory(), "{op:?} loads four doubles");
+            assert!(
+                op.writes_memory_via_args(),
+                "{op:?} may spill to its scratch arg"
+            );
+            assert!(inst.may_write_memory());
+            assert!(!op.reads_pointer_arg(), "scratch is not read-only");
+            assert!(!op.is_pure());
+            assert!(!op.produces_vector_value());
+            assert_eq!(op.vector_home_width(), None);
+            assert_eq!(inst.result_type(), Some(IrType::F64));
+        }
+    }
 
     /// The memory-classification predicates the BB-SLP vectorizer's legality
     /// rules key on. A store misclassified as non-writing is a miscompile (a

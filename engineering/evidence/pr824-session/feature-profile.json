@@ -1,0 +1,362 @@
+{
+  "target": "Haswell (ICC classic CORE-AVX2 dialect)",
+  "compile_only": true,
+  "metric": "feature/option admission, NOT runtime or cross-vendor semantic equivalence",
+  "source_sha256": "ba51a4f280613d7600e29523e538f0acd0a9dc46a9f0199fb2dfc7dadb8b406f",
+  "source": "#include <immintrin.h>\n__m256i avx2(__m256i a, __m256i b) { return _mm256_add_epi32(a,b); }\n__m128 fma(__m128 a, __m128 b, __m128 c) { return _mm_fmadd_ps(a,b,c); }\n__m256 f16c(__m128i a) { return _mm256_cvtph_ps(a); }\nunsigned long long bmi1(unsigned long long a,unsigned long long b) { return _andn_u64(a,b); }\nunsigned long long bmi2(unsigned long long a,unsigned long long b) { return _pdep_u64(a,b); }\nunsigned long long lzcnt(unsigned long long a) { return _lzcnt_u64(a); }\nunsigned long long popcnt(unsigned long long a) { return _mm_popcnt_u64(a); }\n__m128i sse41(__m128i a,__m128i b) { return _mm_min_epi32(a,b); }\nunsigned sse42(unsigned a,unsigned b) { return _mm_crc32_u32(a,b); }\n",
+  "requested_flags": "-O2 -march=haswell -fwrapv",
+  "compilers": {
+    "gcc16.2": {
+      "id": "cg162",
+      "requested_flags": "-O2 -march=haswell -fwrapv",
+      "metadata": {
+        "id": "cg162",
+        "name": "x86-64 gcc 16.2",
+        "semver": "16.2",
+        "compilerType": ""
+      },
+      "effective_flags": "-O2 -march=haswell -fwrapv",
+      "features": {
+        "AVX2": true,
+        "FMA": true,
+        "F16C": true,
+        "BMI1": true,
+        "BMI2": true,
+        "LZCNT": true,
+        "POPCNT": true,
+        "SSE4.1": true,
+        "SSE4.2": true
+      },
+      "assembly_sha256": "7efee4a5944a2c21a24fc44df7608180b51958f0d20e2fef2481f3fda75f865f",
+      "assembly": [
+        "avx2:",
+        "  vpaddd %ymm1, %ymm0, %ymm0",
+        "  ret",
+        "fma:",
+        "  vfmadd132ps %xmm1, %xmm2, %xmm0",
+        "  ret",
+        "f16c:",
+        "  vcvtph2ps %xmm0, %ymm0",
+        "  ret",
+        "bmi1:",
+        "  andn %rsi, %rdi, %rax",
+        "  ret",
+        "bmi2:",
+        "  pdep %rsi, %rdi, %rax",
+        "  ret",
+        "lzcnt:",
+        "  xorl %eax, %eax",
+        "  lzcntq %rdi, %rax",
+        "  ret",
+        "popcnt:",
+        "  xorl %eax, %eax",
+        "  popcntq %rdi, %rax",
+        "  ret",
+        "sse41:",
+        "  vpminsd %xmm1, %xmm0, %xmm0",
+        "  ret",
+        "sse42:",
+        "  movl %edi, %eax",
+        "  crc32l %esi, %eax",
+        "  ret"
+      ],
+      "stderr": [
+        {
+          "text": "\u001b[01m\u001b[K<source>:3:8:\u001b[m\u001b[K \u001b[01;35m\u001b[Kwarning: \u001b[m\u001b[Kconflicting types for built-in function '\u001b[01m\u001b[Kfma\u001b[m\u001b[K'; expected '\u001b[01m\u001b[Kdouble(double,  double,  double)\u001b[m\u001b[K' [\u001b[01;35m\u001b[K-Wbuiltin-declaration-mismatch\u001b[m\u001b[K]",
+          "tag": {
+            "line": 3,
+            "column": 8,
+            "text": "warning: conflicting types for built-in function 'fma'; expected 'double(double,  double,  double)' [-Wbuiltin-declaration-mismatch]",
+            "severity": 2,
+            "file": "example.c"
+          }
+        },
+        {
+          "text": "    3 | __m128 \u001b[01;35m\u001b[Kfma\u001b[m\u001b[K(__m128 a, __m128 b, __m128 c) { return _mm_fmadd_ps(a,b,c); }"
+        },
+        {
+          "text": "      |        \u001b[01;35m\u001b[K^~~\u001b[m\u001b[K"
+        },
+        {
+          "text": "\u001b[01m\u001b[K<source>:2:1:\u001b[m\u001b[K \u001b[01;36m\u001b[Knote: \u001b[m\u001b[K'\u001b[01m\u001b[Kfma\u001b[m\u001b[K' is declared in header '\u001b[01m\u001b[K<math.h>\u001b[m\u001b[K'",
+          "tag": {
+            "line": 2,
+            "column": 1,
+            "text": "note: 'fma' is declared in header '<math.h>'",
+            "severity": 1,
+            "file": "example.c"
+          }
+        },
+        {
+          "text": "    1 | #include <immintrin.h>"
+        },
+        {
+          "text": "  +++ |+\u001b[32m\u001b[K#include <math.h>\u001b[m\u001b[K"
+        },
+        {
+          "text": "    2 | __m256i avx2(__m256i a, __m256i b) { return _mm256_add_epi32(a,b); }"
+        }
+      ],
+      "ok": true
+    },
+    "clang23.1": {
+      "id": "cclang2310",
+      "requested_flags": "-O2 -march=haswell -fwrapv",
+      "metadata": {
+        "id": "cclang2310",
+        "name": "x86-64 clang 23.1.0",
+        "semver": "23.1.0",
+        "compilerType": "clang"
+      },
+      "effective_flags": "-O2 -march=haswell -fwrapv",
+      "features": {
+        "AVX2": true,
+        "FMA": true,
+        "F16C": true,
+        "BMI1": true,
+        "BMI2": true,
+        "LZCNT": true,
+        "POPCNT": true,
+        "SSE4.1": true,
+        "SSE4.2": true
+      },
+      "assembly_sha256": "51e676be7bb820b1dbde165f34a401582e68029ae9149512c56019cdbbdd6678",
+      "assembly": [
+        "avx2:",
+        "  vpaddd %ymm0, %ymm1, %ymm0",
+        "  retq",
+        "",
+        "fma:",
+        "  vfmadd213ps %xmm2, %xmm1, %xmm0",
+        "  retq",
+        "",
+        "f16c:",
+        "  vcvtph2ps %xmm0, %ymm0",
+        "  retq",
+        "",
+        "bmi1:",
+        "  andnq %rsi, %rdi, %rax",
+        "  retq",
+        "",
+        "bmi2:",
+        "  pdepq %rsi, %rdi, %rax",
+        "  retq",
+        "",
+        "lzcnt:",
+        "  lzcntq %rdi, %rax",
+        "  retq",
+        "",
+        "popcnt:",
+        "  popcntq %rdi, %rax",
+        "  retq",
+        "",
+        "sse41:",
+        "  vpminsd %xmm1, %xmm0, %xmm0",
+        "  retq",
+        "",
+        "sse42:",
+        "  movl %edi, %eax",
+        "  crc32l %esi, %eax",
+        "  retq",
+        ""
+      ],
+      "stderr": [
+        {
+          "text": "\u001b[1m<source>:3:8: \u001b[0m\u001b[0;1;35mwarning: \u001b[0m\u001b[1mincompatible redeclaration of library function 'fma' [-Wincompatible-library-redeclaration]\u001b[0m",
+          "tag": {
+            "line": 3,
+            "column": 8,
+            "text": "warning: incompatible redeclaration of library function 'fma' [-Wincompatible-library-redeclaration]",
+            "severity": 2,
+            "file": "example.c"
+          }
+        },
+        {
+          "text": "    3 | __m128 fma(__m128 a, __m128 b, __m128 c) { \u001b[0;34mreturn\u001b[0m _mm_fmadd_ps(a,b,c); }\u001b[0m"
+        },
+        {
+          "text": "      | \u001b[0;1;32m       ^"
+        },
+        {
+          "text": "\u001b[0m\u001b[1m<source>:3:8: \u001b[0m\u001b[0;1;36mnote: \u001b[0m'fma' is a builtin with type 'double (double, double, double)'\u001b[0m",
+          "tag": {
+            "line": 3,
+            "column": 8,
+            "text": "note: 'fma' is a builtin with type 'double (double, double, double)'",
+            "severity": 1,
+            "file": "example.c"
+          }
+        },
+        {
+          "text": "1 warning generated."
+        }
+      ],
+      "ok": true
+    },
+    "icx": {
+      "id": "cicxlatest",
+      "requested_flags": "-O2 -march=haswell -fwrapv",
+      "metadata": {
+        "id": "cicxlatest",
+        "name": "x86-64 icx (latest)",
+        "semver": "(latest)",
+        "compilerType": "clang-intel"
+      },
+      "effective_flags": "-O2 -march=haswell -fwrapv",
+      "features": {
+        "AVX2": true,
+        "FMA": true,
+        "F16C": true,
+        "BMI1": true,
+        "BMI2": true,
+        "LZCNT": true,
+        "POPCNT": true,
+        "SSE4.1": true,
+        "SSE4.2": true
+      },
+      "assembly_sha256": "51e676be7bb820b1dbde165f34a401582e68029ae9149512c56019cdbbdd6678",
+      "assembly": [
+        "avx2:",
+        "  vpaddd %ymm0, %ymm1, %ymm0",
+        "  retq",
+        "",
+        "fma:",
+        "  vfmadd213ps %xmm2, %xmm1, %xmm0",
+        "  retq",
+        "",
+        "f16c:",
+        "  vcvtph2ps %xmm0, %ymm0",
+        "  retq",
+        "",
+        "bmi1:",
+        "  andnq %rsi, %rdi, %rax",
+        "  retq",
+        "",
+        "bmi2:",
+        "  pdepq %rsi, %rdi, %rax",
+        "  retq",
+        "",
+        "lzcnt:",
+        "  lzcntq %rdi, %rax",
+        "  retq",
+        "",
+        "popcnt:",
+        "  popcntq %rdi, %rax",
+        "  retq",
+        "",
+        "sse41:",
+        "  vpminsd %xmm1, %xmm0, %xmm0",
+        "  retq",
+        "",
+        "sse42:",
+        "  movl %edi, %eax",
+        "  crc32l %esi, %eax",
+        "  retq",
+        ""
+      ],
+      "stderr": [
+        {
+          "text": "\u001b[1m<source>:3:8: \u001b[0m\u001b[0;1;35mwarning: \u001b[0m\u001b[1mincompatible redeclaration of library function 'fma' [-Wincompatible-library-redeclaration]\u001b[0m",
+          "tag": {
+            "line": 3,
+            "column": 8,
+            "text": "warning: incompatible redeclaration of library function 'fma' [-Wincompatible-library-redeclaration]",
+            "severity": 2,
+            "file": "example.c"
+          }
+        },
+        {
+          "text": "    3 | __m128 fma(__m128 a, __m128 b, __m128 c) { return _mm_fmadd_ps(a,b,c); }\u001b[0m"
+        },
+        {
+          "text": "      | \u001b[0;1;32m       ^"
+        },
+        {
+          "text": "\u001b[0m\u001b[1m<source>:3:8: \u001b[0m\u001b[0;1;30mnote: \u001b[0m'fma' is a builtin with type 'double (double, double, double)'\u001b[0m",
+          "tag": {
+            "line": 3,
+            "column": 8,
+            "text": "note: 'fma' is a builtin with type 'double (double, double, double)'",
+            "severity": 1,
+            "file": "example.c"
+          }
+        },
+        {
+          "text": "1 warning generated."
+        }
+      ],
+      "ok": true
+    },
+    "icc": {
+      "id": "cicc2021100",
+      "requested_flags": "-O2 -march=haswell -fwrapv",
+      "metadata": {
+        "id": "cicc2021100",
+        "name": "x86-64 icc 2021.10.0",
+        "semver": "2021.10.0",
+        "compilerType": ""
+      },
+      "effective_flags": "-O2 -xCORE-AVX2 -fwrapv",
+      "features": {
+        "AVX2": true,
+        "FMA": true,
+        "F16C": true,
+        "BMI1": true,
+        "BMI2": true,
+        "LZCNT": true,
+        "POPCNT": true,
+        "SSE4.1": true,
+        "SSE4.2": true
+      },
+      "assembly_sha256": "fb9d6d618b3ac23a18dfdd60eaffc1f253a17060def54149a37340f754a3858e",
+      "assembly": [
+        "avx2:",
+        "..B1.1: # Preds ..B1.0",
+        "  vpaddd %ymm1, %ymm0, %ymm0 #2.45",
+        "  ret #2.45",
+        "fma:",
+        "..B2.1: # Preds ..B2.0",
+        "  vfmadd213ps %xmm2, %xmm1, %xmm0 #3.51",
+        "  ret #3.51",
+        "f16c:",
+        "..B3.1: # Preds ..B3.0",
+        "  vcvtph2ps %xmm0, %ymm0 #4.33",
+        "  ret #4.33",
+        "bmi1:",
+        "..B4.1: # Preds ..B4.0",
+        "  andn %rsi, %rdi, %rax #5.77",
+        "  ret #5.77",
+        "bmi2:",
+        "..B5.1: # Preds ..B5.0",
+        "  pdep %rsi, %rdi, %rax #6.77",
+        "  ret #6.77",
+        "lzcnt:",
+        "..B6.1: # Preds ..B6.0",
+        "  xorq %rax, %rax #7.57",
+        "  lzcnt %rdi, %rax #7.57",
+        "  ret #7.57",
+        "popcnt:",
+        "..B7.1: # Preds ..B7.0",
+        "  xorq %rax, %rax #8.58",
+        "  popcnt %rdi, %rax #8.58",
+        "  ret #8.58",
+        "sse41:",
+        "..B8.1: # Preds ..B8.0",
+        "  vpminsd %xmm1, %xmm0, %xmm0 #9.45",
+        "  ret #9.45",
+        "sse42:",
+        "..B9.1: # Preds ..B9.0",
+        "  crc32l %esi, %edi #10.48",
+        "  movl %edi, %eax #10.48",
+        "  ret #10.48"
+      ],
+      "stderr": [
+        {
+          "text": "icc: remark #10441: The Intel(R) C++ Compiler Classic (ICC) is deprecated and will be removed from product release in the second half of 2023. The Intel(R) oneAPI DPC++/C++ Compiler (ICX) is the recommended compiler moving forward. Please transition to use this compiler. Use '-diag-disable=10441' to disable this message."
+        }
+      ],
+      "ok": true
+    }
+  },
+  "complete": true
+}
