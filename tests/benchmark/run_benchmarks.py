@@ -67,8 +67,12 @@ class Benchmark:
 # Keep historical synthetic tests, then add workload-derived kernels.  Sources
 # may live in the legacy numbered directory until they are migrated.
 BENCHMARKS: tuple[Benchmark, ...] = (
+    # Required source semantics, not optional tuning: these signed recurrences
+    # intentionally overflow. Keeping the requirement here covers every native
+    # and static caller, including correctness-only/default invocations.
     Benchmark("arith_loop", "32-variable arithmetic loop / register pressure",
-              ("arith_loop.c", "01_arith_loop.c"), ("synthetic", "regalloc", "integer")),
+              ("arith_loop.c", "01_arith_loop.c"), ("synthetic", "regalloc", "integer"),
+              extra_flags=("-fwrapv",)),
     Benchmark("fib", "recursive Fibonacci / recurrence recognition",
               ("fib.c", "02_fib.c"), ("synthetic", "calls", "recursion")),
     Benchmark("matmul", "dense matrix multiply / FP and cache",
@@ -96,7 +100,8 @@ BENCHMARKS: tuple[Benchmark, ...] = (
     Benchmark("struct_copy", "struct copy / ABI and memory",
               ("struct_copy.c",), ("synthetic", "abi", "memory")),
     Benchmark("loop_patterns", "scalar loop transforms",
-              ("loop_patterns.c",), ("synthetic", "loop", "integer")),
+              ("loop_patterns.c",), ("synthetic", "loop", "integer"),
+              extra_flags=("-fwrapv",)),
     Benchmark("fannkuch", "Fannkuch-Redux / permutations",
               ("fannkuch.c",), ("synthetic", "integer", "branch"), 180),
     Benchmark("ackermann", "Ackermann / deep recursion",

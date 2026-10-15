@@ -29,9 +29,9 @@ The regression authority is
 `tests/corpus/test_benchmark_comparison_safety.py`. The baseline Python corpus
 passed 545 tests with five skips; the competing tree passed 582 with four skips.
 Test counts are not interchangeable coverage or quality scores. The corrected
-tree's full corpus passed 613 tests in 84.463 seconds with five explicit skips;
-the focused safety/report/publication suite passed all 37 tests. Twenty
-compiler-independent local gate commands passed, including the audit census,
+tree's full corpus passed 616 tests in 84.445 seconds with five explicit skips;
+the focused safety/report/publication suite passed all 40 tests. Twenty
+LCCC-independent local gate commands passed, including the audit census,
 import scanner, documentation links, resource checks and corpus. The strict
 CI/local parity mutation suite passed all 73 tests.
 
@@ -58,6 +58,31 @@ semantic matrix explicitly uses an unoptimized independent GCC control and
 records the optimized GCC arm separately. It does **not** establish GCC 16.2
 behavior or LCCC correctness. GCC's pragma support must not be assumed merely
 because it is the reference compiler.
+
+## Native workload input validity
+
+A local GCC 12 UBSan experiment executed all **45 bounded workload IDs**, each
+with and without explicit wrapping (**90 executions**, all builds succeeded).
+`arith_loop` and `loop_patterns` both diagnose signed integer overflow without
+`-fwrapv`. The named timing and Callgrind requests already supplied it, but
+ordinary correctness-only/default native requests could omit it. Both workloads
+now declare `-fwrapv` in the registry, so native and static callers receive the
+required source semantics even after contrary user options. No source, output
+check or workload was removed. New regressions require the negative sanitizer
+arms to fail, the declared-contract arms to pass, and their output to match
+**independent Python 32/64-bit modular models**, not GCC's output alone.
+
+The same sanitizer reports a null-member access for `percpu_ptr_walk`, including
+with wrapping enabled. This diagnostic is retained, **not** counted as a passing
+sanitizer run. GCC 12 and 16 explicitly declare segment-relative address zero
+valid in `ix86_addr_space_zero_address_valid`; the benchmark deliberately starts
+at GS-relative offset zero on private, initialized storage. Its native result
+also matches an independent unsigned modular model. This is a target-specific
+GCC 12 instrumentation limitation, not a reason to delete that boundary case or
+to disable sanitizer checks. The [raw observations, commands, source hashes and
+GCC backend evidence](measurements/compiler-input-validity.json) distinguish the
+two actual missing semantic requirements from this address-space limitation.
+No sanitizer-based universal absence-of-UB or compiler-performance claim follows.
 
 ## Source-qualified hosted semantic screen
 
