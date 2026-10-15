@@ -20,7 +20,8 @@ import tempfile
 
 
 def fixture(kind=2, offset=0, symidx=2, addend=0, binding=0, visibility=0,
-            defined=True, payload=None, uleb=None, no_symbols=False, displacement=None):
+            defined=True, payload=None, uleb=None, no_symbols=False, displacement=None,
+            absolute=False, target_value=0, target_name="target", duplicate_local=False):
     """NULL, .text, .data, .data.more, .rela.data, .symtab, .strtab, .shstrtab.
 
     .data.more deliberately follows .data after section merging, so checking
@@ -33,12 +34,15 @@ def fixture(kind=2, offset=0, symidx=2, addend=0, binding=0, visibility=0,
     for name in names[1:]:
         name_offsets.append(len(shstr))
         shstr += name.encode() + b"\0"
-    strings = b"\0_start\0target\0"
+    strings = b"\0_start\0" + target_name.encode() + b"\0"
     # exit(0), independent of the data-relocation tests.
     text = struct.pack("<III", 0x00000513, 0x05D00893, 0x00000073)
     if uleb is not None:
         text += bytes(0x1010 - len(text))
-    target_section, target_value = (1, 0) if displacement is None else (2, offset + displacement)
+    target_section = 0xfff1 if absolute else 1
+    if displacement is not None:
+        assert not absolute, "a displacement fixture cannot also be absolute"
+        target_section, target_value = 2, offset + displacement
     symbols = bytes(24)
     symbols += struct.pack("<IBBHQQ", 8, binding << 4, visibility,
                            target_section if defined else 0, target_value, 0)
@@ -63,6 +67,16 @@ def fixture(kind=2, offset=0, symidx=2, addend=0, binding=0, visibility=0,
         for operation in sequence:
             k, delta = (operation, 0) if isinstance(operation, int) else operation
             rela += struct.pack("<QQq", offset + delta, ((1 if k == 60 else 2) << 32) | k, addend)
+    if duplicate_local:
+        assert kind == 20 and binding == 0 and defined and not absolute
+        # Two legitimate local symbols may have equal (or empty) names in a
+        # single object, while denoting distinct locations in its .text.
+        symbols = bytes(24)
+        for value in (0, 4):
+            symbols += struct.pack("<IBBHQQ", 8, 0, 0, 1, value, 0)
+        local_count = 3
+        rela = b"".join(struct.pack("<QQq", i * 4, ((i + 1) << 32) | 20, 0)
+                        for i in range(2))
     if no_symbols:
         symbols = b""
     chunks = [b"", text, bytes(16) if payload is None else payload,

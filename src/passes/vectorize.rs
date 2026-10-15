@@ -110,6 +110,7 @@ thread_local! {
     // generic vector pass being active is not evidence that both instructions
     // are legal for this particular lowering.
     static X86_STRICT_RECIP_AVX2_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static STRICT_RECIP_PACK_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     // x86 SIMD register-file availability for the MIDDLE END. Every vector
     // lowering this pass emits (VecLoadI32x8, VecAndI32x8, FmaF64x4, ...)
     // becomes an xmm/ymm instruction in the backend. The Linux kernel is built
@@ -383,6 +384,10 @@ pub(crate) fn set_x86_strict_recip_avx2_enabled(enabled: bool) {
     X86_STRICT_RECIP_AVX2_AVAILABLE.with(|available| available.set(enabled));
 }
 
+pub(crate) fn set_strict_recip_pack_enabled(enabled: bool) {
+    STRICT_RECIP_PACK_ENABLED.with(|cell| cell.set(enabled));
+}
+
 fn x86_strict_recip_avx2_enabled() -> bool {
     X86_STRICT_RECIP_AVX2_AVAILABLE.with(|available| available.get())
 }
@@ -443,6 +448,9 @@ fn vectorize_with_analysis_mode(
     fp_reassoc: bool,
     fp_contract: crate::common::fp_contract::FpContract,
 ) -> usize {
+    if super::fp_environment_blocks_reordering(func) {
+        return 0;
+    }
     let num_blocks = func.blocks.len();
     // `var_os(..).is_some()` is the crate's presence-means-on spelling (see
     // `vec_interleave`'s gate on these same two variables): `var` additionally
@@ -19060,7 +19068,8 @@ fn fresh_strict_value(next_value_id: &mut u32) -> Value {
 
 /// Transactional AVX2 lowering of the already-validated I32 coefficient DAG.
 /// Only lane-wise modular arithmetic and constant in-range shifts are admitted.
-/// Low lanes 0..3 feed FP; high lanes are unobserved integer work, never loads.
+/// Exactly four I32 lanes feed four F64 products. No unobserved upper lanes
+/// or 256-bit denominator homes are necessary.
 struct StrictPackedDag<'a> {
     func: &'a IrFunction,
     body: usize,
@@ -19074,7 +19083,25 @@ struct StrictPackedDag<'a> {
     next: u32,
 }
 
+/// Only a completed plan can transfer IDs and instructions to the function.
+struct StrictPackedPlan {
+    denominator: Value,
+    next: u32,
+    prefix: Vec<Instruction>,
+    instructions: Vec<Instruction>,
+}
+
 impl StrictPackedDag<'_> {
+    fn finish(mut self, root: Operand) -> Option<StrictPackedPlan> {
+        let denominator = self.operand(root, 0)?;
+        Some(StrictPackedPlan {
+            denominator,
+            next: self.next,
+            prefix: self.prefix,
+            instructions: self.instructions,
+        })
+    }
+
     fn emit(&mut self, op: IntrinsicOp, args: Vec<Operand>, invariant: bool) -> Value {
         let dest = fresh_strict_value(&mut self.next);
         let inst = Instruction::Intrinsic {
@@ -19102,7 +19129,7 @@ impl StrictPackedDag<'_> {
                     return Some(value);
                 }
                 let value = self.emit(
-                    IntrinsicOp::VecBroadcastI32x8,
+                    IntrinsicOp::VecBroadcastI32x4,
                     vec![Operand::Const(IrConst::I32(c))],
                     true,
                 );
@@ -19119,7 +19146,7 @@ impl StrictPackedDag<'_> {
         }
         let inst = find_inst_by_dest(&self.func.blocks[self.body], value).cloned();
         let result = match inst {
-            None => self.emit(IntrinsicOp::VecBroadcastI32x8, vec![operand], true),
+            None => self.emit(IntrinsicOp::VecBroadcastI32x4, vec![operand], true),
             Some(
                 Instruction::Copy { src, .. }
                 | Instruction::Cast {
@@ -19137,15 +19164,15 @@ impl StrictPackedDag<'_> {
                 ..
             }) => {
                 let packed_op = match op {
-                    IrBinOp::Add => IntrinsicOp::VecAddI32x8,
-                    IrBinOp::Sub => IntrinsicOp::VecSubI32x8,
-                    IrBinOp::Mul => IntrinsicOp::VecMulI32x8,
-                    IrBinOp::And => IntrinsicOp::VecAndI32x8,
-                    IrBinOp::Or => IntrinsicOp::VecOrI32x8,
-                    IrBinOp::Xor => IntrinsicOp::VecXorI32x8,
-                    IrBinOp::Shl => IntrinsicOp::VecShlI32x8,
-                    IrBinOp::LShr => IntrinsicOp::VecLShrI32x8,
-                    IrBinOp::AShr => IntrinsicOp::VecAShrI32x8,
+                    IrBinOp::Add => IntrinsicOp::VecAddI32x4,
+                    IrBinOp::Sub => IntrinsicOp::VecSubI32x4,
+                    IrBinOp::Mul => IntrinsicOp::VecMulI32x4,
+                    IrBinOp::And => IntrinsicOp::VecAndI32x4,
+                    IrBinOp::Or => IntrinsicOp::VecOrI32x4,
+                    IrBinOp::Xor => IntrinsicOp::VecXorI32x4,
+                    IrBinOp::Shl => IntrinsicOp::VecShlI32x4,
+                    IrBinOp::LShr => IntrinsicOp::VecLShrI32x4,
+                    IrBinOp::AShr => IntrinsicOp::VecAShrI32x4,
                     _ => return None,
                 };
                 let lhs = self.operand(lhs, depth + 1)?;
@@ -19224,47 +19251,52 @@ fn transform_strict_computed_recip_reduction(
     // Build every new instruction before changing the original CFG.  A future
     // extension which accidentally widens the accepted DAG therefore fails as
     // an all-or-nothing no-op rather than leaving half-versioned IR behind.
-    let packed_iv = fresh_strict_value(&mut next_value_id);
-    let mut packed = StrictPackedDag {
-        func,
-        body: pattern.body_idx,
-        iv: pattern.iv,
-        packed_iv,
-        values: FxHashMap::default(),
-        constants: FxHashMap::default(),
-        expressions: FxHashMap::default(),
-        prefix: Vec::new(),
-        instructions: Vec::new(),
-        next: next_value_id,
-    };
-    let offsets = packed.emit(
-        IntrinsicOp::VecConstI8x32,
-        (0i32..8)
-            .flat_map(i32::to_le_bytes)
-            .map(|b| Operand::Const(IrConst::I32(i32::from(b))))
-            .collect(),
-        true,
-    );
-    let splat = packed.emit(
-        IntrinsicOp::VecBroadcastI32x8,
-        vec![Operand::Value(vector_iv)],
-        false,
-    );
-    packed.instructions.push(Instruction::Intrinsic {
-        dest: Some(packed_iv),
-        op: IntrinsicOp::VecAddI32x8,
-        dest_ptr: None,
-        args: vec![Operand::Value(splat), Operand::Value(offsets)],
+    let packed_plan = STRICT_RECIP_PACK_ENABLED.with(|enabled| {
+        if !enabled.get() {
+            return None;
+        }
+        let mut speculative_next = next_value_id;
+        let packed_iv = fresh_strict_value(&mut speculative_next);
+        let mut packed = StrictPackedDag {
+            func,
+            body: pattern.body_idx,
+            iv: pattern.iv,
+            packed_iv,
+            values: FxHashMap::default(),
+            constants: FxHashMap::default(),
+            expressions: FxHashMap::default(),
+            prefix: Vec::new(),
+            instructions: Vec::new(),
+            next: speculative_next,
+        };
+        let offsets = packed.emit(
+            IntrinsicOp::VecPackI32x4,
+            (0..4)
+                .map(|lane| Operand::Const(IrConst::I32(lane)))
+                .collect(),
+            true,
+        );
+        let splat = packed.emit(
+            IntrinsicOp::VecBroadcastI32x4,
+            vec![Operand::Value(vector_iv)],
+            false,
+        );
+        packed.instructions.push(Instruction::Intrinsic {
+            dest: Some(packed_iv),
+            op: IntrinsicOp::VecAddI32x4,
+            dest_ptr: None,
+            args: vec![Operand::Value(splat), Operand::Value(offsets)],
+        });
+        packed.finish(Operand::Value(pattern.denominator))
     });
-    let packed_denominator = packed.operand(Operand::Value(pattern.denominator), 0);
     let mut prefix = Vec::new();
     let mut vector_body_instructions;
     let mut denominator_args = Vec::new();
-    let intrinsic = if let Some(denominator) = packed_denominator {
-        next_value_id = packed.next;
-        prefix = packed.prefix;
-        vector_body_instructions = packed.instructions;
-        denominator_args.push(Operand::Value(denominator));
+    let intrinsic = if let Some(plan) = packed_plan {
+        next_value_id = plan.next;
+        prefix = plan.prefix;
+        vector_body_instructions = plan.instructions;
+        denominator_args.push(Operand::Value(plan.denominator));
         IntrinsicOp::StrictRecipMulAddPackedF64x4
     } else {
         // The private allocator MAY have advanced before a later DAG operand
@@ -31685,6 +31717,9 @@ pub(crate) fn vectorize_const_trip_map_loops(
     fp_contract: FpContract,
     no_map_vec: bool,
 ) -> usize {
+    if super::fp_environment_blocks_reordering(func) {
+        return 0;
+    }
     // ISA gate FIRST.  This entry runs before the main vectorizer and
     // therefore needs its own gate: it emits the same Vec* intrinsics, but the
     // caller's generic `vectorize_with_analysis` gate is not reached here.  In
@@ -34912,6 +34947,196 @@ mod strict_packed_dag_tests {
             rhs,
             ty: IrType::I32,
         }
+    }
+
+    fn scalar(op: IrBinOp, a: i32, b: i32) -> i32 {
+        match op {
+            IrBinOp::Add => a.wrapping_add(b),
+            IrBinOp::Sub => a.wrapping_sub(b),
+            IrBinOp::Mul => a.wrapping_mul(b),
+            IrBinOp::And => a & b,
+            IrBinOp::Or => a | b,
+            IrBinOp::Xor => a ^ b,
+            IrBinOp::Shl => a.wrapping_shl(b as u32),
+            IrBinOp::LShr => ((a as u32) >> b) as i32,
+            IrBinOp::AShr => a >> b,
+            _ => panic!("unsupported test op"),
+        }
+    }
+
+    fn scalar_chain(op: IrBinOp, rhs: Operand, count: u32) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(0),
+            instructions: (0..count)
+                .map(|i| Instruction::BinOp {
+                    dest: Value(i + 1),
+                    op,
+                    lhs: Operand::Value(Value(i)),
+                    rhs,
+                    ty: IrType::I32,
+                })
+                .collect(),
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        }
+    }
+
+    #[test]
+    fn packed_integer_dag_matches_modular_scalar_lanes() {
+        for op in [
+            IrBinOp::Add,
+            IrBinOp::Sub,
+            IrBinOp::Mul,
+            IrBinOp::And,
+            IrBinOp::Or,
+            IrBinOp::Xor,
+            IrBinOp::Shl,
+            IrBinOp::LShr,
+            IrBinOp::AShr,
+        ] {
+            for rhs in [0, 1, 7, 31] {
+                let block = scalar_chain(op, Operand::Const(IrConst::I32(rhs)), 5);
+                let f = function(block.instructions);
+                let plan = builder(&f).finish(Operand::Value(Value(5))).unwrap();
+                let result = plan.denominator;
+                for start in [i32::MIN, -50000, -1, 0, 1, 50000, i32::MAX - 3] {
+                    let mut values = FxHashMap::<Value, [i32; 4]>::default();
+                    values.insert(
+                        Value(100),
+                        std::array::from_fn(|i| start.wrapping_add(i as i32)),
+                    );
+                    for inst in plan.prefix.iter().chain(&plan.instructions) {
+                        let Instruction::Intrinsic {
+                            dest: Some(dest),
+                            op,
+                            args,
+                            ..
+                        } = inst
+                        else {
+                            panic!("unexpected node")
+                        };
+                        let get = |operand: Operand| match operand {
+                            Operand::Const(c) => [c.to_i64().unwrap() as i32; 4],
+                            Operand::Value(v) => values[&v],
+                        };
+                        assert_eq!(
+                            op.vector_home_width(),
+                            Some(16),
+                            "only 128-bit denominator values"
+                        );
+                        let a = get(args[0]);
+                        let lanes = match op {
+                            IntrinsicOp::VecBroadcastI32x4 => [a[0]; 4],
+                            IntrinsicOp::VecPackI32x4 => std::array::from_fn(|i| get(args[i])[0]),
+                            _ => {
+                                let operation = match op {
+                                    IntrinsicOp::VecAddI32x4 => IrBinOp::Add,
+                                    IntrinsicOp::VecSubI32x4 => IrBinOp::Sub,
+                                    IntrinsicOp::VecMulI32x4 => IrBinOp::Mul,
+                                    IntrinsicOp::VecAndI32x4 => IrBinOp::And,
+                                    IntrinsicOp::VecOrI32x4 => IrBinOp::Or,
+                                    IntrinsicOp::VecXorI32x4 => IrBinOp::Xor,
+                                    IntrinsicOp::VecShlI32x4 => IrBinOp::Shl,
+                                    IntrinsicOp::VecLShrI32x4 => IrBinOp::LShr,
+                                    IntrinsicOp::VecAShrI32x4 => IrBinOp::AShr,
+                                    _ => panic!("unexpected intrinsic"),
+                                };
+                                let b = get(args[1]);
+                                std::array::from_fn(|i| scalar(operation, a[i], b[i]))
+                            }
+                        };
+                        values.insert(*dest, lanes);
+                    }
+                    for lane in 0..4 {
+                        let mut expected = start.wrapping_add(lane as i32);
+                        for _ in 0..5 {
+                            expected = scalar(op, expected, rhs);
+                        }
+                        assert_eq!(
+                            values[&result][lane], expected,
+                            "{op:?} {start} {rhs} {lane}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn failed_speculation_drops_ids_and_complete_plan_owns_unique_ids() {
+        let f = function(vec![bin(
+            2,
+            IrBinOp::SDiv,
+            Operand::Value(Value(0)),
+            Operand::Const(IrConst::I32(3)),
+        )]);
+        let mut b = builder(&f);
+        let checkpoint = b.next;
+        b.operand(Operand::Const(IrConst::I32(7)), 0).unwrap();
+        assert!(
+            b.next > checkpoint,
+            "valid speculation advances its private counter"
+        );
+        assert!(b.finish(Operand::Value(Value(2))).is_none());
+        let f = function(vec![bin(
+            2,
+            IrBinOp::Add,
+            Operand::Value(Value(0)),
+            Operand::Const(IrConst::I32(3)),
+        )]);
+        let plan = builder(&f).finish(Operand::Value(Value(2))).unwrap();
+        let ids: Vec<_> = plan
+            .prefix
+            .iter()
+            .chain(&plan.instructions)
+            .filter_map(Instruction::dest)
+            .collect();
+        assert_eq!(ids.len(), ids.iter().collect::<FxHashSet<_>>().len());
+        assert!(ids.iter().all(|v| v.0 < plan.next));
+        assert!(ids.contains(&plan.denominator));
+    }
+
+    #[test]
+    fn copy_index_rejects_duplicate_definitions_cycles_and_overlong_chains() {
+        let mut f = function(vec![
+            Instruction::Copy {
+                dest: Value(10),
+                src: Operand::Value(Value(4)),
+            },
+            Instruction::Copy {
+                dest: Value(10),
+                src: Operand::Value(Value(5)),
+            },
+        ]);
+        assert!(reduction_definitions(&f).is_none());
+        f.blocks[0].instructions.pop();
+        assert_eq!(
+            reduction_copy_root(&reduction_definitions(&f).unwrap(), Value(10)),
+            Some(Value(4))
+        );
+        f.blocks[0].instructions = (0..10)
+            .map(|n| Instruction::Copy {
+                dest: Value(n),
+                src: Operand::Value(Value(n + 1)),
+            })
+            .collect();
+        assert_eq!(
+            reduction_copy_root(&reduction_definitions(&f).unwrap(), Value(0)),
+            None
+        );
+        f.blocks[0].instructions = vec![Instruction::Copy {
+            dest: Value(0),
+            src: Operand::Value(Value(0)),
+        }];
+        assert_eq!(
+            reduction_copy_root(&reduction_definitions(&f).unwrap(), Value(0)),
+            None
+        );
+        // A definition not traversed by this query does not poison a parameter.
+        assert_eq!(
+            reduction_copy_root(&reduction_definitions(&f).unwrap(), Value(99)),
+            Some(Value(99))
+        );
     }
 
     #[test]

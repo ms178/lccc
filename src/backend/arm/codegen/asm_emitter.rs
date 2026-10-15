@@ -39,7 +39,16 @@ fn const_for_asm_operand(c: &IrConst, operand_type: &IrType) -> i64 {
     }
 }
 
+// Comments understood by both the native assembler and GAS. Keep the same
+// delimiters on extended, naked and file-scope user text; operand setup and
+// output writeback remain outside the extended-asm region.
+pub(super) const USER_ASM_MARKERS: (&str, &str) = ("//APP", "//NO_APP");
+
 impl InlineAsmEmitter for ArmCodegen {
+    fn asm_block_markers(&self) -> Option<(&'static str, &'static str)> {
+        Some(USER_ASM_MARKERS)
+    }
+
     fn asm_state(&mut self) -> &mut CodegenState {
         &mut self.state
     }
@@ -201,10 +210,57 @@ impl InlineAsmEmitter for ArmCodegen {
         }
     }
 
-    fn load_input_to_reg(&mut self, op: &AsmOperand, val: &Operand, _constraint: &str) {
+    fn load_input_to_reg(
+        &mut self,
+        op: &AsmOperand,
+        val: &Operand,
+        _constraint: &str,
+        operands: &[AsmOperand],
+    ) {
         let reg = &op.reg;
         let is_fp = is_arm_fp_reg(reg);
         let is_sp = reg == "sp";
+        // Lowering represents a 16-byte C vector/aggregate by its address,
+        // but records I128 as the asm transfer width. A spilled POINTER is
+        // not the vector's home. True I128 values and direct/vector homes
+        // retain their by-value load path below.
+        if is_fp && op.operand_type == IrType::I128 {
+            if let Operand::Value(v) = val {
+                if !self.state.is_direct_slot(v.0)
+                    && !self.state.i128_values.contains(&v.0)
+                    && !self.state.vector_values.contains(&v.0)
+                    && !self
+                        .reg_assignments
+                        .get(&v.0)
+                        .is_some_and(|&r| super::emit::is_arm_fp_phys(r))
+                {
+                    let dst = Self::fp_to_q_reg(reg);
+                    if let Some(&phys) = self.reg_assignments.get(&v.0) {
+                        let src = super::emit::callee_saved_name(phys);
+                        self.state
+                            .emit_fmt(format_args!("    ldr {}, [{}]", dst, src));
+                        return;
+                    }
+                    if let Some(slot) = self.state.get_slot(v.0) {
+                        // x17 is outside the ordinary operand/RA pools, but
+                        // an explicit register variable can still claim it.
+                        let preserve = operands
+                            .iter()
+                            .any(|operand| matches!(operand.reg.as_str(), "x17" | "w17" | "r17"));
+                        if preserve {
+                            self.state.emit("    str x17, [sp, #-16]!");
+                        }
+                        let adjustment = if preserve { 16 } else { 0 };
+                        self.emit_load_from_sp("x17", slot.0 + adjustment, "ldr");
+                        self.state.emit_fmt(format_args!("    ldr {}, [x17]", dst));
+                        if preserve {
+                            self.state.emit("    ldr x17, [sp], #16");
+                        }
+                        return;
+                    }
+                }
+            }
+        }
         match val {
             Operand::Const(c) => {
                 if is_fp {
@@ -282,13 +338,32 @@ impl InlineAsmEmitter for ArmCodegen {
                     // skipping the load feeds the asm stale register
                     // contents (the x86-64 OPTIMIZER_HIDE_VAR bug class).
                     if is_fp {
-                        panic!(
-                            "arm codegen: inline-asm FP input value {} has no stack \
-                             slot — register home cannot feed an FP asm register",
-                            v.0
-                        );
-                    }
-                    if is_sp {
+                        let size = op.operand_type.size();
+                        if size == 16 {
+                            // A 128-bit value has a SIMD home; moving only D
+                            // would silently lose its high half.
+                            let src = super::emit::arm_vector_name(phys);
+                            let dst = Self::fp_to_q_reg(reg).replacen('q', "v", 1);
+                            self.state
+                                .emit_fmt(format_args!("    mov {}.16b, {}.16b", dst, src));
+                        } else {
+                            let ty = if size == 4 { IrType::F32 } else { IrType::F64 };
+                            let dst = if size == 4 {
+                                Self::fp_to_s_reg(reg)
+                            } else {
+                                Self::fp_to_d_reg(reg)
+                            };
+                            let src = if super::emit::is_arm_fp_phys(phys) {
+                                super::emit::arm_fp_name(phys, ty)
+                            } else if size == 4 {
+                                super::emit::callee_saved_name_32(phys).to_owned()
+                            } else {
+                                super::emit::callee_saved_name(phys).to_owned()
+                            };
+                            self.state
+                                .emit_fmt(format_args!("    fmov {}, {}", dst, src));
+                        }
+                    } else if is_sp {
                         // sp cannot be an ldr/mov destination from an
                         // arbitrary home in all states; stage via x9.
                         let src = super::emit::callee_saved_name(phys);

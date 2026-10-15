@@ -17,8 +17,8 @@ CLI examples::
 
 Aliases are pinned where a fixed release exists. ``icx`` deliberately resolves
 through Compiler Explorer's ``cicxlatest`` channel; every comparison manifest
-records the resolved id/name so a future rerun cannot silently claim it used the
-same compiler.  Assembly is requested in AT&T syntax to match LCCC and permit
+records the resolved id/name. These identify a channel/version label, not a
+compiler binary; a moving channel may change between runs.  Assembly is requested in AT&T syntax to match LCCC and permit
 operand-side load/store analysis in codegen_oracle.py (compare and --rank).
 """
 from __future__ import annotations
@@ -215,15 +215,17 @@ def compiler_fingerprint(compiler_id: str, *, now: float | None = None) -> str:
     cache miss. Two shapes come back:
 
     ``"<name>|<semver>"``
-        A release channel. The version identifies the build, so the record is
-        pinned and never expires; if the id is ever repointed, the version
-        moves and the old records leave the key space.
+        A release channel. The reported version is keyed and never expires.
+        Metadata changes invalidate old records; a rebuild that keeps the
+        same name/version is NOT detected. This is not a binary-build pin.
 
     ``"moving|<name>|<window>"``
         A moving channel, whose version string is a placeholder that never
         changes however often the build does. Pinning on it would be a lie,
         so the window counter rolls over every MOVING_CHANNEL_TTL seconds and
-        the record is quietly re-fetched instead.
+        the record is quietly re-fetched instead. Changes within that window
+        are not detected. Use a cold cache plus explicit version probes for
+        fresh evidence; even a version string is not a compiler-binary hash.
 
     Never raises. An offline run or an unrecognised id degrades to
     FINGERPRINT_UNKNOWN, so the cache keeps working and simply loses its

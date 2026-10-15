@@ -1,0 +1,3 @@
+unsigned affine model: 4-bit 131072 cases, 9366 admitted; every observed condition identical
+unsigned affine model: 8-bit 300000 cases, 20828 admitted; every observed condition identical
+FAIL: proved unsigned header guard did not fold

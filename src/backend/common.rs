@@ -103,7 +103,7 @@ pub fn assemble_with_extra(
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("asm");
-        TempFile::new("ccc_asm", stem, "s")
+        TempFile::try_new("ccc_asm", stem, "s").map_err(|error| error.to_string())?
     };
     std::fs::write(asm_file.path(), asm_text)
         .map_err(|e| format!("Failed to write assembly: {}", e))?;
@@ -111,7 +111,8 @@ pub fn assemble_with_extra(
     let mut cmd = Command::new(config.command);
     cmd.args(config.extra_args);
     cmd.args(extra_dynamic_args);
-    cmd.args(["-c", "-o", output_path, asm_file.to_str()]);
+    cmd.args(["-c", "-o", output_path]);
+    cmd.arg(asm_file.path());
 
     let result = cmd
         .output()
@@ -476,10 +477,12 @@ struct DirectLdArchConfig {
 
 /// Standard GCC versions to probe (newest to oldest), shared across most architectures.
 #[cfg(not(feature = "gcc_linker"))]
-const GCC_VERSIONS_FULL: &[&str] = &["14", "13", "12", "11", "10", "9", "8", "7", "6", "5", "4.9"];
+const GCC_VERSIONS_FULL: &[&str] = &[
+    "16", "15", "14", "13", "12", "11", "10", "9", "8", "7", "6", "5", "4.9",
+];
 /// Shorter version list for architectures that don't have very old GCC support.
 #[cfg(not(feature = "gcc_linker"))]
-const GCC_VERSIONS_SHORT: &[&str] = &["14", "13", "12", "11", "10", "9", "8", "7"];
+const GCC_VERSIONS_SHORT: &[&str] = &["16", "15", "14", "13", "12", "11", "10", "9", "8", "7"];
 
 #[cfg(not(feature = "gcc_linker"))]
 const DIRECT_LD_X86_64: DirectLdArchConfig = DirectLdArchConfig {
@@ -693,36 +696,81 @@ fn resolve_sysroot_file_dir(dir: &str, file: &str) -> Option<String> {
 /// root whose crtbegin.o satisfied the probe.
 #[cfg(not(feature = "gcc_linker"))]
 fn find_gcc_lib_dir(arch: &DirectLdArchConfig) -> Option<String> {
-    // Plain bases: `<base>/<ver>` itself is eligible, plus any multilib
-    // sub-directory variants (only relevant when the base is multilib-aware).
-    for base in arch.gcc_lib_base_paths {
-        for ver in arch.gcc_versions {
-            let dir = format!("{}/{}", base, ver);
-            let mut candidates = vec![dir.clone()];
-            for sub in arch.gcc_multilib_subdirs {
-                candidates.push(format!("{}/{}", dir, sub));
-            }
-            for cand in candidates {
-                if let Some(resolved) = resolve_sysroot_file_dir(&cand, "crtbegin.o") {
+    probe_gcc_bases(
+        arch.gcc_lib_base_paths,
+        arch.gcc_versions,
+        arch.gcc_multilib_subdirs,
+        true,
+    )
+    .or_else(|| {
+        probe_gcc_bases(
+            arch.gcc_multilib_base_paths,
+            arch.gcc_versions,
+            arch.gcc_multilib_subdirs,
+            false,
+        )
+    })
+}
+
+/// Preserve native-base priority and sysroot fallback. Multilib-only bases
+/// must never admit their native crtbegin.o (it has the wrong ELF class).
+#[cfg(not(feature = "gcc_linker"))]
+fn probe_gcc_bases(
+    bases: &[&str],
+    versions: &[&str],
+    subdirs: &[&str],
+    native: bool,
+) -> Option<String> {
+    for base in bases {
+        for ver in versions {
+            let dir = format!("{base}/{ver}");
+            if native {
+                if let Some(resolved) = resolve_sysroot_file_dir(&dir, "crtbegin.o") {
                     return Some(resolved);
                 }
             }
-        }
-    }
-    // Multilib-only bases: the plain `<base>/<ver>` directory belongs to a
-    // different ELF class (e.g. the amd64 GCC dir when targeting i686), so
-    // only its `<ver>/<subdir>` variants may satisfy the probe.
-    for base in arch.gcc_multilib_base_paths {
-        for ver in arch.gcc_versions {
-            for sub in arch.gcc_multilib_subdirs {
-                let dir = format!("{}/{}/{}", base, ver, sub);
-                if let Some(resolved) = resolve_sysroot_file_dir(&dir, "crtbegin.o") {
+            for sub in subdirs {
+                if let Some(resolved) =
+                    resolve_sysroot_file_dir(&format!("{dir}/{sub}"), "crtbegin.o")
+                {
                     return Some(resolved);
                 }
             }
         }
     }
     None
+}
+
+#[cfg(all(test, not(feature = "gcc_linker")))]
+mod gcc_directory_tests {
+    use super::*;
+
+    #[test]
+    fn gcc16_multilib_discovery_preserves_class_and_newest_priority() -> std::io::Result<()> {
+        let temp = crate::common::temp_files::TempFile::try_new("gcc_probe", "v16", "dir")?;
+        let base = temp.to_str()?;
+        let native = format!("{base}/16");
+        let multilib = format!("{native}/32");
+        std::fs::create_dir_all(&native).unwrap();
+        std::fs::write(format!("{native}/crtbegin.o"), b"probe marker").unwrap();
+        let wrong_class = probe_gcc_bases(&[base], GCC_VERSIONS_FULL, &["32"], false);
+        std::fs::create_dir_all(&multilib).unwrap();
+        std::fs::write(format!("{multilib}/crtbegin.o"), b"probe marker").unwrap();
+        let selected = probe_gcc_bases(&[base], GCC_VERSIONS_FULL, &["32"], false);
+        std::fs::create_dir_all(format!("{base}/14/32")).unwrap();
+        std::fs::write(format!("{base}/14/32/crtbegin.o"), b"old probe marker").unwrap();
+        let preferred = probe_gcc_bases(&[base], GCC_VERSIONS_FULL, &["32"], false);
+        let short = probe_gcc_bases(&[base], GCC_VERSIONS_SHORT, &[], true);
+        std::fs::remove_dir_all(base).unwrap();
+        assert_eq!(
+            wrong_class, None,
+            "native crt must not satisfy a multilib probe"
+        );
+        assert_eq!(selected, Some(multilib.clone()));
+        assert_eq!(preferred, Some(multilib));
+        assert_eq!(short, Some(native));
+        Ok(())
+    }
 }
 
 /// Discover the system CRT directory containing crt1.o.

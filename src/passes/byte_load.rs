@@ -452,6 +452,13 @@ pub(crate) fn run_function(func: &mut IrFunction, target: crate::backend::Target
     ) {
         return 0;
     }
+    // Most functions contain no eligible OR tree. Avoid cloning their whole
+    // SSA definition/use graph merely to discover that in the matching loop.
+    if !func.blocks.iter().flat_map(|block| &block.instructions).any(|inst| {
+        matches!(inst, Instruction::BinOp { op: IrBinOp::Or, ty, .. } if wide_bits(*ty).is_some())
+    }) {
+        return 0;
+    }
     let ctx = Ctx::build(func);
     if ctx.defs.is_empty() {
         return 0;

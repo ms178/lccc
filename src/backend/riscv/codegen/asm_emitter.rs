@@ -262,7 +262,13 @@ impl InlineAsmEmitter for RiscvCodegen {
         }
     }
 
-    fn load_input_to_reg(&mut self, op: &AsmOperand, val: &Operand, _constraint: &str) {
+    fn load_input_to_reg(
+        &mut self,
+        op: &AsmOperand,
+        val: &Operand,
+        _constraint: &str,
+        _operands: &[AsmOperand],
+    ) {
         let reg = &op.reg;
         let is_fp = matches!(op.kind, AsmOperandKind::FpReg);
 

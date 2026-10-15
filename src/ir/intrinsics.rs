@@ -784,11 +784,10 @@ pub enum IntrinsicOp {
     /// 32-byte alloca used only if the scalar result cannot remain XMM-homed.
     /// x86-64 AVX2-only; emitted solely by the strict computed-reduction pass.
     StrictRecipMulAddF64x4,
-    /// Same ordered FP operation with an AVX2 I32x8 denominator input.
-    /// Only its low four lanes are observed. Args: [acc, packed, base,
-    /// byte_offset, scratch]. The result is ONE scalar F64 accumulator: four
-    /// products are added in source order, not a packed F64x4 result.
-    /// No horizontal reassociation or extra FP lanes.
+    /// One scalar F64 result: four products added in source order, not a
+    /// horizontal/vector result. Same ordered FP operation with an exactly 128-bit I32x4 denominator input.
+    /// All four input lanes are observed. Args: [acc, packed, base,
+    /// byte_offset, scratch]. No horizontal reassociation or extra FP lanes.
     StrictRecipMulAddPackedF64x4,
     /// Horizontal reduction: %scalar = horizontal_add(%vec) - AVX2 8×I32 → I32
     /// args[0] = source vector value; dest = scalar I32 result

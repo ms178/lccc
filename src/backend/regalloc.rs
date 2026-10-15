@@ -7430,7 +7430,6 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             5 => matches!(
                 op,
                 O::VecAddI32x8
-                    | O::StrictRecipMulAddPackedF64x4
                     | O::VecMulI32x8
                     | O::VecHorizontalAddI32x8
                     // v12 Fix F: the lane-wise max consumes the I32x8
@@ -7464,7 +7463,8 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             ),
             6 => matches!(
                 op,
-                O::VecAddI32x4 | O::VecMulI32x4 | O::VecHorizontalAddI32x4
+                O::StrictRecipMulAddPackedF64x4
+                    | O::VecAddI32x4 | O::VecMulI32x4 | O::VecHorizontalAddI32x4
                     // ARX lane ops: their emitters resolve a homed source
                     // through %xmm0/%xmm1 scratch without writing the home
                     // (movdqa in, shifts/por on scratch), so a register-homed
@@ -7940,7 +7940,6 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                 op,
                 O::VecMulI32x8
                     | O::VecAddI32x8
-                    | O::StrictRecipMulAddPackedF64x4
                     // Conditional-map consumers: a broadcast invariant is
                     // the compare rhs / blend true-arm (clamp shapes).
                     | O::VecCmpI32x8
@@ -8020,7 +8019,8 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
             ),
             6 => matches!(
                 op,
-                O::VecMulI32x4
+                O::StrictRecipMulAddPackedF64x4
+                    | O::VecMulI32x4
                     | O::VecAddI32x4
                     | O::VecCmpI32x4
                     | O::VecBlendvI32x4
@@ -8398,7 +8398,6 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
             3 => matches!(
                 op,
                 O::VecAddI32x8
-                    | O::StrictRecipMulAddPackedF64x4
                     | O::VecMulI32x8
                     | O::VecSubI32x8
                     | O::VecAndI32x8
@@ -8465,7 +8464,8 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
             ),
             6 => matches!(
                 op,
-                O::VecAddI32x4
+                O::StrictRecipMulAddPackedF64x4
+                    | O::VecAddI32x4
                     | O::VecMulI32x4
                     | O::VecSubI32x4
                     | O::VecAndI32x4

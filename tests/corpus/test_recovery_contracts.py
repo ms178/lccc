@@ -55,6 +55,63 @@ class RecoveryContract(unittest.TestCase):
         self.assertEqual(r['mode'],'offline-reconstructed-base');self.assertTrue(r['exact_history'])
         self.assertEqual(git(dest,'rev-parse','HEAD'),self.head);self.assertEqual(git(dest,'rev-parse',self.base+'^{tree}'),git(self.repo,'rev-parse',self.base+'^{tree}'))
         self.assertEqual((dest/'a.txt').read_text(),'new\n');self.assertEqual((dest/'b.txt').read_text(),'unchanged\n')
+    def test_xz_source_restores_exact_history_offline(self):
+        import gzip
+        import lzma
+        original=self.art/'lccc-src.tar.gz'
+        compact=self.art/'lccc-src.tar.xz'
+        compact.write_bytes(lzma.compress(gzip.decompress(original.read_bytes())))
+        self.recipe.update(archive=compact.name,archive_sha256=recovery.sha(compact))
+        self.write_recipe();original.unlink()
+        dest=self.root/'restored'
+        result=recovery.recover(dest,self.art,offline=True,allow_source_fallback=False)
+        self.assertTrue(result['exact_history'])
+        self.assertEqual(git(dest,'rev-parse','HEAD'),self.head)
+        self.assertEqual(git(dest,'rev-parse','HEAD^{tree}'),self.tree)
+
+    def pack_bundle(self,kind="valid"):
+        bundle_path=self.art/'lccc-session.bundle'
+        data=bundle_path.read_bytes()
+        archive=self.art/'session-bundles.tar.xz'
+        with tarfile.open(archive,'w:xz') as tar:
+            if kind=="corrupt":data=b'not a Git bundle'
+            item=tarfile.TarInfo('other.bundle' if kind=="missing" else bundle_path.name);item.size=len(data)
+            if kind=="link":item.type=tarfile.SYMTYPE;item.linkname='/etc/passwd';item.size=0
+            tar.addfile(item,io.BytesIO(data) if item.isfile() else None)
+            if kind=="duplicate":tar.addfile(item,io.BytesIO(data))
+            if kind=="escape":
+                other=tarfile.TarInfo('../escape');other.size=0;tar.addfile(other,io.BytesIO())
+        metadata=json.loads((self.art/'SESSION_BUNDLE.json').read_text())
+        metadata.update(bundle_archive=archive.name,bundle_archive_sha256=recovery.sha(archive))
+        (self.art/'SESSION_BUNDLE.json').write_text(json.dumps(metadata));bundle_path.unlink()
+        return archive
+
+    def test_packed_bundle_offline_exact_history_without_persistent_extraction(self):
+        self.pack_bundle()
+        dest=self.root/'restored'
+        result=recovery.recover(dest,self.art,offline=True,allow_source_fallback=False)
+        self.assertTrue(result['exact_history']);self.assertEqual(git(dest,'rev-parse','HEAD'),self.head)
+        self.assertFalse((self.art/'lccc-session.bundle').exists())
+
+    def test_packed_bundle_rejects_invalid_members(self):
+        original=(self.art/'lccc-session.bundle').read_bytes()
+        for kind in ['link','duplicate','escape','corrupt','missing']:
+            with self.subTest(kind=kind):
+                (self.art/'lccc-session.bundle').write_bytes(original);self.pack_bundle(kind)
+                dest=self.root/('bad-'+kind)
+                with self.assertRaises(ValueError):
+                    recovery.recover(dest,self.art,offline=True,allow_source_fallback=False)
+                self.assertFalse(dest.exists());self.assertFalse((self.root/'escape').exists())
+
+    def test_packed_bundle_hash_and_standalone_precedence(self):
+        archive=self.pack_bundle();good=archive.read_bytes();archive.write_bytes(b'corrupt')
+        with self.assertRaises(ValueError):
+            recovery.recover(self.root/'bad-archive',self.art,offline=True,allow_source_fallback=False)
+        archive.write_bytes(good);(self.art/'lccc-session.bundle').write_bytes(b'corrupt')
+        with self.assertRaises(ValueError):
+            recovery.recover(self.root/'bad-standalone',self.art,offline=True,allow_source_fallback=False)
+        self.assertFalse((self.root/'bad-archive').exists());self.assertFalse((self.root/'bad-standalone').exists())
+
     def test_failed_network_uses_offline_recipe(self):
         dest=self.root/'restored';r=recovery.recover(dest,self.art,upstream='/definitely/missing/upstream',allow_source_fallback=False)
         self.assertEqual(r['mode'],'offline-reconstructed-base');self.assertEqual(r['head'],self.head)

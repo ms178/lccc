@@ -1,0 +1,50 @@
+name: Live Compiler Explorer delta survey
+
+on:
+  schedule:
+    - cron: '23 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oracle-delta-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  oracle-delta:
+    # External service availability is not a required PR check. Strict mode
+    # makes outages visibly fail this research job, retaining its report.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_FASTBUILD_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Enable bounded build swap
+        run: bash scripts/ci_enable_swap.sh
+      - name: Install GCC header provider
+        run: bash scripts/ci_install_gcc16.sh --base
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-oracle-delta-cargo-${{ hashFiles('Cargo.lock') }}
+      - name: Build O1 with two jobs
+        run: bash scripts/build_lccc_fast.sh
+      - name: Execute three-vendor delta gate
+        run: python3 scripts/oracle_delta_gate.py --strict --report results/oracle-delta/report.json
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: oracle-delta-${{ github.sha }}
+          path: results/oracle-delta/
+          if-no-files-found: warn
+          retention-days: 14

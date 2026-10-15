@@ -134,8 +134,14 @@ class ParallelLayout(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     validate(self.workflow, changed)
 
-    def test_removed_research_gates_stay_off(self):
-        self.assertFalse((ROOT / '.github/workflows/compiler-research.yml').exists())
+    def test_research_does_not_add_automatic_pr_builds(self):
+        research = yaml.load((ROOT / '.github/workflows/compiler-research.yml').read_text(),
+                             Loader=yaml.BaseLoader)
+        self.assertEqual(set(research['on']), {'workflow_dispatch'})
+        self.assertTrue(research['jobs'])
+        for job in research['jobs'].values():
+            self.assertNotIn('continue-on-error', job)
+            self.assertNotIn('pull_request.number', job.get('if', ''))
         redteam = yaml.safe_load((ROOT / '.github/workflows/pr826-redteam.yml').read_text())
         self.assertNotIn('causal-comparison', redteam['jobs'])
         self.assertTrue(redteam['jobs'], 'unrelated red-team checks must survive')

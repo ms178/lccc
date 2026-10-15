@@ -1,0 +1,33 @@
+   Compiling lccc v0.1.0 (/home/user/.cache/lccc-work)
+    Finished `fastbuild` profile [optimized] target(s) in 3m 33s
+     Running unittests src/lib.rs (target/fastbuild/deps/lccc-2790982c43eeadfa)
+
+running 25 tests
+test passes::loop_rotate::affine_fold_orientation_tests::all_signed_relations_in_both_orientations_are_equivalences ... ok
+test passes::loop_rotate::affine_fold_orientation_tests::the_flipped_oracle_catches_the_regression_it_was_written_for ... ok
+test passes::loop_rotate::tests::accepts_a_nonzero_start_and_step ... ok
+test passes::loop_rotate::tests::accepts_le_and_mirrors_the_bound ... ok
+test passes::loop_rotate::tests::accepts_the_canonical_shape ... ok
+test passes::loop_rotate::tests::accepts_the_type_top_boundary ... ok
+test passes::loop_rotate::tests::folds_proven_unsigned_header_comparisons ... ok
+test passes::loop_rotate::tests::refuses_a_constant_on_the_back_edge ... ok
+test passes::loop_rotate::tests::refuses_a_negative_addend ... ok
+test passes::loop_rotate::tests::refuses_a_non_constant_entry_operand ... ok
+test passes::loop_rotate::tests::refuses_a_runaway_orientation ... ok
+test passes::loop_rotate::tests::refuses_a_runtime_bound ... ok
+test passes::loop_rotate::tests::refuses_a_runtime_seed ... ok
+test passes::loop_rotate::tests::refuses_a_runtime_step ... ok
+test passes::loop_rotate::tests::refuses_a_second_use_of_the_temporary ... ok
+test passes::loop_rotate::tests::refuses_a_type_top_zero_trip_shape ... ok
+test passes::loop_rotate::tests::refuses_an_unrepresentable_folded_bound ... ok
+test passes::loop_rotate::tests::refuses_exit_on_true_with_a_greater_than_test_too ... ok
+test passes::loop_rotate::tests::refuses_exit_on_true_with_a_less_than_test ... ok
+test passes::loop_rotate::tests::signed_fold_requires_an_executed_nonwrapping_guard ... ok
+test passes::loop_rotate::tests::unsigned_fold_is_confined_to_the_controlling_header_test ... ok
+test passes::loop_rotate::tests::unsigned_fold_proves_the_failing_test_does_not_wrap ... ok
+test passes::loop_rotate::tests::unsigned_fold_refuses_wrap_and_unproven_entry ... ok
+test passes::verify::tests::the_loop_rotate_stale_guard_label_is_caught ... ok
+test passes::iv_widen::tests::test_self_loop_rotated ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 4709 filtered out; finished in 0.00s
+

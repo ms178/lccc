@@ -11,6 +11,31 @@
 //! - Os: O2 with code-size-increasing transforms disabled
 //! - Oz: Os with inlining disabled
 
+thread_local! {
+    // Per-translation-unit language semantics, not a process environment flag.
+    // run_passes resets this on every worker invocation, including -O0/-O1.
+    static SIGNED_OVERFLOW_WRAPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FP_ENVIRONMENT_OBSERVABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn signed_overflow_wraps() -> bool {
+    SIGNED_OVERFLOW_WRAPS.with(std::cell::Cell::get)
+}
+
+/// Coarse, conservative fence for passes whose FP exception/rounding
+/// scheduling is not proven. Integer-only functions retain the normal path.
+/// Check the TU policy before scanning: FENV-off compilation pays no IR walk.
+fn fp_environment_blocks_reordering(func: &IrFunction) -> bool {
+    FP_ENVIRONMENT_OBSERVABLE.with(std::cell::Cell::get)
+        && func.blocks.iter().any(|block| block.instructions.iter().any(|inst| {
+            inst.result_type().is_some_and(|ty| ty.is_float())
+                || matches!(inst, Instruction::Cmp { ty, .. } | Instruction::Store { ty, .. } if ty.is_float())
+                || matches!(inst, Instruction::Cast { from_ty, .. } if from_ty.is_float())
+                // Unclassified intrinsic result types must fail closed too.
+                || matches!(inst, Instruction::Intrinsic { .. })
+        }))
+}
+
 pub(crate) mod aggregate_copy_forward;
 pub(crate) mod aggregate_sroa;
 pub(crate) mod alias;
@@ -49,6 +74,7 @@ pub(crate) mod licm;
 pub(crate) mod load_forward;
 pub(crate) mod loop_align;
 pub(crate) mod loop_analysis;
+pub(crate) mod loop_bound;
 pub(crate) mod loop_carried_forward;
 pub(crate) mod loop_idiom;
 pub(crate) mod loop_invert;
@@ -774,6 +800,7 @@ fn run_inline_phase(
     disabled: &str,
     allow_inline: bool,
     size_profile: bool,
+    target: crate::backend::Target,
     ra_config: &crate::backend::regalloc::RaConfig,
 ) {
     let dump_pre =
@@ -801,6 +828,23 @@ fn run_inline_phase(
     iphase_dump!("canonicalize-copyprop");
     simplify::run(module);
     iphase_dump!("canonicalize-simplify");
+    // Expose byte-decoding helpers' real cost before inlining and before GVN
+    // gives their byte loads multiple users. The established late run remains
+    // for chains exposed by later simplification. This is the SAME checked
+    // load plan (width/order/volatility/alias-window proofs), not a new matcher.
+    // Profitability is measured on x86-64; other targets and size profiles
+    // retain their existing placement. The legacy postinline switch also
+    // suppresses this additional scheduling opportunity, without disabling
+    // primary inlining itself. Preserve that existing diagnostic contract.
+    if target == crate::backend::Target::X86_64
+        && !size_profile
+        && !pass_disabled(disabled, "byte_load")
+        && !pass_disabled(disabled, "byte_load_early")
+        && !pass_disabled(disabled, "postinline")
+    {
+        module.for_each_function(|f| byte_load::run_function(f, target));
+        iphase_dump!("byte-load-before-inline");
+    }
     // Class-aware GlobalAddr CSE *before* the first GVN. GVN already CSEs
     // GlobalAddr into same-block Copies, so a late-only run after
     // post-structural-inline never sees duplicates.
@@ -1165,6 +1209,8 @@ pub(crate) fn run_passes(
     opt_level: u32,
     target: crate::backend::Target,
     code16gcc: bool,
+    wrap_signed_overflow: bool,
+    fp_environment_observable: bool,
     fp_reassoc: bool,
     fp_contract: crate::common::fp_contract::FpContract,
     x86_isa: X86Isa,
@@ -1176,6 +1222,14 @@ pub(crate) fn run_passes(
     x86_avx512vl: bool,
     ra_config: &crate::backend::regalloc::RaConfig,
 ) {
+    SIGNED_OVERFLOW_WRAPS.with(|cell| cell.set(wrap_signed_overflow));
+    FP_ENVIRONMENT_OBSERVABLE.with(|cell| cell.set(fp_environment_observable));
+    let fp_reassoc = fp_reassoc && !fp_environment_observable;
+    let fp_contract = if fp_environment_observable {
+        FpContract::Off
+    } else {
+        fp_contract
+    };
     // Checkpoint the lowering output BEFORE any optimizer runs: the SSA
     // validators in this function attribute a violation to the phase that
     // created it, and at -O0 the optimizer phase loop is the empty set —
@@ -1281,6 +1335,7 @@ pub(crate) fn run_passes(
         _ => false,
     });
     let mut disabled = std::env::var("CCC_DISABLE_PASSES").unwrap_or_default();
+    vectorize::set_strict_recip_pack_enabled(!pass_disabled(&disabled, "strict_recip_pack"));
     // Snapshot the map policy switches once, like the other pass-pipeline
     // knobs.  Both the pre-unroll constant-trip entry and the main vectorizer
     // must make the same decision without re-reading the environment per
@@ -1530,6 +1585,7 @@ pub(crate) fn run_passes(
         &disabled,
         allow_inline,
         optimize_for_size,
+        target,
         ra_config,
     );
     preloop_dump!("inline_phase");
@@ -1577,6 +1633,29 @@ pub(crate) fn run_passes(
         module.for_each_function(recursion_to_iter::recursion_to_iteration);
     }
     preloop_dump!("rec2iter");
+
+    // Cost the compact form of byte-decoding accessors, not their expanded
+    // shifts/ORs. Reuse the existing legality proof before the already-bounded
+    // second inliner; do not raise any inline threshold. Limit this extra walk
+    // to straight-line private helpers on the i686 target. Size
+    // profiles retain their existing scheduling and inlining decisions.
+    if !optimize_for_size
+        && target == crate::backend::Target::I686
+        && !pass_disabled(&disabled, "byte_load")
+        && !pass_disabled(&disabled, "postinline")
+    {
+        module.for_each_function(|func| {
+            if !func.is_static || func.blocks.len() != 1 {
+                return 0;
+            }
+            // Do not DCE parameter homes here: the second inliner still
+            // uses those ABI bridges for surviving ParamRef instructions.
+            // The fold itself removes its consumed chain; normal cleanup
+            // after inlining removes any remaining dead copies/addresses.
+            byte_load::run_function(func, target)
+        });
+        preloop_dump!("byte-accessors-before-inline");
+    }
 
     // Post-structural inlining: TCE and recursion-to-iteration can turn a
     // previously recursive static helper into a small, ordinary loop. A second
@@ -1782,6 +1861,25 @@ pub(crate) fn run_passes(
             let n = timed_pass!(
                 "vec_arx",
                 run_on_visited(module, &dirty, &mut changed, vec_arx::vec_arx_function)
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Put proven finite unsigned affine guards in IV-vs-bound form before
+        // the unroller/vectorizer make their decisions. Unlike signed affine
+        // folding this proves both IV and sum nonwrapping through the final
+        // exit observation, so -fwrapv does not weaken its contract.
+        if iter == 0
+            && opt_level >= 2
+            && !optimize_for_size
+            && target == crate::backend::Target::X86_64
+            && !pass_disabled(&disabled, "loop_bound")
+            && loop_rotate::affine_fold_enabled()
+        {
+            let n = timed_pass!(
+                "loop_bound",
+                run_on_visited(module, &dirty, &mut changed, loop_bound::run)
             );
             total_changes += n;
             total_changes_excl_dce += n;
@@ -2090,6 +2188,8 @@ pub(crate) fn run_passes(
         // emit after every 32-bit `addl` (the upper 32 bits are clobbered
         // and the next GEP use would read garbage without re-extension).
         // Gated by `CCC_NO_IV_WIDEN`. -O2+, not -Os/-Oz.
+        // The widening analyzer selects UB-based or explicit range proofs
+        // according to the TU's signed-wrapping contract.
         if iter == 0 && opt_level >= 2 && !optimize_for_size {
             let n = timed_pass!(
                 "iv_widen",
@@ -3032,9 +3132,10 @@ pub(crate) fn run_passes(
     }
     // Second-order strength reduction for slope-1 triangular loop indices
     // (t(t+1)/2 recurrences): carries the index as two counters instead of
-    // recomputing mul+corrected-div every iteration. Exact: t(t+1) is always
-    // even, so the accumulator is bit-identical including wraparound.
-    if !pass_disabled(&disabled, "quadsr") {
+    // recomputing mul+corrected-div every iteration. Evenness does NOT make
+    // division commute with a wrapped product; the current proof relies on
+    // signed-overflow UB. Keep it off under the explicit wrapping contract.
+    if !wrap_signed_overflow && !pass_disabled(&disabled, "quadsr") {
         module.for_each_function(quadratic_sr::run);
         module.for_each_function(dce::eliminate_dead_code);
     }
@@ -3685,6 +3786,44 @@ mod m16_size_policy_tests {
             b.source_spans = Vec::new();
             assert!(restore_phi_prefix(&mut b));
             assert!(b.source_spans.is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+mod signed_wrap_policy_tests {
+    use super::*;
+
+    #[test]
+    fn wrapping_policy_resets_for_every_translation_unit_and_level() {
+        for (level, wraps) in [
+            (2, true),
+            (0, false),
+            (0, true),
+            (1, false),
+            (3, true),
+            (2, false),
+        ] {
+            run_passes(
+                &mut IrModule::new(),
+                level,
+                crate::backend::Target::X86_64,
+                false,
+                wraps,
+                wraps,
+                false,
+                crate::common::fp_contract::FpContract::Off,
+                X86Isa::default(),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                &crate::backend::regalloc::RaConfig::default(),
+            );
+            assert_eq!(signed_overflow_wraps(), wraps);
+            assert_eq!(FP_ENVIRONMENT_OBSERVABLE.with(std::cell::Cell::get), wraps);
         }
     }
 }

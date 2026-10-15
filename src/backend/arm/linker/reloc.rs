@@ -110,6 +110,28 @@ pub fn resolve_sym(
         .unwrap_or(sym.value)
 }
 
+/// A shared ADR can cancel load bias only against a local allocated section.
+/// Do not infer this property from an address: zero is a valid mapped address,
+/// whereas UNDEF/ABS and discarded sections can also resolve numerically to zero.
+/// This deliberately does not change resolution of unrelated relocation kinds.
+pub(super) fn resolve_shared_adr_target(
+    obj_idx: usize,
+    sym: &Symbol,
+    section_map: &FxHashMap<(usize, usize), (usize, u64)>,
+    output_sections: &[OutputSection],
+) -> Option<u64> {
+    // 0xff00 begins the ELF reserved section-index range, not an input section.
+    if !sym.is_local() || sym.shndx == SHN_UNDEF || sym.shndx >= 0xff00 {
+        return None;
+    }
+    let &(out_idx, offset) = section_map.get(&(obj_idx, sym.shndx as usize))?;
+    let section = output_sections.get(out_idx)?;
+    if section.flags & SHF_ALLOC == 0 || section.flags & SHF_TLS != 0 {
+        return None;
+    }
+    section.addr.checked_add(offset)?.checked_add(sym.value)
+}
+
 /// Build a GOT key for a symbol reference in a relocation.
 /// Local symbols must be scoped to their object to avoid collisions
 /// (e.g., `.LANCHOR3` in different objects referring to different TLS vars).
@@ -781,6 +803,66 @@ mod tests {
 #[cfg(test)]
 mod adr_checked_tests {
     use super::*;
+
+    #[test]
+    fn shared_adr_requires_section_provenance_not_nonzero_address() {
+        let mut symbol = Symbol {
+            name_idx: 0,
+            name: "local".into(),
+            info: STT_OBJECT,
+            other: 0,
+            shndx: 1,
+            value: 0,
+            size: 0,
+        };
+        let mut sections = vec![OutputSection {
+            name: ".data".into(),
+            sh_type: 1,
+            flags: SHF_ALLOC,
+            alignment: 1,
+            inputs: vec![],
+            data: vec![],
+            addr: 0,
+            file_offset: 0,
+            mem_size: 8,
+        }];
+        let mut map = FxHashMap::default();
+        map.insert((0, 1), (0, 0));
+        assert_eq!(
+            resolve_shared_adr_target(0, &symbol, &map, &sections),
+            Some(0)
+        );
+        // Object identity, missing/discarded mappings, and invalid output indexes.
+        assert_eq!(resolve_shared_adr_target(1, &symbol, &map, &sections), None);
+        map.insert((0, 1), (1, 0));
+        assert_eq!(resolve_shared_adr_target(0, &symbol, &map, &sections), None);
+        map.insert((0, 1), (0, 0));
+        for shndx in [SHN_UNDEF, SHN_ABS, SHN_COMMON, 0xff00, 2] {
+            symbol.shndx = shndx;
+            assert_eq!(resolve_shared_adr_target(0, &symbol, &map, &sections), None);
+        }
+        symbol.shndx = 1;
+        for flags in [0, SHF_ALLOC | SHF_TLS] {
+            sections[0].flags = flags;
+            assert_eq!(resolve_shared_adr_target(0, &symbol, &map, &sections), None);
+        }
+        sections[0].flags = SHF_ALLOC;
+        for binding in [STB_GLOBAL, STB_WEAK] {
+            symbol.info = binding << 4 | STT_OBJECT;
+            for visibility in 0..4 {
+                symbol.other = visibility;
+                assert_eq!(resolve_shared_adr_target(0, &symbol, &map, &sections), None);
+            }
+        }
+        symbol.info = STT_SECTION;
+        symbol.value = 4;
+        assert_eq!(
+            resolve_shared_adr_target(0, &symbol, &map, &sections),
+            Some(4)
+        );
+        sections[0].addr = u64::MAX;
+        assert_eq!(resolve_shared_adr_target(0, &symbol, &map, &sections), None);
+    }
 
     #[test]
     fn input_site_validation_precedes_address_arithmetic() {

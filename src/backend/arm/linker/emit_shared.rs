@@ -3,8 +3,7 @@
 //! Emits an ELF64 shared library (ET_DYN) with PIC relocations, PLT stubs
 //! for external function calls, and a `.dynamic` section for the dynamic linker.
 
-use crate::backend::elf::{STB_LOCAL, STV_DEFAULT};
-use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::fx_hash::FxHashMap;
 
 use super::elf::*;
 use super::reloc;
@@ -24,15 +23,6 @@ pub(super) fn emit_shared_library(
     pending_defsyms: &[(String, String, usize)],
 ) -> Result<(), String> {
     let base_addr: u64 = 0;
-    // A non-default visibility declaration in any input constrains binding,
-    // including a hidden definition referenced by a default-visible undefined
-    // symbol in another TU. GlobalSymbol does not yet retain merged visibility.
-    let locally_bound: FxHashSet<&str> = objects
-        .iter()
-        .flat_map(|obj| &obj.symbols)
-        .filter(|sym| sym.binding() != STB_LOCAL && sym.visibility() != STV_DEFAULT)
-        .map(|sym| sym.name.as_str())
-        .collect();
 
     let mut dynstr = DynStrTab::new();
     for lib in needed_sonames {
@@ -1212,23 +1202,15 @@ pub(super) fn emit_shared_library(
                         }
                     }
                     R_AARCH64_ADR_PREL_LO21 => {
-                        // Load bias cancels only for a locally bound,
-                        // section-relative target. ADR cannot implement symbol
-                        // interposition or an absolute address in an ET_DYN.
-                        let global = globals_snap.get(sym.name.as_str());
-                        let preemptible = sym.binding() != STB_LOCAL
-                            && (!locally_bound.contains(sym.name.as_str())
-                                || global.is_none_or(|g| {
-                                    g.is_dynamic
-                                        || g.defined_in.is_none()
-                                        || g.section_idx == SHN_ABS
-                                }));
-                        if preemptible || sym.shndx == SHN_ABS {
-                            return Err(format!(
-                                "ADR relocation requires a locally bound section-relative symbol: '{}'",
-                                sym.name
-                            ));
-                        }
+                        // Until AArch64 serializes and honors merged visibility
+                        // consistently across dynsym/GOT/PLT, non-local ADR
+                        // targets are unsupported, even if marked hidden.
+                        let s = reloc::resolve_shared_adr_target(
+                            obj_idx, sym, section_map, output_sections,
+                        ).ok_or_else(|| format!(
+                            "ADR relocation requires a local allocated section-relative symbol: object {}, section {}, offset {:#x}, symbol {} ('{}')",
+                            obj_idx, sec_idx, rela.offset, si, sym.name
+                        ))?;
                         let delta = (s as i64).wrapping_add(a).wrapping_sub(p as i64);
                         reloc::encode_adr(&mut out, fp, delta)?;
                     }

@@ -1856,6 +1856,12 @@ pub trait ArchCodegen {
         input_symbols: &[Option<String>],
     );
 
+    /// Emit file-scope user assembly. Targets with post-codegen instruction
+    /// checks may override this to preserve user-text provenance.
+    fn emit_toplevel_asm(&mut self, template: &str) {
+        self.state().emit(template);
+    }
+
     /// Emit raw inline assembly template for naked functions (no operand substitution).
     fn emit_raw_inline_asm(&mut self, template: &str) {
         for line in template.lines() {

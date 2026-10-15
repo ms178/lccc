@@ -1,0 +1,66 @@
+{
+  "source": "User-supplied EPYC 7763 VM report; not a local measurement",
+  "ranking": "descending paired LCCC/GCC median ratio",
+  "cases": [
+    {
+      "name": "byte_load_reassembly",
+      "reported_ratio": 2.625
+    },
+    {
+      "name": "spectral_norm",
+      "reported_ratio": 1.51
+    },
+    {
+      "name": "expat_siphash24",
+      "reported_ratio": 1.331
+    },
+    {
+      "name": "sha256_transform",
+      "reported_ratio": 1.304
+    },
+    {
+      "name": "expat_xml_scan",
+      "reported_ratio": 1.301
+    },
+    {
+      "name": "linux_find_bit_scaled",
+      "reported_ratio": 1.245
+    },
+    {
+      "name": "linux_find_bit",
+      "reported_ratio": 1.22
+    },
+    {
+      "name": "sieve",
+      "reported_ratio": 1.213
+    },
+    {
+      "name": "binary_trees",
+      "reported_ratio": 1.197
+    },
+    {
+      "name": "lz4_match_extend",
+      "reported_ratio": 1.116
+    },
+    {
+      "name": "mandelbrot",
+      "reported_ratio": 1.109
+    },
+    {
+      "name": "sqlite_varint",
+      "reported_ratio": 1.097
+    },
+    {
+      "name": "zlib_ng_adler32_combine",
+      "reported_ratio": 1.091
+    },
+    {
+      "name": "strlen_bench",
+      "reported_ratio": 1.071
+    },
+    {
+      "name": "switch_dispatch",
+      "reported_ratio": 1.046
+    }
+  ]
+}

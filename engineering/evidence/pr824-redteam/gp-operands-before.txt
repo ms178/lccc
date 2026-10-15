@@ -1,0 +1,35 @@
+   Compiling lccc v0.1.0 (/home/user/lccc)
+    Finished `fastbuild` profile [optimized] target(s) in 3m 11s
+     Running unittests src/lib.rs (target/fastbuild/deps/lccc-2790982c43eeadfa)
+
+running 3 tests
+
+thread 'backend::x86::codegen::peephole::passes::load_op_fuse::tests::copy_commute_preserves_fixed_cl_reader' (350458) panicked at src/backend/x86/codegen/peephole/passes/load_op_fuse.rs:2043:9:
+assertion `left == right` failed
+  left: "    .text\n    .globl f\n    .type f, @function\nf:\n    .cfi_startproc\n    addq %rdi, %rsi\n    shlq %sil, %r8\n    movq %r8, %rax\n    ret\n    .cfi_endproc\n    .size f, .-f\n"
+ right: "    .text\n    .globl f\n    .type f, @function\nf:\n    .cfi_startproc\n    movq %rdi, %rcx\n    addq %rsi, %rcx\n    shlq %cl, %r8\n    movq %r8, %rax\n    ret\n    .cfi_endproc\n    .size f, .-f\n"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::copy_commute_preserves_fixed_cl_reader ... FAILED
+
+thread 'backend::x86::codegen::peephole::passes::load_op_fuse::tests::copy_commute_preserves_implicit_accumulator_reader' (350459) panicked at src/backend/x86/codegen/peephole/passes/load_op_fuse.rs:2035:9:
+assertion `left == right` failed
+  left: "    .text\n    .globl f\n    .type f, @function\nf:\n    .cfi_startproc\n    addq %rdi, %rsi\n    mulq %r8\n    movq %rdx, %rax\n    ret\n    .cfi_endproc\n    .size f, .-f\n"
+ right: "    .text\n    .globl f\n    .type f, @function\nf:\n    .cfi_startproc\n    movq %rdi, %rax\n    addq %rsi, %rax\n    mulq %r8\n    movq %rdx, %rax\n    ret\n    .cfi_endproc\n    .size f, .-f\n"
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::copy_commute_preserves_implicit_accumulator_reader ... FAILED
+
+thread 'backend::x86::codegen::peephole::passes::load_op_fuse::tests::adjacent_commute_preserves_fixed_cl_reader' (350457) panicked at src/backend/x86/codegen/peephole/passes/load_op_fuse.rs:2051:9:
+assertion `left == right` failed
+  left: "    .text\n    .globl f\n    .type f, @function\nf:\n    .cfi_startproc\n    addq (%rdi), %rsi\n    shlq %sil, %r8\n    movq %r8, %rax\n    ret\n    .cfi_endproc\n    .size f, .-f\n"
+ right: "    .text\n    .globl f\n    .type f, @function\nf:\n    .cfi_startproc\n    movq (%rdi), %rcx\n    addq %rsi, %rcx\n    shlq %cl, %r8\n    movq %r8, %rax\n    ret\n    .cfi_endproc\n    .size f, .-f\n"
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::adjacent_commute_preserves_fixed_cl_reader ... FAILED
+
+failures:
+
+failures:
+    backend::x86::codegen::peephole::passes::load_op_fuse::tests::adjacent_commute_preserves_fixed_cl_reader
+    backend::x86::codegen::peephole::passes::load_op_fuse::tests::copy_commute_preserves_fixed_cl_reader
+    backend::x86::codegen::peephole::passes::load_op_fuse::tests::copy_commute_preserves_implicit_accumulator_reader
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 4723 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

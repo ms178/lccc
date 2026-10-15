@@ -3535,7 +3535,7 @@ pub fn generate_module(
     if !module.toplevel_asm.is_empty() {
         cg.state().emit(".text");
         for asm_str in &module.toplevel_asm {
-            cg.state().emit(asm_str);
+            cg.emit_toplevel_asm(asm_str);
         }
     }
 

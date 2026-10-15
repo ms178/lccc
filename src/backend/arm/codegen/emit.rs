@@ -3341,6 +3341,19 @@ impl ArchCodegen for ArmCodegen {
     }
 
     // ---- Inline asm / intrinsics (kept inline - has extra logic) ----
+    fn emit_toplevel_asm(&mut self, template: &str) {
+        let (open, close) = super::asm_emitter::USER_ASM_MARKERS;
+        self.state.emit(open);
+        self.state.emit(template);
+        // Always terminate the region, including after user-authored APP
+        // comments. No later compiler instruction may inherit the exemption.
+        self.state.emit(close);
+    }
+
+    fn emit_raw_inline_asm(&mut self, template: &str) {
+        self.emit_toplevel_asm(template);
+    }
+
     fn emit_inline_asm(
         &mut self,
         template: &str,

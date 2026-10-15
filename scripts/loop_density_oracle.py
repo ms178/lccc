@@ -122,14 +122,19 @@ def main(argv: list[str] | None = None) -> int:
 
     oracle_names = [o for o in (s.strip() for s in args.oracles.split(","))
                     if o and not args.local_only]
+    if args.min_oracles < 1:
+        ap.error("min-oracles must be positive")
+    errors: list[dict[str, str]] = []
     rows: list[Row] = []
     for source in args.sources:
+        source_errors = len(errors)
         source_text = source.read_text(errors="replace")
         try:
             local_lines = oracle._local_compile(args.local, source,
                                                 args.local_flags or args.flags)
         except Exception as exc:  # noqa: BLE001 - a survey reports, not aborts
             print(f"{source}: local compile failed: {exc}", file=sys.stderr)
+            errors.append({"source": str(source), "compiler": "lccc", "error": str(exc)})
             continue
         local = measure_all(local_lines)
         remote: dict[str, dict[str, dict]] = {}
@@ -139,6 +144,7 @@ def main(argv: list[str] | None = None) -> int:
                     oracle._compile_remote(name, source_text, args.flags))
             except Exception as exc:  # noqa: BLE001
                 print(f"{source}: {name}: {exc}", file=sys.stderr)
+                errors.append({"source": str(source), "compiler": name, "error": str(exc)})
         for symbol, lr in sorted(local.items()):
             per_oracle: dict[str, float | None] = {}
             for name, table in remote.items():
@@ -152,6 +158,8 @@ def main(argv: list[str] | None = None) -> int:
             if not args.local_only and len(measured) < args.min_oracles:
                 note = (f"only {len(measured)} oracle(s) emit a comparable "
                         f"'{symbol}' (inlining differs): not ranked")
+            if len(errors) != source_errors:
+                note = "incomplete compiler coverage: not ranked"
             rows.append(Row(
                 benchmark=source.stem, symbol=symbol,
                 lccc_insns=lr["insns"],
@@ -195,6 +203,8 @@ def main(argv: list[str] | None = None) -> int:
         tmp.write_text(json.dumps({
             "schema": 1,
             "semantic_loop_equivalence_verified": False,
+            "complete": not errors,
+            "errors": errors,
             "flags": args.flags,
             "local_flags": args.local_flags or args.flags,
             "oracles": oracle_names,
@@ -224,7 +234,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"{r.lccc_insns}/{r.lccc_bytes_per_trip} B |")
         args.markdown.write_text("\n".join(lines) + "\n")
         print(f"wrote {args.markdown}")
-    return 0
+    return int(bool(errors))
 
 
 if __name__ == "__main__":

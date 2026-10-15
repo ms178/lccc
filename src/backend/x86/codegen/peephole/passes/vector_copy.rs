@@ -1448,6 +1448,108 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn pr832_fixture_witnesses_survive_the_real_peephole_pipeline() {
+        use crate::common::fx_hash::FxHashSet;
+        use crate::common::temp_files::TempFile;
+        use std::process::Command;
+        let fixtures = [
+            ("witness.s", "driver.c"),
+            ("implicit-witness.s", "implicit-driver.c"),
+        ];
+        for (fixture, driver) in fixtures {
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+            let path = root
+                .join("tests/regression/fixtures/peephole-vex-flags")
+                .join(fixture);
+            let original = std::fs::read_to_string(&path).unwrap();
+            let expanded = Command::new("python3")
+                .arg(root.join("scripts/expand_asm_fixture.py"))
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(
+                expanded.status.success(),
+                "{}",
+                String::from_utf8_lossy(&expanded.stderr)
+            );
+            let fixture = String::from_utf8(expanded.stdout).unwrap();
+            // GCC's architectural fixture needs no CFI. Supply the same function
+            // boundaries as compiler output so the optimizer cannot vacuously
+            // skip it. This test does not claim to validate unwind metadata.
+            let names: FxHashSet<_> = fixture
+                .lines()
+                .filter_map(|line| {
+                    line.trim()
+                        .strip_prefix(".type ")
+                        .and_then(|rest| rest.split(',').next())
+                })
+                .collect();
+            let mut input = String::new();
+            for line in fixture.lines() {
+                if line.trim().starts_with(".size ") {
+                    input.push_str(".cfi_endproc\n");
+                }
+                input.push_str(line);
+                input.push('\n');
+                if names.contains(line.trim().trim_end_matches(':')) {
+                    input.push_str(".cfi_startproc\n");
+                }
+            }
+            input.push_str(".text\n.type active_canary,@function\nactive_canary:\n.cfi_startproc\n    movq %rax, %rax\n    ret\n.cfi_endproc\n.size active_canary,.-active_canary\n");
+            let optimized = run(&input);
+            assert!(
+                !optimized.contains("movq %rax, %rax"),
+                "pipeline must run its positive canary"
+            );
+            if !std::arch::is_x86_feature_detected!("avx2") {
+                eprintln!(
+                    "SKIP native fixture execution: AVX2 unavailable; pipeline canary passed"
+                );
+                continue;
+            }
+            let assembly = TempFile::try_new("pr832", "fixture", "s")
+                .expect("test temporary-file reservation");
+            let binary = TempFile::try_new("pr832", "fixture", "exe")
+                .expect("test temporary-file reservation");
+            let driver = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/regression/fixtures/peephole-vex-flags")
+                .join(driver);
+            let mut expected = None;
+            for (stage, text) in [
+                ("GAS original", original),
+                ("expanded", input),
+                ("optimized", optimized),
+            ] {
+                std::fs::write(assembly.path(), &text).unwrap();
+                let built = Command::new("gcc")
+                    .args(["-O2", "-mavx2", "-o"])
+                    .arg(binary.path())
+                    .arg(&driver)
+                    .arg(assembly.path())
+                    .output()
+                    .unwrap();
+                assert!(
+                    built.status.success(),
+                    "{stage}: {}",
+                    String::from_utf8_lossy(&built.stderr)
+                );
+                let result = Command::new(binary.path()).output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "{stage}: {}\n{text}",
+                    String::from_utf8_lossy(&result.stdout)
+                );
+                if let Some(expected) = &expected {
+                    assert_eq!(&result.stdout, expected);
+                } else {
+                    expected = Some(result.stdout);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn pr824_external_redteam_copy_preserves_architectural_zeros() {
         for overwrite in [
             "pshufd $27, %xmm5, %xmm7",
@@ -1482,9 +1584,12 @@ mod tests {
         }
         use crate::common::temp_files::TempFile;
         use std::process::Command;
-        let source = TempFile::new("pr824", "upper-witness", "c");
-        let assembly = TempFile::new("pr824", "upper-witness", "s");
-        let binary = TempFile::new("pr824", "upper-witness", "exe");
+        let source = TempFile::try_new("pr824", "upper-witness", "c")
+            .expect("test temporary-file reservation");
+        let assembly = TempFile::try_new("pr824", "upper-witness", "s")
+            .expect("test temporary-file reservation");
+        let binary = TempFile::try_new("pr824", "upper-witness", "exe")
+            .expect("test temporary-file reservation");
         std::fs::write(source.path(), "extern void witness(void*); int main(void) { unsigned long long out[4]; witness(out); return out[2] != 0 || out[3] != 0; }\n").unwrap();
         for overwrite in [
             "pshufd $27, %xmm5, %xmm7",
@@ -1532,9 +1637,12 @@ mod tests {
         use std::process::Command;
         let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/regression/fixtures/peephole-vex-flags");
-        let assembly = TempFile::new("pr832", "pipeline", "s");
-        let object = TempFile::new("pr832", "expanded", "o");
-        let binary = TempFile::new("pr832", "pipeline", "exe");
+        let assembly =
+            TempFile::try_new("pr832", "pipeline", "s").expect("reserve architectural fixture");
+        let object =
+            TempFile::try_new("pr832", "expanded", "o").expect("reserve architectural fixture");
+        let binary =
+            TempFile::try_new("pr832", "pipeline", "exe").expect("reserve architectural fixture");
         for (source, driver, functions) in [
             ("witness.s", "driver.c", 22),
             ("implicit-witness.s", "implicit-driver.c", 18),
@@ -1775,6 +1883,37 @@ mod tests {
     }
 
     #[test]
+    fn gather_mask_is_a_nontrailing_output_not_a_renameable_read() {
+        // AVX2 gathers clear the vector mask as elements complete. Its first
+        // AT&T operand is read AND written, not a source-only operand.
+        for op in [
+            "vgatherdps",
+            "vgatherdpd",
+            "vgatherqps",
+            "vgatherqpd",
+            "vpgatherdd",
+            "vpgatherdq",
+            "vpgatherqd",
+            "vpgatherqq",
+        ] {
+            let gather = format!("{op} %xmm2, (%rdi,%xmm3,4), %xmm4");
+            let asm = body(&format!(
+                "    vmovaps %xmm0, %xmm2\n    {gather}\n    vmovaps %xmm0, (%rsi)\n    vmovaps %xmm2, 16(%rsi)\n    vmovaps %xmm4, 32(%rsi)\n"
+            ));
+            let mut store = LineStore::new(asm.clone());
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            assert!(
+                !propagate_vector_copies(&mut store, &mut infos),
+                "renaming the gather mask also clobbers the copy source: {op}"
+            );
+            let out = run(&asm);
+            assert!(insns(&out).contains(&gather), "gather mask changed: {out}");
+        }
+    }
+
+    #[test]
     fn propagation_does_not_cross_implicit_vector_outputs() {
         for op in [
             "vpcmpistrm $0, %xmm5, %xmm7",
@@ -1930,6 +2069,53 @@ mod tests {
     }
 
     // ── the parsers ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn masked_moves_do_not_establish_unconditional_copy_facts() {
+        for width in ["xmm", "ymm", "zmm"] {
+            for mask in ["{%k1}", "{%k1}{z}"] {
+                let text = format!("vmovdqa64 %{width}1, %{width}2{mask}");
+                assert_eq!(parse_vec_copy(&text), None, "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn masked_moves_cannot_close_or_open_a_copy_bracket() {
+        for mask in ["{%k1}", "{%k1}{z}"] {
+            for (input_mask, output_mask) in [(mask, ""), ("", mask)] {
+                let asm = body(&format!(
+                    "    vmovdqa64 %xmm0, %xmm2{input_mask}\n    vpxor %xmm3, %xmm2, %xmm2\n    vmovdqa64 %xmm2, %xmm0{output_mask}\n"
+                ));
+                let mut store = LineStore::new(asm);
+                let mut infos: Vec<_> = (0..store.len())
+                    .map(|i| classify_line(store.get(i)))
+                    .collect();
+                assert!(!coalesce_vector_brackets(&mut store, &mut infos));
+            }
+            for mnemonic in ["vmovsd", "vmovss"] {
+                assert_eq!(
+                    parse_vec_copy(&format!("{mnemonic} %xmm1, %xmm1, %xmm2{mask}")),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn masked_move_source_must_not_replace_the_masked_result() {
+        for mask in ["{%k1}", "{%k1}{z}"] {
+            let asm = body(&format!(
+                "    vmovdqa64 %xmm1, %xmm2{mask}\n    vmovq %xmm2, %rax\n"
+            ));
+            let mut store = LineStore::new(asm);
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            assert!(!propagate_vector_copies(&mut store, &mut infos));
+            assert!((0..store.len()).any(|i| store.get(i).trim() == "vmovq %xmm2, %rax"));
+        }
+    }
 
     #[test]
     fn copy_forms_carry_their_upper_bit_semantics() {

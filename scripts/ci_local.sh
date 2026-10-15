@@ -228,6 +228,9 @@ gate "a9987-salvage" fast \
 gate "memory-value-contracts" fast \
     env CCC="$LCCC" bash tests/regression/check_memory_value_contracts.sh
 
+gate "byte-accessor-inline" fast \
+    env CCC="$LCCC" bash tests/regression/check_byte_accessor_inline.sh
+
 gate "audit-loop-contracts" fast \
     env CCC="$LCCC" bash tests/regression/check_audit_loop_contracts.sh
 
@@ -271,8 +274,6 @@ gate "const-volatile-objects" fast \
 # siblings chain (no second recurrence).  Pins the SHAPE (zero stride
 # multiplies, one hoisted base materialisation) and the correctness of the
 # transform at every opt level, ILP32, and under the ptr-add kill switch.
-gate "ivsr-vecaddr-struct-walk" fast \
-    env CCC="$LCCC" bash tests/regression/check_ivsr_vecaddr_struct_walk.sh
 
 # Executed miscompile regression for the iv_widen trajectory gates and the
 # exposed-latch intercept: runtime ring-top seeds over a 2^32-span marker
@@ -355,6 +356,11 @@ gate "cross-target-intrinsic-trap" fast \
 # A14-20: libc buffering must remain inside the profile-file lock.
 gate "pgo-io-contract" fast \
     python3 tests/regression/check_pgo_io.py --lccc "$LCCC"
+
+gate "riscv-shared-binding-selftest" fast \
+    python3 tests/linker/test_riscv_shared_binding.py
+gate "riscv-shared-binding" fast \
+    python3 tests/linker/check_riscv_shared_binding.py --lccc target/fastbuild/lccc-riscv
 
 # A14-17: shared linking must not silently consume unknown relocation kinds.
 gate "riscv-relocation-contract" fast \
@@ -484,6 +490,9 @@ gate "regression-corpus-ssa" slow \
     env CCC_VALIDATE_SSA=1 python3 tests/regression/run_regression.py \
         --lccc "$LCCC" -j 2 --gcc gcc-16 --json regression-results.json
 
+gate "benchmark-output-oracle-selftest" fast \
+    python3 tests/corpus/test_benchmark_output_gate.py
+
 gate "benchmark-output-oracle" slow \
     bash scripts/check_benchmark_outputs.sh
 
@@ -563,8 +572,22 @@ gate "differential-fuzz-smoke" fast \
 gate "strict-computed-recip-codegen" fast \
     bash tests/regression/check_strict_computed_recip_codegen.sh
 
+# Unknown scheduler names are exclusive barriers: hashing is not a concurrent
+# installer/compiler task. Network CE comparisons are deliberately NOT local CI.
+gate "evidence-hash-integrity" fast python3 scripts/verify_evidence_hashes.py
+gate "licm-acquire-backedge-contract" fast python3 scripts/check_licm_ordering.py
+
+gate "ivsr-vecaddr-struct-walk" fast \
+    env CCC="$LCCC" bash tests/regression/check_ivsr_vecaddr_struct_walk.sh
+
 gate "strict-packed-dag" fast \
     env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_strict_packed_dag.sh
+
+gate "strict-packed-recip-bitwise" fast \
+    python3 scripts/check_strict_packed_recip.py
+
+gate "fp-environment-trap-order" fast \
+    bash tests/regression/check_fp_environment.sh
 
 gate "machinst-window-alloc" fast \
     bash tests/regression/check_machinst_window_alloc_wide_copy.sh
@@ -899,6 +922,9 @@ gate "select-from-compare" fast \
 gate "affine-loop-fold" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_affine_loop_fold.sh
 
+gate "unsigned-affine-loop" fast \
+    env CCC="$LCCC" bash tests/regression/check_unsigned_affine_loop.sh
+
 # The FMA contract gate.  It is registered here because a regression test that
 # nothing runs is the defect it was written to fix: the audit found the packed
 # matmul arm contracting unconditionally, the fix shipped, and nothing pinned
@@ -985,7 +1011,6 @@ gate "pr-claim-fidelity" fast \
 # traceback) with a message naming the package and the install path, so
 # the failure is actionable without a separate preflight.
 # Read-only integrity check; exclusive by default (not in scheduler whitelist).
-gate "evidence-hash-integrity" fast python3 scripts/verify_evidence_hashes.py
 
 gate "ci-gate-parity" fast \
     python3 scripts/check_ci_gate_parity.py

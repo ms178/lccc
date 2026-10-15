@@ -20,12 +20,12 @@ those decisions *observable* and *comparable*:
 
 Examples:
 
-    scripts/tune_oracle.py dump --lccc target/fastbuild/lccc raptorlake
+    scripts/tune_oracle.py --lccc target/fastbuild/lccc dump raptorlake
     scripts/tune_oracle.py dump --all --json > /tmp/rows.json
-    scripts/tune_oracle.py matrix --lccc target/fastbuild/lccc \\
+    scripts/tune_oracle.py --lccc target/fastbuild/lccc matrix \\
         --tunes generic,skylake,raptorlake,gracemont,znver3 --flags=-O2 \\
         tests/bench/cpu_model/tune_probe.c
-    scripts/tune_oracle.py compare --lccc target/fastbuild/lccc \\
+    scripts/tune_oracle.py --lccc target/fastbuild/lccc compare \\
         --flags="-O2 -march=x86-64-v3 -mtune=raptorlake" \\
         --oracles gcc16.2,clang,icx tests/bench/cpu_model/tune_probe.c
 
@@ -204,7 +204,12 @@ def cmd_matrix(a: argparse.Namespace) -> int:
 
 def cmd_compare(a: argparse.Namespace) -> int:
     src = Path(a.probe)
-    cols = ["lccc"] + [o for o in a.oracles.split(",") if o]
+    names = [o.strip() for o in a.oracles.split(",") if o.strip()]
+    if not names or len(names) != len(set(names)):
+        print("compare requires nonempty, unique oracle identifiers", file=sys.stderr)
+        return 2
+    cols = ["lccc"] + names
+    failed = False
     table: dict[str, dict[str, list[str]]] = OrderedDict()
     outputs = {"lccc": lccc_compile(a.lccc, src, a.flags)}
     for o in cols[1:]:
@@ -213,8 +218,13 @@ def cmd_compare(a: argparse.Namespace) -> int:
         except Exception as e:  # network / API drift must not hide lccc's own table
             print(f"warning: {o}: {e}", file=sys.stderr)
             outputs[o] = ""
+            failed = True
     for c in cols:
-        for fn, body in split_functions(outputs[c]).items():
+        functions = split_functions(outputs[c])
+        if not functions or (a.function and a.function not in functions):
+            print(f"{c}: requested function/assembly missing", file=sys.stderr)
+            failed = True
+        for fn, body in functions.items():
             if a.function and fn != a.function:
                 continue
             table.setdefault(fn, OrderedDict())[c] = classify(body)
@@ -223,7 +233,7 @@ def cmd_compare(a: argparse.Namespace) -> int:
         Path(a.save).mkdir(parents=True, exist_ok=True)
         for c, asm in outputs.items():
             (Path(a.save) / f"{src.stem}.{c}.s").write_text(asm)
-    return 0
+    return int(failed)
 
 
 def main(argv: list[str] | None = None) -> int:

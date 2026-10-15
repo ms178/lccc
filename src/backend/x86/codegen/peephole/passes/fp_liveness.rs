@@ -452,14 +452,25 @@ pub(super) fn is_full_xmm_def_line(t: &str) -> bool {
     is_full_xmm_def(mn, ops)
 }
 
-/// True when textual vector operands do not describe all register effects.
+/// True when textual source/trailing-destination roles miss register effects.
 /// Copy propagation, bracket coalescing and private-upper-lane proofs must
 /// stop at these effects too; preserving a feeder in DCE alone is insufficient.
 pub(super) fn has_implicit_vector_effects_line(t: &str) -> bool {
     let (mn, operands) = split_mnemonic(t);
     let base = mn.strip_prefix('v').unwrap_or(mn);
     state_image_register_reads(mn).is_some()
-        || matches!(base, "pcmpistrm" | "pcmpestrm" | "zeroupper" | "zeroall")
+        // AVX2 gather masks are explicit but nontrailing read/write outputs.
+        // Treat them as local barriers until consumers model both outputs;
+        // merely keeping the mask read live in DCE does not protect equality
+        // facts in copy propagation and register-backed spill forwarding.
+        // The EVEX spellings may use k masks instead; refusing them here is
+        // conservative and avoids inferring encoding from a mnemonic alone.
+        || matches!(
+            base,
+            "pcmpistrm" | "pcmpestrm" | "zeroupper" | "zeroall"
+                | "gatherdps" | "gatherdpd" | "gatherqps" | "gatherqpd"
+                | "pgatherdd" | "pgatherdq" | "pgatherqd" | "pgatherqq"
+        )
         || implicit_fp_reads(mn, operands, xmm_mentions(t)) & VECTOR_ALL != 0
 }
 
@@ -976,7 +987,7 @@ fn frame_operand(op: &str) -> Result<Option<(u8, i32)>, ()> {
 
 /// Conservative READ extent. None means unbounded/unsupported, never zero.
 /// This superset is NOT proof that an instruction overwrites all these bytes.
-fn read_extent(mn: &str, operands: &str) -> Option<i32> {
+pub(super) fn read_extent(mn: &str, operands: &str) -> Option<i32> {
     if let Some(sz) = match mn {
         "movsd" | "vmovsd" | "addsd" | "subsd" | "mulsd" | "divsd" | "minsd" | "maxsd"
         | "sqrtsd" | "ucomisd" | "comisd" | "vaddsd" | "vsubsd" | "vmulsd" | "vdivsd"
@@ -985,13 +996,13 @@ fn read_extent(mn: &str, operands: &str) -> Option<i32> {
         | "cvtsi2sdq" | "cvtsi2ssq" | "pushq" | "popq" | "cmpq" | "testq" | "addq" | "subq"
         | "andq" | "orq" | "xorq" | "imulq" | "leaq" | "incq" | "decq" | "negq" | "notq"
         | "shlq" | "shrq" | "sarq" | "cmovq" => Some(8),
-        "movss" | "vmovss" | "addss" | "subss" | "mulss" | "divss" | "minss" | "maxss"
-        | "sqrtss" | "ucomiss" | "comiss" | "vaddss" | "vsubss" | "vmulss" | "vdivss"
-        | "vminss" | "vmaxss" | "vsqrtss" | "vucomiss" | "vcomiss" | "cvtss2sd" | "vcvtss2sd"
-        | "cvttss2si" | "cvtss2si" | "movd" | "vmovd" | "movl" | "cvtsi2sd" | "cvtsi2ss"
-        | "cvtsi2sdl" | "cvtsi2ssl" | "movslq" | "cmpl" | "testl" | "addl" | "subl" | "andl"
-        | "orl" | "xorl" | "imull" | "incl" | "decl" | "negl" | "notl" | "shll" | "shrl"
-        | "sarl" | "cmovl" => Some(4),
+        "ldmxcsr" | "stmxcsr" | "vldmxcsr" | "vstmxcsr" | "movss" | "vmovss" | "addss"
+        | "subss" | "mulss" | "divss" | "minss" | "maxss" | "sqrtss" | "ucomiss" | "comiss"
+        | "vaddss" | "vsubss" | "vmulss" | "vdivss" | "vminss" | "vmaxss" | "vsqrtss"
+        | "vucomiss" | "vcomiss" | "cvtss2sd" | "vcvtss2sd" | "cvttss2si" | "cvtss2si" | "movd"
+        | "vmovd" | "movl" | "cvtsi2sd" | "cvtsi2ss" | "cvtsi2sdl" | "cvtsi2ssl" | "movslq"
+        | "cmpl" | "testl" | "addl" | "subl" | "andl" | "orl" | "xorl" | "imull" | "incl"
+        | "decl" | "negl" | "notl" | "shll" | "shrl" | "sarl" | "cmovl" => Some(4),
         "movw" | "cmpw" | "testw" | "addw" | "subw" | "andw" | "orw" | "xorw" | "movzwl"
         | "movswl" | "movzwq" | "movswq" => Some(2),
         "movb" | "cmpb" | "testb" | "addb" | "subb" | "andb" | "orb" | "xorb" | "movzbl"

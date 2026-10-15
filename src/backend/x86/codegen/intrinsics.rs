@@ -6557,11 +6557,29 @@ impl X86Codegen {
                     self.flush_pending_vec_store_impl();
                     self.state.invalidate_vec_peephole();
                     self.operand_to_reg(&args[0], "rax");
-                    self.state.emit("    movd %eax, %xmm0");
-                    self.state.emit("    pshufd $0x00, %xmm0, %xmm0");
+                    let home = dest
+                        .as_ref()
+                        .filter(|_| self.avx2_enabled)
+                        .and_then(|d| self.dest_xmm_home_name(d));
+                    if self.avx2_enabled {
+                        // Scratch and the complete typed 128-bit destination are
+                        // owned here; no legacy copy or speculative promotion.
+                        self.state.emit("    vmovd %eax, %xmm0");
+                        self.state.emit_fmt(format_args!(
+                            "    vpshufd $0x00, %xmm0, %{}",
+                            home.unwrap_or("xmm0")
+                        ));
+                    } else {
+                        self.state.emit("    movd %eax, %xmm0");
+                        self.state.emit("    pshufd $0x00, %xmm0, %xmm0");
+                    }
                     if let Some(d) = dest {
                         self.state.vector_values.insert(d.0);
-                        self.sse_store_dest(d, "xmm0");
+                        if let Some(home) = home {
+                            self.sse_commit_dest_direct(d, home);
+                        } else {
+                            self.sse_store_dest(d, "xmm0");
+                        }
                     }
                 }
             }
@@ -6981,8 +6999,8 @@ impl X86Codegen {
                 // scratch].  The scalar denominator DAG is cloned by the pass
                 // for each lane; packing only its already-computed I32 leaves
                 // C's signed-div/mod semantics to the ordinary scalar IR.
-                // The packed variant instead has [acc, I32x8, base, offset,
-                // scratch]; its low four lanes have already been computed by
+                // The packed variant instead has [acc, I32x4, base, offset,
+                // scratch]; its four lanes have already been computed by
                 // equivalent lane-wise modular integer operations.
                 let packed = matches!(op, IntrinsicOp::StrictRecipMulAddPackedF64x4);
                 assert_eq!(
@@ -7003,7 +7021,24 @@ impl X86Codegen {
                 // upper-zero rule is safe here: only the low 128 bits feed
                 // vcvtdq2pd, which fully overwrites ymm0 before its next read.
                 if packed {
-                    self.avx_load_arg(&args[1]);
+                    // Read exactly XMM/m128, including all home-disabled modes.
+                    // avx_load_arg would incorrectly read a 32-byte denominator.
+                    let Operand::Value(value) = args[1] else {
+                        unreachable!("packed denominator must be a vector SSA value");
+                    };
+                    let source = if let Some(name) = self
+                        .vec_operand_reg(&value)
+                        .filter(|name| name.starts_with("xmm"))
+                    {
+                        format!("%{}", name)
+                    } else if let Some(memory) = self.value_ptr_mem_operand(value.0) {
+                        memory
+                    } else {
+                        self.operand_to_reg(&args[1], "rax");
+                        "(%rax)".to_string()
+                    };
+                    self.state
+                        .emit_fmt(format_args!("    vcvtdq2pd {}, %ymm0", source));
                 } else {
                     self.operand_to_eax(&args[1]);
                     self.state.emit("    vmovd %eax, %xmm0");
@@ -7014,9 +7049,9 @@ impl X86Codegen {
                             lane + 1
                         ));
                     }
+                    self.state.emit("    vcvtdq2pd %xmm0, %ymm0");
                 }
                 self.state.dirty_upper_ymm = true;
-                self.state.emit("    vcvtdq2pd %xmm0, %ymm0");
                 let one = self.vec_const_rip_operand(1.0f64.to_bits(), 8);
                 self.state
                     .emit_fmt(format_args!("    vbroadcastsd {}, %ymm1", one));

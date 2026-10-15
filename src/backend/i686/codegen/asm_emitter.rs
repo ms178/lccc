@@ -218,7 +218,13 @@ impl InlineAsmEmitter for I686Codegen {
         }
     }
 
-    fn load_input_to_reg(&mut self, op: &AsmOperand, val: &Operand, _constraint: &str) {
+    fn load_input_to_reg(
+        &mut self,
+        op: &AsmOperand,
+        val: &Operand,
+        _constraint: &str,
+        _operands: &[AsmOperand],
+    ) {
         let reg = &op.reg;
         let ty = op.operand_type;
 
