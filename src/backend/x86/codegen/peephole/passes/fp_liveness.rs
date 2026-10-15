@@ -59,8 +59,10 @@
 //!   moves may be self-move-elided and therefore invisible) and kills all
 //!   sixteen (caller-saved, SysV);
 //! * `ret` reads `%xmm0` and `%xmm1` (FP return registers) and nothing else;
-//! * implicit blend/SHA inputs and vector-state saves are reads; unknown
-//!   vector operations read all facts locally and prove no kills;
+//! * implicit blend/SHA inputs and vector-state saves are reads; FXSAVE-format
+//!   restores kill only low XMM state, while XRSTOR-family writes depend on
+//!   the runtime component mask and therefore prove no unconditional kill;
+//!   unknown vector operations read all facts locally and prove no kills;
 //! * inline asm reads everything and proves no kills;
 //! * an unresolvable transfer (indirect jump, jump table, tail call to a
 //!   symbol) makes the function unanalysable — every query then answers
@@ -870,6 +872,19 @@ fn state_image_register_reads(mn: &str) -> Option<u128> {
         "fxrstor" | "fxrstor64" | "fxrstorq" | "xrstor" | "xrstor64" | "xrstorq" | "xrstors"
         | "xrstors64" => Some(0),
         _ => None,
+    }
+}
+
+/// Definite vector-register writes by architectural state-image restores.
+/// FXSAVE-format state restores the full low 128 bits of XMM registers but
+/// does not restore YMM/ZMM upper components. XRSTOR/XRSTORS writes depend on
+/// XCR0, XSTATE_BV, and the runtime EDX:EAX request mask; without proving that
+/// mask at the instruction, treating any component as unconditionally killed
+/// would be unsound.
+fn state_image_register_writes(mn: &str) -> u128 {
+    match mn {
+        "fxrstor" | "fxrstor64" | "fxrstorq" => XMM_ALL,
+        _ => 0,
     }
 }
 
@@ -1808,7 +1823,7 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
                 (
                     Effect {
                         reads: reads | upper.reads | implicit_fp_reads(mn, operands, mentioned),
-                        writes: writes | upper.writes,
+                        writes: writes | upper.writes | state_image_register_writes(mn),
                     },
                     fall,
                 )
@@ -2117,6 +2132,69 @@ mod tests {
                 lv.reg_move_dead_after(&store, &infos, def, 7),
                 mn.starts_with("fxsave"),
                 "XSAVE observes the upper zeros too; FXSAVE only the overwritten low region: {mn}"
+            );
+        }
+    }
+
+    #[test]
+    fn fxrstor_kills_low_xmm_state_but_preserves_upper_vector_state() {
+        for mn in ["fxrstor", "fxrstor64", "fxrstorq"] {
+            let (store, mut infos, lv) = build(&format!(
+                "    movaps %xmm6, %xmm7\n    {mn} (%rdi)\n    movaps %xmm7, %xmm0\n    movl $1, %eax\n"
+            ));
+            let def = line_of(&store, "movaps %xmm6, %xmm7");
+            assert_eq!(
+                lv.xmm_live_after(def, 7),
+                Some(false),
+                "{mn} restores and overwrites the low XMM value"
+            );
+            assert!(
+                lv.reg_move_dead_after(&store, &infos, def, 7),
+                "the legacy low-XMM move is dead before {mn}"
+            );
+            assert!(
+                super::super::dead_code::eliminate_dead_fp_moves(&store, &mut infos),
+                "the dead legacy move is removed by the production pass for {mn}"
+            );
+            assert!(infos[def].is_nop(), "the move is eliminated for {mn}");
+
+            // FXSAVE-format images do not carry YMM/ZMM upper state. A later
+            // YMM read therefore keeps the prior upper value live even though
+            // the low XMM component was restored.
+            let (store, mut infos, lv) = build(&format!(
+                "    vmovaps %ymm6, %ymm7\n    {mn} (%rdi)\n    vmovaps %ymm7, %ymm0\n    movl $1, %eax\n"
+            ));
+            let def = line_of(&store, "vmovaps %ymm6, %ymm7");
+            assert_eq!(lv.xmm_live_after(def, 7), Some(false), "low region: {mn}");
+            let facts = lv.func_of(def).expect("function facts");
+            assert_ne!(
+                facts.live_out[def - facts.start] & (1u128 << (YMM_HIGH_SHIFT + 7)),
+                0,
+                "YMM-high value survives {mn} and is read afterwards"
+            );
+            assert!(
+                !lv.reg_move_dead_after(&store, &infos, def, 7),
+                "deleting the VEX move would erase a live YMM-high value across {mn}"
+            );
+            super::super::dead_code::eliminate_dead_fp_moves(&store, &mut infos);
+            assert!(
+                !infos[def].is_nop(),
+                "the production pass preserves the move carrying live YMM-high state across {mn}"
+            );
+        }
+    }
+
+    #[test]
+    fn xrstor_family_does_not_unconditionally_kill_masked_vector_state() {
+        for mn in ["xrstor", "xrstor64", "xrstorq", "xrstors", "xrstors64"] {
+            let (store, _, lv) = build(&format!(
+                "    movaps %xmm6, %xmm7\n    {mn} (%rdi)\n    movaps %xmm7, %xmm0\n    movl $1, %eax\n"
+            ));
+            let def = line_of(&store, "movaps %xmm6, %xmm7");
+            assert_eq!(
+                lv.xmm_live_after(def, 7),
+                Some(true),
+                "without a proven request mask, {mn} cannot kill the old value"
             );
         }
     }

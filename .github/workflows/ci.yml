@@ -363,8 +363,28 @@ jobs:
       run: bash scripts/ci_enable_swap.sh
     - name: Install GCC 16 and i686 C runtime/development files
       run: |
-        bash scripts/ci_install_gcc16.sh --multilib
-        sudo apt-get install -y --no-install-recommends qemu-user
+        set +e
+        install_log="$RUNNER_TEMP/gcc16-multilib-install.log"
+        bash scripts/ci_install_gcc16.sh --multilib >"$install_log" 2>&1
+        install_status=$?
+        if (( install_status == 0 )); then
+          sudo apt-get install -y --no-install-recommends qemu-user >>"$install_log" 2>&1
+          install_status=$?
+        fi
+        set -e
+        cat "$install_log"
+        if (( install_status != 0 )); then
+          python3 - "$install_log" <<'PY' || true
+        from pathlib import Path
+        import sys
+        lines = [line for line in Path(sys.argv[1]).read_text(errors="replace").splitlines() if line.strip()]
+        tail = "\n".join(lines[-30:])[-5000:] or "no install output recorded"
+        message = "GCC 16 / i686 provisioning failed: " + tail
+        message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print("::error title=GCC 16 multilib provisioning::" + message)
+        PY
+        fi
+        exit "$install_status"
     - name: Install differential linker oracles
       run: |
         sudo apt-get update

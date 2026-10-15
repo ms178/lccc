@@ -42,6 +42,12 @@ DEFAULT_LCCC = os.environ.get(
 CC = os.environ.get("LINKTEST_CC", "gcc")
 CXX = os.environ.get("LINKTEST_CXX", "g++")
 
+
+def _escape_github_annotation_data(value: str) -> str:
+    """Escape untrusted multiline text before embedding it in an Actions command."""
+    return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
 def compiler_for(fname):
     """Pick the driver for a fixture source; C++ needs g++, not gcc."""
     return CXX if os.path.splitext(fname)[1] in (".cpp", ".cc", ".cxx") else CC
@@ -11288,6 +11294,16 @@ def main():
     for r in results:
         if r.status != "PASS" or args.verbose:
             print(f"[{r.status}] {r.name}" + (f"\n    {r.detail}" if r.detail else ""))
+        if (
+            (r.status == "FAIL" or (args.strict and r.status in ("WARN", "SKIP")))
+            and os.environ.get("GITHUB_ACTIONS") == "true"
+        ):
+            # Keep the primary log/JSON unchanged, but surface the exact
+            # failing case through the Checks API when hosted-runner log
+            # retrieval is unavailable. Escape workflow-command delimiters.
+            message = f"{r.status} {r.name}: {r.detail or 'no detail'}"
+            message = _escape_github_annotation_data(message)
+            print(f"::error title=Linker suite case::{message}")
     # Print the oracle names that were ACTUALLY used. The previous hardcoded
     # "bfd{mold}{wild}" string could not drift when the list did, so a lost
     # registration was invisible in the one line a reviewer would look at --
