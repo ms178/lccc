@@ -2161,7 +2161,10 @@ mod tests {
                     super::super::dead_code::eliminate_dead_fp_moves(&store, &mut infos),
                     "the dead legacy move is removed by the production pass for {mn}/XMM{reg}"
                 );
-                assert!(infos[def].is_nop(), "the move is eliminated for {mn}/XMM{reg}");
+                assert!(
+                    infos[def].is_nop(),
+                    "the move is eliminated for {mn}/XMM{reg}"
+                );
             }
 
             // Use an XMM-width VEX producer: eliminate_dead_fp_moves parses
