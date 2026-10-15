@@ -25,8 +25,8 @@ jobs:
         rustfmt +1.99.0 --version
         rustup run 1.99.0 clippy-driver --version
         mkdir -p target/redteam
-        rustc +1.99.0 --edition=2024 --test tests/linker/riscv_uleb128_unit.rs -D warnings -C opt-level=1 -C debug-assertions=true -o target/redteam/uleb-tests
-        target/redteam/uleb-tests
+        python3 scripts/ci_test_report.py -- rustc +1.99.0 --edition=2024 --test tests/linker/riscv_uleb128_unit.rs -D warnings -C opt-level=1 -C debug-assertions=true -o target/redteam/uleb-tests
+        python3 scripts/ci_test_report.py -- target/redteam/uleb-tests
     - name: Check formatting with API-visible failure detail
       run: |
         python3 - <<'PY'
@@ -117,8 +117,204 @@ jobs:
         name: pr826-redteam-contracts
         path: target/redteam/
         if-no-files-found: warn
+  compiler-comparison:
+    name: Named candidate semantic and performance audit
+    if: github.event_name == 'workflow_dispatch' && inputs.audit_compare
+    runs-on: ubuntu-24.04
+    container: debian:unstable-slim
+    timeout-minutes: 75
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_FASTBUILD_DEBUG: '0'
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: gcc-16
+      RUSTFLAGS: -D warnings -C link-arg=-Wl,--no-keep-memory
+    steps:
+    - name: Provision actual Debian measurement tools
+      run: |
+        apt-get update
+        apt-get install -y --no-install-recommends ca-certificates curl git python3 gcc-16 g++-16 gcc libc6-dev clang lld valgrind binutils
+        test "$(gcc-16 -dumpfullversion)" = 16.2.0
+        gcc-16 --version
+        clang --version
+        valgrind --version
+        dpkg-query -W gcc-16 g++-16 libc6-dev binutils valgrind
+    - uses: actions/checkout@v7
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+    - name: Build pinned reference trees without switching branches
+      id: comparison-build
+      env:
+        COMPETING_REF: ${{ inputs.competing_ref }}
+        PRIOR_REF: ${{ inputs.prior_ref }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        mkdir -p target/compiler-comparison
+        git rev-parse HEAD > target/compiler-comparison/final.commit
+        for label in main pr835 prior; do
+          case "$label" in
+            main) reference=main ;;
+            pr835) reference=$COMPETING_REF ;;
+            prior) reference=$PRIOR_REF ;;
+          esac
+          case "$reference" in
+            ''|-*|*..*|*[!A-Za-z0-9_./-]*) echo "Invalid reference: $reference" >&2; exit 2 ;;
+          esac
+          git fetch --no-tags --depth=1 origin "$reference"
+          sha=$(git rev-parse FETCH_HEAD)
+          source="$RUNNER_TEMP/compiler-$label"
+          mkdir -p "$source"
+          git archive "$sha" | tar -x -C "$source"
+          printf '%s\n' "$sha" > "target/compiler-comparison/$label.commit"
+          CARGO_TARGET_DIR="$source/target" python3 scripts/ci_test_report.py -- \
+            cargo build --manifest-path "$source/Cargo.toml" --profile fastbuild --locked -j 2 --bin lccc
+          cp "$source/target/fastbuild/lccc" "target/compiler-comparison/$label"
+        done
+        python3 scripts/ci_test_report.py -- cargo build --profile fastbuild --locked -j 2 --bin lccc --bin lccc-riscv
+        rustc -Vv
+        cargo --version
+        rustfmt --version
+        cargo clippy --version
+        sha256sum target/fastbuild/lccc target/compiler-comparison/main target/compiler-comparison/pr835 target/compiler-comparison/prior
+    - name: Compare the same native semantic witnesses across every arm
+      if: ${{ !cancelled() && steps.comparison-build.outcome == 'success' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 scripts/compare_compiler_witnesses.py --gcc gcc-16 \
+          --compiler final=target/fastbuild/lccc --require final \
+          --compiler gcc16-optimized=gcc-16 \
+          --compiler main=target/compiler-comparison/main \
+          --compiler pr835=target/compiler-comparison/pr835 \
+          --compiler prior=target/compiler-comparison/prior \
+          --out target/compiler-comparison/witnesses
+    - name: Correctness-gated paired native comparison of all registered shapes
+      if: ${{ !cancelled() && steps.comparison-build.outcome == 'success' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 tests/benchmark/run_benchmarks.py --lccc target/fastbuild/lccc \
+          --gcc gcc-16 --clang clang --compilers lccc,gcc,clang \
+          --candidate pr835="$GITHUB_WORKSPACE/target/compiler-comparison/pr835" \
+          --candidate prior="$GITHUB_WORKSPACE/target/compiler-comparison/prior" \
+          --opt=-O2 --cflag=-march=x86-64-v3 --cflag=-fwrapv \
+          --reps 9 --warmup 1 --strict --no-pmu-probe \
+          --json target/compiler-comparison/native.json \
+          --markdown target/compiler-comparison/native.md \
+          --artifact-dir target/compiler-comparison/native-artifacts
+        python3 scripts/benchmark_comparison_report.py target/compiler-comparison/native.json \
+          --out target/compiler-comparison/native-summary.json --annotations
+    - name: Screen all shapes at O3 without making a second timing claim
+      if: ${{ !cancelled() && steps.comparison-build.outcome == 'success' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 tests/benchmark/run_benchmarks.py --lccc target/fastbuild/lccc \
+          --gcc gcc-16 --clang clang --compilers lccc,gcc,clang \
+          --candidate pr835="$GITHUB_WORKSPACE/target/compiler-comparison/pr835" \
+          --candidate prior="$GITHUB_WORKSPACE/target/compiler-comparison/prior" \
+          --opt=-O3 --cflag=-march=x86-64-v3 --cflag=-fwrapv \
+          --skip-perf --strict --no-pmu-probe \
+          --json target/compiler-comparison/correctness-o3.json
+    - name: Registry-aware local codegen oracles for each exact compiler
+      if: ${{ !cancelled() && steps.comparison-build.outcome == 'success' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        for label in final main pr835 prior; do
+          compiler="$GITHUB_WORKSPACE/target/compiler-comparison/$label"
+          if [[ $label == final ]]; then compiler="$GITHUB_WORKSPACE/target/fastbuild/lccc"; fi
+          python3 scripts/benchmark_codegen.py --gcc gcc-16 --local "$compiler" --oracles '' \
+            --out "target/compiler-comparison/codegen-$label"
+        done
+    - name: Bounded Callgrind comparison of every registered shape
+      if: ${{ !cancelled() && steps.comparison-build.outcome == 'success' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 scripts/callgrind_corpus.py --mine "$GITHUB_WORKSPACE/target/fastbuild/lccc" \
+          --ref "$GITHUB_WORKSPACE/target/compiler-comparison/pr835" --gcc-include-command gcc-16 \
+          --out target/compiler-comparison/callgrind
+    - name: Independent GCC control for the bounded instrumentation sizes
+      if: ${{ !cancelled() && steps.comparison-build.outcome == 'success' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 scripts/callgrind_corpus.py --mine "$GITHUB_WORKSPACE/target/fastbuild/lccc" \
+          --ref gcc-16 --gcc-include-command gcc-16 \
+          --out target/compiler-comparison/callgrind-gcc-control
+    - name: Publish bounded API-readable evidence even after an audit failure
+      if: always()
+      shell: bash
+      run: |
+        python3 - <<'PY'
+        import hashlib
+        import json
+        from pathlib import Path
+        import sys
+        sys.path.insert(0, 'scripts')
+        from benchmark_comparison_report import notice, notice_rows, summarize
+        root = Path('target/compiler-comparison')
+        notice('compiler comparison source identity', {p.stem: p.read_text().strip() for p in sorted(root.glob('*.commit'))})
+        for name in ('native', 'correctness-o3'):
+            path = root / (name + '.json')
+            if path.exists():
+                result = summarize(json.loads(path.read_text()))
+                notice('compiler comparison ' + name, {'sha256': hashlib.sha256(path.read_bytes()).hexdigest(), 'comparisons': result['comparisons']})
+                compact = []
+                for row in result['rows']:
+                    ratios = {}
+                    for label, arm in row['ratios'].items():
+                        pair = arm['paired'] or {}
+                        ratios[label] = {'eligible': arm['eligible'], 'median': pair.get('median'), 'ci95': pair.get('median_ci95_bootstrap'), 'n': pair.get('n')}
+                    compact.append({'name': row['name'], 'correct': row['correct'], 'ratios': ratios})
+                notice_rows('compiler comparison rows ' + name, compact)
+        path = root / 'witnesses/index.json'
+        if path.exists():
+            data = json.loads(path.read_text())
+            notice('native witness comparison', {'complete': data['complete'], 'control_policy': data['control_policy'], 'summary': data['summary'], 'compilers': data['compilers'], 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
+            failed_rows = []
+            for row in data['cases']:
+                failures = {key: {'build': arm['build']['status'], 'run': arm.get('run', {}).get('status'), 'stderr_tail': arm['build']['stderr_tail'][-180:]} for key, arm in row['arms'].items() if not arm['pass']}
+                if failures:
+                    failed_rows.append({'case': row['id'], 'failures': failures})
+            notice_rows('semantic witness failures', failed_rows)
+        for path in sorted(root.glob('codegen-*/index.json')):
+            if path.exists():
+                data = json.loads(path.read_text())
+                notice('codegen audit ' + path.parent.name, {'complete': data['complete'], 'shapes': len(data['results']), 'failures': len(data['failures']), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
+        for name in ('callgrind', 'callgrind-gcc-control'):
+            path = root / name / 'index.json'
+            if path.exists():
+                data = json.loads(path.read_text())
+                notice('bounded ' + name + ' audit', {'complete': data['complete'], 'shapes': len(data['results']), 'failures': data['failures'][:2], 'failure_count': len(data['failures']), 'metric': data['metric'], 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
+                notice_rows(name + ' rows', [{'name': label, **row['metrics']} for label, row in data['results'].items()])
+        PY
+    - name: Retain raw commands, outputs, binaries and counter evidence
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: named-compiler-comparison
+        path: target/compiler-comparison/
+        if-no-files-found: error
 'on':
   pull_request:
     branches:
     - main
-  workflow_dispatch: null
+  workflow_dispatch:
+    inputs:
+      audit_compare:
+        description: Run the opt-in named-candidate research lane
+        type: boolean
+        default: false
+      competing_ref:
+        description: Same-repository competing reference to archive, never check out
+        type: string
+        default: refs/pull/835/head
+      prior_ref:
+        description: Same-repository prior candidate commit to archive
+        type: string
+        default: 3671c7c9a088226b2962ff9712c178da79e7b9d4

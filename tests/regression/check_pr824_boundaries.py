@@ -107,6 +107,8 @@ def main():
         args.json.write_text(json.dumps(summary, indent=2) + "\n")
     if error:
         print("FAIL:", error)
+        escaped = error.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(f"::error title=Cross-target boundary witness failed::{escaped}")
     print(f"PR824 boundaries: {len(records)} PASS / {summary['failed']} FAIL / 0 SKIP")
     return int(error is not None)
 

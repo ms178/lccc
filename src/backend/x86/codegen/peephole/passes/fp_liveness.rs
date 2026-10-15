@@ -1002,7 +1002,7 @@ fn frame_operand(op: &str) -> Result<Option<(u8, i32)>, ()> {
 
 /// Conservative READ extent. None means unbounded/unsupported, never zero.
 /// This superset is NOT proof that an instruction overwrites all these bytes.
-fn read_extent(mn: &str, operands: &str) -> Option<i32> {
+pub(super) fn read_extent(mn: &str, operands: &str) -> Option<i32> {
     // CMOV's condition can end in l (signed less-than). The register,
     // not that character, determines the width of an unsuffixed CMOVL.
     if mn.starts_with("cmov") {
@@ -1029,6 +1029,10 @@ fn read_extent(mn: &str, operands: &str) -> Option<i32> {
         };
     }
     if let Some(sz) = match mn {
+        // FXSAVE-format restore images have a fixed 512-byte footprint.
+        // XRSTOR-family footprints depend on enabled XSAVE components and
+        // remain unknown below, never capped at the largest vector width.
+        "fxrstor" | "fxrstor64" | "fxrstorq" => Some(512),
         "movsd" | "vmovsd" | "addsd" | "subsd" | "mulsd" | "divsd" | "minsd" | "maxsd"
         | "sqrtsd" | "ucomisd" | "comisd" | "vaddsd" | "vsubsd" | "vmulsd" | "vdivsd"
         | "vminsd" | "vmaxsd" | "vsqrtsd" | "vucomisd" | "vcomisd" | "cvtsd2ss" | "vcvtsd2ss"
@@ -1036,7 +1040,8 @@ fn read_extent(mn: &str, operands: &str) -> Option<i32> {
         | "cvtsi2sdq" | "cvtsi2ssq" | "pushq" | "popq" | "cmpq" | "testq" | "addq" | "subq"
         | "andq" | "orq" | "xorq" | "imulq" | "leaq" | "incq" | "decq" | "negq" | "notq"
         | "shlq" | "shrq" | "sarq" => Some(8),
-        "movss" | "vmovss" | "addss" | "subss" | "mulss" | "divss" | "minss" | "maxss"
+        "ldmxcsr" | "stmxcsr" | "vldmxcsr" | "vstmxcsr"
+        | "movss" | "vmovss" | "addss" | "subss" | "mulss" | "divss" | "minss" | "maxss"
         | "sqrtss" | "ucomiss" | "comiss" | "vaddss" | "vsubss" | "vmulss" | "vdivss"
         | "vminss" | "vmaxss" | "vsqrtss" | "vucomiss" | "vcomiss" | "cvtss2sd" | "vcvtss2sd"
         | "cvttss2si" | "cvtss2si" | "movd" | "vmovd" | "movl" | "cvtsi2sd" | "cvtsi2ss"

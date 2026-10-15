@@ -32,6 +32,7 @@ import math
 import os
 import platform
 import random
+import re
 import resource
 import shutil
 import statistics
@@ -307,7 +308,15 @@ def discover_compilers(args: argparse.Namespace) -> tuple[list[CompilerSpec], di
     aliases = {"icc": "icx"}
     requested = [aliases.get(item, item) for item in requested]
     known = {"lccc", "lev", "ccc", "gcc", "clang", "icx"}
-    unknown = [item for item in requested if item not in known]
+    additional: dict[str, str] = {}
+    for item in getattr(args, "candidate", []):
+        key, separator, executable = item.partition("=")
+        if (not separator or not executable or not re.fullmatch(r"[a-z][a-z0-9_-]*", key)
+                or key in known or key in additional):
+            raise ValueError("--candidate requires a unique non-reserved label=executable: " + item)
+        additional[key] = executable
+    requested = list(dict.fromkeys([*requested, *additional]))
+    unknown = [item for item in requested if item not in known | additional.keys()]
     if unknown:
         raise ValueError(f"unknown compiler key(s): {', '.join(unknown)}")
 
@@ -319,6 +328,8 @@ def discover_compilers(args: argparse.Namespace) -> tuple[list[CompilerSpec], di
         "clang": ("Clang", args.clang),
         "icx": ("ICX", args.icx),
     }
+    candidates.update((key, ("LCCC candidate: " + key, executable))
+                      for key, executable in additional.items())
     resolved = {key: compiler_path(value) for key, (_, value) in candidates.items()}
     gcc_include = detect_gcc_include(resolved.get("gcc"))
     unavailable: dict[str, str] = {}
@@ -330,7 +341,7 @@ def discover_compilers(args: argparse.Namespace) -> tuple[list[CompilerSpec], di
         if not executable:
             unavailable[key] = f"not found: {supplied}"
             continue
-        if key in ("lccc", "lev", "ccc"):
+        if key in ("lccc", "lev", "ccc") or key in additional:
             if not gcc_include:
                 unavailable[key] = "GCC builtin include directory unavailable (needed for compiler headers)"
                 continue
@@ -678,16 +689,24 @@ def evaluate_correctness(entry: dict[str, Any], compiler_keys: list[str]) -> Non
         entry["correctness"][key] = {
             "stable_within_compiler": len(set(outputs)) == 1 if outputs else None,
             "output": outputs[0] if outputs else None,
+            "all_runs_successful": bool(runs) and len(outputs) == len(runs),
             "matches_baseline": None,
         }
-    baseline = "gcc" if "gcc" in successful else (next(iter(successful), None))
+    # When requested, GCC remains the oracle even if it failed. Falling back
+    # to LCCC would let the candidate certify its own wrong or missing result.
+    baseline = "gcc" if "gcc" in compiler_keys else next(iter(successful), None)
     entry["baseline_compiler"] = baseline
-    if baseline is None:
+    if baseline is None or baseline not in successful:
+        return
+    baseline_check = entry["correctness"][baseline]
+    if not baseline_check["stable_within_compiler"] or not baseline_check["all_runs_successful"]:
         return
     baseline_output = successful[baseline][0]
     for key, outputs in successful.items():
-        stable = len(set(outputs)) == 1
-        entry["correctness"][key]["matches_baseline"] = stable and outputs[0] == baseline_output
+        check = entry["correctness"][key]
+        check["matches_baseline"] = (check["stable_within_compiler"]
+                                     and check["all_runs_successful"]
+                                     and outputs[0] == baseline_output)
 
 
 def pair_ratios(rounds: list[dict[str, Any]], numerator: str, denominator: str,
@@ -849,7 +868,7 @@ def best_reference_for_entry(entry: dict[str, Any]) -> tuple[str, float] | None:
     """Return the lowest-median available reference compiler for one workload."""
     candidates: list[tuple[str, float]] = []
     for key, runtime in entry.get("runtime", {}).items():
-        if key == "lccc":
+        if key == "lccc" or entry.get("correctness", {}).get(key, {}).get("matches_baseline") is not True:
             continue
         wall = runtime.get("wall") if runtime else None
         if wall and wall.get("median") is not None:
@@ -862,7 +881,8 @@ def aggregate_lccc_vs_gcc(entries: list[dict[str, Any]]) -> dict[str, Any] | Non
     for entry in entries:
         ratio = entry.get("ratios_to_gcc", {}).get("lccc")
         lccc_correct = entry.get("correctness", {}).get("lccc", {}).get("matches_baseline")
-        if ratio and ratio.get("median") and lccc_correct is True:
+        gcc_correct = entry.get("correctness", {}).get("gcc", {}).get("matches_baseline")
+        if ratio and ratio.get("median") and lccc_correct is True and gcc_correct is True:
             ratios.append((entry["name"], ratio["median"]))
     if not ratios:
         return None
@@ -1093,6 +1113,8 @@ def main() -> int:
     parser.add_argument("--icx", default="icx", help="ICX executable")
     parser.add_argument("--ccc", default="", help="path to the original Claude's C Compiler executable (Anthropic upstream)")
     parser.add_argument("--lev", default="", help="path to Lev Kropp's original lccc executable (levkropp/lccc)")
+    parser.add_argument("--candidate", action="append", default=[], metavar="LABEL=EXECUTABLE",
+                        help="additional, explicitly labelled LCCC-compatible arm; repeatable, never impersonates a vendor")
     parser.add_argument("--opt", default="-O2", help="optimization flag passed uniformly to every compiler")
     parser.add_argument("--cflag", action="append", default=[], help="additional common compiler flag; may be repeated")
     parser.add_argument("--reps", type=int, default=15, help="timed paired rounds per benchmark (default: %(default)s)")

@@ -687,3 +687,28 @@ pub fn section_order(name: &str, flags: u64) -> u64 {
         _ => 600,
     }
 }
+
+#[cfg(test)]
+mod auipc_encoding_tests {
+    use super::super::displacement::checked_auipc_delta;
+    use super::patch_u_type;
+
+    #[test]
+    fn checked_displacements_round_trip_through_the_production_encoder() {
+        for high in [-524288_i64, -1, 0, 1, 524287] {
+            for low in -2048_i64..2048 {
+                let expected = high * 4096 + low;
+                let place = 1_u64 << 63;
+                let symbol = place.wrapping_add(expected as u64);
+                let delta = checked_auipc_delta(symbol, 0, place).unwrap();
+                let mut insn = 0x97_u32.to_le_bytes();
+                patch_u_type(&mut insn, 0, delta as u32);
+                let word = u32::from_le_bytes(insn);
+                assert_eq!(word & 0xfff, 0x97);
+                let decoded_high = i64::from((word & 0xfffff000) as i32);
+                let decoded_low = (delta << 52) >> 52;
+                assert_eq!(decoded_high + decoded_low, expected);
+            }
+        }
+    }
+}

@@ -154,8 +154,67 @@ def main():
                 obj.write_bytes(changed)
                 run(command)
                 checks += 1
-        # Visibility on a definition in another TU constrains a default-visible
-        # reference, independent of object order.
+        # ELF symbol zero is LOCAL+UNDEF: numeric S=0 is not proof that
+        # load bias cancels. Preserve a sentinel output on every rejected link.
+        src.write_text(".text\n.quad 0x8c67d1284e9ab053\n.global entry\n"
+                       "entry: adr x0,target\nret\n.data\n.local target\n"
+                       "target: .quad 0x52fd03498abc7e91\n")
+        run(["-c", src, "-o", obj])
+        original, rows = sections(obj)
+        rela_site = rows[".rela.text"][4]
+        sym_index = struct.unpack_from("<Q", original, rela_site + 8)[0] >> 32
+        sym_site = rows[".symtab"][4] + 24 * sym_index
+        for case in ["zero", "undef", "abs", "missing-section"]:
+            changed = bytearray(original)
+            if case == "zero":
+                struct.pack_into("<Q", changed, rela_site + 8, 274)
+            else:
+                shndx = {"undef": 0, "abs": 0xfff1, "missing-section": 0xff00}[case]
+                struct.pack_into("<H", changed, sym_site + 6, shndx)
+            obj.write_bytes(changed)
+            exe.write_bytes(b"must not overwrite an existing output")
+            run(["-nostdlib", "-shared", obj, "-o", exe], False)
+            assert exe.read_bytes() == b"must not overwrite an existing output", case
+            checks += 1
+        # STT_SECTION and a named local are independent positive controls.
+        for section_symbol in [False, True]:
+            changed = bytearray(original)
+            if section_symbol:
+                changed[sym_site + 4] = 3  # STB_LOCAL | STT_SECTION
+            obj.write_bytes(changed)
+            run(["-nostdlib", "-shared", obj, "-o", exe])
+            data, site, p, _ = mapped_marker(exe, 0x8c67d1284e9ab053, 8)
+            _, _, target, _ = mapped_marker(exe, 0x52fd03498abc7e91)
+            assert p + displacement(struct.unpack_from("<I", data, site)[0]) == target
+            checks += 1
+        # A real, nonallocated input section is not an address that relocates
+        # with this DSO, even when its symbol is local and numerically in range.
+        src.write_text('.text\n.global entry\nentry: adr x0,target\nret\n'
+                       '.section .debug_target,"",%progbits\n.local target\ntarget: .quad 1\n')
+        run(["-c", src, "-o", obj])
+        p = run(["-nostdlib", "-shared", obj, "-o", exe], False)
+        assert "local allocated section-relative" in p.stderr, p.stderr
+        checks += 1
+        # Same-name local symbols must retain object identity, not consult a
+        # global name-only visibility/address table. Decode both input orders.
+        local_objects = []
+        markers = [(0x129be874e361fa05, 0x6cae48d7902b135f),
+                   (0x54be71a36289fc0d, 0x9b34df07e26518ac)]
+        for i, (site_mark, data_mark) in enumerate(markers):
+            local_src, local_obj = w / f"local{i}.s", w / f"local{i}.o"
+            local_src.write_text(f".text\n.quad {site_mark}\nadr x0,target\nret\n"
+                                 f".data\n.local target\ntarget: .quad {data_mark}\n")
+            run(["-c", local_src, "-o", local_obj])
+            local_objects.append(local_obj)
+        for order in [local_objects, local_objects[::-1]]:
+            run(["-nostdlib", "-shared", *order, "-o", exe])
+            for site_mark, data_mark in markers:
+                data, site, p, _ = mapped_marker(exe, site_mark, 8)
+                _, _, target, _ = mapped_marker(exe, data_mark)
+                assert p + displacement(struct.unpack_from("<I", data, site)[0]) == target
+                checks += 1
+        # AArch64 does not yet serialize/enforce merged ELF visibility across
+        # dynsym/GOT/PLT. Bound shared ADR to true locals, in either input order.
         definition, definition_obj = w / "definition.s", w / "definition.o"
         src.write_text(".text\n.global _start\n_start: adr x0,target\nret\n")
         run(["-c", src, "-o", obj])
@@ -163,7 +222,8 @@ def main():
             definition.write_text(f".data\n.global target\n.{visibility} target\ntarget: .quad 1\n")
             run(["-c", definition, "-o", definition_obj])
             for inputs in [[obj, definition_obj], [definition_obj, obj]]:
-                run(["-shared", "-nostdlib", *inputs, "-o", w / "hidden.so"])
+                p = run(["-shared", "-nostdlib", *inputs, "-o", w / "hidden.so"], False)
+                assert "local allocated section-relative" in p.stderr, p.stderr
                 checks += 1
         # Same-section ADRP must account for the final merged section's page.
         definition.write_text(".text\n.space 4080\n")

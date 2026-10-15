@@ -1,0 +1,689 @@
+{
+  "classification": "old separate CI jobs, bounded simulated Ir only; not a controlled timing A/B",
+  "same_source_shapes": 44,
+  "excluded": [
+    "tce_sum"
+  ],
+  "rows": [
+    {
+      "name": "spectral_norm",
+      "ours_Ir": 5503480,
+      "pr835_Ir": 5170615,
+      "ours_gcc_Ir": 2730474,
+      "pr835_gcc_Ir": 2730474,
+      "ratio": 1.0643762879270648,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "21a48dccebcbc3b9496263f62df260d278051c3cd1a528ed99c8b66bef481e6a",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "struct_copy",
+      "ours_Ir": 395646,
+      "pr835_Ir": 389646,
+      "ours_gcc_Ir": 420916,
+      "pr835_gcc_Ir": 420916,
+      "ratio": 1.0153985925686393,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "b0ca8943fcfed56f7ae9bbd49e7e52a98f9780b4be8151c494fc12b05dcb2bfa",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "lz4_compress",
+      "ours_Ir": 654048,
+      "pr835_Ir": 649093,
+      "ours_gcc_Ir": 580765,
+      "pr835_gcc_Ir": 580765,
+      "ratio": 1.0076337289109574,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "zstd_count",
+      "ours_Ir": 473614,
+      "pr835_Ir": 471574,
+      "ours_gcc_Ir": 427641,
+      "pr835_gcc_Ir": 427641,
+      "ratio": 1.00432593824087,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "cf01953477eadbebe46b07ede170a62ff41b62cf947dd12222a04ad93c985be6",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "sqlite_varint",
+      "ours_Ir": 844807,
+      "pr835_Ir": 844799,
+      "ours_gcc_Ir": 775925,
+      "pr835_gcc_Ir": 775925,
+      "ratio": 1.0000094697081792,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "11c7e09b1507659fe44e678848c5e489268e4dd4aa385d3a542453caa400e1af",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "aarch64_select_patterns",
+      "ours_Ir": 880487,
+      "pr835_Ir": 880487,
+      "ours_gcc_Ir": 727755,
+      "pr835_gcc_Ir": 727755,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "22b7e42c9de227a1b815878d95f3dc2e97630addaf6e3c19e77d2ce38c09c0b1",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "histogram",
+      "ours_Ir": 3239700,
+      "pr835_Ir": 3239700,
+      "ours_gcc_Ir": 1707284,
+      "pr835_gcc_Ir": 1707284,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "67bef36e96b93d37b36e85f02e991eda19cd759393ec104684edfde54c6a3806",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "gzip_crc32",
+      "ours_Ir": 815632,
+      "pr835_Ir": 815632,
+      "ours_gcc_Ir": 822823,
+      "pr835_gcc_Ir": 822823,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "9f9acac042ab580ce2137a9fb653a5b3db5e7015dbb49254944195ef5eb98f6a",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "libm_round_family",
+      "ours_Ir": 186072,
+      "pr835_Ir": 186072,
+      "ours_gcc_Ir": 190512,
+      "pr835_gcc_Ir": 190512,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "b70c5bacd90081c28ea74dc1142f9eacc64278d539f258da5bd1614ebc503668",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "tls_seg_access",
+      "ours_Ir": 225946,
+      "pr835_Ir": 225946,
+      "ours_gcc_Ir": 232069,
+      "pr835_gcc_Ir": 232069,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "02e6d2bcd07b2e1fc253b53d316d522e7b3d912ae634b6fad2c10dc93a1d4835",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "percpu_ptr_walk",
+      "ours_Ir": 299530,
+      "pr835_Ir": 299530,
+      "ours_gcc_Ir": 303892,
+      "pr835_gcc_Ir": 303892,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "8494442ce679590e5710d2f9594587190113d22a6ba5edb5414ba9e5eb85461c",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "byte_load_reassembly",
+      "ours_Ir": 72125195,
+      "pr835_Ir": 72125195,
+      "ours_gcc_Ir": 16834535,
+      "pr835_gcc_Ir": 16834535,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "d98d60eefd244df93fd9f4a828806ce2e32be56aad4872a2672d172b14dda562",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "zlib_ng_adler32",
+      "ours_Ir": 478486,
+      "pr835_Ir": 478486,
+      "ours_gcc_Ir": 519966,
+      "pr835_gcc_Ir": 519966,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "bca7938ef542270a06d734bf814b3f1806ab1796e8f53d5c53d1b5ccd6b08486",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "expat_xml_scan",
+      "ours_Ir": 1664681,
+      "pr835_Ir": 1664681,
+      "ours_gcc_Ir": 1449064,
+      "pr835_gcc_Ir": 1449064,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "a076b1823869765011658d56ec090b22102e2ba7a5bbdf4cd0b6bdd0d774cf35",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "expat_siphash24",
+      "ours_Ir": 15223611,
+      "pr835_Ir": 15223611,
+      "ours_gcc_Ir": 15374964,
+      "pr835_gcc_Ir": 15374964,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "59c5dfbdf3f0d2e149a3681925c46b7b0aeb195f179c285f3b64a2daaf1fb663",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "linux_find_bit",
+      "ours_Ir": 5972634,
+      "pr835_Ir": 5972634,
+      "ours_gcc_Ir": 5091953,
+      "pr835_gcc_Ir": 5091953,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "linux_find_bit_scaled",
+      "ours_Ir": 22956502,
+      "pr835_Ir": 22956502,
+      "ours_gcc_Ir": 19417272,
+      "pr835_gcc_Ir": 19417272,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "glibc_memcmp",
+      "ours_Ir": 737508,
+      "pr835_Ir": 737508,
+      "ours_gcc_Ir": 706580,
+      "pr835_gcc_Ir": 706580,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "6fcec75ff20c60106d78db2013a646579ab4262750fe64eee99387f3c16b0870",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "chacha20_block",
+      "ours_Ir": 433667,
+      "pr835_Ir": 433667,
+      "ours_gcc_Ir": 838492,
+      "pr835_gcc_Ir": 838492,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "7f0b876dc4bbea778d85e2a30d55046207eb60abe8c5388857bb1207efdac85c",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "sha256_transform",
+      "ours_Ir": 1850075,
+      "pr835_Ir": 1850075,
+      "ours_gcc_Ir": 1948496,
+      "pr835_gcc_Ir": 1948496,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "6f55a89cfd9d59eb9a8e115eef968295ec775fa63d0545dd33517c2fdf06bf5e",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "linux_rbtree",
+      "ours_Ir": 529663,
+      "pr835_Ir": 529663,
+      "ours_gcc_Ir": 425119,
+      "pr835_gcc_Ir": 425119,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "7c9c5ada20d8e32116ccbc1ca68690e92470ef7348b51842e49ffa2fa0480253",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "glibc_strstr",
+      "ours_Ir": 3790550,
+      "pr835_Ir": 3790550,
+      "ours_gcc_Ir": 2070781,
+      "pr835_gcc_Ir": 2070781,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "17dcd48414c9eb254cc910905113b7ed8a3cedac3c0d41216305484a5a7cd344",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "arith_loop",
+      "ours_Ir": 2200158,
+      "pr835_Ir": 2200158,
+      "ours_gcc_Ir": 2667434,
+      "pr835_gcc_Ir": 2667434,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "154a39b6e98cf506bf0d62ed4ab44dad88f7d75923a4eb797b4c41e9339f662c",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "fib",
+      "ours_Ir": 160572,
+      "pr835_Ir": 160572,
+      "ours_gcc_Ir": 2030893,
+      "pr835_gcc_Ir": 2030893,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "983660d7782bcce1d90c389a5869452a6b055a399654ad63f34491245ed41379",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "matmul",
+      "ours_Ir": 324476,
+      "pr835_Ir": 324476,
+      "ours_gcc_Ir": 357964,
+      "pr835_gcc_Ir": 357964,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "927478b18ee0aa0d118eea4d2a9d6bb1251fdf3c64c2619ab578463beba99560",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "qsort",
+      "ours_Ir": 3516489,
+      "pr835_Ir": 3516489,
+      "ours_gcc_Ir": 3403286,
+      "pr835_gcc_Ir": 3403286,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "4b7916c27962da3a9cf71ce75b09910467449ce727a1fb2d3dbf75f5f011641a",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "sieve",
+      "ours_Ir": 1829814,
+      "pr835_Ir": 1829814,
+      "ours_gcc_Ir": 1736758,
+      "pr835_gcc_Ir": 1736758,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "2fd99e297a95711800c1bf4b2facd7e5e09efa740b113c86837e3d0cd22f069b",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "nbody",
+      "ours_Ir": 700698,
+      "pr835_Ir": 700698,
+      "ours_gcc_Ir": 547734,
+      "pr835_gcc_Ir": 547734,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "45db2f21add3645a945f1a6635d642f1aad5caecfa4c7b47da4943331a321837",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "binary_trees",
+      "ours_Ir": 48472856,
+      "pr835_Ir": 48472856,
+      "ours_gcc_Ir": 44921691,
+      "pr835_gcc_Ir": 44921691,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "0a19ef11ab58e32a6ef0ecb8703a856347ba295d2bca67bbe20dfa5243251dc0",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "mandelbrot",
+      "ours_Ir": 6020199,
+      "pr835_Ir": 6020199,
+      "ours_gcc_Ir": 5532125,
+      "pr835_gcc_Ir": 5532125,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "3f9d3a3e0da962e5a1840790ebf46fa09f38cd5e758645c8c65625fa9882555c",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "hash_table",
+      "ours_Ir": 7728512,
+      "pr835_Ir": 7728512,
+      "ours_gcc_Ir": 7386250,
+      "pr835_gcc_Ir": 7386250,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "1c742684a0ea694fbeb95d249748488e89f9033c64d518cd1fafe27da24a2e5a",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "strlen_bench",
+      "ours_Ir": 9235844,
+      "pr835_Ir": 9235844,
+      "ours_gcc_Ir": 8113245,
+      "pr835_gcc_Ir": 8113245,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "175202f59218fa62a3120f9f5202a005f5e234f2cbabd453048d933082e0dd44",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "switch_dispatch",
+      "ours_Ir": 567634,
+      "pr835_Ir": 567634,
+      "ours_gcc_Ir": 526082,
+      "pr835_gcc_Ir": 526082,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "6a044523272024b733f4af8e5101d5bf2d72ba9d6e9362798f6149cd9265117a",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "loop_patterns",
+      "ours_Ir": 723884,
+      "pr835_Ir": 723884,
+      "ours_gcc_Ir": 581685,
+      "pr835_gcc_Ir": 581685,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "e56488201b8d9e8fc7ad17ec521f395232d4c66edcaf880876d2adccba28df88",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "ackermann",
+      "ours_Ir": 160306,
+      "pr835_Ir": 160306,
+      "ours_gcc_Ir": 1172872,
+      "pr835_gcc_Ir": 1172872,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "8f4443c46516743ca68886d1e882b9431d42ea812df71bf58236013193b790b9",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "constant_recursion",
+      "ours_Ir": 159997,
+      "pr835_Ir": 159997,
+      "ours_gcc_Ir": 1172563,
+      "pr835_gcc_Ir": 1172563,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "86d59c961c6c10e03a75dbb42b3c73f01d448bf6296c401bb960f6120dd985c9",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "bitops",
+      "ours_Ir": 1281206,
+      "pr835_Ir": 1281206,
+      "ours_gcc_Ir": 1748455,
+      "pr835_gcc_Ir": 1748455,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "e1e97ac28dabf06df8859e6812a288f639c7f6f070478ebd6fe834a64ed9f7ea",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "double_reduction",
+      "ours_Ir": 30437784,
+      "pr835_Ir": 30437784,
+      "ours_gcc_Ir": 27037163,
+      "pr835_gcc_Ir": 27037163,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "cad8a08bc76c767ac184e222570f4311d2e1ddab072f59119d737c87fbc1eaf7",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "ascii_case_fold",
+      "ours_Ir": 2254867,
+      "pr835_Ir": 2254867,
+      "ours_gcc_Ir": 1396248,
+      "pr835_gcc_Ir": 1396248,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "7a97d5091e4e166a63cb4d6dd80bb35014c4f9ccd77848b60bac357f3211a5dd",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "binary_search",
+      "ours_Ir": 619647,
+      "pr835_Ir": 619647,
+      "ours_gcc_Ir": 446392,
+      "pr835_gcc_Ir": 446392,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "e53295433fcba1e277011bd4ae6860e38a1dc27934c36dc9b2de9c6d3d533422",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "ring_fifo",
+      "ours_Ir": 637710,
+      "pr835_Ir": 637710,
+      "ours_gcc_Ir": 265362,
+      "pr835_gcc_Ir": 265362,
+      "ratio": 1.0,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "e5c01f13f9472d27106f37b76e0076f2d3e4cb71109c38344688e4e8f6e6db03",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "lz4_match_extend",
+      "ours_Ir": 1165483,
+      "pr835_Ir": 1165485,
+      "ours_gcc_Ir": 940749,
+      "pr835_gcc_Ir": 940749,
+      "ratio": 0.9999982839761987,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "zlib_ng_adler32_combine",
+      "ours_Ir": 21869096,
+      "pr835_Ir": 21946318,
+      "ours_gcc_Ir": 21389195,
+      "pr835_gcc_Ir": 21389195,
+      "ratio": 0.9964813231996364,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "5d9a2ade64019e993686dab352d67dbdc4a009e2e33dd8568beff5c9ac423940",
+      "native_output_matched_gcc": true
+    },
+    {
+      "name": "fannkuch",
+      "ours_Ir": 1275870,
+      "pr835_Ir": 1310231,
+      "ours_gcc_Ir": 1111879,
+      "pr835_gcc_Ir": 1111879,
+      "ratio": 0.973774853441874,
+      "gcc_control_ratio": 1.0,
+      "source_sha256": "2a78d670ab985384a3008ac031e7a478fdc790b627d011177dd528b7282d11e5",
+      "native_output_matched_gcc": true
+    }
+  ],
+  "identities": {
+    "ours": {
+      "compiler_versions": {
+        "gcc": "gcc-16 (Debian 16.2.0-3) 16.2.0",
+        "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+      },
+      "git": {
+        "repo": "/__w/lccc/lccc",
+        "revision": "2015e8d85b0c1048887dc98ad36fe53b761c60e6",
+        "status": ""
+      },
+      "settings": {
+        "common_cflags": [],
+        "compiler_order_policy": "randomized independently in every paired round",
+        "opt": "-O2",
+        "outlier_policy": "MAD outliers counted and reported; none are removed",
+        "reps": 1,
+        "seed": 20260810,
+        "skip_perf": true,
+        "timer": "time.perf_counter_ns wall-clock plus resource.RUSAGE_CHILDREN CPU time",
+        "warmup": 0
+      },
+      "complete_registry": [
+        "aarch64_select_patterns",
+        "ackermann",
+        "arith_loop",
+        "ascii_case_fold",
+        "binary_search",
+        "binary_trees",
+        "bitops",
+        "byte_load_reassembly",
+        "chacha20_block",
+        "constant_recursion",
+        "double_reduction",
+        "expat_siphash24",
+        "expat_xml_scan",
+        "fannkuch",
+        "fib",
+        "glibc_memcmp",
+        "glibc_strstr",
+        "gzip_crc32",
+        "hash_table",
+        "histogram",
+        "libm_round_family",
+        "linux_find_bit",
+        "linux_find_bit_scaled",
+        "linux_rbtree",
+        "loop_patterns",
+        "lz4_compress",
+        "lz4_match_extend",
+        "mandelbrot",
+        "matmul",
+        "nbody",
+        "percpu_ptr_walk",
+        "qsort",
+        "ring_fifo",
+        "sha256_transform",
+        "sieve",
+        "spectral_norm",
+        "sqlite_varint",
+        "strlen_bench",
+        "struct_copy",
+        "switch_dispatch",
+        "tce_sum",
+        "tls_seg_access",
+        "zlib_ng_adler32",
+        "zlib_ng_adler32_combine",
+        "zstd_count"
+      ],
+      "workloads": 45,
+      "report_sha256": "c2f9ef2ebf2be18dc50683d0320ccc6976b61cf06a7c782948687aa0f7abd916",
+      "artifact": "debian-exact-oracle/debian-results.json"
+    },
+    "pr835": {
+      "compiler_versions": {
+        "gcc": "gcc-16 (Debian 16.2.0-3) 16.2.0",
+        "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+      },
+      "git": {
+        "repo": "/__w/lccc/lccc",
+        "revision": "718285d62f92a1a7f31e536cc8db791cceb87b9e",
+        "status": ""
+      },
+      "settings": {
+        "common_cflags": [],
+        "compiler_order_policy": "randomized independently in every paired round",
+        "opt": "-O2",
+        "outlier_policy": "MAD outliers counted and reported; none are removed",
+        "reps": 1,
+        "seed": 20260810,
+        "skip_perf": true,
+        "timer": "time.perf_counter_ns wall-clock plus resource.RUSAGE_CHILDREN CPU time",
+        "warmup": 0
+      },
+      "complete_registry": [
+        "aarch64_select_patterns",
+        "ackermann",
+        "arith_loop",
+        "ascii_case_fold",
+        "binary_search",
+        "binary_trees",
+        "bitops",
+        "byte_load_reassembly",
+        "chacha20_block",
+        "constant_recursion",
+        "double_reduction",
+        "expat_siphash24",
+        "expat_xml_scan",
+        "fannkuch",
+        "fib",
+        "glibc_memcmp",
+        "glibc_strstr",
+        "gzip_crc32",
+        "hash_table",
+        "histogram",
+        "libm_round_family",
+        "linux_find_bit",
+        "linux_find_bit_scaled",
+        "linux_rbtree",
+        "loop_patterns",
+        "lz4_compress",
+        "lz4_match_extend",
+        "mandelbrot",
+        "matmul",
+        "nbody",
+        "percpu_ptr_walk",
+        "qsort",
+        "ring_fifo",
+        "sha256_transform",
+        "sieve",
+        "spectral_norm",
+        "sqlite_varint",
+        "strlen_bench",
+        "struct_copy",
+        "switch_dispatch",
+        "tce_sum",
+        "tls_seg_access",
+        "zlib_ng_adler32",
+        "zlib_ng_adler32_combine",
+        "zstd_count"
+      ],
+      "workloads": 45,
+      "report_sha256": "f771ad6b0f48e8155cf52ea2fdeb2d5e1fb745f5053fa2f1facdf5287eb0c3ab",
+      "artifact": "debian-exact-oracle/debian-results.json"
+    }
+  },
+  "checks_api": {
+    "ours": "https://api.github.com/repos/ms178/lccc/check-runs/116583738392/annotations",
+    "pr835": "https://api.github.com/repos/ms178/lccc/check-runs/116522202545/annotations"
+  },
+  "comparison_contract_replay": {
+    "prior": {
+      "tests": 7,
+      "failures": 5,
+      "errors": 0,
+      "failing_tests": [
+        "test_best_reference_is_selected_only_from_correct_compilers (tests.corpus.test_benchmark_comparison_safety.ComparisonSafety.test_best_reference_is_selected_only_from_correct_compilers)",
+        "test_failed_sample_cannot_be_hidden_by_successful_samples (tests.corpus.test_benchmark_comparison_safety.ComparisonSafety.test_failed_sample_cannot_be_hidden_by_successful_samples)",
+        "test_gcc_aggregate_requires_a_correct_reference (tests.corpus.test_benchmark_comparison_safety.ComparisonSafety.test_gcc_aggregate_requires_a_correct_reference)",
+        "test_missing_gcc_never_promotes_the_candidate_to_its_own_oracle (tests.corpus.test_benchmark_comparison_safety.ComparisonSafety.test_missing_gcc_never_promotes_the_candidate_to_its_own_oracle)",
+        "test_unstable_gcc_cannot_certify_a_matching_first_output (tests.corpus.test_benchmark_comparison_safety.ComparisonSafety.test_unstable_gcc_cannot_certify_a_matching_first_output)"
+      ]
+    },
+    "pr835": {
+      "tests": 7,
+      "failures": 5,
+      "errors": 0,
+      "failing_tests": [
+        "test_best_reference_is_selected_only_from_correct_compilers (tests.corpus.test_benchmark_comparison_safety.ComparisonSafety.test_best_reference_is_selected_only_from_correct_compilers)",
+        "test_failed_sample_cannot_be_hidden_by_successful_samples (tests.corpus.test_benchmark_comparison_safety.ComparisonSafety.test_failed_sample_cannot_be_hidden_by_successful_samples)",
+        "test_gcc_aggregate_requires_a_correct_reference (tests.corpus.test_benchmark_comparison_safety.ComparisonSafety.test_gcc_aggregate_requires_a_correct_reference)",
+        "test_missing_gcc_never_promotes_the_candidate_to_its_own_oracle (tests.corpus.test_benchmark_comparison_safety.ComparisonSafety.test_missing_gcc_never_promotes_the_candidate_to_its_own_oracle)",
+        "test_unstable_gcc_cannot_certify_a_matching_first_output (tests.corpus.test_benchmark_comparison_safety.ComparisonSafety.test_unstable_gcc_cannot_certify_a_matching_first_output)"
+      ]
+    },
+    "candidate": {
+      "tests": 7,
+      "failures": 0,
+      "errors": 0,
+      "failing_tests": []
+    }
+  },
+  "protocol_blobs": {
+    "scripts/callgrind_corpus.py": {
+      "ours": "b1a5e1851e245af1903abe6573c342ecb8c2e8d1",
+      "pr835": "2a3be88537b67cf7aafa60fc93c3162392ad96a1"
+    },
+    "scripts/callgrind_ab.py": {
+      "ours": "5fa39e8e435746677161d1ec0ee8af9d346d88ee",
+      "pr835": "5fa39e8e435746677161d1ec0ee8af9d346d88ee"
+    },
+    "tests/benchmark/callgrind_sizes.json": {
+      "ours": "c0403f16123eb1fbb60103df9272149463570574",
+      "pr835": "c0403f16123eb1fbb60103df9272149463570574"
+    }
+  }
+}

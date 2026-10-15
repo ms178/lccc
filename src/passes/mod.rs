@@ -3742,35 +3742,30 @@ mod signed_wrap_policy_tests {
     use super::*;
 
     #[test]
-    fn wrapping_policy_resets_for_every_translation_unit_and_level() {
-        for (level, wraps) in [
-            (2, true),
-            (0, false),
-            (0, true),
-            (1, false),
-            (3, true),
-            (2, false),
-        ] {
-            run_passes(
-                &mut IrModule::new(),
-                level,
-                crate::backend::Target::X86_64,
-                false,
-                wraps,
-                wraps,
-                false,
-                crate::common::fp_contract::FpContract::Off,
-                X86Isa::default(),
-                false,
-                false,
-                false,
-                false,
-                false,
-                false,
-                &crate::backend::regalloc::RaConfig::default(),
-            );
-            assert_eq!(signed_overflow_wraps(), wraps);
-            assert_eq!(fp_environment_observable(), wraps);
+    fn arithmetic_policies_reset_independently_for_every_translation_unit_and_level() {
+        for level in [2, 0, 1, 3] {
+            for (wraps, observable) in [(true, false), (false, true), (true, true), (false, false)] {
+                run_passes(
+                    &mut IrModule::new(),
+                    level,
+                    crate::backend::Target::X86_64,
+                    false,
+                    wraps,
+                    observable,
+                    false,
+                    crate::common::fp_contract::FpContract::Off,
+                    X86Isa::default(),
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                    &crate::backend::regalloc::RaConfig::default(),
+                );
+                assert_eq!(signed_overflow_wraps(), wraps);
+                assert_eq!(fp_environment_observable(), observable);
+            }
         }
     }
 }

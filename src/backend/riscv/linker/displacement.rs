@@ -128,7 +128,8 @@ mod tests {
     #[test]
     fn auipc_rounding_boundaries_and_all_low_bits() {
         // Independently construct offsets from signed ISA field values, then
-        // check the round-trip of the actual U-type encoder plus an I immediate.
+        // check representability independently of the encoding module. The
+        // encoder owns a separate production round-trip regression.
         for high in [-524288_i64, -1, 0, 1, 524287] {
             for low in -2048_i64..2048 {
                 let expected = high * 4096 + low;
@@ -136,13 +137,6 @@ mod tests {
                 let symbol = place.wrapping_add(expected as u64);
                 let delta = checked_auipc_delta(symbol, 0, place).unwrap();
                 assert_eq!(delta, expected);
-                let mut insn = 0x97_u32.to_le_bytes(); // auipc ra, 0
-                super::super::relocations::patch_u_type(&mut insn, 0, delta as u32);
-                let word = u32::from_le_bytes(insn);
-                assert_eq!(word & 0xfff, 0x97);
-                let decoded_high = i64::from((word & 0xfffff000) as i32);
-                let decoded_low = (delta << 52) >> 52;
-                assert_eq!(decoded_high + decoded_low, expected);
             }
         }
     }

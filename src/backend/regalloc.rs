@@ -7430,7 +7430,6 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             5 => matches!(
                 op,
                 O::VecAddI32x8
-                    | O::StrictRecipMulAddPackedF64x4
                     | O::VecMulI32x8
                     | O::VecHorizontalAddI32x8
                     // v12 Fix F: the lane-wise max consumes the I32x8
@@ -7464,7 +7463,8 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             ),
             6 => matches!(
                 op,
-                O::VecAddI32x4 | O::VecMulI32x4 | O::VecHorizontalAddI32x4
+                O::StrictRecipMulAddPackedF64x4
+                    | O::VecAddI32x4 | O::VecMulI32x4 | O::VecHorizontalAddI32x4
                     // ARX lane ops: their emitters resolve a homed source
                     // through %xmm0/%xmm1 scratch without writing the home
                     // (movdqa in, shifts/por on scratch), so a register-homed
@@ -7940,7 +7940,6 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                 op,
                 O::VecMulI32x8
                     | O::VecAddI32x8
-                    | O::StrictRecipMulAddPackedF64x4
                     // Conditional-map consumers: a broadcast invariant is
                     // the compare rhs / blend true-arm (clamp shapes).
                     | O::VecCmpI32x8
@@ -8020,7 +8019,8 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
             ),
             6 => matches!(
                 op,
-                O::VecMulI32x4
+                O::StrictRecipMulAddPackedF64x4
+                    | O::VecMulI32x4
                     | O::VecAddI32x4
                     | O::VecCmpI32x4
                     | O::VecBlendvI32x4
@@ -8398,7 +8398,6 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
             3 => matches!(
                 op,
                 O::VecAddI32x8
-                    | O::StrictRecipMulAddPackedF64x4
                     | O::VecMulI32x8
                     | O::VecSubI32x8
                     | O::VecAndI32x8
@@ -8465,7 +8464,8 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
             ),
             6 => matches!(
                 op,
-                O::VecAddI32x4
+                O::StrictRecipMulAddPackedF64x4
+                    | O::VecAddI32x4
                     | O::VecMulI32x4
                     | O::VecSubI32x4
                     | O::VecAndI32x4
@@ -13112,6 +13112,55 @@ mod map_collector_tests {
             source_spans: Vec::new(),
         }];
         f
+    }
+
+    #[test]
+    fn strict_reciprocal_denominators_are_128_bit_in_every_home_collector() {
+        for (producer, expected) in [
+            (O::VecAddI32x4, true),
+            (O::VecBroadcastI32x4, true),
+            (O::VecMulI32x4, true),
+            (O::VecAddI32x8, false),
+            (O::VecBroadcastI32x8, false),
+            (O::VecMulI32x8, false),
+        ] {
+            let arguments = if matches!(producer, O::VecBroadcastI32x4 | O::VecBroadcastI32x8) {
+                vec![Operand::Const(IrConst::I32(7))]
+            } else {
+                vec![Operand::Value(Value(9)), Operand::Value(Value(9))]
+            };
+            let f = func(
+                vec![
+                    intrinsic(producer, 1, arguments),
+                    intrinsic(
+                        O::StrictRecipMulAddPackedF64x4,
+                        2,
+                        vec![
+                            Operand::Const(IrConst::F64(0.0)),
+                            Operand::Value(Value(1)),
+                            Operand::Value(Value(100)),
+                            Operand::Const(IrConst::I64(0)),
+                            Operand::Value(Value(101)),
+                        ],
+                    ),
+                ],
+                Terminator::Return(None),
+            );
+            let sets = [
+                collect_x86_reduction_vector_values(&f),
+                collect_x86_map_broadcast_values(&f),
+                collect_x86_map_intermediate_values(&f),
+            ];
+            let admitted = sets.iter().any(|set| set.contains(&1));
+            assert_eq!(admitted, expected, "{producer:?}: {sets:?}");
+            if matches!(producer, O::VecAddI32x4 | O::VecAddI32x8) {
+                assert_eq!(sets[0].contains(&1), expected);
+                assert_eq!(sets[2].contains(&1), expected);
+            }
+            if matches!(producer, O::VecBroadcastI32x4 | O::VecBroadcastI32x8) {
+                assert_eq!(sets[1].contains(&1), expected);
+            }
+        }
     }
 
     #[test]

@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Summarize canonical named-arm benchmark evidence without timing false wins.
+
+Keep every registered shape and every failure visible. Ratios below 1 mean
+LCCC faster, not reference/LCCC. Launch-floor rows stay in the correctness
+inventory but are excluded from the primary geometric-mean screening ratio.
+No number from this script is a hardware-counter or bare-metal performance claim.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+from pathlib import Path
+import statistics
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from tests.benchmark import run_benchmarks as bench
+from tools.corpus import publication
+
+
+def summarize(data, floor=.020):
+    expected = {item.name for item in bench.BENCHMARKS}
+    rows = data['benchmarks']
+    names = [row['name'] for row in rows]
+    if len(names) != len(expected) or set(names) != expected:
+        raise ValueError('report does not cover the exact complete benchmark registry')
+    arms = [item['key'] for item in data['compilers']]
+    if len(arms) != len(set(arms)) or 'lccc' not in arms or 'gcc' not in arms:
+        raise ValueError('requires unique compiler arms, including LCCC and GCC')
+    result = {'workloads': len(rows), 'skip_perf': data['settings']['skip_perf'],
+              'floor_s': floor, 'identity': data['compilers'], 'rows': [], 'comparisons': {}}
+    for row in rows:
+        item = {'name': row['name'], 'correct': {}, 'ratios': {}}
+        for arm in arms:
+            runs = row.get('runs', {}).get(arm, [])
+            check = row.get('correctness', {}).get(arm, {})
+            item['correct'][arm] = bool(check.get('matches_baseline') is True
+                and check.get('stable_within_compiler') is True and runs
+                and all(run.get('ok') is True for run in runs))
+        for arm in arms:
+            if arm == 'lccc':
+                continue
+            ratio = row.get('ratios_from_lccc', {}).get(arm)
+            wall_a = row.get('runtime', {}).get('lccc', {}).get('wall') or {}
+            wall_b = row.get('runtime', {}).get(arm, {}).get('wall') or {}
+            above_floor = wall_a.get('median', 0) >= floor and wall_b.get('median', 0) >= floor
+            enough_samples = bool(ratio and 7 <= ratio.get('n', 0)
+                                  <= min(len(row.get('runs', {}).get('lccc', [])),
+                                         len(row.get('runs', {}).get(arm, []))))
+            eligible = bool(not result['skip_perf'] and item['correct']['lccc']
+                            and item['correct'][arm] and item['correct']['gcc']
+                            and above_floor and enough_samples)
+            item['ratios'][arm] = {'eligible': eligible, 'above_floor': above_floor,
+                                   'enough_samples': enough_samples, 'paired': ratio}
+        result['rows'].append(item)
+    for arm in arms:
+        if arm == 'lccc':
+            continue
+        eligible = [row['ratios'][arm]['paired']['median'] for row in result['rows']
+                    if row['ratios'][arm]['eligible']]
+        if any(not math.isfinite(value) or value <= 0 for value in eligible):
+            raise ValueError('nonpositive/nonfinite timing ratio')
+        result['comparisons'][arm] = {
+            'correct': sum(row['correct'][arm] for row in result['rows']),
+            'candidate_correct': sum(row['correct']['lccc'] for row in result['rows']),
+            'timing_eligible': len(eligible), 'timing_excluded': len(rows) - len(eligible),
+            'geometric_mean_ratio': math.exp(statistics.fmean(map(math.log, eligible))) if eligible else None,
+            'arithmetic_mean_ratio': statistics.fmean(eligible) if eligible else None,
+            'interpretation': 'LCCC/reference paired median ratio; screening only; <1 faster',
+        }
+    return result
+
+
+def notice(title, data):
+    text = json.dumps(data, separators=(',', ':'), allow_nan=False)
+    if len(text.encode()) > 3800:
+        raise ValueError('notice exceeds checks-API evidence budget')
+    escaped = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+    print(f'::notice title={title}::{escaped}')
+
+
+def notice_rows(title, rows):
+    """Pack rows into bounded notices instead of losing late rows to UI caps."""
+    chunk = []
+    for row in rows:
+        if chunk and len(json.dumps([*chunk, row], separators=(',', ':'), allow_nan=False).encode()) > 3500:
+            notice(title, chunk)
+            chunk = []
+        chunk.append(row)
+    if chunk:
+        notice(title, chunk)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument('report', type=Path)
+    parser.add_argument('--out', type=Path, required=True)
+    parser.add_argument('--annotations', action='store_true')
+    args = parser.parse_args(argv)
+    data = json.loads(args.report.read_text())
+    result = summarize(data)
+    result['report_sha256'] = hashlib.sha256(args.report.read_bytes()).hexdigest()
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    publication.atomic_bytes(args.out, (json.dumps(result, indent=2, allow_nan=False) + '\n').encode())
+    if args.annotations:
+        notice('compiler comparison aggregate', {key: value for key, value in result.items() if key not in ('rows', 'identity')})
+        for row in result['rows']:
+            notice('compiler comparison ' + row['name'], row)
+    print(json.dumps(result['comparisons'], sort_keys=True))
+    return int(any(not row['correct']['lccc'] or not row['correct']['gcc'] for row in result['rows']))
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

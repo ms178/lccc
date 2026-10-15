@@ -103,7 +103,7 @@ pub fn assemble_with_extra(
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("asm");
-        TempFile::new("ccc_asm", stem, "s")
+        TempFile::try_new("ccc_asm", stem, "s").map_err(|error| error.to_string())?
     };
     std::fs::write(asm_file.path(), asm_text)
         .map_err(|e| format!("Failed to write assembly: {}", e))?;
@@ -111,7 +111,8 @@ pub fn assemble_with_extra(
     let mut cmd = Command::new(config.command);
     cmd.args(config.extra_args);
     cmd.args(extra_dynamic_args);
-    cmd.args(["-c", "-o", output_path, asm_file.to_str()]);
+    cmd.args(["-c", "-o", output_path]);
+    cmd.arg(asm_file.path());
 
     let result = cmd
         .output()
@@ -4650,7 +4651,9 @@ mod gcc_version_discovery_tests {
     use super::installed_gcc_versions;
     #[test]
     fn installed_versions_are_numeric_complete_names_not_a_release_allowlist() {
-        let root = crate::common::temp_files::make_temp_path("test", "gcc-versions", "dir");
+        let owner = crate::common::temp_files::TempFile::try_new("test", "gcc-versions", "dir")
+            .expect("reserve GCC discovery test directory");
+        let root = owner.path().to_path_buf();
         struct Cleanup(std::path::PathBuf);
         impl Drop for Cleanup {
             fn drop(&mut self) {
