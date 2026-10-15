@@ -114,10 +114,10 @@ int main(int argc, char **argv) {
         bodies[i].mass = 11 + i;
         ref[i] = bodies[i];
     }
-    /* Reference: the same interaction order, kept in plain local scalars
-       with no struct-array walking, so no compiler can strength-reduce the
-       two legs together.  Same integer operations, same order -> the two
-       legs are bit-exact by construction. */
+    /* Reference: same interaction order, with explicit scalar temporaries.
+       This still walks ref[i]/ref[j], so it is NOT independent of IVSR.
+       The separately compiled GCC executable supplies the independent oracle;
+       same-TU equality alone would not catch a shared optimizer defect. */
     for (int step = 0; step < n; step++) {
         for (int i = 0; i < 6; i++) {
             for (int j = i + 1; j < 6; j++) {

@@ -40,10 +40,8 @@
 # accepts a mode=fast stamp as its gate (owner decision: GitHub CI runs the
 # slow gates; a local --fast pass is the snapshot requirement).
 #
-#   CI_LOCAL_JOBS=N   parallelism for the clippy gate (default 2).  Set 1 on
-#                     low-memory hosts: `cargo clippy --all-targets` peaks
-#                     near 1.6 GB resident for this crate, and OOM-killing
-#                     rustc mid-gate reads as a lint failure.
+#   CI_LOCAL_GATE_JOBS=1|2 controls isolated compiler-free gate overlap.
+#   Cargo always uses exactly two jobs; heavy gates are exclusive barriers.
 #
 # Environment:
 #   LCCC_TEST_REPEATS=N   run the unit-test suite N times (default 1). N > 1
@@ -62,6 +60,11 @@ REPO=$(pwd)
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 export PATH="$CARGO_HOME/bin:$PATH"
+export CARGO_BUILD_JOBS=2
+# Same fingerprints for build, normal unit tests and clippy. Debug assertions
+# have their own target directory and explicitly disable incremental state.
+export CARGO_PROFILE_FASTBUILD_DEBUG="${CARGO_PROFILE_FASTBUILD_DEBUG:-0}"
+export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-1}"
 
 FAST=0
 SLOW_ONLY=0
@@ -105,6 +108,9 @@ rm -f "$STAMP"
 FAILED=()
 PASSED=0
 SKIPPED=0
+# Audited isolated checks overlap; compiler/toolchain gates drain first.
+# CI_LOCAL_GATE_JOBS=1 selects the serial reference (default: 2).
+source scripts/ci_gate_scheduler.sh
 
 hr() { printf '─%.0s' {1..72}; echo; }
 
@@ -124,18 +130,10 @@ gate() {
     if [ "$SLOW_ONLY" = "1" ] && [ "$slow" != "slow" ] && [ "$name" != "build" ]; then
         return 0
     fi
-    hr
-    echo "GATE  $name"
-    hr
-    local start
-    start=$(date +%s)
-    if "$@"; then
-        echo "PASS  $name  ($(($(date +%s) - start))s)"
-        PASSED=$((PASSED + 1))
-    else
-        echo "FAIL  $name  ($(($(date +%s) - start))s)"
+    ci_gate_submit "$name" "$@" || {
+        echo "FAIL  $name (scheduler infrastructure)"
         FAILED+=("$name")
-    fi
+    }
 }
 
 # Cheapest possible gate, and the one that catches the failure mode that is
@@ -202,6 +200,18 @@ gate "cpu-supports-runtime" fast \
 gate "got-slot-local-addend" fast \
     env CCC="$LCCC" bash tests/regression/check_got_slot_local_addend.sh
 
+gate "vex-flag-reads" fast \
+    bash tests/regression/check_vex_flag_reads.sh
+
+gate "benchmark-codegen-registry" fast \
+    python3 tests/regression/check_benchmark_codegen_registry.py
+
+gate "gcc-provisioning-mocks" fast \
+    python3 tests/regression/check_ci_gcc16_provisioning.py
+
+gate "swap-provisioning-mocks" fast \
+    python3 tests/regression/check_ci_swap_provisioning.py
+
 gate "rust-toolchain-selector" fast \
     bash tests/regression/check_rust_toolchain_selector.sh
 
@@ -255,7 +265,6 @@ gate "volatile-member-codegen" fast \
 # members, against GCC 16.2's per-function memory-reference counts.
 gate "const-volatile-objects" fast \
     env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_const_volatile_objects.sh
-
 # nbody pair-loop family: vector-memory `(base, index, disp)` triples and
 # GEP offsets through GVN Copy glue join one pointer recurrence, affine
 # siblings chain (no second recurrence).  Pins the SHAPE (zero stride
@@ -394,20 +403,11 @@ gate "ill-typed-builtins" fast \
 # cheap once the test binaries are built. Set LCCC_TEST_REPEATS to raise the
 # count (CI itself runs it once).
 #
-# Memory-constrained hosts: the monolithic lib-test compile with the
-# fastbuild profile's line-tables debuginfo needs ~3 GB of resident rustc;
-# on a 4 GB sandbox the OOM killer SIGKILLs it and the gate reports a
-# compile failure that has nothing to do with the code under test. The
-# test binary's debuginfo contributes nothing the assertions read --
-# panic messages carry their own source spans -- and cargo's -j only
-# serialises the COMPILE (the test harness's own parallelism is
-# --test-threads, untouched), so on hosts with less than 6 GB of RAM
-# the test compile drops the debuginfo AND builds one rustc at a time
-# (CARGO_PROFILE_FASTBUILD_DEBUG=0, -j 1; set the env var explicitly to
-# override the heuristic, including back to the profile default with
-# CARGO_PROFILE_FASTBUILD_DEBUG=line-tables-only).
+# Keep the O1 fastbuild/two-job contract. Dropped debug information and swap
+# provide memory headroom without changing parallelism or recompiling the
+# normal library under a different incremental fingerprint.
 cargo_test_repeated() {
-    local flags="" n i dbg jobs
+    local flags="" n i dbg jobs incr
     # Reuse the flags the build gate resolved, or cargo rebuilds everything.
     [ -r target/lccc-rustflags ] && flags="$(cat target/lccc-rustflags)"
     dbg="${CARGO_PROFILE_FASTBUILD_DEBUG:-}"
@@ -418,7 +418,6 @@ cargo_test_repeated() {
         total_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
         if [ -n "$total_mb" ] && [ "$total_mb" -lt 6000 ]; then
             dbg=0
-            jobs=1
         fi
     fi
     # The debuginfo drop alone is not always enough: rustc's incremental
@@ -469,10 +468,10 @@ DBGASSERT_CONFIG=(--config 'profile.fastbuild.debug-assertions=true'
     --config 'profile.fastbuild.incremental=false'
     --config 'profile.fastbuild.debug=0')
 cargo_test_dbgassert() {
-    local flags="" jobs="${CI_LOCAL_JOBS:-2}"
+    local flags="" jobs=2
     [ -r target/lccc-rustflags ] && flags="$(cat target/lccc-rustflags)"
     CARGO_INCREMENTAL=0 RUSTFLAGS="$flags" python3 scripts/ci_test_report.py -- \
-        cargo test --profile fastbuild \
+        cargo test --target-dir target/ci-debug --profile fastbuild \
         --all-targets --locked -j "$jobs" "${DBGASSERT_CONFIG[@]}"
 }
 gate "cargo-test-debug-assertions" slow cargo_test_dbgassert
@@ -482,10 +481,18 @@ gate "cargo-test-debug-assertions" slow cargo_test_dbgassert
 # result.
 gate "regression-corpus-ssa" slow \
     env CCC_VALIDATE_SSA=1 python3 tests/regression/run_regression.py \
-        --lccc "$LCCC" -j 2 --json regression-results.json
+        --lccc "$LCCC" -j 2 --gcc gcc-16 --json regression-results.json
 
 gate "benchmark-output-oracle" slow \
     bash scripts/check_benchmark_outputs.sh
+
+# Bounded native Callgrind surveys remain measurements, not fast smoke gates.
+# Live Compiler Explorer research is not part of either CI mode.
+gate "bounded-callgrind-corpus" slow \
+    python3 scripts/callgrind_corpus.py --mine "$LCCC" --ref "${GCC:-gcc-16}" \
+        --gcc-include-command "${GCC:-gcc-16}" --out results/callgrind-corpus
+
+# Live Compiler Explorer surveys are explicitly invoked research tools, not CI gates.
 
 gate "differential-correctness-oracle" fast \
     env LCCC_BIN="$LCCC" python3 tests/correctness/run_correctness.py
@@ -554,6 +561,9 @@ gate "differential-fuzz-smoke" fast \
 
 gate "strict-computed-recip-codegen" fast \
     bash tests/regression/check_strict_computed_recip_codegen.sh
+
+gate "strict-packed-dag" fast \
+    env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_strict_packed_dag.sh
 
 gate "machinst-window-alloc" fast \
     bash tests/regression/check_machinst_window_alloc_wide_copy.sh
@@ -1803,28 +1813,18 @@ gate "rustfmt" fast cargo fmt --all -- --check
 # the pair). Needs the 1.97.0 rustup toolchain installed.
 gate "msrv-check" fast cargo +1.97.0 check --locked
 
-# Memory-constrained hosts OOM-kill the clippy gate the same way they kill
-# the cargo-test compile (see cargo_test_repeated): clippy-driver's metadata
-# compile of the monolithic lib-test target has the same resident peak as
-# rustc's, so on a < 6 GB host the OOM killer SIGKILLs it mid-gate and the
-# gate reports a LINT failure that never happened (verified 2026-09-30:
-# CI_LOCAL_JOBS=1 alone still SIGKILLs with the profile defaults; debug=0 +
-# incremental=0 + -j1 passes in 81 s with identical lint results).  CI_LOCAL_JOBS
-# stays the explicit parallelism knob; the heuristic only drops it to 1 on a
-# host where the compile itself needs the headroom, mirroring cargo-test.
-# Explicit CARGO_PROFILE_FASTBUILD_DEBUG / CARGO_INCREMENTAL values override
-# the heuristic exactly as documented for cargo_test_repeated.
+# Strict Clippy reuses build flags and the normal profile. The scheduler drains
+# all queued checks before this memory-heavy gate; Cargo stays at two jobs.
 clippy_gate() {
     local flags="" dbg incr jobs total_mb
     [ -r target/lccc-rustflags ] && flags="$(cat target/lccc-rustflags)"
-    jobs="${CI_LOCAL_JOBS:-2}"
+    jobs=2
     dbg="${CARGO_PROFILE_FASTBUILD_DEBUG:-}"
     incr="${CARGO_INCREMENTAL:-}"
     if [ -z "$dbg" ]; then
         total_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
         if [ -n "$total_mb" ] && [ "$total_mb" -lt 6000 ]; then
             dbg=0
-            jobs=1
         fi
     fi
     if [ -z "$incr" ] && [ "${dbg:-}" = "0" ]; then
@@ -1856,28 +1856,22 @@ clippy_gate() {
 }
 gate "clippy" fast clippy_gate
 
-# ci.yml's closing step "Regression corpus (debug-assertions compiler)": the
-# corpus gates above run an assertion-free compiler, so no debug-only
-# invariant (the %rax shadow-epoch validator above all) ever observes real
-# codegen without this.  CI overwrites target/fastbuild/lccc with the
-# assertions-ON binary because nothing after it uses the path; here later
-# work does, so the binary is run from a copy and the shipping build is
-# relinked from its still-cached artifacts afterwards.
+# Assertion-enabled units and corpus share an isolated target directory and
+# identical flags. Never overwrite/rebuild the normal compiler after this gate.
 regression_corpus_dbgassert() {
     local flags="" rc=0
     [ -r target/lccc-rustflags ] && flags="$(cat target/lccc-rustflags)"
-    CARGO_INCREMENTAL=0 RUSTFLAGS="$flags" cargo build --profile fastbuild \
+    CARGO_TARGET_DIR=target/ci-debug CARGO_INCREMENTAL=0 RUSTFLAGS="$flags" cargo build --profile fastbuild \
         --bin lccc --locked -j 2 "${DBGASSERT_CONFIG[@]}" || return 1
-    cp -f target/fastbuild/lccc target/lccc-dbgassert || return 1
     CCC_VALIDATE_SSA=1 python3 tests/regression/run_regression.py \
-        --lccc target/lccc-dbgassert -j 2 \
+        --lccc target/ci-debug/fastbuild/lccc -j 2 --gcc gcc-16 \
         --json target/regression-dbgassert-results.json || rc=1
-    ./scripts/build_lccc_fast.sh >/dev/null || rc=1
     return $rc
 }
 gate "regression-corpus-debug-assertions" slow regression_corpus_dbgassert
 
 # ------------------------------------------------------------------ done ---
+ci_gate_drain
 hr
 echo "SUMMARY: ${PASSED} passed, ${#FAILED[@]} failed, ${SKIPPED} skipped"
 if [ ${#FAILED[@]} -gt 0 ]; then

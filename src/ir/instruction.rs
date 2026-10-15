@@ -807,7 +807,9 @@ impl Instruction {
                 | IntrinsicOp::RoundScalarF64(_)
                 | IntrinsicOp::CopysignF64
                 | IntrinsicOp::VecExtractLaneF64x2
-                | IntrinsicOp::VecExtractLaneF64x4 => Some(IrType::F64),
+                | IntrinsicOp::VecExtractLaneF64x4
+                | IntrinsicOp::StrictRecipMulAddF64x4
+                | IntrinsicOp::StrictRecipMulAddPackedF64x4 => Some(IrType::F64),
                 // The bit-op F128 builtins produce a full _Float128. Their
                 // codegen stores 16 bytes (movdqu) to the dest's home; a
                 // None here made the slot allocator reserve only 8 bytes,

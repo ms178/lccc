@@ -6167,6 +6167,7 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                 | O::VecFnmaF32x4
                 | O::VecAddI32x4
                 | O::VecAddI32x8
+                | O::StrictRecipMulAddPackedF64x4
                 | O::VecAddI8x32
                 | O::VecAddF32x4
                 | O::VecAddF32x8
@@ -7240,6 +7241,7 @@ fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool) -> FxHashSet<u32> {
                             // AVX2 work internally; its ordered accumulator
                             // must use the normal XMM scalar allocation path.
                             | IntrinsicOp::StrictRecipMulAddF64x4
+                            | IntrinsicOp::StrictRecipMulAddPackedF64x4
                             | IntrinsicOp::VecHorizontalAddF32x8
                             | IntrinsicOp::VecHorizontalAddF32x4
                     ) || op.produces_vector_value()
@@ -7428,6 +7430,7 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             5 => matches!(
                 op,
                 O::VecAddI32x8
+                    | O::StrictRecipMulAddPackedF64x4
                     | O::VecMulI32x8
                     | O::VecHorizontalAddI32x8
                     // v12 Fix F: the lane-wise max consumes the I32x8
@@ -7618,6 +7621,7 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 // poison an unrelated mature vector
                                 // accumulator web in the same function.
                                 | O::StrictRecipMulAddF64x4
+                                | O::StrictRecipMulAddPackedF64x4
                                 // v12 Fix C: broadcast/store intrinsics do
                                 // not themselves need an accumulator, but
                                 // they appear in the SAME function as
@@ -7936,6 +7940,7 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                 op,
                 O::VecMulI32x8
                     | O::VecAddI32x8
+                    | O::StrictRecipMulAddPackedF64x4
                     // Conditional-map consumers: a broadcast invariant is
                     // the compare rhs / blend true-arm (clamp shapes).
                     | O::VecCmpI32x8
@@ -8393,6 +8398,7 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
             3 => matches!(
                 op,
                 O::VecAddI32x8
+                    | O::StrictRecipMulAddPackedF64x4
                     | O::VecMulI32x8
                     | O::VecSubI32x8
                     | O::VecAndI32x8
@@ -8660,6 +8666,7 @@ fn collect_f64_values(func: &IrFunction, fp_extract_homes: bool) -> FxHashSet<u3
                         | O::VecHorizontalAddF64x4
                         | O::VecHorizontalAddF64x2
                         | O::StrictRecipMulAddF64x4
+                        | O::StrictRecipMulAddPackedF64x4
                         | O::VecHorizontalAddF32x8
                         | O::VecHorizontalAddF32x4
                 ) || (fp_extract_homes

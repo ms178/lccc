@@ -328,7 +328,7 @@ pub(super) fn const_stack_arg_fold_wins(imm: i32) -> bool {
 
 impl I686Codegen {
     /// Pop the cached x87 top-of-stack copy, if one is live. The slot copy
-    /// was already written by the non-popping `fstl`, so this is purely an
+    /// was already written and reloaded at F64 precision, so this is purely an
     /// FP-stack hygiene step (bounded depth); the popped value is dead.
     pub(super) fn flush_x87_pending_copy(&mut self) {
         if self.state.x87_pending.take().is_some() {
@@ -341,7 +341,7 @@ impl I686Codegen {
     ///
     /// Stack-depth invariant: exactly one register is occupied while
     /// `x87_pending` is `Some(v)` (a copy of `v`; its slot is already
-    /// correct via `fstl`), none while it is `None`. Every path below
+    /// correct via `fstpl; fldl`), none while it is `None`. Every path below
     /// restores the invariant before returning, and the central
     /// `x87_pre_emit` hook flushes the copy before any foreign x87 line or
     /// label, so no sequence of foreign emissions can unbalance the stack.
@@ -361,7 +361,7 @@ impl I686Codegen {
     ///   no P: push(L) + push(R)     -> `f{add,subr,mul,divr}p %st, %st(1)`
     ///                                   (unchanged classic path)
     ///
-    /// The result stays on the stack (non-popping `fstl`) exactly when the
+    /// A rounded copy stays on the stack (`fstpl; fldl`) exactly when the
     /// precomputed `x87_defer_values` analysis guarantees the next F64 binop
     /// is its single consumer; otherwise it is stored with `fstpl` as before.
     fn emit_f64_binop_tracked(
@@ -432,7 +432,14 @@ impl I686Codegen {
         let defer = self.state.x87_defer_values.contains(&dest.0);
         if defer && self.state.get_slot(dest.0).is_some() {
             let sr = self.slot_ref(self.state.get_slot(dest.0).unwrap());
-            emit!(self.state, "    fstl {}", sr);
+            // FST without pop rounds MEMORY, not ST(0). Forwarding the
+            // unrounded 80-bit register violates the F64 IR contract (and
+            // FLT_EVAL_METHOD=0), notably on a cancelling multiply/add.
+            // Keep the depth-one cache invariant, but cache the actual F64
+            // value. No control-word mutation: rounding mode and exponent
+            // range must be those of the original double store/reload.
+            emit!(self.state, "    fstpl {}", sr);
+            emit!(self.state, "    fldl {}", sr);
             self.state.x87_pending = Some(dest.0);
         } else {
             self.emit_f64_store_from_x87(dest);

@@ -1204,8 +1204,20 @@ class AggregatedDiagnosticsTest(unittest.TestCase):
                 "bash scripts/ensure_gas_247.sh x86_64-linux-gnu",
                 "echo bash scripts/ensure_gas_247.sh x86_64-linux-gnu", 1)
             (root / "scripts" / "ci_local.sh").write_text(local)
-            wf = (parity.WORKFLOWS / "ci.yml").read_text().replace(
-                "jobs:\n  test:\n", "jobs:\n  test:\n    continue-on-error: true\n", 1)
+            import yaml
+            original = (parity.WORKFLOWS / "ci.yml").read_text()
+            document = yaml.safe_load(original)
+            guarded = [job for job in document["jobs"].values()
+                       if any(program in str(step.get("run", ""))
+                              for step in job.get("steps", [])
+                              for program in parity.GUARDED_PROGRAMS)]
+            self.assertTrue(guarded, "mutation needs a contract-bearing job")
+            guarded[0]["continue-on-error"] = True
+            # Preserve YAML 1.1's boolean interpretation of GitHub's `on` key.
+            if True in document:
+                document["on"] = document.pop(True)
+            wf = yaml.safe_dump(document, sort_keys=False)
+            self.assertNotEqual(original, wf)
             (root / ".github" / "workflows" / "ci.yml").write_text(wf)
             checker = Path(parity.__file__).read_text()
             (root / "scripts" / "check_ci_gate_parity.py").write_text(checker)

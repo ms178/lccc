@@ -76,7 +76,7 @@
 
 use super::super::types::*;
 use super::liveness::FileLiveness;
-use super::relay_and_lea::{plain_gp_operand, split_two_operands};
+use super::relay_and_lea::{is_stable_symbol_expr, plain_gp_operand, split_two_operands};
 
 const ALL_GPR: u16 = 0xFFFF;
 const RAX: u16 = 1 << 0;
@@ -132,7 +132,9 @@ pub(super) fn may_write_families(t: &str, info: &LineInfo) -> u16 {
     let rest = t[mnemonic.len()..].trim();
 
     // Flag-only / no-write instructions.
-    if mnemonic.starts_with("cmp") && !mnemonic.starts_with("cmpxchg")
+    if mnemonic.starts_with("cmp")
+        && !mnemonic.starts_with("cmpxchg")
+        && !matches!(mnemonic, "cmpsb" | "cmpsw" | "cmpsl" | "cmpsq")
         || mnemonic.starts_with("test")
         || mnemonic.starts_with("ucomis")
         || mnemonic.starts_with("comis")
@@ -162,6 +164,13 @@ pub(super) fn may_write_families(t: &str, info: &LineInfo) -> u16 {
         )
     {
         return 0;
+    }
+    // String compares name only vector inputs: I forms return an index in
+    // ECX, M forms write XMM0. Neither writes its final explicit operand.
+    match mnemonic.strip_prefix('v').unwrap_or(mnemonic) {
+        "pcmpistri" | "pcmpestri" => return RCX,
+        "pcmpistrm" | "pcmpestrm" | "ptest" | "testpd" | "testps" => return 0,
+        _ => {}
     }
     // Multi-destination / opaque: every mentioned GP family plus the
     // implicit accumulator pair (cmpxchg16b names no register at all).
@@ -193,6 +202,72 @@ pub(super) fn may_write_families(t: &str, info: &LineInfo) -> u16 {
     }
     // String instructions without operands (`movsb`, `stosq`, ...).
     if !rest.contains('%') && !rest.contains('$') {
+        return ALL_GPR;
+    }
+    // Only recognized explicit-destination families may use the last-operand
+    // rule. Applying that rule to an unknown mnemonic silently turns this MAY
+    // query into a MUST-like under-approximation of hidden outputs.
+    let base = mnemonic.strip_prefix('v').unwrap_or(mnemonic);
+    let integer = base
+        .strip_suffix('q')
+        .or_else(|| base.strip_suffix('l'))
+        .or_else(|| base.strip_suffix('w'))
+        .or_else(|| base.strip_suffix('b'))
+        .unwrap_or(base);
+    // Apart from the string outputs handled above, the admitted vector
+    // families have no hidden GP outputs. Reuse their positive ISA admission
+    // rather than keeping another incomplete SSE/FMA spelling table here.
+    let explicit_destination = super::fp_liveness::known_explicit_vector_inputs(mnemonic, rest)
+        || base.starts_with("mov")
+        || base.starts_with("cmov")
+        || base.starts_with("set")
+        || base.starts_with("lea")
+        || matches!(
+            integer,
+            "add"
+                | "sub"
+                | "adc"
+                | "sbb"
+                | "and"
+                | "or"
+                | "xor"
+                | "neg"
+                | "not"
+                | "inc"
+                | "dec"
+                | "sal"
+                | "sar"
+                | "shl"
+                | "shr"
+                | "rol"
+                | "ror"
+                | "rcl"
+                | "rcr"
+                | "bswap"
+                | "popcnt"
+                | "lzcnt"
+                | "tzcnt"
+                | "bzhi"
+                | "blsi"
+                | "blsmsk"
+                | "blsr"
+                | "bextr"
+                | "pdep"
+                | "pext"
+                | "andn"
+                | "shlx"
+                | "shrx"
+                | "sarx"
+                | "rorx"
+                | "bts"
+                | "btr"
+                | "btc"
+                | "crc32"
+                | "imul"
+                | "rdrand"
+                | "rdseed"
+        );
+    if !explicit_destination {
         return ALL_GPR;
     }
     // AT&T: the destination is the last top-level operand (single-operand
@@ -1808,7 +1883,7 @@ fn parse_symbol_lea(t: &str) -> Option<(&str, RegId)> {
     if dst != REG_NAMES[0][fam as usize] {
         return None;
     }
-    if src.starts_with('$') || src.starts_with('%') || src.contains(':') {
+    if !is_stable_symbol_expr(src.strip_suffix("(%rip)").unwrap_or(src)) {
         return None;
     }
     if memory_operand_families(src) != 0 {
@@ -1824,6 +1899,10 @@ pub(super) fn eliminate_redundant_symbol_lea(store: &LineStore, infos: &mut [Lin
     let mut changed = false;
     for i in 0..len {
         let info = &infos[i];
+        if info.pinned {
+            cache = Default::default();
+            continue;
+        }
         if super::helpers::steps_over_line(info, info.trimmed(store.get(i))) {
             continue;
         }
@@ -1947,6 +2026,26 @@ mod tests {
 
     const PRO: &str = "    .text\n    .globl f\n    .type f, @function\nf:\n    .cfi_startproc\n";
     const EPI: &str = "    ret\n    .cfi_endproc\n    .size f, .-f\n";
+
+    #[test]
+    fn vector_flag_and_string_output_may_writes_are_precise() {
+        for (text, expected) in [
+            ("vptest %xmm5, %xmm7", 0),
+            ("vpcmpistrm $0, %xmm5, %xmm7", 0),
+            ("pcmpestrm $0, %xmm5, %xmm7", 0),
+            ("vpcmpistri $0, %xmm5, %xmm7", RCX),
+            ("pcmpestri $0, %xmm5, %xmm7", RCX),
+            ("vfmadd231sd %xmm2, %xmm3, %xmm4", 0),
+            ("vcvttsd2siq %xmm3, %rax", RAX),
+            ("vfutureop %xmm5, %xmm7", ALL_GPR),
+        ] {
+            assert_eq!(
+                may_write_families(text, &classify_line(text)),
+                expected,
+                "{text}"
+            );
+        }
+    }
 
     #[test]
     fn fuses_sib_load_into_xor() {
@@ -2543,6 +2642,23 @@ mod tests {
             RAX | RDX
         );
     }
+    #[test]
+    fn symbol_cse_rejects_position_dependent_addresses() {
+        for expr in [".", ".+8", ".-8", "8", "-8", "0x10", "1f", "1b"] {
+            let asm = format!(
+                "{PRO}    leaq {expr}(%rip), %r9\n    movq %r9, (%rdi)\n    leaq {expr}(%rip), %r9\n    movq %r9, (%rsi)\n{EPI}"
+            );
+            let out = body(&run(&asm, |store, infos| {
+                eliminate_redundant_symbol_lea(store, infos)
+            }));
+            assert_eq!(
+                out.iter().filter(|s| s.starts_with("leaq ")).count(),
+                2,
+                "{expr}: {out:?}"
+            );
+        }
+    }
+
     #[test]
     fn may_write_model_is_exact_for_implicit_operands() {
         let li = |s: &str| classify_line(s);

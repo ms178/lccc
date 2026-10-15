@@ -8,10 +8,9 @@ second, permanently smaller benchmark list from drifting away from
 ``tests/benchmark/run_benchmarks.py``.
 
 With no explicit selection the runner executes every registered synthetic and
-workload-derived kernel (currently the full 39-program corpus, including the
-six workload kernels added 2026-09-06: chacha20_block, sha256_transform,
-linux_rbtree, zstd_count, lz4_compress, glibc_strstr).  Use
-``--only`` for a local focused experiment, never in the benchmark workflow.
+workload-derived kernel. The registry, not a hard-coded count or source glob,
+defines the corpus. Use ``--only`` for focused experiments, never in the timed
+benchmark workflow.
 """
 
 from __future__ import annotations

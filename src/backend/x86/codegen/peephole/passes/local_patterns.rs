@@ -3115,8 +3115,13 @@ pub(super) fn eliminate_fp_spill_around_load(
                             5
                         };
                         if oracle.slot_dead_after(l_pos, base, offset as i32, 8) {
-                            let xmm1_dead_after =
-                                oracle.xmm_dead_after(store, infos, l_pos, 1, &[k_pos, l_pos]);
+                            let xmm1_dead_after = oracle.deleted_write_regions_dead_after(
+                                store,
+                                infos,
+                                l_pos,
+                                1,
+                                &[k_pos, l_pos],
+                            );
 
                             if xmm1_dead_after {
                                 // Two rewrites, chosen by what the gap
@@ -3393,7 +3398,8 @@ pub(super) fn promote_loop_invariant_fp_load(
                     continue;
                 }
                 let oracle = lv.get_or_insert_with(|| FpLiveness::new(store, infos));
-                if !oracle.xmm_dead_after(store, infos, ph_pos, 2, &[ph_pos, pos]) {
+                if !oracle.deleted_write_regions_dead_after(store, infos, ph_pos, 2, &[ph_pos, pos])
+                {
                     continue;
                 }
                 let ph_text = infos[ph_pos].trimmed(store.get(ph_pos));
@@ -8316,7 +8322,7 @@ pub(super) fn fold_scalar_fp_memory_into_vex_op(
         // loop top of the next iteration) and to legacy destructive
         // consumers in -O0 code (patE.c).
         let d_num: u32 = dst_d[3..].parse().unwrap_or(u32::MAX);
-        if !lv.xmm_dead_after(store, infos, j, d_num, &[i, j]) {
+        if !lv.deleted_write_regions_dead_after(store, infos, j, d_num, &[i, j]) {
             i += 1;
             continue;
         }
@@ -8466,7 +8472,7 @@ pub(super) fn fold_broadcast_load_into_broadcast(
             .unwrap_or(u32::MAX);
         if !(vex_load && m_num == d_num) {
             let oracle = lv.get_or_insert_with(|| FpLiveness::new(store, infos));
-            if !oracle.xmm_dead_after(store, infos, j, d_num, &[i, j]) {
+            if !oracle.deleted_write_regions_dead_after(store, infos, j, d_num, &[i, j]) {
                 i += 1;
                 continue;
             }
@@ -11882,6 +11888,8 @@ pub(super) fn fold_shift_into_sib(store: &mut LineStore, infos: &mut [LineInfo])
         //   reader would see; the `lea` replacing the add writes none.  A flag
         //   WRITER is harmless -- the fold separately requires the flags to be
         //   dead after the add.
+        // Debug attribution does not consume the instruction budget. In
+        // particular a .loc per instruction must not change -g codegen.
         const WINDOW: usize = 6;
         let mut j = next_non_debug(store, infos, i + 1, len);
         let mut steps = 0usize;
@@ -12089,42 +12097,45 @@ mod shift_into_sib_tests {
     }
 
     #[test]
-    fn debug_locations_do_not_consume_the_instruction_window() {
+    fn debug_markers_do_not_consume_the_sib_window() {
         let plain = [
-            "shlq $3, %rcx",
-            "movq %rsi, %rdi",
-            "leaq bins(%rip), %r9",
-            "addq %rcx, %r9",
-            "movq %r9, %rax",
+            "shlq $2, %rdi",
+            "movq %r13, %rax",
+            "movl %eax, (%r11, %r9, 4)",
+            "leaq count(%rip), %rdx",
+            "addq %rdi, %rdx",
+            "movq %rdx, %rax",
             "ret",
         ];
-        let mut attributed = Vec::new();
-        for line in plain {
-            // Enough metadata to exceed WINDOW if it were counted as code.
-            attributed.extend(std::iter::repeat_n(".loc 1 2 0", 8));
-            attributed.push(line);
+        let expected = run(&plain);
+        assert!(!expected.contains("shlq"), "{expected}");
+        let mut debug = Vec::new();
+        for insn in plain {
+            // More markers than the six-instruction search budget, including
+            // markers immediately before the consumer.
+            debug.extend([".loc 1 42 0", ".loc 1 43 0", insn]);
         }
-        let out = run(&attributed);
-        let code = out
+        let actual = run(&debug);
+        let without_loc = actual
             .lines()
-            .filter(|l| !l.starts_with(".loc "))
+            .filter(|l| !l.starts_with(".loc"))
             .collect::<Vec<_>>()
             .join("\n");
-        assert_eq!(code, run(&plain));
-        assert!(flat(&code).contains("leaq (%r9,%rcx,8),%r9"), "{code}");
+        assert_eq!(expected, without_loc);
     }
 
     #[test]
-    fn refuses_to_cross_bytes_that_can_read_flags_or_registers() {
-        for barrier in [".byte 0x9f", ".long 0", ".p2align 4,0xcc", "opaque_insn"] {
+    fn debug_skipping_does_not_cross_emitted_bytes() {
+        for barrier in [".byte 0x90", ".long 0", ".p2align 4, 0xcc", ".Lentry:"] {
             let out = run(&[
                 "shlq $3, %rcx",
+                ".loc 1 42 0",
                 barrier,
                 "addq %rcx, %r9",
                 "movq %r9, %rax",
                 "ret",
             ]);
-            assert!(out.contains("shlq $3, %rcx"), "{barrier}: {out}");
+            assert!(out.contains("shlq"), "crossed {barrier}: {out}");
         }
     }
 
@@ -12162,5 +12173,44 @@ mod shift_into_sib_tests {
         );
         assert!(out.contains("idivq %r11"), "{out}");
         assert!(!flat(&out).contains("leaq (%r9,%rax,8)"), "{out}");
+    }
+    #[test]
+    fn debug_locations_do_not_consume_the_instruction_window() {
+        let plain = [
+            "shlq $3, %rcx",
+            "movq %rsi, %rdi",
+            "leaq bins(%rip), %r9",
+            "addq %rcx, %r9",
+            "movq %r9, %rax",
+            "ret",
+        ];
+        let mut attributed = Vec::new();
+        for line in plain {
+            // Enough metadata to exceed WINDOW if it were counted as code.
+            attributed.extend(std::iter::repeat_n(".loc 1 2 0", 8));
+            attributed.push(line);
+        }
+        let out = run(&attributed);
+        let code = out
+            .lines()
+            .filter(|l| !l.starts_with(".loc "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(code, run(&plain));
+        assert!(flat(&code).contains("leaq (%r9,%rcx,8),%r9"), "{code}");
+    }
+
+    #[test]
+    fn refuses_to_cross_bytes_that_can_read_flags_or_registers() {
+        for barrier in [".byte 0x9f", ".long 0", ".p2align 4,0xcc", "opaque_insn"] {
+            let out = run(&[
+                "shlq $3, %rcx",
+                barrier,
+                "addq %rcx, %r9",
+                "movq %r9, %rax",
+                "ret",
+            ]);
+            assert!(out.contains("shlq $3, %rcx"), "{barrier}: {out}");
+        }
     }
 }

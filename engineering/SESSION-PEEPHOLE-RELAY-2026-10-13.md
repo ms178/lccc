@@ -38,11 +38,13 @@ overwritten by `pshufd $0x0E, %xmm15, %xmm0` survived in every pair loop.
 
 * New `dead_code::eliminate_dead_fp_moves`: pure XMM→XMM reg moves (incl.
   store forwarding's 3-operand `vmovsd` merge forms) whose destination is
-  never read before its next rewrite die. Uses `FpLiveness::xmm_dead_after`.
+  never read before its next rewrite die. Uses region-aware `FpLiveness::reg_move_dead_after` after the safety repair.
   Wired after every `eliminate_dead_reg_moves` site in the pipeline.
 * `fp_liveness::is_full_xmm_def` misclassified the LEGACY immediate shuffles
-  (`pshufd`/`pshufhw`/`pshuflw`/`shufps`/`shufpd`) as dest-reading merges —
-  they build the destination from source+immediate only. The VEX spellings
+  (`pshufd`/`pshufhw`/`pshuflw`) as dest-reading merges — they build the
+  destination from source+immediate only. Legacy `shufps`/`shufpd` DO read
+  their destination and must stay excluded (the original narrative incorrectly
+  grouped them with source-only shuffles). The VEX spellings
   were already full defs. This fix is what lets the liveness answer "dead"
   across a shuffle overwrite; it benefits every FpLiveness consumer.
 

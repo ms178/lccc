@@ -75,6 +75,19 @@ int main(void) {
             self.assertEqual(result["worst_first"], [])
             self.assertEqual(len(result["failures"]), 1)
 
+    def test_header_driver_is_forwarded_in_both_default_and_versioned_runs(self):
+        for driver in ("gcc", "gcc-16"):
+            with self.subTest(driver=driver), tempfile.TemporaryDirectory() as td, \
+                    patch.object(screen.cg, "main", return_value=1) as measure:
+                options = [] if driver == "gcc" else ["--gcc-include-command", driver]
+                self.assertEqual(screen.main([
+                    "--mine", "stub", "--ref", driver, "--only", "ring_fifo",
+                    "--out", td, *options,
+                ]), 1)
+                args = measure.call_args.args[0]
+                self.assertEqual(args[1], driver)
+                self.assertEqual(args[args.index("--gcc-include-command") + 1], driver)
+
     def test_interruption_keeps_incomplete_checkpoint(self):
         with tempfile.TemporaryDirectory() as td, patch.object(screen.cg, "main", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):

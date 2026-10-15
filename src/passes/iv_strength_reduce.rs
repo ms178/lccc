@@ -48,6 +48,9 @@ struct BasicIV {
     step: i64,
 }
 
+type GepAddressUse = (usize, usize, Value, BaseKey);
+type VecAddressUse = (usize, usize, bool, BaseKey);
+
 /// A derived expression from a basic IV that can be strength-reduced.
 /// Pattern: %derived = %iv_or_cast * const_stride (or Shl), used as offset in GEP
 struct DerivedExpr {
@@ -61,7 +64,7 @@ struct DerivedExpr {
     add_offset: i64,
     /// GEPs that use this multiply/shift result as their offset.
     /// (block_idx, inst_idx, GEP dest, base key)
-    gep_uses: Vec<(usize, usize, Value, BaseKey)>,
+    gep_uses: Vec<GepAddressUse>,
     /// Vector-memory `(base, index, disp)` address triples whose INDEX reads
     /// this multiply/shift result (possibly through GVN Copy glue).
     /// (block_idx, inst_idx, is_store, base key).
@@ -71,7 +74,7 @@ struct DerivedExpr {
     /// kept `imulq $56` alive on every iteration because the SLP/vectorizer
     /// forms `VecLoadF64x2(base, i*56, K)` triples that the GEP-only scan
     /// could not see, so the multiply had live uses and no recurrence formed.
-    vec_uses: Vec<(usize, usize, bool, BaseKey)>,
+    vec_uses: Vec<VecAddressUse>,
     /// The multiply/shift instruction's destination — the identity of the
     /// derived value for the scalar flavor below.
     mul_dest: Value,
@@ -200,6 +203,26 @@ fn global_addr_names(func: &IrFunction) -> FxHashMap<u32, String> {
     names
 }
 
+/// Reuse only an SSA definition available at the preheader insertion point.
+/// CFG edges do not change during IVSR, so the caller's dominators remain valid.
+fn dominating_global_addr(
+    func: &IrFunction,
+    cfg: &analysis::CfgAnalysis,
+    name: &str,
+    preheader: usize,
+) -> Option<Value> {
+    for (block_index, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            if let Instruction::GlobalAddr { dest, name: symbol } = inst {
+                if symbol == name && analysis::dominates_idom(&cfg.idom, block_index, preheader) {
+                    return Some(*dest);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Run IVSR on a single function (test wrapper: PRODUCTION defaults — the
 /// scalar derived-IV flavor is OFF, matching the pipeline's default).
 #[cfg(test)]
@@ -297,7 +320,7 @@ pub(crate) fn ivsr_with_analysis(
         let changed = reduce_loop(
             func,
             natural_loop,
-            &cfg.preds,
+            cfg,
             scalar_derived,
             ptr_add,
             x86_sib_cost,
@@ -315,11 +338,12 @@ pub(crate) fn ivsr_with_analysis(
 fn reduce_loop(
     func: &mut IrFunction,
     natural_loop: &NaturalLoop,
-    preds: &analysis::FlatAdj,
+    cfg: &analysis::CfgAnalysis,
     scalar_derived: bool,
     ptr_add: bool,
     x86_sib_cost: bool,
 ) -> usize {
+    let preds = &cfg.preds;
     let header = natural_loop.header;
     let dbg = std::env::var("CCC_IVSR_DEBUG").is_ok();
 
@@ -536,7 +560,7 @@ fn reduce_loop(
         // stencil5 +5.7% insns / +6.7% moves (codegen-quality-gate band
         // trip) when this rule was missing.
         //
-        // Two exemptions, both measured:
+        // The original exemptions, both measured:
         //   * groups with vec-memory uses always form: the vector emitter's
         //     index is a BYTE offset (`vec_mem_operand` emits
         //     `disp(%base,%index)`, never a scaled SIB), so the multiply is
@@ -558,7 +582,20 @@ fn reduce_loop(
         let sib_scaled = x86_sib_cost
             && matches!(stride, 1 | 2 | 4 | 8)
             && !addr_uses.iter().any(|u| matches!(u, AddrUse::Vec(..)));
-        if sib_scaled && !from_address_add {
+        // A narrow symbol index also needs a widening conversion. Reusing a
+        // dominating base avoids the duplicate live address that otherwise
+        // makes a recurrence lose to SIB through register pressure. Keep the
+        // ordinary pointer-base stencil policy and non-x86 materialisation.
+        let reusable_symbol_base = match &gep_base {
+            BaseKey::Symbol(name) if x86_sib_cost => {
+                dominating_global_addr(func, cfg, name, preheader)
+            }
+            _ => None,
+        };
+        let narrow_symbol_index = reusable_symbol_base.is_some()
+            && iv.ty.size() < mul_ty.size()
+            && iv.ty.size() < crate::common::types::target_ptr_size();
+        if sib_scaled && !from_address_add && !narrow_symbol_index {
             if dbg {
                 eprintln!(
                     "[IVSR] header={} skip SIB-friendly group iv={} stride={} (scaled-index form is free)",
@@ -661,20 +698,23 @@ fn reduce_loop(
         // Build preheader instructions for computing the initial pointer
         let mut preheader_insts: Vec<Instruction> = Vec::new();
 
-        // The base the init reads: the alias ROOT for a plain value (the
-        // value the recurrence is semantically anchored to), or a fresh
-        // `GlobalAddr` materialisation for a symbol key — its own definition
-        // in the preheader dominates every later read by construction.
+        // The init reads the alias ROOT for a plain value. On x86 a symbol
+        // first reuses an already-dominating GlobalAddr; otherwise materialise
+        // a fresh definition in the preheader, which dominates by construction.
         let init_base = match &gep_base {
             BaseKey::Value(root) => Value(*root),
             BaseKey::Symbol(name) => {
-                let gv = Value(next_id);
-                next_id += 1;
-                preheader_insts.push(Instruction::GlobalAddr {
-                    dest: gv,
-                    name: name.clone(),
-                });
-                gv
+                if let Some(gv) = reusable_symbol_base {
+                    gv
+                } else {
+                    let gv = Value(next_id);
+                    next_id += 1;
+                    preheader_insts.push(Instruction::GlobalAddr {
+                        dest: gv,
+                        name: name.clone(),
+                    });
+                    gv
+                }
             }
         };
 
@@ -1247,6 +1287,59 @@ fn find_derived_exprs(
     let aliases = build_alias_map(func);
     let global_names = global_addr_names(func);
 
+    // Index the immutable input once. Candidate discovery below never mutates
+    // IR, so definitions and raw use identities stay valid for this scan. In
+    // particular, raw uses are NOT alias-canonicalized: that would change the
+    // old has_uses contract for Copy glue and terminator-only consumers.
+    let mut definitions = FxHashMap::default();
+    let mut used_values = FxHashSet::default();
+    let mut gep_uses_by_index: FxHashMap<u32, Vec<GepAddressUse>> = FxHashMap::default();
+    let mut vec_uses_by_index: FxHashMap<u32, Vec<VecAddressUse>> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            inst.for_each_used_value(|value| {
+                used_values.insert(value);
+            });
+        }
+        block.terminator.for_each_used_value(|value| {
+            used_values.insert(value);
+        });
+    }
+    for &bi in loop_body {
+        let Some(block) = func.blocks.get(bi) else {
+            continue;
+        };
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if let Some(dest) = inst.dest() {
+                definitions.insert(dest.0, inst);
+            }
+            match inst {
+                Instruction::GetElementPtr {
+                    dest,
+                    base,
+                    offset: Operand::Value(offset),
+                    ..
+                } => {
+                    gep_uses_by_index
+                        .entry(alias_root(&aliases, offset.0))
+                        .or_default()
+                        .push((bi, ii, *dest, base_key_of(base, &aliases, &global_names)));
+                }
+                Instruction::Intrinsic { op, args, .. } => {
+                    if let Some((is_store, _, Operand::Value(base), Operand::Value(offset), _)) =
+                        super::alias::vec_intrinsic_access(op, args)
+                    {
+                        vec_uses_by_index
+                            .entry(alias_root(&aliases, offset.0))
+                            .or_default()
+                            .push((bi, ii, is_store, base_key_of(base, &aliases, &global_names)));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     // Build a set of IV phi values for quick lookup
     let mut iv_values: FxHashMap<u32, usize> = FxHashMap::default();
     for (i, iv) in basic_ivs.iter().enumerate() {
@@ -1327,88 +1420,53 @@ fn find_derived_exprs(
     // `offset_product_cannot_overflow` check still independently certifies the
     // multiply/product ring.
     let find_affine = |val_id: u32, _result_ty: IrType| -> Option<(usize, i64)> {
-        // Candidate definition ids: the operand itself plus every value
-        // reachable through Copy / offset-preserving Cast glue.
-        let mut candidates: Vec<u32> = vec![val_id];
-        let mut frontier = vec![val_id];
+        let mut candidates = vec![val_id];
+        let mut cur = val_id;
         for _ in 0..MAX_CAST_CHAIN_LENGTH {
-            let mut next = Vec::new();
-            for &cur in &frontier {
-                for &bi in loop_body {
-                    if bi >= func.blocks.len() {
-                        continue;
-                    }
-                    for inst in &func.blocks[bi].instructions {
-                        match inst {
-                            Instruction::Copy {
-                                dest,
-                                src: Operand::Value(v),
-                            } if dest.0 == cur => {
-                                if !candidates.contains(&v.0) {
-                                    candidates.push(v.0);
-                                    next.push(v.0);
-                                }
-                            }
-                            Instruction::Cast {
-                                dest,
-                                src: Operand::Value(v),
-                                from_ty,
-                                to_ty,
-                            } if dest.0 == cur && from_ty.cast_preserves_offset_value(*to_ty) => {
-                                if !candidates.contains(&v.0) {
-                                    candidates.push(v.0);
-                                    next.push(v.0);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            if next.is_empty() {
+            let next = match definitions.get(&cur).copied() {
+                Some(Instruction::Copy {
+                    src: Operand::Value(v),
+                    ..
+                }) => v.0,
+                Some(Instruction::Cast {
+                    src: Operand::Value(v),
+                    from_ty,
+                    to_ty,
+                    ..
+                }) if from_ty.cast_preserves_offset_value(*to_ty) => v.0,
+                _ => break,
+            };
+            if candidates.contains(&next) {
                 break;
             }
-            frontier = next;
+            candidates.push(next);
+            cur = next;
         }
-        for &cid in &candidates {
-            for &bi in loop_body {
-                if bi >= func.blocks.len() {
-                    continue;
-                }
-                for inst in &func.blocks[bi].instructions {
-                    if inst.dest() != Some(Value(cid)) {
-                        continue;
-                    }
-                    if let Instruction::BinOp {
-                        op: IrBinOp::Add,
-                        lhs,
-                        rhs,
-                        ty,
-                        ..
-                    } = inst
-                    {
-                        let candidate = match (lhs, rhs) {
-                            (Operand::Value(v), Operand::Const(c))
-                            | (Operand::Const(c), Operand::Value(v)) => {
-                                match (find_iv(v.0), c.to_i64()) {
-                                    (Some(idx), Some(raw_k)) => affine_add_offset_cannot_wrap(
-                                        func,
-                                        natural_loop,
-                                        back_blocks,
-                                        &basic_ivs[idx],
-                                        raw_k,
-                                        *ty,
-                                    )
-                                    .map(|k| (idx, k)),
-                                    _ => None,
-                                }
-                            }
-                            _ => None,
-                        };
-                        if candidate.is_some() {
-                            return candidate;
-                        }
-                    }
+        for cid in candidates {
+            if let Some(Instruction::BinOp {
+                op: IrBinOp::Add,
+                lhs,
+                rhs,
+                ty,
+                ..
+            }) = definitions.get(&cid).copied()
+            {
+                let (v, c) = match (lhs, rhs) {
+                    (Operand::Value(v), Operand::Const(c))
+                    | (Operand::Const(c), Operand::Value(v)) => (v, c),
+                    _ => continue,
+                };
+                if let (Some(idx), Some(raw_k)) = (find_iv(v.0), c.to_i64())
+                    && let Some(k) = affine_add_offset_cannot_wrap(
+                        func,
+                        natural_loop,
+                        back_blocks,
+                        &basic_ivs[idx],
+                        raw_k,
+                        *ty,
+                    )
+                {
+                    return Some((idx, k));
                 }
             }
         }
@@ -1524,86 +1582,17 @@ fn find_derived_exprs(
             // surviving multiply behind Copy glue for old value ids, so
             // operands are resolved through `aliases` before matching.
             let mul_dest_id = mul_dest.0;
-            let mut gep_uses = Vec::with_capacity(16);
-            let mut vec_uses = Vec::with_capacity(16);
+            let gep_uses = gep_uses_by_index
+                .get(&mul_dest_id)
+                .cloned()
+                .unwrap_or_default();
+            let vec_uses = vec_uses_by_index
+                .get(&mul_dest_id)
+                .cloned()
+                .unwrap_or_default();
+            let has_uses = used_values.contains(&mul_dest_id);
 
-            for &gbi in loop_body {
-                if gbi >= func.blocks.len() {
-                    continue;
-                }
-                for (gii, ginst) in func.blocks[gbi].instructions.iter().enumerate() {
-                    match ginst {
-                        Instruction::GetElementPtr {
-                            dest: gdest,
-                            base,
-                            offset: Operand::Value(ov),
-                            ..
-                        } => {
-                            // The offset's own ring is checked once per group in
-                            // `reduce_loop` (`offset_product_cannot_overflow`),
-                            // not by vetoing every sub-pointer-width multiply:
-                            // a 32-bit `i * 4` whose bound is a compile-time
-                            // constant is exactly as linear as a 64-bit one.
-                            // GVN Copy glue is transparent: the surviving
-                            // multiply is the use's alias root.
-                            if alias_root(&aliases, ov.0) == mul_dest_id {
-                                let key = base_key_of(base, &aliases, &global_names);
-                                gep_uses.push((gbi, gii, *gdest, key));
-                            }
-                        }
-                        Instruction::Intrinsic { op, args, .. } => {
-                            // `(base, index, disp)` vector memory triples are
-                            // address uses of `base + index + disp` — the same
-                            // `base + derived` address a GEP offset computes.
-                            // Leaving them out of the recurrence keeps the
-                            // multiply alive for the vector accesses alone
-                            // (nbody pair loop: the `j * 56` mul fed ONLY
-                            // vector triples and no recurrence ever formed).
-                            // `vec_intrinsic_access` is the one modelled
-                            // contract for those argument shapes and fails
-                            // closed on anything else (value displacement,
-                            // odd arity, unmodelled op).
-                            let Some((is_store, _bytes, base, off, _disp)) =
-                                super::alias::vec_intrinsic_access(op, args)
-                            else {
-                                continue;
-                            };
-                            let Operand::Value(ov) = off else {
-                                continue;
-                            };
-                            if alias_root(&aliases, ov.0) != mul_dest_id {
-                                continue;
-                            }
-                            let Operand::Value(bv) = base else {
-                                continue;
-                            };
-                            let key = base_key_of(bv, &aliases, &global_names);
-                            vec_uses.push((gbi, gii, is_store, key));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            // Any use of the derived value anywhere in the function (GEP
-            // offsets included)?  A dead multiply earns no recurrence.
-            let mut use_count = 0usize;
-            for block in &func.blocks {
-                for uinst in &block.instructions {
-                    uinst.for_each_used_value(|u| {
-                        if u == mul_dest_id {
-                            use_count += 1;
-                        }
-                    });
-                }
-                block.terminator.for_each_used_value(|u| {
-                    if u == mul_dest_id {
-                        use_count += 1;
-                    }
-                });
-            }
-
-            if !gep_uses.is_empty() || !vec_uses.is_empty() || use_count > 0 {
+            if !gep_uses.is_empty() || !vec_uses.is_empty() || has_uses {
                 derived.push(DerivedExpr {
                     stride,
                     iv_index: iv_idx,
@@ -1612,7 +1601,7 @@ fn find_derived_exprs(
                     vec_uses,
                     mul_dest,
                     mul_ty,
-                    has_uses: use_count > 0,
+                    has_uses,
                     from_address_add: false,
                 });
             } else if dbg {
@@ -5072,6 +5061,215 @@ mod tests {
                 .iter()
                 .any(|i| matches!(i, Instruction::Phi { ty, .. } if *ty == IrType::Ptr)),
             "no pointer recurrence for a SIB-friendly GEP-only group"
+        );
+    }
+    fn symbol_recurrence_fixture(stride: i64, entry_base: bool) -> IrFunction {
+        let body = vec![
+            Instruction::GlobalAddr {
+                dest: Value(5),
+                name: "arr".to_string(),
+            },
+            Instruction::Cast {
+                dest: Value(6),
+                src: Operand::Value(Value(3)),
+                from_ty: IrType::I32,
+                to_ty: IrType::I64,
+            },
+            Instruction::BinOp {
+                dest: Value(7),
+                op: IrBinOp::Mul,
+                lhs: Operand::Value(Value(6)),
+                rhs: Operand::Const(IrConst::I64(stride)),
+                ty: IrType::I64,
+            },
+            Instruction::GetElementPtr {
+                dest: Value(8),
+                base: Value(5),
+                offset: Operand::Value(Value(7)),
+                ty: IrType::I64,
+            },
+            Instruction::Load {
+                volatile: false,
+                dest: Value(9),
+                ptr: Value(8),
+                ty: IrType::I64,
+                seg_override: AddressSpace::Default,
+            },
+            Instruction::BinOp {
+                dest: Value(10),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(3)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::I32,
+            },
+        ];
+        let mut func = loop_fixture(body, 10, 11);
+
+        if entry_base {
+            let base = func.blocks[2].instructions.remove(0);
+            func.blocks[0].instructions.push(base);
+        }
+        func
+    }
+
+    #[test]
+    fn symbol_recurrence_reuses_dominating_materialization() {
+        let mut func = symbol_recurrence_fixture(24, true);
+        assert_eq!(ivsr_function(&mut func), 1);
+        let bases: Vec<_> = func.blocks[0]
+            .instructions
+            .iter()
+            .filter_map(|inst| match inst {
+                Instruction::GlobalAddr { dest, name } if name == "arr" => Some(*dest),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            bases,
+            [Value(5)],
+            "do not add a second live address for the same symbol"
+        );
+        assert!(
+            func.blocks[0].instructions.iter().any(|inst| matches!(
+                inst,
+                Instruction::Copy {
+                    src: Operand::Value(Value(5)),
+                    ..
+                }
+            )),
+            "recurrence initializer must reuse the available base"
+        );
+    }
+
+    #[test]
+    fn symbol_recurrence_narrow_index_is_not_free_sib() {
+        let mut func = symbol_recurrence_fixture(4, true);
+        assert_eq!(
+            ivsr_function(&mut func),
+            1,
+            "widening a narrow symbol index is not free scaled-index addressing"
+        );
+        assert!(func.blocks[1].instructions.iter().any(|inst| matches!(
+            inst,
+            Instruction::Phi {
+                ty: IrType::Ptr,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn symbol_recurrence_keeps_sib_without_available_base() {
+        let mut func = symbol_recurrence_fixture(4, false);
+        assert_eq!(
+            ivsr_function(&mut func),
+            0,
+            "do not trade the widening for an extra live symbol materialization"
+        );
+    }
+
+    #[test]
+    fn symbol_recurrence_rejects_nondominating_materialization() {
+        let mut func = symbol_recurrence_fixture(24, false);
+        let mut prefix = vec![
+            BasicBlock {
+                label: BlockId(10),
+                instructions: vec![],
+                source_spans: vec![],
+                terminator: Terminator::CondBranch {
+                    cond: Operand::Const(IrConst::I32(1)),
+                    true_label: BlockId(11),
+                    false_label: BlockId(12),
+                },
+            },
+            BasicBlock {
+                label: BlockId(11),
+                source_spans: vec![],
+                instructions: vec![Instruction::GlobalAddr {
+                    dest: Value(11),
+                    name: "arr".into(),
+                }],
+                terminator: Terminator::Branch(BlockId(0)),
+            },
+            BasicBlock {
+                label: BlockId(12),
+                instructions: vec![],
+                source_spans: vec![],
+                terminator: Terminator::Branch(BlockId(0)),
+            },
+        ];
+        prefix.append(&mut func.blocks);
+        func.blocks = prefix;
+        func.next_value_id = 12;
+        assert_eq!(ivsr_function(&mut func), 1);
+        let fresh = func.blocks[3]
+            .instructions
+            .iter()
+            .find_map(|inst| match inst {
+                Instruction::GlobalAddr { dest, name } if name == "arr" => Some(*dest),
+                _ => None,
+            })
+            .expect("must materialize a fresh base in the actual preheader");
+        assert_ne!(
+            fresh,
+            Value(11),
+            "one diamond arm does not dominate the merge"
+        );
+        assert_ne!(
+            fresh,
+            Value(5),
+            "the loop-body base does not dominate the preheader"
+        );
+    }
+
+    #[test]
+    fn symbol_recurrence_preserves_non_x86_materialization_policy() {
+        let mut func = symbol_recurrence_fixture(24, true);
+        let cfg = analysis::CfgAnalysis::build(&func);
+        assert_eq!(ivsr_with_analysis(&mut func, &cfg, false, true, false), 1);
+        assert_eq!(
+            func.blocks[0]
+                .instructions
+                .iter()
+                .filter(|inst| matches!(inst,
+                    Instruction::GlobalAddr { name, .. } if name == "arr"
+                ))
+                .count(),
+            2,
+            "non-x86 codegen policy remains unchanged"
+        );
+    }
+
+    #[test]
+    fn symbol_recurrence_keeps_sib_for_native_width_index() {
+        let mut func = symbol_recurrence_fixture(4, true);
+        for block in &mut func.blocks {
+            for inst in &mut block.instructions {
+                match inst {
+                    Instruction::Copy {
+                        src: Operand::Const(c @ IrConst::I32(_)),
+                        ..
+                    } => {
+                        *c = IrConst::I64(c.to_i64().unwrap());
+                    }
+                    Instruction::Phi { ty, .. } | Instruction::Cmp { ty, .. } => *ty = IrType::I64,
+                    Instruction::Cast { from_ty, .. } => *from_ty = IrType::I64,
+                    Instruction::BinOp {
+                        ty,
+                        rhs: Operand::Const(c @ IrConst::I32(_)),
+                        ..
+                    } => {
+                        *ty = IrType::I64;
+                        *c = IrConst::I64(c.to_i64().unwrap());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(
+            ivsr_function(&mut func),
+            0,
+            "native-width symbol index stays SIB"
         );
     }
 }
