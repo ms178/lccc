@@ -1,0 +1,1517 @@
+[
+ {
+  "name": "weak_strong_override",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "weak_no_override",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "weak_undef_null_check",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "weak_undef_data",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "common_symbols_merge",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "common_vs_strong_def",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "common_alignment",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "strong_duplicate_rejected",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "undefined_symbol_rejected",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "alias_attribute",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "hidden_visibility",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "protected_visibility",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "local_symbol_shadowing",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "archive_selective_extract",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "archive_circular_groups",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "whole_archive_exec",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "archive_lazy_loading_is_lazy",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "archive_weak_ref_no_extract",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "thin_archive",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "archive_strong_over_weak_obj",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "init_fini_arrays",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "ctor_priority_order",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "start_stop_section_symbols",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "gc_sections_basic",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "gc_sections_keeps_used",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "gc_sections_keep_start_stop",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "gc_sections_keeps_eh_frame",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "gc_sections_comdat_winner_reached",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "gc_sections_weak_loses_to_strong",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "gc_sections_cxx_personality_via_cie",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "gc_sections_export_dynamic_dlsym",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "build_id_note_emitted",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "defsym_two_argument_form",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "wrap_two_argument_form",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "bss_zeroed",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "large_alignment_data",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "rodata_merge_strings",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "strmerge_dedup_identity",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "strmerge_fp_constants",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "strmerge_wide_and_narrow",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "tentative_array",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "pc32_cross_object",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "abs64_data_reloc",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "got_data_access_pic",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "tls_local_exec",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "tls_cross_object",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "tls_initial_values",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "tls_alignment",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "tls_segment_alignment_after_tdata_pad1",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "tls_segment_alignment_after_tdata_pad3",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "tls_segment_alignment_after_tdata_pad6",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "tls_segment_alignment_after_tdata_pad11",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "tls_segment_alignment_after_tdata_static_pad1",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "tls_segment_alignment_after_tdata_static_pad3",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "tls_segment_alignment_after_tdata_static_pad6",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "tls_segment_alignment_after_tdata_static_pad11",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "tls_general_dynamic",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "tls_local_dynamic",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "tls_gd_across_shared_lib",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "tls_ld_dlopen_lccc_so",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "tls_mixed_models",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "tls_many_gd_sites",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "tls_consumed_skip_correctness",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "icf_identical_leaf_functions",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "parallel_reloc_smoke",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "large_got_pressure",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "pie_basic_et_dyn",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "pie_string_array",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "pie_jump_table",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "pie_function_pointer_array",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "pie_main_via_got",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "no_pie_stays_et_exec",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "local_ifunc",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "gc_sections_symtab_no_dead_locals",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "symtab_sh_info_equals_locals",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "symtab_locals_before_globals_with_pools",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "strip_all_drops_symtab",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "hash_style_gnu",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "hash_style_sysv",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "hash_style_both",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "dyn_init_fini_pie",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "dyn_init_fini_nopie",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "rpath_default_is_runpath",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "rpath_disable_new_dtags",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "rpath_enable_new_dtags",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "comment_merged_deduplicated",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "sort_common_largest_first",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "local_ifunc_static_link",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "ifunc_resolver",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "ifunc_static_link",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "copy_reloc_libc_data",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "gotpcrelx_relaxation",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "plt_libc_calls",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "libm_link",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "export_dynamic_dladdr",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "dlopen_shared_lib",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "link_against_lccc_so",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "soname_and_needed",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "preinit_array",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "static_hello",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "static_tls_pthread",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "static_malloc_heavy",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "nostdlib_custom_start",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "custom_entry_flag",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "defsym_alias",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "wrap_symbol",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "z_now_relro",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "relro_write_protection",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "relro_data_rel_ro_dynamic",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "relro_static_init_array",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "z_now_dynamic_flags",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "z_noexecstack",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "as_needed_flag",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "build_id_flag_accepted",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "strip_all",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "undefined_flag_pulls_archive",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "comdat_dedup",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "eh_frame_present",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "eh_frame_hdr_backtrace",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "many_objects_60",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "mixed_pic_nopic",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "large_rodata",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "icf_never_folds_different_call_targets",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "icf_folds_truly_identical_functions",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "icf_respects_reloc_addends",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "icf_safe_preserves_function_pointer_identity",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "icf_folded_code_still_unwinds",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "icf_none_is_accepted_and_disables",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "icf_cross_object_locals_safe",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "icf_cross_object_locals_all",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "icf_transitive_cross_object_fold",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "icf_hot_unlikely_stay_split",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "icf_local_ifunc_resolvers_survive",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "icf_shifted_indices_fold",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "icf_weak_strong_address_identity",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "icf_lea_address_taken_safe",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "prop_note_and_or_merge",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "prop_note_or_survives_veto",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "prop_note_z_ibt_rescues_veto",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "prop_note_z_ibt_joined_form",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "prop_note_isa_level_created",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "prop_note_z_lam_u48_sets_both_bits",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "prop_note_synthetic_objects_do_not_veto",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "prop_note_multi_note_section",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "prop_note_invalid_isa_rejected",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "script_kernel_style",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "script_memory_region_placement",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "script_segment_start_and_data_segment",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "script_hidden_symbol_definitions",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "rel_basic_merge",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "rel_local_name_collision",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "rel_common_symbols",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "rel_ctor_preserved",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "rel_data_relocs",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "reloc_whole_archive_thin_and_regular",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "file_mode_libs_r_and_T",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "dso_pointer_equality",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "i386_dso_pointer_equality",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "gotpcrelx_relax_vs_bfd",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "dso_emit_semantics",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "i386_dso_emit_semantics",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "code_model_large_medium",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "exe_exports_dso_names",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "so_bound_ifunc",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "eh_frame_packing",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "gotpcrel_edges",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "got64_spelling_matrix",
+  "status": "PASS",
+  "detail": "3 fixture(s) x 1 assembler(s); relocations seen: as/0: GOTPC32:_GLOBAL_OFFSET_TABLE_ - 4,GOT64:lvar0 + 0,GOTPC32:_GLOBAL_OFFSET_TABLE_ - 4,GOT64:lvar1 + 0,GOTPC32:_GLOBAL_OFFSET_TABLE_ - 4,GOT64:lvar2 + 0; as/1: GOTPC32:_GLOBAL_OFFSET_TABLE_ - 4,GOT64:lvar0 + 0,GOTPC32:_GLOBAL_OFFSET_TABLE_ - 4,GOT64:lvar1 + 0,GOTPC32:_GLOBAL_OFFSET_TABLE_ - 4,GOT64:lvar2 + 0; as/2: GOTPC32:_GLOBAL_OFFSET_TABLE_ - 4,GOT64:lvar0 + 0,GOTPC32:_GLOBAL_OFFSET_TABLE_ - 4,GOT64:lvar1 + 0,GOTPC32:_GLOBAL_OFFSET_TABLE_ - 4,GOT64:lvar2 + 0"
+ },
+ {
+  "name": "absolute_symbols_pic",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "ie_to_le_local",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "ie_to_le_forms",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "movrs_relocations",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "plain_gotpcrel_relaxation",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "text_relocations",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "cxx_exceptions_unwind",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "cxx_exceptions_local_typeinfo",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "script_pie_base0",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "script_undefined_pulls_archive",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "script_undefined_pulls_archive_i386",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "i386_tls_matrix",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "i386_exe_tls_transitions",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "i386_dso_chain_archive",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "i386_archive_semantics",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "i386_options_and_tags",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "i386_property_notes",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "i386_text_relocations",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "i386_copy_relocation_aliases",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "i386_copy_only_when_addressed",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "script_vdso_dynamic",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "script_vdso_declared_note_phdrs",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "script_elf32_i386_relocations",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "script_elf32_gc_keep",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "script_elf32_vdso_multiversion",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "gc_eh_frame_invariant",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "build_id_note",
+  "status": "PASS",
+  "detail": "digest 3f4ffc36f13dfcd991f2347e90e48dcc8e4e76cb"
+ },
+ {
+  "name": "relro_nobits_pad",
+  "status": "PASS",
+  "detail": "relro fsz=0x1dc msz=0x8ac w2 off=0x930 va=0x4930"
+ },
+ {
+  "name": "note_run_merge",
+  "status": "PASS",
+  "detail": "3 notes in 1 PT_NOTE run(s)"
+ },
+ {
+  "name": "gnu_hash_sizing",
+  "status": "PASS",
+  "detail": "n=600 buckets=150 bloom=256 shift=14"
+ },
+ {
+  "name": "crossarch_gnu_hash_relro",
+  "status": "PASS",
+  "detail": "3 arch drivers verified (@48 exports each)"
+ },
+ {
+  "name": "static_pie_refused",
+  "status": "PASS",
+  "detail": "refused with a diagnostic"
+ },
+ {
+  "name": "emit_relocs_warns_when_unimplemented",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "dyn_init_fini_shared",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "script_hidden_not_exported",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "script_pic_gotpcrel_relaxation",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "script_tls_initial_exec",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "script_tls_gd_ld_relaxation",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "script_overlay_shared_vma",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "as_needed_positional_dt_needed",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "script_as_needed_input",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "bstatic_positional_search",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "print_map_to_stdout",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "version_script_multiple_nodes",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "comdat_group_dedup",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "section_header_index_consistency",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "script_nonalloc_debug_payload",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "so_default_interposable",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "so_bsymbolic_binds_local",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "so_z_defs_rejects_undefined",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "so_shared_flag_parity",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "shared_icf_tls_twin",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "export_dynamic_exports_globals",
+  "status": "PASS",
+  "detail": "10 dynamic symbols"
+ },
+ {
+  "name": "export_dynamic_dlopen_callback",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "export_dynamic_version_script",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "export_dynamic_matches_gnu_ld",
+  "status": "PASS",
+  "detail": "both export ['exported_api', 'internal_helper', 'main']"
+ },
+ {
+  "name": "emit_relocs_sections_present",
+  "status": "PASS",
+  "detail": "9 relocations retained"
+ },
+ {
+  "name": "emit_relocs_header_wiring",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "emit_relocs_matches_gnu_ld",
+  "status": "PASS",
+  "detail": "all 9 relocations agree with GNU ld"
+ },
+ {
+  "name": "emit_relocs_kernel_relocs_tool",
+  "status": "PASS",
+  "detail": "kernel relocs tool derives an identical set (4 entries) from lccc and GNU ld"
+ },
+ {
+  "name": "emit_relocs_does_not_perturb_image",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "exclude_libs_control",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "exclude_libs_hides_symbols",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "exclude_libs_lib_still_works",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "exclude_libs_no_null_jumpslot",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "exclude_libs_ALL",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "driver_option_noise",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "driver_flag_silent[--push-state]",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "driver_flag_silent[--pop-state]",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "driver_flag_silent[--eh-frame-hdr]",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "driver_flag_silent[--no-warn-execstack]",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "driver_flag_silent[-plugin-opt=whatever]",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "lto_bytecode_refused",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "segment_congruence",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "segment_no_page_padding",
+  "status": "PASS",
+  "detail": "largest inter-LOAD file gap = 392 bytes"
+ },
+ {
+  "name": "relro_ends_on_page_boundary",
+  "status": "PASS",
+  "detail": "RELRO end vaddr = 0x5000"
+ },
+ {
+  "name": "shared_lib_segment_congruence",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "shared_lib_no_page_padding",
+  "status": "PASS",
+  "detail": "largest inter-LOAD gap = 344 bytes"
+ },
+ {
+  "name": "shared_lib_still_loads",
+  "status": "PASS",
+  "detail": "output '12\\n' (expected '12')"
+ },
+ {
+  "name": "output_not_larger_than_bfd",
+  "status": "PASS",
+  "detail": "lccc 14624 B vs bfd 24176 B"
+ },
+ {
+  "name": "map_file_matches_binary",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "map_file_two_arg_spelling",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "malformed_addralign_not_power_of_two",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "malformed_section_offset_wraps_u64",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "malformed_section_size_huge",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "malformed_shoff_beyond_eof",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "malformed_shentsize_zero",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "malformed_shnum_huge",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "malformed_shstrndx_out_of_range",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "malformed_symtab_link_out_of_range",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "malformed_symbol_name_out_of_range",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "malformed_symbol_shndx_out_of_range",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "malformed_reloc_sym_idx_out_of_range",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "malformed_reloc_offset_out_of_range",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "malformed_reloc_type_unknown",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "malformed_rela_info_target_oob",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "malformed_truncated_file",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "reloc_pc32_out_of_range_diagnosed_on_exec_path",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "reloc_pc32_out_of_range_diagnosed_on_script_path",
+  "status": "PASS",
+  "detail": "agreed by 2 of 3 oracles; not counted (incapable): mold(incapable)"
+ },
+ {
+  "name": "reloc_32_out_of_range_diagnosed_on_shared_path",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "reloc_32_preemptible_abs_in_shared_refused",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "reloc_pc32_abs_in_shared_is_dynamic",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "reloc_out_of_range_diagnosed_r_x86_64_32",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "reloc_in_range_accepted_r_x86_64_32",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "reloc_out_of_range_diagnosed_r_x86_64_32s",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "reloc_in_range_accepted_r_x86_64_32s",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "reloc_out_of_range_diagnosed_r_x86_64_16",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "reloc_in_range_accepted_r_x86_64_16",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "reloc_out_of_range_diagnosed_r_x86_64_8",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "reloc_in_range_accepted_r_x86_64_8",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "reloc_64_accepts_above_4g",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "reloc_offset_text_w4",
+  "status": "PASS",
+  "detail": "13 offsets swept, boundary 0x5 matches GNU ld"
+ },
+ {
+  "name": "reloc_offset_wrap_text",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "reloc_offset_data.rel.ro_w8",
+  "status": "PASS",
+  "detail": "12 offsets swept, boundary 0x0 matches GNU ld"
+ },
+ {
+  "name": "reloc_offset_wrap_data.rel.ro",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "defsym_layout_plus",
+  "status": "PASS",
+  "detail": "delta 8 matches GNU ld"
+ },
+ {
+  "name": "defsym_layout_arith",
+  "status": "PASS",
+  "detail": "delta -3 matches GNU ld"
+ },
+ {
+  "name": "defsym_layout_end_final",
+  "status": "PASS",
+  "detail": "E = final _end - 4 (0x40446c)"
+ },
+ {
+  "name": "defsym_layout_reloc_reference",
+  "status": "PASS",
+  "detail": "relocation against defsym'd symbol patched with the final value (lccc 0x404478 / gnu 0x402040)"
+ },
+ {
+  "name": "defsym_layout_shared",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "lccc_ld_default_search_path_x86_64",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "lccc_ld_new_dtags_x86_64",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "lccc_ld_default_search_path_i386",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "lccc_ld_new_dtags_i386",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "pltoff_library_variable_exec",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "pltoff_library_variable_shared",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "pie_absolute32_refused",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "driver_pie_startfiles",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "as_needed_dropped_library_exports_nothing",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "defsym_forward_reference_pie",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "defsym_forward_reference_shared",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "defsym_forward_reference_script",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "defsym_forward_reference_i386",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "defsym_address_slides_in_pie",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "defsym_pc32_absolute_pie_refused",
+  "status": "PASS",
+  "detail": ""
+ },
+ {
+  "name": "defsym_cycle_diagnosed",
+  "status": "PASS",
+  "detail": ""
+ }
+]

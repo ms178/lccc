@@ -1,0 +1,88 @@
+{
+  "source": "tests/benchmark/programs/expat_xml_scan.c",
+  "function": null,
+  "arch": "x86",
+  "errors": [
+    {
+      "compiler": "icc",
+      "id": "cicc2021100",
+      "error": "GodboltError: remote compile failed: icc (cicc2021100)"
+    }
+  ],
+  "records": [
+    {
+      "key": "lccc",
+      "id": "/home/user/lccc/target/lccc-pr814-before",
+      "name": "local LCCC",
+      "flags": "-O2 -march=x86-64-v3",
+      "elapsed_s": 0.24105922100000043,
+      "instructions": 221,
+      "loads": 18,
+      "stores": 10,
+      "spills": 17,
+      "stack_refs": 17,
+      "xmm_reg_moves": 0,
+      "branches": 57,
+      "vectors": 0,
+      "calls": 4,
+      "ratio_vs_best": 1.2848837209302326
+    },
+    {
+      "key": "gcc16.2",
+      "id": "cg162",
+      "name": "x86-64 gcc 16.2",
+      "semver": "16.2",
+      "compilerType": "",
+      "flags": "-O2 -march=x86-64-v3",
+      "elapsed_s": 0.3529793590000736,
+      "instructions": 172,
+      "loads": 15,
+      "stores": 6,
+      "spills": 4,
+      "stack_refs": 4,
+      "xmm_reg_moves": 0,
+      "branches": 50,
+      "vectors": 7,
+      "calls": 4,
+      "ratio_vs_best": 1.0
+    },
+    {
+      "key": "clang23.1",
+      "id": "cclang2310",
+      "name": "x86-64 clang 23.1.0",
+      "semver": "23.1.0",
+      "compilerType": "clang",
+      "flags": "-O2 -march=x86-64-v3",
+      "elapsed_s": 0.25916185999994923,
+      "instructions": 222,
+      "loads": 15,
+      "stores": 10,
+      "spills": 0,
+      "stack_refs": 0,
+      "xmm_reg_moves": 0,
+      "branches": 59,
+      "vectors": 12,
+      "calls": 1,
+      "ratio_vs_best": 1.2906976744186047
+    },
+    {
+      "key": "icx",
+      "id": "cicxlatest",
+      "name": "x86-64 icx (latest)",
+      "semver": "(latest)",
+      "compilerType": "clang-intel",
+      "flags": "-O2 -march=x86-64-v3",
+      "elapsed_s": 1.8838679430000411,
+      "instructions": 327,
+      "loads": 21,
+      "stores": 29,
+      "spills": 3,
+      "stack_refs": 3,
+      "xmm_reg_moves": 0,
+      "branches": 107,
+      "vectors": 30,
+      "calls": 1,
+      "ratio_vs_best": 1.9011627906976745
+    }
+  ]
+}

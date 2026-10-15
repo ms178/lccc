@@ -31,6 +31,11 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Enable temporary CI swap file
+        run: bash scripts/ci_enable_swap.sh
 
       # The regression corpus includes executable i686 cases.  ubuntu-latest
       # can provide /lib/ld-linux.so.2 without the 32-bit development/startup
@@ -39,19 +44,15 @@ jobs:
       # with SIGSEGV.  Install the complete multilib contract before building
       # so the i686 tests exercise compiler codegen rather than host setup.
       #
-      # This is the ONE provisioning step for the 32-bit runtime: the ABI
-      # cross-checks later in this same job compile, link and *run* `-m32`
-      # caller/callee pairs against it, and each treats a missing runtime as an
-      # infrastructure failure rather than a skip (a skipped ABI gate is how a
-      # miscompile ships).  The runtime is provisioned here, once.  Installing
-      # it in a second step with a narrower package set (no `g++-multilib`)
-      # would let one consumer silently depend on a weaker environment than
-      # the other, so there is exactly one provisioning step.
-      - name: Install i686 C runtime and development files
+      # This is the ONE provisioning step for the 32-bit runtime and the
+      # current GCC oracle: the regression corpus and ABI cross-checks compile,
+      # link and *run* -m32 pairs. Keep both the runner compiler's multilib and
+      # GCC 16's multilib available because older helper gates still invoke the
+      # unversioned `gcc`, while the differential corpus explicitly uses GCC 16.
+      - name: Install GCC 16 and i686 C runtime/development files
         run: |
-          sudo dpkg --add-architecture i386
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-multilib g++-multilib libc6-dev-i386 qemu-user
+          bash scripts/ci_install_gcc16.sh --multilib
+          sudo apt-get install -y --no-install-recommends qemu-user
 
       # The differential oracle set must be EXPLICIT, not whatever the runner
       # image happens to ship: a gate whose evidence depends on the image is a
@@ -67,38 +68,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mold lld
 
-      # The record-tag identity gate diffs against a real compiler, and it needs
-      # one that understands -std=c23. ubuntu-latest ships GCC 13, which does
-      # not: it rejects the FLAG, and because a rejection of the flag and a
-      # rejection of the program both look like "reject", five negative rows
-      # then "agreed" with lccc and one positive row went red. That is PR #737,
-      # and the red was the gate's fault, not the compiler's. Per the doctrine
-      # stated above, the oracle set is provisioned explicitly rather than left
-      # to the image. The gate independently probes for a compiler that accepts
-      # both -std=c17 and -std=c23, refuses to run without one, runs a positive
-      # control per dialect before any row, requires every rejection to be for
-      # the stated reason, and prints the oracle's --version in its summary --
-      # so this step is what makes the oracle deterministic, and the gate is
-      # what makes a missing one loud instead of vacuous.
-      - name: Install a C23-capable GCC oracle
+      # Confirm that the explicitly provisioned current GCC oracle is a usable
+      # C17/C23 compiler before any differential gate can mistake a rejected
+      # language flag for a rejected program.
+      - name: Verify GCC 16 C23 oracle
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-14
-
-      # The named-address-space and constant-initializer gates pin GCC 16 as
-      # their verdict oracle (tests/regression/lib/gcc_oracle.sh): older GCC
-      # disagrees on named-space verdicts, and the gates fail rather than
-      # substitute another oracle. ubuntu-24.04 ships no gcc-16 package, so
-      # provision it from the toolchain PPA; without this step the nine
-      # GCC-16 gates below (and ci_local.sh's mirrors of them, whose parity
-      # scripts/check_ci_gate_parity.py enforces) cannot run hosted at all.
-      - name: Install the GCC 16 verdict oracle
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends software-properties-common
-          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-16 gcc-16-multilib lib32gcc-16-dev
+          test "$(gcc-16 -dumpfullversion | cut -d. -f1)" = 16
+          printf 'int main(void) { return 0; }\n' | gcc-16 -std=c17 -x c -fsyntax-only -
+          printf 'int main(void) { return 0; }\n' | gcc-16 -std=c23 -x c -fsyntax-only -
+          gcc-16 --version | head -n 1
 
       - name: Cache cargo registry
         uses: actions/cache@v6
@@ -134,7 +112,49 @@ jobs:
       # Keep CI on the documented compiler build policy: fastbuild, Rust -O1
       # and two jobs. This is deliberately not Cargo's default release -O3.
       - name: Build
-        run: ./scripts/build_lccc_fast.sh
+        run: |
+          set +e
+          ./scripts/build_lccc_fast.sh 2>&1 | tee "$RUNNER_TEMP/lccc-build.log"
+          build_status=${PIPESTATUS[0]}
+          set -e
+          if [ "$build_status" -ne 0 ]; then
+            # Surface the rustc diagnostic tail as a check annotation: the
+            # Actions log download endpoint may be unavailable to API clients,
+            # but the annotation remains inspectable through the Checks API.
+            python3 - "$RUNNER_TEMP/lccc-build.log" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          text = Path(sys.argv[1]).read_text(errors="replace")
+          text = re.sub(chr(27) + r"\[[0-9;]*m", "", text)
+          lines = text.splitlines()
+          ranges = []
+          for index, line in enumerate(lines):
+              if re.match(r"^(?:error(?:\[[^]]+\])?:|warning:)", line):
+                  ranges.append((max(0, index - 2), min(len(lines), index + 32)))
+          merged = []
+          for start, end in ranges:
+              if merged and start <= merged[-1][1]:
+                  merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+              else:
+                  merged.append((start, end))
+          if merged:
+              context = []
+              for start, end in merged:
+                  if context:
+                      context.append("... omitted log lines ...")
+                  context.extend(lines[start:end])
+          else:
+              context = lines[-120:]
+          detail = chr(10).join(context)
+          if len(detail) > 40000:
+              detail = detail[:20000] + chr(10) + "... diagnostic output truncated ..." + chr(10) + detail[-20000:]
+          escaped = detail.replace(chr(37), "%25").replace(chr(13), "%0D").replace(chr(10), "%0A")
+          print(f"::error title=Rust build diagnostics::{escaped}")
+          PY
+          fi
+          exit "$build_status"
 
       - name: Check the recursion-to-iteration pass
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_rec2iter.sh
@@ -165,6 +185,15 @@ jobs:
 
       - name: IVSR integer-domain contracts
         run: env CCC=target/fastbuild/lccc bash tests/regression/check_ivsr_domains.sh
+
+      # nbody pair-loop family: vector-memory (base, index, disp) triples and
+      # GEP offsets through GVN Copy glue join one pointer recurrence, affine
+      # siblings chain (no second recurrence). Pins the SHAPE (zero stride
+      # multiplies, one hoisted base materialisation) and the correctness of
+      # the transform at every opt level, ILP32, and under the ptr-add kill
+      # switch.
+      - name: IVSR vecaddr struct-walk shape and contracts
+        run: env CCC=target/fastbuild/lccc bash tests/regression/check_ivsr_vecaddr_struct_walk.sh
 
       # Executed miscompile regression for the iv_widen theorem-5'
       # trajectory gates and the exposed-latch intercept (runtime ring-top
@@ -372,11 +401,18 @@ jobs:
             echo '== Rust =='
             rustc -Vv
             cargo --version
-            echo '== C toolchain =='
+            rustfmt --version
+            cargo clippy --version
+            echo '== C toolchains =='
+            gcc-16 --version | head -1
+            g++-16 --version | head -1
             gcc --version | head -1
             as --version | head -1
             ld --version | head -1
-            dpkg-query -W -f='${Package} ${Version}\n' gcc-multilib libc6-dev-i386 2>/dev/null || echo 'gcc-multilib libc6-dev-i386: ABSENT (every -m32 gate on this runner will SKIP, and this record is the only place that says so)'
+            echo '== memory/swap =='
+            free -h
+            swapon --show
+            dpkg-query -W -f='${Package} ${Version}\n' gcc-16 g++-16 gcc-16-multilib g++-16-multilib gcc-multilib libc6-dev-i386 2>/dev/null || echo 'one or more GCC/multilib packages are absent'
             echo '== CPU flags =='
             grep -m1 -E '^flags[[:space:]]*:' /proc/cpuinfo || true
             echo '== tested compiler =='
@@ -396,6 +432,7 @@ jobs:
           python3 tests/regression/run_regression.py \
             --lccc target/fastbuild/lccc \
             -j 2 \
+            --gcc gcc-16 \
             --json regression-results.json 2>&1 | tee regression-results.log
 
       # Correctness gate over the benchmark corpus (INF-BENCHGATE-1): the
@@ -406,6 +443,8 @@ jobs:
       # every kernel against GCC at -O0/-O1/-O2/-O3: a level-specific
       # miscompile is still a miscompile.
       - name: Benchmark output gate (workload kernels vs GCC oracle)
+        env:
+          GCC_BIN: gcc-16
         run: bash scripts/check_benchmark_outputs.sh
 
       # Differential correctness gate (vectorizer + codegen vs GCC oracle):
@@ -414,8 +453,11 @@ jobs:
       # and the benchmark-output gate. Each case compiles under lccc and
       # GCC at aggressive vectorization flags and diffs stdout: a level-
       # or flag-specific miscompile is still a miscompile.
-      - name: Differential correctness gate (lccc vs GCC oracle)
-        run: LCCC_BIN=target/fastbuild/lccc python3 tests/correctness/run_correctness.py
+      - name: Differential correctness gate (lccc vs GCC 16 oracle)
+        env:
+          LCCC_BIN: target/fastbuild/lccc
+          GCC_BIN: gcc-16
+        run: python3 tests/correctness/run_correctness.py
 
       # Emitted-assembly contract for the hot-loop alignment policy: every
       # vector loop carries the bounded `.p2align 5,,15` + `.p2align 4`
@@ -1306,6 +1348,9 @@ jobs:
           CCC: target/fastbuild/lccc
         run: |
           set -euo pipefail
+          # Preserve the failing command in Checks because these independent
+          # gates share one shell step.
+          trap 'rc=$?; printf "::error title=Fast contract failed::%s (exit %s)\n" "$BASH_COMMAND" "$rc"; exit "$rc"' ERR
           python3 scripts/check_ci_gate_parity.py
           # A `run: |` block is shell, not YAML. Step scaffolding pasted
           # into one is valid YAML that dies with exit 127 on the runner
@@ -1655,6 +1700,16 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Enable temporary CI swap file
+        run: bash scripts/ci_enable_swap.sh
+
+      - name: Report stable Rust toolchain versions
+        run: |
+          rustc -Vv
+          cargo --version
+          rustfmt --version
+          cargo clippy --version
+
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
@@ -1704,6 +1759,18 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Enable temporary CI swap file
+        run: bash scripts/ci_enable_swap.sh
+
+      - name: Report stable Rust toolchain versions
+        run: |
+          rustc -Vv
+          cargo --version
+          rustfmt --version
+          cargo clippy --version
 
       - name: Build LCCC (fastbuild)
         env:

@@ -1,0 +1,4 @@
+# 2026-10-14T19:31:55Z setup_oracles.sh
+ld      GNU ld (GNU Binutils) 2.47.20260726
+mold    mold 2.42.1 (compatible with GNU ld) (MOLD_TARGETS=X86_64;I386)
+ld.lld  Debian LLD 23.1.4 (compatible with GNU linkers)

@@ -39,16 +39,20 @@ if [[ ! -x $LCCC_BIN ]]; then
     exit 2
 fi
 
-# Match what run_benchmarks.py passes, so a failure here reproduces there.
-GCC_INC=""
-for d in /usr/lib/gcc/x86_64-linux-gnu/*/include; do
-    [[ -d $d ]] && GCC_INC="-I$d"
-done
+# Match the selected reference compiler exactly, so this correctness-only
+# gate uses the same builtin headers as run_benchmarks.py (including when CI
+# selects gcc-16 explicitly).
+if ! gcc_include=$("$GCC_BIN" -print-file-name=include 2>/dev/null) ||
+   [[ ! -d $gcc_include ]]; then
+    echo "error: cannot find builtin include directory for GCC_BIN=$GCC_BIN" >&2
+    exit 2
+fi
+GCC_INC="-I$gcc_include"
 
 WORK=$(mktemp -d -t lccc-benchcheck-XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 
-pass=0; fail=0; skip=0
+pass=0; fail=0; skip=0; cases=0
 declare -a FAILED=()
 
 for src in "$REPO"/tests/benchmark/programs/*.c; do
@@ -64,10 +68,12 @@ for src in "$REPO"/tests/benchmark/programs/*.c; do
     # an unoptimised build legitimately overflows the stack. Both compilers
     # must be asked the same question.
     for lev in $LEVELS; do
+        cases=$((cases+1))
         ref_bin="$WORK/$name.ref$lev"
-        if ! "$GCC_BIN" "$lev" "$src" -o "$ref_bin" -lm 2>/dev/null \
-           && ! "$GCC_BIN" "$lev" "$src" -o "$ref_bin" 2>/dev/null; then
-            skip=$((skip+1)); continue
+        if ! "$GCC_BIN" "$lev" "$src" -o "$ref_bin" -lm 2>"$WORK/gcc.err" \
+           && ! "$GCC_BIN" "$lev" "$src" -o "$ref_bin" 2>>"$WORK/gcc.err"; then
+            echo "FAIL  $name $lev (GCC oracle build: $(head -2 "$WORK/gcc.err" | tr '\n' ' '))"
+            fail=$((fail+1)); FAILED+=("$name$lev:oracle-build"); continue
         fi
         # STDOUT ONLY.  The benchmark programs log wall-clock timings to
         # stderr (they differ on every run and across compilers); the
@@ -75,7 +81,10 @@ for src in "$REPO"/tests/benchmark/programs/*.c; do
         # flipped every timing-logging program's comparison into a coin
         # toss (i686_alu_chains failed 4/4 levels on identical checksums).
         ref_out=$(timeout 300 "$ref_bin" 2>/dev/null); ref_ec=$?
-        if [[ $ref_ec -eq 124 ]]; then skip=$((skip+1)); continue; fi
+        if [[ $ref_ec -eq 124 ]]; then
+            echo "FAIL  $name $lev (GCC oracle timeout)"
+            fail=$((fail+1)); FAILED+=("$name$lev:oracle-timeout"); continue
+        fi
 
         bin="$WORK/$name$lev"
         if ! "$LCCC_BIN" $GCC_INC "$lev" "$src" -o "$bin" 2>"$WORK/cc.err"; then
@@ -96,6 +105,16 @@ for src in "$REPO"/tests/benchmark/programs/*.c; do
         pass=$((pass+1))
     done
 done
+
+# A typoed filter used to produce PASS=0/FAIL=0, and reference build failures
+# or timeouts were counted as skips. Both outcomes made this correctness gate
+# vacuous: it could report success without comparing a single executable. The
+# corpus and GCC oracle are mandatory CI infrastructure, so there are no
+# permissible skip reasons here.
+if [[ $cases -eq 0 ]]; then
+    echo "FAIL  no benchmark cases matched filter '$FILTER'"
+    fail=$((fail+1)); FAILED+=("no-matching-cases")
+fi
 
 echo
 echo "================================================================"

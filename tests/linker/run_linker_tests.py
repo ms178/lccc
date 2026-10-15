@@ -3222,8 +3222,7 @@ def _script_tls_gd_ld_test(args, oracles):
     """
     name = "script_tls_gd_ld_relaxation"
     src = r"""
-__thread int gd_a = 11;
-__thread int gd_b = 22;
+extern int check_tls(void);
 static long sys_write(const void *b, unsigned long n){
   long r; __asm__ volatile("syscall":"=a"(r)
       :"a"(1L),"D"(1L),"S"(b),"d"(n):"rcx","r11","memory");
@@ -3236,7 +3235,7 @@ static long set_fs(void *p){
 }
 extern char __tdata_start[], __tdata_end[], __tls_size_sym[];
 static char tls_area[512] __attribute__((aligned(64)));
-void my_start(void){
+void tls_main(void){
   unsigned long tls_size = (unsigned long)__tls_size_sym;
   /* The ABI requires *(void**)tp == tp; the TLS block sits just below tp. */
   char *tp = tls_area + 256;
@@ -3246,12 +3245,33 @@ void my_start(void){
   for (unsigned long i = 0; i < tls_size; i++)
       (tp - tls_size)[i] = i < init ? s[i] : 0;
   set_fs(tp);
-  int ok = (gd_a == 11) && (gd_b == 22);
+  int ok = check_tls();
   char m[2] = { (char)('0' + ok), '\n' };
   sys_write(m, 2);
   __asm__ volatile("syscall"::"a"(60L),"D"((long)(ok ? 0 : 1)));
   __builtin_unreachable();
 }
+"""
+    # GCC may hoist the module-base lookup across an inline arch_prctl even
+    # with a memory clobber: the C TLS model assumes a stable thread pointer.
+    # Keep the TLS access in a separate TU (without LTO), reached only after
+    # FS is installed. Also supply a real process entry rather than entering
+    # a C function with the kernel's non-call stack alignment.
+    access_src = """
+__thread int gd_a = 11;
+__thread int gd_b = 22;
+int check_tls(void) { return (gd_a == 11) && (gd_b == 22); }
+"""
+    entry_src = """
+.text
+.globl my_start
+.type my_start,@function
+my_start:
+  andq $-16, %rsp
+  call tls_main
+  ud2
+.size my_start, .-my_start
+.section .note.GNU-stack,"",@progbits
 """
     script = ("ENTRY(my_start)\n"
               "SECTIONS {\n"
@@ -3272,21 +3292,29 @@ void my_start(void){
             f.write(src)
         with open(os.path.join(td, "t.lds"), "w") as f:
             f.write(script)
+        with open(os.path.join(td, "access.c"), "w") as f:
+            f.write(access_src)
+        with open(os.path.join(td, "entry.s"), "w") as f:
+            f.write(entry_src)
+        r = sh([CC, "-c", "entry.s", "-o", "entry.o"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"entry assembly failed: {r.stderr.decode()[:150]}")
         lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
         for model, expect_reloc in (("global-dynamic", "TLSGD"),
                                     ("local-dynamic", "TLSLD")):
             obj = "t." + model + ".o"
-            r = sh([CC, "-c", "-O1", "-fPIC", "-ftls-model=" + model,
-                    "-ffreestanding", "-fno-stack-protector",
-                    "t.c", "-o", obj], cwd=td)
-            if r.returncode != 0:
-                return Result(name, "SKIP", r.stderr.decode()[:150])
-            rel = sh(["readelf", "-rW", obj], cwd=td).stdout.decode()
+            access_obj = "access." + model + ".o"
+            for source, output in (("t.c", obj), ("access.c", access_obj)):
+                r = sh([CC, "-c", "-O1", "-fPIC", "-ftls-model=" + model,
+                        "-ffreestanding", "-fno-stack-protector",
+                        source, "-o", output], cwd=td)
+                if r.returncode != 0:
+                    return Result(name, "FAIL", r.stderr.decode()[:150])
+            rel = sh(["readelf", "-rW", access_obj], cwd=td).stdout.decode()
             if expect_reloc not in rel:
-                # The compiler optimised the model away; nothing to test here.
-                continue
+                return Result(name, "FAIL", f"{model}: expected {expect_reloc} relocation missing")
             out_b = "out." + model
-            r = sh([lccc_ld, "-T", "t.lds", obj, "-o", out_b], cwd=td)
+            r = sh([lccc_ld, "-T", "t.lds", "entry.o", obj, access_obj, "-o", out_b], cwd=td)
             if r.returncode != 0:
                 return Result(name, "FAIL",
                     f"{model}: lccc-ld failed: {r.stderr.decode()[:300]}")
@@ -3296,7 +3324,7 @@ void my_start(void){
                     f"{model}: relaxed TLS wrong at runtime: {(code, out)!r} "
                     f"(want (0, '1\\n'))")
             # GNU ld must agree.
-            r2 = sh(["ld", "-T", "t.lds", obj, "-o", "ref." + model], cwd=td)
+            r2 = sh(["ld", "-T", "t.lds", "entry.o", obj, access_obj, "-o", "ref." + model], cwd=td)
             if r2.returncode == 0:
                 code2, out2 = run_bin(os.path.join(td, "ref." + model), [], td)
                 if (code, out) != (code2, out2):
@@ -5780,7 +5808,7 @@ def _ie_to_le_forms_test(args, oracles):
         with open(os.path.join(td, "m.c"), "w") as f:
             f.write("#include <stdio.h>\nint ie_movl(void), ie_gadd(void);\n"
                     "int main(void) { printf(\"%d %d\\n\", ie_movl(), ie_gadd()); return 0; }\n")
-        r = sh([CC, "-c", "ief.s"], cwd=td)
+        r = sh(["as", "--64", "ief.s", "-o", "ief.o"], cwd=td)
         if r.returncode != 0:
             err = r.stderr.decode()[:300]
             if "movrs" in err or "no such instruction" in err:
@@ -5949,7 +5977,7 @@ def _movrs_relocations_test(args, oracles):
                     "int main(void) { printf(\"%d %ld\\n\", mvr(), mvd()); return 0; }\n")
         with open(os.path.join(td, "ext.c"), "w") as f:
             f.write("int ext = 3;\n")
-        r = sh([CC, "-c", "mv.s"], cwd=td)
+        r = sh(["as", "--64", "mv.s", "-o", "mv.o"], cwd=td)
         if r.returncode != 0:
             err = r.stderr.decode()[:300]
             if "movrs" in err:

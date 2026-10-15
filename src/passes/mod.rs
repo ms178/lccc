@@ -485,6 +485,7 @@ fn run_gvn_licm_ivsr_shared(
     run_ivsr: bool,
     run_ivsr_scalar: bool,
     run_ivsr_ptr_add: bool,
+    ivsr_x86_sib_cost: bool,
     run_univsr: bool,
     time_passes: bool,
     iter: usize,
@@ -601,6 +602,7 @@ fn run_gvn_licm_ivsr_shared(
                     &cfg,
                     run_ivsr_scalar,
                     run_ivsr_ptr_add,
+                    ivsr_x86_sib_cost,
                 );
                 verify::verify_after_func_pass(func, "ivsr");
                 n += round;
@@ -2424,6 +2426,15 @@ pub(crate) fn run_passes(
             // read HERE, once, rather than inside the pass — see the env-read
             // ratchet in tests/regression/check_env_test_hygiene.sh.
             let run_ivsr_ptr_add = run_ivsr && std::env::var_os("CCC_NO_IVSR_PTR_ADD").is_none();
+            // The x86 SIB cost rule inside IVSR is a TARGET property (scaled-
+            // index addressing is free on x86, absent on RISC-V / limited on
+            // AArch64); on other targets it reshaped constant usage enough to
+            // flip RA/GLA decisions (double_reduction riscv64 +14 insns, the
+            // RA-GLA-03 cascade). x86 keeps the measured stencil5/CTZ wins.
+            let ivsr_x86_sib_cost = matches!(
+                target,
+                crate::backend::Target::X86_64 | crate::backend::Target::I686
+            );
             // Un-IVSR only pays off on targets with scaled-index addressing
             // (x86-64 SIB). Gated for diagnostics like the other loop passes.
             let run_univsr = run_ivsr
@@ -2441,6 +2452,7 @@ pub(crate) fn run_passes(
                     run_ivsr,
                     run_ivsr_scalar,
                     run_ivsr_ptr_add,
+                    ivsr_x86_sib_cost,
                     run_univsr,
                     time_passes,
                     iter,

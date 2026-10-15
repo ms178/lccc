@@ -1,0 +1,88 @@
+{
+  "source": "tests/benchmark/programs/gzip_crc32.c",
+  "function": null,
+  "arch": "x86",
+  "errors": [
+    {
+      "compiler": "icc",
+      "id": "cicc2021100",
+      "error": "GodboltError: remote compile failed: icc (cicc2021100)"
+    }
+  ],
+  "records": [
+    {
+      "key": "lccc",
+      "id": "/home/user/lccc/target/lccc-pr814-before",
+      "name": "local LCCC",
+      "flags": "-O2 -march=x86-64-v3",
+      "elapsed_s": 0.4018432870000197,
+      "instructions": 73,
+      "loads": 3,
+      "stores": 2,
+      "spills": 0,
+      "stack_refs": 0,
+      "xmm_reg_moves": 0,
+      "branches": 13,
+      "vectors": 0,
+      "calls": 3,
+      "ratio_vs_best": 1.46
+    },
+    {
+      "key": "gcc16.2",
+      "id": "cg162",
+      "name": "x86-64 gcc 16.2",
+      "semver": "16.2",
+      "compilerType": "",
+      "flags": "-O2 -march=x86-64-v3",
+      "elapsed_s": 0.44176293800001076,
+      "instructions": 50,
+      "loads": 5,
+      "stores": 2,
+      "spills": 0,
+      "stack_refs": 0,
+      "xmm_reg_moves": 0,
+      "branches": 8,
+      "vectors": 0,
+      "calls": 1,
+      "ratio_vs_best": 1.0
+    },
+    {
+      "key": "clang23.1",
+      "id": "cclang2310",
+      "name": "x86-64 clang 23.1.0",
+      "semver": "23.1.0",
+      "compilerType": "clang",
+      "flags": "-O2 -march=x86-64-v3",
+      "elapsed_s": 0.4095656089999693,
+      "instructions": 82,
+      "loads": 9,
+      "stores": 9,
+      "spills": 0,
+      "stack_refs": 0,
+      "xmm_reg_moves": 0,
+      "branches": 5,
+      "vectors": 0,
+      "calls": 1,
+      "ratio_vs_best": 1.64
+    },
+    {
+      "key": "icx",
+      "id": "cicxlatest",
+      "name": "x86-64 icx (latest)",
+      "semver": "(latest)",
+      "compilerType": "clang-intel",
+      "flags": "-O2 -march=x86-64-v3",
+      "elapsed_s": 0.29104559500001415,
+      "instructions": 100,
+      "loads": 20,
+      "stores": 6,
+      "spills": 3,
+      "stack_refs": 3,
+      "xmm_reg_moves": 0,
+      "branches": 5,
+      "vectors": 15,
+      "calls": 1,
+      "ratio_vs_best": 2.0
+    }
+  ]
+}

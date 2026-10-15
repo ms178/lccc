@@ -1,0 +1,18 @@
+  contract 1: inverted-polarity break loops match the oracle at every trip count
+    lim=0 -> 10623.257143
+    lim=1 -> 0.000000
+    lim=3 -> 0.000000
+    lim=17 -> 0.000000
+  contract 2: an inline-asm side effect in the body keeps its count
+    asm counter -> 262144
+  contract 3: a loop-carried scalar read after the loop
+    carried counter -> 262144
+  contract 4: long-indexed runtime-bound matmul -- correct AND still vectorized
+    long index: IR verifiers clean (CCC_VERIFY_IR=abort + CCC_VALIDATE_SSA=1)
+    long IV: 4 packed FMAs, result matches the oracle
+  contract 5: the canonical inclusive-bound matmul still matches the packed arm
+    canonical matmul: 4 packed FMAs (reach preserved)
+  contract 6: reduction exit polarity -- inclusive bound refused, no over-read
+    inclusive exit comparison: refused (was the over-read)
+    canonical < / != reductions: 8 packed adds (reach intact)
+check_fma_matcher_guards: PASS (inverted polarity + asm + carried state + inclusive exit refused; long-IV width kept, reach intact)

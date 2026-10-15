@@ -1,0 +1,1 @@
+/home/user/.cache/lccc-expat.WzvEgx/bad-utf8.xml:1:3: not well-formed (invalid token)

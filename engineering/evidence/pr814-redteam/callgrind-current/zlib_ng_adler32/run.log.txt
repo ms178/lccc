@@ -1,0 +1,5 @@
+| benchmark | Ir ref | Ir mine | Ir m/r | I1miss m/r | D1miss r+w m/r | LLmiss r+w m/r | Bcm m/r | Bim m/r |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| zlib_ng_adler32 | 505240 | 463788 | 0.91796 | 1376/1369 | 2194/2199 | 3174/3184 | 3376/3469 | 233/240 |
+geomean simulated Ir mine/ref = 0.9179558229752197 (not measured speedup)
+manifest -> /home/user/artifacts/pr814-callgrind-current/zlib_ng_adler32/manifest.json

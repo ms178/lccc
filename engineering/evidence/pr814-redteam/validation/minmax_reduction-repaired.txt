@@ -1,0 +1,29 @@
+  contract 1: randomized differential correctness vs the GCC oracle
+  contract 2: the min/max steady-state loop is 256-bit (AVX2)
+function         group          insn/B  B/trip    vec  verdict
+--------------------------------------------------------------
+max_const_init   vectorized     0.0625     128   256b  PASS
+max_empty_negative_start refused        1.5000       4     0b  PASS
+max_ge           vectorized     0.0625     128   256b  PASS
+max_guarded      refused        2.7500       4     0b  PASS
+max_i16          refused        5.5000       2     0b  PASS
+max_i32          vectorized     0.0625     128   256b  PASS
+max_start1       vectorized     0.1562      32   256b  PASS
+max_start1_exit_iv vectorized     0.1562      32   256b  PASS
+max_swapped      vectorized     0.0625     128   256b  PASS
+max_u32          refused        1.5000       4     0b  PASS
+max_volatile_load refused        1.5000       4     0b  PASS
+max_with_sum     refused        1.7500       4     0b  PASS
+max_with_volatile_store refused        2.0000       4     0b  PASS
+max_zero_start_dynamic_limit vectorized     0.0625     128   256b  PASS
+min_f32          refused        1.5000       4   128b  PASS
+min_i16          refused        5.5000       2     0b  PASS
+min_i32          vectorized     0.1562      32   256b  PASS
+min_le           vectorized     0.1562      32   256b  PASS
+minmax_pair      refused        2.0000       4     0b  PASS
+sum_volatile_load refused        1.5000       4     0b  PASS
+--------------------------------------------------------------
+check_minmax_shapes: PASS (20 shapes)
+  contract 3: the refused shapes stay scalar and stay correct
+  contract 4: i686 (no AVX2 min/max) still agrees with the oracle
+check_minmax_reduction: PASS
