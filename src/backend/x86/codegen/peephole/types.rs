@@ -2316,7 +2316,7 @@ fn classify_implicit_operands(b: &[u8]) -> (u16, u16) {
         b"lods" => (RSI, RAX | RSI),
         b"cmps" => (RSI | RDI, RSI | RDI),
         b"scas" => (RAX | RDI, RDI),
-        b"ins" | b"insb" | b"insw" | b"insl" => (RDX, RDI),
+        b"ins" | b"insb" | b"insw" | b"insl" => (RDX | RDI, RDI),
         b"outs" | b"outsb" | b"outsw" | b"outsl" => (RDX | RSI, RSI),
         b"in" | b"inb" | b"inw" | b"inl" => (RDX, RAX),
         b"out" | b"outb" | b"outw" | b"outl" => (RAX | RDX, 0),
@@ -2335,7 +2335,7 @@ fn classify_implicit_operands(b: &[u8]) -> (u16, u16) {
         b"cpuid" => (RAX | RCX, RAX | RBX | RCX | RDX),
         b"rdtsc" => (0, RAX | RDX),
         b"rdtscp" => (0, RAX | RCX | RDX),
-        b"rdpmc" | b"rdmsr" | b"xgetbv" => (RCX, RAX | RDX),
+        b"rdpmc" | b"rdmsr" | b"xgetbv" | b"rdpru" => (RCX, RAX | RDX),
         b"wrmsr" | b"xsetbv" => (RAX | RDX | RCX, 0),
         b"monitor" | b"mwait" => (RAX | RCX | RDX, 0),
         // The xsave family passes its feature mask in %edx:%eax; state goes
@@ -2345,15 +2345,13 @@ fn classify_implicit_operands(b: &[u8]) -> (u16, u16) {
         // syscall: number/return in %rax, arguments in rdi/rsi/rdx/r10/r8/r9,
         // and the kernel clobbers %rcx/%r11.
         b"syscall" => (RAX | RDX | RSI | RDI | R8 | R9 | R10, RAX | RCX | R11),
-        // sysenter reads the target from MSRs and writes no GP register;
-        // sysexit takes the return RIP in %rdx and the return RSP in %rcx;
-        // sysret returns through %rcx (RIP) and %r11 (RFLAGS) and writes no
-        // GP register either.  (The old shared row claimed all three wrote
+        // SYSENTER loads RSP from its MSR; SYSEXIT loads RSP from RCX
+        // and RIP from RDX. SYSRET consumes RCX/R11 without changing RSP.  (The old shared row claimed all three wrote
         // %rax:%rcx:%rdx — a fabricated clobber that an acceptance-style
         // redefinition check could use to retire a live value, e.g. a cltq
         // before a sysret whose %rax IS the syscall return value.)
-        b"sysenter" => (0, 0),
-        b"sysexit" => (RCX | RDX, 0),
+        b"sysenter" => (0, RSP),
+        b"sysexit" => (RCX | RDX, RSP),
         b"sysret" | b"sysretl" | b"sysretq" => (RCX | R11, 0),
         // Flags saved/restored through the stack: both forms implicitly
         // read and write %rsp (8 bytes per instruction).
@@ -2371,7 +2369,7 @@ fn classify_implicit_operands(b: &[u8]) -> (u16, u16) {
             RAX | RBX | RCX | RDX | RSI | RDI | RBP,
         ),
         // SYSEXIT carries an l/q width suffix in 64-bit mode.
-        b"sysexitl" | b"sysexitq" => (RCX | RDX, 0),
+        b"sysexitl" | b"sysexitq" => (RCX | RDX, RSP),
         // RSM returns from SMM by reloading the whole register state.
         b"rsm" => (
             0,
@@ -2393,9 +2391,8 @@ fn classify_implicit_operands(b: &[u8]) -> (u16, u16) {
         ),
         // PCONFIG: leaf in EAX, payload/result across EBX/ECX/EDX.
         b"pconfig" => (RAX | RBX | RCX | RDX, RAX | RBX | RCX | RDX),
-        // PKRU read: ECX must be zero, EAX receives the value; write reads
-        // ECX/EDX.
-        b"rdpkru" => (RCX, RAX),
+        // PKRU read: ECX must be zero, EAX receives PKRU and EDX is zeroed.
+        b"rdpkru" => (RCX, RAX | RDX),
         b"wrpkru" | b"wrmsrns" => (RAX | RCX | RDX, 0),
         // Hypervisor calls follow an unknown ABI like SYSCALL: leaf in RAX,
         // caller-saved GPRs may be clobbered.
@@ -2410,9 +2407,9 @@ fn classify_implicit_operands(b: &[u8]) -> (u16, u16) {
         // MONITORX/MWAITX mirror MONITOR/MWAIT on EAX/ECX(/EDX); INVLPGA
         // addresses by RAX with ASID in ECX; SKINIT jumps through EAX.
         b"monitorx" => (RAX | RCX | RDX, 0),
-        b"mwaitx" => (RAX | RCX, 0),
+        b"mwaitx" => (RAX | RBX | RCX, 0), // EBX is the optional timeout
         b"invlpga" => (RAX | RCX, 0),
-        b"skinit" => (RAX, 0),
+        b"skinit" | b"clzero" => (RAX, 0),
         // RTM: the abort status lands in %eax (only on the abort path — the
         // union keeps the family conservative; the exact full-write oracle
         // deliberately excludes this conditional write).
@@ -2440,7 +2437,7 @@ fn classify_implicit_operands(b: &[u8]) -> (u16, u16) {
         b"loop" | b"loope" | b"loopz" | b"loopne" | b"loopnz" => (RCX, RCX),
         b"jrcxz" | b"jecxz" => (RCX, 0),
         // Frame instructions.
-        b"enter" => (0, RSP | RBP),
+        b"enter" => (RSP | RBP, RSP | RBP),
         b"leave" | b"leaveq" => (RBP, RSP | RBP),
         _ => (0, 0),
     };
@@ -2489,6 +2486,10 @@ pub(super) fn implicit_full_write_refs(b: &[u8]) -> u16 {
         b"cbtw" | b"cbw" => RAX,
         b"cwd" | b"cwtd" => RDX,
         b"divb" | b"idivb" | b"mulb" | b"imulb" => RAX,
+        b"divw" | b"idivw" | b"mulw" | b"imulw" => RAX | RDX,
+        // POPAW restores only the low word of each data register; its
+        // stack-pointer update remains full-width for the active mode.
+        b"popaw" => 0xff & !(1 << 4),
         b"lodsb" | b"lodsw" => RAX,
         b"in" | b"inb" | b"inw" => RAX,
         b"xlat" | b"xlatb" | b"lahf" | b"fnstsw" => RAX,

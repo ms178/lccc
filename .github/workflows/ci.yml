@@ -371,8 +371,28 @@ jobs:
       run: bash scripts/ci_enable_swap.sh
     - name: Install GCC 16 and i686 C runtime/development files
       run: |
-        bash scripts/ci_install_gcc16.sh --multilib
-        sudo apt-get install -y --no-install-recommends qemu-user
+        set +e
+        install_log="$RUNNER_TEMP/gcc16-multilib-install.log"
+        bash scripts/ci_install_gcc16.sh --multilib >"$install_log" 2>&1
+        install_status=$?
+        if (( install_status == 0 )); then
+          sudo apt-get install -y --no-install-recommends qemu-user >>"$install_log" 2>&1
+          install_status=$?
+        fi
+        set -e
+        cat "$install_log"
+        if (( install_status != 0 )); then
+          python3 - "$install_log" <<'PY' || true
+        from pathlib import Path
+        import sys
+        lines = [line for line in Path(sys.argv[1]).read_text(errors="replace").splitlines() if line.strip()]
+        tail = "\n".join(lines[-30:])[-5000:] or "no install output recorded"
+        message = "GCC 16 / i686 provisioning failed: " + tail
+        message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print("::error title=GCC 16 multilib provisioning::" + message)
+        PY
+        fi
+        exit "$install_status"
     - name: Install differential linker oracles
       run: |
         sudo apt-get update
@@ -520,6 +540,8 @@ jobs:
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_seg_typedef_codegen.sh
     - name: Named-space conversion parity
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_seg_conversion_parity.sh
+    - name: Cargo gate resource isolation
+      run: python3 scripts/test_ci_resources.py
     needs:
     - build
   codegen:
@@ -734,6 +756,16 @@ jobs:
       run: bash tests/regression/check_chroot_bind.sh
     - name: Run kernel-tree deletion-safety regression
       run: bash tests/regression/check_kernel_tree_clear.sh
+    - name: Verify observable FP exception ordering
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/check_fp_environment.sh
+    - name: Verify packed integer reciprocal bitwise semantics
+      env:
+        CCC: target/fastbuild/lccc
+      run: python3 scripts/check_strict_packed_recip.py
+    - name: PR824 boundary witnesses
+      run: python3 tests/regression/check_pr824_boundaries.py --lccc target/fastbuild/lccc --cross
     needs:
     - build
   backend:
@@ -1240,6 +1272,7 @@ jobs:
       env:
         LCCC_I386_SCRATCH_ROOT: ${{ runner.temp }}/i386-linker-scratch
       run: |
+        LCCC_TEST_ASSEMBLER="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
         PATH="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin:$PATH" \
         LCCC_REQUIRE_I386=1 \
         LCCC_RELOCS_TOOL="$HOME/.cache/lccc-kernel-tools/bin/relocs" \
@@ -1255,6 +1288,14 @@ jobs:
           ${{ runner.temp }}/linker-results.json
           ${{ runner.temp }}/i386-linker-scratch
         if-no-files-found: ignore
+    - name: Temp-file symlink hardening
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_temp_symlink.sh
+    - name: Note-run oracle boundary tests
+      run: python3 tests/linker/test_note_runs.py
+    - name: RISC-V shared symbol binding and visibility
+      run: |
+        python3 tests/linker/test_riscv_shared_binding.py
+        python3 tests/linker/check_riscv_shared_binding.py --lccc target/fastbuild/lccc-riscv
     needs:
     - build
   clippy:

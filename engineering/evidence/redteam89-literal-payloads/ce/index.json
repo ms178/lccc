@@ -1,0 +1,50 @@
+[
+  {
+    "compiler": "cclang2310",
+    "source_sha256": "4d4ee448ec8c1ae7ba967f1f7d10970e86834451964b572386635b9a9460626e",
+    "compile_code": 0,
+    "execution_code": 0,
+    "did_execute": true,
+    "timed_out": false,
+    "compile_stderr": [],
+    "execution_stderr": [],
+    "ok": true
+  },
+  {
+    "compiler": "cg162",
+    "source_sha256": "4d4ee448ec8c1ae7ba967f1f7d10970e86834451964b572386635b9a9460626e",
+    "compile_code": 0,
+    "execution_code": 0,
+    "did_execute": true,
+    "timed_out": false,
+    "compile_stderr": [],
+    "execution_stderr": [],
+    "ok": true
+  },
+  {
+    "compiler": "cicc2021100",
+    "source_sha256": "4d4ee448ec8c1ae7ba967f1f7d10970e86834451964b572386635b9a9460626e",
+    "compile_code": 0,
+    "execution_code": 0,
+    "did_execute": true,
+    "timed_out": false,
+    "compile_stderr": [
+      {
+        "text": "icc: remark #10441: The Intel(R) C++ Compiler Classic (ICC) is deprecated and will be removed from product release in the second half of 2023. The Intel(R) oneAPI DPC++/C++ Compiler (ICX) is the recommended compiler moving forward. Please transition to use this compiler. Use '-diag-disable=10441' to disable this message."
+      }
+    ],
+    "execution_stderr": [],
+    "ok": true
+  },
+  {
+    "compiler": "cicxlatest",
+    "source_sha256": "4d4ee448ec8c1ae7ba967f1f7d10970e86834451964b572386635b9a9460626e",
+    "compile_code": 0,
+    "execution_code": 0,
+    "did_execute": true,
+    "timed_out": false,
+    "compile_stderr": [],
+    "execution_stderr": [],
+    "ok": true
+  }
+]

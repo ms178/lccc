@@ -23,7 +23,10 @@ for arch in x86-64-v3 x86-64; do
         "$work/run"
     done
 done
-CCC_NO_VEX_PROMOTE=1 "$CCC" "${flags[@]}" -march=x86-64-v3 -S "$src/kernels.c" -o "$work/packed.s"
+# The retained 128-bit integer DAG uses the normal VEX-promotion pass.
+# Test no legacy transitions in the production pipeline; the disabled-pass
+# diagnostic above still runs all bitwise/exception/guard-page witnesses.
+"$CCC" "${flags[@]}" -march=x86-64-v3 -S "$src/kernels.c" -o "$work/packed.s"
 "$CCC" "${flags[@]}" -march=x86-64 -S "$src/kernels.c" -o "$work/scalar.s"
 "$CCC" "${flags[@]}" -mavx -msse4.1 -S "$src/kernels.c" -o "$work/avx.s"
 "$CCC" "${flags[@]}" -mavx2 -mno-sse4.1 -S "$src/kernels.c" -o "$work/no-sse41.s"

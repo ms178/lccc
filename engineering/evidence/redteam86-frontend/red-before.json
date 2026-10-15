@@ -1,0 +1,71 @@
+{
+  "S85_compiler_sha256": "99bb1888b1445a253efeabc7bbfc69c21aad59cfbd320c1c5bcbe70ed777fe32",
+  "main_compiler_sha256": "d1d0b37c2cbc0354c602201827c89834598a907f24df14b4e054bf39960ecd68",
+  "native_canaries": {
+    "enumerator_attribute_aliases": {
+      "gcc": 0,
+      "S85": 1,
+      "main-f07": 1
+    },
+    "macro_token_boundary_stringification": {
+      "gcc": 0,
+      "S85": 1,
+      "main-f07": 1
+    }
+  },
+  "CLI_first_run": {
+    "commands": 3209,
+    "failures": [
+      {
+        "case": "duplicates/['--format=lz4']",
+        "error": "compression failed candidate"
+      },
+      {
+        "case": "elf/['--format=lz4']",
+        "error": "compression failed candidate"
+      },
+      {
+        "case": "json/['--format=lz4']",
+        "error": "compression failed candidate"
+      },
+      {
+        "case": "random/['--format=lz4']",
+        "error": "compression failed candidate"
+      },
+      {
+        "case": "rle/['--format=lz4']",
+        "error": "compression failed candidate"
+      },
+      {
+        "case": "source/['--format=lz4']",
+        "error": "compression failed candidate"
+      },
+      {
+        "case": "patch-from",
+        "error": "compression failed gcc"
+      },
+      {
+        "case": "version/candidate",
+        "error": "wrong version string candidate"
+      },
+      {
+        "case": "version/main",
+        "error": "wrong version string main"
+      }
+    ],
+    "clis": {
+      "candidate": {
+        "path": "/home/user/.cache/redteam78/zstd-f07/programs/zstd",
+        "sha256": "002f91bf708fb7c4db5c6cc2a735bb4ee66a256607266fd69b97081ac99c388b"
+      },
+      "main": {
+        "path": "/home/user/.cache/redteam78/zstd-main-f07/programs/zstd",
+        "sha256": "bcd90a6229e447f69ab372199574be6966341e000b1bdbd4813ced9487c95445"
+      },
+      "gcc": {
+        "path": "/home/user/.cache/redteam78/zstd-gcc/programs/zstd",
+        "sha256": "7894362fa9c716eca791823d2b0c61dfa3c2bf44cb64f6abc1ca3580fb084eb7"
+      }
+    }
+  }
+}

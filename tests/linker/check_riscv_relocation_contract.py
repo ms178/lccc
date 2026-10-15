@@ -20,7 +20,8 @@ import tempfile
 
 
 def fixture(kind=2, offset=0, symidx=2, addend=0, binding=0, visibility=0,
-            defined=True, payload=None, uleb=None, no_symbols=False, displacement=None):
+            defined=True, payload=None, uleb=None, no_symbols=False, displacement=None,
+            absolute=False, target_value=0, target_name="target", duplicate_local=False):
     """NULL, .text, .data, .data.more, .rela.data, .symtab, .strtab, .shstrtab.
 
     .data.more deliberately follows .data after section merging, so checking
@@ -33,12 +34,15 @@ def fixture(kind=2, offset=0, symidx=2, addend=0, binding=0, visibility=0,
     for name in names[1:]:
         name_offsets.append(len(shstr))
         shstr += name.encode() + b"\0"
-    strings = b"\0_start\0target\0"
+    strings = b"\0_start\0" + target_name.encode() + b"\0"
     # exit(0), independent of the data-relocation tests.
     text = struct.pack("<III", 0x00000513, 0x05D00893, 0x00000073)
     if uleb is not None:
         text += bytes(0x1010 - len(text))
-    target_section, target_value = (1, 0) if displacement is None else (2, offset + displacement)
+    target_section = 0xfff1 if absolute else 1
+    if displacement is not None:
+        assert not absolute, "a displacement fixture cannot also be absolute"
+        target_section, target_value = 2, offset + displacement
     symbols = bytes(24)
     symbols += struct.pack("<IBBHQQ", 8, binding << 4, visibility,
                            target_section if defined else 0, target_value, 0)
@@ -63,6 +67,16 @@ def fixture(kind=2, offset=0, symidx=2, addend=0, binding=0, visibility=0,
         for operation in sequence:
             k, delta = (operation, 0) if isinstance(operation, int) else operation
             rela += struct.pack("<QQq", offset + delta, ((1 if k == 60 else 2) << 32) | k, addend)
+    if duplicate_local:
+        assert kind == 20 and binding == 0 and defined and not absolute
+        # Two legitimate local symbols may have equal (or empty) names in a
+        # single object, while denoting distinct locations in its .text.
+        symbols = bytes(24)
+        for value in (0, 4):
+            symbols += struct.pack("<IBBHQQ", 8, 0, 0, 1, value, 0)
+        local_count = 3
+        rela = b"".join(struct.pack("<QQq", i * 4, ((i + 1) << 32) | 20, 0)
+                        for i in range(2))
     if no_symbols:
         symbols = b""
     chunks = [b"", text, bytes(16) if payload is None else payload,
@@ -185,6 +199,25 @@ def cases():
             diagnostic = "misaligned" if delta & 1 else "does not fit"
             yield (f"bad-range-{kind}-{delta}", dict(kind=kind, offset=site,
                    payload=bytes(payload), displacement=delta), False, diagnostic)
+    # AUIPC's signed HI20 is rounded by the signed LO12, so a generic i32
+    # bound is wrong at BOTH ends. S == P keeps every symbol in its input
+    # section; only the RELA addend spans the range (no multi-GiB fixture).
+    for kind in (19, 23):
+        for binding, visibility in ((0, 0), (1, 2)):
+            payload = struct.pack("<IIII", 0x5a5a5a5a, 0x297, 0x280e7, 0x13131313)
+            valid = {-2147485696, -2147485695, -2147483648, -2049, -2048,
+                     -1, 0, 1, 2047, 2048, 2147481598, 2147481599}
+            rng = random.Random(kind + binding)
+            valid.update(rng.randrange(-2147485696, 2147481600) for _ in range(24))
+            for delta in sorted(valid):
+                yield (f"valid-auipc-{kind}-{binding}-{delta}", dict(kind=kind, offset=4,
+                       payload=payload, displacement=0, addend=delta,
+                       binding=binding, visibility=visibility), True, "")
+            for delta in (-(1 << 63), -2147485698, -2147485697, 2147481600,
+                          2147481601, 2147483647, 2147483648, (1 << 63) - 1):
+                yield (f"bad-auipc-{kind}-{binding}-{delta}", dict(kind=kind, offset=4,
+                       payload=payload, displacement=0, addend=delta,
+                       binding=binding, visibility=visibility), False, "does not fit")
     # NONE and RELAX must not be confused with unknown relocation kinds.
     for kind in (0, 51):
         yield f"valid-marker-{kind}", dict(kind=kind, symidx=0), True, ""
@@ -270,6 +303,31 @@ def main():
                                 expected_field = bytes(((result >> (7 * i)) & 127) | (128 if i + 1 < width else 0)
                                                        for i in range(width))
                                 assert sec[".data"][1][offset:offset + width] == expected_field
+                            elif options.get("kind") in (19, 23):
+                                offset, kind = options["offset"], options["kind"]
+                                width = 8 if kind == 19 else 4
+                                original, data = options["payload"], sec[".data"][1]
+                                delta = options["addend"]  # S == P in this fixture.
+                                word = struct.unpack_from("<I", data, offset)[0]
+                                before = struct.unpack_from("<I", original, offset)[0]
+                                high = word & 0xfffff000
+                                if high & 0x80000000:
+                                    high -= 1 << 32
+                                assert word & 0xfff == before & 0xfff, "AUIPC registers/opcode overwritten"
+                                # Derive signed low field by modulo, independently
+                                # of the production high-rounding formula.
+                                low = (delta + 2048) % 4096 - 2048
+                                assert high + low == delta, (high, low, delta)
+                                if kind == 19:
+                                    word = struct.unpack_from("<I", data, offset + 4)[0]
+                                    before = struct.unpack_from("<I", original, offset + 4)[0]
+                                    decoded_low = word >> 20
+                                    if decoded_low & 2048:
+                                        decoded_low -= 4096
+                                    assert decoded_low == low, (decoded_low, low)
+                                    assert word & 0xfffff == before & 0xfffff, "JALR registers/opcode overwritten"
+                                assert data[:offset] == original[:offset], "prefix overwritten"
+                                assert data[offset + width:len(original)] == original[offset + width:], "suffix overwritten"
                             elif options.get("displacement") is not None:
                                 offset, kind = options["offset"], options["kind"]
                                 width = 2 if kind in (44, 45) else 4

@@ -217,6 +217,9 @@ pub(super) fn arm_invert_cond_code(cc: &str) -> &'static str {
 /// Uses AAPCS64 calling convention with stack-based allocation.
 pub struct ArmCodegen {
     pub(crate) state: CodegenState,
+    /// Actual IR value widths for typed register-offset addressing. Rebuilt
+    /// per function; an X-register home alone does not prove 64 valid bits.
+    pub(super) value_types: FxHashMap<u32, IrType>,
     /// FP contraction contract; gates fmadd fusion (see supports_fused_float_mul_add).
     pub(super) fp_contract: crate::common::fp_contract::FpContract,
     /// Frame size for the current function (needed for epilogue in terminators).
@@ -295,6 +298,7 @@ impl ArmCodegen {
     pub(crate) fn new_with_ra_config(ra_config: Arc<RaConfig>) -> Self {
         Self {
             state: CodegenState::new_with_ra_config(ra_config),
+            value_types: FxHashMap::default(),
             fp_contract: crate::common::fp_contract::FpContract::default(),
             current_frame_size: 0,
             current_return_type: IrType::I64,
@@ -2738,11 +2742,11 @@ impl ArchCodegen for ArmCodegen {
     /// without this override a slot-based `a[i]` loop would skip its offset
     /// producers and the rematerialise fallback would reload them after
     /// their homes expired (the i686 20080122-1 / local-i64-loop class).
-    /// Sub-word accesses have no shifted register-offset form, and both
-    /// address registers must be GPR homes; value staging goes through
+    /// The shift must be zero or the access-width scale. Both address
+    /// registers must be GPR homes with known index width; staging goes through
     /// x0/d0/s0, which no GPR home can alias, so stores add no constraint.
     fn indexed_fold_ok(&self, info: &crate::backend::generation::IndexedGepInfo) -> bool {
-        if info.disp != 0 || info.shift > 3 {
+        if info.disp != 0 || info.shift > 3 || !self.indexed_index_type_ok(&info.index) {
             return false;
         }
         // Type mirror of the indexed emitters: every arm below moves its
@@ -2774,11 +2778,11 @@ impl ArchCodegen for ArmCodegen {
         if !types_ok {
             return false;
         }
-        let sub_word = info
+        if !info
             .access_tys
             .iter()
-            .any(|t| matches!(t, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16));
-        if sub_word && info.shift != 0 {
+            .all(|ty| Self::indexed_shift_ok(*ty, info.shift))
+        {
             return false;
         }
         if self
@@ -3611,17 +3615,17 @@ mod indexed_fold_contract_tests {
         let mut cg = ArmCodegen::new();
         cg.reg_assignments.insert(1, PhysReg(0));
         cg.reg_assignments.insert(2, PhysReg(1));
+        cg.value_types.insert(2, IrType::I64);
         cg
     }
 
     #[test]
     fn decider_accepts_every_emitter_armed_type() {
         let cg = gpr_homed_cg();
-        // Sub-word types fold only unshifted (no shifted register-offset
-        // form); the rest take shift 2 (scale 4).
+        // A shifted register offset must scale by the memory access width.
         for ty in [IrType::F64, IrType::D64] {
             assert!(
-                cg.indexed_fold_ok(&gep_info(vec![ty], 2)),
+                cg.indexed_fold_ok(&gep_info(vec![ty], 3)),
                 "{ty:?} must fold: the emitter's 64-bit arms move it width-exactly"
             );
         }
@@ -3635,7 +3639,7 @@ mod indexed_fold_contract_tests {
         }
         for ty in [IrType::I64, IrType::U64, IrType::Ptr] {
             assert!(
-                cg.indexed_fold_ok(&gep_info(vec![ty], 2)),
+                cg.indexed_fold_ok(&gep_info(vec![ty], 3)),
                 "{ty:?} must fold"
             );
         }
@@ -3672,8 +3676,43 @@ mod indexed_fold_contract_tests {
     #[test]
     fn decider_mirrors_the_shift_guard() {
         let cg = gpr_homed_cg();
-        assert!(cg.indexed_fold_ok(&gep_info(vec![IrType::F32], 3)));
+        assert!(cg.indexed_fold_ok(&gep_info(vec![IrType::F32], 2)));
+        assert!(!cg.indexed_fold_ok(&gep_info(vec![IrType::F32], 3)));
+        assert!(!cg.indexed_fold_ok(&gep_info(vec![IrType::F64], 2)));
+        assert!(cg.indexed_fold_ok(&gep_info(vec![IrType::U16], 1)));
         assert!(!cg.indexed_fold_ok(&gep_info(vec![IrType::F32], 4)));
+    }
+
+    #[test]
+    fn indexed_width_is_required_before_suppressing_producers() {
+        let mut cg = gpr_homed_cg();
+        cg.value_types.remove(&2);
+        assert!(!cg.indexed_fold_ok(&gep_info(vec![IrType::U8], 0)));
+        assert!(!cg.emit_load_indexed_impl(&Value(100), &Value(1), &Value(2), 0, IrType::U8));
+        assert!(cg.state.out.buf.is_empty());
+    }
+
+    #[test]
+    fn indexed_load_extends_the_actual_integer_width() {
+        for (ty, extension) in [
+            (IrType::I32, "sxtw #0"),
+            (IrType::U32, "uxtw #0"),
+            (IrType::I8, "sxtb"),
+            (IrType::U8, "uxtb"),
+            (IrType::I16, "sxth"),
+            (IrType::U16, "uxth"),
+        ] {
+            let mut cg = gpr_homed_cg();
+            cg.value_types.insert(2, ty);
+            cg.reg_assignments.insert(100, PhysReg(2));
+            assert!(cg.indexed_fold_ok(&gep_info(vec![IrType::U8], 0)));
+            assert!(cg.emit_load_indexed_impl(&Value(100), &Value(1), &Value(2), 0, IrType::U8));
+            assert!(
+                cg.state.out.buf.contains(extension),
+                "{ty:?}: {}",
+                cg.state.out.buf
+            );
+        }
     }
 
     #[test]

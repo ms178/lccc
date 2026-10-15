@@ -22,3 +22,7 @@ echo 'VEX flag-read architectural witnesses: PASS (11 original/deleted pairs)'
 "$compiler" -O2 -mavx2 "$fixture/implicit-driver.c" "$fixture/implicit-witness.s" -o "$tmp/implicit"
 "$tmp/implicit"
 echo 'Implicit vector/state architectural witnesses: PASS (SHA conditional on ISA availability)'
+
+"$compiler" -O2 -mavx2 "$fixture/gather-driver.c" "$fixture/gather-witness.s" -o "$tmp/gather"
+"$tmp/gather"
+echo 'AVX2 gather read/write mask witnesses: PASS (8 original/rewritten pairs)'

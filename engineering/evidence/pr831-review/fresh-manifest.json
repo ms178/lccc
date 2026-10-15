@@ -1,0 +1,12 @@
+{
+  "compiler_source_head": "c7d5062b39aacaec669e675c171cc09b8f0193e2",
+  "base": "7f9eb225def23bda9370d3349304b9b785554fea",
+  "candidate_sha256": "47cd3acac75c81c414cfa6eda9b3fa04e1ca733e6216a3191b675a15fb0b9ed9",
+  "pr831_head": "9881506686a270497d635917dde75297ed805a5f",
+  "pr831_sha256": "01503f8b1383b2ec37d2f02730c1c6e9880d07c38230a1785a622c24f28ab5d8",
+  "archive_sha256": "174832d593eaf772c33d20af759511d4ea52a243c0da09fbe2ebc65b18c5c1b7",
+  "note": "S60 changes only the FP structural test and audit text, not compiler Rust source. Native no-wrap is diagnostic only, not shipped policy. Final full fast-CI verdict is in the external delivery ledger, avoiding a self-referential source stamp.",
+  "delivery_compiler_sha256": "84d0463930962e007eba27f82ec0423c562a05d58ac6359c233c0d118c2dad94",
+  "delivery_compiler_source_head": "8a619512d1e169d7a3a6960c2784d38bb166f342",
+  "benchmark_carry_forward": "90 whole x86-64 executables (45 default native, 45 bounded Callgrind) are byte-identical to the measured compiler; see x86-binary-equivalence.json. The only compiler change is i686 DT_RELENT metadata."
+}

@@ -91,6 +91,10 @@ impl DynamicDesc {
         if let Some((a, s)) = self.rel {
             v.push((DT_REL, a));
             v.push((DT_RELSZ, s));
+        }
+        // PLT relocations are Elf32_Rel too, even with no .rel.dyn table.
+        // Consumers such as readelf need their entry size in that case.
+        if self.rel.is_some() || self.plt.is_some() {
             v.push((DT_RELENT, 8));
         }
         if let Some(n) = self.relcount {
@@ -183,6 +187,32 @@ mod tests {
                 .collect();
             assert_eq!(tags.last(), Some(&DT_NULL));
             assert_eq!(tags.iter().filter(|&&t| t == DT_NULL).count(), 1);
+        }
+    }
+
+    #[test]
+    fn relent_covers_plt_only_and_is_never_duplicated() {
+        for has_plt in [false, true] {
+            for has_rel in [false, true] {
+                let d = DynamicDesc {
+                    plt: has_plt.then_some((0x3000, 0x400, 8)),
+                    rel: has_rel.then_some((0x500, 8)),
+                    ..Default::default()
+                };
+                let entries = d.entries();
+                let sizes: Vec<_> = entries
+                    .iter()
+                    .filter(|(tag, _)| *tag == DT_RELENT)
+                    .collect();
+                assert_eq!(sizes.len(), usize::from(has_plt || has_rel));
+                if let Some((_, size)) = sizes.first() {
+                    assert_eq!(*size, 8);
+                }
+                assert_eq!(
+                    d.serialize(d.byte_size()).unwrap().len() as u32,
+                    d.byte_size()
+                );
+            }
         }
     }
 

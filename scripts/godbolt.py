@@ -30,6 +30,7 @@ import os
 import re
 import shlex
 import subprocess
+import tempfile
 import sys
 import time
 import urllib.error
@@ -446,21 +447,21 @@ def _instruction_count(lines: list[str]) -> int:
 
 
 def _compile_local(executable: str, source: Path, flags: str) -> list[str]:
-    digest = hashlib.sha256((str(source.resolve()) + "\0" + flags).encode()).hexdigest()[:16]
-    # Include the process id: separate scoreboard/compare processes are often
-    # launched in parallel for different functions of the same source. A
-    # digest-only name let one process unlink another's completed assembly.
-    output = Path(os.environ.get("TMPDIR", "/tmp")) / (
-        f"lccc-godbolt-{digest}-{os.getpid()}.s"
-    )
-    command = [executable, *shlex.split(flags), "-S", str(source), "-o", str(output)]
-    result = subprocess.run(command, capture_output=True, text=True)
-    if result.returncode:
-        raise GodboltError(f"local compile failed: {' '.join(command)}\n{result.stderr}")
-    try:
-        return output.read_text().splitlines()
-    finally:
-        output.unlink(missing_ok=True)
+    # A PID/digest name still collides between threads and can be pre-created
+    # as a symlink. Own a private directory and clean it on every failure path.
+    with tempfile.TemporaryDirectory(prefix="lccc-godbolt-") as td:
+        output = Path(td) / "output.s"
+        command = [executable, *shlex.split(flags), "-S", str(source), "-o", str(output)]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+            if result.returncode:
+                raise GodboltError(f"local compile failed: {' '.join(command)}\n{result.stderr}")
+            text = output.read_text(errors="replace")
+            if not text.strip():
+                raise GodboltError("local compiler produced empty assembly")
+            return text.splitlines()
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise GodboltError(f"local compile failed: {error}") from error
 
 
 def command_list(args: argparse.Namespace) -> int:
@@ -504,6 +505,11 @@ def command_compile(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 1
     print("\n".join(lines))
+    if args.execute:
+        execution = result.get("execResult") or {}
+        return int(execution.get("code") != 0
+                   or execution.get("timedOut", False)
+                   or execution.get("didExecute") is False)
     return 0
 
 

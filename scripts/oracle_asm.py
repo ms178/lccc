@@ -24,13 +24,14 @@ Usage::
         --out /tmp/matmul --flags '-O2 -march=x86-64-v3'
 
 Writes ``<out>/{lccc,gcc16.2,clang,icc,icx}.s`` (whole function bodies, AT&T)
-and prints the shared statistic columns.  Exit status is non-zero only when
-the local compile or function extraction fails; a missing oracle is an error
-row because a silent gap would understate the competition.
+and prints the shared statistic columns.  Any requested compile or function-extraction failure returns non-zero.
+Failed requested outputs are removed, so an old assembly file cannot silently
+masquerade as current evidence.
 """
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -57,12 +58,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--local", default=str(REPO / "target" / "fastbuild" / "lccc"))
     parser.add_argument("--oracles", default=",".join(DEFAULT_ORACLES))
     parser.add_argument("--out", type=Path)
-    args = parser.parse_args(argv)
+    args = parser.parse_args(godbolt.join_dash_values(list(sys.argv[1:] if argv is None else argv)))
 
+    names = [name.strip() for name in args.oracles.split(",") if name.strip()]
+    if (len(set(names)) != len(names) or "lccc" in names
+            or any(not re.fullmatch(r"[A-Za-z0-9_.-]+", name) for name in names)):
+        parser.error("oracle labels must be unique, path-safe, and not 'lccc'")
     source_text = args.source.read_text(errors="replace")
     out: Path | None = args.out
     if out:
         out.mkdir(parents=True, exist_ok=True)
+        for key in ["lccc", *names]:
+            (out / f"{key}.s").unlink(missing_ok=True)
 
     records: list[tuple[str, list[str] | None, str | None]] = []
     try:
@@ -76,7 +83,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001 - report, never abort the survey
         records.append(("lccc", None, str(exc)))
 
-    for name in [o for o in (s.strip() for s in args.oracles.split(",")) if o]:
+    for name in names:
         try:
             body = oracle._function_body(oracle._compile_remote(name, source_text,
                                                                 args.flags),
@@ -98,7 +105,7 @@ def main(argv: list[str] | None = None) -> int:
               f"{stats.spills:>6} {stats.branches:>6} {stats.vectors:>4}")
         if out:
             (out / f"{key}.s").write_text("\n".join(body) + "\n")
-    return 0
+    return int(any(body is None for _, body, _ in records))
 
 
 if __name__ == "__main__":

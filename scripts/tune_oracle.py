@@ -40,6 +40,8 @@ import json
 import os
 import re
 import subprocess
+import shlex
+import tempfile
 import sys
 from collections import OrderedDict
 from pathlib import Path
@@ -79,7 +81,7 @@ def split_functions(asm: str) -> "OrderedDict[str, str]":
     cur = None
     buf: list[str] = []
     for line in asm.splitlines():
-        m = re.match(r"^([A-Za-z_][\w.$]*):\s*$", line)
+        m = re.match(r'^\s*"?([A-Za-z_][\w.$]*)"?:\s*(?:[#;].*)?$', line)
         if m and not m.group(1).startswith(".L"):
             if cur is not None:
                 out[cur] = "\n".join(buf)
@@ -107,15 +109,17 @@ def classify(body: str) -> list[str]:
 def lccc_dump(lccc: str, tune: str | None, all_rows: bool) -> str:
     env = dict(os.environ)
     env["LCCC_DUMP_TUNE"] = "all" if all_rows else "1"
-    tmp = Path("/tmp") / "lccc_tune_probe.c"
-    tmp.write_text("int lccc_tune_probe;\n")
-    flags = ["-O2", "-S", "-o", os.devnull, str(tmp)]
-    if tune and not all_rows:
-        flags.insert(1, f"-mtune={tune}")
-    p = subprocess.run([lccc, *flags], text=True, capture_output=True, env=env)
+    with tempfile.TemporaryDirectory(prefix="lccc-tune-dump-") as td:
+        tmp = Path(td) / "probe.c"
+        tmp.write_text("int lccc_tune_probe;\n")
+        flags = ["-O2", "-S", "-o", os.devnull, str(tmp)]
+        if tune and not all_rows:
+            flags.insert(1, f"-mtune={tune}")
+        p = subprocess.run([lccc, *flags], text=True, capture_output=True,
+                           env=env, timeout=120)
     text = p.stdout + p.stderr
-    if p.returncode != 0 and "tune=" not in text:
-        sys.exit(f"lccc failed: {text}")
+    if p.returncode != 0 or not parse_dump(text):
+        raise RuntimeError(f"lccc tuning dump failed or empty: {text}")
     return text
 
 
@@ -143,12 +147,16 @@ def parse_dump(text: str) -> list[dict]:
 
 
 def lccc_compile(lccc: str, src: Path, flags: str) -> str:
-    tmp = Path("/tmp") / (src.stem + ".tune_oracle.s")
-    p = subprocess.run([lccc, *flags.split(), "-S", "-o", str(tmp), str(src)],
-                       text=True, capture_output=True)
-    if p.returncode != 0:
-        sys.exit(f"lccc failed for {flags}: {p.stderr}")
-    return tmp.read_text()
+    with tempfile.TemporaryDirectory(prefix="lccc-tune-asm-") as td:
+        tmp = Path(td) / "output.s"
+        p = subprocess.run([lccc, *shlex.split(flags), "-S", "-o", str(tmp), str(src)],
+                           text=True, capture_output=True, timeout=120)
+        if p.returncode != 0:
+            raise RuntimeError(f"lccc failed for {flags}: {p.stderr}")
+        text = tmp.read_text()
+        if not text.strip():
+            raise RuntimeError("local compiler produced empty assembly")
+        return text
 
 
 # --------------------------------------------------------------------------
@@ -158,13 +166,13 @@ def godbolt_compile(compiler: str, src: Path, flags: str) -> str:
     sys.path.insert(0, str(REPO / "scripts"))
     import godbolt  # type: ignore
 
-    res = godbolt.compile_on_godbolt(compiler, src.read_text(), flags)
-    if isinstance(res, dict):
-        asm = res.get("asm") or res.get("text") or ""
-        if isinstance(asm, list):
-            asm = "\n".join(x.get("text", "") if isinstance(x, dict) else str(x) for x in asm)
-        return asm
-    return str(res)
+    res = godbolt.compile_on_godbolt(compiler, src.read_text(), flags, raise_on_error=True)
+    if res is None:
+        raise godbolt.GodboltError("missing compiler response")
+    text = "\n".join(godbolt.assembly_lines(res))
+    if not text.strip():
+        raise godbolt.GodboltError("compiler produced empty assembly")
+    return text
 
 
 # --------------------------------------------------------------------------
@@ -199,19 +207,31 @@ def cmd_matrix(a: argparse.Namespace) -> int:
                 continue
             table.setdefault(fn, OrderedDict())[t] = classify(body)
     print_table(f"lccc decision matrix — {src.name} ({a.flags})", tunes, table)
-    return 0
+    return int(not table or any(not any(t in row for row in table.values()) for t in tunes))
 
 
 def cmd_compare(a: argparse.Namespace) -> int:
     src = Path(a.probe)
-    cols = ["lccc"] + [o for o in a.oracles.split(",") if o]
+    cols = ["lccc"] + [o.strip() for o in a.oracles.split(",") if o.strip()]
+    if len(set(cols)) != len(cols) or any(not re.fullmatch(r"[A-Za-z0-9_.-]+", c) for c in cols):
+        raise ValueError("oracle labels must be unique and path-safe")
+    if a.save:
+        Path(a.save).mkdir(parents=True, exist_ok=True)
+        for c in cols:
+            (Path(a.save) / f"{src.stem}.{c}.s").unlink(missing_ok=True)
+        # Fail closed even if the local compile aborts before the final report.
+        (Path(a.save) / "status.json").write_text(json.dumps(
+            {"complete": False, "requested": cols, "flags": a.flags,
+             "errors": {"setup": "comparison incomplete"}}, indent=2) + "\n")
+    errors = {}
     table: dict[str, dict[str, list[str]]] = OrderedDict()
     outputs = {"lccc": lccc_compile(a.lccc, src, a.flags)}
     for o in cols[1:]:
         try:
             outputs[o] = godbolt_compile(o, src, a.flags)
         except Exception as e:  # network / API drift must not hide lccc's own table
-            print(f"warning: {o}: {e}", file=sys.stderr)
+            print(f"error: {o}: {e}", file=sys.stderr)
+            errors[o] = str(e)
             outputs[o] = ""
     for c in cols:
         for fn, body in split_functions(outputs[c]).items():
@@ -219,11 +239,17 @@ def cmd_compare(a: argparse.Namespace) -> int:
                 continue
             table.setdefault(fn, OrderedDict())[c] = classify(body)
     print_table(f"lccc vs oracles — {src.name} ({a.flags})", cols, table)
+    for c in cols:
+        if not any(c in row for row in table.values()):
+            errors.setdefault(c, "requested function(s) not emitted")
     if a.save:
-        Path(a.save).mkdir(parents=True, exist_ok=True)
         for c, asm in outputs.items():
-            (Path(a.save) / f"{src.stem}.{c}.s").write_text(asm)
-    return 0
+            if asm:
+                (Path(a.save) / f"{src.stem}.{c}.s").write_text(asm)
+        (Path(a.save) / "status.json").write_text(json.dumps(
+            {"complete": not errors, "requested": cols, "flags": a.flags, "errors": errors},
+            indent=2) + "\n")
+    return int(bool(errors))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -252,8 +278,13 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--save", default=None, help="directory for the raw .s files")
     c.set_defaults(fn=cmd_compare)
 
-    a = ap.parse_args(argv)
-    return a.fn(a)
+    import godbolt
+    a = ap.parse_args(godbolt.join_dash_values(list(sys.argv[1:] if argv is None else argv)))
+    try:
+        return a.fn(a)
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

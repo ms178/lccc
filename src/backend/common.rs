@@ -433,8 +433,6 @@ struct DirectLdArchConfig {
     dynamic_linker: &'static str,
     /// Base paths to search for GCC lib dir (containing crtbegin.o)
     gcc_lib_base_paths: &'static [&'static str],
-    /// GCC versions to probe (newest first)
-    gcc_versions: &'static [&'static str],
     /// Candidate directories for system CRT objects (crt1.o)
     crt_dir_candidates: &'static [&'static str],
     /// Standard system library directories for -L paths
@@ -474,13 +472,6 @@ struct DirectLdArchConfig {
     gcc_multilib_base_paths: &'static [&'static str],
 }
 
-/// Standard GCC versions to probe (newest to oldest), shared across most architectures.
-#[cfg(not(feature = "gcc_linker"))]
-const GCC_VERSIONS_FULL: &[&str] = &["14", "13", "12", "11", "10", "9", "8", "7", "6", "5", "4.9"];
-/// Shorter version list for architectures that don't have very old GCC support.
-#[cfg(not(feature = "gcc_linker"))]
-const GCC_VERSIONS_SHORT: &[&str] = &["14", "13", "12", "11", "10", "9", "8", "7"];
-
 #[cfg(not(feature = "gcc_linker"))]
 const DIRECT_LD_X86_64: DirectLdArchConfig = DirectLdArchConfig {
     arch_name: "x86-64",
@@ -494,7 +485,6 @@ const DIRECT_LD_X86_64: DirectLdArchConfig = DirectLdArchConfig {
         "/usr/lib64/gcc/x86_64-linux-gnu",
         "/usr/lib64/gcc/x86_64-redhat-linux",
     ],
-    gcc_versions: GCC_VERSIONS_FULL,
     crt_dir_candidates: &[
         "/usr/lib/x86_64-linux-gnu",
         "/usr/lib64",
@@ -529,7 +519,6 @@ const DIRECT_LD_RISCV64: DirectLdArchConfig = DirectLdArchConfig {
         "/usr/lib/gcc/riscv64-redhat-linux",
         "/usr/lib64/gcc/riscv64-linux-gnu",
     ],
-    gcc_versions: GCC_VERSIONS_SHORT,
     crt_dir_candidates: &[
         "/usr/riscv64-linux-gnu/lib",
         "/usr/lib/riscv64-linux-gnu",
@@ -561,7 +550,6 @@ const DIRECT_LD_I686: DirectLdArchConfig = DirectLdArchConfig {
         "/usr/lib/gcc/i386-linux-gnu",
         "/usr/lib/gcc/i386-redhat-linux",
     ],
-    gcc_versions: GCC_VERSIONS_FULL,
     crt_dir_candidates: &[
         "/usr/lib/i386-linux-gnu",
         "/usr/i686-linux-gnu/lib",
@@ -606,7 +594,6 @@ const DIRECT_LD_AARCH64: DirectLdArchConfig = DirectLdArchConfig {
         "/usr/lib64/gcc/aarch64-linux-gnu",
         "/usr/lib64/gcc/aarch64-redhat-linux",
     ],
-    gcc_versions: GCC_VERSIONS_FULL,
     crt_dir_candidates: &[
         "/usr/aarch64-linux-gnu/lib",
         "/usr/lib/aarch64-linux-gnu",
@@ -687,6 +674,52 @@ fn resolve_sysroot_file_dir(dir: &str, file: &str) -> Option<String> {
     None
 }
 
+/// Enumerate numeric GCC versions, newest first, from actual installations.
+/// A fixed list ending at GCC 14 silently missed Debian GCC 16 multilib.
+/// Keep sysroot and host candidates together, but resolve each required file
+/// through the existing same-root probe; a directory alone is not a runtime.
+#[cfg(not(feature = "gcc_linker"))]
+fn installed_gcc_versions(roots: &[std::path::PathBuf]) -> Vec<String> {
+    let mut versions = std::collections::BTreeMap::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            let key: Option<Vec<u64>> = name
+                .split('.')
+                .map(|part| {
+                    if part.is_empty() || !part.bytes().all(|c| c.is_ascii_digit()) {
+                        None
+                    } else {
+                        part.parse().ok()
+                    }
+                })
+                .collect();
+            if let Some(key) = key {
+                versions.insert((key, name.clone()), name);
+            }
+        }
+    }
+    versions.into_iter().rev().map(|(_, name)| name).collect()
+}
+
+#[cfg(not(feature = "gcc_linker"))]
+fn gcc_versions_at(base: &str) -> Vec<String> {
+    let mut roots = vec![std::path::PathBuf::from(base)];
+    let prefixed = with_sysroot_prefix(base);
+    if prefixed != base {
+        roots.push(prefixed.into());
+    }
+    installed_gcc_versions(&roots)
+}
+
 /// Discover GCC's library directory by probing well-known paths.
 /// Returns the path containing crtbegin.o (e.g., "/usr/lib/gcc/x86_64-linux-gnu/13").
 /// Honouring LCCC_SYSROOT: the returned directory always points at the same
@@ -696,7 +729,7 @@ fn find_gcc_lib_dir(arch: &DirectLdArchConfig) -> Option<String> {
     // Plain bases: `<base>/<ver>` itself is eligible, plus any multilib
     // sub-directory variants (only relevant when the base is multilib-aware).
     for base in arch.gcc_lib_base_paths {
-        for ver in arch.gcc_versions {
+        for ver in gcc_versions_at(base) {
             let dir = format!("{}/{}", base, ver);
             let mut candidates = vec![dir.clone()];
             for sub in arch.gcc_multilib_subdirs {
@@ -713,7 +746,7 @@ fn find_gcc_lib_dir(arch: &DirectLdArchConfig) -> Option<String> {
     // different ELF class (e.g. the amd64 GCC dir when targeting i686), so
     // only its `<ver>/<subdir>` variants may satisfy the probe.
     for base in arch.gcc_multilib_base_paths {
-        for ver in arch.gcc_versions {
+        for ver in gcc_versions_at(base) {
             for sub in arch.gcc_multilib_subdirs {
                 let dir = format!("{}/{}/{}", base, ver, sub);
                 if let Some(resolved) = resolve_sysroot_file_dir(&dir, "crtbegin.o") {
@@ -872,6 +905,18 @@ fn resolve_builtin_link_setup(
         lib_paths,
         needed_libs,
     }
+}
+
+/// The driver reports the SAME target-specific search paths as the linker.
+#[cfg(not(feature = "gcc_linker"))]
+pub(crate) fn builtin_library_paths(target: super::Target) -> Vec<String> {
+    let arch = match target {
+        super::Target::X86_64 => &DIRECT_LD_X86_64,
+        super::Target::I686 => &DIRECT_LD_I686,
+        super::Target::Aarch64 => &DIRECT_LD_AARCH64,
+        super::Target::Riscv64 => &DIRECT_LD_RISCV64,
+    };
+    resolve_builtin_link_setup(arch, &[], true, false).lib_paths
 }
 
 /// Add architecture-specific extra libraries after "gcc" in the needed libs list.
@@ -4597,5 +4642,32 @@ mod rcx_epoch_sink_coverage_tests {
         assert_eq!(out.debug_rcx_epoch(), 2);
         assert_eq!(out.debug_rax_epoch(), 2);
         out.debug_assert_fully_scanned();
+    }
+}
+
+#[cfg(all(test, not(feature = "gcc_linker")))]
+mod gcc_version_discovery_tests {
+    use super::installed_gcc_versions;
+    #[test]
+    fn installed_versions_are_numeric_complete_names_not_a_release_allowlist() {
+        let root = crate::common::temp_files::make_temp_path("test", "gcc-versions", "dir");
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        std::fs::create_dir(&root).unwrap();
+        let _cleanup = Cleanup(root.clone());
+        for name in [
+            "9", "14", "16", "17.1.2", "17.1.10", "17junk", "18..1", "includes",
+        ] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        std::fs::write(root.join("99"), b"not a directory").unwrap();
+        assert_eq!(
+            installed_gcc_versions(&[root.clone(), root]),
+            ["17.1.10", "17.1.2", "16", "14", "9"]
+        );
     }
 }

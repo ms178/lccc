@@ -90,6 +90,14 @@ class UniversalContractTest(unittest.TestCase):
                 self.hosted if hosted is None else hosted,
             )
 
+    def test_pr824_cross_target_matrix_cannot_be_removed_from_both_mirrors(self) -> None:
+        command = "tests/regression/check_pr824_boundaries.py --lccc target/fastbuild/lccc --cross"
+        shortened = command.removesuffix(" --cross")
+        self.assertIn(command, self.local)
+        self.assertIn(command, self.hosted)
+        self.assertEqual(self.check(local=self.local.replace(command, shortened),
+                                    hosted=self.hosted.replace(command, shortened)), 1)
+
     def test_real_mirrors_pass(self) -> None:
         self.assertEqual(self.check(), 0)
 

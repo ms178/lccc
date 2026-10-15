@@ -1,0 +1,14 @@
+   Compiling lccc v0.1.0 (/opt/lccc-audit-cache/lccc)
+    Finished `fastbuild` profile [optimized] target(s) in 3m 47s
+     Running unittests src/lib.rs (target/fastbuild/deps/lccc-63d4da9b885ca1e5)
+
+running 6 tests
+test backend::riscv::linker::displacement::tests::auipc_rejects_rounded_overflow_not_just_i32_overflow ... ok
+test backend::riscv::linker::displacement::tests::auipc_uses_xlen_arithmetic_across_address_and_addend_wrap ... ok
+test backend::riscv::linker::displacement::tests::auipc_rounding_boundaries_and_all_low_bits ... ok
+test backend::riscv::linker::displacement::tests::reject_truncation_and_discarded_alignment_bits ... ok
+test backend::riscv::linker::displacement::tests::xlen_wrap_and_signed_boundary_are_not_host_overflows ... ok
+test backend::riscv::linker::displacement::tests::exhaustive_representable_displacements ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 4608 filtered out; finished in 0.00s
+

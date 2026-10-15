@@ -418,16 +418,22 @@ const FUSIBLE_OPS: &[&str] = &["add", "sub", "and", "or", "xor", "cmp", "test", 
 /// Subset for which `B = T op C` equals `B = C op T`.
 const COMMUTATIVE_OPS: &[&str] = &["add", "and", "or", "xor", "imul"];
 
+/// Reject unsupported suffixes without slicing through a UTF-8 character.
+/// The accepted ASCII instruction set is unchanged.
+#[inline]
+fn split_lq_mnemonic(mnemonic: &str) -> Option<(&str, bool)> {
+    if let Some(op) = mnemonic.strip_suffix('q') {
+        Some((op, true))
+    } else {
+        mnemonic.strip_suffix('l').map(|op| (op, false))
+    }
+}
+
 /// Parse `OP{l,q} %src, %dst` where both are plain GP registers of the
 /// suffix width.  Returns `(op, is_q, src_fam, dst_fam)`.
 fn parse_reg_reg_alu(t: &str) -> Option<(&'static str, bool, RegId, RegId)> {
     let mnemonic = t.split_whitespace().next()?;
-    let (op, suffix) = mnemonic.split_at(mnemonic.len().checked_sub(1)?);
-    let is_q = match suffix {
-        "q" => true,
-        "l" => false,
-        _ => return None,
-    };
+    let (op, is_q) = split_lq_mnemonic(mnemonic)?;
     let op = *FUSIBLE_OPS.iter().find(|o| **o == op)?;
     let rest = t[mnemonic.len()..].trim();
     let (a, b) = split_two_operands(rest)?;
@@ -448,12 +454,7 @@ fn parse_reg_reg_alu(t: &str) -> Option<(&'static str, bool, RegId, RegId)> {
 /// as the register mirror form.
 fn parse_imm_reg_flag(t: &str) -> Option<(&'static str, bool, &str, RegId)> {
     let mnemonic = t.split_whitespace().next()?;
-    let (op, suffix) = mnemonic.split_at(mnemonic.len().checked_sub(1)?);
-    let is_q = match suffix {
-        "q" => true,
-        "l" => false,
-        _ => return None,
-    };
+    let (op, is_q) = split_lq_mnemonic(mnemonic)?;
     if op != "cmp" && op != "test" {
         return None;
     }
@@ -936,12 +937,7 @@ const INPLACE_UNARY: &[&str] = &["not", "neg", "inc", "dec"];
 /// register of the same width.
 fn parse_inplace_op(t: &str) -> Option<(bool, RegId, &str, bool)> {
     let mnemonic = t.split_whitespace().next()?;
-    let (op, suffix) = mnemonic.split_at(mnemonic.len().checked_sub(1)?);
-    let is_q = match suffix {
-        "q" => true,
-        "l" => false,
-        _ => return None,
-    };
+    let (op, is_q) = split_lq_mnemonic(mnemonic)?;
     let rest = t[mnemonic.len()..].trim();
     let width = if is_q { 0 } else { 1 };
     if INPLACE_UNARY.contains(&op) {
@@ -2002,6 +1998,17 @@ pub(super) fn narrow_wide_immediates(store: &mut LineStore, infos: &mut [LineInf
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unsupported_unicode_mnemonics_refuse_without_panicking() {
+        for mnemonic in ["cmpé", "λ", "add界", "λq", "cmplλ", "q", "l"] {
+            let regs = format!("{mnemonic} %eax, %ecx");
+            let immediate = format!("{mnemonic} $1, %eax");
+            assert!(super::parse_reg_reg_alu(&regs).is_none());
+            assert!(super::parse_imm_reg_flag(&immediate).is_none());
+            assert!(super::parse_inplace_op(&immediate).is_none());
+        }
+    }
+
     use super::*;
 
     fn run<F: Fn(&mut LineStore, &mut [LineInfo]) -> bool>(asm: &str, f: F) -> String {

@@ -36,9 +36,10 @@
       "sha256": "8d7b086204e8f946b975e540a909742bac77ee90584fa861ac521e9dc01ae764"
     },
     {
-      "path": "engineering/PR831-AUDIT.md",
+      "path": "engineering/evidence/pr832-originals/PR831-AUDIT.md",
       "bytes": 9727,
-      "sha256": "e3af0932bb02500031d3289d6aaff7979a3e389bdffa27e6baf0571811961956"
+      "sha256": "e3af0932bb02500031d3289d6aaff7979a3e389bdffa27e6baf0571811961956",
+      "relocated_from": "engineering/PR831-AUDIT.md"
     },
     {
       "path": "engineering/SESSION-PEEPHOLE-RELAY-2026-10-13.md",

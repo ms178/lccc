@@ -70,20 +70,16 @@ case $expected in
     *) bad "gcc oracle did not report the expected success line" ;;
 esac
 
-run_case() { # name  "flags"  "RUN env assignments"
+run_case() { # name  "flags"  "compiler env assignments"
     local name=$1 flags=$2 envs=$3
     local -a farr=() earr=()
     read -r -a farr <<< "$flags"
     read -r -a earr <<< "$envs"
-    if ! "$CCC" "${farr[@]}" "$corpus" -o "$work/$name" > "$work/$name.build" 2>&1; then
+    if ! env "${earr[@]}" "$CCC" "${farr[@]}" "$corpus" -o "$work/$name" > "$work/$name.build" 2>&1; then
         bad "$name: lccc failed to build"; return
     fi
     local out rc=0
-    if [[ ${#earr[@]} -gt 0 ]]; then
-        out=$(timeout 900 env "${earr[@]}" "$work/$name") || rc=$?
-    else
-        out=$(timeout 900 "$work/$name") || rc=$?
-    fi
+    out=$(timeout 900 "$work/$name") || rc=$?
     [[ $rc -eq 0 ]] || { bad "$name: exited $rc (expected 0)"; return; }
     [[ $out == "$expected" ]] || bad "$name: stdout differs from the gcc oracle"
     [[ $out == "$expected" ]] && note "$name: parity"
@@ -101,7 +97,9 @@ run_case "O3-rot"           "-O3 -march=x86-64-v3" "CCC_LOOP_ROTATE=1"
 note "contract 2: default-on reporting, independent of rotation, kill switch"
 count_reports() { # env...
     local out
-    out=$(timeout 900 env "$@" "$CCC" -O2 -march=x86-64-v3 -S "$corpus" -o /dev/null 2>&1 >/dev/null || true)
+    out=$(timeout 900 env "$@" "$CCC" -O2 -march=x86-64-v3 -S "$corpus" -o /dev/null 2>&1 >/dev/null) || {
+        printf '%s\n' "$out" >&2; return 1;
+    }
     printf '%s\n' "$out" | grep -c "affine exit-compare folds:" || true
 }
 n_def=$(count_reports CCC_DEBUG_AFFINE_FOLD=1)

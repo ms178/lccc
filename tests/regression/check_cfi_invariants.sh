@@ -34,9 +34,8 @@ set -euo pipefail
 CCC=${CCC:-./target/fastbuild/lccc}
 CCC=$(realpath "$CCC")
 root=$(cd "$(dirname "$0")" && pwd)
-tmp=${TMPDIR:-/tmp}/lccc-cfi-inv.$$
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/lccc-cfi-inv.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
-mkdir -p "$tmp"
 
 m32=-m32
 if ! echo 'int main(void){return 0;}' | "$CCC" -m32 -x c - -S -o "$tmp/probe.out" 2>/dev/null; then
@@ -60,8 +59,13 @@ compile_one() {
             2>"$out.err" >/dev/null; then
             # Instrumented code embeds a per-process default profile name.
             [[ "$flags" == *profile-generate* ]] && continue
-            timeout 120 "$CCC" $m -O2 $flags -fno-asynchronous-unwind-tables -S "$f" \
-                -o "$out.nocfi" 2>/dev/null >/dev/null || rm -f "$out.nocfi"
+            # Once the baseline compiled, its no-unwind twin must compile
+            # too. Silently deleting a failed twin made parity vacuous.
+            if ! timeout 120 "$CCC" $m -O2 $flags -fno-asynchronous-unwind-tables -S "$f" \
+                -o "$out.nocfi" 2>"$out.nocfi.err" >/dev/null || [[ ! -f "$out.nocfi" ]]; then
+                rm -f "$out.nocfi"
+                touch "$out.nocfi.failed"
+            fi
         else
             rm -f "$out.s"
         fi
@@ -75,6 +79,10 @@ python3 - "$tmp" "$root" <<'PY'
 import glob, os, re, sys
 tmp, root = sys.argv[1], sys.argv[2]
 bad = []
+for failed in sorted(glob.glob(os.path.join(tmp, "*.nocfi.failed"))):
+    diagnostic = failed[:-len(".failed")] + ".err"
+    detail = open(diagnostic, errors="replace").read()[-500:].strip() if os.path.exists(diagnostic) else ""
+    bad.append(f"{os.path.basename(failed)}: no-unwind compile failed or produced no output: {detail}")
 nfn = nret = 0
 for fn in sorted(glob.glob(os.path.join(tmp, "*.s"))):
     slot = 4 if fn.endswith(".m32.s") else 8

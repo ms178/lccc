@@ -1,6 +1,8 @@
 /* Exact IEEE results and sticky exceptions, not a tolerance comparison.
  * The volatile/call-based references cannot use either new optimization. */
+#ifndef NO_FENV_PRAGMA
 #pragma STDC FENV_ACCESS ON
+#endif
 #include <fenv.h>
 #include <stdint.h>
 #include <stdio.h>

@@ -632,9 +632,10 @@ if command -v flock >/dev/null 2>&1; then
     flock 9
 fi
 
-# Double-checked under the lock: the pair may have been installed while this
-# invocation waited for it.
-if [[ -x "$as" && -x "$od" ]] && validate_pair && _pair_provenance_ok; then
+# Recheck the SAME complete-cache predicate under the lock. Another owner may
+# have finished provisioning, but valid binaries alone still do not supply a
+# missing consumer input (notably the AArch64 system-register table).
+if _prefix_provisioned; then
     "$as" --version | sed -n '1,1p'
     "$od" --version | sed -n '1,1p'
     exit 0

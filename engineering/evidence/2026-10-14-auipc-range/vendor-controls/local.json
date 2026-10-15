@@ -1,0 +1,16 @@
+{
+  "command": [
+    "target/fastbuild/lccc",
+    "-O2",
+    "-march=x86-64-v3",
+    "-DDATA_SIZE=4096",
+    "-DPASSES=2",
+    "tests/benchmark/programs/gzip_crc32.c",
+    "-o",
+    "/home/user/.cache/vendor-crc"
+  ],
+  "compile_stderr": "",
+  "stdout": "6d5b5c2b\n",
+  "status": 0,
+  "sha256": "b4d63b4f812959c128f29addf0f66651d0c24c55ae0d60ee99d6a7b8d3e263d4"
+}

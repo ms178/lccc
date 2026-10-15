@@ -25,6 +25,7 @@ No third-party Python packages are required.
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import math
@@ -396,7 +397,13 @@ def compile_one(compiler: CompilerSpec, benchmark: Benchmark, source: Path,
     # from compiler flags so this ordering is invariant across compilers.
     command = [compiler.executable, *compiler.flags, "-o", str(output),
                str(source), *benchmark.extra_flags]
+    # A zero-exit/no-output compiler must never reuse a previous executable.
+    output.unlink(missing_ok=True)
     result = invoke(command, timeout_s=180, cwd=REPO_ROOT)
+    if result["ok"] and (not output.is_file() or not os.access(output, os.X_OK)):
+        result["ok"] = False
+        result["error"] = "compiler reported success without an executable artifact"
+    result["binary_sha256"] = sha256_file(output) if result["ok"] else None
     result["binary_bytes"] = output.stat().st_size if result["ok"] and output.is_file() else 0
     result["text_bytes"] = text_size(output) if result["ok"] and output.is_file() else 0
     result["source_sha256"] = sha256_file(source)
@@ -484,14 +491,42 @@ def probe_pmu(enabled: bool) -> dict[str, Any]:
     if not status["perf_path"]:
         status["reason"] = "perf is not installed"
         return status
-    result = invoke([status["perf_path"], "stat", "-e", "cycles,instructions", "--", "/bin/true"],
-                    timeout_s=15)
-    if result["ok"]:
+    command = [status["perf_path"], "stat", "--no-big-num", "-x", ",",
+               "-e", "cycles,instructions", "--", "/bin/true"]
+    result = invoke(command, timeout_s=15)
+    status["probe_command"] = command
+    status["probe_returncode"] = result["returncode"]
+    status["probe_stderr"] = result["stderr"]
+    counts: dict[str, float] = {}
+    invalid: set[str] = set()
+    required = {"cycles", "instructions"}
+    for row in csv.reader(result["stderr"].splitlines()):
+        if len(row) < 3:
+            continue
+        event = row[2].strip().split(":", 1)[0]
+        if event not in required:
+            continue
+        if event in counts:
+            invalid.add(event)
+        try:
+            count = float(row[0].strip())
+        except ValueError:
+            invalid.add(event)
+            continue
+        if not math.isfinite(count) or count <= 0:
+            invalid.add(event)
+            continue
+        counts[event] = count
+    status["observed_counts"] = counts
+    if result["ok"] and counts.keys() >= required and not invalid:
         status["available"] = True
-        status["reason"] = "perf stat cycles,instructions succeeded"
+        status["reason"] = "perf returned usable cycles and instructions counters"
+    elif result["ok"]:
+        status["reason"] = "perf exited zero without usable cycles/instructions counters"
     else:
         detail = first_nonempty_line(result["stderr"]) or result["error"] or f"exit={result['returncode']}"
         status["reason"] = detail
+
     return status
 
 

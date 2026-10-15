@@ -245,6 +245,109 @@ fn stack_offset_str(offset: i32, context: &str) -> String {
     }
 }
 
+/// Forward the low bytes of an immediately preceding plain GP stack store.
+/// Keep the load opcode: its signedness, destination width and upper-bit
+/// writes are observable, even when source and destination share a family.
+/// Exact address equality avoids the global offset map's base/alias questions.
+fn adjacent_gp_stack_load(store: &str, load: &str) -> Option<String> {
+    let (sm, so) = store.trim().split_once(char::is_whitespace)?;
+    let sw = match sm {
+        "movb" => MoveSize::B,
+        "movw" => MoveSize::W,
+        "movl" => MoveSize::L,
+        "movq" => MoveSize::Q,
+        _ => return None,
+    };
+    let (src, address) = so.split_once(',')?;
+    let src = src.trim();
+    let address = address.trim();
+    let sr = register_family_fast(src);
+    if !is_valid_gp_reg(sr) || matches!(sr, 4 | 5) || src != reg_id_to_name(sr, sw) {
+        return None; // In particular, AH is not AL despite the same family.
+    }
+    let displacement = address
+        .strip_suffix("(%rsp)")
+        .or_else(|| address.strip_suffix("(%rbp)"))?;
+    if !displacement.is_empty() && displacement.parse::<i32>().is_err() {
+        return None;
+    }
+    let (lm, lo) = load.trim().split_once(char::is_whitespace)?;
+    let (rw, dw) = match lm {
+        "movb" => (MoveSize::B, MoveSize::B),
+        "movw" => (MoveSize::W, MoveSize::W),
+        "movl" => (MoveSize::L, MoveSize::L),
+        "movq" => (MoveSize::Q, MoveSize::Q),
+        "movzbw" | "movsbw" => (MoveSize::B, MoveSize::W),
+        "movzbl" | "movsbl" => (MoveSize::B, MoveSize::L),
+        "movzbq" | "movsbq" => (MoveSize::B, MoveSize::Q),
+        "movzwl" | "movswl" => (MoveSize::W, MoveSize::L),
+        "movzwq" | "movswq" => (MoveSize::W, MoveSize::Q),
+        "movslq" => (MoveSize::L, MoveSize::Q),
+        _ => return None,
+    };
+    let (memory, dst) = lo.split_once(',')?;
+    let dst = dst.trim();
+    let dr = register_family_fast(dst);
+    if memory.trim() != address
+        || sw.byte_size() < rw.byte_size()
+        || !is_valid_gp_reg(dr)
+        || matches!(dr, 4 | 5)
+        || dst != reg_id_to_name(dr, dw)
+    {
+        return None;
+    }
+    Some(format!("    {lm} {}, {dst}", reg_id_to_name(sr, rw)))
+}
+
+/// Run after compare/branch fusion: that pass proves boolean spill identity
+/// from the original memory operands. Early register rewrites erase its proof.
+/// Stores remain observable until ordinary dead-store analysis proves otherwise.
+pub(super) fn forward_adjacent_gp_stack_loads(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let mut changed = false;
+    let len = store.len();
+    for i in 0..len {
+        if !matches!(infos[i].kind, LineKind::StoreRbp { .. }) {
+            continue;
+        }
+        // A final boolean-spill fusion also owns this materialization
+        // bundle. Keep its original memory operands: forwarding here can erase
+        // a stronger fusion even after the CFG-aware branch pass has run.
+        // This is only a profitability refusal, not a semantic exception.
+        if matches!(infos[i].kind, LineKind::StoreRbp { reg: 0, .. }) {
+            let mut prior = (0..i)
+                .rev()
+                .filter(|&k| !debug_transparent(store, infos[k], k));
+            if let (Some(ext), Some(set)) = (prior.next(), prior.next()) {
+                if matches!(infos[set].kind, LineKind::SetCC { reg: 0 })
+                    && matches!(
+                        infos[ext].ext_kind,
+                        ExtKind::MovzbqAlRax | ExtKind::ProducerMovzbToEax
+                    )
+                {
+                    continue;
+                }
+            }
+        }
+        let j = next_non_debug(store, infos, i + 1, len);
+        if j < len && all_editable(infos, &[i, j]) {
+            if let Some(text) = adjacent_gp_stack_load(store.get(i), store.get(j)) {
+                // A full-width self copy is a real no-op; leave the old raw
+                // load text available to any later memory-census consumer.
+                if classify_line(&text).kind == LineKind::SelfMove {
+                    mark_nop(&mut infos[j]);
+                } else {
+                    replace_line(store, &mut infos[j], j, text);
+                }
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let mut changed = false;
     let len = store.len();
@@ -765,72 +868,6 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
             }
         }
 
-        // --- Pattern: adjacent store/load at same %rbp offset ---
-        if let LineKind::StoreRbp {
-            reg: sr,
-            offset: so,
-            size: ss,
-        } = infos[i].kind
-        {
-            if i + 1 < len && !debug_transparent(store, infos[i + 1], i + 1) {
-                if let LineKind::LoadRbp {
-                    reg: lr,
-                    offset: lo,
-                    size: ls,
-                } = infos[i + 1].kind
-                {
-                    // Same base register (both %rsp or both %rbp) so the offsets refer
-                    // to the same slot. With FPO the codegen uses (%rsp); otherwise
-                    // (%rbp). Mixing bases at the same numeric offset would be wrong.
-                    let store_base = line_stack_base(infos[i].trimmed(store.get(i)));
-                    let load_base = line_stack_base(infos[i + 1].trimmed(store.get(i + 1)));
-                    if so == lo
-                        && ss == ls
-                        && store_base.is_some()
-                        && store_base == load_base
-                        && sr != REG_NONE
-                    {
-                        if sr == lr {
-                            // Same register: load is redundant
-                            mark_nop(&mut infos[i + 1]);
-                            changed = true;
-                            i += 1;
-                            continue;
-                        } else if lr != REG_NONE
-                            && is_valid_gp_reg(sr)
-                            && is_valid_gp_reg(lr)
-                            && matches!(ss, MoveSize::Q | MoveSize::L)
-                            && lr != 4
-                            && lr != 5
-                            && sr != 4
-                            && sr != 5
-                        {
-                            // Different registers at the SAME offset, ADJACENT (i+1):
-                            //   movq %sr, OFF(%rsp)   ; store
-                            //   movq OFF(%rsp), %lr   ; load, immediately after
-                            // The slot just holds sr's value, so the load is exactly
-                            // `movq %sr, %lr`. Provably safe: no instruction intervenes
-                            // (i+1 is checked directly), no pushfq/popfq can have shifted
-                            // %rsp, and no label/branch merges here. Restricted to Q/L
-                            // (a plain move; SLQ/zero-extend differ).
-                            let store_reg_str = reg_id_to_name(sr, ls);
-                            let load_reg_str = reg_id_to_name(lr, ls);
-                            let new_text = format!(
-                                "    {} {}, {}",
-                                ls.mnemonic(),
-                                store_reg_str,
-                                load_reg_str
-                            );
-                            replace_line(store, &mut infos[i + 1], i + 1, new_text);
-                            changed = true;
-                            i += 1;
-                            continue;
-                        }
-                    }
-                }
-            }
-        }
-
         // --- Pattern: store/load forwarding across the stored register's
         //     own modification (post-inc/dec shape) ---
         //   movq %S, OFF(%rsp)      ; spill of OLD value
@@ -856,7 +893,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                 let m = next_non_debug(store, infos, i + 1, len);
                 if m < len && !infos[m].is_barrier() {
                     let l = next_non_debug(store, infos, m + 1, len);
-                    if l < len {
+                    if l < len && all_editable(infos, &[i, m, l]) {
                         if let LineKind::LoadRbp {
                             reg: lr,
                             offset: lo,
@@ -11894,9 +11931,7 @@ pub(super) fn fold_shift_into_sib(store: &mut LineStore, infos: &mut [LineInfo])
         let mut j = next_non_debug(store, infos, i + 1, len);
         let mut steps = 0usize;
         let mut add_rest: Option<String> = None;
-        // Debug attribution is not an instruction and cannot consume WINDOW
-        // or be classified as an unknown flag reader. Keep pinned lines opaque.
-        while j < len && steps <= WINDOW && !infos[j].is_barrier() && !infos[j].pinned {
+        while j < len && steps <= WINDOW && !infos[j].is_barrier() {
             let t = infos[j].trimmed(store.get(j));
             if let Some(rest) = t.strip_prefix("addq ") {
                 if rest.contains(&shifted_reg) {
@@ -12211,6 +12246,178 @@ mod shift_into_sib_tests {
                 "ret",
             ]);
             assert!(out.contains("shlq $3, %rcx"), "{barrier}: {out}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod extending_stack_tests {
+    use super::*;
+
+    fn run_plain(body: &str, pin: Option<usize>) -> (LineStore, Vec<LineInfo>) {
+        let mut store = LineStore::new(body.to_owned());
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        if let Some(i) = pin {
+            infos[i].pinned = true;
+        }
+        combined_local_pass(&mut store, &mut infos);
+        forward_adjacent_gp_stack_loads(&mut store, &mut infos);
+        (store, infos)
+    }
+
+    #[test]
+    fn plain_dword_self_reload_must_still_zero_the_upper_half() {
+        let (store, infos) = run_plain(
+            "movabsq $0xfedcba9876543210, %rax\nmovl %eax, 8(%rsp)\nmovl 8(%rsp), %eax\nret\n",
+            None,
+        );
+        assert!(!infos[2].is_nop(), "32-bit load is an upper-half write");
+        assert!(store.get(2).trim().starts_with("movl "));
+    }
+
+    #[test]
+    fn high_and_low_byte_views_are_not_interchangeable() {
+        for (src, dst) in [("%ah", "%al"), ("%al", "%ah")] {
+            let asm = format!("movb {src}, 8(%rsp)\nmovb 8(%rsp), {dst}\nret\n");
+            let (store, infos) = run_plain(&asm, None);
+            assert!(!infos[1].is_nop(), "{src} -> {dst}");
+            assert!(store.get(1).contains("8(%rsp)"));
+        }
+    }
+
+    #[test]
+    fn plain_reload_does_not_drop_an_access_pin() {
+        for pin in [0, 1] {
+            let (store, infos) =
+                run_plain("movl %eax, 8(%rsp)\nmovl 8(%rsp), %ecx\nret\n", Some(pin));
+            assert_eq!(store.get(1).trim(), "movl 8(%rsp), %ecx");
+            assert!(infos[pin].pinned);
+        }
+    }
+
+    #[test]
+    fn post_modify_reload_does_not_drop_any_access_pin() {
+        for pin in [0, 1, 2] {
+            let (store, infos) = run_plain(
+                "movl %eax, 8(%rsp)\naddl $1, %eax\nmovl 8(%rsp), %ecx\nret\n",
+                Some(pin),
+            );
+            assert_eq!(store.get(1).trim(), "addl $1, %eax");
+            assert_eq!(store.get(2).trim(), "movl 8(%rsp), %ecx");
+            assert!(infos[pin].pinned);
+        }
+    }
+
+    #[test]
+    fn boolean_bundle_stays_available_but_ordinary_byte_loads_forward() {
+        for (prefix, forwarded) in [
+            ("setb %al\nmovzbl %al, %eax\n", false),
+            ("setb %al\nmovzbq %al, %rax\n", false),
+            ("movzbl (%rdi), %eax\n", true),
+        ] {
+            let mut store = LineStore::new(format!(
+                "{prefix}movq %rax, 8(%rsp)\nmovsbq 8(%rsp), %rax\ntestq %rax, %rax\njne .Lyes\n"
+            ));
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            assert_eq!(
+                forward_adjacent_gp_stack_loads(&mut store, &mut infos),
+                forwarded
+            );
+            let output = store.build_result(|i| infos[i].is_nop());
+            assert_eq!(output.contains("movsbq %al, %rax"), forwarded);
+        }
+    }
+
+    #[test]
+    fn every_gp_view_preserves_the_extension_opcode() {
+        for sw in [MoveSize::B, MoveSize::W, MoveSize::L, MoveSize::Q] {
+            for (op, rw, dw) in [
+                ("movb", MoveSize::B, MoveSize::B),
+                ("movw", MoveSize::W, MoveSize::W),
+                ("movl", MoveSize::L, MoveSize::L),
+                ("movq", MoveSize::Q, MoveSize::Q),
+                ("movzbw", MoveSize::B, MoveSize::W),
+                ("movsbw", MoveSize::B, MoveSize::W),
+                ("movzbl", MoveSize::B, MoveSize::L),
+                ("movsbl", MoveSize::B, MoveSize::L),
+                ("movzbq", MoveSize::B, MoveSize::Q),
+                ("movsbq", MoveSize::B, MoveSize::Q),
+                ("movzwl", MoveSize::W, MoveSize::L),
+                ("movswl", MoveSize::W, MoveSize::L),
+                ("movzwq", MoveSize::W, MoveSize::Q),
+                ("movswq", MoveSize::W, MoveSize::Q),
+                ("movslq", MoveSize::L, MoveSize::Q),
+            ] {
+                for sr in (0..16).filter(|r| !matches!(r, 4 | 5)) {
+                    for dr in (0..16).filter(|r| !matches!(r, 4 | 5)) {
+                        let st = format!("{} {}, -16(%rbp)", sw.mnemonic(), reg_id_to_name(sr, sw));
+                        let ld = format!("{op} -16(%rbp), {}", reg_id_to_name(dr, dw));
+                        let got = adjacent_gp_stack_load(&st, &ld);
+                        if sw.byte_size() >= rw.byte_size() {
+                            assert_eq!(
+                                got,
+                                Some(format!(
+                                    "    {op} {}, {}",
+                                    reg_id_to_name(sr, rw),
+                                    reg_id_to_name(dr, dw)
+                                ))
+                            );
+                        } else {
+                            assert!(got.is_none());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn refuses_other_addresses_high_bytes_and_malformed_views() {
+        for (st, ld) in [
+            ("movb %ah, 8(%rsp)", "movzbl 8(%rsp), %ecx"),
+            ("movl %eax, 8(%rsp)", "movzbl 8(%rbp), %ecx"),
+            ("movl %eax, 8(%rsp)", "movzbl 9(%rsp), %ecx"),
+            ("movl %eax, 8(%rsp)", "movzbl 8(%rsp), %rcx"),
+            ("movl %eax, 8(%rsp)", "movzbl 8(%rsp), %esp"),
+            ("movb %al, 8(%rsp)", "movzwl 8(%rsp), %ecx"),
+            ("movl %eax, 8(%rsp,%rcx)", "movzbl 8(%rsp,%rcx), %edx"),
+            ("movl %eax, %fs:8(%rsp)", "movzbl %fs:8(%rsp), %edx"),
+        ] {
+            assert!(adjacent_gp_stack_load(st, ld).is_none(), "{st}; {ld}");
+        }
+    }
+
+    #[test]
+    fn pinned_accesses_and_control_boundaries_are_not_forwarded() {
+        for gap in [
+            ".Lentry:\n",
+            ".p2align 4\n",
+            ".cfi_def_cfa_offset 32\n",
+            "call opaque\n",
+        ] {
+            let asm = format!("movl %eax, 12(%rsp)\n{gap}movzbl 12(%rsp), %esi\nret\n");
+            let mut store = LineStore::new(asm);
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            combined_local_pass(&mut store, &mut infos);
+            forward_adjacent_gp_stack_loads(&mut store, &mut infos);
+            assert!((0..store.len()).any(|i| store.get(i).contains("movzbl 12(%rsp), %esi")));
+        }
+        for pinned in [0, 1] {
+            let mut store =
+                LineStore::new("movl %eax, 12(%rsp)\nmovzbl 12(%rsp), %esi\nret\n".to_owned());
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            infos[pinned].pinned = true;
+            combined_local_pass(&mut store, &mut infos);
+            forward_adjacent_gp_stack_loads(&mut store, &mut infos);
+            assert!(store.get(1).contains("movzbl 12(%rsp), %esi"));
         }
     }
 }

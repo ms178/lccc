@@ -1356,6 +1356,20 @@ impl Parser {
             if let TokenKind::Identifier(name) = self.peek() {
                 let name = name.clone();
                 self.advance();
+                // Enumerator attributes belong to this enumerator, not the
+                // enclosing declaration. Consume them before looking for `=`;
+                // otherwise their identifiers (and the initializer's name)
+                // become bogus enumerators and overwrite earlier constants.
+                let enclosing_attrs = std::mem::take(&mut self.attrs);
+                loop {
+                    let before = self.pos;
+                    self.parse_gcc_attributes();
+                    self.skip_c23_attribute_lists();
+                    if self.pos == before {
+                        break;
+                    }
+                }
+                self.attrs = enclosing_attrs;
                 let value = if self.consume_if(&TokenKind::Assign) {
                     Some(Box::new(self.parse_assignment_expr()))
                 } else {
@@ -1787,5 +1801,30 @@ impl Parser {
             result_type = TypeSpecifier::Array(Box::new(result_type), dim);
         }
         result_type
+    }
+}
+
+#[cfg(test)]
+mod enumerator_attribute_tests {
+    use super::super::Parser;
+    use crate::frontend::lexer::Lexer;
+
+    #[test]
+    fn enumerator_attributes_do_not_create_or_overwrite_constants() {
+        for attribute in [
+            "__attribute__((deprecated))",
+            "[[deprecated]]",
+            "__attribute__((deprecated(\"use base\"))) [[maybe_unused]]",
+        ] {
+            let source =
+                format!("enum E {{ base = 4, alias {attribute} = base, next, last = -3 }};");
+            let mut parser = Parser::new(Lexer::new(&source, 0).tokenize());
+            parser.parse();
+            for (name, value) in [("base", 4), ("alias", 4), ("next", 5), ("last", -3)] {
+                assert_eq!(parser.enum_constants.get(name), Some(&value), "{source}");
+            }
+            assert!(!parser.enum_constants.contains_key("deprecated"));
+            assert!(!parser.enum_constants.contains_key("maybe_unused"));
+        }
     }
 }

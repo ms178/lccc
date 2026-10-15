@@ -71,7 +71,6 @@ import shlex
 import statistics
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -336,24 +335,7 @@ def _split_function_bodies(lines: Iterable[str]) -> dict[str, list[str]]:
 
 
 def _local_compile(executable: str, source: Path, flags: str) -> list[str]:
-    digest = hashlib.sha256((str(source.resolve()) + "\0" + flags).encode()).hexdigest()[:16]
-    fd, output_name = tempfile.mkstemp(
-        prefix=f"codegen-oracle-{digest}-",
-        suffix=".s",
-        dir=os.environ.get("TMPDIR", "/tmp"),
-    )
-    os.close(fd)
-    output = Path(output_name)
-    command = [executable, *shlex.split(flags), "-S", str(source), "-o", str(output)]
-    result = subprocess.run(command, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise godbolt.GodboltError(
-            f"local compile failed: {' '.join(command)}\n{result.stderr.strip()}"
-        )
-    try:
-        return output.read_text(errors="replace").splitlines()
-    finally:
-        output.unlink(missing_ok=True)
+    return godbolt._compile_local(executable, source, flags)
 
 
 def _compile_remote(name: str, source: str, flags: str) -> list[str]:

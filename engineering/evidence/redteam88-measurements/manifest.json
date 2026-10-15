@@ -1,0 +1,66 @@
+{
+  "S86-callgrind45-s86-index.json.gz": {
+    "sha256": "4a23a46b29199f466c3a35e2e04135effd77ad6c3b824806bec38c96c11d2655",
+    "raw_sha256": "c9171fdbe0c9900f5380c4a749f1ec4a0f3dad943cf7e56ca9821bb23a49298a"
+  },
+  "S86-cli-s86-report.json.gz": {
+    "sha256": "6eefb8f113f7c7e67a19257e484efb2efe75d5a3d81289c018ccb9045990cd52",
+    "raw_sha256": "a6d0ba27fab9ae0611b92c0098b34e660afabc00e021cf84566c4101107d2018"
+  },
+  "S86-frontend-cross.json.gz": {
+    "sha256": "1cbcee414f9a37432c85812167a1fa76eb0a4ee1d82d80a9ad1ba19c170f8b95",
+    "raw_sha256": "9a9ffdefdd312334ba40aa1c0397db74eefd50ce8bf55f730e7859a086b6ea0b"
+  },
+  "S86-frontend-native-after.json.gz": {
+    "sha256": "a3540622074055af7437711bbee6d6cbc178f3526ea2fda3a6f1f7c383c80bf9",
+    "raw_sha256": "9def3f084229378d485dc17896b6f5935b795b65ffdfdb6b0e5f0d54d2446f3d"
+  },
+  "S86-native45-s86.json.gz": {
+    "sha256": "85441cc5638361cf7745029c3d4a540293f5761aad81a2f6b2a6d8bf5323e572",
+    "raw_sha256": "040324d27e3a4d8ed97e37a17d179173bcd529c109c71a821a455ab0f8c509b7"
+  },
+  "S86-pmu-probe-corrected.json.gz": {
+    "sha256": "cd5b40e9db1dc9b9e5d103b41ce8c59a91a2b3c417a5770baced0d2d6e8c73e6",
+    "raw_sha256": "90e14a55db7b6e3074ad7938ba98867d2a40445177e1f58c1fcf20227542cd57"
+  },
+  "S86-rle31-s86-matrix.json.gz": {
+    "sha256": "7bd4a58cfce4d0ebec74487c1bd0abcc07f4958b349a3fab2afef186cfa774fc",
+    "raw_sha256": "8a8a476065ff452fb7809dae71c6746fcf7dc1a51208bc32c11413001629d5b3"
+  },
+  "S86-zstd96-s86-matrix.json.gz": {
+    "sha256": "391612c783dc12e2a0681ee5598de9c7ce40507da3a4225f8b56c194cfa78cc9",
+    "raw_sha256": "4aa275b5717652d98cce6177b66e1b47d871e782c19df61852e3b69acc728043"
+  },
+  "nativefocus31-s86.json.gz": {
+    "sha256": "c89b02f4029e624a91abcc840bd6488fe0000bfe45fa4db188ce0dd8bb978794",
+    "raw_sha256": "70d4eac31c06202765520e5ad1e52a26bc9c88f0fae6894210b61a89bc1cffd0"
+  },
+  "nativefocus31-s88-remainder.json.gz": {
+    "sha256": "bd401158366a472bcb2c8d00c282c028867e3229b9678e636429fc5d88fde46a",
+    "raw_sha256": "e487fb1633095f6a9b9ff43696dc21a43020642328ef65d7013e04939a77f84c"
+  },
+  "zstd-focus31-s88-source-matrix.json.gz": {
+    "sha256": "a060636dc0e314ca79f0175c51871464538b886d9aceb390422a3b6f86e75df7",
+    "raw_sha256": "cf843dc2784e4da54c90c7bd17697191308fef4fad7165adc1b0bf81fb19453b"
+  },
+  "zstd-focus31-s88-random-matrix.json.gz": {
+    "sha256": "04bfd1824b9a52d4f504d75ed61f2318335d6b6dc4b5ccc906d48775454cfe6b",
+    "raw_sha256": "994143f77deab82a6e852d0c6efa30a0b483238aaec1a894323aa12a4e8cc653"
+  },
+  "zstd-focus31-s88-json-matrix.json.gz": {
+    "sha256": "53ddec69902181b23740237f525f916c5832285e519a06927665933731975f4b",
+    "raw_sha256": "6da660633de876b6a60735574529250043731b5aaa195c552d9dc0c88719cb97"
+  },
+  "zstd-focus31-s88-elf-matrix.json.gz": {
+    "sha256": "cff5ea9360002bdf0ca5a1f1f661b3431684969e201bb8bc7485973c2656a4d4",
+    "raw_sha256": "a03567383cd3fb800dce39232a4364c1d76d6f7b060d3e6d5b509ff0017a0db0"
+  },
+  "zstd-focus31-s88-rle-matrix.json.gz": {
+    "sha256": "f6496ae291f7cd50fc65ab28ac1afac32c20f2e888eabc73d53eab8767d1afba",
+    "raw_sha256": "2a250df81718775f2121f1e6a28df05985e4f96646e864404999e294348c0cd3"
+  },
+  "zstd-focus31-s88-duplicates-matrix.json.gz": {
+    "sha256": "971e8d28eec1acdc6d4d943822a24977107591e477de2a20465d90ef3c8e90f7",
+    "raw_sha256": "0f60a2b87ac1e48549619b63bb11ef8abd5cc0e92f600963038f5adb6ce0523b"
+  }
+}

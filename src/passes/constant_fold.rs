@@ -272,6 +272,9 @@ pub fn resolve_remaining_is_constant(module: &mut IrModule) {
 /// extended (for U8/U16 targets) or sign-extended (for I8/I16 targets) when
 /// used as operands of UnaryOp/BitNot instructions.
 pub(crate) fn fold_function(func: &mut IrFunction) -> usize {
+    if super::fp_environment_blocks_reordering(func) {
+        return 0;
+    }
     let max_id = func.max_value_id() as usize;
     let mut total = 0;
 
@@ -588,6 +591,13 @@ pub(crate) fn eval_binop_const(
     rhs: IrConst,
     ty: IrType,
 ) -> Option<IrConst> {
+    // The shared oracle is also called by SCCP and IPCP, bypassing the
+    // constant-fold pass's function fence. Host rounding/exception behavior
+    // cannot replace an operation in an observable target FP environment.
+    if ty.is_float() && crate::common::semantics::fp_environment_observable() {
+        return None;
+    }
+
     if ty.is_128bit() {
         let l = lhs.to_i128()?;
         let r = rhs.to_i128()?;
@@ -632,6 +642,13 @@ pub(crate) fn eval_unaryop_const(
     src_cast_to_ty: Option<IrType>,
     ty: IrType,
 ) -> Option<IrConst> {
+    // The shared oracle is also called by SCCP and IPCP, bypassing the
+    // constant-fold pass's function fence. Host rounding/exception behavior
+    // cannot replace an operation in an observable target FP environment.
+    if ty.is_float() && crate::common::semantics::fp_environment_observable() {
+        return None;
+    }
+
     debug_assert!(
         op != IrUnaryOp::IsConstant,
         "IsConstant is phase-dependent and must be resolved by the caller"
@@ -667,6 +684,13 @@ pub(crate) fn eval_cmp_const(
     rhs: IrConst,
     ty: IrType,
 ) -> Option<IrConst> {
+    // The shared oracle is also called by SCCP and IPCP, bypassing the
+    // constant-fold pass's function fence. Host rounding/exception behavior
+    // cannot replace an operation in an observable target FP environment.
+    if ty.is_float() && crate::common::semantics::fp_environment_observable() {
+        return None;
+    }
+
     if ty.is_128bit() {
         let l = lhs.to_i128()?;
         let r = rhs.to_i128()?;
@@ -689,6 +713,12 @@ pub(crate) fn eval_cmp_const(
 
 /// Evaluate a cast of a constant operand from `from_ty` to `to_ty`.
 pub(crate) fn eval_cast_const(src: IrConst, from_ty: IrType, to_ty: IrType) -> Option<IrConst> {
+    if (from_ty.is_float() || to_ty.is_float())
+        && crate::common::semantics::fp_environment_observable()
+    {
+        return None;
+    }
+
     if from_ty.is_128bit() || to_ty.is_128bit() {
         return fold_cast_i128(&src, from_ty, to_ty);
     }
@@ -1551,5 +1581,43 @@ mod tests {
             }
             _ => panic!("Expected Copy with F64(7.0)"),
         }
+    }
+}
+
+#[cfg(test)]
+mod observable_fp_oracle_tests {
+    use super::*;
+    #[test]
+    fn shared_evaluators_do_not_bypass_fp_environment_policy() {
+        let _guard =
+            crate::common::semantics::TestGuard::new(crate::common::semantics::Semantics {
+                signed_overflow_wraps: false,
+                fp_environment_observable: true,
+            });
+        assert!(
+            eval_binop_const(
+                IrBinOp::Add,
+                IrConst::F64(1.0),
+                IrConst::F64(f64::EPSILON / 2.0),
+                IrType::F64
+            )
+            .is_none()
+        );
+        assert!(
+            eval_cmp_const(
+                IrCmpOp::Eq,
+                IrConst::F64(1.0),
+                IrConst::F64(1.0),
+                IrType::F64
+            )
+            .is_none()
+        );
+        assert!(eval_unaryop_const(IrUnaryOp::Neg, IrConst::F64(1.0), None, IrType::F64).is_none());
+        assert!(eval_cast_const(IrConst::I32(16_777_217), IrType::I32, IrType::F32).is_none());
+        assert!(eval_cast_const(IrConst::F64(1.25), IrType::F64, IrType::I32).is_none());
+        assert_eq!(
+            eval_binop_const(IrBinOp::Add, IrConst::I32(2), IrConst::I32(3), IrType::I32),
+            Some(IrConst::I32(5))
+        );
     }
 }

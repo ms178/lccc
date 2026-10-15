@@ -110,6 +110,7 @@ thread_local! {
     // generic vector pass being active is not evidence that both instructions
     // are legal for this particular lowering.
     static X86_STRICT_RECIP_AVX2_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static STRICT_RECIP_PACK_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     // x86 SIMD register-file availability for the MIDDLE END. Every vector
     // lowering this pass emits (VecLoadI32x8, VecAndI32x8, FmaF64x4, ...)
     // becomes an xmm/ymm instruction in the backend. The Linux kernel is built
@@ -383,6 +384,10 @@ pub(crate) fn set_x86_strict_recip_avx2_enabled(enabled: bool) {
     X86_STRICT_RECIP_AVX2_AVAILABLE.with(|available| available.set(enabled));
 }
 
+pub(crate) fn set_strict_recip_pack_enabled(enabled: bool) {
+    STRICT_RECIP_PACK_ENABLED.with(|cell| cell.set(enabled));
+}
+
 fn x86_strict_recip_avx2_enabled() -> bool {
     X86_STRICT_RECIP_AVX2_AVAILABLE.with(|available| available.get())
 }
@@ -443,6 +448,9 @@ fn vectorize_with_analysis_mode(
     fp_reassoc: bool,
     fp_contract: crate::common::fp_contract::FpContract,
 ) -> usize {
+    if super::fp_environment_blocks_reordering(func) {
+        return 0;
+    }
     let num_blocks = func.blocks.len();
     // `var_os(..).is_some()` is the crate's presence-means-on spelling (see
     // `vec_interleave`'s gate on these same two variables): `var` additionally
@@ -18443,6 +18451,8 @@ fn find_inst_in_loop<'a>(
 // important: this is a correctness feature, not a relaxed fast-math path.
 // ═══════════════════════════════════════════════════════════════════════════
 
+mod strict_i32_pack;
+
 #[derive(Debug)]
 struct StrictComputedRecipReductionPattern {
     header_idx: usize,
@@ -19058,142 +19068,6 @@ fn fresh_strict_value(next_value_id: &mut u32) -> Value {
     value
 }
 
-/// Transactional AVX2 lowering of the already-validated I32 coefficient DAG.
-/// Only lane-wise modular arithmetic and constant in-range shifts are admitted.
-/// Low lanes 0..3 feed FP; high lanes are unobserved integer work, never loads.
-struct StrictPackedDag<'a> {
-    func: &'a IrFunction,
-    body: usize,
-    iv: Value,
-    packed_iv: Value,
-    values: FxHashMap<Value, Value>,
-    constants: FxHashMap<i32, Value>,
-    expressions: FxHashMap<(IntrinsicOp, Value, u64), Value>,
-    prefix: Vec<Instruction>,
-    instructions: Vec<Instruction>,
-    next: u32,
-}
-
-impl StrictPackedDag<'_> {
-    fn emit(&mut self, op: IntrinsicOp, args: Vec<Operand>, invariant: bool) -> Value {
-        let dest = fresh_strict_value(&mut self.next);
-        let inst = Instruction::Intrinsic {
-            dest: Some(dest),
-            op,
-            dest_ptr: None,
-            args,
-        };
-        if invariant {
-            self.prefix.push(inst);
-        } else {
-            self.instructions.push(inst);
-        }
-        dest
-    }
-
-    fn operand(&mut self, operand: Operand, depth: usize) -> Option<Value> {
-        if depth > 64 {
-            return None;
-        }
-        let value = match operand {
-            Operand::Const(c) => {
-                let c = i32::try_from(c.to_i64()?).ok()?;
-                if let Some(&value) = self.constants.get(&c) {
-                    return Some(value);
-                }
-                let value = self.emit(
-                    IntrinsicOp::VecBroadcastI32x8,
-                    vec![Operand::Const(IrConst::I32(c))],
-                    true,
-                );
-                self.constants.insert(c, value);
-                return Some(value);
-            }
-            Operand::Value(value) => value,
-        };
-        if value == self.iv {
-            return Some(self.packed_iv);
-        }
-        if let Some(&packed) = self.values.get(&value) {
-            return Some(packed);
-        }
-        let inst = find_inst_by_dest(&self.func.blocks[self.body], value).cloned();
-        let result = match inst {
-            None => self.emit(IntrinsicOp::VecBroadcastI32x8, vec![operand], true),
-            Some(
-                Instruction::Copy { src, .. }
-                | Instruction::Cast {
-                    src,
-                    from_ty: IrType::I32,
-                    to_ty: IrType::I32,
-                    ..
-                },
-            ) => self.operand(src, depth + 1)?,
-            Some(Instruction::BinOp {
-                op,
-                lhs,
-                rhs,
-                ty: IrType::I32,
-                ..
-            }) => {
-                let packed_op = match op {
-                    IrBinOp::Add => IntrinsicOp::VecAddI32x8,
-                    IrBinOp::Sub => IntrinsicOp::VecSubI32x8,
-                    IrBinOp::Mul => IntrinsicOp::VecMulI32x8,
-                    IrBinOp::And => IntrinsicOp::VecAndI32x8,
-                    IrBinOp::Or => IntrinsicOp::VecOrI32x8,
-                    IrBinOp::Xor => IntrinsicOp::VecXorI32x8,
-                    IrBinOp::Shl => IntrinsicOp::VecShlI32x8,
-                    IrBinOp::LShr => IntrinsicOp::VecLShrI32x8,
-                    IrBinOp::AShr => IntrinsicOp::VecAShrI32x8,
-                    _ => return None,
-                };
-                let lhs = self.operand(lhs, depth + 1)?;
-                let rhs = if matches!(op, IrBinOp::Shl | IrBinOp::LShr | IrBinOp::AShr) {
-                    let Operand::Const(count) = rhs else {
-                        return None;
-                    };
-                    let count = count.to_i64()?;
-                    if !(0..32).contains(&count) {
-                        return None;
-                    }
-                    Operand::Const(IrConst::I32(count as i32))
-                } else {
-                    Operand::Value(self.operand(rhs, depth + 1)?)
-                };
-                // Scalar copies may present the same commutative DAG in
-                // different operand orders. Intern its packed operation once,
-                // reducing transient register pressure without FP algebra.
-                let (lhs, rhs) = match rhs {
-                    Operand::Value(r)
-                        if matches!(
-                            op,
-                            IrBinOp::Add | IrBinOp::Mul | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor
-                        ) && r.0 < lhs.0 =>
-                    {
-                        (r, Operand::Value(lhs))
-                    }
-                    _ => (lhs, rhs),
-                };
-                let rhs_key = match rhs {
-                    Operand::Value(v) => u64::from(v.0),
-                    Operand::Const(c) => (1u64 << 32) | c.to_i64()? as u64,
-                };
-                let key = (packed_op, lhs, rhs_key);
-                if let Some(&value) = self.expressions.get(&key) {
-                    return Some(value);
-                }
-                let value = self.emit(packed_op, vec![Operand::Value(lhs), rhs], false);
-                self.expressions.insert(key, value);
-                value
-            }
-            _ => return None,
-        };
-        self.values.insert(value, result);
-        Some(result)
-    }
-}
-
 /// Insert the ordered four-lane prefix ahead of the original scalar loop.
 /// The scalar header/body are deliberately not cloned or edited beyond their
 /// preheader phi inputs: their existing body is the exact tail for 0..3
@@ -19224,69 +19098,43 @@ fn transform_strict_computed_recip_reduction(
     // Build every new instruction before changing the original CFG.  A future
     // extension which accidentally widens the accepted DAG therefore fails as
     // an all-or-nothing no-op rather than leaving half-versioned IR behind.
-    let packed_iv = fresh_strict_value(&mut next_value_id);
-    let mut packed = StrictPackedDag {
-        func,
-        body: pattern.body_idx,
-        iv: pattern.iv,
-        packed_iv,
-        values: FxHashMap::default(),
-        constants: FxHashMap::default(),
-        expressions: FxHashMap::default(),
-        prefix: Vec::new(),
-        instructions: Vec::new(),
-        next: next_value_id,
-    };
-    let offsets = packed.emit(
-        IntrinsicOp::VecConstI8x32,
-        (0i32..8)
-            .flat_map(i32::to_le_bytes)
-            .map(|b| Operand::Const(IrConst::I32(i32::from(b))))
-            .collect(),
-        true,
-    );
-    let splat = packed.emit(
-        IntrinsicOp::VecBroadcastI32x8,
-        vec![Operand::Value(vector_iv)],
-        false,
-    );
-    packed.instructions.push(Instruction::Intrinsic {
-        dest: Some(packed_iv),
-        op: IntrinsicOp::VecAddI32x8,
-        dest_ptr: None,
-        args: vec![Operand::Value(splat), Operand::Value(offsets)],
-    });
-    let packed_denominator = packed.operand(Operand::Value(pattern.denominator), 0);
-    let mut prefix = Vec::new();
-    let mut vector_body_instructions;
-    let mut denominator_args = Vec::new();
-    let intrinsic = if let Some(denominator) = packed_denominator {
-        next_value_id = packed.next;
-        prefix = packed.prefix;
-        vector_body_instructions = packed.instructions;
-        denominator_args.push(Operand::Value(denominator));
+    let mut vector_body_instructions = Vec::new();
+    let mut lane_ivs = Vec::with_capacity(4);
+    lane_ivs.push(vector_iv);
+    for lane in 1..4 {
+        let lane_iv = fresh_strict_value(&mut next_value_id);
+        vector_body_instructions.push(Instruction::BinOp {
+            dest: lane_iv,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(vector_iv),
+            rhs: Operand::Const(IrConst::I32(lane)),
+            ty: IrType::I32,
+        });
+        lane_ivs.push(lane_iv);
+    }
+
+    let packed = STRICT_RECIP_PACK_ENABLED
+        .with(|cell| cell.get())
+        .then(|| {
+            strict_i32_pack::build(
+                &func.blocks[pattern.body_idx],
+                pattern.iv,
+                vector_iv,
+                pattern.denominator,
+                next_value_id,
+            )
+        })
+        .flatten();
+    let mut args = vec![Operand::Value(vector_sum)];
+    // The 128-bit builder owns speculative instructions and IDs. A rejected
+    // plan leaves this caller's scalar lane instructions/counter unchanged
+    // (PR834's transactional-allocation contract).
+    let op = if let Some((denominator, instructions, next)) = packed {
+        next_value_id = next;
+        vector_body_instructions.extend(instructions);
+        args.push(Operand::Value(denominator));
         IntrinsicOp::StrictRecipMulAddPackedF64x4
     } else {
-        // The private allocator MAY have advanced before a later DAG operand
-        // failed. Discard its instructions AND IDs together; equality with
-        // next_value_id would be an invalid assertion. The scalar fallback
-        // owns the unchanged caller counter, so none of those IDs escape.
-        vector_body_instructions = Vec::new();
-        let mut lane_ivs = Vec::with_capacity(4);
-        lane_ivs.push(vector_iv);
-        for lane in 1..4 {
-            let lane_iv = fresh_strict_value(&mut next_value_id);
-            vector_body_instructions.push(Instruction::BinOp {
-                dest: lane_iv,
-                op: IrBinOp::Add,
-                lhs: Operand::Value(vector_iv),
-                rhs: Operand::Const(IrConst::I32(lane)),
-                ty: IrType::I32,
-            });
-            lane_ivs.push(lane_iv);
-        }
-
-        let mut denominators = Vec::with_capacity(4);
         for lane_iv in lane_ivs {
             let mut cache = FxHashMap::default();
             let denominator = clone_strict_i32_dag_for_lane(
@@ -19299,10 +19147,8 @@ fn transform_strict_computed_recip_reduction(
                 &mut vector_body_instructions,
                 &mut next_value_id,
             )?;
-            denominators.push(denominator);
+            args.push(Operand::Value(denominator));
         }
-
-        denominator_args.extend(denominators.into_iter().map(Operand::Value));
         IntrinsicOp::StrictRecipMulAddF64x4
     };
 
@@ -19322,8 +19168,6 @@ fn transform_strict_computed_recip_reduction(
         ty: IrType::I64,
     });
     let vector_sum_next = fresh_strict_value(&mut next_value_id);
-    let mut args = vec![Operand::Value(vector_sum)];
-    args.extend(denominator_args);
     args.extend([
         Operand::Value(pattern.source_base),
         Operand::Value(byte_offset),
@@ -19331,7 +19175,7 @@ fn transform_strict_computed_recip_reduction(
     ]);
     vector_body_instructions.push(Instruction::Intrinsic {
         dest: Some(vector_sum_next),
-        op: intrinsic,
+        op,
         dest_ptr: None,
         args,
     });
@@ -19442,15 +19286,11 @@ fn transform_strict_computed_recip_reduction(
         *value = replacement;
         *label = vector_header_label;
     }
-    let change_count =
-        1 + prefix.len() + vector_header.instructions.len() + vector_body.instructions.len() + 2;
+    let change_count = 1 + vector_header.instructions.len() + vector_body.instructions.len() + 2;
 
     // `scratch` is normally unused by the direct XMM-result lowering, but it
     // gives the code generator a sound register-pressure fallback without
     // borrowing an allocator-owned XMM register or dynamically moving %rsp.
-    func.blocks[pattern.preheader_idx]
-        .instructions
-        .extend(prefix);
     func.blocks[pattern.header_idx].instructions = rewritten_header_instructions;
     func.blocks[pattern.preheader_idx]
         .instructions
@@ -31685,6 +31525,9 @@ pub(crate) fn vectorize_const_trip_map_loops(
     fp_contract: FpContract,
     no_map_vec: bool,
 ) -> usize {
+    if super::fp_environment_blocks_reordering(func) {
+        return 0;
+    }
     // ISA gate FIRST.  This entry runs before the main vectorizer and
     // therefore needs its own gate: it emits the same Vec* intrinsics, but the
     // caller's generic `vectorize_with_analysis` gate is not reached here.  In
@@ -34871,152 +34714,5 @@ mod outside_rewrite_availability_tests {
         assert_eq!(incoming[0].0, Operand::Value(Value(10)));
         assert_eq!(incoming[1].0, Operand::Value(Value(10)));
         assert_eq!(updates, 1, "only the exit reader is redirected");
-    }
-}
-
-#[cfg(test)]
-mod strict_packed_dag_tests {
-    use super::*;
-
-    fn function(instructions: Vec<Instruction>) -> IrFunction {
-        let mut f = IrFunction::new("packed_dag".into(), IrType::Void, vec![], false);
-        f.blocks.push(BasicBlock {
-            label: BlockId(0),
-            instructions,
-            terminator: Terminator::Return(None),
-            source_spans: vec![],
-        });
-        f
-    }
-
-    fn builder(func: &IrFunction) -> StrictPackedDag<'_> {
-        StrictPackedDag {
-            func,
-            body: 0,
-            iv: Value(0),
-            packed_iv: Value(100),
-            next: 101,
-            values: FxHashMap::default(),
-            constants: FxHashMap::default(),
-            expressions: FxHashMap::default(),
-            prefix: vec![],
-            instructions: vec![],
-        }
-    }
-
-    fn bin(dest: u32, op: IrBinOp, lhs: Operand, rhs: Operand) -> Instruction {
-        Instruction::BinOp {
-            dest: Value(dest),
-            op,
-            lhs,
-            rhs,
-            ty: IrType::I32,
-        }
-    }
-
-    #[test]
-    fn packed_integer_cse_is_commutative_but_subtraction_is_not() {
-        for op in [
-            IrBinOp::Add,
-            IrBinOp::Mul,
-            IrBinOp::And,
-            IrBinOp::Or,
-            IrBinOp::Xor,
-            IrBinOp::Sub,
-        ] {
-            let iv = Operand::Value(Value(0));
-            let external = Operand::Value(Value(1));
-            let f = function(vec![bin(2, op, iv, external), bin(3, op, external, iv)]);
-            let mut b = builder(&f);
-            let a = b.operand(Operand::Value(Value(2)), 0).unwrap();
-            let c = b.operand(Operand::Value(Value(3)), 0).unwrap();
-            assert_eq!(a == c, op != IrBinOp::Sub, "{op:?}");
-            assert_eq!(b.prefix.len(), 1, "broadcast external once");
-        }
-    }
-
-    #[test]
-    fn packed_shift_boundaries_and_unsupported_ops_fail_closed() {
-        for op in [IrBinOp::Shl, IrBinOp::LShr, IrBinOp::AShr] {
-            for count in [-1, 0, 1, 31, 32, 63] {
-                let f = function(vec![bin(
-                    2,
-                    op,
-                    Operand::Value(Value(0)),
-                    Operand::Const(IrConst::I32(count)),
-                )]);
-                assert_eq!(
-                    builder(&f).operand(Operand::Value(Value(2)), 0).is_some(),
-                    (0..32).contains(&count),
-                    "{op:?} {count}"
-                );
-            }
-            let f = function(vec![bin(
-                2,
-                op,
-                Operand::Value(Value(0)),
-                Operand::Value(Value(1)),
-            )]);
-            assert!(builder(&f).operand(Operand::Value(Value(2)), 0).is_none());
-        }
-        for op in [IrBinOp::SDiv, IrBinOp::SRem] {
-            let f = function(vec![bin(
-                2,
-                op,
-                Operand::Value(Value(0)),
-                Operand::Const(IrConst::I32(3)),
-            )]);
-            assert!(builder(&f).operand(Operand::Value(Value(2)), 0).is_none());
-        }
-    }
-
-    #[test]
-    fn rejected_packed_plan_discards_partially_allocated_ids() {
-        let f = function(vec![
-            bin(
-                2,
-                IrBinOp::SDiv,
-                Operand::Value(Value(0)),
-                Operand::Const(IrConst::I32(3)),
-            ),
-            bin(
-                3,
-                IrBinOp::Add,
-                Operand::Value(Value(1)),
-                Operand::Value(Value(2)),
-            ),
-        ]);
-        let before = format!("{f:?}");
-        let mut plan = builder(&f);
-        let next = plan.next;
-        assert!(plan.operand(Operand::Value(Value(3)), 0).is_none());
-        assert!(
-            plan.next > next,
-            "left broadcast allocated before right operand failed"
-        );
-        assert!(!plan.prefix.is_empty());
-        drop(plan);
-        assert_eq!(
-            format!("{f:?}"),
-            before,
-            "speculation never mutates caller IR/counter"
-        );
-    }
-
-    #[test]
-    fn packed_constants_are_signed_i32_and_depth_is_bounded() {
-        let f = function(vec![]);
-        let mut b = builder(&f);
-        for c in [i32::MIN, -1, 0, i32::MAX] {
-            let op = Operand::Const(IrConst::I32(c));
-            let first = b.operand(op, 0).unwrap();
-            assert_eq!(b.operand(op, 0), Some(first));
-        }
-        assert_eq!(b.prefix.len(), 4);
-        assert!(
-            b.operand(Operand::Const(IrConst::I64(1i64 << 32)), 0)
-                .is_none()
-        );
-        assert!(b.operand(Operand::Value(Value(0)), 65).is_none());
     }
 }

@@ -222,13 +222,17 @@ pub fn resolve_symbol_value(
 ///
 /// Returns (key, is_local) where is_local indicates the symbol won't be in global_syms.
 pub fn got_sym_key(obj_idx: usize, sym: &Symbol, addend: i64) -> (String, bool) {
-    if sym.sym_type() == STT_SECTION {
+    if sym.sym_type() == STT_SECTION || sym.binding() == STB_LOCAL {
+        // ELF names cannot contain NUL, so an input global cannot impersonate
+        // this internal namespace. Include location as well as name: distinct
+        // unnamed/local symbols in one object need not have distinct names.
         (
-            format!("__local_sec_{}_{}_{}", obj_idx, sym.shndx, addend),
+            format!(
+                "\0local:{}:{}:{}:{}:{}",
+                obj_idx, sym.shndx, sym.value, addend, sym.name
+            ),
             true,
         )
-    } else if sym.binding() == STB_LOCAL {
-        (format!("__local_{}_{}_{}", obj_idx, sym.name, addend), true)
     } else {
         (sym.name.to_string(), false)
     }

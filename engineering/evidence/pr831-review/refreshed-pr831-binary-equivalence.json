@@ -1,0 +1,3097 @@
+{
+  "old_compiler": "01503f8b1383b2ec37d2f02730c1c6e9880d07c38230a1785a622c24f28ab5d8",
+  "new_compiler": "a7ed15ca95057f8e8ca6723e80149ee244e3190cabfe9c3e93e7ad1d3abdf4ce",
+  "complete": true,
+  "comparisons": [
+    {
+      "case": "arith_loop",
+      "profile": "native",
+      "before_sha256": "f9f787b1a81a5b454c879e38a88d836c2192669aa86ceec66cc9da8a5b302a08",
+      "after_sha256": "f9f787b1a81a5b454c879e38a88d836c2192669aa86ceec66cc9da8a5b302a08",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/arith_loop.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/arith_loop.c"
+        ]
+      ]
+    },
+    {
+      "case": "arith_loop",
+      "profile": "callgrind",
+      "before_sha256": "2a9d8ccdd04e19ff72024ecbd1d2c29642ae20bd63ba2d94bace94e472657794",
+      "after_sha256": "2a9d8ccdd04e19ff72024ecbd1d2c29642ae20bd63ba2d94bace94e472657794",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DARITH_ITERS=20000",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/arith_loop.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DARITH_ITERS=20000",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/arith_loop.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "fib",
+      "profile": "native",
+      "before_sha256": "35ecd60ac8626414abc220a41c6eb5e706c5018a747f1a45632741ac69670afd",
+      "after_sha256": "35ecd60ac8626414abc220a41c6eb5e706c5018a747f1a45632741ac69670afd",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/fib.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/fib.c"
+        ]
+      ]
+    },
+    {
+      "case": "fib",
+      "profile": "callgrind",
+      "before_sha256": "11f3a2b1081018aae3ecbcee7d5a677cfc7c0e2b3021f7278f5104321fe3a515",
+      "after_sha256": "11f3a2b1081018aae3ecbcee7d5a677cfc7c0e2b3021f7278f5104321fe3a515",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DFIB_N=25",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/fib.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DFIB_N=25",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/fib.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "matmul",
+      "profile": "native",
+      "before_sha256": "5509c50c6a410db47e9fc3ce1f6cfd3c677b10d25b883850204593196e1ef1dd",
+      "after_sha256": "5509c50c6a410db47e9fc3ce1f6cfd3c677b10d25b883850204593196e1ef1dd",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/matmul.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/matmul.c"
+        ]
+      ]
+    },
+    {
+      "case": "matmul",
+      "profile": "callgrind",
+      "before_sha256": "70862a43700fd5071e784451d44b8218d0c42c892f484d88c85b92f73ea2b5aa",
+      "after_sha256": "70862a43700fd5071e784451d44b8218d0c42c892f484d88c85b92f73ea2b5aa",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DN=48",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/matmul.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DN=48",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/matmul.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "qsort",
+      "profile": "native",
+      "before_sha256": "5ff4f151d880d4e19edada066fcab912eb760fa88b4f2fdd241f204239e988d5",
+      "after_sha256": "5ff4f151d880d4e19edada066fcab912eb760fa88b4f2fdd241f204239e988d5",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/qsort.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/qsort.c"
+        ]
+      ]
+    },
+    {
+      "case": "qsort",
+      "profile": "callgrind",
+      "before_sha256": "d03e5c8d83a4f2efc4974c31724236b70e232d1066c34f0e251b02a0d752a696",
+      "after_sha256": "d03e5c8d83a4f2efc4974c31724236b70e232d1066c34f0e251b02a0d752a696",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DN=10000",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/qsort.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DN=10000",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/qsort.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "sieve",
+      "profile": "native",
+      "before_sha256": "16ed107db9eab47894102a2882fb8a05d1c6b334ec24bec252993801c4e9af71",
+      "after_sha256": "16ed107db9eab47894102a2882fb8a05d1c6b334ec24bec252993801c4e9af71",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/sieve.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/sieve.c"
+        ]
+      ]
+    },
+    {
+      "case": "sieve",
+      "profile": "callgrind",
+      "before_sha256": "1da6de99bdd2b0e46da177215c7b03ddd743ec1f0ef390540f311eafa5660cff",
+      "after_sha256": "1da6de99bdd2b0e46da177215c7b03ddd743ec1f0ef390540f311eafa5660cff",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DN=100000",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/sieve.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DN=100000",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/sieve.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "tce_sum",
+      "profile": "native",
+      "before_sha256": "ef8272fe4124b76ac277507905628d6962605b9310a47e0d1d6854c9a3c59a73",
+      "after_sha256": "ef8272fe4124b76ac277507905628d6962605b9310a47e0d1d6854c9a3c59a73",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/tce_sum.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/tce_sum.c"
+        ]
+      ]
+    },
+    {
+      "case": "tce_sum",
+      "profile": "callgrind",
+      "before_sha256": "ef8272fe4124b76ac277507905628d6962605b9310a47e0d1d6854c9a3c59a73",
+      "after_sha256": "ef8272fe4124b76ac277507905628d6962605b9310a47e0d1d6854c9a3c59a73",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/tce_sum.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/tce_sum.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "nbody",
+      "profile": "native",
+      "before_sha256": "a8c246651a970abc447984eab46d166bc8cefa4a454a8fed2c247848f8bdd766",
+      "after_sha256": "a8c246651a970abc447984eab46d166bc8cefa4a454a8fed2c247848f8bdd766",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/nbody.c",
+          "-lm"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/nbody.c",
+          "-lm"
+        ]
+      ]
+    },
+    {
+      "case": "nbody",
+      "profile": "callgrind",
+      "before_sha256": "2681c62574b470477eeb3882d9b50f651833a9657ebeb59e5a1df9ceb055e236",
+      "after_sha256": "2681c62574b470477eeb3882d9b50f651833a9657ebeb59e5a1df9ceb055e236",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DSTEPS=1000",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/nbody.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DSTEPS=1000",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/nbody.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "binary_trees",
+      "profile": "native",
+      "before_sha256": "c0806e78e99998dc811360ef4ad6af86a2bd62bc26eeeaed149533bb175a5273",
+      "after_sha256": "c0806e78e99998dc811360ef4ad6af86a2bd62bc26eeeaed149533bb175a5273",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/binary_trees.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/binary_trees.c"
+        ]
+      ]
+    },
+    {
+      "case": "binary_trees",
+      "profile": "callgrind",
+      "before_sha256": "43d05bee76a7cbb40526b2719de5f95ddea1cfeb5aec5884f5c832ad6e9cc9de",
+      "after_sha256": "43d05bee76a7cbb40526b2719de5f95ddea1cfeb5aec5884f5c832ad6e9cc9de",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DTREE_DEPTH=10",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/binary_trees.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DTREE_DEPTH=10",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/binary_trees.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "spectral_norm",
+      "profile": "native",
+      "before_sha256": "c1f4873c1291dd8ee7e6ac891574a263ae4907bbff2bce3610786e22b57078d0",
+      "after_sha256": "c1f4873c1291dd8ee7e6ac891574a263ae4907bbff2bce3610786e22b57078d0",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/spectral_norm.c",
+          "-lm"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/spectral_norm.c",
+          "-lm"
+        ]
+      ]
+    },
+    {
+      "case": "spectral_norm",
+      "profile": "callgrind",
+      "before_sha256": "6b79e2cd78c2bd54ef85aa6857c3caf86e9673892c1cb5f7a7c5b13ba890c73b",
+      "after_sha256": "6b79e2cd78c2bd54ef85aa6857c3caf86e9673892c1cb5f7a7c5b13ba890c73b",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DN=128",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/spectral_norm.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DN=128",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/spectral_norm.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "mandelbrot",
+      "profile": "native",
+      "before_sha256": "cbef37146acdfe07eadfc362dc69897e745191dcac8e1fa49219d66b43bcf758",
+      "after_sha256": "cbef37146acdfe07eadfc362dc69897e745191dcac8e1fa49219d66b43bcf758",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/mandelbrot.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/mandelbrot.c"
+        ]
+      ]
+    },
+    {
+      "case": "mandelbrot",
+      "profile": "callgrind",
+      "before_sha256": "e98ba1bb67a905b9d341aa33396c641274379727e58a979bb7c018c12c19e64c",
+      "after_sha256": "e98ba1bb67a905b9d341aa33396c641274379727e58a979bb7c018c12c19e64c",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DWIDTH=128",
+          "-DHEIGHT=128",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/mandelbrot.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DWIDTH=128",
+          "-DHEIGHT=128",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/mandelbrot.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "hash_table",
+      "profile": "native",
+      "before_sha256": "60c55f2daf88706d1a8aedd5bcad2b791d6e7bf140b382b2e9a8885db6581b04",
+      "after_sha256": "60c55f2daf88706d1a8aedd5bcad2b791d6e7bf140b382b2e9a8885db6581b04",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/hash_table.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/hash_table.c"
+        ]
+      ]
+    },
+    {
+      "case": "hash_table",
+      "profile": "callgrind",
+      "before_sha256": "b7ce6e912fb2013c77cdd858cd08135ce718cef0cc33408367e4a24ab1288778",
+      "after_sha256": "b7ce6e912fb2013c77cdd858cd08135ce718cef0cc33408367e4a24ab1288778",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DNUM_OPS=20000",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/hash_table.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DNUM_OPS=20000",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/hash_table.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "strlen_bench",
+      "profile": "native",
+      "before_sha256": "8657f8aa45741b238e87dcc18950fc1484a50c841680bc544f37b459dbb45a18",
+      "after_sha256": "8657f8aa45741b238e87dcc18950fc1484a50c841680bc544f37b459dbb45a18",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/strlen_bench.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/strlen_bench.c"
+        ]
+      ]
+    },
+    {
+      "case": "strlen_bench",
+      "profile": "callgrind",
+      "before_sha256": "8116617a0a2b744c28a679cc9ddee3e99a00f3ec94662b19b3c39e953fa6695f",
+      "after_sha256": "8116617a0a2b744c28a679cc9ddee3e99a00f3ec94662b19b3c39e953fa6695f",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DNSTRINGS=1000",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/strlen_bench.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DNSTRINGS=1000",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/strlen_bench.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "switch_dispatch",
+      "profile": "native",
+      "before_sha256": "fecd1d1106bf41327179df68d6d75586c8891a87ed957c1a811ccd3297500ad8",
+      "after_sha256": "fecd1d1106bf41327179df68d6d75586c8891a87ed957c1a811ccd3297500ad8",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/switch_dispatch.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/switch_dispatch.c"
+        ]
+      ]
+    },
+    {
+      "case": "switch_dispatch",
+      "profile": "callgrind",
+      "before_sha256": "4d900df4bb62ddd768e08998c8855f9b2ec4f7637c9352ac76ea8c648b4a5590",
+      "after_sha256": "4d900df4bb62ddd768e08998c8855f9b2ec4f7637c9352ac76ea8c648b4a5590",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DN=20000",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/switch_dispatch.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DN=20000",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/switch_dispatch.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "struct_copy",
+      "profile": "native",
+      "before_sha256": "474468ea00289e0998e6470d583d600bd814b4192f59f872480f78ca776a39ed",
+      "after_sha256": "474468ea00289e0998e6470d583d600bd814b4192f59f872480f78ca776a39ed",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/struct_copy.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/struct_copy.c"
+        ]
+      ]
+    },
+    {
+      "case": "struct_copy",
+      "profile": "callgrind",
+      "before_sha256": "5e30f8450f33da6dd21073eac02b0777283d4a6cb280fdb35f0c36d86207470f",
+      "after_sha256": "5e30f8450f33da6dd21073eac02b0777283d4a6cb280fdb35f0c36d86207470f",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DN=2000",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/struct_copy.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DN=2000",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/struct_copy.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "loop_patterns",
+      "profile": "native",
+      "before_sha256": "7b6315142778e334aa93854f785ab9918587c79387a5f440afdae166a55be369",
+      "after_sha256": "7b6315142778e334aa93854f785ab9918587c79387a5f440afdae166a55be369",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/loop_patterns.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/loop_patterns.c"
+        ]
+      ]
+    },
+    {
+      "case": "loop_patterns",
+      "profile": "callgrind",
+      "before_sha256": "1020431397a44f3f79ef2b727466eaf943b15d1e4a12e76159a11b335b9bd8d2",
+      "after_sha256": "1020431397a44f3f79ef2b727466eaf943b15d1e4a12e76159a11b335b9bd8d2",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DSIZE=16384",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/loop_patterns.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DSIZE=16384",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/loop_patterns.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "fannkuch",
+      "profile": "native",
+      "before_sha256": "d4c9a2ae4eb7c07f1a5295749dfe3503a1291fd8ee0ca3e3758ab11ca4716878",
+      "after_sha256": "d4c9a2ae4eb7c07f1a5295749dfe3503a1291fd8ee0ca3e3758ab11ca4716878",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/fannkuch.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/fannkuch.c"
+        ]
+      ]
+    },
+    {
+      "case": "fannkuch",
+      "profile": "callgrind",
+      "before_sha256": "38338a03048d542a5e8ca605763af2e3b92ced3a9300f49d5b5079223f2d9245",
+      "after_sha256": "38338a03048d542a5e8ca605763af2e3b92ced3a9300f49d5b5079223f2d9245",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DFANNKUCH_N=7",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/fannkuch.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DFANNKUCH_N=7",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/fannkuch.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "ackermann",
+      "profile": "native",
+      "before_sha256": "c4773250669a3a6ae58bfba05065148a99f46d94aad1f7dec89b8d820d08c38e",
+      "after_sha256": "c4773250669a3a6ae58bfba05065148a99f46d94aad1f7dec89b8d820d08c38e",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/ackermann.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/ackermann.c"
+        ]
+      ]
+    },
+    {
+      "case": "ackermann",
+      "profile": "callgrind",
+      "before_sha256": "f3d88d11c59ee4787746fb892685abedc51532a3e184e002ba79ba4f72b4bb2f",
+      "after_sha256": "f3d88d11c59ee4787746fb892685abedc51532a3e184e002ba79ba4f72b4bb2f",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DACK_N=6",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/ackermann.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DACK_N=6",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/ackermann.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "constant_recursion",
+      "profile": "native",
+      "before_sha256": "d7d9808d49b5d3f646e2c09d233b36792161d6c3f1a24cae365312d636d47188",
+      "after_sha256": "d7d9808d49b5d3f646e2c09d233b36792161d6c3f1a24cae365312d636d47188",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/constant_recursion.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/constant_recursion.c"
+        ]
+      ]
+    },
+    {
+      "case": "constant_recursion",
+      "profile": "callgrind",
+      "before_sha256": "94a2b3d4d90cfc032385b4e5a78c3184df1fb4c70f3cb53a7f9807451734a1a4",
+      "after_sha256": "94a2b3d4d90cfc032385b4e5a78c3184df1fb4c70f3cb53a7f9807451734a1a4",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DACK_N=6",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/constant_recursion.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DACK_N=6",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/constant_recursion.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "bitops",
+      "profile": "native",
+      "before_sha256": "8981a51d21bb37e88f4a7f2e8ea468e867d4db5bd9c1f9c6d88ee8af4ff43af7",
+      "after_sha256": "8981a51d21bb37e88f4a7f2e8ea468e867d4db5bd9c1f9c6d88ee8af4ff43af7",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/bitops.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/bitops.c"
+        ]
+      ]
+    },
+    {
+      "case": "bitops",
+      "profile": "callgrind",
+      "before_sha256": "62b62eeed70b198f99566ee9373deb79cf39ec259223d548db6b487ebf63e531",
+      "after_sha256": "62b62eeed70b198f99566ee9373deb79cf39ec259223d548db6b487ebf63e531",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DN=20000",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/bitops.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DN=20000",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/bitops.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "double_reduction",
+      "profile": "native",
+      "before_sha256": "38270f33f18f51a27bdd74b618f0993f48287492fe03e4fb0776a73106c51265",
+      "after_sha256": "38270f33f18f51a27bdd74b618f0993f48287492fe03e4fb0776a73106c51265",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/double_reduction.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/double_reduction.c"
+        ]
+      ]
+    },
+    {
+      "case": "double_reduction",
+      "profile": "callgrind",
+      "before_sha256": "5ce55440944d0e896fdd40e1cd51c64d2125b708290629c0d8584c0a55979d02",
+      "after_sha256": "5ce55440944d0e896fdd40e1cd51c64d2125b708290629c0d8584c0a55979d02",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DREDUCTION_PASSES=1",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/double_reduction.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DREDUCTION_PASSES=1",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/double_reduction.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "ascii_case_fold",
+      "profile": "native",
+      "before_sha256": "343d2e2e205f8657052688a8ac9dbdbd4605b496202a1607010e06fc38ee9518",
+      "after_sha256": "343d2e2e205f8657052688a8ac9dbdbd4605b496202a1607010e06fc38ee9518",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/ascii_case_fold.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/ascii_case_fold.c"
+        ]
+      ]
+    },
+    {
+      "case": "ascii_case_fold",
+      "profile": "callgrind",
+      "before_sha256": "343d2e2e205f8657052688a8ac9dbdbd4605b496202a1607010e06fc38ee9518",
+      "after_sha256": "343d2e2e205f8657052688a8ac9dbdbd4605b496202a1607010e06fc38ee9518",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/ascii_case_fold.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/ascii_case_fold.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "binary_search",
+      "profile": "native",
+      "before_sha256": "997341f88194920139fc1fa4206902f980234e8a44c2651f28fddad79f930793",
+      "after_sha256": "997341f88194920139fc1fa4206902f980234e8a44c2651f28fddad79f930793",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/binary_search.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/binary_search.c"
+        ]
+      ]
+    },
+    {
+      "case": "binary_search",
+      "profile": "callgrind",
+      "before_sha256": "997341f88194920139fc1fa4206902f980234e8a44c2651f28fddad79f930793",
+      "after_sha256": "997341f88194920139fc1fa4206902f980234e8a44c2651f28fddad79f930793",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/binary_search.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/binary_search.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "ring_fifo",
+      "profile": "native",
+      "before_sha256": "4d79d3d50ad3718be8952c1e449fe5567258a48966b9a43a3d70a0e05ca2c9fa",
+      "after_sha256": "4d79d3d50ad3718be8952c1e449fe5567258a48966b9a43a3d70a0e05ca2c9fa",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/ring_fifo.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/ring_fifo.c"
+        ]
+      ]
+    },
+    {
+      "case": "ring_fifo",
+      "profile": "callgrind",
+      "before_sha256": "4d79d3d50ad3718be8952c1e449fe5567258a48966b9a43a3d70a0e05ca2c9fa",
+      "after_sha256": "4d79d3d50ad3718be8952c1e449fe5567258a48966b9a43a3d70a0e05ca2c9fa",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/ring_fifo.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/ring_fifo.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "aarch64_select_patterns",
+      "profile": "native",
+      "before_sha256": "281dc193b36ecb64fec8341df180eb15970a2723c0758cd6c526b229212fbdbd",
+      "after_sha256": "281dc193b36ecb64fec8341df180eb15970a2723c0758cd6c526b229212fbdbd",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/aarch64_select_patterns.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/aarch64_select_patterns.c"
+        ]
+      ]
+    },
+    {
+      "case": "aarch64_select_patterns",
+      "profile": "callgrind",
+      "before_sha256": "c7da302b00c44dceb22e3b96499bcf74db2dab51a8a01bf2fa511fc0d662d07d",
+      "after_sha256": "c7da302b00c44dceb22e3b96499bcf74db2dab51a8a01bf2fa511fc0d662d07d",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DSELECT_ITERS=20000",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/aarch64_select_patterns.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DSELECT_ITERS=20000",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/aarch64_select_patterns.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "histogram",
+      "profile": "native",
+      "before_sha256": "bec2886180dc448a311bc28a74b714541192edbffb3c600745aec04253b2dca9",
+      "after_sha256": "bec2886180dc448a311bc28a74b714541192edbffb3c600745aec04253b2dca9",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/histogram.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/histogram.c"
+        ]
+      ]
+    },
+    {
+      "case": "histogram",
+      "profile": "callgrind",
+      "before_sha256": "bec2886180dc448a311bc28a74b714541192edbffb3c600745aec04253b2dca9",
+      "after_sha256": "bec2886180dc448a311bc28a74b714541192edbffb3c600745aec04253b2dca9",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/histogram.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/histogram.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "gzip_crc32",
+      "profile": "native",
+      "before_sha256": "095811bdeb314e6420ea9b84ffec26f7a447230a784e8b9212f53bfcff56131a",
+      "after_sha256": "095811bdeb314e6420ea9b84ffec26f7a447230a784e8b9212f53bfcff56131a",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/gzip_crc32.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/gzip_crc32.c"
+        ]
+      ]
+    },
+    {
+      "case": "gzip_crc32",
+      "profile": "callgrind",
+      "before_sha256": "a6349f5fca98187d1b0da5d20fae295386e445fa4d8c61e55ce6df622d44903b",
+      "after_sha256": "a6349f5fca98187d1b0da5d20fae295386e445fa4d8c61e55ce6df622d44903b",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DDATA_SIZE=16384",
+          "-DPASSES=4",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/gzip_crc32.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DDATA_SIZE=16384",
+          "-DPASSES=4",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/gzip_crc32.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "libm_round_family",
+      "profile": "native",
+      "before_sha256": "eb2d56ba02d7e4d6abf3689c5a214c4ed0c6956091d8cb6ac5204f860b61f0cf",
+      "after_sha256": "eb2d56ba02d7e4d6abf3689c5a214c4ed0c6956091d8cb6ac5204f860b61f0cf",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/libm_round_family.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/libm_round_family.c"
+        ]
+      ]
+    },
+    {
+      "case": "libm_round_family",
+      "profile": "callgrind",
+      "before_sha256": "4f32e8e31214aa19a86c5ccbbd662bda6a80b2b5bd64a7323fc5343f4b33a4b0",
+      "after_sha256": "4f32e8e31214aa19a86c5ccbbd662bda6a80b2b5bd64a7323fc5343f4b33a4b0",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DN=256",
+          "-DPASSES=4",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/libm_round_family.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DN=256",
+          "-DPASSES=4",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/libm_round_family.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "tls_seg_access",
+      "profile": "native",
+      "before_sha256": "bf006483a542a22bbc3ce8fbfddf72cd904008592c0cec344dd65c73b14cf1ce",
+      "after_sha256": "bf006483a542a22bbc3ce8fbfddf72cd904008592c0cec344dd65c73b14cf1ce",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/tls_seg_access.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/tls_seg_access.c"
+        ]
+      ]
+    },
+    {
+      "case": "tls_seg_access",
+      "profile": "callgrind",
+      "before_sha256": "020c3b5471ad73045dc23a7cd11a48ac19ed4272d81436b58b8d4556bfd7efe6",
+      "after_sha256": "020c3b5471ad73045dc23a7cd11a48ac19ed4272d81436b58b8d4556bfd7efe6",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DPASSES=100",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/tls_seg_access.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DPASSES=100",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/tls_seg_access.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "percpu_ptr_walk",
+      "profile": "native",
+      "before_sha256": "2b3b1f66d651c1e0d0a530a26caef3bfa1ebef2aec4b4a3f940926a7bf315c06",
+      "after_sha256": "2b3b1f66d651c1e0d0a530a26caef3bfa1ebef2aec4b4a3f940926a7bf315c06",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/percpu_ptr_walk.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/percpu_ptr_walk.c"
+        ]
+      ]
+    },
+    {
+      "case": "percpu_ptr_walk",
+      "profile": "callgrind",
+      "before_sha256": "7fab0dd7fd5b1e274e03e4d5580dfd02dec115f5803fdb3ae52f2f636608d903",
+      "after_sha256": "7fab0dd7fd5b1e274e03e4d5580dfd02dec115f5803fdb3ae52f2f636608d903",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DPASSES=1000",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/percpu_ptr_walk.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DPASSES=1000",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/percpu_ptr_walk.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "byte_load_reassembly",
+      "profile": "native",
+      "before_sha256": "529c03add4a14d7b368e755943dfa02ae83e8eafe2da559e53c0fc18e8eb7d71",
+      "after_sha256": "529c03add4a14d7b368e755943dfa02ae83e8eafe2da559e53c0fc18e8eb7d71",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/byte_load_reassembly.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/byte_load_reassembly.c"
+        ]
+      ]
+    },
+    {
+      "case": "byte_load_reassembly",
+      "profile": "callgrind",
+      "before_sha256": "529c03add4a14d7b368e755943dfa02ae83e8eafe2da559e53c0fc18e8eb7d71",
+      "after_sha256": "529c03add4a14d7b368e755943dfa02ae83e8eafe2da559e53c0fc18e8eb7d71",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/byte_load_reassembly.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/byte_load_reassembly.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "zlib_ng_adler32",
+      "profile": "native",
+      "before_sha256": "74453f6c2087c2f0867b645fd67e7d6390f97ec19abdf7a547d07062d28c9c85",
+      "after_sha256": "74453f6c2087c2f0867b645fd67e7d6390f97ec19abdf7a547d07062d28c9c85",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/zlib_ng_adler32.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/zlib_ng_adler32.c"
+        ]
+      ]
+    },
+    {
+      "case": "zlib_ng_adler32",
+      "profile": "callgrind",
+      "before_sha256": "4743cb0196338df3b363487d66dbdf8b2be4ee7eb880986287936a42bae0e721",
+      "after_sha256": "4743cb0196338df3b363487d66dbdf8b2be4ee7eb880986287936a42bae0e721",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DDATA_SIZE=16384",
+          "-DPASSES=4",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/zlib_ng_adler32.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DDATA_SIZE=16384",
+          "-DPASSES=4",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/zlib_ng_adler32.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "zlib_ng_adler32_combine",
+      "profile": "native",
+      "before_sha256": "c9cd338530d7dc15ba157eb2d17b6858ba1cf775b68772ae7cdad04b0c54a9f9",
+      "after_sha256": "c9cd338530d7dc15ba157eb2d17b6858ba1cf775b68772ae7cdad04b0c54a9f9",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/zlib_ng_adler32_combine.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/zlib_ng_adler32_combine.c"
+        ]
+      ]
+    },
+    {
+      "case": "zlib_ng_adler32_combine",
+      "profile": "callgrind",
+      "before_sha256": "7aaf25c081b7b2d88c3690d979ad478fa1fa9e5a687cbe82a5701a80c9d9cf70",
+      "after_sha256": "7aaf25c081b7b2d88c3690d979ad478fa1fa9e5a687cbe82a5701a80c9d9cf70",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DPASSES=10000",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/zlib_ng_adler32_combine.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DPASSES=10000",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/zlib_ng_adler32_combine.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "expat_xml_scan",
+      "profile": "native",
+      "before_sha256": "f99c5dd65cce50435508ccc2acbf9c2e1bf01f6ad578875ecc9947ed37933910",
+      "after_sha256": "f99c5dd65cce50435508ccc2acbf9c2e1bf01f6ad578875ecc9947ed37933910",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/expat_xml_scan.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/expat_xml_scan.c"
+        ]
+      ]
+    },
+    {
+      "case": "expat_xml_scan",
+      "profile": "callgrind",
+      "before_sha256": "31bdf5cdc197027354c17d9fafb58e17df2511783a90cd779fa2ff7ba6ac4d2c",
+      "after_sha256": "31bdf5cdc197027354c17d9fafb58e17df2511783a90cd779fa2ff7ba6ac4d2c",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DXML_SIZE=16384",
+          "-DPASSES=4",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/expat_xml_scan.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DXML_SIZE=16384",
+          "-DPASSES=4",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/expat_xml_scan.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "expat_siphash24",
+      "profile": "native",
+      "before_sha256": "3c7b8cd039428908e76a4d1cddbfdff0af54f2d18cb46f5747a06b8c991f0b79",
+      "after_sha256": "3c7b8cd039428908e76a4d1cddbfdff0af54f2d18cb46f5747a06b8c991f0b79",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/expat_siphash24.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/expat_siphash24.c"
+        ]
+      ]
+    },
+    {
+      "case": "expat_siphash24",
+      "profile": "callgrind",
+      "before_sha256": "8232deea8b8c5e2fe9e04becb61dd8ce3534e7730cd882ab03af43cf93809024",
+      "after_sha256": "8232deea8b8c5e2fe9e04becb61dd8ce3534e7730cd882ab03af43cf93809024",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DPASSES=1000",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/expat_siphash24.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DPASSES=1000",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/expat_siphash24.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "sqlite_varint",
+      "profile": "native",
+      "before_sha256": "e4bce50f4c6940e143ff9fa66dcfae300f5af488dcf98eb9d1bec1af9a3c6b9b",
+      "after_sha256": "e4bce50f4c6940e143ff9fa66dcfae300f5af488dcf98eb9d1bec1af9a3c6b9b",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/sqlite_varint.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/sqlite_varint.c"
+        ]
+      ]
+    },
+    {
+      "case": "sqlite_varint",
+      "profile": "callgrind",
+      "before_sha256": "af6d77e3d09f08a34ba8fc751d03f04e781884c0abdc9d507cbb6d9346045e09",
+      "after_sha256": "af6d77e3d09f08a34ba8fc751d03f04e781884c0abdc9d507cbb6d9346045e09",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DVALUE_COUNT=2048",
+          "-DPASSES=4",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/sqlite_varint.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DVALUE_COUNT=2048",
+          "-DPASSES=4",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/sqlite_varint.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "linux_find_bit",
+      "profile": "native",
+      "before_sha256": "b059a766841d1620a2b52fb1666cc7ba68f5ea7234508d876d9493263161ec71",
+      "after_sha256": "b059a766841d1620a2b52fb1666cc7ba68f5ea7234508d876d9493263161ec71",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/linux_find_bit.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/linux_find_bit.c"
+        ]
+      ]
+    },
+    {
+      "case": "linux_find_bit",
+      "profile": "callgrind",
+      "before_sha256": "08e0043d776b11b8be60a2ae13124c810a392d8d072e95fe76493fcf07d3fb3c",
+      "after_sha256": "08e0043d776b11b8be60a2ae13124c810a392d8d072e95fe76493fcf07d3fb3c",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DPASSES=32",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/linux_find_bit.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DPASSES=32",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/linux_find_bit.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "linux_find_bit_scaled",
+      "profile": "native",
+      "before_sha256": "9fec4a4a268f4ed314d265110a68de5f97b47b75ccbce2f0127ccc33aa8f83ec",
+      "after_sha256": "9fec4a4a268f4ed314d265110a68de5f97b47b75ccbce2f0127ccc33aa8f83ec",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/linux_find_bit.c",
+          "-DPASSES=65536"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/linux_find_bit.c",
+          "-DPASSES=65536"
+        ]
+      ]
+    },
+    {
+      "case": "linux_find_bit_scaled",
+      "profile": "callgrind",
+      "before_sha256": "3eeb5826ebc77da3a9eb519f39528d01a70347d6ed6e65eb8e10f31ad50b2584",
+      "after_sha256": "3eeb5826ebc77da3a9eb519f39528d01a70347d6ed6e65eb8e10f31ad50b2584",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DPASSES=128",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/linux_find_bit.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DPASSES=128",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/linux_find_bit.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "glibc_memcmp",
+      "profile": "native",
+      "before_sha256": "c119b50e1bab741d270ada0fd0fb626d04b8d185715a419541edc64b0e9cf4d1",
+      "after_sha256": "c119b50e1bab741d270ada0fd0fb626d04b8d185715a419541edc64b0e9cf4d1",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/glibc_memcmp.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/glibc_memcmp.c"
+        ]
+      ]
+    },
+    {
+      "case": "glibc_memcmp",
+      "profile": "callgrind",
+      "before_sha256": "c96dc48781b4df9c1db004f46eb56e7c3c9cd0648aa44d5c2d40942ebd7b24e7",
+      "after_sha256": "c96dc48781b4df9c1db004f46eb56e7c3c9cd0648aa44d5c2d40942ebd7b24e7",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DPASSES=16",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/glibc_memcmp.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DPASSES=16",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/glibc_memcmp.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "chacha20_block",
+      "profile": "native",
+      "before_sha256": "2117754ac17e2f400bd46b4d43ffa7f40157f1f3193f0c0579b740aa867d53a7",
+      "after_sha256": "2117754ac17e2f400bd46b4d43ffa7f40157f1f3193f0c0579b740aa867d53a7",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/chacha20_block.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/chacha20_block.c"
+        ]
+      ]
+    },
+    {
+      "case": "chacha20_block",
+      "profile": "callgrind",
+      "before_sha256": "1aab897cecf5f8e200202469e0338602cd4fd62e2f47a6b0022ae855cd976632",
+      "after_sha256": "1aab897cecf5f8e200202469e0338602cd4fd62e2f47a6b0022ae855cd976632",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DBLOCK_COUNT=256",
+          "-DPASSES=2",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/chacha20_block.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DBLOCK_COUNT=256",
+          "-DPASSES=2",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/chacha20_block.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "sha256_transform",
+      "profile": "native",
+      "before_sha256": "6bc5b137cf91cd91c1c822d8d0d1d651eed60ee1504b64d79489692d23ac0d02",
+      "after_sha256": "6bc5b137cf91cd91c1c822d8d0d1d651eed60ee1504b64d79489692d23ac0d02",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/sha256_transform.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/sha256_transform.c"
+        ]
+      ]
+    },
+    {
+      "case": "sha256_transform",
+      "profile": "callgrind",
+      "before_sha256": "d6f96c069e170e4a8f09fc14ffc933a24e108cc9035faa8ad9827b6b1aabc5d3",
+      "after_sha256": "d6f96c069e170e4a8f09fc14ffc933a24e108cc9035faa8ad9827b6b1aabc5d3",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DBLOCK_COUNT=256",
+          "-DPASSES=2",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/sha256_transform.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DBLOCK_COUNT=256",
+          "-DPASSES=2",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/sha256_transform.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "linux_rbtree",
+      "profile": "native",
+      "before_sha256": "7ef5fe5a2412b85f61c6f2039f77373a624298de8cfb2f2473f31d0707743c11",
+      "after_sha256": "7ef5fe5a2412b85f61c6f2039f77373a624298de8cfb2f2473f31d0707743c11",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/linux_rbtree.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/linux_rbtree.c"
+        ]
+      ]
+    },
+    {
+      "case": "linux_rbtree",
+      "profile": "callgrind",
+      "before_sha256": "a30a11022a20fa820838068cf8d5238061933c813a1317c63096bf48dc3cf9bc",
+      "after_sha256": "a30a11022a20fa820838068cf8d5238061933c813a1317c63096bf48dc3cf9bc",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DNODE_COUNT=1024",
+          "-DLOOKUP_ROUNDS=2",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/linux_rbtree.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DNODE_COUNT=1024",
+          "-DLOOKUP_ROUNDS=2",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/linux_rbtree.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "zstd_count",
+      "profile": "native",
+      "before_sha256": "4ae41797b7d71d9ac4505d747450a2846e84b43e1d7b4d6f222dbd66495c3677",
+      "after_sha256": "4ae41797b7d71d9ac4505d747450a2846e84b43e1d7b4d6f222dbd66495c3677",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/zstd_count.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/zstd_count.c"
+        ]
+      ]
+    },
+    {
+      "case": "zstd_count",
+      "profile": "callgrind",
+      "before_sha256": "0c0e8257bb36d87d5354a0781261c70b1c444786eb8be67680c334d77a0e39a9",
+      "after_sha256": "0c0e8257bb36d87d5354a0781261c70b1c444786eb8be67680c334d77a0e39a9",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DBUFFER_SIZE=16384",
+          "-DQUERY_COUNT=1024",
+          "-DPASSES=2",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/zstd_count.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DBUFFER_SIZE=16384",
+          "-DQUERY_COUNT=1024",
+          "-DPASSES=2",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/zstd_count.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "lz4_compress",
+      "profile": "native",
+      "before_sha256": "17f5f5b8ee7d761ca6ea17d3ee33aa8a739d56d1a3ed9d4f189b9ec02cabf766",
+      "after_sha256": "17f5f5b8ee7d761ca6ea17d3ee33aa8a739d56d1a3ed9d4f189b9ec02cabf766",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/lz4_compress.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/lz4_compress.c"
+        ]
+      ]
+    },
+    {
+      "case": "lz4_compress",
+      "profile": "callgrind",
+      "before_sha256": "5a7ffee5517350841b8fda9e8e7b441f23f5fdab66ffbafe60b38d8f947fcfb6",
+      "after_sha256": "5a7ffee5517350841b8fda9e8e7b441f23f5fdab66ffbafe60b38d8f947fcfb6",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DSRC_SIZE=16384",
+          "-DPASSES=2",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/lz4_compress.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DSRC_SIZE=16384",
+          "-DPASSES=2",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/lz4_compress.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "lz4_match_extend",
+      "profile": "native",
+      "before_sha256": "7ec50f792be9f623fd0b03d943b8a3db3ec621f08f28cd6d167b27391bb0404c",
+      "after_sha256": "7ec50f792be9f623fd0b03d943b8a3db3ec621f08f28cd6d167b27391bb0404c",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/lz4_compress.c",
+          "-DMATCH_RICH=1",
+          "-DPASSES=2048"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/lz4_compress.c",
+          "-DMATCH_RICH=1",
+          "-DPASSES=2048"
+        ]
+      ]
+    },
+    {
+      "case": "lz4_match_extend",
+      "profile": "callgrind",
+      "before_sha256": "e1e3472075ff45147467b7bded219b87bc73ba26508f4847dd0e0badfcb3a4ca",
+      "after_sha256": "e1e3472075ff45147467b7bded219b87bc73ba26508f4847dd0e0badfcb3a4ca",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DSRC_SIZE=16384",
+          "-DPASSES=2",
+          "-DMATCH_RICH=1",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/lz4_compress.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DSRC_SIZE=16384",
+          "-DPASSES=2",
+          "-DMATCH_RICH=1",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/lz4_compress.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    },
+    {
+      "case": "glibc_strstr",
+      "profile": "native",
+      "before_sha256": "5f9c37d3921cadceae68b8db978ac44b76bcdbf3d7700b351bf2716889655a4f",
+      "after_sha256": "5f9c37d3921cadceae68b8db978ac44b76bcdbf3d7700b351bf2716889655a4f",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before",
+          "/home/user/.cache/lccc/tests/benchmark/programs/glibc_strstr.c"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after",
+          "/home/user/.cache/lccc/tests/benchmark/programs/glibc_strstr.c"
+        ]
+      ]
+    },
+    {
+      "case": "glibc_strstr",
+      "profile": "callgrind",
+      "before_sha256": "700e2cbffb8ddf9b3ec1e99776099f7f4030a18dfcf1dd59eba905c2385e349f",
+      "after_sha256": "700e2cbffb8ddf9b3ec1e99776099f7f4030a18dfcf1dd59eba905c2385e349f",
+      "identical": true,
+      "commands": [
+        [
+          "/home/user/.cache/pr831/arms/pr831/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DHAYSTACK_LEN=16384",
+          "-DQUERY_COUNT=32",
+          "-DPASSES=2",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/glibc_strstr.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/before"
+        ],
+        [
+          "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-Wl,--no-as-needed",
+          "-lm",
+          "-DHAYSTACK_LEN=16384",
+          "-DQUERY_COUNT=32",
+          "-DPASSES=2",
+          "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+          "/home/user/.cache/lccc/tests/benchmark/programs/glibc_strstr.c",
+          "-o",
+          "/tmp/lccc-identity-vkosijp_/after"
+        ]
+      ]
+    }
+  ]
+}

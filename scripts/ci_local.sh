@@ -43,6 +43,10 @@
 #
 #   CI_LOCAL_GATE_JOBS=1|2 controls isolated compiler-free gate overlap.
 #   Cargo always uses exactly two jobs; heavy gates are exclusive barriers.
+#   CI_LOCAL_JOBS=N   positive explicit job count for test and Clippy gates;
+#                     takes precedence over CARGO_BUILD_JOBS. Otherwise choose
+#                     1 below 6 GB RAM (or if RAM cannot be detected), 2 above.
+#                     Debug/incremental overrides do not disable job budgeting.
 #
 # Environment:
 #   LCCC_TEST_REPEATS=N   run the unit-test suite N times (default 1). N > 1
@@ -356,9 +360,21 @@ gate "cross-target-intrinsic-trap" fast \
 gate "pgo-io-contract" fast \
     python3 tests/regression/check_pgo_io.py --lccc "$LCCC"
 
+# Shared binding must preserve symbol preemption, visibility and RELA addends.
+gate "riscv-shared-binding-selftest" fast \
+    python3 tests/linker/test_riscv_shared_binding.py
+gate "riscv-shared-binding" fast \
+    python3 tests/linker/check_riscv_shared_binding.py --lccc target/fastbuild/lccc-riscv
+
 # A14-17: shared linking must not silently consume unknown relocation kinds.
 gate "riscv-relocation-contract" fast \
     python3 tests/linker/check_riscv_relocation_contract.py --lccc target/fastbuild/lccc-riscv
+
+gate "pr824-boundaries" fast \
+    python3 tests/regression/check_pr824_boundaries.py --lccc target/fastbuild/lccc --cross
+
+gate "note-run-oracle-selftest" fast \
+    python3 tests/linker/test_note_runs.py
 
 gate "pr826-harness-redteam" fast \
     python3 tests/linker/test_pr826_redteam.py
@@ -404,58 +420,69 @@ gate "ill-typed-builtins" fast \
 # cheap once the test binaries are built. Set LCCC_TEST_REPEATS to raise the
 # count (CI itself runs it once).
 #
-# Keep the O1 fastbuild/two-job contract. Dropped debug information and swap
-# provide memory headroom without changing parallelism or recompiling the
-# normal library under a different incremental fingerprint.
-cargo_test_repeated() {
-    local flags="" n i dbg jobs incr
-    # Reuse the flags the build gate resolved, or cargo rebuilds everything.
-    [ -r target/lccc-rustflags ] && flags="$(cat target/lccc-rustflags)"
+# Memory-constrained hosts: the monolithic lib-test compile with the
+# fastbuild profile's line-tables debuginfo needs ~3 GB of resident rustc;
+# on a 4 GB sandbox the OOM killer SIGKILLs it and the gate reports a
+# compile failure that has nothing to do with the code under test. The
+# test binary's debuginfo contributes nothing the assertions read --
+# panic messages carry their own source spans -- and cargo's -j only
+# serialises the COMPILE (the test harness's own parallelism is
+# --test-threads, untouched), so on hosts with less than 6 GB of RAM
+# the test compile drops the debuginfo AND builds one rustc at a time
+# (CARGO_PROFILE_FASTBUILD_DEBUG=0, -j 1). Debug/incremental preferences and
+# explicit job overrides are independent; neither gate changes its caller's
+# environment. LCCC_TEST_REPEATS accepts decimal counts 1..2147483647.
+# Called only inside gate subshells. Job budgeting is independent of debug
+# preference; an explicit debug=0 must not accidentally disable OOM protection.
+configure_cargo_gate_resources() {
+    local total_mb jobs dbg incr
+    total_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
+    # Bound parsing before the signed shell comparison; malformed huge probe
+    # output must not bypass the conservative fallback with an integer error.
+    [[ "$total_mb" =~ ^[0-9]{1,18}$ ]] || total_mb=0
+    jobs="${CI_LOCAL_JOBS:-${CARGO_BUILD_JOBS:-}}"
+    if [ -z "$jobs" ]; then
+        if [ "$total_mb" -lt 6000 ]; then jobs=1; else jobs=2; fi
+    fi
+    if [[ ! "$jobs" =~ ^[1-9][0-9]*$ ]]; then
+        printf 'invalid Cargo gate job count: %s\n' "$jobs" >&2
+        return 2
+    fi
     dbg="${CARGO_PROFILE_FASTBUILD_DEBUG:-}"
+    if [ -z "$dbg" ] && [ "$total_mb" -lt 6000 ]; then dbg=0; fi
     incr="${CARGO_INCREMENTAL:-}"
-    jobs=2
-    if [ -z "$dbg" ]; then
-        local total_mb
-        total_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
-        if [ -n "$total_mb" ] && [ "$total_mb" -lt 6000 ]; then
-            dbg=0
-        fi
-    fi
-    # The debuginfo drop alone is not always enough: rustc's incremental
-    # session state for the monolithic lib-test compile adds roughly a
-    # gigabyte of resident memory on this crate, and on a 4 GB host with
-    # a cold page cache the OOM killer still SIGKILLs a compile that
-    # succeeds with incremental off (verified both ways, 2026-09-16 v7
-    # session: same rustc invocation, SIGKILL with -C incremental, clean
-    # pass with CARGO_INCREMENTAL=0). Incremental only speeds up
-    # REBUILDS of the test binary; set CARGO_INCREMENTAL explicitly to
-    # override.
-    if [ -z "$incr" ] && [ "${dbg:-}" = "0" ]; then
-        incr=0
-    fi
+    if [ -z "$incr" ] && [ "$dbg" = 0 ]; then incr=0; fi
+    export CARGO_BUILD_JOBS="$jobs"
+    if [ -n "$dbg" ]; then export CARGO_PROFILE_FASTBUILD_DEBUG="$dbg";
+    else unset CARGO_PROFILE_FASTBUILD_DEBUG; fi
+    if [ -n "$incr" ]; then export CARGO_INCREMENTAL="$incr";
+    else unset CARGO_INCREMENTAL; fi
+}
+
+# A subshell preserves set/unset/empty caller environment and shell variables,
+# even on an early error. No gate's automatic settings can become the next
+# gate's apparent explicit overrides.
+cargo_test_repeated() (
+    local flags="" n i
+    [ -r target/lccc-rustflags ] && flags="$(cat target/lccc-rustflags)"
+    configure_cargo_gate_resources || return
     n="${LCCC_TEST_REPEATS:-1}"
-    # The reporter's own test corpus runs first: it is what fails when the
-    # reporter quietly stops reporting, and the suite below is exactly the log
-    # it exists to explain (see scripts/ci_test_report.py).
-    python3 scripts/ci_test_report.py --self-test
+    # Bound arithmetic before Bash evaluates it: huge decimals otherwise wrap
+    # negative and make a requested test run silently execute zero repetitions.
+    if [[ ! "$n" =~ ^[1-9][0-9]*$ || ${#n} -gt 10 ||
+          ( ${#n} -eq 10 && "$n" > 2147483647 ) ]]; then
+        printf 'invalid LCCC_TEST_REPEATS: %s\n' "$n" >&2
+        return 2
+    fi
+    python3 scripts/ci_test_report.py --self-test || return
     for ((i = 1; i <= n; i++)); do
-        if [ -n "$dbg" ]; then
-            export CARGO_PROFILE_FASTBUILD_DEBUG="$dbg"
-        else
-            unset CARGO_PROFILE_FASTBUILD_DEBUG
-        fi
-        if [ -n "$incr" ]; then
-            export CARGO_INCREMENTAL="$incr"
-        else
-            unset CARGO_INCREMENTAL
-        fi
         if ! RUSTFLAGS="$flags" python3 scripts/ci_test_report.py -- \
-            cargo test --profile fastbuild --all-targets --locked -j "$jobs"; then
+            cargo test --profile fastbuild --all-targets --locked -j "$CARGO_BUILD_JOBS"; then
             printf 'cargo-test: FAILED on repeat %d/%d\n' "$i" "$n" >&2
             return 1
         fi
     done
-}
+)
 
 gate "cargo-test" fast cargo_test_repeated
 
@@ -565,6 +592,11 @@ gate "strict-computed-recip-codegen" fast \
 
 gate "strict-packed-dag" fast \
     env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_strict_packed_dag.sh
+gate "strict-packed-recip-bitwise" fast \
+    python3 scripts/check_strict_packed_recip.py
+
+gate "fp-environment-trap-order" fast \
+    bash tests/regression/check_fp_environment.sh
 
 gate "machinst-window-alloc" fast \
     bash tests/regression/check_machinst_window_alloc_wide_copy.sh
@@ -986,6 +1018,9 @@ gate "pr-claim-fidelity" fast \
 # the failure is actionable without a separate preflight.
 # Read-only integrity check; exclusive by default (not in scheduler whitelist).
 gate "evidence-hash-integrity" fast python3 scripts/verify_evidence_hashes.py
+
+gate "ci-resource-isolation" fast \
+    python3 scripts/test_ci_resources.py
 
 gate "ci-gate-parity" fast \
     python3 scripts/check_ci_gate_parity.py
@@ -1540,6 +1575,7 @@ if [ -x target/fastbuild/lccc-ld ]; then
     gate "kernel-relocs-tool" fast \
         bash tests/linker/setup_kernel_tools.sh --prefix "$HOME/.cache/lccc-kernel-tools"
     gate "linker-suite" fast env \
+        LCCC_TEST_ASSEMBLER="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
         PATH="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin:$PATH" \
         LCCC_REQUIRE_I386=1 \
         LCCC_RELOCS_TOOL="$HOME/.cache/lccc-kernel-tools/bin/relocs" \
@@ -1819,33 +1855,13 @@ gate "rustfmt" fast cargo fmt --all -- --check
 # the pair). Needs the 1.97.0 rustup toolchain installed.
 gate "msrv-check" fast cargo +1.97.0 check --locked
 
-# Strict Clippy reuses build flags and the normal profile. The scheduler drains
-# all queued checks before this memory-heavy gate; Cargo stays at two jobs.
-clippy_gate() {
-    local flags="" dbg incr jobs total_mb
+# Test and Clippy gates use the same resource policy, independently in
+# subshells. CI_LOCAL_JOBS / CARGO_BUILD_JOBS override automatic parallelism;
+# explicit debug/incremental preferences affect only those respective knobs.
+clippy_gate() (
+    local flags=""
     [ -r target/lccc-rustflags ] && flags="$(cat target/lccc-rustflags)"
-    jobs=2
-    dbg="${CARGO_PROFILE_FASTBUILD_DEBUG:-}"
-    incr="${CARGO_INCREMENTAL:-}"
-    if [ -z "$dbg" ]; then
-        total_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
-        if [ -n "$total_mb" ] && [ "$total_mb" -lt 6000 ]; then
-            dbg=0
-        fi
-    fi
-    if [ -z "$incr" ] && [ "${dbg:-}" = "0" ]; then
-        incr=0
-    fi
-    if [ -n "$dbg" ]; then
-        export CARGO_PROFILE_FASTBUILD_DEBUG="$dbg"
-    else
-        unset CARGO_PROFILE_FASTBUILD_DEBUG
-    fi
-    if [ -n "$incr" ]; then
-        export CARGO_INCREMENTAL="$incr"
-    else
-        unset CARGO_INCREMENTAL
-    fi
+    configure_cargo_gate_resources || return
     # RUSTFLAGS reuses the build gate's resolved flags (see cargo_test_repeated):
     # without them clippy recompiles the whole crate under a different flag set.
     #
@@ -1854,12 +1870,10 @@ clippy_gate() {
     # declared MSRV cannot break `-D warnings` on a lint name that does not
     # exist yet, and the wrapper re-probes every name in the policy list under
     # `#![deny(unknown_lints)]` to keep typos from hiding behind that allow.
-    # Match hosted CI's toolchain report; this also confirms the Clippy
-    # component is installed before the policy wrapper invokes it.
-    cargo clippy --version
-    RUSTFLAGS="$flags" CARGO_BUILD_JOBS="$jobs" \
-        python3 scripts/check_clippy_policy.py
-}
+    cargo clippy --version || return
+    RUSTFLAGS="$flags" python3 scripts/check_clippy_policy.py
+)
+
 gate "clippy" fast clippy_gate
 
 # Assertion-enabled units and corpus share an isolated target directory and

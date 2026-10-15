@@ -1775,6 +1775,37 @@ mod tests {
     }
 
     #[test]
+    fn gather_mask_is_a_nontrailing_output_not_a_renameable_read() {
+        // AVX2 gathers clear the vector mask as elements complete. Its first
+        // AT&T operand is read AND written, not a source-only operand.
+        for op in [
+            "vgatherdps",
+            "vgatherdpd",
+            "vgatherqps",
+            "vgatherqpd",
+            "vpgatherdd",
+            "vpgatherdq",
+            "vpgatherqd",
+            "vpgatherqq",
+        ] {
+            let gather = format!("{op} %xmm2, (%rdi,%xmm3,4), %xmm4");
+            let asm = body(&format!(
+                "    vmovaps %xmm0, %xmm2\n    {gather}\n    vmovaps %xmm0, (%rsi)\n    vmovaps %xmm2, 16(%rsi)\n    vmovaps %xmm4, 32(%rsi)\n"
+            ));
+            let mut store = LineStore::new(asm.clone());
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            assert!(
+                !propagate_vector_copies(&mut store, &mut infos),
+                "renaming the gather mask also clobbers the copy source: {op}"
+            );
+            let out = run(&asm);
+            assert!(insns(&out).contains(&gather), "gather mask changed: {out}");
+        }
+    }
+
+    #[test]
     fn propagation_does_not_cross_implicit_vector_outputs() {
         for op in [
             "vpcmpistrm $0, %xmm5, %xmm7",

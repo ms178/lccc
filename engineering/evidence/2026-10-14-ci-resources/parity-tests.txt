@@ -1,0 +1,112 @@
+.....missing local fuzz-harness discovery gate
+missing local fuzz-harness discovery gate
+missing hosted fuzz-harness discovery gate
+.........................gate steps violate execution semantics:
+  ci.yml job=t step="g": scripts/aarch64_encoder_differential.py sits in a step kept off the green-path run (step `if: failure()` keeps it off the green-path run) — a gate that does not execute on the PR path is not coverage
+gate steps violate execution semantics:
+  ci.yml job=t step="g": scripts/aarch64_family_sweeps.py sits in a step kept off the green-path run (step `if: failure()` keeps it off the green-path run) — a gate that does not execute on the PR path is not coverage
+gate steps violate execution semantics:
+  ci.yml job=t step="g": scripts/aarch64_legality_probe_differ.py sits in a step kept off the green-path run (step `if: failure()` keeps it off the green-path run) — a gate that does not execute on the PR path is not coverage
+gate steps violate execution semantics:
+  ci.yml job=t step="g": scripts/aarch64_operand_legality_matrix.py sits in a step kept off the green-path run (step `if: failure()` keeps it off the green-path run) — a gate that does not execute on the PR path is not coverage
+gate steps violate execution semantics:
+  ci.yml job=t step="g": scripts/aarch64_sysreg_table.py sits in a step kept off the green-path run (step `if: failure()` keeps it off the green-path run) — a gate that does not execute on the PR path is not coverage
+gate steps violate execution semantics:
+  ci.yml job=t step="g": scripts/asmdiff.py sits in a step kept off the green-path run (step `if: failure()` keeps it off the green-path run) — a gate that does not execute on the PR path is not coverage
+gate steps violate execution semantics:
+  ci.yml job=t step="g": scripts/check_ci_gate_parity.py sits in a step kept off the green-path run (step `if: failure()` keeps it off the green-path run) — a gate that does not execute on the PR path is not coverage
+gate steps violate execution semantics:
+  ci.yml job=t step="g": scripts/encdiff.py sits in a step kept off the green-path run (step `if: failure()` keeps it off the green-path run) — a gate that does not execute on the PR path is not coverage
+gate steps violate execution semantics:
+  ci.yml job=t step="g": scripts/ensure_gas_247.sh sits in a step kept off the green-path run (step `if: failure()` keeps it off the green-path run) — a gate that does not execute on the PR path is not coverage
+gate steps violate execution semantics:
+  ci.yml job=t step="g": scripts/test_asmdiff.py sits in a step kept off the green-path run (step `if: failure()` keeps it off the green-path run) — a gate that does not execute on the PR path is not coverage
+gate steps violate execution semantics:
+  ci.yml job=t step="g": scripts/test_ci_gate_parity.py sits in a step kept off the green-path run (step `if: failure()` keeps it off the green-path run) — a gate that does not execute on the PR path is not coverage
+gate steps violate execution semantics:
+  ci.yml job=t step="g": scripts/test_ci_resources.py sits in a step kept off the green-path run (step `if: failure()` keeps it off the green-path run) — a gate that does not execute on the PR path is not coverage
+gate steps violate execution semantics:
+  ci.yml job=t step="g": scripts/test_encdiff.py sits in a step kept off the green-path run (step `if: failure()` keeps it off the green-path run) — a gate that does not execute on the PR path is not coverage
+gate steps violate execution semantics:
+  ci.yml job=t step="g": tests/linker/run_linker_tests.py sits in a step kept off the green-path run (step `if: failure()` keeps it off the green-path run) — a gate that does not execute on the PR path is not coverage
+gate steps violate execution semantics:
+  ci.yml job=t step="g": tests/linker/setup_kernel_tools.sh sits in a step kept off the green-path run (step `if: failure()` keeps it off the green-path run) — a gate that does not execute on the PR path is not coverage
+gate steps violate execution semantics:
+  ci.yml job=t step="g": tests/regression/check_arm_address_contract.py sits in a step kept off the green-path run (step `if: failure()` keeps it off the green-path run) — a gate that does not execute on the PR path is not coverage
+gate steps violate execution semantics:
+  ci.yml job=t step="g": tests/regression/check_arm_popcount_contract.py sits in a step kept off the green-path run (step `if: failure()` keeps it off the green-path run) — a gate that does not execute on the PR path is not coverage
+..gate steps violate execution semantics:
+  ci.yml job=test step="arm contract": tests/regression/check_arm_address_contract.py runs with hidden env ['CCC_ARM'] — a channel that can override what the invocation's own pins chose
+gate steps violate execution semantics:
+  ci.yml job=test step="arm contract": tests/regression/check_arm_address_contract.py runs with hidden env ['CCC_ARM'] — a channel that can override what the invocation's own pins chose
+gate steps violate execution semantics:
+  ci.yml job=test step="arm contract": tests/regression/check_arm_address_contract.py runs with hidden env ['CCC_ARM'] — a channel that can override what the invocation's own pins chose
+gate steps violate execution semantics:
+  ci.yml job=test step="arm contract": tests/regression/check_arm_address_contract.py runs with hidden env ['PYTHONOPTIMIZE'] — a channel that can override what the invocation's own pins chose
+gate steps violate execution semantics:
+  ci.yml job=test step="arm contract": tests/regression/check_arm_address_contract.py runs with hidden env ['PYTHONOPTIMIZE'] — a channel that can override what the invocation's own pins chose
+gate steps violate execution semantics:
+  ci.yml job=test step="arm contract": tests/regression/check_arm_address_contract.py runs with hidden env ['PYTHONOPTIMIZE'] — a channel that can override what the invocation's own pins chose
+gate steps violate execution semantics:
+  ci.yml job=test step="arm contract": tests/regression/check_arm_popcount_contract.py runs with hidden env ['CCC_ARM'] — a channel that can override what the invocation's own pins chose
+gate steps violate execution semantics:
+  ci.yml job=test step="arm contract": tests/regression/check_arm_popcount_contract.py runs with hidden env ['CCC_ARM'] — a channel that can override what the invocation's own pins chose
+gate steps violate execution semantics:
+  ci.yml job=test step="arm contract": tests/regression/check_arm_popcount_contract.py runs with hidden env ['CCC_ARM'] — a channel that can override what the invocation's own pins chose
+gate steps violate execution semantics:
+  ci.yml job=test step="arm contract": tests/regression/check_arm_popcount_contract.py runs with hidden env ['PYTHONOPTIMIZE'] — a channel that can override what the invocation's own pins chose
+gate steps violate execution semantics:
+  ci.yml job=test step="arm contract": tests/regression/check_arm_popcount_contract.py runs with hidden env ['PYTHONOPTIMIZE'] — a channel that can override what the invocation's own pins chose
+gate steps violate execution semantics:
+  ci.yml job=test step="arm contract": tests/regression/check_arm_popcount_contract.py runs with hidden env ['PYTHONOPTIMIZE'] — a channel that can override what the invocation's own pins chose
+..gate steps violate execution semantics:
+  ci.yml job=test step="Verify x86-64 assembly differential": scripts/asmdiff.py sits in a step kept off the green-path run (step `if: failure()` keeps it off the green-path run) — a gate that does not execute on the PR path is not coverage
+gate steps violate execution semantics:
+  ci.yml job=test step="Verify x86-64 assembly differential": scripts/asmdiff.py sits in a step kept off the green-path run (step `if: runner.os == 'Windows'` keeps it off the green-path run) — a gate that does not execute on the PR path is not coverage
+gate steps violate execution semantics:
+  ci.yml job=test step="Verify x86-64 assembly differential": scripts/asmdiff.py sits in a step kept off the green-path run (step `if: ${{ github.event_name == 'schedule' }}` keeps it off the green-path run) — a gate that does not execute on the PR path is not coverage
+.gate steps violate execution semantics:
+  ci.yml job=test step="Verify x86-64 assembly differential": scripts/asmdiff.py runs under continue-on-error (continue-on-error swallows its red) — a gate whose failure cannot fail the build is not a gate
+..gate steps violate execution semantics:
+  ci.yml job=test step="Verify x86-64 assembly differential": scripts/asmdiff.py runs with hidden env ['LCCC_GAS'] — a channel that can override what the invocation's own pins chose
+gate steps violate execution semantics:
+  ci.yml job=test step="Verify x86-64 assembly differential": scripts/asmdiff.py runs with hidden env ['LCCC'] — a channel that can override what the invocation's own pins chose
+gate steps violate execution semantics:
+  ci.yml job=test step="Verify x86-64 assembly differential": scripts/asmdiff.py runs with hidden env ['LCCC_OBJDUMP'] — a channel that can override what the invocation's own pins chose
+gate steps violate execution semantics:
+  ci.yml job=test step="Verify x86-64 assembly differential": scripts/asmdiff.py runs with hidden env ['LCCC_OBJDUMP'] — a channel that can override what the invocation's own pins chose
+.gate steps violate execution semantics:
+  ci.yml job=test step="Verify x86-64 assembly differential": scripts/asmdiff.py runs under continue-on-error (job-level continue-on-error swallows its red) — a gate whose failure cannot fail the build is not a gate
+gate steps violate execution semantics:
+  ci.yml job=test step="Verify x86-64 assembly differential": scripts/asmdiff.py sits in a step kept off the green-path run (job `if: github.event_name == 'schedule'` keeps the whole job off the green-path run) — a gate that does not execute on the PR path is not coverage
+.gate steps violate execution semantics:
+  ci.yml job=t step="g": tests/linker/run_linker_tests.py runs with hidden env ['LINKTEST_CC'] — a channel that can override what the invocation's own pins chose
+.gate steps violate execution semantics:
+  ci.yml job=t step="g": scripts/ensure_gas_247.sh runs with hidden env ['GAS_DL_DIR'] — a channel that can override what the invocation's own pins chose
+gate steps violate execution semantics:
+  ci.yml job=t step="g": scripts/ensure_gas_247.sh runs with hidden env ['GAS_CACHE'] — a channel that can override what the invocation's own pins chose
+.gate steps violate execution semantics:
+  ci.yml job=t step="g": scripts/ensure_gas_247.sh is mentioned in a run body outside the command-position grammar — spell it as one command or remove the mention
+gate steps violate execution semantics:
+  ci.yml job=t step="g": scripts/asmdiff.py is mentioned in a run body outside the command-position grammar — spell it as one command or remove the mention
+.gate steps violate execution semantics:
+  ci.yml job=test step="Verify x86-64 assembly differential": scripts/asmdiff.py runs with hidden env ['LCCC_OBJDUMP'] — a channel that can override what the invocation's own pins chose
+......................gate steps violate execution semantics:
+  ci.yml job=test step="Verify x86-64 assembly differential": scripts/asmdiff.py sits in a step kept off the green-path run (workflow `on:' (workflow_dispatch) never runs on the push/pull_request path) — a gate that does not execute on the PR path is not coverage
+gate steps violate execution semantics:
+  ci.yml job=test step="Verify x86-64 assembly differential": scripts/asmdiff.py sits in a step kept off the green-path run (workflow `on:' (release) never runs on the push/pull_request path) — a gate that does not execute on the PR path is not coverage
+gate steps violate execution semantics:
+  ci.yml job=test step="Verify x86-64 assembly differential": scripts/asmdiff.py sits in a step kept off the green-path run (workflow `on:' (release, workflow_dispatch) never runs on the push/pull_request path) — a gate that does not execute on the PR path is not coverage
+...gate steps violate execution semantics:
+  ci.yml job=test step="Verify x86-64 assembly differential": scripts/asmdiff.py sits in a step kept off the green-path run (workflow `on:' (schedule) never runs on the push/pull_request path) — a gate that does not execute on the PR path is not coverage
+.gate steps violate execution semantics:
+  ci.yml job=test step="Verify x86-64 assembly differential": scripts/asmdiff.py sits in a step kept off the green-path run (workflow `on:' (schedule) never runs on the push/pull_request path) — a gate that does not execute on the PR path is not coverage
+gate steps violate execution semantics:
+  ci.yml job=test step="Verify x86-64 assembly differential": scripts/asmdiff.py sits in a step kept off the green-path run (workflow `on:' (schedule) never runs on the push/pull_request path) — a gate that does not execute on the PR path is not coverage
+..gate steps violate execution semantics:
+  ci.yml job=test step="Verify x86-64 assembly differential": scripts/asmdiff.py sits in a step kept off the green-path run (workflow `on:' (nothing declared) never runs on the push/pull_request path) — a gate that does not execute on the PR path is not coverage
+.
+----------------------------------------------------------------------
+Ran 71 tests in 13.950s
+
+OK
