@@ -856,7 +856,9 @@ fn parse_single_data_value(s: &str) -> Result<DataValue, String> {
             let (sym_b_raw, addend) = if let Some(plus_pos) = rest.find('+') {
                 let b = rest[..plus_pos].trim();
                 let add_str = rest[plus_pos + 1..].trim();
-                let add_val: i64 = add_str.parse().unwrap_or(0);
+                let add_val: i64 = parse_data_value_int(add_str).map_err(|_| {
+                    format!("invalid symbol-difference addend in data expression: {s}")
+                })?;
                 (b, add_val)
             } else {
                 (rest, 0i64)
@@ -879,7 +881,7 @@ fn parse_single_data_value(s: &str) -> Result<DataValue, String> {
 
         if is_sym_start {
             // Not a symbol diff — parse as symbol reference with optional addend
-            let (sym, addend) = parse_symbol_addend(s);
+            let (sym, addend) = parse_symbol_addend(s)?;
             return Ok(DataValue::Symbol { name: sym, addend });
         } else if could_be_numeric_ref && is_numeric_label_ref(s) {
             // Standalone numeric label reference like "2f" or "1b"
@@ -907,7 +909,7 @@ fn parse_single_data_value(s: &str) -> Result<DataValue, String> {
                     // Check if right side looks like a symbol
                     let r_first = right.chars().next().unwrap_or('\0');
                     if r_first.is_ascii_alphabetic() || r_first == '_' || r_first == '.' {
-                        let (sym, extra_addend) = parse_symbol_addend(right);
+                        let (sym, extra_addend) = parse_symbol_addend(right)?;
                         return Ok(DataValue::Symbol {
                             name: sym,
                             addend: offset + extra_addend,
@@ -940,23 +942,19 @@ fn find_symbol_diff_minus(expr: &str) -> Option<usize> {
     asm_preprocess::find_symbol_diff_minus(expr)
 }
 
-fn parse_symbol_addend(s: &str) -> (String, i64) {
-    if let Some(plus_pos) = s.find('+') {
-        let sym = s[..plus_pos].trim().to_string();
-        let off: i64 = s[plus_pos + 1..].trim().parse().unwrap_or(0);
-        (sym, off)
-    } else if let Some(minus_pos) = s.find('-') {
-        if minus_pos > 0 {
-            let sym = s[..minus_pos].trim().to_string();
-            let off_str = &s[minus_pos..];
-            let off: i64 = off_str.parse().unwrap_or(0);
-            (sym, off)
-        } else {
-            (s.to_string(), 0)
+fn parse_symbol_addend(s: &str) -> Result<(String, i64), String> {
+    if let Some(pos) = s.find(['+', '-']) {
+        if pos > 0 {
+            let sym = s[..pos].trim();
+            let offset = parse_data_value_int(&s[pos..])
+                .map_err(|_| format!("unsupported symbolic data expression: {s}"))?;
+            if sym.is_empty() {
+                return Err(format!("missing symbol in data expression: {s}"));
+            }
+            return Ok((sym.to_string(), offset));
         }
-    } else {
-        (s.to_string(), 0)
     }
+    Ok((s.to_string(), 0))
 }
 
 fn parse_instruction(line: &str) -> Result<AsmStatement, String> {

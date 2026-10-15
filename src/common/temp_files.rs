@@ -18,12 +18,12 @@
 //! ln -s ~/victim.o /tmp/ccc_<pid>_big.0.o && TMPDIR=/tmp exec lccc -O1 big.c
 //! ```
 //!
-//! Managed temporary files live in `$TMPDIR/lccc-<pid>-<nanos>-<n>/`, created with
-//! `mkdir` mode 0700 and never reused: an attacker cannot pre-create it (a
-//! pre-placed file/symlink/directory makes `mkdir` fail with `EEXIST`, and we
-//! retry with the next candidate), and cannot write into it afterwards, because
-//! it is owned by us and mode 0700. The directory is removed when the last
-//! `TempFile` guard drops, so a compile leaves no debris behind.
+//! Managed temporary paths live in `$TMPDIR/lccc-<pid>-<nanos>-<n>/`,
+//! created with exclusive `mkdir` mode 0700. A pre-placed entry prevents
+//! creation; no planted path is adopted. Managed guards lease the directory
+//! even for paths not written yet. The last lease removes an empty directory;
+//! kept files AND pending kept paths intentionally retain their directory.
+//! Debug dumps use a separate persistent private directory without leases.
 //!
 //! If no private directory can be created, path-reserving APIs fail closed.
 //! A read-only public directory can still contain a symlink to a writable file;
@@ -152,8 +152,9 @@ pub fn private_temp_dir() -> Option<&'static Path> {
 }
 
 /// A generation is owned by live guards, including paths not yet materialized.
-/// Removing an empty directory on *every* file drop races those pending paths;
-/// caching the removed path in OnceLock also breaks sequential generations.
+/// A later generation mints candidate names and uses exclusive mkdir plus an
+/// ownership probe: even if a name recurs, it cannot adopt a planted path.
+/// Reaping on each file drop would race other reserved paths.
 struct ManagedTempDirectory {
     path: PathBuf,
     retained: AtomicBool,

@@ -110,3 +110,48 @@ fn march_has_c_extension(march: &str) -> bool {
     // 'g' expands to 'imafd' (no 'c'), so only check for explicit 'c'
     base.contains('c')
 }
+
+#[cfg(test)]
+mod data_expression_contracts {
+    use super::assemble_with_args;
+    use crate::common::temp_files::TempFile;
+
+    #[test]
+    fn unrepresentable_data_expressions_never_write_successful_objects() {
+        for directive in ["byte", "half", "word", "quad"] {
+            for expr in ["missing*2", "missing+other", "missing-other+more"] {
+                let out = TempFile::try_new("riscv", "invalid-data", "o")
+                    .expect("reserve private RISC-V negative-test output");
+                let asm = format!(".data\n.{directive} {expr}\n");
+                let error =
+                    assemble_with_args(&asm, &out.path().to_string_lossy(), &[]).expect_err(&asm);
+                assert!(
+                    !out.path().exists(),
+                    "{asm} unexpectedly produced an object"
+                );
+                assert!(
+                    error.contains("expression") || error.contains("addend"),
+                    "{asm}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn valid_forward_difference_and_relocation_remain_accepted() {
+        for directive in ["byte", "half", "word", "quad"] {
+            for expr in if directive == "word" || directive == "quad" {
+                &["end-start", "external+4"][..]
+            } else {
+                &["end-start"][..]
+            } {
+                let out = TempFile::try_new("riscv", "valid-data", "o")
+                    .expect("reserve private RISC-V positive-test output");
+                let asm = format!(".data\nstart: .{directive} {expr}\nend:\n");
+                assemble_with_args(&asm, &out.path().to_string_lossy(), &[])
+                    .unwrap_or_else(|error| panic!("{asm}: {error}"));
+                assert!(out.path().metadata().unwrap().len() > 0);
+            }
+        }
+    }
+}

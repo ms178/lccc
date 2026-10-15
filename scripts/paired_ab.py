@@ -113,10 +113,10 @@ def run_once(binary: str) -> tuple[int, str]:
     return r.returncode, r.stdout
 
 
-def time_run(binary: str) -> float:
+def time_run(binary: str) -> tuple[float, int, str]:
     t0 = time.perf_counter()
-    subprocess.run([binary], capture_output=True)
-    return (time.perf_counter() - t0) * 1000.0
+    r = subprocess.run([binary], capture_output=True, text=True)
+    return (time.perf_counter() - t0) * 1000.0, r.returncode, r.stdout
 
 
 def sign_test_p(diffs: list[float]) -> float:
@@ -215,7 +215,7 @@ def main() -> int:
     rc_b, out_b = run_once(bin_b)
     result["arm_a"]["warmup"] = {"rc": rc_a, "stdout_sha256": sha256_of_str(out_a)}
     result["arm_b"]["warmup"] = {"rc": rc_b, "stdout_sha256": sha256_of_str(out_b)}
-    if (rc_a, out_a) != (rc_b, out_b):
+    if rc_a != 0 or rc_b != 0 or out_a != out_b:
         print(
             "\n  CORRECTNESS FAILURE: the two arms disagree, so no timing "
             "comparison is meaningful.\n"
@@ -242,17 +242,39 @@ def main() -> int:
         return 3
 
     # ---- interleaved, order-alternated timing -------------------------
+    if args.rounds <= 0 or args.warmup < 0:
+        result['verdict'] = 'invalid-sample-count'
+        emit(args.json, result)
+        return 2
     ta: list[float] = []
     tb: list[float] = []
+    records: list[dict] = []
+    result['samples'] = records
     total = args.warmup + args.rounds
     for r in range(total):
-        if r % 2 == 0:
-            a, b = time_run(bin_a), time_run(bin_b)
-        else:
-            b, a = time_run(bin_b), time_run(bin_a)
-        if r >= args.warmup:
-            ta.append(a)
-            tb.append(b)
+        order = ((('a',bin_a),('b',bin_b)) if r % 2 == 0
+                 else (('b',bin_b),('a',bin_a)))
+        for position, (arm,binary) in enumerate(order):
+            try:
+                elapsed, rc, out = time_run(binary)
+            except (OSError, subprocess.SubprocessError) as exc:
+                records.append({'round':r,'arm':arm,'order':position,
+                                'phase':'warmup' if r < args.warmup else 'timed',
+                                'error':str(exc)})
+                result['verdict'] = 'infrastructure-failure'
+                emit(args.json, result)
+                return 4
+            records.append({'round':r,'arm':arm,'order':position,
+                            'phase':'warmup' if r < args.warmup else 'timed',
+                            'rc':rc,'stdout_sha256':sha256_of_str(out),
+                            'ms':elapsed})
+            if rc != 0 or out != out_a or not (0 <= elapsed < float('inf')):
+                result['verdict'] = 'correctness-failure'
+                print(f'CORRECTNESS FAILURE: {arm} round {r} rc={rc} output differs from preflight',file=sys.stderr)
+                emit(args.json, result)
+                return 4
+            if r >= args.warmup:
+                (ta if arm == 'a' else tb).append(elapsed)
 
     sa, sb = summarise(args.name_a, ta), summarise(args.name_b, tb)
     diffs = [x - y for x, y in zip(ta, tb)]  # >0 means A slower than B

@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import re
 import os
 import shutil
@@ -64,9 +65,8 @@ def timed_function_hash(obj: Path) -> str:
     alone and strip the address column, which moves whenever anything ahead of
     it changes size, and the relocation-dependent RIP displacements.
 
-    Falls back to hashing the whole object if objdump is unavailable, which
-    only makes the artifact filter more conservative (fewer deltas classified
-    as noise).
+    Falls back to hashing the whole object if objdump is unavailable. Both
+    hashes are diagnostics only: neither can auto-waive a runtime regression.
     """
     try:
         r = subprocess.run(
@@ -130,9 +130,8 @@ def build_arm(arm: str, cc: str, env_extra: dict[str, str], cflags: list[str],
                        capture_output=True, text=True, env=env)
     if r.returncode != 0:
         return False, f"kernel compile failed: {r.stderr.strip()[:300]}", ""
-    # Hash the kernel object. Relocatable objects carry no timestamp, so this
-    # is a stable fingerprint of the generated code -- see `codegen_hash` use
-    # in the baseline comparison below.
+    # Diagnostic fingerprint of the normalized timed function, NOT a proof
+    # of equal linked layout, callee implementations, relocations or data.
     digest = timed_function_hash(kobj)
     # Link with the reference compiler so the linker is identical across arms.
     r = subprocess.run([REFERENCE_CC, str(kobj), str(driver_obj), "-o", str(out), "-lm"],
@@ -177,19 +176,55 @@ def choose_taskset(cpu_option: str) -> tuple[list[str], str]:
     return [taskset, "-c", str(cpu)], f"CPU {cpu} via taskset"
 
 
-def time_once(binary: Path, inner: int, taskset_prefix: list[str]) -> tuple[float, str] | None:
-    r = subprocess.run([*taskset_prefix, str(binary), str(inner)], capture_output=True, text=True,
-                       timeout=300)
-    if r.returncode != 0:
-        return None
-    # Driver prints: "<seconds> <checksum>"
-    parts = r.stdout.split()
-    if len(parts) < 2:
-        return None
+def time_once(binary: Path, inner: int, taskset_prefix: list[str]) -> dict:
+    """Record even bad samples: none may silently disappear from a verdict."""
     try:
-        return float(parts[0]), parts[1]
+        r = subprocess.run([*taskset_prefix, str(binary), str(inner)],
+                           capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"rc": None, "error": str(exc), "stdout_sha256": None,
+                "seconds": None, "checksum": None}
+    parts = r.stdout.split()
+    sample = {"rc": r.returncode,
+              "stdout_sha256": hashlib.sha256(r.stdout.encode()).hexdigest(),
+              "seconds": None, "checksum": None}
+    if r.returncode != 0 or len(parts) != 2:
+        sample["error"] = f"exit {r.returncode}; expected exactly two output fields"
+        return sample
+    try:
+        sample["seconds"] = float(parts[0])
     except ValueError:
-        return None
+        sample["error"] = "invalid time"
+        return sample
+    if not math.isfinite(sample["seconds"]) or sample["seconds"] <= 0:
+        sample["error"] = "nonpositive/nonfinite time"
+        return sample
+    sample["checksum"] = parts[1]
+    return sample
+
+
+def checked_samples(records: list[dict], arms: list[str], rounds: int) -> tuple[dict, str | None]:
+    """Validate every arm/round (including warmups) before computing any ratio."""
+    if rounds <= 0 or len(records) != len(arms) * rounds:
+        return {}, "missing/extra benchmark samples"
+    checksums = set()
+    samples = {arm: [] for arm in arms}
+    for record in records:
+        arm = record['arm']
+        if arm not in samples or record['round'] not in range(rounds):
+            return {}, "unknown arm/round"
+        if record.get('rc') != 0 or record.get('error') or record.get('seconds') is None or record.get('checksum') is None:
+            return {}, f"{arm} round {record['round']}: run/parse failure {record.get('error', '')}"
+        if not math.isfinite(record['seconds']) or record['seconds'] <= 0:
+            return {}, "invalid sample time"
+        samples[arm].append(record)
+        checksums.add(record['checksum'])
+    if any(len(samples[arm]) != rounds or
+           {r['round'] for r in samples[arm]} != set(range(rounds)) for arm in arms):
+        return {}, "duplicate/missing arm/round"
+    if len(checksums) != 1:
+        return {}, "CORRECTNESS: samples disagree on checksum"
+    return {arm: min(r['seconds'] for r in rows) for arm, rows in samples.items()}, None
 
 
 REFERENCE_CC = "cc"
@@ -289,40 +324,33 @@ def main() -> int:
                     continue
                 binaries[arm] = out
                 hashes.setdefault(name, {})[arm] = digest
-            if len(binaries) < 2:
+            if len(binaries) != len(arms):
+                # An omitted compiler is not a complete multi-arm sample.
                 continue
 
             # Balance both first/second position and (for 3+ arms) relative
             # neighbours.  Merely running A then B inside every repetition is
             # not an A/B experiment: warm-cache, thermal and scheduler drift
             # would all be permanently assigned to one side.
-            samples: dict[str, list[float]] = {a: [] for a in binaries}
-            checksums: dict[str, set[str]] = {a: set() for a in binaries}
+            records: list[dict] = []
             base_order = list(binaries.items())
             for round_index in range(args.reps):
                 rotate = (round_index // 2) % len(base_order)
                 order = base_order[rotate:] + base_order[:rotate]
                 if round_index % 2:
                     order.reverse()
-                for arm, binary in order:
-                    got = time_once(binary, inner, taskset_prefix)
-                    if got is None:
-                        failures.append(f"{name}/{arm}: run failed")
-                        continue
-                    secs, checksum = got
-                    samples[arm].append(secs)
-                    checksums[arm].add(checksum)
+                for position, (arm, binary) in enumerate(order):
+                    records.append(dict(time_once(binary, inner, taskset_prefix),
+                                        round=round_index, arm=arm, order=position))
 
-            # A faster arm that computes something else is not faster.
-            distinct = {next(iter(v)) for v in checksums.values() if v}
-            if len(distinct) > 1:
-                failures.append(
-                    f"{name}: CORRECTNESS - arms disagree: "
-                    + ", ".join(f"{a}={next(iter(v))}" for a, v in checksums.items() if v)
-                )
+            result, error = checked_samples(records, list(binaries), args.reps)
+            if error:
+                failures.append(f"{name}: {error}")
+                # Preserve failures without presenting a partial performance
+                # result. The legacy baseline loader ignores metadata keys.
+                results[name] = {"_samples": records, "_invalid": error}
                 continue
-
-            results[name] = {a: min(s) for a, s in samples.items() if s}
+            results[name] = {**result, "_samples": records}
             # Preserve _hash_lccc for existing baseline files, while making
             # the alternate arm independently auditable as well.
             for arm, digest in hashes.get(name, {}).items():
@@ -375,7 +403,6 @@ def main() -> int:
     if args.baseline:
         base = json.loads(Path(args.baseline).read_text())
         regressed = 0
-        noise = 0
         print()
         for name, row in sorted(results.items()):
             if "lccc" not in row or name not in base or "lccc" not in base[name]:
@@ -385,44 +412,24 @@ def main() -> int:
             if abs(delta) <= args.tolerance:
                 continue
 
-            # CODE-LAYOUT ARTIFACT FILTER.
-            #
-            # A change elsewhere in the translation unit shifts the benchmarked
-            # function's address, and a 16-byte shift alone is worth several
-            # percent on this core (instruction-fetch and uop-cache windows).
-            # Observed for real: a fold that only touched the UNTIMED
-            # `bench_setup` moved `bench_run` from 0x1270 to 0x1260 and was
-            # reported as a 3.7% regression, while the two `bench_run` bodies
-            # were byte-for-byte identical.
-            #
-            # The kernel object's hash settles it. Identical codegen means the
-            # delta cannot be attributed to the change under test, so report it
-            # as noise instead of manufacturing a regression -- or, just as
-            # importantly, a win.
+            # The normalized function hash is diagnostic only. Same text can
+            # call a different callee, load different data, or move to another
+            # alignment. Never auto-waive a timing regression from this hash.
             old_hash = base[name].get("_hash_lccc", "")
             new_hash = row.get("_hash_lccc", "")
             same_codegen = bool(old_hash) and old_hash == new_hash
-
-            if same_codegen:
-                print(f"  NOISE     {name}: {was*1e3:.3f} -> {now*1e3:.3f} ms "
-                      f"({delta:+.1f}%) - kernel codegen is IDENTICAL "
-                      f"({new_hash}); this is layout/measurement noise")
-                noise += 1
-            elif delta > 0:
+            diagnostic = f" (normalized function hash equal: {new_hash}; investigate layout/callees/data)" if same_codegen else ""
+            if delta > 0:
                 print(f"  REGRESSED {name}: {was*1e3:.3f} -> {now*1e3:.3f} ms "
-                      f"({delta:+.1f}%)")
+                      f"({delta:+.1f}%){diagnostic}")
                 regressed += 1
             else:
                 print(f"  IMPROVED  {name}: {was*1e3:.3f} -> {now*1e3:.3f} ms "
-                      f"({delta:+.1f}%)")
+                      f"({delta:+.1f}%){diagnostic}")
 
-        if noise:
-            print(f"\n  note: {noise} kernel(s) moved beyond the tolerance with "
-                  f"UNCHANGED codegen. That is the layout-noise floor of this "
-                  f"host; treat deltas smaller than it as unmeasurable.")
         if regressed:
             print(f"\n  FAIL: {regressed} kernel(s) regressed beyond "
-                  f"{args.tolerance}% WITH changed codegen")
+                  f"{args.tolerance}%")
             return 1
         print("\n  OK: no runtime regressions against baseline")
 

@@ -341,6 +341,52 @@ fn label_name(l: &str) -> Option<&str> {
     Some(&t[..t.len() - 1])
 }
 
+/// Skip legacy instruction-prefix tokens, not substrings of mnemonics. The
+/// emitter normally writes a bare mnemonic, but GAS accepts prefixes as
+/// separate tokens. Both read modelling and CFG construction must use this
+/// same decoded instruction; treating a prefixed jump as fall-through can
+/// incorrectly make a real observer unreachable.
+fn unprefixed_insn(mut text: &str) -> (&str, &str) {
+    loop {
+        let (mn, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+        if !matches!(
+            mn,
+            "bnd"
+                | "notrack"
+                | "lock"
+                | "rep"
+                | "repe"
+                | "repz"
+                | "repne"
+                | "repnz"
+                | "data16"
+                | "addr16"
+                | "addr32"
+                | "rex"
+                | "rex64"
+                | "xacquire"
+                | "xrelease"
+                | "cs"
+                | "ds"
+                | "es"
+                | "fs"
+                | "gs"
+                | "ss"
+        ) || rest.trim().is_empty()
+        {
+            return (mn, rest.trim());
+        }
+        text = rest.trim_start();
+    }
+}
+
+fn is_call(mn: &str) -> bool {
+    matches!(
+        mn,
+        "call" | "callq" | "callw" | "calll" | "lcall" | "lcallq" | "lcallw" | "lcalll"
+    )
+}
+
 /// Successor line indices of `i` inside one function body.  Direct `jmp`/
 /// `jcc` targets resolve through `labels`; an unresolved or indirect branch
 /// conservatively reaches every line (fail closed).
@@ -361,10 +407,7 @@ fn successor_lines(
         fall(&mut v);
         return v;
     }
-    let (mn, rest) = match t.find(|c: char| c.is_ascii_whitespace()) {
-        Some(p) => (&t[..p], t[p..].trim()),
-        None => (t, ""),
-    };
+    let (mn, rest) = unprefixed_insn(t);
     match mn {
         "ret" | "retq" | "iret" | "iretq" | "ud2" => Vec::new(),
         "jmp" | "jmpq" => {
@@ -419,8 +462,8 @@ fn allowed_masks(body: &[&str]) -> Vec<u32> {
             continue;
         }
         let (mut reads, mut writes) = super::fp_liveness::upper_vector_access_line(text);
-        let (mn, operand) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
-        if matches!(mn, "call" | "callq")
+        let (mn, operand) = unprefixed_insn(text);
+        if is_call(mn)
             || mn.starts_with('j')
                 && (operand.trim().starts_with('*') || !labels.contains_key(operand.trim()))
         {
@@ -573,6 +616,43 @@ mod tests {
                 "full overwrite remains a positive control: {out}"
             );
         }
+    }
+
+    #[test]
+    fn prefixed_external_transfers_observe_upper_arguments() {
+        for transfer in [
+            "notrack call *%rax",
+            "bnd call witness",
+            "lcall witness",
+            "notrack jmp *%rax",
+            "data16 call witness",
+            "bnd notrack call *%rax",
+        ] {
+            let src = format!(
+                "f:\n    vmovupd (%rdi), %ymm0\n    addsd %xmm2, %xmm0\n    {transfer}\n    ret\n"
+            );
+            let (out, _) = run(&src);
+            assert!(
+                out.contains("    addsd %xmm2, %xmm0\n"),
+                "{transfer}: {out}"
+            );
+            let killed = src.replace(
+                transfer,
+                &format!("vxorps %ymm0, %ymm0, %ymm0\n    {transfer}"),
+            );
+            let (out, count) = run(&killed);
+            assert!(count > 0 && out.contains("vaddsd"), "{transfer}: {out}");
+        }
+    }
+
+    #[test]
+    fn prefixed_local_jump_uses_the_real_cfg_not_fallthrough() {
+        // A jump over a full overwrite still reaches the YMM reader. The
+        // unprefixed reader is local: an external-target mask alone cannot
+        // compensate for incorrectly modelling the jump as fall-through.
+        let src = "f:\n    vmovupd (%rdi), %ymm0\n    addsd %xmm2, %xmm0\n    notrack jmp .Lread\n    vxorps %ymm0, %ymm0, %ymm0\n.Lread:\n    vmovupd %ymm0, (%rsi)\n    ret\n";
+        let (out, _) = run(src);
+        assert!(out.contains("    addsd %xmm2, %xmm0\n"), "{out}");
     }
 
     #[test]

@@ -64,30 +64,64 @@ impl Parser {
             return TypeSpecifier::Vector(Box::new(ts), total_bytes);
         }
         if let Some(nelem) = self.attrs.parsing_ext_vector_nelem.take() {
-            // Compute total bytes from element count * element size
-            let elem_size = self.estimate_type_size(&ts);
-            return TypeSpecifier::Vector(Box::new(ts), nelem * elem_size);
+            // Type names (casts/compound literals/sizeof) do not go through the
+            // declaration's sema/lowering vector-size resolver. Resolve the
+            // actual target width here, including chains of typedefs, rather
+            // than guessing LP64 or inventing a four-byte unknown type.
+            let total = self
+                .ext_vector_element_storage_size(&ts)
+                .and_then(|width| nelem.checked_mul(width));
+            if let Some(total) = total {
+                return TypeSpecifier::Vector(Box::new(ts), total);
+            }
+            self.emit_error(
+                "invalid or unresolvable ext_vector_type element size",
+                self.peek_span(),
+            );
         }
         ts
     }
 
-    /// Rough size estimate for a scalar type (for ext_vector_type element size computation).
-    /// TODO: Long/UnsignedLong are 4 bytes on i686 and LongDouble is 12 on i686;
-    /// this currently hardcodes 64-bit sizes. Only affects ext_vector_type (not vector_size).
-    fn estimate_type_size(&self, ts: &TypeSpecifier) -> usize {
-        match ts {
-            TypeSpecifier::Char | TypeSpecifier::UnsignedChar | TypeSpecifier::Bool => 1,
-            TypeSpecifier::Short | TypeSpecifier::UnsignedShort => 2,
-            TypeSpecifier::Int
-            | TypeSpecifier::UnsignedInt
-            | TypeSpecifier::Signed
-            | TypeSpecifier::Unsigned => 4,
-            TypeSpecifier::Long | TypeSpecifier::UnsignedLong => 8, // 64-bit default
-            TypeSpecifier::LongLong | TypeSpecifier::UnsignedLongLong => 8,
-            TypeSpecifier::Float => 4,
-            TypeSpecifier::Double => 8,
-            TypeSpecifier::LongDouble => 16,
-            _ => 4, // fallback
+    /// Storage width of an ext_vector_type lane in a type-name context. This
+    /// is deliberately restricted to scalar element types: pointer, array,
+    /// record, and vector typedefs cannot be safely treated as four-byte
+    /// scalars. Typedef cycles (even in a malformed AST) fail closed.
+    fn ext_vector_element_storage_size(&self, ts: &TypeSpecifier) -> Option<usize> {
+        let mut spec = ts;
+        let mut seen = crate::common::fx_hash::FxHashSet::default();
+        loop {
+            match spec {
+                TypeSpecifier::TypedefName(name) => {
+                    if !seen.insert(name) {
+                        return None;
+                    }
+                    spec = self.typedef_type_specs.get(name)?;
+                }
+                TypeSpecifier::TypeofType(inner) => spec = inner,
+                // i686 long double's object sizeof is 12, but a vector lane
+                // occupies 16 bytes (as on LP64). Preserve that distinct
+                // storage contract; using scalar sizeof would make a 48-byte
+                // vector where Clang and the existing declaration path use 64.
+                TypeSpecifier::LongDouble => return Some(16),
+                TypeSpecifier::Char
+                | TypeSpecifier::UnsignedChar
+                | TypeSpecifier::Short
+                | TypeSpecifier::UnsignedShort
+                | TypeSpecifier::Int
+                | TypeSpecifier::UnsignedInt
+                | TypeSpecifier::Signed
+                | TypeSpecifier::Unsigned
+                | TypeSpecifier::Long
+                | TypeSpecifier::UnsignedLong
+                | TypeSpecifier::LongLong
+                | TypeSpecifier::UnsignedLongLong
+                | TypeSpecifier::Float
+                | TypeSpecifier::Double
+                | TypeSpecifier::Int128
+                | TypeSpecifier::UnsignedInt128
+                | TypeSpecifier::Bool => return Self::try_sizeof_type_spec(spec),
+                _ => return None,
+            }
         }
     }
 
