@@ -63,6 +63,29 @@ class SampleIntegrity(unittest.TestCase):
             self.assertIn('normalized function hash equal',out.getvalue())
             self.assertNotIn('NOISE',out.getvalue())
 
+    def test_compile_failures_are_saved_as_structured_receipts(self):
+        with tempfile.TemporaryDirectory() as td:
+            report=Path(td)/'nested'/'report.json'
+            argv=['bench_kernels.py','--lccc',str(Path(__file__)),
+                  '--gcc','fake-gcc','--clang','','--reference-cc','fake-gcc',
+                  '--kernels','adler32','--reps','1','--cpu','none',
+                  '--save',str(report)]
+            def fail_build(arm,cc,env,cflags,kernel,driver,out,workdir,receipts=None):
+                receipts.append({'arm':arm,'phase':'compile','command':[cc,'-c'],
+                                 'returncode':9,'stdout':'','stderr':'bad compile'})
+                return False,'kernel compile failed: bad compile',''
+            with mock.patch.object(sys,'argv',argv),\
+                 mock.patch.object(b,'build_arm',side_effect=fail_build),\
+                 mock.patch.object(b.subprocess,'run',return_value=mock.Mock(returncode=0,stdout='',stderr='')),\
+                 redirect_stdout(io.StringIO()):
+                self.assertEqual(b.main(),1)
+            data=json.loads(report.read_text())
+            self.assertEqual(data['adler32']['_invalid'],
+                             'one or more compiler arms failed to build')
+            self.assertEqual(len(data['adler32']['_builds']),2)
+            self.assertTrue(all(row['returncode']==9
+                                for row in data['adler32']['_builds']))
+
     def test_time_once_rejects_nonzero_or_partial_output(self):
         for rc, stdout in ((9,'0.1 2'), (0,'0.1'), (0,'NaN 2'), (0,'0.0 2'), (0,'0.1 2 extra')):
             with self.subTest(rc=rc, stdout=stdout):

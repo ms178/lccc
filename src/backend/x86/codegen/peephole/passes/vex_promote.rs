@@ -363,6 +363,8 @@ fn unprefixed_insn(mut text: &str) -> (&str, &str) {
                 | "addr16"
                 | "addr32"
                 | "rex"
+                | "rex.W"
+                | "rex.w"
                 | "rex64"
                 | "xacquire"
                 | "xrelease"
@@ -385,6 +387,11 @@ fn is_call(mn: &str) -> bool {
         mn,
         "call" | "callq" | "callw" | "calll" | "lcall" | "lcallq" | "lcallw" | "lcalll"
     )
+}
+
+fn is_conditional_branch(mn: &str) -> bool {
+    (mn.len() > 1 && mn.starts_with('j'))
+        || matches!(mn, "loop" | "loope" | "loopz" | "loopne" | "loopnz")
 }
 
 /// Successor line indices of `i` inside one function body.  Direct `jmp`/
@@ -419,7 +426,7 @@ fn successor_lines(
                 (0..n).collect()
             }
         }
-        _ if mn.len() > 1 && mn.starts_with('j') => {
+        _ if is_conditional_branch(mn) => {
             let mut v = Vec::new();
             fall(&mut v);
             if rest.starts_with('*') {
@@ -461,10 +468,19 @@ fn allowed_masks(body: &[&str]) -> Vec<u32> {
         if !is_insn_line(text) {
             continue;
         }
-        let (mut reads, mut writes) = super::fp_liveness::upper_vector_access_line(text);
         let (mn, operand) = unprefixed_insn(text);
+        // Prefixes are encoding modifiers, not the decoded operation. Feed
+        // the same canonical instruction to the effect model and the CFG;
+        // otherwise `rex.W xsave` loses its implicit YMM reads while a
+        // prefixed transfer gets a different successor graph.
+        let decoded = if operand.is_empty() {
+            mn.to_string()
+        } else {
+            format!("{mn} {operand}")
+        };
+        let (mut reads, mut writes) = super::fp_liveness::upper_vector_access_line(&decoded);
         if is_call(mn)
-            || mn.starts_with('j')
+            || is_conditional_branch(mn)
                 && (operand.trim().starts_with('*') || !labels.contains_key(operand.trim()))
         {
             // A target outside this model may observe ANY upper register.
@@ -650,9 +666,45 @@ mod tests {
         // A jump over a full overwrite still reaches the YMM reader. The
         // unprefixed reader is local: an external-target mask alone cannot
         // compensate for incorrectly modelling the jump as fall-through.
-        let src = "f:\n    vmovupd (%rdi), %ymm0\n    addsd %xmm2, %xmm0\n    notrack jmp .Lread\n    vxorps %ymm0, %ymm0, %ymm0\n.Lread:\n    vmovupd %ymm0, (%rsi)\n    ret\n";
+        let src = "f:\n    vmovupd (%rdi), %ymm0\n    addsd %xmm2, %xmm0\n    bnd jmp .Lread\n    vxorps %ymm0, %ymm0, %ymm0\n.Lread:\n    vmovupd %ymm0, (%rsi)\n    ret\n";
         let (out, _) = run(src);
         assert!(out.contains("    addsd %xmm2, %xmm0\n"), "{out}");
+    }
+
+    #[test]
+    fn loop_family_taken_edges_reach_upper_register_readers() {
+        for branch in ["loop", "loope", "loopz", "loopne", "loopnz"] {
+            let src = format!(
+                "f:\n    vmovupd (%rdi), %ymm0\n    addsd %xmm2, %xmm0\n    {branch} .Lread\n    vxorps %ymm0, %ymm0, %ymm0\n    jmp .Ldone\n.Lread:\n    vmovupd %ymm0, (%rsi)\n.Ldone:\n    ret\n"
+            );
+            let (out, _) = run(&src);
+            assert!(
+                out.contains("    addsd %xmm2, %xmm0\n"),
+                "{branch} taken edge lost: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_decoding_is_shared_with_upper_effect_modelling() {
+        for prefix in ["data16", "rep", "rex.W", "rex.w"] {
+            let src = format!(
+                "f:\n    vmovupd (%rsi), %ymm0\n    addsd %xmm2, %xmm0\n    {prefix} xsave (%rdi)\n    ret\n"
+            );
+            let (out, _) = run(&src);
+            assert!(
+                out.contains("    addsd %xmm2, %xmm0\n"),
+                "{prefix} hid xsave's implicit upper-register read: {out}"
+            );
+
+            let killed = src.replace(
+                &format!("    {prefix} xsave"),
+                &format!("    vxorps %ymm0, %ymm0, %ymm0\n    {prefix} xsave"),
+            );
+            let (out, count) = run(&killed);
+            assert!(count > 0 && out.contains("vaddsd"), "{prefix}: {out}");
+        }
+        assert_eq!(unprefixed_insn("rex.W jmp .Lx"), ("jmp", ".Lx"));
     }
 
     #[test]

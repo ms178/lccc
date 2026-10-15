@@ -2092,6 +2092,18 @@ mod branch_range_tests {
         }
     }
 
+    #[test]
+    fn symbol_difference_trailing_minus_is_an_add_relocation_addend() {
+        let w = assemble(".data\nA:\n.byte 0,0,0,0\nB:\n.byte 0,0,0,0\n.long A-B-4\n")
+            .expect("symbol difference must assemble");
+        let relocs = &w.base.sections[".data"].relocs;
+        assert_eq!(relocs.len(), 2, "ADD32 and SUB32 are both required");
+        assert_eq!(relocs[0].symbol_name, "A");
+        assert_eq!(relocs[0].addend, -4, "the trailing -4 applies to A-B");
+        assert_eq!(relocs[1].symbol_name, "B");
+        assert_eq!(relocs[1].addend, 0, "B must not absorb and invert -4");
+    }
+
     /// A surplus operand used to be discarded silently, so a malformed branch
     /// assembled as a valid one. The three literal-bearing forms now bound
     /// their operand counts.

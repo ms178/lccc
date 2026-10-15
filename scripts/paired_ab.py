@@ -176,7 +176,12 @@ def main() -> int:
     )
     args = ap.parse_args(_normalise_dash_values(sys.argv[1:]))
 
-    tmp = tempfile.mkdtemp(prefix="paired_ab_")
+    with tempfile.TemporaryDirectory(prefix="paired_ab_") as tmp:
+        return run_comparison(args, ap, tmp)
+
+
+def run_comparison(args, ap, tmp):
+    """Execute one comparison inside a deterministically cleaned workdir."""
     if args.bin_a and args.bin_b:
         bin_a, bin_b = args.bin_a, args.bin_b
     elif args.src:
@@ -268,7 +273,7 @@ def main() -> int:
                             'phase':'warmup' if r < args.warmup else 'timed',
                             'rc':rc,'stdout_sha256':sha256_of_str(out),
                             'ms':elapsed})
-            if rc != 0 or out != out_a or not (0 <= elapsed < float('inf')):
+            if rc != 0 or out != out_a or not (0 < elapsed < float('inf')):
                 result['verdict'] = 'correctness-failure'
                 print(f'CORRECTNESS FAILURE: {arm} round {r} rc={rc} output differs from preflight',file=sys.stderr)
                 emit(args.json, result)

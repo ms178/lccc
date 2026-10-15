@@ -14,6 +14,15 @@ the effect is smaller than the run-to-run spread.
 import argparse, json, math, re, statistics, subprocess, sys, tempfile, os
 from pathlib import Path
 
+
+class BuildFailure(RuntimeError):
+    """A compiler invocation failed; ``record`` is the complete receipt."""
+
+    def __init__(self, message, record):
+        super().__init__(message)
+        self.record = record
+
+
 def build(cc, kern, out, flags, repo, env=None, program=None, defines=()):
     """Compile one arm.
 
@@ -33,9 +42,32 @@ def build(cc, kern, out, flags, repo, env=None, program=None, defines=()):
     run_env = dict(os.environ)
     run_env.update(env or {})
     cmd = [cc, *flags, *[f"-D{d}" for d in defines], "-w", *src, "-o", out]
-    r = subprocess.run(cmd, capture_output=True, text=True, env=run_env)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, env=run_env)
+    except (OSError, subprocess.SubprocessError) as exc:
+        record = {
+            "compiler": cc,
+            "command": cmd,
+            "env_overrides": dict(env or {}),
+            "returncode": None,
+            "stdout": "",
+            "stderr": "",
+            "error": str(exc),
+        }
+        raise BuildFailure(f"build invocation failed for {cc} {program or kern}: {exc}", record) from exc
+    record = {
+        "compiler": cc,
+        "command": cmd,
+        "env_overrides": dict(env or {}),
+        "returncode": r.returncode,
+        "stdout": r.stdout,
+        "stderr": r.stderr,
+    }
     if r.returncode != 0:
-        sys.exit(f"build failed for {cc} {program or kern}: {r.stderr[:400]}")
+        raise BuildFailure(
+            f"build failed for {cc} {program or kern}: {r.stderr[:400]}", record
+        )
+    return record
 
 def sample_program(binary, cpu, reps=1):
     """Time a standalone program.
@@ -69,8 +101,21 @@ def sample(binary, cpu):
     return float(m.group(1)), int(m.group(2))
 
 def checked_sample(take, binary, expected, records, round_index, arm, order, phase):
-    """Every warmup/timed sample must agree, not just a later control run."""
-    elapsed, checksum = take(binary)
+    """Every invocation gets a receipt, including exceptions and bad output."""
+    try:
+        elapsed, checksum = take(binary)
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        records.append(
+            dict(
+                round=round_index,
+                arm=arm,
+                order=order,
+                phase=phase,
+                rc=None,
+                error=str(exc),
+            )
+        )
+        raise
     record = dict(round=round_index, arm=arm, order=order, phase=phase,
                   rc=0, checksum=str(checksum), seconds=elapsed)
     records.append(record)
@@ -116,14 +161,33 @@ def main():
     ta, tb = [], []
     ta_c = None
     records = []
+    build_records = []
     take = (lambda b: sample_program(b, a.cpu)) if a.program else (lambda b: sample(b, a.cpu))
     try:
         with tempfile.TemporaryDirectory() as d:
             ba, bb = os.path.join(d, "a"), os.path.join(d, "b")
-            build(a.a, a.kernel, ba, flags, a.repo, env=a_env,
-                  program=a.program, defines=defines)
-            build(a.b, a.kernel, bb, flags, a.repo, env=b_env,
-                  program=a.program, defines=defines)
+            for arm, compiler, binary, arm_env in (
+                ("a", a.a, ba, a_env),
+                ("b", a.b, bb, b_env),
+            ):
+                try:
+                    record = build(
+                        compiler,
+                        a.kernel,
+                        binary,
+                        flags,
+                        a.repo,
+                        env=arm_env,
+                        program=a.program,
+                        defines=defines,
+                    )
+                except BuildFailure as exc:
+                    record = exc.record
+                    record["arm"] = arm
+                    build_records.append(record)
+                    raise
+                record["arm"] = arm
+                build_records.append(record)
             for phase, count in (('warmup',3),('timed',a.samples)):
                 for i in range(count):
                     order = (('a',ba,ta),('b',bb,tb)) if i%2 == 0 else (('b',bb,tb),('a',ba,ta))
@@ -131,15 +195,17 @@ def main():
                         elapsed,checksum = checked_sample(take,binary,ta_c,records,i,arm,position,phase)
                         if ta_c is None: ta_c = checksum
                         if phase == 'timed': times.append(elapsed)
-    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+    except (BuildFailure, ValueError, OSError, subprocess.SubprocessError) as exc:
         if a.json:
             Path(a.json).write_text(json.dumps({'verdict':'correctness-or-infrastructure-failure',
-                                               'detail':str(exc),'samples':records},indent=2)+'\n')
+                                               'detail':str(exc),'builds':build_records,
+                                               'samples':records},indent=2)+'\n')
         print(f'CORRECTNESS/INFRASTRUCTURE FAILURE: {exc}',file=sys.stderr)
         return 2
     if a.json:
         Path(a.json).write_text(json.dumps({'verdict':'sample-complete',
-                                           'checksum':str(ta_c),'samples':records},indent=2)+'\n')
+                                           'checksum':str(ta_c),'builds':build_records,
+                                           'samples':records},indent=2)+'\n')
 
     pairs = [(x, y) for x, y in zip(ta, tb)]
     wins = sum(1 for x, y in pairs if y < x)

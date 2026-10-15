@@ -118,24 +118,45 @@ def parse_env_assignments(raw: str) -> dict[str, str]:
 
 
 def build_arm(arm: str, cc: str, env_extra: dict[str, str], cflags: list[str],
-              kernel: Path, driver_obj: Path, out: Path, workdir: Path) -> tuple[bool, str, str]:
-    """Compile + link one arm. Returns (ok, error, codegen_hash)."""
+              kernel: Path, driver_obj: Path, out: Path, workdir: Path,
+              receipts: list[dict] | None = None) -> tuple[bool, str, str]:
+    """Compile + link one arm and retain every subprocess receipt."""
+    if receipts is None:
+        receipts = []
     # Two arms may deliberately invoke the exact same compiler under different
     # knobs.  Key the object on the ARM, not the compiler basename, so one arm
     # can never overwrite the other before its link/hash step.
     kobj = workdir / f"{kernel.stem}.{arm}.o"
     env = dict(os.environ)
     env.update(env_extra)
-    r = subprocess.run([cc, "-c", str(kernel), "-o", str(kobj), *cflags],
-                       capture_output=True, text=True, env=env)
+    compile_cmd = [cc, "-c", str(kernel), "-o", str(kobj), *cflags]
+    try:
+        r = subprocess.run(compile_cmd, capture_output=True, text=True, env=env)
+    except (OSError, subprocess.SubprocessError) as exc:
+        receipts.append({"arm": arm, "phase": "compile", "command": compile_cmd,
+                         "env_overrides": env_extra, "returncode": None,
+                         "stdout": "", "stderr": "", "error": str(exc)})
+        return False, f"kernel compile invocation failed: {exc}", ""
+    receipts.append({"arm": arm, "phase": "compile", "command": compile_cmd,
+                     "env_overrides": env_extra, "returncode": r.returncode,
+                     "stdout": r.stdout, "stderr": r.stderr})
     if r.returncode != 0:
         return False, f"kernel compile failed: {r.stderr.strip()[:300]}", ""
     # Diagnostic fingerprint of the normalized timed function, NOT a proof
     # of equal linked layout, callee implementations, relocations or data.
     digest = timed_function_hash(kobj)
     # Link with the reference compiler so the linker is identical across arms.
-    r = subprocess.run([REFERENCE_CC, str(kobj), str(driver_obj), "-o", str(out), "-lm"],
-                       capture_output=True, text=True)
+    link_cmd = [REFERENCE_CC, str(kobj), str(driver_obj), "-o", str(out), "-lm"]
+    try:
+        r = subprocess.run(link_cmd, capture_output=True, text=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        receipts.append({"arm": arm, "phase": "link", "command": link_cmd,
+                         "env_overrides": {}, "returncode": None,
+                         "stdout": "", "stderr": "", "error": str(exc)})
+        return False, f"link invocation failed: {exc}", ""
+    receipts.append({"arm": arm, "phase": "link", "command": link_cmd,
+                     "env_overrides": {}, "returncode": r.returncode,
+                     "stdout": r.stdout, "stderr": r.stderr})
     if r.returncode != 0:
         return False, f"link failed: {r.stderr.strip()[:300]}", ""
     return True, "", digest
@@ -306,9 +327,25 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="lccc-bench-") as td:
         work = Path(td)
         driver_obj = work / "driver.o"
-        r = subprocess.run([REFERENCE_CC, "-O2", "-c", str(driver), "-o", str(driver_obj)],
-                           capture_output=True, text=True)
+        driver_cmd = [REFERENCE_CC, "-O2", "-c", str(driver), "-o", str(driver_obj)]
+        try:
+            r = subprocess.run(driver_cmd, capture_output=True, text=True)
+            driver_receipt = {"phase": "driver-compile", "command": driver_cmd,
+                              "returncode": r.returncode, "stdout": r.stdout,
+                              "stderr": r.stderr}
+        except (OSError, subprocess.SubprocessError) as exc:
+            driver_receipt = {"phase": "driver-compile", "command": driver_cmd,
+                              "returncode": None, "stdout": "", "stderr": "",
+                              "error": str(exc)}
+            results["_harness"] = {"_invalid": "driver build invocation failed",
+                                   "_builds": [driver_receipt]}
+            save_results(args.save, results)
+            print(f"error: driver build invocation failed: {exc}", file=sys.stderr)
+            return 2
         if r.returncode != 0:
+            results["_harness"] = {"_invalid": "driver build failed",
+                                   "_builds": [driver_receipt]}
+            save_results(args.save, results)
             print(f"error: driver build failed:\n{r.stderr}", file=sys.stderr)
             return 2
 
@@ -316,16 +353,25 @@ def main() -> int:
             name = kernel.stem[2:]
             inner = args.inner or default_inner(name)
             binaries: dict[str, Path] = {}
+            build_records: list[dict] = []
             for arm, cc, env_extra in arms:
                 out = work / f"{name}.{arm}"
-                ok, err, digest = build_arm(arm, cc, env_extra, cflags, kernel, driver_obj, out, work)
+                ok, err, digest = build_arm(
+                    arm, cc, env_extra, cflags, kernel, driver_obj, out, work,
+                    receipts=build_records,
+                )
                 if not ok:
                     failures.append(f"{name}/{arm}: {err}")
                     continue
                 binaries[arm] = out
                 hashes.setdefault(name, {})[arm] = digest
             if len(binaries) != len(arms):
-                # An omitted compiler is not a complete multi-arm sample.
+                # An omitted compiler is not a complete multi-arm sample, but
+                # its failed invocations remain first-class structured evidence.
+                results[name] = {
+                    "_invalid": "one or more compiler arms failed to build",
+                    "_builds": build_records,
+                }
                 continue
 
             # Balance both first/second position and (for 3+ arms) relative
@@ -348,9 +394,10 @@ def main() -> int:
                 failures.append(f"{name}: {error}")
                 # Preserve failures without presenting a partial performance
                 # result. The legacy baseline loader ignores metadata keys.
-                results[name] = {"_samples": records, "_invalid": error}
+                results[name] = {"_samples": records, "_builds": build_records,
+                                 "_invalid": error}
                 continue
-            results[name] = {**result, "_samples": records}
+            results[name] = {**result, "_samples": records, "_builds": build_records}
             # Preserve _hash_lccc for existing baseline files, while making
             # the alternate arm independently auditable as well.
             for arm, digest in hashes.get(name, {}).items():
@@ -397,7 +444,7 @@ def main() -> int:
         print(f"  FAIL {f}")
 
     if args.save:
-        Path(args.save).write_text(json.dumps(results, indent=2, sort_keys=True) + "\n")
+        save_results(args.save, results)
         print(f"\n  saved -> {args.save}")
 
     if args.baseline:
@@ -434,6 +481,15 @@ def main() -> int:
         print("\n  OK: no runtime regressions against baseline")
 
     return 1 if failures else 0
+
+
+def save_results(path: str | None, results: dict) -> None:
+    """Persist receipts on every exit path that accepted ``--save``."""
+    if not path:
+        return
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(results, indent=2, sort_keys=True) + "\n")
 
 
 def default_inner(name: str) -> int:
