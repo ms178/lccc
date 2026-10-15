@@ -179,4 +179,67 @@ if [[ -x $CCC_ARM ]]; then
     cmp -s "$vault/victim.txt" "$vault/victim.expected" || fail "lccc-arm followed a pre-placed symlink"
 fi
 
+# 5. Failure to create a private directory must not revive flat-name attacks.
+# Directory write permission is not needed to follow a pre-existing symlink
+# and overwrite its writable target. A warning followed by fallback is unsafe.
+chmod 0555 "$vault"
+if mkdir "$vault/permission-probe" 2>/dev/null; then
+    rmdir "$vault/permission-probe"
+    chmod 0700 "$vault"
+    echo "SKIP: read-only TMPDIR attack (permission-bypassing privileges)"
+else
+    chmod 0700 "$vault"
+    set +e
+    bash -c '
+        set -e
+        vault=$1; ccc=$2; work=$3; log=$4
+        ln -sf "$vault/victim.txt" "$vault/ccc_$$_a.0.o"
+        ln -sf "$vault/victim.txt" "$vault/ccc_$$_b.1.o"
+        ln -sf "$vault/victim.txt" "$vault/ccc_$$_main.2.o"
+        chmod 0555 "$vault"
+        cd "$work"
+        TMPDIR="$vault" exec "$ccc" -O1 a.c b.c main.c -o refused >"$log" 2>&1
+    ' _ "$vault" "$CCC" "$work" "$tmp/readonly.log"
+    rc=$?
+    set -e
+    chmod 0700 "$vault"
+    cmp -s "$vault/victim.txt" "$vault/victim.expected" \
+        || fail "read-only TMPDIR fallback overwrote the symlink target"
+    [[ $rc -ne 0 ]] || fail "private-directory failure did not stop compilation"
+    if grep -q 'panicked at' "$tmp/readonly.log"; then
+        fail "driver must report a normal temporary-directory error, not panic"
+    fi
+    grep -q 'cannot reserve a secure temporary-file directory' "$tmp/readonly.log" \
+        || { cat "$tmp/readonly.log" >&2; fail "compilation failed for the wrong reason"; }
+    echo "PASS: read-only TMPDIR fails closed without overwriting its symlink target"
+fi
+
+# 6. Unix accepts non-UTF-8 directory names. The internal driver's string
+# interface may reject them, but that is a normal error, not a worker panic.
+python3 - "$CCC" "$work" <<'PYUTF8'
+import os
+from pathlib import Path
+import subprocess
+import sys
+compiler, work = sys.argv[1], Path(sys.argv[2])
+source = work / 'nonutf8.c'
+source.write_text('int main(void) { return 0; }\n')
+assembly = work / 'nonutf8.s'
+subprocess.run([compiler, '-S', str(source), '-o', str(assembly)], check=True, timeout=20)
+base = os.fsencode(work) + b'/invalid-\xff'
+os.mkdir(base)
+for input_file in (source, assembly):
+    output = work / 'nonutf8-output'
+    output.unlink(missing_ok=True)
+    result = subprocess.run([compiler, '-O1', str(input_file), '-o', str(output)],
+                            env=os.environb | {b'TMPDIR': base},
+                            capture_output=True, timeout=20)
+    assert result.returncode != 0, 'unsupported temporary path unexpectedly accepted'
+    assert b'temp file path is not valid UTF-8' in result.stderr, result.stderr
+    assert b'panicked' not in result.stderr and b'internal error' not in result.stderr, result.stderr
+    assert not output.exists(), 'failed compilation published an executable'
+    assert os.listdir(base) == [], 'temporary directory lease leaked after conversion error'
+print('PASS: non-UTF-8 TMPDIR is rejected without panic, lossy paths or leaked leases')
+PYUTF8
+
 echo "PASS: temp files are symlink-safe (private 0700 directory, victim untouched, no TMPDIR debris)"

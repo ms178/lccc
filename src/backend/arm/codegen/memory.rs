@@ -11,6 +11,27 @@ use crate::ir::reexports::{IrConst, Operand, Value};
 impl ArmCodegen {
     // ---- Indexed (register+register) addressing for folded GEPs ----
 
+    pub(super) fn indexed_shift_ok(ty: IrType, shift: u8) -> bool {
+        shift == 0 || (shift <= 3 && (1usize << shift) == ty.size())
+    }
+
+    pub(super) fn indexed_index_type_ok(&self, index: &Value) -> bool {
+        matches!(
+            self.value_types.get(&index.0),
+            Some(
+                IrType::I8
+                    | IrType::U8
+                    | IrType::I16
+                    | IrType::U16
+                    | IrType::I32
+                    | IrType::U32
+                    | IrType::I64
+                    | IrType::U64
+                    | IrType::Ptr
+            )
+        )
+    }
+
     /// Compute the `[base, index]` / `[base, index, lsl #shift]` operand string
     /// and resolve the base/index registers. Returns None when either value is
     /// not in a GP register or the shift is unusable for the access size.
@@ -27,20 +48,45 @@ impl ArmCodegen {
         let ip = self
             .get_phys_reg_for_value(index.0)
             .filter(|r| !is_arm_fp_phys(*r))?;
-        // Sub-word loads/stores have no shifted register-offset form.
-        let sub_word = matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16);
-        if sub_word && shift != 0 {
-            return None;
-        }
-        if shift > 3 {
+        // The register-offset scale is zero or log2(access width), not
+        // an arbitrary SIB scale. Decider and emitter share this predicate.
+        if !Self::indexed_shift_ok(ty, shift) || !self.indexed_index_type_ok(index) {
             return None;
         }
         let b = callee_saved_name(bp);
         let i = callee_saved_name(ip);
+        let w = callee_saved_name_32(ip);
+        match self.value_types[&index.0] {
+            IrType::I32 | IrType::U32 => {
+                let extend = if self.value_types[&index.0] == IrType::I32 {
+                    "sxtw"
+                } else {
+                    "uxtw"
+                };
+                return Some(format!("[{b}, {w}, {extend} #{shift}]"));
+            }
+            IrType::I8 | IrType::I16 => {
+                let op = if self.value_types[&index.0] == IrType::I8 {
+                    "sxtb"
+                } else {
+                    "sxth"
+                };
+                self.state.emit_fmt(format_args!("    {op} {i}, {w}"));
+            }
+            IrType::U8 | IrType::U16 => {
+                let op = if self.value_types[&index.0] == IrType::U8 {
+                    "uxtb"
+                } else {
+                    "uxth"
+                };
+                self.state.emit_fmt(format_args!("    {op} {w}, {w}"));
+            }
+            _ => {}
+        }
         if shift == 0 {
-            Some(format!("[{}, {}]", b, i))
+            Some(format!("[{b}, {i}]"))
         } else {
-            Some(format!("[{}, {}, lsl #{}]", b, i, shift))
+            Some(format!("[{b}, {i}, lsl #{shift}]"))
         }
     }
 

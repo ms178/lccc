@@ -978,6 +978,14 @@ fn plan_loop(cx: &Ctx<'_>, lp: &NaturalLoop, out: &mut Vec<Rewrite>) {
         for inst in &func.blocks[eb].instructions {
             let Some(p) = Parts::of(inst) else { continue };
             let (e, op, ty) = (p.dest, p.op, p.ty);
+            // A carried result was computed in the preceding iteration's
+            // rounding environment; f(init) is also speculated on zero-trip
+            // paths. Without an FP-environment proof neither transformation
+            // preserves observable rounding/traps/flags. Keep integer PRE.
+            if ty.is_float() && super::fp_environment_observable() {
+                explain(e, "observable FP environment");
+                continue;
+            }
             if cx.defs.tainted(e.0) {
                 continue;
             }
@@ -1653,6 +1661,68 @@ mod tests {
         assert!(q.0 >= 14 && f.next_value_id > q.0);
         // Idempotent: a second run finds nothing new.
         assert_eq!(run(&mut f), 0);
+    }
+
+    #[test]
+    fn observable_fp_environment_blocks_fp_but_not_integer_pre() {
+        crate::common::types::set_target_elf_machine(EM_X86_64);
+        let mut tm = TargetModel::detect();
+        tm.fp_fma = false;
+        for observable in [false, true] {
+            let _guard =
+                crate::common::semantics::TestGuard::new(crate::common::semantics::Semantics {
+                    signed_overflow_wraps: false,
+                    fp_environment_observable: observable,
+                });
+            let fc = |x| Operand::Const(IrConst::F64(x));
+            let mut f = IrFunction::new("fp_environment".into(), IrType::F64, Vec::new(), false);
+            f.blocks
+                .push(block(0, vec![], Terminator::Branch(BlockId(1))));
+            f.blocks.push(block(
+                1,
+                vec![
+                    Instruction::Phi {
+                        dest: Value(1),
+                        ty: IrType::F64,
+                        incoming: vec![(fc(0.25), BlockId(0)), (val(3), BlockId(1))],
+                    },
+                    Instruction::Phi {
+                        dest: Value(10),
+                        ty: IrType::U64,
+                        incoming: vec![(i64c(0), BlockId(0)), (val(11), BlockId(1))],
+                    },
+                    binop(4, IrBinOp::Mul, val(1), val(1), IrType::F64),
+                    binop(3, IrBinOp::Add, val(1), fc(0.125), IrType::F64),
+                    binop(5, IrBinOp::Mul, val(3), val(3), IrType::F64),
+                    binop(7, IrBinOp::Add, val(4), val(5), IrType::F64),
+                    binop(9, IrBinOp::Add, val(4), val(7), IrType::F64),
+                    binop(11, IrBinOp::Add, val(10), i64c(1), IrType::U64),
+                    Instruction::Cmp {
+                        dest: Value(12),
+                        op: crate::ir::reexports::IrCmpOp::Ult,
+                        lhs: val(11),
+                        rhs: i64c(8),
+                        ty: IrType::U64,
+                    },
+                ],
+                Terminator::CondBranch {
+                    cond: val(12),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ));
+            f.blocks
+                .push(block(2, vec![], Terminator::Return(Some(val(9)))));
+            f.next_value_id = 14;
+            assert_eq!(
+                run_round(&mut f, &ENV_CONFIG_DEFAULT, &tm),
+                usize::from(!observable)
+            );
+            assert_eq!(
+                run_round(&mut int_recurrence(), &ENV_CONFIG_DEFAULT, &tm),
+                1
+            );
+        }
     }
 
     #[test]

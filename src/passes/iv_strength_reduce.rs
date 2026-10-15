@@ -538,6 +538,15 @@ fn reduce_loop(
         pointer_groups
     {
         let iv = &basic_ivs[iv_index];
+        let ptr_width = crate::common::types::target_ptr_size();
+        let narrow_signed =
+            |ty: IrType| ty.is_integer() && !ty.is_unsigned() && ty.size() < ptr_width;
+        if super::signed_overflow_wraps() && (narrow_signed(iv.ty) || narrow_signed(mul_ty)) {
+            // A pointer-width recurrence must not skip a defined signed wrap
+            // in either the source counter or its pre-extension product.
+            // Pointer-width rings and already-certified unsigned paths remain.
+            continue;
+        }
         // A narrow unsigned counter is modular: zero-extending it into an
         // address recurrence is linear only while the executed backedges cannot
         // wrap. That is a proof obligation, not an inference from "there is a
@@ -2148,6 +2157,13 @@ fn affine_add_offset_cannot_wrap(
     add_ty: IrType,
 ) -> Option<i64> {
     if !add_ty.is_integer() {
+        return None;
+    }
+    if super::signed_overflow_wraps()
+        && !add_ty.is_unsigned()
+        && add_ty.size() < crate::common::types::target_ptr_size()
+        && raw_offset != 0
+    {
         return None;
     }
     let narrow_unsigned =

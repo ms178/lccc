@@ -25,3 +25,14 @@ The four VPCMP{E,I}STR{I,M} forms read both vector operands and produce
 implicit index/mask outputs. The prior seven-case repair still failed the
 extended optimizer regression at `vpcmpistri`; positive full-definition
 admission fixes that separate defect without relying on a `v` prefix.
+
+## AVX2 gather mask outputs (independent PR824 re-review)
+
+`gather-witness.s` and `gather-driver.c` execute all eight AVX2 gather families.
+Each original copies XMM0 to XMM2 before gathering with XMM2 as the mask.
+The deliberately invalid twin substitutes XMM0 for that mask. Completed lanes
+clear the mask, so the twin corrupts the still-observable XMM0. Each pair must
+return original=1, rewritten=0. The Rust tests separately exercise direct copy
+propagation, the full peephole pipeline, and spill-home invalidation. This is
+an admitted-assembly architectural witness, not a claim of an automatic
+production C reproducer. The current emitter does not generate these gathers.

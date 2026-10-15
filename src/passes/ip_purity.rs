@@ -133,6 +133,10 @@ fn analyze_function_purity(
     pure_fns: &FxHashSet<String>,
     const_fns: &FxHashSet<String>,
 ) -> (bool, bool) {
+    if super::fp_environment_blocks_reordering(func) {
+        return (false, false);
+    }
+
     // Collect local alloca destinations
     let mut local_allocas: FxHashSet<u32> = FxHashSet::default();
     for block in &func.blocks {

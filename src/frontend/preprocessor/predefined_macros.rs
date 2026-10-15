@@ -158,6 +158,11 @@ impl Preprocessor {
                 "1.19209289550781250000000000000000000e-7F",
             ),
             ("__FLT_RADIX__", "2"),
+            // IR operations use their declared FP precision. In particular,
+            // i686's x87 cache must round through F64 before forwarding.
+            // GCC's real <float.h> expands FLT_EVAL_METHOD to these names.
+            ("__FLT_EVAL_METHOD__", "0"),
+            ("__FLT_EVAL_METHOD_TS_18661_3__", "0"),
             (
                 "__FLT_DENORM_MIN__",
                 "1.40129846432481707092372958328991613e-45F",

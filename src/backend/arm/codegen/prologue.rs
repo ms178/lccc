@@ -168,6 +168,7 @@ impl ArmCodegen {
         use crate::backend::regalloc::PhysReg;
         use crate::ir::reexports::Instruction;
 
+        self.value_types = crate::backend::common::compute_value_type_map(func);
         self.loop_promoted_f64_values = func.loop_promoted_f64_values.clone();
         self.conditional_increment_leaf = false;
         self.conditional_increment_leaf_condition_32 = false;

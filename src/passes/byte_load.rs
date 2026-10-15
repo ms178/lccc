@@ -605,6 +605,10 @@ fn validate(
         return None;
     }
     let anchor = resolved.iter().map(|(_, o)| *o).min()?;
+    // Several nonnegative i64 GEP steps can sum to u64::MAX. Prove the
+    // proposed span fits before evaluating anchor + k below, even for a
+    // malformed/repeated-byte chain in an overflow-checked build.
+    anchor.checked_add((m - 1) as u64)?;
 
     // Which byte order? Little-endian puts the shift-0 byte at the run's
     // lowest address, big-endian at its highest. Anything else (a gap, an
@@ -1545,6 +1549,88 @@ mod tests {
             0,
             "base redefined after unconsumed anchor gep must be refused"
         );
+    }
+
+    #[test]
+    fn negative_duplicate_offsets_refuse_without_unsigned_overflow() {
+        for (bits, ty) in [(16, IrType::U16), (32, IrType::U32), (64, IrType::U64)] {
+            for target in [
+                Target::X86_64,
+                Target::I686,
+                Target::Aarch64,
+                Target::Riscv64,
+            ] {
+                let mut f = chain_func(bits, ty, Flags::default());
+                for inst in &mut f.blocks[0].instructions {
+                    if let Instruction::GetElementPtr { offset, .. } = inst {
+                        *offset = Operand::Const(IrConst::I64(-1));
+                    }
+                }
+                let before = format!("{f:?}");
+                assert_eq!(run_function(&mut f, target), 0);
+                assert_eq!(format!("{f:?}"), before);
+            }
+        }
+    }
+
+    #[test]
+    fn negative_offset_runs_remain_conservatively_scalar() {
+        for (bits, ty) in [(16, IrType::U16), (32, IrType::U32), (64, IrType::U64)] {
+            for target in [
+                Target::X86_64,
+                Target::I686,
+                Target::Aarch64,
+                Target::Riscv64,
+            ] {
+                let mut f = chain_func(bits, ty, Flags::default());
+                for inst in &mut f.blocks[0].instructions {
+                    if let Instruction::GetElementPtr {
+                        offset: Operand::Const(IrConst::I64(k)),
+                        ..
+                    } = inst
+                    {
+                        *k -= i64::from(bits / 8);
+                    }
+                }
+                let before = f.clone();
+                // resolve_ptr deliberately refuses negative constant steps.
+                assert_eq!(run_function(&mut f, target), 0);
+                assert_loads_stay_in_footprint(&before, &f);
+            }
+        }
+    }
+
+    #[test]
+    fn large_nested_gep_offsets_do_not_overflow_the_candidate_span() {
+        for (bits, ty) in [(16, IrType::U16), (32, IrType::U32), (64, IrType::U64)] {
+            let mut f = chain_func(bits, ty, Flags::default());
+            let first = f.next_value_id;
+            f.next_value_id += 3;
+            for inst in &mut f.blocks[0].instructions {
+                if let Instruction::GetElementPtr { base, offset, .. } = inst {
+                    *base = Value(first + 2);
+                    *offset = Operand::Const(IrConst::I64(0));
+                }
+            }
+            let steps = [i64::MAX, i64::MAX, 1];
+            let prefix = steps
+                .into_iter()
+                .enumerate()
+                .map(|(i, off)| Instruction::GetElementPtr {
+                    dest: Value(first + i as u32),
+                    base: if i == 0 {
+                        Value(0)
+                    } else {
+                        Value(first + i as u32 - 1)
+                    },
+                    offset: Operand::Const(IrConst::I64(off)),
+                    ty: IrType::Ptr,
+                });
+            f.blocks[0].instructions.splice(1..1, prefix);
+            let before = format!("{f:?}");
+            assert_eq!(run_function(&mut f, X64), 0);
+            assert_eq!(format!("{f:?}"), before);
+        }
     }
 
     #[test]

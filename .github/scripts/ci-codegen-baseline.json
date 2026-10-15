@@ -49,7 +49,7 @@
   },
   "zstd_count": {
     "insns": 146,
-    "stackmem": 8,
+    "stackmem": 11,
     "pushes": 6,
     "moves": 34,
     "ymm": 4,

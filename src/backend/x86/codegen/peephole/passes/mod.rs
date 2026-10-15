@@ -1256,6 +1256,13 @@ fn peephole_optimize_inner(
                 changed |= c;
             }
         }
+        // Give the stronger branch fusion first ownership of materialized
+        // booleans, before load/test folding erases the reload it proves.
+        if !sk("cmp_branch") {
+            let c = compare_branch::fuse_compare_and_branch(&mut store, &mut infos);
+            trace("fuse_compare_and_branch", pass_count, c, &store, &infos);
+            changed |= c;
+        }
         if !sk("load_test_cmp") {
             {
                 let c = dead_writes::fold_load_test_into_cmp(&mut store, &mut infos);
@@ -1542,6 +1549,13 @@ fn peephole_optimize_inner(
         }
         if !sk("cmp_branch") {
             global_changed |= compare_branch::fuse_compare_and_branch(&mut store, &mut infos);
+        }
+        // Preserve fusion's original spill/reload census, then forward any
+        // remaining GP loads. The existing combined-pass skip controls this
+        // local rewrite too, retaining ablation semantics.
+        if !sk("combined") {
+            global_changed |=
+                local_patterns::forward_adjacent_gp_stack_loads(&mut store, &mut infos);
         }
         if !sk("mem_fold") {
             global_changed |= memory_fold::fold_memory_operands(&mut store, &mut infos);
@@ -3350,6 +3364,9 @@ mod tests {
     fn test_compare_branch_fusion_with_matched_store_load() {
         let asm = [
             "    .cfi_startproc",
+            "    pushq %rbp",
+            "    movq %rsp, %rbp",
+            "    subq $32, %rsp",
             "    cmpq %rcx, %rax",
             "    setl %al",
             "    movzbq %al, %rax",
@@ -3360,10 +3377,13 @@ mod tests {
             "    jmp .LBB4",
             ".LBB2:",
             "    movl $1, %eax",
+            "    leave",
             "    ret",
             ".LBB4:",
             "    movl $2, %eax",
+            "    leave",
             "    ret",
+            "    .cfi_endproc",
         ]
         .join("\n")
             + "\n";
@@ -3587,7 +3607,7 @@ mod tests {
             ("a", "ja"),
         ] {
             let asm = format!(
-                "    .cfi_startproc\n    cmpq %rcx, %rax\n    set{} %al\n    movzbq %al, %rax\n    testq %rax, %rax\n    jne .LBB1\n    ret\n.LBB1:\n    ret\n",
+                "    .cfi_startproc\n    cmpq %rcx, %rax\n    set{} %al\n    movzbq %al, %rax\n    testq %rax, %rax\n    jne .LBB1\n    movl $0, %eax\n    ret\n.LBB1:\n    movl $1, %eax\n    ret\n    .cfi_endproc\n",
                 cc
             );
             let result = peephole_optimize(asm);
@@ -5068,7 +5088,7 @@ mod regression_tests {
 
     #[test]
     fn test_compare_branch_rsp_signed_byte_reload() {
-        let asm = "    cmpl %edx, %esi\n    setb %al\n    movzbl %al, %eax\n    movq %rax, 384(%rsp)\n    movsbq 384(%rsp), %rax\n    testq %rax, %rax\n    je .Lno\n    jmp .Lyes\n.Lno:\n";
+        let asm = ".cfi_startproc\nsubq $400, %rsp\n    cmpl %edx, %esi\n    setb %al\n    movzbl %al, %eax\n    movq %rax, 384(%rsp)\n    movsbq 384(%rsp), %rax\n    testq %rax, %rax\n    je .Lno\n    jmp .Lyes\n.Lno:\nmovl $10, %eax\naddq $400, %rsp\nret\n.Lyes:\nmovl $20, %eax\naddq $400, %rsp\nret\n.cfi_endproc\n";
         let out = peephole_optimize(asm.to_string());
         assert!(
             out.contains("jae .Lno") || out.contains("jb .Lyes"),
@@ -5081,19 +5101,20 @@ mod regression_tests {
 
     #[test]
     fn test_late_compare_bool_rsp_spill() {
-        let mut asm="    cmpl %edx, %esi\n    setb %al\n    movzbl %al, %eax\n    movq %rax, 384(%rsp)\n    movsbq 384(%rsp), %rax\n    testq %rax, %rax\n    je .Lno\n".to_string();
+        let mut asm=".cfi_startproc\nsubq $400, %rsp\n    cmpl %edx, %esi\n    setb %al\n    movzbl %al, %eax\n    movq %rax, 384(%rsp)\n    movsbq 384(%rsp), %rax\n    testq %rax, %rax\n    je .Lno\nmovl $10, %eax\naddq $400, %rsp\nret\n.Lno:\nmovl $20, %eax\naddq $400, %rsp\nret\n.cfi_endproc\n".to_string();
         assert!(compare_branch::fuse_late_compare_bool_spills(&mut asm));
         assert!(asm.contains("jae .Lno"), "{}", asm);
         assert!(!asm.contains("setb"), "{}", asm);
     }
 
     #[test]
-    fn test_late_compare_phi_false_redirect() {
+    fn test_late_compare_phi_false_keeps_shared_join() {
         let mut asm="    cmpl %edx, %esi\n    setb %al\n    movzbl %al, %eax\n    movq %rax, 384(%rsp)\n.Ljoin:\n    movsbq 384(%rsp), %rax\n    testq %rax, %rax\n    je .Lfalse_target\n.Lother:\n    ret\n.Lpred_false:\n    xorl %eax, %eax\n    movq %rax, 384(%rsp)\n    jmp .Ljoin\n.Lfalse_target:\n    ret\n".to_string();
-        assert!(compare_branch::fuse_late_compare_bool_spills(&mut asm));
-        assert!(asm.contains("jae .Lfalse_target"), "{}", asm);
-        assert!(asm.contains("jmp .Lfalse_target"), "{}", asm);
-        assert!(!asm.contains("setb"), "{}", asm);
+        // This fragment returns the materialized RAX value and has a shared
+        // join. The historical raw-text redirect deleted observable state.
+        let original = asm.clone();
+        assert!(!compare_branch::fuse_late_compare_bool_spills(&mut asm));
+        assert_eq!(asm, original);
     }
 
     #[test]

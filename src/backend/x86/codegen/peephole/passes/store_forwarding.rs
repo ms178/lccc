@@ -2218,6 +2218,14 @@ mod tests {
     #[test]
     fn implicit_vector_outputs_invalidate_backing_spill_homes() {
         for effect in [
+            "vgatherdps %xmm0, (%rdi,%xmm3,4), %xmm4",
+            "vgatherdpd %xmm0, (%rdi,%xmm3,4), %xmm4",
+            "vgatherqps %xmm0, (%rdi,%xmm3,4), %xmm4",
+            "vgatherqpd %xmm0, (%rdi,%xmm3,4), %xmm4",
+            "vpgatherdd %xmm0, (%rdi,%xmm3,4), %xmm4",
+            "vpgatherdq %xmm0, (%rdi,%xmm3,4), %xmm4",
+            "vpgatherqd %xmm0, (%rdi,%xmm3,4), %xmm4",
+            "vpgatherqq %xmm0, (%rdi,%xmm3,4), %xmm4",
             "pcmpistrm $0, %xmm5, %xmm7",
             "vpcmpestrm $0, %xmm5, %xmm7",
             "vfutureop %xmm5, %xmm7",

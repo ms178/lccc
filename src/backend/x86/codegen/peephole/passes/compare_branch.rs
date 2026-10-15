@@ -5,6 +5,7 @@
 
 use super::super::types::*;
 use super::flag_peepholes;
+use super::fp_liveness::FpLiveness;
 use super::liveness::FileLiveness;
 
 /// Maximum number of store/load offsets tracked during compare-and-branch fusion.
@@ -188,9 +189,13 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
     let mut changed = false;
     let len = store.len();
 
+    // Construct whole-file facts lazily, and refresh only the edited function.
+    let mut gp_liveness = None;
+    let mut slot_liveness = None;
+
     let mut i = 0;
     while i < len {
-        if infos[i].kind != LineKind::Cmp {
+        if infos[i].kind != LineKind::Cmp || infos[i].pinned {
             i += 1;
             continue;
         }
@@ -204,7 +209,7 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
         seq_indices[1..(rest_count + 1)].copy_from_slice(&rest[..rest_count]);
         let seq_count = 1 + rest_count;
 
-        if seq_count < 4 {
+        if seq_count < 4 || infos[seq_indices[1]].pinned {
             i += 1;
             continue;
         }
@@ -244,13 +249,11 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
         // if any store's slot is potentially read by another basic block (no
         // matching load nearby).
         let mut test_idx = None;
-        // Final carrier of the boolean: legacy `%al`→`%rax` (corpus-validated
-        // no-gate contract, tracked by `legacy_ext_seen`), or a generalized
-        // relay destination family (`relay_fam` — every non-legacy shape is
-        // gated on exact liveness below).
+        // Final carrier of the boolean: canonical `%al`→`%rax`, tracked by
+        // `legacy_ext_seen`, or a generalized relay destination family.
+        // Every family is gated on exact liveness below.
         let mut legacy_ext_seen = false;
         let mut relay_fam: Option<RegId> = None;
-        let mut legacy_pure = setcc_is_al;
         let mut transparent_skip = [false; CMP_FUSION_LOOKAHEAD];
         // Boolean slots: stack slots stored FROM a carrier, with the count of
         // meaningful boolean bytes. A carrier-destined reload is plumbing
@@ -272,7 +275,7 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
             // length-placeholder idiom) — fusing across it would then NOP
             // user bytes and leave the template reading a %al that the
             // deleted setCC no longer defines. Abort the fusion instead.
-            if infos[si].kind == LineKind::InlineAsm {
+            if infos[si].kind == LineKind::InlineAsm || infos[si].pinned {
                 break;
             }
 
@@ -302,7 +305,6 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
                 match parse_bool_extension(line, "%al") {
                     Some(Ok(dfam)) => {
                         relay_fam = Some(dfam);
-                        legacy_pure = false;
                         scan += 1;
                         continue;
                     }
@@ -321,7 +323,6 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
                     match parse_bool_extension(line, setcc_src) {
                         Some(Ok(dfam)) => {
                             relay_fam = Some(dfam);
-                            legacy_pure = false;
                             scan += 1;
                             continue;
                         }
@@ -492,7 +493,6 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
             // skipped before the relay appeared could otherwise clobber the
             // relay family or observe a NOPed store's absence).
             if is_fusion_transparent(line, infos[si].kind) {
-                legacy_pure = false;
                 transparent_skip[scan] = true;
                 scan += 1;
                 continue;
@@ -560,7 +560,7 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
             }
         }
 
-        if test_scan + 1 >= seq_count {
+        if test_scan + 1 >= seq_count || infos[seq_indices[test_scan + 1]].pinned {
             i += 1;
             continue;
         }
@@ -576,11 +576,9 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
             continue;
         };
 
-        // Post-scan verification for every NON-legacy shape (legacy-pure =
-        // setCC %al + legacy extension + rax test keeps its corpus-validated
-        // no-gate contract; ALL other shapes gate here).
-        let needs_gate = relay_fam.is_some() || !legacy_pure;
-        if needs_gate {
+        // Every shape, including the historical AL/RAX shape, must prove
+        // that deleting its boolean definitions is unobservable.
+        {
             // The setCC family must be nameable for the gate (a non-GP
             // family means the destination failed to parse, in which case no
             // generalized arm could have fired — defensive).
@@ -630,7 +628,7 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
             // which requires a `%` prefix, so it evaluated to REG_NONE and
             // never fired): every family whose definition is NOPed must be
             // dead after the fused jump. Unknown liveness refuses.
-            let lv = FileLiveness::new(store, infos);
+            let lv = gp_liveness.get_or_insert_with(|| FileLiveness::new(store, infos));
             let setcc_dead = lv.live_after(jcc_pos, setcc_fam) == Some(false);
             let relay_dead = relay_fam
                 .map(|f| lv.live_after(jcc_pos, f) == Some(false))
@@ -665,7 +663,7 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
             if !dead {
                 if std::env::var_os("CCC_DEBUG_CMP_FUSE").is_some() {
                     eprintln!(
-                        "[CMPFUSE] refusing non-legacy fusion (setcc_fam={} setcc_live_after={:?} relay_live_after={:?} region_dropped_live={:?})",
+                        "[CMPFUSE] refusing fusion (setcc_fam={} setcc_live_after={:?} relay_live_after={:?} region_dropped_live={:?})",
                         setcc_fam,
                         lv.live_after(jcc_pos, setcc_fam),
                         relay_fam.map(|f| lv.live_after(jcc_pos, f)),
@@ -730,6 +728,28 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
             continue;
         }
 
+        // A matching nearby load does NOT prove the store dead: another
+        // block, an overlapping access, or an escaped address may observe it.
+        // Reuse the shared CFG/alias-aware frame-slot analysis, failing closed
+        // for opaque frames and incomplete functions.
+        if store_count > 0 {
+            let lv = slot_liveness.get_or_insert_with(|| FpLiveness::new(store, infos));
+            let branch = seq_indices[test_scan + 1];
+            if (1..=test_scan).filter(|&s| !transparent_skip[s]).any(|s| {
+                let n = seq_indices[s];
+                if let LineKind::StoreRbp { size, .. } = infos[n].kind {
+                    let text = infos[n].trimmed(store.get(n));
+                    return parse_stack_operand(text, false).is_none_or(|(base, off)| {
+                        !lv.slot_dead_after(branch, base, off, size.byte_size())
+                    });
+                }
+                false
+            }) {
+                i += 1;
+                continue;
+            }
+        }
+
         let fused_cc = if is_jne { cc } else { invert_cc(cc) };
         let fused_jcc = format!("    j{} {}", fused_cc, branch_target);
 
@@ -745,6 +765,12 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
         let idx = seq_indices[test_scan + 1];
         replace_line(store, &mut infos[idx], idx, fused_jcc);
 
+        if let Some(lv) = gp_liveness.as_mut() {
+            lv.refresh_span(store, infos, seq_indices[1], idx);
+        }
+        if let Some(lv) = slot_liveness.as_mut() {
+            lv.refresh_at(store, infos, idx);
+        }
         changed = true;
         i = idx + 1;
     }
@@ -752,189 +778,25 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
     changed
 }
 
-/// Late fusion for boolean materializations that survive stack-slot pinning and
-/// frame compaction. The stack slot must occur exactly twice in the function
-/// text (one store and its matching load), proving it is an unobservable
-/// compiler temporary.
+/// Re-run the proven fusion after frame compaction, using exactly the same
+/// register, flag, and frame-slot legality checks as the earlier pass.
+/// Reconstruct ALL pin metadata; raw text alone must not bypass volatile,
+/// inline-assembly, address-escape, or ABI-read protection.
 pub(super) fn fuse_late_compare_bool_spills(asm: &mut String) -> bool {
-    let mut lines: Vec<String> = asm.lines().map(str::to_string).collect();
-    let mut changed = false;
-
-    // Inline-asm regions are user-authored bytes; this pass runs on raw text
-    // (phase 9) where `LineKind::InlineAsm` pinning no longer exists, so it
-    // must exclude every line inside a `#APP`..`#NO_APP` span from matching,
-    // and the "slot occurs exactly 3 times" census below must ignore the
-    // possibility of template text mentioning the slot (an asm mention makes
-    // the count differ, which correctly suppresses the fusion).
-    let mut in_asm = vec![false; lines.len()];
-    let mut inside = false;
-    for (idx, l) in lines.iter().enumerate() {
-        let t = l.trim();
-        if t == "#APP" {
-            inside = true;
-        } else if t == "#NO_APP" {
-            inside = false;
-        }
-        in_asm[idx] = inside;
-    }
-    let asm_free = |i: usize| !in_asm[i];
-
-    // First collapse a constant-false predecessor of a spilled-boolean join.
-    // This turns the remaining compare path into a single-predecessor fallthrough.
-    let active0: Vec<usize> = (0..lines.len())
-        .filter(|i| !lines[*i].trim().is_empty())
+    let mut store = LineStore::new(asm.clone());
+    let mut infos: Vec<_> = (0..store.len())
+        .map(|i| classify_line(store.get(i)))
         .collect();
-    for p in 0..active0.len().saturating_sub(2) {
-        let a = active0[p];
-        let b = active0[p + 1];
-        let c = active0[p + 2];
-        if !asm_free(a) || !asm_free(b) || !asm_free(c) {
-            continue;
-        }
-        if lines[a].trim() != "xorl %eax, %eax" {
-            continue;
-        }
-        let Some(slot) = lines[b]
-            .trim()
-            .strip_prefix("movq %rax, ")
-            .map(str::to_string)
-        else {
-            continue;
-        };
-        let Some(join) = lines[c].trim().strip_prefix("jmp ").map(str::to_string) else {
-            continue;
-        };
-        if lines.iter().filter(|l| l.contains(&slot)).count() != 3 {
-            continue;
-        }
-        let Some(li) = lines.iter().position(|l| l.trim() == format!("{}:", join)) else {
-            continue;
-        };
-        let tail: Vec<usize> = ((li + 1)..lines.len())
-            .filter(|i| !lines[*i].trim().is_empty())
-            .take(3)
-            .collect();
-        if tail.len() != 3 || tail.iter().any(|&i| !asm_free(i)) {
-            continue;
-        }
-        let load = lines[tail[0]].trim();
-        let load_ok = [
-            "movsbq ", "movswq ", "movslq ", "movzbq ", "movzwq ", "movq ",
-        ]
-        .iter()
-        .any(|q| {
-            load.strip_prefix(q)
-                .map(|r| r == format!("{}, %rax", slot))
-                .unwrap_or(false)
-        });
-        if !load_ok
-            || (lines[tail[1]].trim() != "testq %rax, %rax"
-                && lines[tail[1]].trim() != "testl %eax, %eax")
-        {
-            continue;
-        }
-        let Some(target) = lines[tail[2]]
-            .trim()
-            .strip_prefix("je ")
-            .map(str::to_string)
-        else {
-            continue;
-        };
-        lines[a].clear();
-        lines[b].clear();
-        lines[c] = format!("    jmp {}", target);
-        changed = true;
+    super::pin_inline_asm_regions(&store, &mut infos);
+    super::pin_volatile_access_regions(&store, &mut infos);
+    super::pin_volatile_stack_slots(&store, &mut infos);
+    super::pin_address_taken_stack_slots(&store, &mut infos);
+    super::pin_param_abi_reads(&store, &mut infos);
+    if !fuse_compare_and_branch(&mut store, &mut infos) {
+        return false;
     }
-
-    // Count explicit branch references; labels with none are transparent joins.
-    let mut refs = crate::common::fx_hash::FxHashMap::<String, usize>::default();
-    for l in &lines {
-        let t = l.trim();
-        if t.starts_with('j') {
-            if let Some(x) = t.split_whitespace().last() {
-                *refs.entry(x.to_string()).or_default() += 1;
-            }
-        }
-    }
-    let active: Vec<usize> = (0..lines.len())
-        .filter(|i| {
-            let t = lines[*i].trim();
-            if t.is_empty() {
-                return false;
-            }
-            if let Some(label) = t.strip_suffix(':') {
-                return refs.get(label).copied().unwrap_or(0) != 0;
-            }
-            true
-        })
-        .collect();
-    let mut p = 0;
-    while p + 6 < active.len() {
-        let ix = &active[p..p + 7];
-        // User asm bytes are immutable: no fused rewrite may touch, NOP, or
-        // consume a line inside a `#APP`..`#NO_APP` region.
-        if ix.iter().any(|&i| !asm_free(i)) {
-            p += 1;
-            continue;
-        }
-        let t: Vec<&str> = ix.iter().map(|i| lines[*i].trim()).collect();
-        if !(t[0].starts_with("cmp") || t[0].starts_with("test")) {
-            p += 1;
-            continue;
-        }
-        let Some(cc) = parse_setcc(t[1]) else {
-            p += 1;
-            continue;
-        };
-        if !(t[2].starts_with("movzbl %al, %eax") || t[2].starts_with("movzbq %al, %rax")) {
-            p += 1;
-            continue;
-        }
-        let Some(slot) = t[3].strip_prefix("movq %rax, ") else {
-            p += 1;
-            continue;
-        };
-        let load_ok = [
-            "movsbq ", "movswq ", "movslq ", "movzbq ", "movzwq ", "movq ",
-        ]
-        .iter()
-        .any(|q| {
-            t[4].strip_prefix(q)
-                .map(|r| r == format!("{}, %rax", slot))
-                .unwrap_or(false)
-        });
-        if !load_ok || (t[5] != "testq %rax, %rax" && t[5] != "testl %eax, %eax") {
-            p += 1;
-            continue;
-        }
-        let (nonzero, target) = if let Some(x) = t[6].strip_prefix("jne ") {
-            (true, x)
-        } else if let Some(x) = t[6].strip_prefix("je ") {
-            (false, x)
-        } else {
-            p += 1;
-            continue;
-        };
-        if lines
-            .iter()
-            .any(|l| l.trim_start().starts_with("leaq ") && l.contains(slot))
-        {
-            p += 1;
-            continue;
-        }
-        let fused = (if nonzero { cc } else { invert_cc(cc) }).to_string();
-        let target = target.to_string();
-        for q in 1..=5 {
-            lines[ix[q]].clear();
-        }
-        lines[ix[6]] = format!("    j{} {}", fused, target);
-        changed = true;
-        p += 7;
-    }
-    if changed {
-        *asm = lines.join("\n") + "\n";
-    }
-    changed
+    *asm = store.build_result(|i| infos[i].is_nop());
+    true
 }
 
 #[cfg(test)]
@@ -964,18 +826,64 @@ mod compare_branch_fusion_tests {
         format!(".text\nf:\n.cfi_startproc\n{}\n.cfi_endproc\n", body)
     }
 
+    #[test]
+    fn late_fusion_preserves_observable_boolean_state() {
+        let prefix = "movl $9, %eax\ncmpl %esi, %edi\nsetb %al\nmovzbl %al, %eax\nmovq %rax, -8(%rsp)\nmovsbq -8(%rsp), %rax\ntestq %rax, %rax\nje .Lzero\n";
+        let cases = [
+            format!("{prefix}ret\n.Lzero:\nret"),
+            format!(
+                "{prefix}movl $0, %eax\nsetbe %al\nret\n.Lzero:\nmovl $0, %eax\nsetbe %al\nret"
+            ),
+            format!(
+                "movq $7, -8(%rsp)\n{prefix}movq -8(%rsp), %rax\nret\n.Lzero:\nmovq -8(%rsp), %rax\nret"
+            ),
+            format!(
+                "{}movl $1, %eax\nret\n.Lzero:\nmovl $2, %eax\nret",
+                prefix.replace("setb %al", "setb %cl")
+            ),
+            format!(
+                "{}movl $1, %eax\nret\n.Lzero:\nmovl $2, %eax\nret",
+                prefix.replace("-8(%rsp)", "(%rdx)")
+            ),
+        ];
+        for body in cases {
+            let original = f(&body);
+            let mut output = original.clone();
+            assert!(
+                !super::fuse_late_compare_bool_spills(&mut output),
+                "{body}\n{output}"
+            );
+            assert_eq!(output, original);
+        }
+    }
+
+    #[test]
+    fn late_fusion_requires_complete_cfg_and_respects_volatile_pins() {
+        let body = "cmpl %edx, %esi\nsetb %al\nmovzbl %al, %eax\nmovq %rax, -8(%rsp)\nmovsbq -8(%rsp), %rax\ntestq %rax, %rax\nje .Lno\nmovl $1, %eax\nret\n.Lno:\nmovl $2, %eax\nret";
+        for candidate in [
+            f(&body.replace("je .Lno", "je .Lmissing")),
+            f(&body.replace(
+                "movq %rax, -8(%rsp)",
+                "# LCCC_VOLATILE_BEGIN\nmovq %rax, -8(%rsp)\n# LCCC_VOLATILE_END",
+            )),
+            f(&format!("#APP\n{body}\n#NO_APP")),
+        ] {
+            let mut output = candidate.clone();
+            assert!(!super::fuse_late_compare_bool_spills(&mut output));
+            assert_eq!(output, candidate);
+        }
+    }
+
     // ── A. positives: accepted shapes fuse ────────────────────────────────
 
     #[test]
-    fn a_legacy_rax_shape_fuses_without_a_liveness_gate() {
-        // The corpus-validated contract: setCC %al + extension + rax test
-        // fuses even with %rax live after the jump (pinned, not endorsed —
-        // the new shapes all gate).
+    fn a_legacy_rax_shape_keeps_a_live_boolean() {
+        // The historical exception deleted a live boolean. Passing a corpus
+        // never licenses that semantic change, even for canonical AL/RAX.
         let out = run(&f(
             "    cmpl %eax, %ebx\n    setl %al\n    movzbq %al, %rax\n    testq %rax, %rax\n    jne .Lx\n    movq %rax, %rdi\n    ret\n.Lx:\n    xorl %eax, %eax\n    ret",
         ));
-        assert!(out.contains("jl .Lx"), "{}", out);
-        assert!(!out.contains("setl"), "{}", out);
+        assert!(out.contains("setl"), "{}", out);
     }
 
     #[test]
@@ -1183,6 +1091,9 @@ mod fusion_flags_flow_tests {
     }
 
     fn f(body: &str) -> String {
+        // Isolate flag legality from GP-return liveness. MOV preserves flags,
+        // and every return explicitly kills the materialized RAX boolean.
+        let body = body.replace("    ret", "    movl $0, %eax\n    ret");
         format!(".text\nf:\n.cfi_startproc\n{body}\n.cfi_endproc\n")
     }
 
@@ -1313,6 +1224,9 @@ mod flags_horizon_tests {
     }
 
     fn f(body: &str) -> String {
+        // Isolate flag legality from GP-return liveness. MOV preserves flags,
+        // and every return explicitly kills the materialized RAX boolean.
+        let body = body.replace("    ret", "    movl $0, %eax\n    ret");
         format!(".text\nf:\n.cfi_startproc\n{body}\n.cfi_endproc\n")
     }
 

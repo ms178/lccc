@@ -1,0 +1,784 @@
+{
+  "gcc": "local GCC12.2; preprocessing sensitivity only, not codegen/performance",
+  "shapes": [
+    {
+      "id": "arith_loop",
+      "source_sha256": "154a39b6e98cf506bf0d62ed4ab44dad88f7d75923a4eb797b4c41e9339f662c",
+      "bounded_flags": [
+        "-DARITH_ITERS=20000"
+      ],
+      "preprocessed_sha256": "ab0023bd3477689a06b571360915e1fef6659cb74ce6f426e3bed89642238ddb",
+      "scale_controls": [
+        {
+          "macro": "ARITH_ITERS",
+          "requested": "20000",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "fib",
+      "source_sha256": "983660d7782bcce1d90c389a5869452a6b055a399654ad63f34491245ed41379",
+      "bounded_flags": [
+        "-DFIB_N=25"
+      ],
+      "preprocessed_sha256": "0975c83ca706ab39383898cb900f94ae5e35e838cf3255b5b802763fe472bd44",
+      "scale_controls": [
+        {
+          "macro": "FIB_N",
+          "requested": "25",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "matmul",
+      "source_sha256": "927478b18ee0aa0d118eea4d2a9d6bb1251fdf3c64c2619ab578463beba99560",
+      "bounded_flags": [
+        "-DN=48"
+      ],
+      "preprocessed_sha256": "08c4ea58a66f461a05f65440501ba2d529877c08088c4f0229d6d9b656554c26",
+      "scale_controls": [
+        {
+          "macro": "N",
+          "requested": "48",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "qsort",
+      "source_sha256": "4b7916c27962da3a9cf71ce75b09910467449ce727a1fb2d3dbf75f5f011641a",
+      "bounded_flags": [
+        "-DN=10000"
+      ],
+      "preprocessed_sha256": "6009d396eed49a39acecb444274d76f64ae90bca44e5572166f3ac14083a3f97",
+      "scale_controls": [
+        {
+          "macro": "N",
+          "requested": "10000",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "sieve",
+      "source_sha256": "2fd99e297a95711800c1bf4b2facd7e5e09efa740b113c86837e3d0cd22f069b",
+      "bounded_flags": [
+        "-DN=100000"
+      ],
+      "preprocessed_sha256": "997252ee3435a2b63684560e00245a67c54f0c2ac49a5748d2d9c829703e6b5b",
+      "scale_controls": [
+        {
+          "macro": "N",
+          "requested": "100000",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "tce_sum",
+      "source_sha256": "57ddb14e5fd945998d614fbe2bba64a9861b8a0f5153ce4fcd84a15348991eee",
+      "bounded_flags": [],
+      "preprocessed_sha256": "abff3e415d564a3cd7c7f31f56112003cf5757a088cecd557eaea1892ce56183",
+      "scale_controls": []
+    },
+    {
+      "id": "nbody",
+      "source_sha256": "45db2f21add3645a945f1a6635d642f1aad5caecfa4c7b47da4943331a321837",
+      "bounded_flags": [
+        "-DSTEPS=1000"
+      ],
+      "preprocessed_sha256": "10f48ed9d40a1b03aa58d2f7e26d7abe2ab2c67b7ec6a97126ce0e42cc532f26",
+      "scale_controls": [
+        {
+          "macro": "STEPS",
+          "requested": "1000",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "binary_trees",
+      "source_sha256": "0a19ef11ab58e32a6ef0ecb8703a856347ba295d2bca67bbe20dfa5243251dc0",
+      "bounded_flags": [
+        "-DTREE_DEPTH=10"
+      ],
+      "preprocessed_sha256": "7e14a365ec30948b8295b399f19d56f9d2d12c1cda514d09ac2c3225aa38d9e0",
+      "scale_controls": [
+        {
+          "macro": "TREE_DEPTH",
+          "requested": "10",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "spectral_norm",
+      "source_sha256": "21a48dccebcbc3b9496263f62df260d278051c3cd1a528ed99c8b66bef481e6a",
+      "bounded_flags": [
+        "-DN=128"
+      ],
+      "preprocessed_sha256": "86d2f38d7f69cd1fca04eb422c4d710b2f673b8b1f6c32717ffa38624fcd36ad",
+      "scale_controls": [
+        {
+          "macro": "N",
+          "requested": "128",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "mandelbrot",
+      "source_sha256": "3f9d3a3e0da962e5a1840790ebf46fa09f38cd5e758645c8c65625fa9882555c",
+      "bounded_flags": [
+        "-DWIDTH=128",
+        "-DHEIGHT=128"
+      ],
+      "preprocessed_sha256": "c409499e52b41d66c68e007756f5562d2186be30b398d90d380aa9bd8434cbaa",
+      "scale_controls": [
+        {
+          "macro": "WIDTH",
+          "requested": "128",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        },
+        {
+          "macro": "HEIGHT",
+          "requested": "128",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "hash_table",
+      "source_sha256": "1c742684a0ea694fbeb95d249748488e89f9033c64d518cd1fafe27da24a2e5a",
+      "bounded_flags": [
+        "-DNUM_OPS=20000"
+      ],
+      "preprocessed_sha256": "d121d2ed909d04b46c60f717f65e73c9fd797fc76c92a276b852e4f60f86a2fc",
+      "scale_controls": [
+        {
+          "macro": "NUM_OPS",
+          "requested": "20000",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "strlen_bench",
+      "source_sha256": "175202f59218fa62a3120f9f5202a005f5e234f2cbabd453048d933082e0dd44",
+      "bounded_flags": [
+        "-DNSTRINGS=1000"
+      ],
+      "preprocessed_sha256": "5d84c37194d2c5efc7b2bc2153a38fd4a89ba3671d6b14a016700b11e473cca4",
+      "scale_controls": [
+        {
+          "macro": "NSTRINGS",
+          "requested": "1000",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "switch_dispatch",
+      "source_sha256": "6a044523272024b733f4af8e5101d5bf2d72ba9d6e9362798f6149cd9265117a",
+      "bounded_flags": [
+        "-DN=20000"
+      ],
+      "preprocessed_sha256": "09fbefa117e029560b6766c7f87d74e8bf1a1e6bbdac402b087df6cc729c6862",
+      "scale_controls": [
+        {
+          "macro": "N",
+          "requested": "20000",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "struct_copy",
+      "source_sha256": "b0ca8943fcfed56f7ae9bbd49e7e52a98f9780b4be8151c494fc12b05dcb2bfa",
+      "bounded_flags": [
+        "-DN=2000"
+      ],
+      "preprocessed_sha256": "ecc0bfa699ae3e982c59d5b500acd7b7392378f451f58b9002ab63035da4cff8",
+      "scale_controls": [
+        {
+          "macro": "N",
+          "requested": "2000",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "loop_patterns",
+      "source_sha256": "e56488201b8d9e8fc7ad17ec521f395232d4c66edcaf880876d2adccba28df88",
+      "bounded_flags": [
+        "-DSIZE=16384"
+      ],
+      "preprocessed_sha256": "08893a21d6cc6618b62ded00d8556e3cbcb5182adc277eacf552e2dae4b2055b",
+      "scale_controls": [
+        {
+          "macro": "SIZE",
+          "requested": "16384",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "fannkuch",
+      "source_sha256": "2a78d670ab985384a3008ac031e7a478fdc790b627d011177dd528b7282d11e5",
+      "bounded_flags": [
+        "-DFANNKUCH_N=7"
+      ],
+      "preprocessed_sha256": "e5c17f43df90d27ba7e17fe0a19b8d76669f0e906aae443ad4bc64ee4a0aa484",
+      "scale_controls": [
+        {
+          "macro": "FANNKUCH_N",
+          "requested": "7",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "ackermann",
+      "source_sha256": "8f4443c46516743ca68886d1e882b9431d42ea812df71bf58236013193b790b9",
+      "bounded_flags": [
+        "-DACK_N=6"
+      ],
+      "preprocessed_sha256": "2136ed0610d5a22ff46337d7d1f0f2d2355bfb47036e7e0b64d39a377b7a9a9c",
+      "scale_controls": [
+        {
+          "macro": "ACK_N",
+          "requested": "6",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "constant_recursion",
+      "source_sha256": "86d59c961c6c10e03a75dbb42b3c73f01d448bf6296c401bb960f6120dd985c9",
+      "bounded_flags": [
+        "-DACK_N=6"
+      ],
+      "preprocessed_sha256": "99cd947c00d9a26a57f652f9da78927588d20aec9e91e9fc4a7d422b1a7ff7f3",
+      "scale_controls": [
+        {
+          "macro": "ACK_N",
+          "requested": "6",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "bitops",
+      "source_sha256": "e1e97ac28dabf06df8859e6812a288f639c7f6f070478ebd6fe834a64ed9f7ea",
+      "bounded_flags": [
+        "-DN=20000"
+      ],
+      "preprocessed_sha256": "8452666cdebd557de002e0efebd3bd2df1b607e7a0e5d09d562756e8f910622b",
+      "scale_controls": [
+        {
+          "macro": "N",
+          "requested": "20000",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "double_reduction",
+      "source_sha256": "cad8a08bc76c767ac184e222570f4311d2e1ddab072f59119d737c87fbc1eaf7",
+      "bounded_flags": [
+        "-DREDUCTION_PASSES=1"
+      ],
+      "preprocessed_sha256": "23f446dd549d346bb1e1f6b38aef4c598203996b6334d5b351be40012e390c70",
+      "scale_controls": [
+        {
+          "macro": "REDUCTION_PASSES",
+          "requested": "1",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "ascii_case_fold",
+      "source_sha256": "7a97d5091e4e166a63cb4d6dd80bb35014c4f9ccd77848b60bac357f3211a5dd",
+      "bounded_flags": [],
+      "preprocessed_sha256": "c2220ecd6147f1df1bba73d6efee7f0582c9f44e219a5deb3fc6015309696bc3",
+      "scale_controls": []
+    },
+    {
+      "id": "binary_search",
+      "source_sha256": "e53295433fcba1e277011bd4ae6860e38a1dc27934c36dc9b2de9c6d3d533422",
+      "bounded_flags": [],
+      "preprocessed_sha256": "66237b9d69d71a9a05dc82bac925ed286a7b90f4ece349c7e99157d63f6f1bc9",
+      "scale_controls": []
+    },
+    {
+      "id": "ring_fifo",
+      "source_sha256": "e5c01f13f9472d27106f37b76e0076f2d3e4cb71109c38344688e4e8f6e6db03",
+      "bounded_flags": [],
+      "preprocessed_sha256": "e838bfc3d61530013aa04a8f2f31457108e635afddab9159201fa91b45e63d27",
+      "scale_controls": []
+    },
+    {
+      "id": "aarch64_select_patterns",
+      "source_sha256": "22b7e42c9de227a1b815878d95f3dc2e97630addaf6e3c19e77d2ce38c09c0b1",
+      "bounded_flags": [
+        "-DSELECT_ITERS=20000"
+      ],
+      "preprocessed_sha256": "a287f0aa043fba09aed5789475723854533a31d2a3a24d5e2e76c46904bf4f26",
+      "scale_controls": [
+        {
+          "macro": "SELECT_ITERS",
+          "requested": "20000",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "histogram",
+      "source_sha256": "67bef36e96b93d37b36e85f02e991eda19cd759393ec104684edfde54c6a3806",
+      "bounded_flags": [],
+      "preprocessed_sha256": "2aca3ce127276e6096dd9c974949f0f80ba5e2ba9d8530af104b332cf3aa75f8",
+      "scale_controls": []
+    },
+    {
+      "id": "gzip_crc32",
+      "source_sha256": "9f9acac042ab580ce2137a9fb653a5b3db5e7015dbb49254944195ef5eb98f6a",
+      "bounded_flags": [
+        "-DDATA_SIZE=16384",
+        "-DPASSES=4"
+      ],
+      "preprocessed_sha256": "c01e4020212650237af4220e109ca8e09591d81f24f65c26d534b65b99ddb6f7",
+      "scale_controls": [
+        {
+          "macro": "DATA_SIZE",
+          "requested": "16384",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        },
+        {
+          "macro": "PASSES",
+          "requested": "4",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "libm_round_family",
+      "source_sha256": "b70c5bacd90081c28ea74dc1142f9eacc64278d539f258da5bd1614ebc503668",
+      "bounded_flags": [
+        "-DN=256",
+        "-DPASSES=4"
+      ],
+      "preprocessed_sha256": "cfa64ff9b788ca188a41f8dfb28b9c700446521286fc5204d3dc5cf9c4d47317",
+      "scale_controls": [
+        {
+          "macro": "N",
+          "requested": "256",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        },
+        {
+          "macro": "PASSES",
+          "requested": "4",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "tls_seg_access",
+      "source_sha256": "02e6d2bcd07b2e1fc253b53d316d522e7b3d912ae634b6fad2c10dc93a1d4835",
+      "bounded_flags": [
+        "-DPASSES=100"
+      ],
+      "preprocessed_sha256": "374921bc2ea0942241910dd9ab5029618091302ff7af7d908e911538a6b67139",
+      "scale_controls": [
+        {
+          "macro": "PASSES",
+          "requested": "100",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "percpu_ptr_walk",
+      "source_sha256": "8494442ce679590e5710d2f9594587190113d22a6ba5edb5414ba9e5eb85461c",
+      "bounded_flags": [
+        "-DPASSES=1000"
+      ],
+      "preprocessed_sha256": "94450bd80c93c5169cfbdb1b622c6a4d5bd9c8c2f7e328f27938b9e758327b94",
+      "scale_controls": [
+        {
+          "macro": "PASSES",
+          "requested": "1000",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "byte_load_reassembly",
+      "source_sha256": "d98d60eefd244df93fd9f4a828806ce2e32be56aad4872a2672d172b14dda562",
+      "bounded_flags": [],
+      "preprocessed_sha256": "2560cbe2b4c5592c24cb399607d4bca6ec801dab30565629ac4424bde1203284",
+      "scale_controls": []
+    },
+    {
+      "id": "zlib_ng_adler32",
+      "source_sha256": "bca7938ef542270a06d734bf814b3f1806ab1796e8f53d5c53d1b5ccd6b08486",
+      "bounded_flags": [
+        "-DDATA_SIZE=16384",
+        "-DPASSES=4"
+      ],
+      "preprocessed_sha256": "392465594103b60fd213a636204eea52062db4afe31b0a9dd9ee6aecb0c31108",
+      "scale_controls": [
+        {
+          "macro": "DATA_SIZE",
+          "requested": "16384",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        },
+        {
+          "macro": "PASSES",
+          "requested": "4",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "zlib_ng_adler32_combine",
+      "source_sha256": "5d9a2ade64019e993686dab352d67dbdc4a009e2e33dd8568beff5c9ac423940",
+      "bounded_flags": [
+        "-DPASSES=10000"
+      ],
+      "preprocessed_sha256": "8bd34a2e70f63ffaefa170f829cba29f329ae2e45b75f078abdcf40271e453f1",
+      "scale_controls": [
+        {
+          "macro": "PASSES",
+          "requested": "10000",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "expat_xml_scan",
+      "source_sha256": "a076b1823869765011658d56ec090b22102e2ba7a5bbdf4cd0b6bdd0d774cf35",
+      "bounded_flags": [
+        "-DXML_SIZE=16384",
+        "-DPASSES=4"
+      ],
+      "preprocessed_sha256": "58211bafc8446a7648b1b4fbf8e261ff8f76bc2febf9113943c34015b1598c05",
+      "scale_controls": [
+        {
+          "macro": "XML_SIZE",
+          "requested": "16384",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        },
+        {
+          "macro": "PASSES",
+          "requested": "4",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "expat_siphash24",
+      "source_sha256": "59c5dfbdf3f0d2e149a3681925c46b7b0aeb195f179c285f3b64a2daaf1fb663",
+      "bounded_flags": [
+        "-DPASSES=1000"
+      ],
+      "preprocessed_sha256": "cd98041203ce162774039d1339dab339ffe59f9a255a1a09c41ba48a7ebea5a5",
+      "scale_controls": [
+        {
+          "macro": "PASSES",
+          "requested": "1000",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "sqlite_varint",
+      "source_sha256": "11c7e09b1507659fe44e678848c5e489268e4dd4aa385d3a542453caa400e1af",
+      "bounded_flags": [
+        "-DVALUE_COUNT=2048",
+        "-DPASSES=4"
+      ],
+      "preprocessed_sha256": "3416c29c8998f8ec2ca9db1791c8164366b0d9e4e606d8bb63bd9105669c4596",
+      "scale_controls": [
+        {
+          "macro": "VALUE_COUNT",
+          "requested": "2048",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        },
+        {
+          "macro": "PASSES",
+          "requested": "4",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "linux_find_bit",
+      "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a",
+      "bounded_flags": [
+        "-DPASSES=32"
+      ],
+      "preprocessed_sha256": "c8aa96afbeed21c5e0b171ace02c35cc42b6dc7e1a054fd48e851ddc534e633d",
+      "scale_controls": [
+        {
+          "macro": "PASSES",
+          "requested": "32",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "linux_find_bit_scaled",
+      "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a",
+      "bounded_flags": [
+        "-DPASSES=128"
+      ],
+      "preprocessed_sha256": "6bb42ec483cb18f277ad89bd12412e6930ee108ef13d07a761dd2bbdd0726b6f",
+      "scale_controls": [
+        {
+          "macro": "PASSES",
+          "requested": "128",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "glibc_memcmp",
+      "source_sha256": "6fcec75ff20c60106d78db2013a646579ab4262750fe64eee99387f3c16b0870",
+      "bounded_flags": [
+        "-DPASSES=16"
+      ],
+      "preprocessed_sha256": "42952a533bb790e7413af78646dc9a487b86d91cbfe491415e27c886b49a4cc2",
+      "scale_controls": [
+        {
+          "macro": "PASSES",
+          "requested": "16",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "chacha20_block",
+      "source_sha256": "7f0b876dc4bbea778d85e2a30d55046207eb60abe8c5388857bb1207efdac85c",
+      "bounded_flags": [
+        "-DBLOCK_COUNT=256",
+        "-DPASSES=2"
+      ],
+      "preprocessed_sha256": "f60af80323fb4dc183d82ef9666cfb9ddaee3f301e9f4bc2cc24cf24edec306a",
+      "scale_controls": [
+        {
+          "macro": "BLOCK_COUNT",
+          "requested": "256",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        },
+        {
+          "macro": "PASSES",
+          "requested": "2",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "sha256_transform",
+      "source_sha256": "6f55a89cfd9d59eb9a8e115eef968295ec775fa63d0545dd33517c2fdf06bf5e",
+      "bounded_flags": [
+        "-DBLOCK_COUNT=256",
+        "-DPASSES=2"
+      ],
+      "preprocessed_sha256": "1341afd7fd54da3a9385261d8ed6d719e5a1dd7991523af262509fd0ff1b28e4",
+      "scale_controls": [
+        {
+          "macro": "BLOCK_COUNT",
+          "requested": "256",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        },
+        {
+          "macro": "PASSES",
+          "requested": "2",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "linux_rbtree",
+      "source_sha256": "7c9c5ada20d8e32116ccbc1ca68690e92470ef7348b51842e49ffa2fa0480253",
+      "bounded_flags": [
+        "-DNODE_COUNT=1024",
+        "-DLOOKUP_ROUNDS=2"
+      ],
+      "preprocessed_sha256": "7eeb3253baeb5bf34c99dbfdec9f34d3102f71700cb08595b1549b00abfcf331",
+      "scale_controls": [
+        {
+          "macro": "NODE_COUNT",
+          "requested": "1024",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        },
+        {
+          "macro": "LOOKUP_ROUNDS",
+          "requested": "2",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "zstd_count",
+      "source_sha256": "cf01953477eadbebe46b07ede170a62ff41b62cf947dd12222a04ad93c985be6",
+      "bounded_flags": [
+        "-DBUFFER_SIZE=16384",
+        "-DQUERY_COUNT=1024",
+        "-DPASSES=2"
+      ],
+      "preprocessed_sha256": "91202486d4d7e0ed8afe7e092583dc03dfd8fcc0fbbf2ffa63353260cc2db6da",
+      "scale_controls": [
+        {
+          "macro": "BUFFER_SIZE",
+          "requested": "16384",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        },
+        {
+          "macro": "QUERY_COUNT",
+          "requested": "1024",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        },
+        {
+          "macro": "PASSES",
+          "requested": "2",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "lz4_compress",
+      "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4",
+      "bounded_flags": [
+        "-DSRC_SIZE=16384",
+        "-DPASSES=2"
+      ],
+      "preprocessed_sha256": "43fb65ce120e01adaf0eb80f001350a3aab9f939689e01d747b8ac7ecacc29ff",
+      "scale_controls": [
+        {
+          "macro": "SRC_SIZE",
+          "requested": "16384",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        },
+        {
+          "macro": "PASSES",
+          "requested": "2",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "lz4_match_extend",
+      "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4",
+      "bounded_flags": [
+        "-DSRC_SIZE=16384",
+        "-DPASSES=2",
+        "-DMATCH_RICH=1"
+      ],
+      "preprocessed_sha256": "e38a24aedbecea7db6dd6b953654727f9234de64059640b040517e88a61699a2",
+      "scale_controls": [
+        {
+          "macro": "SRC_SIZE",
+          "requested": "16384",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        },
+        {
+          "macro": "PASSES",
+          "requested": "2",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        },
+        {
+          "macro": "MATCH_RICH",
+          "requested": "1",
+          "control_kind": "defined vs undefined",
+          "preprocessed_program_changed": true
+        }
+      ]
+    },
+    {
+      "id": "glibc_strstr",
+      "source_sha256": "17dcd48414c9eb254cc910905113b7ed8a3cedac3c0d41216305484a5a7cd344",
+      "bounded_flags": [
+        "-DHAYSTACK_LEN=16384",
+        "-DQUERY_COUNT=32",
+        "-DPASSES=2"
+      ],
+      "preprocessed_sha256": "a12d5a1f209275532fc5fd79cc9584f711b2e95622f608079586f77e0302df03",
+      "scale_controls": [
+        {
+          "macro": "HAYSTACK_LEN",
+          "requested": "16384",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        },
+        {
+          "macro": "QUERY_COUNT",
+          "requested": "32",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        },
+        {
+          "macro": "PASSES",
+          "requested": "2",
+          "control_kind": "numeric zero/nonzero",
+          "preprocessed_program_changed": true
+        }
+      ]
+    }
+  ],
+  "ineffective": []
+}

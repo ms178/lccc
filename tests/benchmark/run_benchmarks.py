@@ -25,12 +25,14 @@ No third-party Python packages are required.
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import math
 import os
 import platform
 import random
+import re
 import resource
 import shutil
 import statistics
@@ -65,8 +67,12 @@ class Benchmark:
 # Keep historical synthetic tests, then add workload-derived kernels.  Sources
 # may live in the legacy numbered directory until they are migrated.
 BENCHMARKS: tuple[Benchmark, ...] = (
+    # Required source semantics, not optional tuning: these signed recurrences
+    # intentionally overflow. Keeping the requirement here covers every native
+    # and static caller, including correctness-only/default invocations.
     Benchmark("arith_loop", "32-variable arithmetic loop / register pressure",
-              ("arith_loop.c", "01_arith_loop.c"), ("synthetic", "regalloc", "integer")),
+              ("arith_loop.c", "01_arith_loop.c"), ("synthetic", "regalloc", "integer"),
+              extra_flags=("-fwrapv",)),
     Benchmark("fib", "recursive Fibonacci / recurrence recognition",
               ("fib.c", "02_fib.c"), ("synthetic", "calls", "recursion")),
     Benchmark("matmul", "dense matrix multiply / FP and cache",
@@ -90,11 +96,13 @@ BENCHMARKS: tuple[Benchmark, ...] = (
     Benchmark("strlen_bench", "string operations / byte loops",
               ("strlen_bench.c",), ("synthetic", "string", "memory")),
     Benchmark("switch_dispatch", "switch lowering / dispatch",
-              ("switch_dispatch.c",), ("synthetic", "switch", "branch")),
+              ("switch_dispatch.c",), ("synthetic", "switch", "branch"),
+              extra_flags=("-fwrapv",)),
     Benchmark("struct_copy", "struct copy / ABI and memory",
               ("struct_copy.c",), ("synthetic", "abi", "memory")),
     Benchmark("loop_patterns", "scalar loop transforms",
-              ("loop_patterns.c",), ("synthetic", "loop", "integer")),
+              ("loop_patterns.c",), ("synthetic", "loop", "integer"),
+              extra_flags=("-fwrapv",)),
     Benchmark("fannkuch", "Fannkuch-Redux / permutations",
               ("fannkuch.c",), ("synthetic", "integer", "branch"), 180),
     Benchmark("ackermann", "Ackermann / deep recursion",
@@ -306,7 +314,15 @@ def discover_compilers(args: argparse.Namespace) -> tuple[list[CompilerSpec], di
     aliases = {"icc": "icx"}
     requested = [aliases.get(item, item) for item in requested]
     known = {"lccc", "lev", "ccc", "gcc", "clang", "icx"}
-    unknown = [item for item in requested if item not in known]
+    additional: dict[str, str] = {}
+    for item in getattr(args, "candidate", []):
+        key, separator, executable = item.partition("=")
+        if (not separator or not executable or not re.fullmatch(r"[a-z][a-z0-9_-]*", key)
+                or key in known or key in additional):
+            raise ValueError("--candidate requires a unique non-reserved label=executable: " + item)
+        additional[key] = executable
+    requested = list(dict.fromkeys([*requested, *additional]))
+    unknown = [item for item in requested if item not in known | additional.keys()]
     if unknown:
         raise ValueError(f"unknown compiler key(s): {', '.join(unknown)}")
 
@@ -318,6 +334,8 @@ def discover_compilers(args: argparse.Namespace) -> tuple[list[CompilerSpec], di
         "clang": ("Clang", args.clang),
         "icx": ("ICX", args.icx),
     }
+    candidates.update((key, ("LCCC candidate: " + key, executable))
+                      for key, executable in additional.items())
     resolved = {key: compiler_path(value) for key, (_, value) in candidates.items()}
     gcc_include = detect_gcc_include(resolved.get("gcc"))
     unavailable: dict[str, str] = {}
@@ -329,7 +347,7 @@ def discover_compilers(args: argparse.Namespace) -> tuple[list[CompilerSpec], di
         if not executable:
             unavailable[key] = f"not found: {supplied}"
             continue
-        if key in ("lccc", "lev", "ccc"):
+        if key in ("lccc", "lev", "ccc") or key in additional:
             if not gcc_include:
                 unavailable[key] = "GCC builtin include directory unavailable (needed for compiler headers)"
                 continue
@@ -396,7 +414,13 @@ def compile_one(compiler: CompilerSpec, benchmark: Benchmark, source: Path,
     # from compiler flags so this ordering is invariant across compilers.
     command = [compiler.executable, *compiler.flags, "-o", str(output),
                str(source), *benchmark.extra_flags]
+    # A zero-exit/no-output compiler must never reuse a previous executable.
+    output.unlink(missing_ok=True)
     result = invoke(command, timeout_s=180, cwd=REPO_ROOT)
+    if result["ok"] and (not output.is_file() or not os.access(output, os.X_OK)):
+        result["ok"] = False
+        result["error"] = "compiler reported success without an executable artifact"
+    result["binary_sha256"] = sha256_file(output) if result["ok"] else None
     result["binary_bytes"] = output.stat().st_size if result["ok"] and output.is_file() else 0
     result["text_bytes"] = text_size(output) if result["ok"] and output.is_file() else 0
     result["source_sha256"] = sha256_file(source)
@@ -484,14 +508,42 @@ def probe_pmu(enabled: bool) -> dict[str, Any]:
     if not status["perf_path"]:
         status["reason"] = "perf is not installed"
         return status
-    result = invoke([status["perf_path"], "stat", "-e", "cycles,instructions", "--", "/bin/true"],
-                    timeout_s=15)
-    if result["ok"]:
+    command = [status["perf_path"], "stat", "--no-big-num", "-x", ",",
+               "-e", "cycles,instructions", "--", "/bin/true"]
+    result = invoke(command, timeout_s=15)
+    status["probe_command"] = command
+    status["probe_returncode"] = result["returncode"]
+    status["probe_stderr"] = result["stderr"]
+    counts: dict[str, float] = {}
+    invalid: set[str] = set()
+    required = {"cycles", "instructions"}
+    for row in csv.reader(result["stderr"].splitlines()):
+        if len(row) < 3:
+            continue
+        event = row[2].strip().split(":", 1)[0]
+        if event not in required:
+            continue
+        if event in counts:
+            invalid.add(event)
+        try:
+            count = float(row[0].strip())
+        except ValueError:
+            invalid.add(event)
+            continue
+        if not math.isfinite(count) or count <= 0:
+            invalid.add(event)
+            continue
+        counts[event] = count
+    status["observed_counts"] = counts
+    if result["ok"] and counts.keys() >= required and not invalid:
         status["available"] = True
-        status["reason"] = "perf stat cycles,instructions succeeded"
+        status["reason"] = "perf returned usable cycles and instructions counters"
+    elif result["ok"]:
+        status["reason"] = "perf exited zero without usable cycles/instructions counters"
     else:
         detail = first_nonempty_line(result["stderr"]) or result["error"] or f"exit={result['returncode']}"
         status["reason"] = detail
+
     return status
 
 
@@ -636,23 +688,34 @@ def evaluate_correctness(entry: dict[str, Any], compiler_keys: list[str]) -> Non
     """Mark output stability and cross-compiler equivalence without hiding errors."""
     successful: dict[str, list[str]] = {}
     for key in compiler_keys:
-        runs = entry["runs"].get(key, [])
+        timed = entry["runs"].get(key, [])
+        # Warm-ups are excluded from timing, never from correctness. A wrong
+        # first execution or unstable control cannot certify later samples.
+        runs = [*entry.get("warmups", {}).get(key, []), *timed]
         outputs = [run["stdout"] for run in runs if run.get("ok")]
         if outputs:
             successful[key] = outputs
         entry["correctness"][key] = {
             "stable_within_compiler": len(set(outputs)) == 1 if outputs else None,
             "output": outputs[0] if outputs else None,
+            "all_runs_successful": bool(timed) and len(outputs) == len(runs),
             "matches_baseline": None,
         }
-    baseline = "gcc" if "gcc" in successful else (next(iter(successful), None))
+    # When requested, GCC remains the oracle even if it failed. Falling back
+    # to LCCC would let the candidate certify its own wrong or missing result.
+    baseline = "gcc" if "gcc" in compiler_keys else next(iter(successful), None)
     entry["baseline_compiler"] = baseline
-    if baseline is None:
+    if baseline is None or baseline not in successful:
+        return
+    baseline_check = entry["correctness"][baseline]
+    if not baseline_check["stable_within_compiler"] or not baseline_check["all_runs_successful"]:
         return
     baseline_output = successful[baseline][0]
     for key, outputs in successful.items():
-        stable = len(set(outputs)) == 1
-        entry["correctness"][key]["matches_baseline"] = stable and outputs[0] == baseline_output
+        check = entry["correctness"][key]
+        check["matches_baseline"] = (check["stable_within_compiler"]
+                                     and check["all_runs_successful"]
+                                     and outputs[0] == baseline_output)
 
 
 def pair_ratios(rounds: list[dict[str, Any]], numerator: str, denominator: str,
@@ -814,7 +877,7 @@ def best_reference_for_entry(entry: dict[str, Any]) -> tuple[str, float] | None:
     """Return the lowest-median available reference compiler for one workload."""
     candidates: list[tuple[str, float]] = []
     for key, runtime in entry.get("runtime", {}).items():
-        if key == "lccc":
+        if key == "lccc" or entry.get("correctness", {}).get(key, {}).get("matches_baseline") is not True:
             continue
         wall = runtime.get("wall") if runtime else None
         if wall and wall.get("median") is not None:
@@ -827,7 +890,8 @@ def aggregate_lccc_vs_gcc(entries: list[dict[str, Any]]) -> dict[str, Any] | Non
     for entry in entries:
         ratio = entry.get("ratios_to_gcc", {}).get("lccc")
         lccc_correct = entry.get("correctness", {}).get("lccc", {}).get("matches_baseline")
-        if ratio and ratio.get("median") and lccc_correct is True:
+        gcc_correct = entry.get("correctness", {}).get("gcc", {}).get("matches_baseline")
+        if ratio and ratio.get("median") and lccc_correct is True and gcc_correct is True:
             ratios.append((entry["name"], ratio["median"]))
     if not ratios:
         return None
@@ -1058,6 +1122,8 @@ def main() -> int:
     parser.add_argument("--icx", default="icx", help="ICX executable")
     parser.add_argument("--ccc", default="", help="path to the original Claude's C Compiler executable (Anthropic upstream)")
     parser.add_argument("--lev", default="", help="path to Lev Kropp's original lccc executable (levkropp/lccc)")
+    parser.add_argument("--candidate", action="append", default=[], metavar="LABEL=EXECUTABLE",
+                        help="additional, explicitly labelled LCCC-compatible arm; repeatable, never impersonates a vendor")
     parser.add_argument("--opt", default="-O2", help="optimization flag passed uniformly to every compiler")
     parser.add_argument("--cflag", action="append", default=[], help="additional common compiler flag; may be repeated")
     parser.add_argument("--reps", type=int, default=15, help="timed paired rounds per benchmark (default: %(default)s)")

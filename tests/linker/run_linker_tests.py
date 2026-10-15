@@ -42,6 +42,11 @@ DEFAULT_LCCC = os.environ.get(
 CC = os.environ.get("LINKTEST_CC", "gcc")
 CXX = os.environ.get("LINKTEST_CXX", "g++")
 
+def _escape_github_annotation_data(value: str) -> str:
+    """Escape untrusted multiline text before embedding it in an Actions command."""
+    return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
 def compiler_for(fname):
     """Pick the driver for a fixture source; C++ needs g++, not gcc."""
     return CXX if os.path.splitext(fname)[1] in (".cpp", ".cc", ".cxx") else CC
@@ -6164,6 +6169,7 @@ def _plain_gotpcrel_test(args, oracles):
     is refused now (a -T link has no GOT).
     """
     name = "plain_gotpcrel_relaxation"
+    assembler = os.environ.get("LCCC_TEST_ASSEMBLER", "as")
     td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
     try:
         for fname, text in (("pg.s", _PLAIN_GOTPCREL_ASM),
@@ -6179,7 +6185,7 @@ def _plain_gotpcrel_test(args, oracles):
         # Invoke GAS directly: distro GCC may configure an absolute assembler
         # path that ignores PATH. This fixture needs the pinned GAS (MOVRS),
         # not the compiler driver's private assembler. Keep the C driver for C.
-        r = sh(["as", "--64", "-mrelax-relocations=no", "pg.s", "-o", "pg.o"], cwd=td)
+        r = sh([assembler, "--64", "-mrelax-relocations=no", "pg.s", "-o", "pg.o"], cwd=td)
         if r.returncode != 0:
             err = r.stderr.decode()[:300]
             if "movrs" in err:
@@ -6188,7 +6194,7 @@ def _plain_gotpcrel_test(args, oracles):
         rel = sh(["readelf", "-rW", "pg.o"], cwd=td).stdout.decode()
         if rel.count("R_X86_64_GOTPCREL ") != 7:
             return Result(name, "FAIL", f"assembler did not emit plain GOTPCREL:\n{rel[-600:]}")
-        r = sh(["as", "--64", "-mrelax-relocations=no", "sc.s", "-o", "sc.o"], cwd=td)
+        r = sh([assembler, "--64", "-mrelax-relocations=no", "sc.s", "-o", "sc.o"], cwd=td)
         if r.returncode != 0:
             return Result(name, "FAIL", f"assemble sc.s: {r.stderr.decode()[:300]}")
         for argv in (["-O1", "-c", "m.c"],
@@ -6566,7 +6572,7 @@ def _elf_bytes_phdrs(d):
 
 
 def _elf_bytes_shdrs(d):
-    """Parse all section headers; returns list of (name, type, flags, addr, off, size, align)."""
+    """Parse all section headers; returns (name, type, flags, addr, off, size, link, info, align)."""
     e_shoff, = struct.unpack_from("<Q", d, 0x28)
     e_shentsize, e_shnum, e_shstrndx = struct.unpack_from("<HHH", d, 0x3A)
     hdrs = []
@@ -6674,6 +6680,27 @@ def _relro_nobits_pad_test(args, oracles):
                       % (r_fsz, r_msz, w2[2], w2[3]))
 
 
+def _note_run_count(notes, occupied):
+    """Count note spans; short non-note data is not alignment padding.
+
+    notes: sorted (virtual address, file offset, size, alignment).
+    occupied: nonempty allocated, file-backed NON-note intervals.
+    """
+    if not notes:
+        return 0
+    runs = 1
+    prev_addr_end = notes[0][0] + notes[0][2]
+    prev_end = notes[0][1] + notes[0][2]
+    for addr, off, size, _align in notes[1:]:
+        gap = off - prev_end
+        data_in_gap = any(lo < off and prev_end < hi for lo, hi in occupied)
+        if gap < 0 or gap > 8 or addr - prev_addr_end != gap or data_in_gap:
+            runs += 1
+        prev_end = max(prev_end, off + size)
+        prev_addr_end = max(prev_addr_end, addr + size)
+    return runs
+
+
 def _note_run_merge_test(args, oracles):
     """Contiguous allocated note sections share ONE PT_NOTE (lld-style).
 
@@ -6706,19 +6733,17 @@ def _note_run_merge_test(args, oracles):
             return Result(name, "FAIL", "not an ELF64 LSB file")
         SHF_ALLOC = 2
         notes = sorted(
-            ([h[3], h[4], h[5], h[6]] for h in shdrs
+            ([h[3], h[4], h[5], h[8]] for h in shdrs
              if h[1] == _SHT_NOTE and (h[2] & SHF_ALLOC) and h[5] > 0),
             key=lambda h: h[1])
         if len(notes) < 2:
             return Result(name, "SKIP", "fixture has <2 note sections")
-        # Independent expectation: maximal runs allowing <= 8-byte alignment
-        # gaps (section alignment inside a span is legal for one PT_NOTE).
-        runs = 1
-        prev_end = notes[0][1] + notes[0][2]
-        for _, off, sz, _al in notes[1:]:
-            if off - prev_end > 8:
-                runs += 1
-            prev_end = max(prev_end, off + sz)
+        # Short gaps can contain real .rodata, not just alignment bytes.
+        # Folding that data into PT_NOTE would make the note reader interpret
+        # arbitrary string bytes as a note header. SHT_NOBITS has no file span.
+        occupied = [(h[4], h[4] + h[5]) for h in shdrs
+                    if h[1] not in (_SHT_NOTE, 8) and h[2] & SHF_ALLOC and h[5] > 0]
+        runs = _note_run_count(notes, occupied)
         ptn = [p for p in phdrs if p[0] == _PT_NOTE]
         if len(ptn) != runs:
             return Result(name, "FAIL",
@@ -6732,8 +6757,8 @@ def _note_run_merge_test(args, oracles):
             covered.append((off, off + fsz))
         covered.sort()
         for _, off, sz, _ in notes:
-            if not any(lo <= off and off + sz <= hi for lo, hi in covered):
-                return Result(name, "FAIL", "note section at %#x not covered"
+            if sum(lo <= off and off + sz <= hi for lo, hi in covered) != 1:
+                return Result(name, "FAIL", "note section at %#x not covered exactly once"
                               % off)
         props = [p for p in phdrs if p[0] == _PT_GNU_PROPERTY]
         prop_secs = [h for h in shdrs if h[0] == ".note.gnu.property"]
@@ -11294,6 +11319,16 @@ def main():
     for r in results:
         if r.status != "PASS" or args.verbose:
             print(f"[{r.status}] {r.name}" + (f"\n    {r.detail}" if r.detail else ""))
+        if (
+            (r.status == "FAIL" or (args.strict and r.status in ("WARN", "SKIP")))
+            and os.environ.get("GITHUB_ACTIONS") == "true"
+        ):
+            # Keep the primary log/JSON unchanged, but surface the exact
+            # failing case through the Checks API when hosted-runner log
+            # retrieval is unavailable. Escape workflow-command delimiters.
+            message = f"{r.status} {r.name}: {r.detail or 'no detail'}"
+            message = _escape_github_annotation_data(message)
+            print(f"::error title=Linker suite case::{message}")
     # Print the oracle names that were ACTUALLY used. The previous hardcoded
     # "bfd{mold}{wild}" string could not drift when the list did, so a lost
     # registration was invisible in the one line a reviewer would look at --

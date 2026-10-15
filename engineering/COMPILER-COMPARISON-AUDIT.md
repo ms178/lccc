@@ -1,0 +1,275 @@
+# Compiler-candidate audit
+
+Date: 2026-10-15. Current integrated main: `84a62201cc90a41c9a0eefe2faf5196f43370cfa`.
+Compared source trees: PR #835 (`4216f897460be1eef08cc0f24e8b6016cd738283`)
+and PR #836 (`3671c7c9a088226b2962ff9712c178da79e7b9d4`), followed by the
+changes in this tree. Source archives, not branch switches, isolate references.
+
+## What the experiments establish
+
+The independent, seven-test adversarial comparison contract was replayed
+against both original runners and the corrected runner:
+
+| Runner | Tests | Failures | Errors |
+|---|---:|---:|---:|
+| PR #835 | 7 | 5 | 0 |
+| PR #836 input | 7 | 5 | 0 |
+| Corrected tree | 7 | 0 | 0 |
+
+The five reproduced defects were:
+
+1. an unstable GCC control could certify a candidate matching its first output;
+2. unavailable requested GCC could be replaced by the candidate itself;
+3. successful samples could conceal failed candidate executions;
+4. the GCC aggregate checked candidate correctness but not control correctness;
+5. fastest-reference selection admitted an incorrect reference compiler.
+
+These are **harness defect reproductions**, not compiler speed measurements.
+The regression authority is
+`tests/corpus/test_benchmark_comparison_safety.py`. The baseline Python corpus
+passed 545 tests with five skips; the competing tree passed 582 with four skips.
+Test counts are not interchangeable coverage or quality scores. The corrected
+tree's full corpus passed 616 tests in 84.452 seconds with five explicit skips;
+the focused safety/report/publication suite passed all 40 tests. Twenty
+LCCC-independent local gate commands passed, including the audit census,
+import scanner, documentation links, resource checks and corpus. The strict
+CI/local parity mutation suite passed all 73 tests.
+
+An expanded 11-method replay includes all **1,296** combinations of bounded
+warm-up/timed, control/candidate states: absent, correct, different, failed,
+unstable and mixed-success observations. Both supplied runners fail nine test
+methods; the corrected runner passes all 11. The 469 failing subtests in each
+supplied runner are **not** 469 distinct compiler defects. See the
+[exact runner/protocol hashes and results](measurements/compiler-warmup-safety.json).
+
+This found a further defect in this audit's own harness: successful but wrong
+warm-up output was excluded from correctness along with its timing. Warm-ups
+now participate in output stability and execution-success checks, but never in
+timing distributions; a warm-up-only arm still cannot pass. The report also
+revalidates raw observations instead of trusting cached correctness flags.
+This closes a real false-certification path without removing self-checks,
+execution failures, samples or workloads.
+
+A native GCC 12.2 smoke run of all 65 semantic cases is also informative:
+all 65 independent `-O0` controls passed, but the optimized GCC arm failed four
+`fenv_constant_rounding` cases with exit 52: a discarded division no longer
+raised the expected exception. No self-check was removed. This is why the
+semantic matrix explicitly uses an unoptimized independent GCC control and
+records the optimized GCC arm separately. It does **not** establish GCC 16.2
+behavior or LCCC correctness. GCC's pragma support must not be assumed merely
+because it is the reference compiler.
+
+## Native workload input validity
+
+A local GCC 12 UBSan experiment executed all **45 bounded workload IDs**, each
+with and without explicit wrapping (**90 executions**, all builds succeeded).
+`arith_loop` and `loop_patterns` both diagnose signed integer overflow without
+`-fwrapv`. The named timing and Callgrind requests already supplied it, but
+ordinary correctness-only/default native requests could omit it. These workloads and `switch_dispatch`
+now declare `-fwrapv` in the registry, so native and static callers receive the
+required source semantics even after contrary user options. A separate default-size
+sweep found the third requirement: reduced `switch_dispatch` does not diagnose
+overflow, but its full 50-million-iteration input does. Declaring wrapping fixes
+it without changing the source, size or sanitizer options. The two default-size
+45-ID sweeps and an additional full-size confirmation bring this evidence to
+**181 recorded executions**. The final default-size sweep has 44 zero exits and
+the retained GS-zero diagnostic, not an unqualified sanitizer pass. No source,
+output check or workload was removed. New regressions require the negative sanitizer
+arms to fail, the declared-contract arms to pass, and their output to match
+**independent Python 32/64-bit modular models**, not GCC's output alone.
+
+The same sanitizer reports a null-member access for `percpu_ptr_walk`, including
+with wrapping enabled. This diagnostic is retained, **not** counted as a passing
+sanitizer run. GCC 12 and 16 explicitly declare segment-relative address zero
+valid in `ix86_addr_space_zero_address_valid`; the benchmark deliberately starts
+at GS-relative offset zero on private, initialized storage. Its native result
+also matches an independent unsigned modular model. This is a target-specific
+GCC 12 instrumentation limitation, not a reason to delete that boundary case or
+to disable sanitizer checks. The [raw observations, commands, source hashes and
+GCC backend evidence](measurements/compiler-input-validity.json) distinguish the
+two actual missing semantic requirements from this address-space limitation.
+No sanitizer-based universal absence-of-UB or compiler-performance claim follows.
+
+## Source-qualified hosted semantic screen
+
+The [completed semantic stage](https://github.com/ms178/lccc/actions/runs/38793747389/job/116624973791)
+used final source `c8ea67fb9eec195f5db958eea93ca6c35a0f4d2d`, main
+`84a62201cc90a41c9a0eefe2faf5196f43370cfa`, PR #835's exact source above,
+and the PR #836 input. Its witness index SHA256 is
+`9bb7da9b4b669b6f2263735305e32c7dae3ed8d7ac97979b46e570c377837ac2`.
+
+| Arm | Pass | Fail |
+|---|---:|---:|
+| Independent Debian GCC 16.2 at O0 | 65 | 0 |
+| Final compiler in this screen | 65 | 0 |
+| Main | 31 | 34 |
+| PR #835 | 35 | 30 |
+| PR #836 input | 65 | 0 |
+| Separately recorded optimized GCC 16.2 | 60 | 5 |
+
+Main and PR #835 both fail 15 macro/enumerator cases, five wrapping byte-address
+cases and ten FP-environment cases. Main additionally fails two strict trap-order
+and two wrapping-domain cases. Optimized GCC fails four discarded-division
+exception cases and one strict first-trap-order case. Those are failures of the
+**requested observable-FP contract**, not a general claim about GCC's supported
+pragma semantics or overall quality. Zero failures in 65 bounded cases is not
+proof of exhaustive correctness or a performance result.
+
+Only this semantic stage completed: the job was cancelled during native timing.
+It also used compiler-default dialects. The acceptance measurements now explicitly
+select **GNU C17** for every arm in semantic, native, static and Callgrind inputs;
+GCC 16's newer GNU23 default must not silently differ from LCCC's GNU17 default.
+A local explicit-GNU17 replay again passes all 65 GCC 12 O0 controls and retains
+its four optimized-GCC failures and nonzero runner status. This does not replace
+the new hosted comparison or validate LCCC locally.
+
+## Existing hosted screening: evidence, not a new timing experiment
+
+Checks-API annotations from the original Debian jobs are retained in
+[`measurements/compiler-comparison-screen.json`](measurements/compiler-comparison-screen.json).
+The run-page source identities are the synthetic PR merge commits, recorded in
+that file, not silently relabelled as the new compiler.
+
+- [PR #836 Debian job](https://github.com/ms178/lccc/actions/runs/38781829546/job/116583738392)
+- [PR #835 Debian check](https://github.com/ms178/lccc/runs/116522202545)
+
+Both native reports are correctness-only (`skip_perf=true`, one run): no timing
+ranking can be inferred. Both report Debian GCC 16.2.0-3. There are 44 matching
+source hashes; `tce_sum` changed its size macro and is excluded from this
+cross-run comparison. The GCC simulated `Ir` control is identical for all 44
+matching shapes. Illustrative whole-program Callgrind counts:
+
+| Same-source shape | PR #836 input Ir | PR #835 Ir | Input / competing |
+|---|---:|---:|---:|
+| spectral_norm | 5,503,480 | 5,170,615 | 1.06438 |
+| struct_copy | 395,646 | 389,646 | 1.01540 |
+| lz4_compress | 654,048 | 649,093 | 1.00763 |
+| zstd_count | 473,614 | 471,574 | 1.00433 |
+| zlib_ng_adler32_combine | 21,869,096 | 21,946,318 | 0.99648 |
+| fannkuch | 1,275,870 | 1,310,231 | 0.97377 |
+
+These are **separate-job, bounded-size, simulated instruction screens**, not
+native speedups, hardware cycles, or results for the edited compiler. They
+refute a blanket claim that either input is uniformly better. The large
+shared gaps to GCC also remain visible: `byte_load_reassembly` executes
+72,125,195 simulated instructions versus GCC's 16,834,535 (4.28436x), and
+`ring_fifo` 637,710 versus 265,362 (2.40317x). An attractive aggregate would not
+remove these weaknesses or establish a fix.
+
+## Integration with current main
+
+The remote main ref advanced during the audit. Its private-XMM liveness cache
+and staged wide-call argument fix are retained, along with the native typed
+wide-argument witness and all six temporary-lifetime tests. Those lifetime tests
+now use the fallible reservation API; unmanaged pending paths remain covered.
+The final managed implementation additionally preserves a kept-but-unwritten
+path and fails closed when secure directory creation fails.
+
+The stricter upstream evidence verifier retains its exact schema and frozen
+69-file scope. The byte-identical protected audit was restored to its canonical
+path; the independently updated report lives in
+[`PR831-COMPILER-AUDIT.md`](PR831-COMPILER-AUDIT.md). No protected measurement
+was rehashed to conceal a mismatch. Source/benchmark results recorded below
+remain qualified by their own identities; integration requires fresh hosted
+validation rather than inheritance of an earlier green check.
+
+## Implementation decisions and their proof obligations
+
+| Area | Decision | Regression authority / limitation |
+|---|---|---|
+| Managed temporary paths | Adopt leased directory ownership and fallible reservation; remove flat-name fallback; preserve `OsStr` at subprocess boundaries | Concurrent/pending/kept lifetimes, failure cleanup, separators/NUL, valid Unix filename characters, symlink and non-UTF-8 driver cases |
+| Packed F64 reciprocal denominators | Use the competing tree's correct I32x4/XMM class in all three home collectors, not I32x8/YMM | Six producer shapes; each relevant collector checked; exact-bit and guarded-tail runtime fixture remains required |
+| Architectural register renaming | Preserve the competing fixed/implicit-operand checks, add destination-RCX and invalid-ID guards, retain Unicode-safe scanning and opaque-instruction barriers | MUL/DIV/string implicit operands; ten shift/rotate families and five suffixes; ordinary RCX addresses/BMI2 remain positive controls |
+| Never-read frame stores | Adopt architectural read extents rather than arbitrary 16/32/64-byte caps; use wide endpoint arithmetic | ZMM, fixed 512-byte FXRSTOR, unknown XSAVE/state images, MXCSR four-byte control, nonoverlapping stores, i32 endpoint boundary |
+| FP liveness and branch fusion | Retain this tree's stronger CMOV/source-width, conditional XSAVE, pin, CFG-edge and live-register requirements | Existing executable and Rust regressions; do not trade defined behavior for smaller assembly |
+| AArch64 shared ADR | Adopt structural local/allocated/non-TLS section provenance, checked address construction, object identity and valid-zero support | UNDEF/ABS/reserved/discarded/nonallocated targets rejected; named and section-symbol controls; output sentinel preserved on rejection |
+| Arithmetic policy | Keep wrapping and observable FP state independent across compilation boundaries | Four policy combinations at O0/O1/O2/O3, not a test that toggles both together |
+| Standalone RV64 tests | Keep the pure displacement sweep standalone; test the real instruction encoder in its production module | Exact asymmetric AUIPC bounds and XLEN wrapping retained; no invented alignment restriction |
+
+The AArch64 linker does not yet consistently serialize merged hidden/protected
+visibility through dynsym/GOT/PLT. Consequently shared ADR to nonlocal symbols
+is explicitly unsupported, even with a visibility declaration; pretending
+that a numeric address proves local binding would be incorrect. This is a
+capability limitation, not a claim that general ELF visibility is complete.
+
+Competing unsigned-loop normalization, inline-assembly vector traits and CSE
+changes were not bulk-copied without independently applicable proofs. The
+existing affine proof already owns a kill switch and signed/unsigned,
+full-width, optional-exit and modular-sequence tests. Extra optimization is
+not justified by source size or by an old green check alone.
+
+## Reproducible hosted comparison
+
+The opt-in `compiler-comparison` job in `pr826-redteam.yml` is enabled either by
+its dispatch input or the `compiler-comparison` PR label. It uses actual Debian
+GCC 16.2.0 and the current stable Rust/cargo/rustfmt/clippy. It archives exact
+same-repository main/competing/prior trees, builds them with one toolchain, and
+records source IDs, executable hashes, versions, commands and raw outputs.
+
+1. **Semantic witnesses:** 65 current-tree cases across O0/O1/O2/O3/Os, with
+   independent GCC `-O0` controls and separately labelled optimized GCC.
+   Historical failures remain failures in the inventory; final and control
+   failures fail the job. This is not timing evidence.
+2. **Native workload comparison:** all 45 registry IDs, shared O2 target and
+   wrapping flags, randomized paired rounds, affinity where available, one
+   warm-up and nine retained samples. The native A/B focuses on the requested
+   compiler candidates; main is an additional semantic/static baseline, not
+   included in the timing aggregate.
+3. **O3:** all 45 shapes, correctness-only, never a second timing claim.
+4. **Static codegen:** `benchmark_codegen.py --oracles ''`, every registry ID
+   per compiler. All compiler arms run even if another fails; aggregate status
+   remains failure. Bounded rows retain whole-TU counts and raw report hashes;
+   `stack_refs` explicitly names the oracle's legacy `spills` field. Instruction
+   counts are screening, not runtime or proof of allocator spill causality.
+5. **Bounded instrumentation:** all 45 IDs using `callgrind_corpus.py`, both a
+   direct candidate comparison and a separate GCC control at the same sizes.
+   Raw counters, native/instrumented output checks and manifests are retained.
+
+All 55 size/shape macro overrides were also sensitivity-checked with local
+GCC 12.2 preprocessing across the complete 45-ID registry. Numeric zero/nonzero
+controls and a defined/undefined control for LZ4's presence-based `MATCH_RICH`
+all changed the preprocessed program. No ineffective override was found. This
+checks configuration plumbing, not compiler execution or performance; the
+[machine-readable controls](measurements/compiler-scale-controls.json) retain
+that distinction.
+
+A failure in one measurement does not suppress the other independent
+measurements after a successful build. No `continue-on-error` converts it into
+success. Bounded Checks annotations make evidence readable without relying on
+an artifact-download host. Live Compiler Explorer calls remain outside CI,
+including the optional lane; offline helper coverage is not a claim of an
+ICX/multi-vendor survey.
+
+Evidence publication itself was red-teamed: byte-sized notices alone were
+insufficient. Actions retained only ten notices from each step, so a successful
+combined publication step hid later semantic, O3 and static sections. The
+[recorded API observation](measurements/compiler-notice-budget.json) preserves
+that failure without presenting the cancelled run as complete validation.
+Each section now has its own unconditional step immediately after measurement.
+The publisher buffers the complete section and rejects more than ten notices
+before emitting any successful-looking prefix. Tests recover all 45 native rows
+with five compiler arms and all 65 worst-case semantic failure rows; missing,
+partial, malformed, over-budget and required-failing sections cannot pass.
+
+The report rejects missing/duplicated shapes and unqualified timing arms.
+Primary screening aggregates exclude incorrect or unstable executions, failed
+GCC controls, fewer than seven actual pairs, and either median below 20 ms.
+Excluded rows remain in the correctness inventory. Hosted wall times are VM
+screening, never bare-metal performance or proof of universal superiority.
+
+## Environment and acceptance criteria
+
+The local sandbox is Debian 12 with GCC 12.2; Rust, Clang, Valgrind and hardware
+PMU access are unavailable. The repository swap script activated a real 2 GiB
+swap file. Network restrictions prevented installing local Debian GCC 16.2 or
+Rust; those exact tools must execute in hosted jobs. The cross-target boundary
+matrix, which requires GCC 16.2.0 explicitly, belongs in the exact Debian lane,
+not a rolling-major Ubuntu PPA lane. Its complete result JSON is now required
+by the mirrored invocation contract and retained with the other artifacts.
+Old green checks and Python contracts do not validate the edited Rust.
+
+Before claiming completion, inspect current-head compiled tests, strict
+Clippy/rustfmt, all required cross-target and linker gates, and the named
+comparison evidence. Any discovered miscompile must retain its failing case
+and independent control. Native performance conclusions require qualified
+samples; neither byte counts nor simulated `Ir` alone settle them.

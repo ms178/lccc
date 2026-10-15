@@ -1066,7 +1066,8 @@ pub(super) fn line_writes_memory(t: &str) -> bool {
         return true;
     }
     // Implicit memory WRITERS with no AT&T memory-operand convention to
-    // rely on: string stores (`stos*`, `ins*` write (%rdi)/(%rdi)), the
+    // rely on: string stores (`stos*`, `ins*` write through RDI), CLZERO (writes
+    // the cache line through RAX), the
     // streaming store `maskmov*` (writes (%rdi) with two REGISTER operands
     // — the dst-is-memory check below would misclassify it as a pure read),
     // and the read-modify-write forms `xchg*`/`cmpxchg*` (either operand
@@ -1075,6 +1076,8 @@ pub(super) fn line_writes_memory(t: &str) -> bool {
     // both consumers (dead store removal, store-forwarding barriers) only
     // get more conservative.
     if t.starts_with("stos")
+        || t.starts_with("clzero")
+        || t.starts_with("ins") && t.as_bytes().get(3).is_none_or(u8::is_ascii_whitespace)
         || t.starts_with("insb")
         || t.starts_with("insw")
         || t.starts_with("insl")
@@ -2771,6 +2774,37 @@ mod tests {
     // behind tests/regression/pic_indexed_store_static_global.c.
 
     #[test]
+    fn clzero_is_an_implicit_memory_writer() {
+        assert!(line_writes_memory("clzero"));
+        assert!(line_writes_memory("clzero # aligned line through rax"));
+    }
+
+    #[test]
+    fn clzero_implicit_address_setup_survives_the_full_pipeline() {
+        assert_ne!(classify_line("clzero").reg_refs & 1, 0, "implicit rax read");
+        let out = run(&frame(
+            "    movq %rdi, %rax\n    clzero\n    movq (%rdi), %rax\n",
+        ));
+        assert!(
+            out.contains("movq %rdi, %rax"),
+            "lost CLZERO address: {out}"
+        );
+    }
+
+    #[test]
+    fn clzero_prevents_stale_reload_reuse_directly_and_in_full_pipeline() {
+        let text = frame(
+            "    movq (%rdi), %r8\n    movq %rdi, %rax\n    clzero\n    movq (%rdi), %r9\n    addq %r8, %r9\n    movq %r9, %rax\n",
+        );
+        for out in [run_reuse(&text, ReusePolicy::full()), run(&text)] {
+            assert!(
+                out.matches("(%rdi)").count() >= 2,
+                "reused pre-CLZERO bytes: {out}"
+            );
+        }
+    }
+
+    #[test]
     fn implicit_memory_writers_are_forwarding_barriers() {
         for text in [
             "vmaskmovdqu %xmm0, %xmm1",
@@ -2779,6 +2813,9 @@ mod tests {
             "movdir64b (%rsi), %rdi",
             "enqcmd (%rsi), %rdi",
             "enqcmds (%rsi), %rdi",
+            "clzero",
+            "ins",
+            "ins # implicit destination",
             "stosb",
             "stosq",
             "rep movsq",

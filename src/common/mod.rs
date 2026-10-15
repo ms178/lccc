@@ -10,6 +10,7 @@ pub(crate) mod fp_contract;
 pub(crate) mod fx_hash;
 pub(crate) mod isa_features;
 pub(crate) mod long_double;
+pub(crate) mod semantics;
 pub(crate) mod source;
 pub(crate) mod symbol_table;
 pub(crate) mod temp_files;

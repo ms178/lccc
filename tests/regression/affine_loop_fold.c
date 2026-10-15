@@ -236,7 +236,7 @@ static void refuse_negative_c(long *cnt, long *sum) {
     *sum = s;
 }
 
-static void refuse_unsigned(long *cnt, long *sum) {
+static void unsigned_counted(long *cnt, long *sum) {
     unsigned s = 0;
     long n = 0;
     for (unsigned i = 0; i + 4u < 64u; i++) {
@@ -425,7 +425,7 @@ int main(void) {
         {"refuse_rt_start", refuse_rt_start},
         {"refuse_rt_step", refuse_rt_step},
         {"refuse_negative_c", refuse_negative_c},
-        {"refuse_unsigned", refuse_unsigned},
+        {"unsigned_counted", unsigned_counted},
         {"refuse_width_mismatch", refuse_width_mismatch},
         {"refuse_two_uses", refuse_two_uses},
         {"ptr_iv", ptr_iv},

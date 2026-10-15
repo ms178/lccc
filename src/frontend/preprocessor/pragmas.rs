@@ -43,6 +43,10 @@ impl Preprocessor {
         col: usize,
     ) -> Option<String> {
         let rest = rest.trim();
+        if rest.starts_with("STDC") && rest.split_whitespace().eq(["STDC", "FENV_ACCESS", "ON"]) {
+            self.fenv_access_requested = true;
+            return None;
+        }
         if rest == "once" {
             // Mark the current file as "include once".  Track both canonical
             // path and device/inode so the same file included through a symlink
@@ -327,5 +331,31 @@ impl Preprocessor {
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod fp_environment_tests {
+    use super::*;
+
+    #[test]
+    fn active_fp_environment_pragmas_are_monotone_and_tu_local() {
+        for (source, expected) in [
+            ("int x;", false),
+            ("#pragma STDC FENV_ACCESS OFF\nint x;", false),
+            ("#if 0\n#pragma STDC FENV_ACCESS ON\n#endif\nint x;", false),
+            ("#pragma STDC FENV_ACCESS ON\nint x;", true),
+            (
+                "#pragma STDC FENV_ACCESS ON\n#pragma STDC FENV_ACCESS OFF\nint x;",
+                true,
+            ),
+            ("_Pragma(\"STDC FENV_ACCESS ON\")\nint x;", true),
+        ] {
+            let mut pp = Preprocessor::new();
+            let _ = pp.preprocess(source);
+            assert!(pp.errors().is_empty());
+            assert_eq!(pp.fenv_access_requested, expected, "{source}");
+        }
+        assert!(!Preprocessor::new().fenv_access_requested);
     }
 }

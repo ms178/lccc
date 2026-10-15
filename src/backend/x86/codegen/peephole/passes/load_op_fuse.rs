@@ -418,16 +418,22 @@ const FUSIBLE_OPS: &[&str] = &["add", "sub", "and", "or", "xor", "cmp", "test", 
 /// Subset for which `B = T op C` equals `B = C op T`.
 const COMMUTATIVE_OPS: &[&str] = &["add", "and", "or", "xor", "imul"];
 
+/// Reject unsupported suffixes without slicing through a UTF-8 character.
+/// The accepted ASCII instruction set is unchanged.
+#[inline]
+fn split_lq_mnemonic(mnemonic: &str) -> Option<(&str, bool)> {
+    if let Some(op) = mnemonic.strip_suffix('q') {
+        Some((op, true))
+    } else {
+        mnemonic.strip_suffix('l').map(|op| (op, false))
+    }
+}
+
 /// Parse `OP{l,q} %src, %dst` where both are plain GP registers of the
 /// suffix width.  Returns `(op, is_q, src_fam, dst_fam)`.
 fn parse_reg_reg_alu(t: &str) -> Option<(&'static str, bool, RegId, RegId)> {
     let mnemonic = t.split_whitespace().next()?;
-    let (op, suffix) = mnemonic.split_at(mnemonic.len().checked_sub(1)?);
-    let is_q = match suffix {
-        "q" => true,
-        "l" => false,
-        _ => return None,
-    };
+    let (op, is_q) = split_lq_mnemonic(mnemonic)?;
     let op = *FUSIBLE_OPS.iter().find(|o| **o == op)?;
     let rest = t[mnemonic.len()..].trim();
     let (a, b) = split_two_operands(rest)?;
@@ -448,12 +454,7 @@ fn parse_reg_reg_alu(t: &str) -> Option<(&'static str, bool, RegId, RegId)> {
 /// as the register mirror form.
 fn parse_imm_reg_flag(t: &str) -> Option<(&'static str, bool, &str, RegId)> {
     let mnemonic = t.split_whitespace().next()?;
-    let (op, suffix) = mnemonic.split_at(mnemonic.len().checked_sub(1)?);
-    let is_q = match suffix {
-        "q" => true,
-        "l" => false,
-        _ => return None,
-    };
+    let (op, is_q) = split_lq_mnemonic(mnemonic)?;
     if op != "cmp" && op != "test" {
         return None;
     }
@@ -936,12 +937,7 @@ const INPLACE_UNARY: &[&str] = &["not", "neg", "inc", "dec"];
 /// register of the same width.
 fn parse_inplace_op(t: &str) -> Option<(bool, RegId, &str, bool)> {
     let mnemonic = t.split_whitespace().next()?;
-    let (op, suffix) = mnemonic.split_at(mnemonic.len().checked_sub(1)?);
-    let is_q = match suffix {
-        "q" => true,
-        "l" => false,
-        _ => return None,
-    };
+    let (op, is_q) = split_lq_mnemonic(mnemonic)?;
     let rest = t[mnemonic.len()..].trim();
     let width = if is_q { 0 } else { 1 };
     if INPLACE_UNARY.contains(&op) {
@@ -1394,6 +1390,40 @@ pub(super) fn fuse_load_into_lea_add(store: &mut LineStore, infos: &mut [LineInf
 /// Returns `None` when a high-byte alias (`%ah`..`%dh`) is present, because
 /// families 4..15 have no high-byte counterpart.
 fn rename_family(text: &str, from: RegId, to: RegId) -> Option<String> {
+    // Register names are not interchangeable when the ISA fixes an operand:
+    // MUL's accumulator is absent from the text, and legacy shifts name CL
+    // explicitly but cannot encode another byte register. This helper also
+    // accepts isolated source expressions (no mnemonic), which have no such
+    // instruction effects. Keep ordinary RCX addressing and BMI2 shifts legal.
+    let trimmed = text.trim();
+    if from >= 16 || to >= 16 {
+        return None;
+    }
+    let families = (1u16 << from) | (1u16 << to);
+    if from == RSP_FAM || to == RSP_FAM || implicit_reg_refs(trimmed.as_bytes()) & families != 0 {
+        return None;
+    }
+    let mn = trimmed.split_whitespace().next().unwrap_or("");
+    let operands = trimmed[mn.len()..].trim();
+    let fixed_shift = [
+        "shl", "sal", "shr", "sar", "rol", "ror", "rcl", "rcr", "shld", "shrd",
+    ]
+    .iter()
+    .any(|base| {
+        mn == *base
+            || mn
+                .strip_prefix(base)
+                .is_some_and(|suffix| matches!(suffix, "b" | "w" | "l" | "q"))
+    });
+    if (from == 1 || to == 1)
+        && fixed_shift
+        && operands
+            .split(',')
+            .next()
+            .is_some_and(|count| count.trim() == "%cl")
+    {
+        return None;
+    }
     const HIGH: [&str; 4] = ["%ah", "%ch", "%dh", "%bh"];
     if HIGH.iter().any(|h| text.contains(h)) {
         return None;
@@ -1708,6 +1738,10 @@ fn rename_product_range(
             return None;
         }
         let t = info.trimmed(store.get(k));
+        // Opaque instructions can read unspelled architectural operands.
+        if may_write_families(t, info) == ALL_GPR {
+            return None;
+        }
         if info.reg_refs & t_bit != 0 {
             return None;
         }
@@ -2002,6 +2036,17 @@ pub(super) fn narrow_wide_immediates(store: &mut LineStore, infos: &mut [LineInf
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unsupported_unicode_mnemonics_refuse_without_panicking() {
+        for mnemonic in ["cmpé", "λ", "add界", "λq", "cmplλ", "q", "l"] {
+            let regs = format!("{mnemonic} %eax, %ecx");
+            let immediate = format!("{mnemonic} $1, %eax");
+            assert!(super::parse_reg_reg_alu(&regs).is_none());
+            assert!(super::parse_imm_reg_flag(&immediate).is_none());
+            assert!(super::parse_inplace_op(&immediate).is_none());
+        }
+    }
+
     use super::*;
 
     fn run<F: Fn(&mut LineStore, &mut [LineInfo]) -> bool>(asm: &str, f: F) -> String {
@@ -2026,6 +2071,59 @@ mod tests {
 
     const PRO: &str = "    .text\n    .globl f\n    .type f, @function\nf:\n    .cfi_startproc\n";
     const EPI: &str = "    ret\n    .cfi_endproc\n    .size f, .-f\n";
+
+    #[test]
+    fn copy_commute_preserves_implicit_accumulator_reader() {
+        let asm = format!(
+            "{PRO}    movq %rdi, %rax\n    addq %rsi, %rax\n    mulq %r8\n    movq %rdx, %rax\n{EPI}"
+        );
+        assert_eq!(run(&asm, fold_copy_into_dying_operand), asm);
+    }
+
+    #[test]
+    fn copy_commute_preserves_fixed_cl_reader() {
+        let asm = format!(
+            "{PRO}    movq %rdi, %rcx\n    addq %rsi, %rcx\n    shlq %cl, %r8\n    movq %r8, %rax\n{EPI}"
+        );
+        assert_eq!(run(&asm, fold_copy_into_dying_operand), asm);
+    }
+
+    #[test]
+    fn adjacent_commute_preserves_fixed_cl_reader() {
+        let asm = format!(
+            "{PRO}    movq (%rdi), %rcx\n    addq %rsi, %rcx\n    shlq %cl, %r8\n    movq %r8, %rax\n{EPI}"
+        );
+        assert_eq!(run(&asm, fuse_load_into_alu), asm);
+    }
+
+    #[test]
+    fn family_rename_preserves_isa_constraints_not_just_text() {
+        for op in [
+            "shl", "sal", "shr", "sar", "rol", "ror", "rcl", "rcr", "shld", "shrd",
+        ] {
+            for suffix in ["", "b", "w", "l", "q"] {
+                let text = format!("    {op}{suffix} %cl, %r8");
+                assert!(rename_family(&text, 1, 6).is_none(), "{text}");
+            }
+        }
+        for text in ["mulq %r8", "imulq %r8", "divq %r8", "cqto", "rep movsq"] {
+            assert!(rename_family(text, 0, 6).is_none(), "{text}");
+        }
+        // Positive controls: no blanket ban of RCX, CL or shifts.
+        for (text, from, to, expected) in [
+            ("movzbl %cl, %eax", 1, 6, "movzbl %sil, %eax"),
+            ("shlq $1, (%rcx)", 1, 6, "shlq $1, (%rsi)"),
+            ("shlxq %rcx, %r8, %r9", 1, 6, "shlxq %rsi, %r8, %r9"),
+            ("shlq %cl, %r8", 8, 9, "shlq %cl, %r9"),
+        ] {
+            assert_eq!(rename_family(text, from, to).as_deref(), Some(expected));
+        }
+        assert!(rename_family("movq %rax, %rdx", 0, RSP_FAM).is_none());
+        assert!(rename_family("shlq %cl, %r8", 8, 1).is_none());
+        for (from, to) in [(REG_NONE, 0), (0, REG_NONE), (16, 1), (1, 24)] {
+            assert!(rename_family("movq %rax, %rcx", from, to).is_none());
+        }
+    }
 
     #[test]
     fn vector_flag_and_string_output_may_writes_are_precise() {

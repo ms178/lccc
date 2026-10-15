@@ -4,9 +4,9 @@
  * `loop_rotate` clones the header guard into the latch, so the cloned compare
  * is `add(iv, C) < N` and the backend materialises the `+C` as a fresh
  * temporary before every compare (5 instructions per iteration against GCC's
- * 4).  `canonicalise_affine_exit_cmps` folds the constant into the bound
- * (`iv < N - C`) for signed compares only, which also gives the compare-branch
- * fusion a bare-register compare to fuse on the back edge.
+ * 4). The shared proof-based affine pass folds the constant into the bound
+ * only after certifying every tested IV value. The same proof covers signed
+ * and unsigned domains and preserves a shared post-increment source.
  *
  * The file is compiled with CCC_LOOP_ROTATE=1 (see the sibling .env) so the
  * regression corpus exercises the rotated path against the GCC oracle, and is

@@ -1,0 +1,11 @@
+{
+  "main": "63e783b15586eca86f306bd75a52b82c57304bbb",
+  "pr831": "acd48b0ca8b8427e95d30ecdae72bfb1fd888f38",
+  "compiler_hashes": {
+    "final": "3b78f2e710e8c0d7fd3949a005623d3abcbe3455fbba085caeb44df2b9f40656",
+    "main63": "34d37df9c6d7e805acff976ab5798d36bae53bc1d99f58005326cc7e3cdff8aa",
+    "pr831-refreshed": "a7ed15ca95057f8e8ca6723e80149ee244e3190cabfe9c3e93e7ad1d3abdf4ce"
+  },
+  "archive_sha256": "9e69a51a0a6eda60af3b3d73496aa00031306c03c8e8e76dbcd8d45ba7fc2f74",
+  "scope": "Latest-main measurements; earlier candidate and PR831 runs carry forward only via explicit 90-executable identity proofs per arm."
+}

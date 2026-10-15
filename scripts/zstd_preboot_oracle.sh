@@ -19,6 +19,7 @@ K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.55}
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 LCCC=${LCCC:-$REPO_ROOT/target/fastbuild/lccc}
+GCC=${GCC:-gcc-16}
 OUT=${OUT:-/tmp/zstd-oracle}
 mkdir -p "$OUT"
 
@@ -383,28 +384,45 @@ sed -i "s|DECOMPRESS_UNZSTD_PATH_PLACEHOLDER|$K/lib/decompress_unzstd.c|" \
 compile_one() {
   local cc=$1 name=$2
   echo "CC  oracle ($name)"
-  $cc $CFLAGS_COMMON ${EXTRA_CFLAGS:-} @"$OUT/cflags.rsp" -c "$OUT/oracle.c" -o "$OUT/oracle-$name.o"
+  "$cc" $CFLAGS_COMMON ${EXTRA_CFLAGS:-} @"$OUT/cflags.rsp" -c "$OUT/oracle.c" -o "$OUT/oracle-$name.o"
   echo "CC  driver ($name)"
   # driver is userspace; use host gcc always for libc
-  gcc -O2 -fPIE -c "$OUT/driver.c" -o "$OUT/driver.o"
-  gcc -pie -o "$OUT/oracle-$name" "$OUT/driver.o" "$OUT/oracle-$name.o"
-  gcc -O2 -fPIE -c "$OUT/driver_inplace.c" -o "$OUT/driver_inplace.o"
-  gcc -pie -o "$OUT/oracle-inplace-$name" "$OUT/driver_inplace.o" "$OUT/oracle-$name.o"
+  "$GCC" -O2 -fPIE -c "$OUT/driver.c" -o "$OUT/driver.o"
+  "$GCC" -pie -o "$OUT/oracle-$name" "$OUT/driver.o" "$OUT/oracle-$name.o"
+  "$GCC" -O2 -fPIE -c "$OUT/driver_inplace.c" -o "$OUT/driver_inplace.o"
+  "$GCC" -pie -o "$OUT/oracle-inplace-$name" "$OUT/driver_inplace.o" "$OUT/oracle-$name.o"
 }
 
-compile_one gcc gcc
+compile_one "$GCC" gcc
 compile_one "$LCCC" lccc
 
+failed=0
+run_oracle() {
+  local rc=0
+  "$@" || rc=$?
+  if (( rc != 0 )); then
+    printf 'FAIL rc=%d: %s\n' "$rc" "$1" >&2
+    failed=1
+  fi
+  return 0 # continue the other independent checks, then fail the whole script
+}
+
 echo "==== gcc ===="
-"$OUT/oracle-gcc" "$@" || true
+run_oracle "$OUT/oracle-gcc" "$@"
 echo "==== lccc ===="
-"$OUT/oracle-lccc" "$@" || true
+run_oracle "$OUT/oracle-lccc" "$@"
 
 # In-place (guest geometry) run on the real piggy payload, when present.
 ZFILE=${ZFILE:-$K/arch/x86/boot/compressed/vmlinux.bin.zst}
 PFILE=${PFILE:-$K/arch/x86/boot/compressed/vmlinux.bin}
 if [[ -f "$ZFILE" && -f "$PFILE" ]]; then
   echo "==== in-place (guest geometry) ===="
-  printf '%-6s ' gcc;  "$OUT/oracle-inplace-gcc"  "$ZFILE" "$PFILE" || true
-  printf '%-6s ' lccc; "$OUT/oracle-inplace-lccc" "$ZFILE" "$PFILE" || true
+  printf '%-6s ' gcc;  run_oracle "$OUT/oracle-inplace-gcc"  "$ZFILE" "$PFILE"
+  printf '%-6s ' lccc; run_oracle "$OUT/oracle-inplace-lccc" "$ZFILE" "$PFILE"
+elif [[ -e "$ZFILE" || -e "$PFILE" ]]; then
+  echo "FAIL: in-place validation requires both compressed and plain payloads" >&2
+  failed=1
+else
+  echo "SKIP in-place oracle: no paired kernel payloads supplied"
 fi
+exit "$failed"

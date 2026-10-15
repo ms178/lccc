@@ -34,3 +34,7 @@ Makefile        text eol=lf
 *.ttf    binary
 *.eot    binary
 *.pdf    binary
+
+# Historical instrumentation is byte evidence, not formatted source. Preserve
+# Valgrind's trailing spaces and captured terminal blank lines verbatim.
+engineering/evidence/2026-10-14-auipc-range/**/*.txt whitespace=-blank-at-eol,-blank-at-eof

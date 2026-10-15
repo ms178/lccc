@@ -426,7 +426,9 @@ impl Lowerer {
             };
 
         let ptr_int_ty = crate::common::types::target_int_ir_type();
-        let index_ty = self.get_expr_type(actual_index);
+        // The storage annotation can be I64 for an I32 arithmetic result.
+        // Extend the actual value width, including negative wrapped offsets.
+        let index_ty = self.value_ir_type(actual_index);
         let index_val = self.lower_expr(actual_index);
         // Widen the index to pointer width (sign-extend for signed, zero-extend for unsigned)
         // before use in pointer arithmetic.

@@ -15,6 +15,23 @@ there, not here.
 - Deep research: [`engineering/DECISIONS.md`](engineering/DECISIONS.md) (measured
   negative-space, do-not-retry grounds), [`ideas/`](ideas/README.md).
 
+Frontend follow-up (2026-10-15):
+[`FRONTEND-ZSTD-REDTEAM-2026-10-15.md`](engineering/FRONTEND-ZSTD-REDTEAM-2026-10-15.md)
+records native reproducers for corrupted enum aliases and macro stringification,
+including six real LZ4-format compression failures. Repairs are under validation.
+Fresh-path rebuilds are mandatory; Ninja does not track compiler-binary content.
+
+Current critical follow-up (2026-10-15): see
+[`engineering/FUSION-REDTEAM-2026-10-15.md`](engineering/FUSION-REDTEAM-2026-10-15.md).
+Five native counterexamples invalidate the inherited late boolean-spill fusion.
+The shared legality repair is under test, not accepted. Open concrete work:
+finish full units and FAST/Clippy on the repaired source; capture immutable
+candidate/main-f07 compiler and workload hashes; rerun all 45 shapes and broad
+patched-zstd options; resolve the reproduced macro-stringification version bug;
+recheck the prior RLE-level1 >5% regression with at least 31 paired samples.
+A frame-delta proof could recover mixed-RBP/RSP slot precision, but must retain
+an alias regression for `-8(%rbp)` versus `8(%rsp)` after a 16-byte allocation.
+
 Latest whole-tree audit: **2026-10-14**, baseline `3b66cd1d73743a7a79f912c01df48ac15cc646ef`.
 See the **A14 queue** below and [scope/evidence](engineering/AUDIT-2026-10-14-whole-tree.md).
 Evidence is classified as reproduced (R), source-confirmed (S), or hypothesis (H);
@@ -338,16 +355,17 @@ Priority: **P0 correctness/evidence integrity**, **P1 high-leverage code quality
 Evidence: **R** reproduced here; **S** direct source fact, runtime consequence
 unproven; **H** hypothesis requiring an experiment.
 
-**Current upstream base:** `f764242` (PR #822).
+**Current upstream base:** `3ff36e8592b0d0e26645bf37d6685395b1a6eca5` (PR #826, including #827).
 A14-05 is closed upstream; A14-14/19/29/30 are repaired; A14-01 is
 partially repaired. A14-35 records a newly reproduced existing visibility defect.
-The queue contains **35 entries, 30 still open**. Original
+A14-20 is repaired upstream and revalidated; A14-34 is repaired locally.
+The queue contains **35 entries, 28 still open**. Original
 negative evidence retains its original base. Current implementation and measured
 trade-offs: [constant-GEP follow-up](engineering/FOLLOWUP-2026-10-14-constant-gep-fix.md)
 and [AArch64 contracts follow-up](engineering/FOLLOWUP-2026-10-14-arm-contracts.md).
 
 **Remaining implementation order:** A14-17/35/15/13
-(linker/ISA/encoding/type correctness), A14-20 (profile integrity), then
+(linker/ISA/encoding/type correctness), then
 A14-01/02/03 (evidence), before profitability work A14-24/25. Do not let a
 green fast-CI stamp override the known failures in this queue. Locations refer to baseline
 `3b66cd1`; use function names if lines move. Do not close an item merely by
@@ -596,6 +614,14 @@ because Clang rejects those (they are excluded from this item).
 
 ### A14-16 · P0 · R/S — unsupported driver options silently promise capabilities
 
+**PR824 review follow-through:** still open. An accepted `-fwrapv` signed
+product used as a byte offset (`p[i*4]`, i starting at 2^30) faults at -O1/-O2
+instead of addressing offsets 0/4/8/12. GCC16.2 returns the expected answer;
+S36, PR824 and the reviewed candidate all fault. Source/status evidence:
+`engineering/evidence/pr824-review/accepted-wrap-product-open.json`.
+The separate rotation-clone overflow defect is repaired; that is not proof
+that all signed-overflow-dependent transformations honor the accepted flag.
+
 **Where:** `src/driver/cli.rs` unknown-option arm (around 2219): warning only
 with `verbose`; module comment incorrectly says GCC ignores unknown -f/-m.
 **Reproducer:** `A14-16-unknown-flag` in the probe script: LCCC accepts
@@ -611,7 +637,16 @@ all -f flags indiscriminately, breaking legitimate build-system probes.
 `-fsanitize=address` either instruments and catches a seeded OOB or rejects;
 `-flto` either round-trips IR and demonstrates cross-TU behavior or rejects.
 
-### A14-17 · P0 · R — RISC-V shared linker silently drops unknown relocations
+### A14-17 · P0 · R — RISC-V relocation contracts (partially repaired)
+
+**Current status:** PR827 rejects unknown relocations in both link modes and
+checks input extents/indices. PR826 adds bounded paired ULEB handling and all
+four direct-branch range checks. Fresh native replay: 466/0 before the local
+AUIPC extension. The original reproducer below is historical, not a current
+failure. This continuation additionally repairs rounded AUIPC range truncation;
+see `engineering/FOLLOWUP-2026-10-14D-resource-auipc.md`. Keep the broader
+cross-architecture acceptance audit open; these fixes do not certify all TLS,
+preemption or symbol-visibility semantics.
 
 **Where:** `src/backend/riscv/linker/reloc.rs::apply_relocation` default arm:
 error only when `!ctx.collect_relatives`; shared mode explicitly skips unknowns.
@@ -675,7 +710,15 @@ kernel code does not use popcount builtins as a correctness justification.
 **Accept:** exact integer popcount results for zeros/all-ones/randoms, no FP/NEON
 references under the flag, default NEON path unchanged, cross-assembler legality.
 
-### A14-20 · P0 · R/S — PGO releases the file lock before stdio flush
+### A14-20 · CLOSED upstream — PGO lock lifetime and checked I/O
+
+**Current status:** PR827/826 retain the lock through checked fclose, diagnose
+lock/stream/close failures and use close-on-exec opening. Fresh
+`check_pgo_io.py` replay: **72 PASS / 0 FAIL / 0 SKIP**, including deterministic
+kernel-observed contention, exact merged counts after production ingestion,
+large records, injected errors and /dev/full at -O0/-O2/-O3. Harness red-team:
+9 tests pass, including early-unlock and no-CLOEXEC mutants. Evidence is in the
+resource/AUIPC follow-up; the defect description below is historical.
 
 **Where:** `src/pgo/instrument.rs::dump_helper`, LOCK_EX around 1098,
 LOCK_UN around 1433, `fclose` afterwards; no intervening `fflush`.
@@ -963,7 +1006,16 @@ compiler uses the already-built fastbuild binary, never silently triggers a
 release build. This is a concurrency/robustness gap, not a demonstrated race in
 this session's sequential CI.
 
-### A14-34 · P1 · R — CI memory heuristic leaks state between gates, then Clippy OOMs
+### A14-34 · CLOSED — CI gate resource-state isolation
+
+**Current status:** test and Clippy gates run in subshells, share independent
+job/debug selection, honor CI_LOCAL_JOBS before CARGO_BUILD_JOBS, and fail
+conservatively when RAM is unknown. Permanent stub tests cover 64 resource
+configurations, both orders, failures and caller state. Reporter errors now
+propagate; bounded decimal repetition prevents overflow into a zero-test PASS.
+All four tests pass and run in both local fast and hosted CI, with an invocation
+parity contract. Historical failure follows; aggregate certification is recorded
+separately in the delivery manifest, never inferred from these surgical tests.
 
 **Where:** `scripts/ci_local.sh::{cargo_test_repeated,clippy_gate}`.
 The test gate exports CARGO_PROFILE_FASTBUILD_DEBUG=0 / CARGO_INCREMENTAL=0 into
@@ -2858,3 +2910,168 @@ lz4 −15.3 %); RA web-wide in-loop-use supply (+3.63/+4.33 % sha256,A/B)
 `CCC_PHI_ACYCLIC_ORDER=1`); SROA split `0.0`/`-0.0` bit-exact zero
 (CG-07); epilogue-suffix sharing (CG-09); OP-42 transactional sinking;
 RA mode-6 stays opt-in (RA-28/28b); TLS CSE merge (3→2).
+
+
+## PR824 review — evidence and remaining profitability work
+
+See `engineering/PR824-REVIEW-2026-10-14.md` for exact identities, repaired
+rotation arithmetic and test-controller defects, UTF-8 parser hardening,
+byte-load inlining and unsigned affine proofs, cross-target executions and
+all fifteen prioritized results. The temporary duplicate IVSR proof and two
+regressive recurrence-policy alternatives were rejected, not shipped.
+
+Remaining measured trade-off: XML scan is 1.035300 candidate/prior in a
+31-round pinned Xeon-VM screen (95% CI 1.027592–1.038240), despite lower Ir.
+Disabling the new affine fold restores the baseline assembly: investigate
+stability of scratch-register selection/code layout across cold-loop changes
+rather than adding a workload-name exception. Fannkuch's +4.276% Ir does not
+imply a runtime loss: its 31-round native ratio is 0.960401. Neither VM screen
+is a result on the supplied EPYC7763 host. The original 35-item A14 queue
+still has 28 open items; do not infer closure from a green fast gate.
+
+## PR831 synthesis — 2026-10-15 follow-through
+
+Accomplished: selective x87/LICM/vector-liveness/pointer-domain synthesis;
+source-width and overlap-boundary repairs; GCC16 runtime enumeration and
+shared verbose-path authority; float.h evaluation macros; FP-environment
+backedge-PRE fence; signed nonnegative-mask range propagation recovering TLS.
+See engineering/PR831-COMPARISON.md for fresh correctness and performance,
+including failures and unavailable-current-ICX coverage, not only wins.
+
+Open, concrete priority order:
+1. **Fannkuch N=11 +23% native:** prove strict runtime signed IV bounds for
+   nonnegative constant seeds/unit steps, and preserve unsupported narrow
+   internal consumers with explicit truncations rather than widening their
+   arithmetic. Audit plan verification/dominance/zero-trip and negative bounds.
+   Test INT_MAX and wrapping consumer cases on all four architectures; require
+   default-size paired native evidence. Do not remove -fwrapv guards.
+2. **Sieve +4.4% native/+11.9% bounded Ir:** derive sufficient bounds for
+   nonlinear outer guards and loop-variant inner steps; do not infer no-wrap
+   merely because the pointer domain is wide.
+3. **LZ4 +2.53% at 31 rounds/PASSES4096:** attribute layout/register-pressure
+   differences; the 2.9ms default run's +9% is launch-noise-sensitive. Preserve
+   both samples and measure meaningful durations before accepting a change.
+4. **Driver/runtime queries:** optional gcc_linker verbose fallback still has
+   a version allowlist; CLI print-file-name/search-dirs and early -m32 handling
+   remain separate authorities. Unify with ABI/sysroot-aware discovery and
+   add synthetic-root tests (including single-output libgcc queries). Do not
+   claim S56 repaired every query or sysroot preference policy.
+5. **FP proof refinement:** BEPRE's observable-environment fence is mandatory
+   until same-rounding/no-exception speculation can be proved per candidate.
+   Retain integer PRE and fixed-environment positive controls. Preserve the
+   exact-bit changing-rounding witness and FENV-on contraction negative case.
+6. Real-host EPYC7763/Raptor Lake validation and newer actual ICX coverage
+   remain unfulfilled. CE's icxlatest executed 2024.0.0, not a 2026 release.
+   Known ill-typed builtin baseline remains 174 ICE/294 silent accepts.
+7. Zstd's static stack-operand ratchet has a documented narrow exception,
+   8→11, while native ratio is 1.004486 [0.996202,1.015288]. Attribute and remove
+   unnecessary homes only with a valid alias/liveness proof; do not remove
+   correctness fences or call a baseline update a performance improvement.
+
+### Latest-main integration follow-through
+
+- Preserved pre-refresh S63, rebased on PR832/main63e783b, and audited both
+  new PR831 commits through acd48b0. Retained FXRSTOR low-XMM kill with upper
+  and masked-XRSTOR negative controls; explicit GAS selection/annotations.
+- Retained main's independent CI lanes, mask-spacing protections, nbody census
+  and version checks; kept tested 128-bit packing and all semantic guards.
+- Rebuilt and proved 90 benchmark executables unchanged after the rebase.
+  Main's packed-DAG gate passes all nine runtime legs; transition assertions
+  inspect production VEX promotion, not a deliberately disabled pass.
+- Latest-main 20-case native and 45-case Callgrind comparisons are complete;
+  earlier source identities remain historical. Read the matching-tree delivery
+  receipt for final FAST acceptance, never an interrupted log or old checkpoint.
+
+Latest-main 31-round follow-through: keep sieve (~4.83%), XML scan (~4.51%)
+and scaled LZ4 (~2.68%) as open performance work. XML's same-candidate affine
+fold ablation is ~3.52% slower with folding, despite lower Ir: investigate
+general profitability/layout, not source-name exceptions. Linux scaled/SipHash
+function bytes and addresses are identical to main; distinguish VM timing
+variation/CRT padding from compiler hot-code differences. Fann remains ~25%
+slower; semantics are mandatory and performance approval stays withheld.
+
+### Oracle recheck: remaining concrete work
+
+See `engineering/PR831-ORACLE-RECHECK.md` for completed fail-closed repairs,
+4,782 unit passes, fresh four-vendor evidence and unchanged benchmark ELFs.
+- Generalize GP store forwarding to narrow extending loads only after proving
+  volatile exclusion, range/alias safety and register-view/upper-write semantics;
+  add negative controls before targeting the observed Zstd byte relay.
+- Repair the legacy tight-loop census's mismatched local/remote target flags,
+  commented labels, maximum-unconditional alignment selection and failure census;
+  do not use its current success status as acceptance evidence.
+- Keep ICC's optimized signed-rotation and four-domain counterexamples, including
+  strict-FP failures and passing O0 controls. Add them to any future vendor
+  conformance registry; an exit0 with the wrong printed value is not a pass.
+- Obtain a genuinely newer ICX deployment and controlled physical-host timings;
+  the refreshed CE latest alias still executes2024.0.0. No semantic weakening
+  or workload-specific exception is authorized to recover the remaining costs.
+
+### S86–S89 measured follow-through (2026-10-15)
+
+Full tables/raw summaries: `engineering/MEASUREMENTS-S86-FOLLOWTHROUGH-2026-10-15.md`.
+Performance approval remains withheld; correctness fixes are not speed wins.
+
+- Completed: native45/Callgrind45, zstd96, original-driver RLE31, fresh CLI1976,
+  frontend16 Memcheck+12 cross-target+8 CE, and frozen frontend/fusion replays.
+  PMU exit0/all-unsupported false-positive fixed and covered by six tests;
+  together with five native-lifecycle tests the actual count is eleven.
+- Prioritize **fannkuch**: +25.53% against main. Develop a dominating, width-aware
+  signed no-wrap/range certificate including pre-extension products and executed
+  backedges; test INT_MIN/MAX, negative/variable steps, off-by-one bounds and
+  all target pointer widths. Existing no-wrap ablation is diagnostic only.
+- **Zstd/GCC deficit**: compression GM1.44553, decompression GM1.30775. Attribute
+  hot loops using bounded Callgrind, emitted assembly and register/stack traffic;
+  pursue general narrow-load forwarding, register-pressure and legal address
+  recurrences. Do not widen alias assumptions or special-case codec names.
+- Investigate initial >1% main regressions with separately reported 31-pair
+  follow-ups; retain original nine-pair samples and interrupted-run metadata.
+  RLE's historical +8.14% is not reproduced with the same original drivers.
+- Replace mixed-frame opacity only with CFG-aware, dominating RBP/RSP delta
+  facts; cover conditional prologues, dynamic stack adjustment, epilogues,
+  escaped/volatile slots and full overlapping widths before enabling deletion.
+- Frontend red team exposed marker/literal collision and bytewise UTF-8
+  stringification. Require red-before production C tests and quoted-token-aware
+  metadata cleanup; synthetic separators must never rewrite literal payloads.
+- Local acceptance remains FAST+strict Clippy/rustfmt; full/slow CI belongs on
+  hosted runners. Actual physical-CPU measurements and a genuinely newer ICX
+  deployment remain unavailable here, not presumed successful.
+
+31-pair follow-up completed: XML/main1.043847 [1.036368,1.049370],
+nbody1.029854 [1.009686,1.043685]. Binary trees/strlen/varint span parity;
+spectral_norm reverses from1.026378 to0.987975 [0.985155,0.992405] in the selected rerun.
+Zstd source-level19 decompression falls from the initial1.113461 to1.014195
+[1.004860,1.025406], not a compiler fix. Source-threads2 decompression1.032890
+[1.016064,1.063963] and JSON/no-checksum C1.013705, D1.019530 remain evidence-backed
+regressions requiring attribution. All13 profiles/26 operations completed
+without failures; initial and follow-up reports remain separate.
+
+### Post-reset S91 provisioning audit
+
+- Exact S90 history recovered from verified Git bundle; stale source tar refused
+  and regenerated to its original recorded hash. Interrupted FAST is not green.
+- Fixed the weaker post-lock GAS cache check to reuse `_prefix_provisioned`.
+  One red orchestration test becomes three green controls; existing self-tests
+  remain green. Keep full input/provenance checks on every early-return path.
+- Latest visible lccc main remainsf07f4c51; archpkgbuilds nowd315f524 but zstd
+  source/patch hashes remain unchanged. Toolchain and active6GiB swap restored.
+
+### S92 rejected experiment and bounded profiling
+
+- Completed: fresh 45-shape static oracle retry (44 complete rows; ICC GS syntax
+  unsupported on one), 8 original level1/3 profiles, 4 separately bounded
+  64KiB/one-call level19 profiles, 4 base/BZHI profiles and their Memcheck
+  controls; 15-round 8-cell BZHI codec pilot. See S92-EMPIRICAL-REDTEAM.md.
+- Rejected header-inline-asm BZHI: compression GM1.017476, JSON level3 CI wholly
+  slower, compression Ir/Dr/Dw increase. Keep portable production header.
+- Implement/compare a pure typed BZHI IR operation versus general mask-idiom
+  recognition; preserve low8-bit index semantics and flags, test widths0/31/32/
+  63/64/255/256, high index bits, zero/all-one sources, fallback and each target.
+  Add allocator-visible uses/defs before attempting codec acceptance again.
+- Diagnose why FSE_encodeSymbol/BIT_addBits remain outlined using per-call-site
+  rejection reasons and controlled legal inliner alternatives; never remove
+  safety/cost guards solely to win this codec.
+- Consider Retry-After-aware bounded CE retry only with mocked429/503/date
+  header tests, retry-budget tests and preservation of terminal compiler errors.
+- Original1MiB level19 profile timed out; its report remains partial. Smaller
+  follow-up is independent evidence, not completion of the original workload.

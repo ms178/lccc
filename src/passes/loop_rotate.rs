@@ -1126,23 +1126,10 @@ fn try_rotate_loop(
         }
         cloned_insts.push(cloned);
     }
-    // 7b. ZERO-ROT-AFFINE: fold the cloned exit comparison's affine operand
-    //     into its constant bound (see `canonicalise_affine_exit_cmps`).
-    //
-    // `CCC_NO_AFFINE_EXIT_FOLD` must cover BOTH producers of the fold -- this
-    // clone and the standalone pass.  The switch exists so a misbehaving fold
-    // can be turned off without turning off rotation (which is a separate,
-    // older transformation), and a switch that quietly leaves half the fold
-    // running is worse than no switch: it makes the A/B that condemns the fold
-    // the same A/B that hides it.
-    let affine_folds = if affine_fold_enabled() {
-        canonicalise_affine_exit_cmps(&mut cloned_insts)
-    } else {
-        0
-    };
-    if debug && affine_folds > 0 {
-        eprintln!("[ROT] affine exit-compare folds: {affine_folds}");
-    }
+    // Keep the cloned arithmetic exact. Subtracting its addend from a bound
+    // is unsound when the addition wraps (-fwrapv has a concrete two-trip
+    // counterexample). The post-rotation affine pass owns this rewrite and
+    // requires a whole-sequence no-wrap certificate, including the exit test.
 
     // The cloned cond value (new ID) is the latch's new CondBranch cond.
     let new_cond = Operand::Value(Value(*clone_map.get(&cond_val.0).expect(
@@ -1242,145 +1229,43 @@ fn is_dominated_by(block_idx: usize, dom_idx: usize, cfg: &CfgAnalysis) -> bool 
     false // dom chain longer than num_blocks — corrupt CfgAnalysis, fail closed
 }
 
-/// Upper bound of a SIGNED integer type, or `None` for every type the affine
-/// fold below must not touch (unsigned widths, pointers, floats).
-fn signed_type_bounds(ty: IrType) -> Option<(i64, i64)> {
-    match ty {
-        IrType::I8 => Some((i8::MIN as i64, i8::MAX as i64)),
-        IrType::I16 => Some((i16::MIN as i64, i16::MAX as i64)),
-        IrType::I32 => Some((i32::MIN as i64, i32::MAX as i64)),
-        IrType::I64 => Some((i64::MIN, i64::MAX)),
-        _ => None,
+/// Mathematical domain for the sequence proof. U64's upper endpoint does
+/// not fit in i64; use i128 until the final typed constant is encoded.
+fn integer_type_bounds(ty: IrType) -> Option<(i128, i128)> {
+    if !ty.is_integer() || !matches!(ty.size(), 1 | 2 | 4 | 8) {
+        return None;
     }
+    let bits = ty.size() * 8;
+    Some(if ty.is_unsigned() {
+        (0, (1_i128 << bits) - 1)
+    } else {
+        (-(1_i128 << (bits - 1)), (1_i128 << (bits - 1)) - 1)
+    })
 }
 
-/// ZERO-ROT-AFFINE: canonicalise the CLONED exit comparison
-/// `icmp slt (add iv, C), N` -> `icmp slt iv, (N - C)`.
-///
-/// Rotation re-tests the loop condition in the latch, on the values the latch
-/// just produced (`i_next`), so the cloned condition is
-/// `icmp slt (add i_next, 4), 2048` and the backend materialises the `+4` as a
-/// fresh `leaq`-style temporary before every compare -- the shape the
-/// FOLLOWUP-2026-09-30-affine-exit-compare blocker measured at 5 instructions
-/// per iteration against GCC's 4.  Folding the constant into the bound removes
-/// the temporary AND gives the compare-branch fusion a register compare it can
-/// fuse on the back edge (the rotation's licence).
-///
-/// Scope and justification:
-/// * only freshly cloned temporaries whose ONLY use is the cloned compare are
-///   rewritten (`use_count` is computed over `cloned`); the header's original
-///   `add`/`cmp` pair is untouched, so nothing outside the rotated latch
-///   changes;
-/// * signed comparisons only, on signed integer types:
-///   `Slt(iv + C, N) == Slt(iv, N - C)` holds only for the signed order (the
-///   unsigned order has no such freedom), and only when neither side
-///   overflows -- `iv + C` overflowing is signed-overflow UB in the C source
-///   (the same licence GCC's own `cmpq %rsi, %rax` fold takes);
-/// * the folded bound must be REPRESENTABLE in the comparison's type
-///   (`checked_sub` + `signed_type_bounds`), so no wrap is ever introduced;
-/// * constants may appear on either side of the `add` and the affine operand
-///   may be on either side of the compare (`N > i + C` folds too).  The
-///   comparison OPERATOR is preserved, never mirrored: mirroring the operand
-///   side requires negating the relation as well, and taking one without the
-///   other is exactly the double-negation bug the orientation oracle pins
-///   (`N op (i + C) == (N - C) op i`, operator unchanged).
-fn canonicalise_affine_exit_cmps(cloned: &mut [Instruction]) -> usize {
-    // Uses of each cloned dest inside the cloned slice (fresh IDs cannot be
-    // referenced anywhere else, so this is the function-wide count).
-    let mut use_count: FxHashMap<u32, usize> = FxHashMap::default();
-    for inst in cloned.iter() {
-        inst.for_each_used_value(|v| *use_count.entry(v).or_default() += 1);
-    }
-    // Cloned `add iv, C` (or `add C, iv`) temporaries.
-    let mut affine: FxHashMap<u32, (Operand, i64, IrType)> = FxHashMap::default();
-    for inst in cloned.iter() {
-        let Instruction::BinOp {
-            dest,
-            op: IrBinOp::Add,
-            lhs,
-            rhs,
-            ty,
-        } = inst
-        else {
-            continue;
-        };
-        let pair = match (lhs, rhs) {
-            (Operand::Value(v), Operand::Const(c)) | (Operand::Const(c), Operand::Value(v)) => {
-                c.to_i64().map(|c| (*v, c))
-            }
-            _ => None,
-        };
-        if let Some((v, c)) = pair {
-            affine.insert(dest.0, (Operand::Value(v), c, *ty));
-        }
-    }
+fn integer_constant(c: IrConst, ty: IrType) -> Option<i128> {
+    integer_type_bounds(ty)?;
+    let bits = ty.size() * 8;
+    let value = c.to_i128()? & ((1_i128 << bits) - 1);
+    Some(if !ty.is_unsigned() && value >= 1_i128 << (bits - 1) {
+        value - (1_i128 << bits)
+    } else {
+        value
+    })
+}
 
-    let mut folded = 0usize;
-    for inst in cloned.iter_mut() {
-        let Instruction::Cmp {
-            lhs, op, rhs, ty, ..
-        } = inst
-        else {
-            continue;
-        };
-        let (lhs_snapshot, rhs_snapshot) = (lhs.clone(), rhs.clone());
-        let is_foldable = |v: Value| use_count.get(&v.0) == Some(&1) && affine.contains_key(&v.0);
-        let (affine_val, flipped) = match (&lhs_snapshot, &rhs_snapshot) {
-            (Operand::Value(v), _) if is_foldable(*v) => (*v, false),
-            (_, Operand::Value(v)) if is_foldable(*v) => (*v, true),
-            _ => continue,
-        };
-        // Signed order only -- see the doc comment.  The OPERATOR DOES NOT
-        // CHANGE in either orientation: `iv + C op N` is `iv op N - C`, and
-        // `N op (iv + C)` is `(N - C) op iv` -- subtracting the same constant
-        // from both sides is what preserves the relation, and it is also why
-        // the rewrite is exact rather than approximate.  (An earlier revision
-        // mirrored the operator in the flipped case while ALSO swapping the
-        // operands; two negations do not cancel, so `N > iv + C` came out as
-        // `(N - C) < iv` -- for N=100, C=4, iv=0 that turned the true `100 > 4`
-        // into the false `96 < 0`.  Pinned by `affine_fold_orientation_tests`.)
-        let folded_op = match op {
-            IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge => *op,
-            _ => continue,
-        };
-        let Some((iv_op, c, add_ty)) = affine.get(&affine_val.0) else {
-            continue;
-        };
-        if add_ty != ty {
-            continue; // the add's width is what makes the constant affine
-        }
-        let Some((lo, hi)) = signed_type_bounds(*ty) else {
-            continue;
-        };
-        let bound_op = if flipped {
-            &lhs_snapshot
-        } else {
-            &rhs_snapshot
-        };
-        let Operand::Const(bound_c) = bound_op else {
-            continue; // only an invariant constant bound is foldable here
-        };
-        let Some(bound) = bound_c.to_i64() else {
-            continue;
-        };
-        let Some(new_bound) = bound.checked_sub(*c) else {
-            continue; // would wrap: skip
-        };
-        if new_bound < lo || new_bound > hi {
-            continue; // not representable in the comparison's type: skip
-        }
-        let new_bound_c = IrConst::from_i64(new_bound, *ty);
-        if flipped {
-            *lhs = Operand::Const(new_bound_c);
-            *rhs = iv_op.clone();
-        } else {
-            *lhs = iv_op.clone();
-            *rhs = Operand::Const(new_bound_c);
-        }
-        *op = folded_op;
-        folded += 1;
+fn comparison_matches_domain(op: IrCmpOp, ty: IrType) -> bool {
+    if ty.is_unsigned() {
+        matches!(
+            op,
+            IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge
+        )
+    } else {
+        matches!(
+            op,
+            IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge
+        )
     }
-    folded
 }
 
 /// Predicate: is this instruction safe to clone into the latch?
@@ -1459,6 +1344,11 @@ pub(crate) fn fold_affine_exit_compares(func: &mut IrFunction) -> usize {
     if !affine_fold_enabled() {
         return 0;
     }
+    // The value-based searches below are not a reaching-definitions analysis.
+    // Fail closed on non-SSA webs rather than selecting a convenient writer.
+    if !super::gvn::find_multi_def_values(func).is_empty() {
+        return 0;
+    }
     let cfg = CfgAnalysis::build(func);
     let raw = find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
     if raw.is_empty() {
@@ -1473,7 +1363,7 @@ pub(crate) fn fold_affine_exit_compares(func: &mut IrFunction) -> usize {
     order.sort_by_key(|lp| (lp.body.len(), lp.header));
     let mut total = 0;
     for lp in order {
-        total += fold_loop(func, lp);
+        total += fold_loop(func, lp, &cfg);
     }
     if total > 0 && affine_fold_debug() {
         eprintln!(
@@ -1497,12 +1387,9 @@ struct IvShape {
 
 /// Classify a loop's induction variable BY VALUE.
 ///
-/// The phi's incoming edges are not classified by predecessor: a do-while
-/// self-loop has the header as its own entry predecessor, and the "entry"
-/// incoming may be the second slot, so the seed is the incoming operand that is
-/// a constant and the step is the incoming value that is a `phi + Const` add.
-/// Requiring BOTH (rather than "the non-latch incoming is a constant") is what
-/// makes `refuse_rt_start` and `refuse_rt_step` refusals instead of guesses.
+/// Classify incoming edges by loop membership, not their order: a unique
+/// outside edge supplies a constant seed; a unique inside edge supplies the
+/// matching typed phi + constant step. Neither fact alone is a certificate.
 fn loop_iv_shape(func: &IrFunction, lp: &NaturalLoop) -> Vec<IvShape> {
     let mut out = Vec::new();
     let body_set: FxHashSet<usize> = lp.body.iter().copied().collect();
@@ -1523,8 +1410,8 @@ fn loop_iv_shape(func: &IrFunction, lp: &NaturalLoop) -> Vec<IvShape> {
             let Instruction::Phi { dest, incoming, ty } = inst else {
                 continue;
             };
-            if signed_type_bounds(*ty).is_none() {
-                continue; // unsigned IVs are refused by the fold itself
+            if integer_type_bounds(*ty).is_none() {
+                continue; // unsupported widths/types have no domain certificate
             }
             if let Some((start, step)) =
                 phi_iv_shape(func, &body_set, &body_insts, dest, *ty, incoming)
@@ -1586,10 +1473,10 @@ fn phi_iv_shape(
             .is_some_and(|i| body_set.contains(&i));
         match (from_body, val) {
             // Entry edge, constant written directly.
-            (false, Operand::Const(c)) => seed = Some(c.to_i64()? as i128),
+            (false, Operand::Const(c)) => seed = Some(integer_constant(*c, ty)?),
             // Entry edge, constant through a `Copy` defined outside the body.
             (false, Operand::Value(v)) => {
-                seed = Some(const_through_copy_outside(func, v.0, body_set)?)
+                seed = Some(const_through_copy_outside(func, v.0, body_set, ty)?)
             }
             // Back edge: `phi + Const`, either operand order.
             (true, Operand::Value(v)) => {
@@ -1603,14 +1490,14 @@ fn phi_iv_shape(
                     } if d2 == v && *add_ty == ty => match (lhs, rhs) {
                         (Operand::Value(p), Operand::Const(c))
                         | (Operand::Const(c), Operand::Value(p))
-                            if p.0 == dest.0 && c.to_i64().is_some() =>
+                            if p.0 == dest.0 =>
                         {
-                            c.to_i64()
+                            integer_constant(*c, ty)
                         }
                         _ => None,
                     },
                     _ => None,
-                })? as i128)
+                })?)
             }
             // A constant on the back edge, or a non-constant on the entry edge.
             _ => return None,
@@ -1627,6 +1514,7 @@ fn const_through_copy_outside(
     func: &IrFunction,
     value: u32,
     body_set: &FxHashSet<usize>,
+    ty: IrType,
 ) -> Option<i128> {
     func.blocks.iter().enumerate().find_map(|(bi, b)| {
         if body_set.contains(&bi) {
@@ -1634,7 +1522,7 @@ fn const_through_copy_outside(
         }
         b.instructions.iter().find_map(|i| match i {
             Instruction::Copy { dest, src } if dest.0 == value => match src {
-                Operand::Const(c) => c.to_i64().map(|v| v as i128),
+                Operand::Const(c) => integer_constant(*c, ty),
                 _ => None,
             },
             _ => None,
@@ -1645,30 +1533,47 @@ fn const_through_copy_outside(
 /// Constant `C` when `value` is defined as `iv + C` (either operand order) in
 /// `func`, for the induction variable `iv`.  `None` for anything else --
 /// including `iv` itself, which callers handle as the `C == 0` case.
-fn affine_offset_of(func: &IrFunction, iv: u32, value: u32, ty: IrType) -> Option<i128> {
-    func.blocks
-        .iter()
-        .find_map(|b| {
-            b.instructions.iter().find_map(|i| match i {
-                Instruction::BinOp {
-                    dest,
-                    op: IrBinOp::Add,
-                    lhs,
-                    rhs,
-                    ty: add_ty,
-                } if dest.0 == value && *add_ty == ty => match (lhs, rhs) {
-                    (Operand::Value(p), Operand::Const(c)) if p.0 == iv => c.to_i64(),
-                    (Operand::Const(c), Operand::Value(p)) if p.0 == iv => c.to_i64(),
-                    _ => None,
-                },
-                _ => None,
-            })
-        })
-        .map(|c| c as i128)
+fn affine_offset_of(func: &IrFunction, iv: u32, mut value: u32, ty: IrType) -> Option<i128> {
+    let mut offset = 0_i128;
+    // Rotation composes (phi + step) + bias. Follow a bounded, same-width
+    // additive chain; never infer a value through a narrowing/sign cast.
+    for _ in 0..16 {
+        if value == iv {
+            return Some(offset);
+        }
+        let inst = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .find(|i| i.dest() == Some(Value(value)))?;
+        match inst {
+            Instruction::BinOp {
+                op: IrBinOp::Add,
+                lhs,
+                rhs,
+                ty: add_ty,
+                ..
+            } if *add_ty == ty => {
+                let (v, k) = match (lhs, rhs) {
+                    (Operand::Value(v), Operand::Const(k))
+                    | (Operand::Const(k), Operand::Value(v)) => (v, k),
+                    _ => return None,
+                };
+                offset = offset.checked_add(integer_constant(*k, ty)?)?;
+                value = v.0;
+            }
+            Instruction::Copy {
+                src: Operand::Value(v),
+                ..
+            } => value = v.0,
+            _ => return None,
+        }
+    }
+    None // cycles/deep chains prove nothing
 }
 
-/// The exclusive upper bound `T` every test of `iv` in this loop respects:
-/// the loop runs only while `iv <s T`, in the folded domain.  `None` when the
+/// The exclusive upper bound `T` every test of `iv` in this loop respects,
+/// interpreted in the comparison's signed or unsigned mathematical domain.  `None` when the
 /// loop's exit is not a single branch on a constant-bounded comparison of
 /// `iv` -- a runtime bound (`refuse_rt_bound`), several exits, or an exit that
 /// tests something else entirely gives the proof nothing to stand on.
@@ -1677,6 +1582,7 @@ fn loop_exit_threshold(
     lp: &NaturalLoop,
     iv: u32,
     iv_ty: IrType,
+    cfg: &CfgAnalysis,
 ) -> Option<i128> {
     let mut exiting: Vec<(usize, &Terminator)> = Vec::new();
     for &bi in &lp.body {
@@ -1702,7 +1608,23 @@ fn loop_exit_threshold(
     if exiting.len() != 1 {
         return None;
     }
-    let (_, term) = exiting[0];
+    let (test_block, term) = exiting[0];
+    // An optional interior test is not an induction bound: a bypass could
+    // advance the IV past the certified interval before testing it again.
+    // Every loop-closing edge must pass through this actual exit test.
+    let mut saw_backedge = false;
+    for &pred in cfg.preds.row(lp.header) {
+        let pred = pred as usize;
+        if lp.body.contains(&pred) {
+            saw_backedge = true;
+            if !is_dominated_by(pred, test_block, cfg) {
+                return None;
+            }
+        }
+    }
+    if !saw_backedge {
+        return None;
+    }
     let Terminator::CondBranch {
         cond,
         true_label,
@@ -1748,6 +1670,9 @@ fn loop_exit_threshold(
         })
     })?;
     let (lhs, op, rhs) = cmp;
+    if !comparison_matches_domain(*op, iv_ty) {
+        return None;
+    }
     // One side names the IV (directly, or through `iv + C`) and contributes a
     // constant offset; the other side must be the constant bound.  A side that
     // is neither -- a runtime bound (`refuse_rt_bound`), an unrelated value --
@@ -1761,7 +1686,9 @@ fn loop_exit_threshold(
     };
     let (bound_c, c, op) = match (lhs, rhs) {
         // `iv + C <op> N`
-        (l, Operand::Const(bc)) if iv_side(l).is_some() => (bc.to_i64()?, iv_side(l)?, *op),
+        (l, Operand::Const(bc)) if iv_side(l).is_some() => {
+            (integer_constant(*bc, iv_ty)?, iv_side(l)?, *op)
+        }
         // `N <op> iv + C`: mirror so the affine side is on the left.
         (Operand::Const(bc), r) if iv_side(r).is_some() => {
             let mirrored = match op {
@@ -1769,9 +1696,13 @@ fn loop_exit_threshold(
                 IrCmpOp::Sle => IrCmpOp::Sge,
                 IrCmpOp::Sgt => IrCmpOp::Slt,
                 IrCmpOp::Sge => IrCmpOp::Sle,
+                IrCmpOp::Ult => IrCmpOp::Ugt,
+                IrCmpOp::Ule => IrCmpOp::Uge,
+                IrCmpOp::Ugt => IrCmpOp::Ult,
+                IrCmpOp::Uge => IrCmpOp::Ule,
                 _ => return None,
             };
-            (bc.to_i64()?, iv_side(r)?, mirrored)
+            (integer_constant(*bc, iv_ty)?, iv_side(r)?, mirrored)
         }
         _ => return None,
     };
@@ -1779,29 +1710,35 @@ fn loop_exit_threshold(
     // CONTINUATION test.  Anything else is the upper-interval case the polarity
     // comment above refuses.
     if continue_on_true {
-        if !matches!(op, IrCmpOp::Slt | IrCmpOp::Sle) {
+        if !matches!(
+            op,
+            IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Ult | IrCmpOp::Ule
+        ) {
             return None;
         }
-    } else if !matches!(op, IrCmpOp::Sgt | IrCmpOp::Sge) {
+    } else if !matches!(
+        op,
+        IrCmpOp::Sgt | IrCmpOp::Sge | IrCmpOp::Ugt | IrCmpOp::Uge
+    ) {
         return None;
     }
     // Failing test of `iv + c <op> bound`, in terms of `iv`: the exclusive
     // upper bound of the values for which the loop continues.
-    let bound = bound_c as i128;
+    let bound = bound_c;
     let t = match op {
-        IrCmpOp::Slt => bound,
-        IrCmpOp::Sle => bound + 1,
-        IrCmpOp::Sgt => bound + 1,
-        IrCmpOp::Sge => bound,
+        IrCmpOp::Slt | IrCmpOp::Ult => bound,
+        IrCmpOp::Sle | IrCmpOp::Ule => bound + 1,
+        IrCmpOp::Sgt | IrCmpOp::Ugt => bound + 1,
+        IrCmpOp::Sge | IrCmpOp::Uge => bound,
         _ => return None,
     } - c;
-    let (lo, hi) = signed_type_bounds(iv_ty)?;
-    (t >= lo as i128 && t <= hi as i128).then_some(t)
+    let (lo, hi) = integer_type_bounds(iv_ty)?;
+    (t >= lo && t <= hi).then_some(t)
 }
 
 /// Fold every eligible affine comparison in one loop.  Returns the number of
 /// comparisons rewritten.
-fn fold_loop(func: &mut IrFunction, lp: &NaturalLoop) -> usize {
+fn fold_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -> usize {
     // Uses of every value in the function: the affine temporary must have
     // exactly one (the comparison), or folding it neither removes the add nor
     // is provably local (`refuse_two_uses`).
@@ -1824,7 +1761,7 @@ fn fold_loop(func: &mut IrFunction, lp: &NaturalLoop) -> usize {
     // nothing to prove with.
     let mut bound_iv: Option<(IvShape, i128)> = None;
     for shape in shapes {
-        if let Some(t) = loop_exit_threshold(func, lp, shape.iv, shape.ty) {
+        if let Some(t) = loop_exit_threshold(func, lp, shape.iv, shape.ty, cfg) {
             bound_iv = Some((shape, t));
             break;
         }
@@ -1896,15 +1833,14 @@ fn plan_affine_fold(
     inst_idx: usize,
     uses: &FxHashMap<u32, usize>,
 ) -> Option<(IrCmpOp, Operand, Operand)> {
-    let (lo, hi) = signed_type_bounds(iv_shape.ty)?;
-    let (lo, hi) = (lo as i128, hi as i128);
+    let (lo, hi) = integer_type_bounds(iv_shape.ty)?;
     let Instruction::Cmp {
         lhs, op, rhs, ty, ..
     } = &func.blocks[block_idx].instructions[inst_idx]
     else {
         return None;
     };
-    if *ty != iv_shape.ty {
+    if *ty != iv_shape.ty || !comparison_matches_domain(*op, *ty) {
         return None;
     }
     // The affine temporary on one side: a single-use `Add(iv, Const c)` of the
@@ -1928,16 +1864,20 @@ fn plan_affine_fold(
     // is refused -- the sequence argument below covers the terminating forms
     // only.
     let (c, bound, op) = match (affine_l, &lhs, &rhs, op) {
-        (Some(c), _, Operand::Const(b), o) if matches!(o, IrCmpOp::Slt | IrCmpOp::Sle) => {
-            (c, b.to_i64()? as i128, *o)
+        (Some(c), _, Operand::Const(b), o)
+            if matches!(o, IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Ult | IrCmpOp::Ule) =>
+        {
+            (c, integer_constant(*b, *ty)?, *o)
         }
         (None, Operand::Const(b), _, o) if affine_r.is_some() => {
             let mirrored = match o {
                 IrCmpOp::Sgt => IrCmpOp::Slt,
                 IrCmpOp::Sge => IrCmpOp::Sle,
+                IrCmpOp::Ugt => IrCmpOp::Ult,
+                IrCmpOp::Uge => IrCmpOp::Ule,
                 _ => return None,
             };
-            (affine_r?, b.to_i64()? as i128, mirrored)
+            (affine_r?, integer_constant(*b, *ty)?, mirrored)
         }
         _ => return None,
     };
@@ -1967,12 +1907,55 @@ fn plan_affine_fold(
     if last_plus_c < lo || last_plus_c > hi {
         return None;
     }
+    // Prefer an already-shared additive source, especially the latch's
+    // post-increment value. Folding all the way back to the phi would keep
+    // its old value live across the update and lose the original one-compare
+    // loop. Both the anchor and the final sum need representable endpoints.
+    let candidate = if affine_l.is_some() { lhs } else { rhs };
+    let anchor = if let Operand::Value(sum) = candidate {
+        func.blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .find_map(|i| {
+                let Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Add,
+                    lhs,
+                    rhs,
+                    ty: add_ty,
+                } = i
+                else {
+                    return None;
+                };
+                if dest != sum || add_ty != ty {
+                    return None;
+                }
+                let (v, k) = match (lhs, rhs) {
+                    (Operand::Value(v), Operand::Const(k))
+                    | (Operand::Const(k), Operand::Value(v)) => (v, k),
+                    _ => return None,
+                };
+                if uses.get(&v.0).copied().unwrap_or(0) < 2 {
+                    return None;
+                }
+                let bias = integer_constant(*k, *ty)?;
+                let prefix = affine_offset_of(func, iv_shape.iv, v.0, *ty)?;
+                let adjusted = bound.checked_sub(bias)?;
+                if bias < 0
+                    || !(lo..=hi).contains(&adjusted)
+                    || !(lo..=hi).contains(&iv_shape.start.checked_add(prefix)?)
+                    || !(lo..=hi).contains(&last.checked_add(prefix)?)
+                {
+                    return None;
+                }
+                Some((*v, adjusted))
+            })
+    } else {
+        None
+    };
+    let (anchor, new_bound) = anchor.unwrap_or((Value(iv_shape.iv), new_bound));
     let new_bound_c = IrConst::from_i64(new_bound as i64, iv_shape.ty);
-    Some((
-        op,
-        Operand::Value(Value(iv_shape.iv)),
-        Operand::Const(new_bound_c),
-    ))
+    Some((op, Operand::Value(anchor), Operand::Const(new_bound_c)))
 }
 
 #[cfg(test)]
@@ -2237,9 +2220,10 @@ mod tests {
     }
 
     #[test]
-    fn refuses_an_unsigned_comparison() {
+    fn accepts_a_proven_unsigned_comparison() {
         let mut f = counted_loop(Ty::U32, 0, 4, IrCmpOp::Ult, 64, true, 1, true, true);
-        assert_eq!(fold_affine_exit_compares(&mut f), 0);
+        assert_eq!(fold_affine_exit_compares(&mut f), 1);
+        assert_eq!(folded_cmp(&f), Some((IrCmpOp::Ult, 2, 60)));
     }
 
     #[test]
@@ -2352,136 +2336,240 @@ mod tests {
         });
         assert_eq!(fold_affine_exit_compares(&mut f), 0);
     }
-}
-
-#[cfg(test)]
-mod affine_fold_orientation_tests {
-    //! `canonicalise_affine_exit_cmps` folds the rotated latch's cloned exit
-    //! comparison.  Its algebra is the whole content of the pass, and it had a
-    //! wrong half: with the affine operand on the RIGHT it swapped the operands
-    //! *and* mirrored the operator, and two negations do not cancel, so
-    //! `N > iv + C` became `(N - C) < iv` -- for N=100, C=4, iv=0 the true
-    //! `100 > 4` came out as the false `96 < 0`.
-    //!
-    //! These tests do not check the SHAPE of the rewrite; they check that it is
-    //! an EQUIVALENCE, by evaluating the source predicate and the rewritten
-    //! comparison over a sweep of induction-variable values, for every signed
-    //! relation in both orientations.  A shape assertion would have passed on
-    //! the broken version -- it produced a comparison of exactly the expected
-    //! shape -- which is precisely why the algebra needs an oracle.
-    use super::*;
-
-    /// The IV value both sides are evaluated at.
-    const IV: u32 = 1;
-    /// The cloned `iv + C` temporary.
-    const TEMP: u32 = 100;
-
-    fn build(flipped: bool, op: IrCmpOp, c: i64, n: i64) -> Vec<Instruction> {
-        let add = Instruction::BinOp {
-            dest: Value(TEMP),
-            op: IrBinOp::Add,
-            lhs: Operand::Value(Value(IV)),
-            rhs: Operand::Const(IrConst::from_i64(c, IrType::I64)),
-            ty: IrType::I64,
-        };
-        let n_konst = Operand::Const(IrConst::from_i64(n, IrType::I64));
-        let cmp = Instruction::Cmp {
-            dest: Value(101),
-            lhs: if flipped {
-                n_konst.clone()
-            } else {
-                Operand::Value(Value(TEMP))
-            },
-            op,
-            rhs: if flipped {
-                Operand::Value(Value(TEMP))
-            } else {
-                n_konst
-            },
-            ty: IrType::I64,
-        };
-        vec![add, cmp]
-    }
-
-    /// Evaluate the (possibly rewritten) comparison at `iv`.  Only the IV and
-    /// constants may appear once the fold has run; the temporary appearing means
-    /// the fold did not fire.
-    fn eval_folded(cmp: &Instruction, iv: i64) -> Option<bool> {
-        let Instruction::Cmp { lhs, op, rhs, .. } = cmp else {
-            return None;
-        };
-        let value = |o: &Operand| -> Option<i64> {
-            match o {
-                Operand::Const(c) => c.to_i64(),
-                Operand::Value(v) if v.0 == IV => Some(iv),
-                _ => None,
-            }
-        };
-        Some(op.eval_i64(value(lhs)?, value(rhs)?))
-    }
-
-    /// The source predicate, evaluated directly from the C-level relation.
-    fn eval_source(flipped: bool, op: IrCmpOp, c: i64, n: i64, iv: i64) -> bool {
-        let temp = iv + c;
-        if flipped {
-            op.eval_i64(n, temp)
-        } else {
-            op.eval_i64(temp, n)
-        }
-    }
-
     #[test]
-    fn all_signed_relations_in_both_orientations_are_equivalences() {
-        let relations = [IrCmpOp::Slt, IrCmpOp::Sle, IrCmpOp::Sgt, IrCmpOp::Sge];
-        let mut checked = 0usize;
-        for flipped in [false, true] {
-            for op in relations {
-                for &c in &[0i64, 1, 4, 7] {
-                    for &n in &[0i64, 1, 5, 16, 4096] {
-                        for iv in [-33i64, -1, 0, 1, 2, 5, 17, 100, 4095] {
-                            let mut insts = build(flipped, op, c, n);
-                            let folded = canonicalise_affine_exit_cmps(&mut insts);
-                            // `iv + C` must not overflow for the source to be
-                            // defined; skip the wrapping cases.
-                            if iv.checked_add(c).is_none() {
-                                continue;
-                            }
-                            // The fold is allowed to refuse when `N - C` is not
-                            // representable; when it fires it must be exact.
-                            if folded == 0 {
-                                continue;
-                            }
-                            let Some(after) = eval_folded(&insts[1], iv) else {
-                                // Still refers to the temporary: refused.
-                                continue;
-                            };
-                            let before = eval_source(flipped, op, c, n, iv);
-                            assert_eq!(
-                                before, after,
-                                "fold changed the predicate: flipped={flipped} op={op:?} c={c} \
-                                 n={n} iv={iv} ({before} -> {after})"
+    fn unsigned_byte_sequences_and_mirrored_bounds_are_exact() {
+        let mut checked = 0;
+        for start in [0, 1, 127, 254, 255] {
+            for bound in 0..=255 {
+                for step in [1, 2, 7, 128] {
+                    for offset in [0, 1, 8, 127, 255] {
+                        for (op, mirror) in [
+                            (IrCmpOp::Ult, false),
+                            (IrCmpOp::Ule, false),
+                            (IrCmpOp::Ugt, true),
+                            (IrCmpOp::Uge, true),
+                        ] {
+                            let mut f = counted_loop(
+                                Ty::U8,
+                                start,
+                                offset,
+                                if mirror {
+                                    if op == IrCmpOp::Ugt {
+                                        IrCmpOp::Ult
+                                    } else {
+                                        IrCmpOp::Ule
+                                    }
+                                } else {
+                                    op
+                                },
+                                bound,
+                                true,
+                                step,
+                                true,
+                                true,
                             );
+                            if mirror {
+                                for inst in &mut f.blocks[1].instructions {
+                                    if let Instruction::Cmp {
+                                        lhs, rhs, op: o, ..
+                                    } = inst
+                                    {
+                                        std::mem::swap(lhs, rhs);
+                                        *o = op;
+                                    }
+                                }
+                            }
+                            if fold_affine_exit_compares(&mut f) == 0 {
+                                continue;
+                            }
+                            let (folded_op, _, raw) = folded_cmp(&f).unwrap();
+                            let cutoff = integer_constant(IrConst::I64(raw), Ty::U8).unwrap();
+                            let inclusive = matches!(op, IrCmpOp::Ule | IrCmpOp::Uge);
+                            assert_eq!(
+                                folded_op,
+                                if inclusive {
+                                    IrCmpOp::Ule
+                                } else {
+                                    IrCmpOp::Ult
+                                }
+                            );
+                            let mut v = start;
+                            let mut exited = false;
+                            for _ in 0..=256 {
+                                let sum = (v + offset) & 255; // independent modulo-256 model
+                                let old = if inclusive { sum <= bound } else { sum < bound };
+                                let new = if inclusive {
+                                    i128::from(v) <= cutoff
+                                } else {
+                                    i128::from(v) < cutoff
+                                };
+                                assert_eq!(old, new, "{start}/{step}/{offset}/{bound} at {v}");
+                                if !old {
+                                    exited = true;
+                                    break;
+                                }
+                                v = (v + step) & 255;
+                            }
+                            assert!(exited);
                             checked += 1;
                         }
                     }
                 }
             }
         }
-        assert!(
-            checked > 400,
-            "expected a broad sweep, checked only {checked}"
-        );
+        assert!(checked > 1000, "nonvacuous certificate sweep: {checked}");
     }
 
     #[test]
-    fn the_flipped_oracle_catches_the_regression_it_was_written_for() {
-        // The exact shape the audit reported: `100 > (iv + 4)` at `iv = 0` is
-        // true.  The broken rewrite produced `96 < 0` (false).  Pin the value
-        // pair so the oracle above cannot silently stop covering it.
-        let mut insts = build(true, IrCmpOp::Sgt, 4, 100);
-        assert_eq!(canonicalise_affine_exit_cmps(&mut insts), 1);
-        let after = eval_folded(&insts[1], 0).expect("fold must leave a constant bound");
-        assert!(after, "100 > (0 + 4) must stay true after folding");
-        assert_eq!(eval_source(true, IrCmpOp::Sgt, 4, 100, 0), after);
+    fn unsigned_full_width_bounds_are_not_signed_raw_patterns() {
+        for ty in [Ty::U8, Ty::U16, Ty::U32, Ty::U64] {
+            let max = (1_i128 << (ty.size() * 8)) - 1;
+            let mut good = counted_loop(
+                ty,
+                (max - 20) as i64,
+                4,
+                IrCmpOp::Ult,
+                (max - 1) as i64,
+                true,
+                1,
+                true,
+                true,
+            );
+            assert_eq!(fold_affine_exit_compares(&mut good), 1);
+            let (_, _, raw) = folded_cmp(&good).unwrap();
+            assert_eq!(integer_constant(IrConst::I64(raw), ty), Some(max - 5));
+            let mut bad = counted_loop(
+                ty,
+                (max - 15) as i64,
+                8,
+                IrCmpOp::Ule,
+                (max - 2) as i64,
+                true,
+                8,
+                true,
+                true,
+            );
+            let before = format!("{bad:?}");
+            assert_eq!(fold_affine_exit_compares(&mut bad), 0);
+            assert_eq!(format!("{bad:?}"), before);
+        }
+    }
+
+    #[test]
+    fn affine_fold_rejects_signedness_mismatch_and_multi_def_webs() {
+        for (ty, op) in [(Ty::U32, IrCmpOp::Slt), (Ty::I32, IrCmpOp::Ult)] {
+            let mut f = counted_loop(ty, 0, 8, op, 256, true, 8, true, true);
+            let before = format!("{f:?}");
+            assert_eq!(fold_affine_exit_compares(&mut f), 0);
+            assert_eq!(format!("{f:?}"), before);
+        }
+        let mut f = counted_loop(Ty::U64, 0, 8, IrCmpOp::Ule, 256, true, 8, true, true);
+        f.blocks[1].instructions.insert(
+            2,
+            Instruction::Copy {
+                dest: Value(3),
+                src: Operand::Const(IrConst::I64(1000)),
+            },
+        );
+        let before = format!("{f:?}");
+        assert_eq!(fold_affine_exit_compares(&mut f), 0);
+        assert_eq!(format!("{f:?}"), before);
+    }
+
+    #[test]
+    fn unsigned_folding_respects_the_existing_kill_switch() {
+        let mut f = counted_loop(Ty::U32, 0, 8, IrCmpOp::Ule, 256, true, 8, true, true);
+        let before = format!("{f:?}");
+        let old = affine_fold_enabled();
+        AFFINE_FOLD_ENABLED.with(|v| v.set(false));
+        let result = fold_affine_exit_compares(&mut f);
+        AFFINE_FOLD_ENABLED.with(|v| v.set(old));
+        assert_eq!(result, 0);
+        assert_eq!(format!("{f:?}"), before);
+        assert_eq!(fold_affine_exit_compares(&mut f), 1);
+    }
+
+    #[test]
+    fn signed_mirrored_comparisons_retain_the_original_orientation() {
+        for (ty, op) in [(Ty::I32, IrCmpOp::Slt), (Ty::I64, IrCmpOp::Sle)] {
+            let mut f = counted_loop(ty, 0, 4, op, 100, true, 1, true, true);
+            for inst in &mut f.blocks[1].instructions {
+                if let Instruction::Cmp {
+                    lhs, rhs, op: o, ..
+                } = inst
+                {
+                    std::mem::swap(lhs, rhs);
+                    *o = if op == IrCmpOp::Slt {
+                        IrCmpOp::Sgt
+                    } else {
+                        IrCmpOp::Sge
+                    };
+                }
+            }
+            assert_eq!(fold_affine_exit_compares(&mut f), 1);
+            assert_eq!(folded_cmp(&f), Some((op, 2, 96)));
+            for v in -32..=100 {
+                assert_eq!(op.eval_i64(v + 4, 100), op.eval_i64(v, 96));
+            }
+        }
+    }
+    #[test]
+    fn optional_exit_test_does_not_bound_the_induction_sequence() {
+        let mut f = counted_loop(Ty::U32, 0, 4, IrCmpOp::Ult, 64, true, 1, true, true);
+        f.blocks[0].instructions.push(Instruction::ParamRef {
+            dest: Value(9),
+            param_idx: 0,
+            ty: Ty::I32,
+        });
+        f.blocks[1].terminator = Terminator::Branch(BlockId(2));
+        f.blocks[2].terminator = Terminator::CondBranch {
+            cond: Operand::Value(Value(9)),
+            true_label: BlockId(5),
+            false_label: BlockId(3),
+        };
+        f.blocks.push(blk(
+            5,
+            vec![],
+            Terminator::CondBranch {
+                cond: Operand::Value(Value(4)),
+                true_label: BlockId(3),
+                false_label: BlockId(4),
+            },
+        ));
+        let before = format!("{f:?}");
+        assert_eq!(fold_affine_exit_compares(&mut f), 0);
+        assert_eq!(format!("{f:?}"), before);
+    }
+
+    #[test]
+    fn a_shared_affine_source_keeps_its_existing_value_and_bound() {
+        let mut f = counted_loop(Ty::I64, 0, 4, IrCmpOp::Slt, 64, true, 1, true, true);
+        f.blocks[1].instructions.insert(
+            1,
+            Instruction::BinOp {
+                dest: Value(9),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(2)),
+                rhs: Operand::Const(IrConst::I64(3)),
+                ty: Ty::I64,
+            },
+        );
+        if let Instruction::BinOp { lhs, .. } = &mut f.blocks[1].instructions[2] {
+            *lhs = Operand::Value(Value(9));
+        }
+        f.blocks[2].instructions.push(Instruction::Copy {
+            dest: Value(10),
+            src: Operand::Value(Value(9)),
+        });
+        assert_eq!(fold_affine_exit_compares(&mut f), 1);
+        assert!(matches!(
+            f.blocks[1].instructions[3],
+            Instruction::Cmp {
+                op: IrCmpOp::Slt,
+                lhs: Operand::Value(Value(9)),
+                rhs: Operand::Const(IrConst::I64(60)),
+                ..
+            }
+        ));
     }
 }

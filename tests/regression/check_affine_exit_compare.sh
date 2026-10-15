@@ -1,49 +1,11 @@
 #!/usr/bin/env bash
-# ============================================================================
-# check_affine_exit_compare.sh — ZERO-ROT-AFFINE: the rotated latch compares a
-# bare IV against a FOLDED bound, and the compare-branch fusion accepts it.
-#
-# Why this gate exists.  `loop_rotate` clones the header guard into the latch,
-# so the cloned test is `add(iv, C) < N` and the backend materialises `+C` as a
-# fresh temporary on every iteration (the blocker measured in
-# engineering/FOLLOWUP-2026-09-30-affine-exit-compare.md: 5 insns/iter against
-# GCC's 4).  `canonicalise_affine_exit_cmps` folds the constant into the bound
-# (`iv < N - C`, signed compares only), which both removes the temporary and
-# gives the compare-branch fusion a bare-register compare to fuse — the second
-# half only works because FileLiveness's backward-edge analysis became
-# region-relative (the stale full-analysis answer made the fusion refuse the
-# rotated setcc shape outright).
-#
-# The pass is opt-in (`CCC_LOOP_ROTATE=1`), so the gate drives it explicitly
-# and pins three contracts:
-#
-#   1. CORRECTNESS. `affine_exit_compare.c` (constant-bound, runtime-bound,
-#      pointer-IV, unsigned-refusal, define-mimic and already-canonical shapes,
-#      references read through `volatile`) must agree with the GCC oracle on
-#      stdout AND exit status with rotation on, with rotation off, and under
-#      the kill switch.
-#
-#   2b. THE KILL SWITCH REACHES THE CLONE.  With rotation ON and
-#      `CCC_NO_AFFINE_EXIT_FOLD=1`, the rotation path must report ZERO clone
-#      folds while still reporting rotation candidates (otherwise the assertion
-#      would hold for the wrong reason).
-#
-#   2. THE ROTATION CLONE IS STILL COUNTED.  Under `CCC_DEBUG_LOOP_ROTATE=1`
-#      the rotation path must report at least one `[ROT] affine exit-compare
-#      folds:` and none when rotation is off.  The fold is now ALSO a
-#      default-on phase of its own (`[AFFOLD]` reports, gated by
-#      tests/regression/check_affine_loop_fold.sh), so this contract is matched
-#      on the rotation prefix alone: the two must not be confused.
-#
-#   3. THE OBJECT CODE IS THE 4-INSTRUCTION LOOP.  In `f_const` (`i + 4 <
-#      2048`) the rotated build must compare the IV against the folded bound
-#      directly and branch on it (`cmpq $2044, %rdx` followed by the
-#      conditional jump — no setcc relay, no `test`), with no `leaq 4(` offset
-#      materialisation and no `$2048` anywhere; the unrotated build must show
-#      the 5-instruction shape it replaces (`leaq 4(%rdx)` + `cmpq $2048`).
-#      That difference IS the win: the gate fails if the fold silently stops
-#      applying, not just if the answer changes.
-# ============================================================================
+# Affine bounds after rotation must use the same sequence proof as ordinary
+# loops. There is no separate unchecked rotation-clone shortcut: it miscompiled
+# defined -fwrapv loops. Check actual compiler environments, reference output,
+# counted proof-based folds, the kill switch, and the original hot-loop shape.
+# Rotation must still run when affine folding is disabled, otherwise the kill
+# control would be vacuous. Both rotated and unrotated constant-bound loops
+# should use a bare-register folded compare feeding the branch directly.
 set -euo pipefail
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -69,20 +31,16 @@ case $expected in
     *) bad "gcc oracle did not report the expected success line" ;;
 esac
 
-run_case() { # name  "compile flags"  "RUN env assignments"
+run_case() { # name  "compile flags"  "compiler env assignments"
     local name=$1 flags=$2 envs=$3
     local -a farr=() earr=()
     read -r -a farr <<< "$flags"
     read -r -a earr <<< "$envs"
-    if ! "$CCC" "${farr[@]}" "$corpus" -o "$work/$name" > "$work/$name.build" 2>&1; then
+    if ! env "${earr[@]}" "$CCC" "${farr[@]}" "$corpus" -o "$work/$name" > "$work/$name.build" 2>&1; then
         bad "$name: lccc failed to build"; return
     fi
     local out rc=0
-    if [[ ${#earr[@]} -gt 0 ]]; then
-        out=$(timeout 300 env "${earr[@]}" "$work/$name") || rc=$?
-    else
-        out=$(timeout 300 "$work/$name") || rc=$?
-    fi
+    out=$(timeout 300 "$work/$name") || rc=$?
     [[ $rc -eq 0 ]] || { bad "$name: exited $rc (expected 0)"; return; }
     [[ $out == "$expected" ]] || bad "$name: stdout differs from the gcc oracle"
 }
@@ -94,27 +52,23 @@ run_case "norot-O2" "-O2 -march=x86-64-v3" ""
 run_case "killed-O2" "-O2 -march=x86-64-v3" "CCC_LOOP_ROTATE=1 CCC_NO_LOOP_ROTATE=1"
 
 # ---------------------------------------------------------------- contract 2
-note "contract 2: the rotation clone's affine fold is counted"
-CCC_LOOP_ROTATE=1 CCC_DEBUG_LOOP_ROTATE=1 "$CCC" -O2 -march=x86-64-v3 -S "$corpus" \
+note "contract 2: the shared proof-based affine fold is counted"
+CCC_LOOP_ROTATE=1 CCC_DEBUG_LOOP_ROTATE=1 CCC_DEBUG_AFFINE_FOLD=1 "$CCC" -O2 -march=x86-64-v3 -S "$corpus" \
     -o "$work/rot.s" 2> "$work/rot.dbg" || bad "rotated -S build failed"
-CCC_DEBUG_LOOP_ROTATE=1 "$CCC" -O2 -march=x86-64-v3 -S "$corpus" \
+CCC_DEBUG_LOOP_ROTATE=1 CCC_DEBUG_AFFINE_FOLD=1 "$CCC" -O2 -march=x86-64-v3 -S "$corpus" \
     -o "$work/norot.s" 2> "$work/norot.dbg" || bad "unrotated -S build failed"
-folds=$(grep -cF "[ROT] affine exit-compare folds:" "$work/rot.dbg" || true)
-folds_off=$(grep -cF "[ROT] affine exit-compare folds:" "$work/norot.dbg" || true)
-note "rotated: $folds rotation-clone fold report(s); unrotated: $folds_off"
-[[ $folds -gt 0 ]] || bad "no affine exit-compare fold fired inside rotation"
-[[ $folds_off -eq 0 ]] || bad "rotation reported a clone fold without running ($folds_off report(s))"
+folds=$(grep -cF "[AFFOLD]" "$work/rot.dbg" || true)
+folds_off=$(grep -cF "[AFFOLD]" "$work/norot.dbg" || true)
+note "rotated: $folds proof-based fold report(s); unrotated: $folds_off"
+[[ $folds -gt 0 ]] || bad "no proof-based affine exit-compare fold fired after rotation"
+[[ $folds_off -gt 0 ]] || bad "the proof-based fold did not run without rotation"
 
-# The kill switch must reach BOTH producers of the fold.  `CCC_NO_AFFINE_EXIT_FOLD`
-# exists so a misbehaving fold can be disabled without disabling rotation (an
-# older, separate transformation), and it used to gate only the standalone pass:
-# the rotation clone kept folding, which made the A/B that condemns the fold the
-# same A/B that hides it.  The count is the observable, so assert on it.
-CCC_LOOP_ROTATE=1 CCC_NO_AFFINE_EXIT_FOLD=1 CCC_DEBUG_LOOP_ROTATE=1 "$CCC" \
+# One owner, one kill switch. Rotation must remain active under this control.
+CCC_LOOP_ROTATE=1 CCC_NO_AFFINE_EXIT_FOLD=1 CCC_DEBUG_LOOP_ROTATE=1 CCC_DEBUG_AFFINE_FOLD=1 "$CCC" \
     -O2 -march=x86-64-v3 -S "$corpus" -o "$work/rotkilled.s" 2> "$work/rotkilled.dbg" \
     || bad "rotated kill-switch -S build failed"
-folds_killed=$(grep -cF "[ROT] affine exit-compare folds:" "$work/rotkilled.dbg" || true)
-note "rotated with CCC_NO_AFFINE_EXIT_FOLD=1: $folds_killed rotation-clone fold report(s)"
+folds_killed=$(grep -cF "[AFFOLD]" "$work/rotkilled.dbg" || true)
+note "rotated with CCC_NO_AFFINE_EXIT_FOLD=1: $folds_killed proof-based fold report(s)"
 [[ $folds_killed -eq 0 ]] \
     || bad "CCC_NO_AFFINE_EXIT_FOLD left the rotation clone fold running ($folds_killed report(s))"
 # ... and rotation itself still ran, or the line above would be vacuous.
@@ -157,4 +111,4 @@ if [[ $fail -ne 0 ]]; then
     echo "check_affine_exit_compare: FAILED" >&2
     exit 1
 fi
-echo "check_affine_exit_compare: PASS (oracle parity, counted rotation-clone fold, f_const folded rotated and unrotated)"
+echo "check_affine_exit_compare: PASS (oracle parity, counted proof-based fold, f_const folded rotated and unrotated)"

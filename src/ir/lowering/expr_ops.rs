@@ -367,7 +367,7 @@ impl Lowerer {
         if lhs_is_ptr && !rhs_is_ptr {
             let vla_stride = self.get_vla_stride_for_subscript(lhs);
             let elem_size = self.get_pointer_elem_size_from_expr(lhs);
-            let rhs_ty = self.get_expr_type(rhs);
+            let rhs_ty = self.value_ir_type(rhs);
             let lhs_val = self.lower_expr(lhs);
             let rhs_val = self.lower_expr(rhs);
             // Widen the integer index to pointer width (sign-extend for signed types,
@@ -394,7 +394,7 @@ impl Lowerer {
         } else if rhs_is_ptr && !lhs_is_ptr && *op == BinOp::Add {
             let vla_stride = self.get_vla_stride_for_subscript(rhs);
             let elem_size = self.get_pointer_elem_size_from_expr(rhs);
-            let lhs_ty = self.get_expr_type(lhs);
+            let lhs_ty = self.value_ir_type(lhs);
             let lhs_val = self.lower_expr(lhs);
             // Widen the integer index to pointer width before scaling and adding to the pointer.
             let lhs_val = self.emit_implicit_cast(lhs_val, lhs_ty, ptr_int_ty);

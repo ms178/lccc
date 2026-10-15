@@ -18,6 +18,9 @@ use crate::ir::reexports::{Instruction, IrConst, IrFunction, Operand, Value};
 
 /// Run FP-constant hoisting on a function. Returns the number of constants hoisted.
 pub(crate) fn run(func: &mut IrFunction) -> usize {
+    if super::fp_environment_blocks_reordering(func) {
+        return 0;
+    }
     if func.blocks.len() < 2 {
         return 0;
     }

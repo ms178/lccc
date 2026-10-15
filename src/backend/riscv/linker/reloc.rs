@@ -49,6 +49,9 @@ pub struct RelocContext<'a> {
 pub struct RelocResult {
     /// Dynamic RELATIVE relocations (offset, addend) collected during shared lib linking
     pub relative_entries: Vec<(u64, u64)>,
+    /// Symbol-based R_RISCV_64 dynamic relocations: place, name, signed addend.
+    /// A default-visible global can be preempted even when defined in this DSO.
+    pub symbol_entries: Vec<(u64, String, i64)>,
 }
 
 /// Minimum byte extent touched by each implemented relocation. Validate against
@@ -157,6 +160,7 @@ pub fn apply_relocations(
 ) -> Result<RelocResult, String> {
     let mut result = RelocResult {
         relative_entries: Vec::new(),
+        symbol_entries: Vec::new(),
     };
 
     for (obj_idx, (obj_name, obj)) in input_objs.iter().enumerate() {
@@ -340,6 +344,47 @@ fn lookup_got_entry(
     0
 }
 
+/// Resolve a 64-bit address and record the fixup the loader still owes it.
+/// Executable linking remains an allocation/hash-lookup-free arithmetic path.
+fn relocate_address64(
+    symbol_value: u64,
+    addend: i64,
+    place: u64,
+    sym: &Symbol,
+    sym_idx: usize,
+    ctx: &RelocContext,
+    result: &mut RelocResult,
+) -> u64 {
+    // ELF address arithmetic is modulo 2^64, including negative RELA addends.
+    let value = symbol_value.wrapping_add(addend as u64);
+    if !ctx.collect_relatives {
+        return value;
+    }
+    let global = if sym.binding() != STB_LOCAL && !sym.name.is_empty() {
+        ctx.global_syms.get(sym.name.as_str())
+    } else {
+        None
+    };
+    if global.is_some_and(|g| g.visibility == STV_DEFAULT) {
+        // The loader, not this link, chooses S. RELATIVE would incorrectly
+        // bind a definition locally (or lose an import). This includes ABS
+        // definitions: default-visible globals can still be preempted.
+        result
+            .symbol_entries
+            .push((place, sym.name.to_string(), addend));
+        return 0;
+    }
+    let absolute = global.map_or(sym.shndx == SHN_ABS || sym_idx == 0, |g| {
+        (g.defined && g.section_idx.is_none())
+            || (!g.defined && g.binding == STB_WEAK && g.visibility != STV_DEFAULT)
+    });
+    if !absolute {
+        // A section-relative address of zero still needs B+A.
+        result.relative_entries.push((place, value));
+    }
+    value
+}
+
 /// Apply a single relocation to the merged section data.
 fn apply_one_reloc(
     rela_type: u32,
@@ -349,7 +394,7 @@ fn apply_one_reloc(
     a: i64,
     p: u64,
     sym: &super::elf_read::Symbol,
-    _sym_idx: usize,
+    sym_idx: usize,
     obj_idx: usize,
     obj: &super::elf_read::ElfObject,
     sec_idx: usize,
@@ -362,13 +407,12 @@ fn apply_one_reloc(
         R_RISCV_RELAX | R_RISCV_ALIGN => { /* hints, skip */ }
 
         R_RISCV_64 => {
-            let val = (s as i64 + a) as u64;
-            if off + 8 <= data.len() {
-                data[off..off + 8].copy_from_slice(&val.to_le_bytes());
-                if ctx.collect_relatives && s != 0 {
-                    result.relative_entries.push((p, val));
-                }
-            }
+            let field = off
+                .checked_add(8)
+                .and_then(|end| data.get_mut(off..end))
+                .ok_or_else(|| format!("R_RISCV_64 field exceeds output in '{}'", obj_name))?;
+            let value = relocate_address64(s, a, p, sym, sym_idx, ctx, result);
+            field.copy_from_slice(&value.to_le_bytes());
         }
         R_RISCV_32 => {
             let val = (s as i64 + a) as u32;
@@ -377,8 +421,7 @@ fn apply_one_reloc(
             }
         }
         R_RISCV_PCREL_HI20 => {
-            let target = s as i64 + a;
-            let offset_val = target - p as i64;
+            let offset_val = super::displacement::checked_auipc_delta(s, a, p)?;
             patch_u_type(data, off, offset_val as u32);
         }
         R_RISCV_PCREL_LO12_I => {
@@ -417,7 +460,7 @@ fn apply_one_reloc(
         }
         R_RISCV_GOT_HI20 => {
             let got_entry_vaddr = lookup_got_entry(sym, obj_idx, a, ctx);
-            let offset_val = got_entry_vaddr as i64 + a - p as i64;
+            let offset_val = super::displacement::checked_auipc_delta(got_entry_vaddr, a, p)?;
             patch_u_type(data, off, offset_val as u32);
         }
         R_RISCV_CALL_PLT => {
@@ -443,7 +486,7 @@ fn apply_one_reloc(
                 } else {
                     s as i64
                 };
-                let offset_val = target + a - p as i64;
+                let offset_val = super::displacement::checked_auipc_delta(target as u64, a, p)?;
                 let hi = ((offset_val + 0x800) >> 12) & 0xFFFFF;
                 let lo = offset_val & 0xFFF;
                 if off + 8 <= data.len() {
@@ -625,7 +668,7 @@ fn apply_one_reloc(
         }
         R_RISCV_TLS_GOT_HI20 => {
             let got_entry_vaddr = lookup_got_entry(sym, obj_idx, a, ctx);
-            let offset_val = got_entry_vaddr as i64 + a - p as i64;
+            let offset_val = super::displacement::checked_auipc_delta(got_entry_vaddr, a, p)?;
             patch_u_type(data, off, offset_val as u32);
         }
         other => {

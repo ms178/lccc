@@ -42,3 +42,31 @@ for opt in -O0 -O1 -O2 -O3; do
         "$td/test-off"
     done
 done
+
+# The driver used to silently ignore -fwrapv, allowing signed-UB widening of
+# a defined modular address product. Keep the four independent domains and
+# both pointer widths, with fixed expected results from arithmetic + oracles.
+for opt in -O0 -O1 -O2 -O3 -Os -Oz; do
+    for width in native i686; do
+        flags=()
+        if [[ $width == i686 ]]; then flags=(-m32 -msse2 -I"$inc"); fi
+        "$ccc" "$opt" -fwrapv "${flags[@]}" tests/regression/wrapv_domains.c -o "$td/wrapv"
+        for case in 0 1 2 3; do
+            case $case in
+                0) expected=28;; 1) expected=-1073665362;; 2) expected=1;; 3) expected=10;;
+            esac
+            result=$("$td/wrapv" "$case")
+            [[ $result == "$expected" ]] || { echo "FAIL wrapv $opt $width case=$case: $result != $expected" >&2; exit 1; }
+        done
+        echo "wrapv: $opt $width PASS (4 domains)"
+    done
+done
+
+for opt in -O0 -O1 -O2 -O3 -Os -Oz; do
+    for width in native i686; do
+        flags=()
+        if [[ $width == i686 ]]; then flags=(-m32 -msse2 -I"$inc"); fi
+        "$ccc" "$opt" -fwrapv "${flags[@]}" tests/regression/ivw_wrapv_range.c -o "$td/wrapv-range"
+        "$td/wrapv-range"
+    done
+done

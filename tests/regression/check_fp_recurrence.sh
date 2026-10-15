@@ -28,15 +28,19 @@ for arch in x86-64 x86-64-v3; do
         cmp "$work/oracle-expected" "$work/oracle-actual"
         echo "PASS exact FP bits/exceptions and oracle digest: $arch -O$opt"
     done
+    # Positive optimization shapes have a fixed FP environment. Executed
+    # exact-bit/FENV cases above always keep the pragma enabled.
     for mode in on no_square no_double; do
         disabled=""
         [[ $mode != no_square ]] || disabled=loop_square
         [[ $mode != no_double ]] || disabled=fp_double
         CCC_DISABLE_PASSES="$disabled" CCC_VALIDATE_SSA=1 CCC_VERIFY_IR=abort \
-            "$CCC" -O2 -march="$arch" -ffp-contract=off -S "$src" -o "$work/$arch-$mode.s"
+            "$CCC" -O2 -march="$arch" -DNO_FENV_PRAGMA -ffp-contract=off -S "$src" -o "$work/$arch-$mode.s"
     done
 done
-"$CCC" -O2 -march=x86-64-v3 -ffp-contract=fast -S "$src" -o "$work/contract.s"
+# A positive FMA contract needs FENV_ACCESS OFF. Retain the ON negative control.
+"$CCC" -O2 -march=x86-64-v3 -ffp-contract=fast -S "$src" -o "$work/observable-contract.s"
+"$CCC" -O2 -march=x86-64-v3 -DNO_FENV_PRAGMA -ffp-contract=fast -S "$src" -o "$work/contract.s"
 for flags in '-march=x86-64' '-march=x86-64-v2' '-march=x86-64-v3 -mno-fma'; do
     # Deliberate word splitting of this fixed test-only flag list.
     "$CCC" -O2 $flags -ffp-contract=fast -S "$src" -o "$work/no-fma-${flags// /_}.s"
@@ -108,6 +112,7 @@ def inner_fp_loop(text):
 assert mul_fma(inner_fp_loop(body('mandel-on.s', 'main'))) == mul_fma(inner_fp_loop(body('mandel-no_square.s', 'main'))) - 1
 
 for name in ('twice_plus', 'scaled_fma'):
+    assert not re.search(r'vfmadd\d*sd', body('observable-contract.s', name)), name
     assert re.search(r'vfmadd\d*sd', body('contract.s', name)), name
 
 def redundant_edges(file):

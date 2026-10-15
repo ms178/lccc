@@ -93,6 +93,12 @@ pub struct Driver {
     /// fp_reassoc because GCC does not define __FAST_MATH__ for the individual
     /// -fassociative-math/-funsafe-math-optimizations options.
     pub(super) fast_math: bool,
+    /// -fwrapv makes signed Add/Sub/Mul modular; never infer no-wrap from C UB.
+    pub(super) wrap_signed_overflow: bool,
+    /// Explicitly observable FP traps; ordinary TUs retain the FENV-off policy.
+    pub(super) fp_trapping_math: bool,
+    /// Dynamic rounding is observable independently of exception trapping.
+    pub(super) fp_rounding_math: bool,
     pub(super) verbose: bool,
     pub(super) mode: CompileMode,
     pub(super) debug_info: bool,
@@ -501,6 +507,9 @@ impl Driver {
             fp_contract: crate::common::fp_contract::FpContract::c_language_default(),
             fp_contract_explicit: false,
             fast_math: false,
+            wrap_signed_overflow: false,
+            fp_trapping_math: false,
+            fp_rounding_math: false,
             verbose: false,
             mode: CompileMode::Full,
             debug_info: false,
@@ -1261,8 +1270,12 @@ impl Driver {
                 // to -Wl, and -l flags. This is critical for --whole-archive support.
             } else if Self::is_assembly_source(input_file) || self.is_explicit_assembly() {
                 // .s/.S files (or -x assembler): pass to assembler, then link
-                let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o");
-                self.assemble_source_file(input_file, tmp.to_str())?;
+                let tmp = TempFile::try_new("ccc", Self::input_stem(input_file), "o")
+                    .map_err(|error| error.to_string())?;
+                self.assemble_source_file(
+                    input_file,
+                    tmp.to_str().map_err(|error| error.to_string())?,
+                )?;
                 temp_guards.push(tmp);
             } else if !Self::is_c_source(input_file) && Self::looks_like_binary_object(input_file) {
                 // Unrecognized extension but file has ELF/archive magic bytes -
@@ -1274,8 +1287,13 @@ impl Driver {
                 #[cfg(feature = "gcc_m16")]
                 if self.code16gcc {
                     use super::external_tools::GccM16Mode;
-                    let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o");
-                    self.compile_with_gcc_m16(input_file, tmp.to_str(), GccM16Mode::Object)?;
+                    let tmp = TempFile::try_new("ccc", Self::input_stem(input_file), "o")
+                        .map_err(|error| error.to_string())?;
+                    self.compile_with_gcc_m16(
+                        input_file,
+                        tmp.to_str().map_err(|error| error.to_string())?,
+                        GccM16Mode::Object,
+                    )?;
                     if self.verbose {
                         eprintln!("Compiled (GCC -m16): {}", input_file);
                     }
@@ -1286,10 +1304,14 @@ impl Driver {
                 // Compile .c files to .o (handles .code16gcc prepend via internal codegen)
                 let asm = self.compile_to_assembly(input_file)?;
 
-                let tmp = TempFile::new("ccc", Self::input_stem(input_file), "o");
+                let tmp = TempFile::try_new("ccc", Self::input_stem(input_file), "o")
+                    .map_err(|error| error.to_string())?;
                 let extra = self.build_asm_extra_args();
-                self.target
-                    .assemble_with_extra(&asm, tmp.to_str(), &extra)?;
+                self.target.assemble_with_extra(
+                    &asm,
+                    tmp.to_str().map_err(|error| error.to_string())?,
+                    &extra,
+                )?;
                 // Write dependency file for this source file. When compiling and
                 // linking in one step, GCC's -Wp,-MMD uses the .o name as the
                 // dependency target. We use the output executable path as target,
@@ -1303,7 +1325,11 @@ impl Driver {
         // for freshly compiled objects). Passthrough objects, -l flags, and -Wl, flags
         // follow in their original command-line order via linker_ordered_items.
         // Extra passthrough objects (detected by magic bytes at runtime) go after temps.
-        let mut all_objects: Vec<&str> = temp_guards.iter().map(|t| t.to_str()).collect();
+        let mut all_objects: Vec<&str> = temp_guards
+            .iter()
+            .map(TempFile::to_str)
+            .collect::<Result<_, _>>()
+            .map_err(|error| error.to_string())?;
         for obj in &extra_passthrough {
             all_objects.push(obj.as_str());
         }
@@ -1683,6 +1709,15 @@ impl Driver {
         preprocessor.set_filename(filename);
         self.process_force_includes(&mut preprocessor)?;
         let preprocessed = preprocessor.preprocess(&source);
+        let fp_environment_observable =
+            self.fp_trapping_math || self.fp_rounding_math || preprocessor.fenv_access_requested;
+        // Runtime expression lowering also folds casts, before run_passes.
+        // Publish the same TU contract before entering the frontend; static
+        // initializer evaluation retains its separate translation-time rules.
+        crate::common::semantics::replace(crate::common::semantics::Semantics {
+            signed_overflow_wraps: self.wrap_signed_overflow,
+            fp_environment_observable,
+        });
         *self.last_dep_files.borrow_mut() = preprocessor.take_dep_files();
         if time_phases {
             eprintln!("[TIME] preprocess: {:.3}s", t0.elapsed().as_secs_f64());
@@ -2004,6 +2039,8 @@ impl Driver {
             self.opt_level,
             self.target,
             self.code16gcc,
+            self.wrap_signed_overflow,
+            fp_environment_observable,
             self.fp_reassoc,
             self.resolved_fp_contract(),
             // Code-generation ISA permission — one struct shared with the
@@ -2654,7 +2691,11 @@ impl Driver {
             data_sections: self.data_sections,
             code16gcc: self.code16gcc,
             regparm: self.regparm,
-            fp_contract: self.resolved_fp_contract(),
+            fp_contract: if fp_environment_observable {
+                crate::common::fp_contract::FpContract::Off
+            } else {
+                self.resolved_fp_contract()
+            },
             fma: self.enable_fma,
             preferred_stack_bytes: self.preferred_stack_bytes,
             omit_frame_pointer: self.omit_frame_pointer,

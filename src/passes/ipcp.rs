@@ -539,6 +539,10 @@ fn find_constant_return_functions(module: &IrModule) -> FxHashMap<String, IrCons
 /// use case is kernel config stubs that return literal constants without any
 /// memory access.
 fn is_side_effect_free(func: &crate::ir::reexports::IrFunction) -> bool {
+    // A constant return does not make earlier FP exceptions unobservable.
+    if super::fp_environment_blocks_reordering(func) {
+        return false;
+    }
     for block in &func.blocks {
         for inst in &block.instructions {
             match inst {

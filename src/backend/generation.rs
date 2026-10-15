@@ -205,8 +205,11 @@ fn foldable_const_disp(c: &IrConst, allow_u32_wrap: bool) -> Option<i64> {
 /// ring. A scaling instruction (`shl`, `mul`, `add(v, v)`) or a displacement
 /// `add`/`sub` may therefore only be peeled away when its ring IS the pointer
 /// ring or wider -- there the two rings coincide -- or when it is a narrower
-/// SIGNED ring, which cannot wrap in a defined program (C17 6.5/5, the same
+/// SIGNED ring under the default non-wrapping language contract (C17 6.5/5, the same
 /// theorem `iv_strength_reduce::offset_product_cannot_overflow` rests on).
+/// Under -fwrapv the signed narrow result must also be computed BEFORE
+/// extension: sext(i32(i * 4)) is not sext(i) * 4. Keep that producer and use
+/// its extended result as an unscaled index; do not disable all SIB folding.
 /// An UNSIGNED narrower ring wraps by definition, and peeling it reinterprets
 /// that wrap as pointer arithmetic: `buf[i*2]` with `uint32_t i` reached
 /// `buf[0x100000000]` instead of `buf[0]` once `2*i` exceeded 2^32, because the
@@ -216,7 +219,8 @@ fn foldable_const_disp(c: &IrConst, allow_u32_wrap: bool) -> Option<i64> {
 #[inline]
 fn scale_ring_is_linear(ty: IrType) -> bool {
     ty.is_integer()
-        && ((ty.size() as usize) >= crate::common::types::target_ptr_size() || !ty.is_unsigned())
+        && ((ty.size() as usize) >= crate::common::types::target_ptr_size()
+            || (!ty.is_unsigned() && !crate::common::semantics::signed_overflow_wraps()))
 }
 
 fn is_i32_disp(off: i64) -> bool {
@@ -6996,6 +7000,37 @@ mod conditional_increment_tests {
 #[cfg(test)]
 mod scale_ring_tests {
     use super::*;
+
+    #[test]
+    fn wrapping_signed_scale_is_computed_before_pointer_extension() {
+        let _guard =
+            crate::common::semantics::TestGuard::new(crate::common::semantics::Semantics {
+                signed_overflow_wraps: true,
+                fp_environment_observable: false,
+            });
+        let ptr = crate::common::types::target_ptr_size();
+        for ty in [
+            IrType::I8,
+            IrType::I16,
+            IrType::I32,
+            IrType::I64,
+            IrType::U8,
+            IrType::U16,
+            IrType::U32,
+            IrType::U64,
+        ] {
+            assert_eq!(
+                scale_ring_is_linear(ty),
+                ty.size() as usize >= ptr,
+                "{ty:?}"
+            );
+        }
+        // The independently executed char-address witness: the product wraps
+        // to zero, while extending first leaves a four-GiB displacement.
+        let i = 1_073_741_824i32;
+        assert_eq!(i.wrapping_mul(4), 0);
+        assert_eq!(i64::from(i) * 4, 4_294_967_296);
+    }
 
     /// The SIB peel is value-preserving only for rings the CPU's address
     /// arithmetic can reproduce: the pointer ring itself, anything wider, and

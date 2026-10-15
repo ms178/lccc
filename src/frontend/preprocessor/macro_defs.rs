@@ -51,7 +51,7 @@ fn would_paste_tokens(last: u8, first: u8) -> bool {
         // / followed by * or / (comment start)
         (b'/', b'*') | (b'/', b'/') => true,
         // . followed by digit (e.g., prevent "1." + "5" pasting weirdly)
-        (b'.', b'0'..=b'9') => true,
+        (b'.', b'0'..=b'9') | (b'0'..=b'9', b'.') => true,
         // Identifier/number continuation: letter/digit/_ followed by letter/digit/_
         (a, b) if is_ident_cont_byte(a) && is_ident_cont_byte(b) => true,
         _ => false,
@@ -82,6 +82,10 @@ pub struct MacroDef {
 /// identifiers during rescanning so they are never re-expanded, then
 /// stripped from the final output in `expand_line()`.
 const BLUE_PAINT_MARKER: u8 = 0x01;
+// A synthetic separator preserves preprocessing-token boundaries without
+// pretending the source contained whitespace. Rescanning sees a boundary;
+// stringification discards it; final token serialization renders a space.
+const TOKEN_BOUNDARY: u8 = 0x04;
 
 /// Sentinel markers used to protect text injected by `##` token-paste operations
 /// from further parameter substitution in `substitute_params`. The pasted result
@@ -100,10 +104,48 @@ const PASTE_PROTECT_END: u8 = 0x03;
 /// Returns a `Cow<str>` to avoid allocation when no markers are present
 /// (the common case).
 fn strip_blue_paint(s: &str) -> std::borrow::Cow<'_, str> {
-    if s.as_bytes().contains(&BLUE_PAINT_MARKER) {
-        std::borrow::Cow::Owned(s.replace(BLUE_PAINT_MARKER as char, ""))
-    } else {
-        std::borrow::Cow::Borrowed(s)
+    normalize_internal_markers(s, false)
+}
+
+/// Internal markers are metadata only OUTSIDE preprocessing literal tokens.
+/// Raw control bytes are legal literal payloads, including when a literal is
+/// stringified or pasted with a placemarker. Preserve those bytes and UTF-8.
+/// In final output, discard paint/paste markers and serialize token boundaries;
+/// during token paste, discard blue paint only. Allocate only for a real edit.
+fn normalize_internal_markers(s: &str, final_output: bool) -> std::borrow::Cow<'_, str> {
+    let is_marker = |b| {
+        b == BLUE_PAINT_MARKER
+            || (final_output
+                && matches!(b, PASTE_PROTECT_START | PASTE_PROTECT_END | TOKEN_BOUNDARY))
+    };
+    if !s.as_bytes().iter().copied().any(is_marker) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let bytes = s.as_bytes();
+    let mut result: Option<String> = None;
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if matches!(bytes[i], b'"' | b'\'') {
+            i = skip_literal_bytes(bytes, i, bytes[i]);
+        } else if is_marker(bytes[i]) {
+            let out = result.get_or_insert_with(|| String::with_capacity(s.len()));
+            out.push_str(&s[start..i]);
+            if bytes[i] == TOKEN_BOUNDARY {
+                out.push(' ');
+            }
+            i += 1;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    match result {
+        Some(mut out) => {
+            out.push_str(&s[start..]);
+            std::borrow::Cow::Owned(out)
+        }
+        None => std::borrow::Cow::Borrowed(s),
     }
 }
 
@@ -304,25 +346,10 @@ impl MacroTable {
             self.expanded_macros.borrow_mut().clear();
         }
         let result = self.expand_text(line, expanding);
-        // Strip internal marker bytes from the final output:
-        // - 0x01 (BLUE_PAINT_MARKER): prevents re-expansion per C11 §6.10.3.4
-        // - 0x02/0x03 (PASTE_PROTECT_START/END): should already be consumed by
-        //   substitute_params, but strip defensively in case any leak through.
-        let result =
-            if result.as_bytes().iter().any(|&b| {
-                b == BLUE_PAINT_MARKER || b == PASTE_PROTECT_START || b == PASTE_PROTECT_END
-            }) {
-                result.replace(
-                    [
-                        BLUE_PAINT_MARKER as char,
-                        PASTE_PROTECT_START as char,
-                        PASTE_PROTECT_END as char,
-                    ],
-                    "",
-                )
-            } else {
-                result
-            };
+        let result = match normalize_internal_markers(&result, true) {
+            std::borrow::Cow::Borrowed(_) => result,
+            std::borrow::Cow::Owned(cleaned) => cleaned,
+        };
         self.rescan_pragma_operators(result, expanding)
     }
 
@@ -384,7 +411,7 @@ impl MacroTable {
         out
     }
 
-    /// Append `expanded` text to `result`, inserting spaces as needed to prevent
+    /// Append `expanded` text to `result`, inserting token boundaries to prevent
     /// accidental token pasting between the end of `result` and the start/end
     /// of `expanded`, and between the end of `expanded` and `next_byte` (the
     /// next byte in the source after the expansion site).
@@ -399,7 +426,7 @@ impl MacroTable {
             if would_paste_tokens(last, first)
                 || (is_ident_cont_byte(last) && is_ident_cont_byte(first))
             {
-                result.push(' ');
+                result.push(TOKEN_BOUNDARY as char);
             }
         }
         result.push_str(expanded);
@@ -407,7 +434,7 @@ impl MacroTable {
         if let Some(next) = next_byte {
             let last_expanded = expanded.as_bytes()[expanded.len() - 1];
             if would_paste_tokens(last_expanded, next) {
-                result.push(' ');
+                result.push(TOKEN_BOUNDARY as char);
             }
         }
     }
@@ -631,8 +658,9 @@ impl MacroTable {
         }
         let ident = bytes_to_str(bytes, start, i);
 
-        // Check if this identifier is part of a pp-number (e.g., 1.I, 15.IF, 0x1p2).
-        if Self::is_ppnumber_suffix(result.as_bytes(), ident) {
+        // Token membership belongs to the input, not the already-expanded
+        // prefix: MAJOR.MINOR must not become the single token 1.MINOR.
+        if Self::is_ppnumber_suffix(&bytes[..start], ident) {
             result.push_str(ident);
             return i;
         }
@@ -1403,7 +1431,11 @@ impl MacroTable {
                 i += 1; // skip the start marker
                 let start = i;
                 while i < len && bytes[i] != PASTE_PROTECT_END {
-                    i += 1;
+                    if matches!(bytes[i], b'"' | b'\'') {
+                        i = skip_literal_bytes(bytes, i, bytes[i]);
+                    } else {
+                        i += 1;
+                    }
                 }
                 // Copy the protected region as-is (UTF-8 safe via str slice)
                 result.push_str(&body[start..i]);
@@ -1430,7 +1462,7 @@ impl MacroTable {
                 // in "10L", "ULL" in "0xFFULL"). Per C11 §6.4.8, pp-numbers are
                 // single tokens and their suffixes must not be treated as macro
                 // parameters even if they happen to share a name.
-                if Self::is_ppnumber_suffix(result.as_bytes(), ident) {
+                if Self::is_ppnumber_suffix(&bytes[..start], ident) {
                     result.push_str(ident);
                     continue;
                 }
@@ -1679,7 +1711,7 @@ fn stringify_arg(arg: &str) -> String {
 
     while i < len {
         // Skip blue-paint markers (they must not appear in stringified output)
-        if bytes[i] == BLUE_PAINT_MARKER {
+        if bytes[i] == BLUE_PAINT_MARKER || bytes[i] == TOKEN_BOUNDARY {
             i += 1;
             continue;
         }
@@ -1695,71 +1727,25 @@ fn stringify_arg(arg: &str) -> String {
             continue;
         }
 
-        // Handle string literals - escape " and \ inside them
-        if bytes[i] == b'"' {
-            result.push_str("\\\"");
-            i += 1;
-            while i < len && bytes[i] != b'"' {
-                if bytes[i] == b'\\' {
-                    result.push_str("\\\\");
-                    i += 1;
-                    if i < len {
-                        if bytes[i] == b'"' {
-                            result.push_str("\\\"");
-                        } else if bytes[i] == b'\\' {
-                            result.push_str("\\\\");
-                        } else {
-                            result.push(bytes[i] as char);
-                        }
-                        i += 1;
-                    }
-                } else {
-                    result.push(bytes[i] as char);
-                    i += 1;
+        // Stringification escapes quotes and backslashes in literal tokens,
+        // but preserves their payload bytes (including UTF-8 and whitespace).
+        if matches!(bytes[i], b'"' | b'\'') {
+            let end = skip_literal_bytes(bytes, i, bytes[i]);
+            for ch in trimmed[i..end].chars() {
+                if matches!(ch, '"' | '\\') {
+                    result.push('\\');
                 }
+                result.push(ch);
             }
-            if i < len {
-                result.push_str("\\\"");
-                i += 1;
-            }
+            i = end;
             continue;
         }
 
-        // Handle char literals
-        if bytes[i] == b'\'' {
-            result.push('\'');
-            i += 1;
-            while i < len && bytes[i] != b'\'' {
-                if bytes[i] == b'\\' {
-                    result.push_str("\\\\");
-                    i += 1;
-                    if i < len {
-                        if bytes[i] == b'\\' {
-                            result.push_str("\\\\");
-                        } else if bytes[i] == b'"' {
-                            result.push_str("\\\"");
-                        } else {
-                            result.push(bytes[i] as char);
-                        }
-                        i += 1;
-                    }
-                } else if bytes[i] == b'"' {
-                    result.push_str("\\\"");
-                    i += 1;
-                } else {
-                    result.push(bytes[i] as char);
-                    i += 1;
-                }
-            }
-            if i < len {
-                result.push('\'');
-                i += 1;
-            }
-            continue;
-        }
-
-        result.push(bytes[i] as char);
-        i += 1;
+        let Some(ch) = trimmed[i..].chars().next() else {
+            break;
+        };
+        result.push(ch);
+        i += ch.len_utf8();
     }
 
     // Trim trailing space
@@ -1928,5 +1914,103 @@ mod itoa {
             // All bytes are ASCII digits (b'0'..=b'9'), which are valid UTF-8.
             std::str::from_utf8(&self.bytes[..self.len]).expect("digit buffer is not valid UTF-8")
         }
+    }
+}
+
+#[cfg(test)]
+mod token_boundary_tests {
+    use super::{MacroDef, MacroTable};
+
+    fn table() -> MacroTable {
+        let mut t = MacroTable::new();
+        for (name, params, body) in [
+            ("MAJOR", None, "1"),
+            ("MINOR", None, "5"),
+            ("PATCH", None, "7"),
+            ("I", None, "13"),
+            ("L", None, "27"),
+            ("PLUS", None, "+"),
+            ("Q", Some("x"), "#x"),
+            ("S", Some("x"), "Q(x)"),
+            ("F", Some("x"), "x.MINOR.PATCH"),
+            ("CAT", Some("x,y"), "x ## y"),
+            ("XCAT", Some("x,y"), "CAT(x,y)"),
+        ] {
+            t.define(MacroDef {
+                name: name.into(),
+                is_function_like: params.is_some(),
+                params: params
+                    .map(|p| p.split(',').map(str::to_string).collect())
+                    .unwrap_or_default(),
+                is_variadic: false,
+                has_named_variadic: false,
+                body: body.into(),
+            });
+        }
+        t
+    }
+
+    #[test]
+    fn internal_markers_preserve_literal_payloads() {
+        let t = table();
+        for marker in ['\x01', '\x02', '\x03', '\x04'] {
+            for quote in ['"', '\''] {
+                let input = format!("{quote}{marker}{quote}");
+                assert_eq!(t.expand_line(&input), input);
+                let pasted = format!("CAT(,{input})");
+                assert_eq!(t.expand_line(&pasted), input);
+            }
+            let input = format!("Q(\"{marker}\")");
+            assert_eq!(t.expand_line(&input), format!("\"\\\"{marker}\\\"\""));
+        }
+        // Escape-aware scanning must not mistake the escaped quote for the end.
+        let input = "\"a\\\"\x04z\" PLUS+";
+        assert_eq!(t.expand_line(input), "\"a\\\"\x04z\" + +");
+        assert_eq!(super::strip_blue_paint("\x01x \"\x01\""), "x \"\x01\"");
+    }
+
+    #[test]
+    fn stringification_preserves_utf8_and_literal_whitespace() {
+        let t = table();
+        for input in ["\"éλ😀\"", "'é'", "\"a  b\\\"c\\\\d\""] {
+            let escaped = input.replace('\\', "\\\\").replace('"', "\\\"");
+            assert_eq!(
+                t.expand_line(&format!("Q({input})")),
+                format!("\"{escaped}\"")
+            );
+            assert_eq!(
+                t.expand_line(&format!("S({input})")),
+                format!("\"{escaped}\"")
+            );
+        }
+    }
+
+    #[test]
+    fn synthetic_token_boundaries_are_not_stringification_whitespace() {
+        let t = table();
+        for (input, expected) in [
+            ("S(MAJOR.MINOR.PATCH)", "\"1.5.7\""),
+            ("S(F(MAJOR))", "\"1.5.7\""),
+            ("S(MAJOR.MINOR . PATCH)", "\"1.5 . 7\""),
+            ("S(PLUS+)", "\"++\""),
+            ("S(PLUS +)", "\"+ +\""),
+            ("S(XCAT(MAJOR,MINOR))", "\"15\""),
+        ] {
+            assert_eq!(t.expand_line(input), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn real_pp_numbers_remain_single_tokens_and_final_boundaries_survive() {
+        let t = table();
+        for token in ["1.I", "15.IF", "0x1p2", "10L"] {
+            assert_eq!(
+                t.expand_line(&format!("S({token})")),
+                format!("\"{token}\"")
+            );
+        }
+        assert_eq!(t.expand_line("PLUS+"), "+ +");
+        assert_eq!(t.expand_line("MAJOR.2"), "1 .2");
+        assert_eq!(t.expand_line("F(MAJOR)"), "1 . 5 . 7");
     }
 }

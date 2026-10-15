@@ -1,0 +1,656 @@
+[
+  {
+    "kind": "CALL_PLT",
+    "delta": -2147485697,
+    "code": 1,
+    "passed": true,
+    "artifact": "CALL_PLT--2147485697.json.gz",
+    "stdout": [
+      {
+        "text": "LLD 23.1.0 (https://github.com/llvm/llvm-project.git ea7d852a70e8bdfaf601d6626a760f9771b2c4b4) (compatible with GNU linkers)"
+      }
+    ],
+    "stderr": [
+      {
+        "text": "ld.lld: error: /tmp/example-060bc9.o:(function call_probe: .text+0x0): relocation R_RISCV_CALL_PLT out of range: -524289 is not in [-524288, 524287]; references '.Ltmp0'"
+      },
+      {
+        "text": ">>> referenced by example.c:1 (<source>:1)"
+      },
+      {
+        "text": ">>> defined in /tmp/example-060bc9.o"
+      },
+      {
+        "text": "clang: \u001b[0;1;31merror: \u001b[0m\u001b[1mlinker command failed with exit code 1 (use -v to see invocation)\u001b[0m"
+      }
+    ],
+    "asm": [
+      {
+        "text": "<Compilation failed>",
+        "source": null
+      }
+    ]
+  },
+  {
+    "kind": "CALL_PLT",
+    "delta": -2147485696,
+    "code": 0,
+    "passed": true,
+    "artifact": "CALL_PLT--2147485696.json.gz",
+    "stdout": [
+      {
+        "text": "LLD 23.1.0 (https://github.com/llvm/llvm-project.git ea7d852a70e8bdfaf601d6626a760f9771b2c4b4) (compatible with GNU linkers)"
+      }
+    ],
+    "stderr": [],
+    "asm": [
+      {
+        "labels": [],
+        "source": null,
+        "text": "call_probe:"
+      },
+      {
+        "labels": [],
+        "opcodes": [
+          "80000097"
+        ],
+        "address": 5068,
+        "source": {
+          "file": null,
+          "mainsource": "true",
+          "line": 1
+        },
+        "text": " auipc\tra,0x80000"
+      },
+      {
+        "labels": [],
+        "opcodes": [
+          "800080e7"
+        ],
+        "address": 5072,
+        "source": {
+          "file": null,
+          "mainsource": "true",
+          "line": 1
+        },
+        "text": " jalr\t-2048(ra) # ffffffff80000bcc <_DYNAMIC+0xffffffff7fffe7f4>"
+      },
+      {
+        "labels": [],
+        "source": null,
+        "text": "main:"
+      },
+      {
+        "labels": [],
+        "opcodes": [
+          "4501"
+        ],
+        "address": 5076,
+        "source": {
+          "file": null,
+          "mainsource": "true",
+          "line": 3
+        },
+        "text": " li\ta0,0"
+      },
+      {
+        "labels": [],
+        "opcodes": [
+          "8082"
+        ],
+        "address": 5078,
+        "source": {
+          "file": null,
+          "mainsource": "true",
+          "line": 3
+        },
+        "text": " ret"
+      }
+    ]
+  },
+  {
+    "kind": "CALL_PLT",
+    "delta": 2147481599,
+    "code": 0,
+    "passed": true,
+    "artifact": "CALL_PLT-2147481599.json.gz",
+    "stdout": [
+      {
+        "text": "LLD 23.1.0 (https://github.com/llvm/llvm-project.git ea7d852a70e8bdfaf601d6626a760f9771b2c4b4) (compatible with GNU linkers)"
+      }
+    ],
+    "stderr": [],
+    "asm": [
+      {
+        "labels": [],
+        "source": null,
+        "text": "call_probe:"
+      },
+      {
+        "labels": [],
+        "opcodes": [
+          "7ffff097"
+        ],
+        "address": 5068,
+        "source": {
+          "file": null,
+          "mainsource": "true",
+          "line": 1
+        },
+        "text": " auipc\tra,0x7ffff"
+      },
+      {
+        "labels": [],
+        "opcodes": [
+          "7ff080e7"
+        ],
+        "address": 5072,
+        "source": {
+          "file": null,
+          "mainsource": "true",
+          "line": 1
+        },
+        "text": " jalr\t2047(ra) # 80000bcb <_DYNAMIC+0x7fffe7f3>"
+      },
+      {
+        "labels": [],
+        "source": null,
+        "text": "main:"
+      },
+      {
+        "labels": [],
+        "opcodes": [
+          "4501"
+        ],
+        "address": 5076,
+        "source": {
+          "file": null,
+          "mainsource": "true",
+          "line": 3
+        },
+        "text": " li\ta0,0"
+      },
+      {
+        "labels": [],
+        "opcodes": [
+          "8082"
+        ],
+        "address": 5078,
+        "source": {
+          "file": null,
+          "mainsource": "true",
+          "line": 3
+        },
+        "text": " ret"
+      }
+    ]
+  },
+  {
+    "kind": "CALL_PLT",
+    "delta": 2147481600,
+    "code": 1,
+    "passed": true,
+    "artifact": "CALL_PLT-2147481600.json.gz",
+    "stdout": [
+      {
+        "text": "LLD 23.1.0 (https://github.com/llvm/llvm-project.git ea7d852a70e8bdfaf601d6626a760f9771b2c4b4) (compatible with GNU linkers)"
+      }
+    ],
+    "stderr": [
+      {
+        "text": "ld.lld: error: /tmp/example-5048e3.o:(function call_probe: .text+0x0): relocation R_RISCV_CALL_PLT out of range: 524288 is not in [-524288, 524287]; references '.Ltmp0'"
+      },
+      {
+        "text": ">>> referenced by example.c:1 (<source>:1)"
+      },
+      {
+        "text": ">>> defined in /tmp/example-5048e3.o"
+      },
+      {
+        "text": "clang: \u001b[0;1;31merror: \u001b[0m\u001b[1mlinker command failed with exit code 1 (use -v to see invocation)\u001b[0m"
+      }
+    ],
+    "asm": [
+      {
+        "text": "<Compilation failed>",
+        "source": null
+      }
+    ]
+  },
+  {
+    "kind": "CALL_PLT",
+    "delta": 2147483647,
+    "code": 1,
+    "passed": true,
+    "artifact": "CALL_PLT-2147483647.json.gz",
+    "stdout": [
+      {
+        "text": "LLD 23.1.0 (https://github.com/llvm/llvm-project.git ea7d852a70e8bdfaf601d6626a760f9771b2c4b4) (compatible with GNU linkers)"
+      }
+    ],
+    "stderr": [
+      {
+        "text": "ld.lld: error: /tmp/example-e6f70e.o:(function call_probe: .text+0x0): relocation R_RISCV_CALL_PLT out of range: 524288 is not in [-524288, 524287]; references '.Ltmp0'"
+      },
+      {
+        "text": ">>> referenced by example.c:1 (<source>:1)"
+      },
+      {
+        "text": ">>> defined in /tmp/example-e6f70e.o"
+      },
+      {
+        "text": "clang: \u001b[0;1;31merror: \u001b[0m\u001b[1mlinker command failed with exit code 1 (use -v to see invocation)\u001b[0m"
+      }
+    ],
+    "asm": [
+      {
+        "text": "<Compilation failed>",
+        "source": null
+      }
+    ]
+  },
+  {
+    "kind": "CALL_PLT",
+    "delta": 0,
+    "code": 0,
+    "passed": true,
+    "artifact": "CALL_PLT-0.json.gz",
+    "stdout": [
+      {
+        "text": "LLD 23.1.0 (https://github.com/llvm/llvm-project.git ea7d852a70e8bdfaf601d6626a760f9771b2c4b4) (compatible with GNU linkers)"
+      }
+    ],
+    "stderr": [],
+    "asm": [
+      {
+        "labels": [],
+        "source": null,
+        "text": "call_probe:"
+      },
+      {
+        "labels": [],
+        "opcodes": [
+          "00000097"
+        ],
+        "address": 5068,
+        "source": {
+          "file": null,
+          "mainsource": "true",
+          "line": 1
+        },
+        "text": " auipc\tra,0x0"
+      },
+      {
+        "labels": [],
+        "opcodes": [
+          "000080e7"
+        ],
+        "address": 5072,
+        "source": {
+          "file": null,
+          "mainsource": "true",
+          "line": 1
+        },
+        "text": " jalr\tra # 13cc <call_probe>"
+      },
+      {
+        "labels": [],
+        "source": null,
+        "text": "main:"
+      },
+      {
+        "labels": [],
+        "opcodes": [
+          "4501"
+        ],
+        "address": 5076,
+        "source": {
+          "file": null,
+          "mainsource": "true",
+          "line": 3
+        },
+        "text": " li\ta0,0"
+      },
+      {
+        "labels": [],
+        "opcodes": [
+          "8082"
+        ],
+        "address": 5078,
+        "source": {
+          "file": null,
+          "mainsource": "true",
+          "line": 3
+        },
+        "text": " ret"
+      }
+    ]
+  },
+  {
+    "kind": "PCREL_HI20",
+    "delta": -2147485697,
+    "code": 1,
+    "passed": true,
+    "artifact": "PCREL_HI20--2147485697.json.gz",
+    "stdout": [
+      {
+        "text": "LLD 23.1.0 (https://github.com/llvm/llvm-project.git ea7d852a70e8bdfaf601d6626a760f9771b2c4b4) (compatible with GNU linkers)"
+      }
+    ],
+    "stderr": [
+      {
+        "text": "ld.lld: error: /tmp/example-46561b.o:(function call_probe: .text+0x0): relocation R_RISCV_PCREL_HI20 out of range: -524289 is not in [-524288, 524287]; references '.Ltmp0'"
+      },
+      {
+        "text": ">>> referenced by example.c:1 (<source>:1)"
+      },
+      {
+        "text": ">>> defined in /tmp/example-46561b.o"
+      },
+      {
+        "text": "clang: \u001b[0;1;31merror: \u001b[0m\u001b[1mlinker command failed with exit code 1 (use -v to see invocation)\u001b[0m"
+      }
+    ],
+    "asm": [
+      {
+        "text": "<Compilation failed>",
+        "source": null
+      }
+    ]
+  },
+  {
+    "kind": "PCREL_HI20",
+    "delta": -2147485696,
+    "code": 0,
+    "passed": true,
+    "artifact": "PCREL_HI20--2147485696.json.gz",
+    "stdout": [
+      {
+        "text": "LLD 23.1.0 (https://github.com/llvm/llvm-project.git ea7d852a70e8bdfaf601d6626a760f9771b2c4b4) (compatible with GNU linkers)"
+      }
+    ],
+    "stderr": [],
+    "asm": [
+      {
+        "labels": [],
+        "source": null,
+        "text": "call_probe:"
+      },
+      {
+        "labels": [],
+        "opcodes": [
+          "80000097"
+        ],
+        "address": 5068,
+        "source": {
+          "file": null,
+          "mainsource": "true",
+          "line": 1
+        },
+        "text": " auipc\tra,0x80000"
+      },
+      {
+        "labels": [],
+        "opcodes": [
+          "000080e7"
+        ],
+        "address": 5072,
+        "source": {
+          "file": null,
+          "mainsource": "true",
+          "line": 1
+        },
+        "text": " jalr\tra # ffffffff800013cc <_DYNAMIC+0xffffffff7fffeff4>"
+      },
+      {
+        "labels": [],
+        "source": null,
+        "text": "main:"
+      },
+      {
+        "labels": [],
+        "opcodes": [
+          "4501"
+        ],
+        "address": 5076,
+        "source": {
+          "file": null,
+          "mainsource": "true",
+          "line": 3
+        },
+        "text": " li\ta0,0"
+      },
+      {
+        "labels": [],
+        "opcodes": [
+          "8082"
+        ],
+        "address": 5078,
+        "source": {
+          "file": null,
+          "mainsource": "true",
+          "line": 3
+        },
+        "text": " ret"
+      }
+    ]
+  },
+  {
+    "kind": "PCREL_HI20",
+    "delta": 2147481599,
+    "code": 0,
+    "passed": true,
+    "artifact": "PCREL_HI20-2147481599.json.gz",
+    "stdout": [
+      {
+        "text": "LLD 23.1.0 (https://github.com/llvm/llvm-project.git ea7d852a70e8bdfaf601d6626a760f9771b2c4b4) (compatible with GNU linkers)"
+      }
+    ],
+    "stderr": [],
+    "asm": [
+      {
+        "labels": [],
+        "source": null,
+        "text": "call_probe:"
+      },
+      {
+        "labels": [],
+        "opcodes": [
+          "7ffff097"
+        ],
+        "address": 5068,
+        "source": {
+          "file": null,
+          "mainsource": "true",
+          "line": 1
+        },
+        "text": " auipc\tra,0x7ffff"
+      },
+      {
+        "labels": [],
+        "opcodes": [
+          "000080e7"
+        ],
+        "address": 5072,
+        "source": {
+          "file": null,
+          "mainsource": "true",
+          "line": 1
+        },
+        "text": " jalr\tra # 800003cc <_DYNAMIC+0x7fffdff4>"
+      },
+      {
+        "labels": [],
+        "source": null,
+        "text": "main:"
+      },
+      {
+        "labels": [],
+        "opcodes": [
+          "4501"
+        ],
+        "address": 5076,
+        "source": {
+          "file": null,
+          "mainsource": "true",
+          "line": 3
+        },
+        "text": " li\ta0,0"
+      },
+      {
+        "labels": [],
+        "opcodes": [
+          "8082"
+        ],
+        "address": 5078,
+        "source": {
+          "file": null,
+          "mainsource": "true",
+          "line": 3
+        },
+        "text": " ret"
+      }
+    ]
+  },
+  {
+    "kind": "PCREL_HI20",
+    "delta": 2147481600,
+    "code": 1,
+    "passed": true,
+    "artifact": "PCREL_HI20-2147481600.json.gz",
+    "stdout": [
+      {
+        "text": "LLD 23.1.0 (https://github.com/llvm/llvm-project.git ea7d852a70e8bdfaf601d6626a760f9771b2c4b4) (compatible with GNU linkers)"
+      }
+    ],
+    "stderr": [
+      {
+        "text": "ld.lld: error: /tmp/example-c98d98.o:(function call_probe: .text+0x0): relocation R_RISCV_PCREL_HI20 out of range: 524288 is not in [-524288, 524287]; references '.Ltmp0'"
+      },
+      {
+        "text": ">>> referenced by example.c:1 (<source>:1)"
+      },
+      {
+        "text": ">>> defined in /tmp/example-c98d98.o"
+      },
+      {
+        "text": "clang: \u001b[0;1;31merror: \u001b[0m\u001b[1mlinker command failed with exit code 1 (use -v to see invocation)\u001b[0m"
+      }
+    ],
+    "asm": [
+      {
+        "text": "<Compilation failed>",
+        "source": null
+      }
+    ]
+  },
+  {
+    "kind": "PCREL_HI20",
+    "delta": 2147483647,
+    "code": 1,
+    "passed": true,
+    "artifact": "PCREL_HI20-2147483647.json.gz",
+    "stdout": [
+      {
+        "text": "LLD 23.1.0 (https://github.com/llvm/llvm-project.git ea7d852a70e8bdfaf601d6626a760f9771b2c4b4) (compatible with GNU linkers)"
+      }
+    ],
+    "stderr": [
+      {
+        "text": "ld.lld: error: /tmp/example-f3d2d5.o:(function call_probe: .text+0x0): relocation R_RISCV_PCREL_HI20 out of range: 524288 is not in [-524288, 524287]; references '.Ltmp0'"
+      },
+      {
+        "text": ">>> referenced by example.c:1 (<source>:1)"
+      },
+      {
+        "text": ">>> defined in /tmp/example-f3d2d5.o"
+      },
+      {
+        "text": "clang: \u001b[0;1;31merror: \u001b[0m\u001b[1mlinker command failed with exit code 1 (use -v to see invocation)\u001b[0m"
+      }
+    ],
+    "asm": [
+      {
+        "text": "<Compilation failed>",
+        "source": null
+      }
+    ]
+  },
+  {
+    "kind": "PCREL_HI20",
+    "delta": 0,
+    "code": 0,
+    "passed": true,
+    "artifact": "PCREL_HI20-0.json.gz",
+    "stdout": [
+      {
+        "text": "LLD 23.1.0 (https://github.com/llvm/llvm-project.git ea7d852a70e8bdfaf601d6626a760f9771b2c4b4) (compatible with GNU linkers)"
+      }
+    ],
+    "stderr": [],
+    "asm": [
+      {
+        "labels": [],
+        "source": null,
+        "text": "call_probe:"
+      },
+      {
+        "labels": [],
+        "opcodes": [
+          "00000097"
+        ],
+        "address": 5068,
+        "source": {
+          "file": null,
+          "mainsource": "true",
+          "line": 1
+        },
+        "text": " auipc\tra,0x0"
+      },
+      {
+        "labels": [],
+        "opcodes": [
+          "000080e7"
+        ],
+        "address": 5072,
+        "source": {
+          "file": null,
+          "mainsource": "true",
+          "line": 1
+        },
+        "text": " jalr\tra # 13cc <call_probe>"
+      },
+      {
+        "labels": [],
+        "source": null,
+        "text": "main:"
+      },
+      {
+        "labels": [],
+        "opcodes": [
+          "4501"
+        ],
+        "address": 5076,
+        "source": {
+          "file": null,
+          "mainsource": "true",
+          "line": 3
+        },
+        "text": " li\ta0,0"
+      },
+      {
+        "labels": [],
+        "opcodes": [
+          "8082"
+        ],
+        "address": 5078,
+        "source": {
+          "file": null,
+          "mainsource": "true",
+          "line": 3
+        },
+        "text": " ret"
+      }
+    ]
+  }
+]

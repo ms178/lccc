@@ -1683,6 +1683,9 @@ pub(crate) fn run_bb_slp_with_contract(
     func: &mut IrFunction,
     fp_contract: crate::common::fp_contract::FpContract,
 ) -> usize {
+    if super::fp_environment_blocks_reordering(func) {
+        return 0;
+    }
     if !x86_simd_available_pub() {
         return 0;
     }

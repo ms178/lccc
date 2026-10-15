@@ -226,8 +226,12 @@ impl Lowerer {
         // Fold constant casts at lowering time so -O0 matches GCC
         // -fno-trapping-math saturation (gcc.c-torture 20031003-1:
         // `(int)2147483648.0f` is INT_MAX, not the x86 indefinite INT_MIN).
-        if let Some(c) = self.eval_const_cast(target_type, inner) {
-            return Operand::Const(c);
+        let observable_fp = crate::common::semantics::fp_environment_observable()
+            && (inner_ctype.is_floating() || target_ctype.is_floating());
+        if !observable_fp {
+            if let Some(c) = self.eval_const_cast(target_type, inner) {
+                return Operand::Const(c);
+            }
         }
 
         let src = self.lower_expr(inner);
@@ -241,6 +245,12 @@ impl Lowerer {
         // (gcc.c-torture pr81588, amd64 at every opt level).
         let mut from_ty = self.value_ir_type(inner);
         let to_ty = self.type_spec_to_ir(target_type);
+        // A void cast evaluates its operand but performs no conversion.
+        // Keeping Cast(F64 -> Void) is not a backend operation and used to
+        // panic on i686 when observable FP correctly kept the expression.
+        if to_ty == IrType::Void {
+            return src;
+        }
 
         if let Expr::Identifier(name, _) = inner {
             if let Some(vi) = self.lookup_var_info(name) {

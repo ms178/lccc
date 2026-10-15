@@ -1,0 +1,14 @@
+test_assertion_disabled_invocations_fail_closed (__main__.RedTeam.test_assertion_disabled_invocations_fail_closed) ... ok
+test_elf_fixtures_have_unique_names_and_valid_tables (__main__.RedTeam.test_elf_fixtures_have_unique_names_and_valid_tables) ... ok
+test_failure_produces_structured_report (__main__.RedTeam.test_failure_produces_structured_report) ... ok
+test_generated_c_has_independent_output_at_all_opts (__main__.RedTeam.test_generated_c_has_independent_output_at_all_opts) ... ok
+test_preload_detects_original_unlock_mutant_and_faults (__main__.RedTeam.test_preload_detects_original_unlock_mutant_and_faults) ... ok
+test_profile_counts_preserve_header_identity (__main__.RedTeam.test_profile_counts_preserve_header_identity) ... ok
+test_profile_parser_rejects_blank_and_malformed_records (__main__.RedTeam.test_profile_parser_rejects_blank_and_malformed_records) ... ok
+test_profile_parser_resets_record_identity (__main__.RedTeam.test_profile_parser_resets_record_identity) ... ok
+test_relocation_extent_metadata_matches_dispatcher (__main__.RedTeam.test_relocation_extent_metadata_matches_dispatcher) ... ok
+
+----------------------------------------------------------------------
+Ran 9 tests in 1.591s
+
+OK

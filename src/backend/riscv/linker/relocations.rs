@@ -222,13 +222,17 @@ pub fn resolve_symbol_value(
 ///
 /// Returns (key, is_local) where is_local indicates the symbol won't be in global_syms.
 pub fn got_sym_key(obj_idx: usize, sym: &Symbol, addend: i64) -> (String, bool) {
-    if sym.sym_type() == STT_SECTION {
+    if sym.sym_type() == STT_SECTION || sym.binding() == STB_LOCAL {
+        // ELF names cannot contain NUL, so an input global cannot impersonate
+        // this internal namespace. Include location as well as name: distinct
+        // unnamed/local symbols in one object need not have distinct names.
         (
-            format!("__local_sec_{}_{}_{}", obj_idx, sym.shndx, addend),
+            format!(
+                "\0local:{}:{}:{}:{}:{}",
+                obj_idx, sym.shndx, sym.value, addend, sym.name
+            ),
             true,
         )
-    } else if sym.binding() == STB_LOCAL {
-        (format!("__local_{}_{}_{}", obj_idx, sym.name, addend), true)
     } else {
         (sym.name.to_string(), false)
     }
@@ -681,5 +685,30 @@ pub fn section_order(name: &str, flags: u64) -> u64 {
         _ if flags & SHF_EXECINSTR != 0 => 150,
         _ if flags & SHF_WRITE == 0 => 300,
         _ => 600,
+    }
+}
+
+#[cfg(test)]
+mod auipc_encoding_tests {
+    use super::super::displacement::checked_auipc_delta;
+    use super::patch_u_type;
+
+    #[test]
+    fn checked_displacements_round_trip_through_the_production_encoder() {
+        for high in [-524288_i64, -1, 0, 1, 524287] {
+            for low in -2048_i64..2048 {
+                let expected = high * 4096 + low;
+                let place = 1_u64 << 63;
+                let symbol = place.wrapping_add(expected as u64);
+                let delta = checked_auipc_delta(symbol, 0, place).unwrap();
+                let mut insn = 0x97_u32.to_le_bytes();
+                patch_u_type(&mut insn, 0, delta as u32);
+                let word = u32::from_le_bytes(insn);
+                assert_eq!(word & 0xfff, 0x97);
+                let decoded_high = i64::from((word & 0xfffff000) as i32);
+                let decoded_low = (delta << 52) >> 52;
+                assert_eq!(decoded_high + decoded_low, expected);
+            }
+        }
     }
 }

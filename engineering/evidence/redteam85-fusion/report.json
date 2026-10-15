@@ -1,0 +1,91 @@
+{
+  "scope": "Extracted exact production late-fuser body; only visibility and hash-map type replaced; native original vs transformed GNU assembly. Not a full C-frontend reproduction.",
+  "source_sha256": "2dc6ea3d7093e9464ea12b92bfe5845eb89bfb1a93549fc44259d927237870be",
+  "rows": [
+    {
+      "case": "live_rax",
+      "pairs": 64,
+      "mismatches": 64,
+      "memcheck_exit": 0,
+      "stderr": "",
+      "changed": true,
+      "compiler_command": [
+        "gcc-16",
+        "-O1",
+        "/home/user/.cache/redteam78/fusion-audit/driver.c",
+        "/home/user/.cache/redteam78/fusion-audit/live_rax/orig.s",
+        "/home/user/.cache/redteam78/fusion-audit/live_rax/transformed.s",
+        "-o",
+        "/home/user/.cache/redteam78/fusion-audit/live_rax/probe"
+      ]
+    },
+    {
+      "case": "live_test_flags",
+      "pairs": 64,
+      "mismatches": 56,
+      "memcheck_exit": 0,
+      "stderr": "",
+      "changed": true,
+      "compiler_command": [
+        "gcc-16",
+        "-O1",
+        "/home/user/.cache/redteam78/fusion-audit/driver.c",
+        "/home/user/.cache/redteam78/fusion-audit/live_test_flags/orig.s",
+        "/home/user/.cache/redteam78/fusion-audit/live_test_flags/transformed.s",
+        "-o",
+        "/home/user/.cache/redteam78/fusion-audit/live_test_flags/probe"
+      ]
+    },
+    {
+      "case": "live_stack_slot",
+      "pairs": 64,
+      "mismatches": 64,
+      "memcheck_exit": 0,
+      "stderr": "",
+      "changed": true,
+      "compiler_command": [
+        "gcc-16",
+        "-O1",
+        "/home/user/.cache/redteam78/fusion-audit/driver.c",
+        "/home/user/.cache/redteam78/fusion-audit/live_stack_slot/orig.s",
+        "/home/user/.cache/redteam78/fusion-audit/live_stack_slot/transformed.s",
+        "-o",
+        "/home/user/.cache/redteam78/fusion-audit/live_stack_slot/probe"
+      ]
+    },
+    {
+      "case": "non_al_setcc",
+      "pairs": 64,
+      "mismatches": 28,
+      "memcheck_exit": 0,
+      "stderr": "",
+      "changed": true,
+      "compiler_command": [
+        "gcc-16",
+        "-O1",
+        "/home/user/.cache/redteam78/fusion-audit/driver.c",
+        "/home/user/.cache/redteam78/fusion-audit/non_al_setcc/orig.s",
+        "/home/user/.cache/redteam78/fusion-audit/non_al_setcc/transformed.s",
+        "-o",
+        "/home/user/.cache/redteam78/fusion-audit/non_al_setcc/probe"
+      ]
+    },
+    {
+      "case": "non_stack_store",
+      "pairs": 64,
+      "mismatches": 64,
+      "memcheck_exit": 0,
+      "stderr": "",
+      "changed": true,
+      "compiler_command": [
+        "gcc-16",
+        "-O1",
+        "/home/user/.cache/redteam78/fusion-audit/driver.c",
+        "/home/user/.cache/redteam78/fusion-audit/non_stack_store/orig.s",
+        "/home/user/.cache/redteam78/fusion-audit/non_stack_store/transformed.s",
+        "-o",
+        "/home/user/.cache/redteam78/fusion-audit/non_stack_store/probe"
+      ]
+    }
+  ]
+}
