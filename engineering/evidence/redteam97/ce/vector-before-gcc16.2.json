@@ -1,0 +1,564 @@
+{
+  "inputFilename": "example.c",
+  "code": 0,
+  "okToCache": true,
+  "timedOut": false,
+  "stdout": [],
+  "stderr": [],
+  "truncated": false,
+  "execTime": 99,
+  "processExecutionResultTime": 0.006215000001247972,
+  "instructionSet": "amd64",
+  "compilationOptions": [
+    "-g",
+    "-o",
+    "/app/output.s",
+    "-fno-verbose-asm",
+    "-S",
+    "-fdiagnostics-color=always",
+    "-O2",
+    "-Werror",
+    "/app/example.c"
+  ],
+  "downloads": [],
+  "tools": [],
+  "asmSize": 9501,
+  "asm": [
+    {
+      "text": "  .text",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": ".globl vector_witness",
+      "source": null,
+      "labels": [
+        {
+          "name": "vector_witness",
+          "range": {
+            "startCol": 8,
+            "endCol": 22
+          }
+        }
+      ]
+    },
+    {
+      "text": ".type vector_witness,@function",
+      "source": null,
+      "labels": [
+        {
+          "name": "vector_witness",
+          "range": {
+            "startCol": 7,
+            "endCol": 21
+          }
+        }
+      ]
+    },
+    {
+      "text": "vector_witness:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": ".cfi_startproc",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  movq %rdi, %xmm0",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  movapd %xmm0, %xmm2",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  .cfi_remember_state; .byte 0x66,0x0f,0xef,0xc0",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  .cfi_restore_state",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  movq %xmm0, %rax",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  ret",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": ".cfi_endproc",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": ".size vector_witness, .-vector_witness",
+      "source": null,
+      "labels": [
+        {
+          "name": "vector_witness",
+          "range": {
+            "startCol": 7,
+            "endCol": 21
+          }
+        },
+        {
+          "name": "vector_witness",
+          "range": {
+            "startCol": 25,
+            "endCol": 39
+          }
+        }
+      ]
+    },
+    {
+      "text": ".section .note.GNU-stack,\"\",@progbits",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  .section .rodata.str1.1,\"aMS\",@progbits,1",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": ".LC0:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  .string \"16.2.0\"",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "main:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  pushq %rbp",
+      "source": {
+        "file": null,
+        "line": 4,
+        "column": 16
+      },
+      "labels": []
+    },
+    {
+      "text": "  movl $.LC0, %edi",
+      "source": {
+        "file": null,
+        "line": 5,
+        "column": 2
+      },
+      "labels": [
+        {
+          "name": ".LC0",
+          "range": {
+            "startCol": 9,
+            "endCol": 13
+          }
+        }
+      ]
+    },
+    {
+      "text": "  pushq %rbx",
+      "source": {
+        "file": null,
+        "line": 4,
+        "column": 16
+      },
+      "labels": []
+    },
+    {
+      "text": "  subq $40, %rsp",
+      "source": {
+        "file": null,
+        "line": 4,
+        "column": 16
+      },
+      "labels": []
+    },
+    {
+      "text": "  call puts",
+      "source": {
+        "file": null,
+        "line": 5,
+        "column": 2
+      },
+      "labels": []
+    },
+    {
+      "text": "  movdqa .LC1(%rip), %xmm0",
+      "source": {
+        "file": null,
+        "line": 10,
+        "column": 30
+      },
+      "labels": [
+        {
+          "name": ".LC1",
+          "range": {
+            "startCol": 10,
+            "endCol": 14
+          }
+        }
+      ]
+    },
+    {
+      "text": "  movq %rsp, %rbx",
+      "source": {
+        "file": null,
+        "line": 10,
+        "column": 30
+      },
+      "labels": []
+    },
+    {
+      "text": "  movaps %xmm0, (%rsp)",
+      "source": {
+        "file": null,
+        "line": 10,
+        "column": 30
+      },
+      "labels": []
+    },
+    {
+      "text": "  movdqa .LC2(%rip), %xmm0",
+      "source": {
+        "file": null,
+        "line": 10,
+        "column": 30
+      },
+      "labels": [
+        {
+          "name": ".LC2",
+          "range": {
+            "startCol": 10,
+            "endCol": 14
+          }
+        }
+      ]
+    },
+    {
+      "text": "  movaps %xmm0, 16(%rsp)",
+      "source": {
+        "file": null,
+        "line": 10,
+        "column": 30
+      },
+      "labels": []
+    },
+    {
+      "text": ".L3:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  movq (%rbx), %rbp",
+      "source": {
+        "file": null,
+        "line": 12,
+        "column": 34
+      },
+      "labels": []
+    },
+    {
+      "text": "  movq %rbp, %rdi",
+      "source": {
+        "file": null,
+        "line": 12,
+        "column": 13
+      },
+      "labels": []
+    },
+    {
+      "text": "  call vector_witness",
+      "source": {
+        "file": null,
+        "line": 12,
+        "column": 13
+      },
+      "labels": [
+        {
+          "name": "vector_witness",
+          "range": {
+            "startCol": 8,
+            "endCol": 22
+          }
+        }
+      ]
+    },
+    {
+      "text": "  cmpq %rax, %rbp",
+      "source": {
+        "file": null,
+        "line": 12,
+        "column": 12
+      },
+      "labels": []
+    },
+    {
+      "text": "  jne .L4",
+      "source": {
+        "file": null,
+        "line": 12,
+        "column": 12
+      },
+      "labels": [
+        {
+          "name": ".L4",
+          "range": {
+            "startCol": 7,
+            "endCol": 10
+          }
+        }
+      ]
+    },
+    {
+      "text": "  addq $8, %rbx",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 28
+      },
+      "labels": []
+    },
+    {
+      "text": "  leaq 32(%rsp), %rax",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 28
+      },
+      "labels": []
+    },
+    {
+      "text": "  cmpq %rax, %rbx",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 28
+      },
+      "labels": []
+    },
+    {
+      "text": "  jne .L3",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 28
+      },
+      "labels": [
+        {
+          "name": ".L3",
+          "range": {
+            "startCol": 7,
+            "endCol": 10
+          }
+        }
+      ]
+    },
+    {
+      "text": "  xorl %eax, %eax",
+      "source": {
+        "file": null,
+        "line": 15,
+        "column": 12
+      },
+      "labels": []
+    },
+    {
+      "text": ".L1:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  addq $40, %rsp",
+      "source": {
+        "file": null,
+        "line": 16,
+        "column": 1
+      },
+      "labels": []
+    },
+    {
+      "text": "  popq %rbx",
+      "source": {
+        "file": null,
+        "line": 16,
+        "column": 1
+      },
+      "labels": []
+    },
+    {
+      "text": "  popq %rbp",
+      "source": {
+        "file": null,
+        "line": 16,
+        "column": 1
+      },
+      "labels": []
+    },
+    {
+      "text": "  ret",
+      "source": {
+        "file": null,
+        "line": 16,
+        "column": 1
+      },
+      "labels": []
+    },
+    {
+      "text": ".L4:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  movl $1, %eax",
+      "source": {
+        "file": null,
+        "line": 13,
+        "column": 20
+      },
+      "labels": []
+    },
+    {
+      "text": "  jmp .L1",
+      "source": {
+        "file": null,
+        "line": 13,
+        "column": 20
+      },
+      "labels": [
+        {
+          "name": ".L1",
+          "range": {
+            "startCol": 7,
+            "endCol": 10
+          }
+        }
+      ]
+    },
+    {
+      "text": ".LC1:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  .quad 0",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  .quad 1",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": ".LC2:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  .quad -9223372036854775808",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  .quad -1",
+      "source": null,
+      "labels": []
+    }
+  ],
+  "optOutput": [],
+  "labelDefinitions": {
+    "vector_witness": 4,
+    ".LC0": 17,
+    "main": 19,
+    ".L3": 30,
+    ".L1": 41,
+    ".L4": 46,
+    ".LC1": 49,
+    ".LC2": 52
+  },
+  "parsingTime": 8,
+  "filteredCount": 577,
+  "popularArguments": {},
+  "execResult": {
+    "code": 1,
+    "okToCache": true,
+    "timedOut": false,
+    "stdout": [
+      {
+        "text": "16.2.0"
+      }
+    ],
+    "stderr": [],
+    "truncated": false,
+    "execTime": 17,
+    "processExecutionResultTime": 0.02309800000512041,
+    "didExecute": true,
+    "buildResult": {
+      "inputFilename": "example.c",
+      "code": 0,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [],
+      "stderr": [],
+      "truncated": false,
+      "execTime": 61,
+      "processExecutionResultTime": 0.0042840000096475706,
+      "instructionSet": "amd64",
+      "downloads": [],
+      "executableFilename": "/nosym/tmp/compiler-explorer-compilerD5LOgy/output.s",
+      "compilationOptions": [
+        "-g",
+        "-o",
+        "/app/output.s",
+        "-fno-verbose-asm",
+        "-fdiagnostics-color=always",
+        "-O2",
+        "-Werror",
+        "/app/example.c",
+        "-L./lib",
+        "-Wl,-rpath,./lib"
+      ],
+      "preparedLdPaths": [
+        "/opt/compiler-explorer/gcc-16.2.0/lib",
+        "/opt/compiler-explorer/gcc-16.2.0/lib32",
+        "/opt/compiler-explorer/gcc-16.2.0/lib64"
+      ],
+      "defaultExecOptions": {
+        "timeoutMs": 20000,
+        "maxErrorOutput": 5000,
+        "env": {
+          "LD_LIBRARY_PATH": "",
+          "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin",
+          "HOME": "/home/ce"
+        }
+      },
+      "packageStoreTime": 44
+    }
+  },
+  "queueTime": 7,
+  "lcccOracleOptions": {
+    "requested": "-O2 -Werror",
+    "effective": "-O2 -Werror"
+  }
+}

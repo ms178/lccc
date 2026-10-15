@@ -932,7 +932,7 @@ pub(super) fn classify_arith_ext(s: &str, _sb: &[u8], first: u8) -> ExtKind {
 #[inline]
 pub(super) fn compute_trim_offset(b: &[u8]) -> usize {
     let mut i = 0;
-    while i < b.len() && b[i] == b' ' {
+    while i < b.len() && matches!(b[i], b' ' | b'\t') {
         i += 1;
     }
     i
@@ -3214,6 +3214,39 @@ mod range_overlap_boundary_tests {
                         );
                     }
                 }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod indentation_tests {
+    use super::*;
+
+    #[test]
+    fn horizontal_indentation_does_not_change_instruction_or_barrier_classification() {
+        for text in [
+            "movq %rax, %r11",
+            "andq $255, %r8",
+            "call *%r11",
+            "ret",
+            ".Lentry:",
+            ".byte 0x90",
+            ".p2align 4",
+            ".cfi_startproc",
+            ".cfi_endproc",
+            "#APP",
+            "#NO_APP",
+            "syscall",
+        ] {
+            let reference = classify_line(text);
+            for indent in [" ", "\t", " \t ", "\t \t"] {
+                let line = format!("{indent}{text}");
+                let actual = classify_line(&line);
+                assert_eq!(actual.kind, reference.kind, "{line:?}");
+                assert_eq!(actual.reg_refs, reference.reg_refs, "{line:?}");
+                assert_eq!(actual.inert_dir, reference.inert_dir, "{line:?}");
+                assert_eq!(actual.trimmed(&line), text);
             }
         }
     }

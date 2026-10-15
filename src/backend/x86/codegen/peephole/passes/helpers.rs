@@ -997,13 +997,10 @@ mod register_rewrite_tests {
         ] {
             assert!(!steps(t), "{t:?} must not be stepped over");
         }
-        // Tab indentation is not a directive at all to this line model:
-        // `compute_trim_offset` skips only spaces -- the emitter's own
-        // indentation -- so a tab-led line arrives as `Other`.  That is the
-        // conservative answer for a fold (`Other` is not steppable), and the
-        // reason a tab-indented `.s` gets no peepholes whatsoever; pinned here so
-        // nobody "fixes" the directive law by teaching it tabs and thereby
-        // makes a tab-indented `.byte` look benign.
+        // Horizontal indentation is normalized by the shared classifier, not
+        // by a private prefix allowlist. Tabs must preserve the SAME inert-
+        // directive law: bookkeeping and default padding remain steppable,
+        // while bytes, explicit fills and opaque directives remain barriers.
         // A 4th operand is not data, it is an assembler *error*: GAS reads
         // `.p2align abs[,fill[,max-log]]`, so in `.p2align 4,,10,0xcc` the fill
         // field is empty (default nops) and `0xcc` sits in no field at all.
@@ -1015,8 +1012,17 @@ mod register_rewrite_tests {
             "a 4-operand tail is the PARSER's rejection; the step law must not
              invent a second, different verdict for it"
         );
-        for t in ["\t.byte 0xf5", "\t.cfi_startproc", "\t.p2align 4"] {
-            assert!(!steps(t), "{t:?} is not a classified directive");
+        for t in ["\t.cfi_startproc", "\t.p2align 4"] {
+            assert!(steps(t), "{t:?} retains its inert classification");
+        }
+        for t in [
+            "\t.byte 0xf5",
+            "\t.p2align 4,0xf8",
+            "\t.rept 2",
+            " \t.code32",
+            "\t.totally_new_directive 1",
+        ] {
+            assert!(!steps(t), "{t:?} remains an opaque/data barrier");
         }
         // A pass-marked nop is steppable even though its text is empty-ish:
         // that is what `is_nop()` is for.

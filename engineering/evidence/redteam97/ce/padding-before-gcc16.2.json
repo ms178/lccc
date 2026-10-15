@@ -1,0 +1,500 @@
+{
+  "inputFilename": "example.c",
+  "code": 0,
+  "okToCache": true,
+  "timedOut": false,
+  "stdout": [],
+  "stderr": [],
+  "truncated": false,
+  "execTime": 50,
+  "processExecutionResultTime": 0.006895999991684221,
+  "instructionSet": "amd64",
+  "compilationOptions": [
+    "-g",
+    "-o",
+    "/app/output.s",
+    "-fno-verbose-asm",
+    "-S",
+    "-fdiagnostics-color=always",
+    "-O2",
+    "-Werror",
+    "/app/example.c"
+  ],
+  "downloads": [],
+  "tools": [],
+  "asmSize": 7892,
+  "asm": [
+    {
+      "text": "  .text",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": ".p2align 4",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": ".globl padding_witness",
+      "source": null,
+      "labels": [
+        {
+          "name": "padding_witness",
+          "range": {
+            "startCol": 8,
+            "endCol": 23
+          }
+        }
+      ]
+    },
+    {
+      "text": ".type padding_witness,@function",
+      "source": null,
+      "labels": [
+        {
+          "name": "padding_witness",
+          "range": {
+            "startCol": 7,
+            "endCol": 22
+          }
+        }
+      ]
+    },
+    {
+      "text": "padding_witness:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": ".cfi_startproc",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  testl %edi, %edi",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  je .Ls97_witness_bb1",
+      "source": null,
+      "labels": [
+        {
+          "name": ".Ls97_witness_bb1",
+          "range": {
+            "startCol": 6,
+            "endCol": 23
+          }
+        }
+      ]
+    },
+    {
+      "text": ".Ls97_witness_bb1:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  xorl %eax, %eax",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  .p2align 4,0xf8",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  setc %al",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  jmp .Ls97_witness_bb3",
+      "source": null,
+      "labels": [
+        {
+          "name": ".Ls97_witness_bb3",
+          "range": {
+            "startCol": 7,
+            "endCol": 24
+          }
+        }
+      ]
+    },
+    {
+      "text": "  .p2align 4,0xf9",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": ".Ls97_witness_bb3:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  ret",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": ".cfi_endproc",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": ".size padding_witness, .-padding_witness",
+      "source": null,
+      "labels": [
+        {
+          "name": "padding_witness",
+          "range": {
+            "startCol": 7,
+            "endCol": 22
+          }
+        },
+        {
+          "name": "padding_witness",
+          "range": {
+            "startCol": 26,
+            "endCol": 41
+          }
+        }
+      ]
+    },
+    {
+      "text": ".section .note.GNU-stack,\"\",@progbits",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  .section .rodata.str1.1,\"aMS\",@progbits,1",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": ".LC0:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  .string \"16.2.0\"",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "main:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  pushq %rbx",
+      "source": {
+        "file": null,
+        "line": 4,
+        "column": 16
+      },
+      "labels": []
+    },
+    {
+      "text": "  movl $.LC0, %edi",
+      "source": {
+        "file": null,
+        "line": 5,
+        "column": 2
+      },
+      "labels": [
+        {
+          "name": ".LC0",
+          "range": {
+            "startCol": 9,
+            "endCol": 13
+          }
+        }
+      ]
+    },
+    {
+      "text": "  movl $-3, %ebx",
+      "source": {
+        "file": null,
+        "line": 10,
+        "column": 14
+      },
+      "labels": []
+    },
+    {
+      "text": "  call puts",
+      "source": {
+        "file": null,
+        "line": 5,
+        "column": 2
+      },
+      "labels": []
+    },
+    {
+      "text": ".L4:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  movl %ebx, %edi",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": []
+    },
+    {
+      "text": "  call padding_witness",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": [
+        {
+          "name": "padding_witness",
+          "range": {
+            "startCol": 8,
+            "endCol": 23
+          }
+        }
+      ]
+    },
+    {
+      "text": "  movl %eax, %edx",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": []
+    },
+    {
+      "text": "  xorl %eax, %eax",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 46
+      },
+      "labels": []
+    },
+    {
+      "text": "  testl %ebx, %ebx",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 46
+      },
+      "labels": []
+    },
+    {
+      "text": "  sete %al",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 46
+      },
+      "labels": []
+    },
+    {
+      "text": "  cmpl %eax, %edx",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 12
+      },
+      "labels": []
+    },
+    {
+      "text": "  jne .L8",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 12
+      },
+      "labels": [
+        {
+          "name": ".L8",
+          "range": {
+            "startCol": 7,
+            "endCol": 10
+          }
+        }
+      ]
+    },
+    {
+      "text": "  addl $1, %ebx",
+      "source": {
+        "file": null,
+        "line": 10,
+        "column": 38
+      },
+      "labels": []
+    },
+    {
+      "text": "  cmpl $4, %ebx",
+      "source": {
+        "file": null,
+        "line": 10,
+        "column": 32
+      },
+      "labels": []
+    },
+    {
+      "text": "  jne .L4",
+      "source": {
+        "file": null,
+        "line": 10,
+        "column": 32
+      },
+      "labels": [
+        {
+          "name": ".L4",
+          "range": {
+            "startCol": 7,
+            "endCol": 10
+          }
+        }
+      ]
+    },
+    {
+      "text": "  xorl %eax, %eax",
+      "source": {
+        "file": null,
+        "line": 14,
+        "column": 12
+      },
+      "labels": []
+    },
+    {
+      "text": "  popq %rbx",
+      "source": {
+        "file": null,
+        "line": 15,
+        "column": 1
+      },
+      "labels": []
+    },
+    {
+      "text": "  ret",
+      "source": {
+        "file": null,
+        "line": 15,
+        "column": 1
+      },
+      "labels": []
+    },
+    {
+      "text": ".L8:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  leal 13(%rbx), %eax",
+      "source": {
+        "file": null,
+        "line": 12,
+        "column": 23
+      },
+      "labels": []
+    },
+    {
+      "text": "  popq %rbx",
+      "source": {
+        "file": null,
+        "line": 15,
+        "column": 1
+      },
+      "labels": []
+    },
+    {
+      "text": "  ret",
+      "source": {
+        "file": null,
+        "line": 15,
+        "column": 1
+      },
+      "labels": []
+    }
+  ],
+  "optOutput": [],
+  "labelDefinitions": {
+    "padding_witness": 5,
+    ".Ls97_witness_bb1": 9,
+    ".Ls97_witness_bb3": 15,
+    ".LC0": 22,
+    "main": 24,
+    ".L4": 29,
+    ".L8": 44
+  },
+  "parsingTime": 4,
+  "filteredCount": 468,
+  "popularArguments": {},
+  "execResult": {
+    "code": 13,
+    "okToCache": true,
+    "timedOut": false,
+    "stdout": [
+      {
+        "text": "16.2.0"
+      }
+    ],
+    "stderr": [],
+    "truncated": false,
+    "execTime": 15,
+    "processExecutionResultTime": 0.031381000007968396,
+    "didExecute": true,
+    "buildResult": {
+      "inputFilename": "example.c",
+      "code": 0,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [],
+      "stderr": [],
+      "truncated": false,
+      "execTime": 65,
+      "processExecutionResultTime": 0.012222000004840083,
+      "instructionSet": "amd64",
+      "downloads": [],
+      "executableFilename": "/nosym/tmp/compiler-explorer-compiler0xgXd5/output.s",
+      "compilationOptions": [
+        "-g",
+        "-o",
+        "/app/output.s",
+        "-fno-verbose-asm",
+        "-fdiagnostics-color=always",
+        "-O2",
+        "-Werror",
+        "/app/example.c",
+        "-L./lib",
+        "-Wl,-rpath,./lib"
+      ],
+      "preparedLdPaths": [
+        "/opt/compiler-explorer/gcc-16.2.0/lib",
+        "/opt/compiler-explorer/gcc-16.2.0/lib32",
+        "/opt/compiler-explorer/gcc-16.2.0/lib64"
+      ],
+      "defaultExecOptions": {
+        "timeoutMs": 20000,
+        "maxErrorOutput": 5000,
+        "env": {
+          "LD_LIBRARY_PATH": "",
+          "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin",
+          "HOME": "/home/ce"
+        }
+      },
+      "packageStoreTime": 33
+    }
+  },
+  "queueTime": 7,
+  "lcccOracleOptions": {
+    "requested": "-O2 -Werror",
+    "effective": "-O2 -Werror"
+  }
+}

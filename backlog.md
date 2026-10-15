@@ -3075,3 +3075,168 @@ without failures; initial and follow-up reports remain separate.
   header tests, retry-budget tests and preservation of terminal compiler errors.
 - Original1MiB level19 profile timed out; its report remains partial. Smaller
   follow-up is independent evidence, not completion of the original workload.
+
+### PR836/PR837 reconciliation (S95)
+
+- Preserved S93; rebased onto84a62201; retained PR837 call-upper/lazy-cache work.
+- Adopted five actual PR836 review follow-ups; resolved the TempFile conflict
+  in favor of fallible leased reservations, including kept pending paths.
+- Fixed two old-API calls in PR837's native witness; full units4836/0/9.
+- Retained unmanaged/explicit-directory lifetime controls without restoring the
+  insecure flat-path fallback. Final FAST must certify the integrated tree.
+- New red-team report tests reproduce unsupported cached-ratio/floor acceptance
+  and malformed-pair acceptance; raw timing provenance still needs repair.
+
+### S96 timing provenance repair
+
+- Reproduced15 failed subcases across the original6-method report probe.
+- Recompute statistics/CI from matching raw timed rounds, validate round/order
+  identities and positive finite timings, and reject incomplete reports.
+- Cached duration/ratio contradictions cannot enter aggregates; warm-up times
+  remain excluded. Nine new provenance methods plus29 existing focused tests
+  pass. This is measurement correctness, not a generated-code speedup.
+
+### S97 directive barriers and block-exit proof
+
+- Reproduced native identical-block pass wrong result (exit13) and full
+  peephole vector-copy wrong result (exit1). Full pipeline masked the former.
+- Guard both private directive predicates with shared inert-directive proof;
+  preserve the vector window's narrower allowlist. Prefix-only repair remained
+  RED: missing fall-through cannot mean a common exit. Require a modeled exit.
+- Five new tests, full units4841/0/9; CE12/12 expected original/bad controls.
+- `cicxlatest` actually reports2024.0.0, not proven newest Intel release.
+- Still open: latest-main FAST/Clippy receipts, complete24PR hunk disposition,
+  fresh native45/zstd broad-option comparisons and accepted runtime gains.
+- Review debt, not demonstrated new miscompile: identical-block flag helper
+  lists NOT as flag-setting and does not model partial flag definitions.
+  Prove a reachable transformation consequence before widening that repair.
+
+### S99 inventory integration and latest Intel oracle
+
+- Fresh FAST caught stricter PR837 schema vs relocated PR836 historical audit.
+  Preserve exact original capture bytes/hash; update closed scope and remove
+  unsupported metadata, without loosening verifier. Eight integrity tests pass.
+- Official Intel latest2026.1.1-325 provisioned/hashed; actual version verified.
+  Explicit strict-FP arm:65semantic +4directive controls pass, no diagnostics.
+  Default-FP14semantic mismatches/rejections retained as policy differences,
+  not vendor bugs. CE alias remains2024 and is labeled separately.
+- First FAST run became mixed-tree diagnostic after repairing its real failure;
+  final stable-tree FAST is mandatory. No full/slow local run authorized.
+
+### S100 real benchmark producer contract
+
+- Found canonical CLI lacked the completion marker required by S96 consumer;
+  stale success files survived interruption. Keep consumer fail-closed.
+- Add atomic incomplete/progress/final report lifecycle using shared helper;
+  preserve failed-case status rather than conflating complete and correct.
+- Four CLI lifecycle tests +38 report/provenance/safety tests pass (42 total).
+- Diagnostic FAST257/3/6; inventory repair removes two failures, matched GCC16
+  C++ multilib provisioning repairs third (focused linker1/0/0warn/0skip).
+- Latest-main84 fresh fastbuild/-O1/-j2 baseline built; final quiet performance
+  and final stable-tree FAST remain independent acceptance gates.
+
+### S101 fresh runtime screen
+
+- All225 native compiler/workload combinations pass; nine paired rounds each.
+  Qualified main28 GM1.002269/AM1.004321; GCC28 GM1.025237/AM1.037186.
+- Fannkuch/main1.257397 remains confirmed >5% regression; nbody/main0.788114
+  is a promising explicit-FP-policy result, not attributed to S97 without A/B.
+- Fresh patched-zstd96 cells all correct. /GCC C GM1.620623,D1.402463:
+  broad superiority goal unmet. /main C1.000977,D0.999609; repeat outliers.
+- Fresh L3 source4-call Callgrind Ir candidate/main/GCC289235944/288804074/
+  158856414;3 Memcheck passes. Simulated whole-program counts, not PMU cycles.
+- Preserve actual measured232 payloads in external compressed archive plus
+  patch-contained manifest; historical measurements are not this run's proof.
+
+### S102 measured follow-through / remaining acceptance risks
+
+- Post-fix semantic65/65, empty diagnostics. All45 measured candidate ELFs
+  exactly match S96-produced bytes under the same flags: S97 does not cause
+  the corpus's main-relative timing differences.
+-31pairs confirm fannkuch+25.0%,sieve+2.62%,varint+2.20%; nbody-19.97% time.
+  Other four main-relative >1% screen points did not persist significantly.
+- Fannkuch no-wrapv ablation0.793793/current: do NOT remove -fwrapv. Develop
+  and test a relational bounded-index/nonwrapping proof in IVSR/address lowering
+  before widening reversal/permutation recurrence expressions. Require native
+  and boundary tests plus the original wrap-domain negative controls.
+- Full-default fannkuch CG Ir candidate/main17131993449/16054326746; inspect
+  extra sign extensions and address arithmetic, without claiming Ir=cycles.
+- Zstd31pairs retain RLE-long20+3.91%,othersix extremes unconfirmed, including
+  rejected apparent10% ELF-L9 win. RLE CG Ir84111314/82008051; investigate
+  exact hot instruction/value-flow deltas under unchanged valid semantics.
+- GCC PIC legacy v0.1 emits6 warnings; diagnostic-only no-semantic-interposition
+  control emits0. No benchmark source/flags silently changed; no blanket
+  warning-free or vendor-defect claim. Candidate/main zstd logs have0 warnings.
+- All native regression and performance raw receipts retained. Final FAST is
+  certified only by matching external delivery stamp; see current root report.
+  Exhaustive24PR hunk closure, universal zero-defect approval and broad GCC/zstd
+  runtime superiority are not established by these bounded gates.
+
+## S103 — merged PR836 integration
+
+- DONE: preserve S102 before rebase; replay only remaining follow-ups onto
+  2f477ce0, preserving upstream lifetime tests, evidence layout, C17 controls,
+  annotation budgets and full-size input contracts. 4847 Rust units and 50
+  focused Python tests pass; no final FAST certification yet.
+- DONE: refresh all 3 open plus latest 20 closed PRs with ordering proof;
+  PR836 merged, PR819 exits this window. 22 other revisions unchanged.
+- REQUIRED: fresh latest-main/candidate executable identity, stable-tree FAST,
+  gated publication and refreshed final risk/performance reports.
+
+## S104 — measured baseline and native-mask candidate
+
+- DONE: new-main/current45 identical ELFs,225 native checks,195 semantic checks;
+  fresh GNU-C17 patched-zstd96 cells,3 clean Memchecks,3 Callgrind profiles.
+  Baseline /GCC GM1.629650 compression,1.402704 decompression: goal unmet.
+- DONE: strict native BZHI selection preserving low-byte saturation, flags,
+  liveness and pinned/directive barriers; no header asm or budget inflation.
+  Eight new unit methods;4855/0/9 total. Native result/all-arithmetic-flag oracle
+  runs786432 function cases. Remote GCC/Clang/ICX alias controls pass.
+- DONE: shared tab/space classification with explicit non-NOP/data barriers;
+  prior tab-opacity test updated to the stronger shared-classification contract.
+- REQUIRED: native latest-ICX/full45 check, full-size zstd measurements/profiles,
+  reject ineffective or regressing prototype, then stable-tree FAST/Clippy.
+
+## S105 — runtime follow-through
+
+- DONE:25 native mask compiler/optimization controls, no-BMI2 fallback,45/45
+  unchanged corpus ELFs; full96-cell zstd matrix and2 clean Memcheck runs.
+- DONE:31 longer pairs for all14 >1% screen regressions and5 selected gains.
+  Source/L3 compression0.989357[0.986813,0.991171]; random/long20
+  1.036771[1.006656,1.058528] remains an acceptance concern.
+- DONE: source/L3 Ir289235575→284770075; BIT_addBits16→11 instructions.
+  Random/long20 Ir differs by only6 instructions; do not equate Ir with cycles.
+- REQUIRED: independent ASLR-disabled31-pair confirmation plus byte-identical
+  baseline control, then final acceptance and stable-tree FAST/Clippy.
+- FOLLOW-UP: replace heuristic prologue parameter-save pinning with an explicit
+  ABI-emission contract before trying to eliminate FSE's pinned scratch copy.
+  Do not bypass all_editable/liveness merely to obtain a smaller hot helper.
+
+## S106 — scoped performance acceptance and honest limits
+
+- DONE: fixed40M-iteration outlined-mask benchmark,31 pairs,five compilers.
+  Candidate/main elapsed0.800889[0.717086,0.896570], childCPU0.796058;
+  real scoped runtime improvement, NOT a20% zstd claim. Vendors remain faster.
+- DONE: independent ASLR-disabled31 pairs with identical-baseline control;
+  within-process31 rounds with symbol-isolated libraries and same-code control.
+  Text identities and independent GCC frame decoding verified; harness Memcheck0.
+- OPEN: reliable application-level zstd speedup is not established. Random/long20
+  observation reverses across controls and remains a variance/layout concern;
+  preserve all favorable and unfavorable measurements, no pooled cherry-pick.
+- OPEN: use finer-grained explicit parameter-save provenance before optimizing
+  the pinned FSE helper. Measure large-TU liveness-refresh cost before expanding
+  the matching scope; do not replace CFG proof with a textual dead-register scan.
+- DONE: refreshed main2f477ce0 and recipe b4f57d90; current zstd source recipe
+  and patch are byte-identical to the measured inputs. Final FAST gate follows
+  only after all timing/instrumentation processes have completed.
+
+## S107 — final-gate documentation correction
+
+- Final FAST exposed a broken S103 link: a retained external recovery manifest
+  was written as a repository-relative path. Confirmed the actual artifact
+  exists. Corrected the note to identify both external absolute paths rather
+  than weakening the doc-link checker or duplicating an old recovery bundle.
+- Existing doc-link gate is the red/green regression: one broken reference
+  before correction, all references resolve afterward. Compiler sources and
+  measured binaries are unchanged. Full FAST is rerun on the corrected tree.
+- Added focused-benchmark GM/AM and full sample range; VM variation is explicit.

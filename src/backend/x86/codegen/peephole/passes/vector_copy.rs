@@ -544,6 +544,13 @@ fn replace_vec_reads(t: &str, old: u8, new: u8) -> Option<String> {
 /// bracket.  Hence the fill check rather than the prefix.
 fn benign_directive(t: &str) -> bool {
     let t = t.trim();
+    // A metadata prefix is not proof about the entire line: a second GAS
+    // statement can overwrite registers without spelling them (encoded bytes).
+    // Share the quote/comment-aware contract, then retain this window's
+    // deliberately narrower allowlist of metadata kinds.
+    if !crate::backend::peephole_common::inert_directive(t) {
+        return false;
+    }
     if t.starts_with(".cfi_")
         || t.starts_with(".LFB")
         || t.starts_with(".loc ")
@@ -2635,6 +2642,57 @@ mod tests {
             vec!["vroundsd $9, %xmm0, %xmm0, %xmm0", "ret"],
             "{out:?}"
         );
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn s97_compound_directive_real_pipeline_native() {
+        use crate::common::temp_files::TempFile;
+        use std::process::Command;
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/regression/fixtures/peephole-padding-effects");
+        let original = std::fs::read_to_string(fixtures.join("vector.s")).unwrap();
+        let optimized = run(&original);
+        let assembly = TempFile::try_new("compound", "witness", "s").unwrap();
+        let executable = TempFile::try_new("compound", "witness", "exe").unwrap();
+        for (stage, code) in [("original", original), ("optimized", optimized)] {
+            std::fs::write(assembly.path(), &code).unwrap();
+            let compiled = Command::new("gcc")
+                .args(["-O2", "-Werror", "-no-pie", "-o"])
+                .arg(executable.path())
+                .arg(fixtures.join("vector-driver.c"))
+                .arg(assembly.path())
+                .output()
+                .unwrap();
+            assert!(
+                compiled.status.success() && compiled.stderr.is_empty(),
+                "{stage}: {}",
+                String::from_utf8_lossy(&compiled.stderr)
+            );
+            let result = Command::new(executable.path()).output().unwrap();
+            assert!(
+                result.status.success(),
+                "{stage}: {:?}\n{code}",
+                result.status.code()
+            );
+        }
+    }
+
+    #[test]
+    fn s97_vector_directive_windows_reject_compound_statements() {
+        for text in [
+            ".cfi_remember_state; xorps %xmm1, %xmm1",
+            ".loc 1 2 0; vzeroall",
+            ".file 1 \"x.c\"; .byte 0xf8",
+            ".p2align 4; vzeroall",
+            ".p2align_future 4",
+            ".cfi_sections .debug_frame",
+        ] {
+            assert!(!benign_directive(text), "opaque directive: {text}");
+        }
+        for text in [".cfi_remember_state", ".file 1 \"a;b.c\"", ".p2align 4,,10"] {
+            assert!(benign_directive(text), "benign directive: {text}");
+        }
     }
 
     #[test]

@@ -339,6 +339,34 @@ mod lifecycle_tests {
     use super::*;
 
     #[test]
+    fn managed_cleanup_does_not_invalidate_unmanaged_debug_paths() {
+        let parent = private_temp_dir().expect("reserve persistent debug directory");
+        let path = parent.join(unique_filename("lifecycle", "unmanaged", "tmp"));
+        drop(TempFile::try_new("lifecycle", "managed", "tmp").unwrap());
+        write_file_exclusive(&path, b"unmanaged lifetime").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"unmanaged lifetime");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn explicit_sibling_guard_cannot_reap_a_managed_reservation() {
+        let pool = TempDirectoryPool::default();
+        let pending = pool.reserve("lifecycle", "pending", "tmp").unwrap();
+        let parent = pending.path().parent().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        drop(TempFile::with_path(parent.join("unrelated")));
+        fs::write(pending.path(), b"still reserved").unwrap();
+        assert_eq!(fs::read(pending.path()).unwrap(), b"still reserved");
+    }
+
+    #[test]
     fn name_components_cannot_escape_the_private_directory() {
         let pool = TempDirectoryPool::default();
         for (prefix, stem, extension) in [

@@ -1,0 +1,230 @@
+[
+  {
+    "family": "padding",
+    "stage": "original",
+    "tool": "memcheck",
+    "command": [
+      "valgrind",
+      "--tool=memcheck",
+      "--error-exitcode=99",
+      "--log-file=/home/user/lccc/engineering/evidence/redteam97/native-tools/padding-original-memcheck.txt",
+      "/home/user/.cache/redteam94/native97/padding-original"
+    ],
+    "build": [
+      "gcc",
+      "-O2",
+      "-Werror",
+      "-no-pie",
+      "/home/user/lccc/tests/regression/fixtures/peephole-padding-effects/caller.s",
+      "/home/user/lccc/tests/regression/fixtures/peephole-padding-effects/driver.c",
+      "-o",
+      "/home/user/.cache/redteam94/native97/padding-original"
+    ],
+    "binary_sha256": "51b04fdd641e982906576855178d3975b6f0f6cfed90239faf3f8ae635af64e0",
+    "expected_exit": 0,
+    "exit": 0,
+    "stdout": "",
+    "stderr": "",
+    "pass": true
+  },
+  {
+    "family": "padding",
+    "stage": "original",
+    "tool": "callgrind",
+    "command": [
+      "valgrind",
+      "--tool=callgrind",
+      "--error-exitcode=99",
+      "--log-file=/home/user/lccc/engineering/evidence/redteam97/native-tools/padding-original-callgrind.txt",
+      "--callgrind-out-file=/home/user/lccc/engineering/evidence/redteam97/native-tools/padding-original.callgrind",
+      "/home/user/.cache/redteam94/native97/padding-original"
+    ],
+    "build": [
+      "gcc",
+      "-O2",
+      "-Werror",
+      "-no-pie",
+      "/home/user/lccc/tests/regression/fixtures/peephole-padding-effects/caller.s",
+      "/home/user/lccc/tests/regression/fixtures/peephole-padding-effects/driver.c",
+      "-o",
+      "/home/user/.cache/redteam94/native97/padding-original"
+    ],
+    "binary_sha256": "51b04fdd641e982906576855178d3975b6f0f6cfed90239faf3f8ae635af64e0",
+    "expected_exit": 0,
+    "exit": 0,
+    "stdout": "",
+    "stderr": "",
+    "pass": true
+  },
+  {
+    "family": "padding",
+    "stage": "before",
+    "tool": "memcheck",
+    "command": [
+      "valgrind",
+      "--tool=memcheck",
+      "--error-exitcode=99",
+      "--log-file=/home/user/lccc/engineering/evidence/redteam97/native-tools/padding-before-memcheck.txt",
+      "/home/user/.cache/redteam94/native97/padding-before"
+    ],
+    "build": [
+      "gcc",
+      "-O2",
+      "-Werror",
+      "-no-pie",
+      "/home/user/lccc/engineering/evidence/redteam97/padding-before.s",
+      "/home/user/lccc/tests/regression/fixtures/peephole-padding-effects/driver.c",
+      "-o",
+      "/home/user/.cache/redteam94/native97/padding-before"
+    ],
+    "binary_sha256": "52048611b83b100211b029d546ddc8696573ccb3fad850ffde975074749be946",
+    "expected_exit": 13,
+    "exit": 13,
+    "stdout": "",
+    "stderr": "",
+    "pass": true
+  },
+  {
+    "family": "padding",
+    "stage": "before",
+    "tool": "callgrind",
+    "command": [
+      "valgrind",
+      "--tool=callgrind",
+      "--error-exitcode=99",
+      "--log-file=/home/user/lccc/engineering/evidence/redteam97/native-tools/padding-before-callgrind.txt",
+      "--callgrind-out-file=/home/user/lccc/engineering/evidence/redteam97/native-tools/padding-before.callgrind",
+      "/home/user/.cache/redteam94/native97/padding-before"
+    ],
+    "build": [
+      "gcc",
+      "-O2",
+      "-Werror",
+      "-no-pie",
+      "/home/user/lccc/engineering/evidence/redteam97/padding-before.s",
+      "/home/user/lccc/tests/regression/fixtures/peephole-padding-effects/driver.c",
+      "-o",
+      "/home/user/.cache/redteam94/native97/padding-before"
+    ],
+    "binary_sha256": "52048611b83b100211b029d546ddc8696573ccb3fad850ffde975074749be946",
+    "expected_exit": 13,
+    "exit": 13,
+    "stdout": "",
+    "stderr": "",
+    "pass": true
+  },
+  {
+    "family": "vector",
+    "stage": "original",
+    "tool": "memcheck",
+    "command": [
+      "valgrind",
+      "--tool=memcheck",
+      "--error-exitcode=99",
+      "--log-file=/home/user/lccc/engineering/evidence/redteam97/native-tools/vector-original-memcheck.txt",
+      "/home/user/.cache/redteam94/native97/vector-original"
+    ],
+    "build": [
+      "gcc",
+      "-O2",
+      "-Werror",
+      "-no-pie",
+      "/home/user/lccc/tests/regression/fixtures/peephole-padding-effects/vector.s",
+      "/home/user/lccc/tests/regression/fixtures/peephole-padding-effects/vector-driver.c",
+      "-o",
+      "/home/user/.cache/redteam94/native97/vector-original"
+    ],
+    "binary_sha256": "61e1ba1417834271819d74f7c744d2b1858795a6465735ee0c48946d365d23b1",
+    "expected_exit": 0,
+    "exit": 0,
+    "stdout": "",
+    "stderr": "",
+    "pass": true
+  },
+  {
+    "family": "vector",
+    "stage": "original",
+    "tool": "callgrind",
+    "command": [
+      "valgrind",
+      "--tool=callgrind",
+      "--error-exitcode=99",
+      "--log-file=/home/user/lccc/engineering/evidence/redteam97/native-tools/vector-original-callgrind.txt",
+      "--callgrind-out-file=/home/user/lccc/engineering/evidence/redteam97/native-tools/vector-original.callgrind",
+      "/home/user/.cache/redteam94/native97/vector-original"
+    ],
+    "build": [
+      "gcc",
+      "-O2",
+      "-Werror",
+      "-no-pie",
+      "/home/user/lccc/tests/regression/fixtures/peephole-padding-effects/vector.s",
+      "/home/user/lccc/tests/regression/fixtures/peephole-padding-effects/vector-driver.c",
+      "-o",
+      "/home/user/.cache/redteam94/native97/vector-original"
+    ],
+    "binary_sha256": "61e1ba1417834271819d74f7c744d2b1858795a6465735ee0c48946d365d23b1",
+    "expected_exit": 0,
+    "exit": 0,
+    "stdout": "",
+    "stderr": "",
+    "pass": true
+  },
+  {
+    "family": "vector",
+    "stage": "before",
+    "tool": "memcheck",
+    "command": [
+      "valgrind",
+      "--tool=memcheck",
+      "--error-exitcode=99",
+      "--log-file=/home/user/lccc/engineering/evidence/redteam97/native-tools/vector-before-memcheck.txt",
+      "/home/user/.cache/redteam94/native97/vector-before"
+    ],
+    "build": [
+      "gcc",
+      "-O2",
+      "-Werror",
+      "-no-pie",
+      "/home/user/lccc/engineering/evidence/redteam97/vector-before.s",
+      "/home/user/lccc/tests/regression/fixtures/peephole-padding-effects/vector-driver.c",
+      "-o",
+      "/home/user/.cache/redteam94/native97/vector-before"
+    ],
+    "binary_sha256": "a0f42121d24cd2d22b79444a9973cac2ffbfc886ff1b764980a05201a74a87f3",
+    "expected_exit": 1,
+    "exit": 1,
+    "stdout": "",
+    "stderr": "",
+    "pass": true
+  },
+  {
+    "family": "vector",
+    "stage": "before",
+    "tool": "callgrind",
+    "command": [
+      "valgrind",
+      "--tool=callgrind",
+      "--error-exitcode=99",
+      "--log-file=/home/user/lccc/engineering/evidence/redteam97/native-tools/vector-before-callgrind.txt",
+      "--callgrind-out-file=/home/user/lccc/engineering/evidence/redteam97/native-tools/vector-before.callgrind",
+      "/home/user/.cache/redteam94/native97/vector-before"
+    ],
+    "build": [
+      "gcc",
+      "-O2",
+      "-Werror",
+      "-no-pie",
+      "/home/user/lccc/engineering/evidence/redteam97/vector-before.s",
+      "/home/user/lccc/tests/regression/fixtures/peephole-padding-effects/vector-driver.c",
+      "-o",
+      "/home/user/.cache/redteam94/native97/vector-before"
+    ],
+    "binary_sha256": "a0f42121d24cd2d22b79444a9973cac2ffbfc886ff1b764980a05201a74a87f3",
+    "expected_exit": 1,
+    "exit": 1,
+    "stdout": "",
+    "stderr": "",
+    "pass": true
+  }
+]

@@ -22,6 +22,7 @@ use super::types::*;
 use crate::backend::regalloc::RaConfig;
 
 // Submodule pass implementations
+mod bmi2_mask;
 mod callee_saves;
 mod compare_branch;
 mod copy_coalesce;
@@ -1811,6 +1812,13 @@ fn peephole_optimize_inner(
     // Phase 5b: Global dead store elimination for never-read stack slots.
     if !skip_phase5 {
         dead_code::eliminate_never_read_stores(&store, &mut infos);
+    }
+
+    // Select a native mask only from an already-BMI2, low-byte-saturating
+    // sequence. Run before save/frame cleanup so dead temporaries do not
+    // leave unnecessary callee-save traffic behind.
+    if !sk("bmi2_mask") {
+        bmi2_mask::fuse_masks(&mut store, &mut infos);
     }
 
     // Phase 6: Eliminate unused callee-saved register saves/restores.
