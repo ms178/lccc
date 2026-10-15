@@ -2168,10 +2168,7 @@ mod tests {
             // XMM moves, not YMM/ZMM moves. The later wider read makes the
             // producer's upper-zeroing write observable across FXRSTOR.
             for reg in [7u32, 15] {
-                for (width, region_shift) in [
-                    ("ymm", YMM_HIGH_SHIFT),
-                    ("zmm", ZMM_HIGH_SHIFT),
-                ] {
+                for (width, region_shift) in [("ymm", YMM_HIGH_SHIFT), ("zmm", ZMM_HIGH_SHIFT)] {
                     let def_text = format!("vmovaps %xmm6, %xmm{reg}");
                     let use_text = format!("vmovaps %{width}{reg}, %{width}0");
                     let (store, mut infos, lv) = build(&format!(
@@ -2185,8 +2182,7 @@ mod tests {
                     );
                     let facts = lv.func_of(def).expect("function facts");
                     assert_ne!(
-                        facts.live_out[def - facts.start]
-                            & (1u128 << (region_shift + reg)),
+                        facts.live_out[def - facts.start] & (1u128 << (region_shift + reg)),
                         0,
                         "{width}-high state for register {reg} survives {mn} and is read afterwards"
                     );
