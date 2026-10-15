@@ -2137,65 +2137,88 @@ mod tests {
     }
 
     #[test]
-    fn fxrstor_kills_low_xmm_state_but_preserves_upper_vector_state() {
+    fn fxrstor_kills_all_low_xmm_state_but_preserves_upper_vector_state() {
         for mn in ["fxrstor", "fxrstor64", "fxrstorq"] {
-            let (store, mut infos, lv) = build(&format!(
-                "    movaps %xmm6, %xmm7\n    {mn} (%rdi)\n    movaps %xmm7, %xmm0\n    movl $1, %eax\n"
-            ));
-            let def = line_of(&store, "movaps %xmm6, %xmm7");
-            assert_eq!(
-                lv.xmm_live_after(def, 7),
-                Some(false),
-                "{mn} restores and overwrites the low XMM value"
-            );
-            assert!(
-                lv.reg_move_dead_after(&store, &infos, def, 7),
-                "the legacy low-XMM move is dead before {mn}"
-            );
-            assert!(
-                super::super::dead_code::eliminate_dead_fp_moves(&store, &mut infos),
-                "the dead legacy move is removed by the production pass for {mn}"
-            );
-            assert!(infos[def].is_nop(), "the move is eliminated for {mn}");
+            // Cover the low endpoint, the legacy XMM7 boundary, and XMM15
+            // (which only exists in 64-bit mode). The later read must observe
+            // the restored value, not the value copied into the register here.
+            for reg in [0u32, 7, 15] {
+                let def_text = format!("movaps %xmm6, %xmm{reg}");
+                let (store, mut infos, lv) = build(&format!(
+                    "    {def_text}\n    {mn} (%rdi)\n    movaps %xmm{reg}, %xmm0\n    movl $1, %eax\n"
+                ));
+                let def = line_of(&store, &def_text);
+                assert_eq!(
+                    lv.xmm_live_after(def, reg),
+                    Some(false),
+                    "{mn} restores and overwrites low XMM{reg}"
+                );
+                assert!(
+                    lv.reg_move_dead_after(&store, &infos, def, reg),
+                    "the legacy low-XMM move is dead before {mn} for XMM{reg}"
+                );
+                assert!(
+                    super::super::dead_code::eliminate_dead_fp_moves(&store, &mut infos),
+                    "the dead legacy move is removed by the production pass for {mn}/XMM{reg}"
+                );
+                assert!(infos[def].is_nop(), "the move is eliminated for {mn}/XMM{reg}");
+            }
 
-            // FXSAVE-format images do not carry YMM/ZMM upper state. A later
-            // YMM read therefore keeps the prior upper value live even though
-            // the low XMM component was restored.
-            let (store, mut infos, lv) = build(&format!(
-                "    vmovaps %ymm6, %ymm7\n    {mn} (%rdi)\n    vmovaps %ymm7, %ymm0\n    movl $1, %eax\n"
-            ));
-            let def = line_of(&store, "vmovaps %ymm6, %ymm7");
-            assert_eq!(lv.xmm_live_after(def, 7), Some(false), "low region: {mn}");
-            let facts = lv.func_of(def).expect("function facts");
-            assert_ne!(
-                facts.live_out[def - facts.start] & (1u128 << (YMM_HIGH_SHIFT + 7)),
-                0,
-                "YMM-high value survives {mn} and is read afterwards"
-            );
-            assert!(
-                !lv.reg_move_dead_after(&store, &infos, def, 7),
-                "deleting the VEX move would erase a live YMM-high value across {mn}"
-            );
-            super::super::dead_code::eliminate_dead_fp_moves(&store, &mut infos);
-            assert!(
-                !infos[def].is_nop(),
-                "the production pass preserves the move carrying live YMM-high state across {mn}"
-            );
+            // Use an XMM-width VEX producer: eliminate_dead_fp_moves parses
+            // XMM moves, not YMM/ZMM moves. The later wider read makes the
+            // producer's upper-zeroing write observable across FXRSTOR.
+            for reg in [7u32, 15] {
+                for (width, region_shift) in [
+                    ("ymm", YMM_HIGH_SHIFT),
+                    ("zmm", ZMM_HIGH_SHIFT),
+                ] {
+                    let def_text = format!("vmovaps %xmm6, %xmm{reg}");
+                    let use_text = format!("vmovaps %{width}{reg}, %{width}0");
+                    let (store, mut infos, lv) = build(&format!(
+                        "    {def_text}\n    {mn} (%rdi)\n    {use_text}\n    movl $1, %eax\n"
+                    ));
+                    let def = line_of(&store, &def_text);
+                    assert_eq!(
+                        lv.xmm_live_after(def, reg),
+                        Some(false),
+                        "{mn} kills low XMM{reg} before the {width} read"
+                    );
+                    let facts = lv.func_of(def).expect("function facts");
+                    assert_ne!(
+                        facts.live_out[def - facts.start]
+                            & (1u128 << (region_shift + reg)),
+                        0,
+                        "{width}-high state for register {reg} survives {mn} and is read afterwards"
+                    );
+                    assert!(
+                        !lv.reg_move_dead_after(&store, &infos, def, reg),
+                        "deleting the XMM-width VEX move would erase live {width}-high state"
+                    );
+                    super::super::dead_code::eliminate_dead_fp_moves(&store, &mut infos);
+                    assert!(
+                        !infos[def].is_nop(),
+                        "the production pass preserves the XMM VEX move carrying live {width}-high state"
+                    );
+                }
+            }
         }
     }
 
     #[test]
     fn xrstor_family_does_not_unconditionally_kill_masked_vector_state() {
         for mn in ["xrstor", "xrstor64", "xrstorq", "xrstors", "xrstors64"] {
-            let (store, _, lv) = build(&format!(
-                "    movaps %xmm6, %xmm7\n    {mn} (%rdi)\n    movaps %xmm7, %xmm0\n    movl $1, %eax\n"
-            ));
-            let def = line_of(&store, "movaps %xmm6, %xmm7");
-            assert_eq!(
-                lv.xmm_live_after(def, 7),
-                Some(true),
-                "without a proven request mask, {mn} cannot kill the old value"
-            );
+            for reg in [7u32, 15] {
+                let def_text = format!("movaps %xmm6, %xmm{reg}");
+                let (store, _, lv) = build(&format!(
+                    "    {def_text}\n    {mn} (%rdi)\n    movaps %xmm{reg}, %xmm0\n    movl $1, %eax\n"
+                ));
+                let def = line_of(&store, &def_text);
+                assert_eq!(
+                    lv.xmm_live_after(def, reg),
+                    Some(true),
+                    "without a proven request mask, {mn} cannot kill old XMM{reg}"
+                );
+            }
         }
     }
 

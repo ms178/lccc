@@ -1250,6 +1250,7 @@ jobs:
       env:
         LCCC_I386_SCRATCH_ROOT: ${{ runner.temp }}/i386-linker-scratch
       run: |
+        LCCC_TEST_ASSEMBLER="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
         PATH="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin:$PATH" \
         LCCC_REQUIRE_I386=1 \
         LCCC_RELOCS_TOOL="$HOME/.cache/lccc-kernel-tools/bin/relocs" \

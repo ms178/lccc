@@ -472,10 +472,12 @@ ENCDIFF_SUITE_ENV = (
     "LCCC_REQUIRE_PINNED_ORACLE=1",
 )
 
-# The linker suite's environment pins: the pinned GNU as 2.47 first in PATH
-# (fixtures assemble with APX REX2 encodings the runner's older gas cannot),
-# the fail-closed i386 multilib contract, and the kernel relocs tool.
+# The linker suite's environment pins the GNU as 2.47 binary both explicitly
+# for fixtures where GCC would bypass PATH and first in PATH for direct calls
+# (the runner's distro gas lacks APX/MOVRS coverage), plus fail-closed i386
+# multilib and the kernel relocs tool.
 LINKER_ENV = (
+    "LCCC_TEST_ASSEMBLER=$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as",
     f"PATH=$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin:$PATH",
     "LCCC_REQUIRE_I386=1",
     "LCCC_RELOCS_TOOL=$HOME/.cache/lccc-kernel-tools/bin/relocs",
@@ -718,7 +720,7 @@ PROGRAM_ENV_CHANNELS: dict[str, frozenset[str]] = {
         {"ASMDIFF_TEST_AS", "ASMDIFF_TEST_OBJDUMP"}),
     "scripts/ensure_gas_247.sh": frozenset({"GAS_DL_DIR", "GAS_CACHE"}),
     "tests/linker/run_linker_tests.py": frozenset(
-        {"LCCC_BIN", "LINKTEST_CC", "LINKTEST_CXX"}),
+        {"LCCC_BIN", "LINKTEST_CC", "LINKTEST_CXX", "LCCC_TEST_ASSEMBLER"}),
 }
 
 

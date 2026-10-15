@@ -6170,6 +6170,7 @@ def _plain_gotpcrel_test(args, oracles):
     is refused now (a -T link has no GOT).
     """
     name = "plain_gotpcrel_relaxation"
+    assembler = os.environ.get("LCCC_TEST_ASSEMBLER", "as")
     td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
     try:
         for fname, text in (("pg.s", _PLAIN_GOTPCREL_ASM),
@@ -6182,17 +6183,24 @@ def _plain_gotpcrel_test(args, oracles):
                             ("ext.c", "int ext = 3;\n")):
             with open(os.path.join(td, fname), "w") as f:
                 f.write(text)
-        r = sh([CC, "-Wa,-mrelax-relocations=no", "-c", "pg.s"], cwd=td)
-        if r.returncode != 0:
-            err = r.stderr.decode()[:300]
-            if "movrs" in err:
-                return Result(name, "SKIP", f"assembler without MOVRS: {err}")
-            return Result(name, "FAIL", f"assemble: {err}")
+        # Do not route assembly through GCC here: GCC may select its own
+        # configured assembler instead of the pinned linker-oracle assembler
+        # placed first on PATH by CI. That silently converts MOVRS coverage
+        # into a strict-mode SKIP on runners whose GCC still points at distro
+        # binutils. Both fixtures must be assembled by the explicitly selected
+        # GAS, with relaxation disabled so the relocations stay GOTPCREL.
+        for source, output in (("pg.s", "pg.o"), ("sc.s", "sc.o")):
+            r = sh([assembler, "--64", "-mrelax-relocations=no", source, "-o", output], cwd=td)
+            if r.returncode != 0:
+                err = r.stderr.decode()[:300]
+                if source == "pg.s" and "movrs" in err:
+                    return Result(name, "SKIP", f"assembler without MOVRS: {err}")
+                return Result(name, "FAIL", f"assemble {source}: {err}")
         rel = sh(["readelf", "-rW", "pg.o"], cwd=td).stdout.decode()
         if rel.count("R_X86_64_GOTPCREL ") != 7:
             return Result(name, "FAIL", f"assembler did not emit plain GOTPCREL:\n{rel[-600:]}")
-        for argv in (["-Wa,-mrelax-relocations=no", "-c", "sc.s"], ["-O1", "-c", "m.c"],
-                     ["-O1", "-c", "ext.c"], ["-fPIC", "-shared", "ext.c", "-o", "libext.so"]):
+        for argv in (["-O1", "-c", "m.c"], ["-O1", "-c", "ext.c"],
+                     ["-fPIC", "-shared", "ext.c", "-o", "libext.so"]):
             r = sh([CC] + argv, cwd=td)
             if r.returncode != 0:
                 return Result(name, "FAIL", f"{argv}: {r.stderr.decode()[:300]}")
