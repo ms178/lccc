@@ -923,7 +923,7 @@ class _RunStep:
         return loc
 
 
-def workflow_run_steps(path: Path):
+def workflow_run_steps(path: Path, *, _called=None, _soft=False, _stack=()):
     """Yield one _RunStep record for every `run:` step.
 
     `active` is False when the WORKFLOW's `on:` triggers never run it on
@@ -934,9 +934,14 @@ def workflow_run_steps(path: Path):
     workflow-, job- and step-level `env:` names the step inherits; `why`
     explains a non-active/non-soft verdict for diagnostics.
     """
+    resolved = path.resolve()
+    if resolved in _stack:
+        raise _WorkflowError(f"recursive reusable workflow: {path.name}")
     doc = _load_workflow(path)
     triggers = _workflow_triggers(doc)
-    on_pr_path = bool(triggers & _PR_PATH_EVENTS)
+    if _called is not None and "workflow_call" not in triggers:
+        raise _WorkflowError(f"called workflow lacks workflow_call: {path.name}")
+    on_pr_path = bool(triggers & _PR_PATH_EVENTS) if _called is None else _called
     jobs = doc.get("jobs") or {}
     if not isinstance(jobs, dict):
         return
@@ -955,7 +960,19 @@ def workflow_run_steps(path: Path):
         job_env = wf_env | _env_names(job.get("env"))
         job_cond = job.get("if")
         job_active = job_cond is None or str(job_cond).strip() in _ACTIVE_IF
-        job_soft = bool(job.get("continue-on-error"))
+        job_soft = _soft or bool(job.get("continue-on-error"))
+        # Reachability, not mere presence of workflow_call, grants coverage.
+        # Caller conditions and soft-failure policy propagate; workflow env
+        # does NOT propagate across reusable workflows in GitHub Actions.
+        uses = job.get("uses", "")
+        if isinstance(uses, str) and uses.startswith("./"):
+            if not re.fullmatch(r"\./\.github/workflows/[^/]+\.ya?ml", uses):
+                raise _WorkflowError(f"unsupported local workflow path: {uses}")
+            child = path.parent / Path(uses).name
+            if not child.is_file() or child.resolve().parent != path.resolve().parent:
+                raise _WorkflowError(f"missing/escaping reusable workflow: {uses}")
+            yield from workflow_run_steps(child, _called=on_pr_path and job_active,
+                                          _soft=job_soft, _stack=(*_stack, resolved))
         for steps in containers:
             for index, step in enumerate(steps):
                 if isinstance(step, dict) and isinstance(step.get("run"), str):

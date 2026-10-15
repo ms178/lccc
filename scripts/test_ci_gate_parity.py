@@ -1219,6 +1219,9 @@ class AggregatedDiagnosticsTest(unittest.TestCase):
             wf = yaml.safe_dump(document, sort_keys=False)
             self.assertNotEqual(original, wf)
             (root / ".github" / "workflows" / "ci.yml").write_text(wf)
+            # Preserve the real caller's reusable lane in this reduced tree.
+            (root / ".github" / "workflows" / "bench.yml").write_text(
+                (parity.WORKFLOWS / "bench.yml").read_text())
             checker = Path(parity.__file__).read_text()
             (root / "scripts" / "check_ci_gate_parity.py").write_text(checker)
             p = subprocess.run(

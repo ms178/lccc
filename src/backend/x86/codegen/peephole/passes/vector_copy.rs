@@ -315,6 +315,16 @@ fn reads_only_mnemonic(mn: &str) -> bool {
     )
 }
 
+/// VEX scalar source-only instructions carry bits above the scalar element
+/// from the penultimate operand into the result. Those bits are NOT equal
+/// after a narrow legacy copy, even though the arithmetic lanes are equal.
+fn scalar_merge_form(text: &str, mn: &str, ops: &[&str]) -> bool {
+    mn.starts_with('v')
+        && (mn.ends_with("sd") || mn.ends_with("ss"))
+        && (ops.len() == 3 || (ops.len() == 4 && ops[0].starts_with('$')))
+        && super::fp_liveness::is_full_xmm_def_line(text)
+}
+
 /// Width at which `mn` READS a vector operand spelled `spelling` bits wide.
 ///
 /// Scalar forms read one lane; everything else reads the spelling's width.
@@ -368,9 +378,7 @@ fn vec_mention_width(t: &str, n: u8) -> u16 {
     if ops.is_empty() {
         return 0;
     }
-    // The three-operand `vmovsd`/`vmovss` merge reads its middle operand's
-    // upper lane, which the scalar-suffix rule would under-report.
-    let merge_form = matches!(mn, "vmovsd" | "vmovss") && ops.len() == 3;
+    let merge_form = scalar_merge_form(t, mn, &ops);
     let reads_only = reads_only_mnemonic(mn);
     let last = ops.len() - 1;
     ops.iter()
@@ -380,9 +388,13 @@ fn vec_mention_width(t: &str, n: u8) -> u16 {
             if num != n {
                 return None;
             }
-            let read = vec_read_width(mn, spelling, merge_form);
+            let read = vec_read_width(mn, spelling, merge_form && k + 1 == last);
             let write = if k == last && !reads_only {
-                vec_write_width(mn, spelling)
+                if merge_form {
+                    spelling.max(W128)
+                } else {
+                    vec_write_width(mn, spelling)
+                }
             } else {
                 0
             };
@@ -390,6 +402,41 @@ fn vec_mention_width(t: &str, n: u8) -> u16 {
         })
         .max()
         .unwrap_or(0)
+}
+
+/// Read positions only: copy propagation never renames the output. A scalar
+/// data operand can still use a narrow copy; its merging source cannot.
+fn vec_read_mention_width(t: &str, n: u8) -> u16 {
+    if has_implicit_vector_effects_line(t) {
+        return W512;
+    }
+    let (mn, operands) = split_mn(t);
+    let ops = operand_list(operands);
+    let full_def = super::fp_liveness::is_full_xmm_def_line(t);
+    let merging = scalar_merge_form(t, mn, &ops);
+    ops.iter()
+        .enumerate()
+        .filter_map(|(k, op)| {
+            let (num, spelling) = vec_operand(op)?;
+            if num != n || (full_def && k + 1 == ops.len()) {
+                return None;
+            }
+            Some(vec_read_width(mn, spelling, merging && k + 2 == ops.len()))
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// A private bracket may carry the temporary's upper lane back into itself:
+/// it never escapes, and the final narrow copy preserves the source's own
+/// upper bits. A merge into ANY other register is not that proof.
+fn private_scalar_self_merge(t: &str, temporary: u8, width: u16) -> bool {
+    let (mn, operands) = split_mn(t);
+    let ops = operand_list(operands);
+    scalar_merge_form(t, mn, &ops)
+        && vec_write_width(mn, W128) <= width
+        && vec_operand(ops[ops.len() - 2]) == Some((temporary, W128))
+        && vec_operand(ops[ops.len() - 1]) == Some((temporary, W128))
 }
 
 /// True when `t` writes vector register `n` in its destination position.
@@ -597,7 +644,9 @@ pub(super) fn coalesce_vector_brackets(store: &mut LineStore, infos: &mut [LineI
                 break;
             }
             // Rule 3: no interior access wider than the copy that defines it.
-            if vec_mention_width(t, copy_in.dst) > copy_in.width {
+            if vec_mention_width(t, copy_in.dst) > copy_in.width
+                && !private_scalar_self_merge(t, copy_in.dst, copy_in.width)
+            {
                 interior_ok = false;
                 break;
             }
@@ -607,6 +656,11 @@ pub(super) fn coalesce_vector_brackets(store: &mut LineStore, infos: &mut [LineI
             i += 1;
             continue;
         };
+
+        if out_copy.width > copy_in.width {
+            i += 1;
+            continue;
+        }
 
         // Rule 4: the temporary is private to the bracket. "Private" means
         // outside it — the interior is where the temporary is SUPPOSED to be
@@ -651,11 +705,66 @@ pub(super) fn coalesce_vector_brackets(store: &mut LineStore, infos: &mut [LineI
     changed
 }
 
+/// Prove that only the scalar result of a self-merging consumer can escape.
+/// The low-128 liveness oracle cannot distinguish a low-element extraction
+/// from an upper-lane observation, so walk straight-line narrow reads until
+/// the WHOLE old XMM value is proven dead. Its CFG query includes backedges,
+/// calls, returns and implicit observers; an unknown answer is not a proof.
+fn narrow_result_only(
+    store: &LineStore,
+    infos: &[LineInfo],
+    producer: usize,
+    register: u8,
+    width: u16,
+    oracle: &FpLiveness,
+) -> bool {
+    // The unannotated-call fallback infers staged ABI arguments rather than
+    // proving their widths. Do not extend that assumption to this new merge
+    // rewrite: only non-argument/non-return SysV temporaries qualify here.
+    // Existing width-equal propagation remains available for every register.
+    if register < 8 {
+        return false;
+    }
+    for n in producer + 1..store.len() {
+        if oracle.xmm_live_after(n - 1, u32::from(register)) == Some(false) {
+            return true;
+        }
+        if infos[n].is_nop() || infos[n].kind == LineKind::Empty {
+            continue;
+        }
+        let text = infos[n].trimmed(store.get(n));
+        if is_barrier(&infos[n], text) {
+            return false;
+        }
+        let (mn, operands) = split_mn(text);
+        let ops = operand_list(operands);
+        // MOVD/Q extracts exactly the low 32/64 bits; spelling the source
+        // as XMM does not make this an observation of all 128 bits.
+        let read_width = if ops.first().and_then(|op| vec_operand(op)) == Some((register, W128)) {
+            match mn {
+                "movd" | "vmovd" => W32,
+                "movq" | "vmovq" => W64,
+                _ => vec_read_mention_width(text, register),
+            }
+        } else {
+            vec_read_mention_width(text, register)
+        };
+        if read_width > width {
+            return false;
+        }
+        if writes_vec(text, register) && super::fp_liveness::is_full_xmm_def_line(text) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Substitute a vector copy's source for reads of its destination, forward
 /// through the basic block, width-checked at every step.
 pub(super) fn propagate_vector_copies(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
+    let mut fp: Option<FpLiveness> = None;
     let mut i = 0;
     while i < len {
         if infos[i].is_nop() || infos[i].pinned {
@@ -693,22 +802,39 @@ pub(super) fn propagate_vector_copies(store: &mut LineStore, infos: &mut [LineIn
                 if !super::fp_liveness::is_full_xmm_def_line(&t) {
                     break;
                 }
-                let width = vec_mention_width(&t, copy.dst);
-                if width != 0 && width <= copy.width {
+                let width = vec_read_mention_width(&t, copy.dst);
+                let narrow_merge = width > copy.width
+                    && copy.dst >= 8
+                    && private_scalar_self_merge(&t, copy.dst, copy.width)
+                    && narrow_result_only(
+                        store,
+                        infos,
+                        j,
+                        copy.dst,
+                        copy.width,
+                        fp.get_or_insert_with(|| FpLiveness::new(store, infos)),
+                    );
+                if width != 0 && (width <= copy.width || narrow_merge) {
                     if let Some(rewritten) = replace_vec_reads(&t, copy.dst, copy.src) {
                         if rewritten != t {
                             replace_line(store, &mut infos[j], j, format!("    {rewritten}"));
+                            if let Some(oracle) = fp.as_mut() {
+                                oracle.refresh_at(store, infos, j);
+                            }
                             changed = true;
                         }
                     }
                 }
                 break;
             }
-            let width = vec_mention_width(&t, copy.dst);
+            let width = vec_read_mention_width(&t, copy.dst);
             if width != 0 && width <= copy.width {
                 if let Some(rewritten) = replace_vec_reads(&t, copy.dst, copy.src) {
                     if rewritten != t {
                         replace_line(store, &mut infos[j], j, format!("    {rewritten}"));
+                        if let Some(oracle) = fp.as_mut() {
+                            oracle.refresh_at(store, infos, j);
+                        }
                         changed = true;
                     }
                 }
@@ -1245,12 +1371,21 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
             continue;
         }
         let d = copy_out.dst;
-        let wide_reader = (fstart..fend).any(|n| {
-            n != j
-                && n != k
-                && !infos[n].is_nop()
-                && vec_mention_width(infos[n].trimmed(store.get(n)), d) > copy_out.width
-        });
+        // A scalar copy-out immediately followed by return cannot reach an
+        // earlier wide reader again. The old whole-function approximation
+        // rejected legal leaf return folds after merge widths became exact.
+        // Do NOT apply this shortcut across epilogues, labels or transfers:
+        // all other shapes retain the conservative whole-function check.
+        let immediate_return = (k + 1..fend)
+            .find(|&n| !debug_transparent(store, infos[n], n) && infos[n].kind != LineKind::Empty)
+            .is_some_and(|n| infos[n].kind == LineKind::Ret && !infos[n].pinned);
+        let wide_reader = (!immediate_return)
+            && (fstart..fend).any(|n| {
+                n != j
+                    && n != k
+                    && !infos[n].is_nop()
+                    && vec_mention_width(infos[n].trimmed(store.get(n)), d) > copy_out.width
+            });
         if wide_reader {
             j += 1;
             continue;
@@ -1387,6 +1522,120 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn pr832_gcc_architectural_fixtures_through_real_peephole_pipeline() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            eprintln!("SKIP native VEX fixtures: AVX2 unavailable; effect tests still mandatory");
+            return;
+        }
+        use crate::common::temp_files::TempFile;
+        use std::process::Command;
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/regression/fixtures/peephole-vex-flags");
+        let assembly = TempFile::new("pr832", "pipeline", "s");
+        let object = TempFile::new("pr832", "expanded", "o");
+        let binary = TempFile::new("pr832", "pipeline", "exe");
+        for (source, driver, functions) in [
+            ("witness.s", "driver.c", 22),
+            ("implicit-witness.s", "implicit-driver.c", 18),
+        ] {
+            let mut original = if source == "implicit-witness.s" {
+                // GNU as, not the peepholer, expands macros and selects .if
+                // arms. Only active emitted instructions have a listing
+                // address. Feeding raw .macro/.if would merely test barriers.
+                let listing = Command::new("as")
+                    .args([
+                        "-almn",
+                        "--listing-lhs-width=0",
+                        "--listing-lhs-width2=0",
+                        "--listing-rhs-width=200",
+                    ])
+                    .arg(fixtures.join(source))
+                    .arg("-o")
+                    .arg(object.path())
+                    .output()
+                    .expect("GNU as macro listing");
+                assert!(
+                    listing.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&listing.stderr)
+                );
+                let listing = String::from_utf8(listing.stdout).unwrap();
+                let mut expanded = String::from(".text\n");
+                for line in listing.lines() {
+                    let Some((address, text)) = line.split_once("\t>") else {
+                        continue;
+                    };
+                    let text = text.trim();
+                    if text.starts_with(".globl ")
+                        || text.starts_with(".type ")
+                        || text.starts_with(".size ")
+                        || text.ends_with(':')
+                        || (!text.starts_with('.') && address.split_whitespace().count() == 2)
+                    {
+                        expanded.push_str(text);
+                        expanded.push('\n');
+                    }
+                }
+                expanded.push_str(".section .note.GNU-stack,\"\",@progbits\n");
+                assert!(
+                    !expanded.contains(".macro")
+                        && !expanded.contains(".if")
+                        && !expanded.contains('\\')
+                );
+                expanded
+            } else {
+                std::fs::read_to_string(fixtures.join(source)).unwrap()
+            };
+            assert_eq!(
+                original
+                    .lines()
+                    .filter(|line| line.starts_with(".type "))
+                    .count(),
+                functions
+            );
+            // A positive control proves this is an active optimizing pipeline,
+            // not an identity wrapper which merely assembles the fixtures.
+            original.push_str(".text\n.globl pipeline_positive\n.type pipeline_positive,@function\npipeline_positive:\n.cfi_startproc\n    movq %rax, %rax\n    ret\n.cfi_endproc\n.size pipeline_positive,.-pipeline_positive\n");
+            let optimized = run(&original);
+            assert!(
+                !optimized.contains("movq %rax, %rax"),
+                "pipeline must remove positive-control self-copy"
+            );
+            let mut baseline = None;
+            for (stage, code) in [("original", original), ("optimized", optimized)] {
+                std::fs::write(assembly.path(), &code).unwrap();
+                let built = Command::new("gcc")
+                    .args(["-Werror", "-o"])
+                    .arg(binary.path())
+                    .arg(fixtures.join(driver))
+                    .arg(assembly.path())
+                    .output()
+                    .expect("GCC architectural fixture driver");
+                assert!(
+                    built.status.success(),
+                    "{source} {stage}: {}",
+                    String::from_utf8_lossy(&built.stderr)
+                );
+                let result = Command::new(binary.path()).output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "{source} {stage}: {}\n{code}",
+                    String::from_utf8_lossy(&result.stdout)
+                );
+                if let Some(expected) = &baseline {
+                    assert_eq!(
+                        &result.stdout, expected,
+                        "original and deliberate-mutant results survive optimization"
+                    );
+                } else {
+                    baseline = Some(result.stdout);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn pr824_external_redteam_masked_copy_is_not_an_unconditional_relation() {
         assert!(parse_vec_copy("vmovapd %xmm6, %xmm7{%k1}").is_none());
         assert!(parse_vec_copy("vmovapd %ymm6, %ymm7{%k1}{z}").is_none());
@@ -1408,6 +1657,121 @@ mod tests {
             })
             .map(|l| l.trim().to_string())
             .collect()
+    }
+
+    #[test]
+    fn pr832_merge_forwarding_requires_a_narrow_result_and_cfg_deadness() {
+        for (copy, op, extract) in [
+            ("movsd", "vaddsd", "movq %xmm10, %rax"),
+            ("movss", "vaddss", "movd %xmm10, %eax"),
+        ] {
+            for (tail, allowed) in [
+                (format!("{extract}\n    ret"), true),
+                ("movupd %xmm10, (%rdi)\n    ret".into(), false),
+                (format!("{extract}\n    fxsave (%rdi)\n    ret"), false),
+                (format!("{extract}\n    jmp .Lobserve"), false),
+                (format!("{extract}\n    jmp *%rdi"), false),
+            ] {
+                let asm = body(&format!(
+                    ".Lobserve:\n    movupd %xmm10, (%rdi)\n    {copy} %xmm0, %xmm10\n    {op} %xmm1, %xmm10, %xmm10\n    {tail}\n"
+                ));
+                let mut store = LineStore::new(asm);
+                let mut infos: Vec<_> = (0..store.len())
+                    .map(|i| classify_line(store.get(i)))
+                    .collect();
+                assert_eq!(
+                    propagate_vector_copies(&mut store, &mut infos),
+                    allowed,
+                    "{copy}: {tail}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pr832_narrow_merge_must_preserve_returns_and_intermediate_bits() {
+        for (register, copy, op, tail) in [
+            (0, "movsd", "vaddsd", "movq %xmm0, %rax\n    ret"),
+            (10, "movss", "vaddss", "movq %xmm10, %rax\n    ret"),
+            (
+                10,
+                "movsd",
+                "vaddsd",
+                "vaddsd %xmm1, %xmm10, %xmm4\n    movupd %xmm4, (%rdi)\n    ret",
+            ),
+            (0, "movsd", "vaddsd", "call external\n    ret"),
+        ] {
+            let asm = body(&format!(
+                "    # LCCC_RET_XMM 1\n    {copy} %xmm5, %xmm{register}\n    {op} %xmm1, %xmm{register}, %xmm{register}\n    {tail}\n"
+            ));
+            let mut store = LineStore::new(asm);
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            assert!(!propagate_vector_copies(&mut store, &mut infos), "{tail}");
+        }
+    }
+
+    #[test]
+    fn pr832_return_fold_ignores_only_unreachable_earlier_wide_readers() {
+        for tail in [
+            "ret",
+            "vmovupd %xmm0, (%rdi)\n    ret",
+            "jne .Lagain\n    ret",
+        ] {
+            let asm = body(&format!(
+                ".Lagain:\n    vaddpd %xmm0, %xmm1, %xmm1\n    vaddsd %xmm2, %xmm3, %xmm4\n    movsd %xmm4, %xmm0\n    {tail}\n"
+            ));
+            let mut store = LineStore::new(asm);
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            assert_eq!(
+                retarget_vex_result(&mut store, &mut infos),
+                tail == "ret",
+                "{tail}"
+            );
+        }
+    }
+
+    #[test]
+    fn pr832_narrow_bracket_cannot_export_unestablished_upper_bits() {
+        let asm = body(
+            "    movss %xmm0, %xmm2\n    vaddss %xmm1, %xmm2, %xmm2\n    movapd %xmm2, %xmm0\n    ret\n",
+        );
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(!coalesce_vector_brackets(&mut store, &mut infos));
+    }
+
+    #[test]
+    fn pr832_scalar_merge_sources_are_not_narrow_copy_equivalents() {
+        for (copy, op) in [("movsd", "vaddsd"), ("movss", "vaddss")] {
+            let asm = body(&format!(
+                "    {copy} %xmm0, %xmm3\n    {op} %xmm2, %xmm3, %xmm4\n    vmovupd %xmm4, (%rdi)\n    ret\n"
+            ));
+            let mut store = LineStore::new(asm);
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            assert!(
+                !propagate_vector_copies(&mut store, &mut infos),
+                "merging upper bits are distinct"
+            );
+            let asm = body(&format!(
+                "    {copy} %xmm0, %xmm3\n    {op} %xmm3, %xmm2, %xmm4\n    vmovupd %xmm4, (%rdi)\n    ret\n"
+            ));
+            let mut store = LineStore::new(asm);
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            assert!(
+                propagate_vector_copies(&mut store, &mut infos),
+                "low data operand still propagates"
+            );
+        }
     }
 
     #[test]
@@ -1614,11 +1978,14 @@ mod tests {
 
     #[test]
     fn mention_widths_follow_the_mnemonic_not_the_spelling() {
-        // Scalar forms touch one lane; packed forms touch the spelling.
-        assert_eq!(vec_mention_width("vaddsd %xmm3, %xmm2, %xmm2", 2), W64);
+        // Scalar DATA inputs touch one lane; merge inputs and outputs touch
+        // all 128 bits. The old suffix-only expectations hid a wrong-code bug.
+        assert_eq!(vec_mention_width("vaddsd %xmm3, %xmm2, %xmm2", 2), W128);
+        assert_eq!(vec_mention_width("vaddsd %xmm3, %xmm2, %xmm2", 3), W64);
         assert_eq!(vec_mention_width("vaddpd %xmm3, %xmm2, %xmm2", 2), W128);
         assert_eq!(vec_mention_width("vaddpd %ymm3, %ymm2, %ymm2", 2), W256);
-        assert_eq!(vec_mention_width("vaddss %xmm3, %xmm2, %xmm2", 2), W32);
+        assert_eq!(vec_mention_width("vaddss %xmm3, %xmm2, %xmm2", 2), W128);
+        assert_eq!(vec_mention_width("vaddss %xmm3, %xmm2, %xmm2", 3), W32);
         assert_eq!(vec_mention_width("vaddsd %xmm3, %xmm2, %xmm2", 4), 0);
         // Conversions are mixed-width, so they answer with the full spelling:
         // under-reporting a read is the unsound direction.
@@ -1862,10 +2229,9 @@ mod tests {
             "the temporary still has a use outside the bracket: {out:?}"
         );
         // And a temporary read BEFORE the bracket is equally disqualifying for
-        // the rename.  Propagation still shortens the interior, the copy-in
-        // dies, and the result retarget then computes the rounding straight
-        // into %xmm0 -- legal because the earlier read of %xmm2 ran before
-        // any of this and is untouched, and %xmm2 is dead afterwards.
+        // the rename. The result retarget still removes the copy-out, but
+        // a narrow copy is NOT a full-width identity for the VEX merge input.
+        // Preserve the copy-in until a distinct upper-lane death proof exists.
         let asm2 = body(
             "    vaddsd %xmm2, %xmm1, %xmm1\n    movsd %xmm0, %xmm2\n    vroundsd $9, %xmm2, %xmm2, %xmm2\n    movsd %xmm2, %xmm0\n    ret\n",
         );
@@ -1874,10 +2240,11 @@ mod tests {
             out,
             vec![
                 "vaddsd %xmm2, %xmm1, %xmm1",
-                "vroundsd $9, %xmm0, %xmm0, %xmm0",
+                "movsd %xmm0, %xmm2",
+                "vroundsd $9, %xmm2, %xmm2, %xmm0",
                 "ret"
             ],
-            "the pre-bracket read is untouched and the rounding lands in %xmm0: {out:?}"
+            "retain the unproved merge input; pre-bracket read is untouched: {out:?}"
         );
         // The bracket coalescer on its own must refuse (rule 4): renaming
         // %xmm2 onto %xmm0 would make the earlier read see the wrong register.

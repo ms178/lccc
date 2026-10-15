@@ -799,6 +799,15 @@ pub(super) fn known_explicit_vector_inputs(mn: &str, operands: &str) -> bool {
             base,
             "movsd"
                 | "movss"
+                | "movntdq"
+                | "movntdqa"
+                | "movntps"
+                | "movntpd"
+                | "pextrb"
+                | "pextrw"
+                | "pextrd"
+                | "pextrq"
+                | "extractps"
                 | "cvtsi2sd"
                 | "cvtsi2sdq"
                 | "cvtsi2sdl"
@@ -1468,6 +1477,19 @@ fn upper_effect(t: &str) -> Effect {
         }
     }
     Effect { reads, writes }
+}
+
+/// Upper-register projection shared with final VEX promotion. A source's
+/// implicit XSAVE observation is just as real as an explicit YMM/ZMM read;
+/// a flag-only VEX instruction never kills its last textual operand.
+pub(super) fn upper_vector_access_line(t: &str) -> (u32, u32) {
+    let (mn, operands) = split_mnemonic(t);
+    let effect = upper_effect(t);
+    let reads = effect.reads | implicit_fp_reads(mn, operands, xmm_mentions(t));
+    let read_mask = (reads >> YMM_HIGH_SHIFT) | (reads >> ZMM_HIGH_SHIFT);
+    // Promotion can change BOTH regions, so only a full kill absorbs a path.
+    let write_mask = (effect.writes >> YMM_HIGH_SHIFT) & (effect.writes >> ZMM_HIGH_SHIFT);
+    ((read_mask & XMM_ALL) as u32, (write_mask & XMM_ALL) as u32)
 }
 
 /// Analyse one function.
