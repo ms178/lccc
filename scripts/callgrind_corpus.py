@@ -50,7 +50,7 @@ def main(argv=None):
                 continue
             directory = args.out / item.name
             directory.mkdir(exist_ok=True)
-            flags = "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm " + sizes[item.name]
+            flags = "-std=gnu17 -O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm " + sizes[item.name]
             command = [args.mine, args.ref, "--opt=" + flags, bench.source_for(item).stem,
                        "--out-root", str(directory), "--instrument-timeout", "60",
                        "--gcc-include-command", args.gcc_include_command]

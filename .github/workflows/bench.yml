@@ -96,6 +96,7 @@ jobs:
             --lccc target/fastbuild/lccc \
             --compilers lccc,gcc \
             --gcc gcc-16 \
+            --cflag=-std=gnu17 \
             --reps 9 \
             --warmup 1 \
             --artifact-dir bench-artifacts \

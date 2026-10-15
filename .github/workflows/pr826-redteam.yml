@@ -86,8 +86,8 @@ jobs:
       run: python3 tests/regression/check_pr824_boundaries.py --lccc target/fastbuild/lccc --cross --json target/redteam/boundaries.json
     - name: Screen every registered workload at O2 and O3
       run: |
-        python3 tests/benchmark/run_benchmarks.py --compilers lccc,gcc,clang --gcc gcc-16 --opt=-O2 --skip-perf --strict --json target/redteam/corpus-o2.json
-        python3 tests/benchmark/run_benchmarks.py --compilers lccc,gcc,clang --gcc gcc-16 --opt=-O3 --skip-perf --strict --json target/redteam/corpus-o3.json
+        python3 tests/benchmark/run_benchmarks.py --compilers lccc,gcc,clang --gcc gcc-16 --opt=-O2 --cflag=-std=gnu17 --skip-perf --strict --json target/redteam/corpus-o2.json
+        python3 tests/benchmark/run_benchmarks.py --compilers lccc,gcc,clang --gcc gcc-16 --opt=-O3 --cflag=-std=gnu17 --skip-perf --strict --json target/redteam/corpus-o3.json
     - name: Publish compact API-readable result provenance
       if: always()
       run: |
@@ -209,7 +209,7 @@ jobs:
           --gcc gcc-16 --clang clang --compilers lccc,gcc,clang \
           --candidate pr835="$GITHUB_WORKSPACE/target/compiler-comparison/pr835" \
           --candidate prior="$GITHUB_WORKSPACE/target/compiler-comparison/prior" \
-          --opt=-O2 --cflag=-march=x86-64-v3 --cflag=-fwrapv \
+          --opt=-O2 --cflag=-std=gnu17 --cflag=-march=x86-64-v3 --cflag=-fwrapv \
           --reps 9 --warmup 1 --strict --no-pmu-probe \
           --json target/compiler-comparison/native.json \
           --markdown target/compiler-comparison/native.md \
@@ -228,7 +228,7 @@ jobs:
           --gcc gcc-16 --clang clang --compilers lccc,gcc,clang \
           --candidate pr835="$GITHUB_WORKSPACE/target/compiler-comparison/pr835" \
           --candidate prior="$GITHUB_WORKSPACE/target/compiler-comparison/prior" \
-          --opt=-O3 --cflag=-march=x86-64-v3 --cflag=-fwrapv \
+          --opt=-O3 --cflag=-std=gnu17 --cflag=-march=x86-64-v3 --cflag=-fwrapv \
           --skip-perf --strict --no-pmu-probe \
           --json target/compiler-comparison/correctness-o3.json
     - name: Publish all O3 correctness comparisons

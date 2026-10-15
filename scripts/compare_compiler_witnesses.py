@@ -39,9 +39,9 @@ def cases():
             ('strict_recip_traps', ('-ftrapping-math', '-ffp-contract=off', '-march=x86-64-v3', '-lm')),
             ('strict_packed_recip_bits', ('-fwrapv', '-ffp-contract=off', '-march=x86-64-v3')),
         ):
-            yield name + '/' + opt[1:], name, (opt, *flags), ()
+            yield name + '/' + opt[1:], name, ('-std=gnu17', opt, *flags), ()
         for which in range(4):
-            yield f'wrapv_domains/{opt[1:]}/{which}', 'wrapv_domains', (opt, '-fwrapv'), (str(which),)
+            yield f'wrapv_domains/{opt[1:]}/{which}', 'wrapv_domains', ('-std=gnu17', opt, '-fwrapv'), (str(which),)
 
 
 def execute(command, directory, environment, timeout):
@@ -80,7 +80,7 @@ def main(argv=None):
         parser.error('--require names an unregistered compiler')
     args.out.mkdir(parents=True, exist_ok=True)
     report = {'complete': False, 'metric': 'native correctness; NOT performance',
-              'control_policy': 'independent GCC at -O0; identical language, FP and target flags; candidates retain their requested optimization levels',
+              'control_policy': 'independent GCC at -O0; explicit GNU C17 and identical FP/target flags; candidates retain their requested optimization levels',
               'compilers': {}, 'cases': [], 'summary': {}, 'required': args.require}
 
     def save():

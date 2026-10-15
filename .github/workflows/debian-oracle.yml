@@ -71,6 +71,7 @@ jobs:
         run: |
           python3 tests/benchmark/run_benchmarks.py \
             --lccc target/fastbuild/lccc --gcc gcc-16 --compilers lccc,gcc \
+            --cflag=-std=gnu17 \
             --skip-perf --no-pmu-probe --strict \
             --artifact-dir debian-artifacts --json debian-results.json \
             --markdown debian-summary.md

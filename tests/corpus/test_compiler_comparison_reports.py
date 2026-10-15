@@ -198,6 +198,7 @@ class NativeWitnesses(unittest.TestCase):
         self.assertEqual(len(cases), 65)
         self.assertEqual(len({case[0] for case in cases}), 65)
         for _, source, flags, _ in cases:
+            self.assertIn('-std=gnu17', flags)
             self.assertTrue((ROOT / 'tests/regression' / (source + '.c')).is_file())
             if source.startswith('wrapv_'):
                 self.assertIn('-fwrapv', flags)

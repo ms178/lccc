@@ -29,9 +29,11 @@ The regression authority is
 `tests/corpus/test_benchmark_comparison_safety.py`. The baseline Python corpus
 passed 545 tests with five skips; the competing tree passed 582 with four skips.
 Test counts are not interchangeable coverage or quality scores. The corrected
-tree's full corpus passed 613 tests in 84.621 seconds with five explicit skips;
-the focused safety/report/publication suite passed all 37 tests. The strict CI/local parity
-mutation suite passed all 73 tests.
+tree's full corpus passed 613 tests in 84.463 seconds with five explicit skips;
+the focused safety/report/publication suite passed all 37 tests. Twenty
+compiler-independent local gate commands passed, including the audit census,
+import scanner, documentation links, resource checks and corpus. The strict
+CI/local parity mutation suite passed all 73 tests.
 
 An expanded 11-method replay includes all **1,296** combinations of bounded
 warm-up/timed, control/candidate states: absent, correct, different, failed,
@@ -56,6 +58,39 @@ semantic matrix explicitly uses an unoptimized independent GCC control and
 records the optimized GCC arm separately. It does **not** establish GCC 16.2
 behavior or LCCC correctness. GCC's pragma support must not be assumed merely
 because it is the reference compiler.
+
+## Source-qualified hosted semantic screen
+
+The [completed semantic stage](https://github.com/ms178/lccc/actions/runs/38793747389/job/116624973791)
+used final source `c8ea67fb9eec195f5db958eea93ca6c35a0f4d2d`, main
+`84a62201cc90a41c9a0eefe2faf5196f43370cfa`, PR #835's exact source above,
+and the PR #836 input. Its witness index SHA256 is
+`9bb7da9b4b669b6f2263735305e32c7dae3ed8d7ac97979b46e570c377837ac2`.
+
+| Arm | Pass | Fail |
+|---|---:|---:|
+| Independent Debian GCC 16.2 at O0 | 65 | 0 |
+| Final compiler in this screen | 65 | 0 |
+| Main | 31 | 34 |
+| PR #835 | 35 | 30 |
+| PR #836 input | 65 | 0 |
+| Separately recorded optimized GCC 16.2 | 60 | 5 |
+
+Main and PR #835 both fail 15 macro/enumerator cases, five wrapping byte-address
+cases and ten FP-environment cases. Main additionally fails two strict trap-order
+and two wrapping-domain cases. Optimized GCC fails four discarded-division
+exception cases and one strict first-trap-order case. Those are failures of the
+**requested observable-FP contract**, not a general claim about GCC's supported
+pragma semantics or overall quality. Zero failures in 65 bounded cases is not
+proof of exhaustive correctness or a performance result.
+
+Only this semantic stage completed: the job was cancelled during native timing.
+It also used compiler-default dialects. The acceptance measurements now explicitly
+select **GNU C17** for every arm in semantic, native, static and Callgrind inputs;
+GCC 16's newer GNU23 default must not silently differ from LCCC's GNU17 default.
+A local explicit-GNU17 replay again passes all 65 GCC 12 O0 controls and retains
+its four optimized-GCC failures and nonzero runner status. This does not replace
+the new hosted comparison or validate LCCC locally.
 
 ## Existing hosted screening: evidence, not a new timing experiment
 
@@ -191,7 +226,7 @@ GCC controls, fewer than seven actual pairs, and either median below 20 ms.
 Excluded rows remain in the correctness inventory. Hosted wall times are VM
 screening, never bare-metal performance or proof of universal superiority.
 
-## Environment and remaining acceptance criteria
+## Environment and acceptance criteria
 
 The local sandbox is Debian 12 with GCC 12.2; Rust, Clang, Valgrind and hardware
 PMU access are unavailable. The repository swap script activated a real 2 GiB

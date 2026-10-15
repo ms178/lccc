@@ -21,11 +21,11 @@ work is consolidated onto the new base; it is not a blanket “ours” resolutio
   the new contract. Retain the other new reduction/CFG tests unchanged.
 - Clarify the packed intrinsic as one scalar F64 result, with four signed I32
   lanes occupying exactly 128 bits and ordered, unreassociated FP operations.
-- The integrity catalog covered a living `engineering/PR831-AUDIT.md` that our
-  branch had extended. Preserve the **byte-identical upstream original** under
-  `engineering/evidence/pr832-originals/PR831-AUDIT.md`, relocate only that catalog
-  path, and retain its original byte count/SHA256. Do not bless modified bytes
-  by replacing the expected hash. The other 68 catalog entries stay in place.
+- Keep the **byte-identical protected upstream original** at its canonical
+  `engineering/PR831-AUDIT.md` path. The independently extended report is retained
+  separately as `engineering/PR831-COMPILER-AUDIT.md`. All 69 catalog entries keep
+  their original byte counts, hashes and canonical scope; modified prose must
+  not replace a frozen record or require blessing new expected hashes.
 
 ## Forwarding phase-order regression
 
