@@ -1,0 +1,496 @@
+{
+  "complete": true,
+  "metric": "whole-TU static instructions; NOT runtime or spill causality",
+  "selected": [
+    "binary_trees",
+    "byte_load_reassembly",
+    "expat_siphash24",
+    "expat_xml_scan",
+    "linux_find_bit",
+    "linux_find_bit_scaled",
+    "lz4_match_extend",
+    "mandelbrot",
+    "sha256_transform",
+    "sieve",
+    "spectral_norm",
+    "sqlite_varint",
+    "strlen_bench",
+    "switch_dispatch",
+    "zlib_ng_adler32_combine"
+  ],
+  "header_provider": {
+    "command": "gcc-16",
+    "version": "gcc-16 (Debian 16.2.0-3) 16.2.0\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+    "include": "/usr/lib/gcc/x86_64-linux-gnu/16/include"
+  },
+  "results": {
+    "sieve": {
+      "source": "/home/user/lccc/tests/benchmark/programs/sieve.c",
+      "source_sha256": "2fd99e297a95711800c1bf4b2facd7e5e09efa740b113c86837e3d0cd22f069b",
+      "tags": [
+        "synthetic",
+        "memory",
+        "loop"
+      ],
+      "extra_flags": [],
+      "arguments": [
+        "/home/user/lccc/tests/benchmark/programs/sieve.c",
+        "--local",
+        "/home/user/.cache/pr824-s17-tools/lccc",
+        "--flags",
+        "-O2 -march=x86-64-v3 -fwrapv",
+        "--local-flags",
+        "-O2 -march=x86-64-v3 -fwrapv -I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "--all-functions",
+        "--jobs",
+        "1",
+        "--json",
+        "/home/user/.cache/pr824-oracle-restored/sieve/result.json",
+        "--artifact-dir",
+        "/home/user/.cache/pr824-oracle-restored/sieve/artifacts",
+        "--oracles",
+        "gcc16.2,clang23.1,icx"
+      ],
+      "report": "/home/user/.cache/pr824-oracle-restored/sieve/result.json",
+      "exit_code": 0
+    },
+    "binary_trees": {
+      "source": "/home/user/lccc/tests/benchmark/programs/binary_trees.c",
+      "source_sha256": "0a19ef11ab58e32a6ef0ecb8703a856347ba295d2bca67bbe20dfa5243251dc0",
+      "tags": [
+        "synthetic",
+        "allocation",
+        "recursion"
+      ],
+      "extra_flags": [],
+      "arguments": [
+        "/home/user/lccc/tests/benchmark/programs/binary_trees.c",
+        "--local",
+        "/home/user/.cache/pr824-s17-tools/lccc",
+        "--flags",
+        "-O2 -march=x86-64-v3 -fwrapv",
+        "--local-flags",
+        "-O2 -march=x86-64-v3 -fwrapv -I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "--all-functions",
+        "--jobs",
+        "1",
+        "--json",
+        "/home/user/.cache/pr824-oracle-restored/binary_trees/result.json",
+        "--artifact-dir",
+        "/home/user/.cache/pr824-oracle-restored/binary_trees/artifacts",
+        "--oracles",
+        "gcc16.2,clang23.1,icx"
+      ],
+      "report": "/home/user/.cache/pr824-oracle-restored/binary_trees/result.json",
+      "exit_code": 0
+    },
+    "spectral_norm": {
+      "source": "/home/user/lccc/tests/benchmark/programs/spectral_norm.c",
+      "source_sha256": "21a48dccebcbc3b9496263f62df260d278051c3cd1a528ed99c8b66bef481e6a",
+      "tags": [
+        "synthetic",
+        "fp",
+        "loop"
+      ],
+      "extra_flags": [
+        "-lm"
+      ],
+      "arguments": [
+        "/home/user/lccc/tests/benchmark/programs/spectral_norm.c",
+        "--local",
+        "/home/user/.cache/pr824-s17-tools/lccc",
+        "--flags",
+        "-O2 -march=x86-64-v3 -fwrapv -lm",
+        "--local-flags",
+        "-O2 -march=x86-64-v3 -fwrapv -lm -I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "--all-functions",
+        "--jobs",
+        "1",
+        "--json",
+        "/home/user/.cache/pr824-oracle-restored/spectral_norm/result.json",
+        "--artifact-dir",
+        "/home/user/.cache/pr824-oracle-restored/spectral_norm/artifacts",
+        "--oracles",
+        "gcc16.2,clang23.1,icx"
+      ],
+      "report": "/home/user/.cache/pr824-oracle-restored/spectral_norm/result.json",
+      "exit_code": 0
+    },
+    "mandelbrot": {
+      "source": "/home/user/lccc/tests/benchmark/programs/mandelbrot.c",
+      "source_sha256": "3f9d3a3e0da962e5a1840790ebf46fa09f38cd5e758645c8c65625fa9882555c",
+      "tags": [
+        "synthetic",
+        "fp",
+        "branch"
+      ],
+      "extra_flags": [],
+      "arguments": [
+        "/home/user/lccc/tests/benchmark/programs/mandelbrot.c",
+        "--local",
+        "/home/user/.cache/pr824-s17-tools/lccc",
+        "--flags",
+        "-O2 -march=x86-64-v3 -fwrapv",
+        "--local-flags",
+        "-O2 -march=x86-64-v3 -fwrapv -I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "--all-functions",
+        "--jobs",
+        "1",
+        "--json",
+        "/home/user/.cache/pr824-oracle-restored/mandelbrot/result.json",
+        "--artifact-dir",
+        "/home/user/.cache/pr824-oracle-restored/mandelbrot/artifacts",
+        "--oracles",
+        "gcc16.2,clang23.1,icx"
+      ],
+      "report": "/home/user/.cache/pr824-oracle-restored/mandelbrot/result.json",
+      "exit_code": 0
+    },
+    "strlen_bench": {
+      "source": "/home/user/lccc/tests/benchmark/programs/strlen_bench.c",
+      "source_sha256": "175202f59218fa62a3120f9f5202a005f5e234f2cbabd453048d933082e0dd44",
+      "tags": [
+        "synthetic",
+        "string",
+        "memory"
+      ],
+      "extra_flags": [],
+      "arguments": [
+        "/home/user/lccc/tests/benchmark/programs/strlen_bench.c",
+        "--local",
+        "/home/user/.cache/pr824-s17-tools/lccc",
+        "--flags",
+        "-O2 -march=x86-64-v3 -fwrapv",
+        "--local-flags",
+        "-O2 -march=x86-64-v3 -fwrapv -I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "--all-functions",
+        "--jobs",
+        "1",
+        "--json",
+        "/home/user/.cache/pr824-oracle-restored/strlen_bench/result.json",
+        "--artifact-dir",
+        "/home/user/.cache/pr824-oracle-restored/strlen_bench/artifacts",
+        "--oracles",
+        "gcc16.2,clang23.1,icx"
+      ],
+      "report": "/home/user/.cache/pr824-oracle-restored/strlen_bench/result.json",
+      "exit_code": 0
+    },
+    "switch_dispatch": {
+      "source": "/home/user/lccc/tests/benchmark/programs/switch_dispatch.c",
+      "source_sha256": "6a044523272024b733f4af8e5101d5bf2d72ba9d6e9362798f6149cd9265117a",
+      "tags": [
+        "synthetic",
+        "switch",
+        "branch"
+      ],
+      "extra_flags": [],
+      "arguments": [
+        "/home/user/lccc/tests/benchmark/programs/switch_dispatch.c",
+        "--local",
+        "/home/user/.cache/pr824-s17-tools/lccc",
+        "--flags",
+        "-O2 -march=x86-64-v3 -fwrapv",
+        "--local-flags",
+        "-O2 -march=x86-64-v3 -fwrapv -I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "--all-functions",
+        "--jobs",
+        "1",
+        "--json",
+        "/home/user/.cache/pr824-oracle-restored/switch_dispatch/result.json",
+        "--artifact-dir",
+        "/home/user/.cache/pr824-oracle-restored/switch_dispatch/artifacts",
+        "--oracles",
+        "gcc16.2,clang23.1,icx"
+      ],
+      "report": "/home/user/.cache/pr824-oracle-restored/switch_dispatch/result.json",
+      "exit_code": 0
+    },
+    "byte_load_reassembly": {
+      "source": "/home/user/lccc/tests/benchmark/programs/byte_load_reassembly.c",
+      "source_sha256": "d98d60eefd244df93fd9f4a828806ce2e32be56aad4872a2672d172b14dda562",
+      "tags": [
+        "synthetic",
+        "endian",
+        "memory",
+        "integer"
+      ],
+      "extra_flags": [],
+      "arguments": [
+        "/home/user/lccc/tests/benchmark/programs/byte_load_reassembly.c",
+        "--local",
+        "/home/user/.cache/pr824-s17-tools/lccc",
+        "--flags",
+        "-O2 -march=x86-64-v3 -fwrapv",
+        "--local-flags",
+        "-O2 -march=x86-64-v3 -fwrapv -I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "--all-functions",
+        "--jobs",
+        "1",
+        "--json",
+        "/home/user/.cache/pr824-oracle-restored/byte_load_reassembly/result.json",
+        "--artifact-dir",
+        "/home/user/.cache/pr824-oracle-restored/byte_load_reassembly/artifacts",
+        "--oracles",
+        "gcc16.2,clang23.1,icx"
+      ],
+      "report": "/home/user/.cache/pr824-oracle-restored/byte_load_reassembly/result.json",
+      "exit_code": 0
+    },
+    "zlib_ng_adler32_combine": {
+      "source": "/home/user/lccc/tests/benchmark/programs/zlib_ng_adler32_combine.c",
+      "source_sha256": "5d9a2ade64019e993686dab352d67dbdc4a009e2e33dd8568beff5c9ac423940",
+      "tags": [
+        "workload",
+        "zlib-ng",
+        "checksum",
+        "integer"
+      ],
+      "extra_flags": [],
+      "arguments": [
+        "/home/user/lccc/tests/benchmark/programs/zlib_ng_adler32_combine.c",
+        "--local",
+        "/home/user/.cache/pr824-s17-tools/lccc",
+        "--flags",
+        "-O2 -march=x86-64-v3 -fwrapv",
+        "--local-flags",
+        "-O2 -march=x86-64-v3 -fwrapv -I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "--all-functions",
+        "--jobs",
+        "1",
+        "--json",
+        "/home/user/.cache/pr824-oracle-restored/zlib_ng_adler32_combine/result.json",
+        "--artifact-dir",
+        "/home/user/.cache/pr824-oracle-restored/zlib_ng_adler32_combine/artifacts",
+        "--oracles",
+        "gcc16.2,clang23.1,icx"
+      ],
+      "report": "/home/user/.cache/pr824-oracle-restored/zlib_ng_adler32_combine/result.json",
+      "exit_code": 0
+    },
+    "expat_xml_scan": {
+      "source": "/home/user/lccc/tests/benchmark/programs/expat_xml_scan.c",
+      "source_sha256": "a076b1823869765011658d56ec090b22102e2ba7a5bbdf4cd0b6bdd0d774cf35",
+      "tags": [
+        "workload",
+        "expat",
+        "parser",
+        "branch"
+      ],
+      "extra_flags": [],
+      "arguments": [
+        "/home/user/lccc/tests/benchmark/programs/expat_xml_scan.c",
+        "--local",
+        "/home/user/.cache/pr824-s17-tools/lccc",
+        "--flags",
+        "-O2 -march=x86-64-v3 -fwrapv",
+        "--local-flags",
+        "-O2 -march=x86-64-v3 -fwrapv -I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "--all-functions",
+        "--jobs",
+        "1",
+        "--json",
+        "/home/user/.cache/pr824-oracle-restored/expat_xml_scan/result.json",
+        "--artifact-dir",
+        "/home/user/.cache/pr824-oracle-restored/expat_xml_scan/artifacts",
+        "--oracles",
+        "gcc16.2,clang23.1,icx"
+      ],
+      "report": "/home/user/.cache/pr824-oracle-restored/expat_xml_scan/result.json",
+      "exit_code": 0
+    },
+    "expat_siphash24": {
+      "source": "/home/user/lccc/tests/benchmark/programs/expat_siphash24.c",
+      "source_sha256": "59c5dfbdf3f0d2e149a3681925c46b7b0aeb195f179c285f3b64a2daaf1fb663",
+      "tags": [
+        "workload",
+        "expat",
+        "hash",
+        "arx",
+        "integer"
+      ],
+      "extra_flags": [],
+      "arguments": [
+        "/home/user/lccc/tests/benchmark/programs/expat_siphash24.c",
+        "--local",
+        "/home/user/.cache/pr824-s17-tools/lccc",
+        "--flags",
+        "-O2 -march=x86-64-v3 -fwrapv",
+        "--local-flags",
+        "-O2 -march=x86-64-v3 -fwrapv -I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "--all-functions",
+        "--jobs",
+        "1",
+        "--json",
+        "/home/user/.cache/pr824-oracle-restored/expat_siphash24/result.json",
+        "--artifact-dir",
+        "/home/user/.cache/pr824-oracle-restored/expat_siphash24/artifacts",
+        "--oracles",
+        "gcc16.2,clang23.1,icx"
+      ],
+      "report": "/home/user/.cache/pr824-oracle-restored/expat_siphash24/result.json",
+      "exit_code": 0
+    },
+    "sqlite_varint": {
+      "source": "/home/user/lccc/tests/benchmark/programs/sqlite_varint.c",
+      "source_sha256": "11c7e09b1507659fe44e678848c5e489268e4dd4aa385d3a542453caa400e1af",
+      "tags": [
+        "workload",
+        "sqlite",
+        "branch",
+        "integer"
+      ],
+      "extra_flags": [],
+      "arguments": [
+        "/home/user/lccc/tests/benchmark/programs/sqlite_varint.c",
+        "--local",
+        "/home/user/.cache/pr824-s17-tools/lccc",
+        "--flags",
+        "-O2 -march=x86-64-v3 -fwrapv",
+        "--local-flags",
+        "-O2 -march=x86-64-v3 -fwrapv -I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "--all-functions",
+        "--jobs",
+        "1",
+        "--json",
+        "/home/user/.cache/pr824-oracle-restored/sqlite_varint/result.json",
+        "--artifact-dir",
+        "/home/user/.cache/pr824-oracle-restored/sqlite_varint/artifacts",
+        "--oracles",
+        "gcc16.2,clang23.1,icx"
+      ],
+      "report": "/home/user/.cache/pr824-oracle-restored/sqlite_varint/result.json",
+      "exit_code": 0
+    },
+    "linux_find_bit": {
+      "source": "/home/user/lccc/tests/benchmark/programs/linux_find_bit.c",
+      "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a",
+      "tags": [
+        "workload",
+        "linux",
+        "bitmap",
+        "bit"
+      ],
+      "extra_flags": [],
+      "arguments": [
+        "/home/user/lccc/tests/benchmark/programs/linux_find_bit.c",
+        "--local",
+        "/home/user/.cache/pr824-s17-tools/lccc",
+        "--flags",
+        "-O2 -march=x86-64-v3 -fwrapv",
+        "--local-flags",
+        "-O2 -march=x86-64-v3 -fwrapv -I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "--all-functions",
+        "--jobs",
+        "1",
+        "--json",
+        "/home/user/.cache/pr824-oracle-restored/linux_find_bit/result.json",
+        "--artifact-dir",
+        "/home/user/.cache/pr824-oracle-restored/linux_find_bit/artifacts",
+        "--oracles",
+        "gcc16.2,clang23.1,icx"
+      ],
+      "report": "/home/user/.cache/pr824-oracle-restored/linux_find_bit/result.json",
+      "exit_code": 0
+    },
+    "linux_find_bit_scaled": {
+      "source": "/home/user/lccc/tests/benchmark/programs/linux_find_bit.c",
+      "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a",
+      "tags": [
+        "workload",
+        "linux",
+        "bitmap",
+        "bit"
+      ],
+      "extra_flags": [
+        "-DPASSES=65536"
+      ],
+      "arguments": [
+        "/home/user/lccc/tests/benchmark/programs/linux_find_bit.c",
+        "--local",
+        "/home/user/.cache/pr824-s17-tools/lccc",
+        "--flags",
+        "-O2 -march=x86-64-v3 -fwrapv -DPASSES=65536",
+        "--local-flags",
+        "-O2 -march=x86-64-v3 -fwrapv -DPASSES=65536 -I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "--all-functions",
+        "--jobs",
+        "1",
+        "--json",
+        "/home/user/.cache/pr824-oracle-restored/linux_find_bit_scaled/result.json",
+        "--artifact-dir",
+        "/home/user/.cache/pr824-oracle-restored/linux_find_bit_scaled/artifacts",
+        "--oracles",
+        "gcc16.2,clang23.1,icx"
+      ],
+      "report": "/home/user/.cache/pr824-oracle-restored/linux_find_bit_scaled/result.json",
+      "exit_code": 0
+    },
+    "sha256_transform": {
+      "source": "/home/user/lccc/tests/benchmark/programs/sha256_transform.c",
+      "source_sha256": "6f55a89cfd9d59eb9a8e115eef968295ec775fa63d0545dd33517c2fdf06bf5e",
+      "tags": [
+        "workload",
+        "crypto",
+        "sha256",
+        "integer"
+      ],
+      "extra_flags": [],
+      "arguments": [
+        "/home/user/lccc/tests/benchmark/programs/sha256_transform.c",
+        "--local",
+        "/home/user/.cache/pr824-s17-tools/lccc",
+        "--flags",
+        "-O2 -march=x86-64-v3 -fwrapv",
+        "--local-flags",
+        "-O2 -march=x86-64-v3 -fwrapv -I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "--all-functions",
+        "--jobs",
+        "1",
+        "--json",
+        "/home/user/.cache/pr824-oracle-restored/sha256_transform/result.json",
+        "--artifact-dir",
+        "/home/user/.cache/pr824-oracle-restored/sha256_transform/artifacts",
+        "--oracles",
+        "gcc16.2,clang23.1,icx"
+      ],
+      "report": "/home/user/.cache/pr824-oracle-restored/sha256_transform/result.json",
+      "exit_code": 0
+    },
+    "lz4_match_extend": {
+      "source": "/home/user/lccc/tests/benchmark/programs/lz4_compress.c",
+      "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4",
+      "tags": [
+        "workload",
+        "lz4",
+        "compression",
+        "byte-compare"
+      ],
+      "extra_flags": [
+        "-DMATCH_RICH=1",
+        "-DPASSES=2048"
+      ],
+      "arguments": [
+        "/home/user/lccc/tests/benchmark/programs/lz4_compress.c",
+        "--local",
+        "/home/user/.cache/pr824-s17-tools/lccc",
+        "--flags",
+        "-O2 -march=x86-64-v3 -fwrapv -DMATCH_RICH=1 -DPASSES=2048",
+        "--local-flags",
+        "-O2 -march=x86-64-v3 -fwrapv -DMATCH_RICH=1 -DPASSES=2048 -I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "--all-functions",
+        "--jobs",
+        "1",
+        "--json",
+        "/home/user/.cache/pr824-oracle-restored/lz4_match_extend/result.json",
+        "--artifact-dir",
+        "/home/user/.cache/pr824-oracle-restored/lz4_match_extend/artifacts",
+        "--oracles",
+        "gcc16.2,clang23.1,icx"
+      ],
+      "report": "/home/user/.cache/pr824-oracle-restored/lz4_match_extend/result.json",
+      "exit_code": 0
+    }
+  },
+  "failures": []
+}

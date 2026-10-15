@@ -3325,12 +3325,35 @@ my_start:
                     f"(want (0, '1\\n'))")
             # GNU ld must agree.
             r2 = sh(["ld", "-T", "t.lds", "entry.o", obj, access_obj, "-o", "ref." + model], cwd=td)
+            if r2.returncode != 0:
+                return Result(name, "FAIL", model + ": GNU ld control failed: " + r2.stderr.decode()[:300])
             if r2.returncode == 0:
                 code2, out2 = run_bin(os.path.join(td, "ref." + model), [], td)
                 if (code, out) != (code2, out2):
                     return Result(name, "FAIL",
                         f"{model}: lccc {(code, out)!r} != GNU ld {(code2, out2)!r}")
-        return Result(name, "PASS")
+            # Sensitivity control: the reader must actually observe the TLS
+            # template, not merely return success after installing a TCB.
+            data = bytearray(open(os.path.join(td, out_b), "rb").read())
+            sections = _elf_bytes_shdrs(data)
+            tdata = next((h for h in sections or [] if h[0] == ".tdata"), None)
+            if tdata is None:
+                return Result(name, "FAIL", model + ": missing TLS template")
+            off, size = tdata[4], tdata[5]
+            template = data[off:off + size]
+            needle = (11).to_bytes(4, "little")
+            if template.count(needle) != 1:
+                return Result(name, "FAIL", model + ": ambiguous TLS poison site")
+            site = off + template.index(needle)
+            data[site:site + 4] = (10).to_bytes(4, "little")
+            poisoned = os.path.join(td, "poison." + model)
+            with open(poisoned, "wb") as f:
+                f.write(data)
+            os.chmod(poisoned, 0o755)
+            bad = run_bin(poisoned, [], td)
+            if bad != (1, "0\n"):
+                return Result(name, "FAIL", f"{model}: TLS poison insensitive: {bad!r}")
+        return Result(name, "PASS", "GD/LD native + GNU ld controls + two TLS poisons")
     except Exception as e:
         return Result(name, "FAIL", f"harness exception: {e!r}")
     finally:
@@ -6674,6 +6697,27 @@ def _relro_nobits_pad_test(args, oracles):
                       % (r_fsz, r_msz, w2[2], w2[3]))
 
 
+def _note_gap_has_payload(shdrs, start, end):
+    """Alignment holes may join notes; allocated non-note file bytes may not."""
+    return any(h[1] not in (_SHT_NOTE, 8) and h[2] & 2 and h[5] > 0
+               and h[4] < end and start < h[4] + h[5] for h in shdrs)
+
+
+def _note_run_oracle_test(args, oracles):
+    name = "note_run_oracle_contract"
+    # name, type, flags, address, offset, size, alignment
+    payload = (".rodata", 1, 2, 0x2748, 0x748, 7, 4)
+    cases = [([], False), ([payload], True),
+             ([(".bss", 8, 2, 0x2748, 0x748, 7, 4)], False),
+             ([(".debug", 1, 0, 0, 0x748, 7, 4)], False),
+             ([(".rodata", 1, 2, 0x2750, 0x750, 7, 4)], False),
+             ([(".rodata", 1, 2, 0x2744, 0x744, 4, 4)], False)]
+    for sections, expected in cases:
+        if _note_gap_has_payload(sections, 0x748, 0x750) != expected:
+            return Result(name, "FAIL", "padding/payload distinction: " + repr(sections))
+    return Result(name, "PASS", "six padding/payload boundary controls")
+
+
 def _note_run_merge_test(args, oracles):
     """Contiguous allocated note sections share ONE PT_NOTE (lld-style).
 
@@ -6712,11 +6756,12 @@ def _note_run_merge_test(args, oracles):
         if len(notes) < 2:
             return Result(name, "SKIP", "fixture has <2 note sections")
         # Independent expectation: maximal runs allowing <= 8-byte alignment
-        # gaps (section alignment inside a span is legal for one PT_NOTE).
+        # holes, NOT an intervening allocated non-note payload. The old size-
+        # only heuristic mistook a seven-byte .rodata section for padding.
         runs = 1
         prev_end = notes[0][1] + notes[0][2]
         for _, off, sz, _al in notes[1:]:
-            if off - prev_end > 8:
+            if off - prev_end > 8 or _note_gap_has_payload(shdrs, prev_end, off):
                 runs += 1
             prev_end = max(prev_end, off + sz)
         ptn = [p for p in phdrs if p[0] == _PT_NOTE]
@@ -6729,11 +6774,13 @@ def _note_run_merge_test(args, oracles):
             if fsz != msz:
                 return Result(name, "FAIL", "PT_NOTE fsz %#x != msz %#x"
                               % (fsz, msz))
+            if _note_gap_has_payload(shdrs, off, off + fsz):
+                return Result(name, "FAIL", "PT_NOTE includes non-note payload")
             covered.append((off, off + fsz))
         covered.sort()
         for _, off, sz, _ in notes:
-            if not any(lo <= off and off + sz <= hi for lo, hi in covered):
-                return Result(name, "FAIL", "note section at %#x not covered"
+            if sum(lo <= off and off + sz <= hi for lo, hi in covered) != 1:
+                return Result(name, "FAIL", "note section at %#x not covered exactly once"
                               % off)
         props = [p for p in phdrs if p[0] == _PT_GNU_PROPERTY]
         prop_secs = [h for h in shdrs if h[0] == ".note.gnu.property"]
@@ -11117,6 +11164,7 @@ def _registry(args, oracles):
         one("build_id_note", _build_id_note_test, "notes"),
         one("relro_nobits_pad", _relro_nobits_pad_test, "layout"),
         one("note_run_merge", _note_run_merge_test, "notes"),
+        one("note_run_oracle_contract", _note_run_oracle_test, "notes"),
         one("gnu_hash_sizing", _gnu_hash_sizing_test, "dynamic"),
         one("crossarch_gnu_hash_relro", _crossarch_gnu_hash_relro_test, "dynamic"),
         one("static_pie_refused", _static_pie_refusal_test, "driver"),

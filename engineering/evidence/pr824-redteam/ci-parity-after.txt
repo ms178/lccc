@@ -1,0 +1,1 @@
+CI/local standalone gate parity: PASS (226 commands, 22 registered invocation contracts, 2 mode/corpus-specific asm-diff gates, encdiff corpus gate, contract suites wired to the pinned pair, step semantics guarded, strict full linker suite, hosted steps mirrored)

@@ -11894,9 +11894,7 @@ pub(super) fn fold_shift_into_sib(store: &mut LineStore, infos: &mut [LineInfo])
         let mut j = next_non_debug(store, infos, i + 1, len);
         let mut steps = 0usize;
         let mut add_rest: Option<String> = None;
-        // Debug attribution is not an instruction and cannot consume WINDOW
-        // or be classified as an unknown flag reader. Keep pinned lines opaque.
-        while j < len && steps <= WINDOW && !infos[j].is_barrier() && !infos[j].pinned {
+        while j < len && steps <= WINDOW && !infos[j].is_barrier() {
             let t = infos[j].trimmed(store.get(j));
             if let Some(rest) = t.strip_prefix("addq ") {
                 if rest.contains(&shifted_reg) {

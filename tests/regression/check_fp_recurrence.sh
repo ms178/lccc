@@ -36,10 +36,14 @@ for arch in x86-64 x86-64-v3; do
             "$CCC" -O2 -march="$arch" -ffp-contract=off -S "$src" -o "$work/$arch-$mode.s"
     done
 done
-"$CCC" -O2 -march=x86-64-v3 -ffp-contract=fast -S "$src" -o "$work/contract.s"
+# Contraction is a positive only without an observable FENV. The same explicit
+# fast-contract flag must not override FENV_ACCESS in the semantic fixture.
+shape="$root/tests/regression/fp_recurrence/contract_shape.c"
+"$CCC" -O2 -march=x86-64-v3 -ffp-contract=fast -S "$shape" -o "$work/contract.s"
+"$CCC" -O2 -march=x86-64-v3 -ffp-contract=fast -S "$src" -o "$work/contract-fenv.s"
 for flags in '-march=x86-64' '-march=x86-64-v2' '-march=x86-64-v3 -mno-fma'; do
     # Deliberate word splitting of this fixed test-only flag list.
-    "$CCC" -O2 $flags -ffp-contract=fast -S "$src" -o "$work/no-fma-${flags// /_}.s"
+    "$CCC" -O2 $flags -ffp-contract=fast -S "$shape" -o "$work/no-fma-${flags// /_}.s"
 done
 for mode in on no_square; do
     disabled=""
@@ -109,6 +113,7 @@ assert mul_fma(inner_fp_loop(body('mandel-on.s', 'main'))) == mul_fma(inner_fp_l
 
 for name in ('twice_plus', 'scaled_fma'):
     assert re.search(r'vfmadd\d*sd', body('contract.s', name)), name
+    assert not re.search(r'vfmadd\d*sd', body('contract-fenv.s', name)), (name, 'FENV overrides contraction')
 
 def redundant_edges(file):
     lines = [line.split('#', 1)[0].rstrip() for line in (p / file).read_text().splitlines()]

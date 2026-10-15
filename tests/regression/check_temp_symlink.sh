@@ -179,4 +179,39 @@ if [[ -x $CCC_ARM ]]; then
     cmp -s "$vault/victim.txt" "$vault/victim.expected" || fail "lccc-arm followed a pre-placed symlink"
 fi
 
+# 5. Failure to create a private directory must not revive flat-name attacks.
+# Directory write permission is not needed to follow a pre-existing symlink
+# and overwrite its writable target. A warning followed by fallback is unsafe.
+chmod 0555 "$vault"
+if mkdir "$vault/permission-probe" 2>/dev/null; then
+    rmdir "$vault/permission-probe"
+    chmod 0700 "$vault"
+    echo "SKIP: read-only TMPDIR attack (permission-bypassing privileges)"
+else
+    chmod 0700 "$vault"
+    set +e
+    bash -c '
+        set -e
+        vault=$1; ccc=$2; work=$3; log=$4
+        ln -sf "$vault/victim.txt" "$vault/ccc_$$_a.0.o"
+        ln -sf "$vault/victim.txt" "$vault/ccc_$$_b.1.o"
+        ln -sf "$vault/victim.txt" "$vault/ccc_$$_main.2.o"
+        chmod 0555 "$vault"
+        cd "$work"
+        TMPDIR="$vault" exec "$ccc" -O1 a.c b.c main.c -o refused >"$log" 2>&1
+    ' _ "$vault" "$CCC" "$work" "$tmp/readonly.log"
+    rc=$?
+    set -e
+    chmod 0700 "$vault"
+    cmp -s "$vault/victim.txt" "$vault/victim.expected" \
+        || fail "read-only TMPDIR fallback overwrote the symlink target"
+    [[ $rc -ne 0 ]] || fail "private-directory failure did not stop compilation"
+    if grep -q 'panicked at' "$tmp/readonly.log"; then
+        fail "driver must report a normal temporary-directory error, not panic"
+    fi
+    grep -q 'cannot reserve a secure temporary-file directory' "$tmp/readonly.log" \
+        || { cat "$tmp/readonly.log" >&2; fail "compilation failed for the wrong reason"; }
+    echo "PASS: read-only TMPDIR fails closed without overwriting its symlink target"
+fi
+
 echo "PASS: temp files are symlink-safe (private 0700 directory, victim untouched, no TMPDIR debris)"

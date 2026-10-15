@@ -1,0 +1,1 @@
+PASS: notype-code PLT routing (x86-64 + i386) + notype-data PLTOFF (x86-64)

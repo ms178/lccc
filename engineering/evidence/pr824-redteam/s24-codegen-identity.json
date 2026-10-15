@@ -1,0 +1,949 @@
+{
+  "after": "/home/user/.cache/pr824-s24-tools/lccc",
+  "before": "/home/user/.cache/pr824-s22-rebuilt/target/fastbuild/lccc",
+  "compile_fail": 0,
+  "corpora": [
+    "/home/user/.cache/lccc-work/tests/benchmark/programs"
+  ],
+  "default_flags": "-O2 -march=x86-64-v3 -fwrapv",
+  "different": 0,
+  "elapsed_seconds": 5.939,
+  "explicit_environment": {},
+  "extra": [
+    "-I/usr/lib/gcc/x86_64-linux-gnu/16/include"
+  ],
+  "identical": 58,
+  "identical_pgo_pid": 0,
+  "removed_environment": [],
+  "results": [
+    {
+      "after_canonical_sha256": "c657d0ff20b96500f11b0f5890d6e33804a34aea99a6e39d00955be999b0ebdb",
+      "after_rc": 0,
+      "after_sha256": "c657d0ff20b96500f11b0f5890d6e33804a34aea99a6e39d00955be999b0ebdb",
+      "before_canonical_sha256": "c657d0ff20b96500f11b0f5890d6e33804a34aea99a6e39d00955be999b0ebdb",
+      "before_rc": 0,
+      "before_sha256": "c657d0ff20b96500f11b0f5890d6e33804a34aea99a6e39d00955be999b0ebdb",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000000/aarch64_select_patterns.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "1a1a5fc920ec136b10a871fed2bfcfd7837bb972eb711e7b37348df8d15e6530",
+      "after_rc": 0,
+      "after_sha256": "1a1a5fc920ec136b10a871fed2bfcfd7837bb972eb711e7b37348df8d15e6530",
+      "before_canonical_sha256": "1a1a5fc920ec136b10a871fed2bfcfd7837bb972eb711e7b37348df8d15e6530",
+      "before_rc": 0,
+      "before_sha256": "1a1a5fc920ec136b10a871fed2bfcfd7837bb972eb711e7b37348df8d15e6530",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000001/ackermann.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "6ade006ae82347c7c99647486686f4a45b44f330ea508402059e51f116a0e6c6",
+      "after_rc": 0,
+      "after_sha256": "6ade006ae82347c7c99647486686f4a45b44f330ea508402059e51f116a0e6c6",
+      "before_canonical_sha256": "6ade006ae82347c7c99647486686f4a45b44f330ea508402059e51f116a0e6c6",
+      "before_rc": 0,
+      "before_sha256": "6ade006ae82347c7c99647486686f4a45b44f330ea508402059e51f116a0e6c6",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000002/adler32_do8_hot.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "7c2f5bc5e0ca523ed039fc4d2b4dac12b67fd5421ab999a497e68fd2487ac5dc",
+      "after_rc": 0,
+      "after_sha256": "7c2f5bc5e0ca523ed039fc4d2b4dac12b67fd5421ab999a497e68fd2487ac5dc",
+      "before_canonical_sha256": "7c2f5bc5e0ca523ed039fc4d2b4dac12b67fd5421ab999a497e68fd2487ac5dc",
+      "before_rc": 0,
+      "before_sha256": "7c2f5bc5e0ca523ed039fc4d2b4dac12b67fd5421ab999a497e68fd2487ac5dc",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000003/affine_countdown.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "c6e0a17ef748bc78d24995fb20fe85dce7680c114e00502fccea32c70414503c",
+      "after_rc": 0,
+      "after_sha256": "c6e0a17ef748bc78d24995fb20fe85dce7680c114e00502fccea32c70414503c",
+      "before_canonical_sha256": "c6e0a17ef748bc78d24995fb20fe85dce7680c114e00502fccea32c70414503c",
+      "before_rc": 0,
+      "before_sha256": "c6e0a17ef748bc78d24995fb20fe85dce7680c114e00502fccea32c70414503c",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000004/arith_loop.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "0bfa90086ae2460a11456366d15b2f430b36fc8c16c8291dacffbd9f5a3bc408",
+      "after_rc": 0,
+      "after_sha256": "0bfa90086ae2460a11456366d15b2f430b36fc8c16c8291dacffbd9f5a3bc408",
+      "before_canonical_sha256": "0bfa90086ae2460a11456366d15b2f430b36fc8c16c8291dacffbd9f5a3bc408",
+      "before_rc": 0,
+      "before_sha256": "0bfa90086ae2460a11456366d15b2f430b36fc8c16c8291dacffbd9f5a3bc408",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000005/ascii_case_fold.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "b4b70ffdfd171de2ab378799a82d043fb71285b78306f6878cf99292bc7e538f",
+      "after_rc": 0,
+      "after_sha256": "b4b70ffdfd171de2ab378799a82d043fb71285b78306f6878cf99292bc7e538f",
+      "before_canonical_sha256": "b4b70ffdfd171de2ab378799a82d043fb71285b78306f6878cf99292bc7e538f",
+      "before_rc": 0,
+      "before_sha256": "b4b70ffdfd171de2ab378799a82d043fb71285b78306f6878cf99292bc7e538f",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000006/base64_enc.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "df64424c1eeed2f7b5ff032a2ba14e55a4633335d2755ee0a49f7401d1547a2d",
+      "after_rc": 0,
+      "after_sha256": "df64424c1eeed2f7b5ff032a2ba14e55a4633335d2755ee0a49f7401d1547a2d",
+      "before_canonical_sha256": "df64424c1eeed2f7b5ff032a2ba14e55a4633335d2755ee0a49f7401d1547a2d",
+      "before_rc": 0,
+      "before_sha256": "df64424c1eeed2f7b5ff032a2ba14e55a4633335d2755ee0a49f7401d1547a2d",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000007/binary_search.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "39a41445f704b8c517407cfb50eb2c10c59f55ac6e5272605e6dea30411fed79",
+      "after_rc": 0,
+      "after_sha256": "39a41445f704b8c517407cfb50eb2c10c59f55ac6e5272605e6dea30411fed79",
+      "before_canonical_sha256": "39a41445f704b8c517407cfb50eb2c10c59f55ac6e5272605e6dea30411fed79",
+      "before_rc": 0,
+      "before_sha256": "39a41445f704b8c517407cfb50eb2c10c59f55ac6e5272605e6dea30411fed79",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000008/binary_trees.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "0d802f9220ee4ed872604aff1ecc4cd593d1bb60781446242110bace6109f58a",
+      "after_rc": 0,
+      "after_sha256": "0d802f9220ee4ed872604aff1ecc4cd593d1bb60781446242110bace6109f58a",
+      "before_canonical_sha256": "0d802f9220ee4ed872604aff1ecc4cd593d1bb60781446242110bace6109f58a",
+      "before_rc": 0,
+      "before_sha256": "0d802f9220ee4ed872604aff1ecc4cd593d1bb60781446242110bace6109f58a",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000009/bitops.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "97c36d7dfeb9bb151ac51d5f6748849d83f0b672192a44db5054ed5bd11f5c98",
+      "after_rc": 0,
+      "after_sha256": "97c36d7dfeb9bb151ac51d5f6748849d83f0b672192a44db5054ed5bd11f5c98",
+      "before_canonical_sha256": "97c36d7dfeb9bb151ac51d5f6748849d83f0b672192a44db5054ed5bd11f5c98",
+      "before_rc": 0,
+      "before_sha256": "97c36d7dfeb9bb151ac51d5f6748849d83f0b672192a44db5054ed5bd11f5c98",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000010/byte_load_reassembly.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "8595c750a894ba22f6b54bbf3767d47cea01ea4a29e956ed3b3851744eb3740d",
+      "after_rc": 0,
+      "after_sha256": "8595c750a894ba22f6b54bbf3767d47cea01ea4a29e956ed3b3851744eb3740d",
+      "before_canonical_sha256": "8595c750a894ba22f6b54bbf3767d47cea01ea4a29e956ed3b3851744eb3740d",
+      "before_rc": 0,
+      "before_sha256": "8595c750a894ba22f6b54bbf3767d47cea01ea4a29e956ed3b3851744eb3740d",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000011/chacha20_block.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "c884dd7c271918432e21cf91cf756ffa339b722414b8df026f4096f672ea8588",
+      "after_rc": 0,
+      "after_sha256": "c884dd7c271918432e21cf91cf756ffa339b722414b8df026f4096f672ea8588",
+      "before_canonical_sha256": "c884dd7c271918432e21cf91cf756ffa339b722414b8df026f4096f672ea8588",
+      "before_rc": 0,
+      "before_sha256": "c884dd7c271918432e21cf91cf756ffa339b722414b8df026f4096f672ea8588",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000012/constant_recursion.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "9dbd6a2ffdb07d98a9c7406d7eada758d377951410f156c5b6bfd23194f5f42c",
+      "after_rc": 0,
+      "after_sha256": "9dbd6a2ffdb07d98a9c7406d7eada758d377951410f156c5b6bfd23194f5f42c",
+      "before_canonical_sha256": "9dbd6a2ffdb07d98a9c7406d7eada758d377951410f156c5b6bfd23194f5f42c",
+      "before_rc": 0,
+      "before_sha256": "9dbd6a2ffdb07d98a9c7406d7eada758d377951410f156c5b6bfd23194f5f42c",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000013/conv_u8_3x3.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "bf07a9130c8f21349b4db7eac24904ac316e9dac80f3213030f5ced0a0e0fb41",
+      "after_rc": 0,
+      "after_sha256": "bf07a9130c8f21349b4db7eac24904ac316e9dac80f3213030f5ced0a0e0fb41",
+      "before_canonical_sha256": "bf07a9130c8f21349b4db7eac24904ac316e9dac80f3213030f5ced0a0e0fb41",
+      "before_rc": 0,
+      "before_sha256": "bf07a9130c8f21349b4db7eac24904ac316e9dac80f3213030f5ced0a0e0fb41",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000014/crc32_nibble_hot.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "589ee165f6b821b906705a0c8a5216377f5adfb0a0f289749e71563bbba2cb72",
+      "after_rc": 0,
+      "after_sha256": "589ee165f6b821b906705a0c8a5216377f5adfb0a0f289749e71563bbba2cb72",
+      "before_canonical_sha256": "589ee165f6b821b906705a0c8a5216377f5adfb0a0f289749e71563bbba2cb72",
+      "before_rc": 0,
+      "before_sha256": "589ee165f6b821b906705a0c8a5216377f5adfb0a0f289749e71563bbba2cb72",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000015/csv_field_sum.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "c9e991bd71000bb3ff16419ba01dc82c69d1187bb0105126af02a14dd7bcff48",
+      "after_rc": 0,
+      "after_sha256": "c9e991bd71000bb3ff16419ba01dc82c69d1187bb0105126af02a14dd7bcff48",
+      "before_canonical_sha256": "c9e991bd71000bb3ff16419ba01dc82c69d1187bb0105126af02a14dd7bcff48",
+      "before_rc": 0,
+      "before_sha256": "c9e991bd71000bb3ff16419ba01dc82c69d1187bb0105126af02a14dd7bcff48",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000016/double_reduction.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "2e19a950c79e1d41fd4556fb69ddc88dedb87f4d167a3955e9e91797de959710",
+      "after_rc": 0,
+      "after_sha256": "2e19a950c79e1d41fd4556fb69ddc88dedb87f4d167a3955e9e91797de959710",
+      "before_canonical_sha256": "2e19a950c79e1d41fd4556fb69ddc88dedb87f4d167a3955e9e91797de959710",
+      "before_rc": 0,
+      "before_sha256": "2e19a950c79e1d41fd4556fb69ddc88dedb87f4d167a3955e9e91797de959710",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000017/expat_siphash24.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "d9f2784984d51b78b971475d0a6edaa168601213b628ff48637153e424d36b02",
+      "after_rc": 0,
+      "after_sha256": "d9f2784984d51b78b971475d0a6edaa168601213b628ff48637153e424d36b02",
+      "before_canonical_sha256": "d9f2784984d51b78b971475d0a6edaa168601213b628ff48637153e424d36b02",
+      "before_rc": 0,
+      "before_sha256": "d9f2784984d51b78b971475d0a6edaa168601213b628ff48637153e424d36b02",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000018/expat_xml_scan.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "e75e9e6abd31d345627f41bb894311916313b3b86b7871eadc32fc8004b973c9",
+      "after_rc": 0,
+      "after_sha256": "e75e9e6abd31d345627f41bb894311916313b3b86b7871eadc32fc8004b973c9",
+      "before_canonical_sha256": "e75e9e6abd31d345627f41bb894311916313b3b86b7871eadc32fc8004b973c9",
+      "before_rc": 0,
+      "before_sha256": "e75e9e6abd31d345627f41bb894311916313b3b86b7871eadc32fc8004b973c9",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000019/fannkuch.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "75f42b512ee7a324aab675ee5609f8199f4964440dccf5bfff9390d514b60616",
+      "after_rc": 0,
+      "after_sha256": "75f42b512ee7a324aab675ee5609f8199f4964440dccf5bfff9390d514b60616",
+      "before_canonical_sha256": "75f42b512ee7a324aab675ee5609f8199f4964440dccf5bfff9390d514b60616",
+      "before_rc": 0,
+      "before_sha256": "75f42b512ee7a324aab675ee5609f8199f4964440dccf5bfff9390d514b60616",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000020/fib.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "3039c685fe8fdcd9a2cf5ba9b0ca817e8dac3a1ff80eab54cf55790f54921ba3",
+      "after_rc": 0,
+      "after_sha256": "3039c685fe8fdcd9a2cf5ba9b0ca817e8dac3a1ff80eab54cf55790f54921ba3",
+      "before_canonical_sha256": "3039c685fe8fdcd9a2cf5ba9b0ca817e8dac3a1ff80eab54cf55790f54921ba3",
+      "before_rc": 0,
+      "before_sha256": "3039c685fe8fdcd9a2cf5ba9b0ca817e8dac3a1ff80eab54cf55790f54921ba3",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000021/fir_filter.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "834837280a9c723b52b17daa06e271de85335c3a9c172ad5881f01e1c8c9ba6f",
+      "after_rc": 0,
+      "after_sha256": "834837280a9c723b52b17daa06e271de85335c3a9c172ad5881f01e1c8c9ba6f",
+      "before_canonical_sha256": "834837280a9c723b52b17daa06e271de85335c3a9c172ad5881f01e1c8c9ba6f",
+      "before_rc": 0,
+      "before_sha256": "834837280a9c723b52b17daa06e271de85335c3a9c172ad5881f01e1c8c9ba6f",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000022/fp_memfold_stencil5.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "4ce4b796634b207ba34b981eafd0d92083728f8c4dc9d182ee1d62e5a01def11",
+      "after_rc": 0,
+      "after_sha256": "4ce4b796634b207ba34b981eafd0d92083728f8c4dc9d182ee1d62e5a01def11",
+      "before_canonical_sha256": "4ce4b796634b207ba34b981eafd0d92083728f8c4dc9d182ee1d62e5a01def11",
+      "before_rc": 0,
+      "before_sha256": "4ce4b796634b207ba34b981eafd0d92083728f8c4dc9d182ee1d62e5a01def11",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000023/glibc_memcmp.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "116ba62f8ab5030b159d8a96b7dead7d5f25957e974a7d558a303563d526c231",
+      "after_rc": 0,
+      "after_sha256": "116ba62f8ab5030b159d8a96b7dead7d5f25957e974a7d558a303563d526c231",
+      "before_canonical_sha256": "116ba62f8ab5030b159d8a96b7dead7d5f25957e974a7d558a303563d526c231",
+      "before_rc": 0,
+      "before_sha256": "116ba62f8ab5030b159d8a96b7dead7d5f25957e974a7d558a303563d526c231",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000024/glibc_strstr.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "9be8696a9d1ce3cd06a7422b5b45bac35e27b8fabb851b3b68030640476b123f",
+      "after_rc": 0,
+      "after_sha256": "9be8696a9d1ce3cd06a7422b5b45bac35e27b8fabb851b3b68030640476b123f",
+      "before_canonical_sha256": "9be8696a9d1ce3cd06a7422b5b45bac35e27b8fabb851b3b68030640476b123f",
+      "before_rc": 0,
+      "before_sha256": "9be8696a9d1ce3cd06a7422b5b45bac35e27b8fabb851b3b68030640476b123f",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000025/global_addr_pressure.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "1e55a6b9eb5a05d72e5ee50ccfdb4b4334e213cb5ddefa29e332a910b42aa9de",
+      "after_rc": 0,
+      "after_sha256": "1e55a6b9eb5a05d72e5ee50ccfdb4b4334e213cb5ddefa29e332a910b42aa9de",
+      "before_canonical_sha256": "1e55a6b9eb5a05d72e5ee50ccfdb4b4334e213cb5ddefa29e332a910b42aa9de",
+      "before_rc": 0,
+      "before_sha256": "1e55a6b9eb5a05d72e5ee50ccfdb4b4334e213cb5ddefa29e332a910b42aa9de",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000026/gzip_crc32.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "2de6de73811adebdce16dec7c1a8dabe128b7a6cfe3fd4983c1cbf697f274df3",
+      "after_rc": 0,
+      "after_sha256": "2de6de73811adebdce16dec7c1a8dabe128b7a6cfe3fd4983c1cbf697f274df3",
+      "before_canonical_sha256": "2de6de73811adebdce16dec7c1a8dabe128b7a6cfe3fd4983c1cbf697f274df3",
+      "before_rc": 0,
+      "before_sha256": "2de6de73811adebdce16dec7c1a8dabe128b7a6cfe3fd4983c1cbf697f274df3",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000027/hash_table.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "05b8546c5c9e73d8e8ae84c046564491ac1a46782b159c687b38b7957cf298e2",
+      "after_rc": 0,
+      "after_sha256": "05b8546c5c9e73d8e8ae84c046564491ac1a46782b159c687b38b7957cf298e2",
+      "before_canonical_sha256": "05b8546c5c9e73d8e8ae84c046564491ac1a46782b159c687b38b7957cf298e2",
+      "before_rc": 0,
+      "before_sha256": "05b8546c5c9e73d8e8ae84c046564491ac1a46782b159c687b38b7957cf298e2",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000028/histogram.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "836e9eb99e1ac505b23ce7d9593976829ff110d43199870b9a96ae5c968c1dc7",
+      "after_rc": 0,
+      "after_sha256": "836e9eb99e1ac505b23ce7d9593976829ff110d43199870b9a96ae5c968c1dc7",
+      "before_canonical_sha256": "836e9eb99e1ac505b23ce7d9593976829ff110d43199870b9a96ae5c968c1dc7",
+      "before_rc": 0,
+      "before_sha256": "836e9eb99e1ac505b23ce7d9593976829ff110d43199870b9a96ae5c968c1dc7",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000029/i686_alu_chains.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "7b8d09df2490c0a5aa3feaa9d6c045bf91ded30452d8c284b1e1d58bc8143b70",
+      "after_rc": 0,
+      "after_sha256": "7b8d09df2490c0a5aa3feaa9d6c045bf91ded30452d8c284b1e1d58bc8143b70",
+      "before_canonical_sha256": "7b8d09df2490c0a5aa3feaa9d6c045bf91ded30452d8c284b1e1d58bc8143b70",
+      "before_rc": 0,
+      "before_sha256": "7b8d09df2490c0a5aa3feaa9d6c045bf91ded30452d8c284b1e1d58bc8143b70",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000030/libm_round_family.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "0e2d572249a395bb40cca641764e677d3159e3cb930e0e74351cb31a255ea154",
+      "after_rc": 0,
+      "after_sha256": "0e2d572249a395bb40cca641764e677d3159e3cb930e0e74351cb31a255ea154",
+      "before_canonical_sha256": "0e2d572249a395bb40cca641764e677d3159e3cb930e0e74351cb31a255ea154",
+      "before_rc": 0,
+      "before_sha256": "0e2d572249a395bb40cca641764e677d3159e3cb930e0e74351cb31a255ea154",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000031/linux_find_bit.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "b02f2721a492edc4d06710844ccfb745863b99062e2bd23a1297fea5173d54b0",
+      "after_rc": 0,
+      "after_sha256": "b02f2721a492edc4d06710844ccfb745863b99062e2bd23a1297fea5173d54b0",
+      "before_canonical_sha256": "b02f2721a492edc4d06710844ccfb745863b99062e2bd23a1297fea5173d54b0",
+      "before_rc": 0,
+      "before_sha256": "b02f2721a492edc4d06710844ccfb745863b99062e2bd23a1297fea5173d54b0",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000032/linux_rbtree.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "ea940a9367d72417d15d7a5ca08ca2cbefc3370d0d9126b52b7a4461e42e9e70",
+      "after_rc": 0,
+      "after_sha256": "ea940a9367d72417d15d7a5ca08ca2cbefc3370d0d9126b52b7a4461e42e9e70",
+      "before_canonical_sha256": "ea940a9367d72417d15d7a5ca08ca2cbefc3370d0d9126b52b7a4461e42e9e70",
+      "before_rc": 0,
+      "before_sha256": "ea940a9367d72417d15d7a5ca08ca2cbefc3370d0d9126b52b7a4461e42e9e70",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000033/loop_patterns.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "cfe062dab0c35b9f2da98ad5f9a3044c1d262edc0a28f9e00014850facd6dac1",
+      "after_rc": 0,
+      "after_sha256": "cfe062dab0c35b9f2da98ad5f9a3044c1d262edc0a28f9e00014850facd6dac1",
+      "before_canonical_sha256": "cfe062dab0c35b9f2da98ad5f9a3044c1d262edc0a28f9e00014850facd6dac1",
+      "before_rc": 0,
+      "before_sha256": "cfe062dab0c35b9f2da98ad5f9a3044c1d262edc0a28f9e00014850facd6dac1",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000034/lz4_compress.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "351a13b559d61beee469d7f0891923001abb588f6d1e1b251897465e61b1ac3e",
+      "after_rc": 0,
+      "after_sha256": "351a13b559d61beee469d7f0891923001abb588f6d1e1b251897465e61b1ac3e",
+      "before_canonical_sha256": "351a13b559d61beee469d7f0891923001abb588f6d1e1b251897465e61b1ac3e",
+      "before_rc": 0,
+      "before_sha256": "351a13b559d61beee469d7f0891923001abb588f6d1e1b251897465e61b1ac3e",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000035/mandelbrot.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "85fd22676e2fcc3f2565282c0433ca1c951e81054e9dbe7c448d660c866f39ad",
+      "after_rc": 0,
+      "after_sha256": "85fd22676e2fcc3f2565282c0433ca1c951e81054e9dbe7c448d660c866f39ad",
+      "before_canonical_sha256": "85fd22676e2fcc3f2565282c0433ca1c951e81054e9dbe7c448d660c866f39ad",
+      "before_rc": 0,
+      "before_sha256": "85fd22676e2fcc3f2565282c0433ca1c951e81054e9dbe7c448d660c866f39ad",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000036/matmul.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "1cec1108807d7bfdf602a49b78a414f0a9664a7d26426c34f4eeb931ab4fddef",
+      "after_rc": 0,
+      "after_sha256": "1cec1108807d7bfdf602a49b78a414f0a9664a7d26426c34f4eeb931ab4fddef",
+      "before_canonical_sha256": "1cec1108807d7bfdf602a49b78a414f0a9664a7d26426c34f4eeb931ab4fddef",
+      "before_rc": 0,
+      "before_sha256": "1cec1108807d7bfdf602a49b78a414f0a9664a7d26426c34f4eeb931ab4fddef",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000037/moving_stats.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "4b45ad2c21356d90439cb162b8c840c3a8852349ae838322a32acf8a2d30565b",
+      "after_rc": 0,
+      "after_sha256": "4b45ad2c21356d90439cb162b8c840c3a8852349ae838322a32acf8a2d30565b",
+      "before_canonical_sha256": "4b45ad2c21356d90439cb162b8c840c3a8852349ae838322a32acf8a2d30565b",
+      "before_rc": 0,
+      "before_sha256": "4b45ad2c21356d90439cb162b8c840c3a8852349ae838322a32acf8a2d30565b",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000038/nbody.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "134887e5978032dc2be4d98534f7045f9108c299f8437883361373accde7f4e8",
+      "after_rc": 0,
+      "after_sha256": "134887e5978032dc2be4d98534f7045f9108c299f8437883361373accde7f4e8",
+      "before_canonical_sha256": "134887e5978032dc2be4d98534f7045f9108c299f8437883361373accde7f4e8",
+      "before_rc": 0,
+      "before_sha256": "134887e5978032dc2be4d98534f7045f9108c299f8437883361373accde7f4e8",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000039/percpu_ptr_walk.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "6736c07bd64c66fb8cdac10cee5dfedbcd983f3ca4918c0ef24f2b13a1166039",
+      "after_rc": 0,
+      "after_sha256": "6736c07bd64c66fb8cdac10cee5dfedbcd983f3ca4918c0ef24f2b13a1166039",
+      "before_canonical_sha256": "6736c07bd64c66fb8cdac10cee5dfedbcd983f3ca4918c0ef24f2b13a1166039",
+      "before_rc": 0,
+      "before_sha256": "6736c07bd64c66fb8cdac10cee5dfedbcd983f3ca4918c0ef24f2b13a1166039",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000040/prefix_scan.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "9d86db811d78cf93c76475edf5580206361eb76bb23b3d07a77d509aa1319d51",
+      "after_rc": 0,
+      "after_sha256": "9d86db811d78cf93c76475edf5580206361eb76bb23b3d07a77d509aa1319d51",
+      "before_canonical_sha256": "9d86db811d78cf93c76475edf5580206361eb76bb23b3d07a77d509aa1319d51",
+      "before_rc": 0,
+      "before_sha256": "9d86db811d78cf93c76475edf5580206361eb76bb23b3d07a77d509aa1319d51",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000041/qsort.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "9d50122e6c99f0e9d1abd81ba8e0b4a3c73ab8fe7690f807a34dce55851bc7f7",
+      "after_rc": 0,
+      "after_sha256": "9d50122e6c99f0e9d1abd81ba8e0b4a3c73ab8fe7690f807a34dce55851bc7f7",
+      "before_canonical_sha256": "9d50122e6c99f0e9d1abd81ba8e0b4a3c73ab8fe7690f807a34dce55851bc7f7",
+      "before_rc": 0,
+      "before_sha256": "9d50122e6c99f0e9d1abd81ba8e0b4a3c73ab8fe7690f807a34dce55851bc7f7",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000042/reduction_vecreg.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "42b7a5bc902e4d83c1f51325c10e0b9aec6dd925777e45f06830c09e0855e476",
+      "after_rc": 0,
+      "after_sha256": "42b7a5bc902e4d83c1f51325c10e0b9aec6dd925777e45f06830c09e0855e476",
+      "before_canonical_sha256": "42b7a5bc902e4d83c1f51325c10e0b9aec6dd925777e45f06830c09e0855e476",
+      "before_rc": 0,
+      "before_sha256": "42b7a5bc902e4d83c1f51325c10e0b9aec6dd925777e45f06830c09e0855e476",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000043/ring_fifo.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "33b8b475448b47122a624fdea196b2f9634b006695fb6c43ee9f070b0f1c8042",
+      "after_rc": 0,
+      "after_sha256": "33b8b475448b47122a624fdea196b2f9634b006695fb6c43ee9f070b0f1c8042",
+      "before_canonical_sha256": "33b8b475448b47122a624fdea196b2f9634b006695fb6c43ee9f070b0f1c8042",
+      "before_rc": 0,
+      "before_sha256": "33b8b475448b47122a624fdea196b2f9634b006695fb6c43ee9f070b0f1c8042",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000044/sha256_transform.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "8958c9070b99d2d8817188b29ec8dbe74b12b293d2c72e345841c2ee7256d648",
+      "after_rc": 0,
+      "after_sha256": "8958c9070b99d2d8817188b29ec8dbe74b12b293d2c72e345841c2ee7256d648",
+      "before_canonical_sha256": "8958c9070b99d2d8817188b29ec8dbe74b12b293d2c72e345841c2ee7256d648",
+      "before_rc": 0,
+      "before_sha256": "8958c9070b99d2d8817188b29ec8dbe74b12b293d2c72e345841c2ee7256d648",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000045/sieve.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "d2788d7fa26231b7bbddbebac3c00a4dcc1e15bf9feced80aa0bb0cc8bc6cbaf",
+      "after_rc": 0,
+      "after_sha256": "d2788d7fa26231b7bbddbebac3c00a4dcc1e15bf9feced80aa0bb0cc8bc6cbaf",
+      "before_canonical_sha256": "d2788d7fa26231b7bbddbebac3c00a4dcc1e15bf9feced80aa0bb0cc8bc6cbaf",
+      "before_rc": 0,
+      "before_sha256": "d2788d7fa26231b7bbddbebac3c00a4dcc1e15bf9feced80aa0bb0cc8bc6cbaf",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000046/spectral_norm.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "849c98258fa76fea2b6837c1e5a37ca9b946aaefabc256b44b6b389c53f8aa66",
+      "after_rc": 0,
+      "after_sha256": "849c98258fa76fea2b6837c1e5a37ca9b946aaefabc256b44b6b389c53f8aa66",
+      "before_canonical_sha256": "849c98258fa76fea2b6837c1e5a37ca9b946aaefabc256b44b6b389c53f8aa66",
+      "before_rc": 0,
+      "before_sha256": "849c98258fa76fea2b6837c1e5a37ca9b946aaefabc256b44b6b389c53f8aa66",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000047/sqlite_varint.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "fc380499d6ebf23f5d2c95bf0ab5c22ea6437761b527eadc238b5b4312ff0ccb",
+      "after_rc": 0,
+      "after_sha256": "fc380499d6ebf23f5d2c95bf0ab5c22ea6437761b527eadc238b5b4312ff0ccb",
+      "before_canonical_sha256": "fc380499d6ebf23f5d2c95bf0ab5c22ea6437761b527eadc238b5b4312ff0ccb",
+      "before_rc": 0,
+      "before_sha256": "fc380499d6ebf23f5d2c95bf0ab5c22ea6437761b527eadc238b5b4312ff0ccb",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000048/strlen_bench.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "8ffaeb3fe827c2abefff44ea991dd2e0fa8427a76329c1c46ad46f11ff910198",
+      "after_rc": 0,
+      "after_sha256": "8ffaeb3fe827c2abefff44ea991dd2e0fa8427a76329c1c46ad46f11ff910198",
+      "before_canonical_sha256": "8ffaeb3fe827c2abefff44ea991dd2e0fa8427a76329c1c46ad46f11ff910198",
+      "before_rc": 0,
+      "before_sha256": "8ffaeb3fe827c2abefff44ea991dd2e0fa8427a76329c1c46ad46f11ff910198",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000049/struct_copy.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "34c72e8da870b830a99ed044fdaadcdb99725dace378a5e484be411f75ba4c97",
+      "after_rc": 0,
+      "after_sha256": "34c72e8da870b830a99ed044fdaadcdb99725dace378a5e484be411f75ba4c97",
+      "before_canonical_sha256": "34c72e8da870b830a99ed044fdaadcdb99725dace378a5e484be411f75ba4c97",
+      "before_rc": 0,
+      "before_sha256": "34c72e8da870b830a99ed044fdaadcdb99725dace378a5e484be411f75ba4c97",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000050/switch_dispatch.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "00495a227da612c15532707b55e2993c37f5f5608907ff16886dc8219cf146cb",
+      "after_rc": 0,
+      "after_sha256": "00495a227da612c15532707b55e2993c37f5f5608907ff16886dc8219cf146cb",
+      "before_canonical_sha256": "00495a227da612c15532707b55e2993c37f5f5608907ff16886dc8219cf146cb",
+      "before_rc": 0,
+      "before_sha256": "00495a227da612c15532707b55e2993c37f5f5608907ff16886dc8219cf146cb",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000051/tce_sum.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "97ed4f1c919280c9f89348f33d536f6d65f4c77cf843ad606df283b32a61aabc",
+      "after_rc": 0,
+      "after_sha256": "97ed4f1c919280c9f89348f33d536f6d65f4c77cf843ad606df283b32a61aabc",
+      "before_canonical_sha256": "97ed4f1c919280c9f89348f33d536f6d65f4c77cf843ad606df283b32a61aabc",
+      "before_rc": 0,
+      "before_sha256": "97ed4f1c919280c9f89348f33d536f6d65f4c77cf843ad606df283b32a61aabc",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000052/tls_seg_access.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "44b05a4f8f3b6a189cfd4c082b62a21f5e1fff9f120ea88861f2c5bd052ecd55",
+      "after_rc": 0,
+      "after_sha256": "44b05a4f8f3b6a189cfd4c082b62a21f5e1fff9f120ea88861f2c5bd052ecd55",
+      "before_canonical_sha256": "44b05a4f8f3b6a189cfd4c082b62a21f5e1fff9f120ea88861f2c5bd052ecd55",
+      "before_rc": 0,
+      "before_sha256": "44b05a4f8f3b6a189cfd4c082b62a21f5e1fff9f120ea88861f2c5bd052ecd55",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000053/vecreg_new_ops.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "fdc1374f9b23219ada834a924e4ed1da3c722fa023e8f522215abc60a4dec02b",
+      "after_rc": 0,
+      "after_sha256": "fdc1374f9b23219ada834a924e4ed1da3c722fa023e8f522215abc60a4dec02b",
+      "before_canonical_sha256": "fdc1374f9b23219ada834a924e4ed1da3c722fa023e8f522215abc60a4dec02b",
+      "before_rc": 0,
+      "before_sha256": "fdc1374f9b23219ada834a924e4ed1da3c722fa023e8f522215abc60a4dec02b",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000054/vector_remainder.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "ffb12f1b87ca65782f508d14bcfd2316401cf87fb17572b57eec261c3362f58d",
+      "after_rc": 0,
+      "after_sha256": "ffb12f1b87ca65782f508d14bcfd2316401cf87fb17572b57eec261c3362f58d",
+      "before_canonical_sha256": "ffb12f1b87ca65782f508d14bcfd2316401cf87fb17572b57eec261c3362f58d",
+      "before_rc": 0,
+      "before_sha256": "ffb12f1b87ca65782f508d14bcfd2316401cf87fb17572b57eec261c3362f58d",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000055/zlib_ng_adler32.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "53cf684c76821862efd4f236e4a8bddc4b2dfc171066ef2f8bfa910732935804",
+      "after_rc": 0,
+      "after_sha256": "53cf684c76821862efd4f236e4a8bddc4b2dfc171066ef2f8bfa910732935804",
+      "before_canonical_sha256": "53cf684c76821862efd4f236e4a8bddc4b2dfc171066ef2f8bfa910732935804",
+      "before_rc": 0,
+      "before_sha256": "53cf684c76821862efd4f236e4a8bddc4b2dfc171066ef2f8bfa910732935804",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000056/zlib_ng_adler32_combine.c",
+      "verdict": "IDENTICAL"
+    },
+    {
+      "after_canonical_sha256": "3357b3a4d8fceb4d34c3c64468657b6510ebacc8188c10eca7f12f4c09f6ae2b",
+      "after_rc": 0,
+      "after_sha256": "3357b3a4d8fceb4d34c3c64468657b6510ebacc8188c10eca7f12f4c09f6ae2b",
+      "before_canonical_sha256": "3357b3a4d8fceb4d34c3c64468657b6510ebacc8188c10eca7f12f4c09f6ae2b",
+      "before_rc": 0,
+      "before_sha256": "3357b3a4d8fceb4d34c3c64468657b6510ebacc8188c10eca7f12f4c09f6ae2b",
+      "detail": "",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv"
+      ],
+      "source": "source_000057/zstd_count.c",
+      "verdict": "IDENTICAL"
+    }
+  ],
+  "total": 58
+}

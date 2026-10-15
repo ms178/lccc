@@ -1183,6 +1183,9 @@ fn sink_round(func: &mut IrFunction) -> usize {
 /// feeder chain, then applies the established scalar sink plan; rebuilding
 /// facts between rounds keeps both transformations index- and liveness-safe.
 pub(crate) fn sink_expressions(func: &mut IrFunction) -> usize {
+    if super::fp_environment_blocks_reordering(func) {
+        return 0;
+    }
     if std::env::var_os("CCC_NO_EXPR_SINK").is_some() {
         return 0;
     }

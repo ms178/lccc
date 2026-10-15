@@ -757,10 +757,14 @@ Provides safe temporary file management with automatic cleanup.
 **`temp_dir()`** -- Returns the platform temp directory, respecting `$TMPDIR`
 on Unix (falling back to `/tmp`).
 
-**`TempFile::new(prefix, stem, extension)`** -- Returns a fallible RAII guard
+**`TempFile::new(prefix, stem, extension)`** -- Returns an RAII guard
 for a path inside an atomically created private (0700 on Unix) directory in
 `$TMPDIR`. Pre-existing files/symlinks cannot redirect reservation. Drop removes
-the file and directory; `set_keep(true)` retains both for debugging.
+the file and, after the last lease, its empty directory. `set_keep(true)`
+retains the directory even for a not-yet-created file. If private-directory
+creation fails, production callers use `TempFile::try_new` and report an ordinary
+I/O error rather than returning an insecure flat path. The convenience `new`
+wrapper panics on that error; optional debug dumps return `None`.
 
 **`TempFile`** -- An RAII guard that deletes the file when dropped. Ensures
 cleanup happens even on early returns, panics, or errors. Has a `keep` flag

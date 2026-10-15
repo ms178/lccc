@@ -272,6 +272,9 @@ pub fn resolve_remaining_is_constant(module: &mut IrModule) {
 /// extended (for U8/U16 targets) or sign-extended (for I8/I16 targets) when
 /// used as operands of UnaryOp/BitNot instructions.
 pub(crate) fn fold_function(func: &mut IrFunction) -> usize {
+    if super::fp_environment_blocks_reordering(func) {
+        return 0;
+    }
     let max_id = func.max_value_id() as usize;
     let mut total = 0;
 

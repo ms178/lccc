@@ -91,6 +91,10 @@ impl DynamicDesc {
         if let Some((a, s)) = self.rel {
             v.push((DT_REL, a));
             v.push((DT_RELSZ, s));
+        }
+        // DT_JMPREL also describes Elf32_Rel entries. Consumers such as
+        // readelf 2.47 need their size even when .rel.dyn is absent.
+        if self.rel.is_some() || self.plt.is_some() {
             v.push((DT_RELENT, 8));
         }
         if let Some(n) = self.relcount {
@@ -183,6 +187,15 @@ mod tests {
                 .collect();
             assert_eq!(tags.last(), Some(&DT_NULL));
             assert_eq!(tags.iter().filter(|&&t| t == DT_NULL).count(), 1);
+            assert_eq!(
+                tags.iter().filter(|&&t| t == DT_RELENT).count(),
+                usize::from(bit(7) || bit(8))
+            );
+            for (tag, value) in d.entries() {
+                if tag == DT_RELENT {
+                    assert_eq!(value, 8);
+                }
+            }
         }
     }
 

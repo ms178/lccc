@@ -386,7 +386,7 @@ impl Target {
                 "/usr/lib/gcc/riscv64-linux-gnu",
             ],
         };
-        let gcc_versions: &[&str] = &["14", "13", "12", "11", "10", "9", "8", "7"];
+        let gcc_versions: &[&str] = &["16", "15", "14", "13", "12", "11", "10", "9", "8", "7"];
 
         let mut paths: Vec<String> = Vec::new();
 
@@ -399,6 +399,21 @@ impl Target {
                     break 'outer;
                 }
             }
+        }
+
+        // Match the built-in linker's native-i686 multilib fallback rather
+        // than reporting only /usr/lib to CMake on GCC16 multilib hosts.
+        if matches!(self, Target::I686) && paths.is_empty() {
+            for ver in gcc_versions {
+                let dir = format!("/usr/lib/gcc/x86_64-linux-gnu/{ver}/32");
+                if std::path::Path::new(&format!("{dir}/crtbegin.o")).exists() {
+                    paths.push(dir);
+                    break;
+                }
+            }
+        }
+        if matches!(self, Target::I686) && std::path::Path::new("/usr/lib32/crt1.o").exists() {
+            paths.push("/usr/lib32".to_string());
         }
 
         // Multiarch lib dirs

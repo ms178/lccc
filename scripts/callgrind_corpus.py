@@ -29,6 +29,8 @@ def main(argv=None):
     parser.add_argument("--gcc-include-command", default="gcc",
                         help="GCC driver supplying matching builtin headers")
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--target-flags", default="-march=x86-64-v3",
+                        help="common target flags; use an empty string for compiler defaults")
     parser.add_argument("--only", help="comma-separated corpus ids")
     args = parser.parse_args(argv)
     sizes = json.loads((ROOT / "tests/benchmark/callgrind_sizes.json").read_text())
@@ -50,7 +52,7 @@ def main(argv=None):
                 continue
             directory = args.out / item.name
             directory.mkdir(exist_ok=True)
-            flags = "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm " + sizes[item.name]
+            flags = "-O2 " + args.target_flags + " -fwrapv -Wl,--no-as-needed -lm " + sizes[item.name]
             command = [args.mine, args.ref, "--opt=" + flags, bench.source_for(item).stem,
                        "--out-root", str(directory), "--instrument-timeout", "60",
                        "--gcc-include-command", args.gcc_include_command]

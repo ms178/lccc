@@ -94,6 +94,9 @@ pub struct Preprocessor {
     /// - (symbol, None) means "mark symbol as weak"
     /// - (symbol, Some(target)) means "symbol is a weak alias for target"
     pub weak_pragmas: Vec<(String, Option<String>)>,
+    /// Any active STDC FENV_ACCESS ON in this TU, including _Pragma and
+    /// force-includes. Monotone: later OFF cannot erase earlier obligations.
+    pub fenv_access_requested: bool,
     /// #pragma redefine_extname directives: (old_name, new_name)
     pub redefine_extname_pragmas: Vec<(String, String)>,
     /// Accumulated output from force-included files (-include).
@@ -160,6 +163,7 @@ impl Preprocessor {
             macro_save_stack: FxHashMap::default(),
             line_override: None,
             weak_pragmas: Vec::new(),
+            fenv_access_requested: false,
             redefine_extname_pragmas: Vec::new(),
             force_include_output: String::new(),
             include_resolve_cache: FxHashMap::default(),

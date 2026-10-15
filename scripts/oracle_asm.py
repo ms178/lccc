@@ -12,7 +12,7 @@ measurement you cannot afford to lose when you are chasing a gap that the
 survey just quantified.
 
 This tool therefore goes through :func:`codegen_oracle._compile_remote`, the
-SAME cache namespace the survey uses (``att-v2``), so a deep-dive after
+SAME cache namespace the survey uses (``att-v4``), so a deep-dive after
 ``--rank`` is offline: zero network requests, byte-identical assembly to the
 survey's numbers, and no 429 risk.  It reuses the survey's own
 ``_function_body`` / ``_stats`` implementations, so counts printed here match
@@ -24,9 +24,9 @@ Usage::
         --out /tmp/matmul --flags '-O2 -march=x86-64-v3'
 
 Writes ``<out>/{lccc,gcc16.2,clang,icc,icx}.s`` (whole function bodies, AT&T)
-and prints the shared statistic columns.  Exit status is non-zero only when
-the local compile or function extraction fails; a missing oracle is an error
-row because a silent gap would understate the competition.
+and prints the shared statistic columns.  Exit status is non-zero when any requested compiler or function extraction
+fails. All error rows are retained: a missing vendor must not look like a
+successful comparison with weaker competition.
 """
 from __future__ import annotations
 
@@ -98,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
               f"{stats.spills:>6} {stats.branches:>6} {stats.vectors:>4}")
         if out:
             (out / f"{key}.s").write_text("\n".join(body) + "\n")
-    return 0
+    return int(any(body is None or error is not None for _, body, error in records))
 
 
 if __name__ == "__main__":

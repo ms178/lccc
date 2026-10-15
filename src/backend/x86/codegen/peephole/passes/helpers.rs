@@ -1092,6 +1092,28 @@ mod writes_family_tests {
     }
 
     #[test]
+    fn architectural_implicit_operand_matrix() {
+        for line in include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/implicit_operands.tsv"
+        ))
+        .lines()
+        {
+            let fields: Vec<_> = line.split('\t').collect();
+            assert_eq!(fields.len(), 4);
+            let text = fields[0].to_owned();
+            let reads: u16 = fields[1].parse().unwrap();
+            let writes: u16 = fields[2].parse().unwrap();
+            let full: u16 = fields[3].parse().unwrap();
+            for asm in [text.clone(), format!("{text} # trailing comment")] {
+                assert_eq!(implicit_read_refs(asm.as_bytes()) & reads, reads, "{asm}");
+                assert_eq!(implicit_write_refs(asm.as_bytes()), writes, "{asm}");
+                assert_eq!(implicit_full_write_refs(asm.as_bytes()), full, "{asm}");
+            }
+        }
+    }
+
+    #[test]
     fn implicit_full_writes_exclude_partials_and_conditionals() {
         // Full-width implicit writes.
         let info = classify_line("    cqto");

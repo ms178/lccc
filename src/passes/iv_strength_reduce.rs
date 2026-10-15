@@ -267,6 +267,17 @@ pub(crate) fn ivsr_function_scalar(func: &mut IrFunction) -> usize {
 /// (scaled-index addressing is free on x86, absent on RISC-V): the pipeline
 /// passes `matches!(target, X86_64 | I686)` and the unit wrappers pin `true`
 /// because the rule's contracts are written against x86 codegen.
+#[cfg(any(test, debug_assertions))]
+fn ivsr_cfg_unchanged(func: &IrFunction, cfg: &analysis::CfgAnalysis) -> bool {
+    if func.blocks.len() != cfg.num_blocks {
+        return false;
+    }
+    let labels = analysis::build_label_map(func);
+    let (_, successors) = analysis::build_cfg(func, &labels);
+    labels.len() == cfg.num_blocks
+        && (0..cfg.num_blocks).all(|i| successors.row(i) == cfg.succs.row(i))
+}
+
 pub(crate) fn ivsr_with_analysis(
     func: &mut IrFunction,
     cfg: &analysis::CfgAnalysis,
@@ -274,6 +285,11 @@ pub(crate) fn ivsr_with_analysis(
     ptr_add: bool,
     x86_sib_cost: bool,
 ) -> usize {
+    #[cfg(debug_assertions)]
+    assert!(
+        ivsr_cfg_unchanged(func, cfg),
+        "IVSR received stale CFG analysis"
+    );
     if cfg.num_blocks < 2 {
         return 0;
     }
@@ -324,6 +340,11 @@ pub(crate) fn ivsr_with_analysis(
             scalar_derived,
             ptr_add,
             x86_sib_cost,
+        );
+        #[cfg(debug_assertions)]
+        assert!(
+            ivsr_cfg_unchanged(func, cfg),
+            "IVSR changed CFG edges; rebuild dominators before reuse"
         );
         if changed > 0 {
             kept_bodies.push(natural_loop.body.clone());
@@ -487,6 +508,15 @@ fn reduce_loop(
         pointer_groups
     {
         let iv = &basic_ivs[iv_index];
+        let ptr_width = crate::common::types::target_ptr_size();
+        let narrow_signed =
+            |ty: IrType| ty.is_integer() && !ty.is_unsigned() && ty.size() < ptr_width;
+        if super::signed_overflow_wraps() && (narrow_signed(iv.ty) || narrow_signed(mul_ty)) {
+            // A pointer-width recurrence must not skip a defined signed wrap
+            // in either the source counter or its pre-extension product.
+            // Pointer-width rings and already-certified unsigned paths remain.
+            continue;
+        }
         // A narrow unsigned counter is modular: zero-extending it into an
         // address recurrence is linear only while the executed backedges cannot
         // wrap. That is a proof obligation, not an inference from "there is a
@@ -2097,6 +2127,13 @@ fn affine_add_offset_cannot_wrap(
     add_ty: IrType,
 ) -> Option<i64> {
     if !add_ty.is_integer() {
+        return None;
+    }
+    if super::signed_overflow_wraps()
+        && !add_ty.is_unsigned()
+        && add_ty.size() < crate::common::types::target_ptr_size()
+        && raw_offset != 0
+    {
         return None;
     }
     let narrow_unsigned =
@@ -5271,5 +5308,34 @@ mod tests {
             0,
             "native-width symbol index stays SIB"
         );
+    }
+}
+
+#[cfg(test)]
+mod dominance_snapshot_contract {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, Terminator};
+
+    #[test]
+    fn checks_edges_as_well_as_block_count() {
+        let mut f = IrFunction::new("cfg".into(), IrType::Void, vec![], false);
+        for id in 0..2 {
+            f.blocks.push(BasicBlock {
+                label: BlockId(id),
+                instructions: vec![],
+                source_spans: vec![],
+                terminator: Terminator::Return(None),
+            });
+        }
+        let cfg = analysis::CfgAnalysis::build(&f);
+        assert!(ivsr_cfg_unchanged(&f, &cfg));
+        f.blocks[0].terminator = Terminator::Branch(BlockId(1));
+        assert!(
+            !ivsr_cfg_unchanged(&f, &cfg),
+            "same block count is not enough"
+        );
+        f.blocks[0].terminator = Terminator::Return(None);
+        f.blocks.push(f.blocks[1].clone());
+        assert!(!ivsr_cfg_unchanged(&f, &cfg));
     }
 }

@@ -45,6 +45,11 @@
 //!   zero-trip loops; FP division is kept out to match GCC's default
 //!   -ftrapping-math speculation policy).
 //!
+//! Observable floating environments are refused for functions containing FP
+//! operations or conversions: calls may change rounding and even a preheader
+//! multiply/conversion can raise an observable exception. Integer-only
+//! functions remain eligible under the same translation-unit policy.
+//!
 //! # Profitability model
 //!
 //! Fusion-aware and target-aware: the top expression must be an instruction
@@ -1422,7 +1427,11 @@ fn run_round(func: &mut IrFunction, env: &EnvConfig, tm: &TargetModel) -> usize 
 
 pub(crate) fn run(func: &mut IrFunction) -> usize {
     let env = EnvConfig::read();
-    if env.disabled || func.blocks.is_empty() {
+    // FP expressions also depend on rounding mode and exception state. Reusing
+    // a previous iteration (or speculating the initial expression) is not
+    // justified by operand equality under an observable floating environment.
+    // Keep integer-only functions eligible, including when FENV_ACCESS is on.
+    if env.disabled || func.blocks.is_empty() || super::fp_environment_blocks_reordering(func) {
         return 0;
     }
     let tm = TargetModel::detect();
@@ -1599,6 +1608,88 @@ mod tests {
                 )
             })
             .count()
+    }
+
+    fn fp_recurrence() -> IrFunction {
+        let f64c = |v| Operand::Const(IrConst::F64(v));
+        let mut f = IrFunction::new("fp_rounding".into(), IrType::F64, Vec::new(), false);
+        f.blocks
+            .push(block(0, vec![], Terminator::Branch(BlockId(1))));
+        f.blocks.push(block(
+            1,
+            vec![
+                Instruction::Phi {
+                    dest: Value(1),
+                    ty: IrType::F64,
+                    incoming: vec![(f64c(1.0), BlockId(0)), (val(3), BlockId(1))],
+                },
+                Instruction::Phi {
+                    dest: Value(2),
+                    ty: IrType::F64,
+                    incoming: vec![(f64c(0.0), BlockId(0)), (val(9), BlockId(1))],
+                },
+                Instruction::Phi {
+                    dest: Value(10),
+                    ty: IrType::U64,
+                    incoming: vec![(i64c(0), BlockId(0)), (val(11), BlockId(1))],
+                },
+                binop(4, IrBinOp::Mul, val(1), val(1), IrType::F64),
+                binop(3, IrBinOp::Add, val(1), f64c(0.125), IrType::F64),
+                binop(5, IrBinOp::Mul, val(3), val(3), IrType::F64),
+                // Two uses of each square pin an otherwise profitable candidate:
+                // neither side can hide in an FMA, even on the broad-FP path.
+                binop(6, IrBinOp::Add, val(4), val(5), IrType::F64),
+                binop(7, IrBinOp::Sub, val(4), val(5), IrType::F64),
+                binop(8, IrBinOp::Add, val(2), val(6), IrType::F64),
+                binop(9, IrBinOp::Add, val(8), val(7), IrType::F64),
+                binop(11, IrBinOp::Add, val(10), i64c(1), IrType::U64),
+                Instruction::Cmp {
+                    dest: Value(12),
+                    op: crate::ir::reexports::IrCmpOp::Ult,
+                    lhs: val(11),
+                    rhs: i64c(1000),
+                    ty: IrType::U64,
+                },
+            ],
+            Terminator::CondBranch {
+                cond: val(12),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+        ));
+        f.blocks
+            .push(block(2, vec![], Terminator::Return(Some(val(9)))));
+        f
+    }
+
+    #[test]
+    fn observable_fenv_blocks_fp_pre_even_with_broad_research_switch() {
+        struct Restore(bool, EnvConfig);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                super::super::FP_ENVIRONMENT_OBSERVABLE.with(|cell| cell.set(self.0));
+                set_backedge_pre_env(self.1);
+            }
+        }
+        let _restore = Restore(
+            super::super::FP_ENVIRONMENT_OBSERVABLE.with(std::cell::Cell::get),
+            EnvConfig::read(),
+        );
+        crate::common::types::set_target_elf_machine(EM_X86_64);
+        for broad in [false, true] {
+            set_backedge_pre_env(EnvConfig {
+                fp_broad: broad,
+                ..ENV_CONFIG_DEFAULT
+            });
+            for observable in [false, true] {
+                super::super::FP_ENVIRONMENT_OBSERVABLE.with(|cell| cell.set(observable));
+                let mut f = fp_recurrence();
+                assert_eq!(run(&mut f), usize::from(!observable));
+                assert_eq!(count_muls(&f), if observable { 2 } else { 1 });
+                // Do not turn an FP legality fence into a global integer ban.
+                assert_eq!(run(&mut int_recurrence()), 1);
+            }
+        }
     }
 
     #[test]

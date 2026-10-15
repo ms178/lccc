@@ -1,7 +1,7 @@
 //! RISC-V shared library emission.
 //!
 //! Produces an ET_DYN ELF with base address 0 (position-independent).
-//! All defined global symbols are exported to .dynsym.
+//! Defined DEFAULT/PROTECTED global symbols are exported to .dynsym.
 //! R_RISCV_RELATIVE dynamic relocations are emitted for internal absolute addresses.
 //!
 //! Called from `link.rs::link_shared` after input loading, section merging,
@@ -24,7 +24,6 @@ use crate::backend::elf::{
 
 const R_RISCV_RELATIVE: u64 = 3;
 const R_RISCV_JUMP_SLOT: u64 = 5;
-const R_RISCV_GLOB_DAT: u64 = 6;
 const DT_SONAME: u64 = 14;
 const DT_RELACOUNT: u64 = 0x6ffffff9;
 const SHT_DYNAMIC: u32 = 6;
@@ -50,7 +49,7 @@ pub fn emit_shared_library(
     global_syms: &mut FxHashMap<String, GlobalSym>,
     got_symbols: &[String],
     _tls_got_symbols: &FxHashSet<String>,
-    _local_got_sym_info: &FxHashMap<String, (usize, usize, i64)>,
+    local_got_sym_info: &FxHashMap<String, (usize, usize, i64)>,
     needed_sonames: &[String],
     soname: Option<String>,
     output_path: &str,
@@ -162,7 +161,11 @@ pub fn emit_shared_library(
     let mut dyn_sym_names: Vec<String> = Vec::new();
     let mut exported: Vec<String> = global_syms
         .iter()
-        .filter(|(_, g)| g.defined && g.binding != STB_LOCAL)
+        .filter(|(_, g)| {
+            g.defined
+                && g.binding != STB_LOCAL
+                && linker_common::is_dynamic_visibility(g.visibility)
+        })
         .map(|(n, _)| n.clone())
         .collect();
     exported.sort();
@@ -170,8 +173,19 @@ pub fn emit_shared_library(
         dyn_sym_names.push(name);
     }
     for (name, gsym) in global_syms.iter() {
-        if !gsym.defined && !dyn_sym_names.contains(name) {
-            dyn_sym_names.push(name.clone());
+        if !gsym.defined {
+            if gsym.visibility != STV_DEFAULT {
+                if gsym.binding == STB_WEAK {
+                    continue; // An unresolved non-preemptible weak reference is zero.
+                }
+                return Err(format!(
+                    "undefined non-default-visible RISC-V symbol '{}'",
+                    name
+                ));
+            }
+            if !dyn_sym_names.contains(name) {
+                dyn_sym_names.push(name.clone());
+            }
         }
     }
 
@@ -714,23 +728,19 @@ pub fn emit_shared_library(
                 if gsym.defined {
                     let info = (gsym.binding << 4) | gsym.sym_type;
                     elf[ds + 4] = info;
-                    elf[ds + 5] = 0;
+                    elf[ds + 5] = gsym.visibility;
                     let shndx = gsym
                         .section_idx
                         .and_then(|si| merged_to_shdr.get(&si).copied())
-                        .unwrap_or(1);
+                        .unwrap_or(SHN_ABS);
                     elf[ds + 6..ds + 8].copy_from_slice(&shndx.to_le_bytes());
                     elf[ds + 8..ds + 16].copy_from_slice(&gsym.value.to_le_bytes());
                     elf[ds + 16..ds + 24].copy_from_slice(&gsym.size.to_le_bytes());
                 } else {
                     let bind = gsym.binding;
-                    let stype = if gsym.sym_type != 0 {
-                        gsym.sym_type
-                    } else {
-                        STT_FUNC
-                    };
+                    let stype = gsym.sym_type;
                     elf[ds + 4] = (bind << 4) | stype;
-                    elf[ds + 5] = 0;
+                    elf[ds + 5] = gsym.visibility;
                     elf[ds + 6..ds + 8].copy_from_slice(&0u16.to_le_bytes());
                     elf[ds + 8..ds + 16].copy_from_slice(&0u64.to_le_bytes());
                     elf[ds + 16..ds + 24].copy_from_slice(&0u64.to_le_bytes());
@@ -766,16 +776,6 @@ pub fn emit_shared_library(
         let file_off = (ms.vaddr - base_addr) as usize;
         if file_off + ms.data.len() <= elf.len() {
             elf[file_off..file_off + ms.data.len()].copy_from_slice(&ms.data);
-        }
-    }
-
-    // Fill GOT entries
-    for (gi, name) in got_symbols.iter().enumerate() {
-        let entry_off = (got_offset + gi as u64 * 8) as usize;
-        if let Some(gsym) = global_syms.get(name) {
-            if gsym.defined && entry_off + 8 <= elf.len() {
-                elf[entry_off..entry_off + 8].copy_from_slice(&gsym.value.to_le_bytes());
-            }
         }
     }
 
@@ -840,18 +840,25 @@ pub fn emit_shared_library(
 
     // ── Apply relocations and collect R_RISCV_RELATIVE entries ──────
     let mut rela_dyn_entries: Vec<(u64, u64)> = Vec::new();
-    let mut glob_dat_entries: Vec<(u64, String)> = Vec::new();
+    let mut glob_dat_entries: Vec<(u64, String, i64)> = Vec::new();
 
     for (gi, name) in got_symbols.iter().enumerate() {
         let gea = got_vaddr + gi as u64 * 8;
         if let Some(gsym) = global_syms.get(name) {
-            if gsym.defined {
-                rela_dyn_entries.push((gea, gsym.value));
+            if gsym.visibility != STV_DEFAULT {
+                if gsym.defined && gsym.section_idx.is_some() {
+                    rela_dyn_entries.push((gea, gsym.value));
+                }
             } else {
-                glob_dat_entries.push((gea, name.clone()));
+                glob_dat_entries.push((gea, name.clone(), 0));
+            }
+        } else if let Some(&(oi, si, addend)) = local_got_sym_info.get(name) {
+            if input_objs[oi].1.symbols[si].shndx != SHN_ABS {
+                let value = local_sym_vaddrs[oi][si].wrapping_add(addend as u64);
+                rela_dyn_entries.push((gea, value));
             }
         } else {
-            glob_dat_entries.push((gea, name.clone()));
+            return Err(format!("missing RISC-V GOT symbol '{}'", name));
         }
     }
 
@@ -875,6 +882,7 @@ pub fn emit_shared_library(
     };
     let reloc_result = reloc::apply_relocations(input_objs, merged_sections, &ctx)?;
     rela_dyn_entries.extend(reloc_result.relative_entries);
+    glob_dat_entries.extend(reloc_result.symbol_entries);
 
     // Write updated section data back to elf buffer
     for ms in merged_sections.iter() {
@@ -890,14 +898,19 @@ pub fn emit_shared_library(
         }
     }
 
-    // Write GOT entries (re-fill after relocations)
+    // Emit the GOT once, after input section writes. Local GOT keys are
+    // synthetic bookkeeping names and MUST NOT become dynamic symbol names.
     for (gi, name) in got_symbols.iter().enumerate() {
         let entry_off = (got_offset + gi as u64 * 8) as usize;
-        if let Some(gsym) = global_syms.get(name) {
-            if gsym.defined && entry_off + 8 <= elf.len() {
-                elf[entry_off..entry_off + 8].copy_from_slice(&gsym.value.to_le_bytes());
-            }
-        }
+        let value = if let Some(&(oi, si, addend)) = local_got_sym_info.get(name) {
+            local_sym_vaddrs[oi][si].wrapping_add(addend as u64)
+        } else {
+            global_syms
+                .get(name)
+                .filter(|g| g.defined && g.visibility != STV_DEFAULT)
+                .map_or(0, |g| g.value)
+        };
+        elf[entry_off..entry_off + 8].copy_from_slice(&value.to_le_bytes());
     }
 
     // Add RELATIVE entries for init_array/fini_array pointers
@@ -931,17 +944,22 @@ pub fn emit_shared_library(
                 rd += 24;
             }
         }
-        for (rel_offset, sym_name) in &glob_dat_entries {
+        for (rel_offset, sym_name, addend) in &glob_dat_entries {
             let si = dyn_sym_names
                 .iter()
                 .position(|n| n == sym_name)
                 .map(|j| j + 1)
-                .unwrap_or(0) as u64;
+                .ok_or_else(|| {
+                    format!(
+                        "missing dynamic symbol for RISC-V relocation: '{}'",
+                        sym_name
+                    )
+                })? as u64;
             if rd + 24 <= elf.len() {
                 elf[rd..rd + 8].copy_from_slice(&rel_offset.to_le_bytes());
                 elf[rd + 8..rd + 16]
-                    .copy_from_slice(&((si << 32) | R_RISCV_GLOB_DAT).to_le_bytes());
-                elf[rd + 16..rd + 24].copy_from_slice(&0u64.to_le_bytes());
+                    .copy_from_slice(&((si << 32) | u64::from(R_RISCV_64)).to_le_bytes());
+                elf[rd + 16..rd + 24].copy_from_slice(&addend.to_le_bytes());
                 rd += 24;
             }
         }

@@ -46,6 +46,9 @@ use crate::ir::reexports::{
 
 /// Run if-conversion on a single function.
 pub(crate) fn if_convert_function(func: &mut IrFunction) -> usize {
+    if super::fp_environment_blocks_reordering(func) {
+        return 0;
+    }
     let num_blocks = func.blocks.len();
     if num_blocks < 3 {
         return 0; // Need at least 3 blocks (pred + one arm + merge)

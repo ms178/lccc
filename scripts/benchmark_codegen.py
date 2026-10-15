@@ -45,17 +45,19 @@ def main(argv=None):
     parser.add_argument("--gcc", default="gcc-16", help="local builtin-header provider; identity recorded")
     parser.add_argument("--oracles", help="CE compiler list; empty string explicitly selects local-only")
     parser.add_argument("--verify-haswell-profile", action="store_true",
-                        help="require a four-feature-family admission canary before the survey")
+                        help="require a ISA-feature admission canary before the survey")
     parser.add_argument("--flags", default="-O2 -march=x86-64-v3 -fwrapv")
     parser.add_argument("--only", help="comma-separated registry IDs, not source stems")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
     known = {item.name for item in bench.BENCHMARKS}
+    if len(known) != len(bench.BENCHMARKS):
+        parser.error("duplicate benchmark registry identifiers")
     selected = set(args.only.split(",")) if args.only else known
     if not selected or selected - known:
         parser.error("empty/unknown corpus selection")
     include = subprocess.check_output([args.gcc, "-print-file-name=include"], text=True).strip()
-    if not Path(include).is_dir():
+    if not include or not Path(include).is_dir():
         parser.error("GCC did not identify an existing builtin-header directory")
     version = subprocess.check_output([args.gcc, "--version"], text=True)
     args.out.mkdir(parents=True, exist_ok=True)

@@ -574,6 +574,20 @@ jobs:
         tar -xzf lccc-fast.tar.gz
         test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
         sha256sum -c target/ci-build.sha256
+    - name: Preserved synthesis and ordering contracts
+      env:
+        CCC: target/fastbuild/lccc
+        GCC: gcc-16
+      run: |
+        set -euo pipefail
+        python3 scripts/verify_evidence_hashes.py
+        python3 scripts/check_licm_ordering.py
+        python3 scripts/check_strict_packed_recip.py
+        bash tests/regression/check_byte_accessor_inline.sh
+        bash tests/regression/check_fp_environment.sh
+        bash tests/regression/check_unsigned_affine_loop.sh
+        python3 tests/linker/test_riscv_shared_binding.py
+        python3 tests/linker/check_riscv_shared_binding.py --lccc target/fastbuild/lccc-riscv
     - name: Benchmark output gate (workload kernels vs GCC oracle)
       env:
         GCC_BIN: gcc-16
@@ -1118,6 +1132,9 @@ jobs:
         python3 scripts/test_godbolt_cache.py
         python3 scripts/test_glibc_check_triage.py
         python3 scripts/test_oracle_delta_gate.py
+        # Live CE delta execution moved to scheduled/manual oracle-delta.yml:
+        # network outages must not masquerade as PR-time oracle coverage.
+        # Hermetic self-tests and local differential/output gates stay required.
         python3 scripts/oracle_delta_gate.py --self-test
         python3 scripts/glibc_check_triage.py --self-test
         bash tests/regression/check_copy_alias_sizes.sh

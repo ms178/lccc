@@ -1,0 +1,6 @@
+add_test(passed "/bin/sh" "-c" "exit 0")
+add_test(failed "/bin/sh" "-c" "exit 1")
+add_test(disabled "/bin/sh" "-c" "exit 0")
+set_tests_properties(disabled PROPERTIES DISABLED TRUE)
+add_test(runtime_skip "/bin/sh" "-c" "exit 77")
+set_tests_properties(runtime_skip PROPERTIES SKIP_RETURN_CODE 77)

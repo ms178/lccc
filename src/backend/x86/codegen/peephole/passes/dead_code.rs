@@ -904,7 +904,16 @@ fn slot_is_ever_read(
         .any(|&(rb, ro, rs)| rb == base && ranges_overlap(offset, store_bytes, ro, rs))
         || read_floors
             .iter()
-            .any(|&(rb, d)| rb == base && offset + store_bytes > d)
+            .any(|&(rb, d)| rb == base && i64::from(offset) + i64::from(store_bytes) > i64::from(d))
+}
+
+// Share the architectural read contract with FP slot liveness. A suffix or
+// an arbitrary 16/32/64-byte ceiling is not a bound on state images or future
+// instructions. Unknown extents make this function's slot analysis opaque.
+fn frame_read_extent(line: &str) -> Option<i32> {
+    let code = line.split('#').next()?.trim();
+    let (mnemonic, operands) = code.split_once(char::is_whitespace)?;
+    super::fp_liveness::read_extent(mnemonic, operands.trim())
 }
 
 pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineInfo]) {
@@ -1241,7 +1250,11 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                         }
                     } else if rbp_off != RBP_OFFSET_NONE {
                         let base = frame_base(line, b's');
-                        read_ranges.push((base, rbp_off, 32));
+                        let Some(width) = frame_read_extent(line) else {
+                            has_unparseable_indirect = true;
+                            break;
+                        };
+                        read_ranges.push((base, rbp_off, width));
                     } else if parse_frame_mem(line).is_some() {
                         // Frame operand that was neither a leaq, a cached
                         // plain access, nor a provably bounded SIB: fail
@@ -1271,13 +1284,9 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                 | LineKind::Directive => {}
                 LineKind::InlineAsm => {
                     let line = infos[k].trimmed(store.get(k));
-                    // User asm naming a fixed frame slot can read/write that
-                    // location with an unknown mnemonic width. x86 memory
-                    // operands only ever extend UPWARD from the effective
-                    // address (max 64 bytes for AVX-512), so a 64-byte range
-                    // at the displacement is exact-sound without disabling
-                    // DSE for unrelated home slots (`vstmxcsr 48(%rsp)`
-                    // must not pin a counter store at 8(%rsp)).
+                    // A known direct operand observes its architectural extent.
+                    // State images and unsupported mnemonics are NOT bounded by
+                    // the widest vector register. Fail closed for the function.
                     if let Some(fm) = parse_frame_mem(line) {
                         if fm.sib {
                             // Raw asm index values are not bound by C UB: a
@@ -1286,7 +1295,11 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                             has_unparseable_indirect = true;
                             break;
                         }
-                        read_ranges.push((fm.base, fm.disp, 64));
+                        let Some(width) = frame_read_extent(line) else {
+                            has_unparseable_indirect = true;
+                            break;
+                        };
+                        read_ranges.push((fm.base, fm.disp, width));
                     }
                 }
                 _ => {
@@ -1297,7 +1310,11 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                         // the named offset (fldt = 10 bytes, movdqu = 16).
                         // 8 bytes missed the tail of a long double slot.
                         let base = frame_base(line, b's');
-                        read_ranges.push((base, rbp_off, 16));
+                        let Some(width) = frame_read_extent(line) else {
+                            has_unparseable_indirect = true;
+                            break;
+                        };
+                        read_ranges.push((base, rbp_off, width));
                     } else if parse_frame_mem(line).is_some() {
                         if let Some((base, off, len, is_floor)) =
                             sib_frame_observation(store, infos, k, line)
@@ -1454,6 +1471,49 @@ mod tests {
             .map(|i| classify_line(store.get(i)))
             .collect();
         (store, infos)
+    }
+
+    #[test]
+    fn never_read_dse_uses_architectural_memory_extents() {
+        for (read, offset, kept) in [
+            ("fxrstor64 (%rsp)", 272, true),
+            ("fxrstorq (%rsp)", 272, true),
+            ("xrstor64 (%rsp)", 688, true),
+            ("xrstors (%rsp)", 688, true),
+            ("future_state_read (%rsp)", 688, true),
+            ("vmovupd (%rsp), %zmm7", 48, true),
+            ("vmovupd (%rsp), %ymm7", 48, false),
+            ("ldmxcsr (%rsp)", 48, false),
+        ] {
+            let candidate = format!("movsd %xmm6, {offset}(%rsp)");
+            let asm = format!(
+                "f:\n.cfi_startproc\n    subq $1024, %rsp\n    {candidate}\n    {read}\n    addq $1024, %rsp\n    ret\n.cfi_endproc\n.size f, .-f\n"
+            );
+            let (store, mut infos) = build(&asm);
+            let index = (0..store.len())
+                .find(|&i| store.get(i).contains(&candidate))
+                .unwrap();
+            eliminate_never_read_stores(&store, &mut infos);
+            assert_eq!(!infos[index].is_nop(), kept, "{read}: {candidate}");
+        }
+    }
+
+    #[test]
+    fn slot_read_floor_endpoint_does_not_wrap() {
+        assert!(slot_is_ever_read(
+            b's',
+            i32::MAX - 3,
+            8,
+            &[],
+            &[(b's', i32::MAX)]
+        ));
+        assert!(!slot_is_ever_read(
+            b'b',
+            i32::MAX - 3,
+            8,
+            &[],
+            &[(b's', i32::MAX)]
+        ));
     }
 
     #[test]

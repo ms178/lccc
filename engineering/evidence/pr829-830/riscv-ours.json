@@ -1,0 +1,2703 @@
+{
+  "passed": 188,
+  "failed": 292,
+  "skipped": 0,
+  "versions": {
+    "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone\n",
+    "oracle": "GNU ld (GNU Binutils for Debian) 2.47\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis program is free software; you may redistribute it under the terms of\nthe GNU General Public License version 3 or (at your option) a later version.\nThis program has absolutely no warranty.\n"
+  },
+  "records": [
+    {
+      "case": "b0-v0-dTrue-absFalse-0-k2-a-7",
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "b0-v0-dTrue-absFalse-0-k2-a-7",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b0-v0-dTrue-absFalse-0-k2-a0",
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "b0-v0-dTrue-absFalse-0-k2-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b0-v0-dTrue-absFalse-0-k2-a11",
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "b0-v0-dTrue-absFalse-0-k2-a11",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b0-v0-dTrue-absFalse-0-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "b0-v0-dTrue-absFalse-0-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b0-v0-dTrue-absFalse-0-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "b0-v0-dTrue-absFalse-0-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b0-v0-dTrue-absFalse-0-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([(6, 0)], {'binding': 0, 'visibility': 0, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 20, 'addend': 0})"
+    },
+    {
+      "case": "b0-v0-dTrue-absFalse-0-k20-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b0-v0-dTrue-absTrue-0-k2-a-7",
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "b0-v0-dTrue-absTrue-0-k2-a-7",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(3, -7)], 0, 0, -7)"
+    },
+    {
+      "case": "b0-v0-dTrue-absTrue-0-k2-a0",
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "b0-v0-dTrue-absTrue-0-k2-a0",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(3, 0)], 0, 0, 0)"
+    },
+    {
+      "case": "b0-v0-dTrue-absTrue-0-k2-a11",
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "b0-v0-dTrue-absTrue-0-k2-a11",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(3, 11)], 0, 0, 11)"
+    },
+    {
+      "case": "b0-v0-dTrue-absTrue-0-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "b0-v0-dTrue-absTrue-0-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(3, -9223372036854775808)], 0, 0, -9223372036854775808)"
+    },
+    {
+      "case": "b0-v0-dTrue-absTrue-0-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "b0-v0-dTrue-absTrue-0-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(3, 9223372036854775807)], 0, 0, 9223372036854775807)"
+    },
+    {
+      "case": "b0-v0-dTrue-absTrue-0-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([(6, 0)], 0, 0, 0)"
+    },
+    {
+      "case": "b0-v0-dTrue-absTrue-0-k20-a0",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(3, 0)], 0, 0, 0)"
+    },
+    {
+      "case": "b0-v0-dTrue-absTrue-256-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([(3, 249)], 249, 256, -7)"
+    },
+    {
+      "case": "b0-v0-dTrue-absTrue-256-k2-a-7",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(3, 249)], 0, 256, -7)"
+    },
+    {
+      "case": "b0-v0-dTrue-absTrue-256-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([(3, 256)], 256, 256, 0)"
+    },
+    {
+      "case": "b0-v0-dTrue-absTrue-256-k2-a0",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(3, 256)], 0, 256, 0)"
+    },
+    {
+      "case": "b0-v0-dTrue-absTrue-256-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([(3, 267)], 267, 256, 11)"
+    },
+    {
+      "case": "b0-v0-dTrue-absTrue-256-k2-a11",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(3, 267)], 0, 256, 11)"
+    },
+    {
+      "case": "b0-v0-dTrue-absTrue-256-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([(3, -9223372036854775552)], 9223372036854776064, 256, -9223372036854775808)"
+    },
+    {
+      "case": "b0-v0-dTrue-absTrue-256-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(3, -9223372036854775552)], 0, 256, -9223372036854775808)"
+    },
+    {
+      "case": "b0-v0-dTrue-absTrue-256-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([(3, -9223372036854775553)], 9223372036854776063, 256, 9223372036854775807)"
+    },
+    {
+      "case": "b0-v0-dTrue-absTrue-256-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(3, -9223372036854775553)], 0, 256, 9223372036854775807)"
+    },
+    {
+      "case": "b0-v0-dTrue-absTrue-256-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([], [(8376, 6, 0)])"
+    },
+    {
+      "case": "b0-v0-dTrue-absTrue-256-k20-a0",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(3, 256)], 256, 256, 0)"
+    },
+    {
+      "case": "b1-v0-dTrue-absFalse-0-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([(3, 4089)], {'binding': 1, 'visibility': 0, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': -7})"
+    },
+    {
+      "case": "b1-v0-dTrue-absFalse-0-k2-a-7",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v0-dTrue-absFalse-0-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([(3, 4096)], {'binding': 1, 'visibility': 0, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 0})"
+    },
+    {
+      "case": "b1-v0-dTrue-absFalse-0-k2-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v0-dTrue-absFalse-0-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([(3, 4107)], {'binding': 1, 'visibility': 0, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 11})"
+    },
+    {
+      "case": "b1-v0-dTrue-absFalse-0-k2-a11",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v0-dTrue-absFalse-0-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([(3, -9223372036854771712)], {'binding': 1, 'visibility': 0, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': -9223372036854775808})"
+    },
+    {
+      "case": "b1-v0-dTrue-absFalse-0-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v0-dTrue-absFalse-0-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([(3, -9223372036854771713)], {'binding': 1, 'visibility': 0, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 9223372036854775807})"
+    },
+    {
+      "case": "b1-v0-dTrue-absFalse-0-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v0-dTrue-absFalse-0-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([(3, 4096)], {'binding': 1, 'visibility': 0, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 20, 'addend': 0})"
+    },
+    {
+      "case": "b1-v0-dTrue-absFalse-0-k20-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v0-dTrue-absTrue-0-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b1-v0-dTrue-absTrue-0-k2-a-7",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v0-dTrue-absTrue-0-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b1-v0-dTrue-absTrue-0-k2-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v0-dTrue-absTrue-0-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b1-v0-dTrue-absTrue-0-k2-a11",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v0-dTrue-absTrue-0-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b1-v0-dTrue-absTrue-0-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v0-dTrue-absTrue-0-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b1-v0-dTrue-absTrue-0-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v0-dTrue-absTrue-0-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b1-v0-dTrue-absTrue-0-k20-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v0-dTrue-absTrue-256-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}"
+    },
+    {
+      "case": "b1-v0-dTrue-absTrue-256-k2-a-7",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v0-dTrue-absTrue-256-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}"
+    },
+    {
+      "case": "b1-v0-dTrue-absTrue-256-k2-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v0-dTrue-absTrue-256-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}"
+    },
+    {
+      "case": "b1-v0-dTrue-absTrue-256-k2-a11",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v0-dTrue-absTrue-256-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}"
+    },
+    {
+      "case": "b1-v0-dTrue-absTrue-256-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v0-dTrue-absTrue-256-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}"
+    },
+    {
+      "case": "b1-v0-dTrue-absTrue-256-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v0-dTrue-absTrue-256-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}"
+    },
+    {
+      "case": "b1-v0-dTrue-absTrue-256-k20-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v0-dFalse-absFalse-0-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([], {'binding': 1, 'visibility': 0, 'defined': False, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': -7})"
+    },
+    {
+      "case": "b1-v0-dFalse-absFalse-0-k2-a-7",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v0-dFalse-absFalse-0-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([], {'binding': 1, 'visibility': 0, 'defined': False, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 0})"
+    },
+    {
+      "case": "b1-v0-dFalse-absFalse-0-k2-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v0-dFalse-absFalse-0-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([], {'binding': 1, 'visibility': 0, 'defined': False, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 11})"
+    },
+    {
+      "case": "b1-v0-dFalse-absFalse-0-k2-a11",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v0-dFalse-absFalse-0-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([], {'binding': 1, 'visibility': 0, 'defined': False, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': -9223372036854775808})"
+    },
+    {
+      "case": "b1-v0-dFalse-absFalse-0-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v0-dFalse-absFalse-0-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([], {'binding': 1, 'visibility': 0, 'defined': False, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 9223372036854775807})"
+    },
+    {
+      "case": "b1-v0-dFalse-absFalse-0-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v0-dFalse-absFalse-0-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([(8589934598, 0)], {'binding': 1, 'visibility': 0, 'defined': False, 'absolute': False, 'target_value': 0, 'kind': 20, 'addend': 0})"
+    },
+    {
+      "case": "b1-v0-dFalse-absFalse-0-k20-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v1-dTrue-absFalse-0-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 1, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': -7}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}})"
+    },
+    {
+      "case": "b1-v1-dTrue-absFalse-0-k2-a-7",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v1-dTrue-absFalse-0-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 1, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 0}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}})"
+    },
+    {
+      "case": "b1-v1-dTrue-absFalse-0-k2-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v1-dTrue-absFalse-0-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 1, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 11}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}})"
+    },
+    {
+      "case": "b1-v1-dTrue-absFalse-0-k2-a11",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v1-dTrue-absFalse-0-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 1, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': -9223372036854775808}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}})"
+    },
+    {
+      "case": "b1-v1-dTrue-absFalse-0-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v1-dTrue-absFalse-0-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 1, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 9223372036854775807}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}})"
+    },
+    {
+      "case": "b1-v1-dTrue-absFalse-0-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v1-dTrue-absFalse-0-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 1, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 20, 'addend': 0}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}})"
+    },
+    {
+      "case": "b1-v1-dTrue-absFalse-0-k20-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v1-dTrue-absTrue-0-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 1, 'defined': True, 'absolute': True, 'target_value': 0, 'kind': 2, 'addend': -7}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b1-v1-dTrue-absTrue-0-k2-a-7",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v1-dTrue-absTrue-0-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 1, 'defined': True, 'absolute': True, 'target_value': 0, 'kind': 2, 'addend': 0}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b1-v1-dTrue-absTrue-0-k2-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v1-dTrue-absTrue-0-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 1, 'defined': True, 'absolute': True, 'target_value': 0, 'kind': 2, 'addend': 11}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b1-v1-dTrue-absTrue-0-k2-a11",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v1-dTrue-absTrue-0-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 1, 'defined': True, 'absolute': True, 'target_value': 0, 'kind': 2, 'addend': -9223372036854775808}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b1-v1-dTrue-absTrue-0-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v1-dTrue-absTrue-0-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 1, 'defined': True, 'absolute': True, 'target_value': 0, 'kind': 2, 'addend': 9223372036854775807}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b1-v1-dTrue-absTrue-0-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v1-dTrue-absTrue-0-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 1, 'defined': True, 'absolute': True, 'target_value': 0, 'kind': 20, 'addend': 0}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b1-v1-dTrue-absTrue-0-k20-a0",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(3, 0)], 0, 0, 0)"
+    },
+    {
+      "case": "b1-v1-dTrue-absTrue-256-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 1, 'defined': True, 'absolute': True, 'target_value': 256, 'kind': 2, 'addend': -7}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}})"
+    },
+    {
+      "case": "b1-v1-dTrue-absTrue-256-k2-a-7",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v1-dTrue-absTrue-256-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 1, 'defined': True, 'absolute': True, 'target_value': 256, 'kind': 2, 'addend': 0}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}})"
+    },
+    {
+      "case": "b1-v1-dTrue-absTrue-256-k2-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v1-dTrue-absTrue-256-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 1, 'defined': True, 'absolute': True, 'target_value': 256, 'kind': 2, 'addend': 11}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}})"
+    },
+    {
+      "case": "b1-v1-dTrue-absTrue-256-k2-a11",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v1-dTrue-absTrue-256-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 1, 'defined': True, 'absolute': True, 'target_value': 256, 'kind': 2, 'addend': -9223372036854775808}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}})"
+    },
+    {
+      "case": "b1-v1-dTrue-absTrue-256-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v1-dTrue-absTrue-256-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 1, 'defined': True, 'absolute': True, 'target_value': 256, 'kind': 2, 'addend': 9223372036854775807}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}})"
+    },
+    {
+      "case": "b1-v1-dTrue-absTrue-256-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v1-dTrue-absTrue-256-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 1, 'defined': True, 'absolute': True, 'target_value': 256, 'kind': 20, 'addend': 0}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}})"
+    },
+    {
+      "case": "b1-v1-dTrue-absTrue-256-k20-a0",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(3, 256)], 256, 256, 0)"
+    },
+    {
+      "case": "b1-v1-dFalse-absFalse-0-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "(0, '')"
+    },
+    {
+      "case": "b1-v1-dFalse-absFalse-0-k2-a-7",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v1-dFalse-absFalse-0-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "(0, '')"
+    },
+    {
+      "case": "b1-v1-dFalse-absFalse-0-k2-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v1-dFalse-absFalse-0-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "(0, '')"
+    },
+    {
+      "case": "b1-v1-dFalse-absFalse-0-k2-a11",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v1-dFalse-absFalse-0-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "(0, '')"
+    },
+    {
+      "case": "b1-v1-dFalse-absFalse-0-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v1-dFalse-absFalse-0-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "(0, '')"
+    },
+    {
+      "case": "b1-v1-dFalse-absFalse-0-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v1-dFalse-absFalse-0-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "(0, '')"
+    },
+    {
+      "case": "b1-v1-dFalse-absFalse-0-k20-a0",
+      "tool": "oracle",
+      "passed": false,
+      "error": "crash is not a diagnostic: ['/usr/bin/riscv64-linux-gnu-ld', '-m', 'elf64lriscv', '-shared', '--no-relax', '/tmp/lccc-rv-binding-4__4iia2/b1-v1-dFalse-absFalse-0-k20-a0.o', '-o', '/tmp/lccc-rv-binding-4__4iia2/b1-v1-dFalse-absFalse-0-k20-a0-oracle.so']: /usr/bin/riscv64-linux-gnu-ld.bfd: /tmp/lccc-rv-binding-4__4iia2/b1-v1-dFalse-absFalse-0-k20-a0.o:(.data+0x0): undefined reference to `target'\n"
+    },
+    {
+      "case": "b1-v2-dTrue-absFalse-0-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 2, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': -7}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}})"
+    },
+    {
+      "case": "b1-v2-dTrue-absFalse-0-k2-a-7",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v2-dTrue-absFalse-0-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 2, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 0}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}})"
+    },
+    {
+      "case": "b1-v2-dTrue-absFalse-0-k2-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v2-dTrue-absFalse-0-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 2, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 11}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}})"
+    },
+    {
+      "case": "b1-v2-dTrue-absFalse-0-k2-a11",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v2-dTrue-absFalse-0-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 2, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': -9223372036854775808}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}})"
+    },
+    {
+      "case": "b1-v2-dTrue-absFalse-0-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v2-dTrue-absFalse-0-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 2, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 9223372036854775807}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}})"
+    },
+    {
+      "case": "b1-v2-dTrue-absFalse-0-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v2-dTrue-absFalse-0-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 2, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 20, 'addend': 0}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}})"
+    },
+    {
+      "case": "b1-v2-dTrue-absFalse-0-k20-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v2-dTrue-absTrue-0-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 2, 'defined': True, 'absolute': True, 'target_value': 0, 'kind': 2, 'addend': -7}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b1-v2-dTrue-absTrue-0-k2-a-7",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v2-dTrue-absTrue-0-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 2, 'defined': True, 'absolute': True, 'target_value': 0, 'kind': 2, 'addend': 0}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b1-v2-dTrue-absTrue-0-k2-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v2-dTrue-absTrue-0-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 2, 'defined': True, 'absolute': True, 'target_value': 0, 'kind': 2, 'addend': 11}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b1-v2-dTrue-absTrue-0-k2-a11",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v2-dTrue-absTrue-0-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 2, 'defined': True, 'absolute': True, 'target_value': 0, 'kind': 2, 'addend': -9223372036854775808}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b1-v2-dTrue-absTrue-0-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v2-dTrue-absTrue-0-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 2, 'defined': True, 'absolute': True, 'target_value': 0, 'kind': 2, 'addend': 9223372036854775807}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b1-v2-dTrue-absTrue-0-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v2-dTrue-absTrue-0-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 2, 'defined': True, 'absolute': True, 'target_value': 0, 'kind': 20, 'addend': 0}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b1-v2-dTrue-absTrue-0-k20-a0",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(3, 0)], 0, 0, 0)"
+    },
+    {
+      "case": "b1-v2-dTrue-absTrue-256-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 2, 'defined': True, 'absolute': True, 'target_value': 256, 'kind': 2, 'addend': -7}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}})"
+    },
+    {
+      "case": "b1-v2-dTrue-absTrue-256-k2-a-7",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v2-dTrue-absTrue-256-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 2, 'defined': True, 'absolute': True, 'target_value': 256, 'kind': 2, 'addend': 0}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}})"
+    },
+    {
+      "case": "b1-v2-dTrue-absTrue-256-k2-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v2-dTrue-absTrue-256-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 2, 'defined': True, 'absolute': True, 'target_value': 256, 'kind': 2, 'addend': 11}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}})"
+    },
+    {
+      "case": "b1-v2-dTrue-absTrue-256-k2-a11",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v2-dTrue-absTrue-256-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 2, 'defined': True, 'absolute': True, 'target_value': 256, 'kind': 2, 'addend': -9223372036854775808}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}})"
+    },
+    {
+      "case": "b1-v2-dTrue-absTrue-256-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v2-dTrue-absTrue-256-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 2, 'defined': True, 'absolute': True, 'target_value': 256, 'kind': 2, 'addend': 9223372036854775807}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}})"
+    },
+    {
+      "case": "b1-v2-dTrue-absTrue-256-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v2-dTrue-absTrue-256-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 2, 'defined': True, 'absolute': True, 'target_value': 256, 'kind': 20, 'addend': 0}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}})"
+    },
+    {
+      "case": "b1-v2-dTrue-absTrue-256-k20-a0",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(3, 256)], 256, 256, 0)"
+    },
+    {
+      "case": "b1-v2-dFalse-absFalse-0-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "(0, '')"
+    },
+    {
+      "case": "b1-v2-dFalse-absFalse-0-k2-a-7",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v2-dFalse-absFalse-0-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "(0, '')"
+    },
+    {
+      "case": "b1-v2-dFalse-absFalse-0-k2-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v2-dFalse-absFalse-0-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "(0, '')"
+    },
+    {
+      "case": "b1-v2-dFalse-absFalse-0-k2-a11",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v2-dFalse-absFalse-0-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "(0, '')"
+    },
+    {
+      "case": "b1-v2-dFalse-absFalse-0-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v2-dFalse-absFalse-0-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "(0, '')"
+    },
+    {
+      "case": "b1-v2-dFalse-absFalse-0-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v2-dFalse-absFalse-0-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "(0, '')"
+    },
+    {
+      "case": "b1-v2-dFalse-absFalse-0-k20-a0",
+      "tool": "oracle",
+      "passed": false,
+      "error": "crash is not a diagnostic: ['/usr/bin/riscv64-linux-gnu-ld', '-m', 'elf64lriscv', '-shared', '--no-relax', '/tmp/lccc-rv-binding-4__4iia2/b1-v2-dFalse-absFalse-0-k20-a0.o', '-o', '/tmp/lccc-rv-binding-4__4iia2/b1-v2-dFalse-absFalse-0-k20-a0-oracle.so']: /usr/bin/riscv64-linux-gnu-ld.bfd: /tmp/lccc-rv-binding-4__4iia2/b1-v2-dFalse-absFalse-0-k20-a0.o:(.data+0x0): undefined reference to `target'\n"
+    },
+    {
+      "case": "b1-v3-dTrue-absFalse-0-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}"
+    },
+    {
+      "case": "b1-v3-dTrue-absFalse-0-k2-a-7",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, -7)], {'binding': 1, 'visibility': 3, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': -7})"
+    },
+    {
+      "case": "b1-v3-dTrue-absFalse-0-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}"
+    },
+    {
+      "case": "b1-v3-dTrue-absFalse-0-k2-a0",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, 0)], {'binding': 1, 'visibility': 3, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 0})"
+    },
+    {
+      "case": "b1-v3-dTrue-absFalse-0-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}"
+    },
+    {
+      "case": "b1-v3-dTrue-absFalse-0-k2-a11",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, 11)], {'binding': 1, 'visibility': 3, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 11})"
+    },
+    {
+      "case": "b1-v3-dTrue-absFalse-0-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}"
+    },
+    {
+      "case": "b1-v3-dTrue-absFalse-0-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, -9223372036854775808)], {'binding': 1, 'visibility': 3, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': -9223372036854775808})"
+    },
+    {
+      "case": "b1-v3-dTrue-absFalse-0-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}"
+    },
+    {
+      "case": "b1-v3-dTrue-absFalse-0-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, 9223372036854775807)], {'binding': 1, 'visibility': 3, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 9223372036854775807})"
+    },
+    {
+      "case": "b1-v3-dTrue-absFalse-0-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}"
+    },
+    {
+      "case": "b1-v3-dTrue-absFalse-0-k20-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v3-dTrue-absTrue-0-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b1-v3-dTrue-absTrue-0-k2-a-7",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, -7)], 0, 0, -7)"
+    },
+    {
+      "case": "b1-v3-dTrue-absTrue-0-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b1-v3-dTrue-absTrue-0-k2-a0",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, 0)], 0, 0, 0)"
+    },
+    {
+      "case": "b1-v3-dTrue-absTrue-0-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b1-v3-dTrue-absTrue-0-k2-a11",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, 11)], 0, 0, 11)"
+    },
+    {
+      "case": "b1-v3-dTrue-absTrue-0-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b1-v3-dTrue-absTrue-0-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, -9223372036854775808)], 0, 0, -9223372036854775808)"
+    },
+    {
+      "case": "b1-v3-dTrue-absTrue-0-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b1-v3-dTrue-absTrue-0-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, 9223372036854775807)], 0, 0, 9223372036854775807)"
+    },
+    {
+      "case": "b1-v3-dTrue-absTrue-0-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b1-v3-dTrue-absTrue-0-k20-a0",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(3, 0)], 0, 0, 0)"
+    },
+    {
+      "case": "b1-v3-dTrue-absTrue-256-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}"
+    },
+    {
+      "case": "b1-v3-dTrue-absTrue-256-k2-a-7",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, -7)], 0, 256, -7)"
+    },
+    {
+      "case": "b1-v3-dTrue-absTrue-256-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}"
+    },
+    {
+      "case": "b1-v3-dTrue-absTrue-256-k2-a0",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, 0)], 0, 256, 0)"
+    },
+    {
+      "case": "b1-v3-dTrue-absTrue-256-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}"
+    },
+    {
+      "case": "b1-v3-dTrue-absTrue-256-k2-a11",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, 11)], 0, 256, 11)"
+    },
+    {
+      "case": "b1-v3-dTrue-absTrue-256-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}"
+    },
+    {
+      "case": "b1-v3-dTrue-absTrue-256-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, -9223372036854775808)], 0, 256, -9223372036854775808)"
+    },
+    {
+      "case": "b1-v3-dTrue-absTrue-256-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}"
+    },
+    {
+      "case": "b1-v3-dTrue-absTrue-256-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, 9223372036854775807)], 0, 256, 9223372036854775807)"
+    },
+    {
+      "case": "b1-v3-dTrue-absTrue-256-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}"
+    },
+    {
+      "case": "b1-v3-dTrue-absTrue-256-k20-a0",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(3, 256)], 256, 256, 0)"
+    },
+    {
+      "case": "b1-v3-dFalse-absFalse-0-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "(0, '')"
+    },
+    {
+      "case": "b1-v3-dFalse-absFalse-0-k2-a-7",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v3-dFalse-absFalse-0-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "(0, '')"
+    },
+    {
+      "case": "b1-v3-dFalse-absFalse-0-k2-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v3-dFalse-absFalse-0-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "(0, '')"
+    },
+    {
+      "case": "b1-v3-dFalse-absFalse-0-k2-a11",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v3-dFalse-absFalse-0-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "(0, '')"
+    },
+    {
+      "case": "b1-v3-dFalse-absFalse-0-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v3-dFalse-absFalse-0-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "(0, '')"
+    },
+    {
+      "case": "b1-v3-dFalse-absFalse-0-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b1-v3-dFalse-absFalse-0-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "(0, '')"
+    },
+    {
+      "case": "b1-v3-dFalse-absFalse-0-k20-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v0-dTrue-absFalse-0-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([(3, 4089)], {'binding': 2, 'visibility': 0, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': -7})"
+    },
+    {
+      "case": "b2-v0-dTrue-absFalse-0-k2-a-7",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v0-dTrue-absFalse-0-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([(3, 4096)], {'binding': 2, 'visibility': 0, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 0})"
+    },
+    {
+      "case": "b2-v0-dTrue-absFalse-0-k2-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v0-dTrue-absFalse-0-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([(3, 4107)], {'binding': 2, 'visibility': 0, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 11})"
+    },
+    {
+      "case": "b2-v0-dTrue-absFalse-0-k2-a11",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v0-dTrue-absFalse-0-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([(3, -9223372036854771712)], {'binding': 2, 'visibility': 0, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': -9223372036854775808})"
+    },
+    {
+      "case": "b2-v0-dTrue-absFalse-0-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v0-dTrue-absFalse-0-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([(3, -9223372036854771713)], {'binding': 2, 'visibility': 0, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 9223372036854775807})"
+    },
+    {
+      "case": "b2-v0-dTrue-absFalse-0-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v0-dTrue-absFalse-0-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([(3, 4096)], {'binding': 2, 'visibility': 0, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 20, 'addend': 0})"
+    },
+    {
+      "case": "b2-v0-dTrue-absFalse-0-k20-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v0-dTrue-absTrue-0-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b2-v0-dTrue-absTrue-0-k2-a-7",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v0-dTrue-absTrue-0-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b2-v0-dTrue-absTrue-0-k2-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v0-dTrue-absTrue-0-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b2-v0-dTrue-absTrue-0-k2-a11",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v0-dTrue-absTrue-0-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b2-v0-dTrue-absTrue-0-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v0-dTrue-absTrue-0-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b2-v0-dTrue-absTrue-0-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v0-dTrue-absTrue-0-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b2-v0-dTrue-absTrue-0-k20-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v0-dTrue-absTrue-256-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}"
+    },
+    {
+      "case": "b2-v0-dTrue-absTrue-256-k2-a-7",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v0-dTrue-absTrue-256-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}"
+    },
+    {
+      "case": "b2-v0-dTrue-absTrue-256-k2-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v0-dTrue-absTrue-256-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}"
+    },
+    {
+      "case": "b2-v0-dTrue-absTrue-256-k2-a11",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v0-dTrue-absTrue-256-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}"
+    },
+    {
+      "case": "b2-v0-dTrue-absTrue-256-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v0-dTrue-absTrue-256-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}"
+    },
+    {
+      "case": "b2-v0-dTrue-absTrue-256-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v0-dTrue-absTrue-256-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}"
+    },
+    {
+      "case": "b2-v0-dTrue-absTrue-256-k20-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v0-dFalse-absFalse-0-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([], {'binding': 2, 'visibility': 0, 'defined': False, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': -7})"
+    },
+    {
+      "case": "b2-v0-dFalse-absFalse-0-k2-a-7",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v0-dFalse-absFalse-0-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([], {'binding': 2, 'visibility': 0, 'defined': False, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 0})"
+    },
+    {
+      "case": "b2-v0-dFalse-absFalse-0-k2-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v0-dFalse-absFalse-0-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([], {'binding': 2, 'visibility': 0, 'defined': False, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 11})"
+    },
+    {
+      "case": "b2-v0-dFalse-absFalse-0-k2-a11",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v0-dFalse-absFalse-0-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([], {'binding': 2, 'visibility': 0, 'defined': False, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': -9223372036854775808})"
+    },
+    {
+      "case": "b2-v0-dFalse-absFalse-0-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v0-dFalse-absFalse-0-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([], {'binding': 2, 'visibility': 0, 'defined': False, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 9223372036854775807})"
+    },
+    {
+      "case": "b2-v0-dFalse-absFalse-0-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v0-dFalse-absFalse-0-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([(8589934598, 0)], {'binding': 2, 'visibility': 0, 'defined': False, 'absolute': False, 'target_value': 0, 'kind': 20, 'addend': 0})"
+    },
+    {
+      "case": "b2-v0-dFalse-absFalse-0-k20-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v1-dTrue-absFalse-0-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 1, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': -7}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}})"
+    },
+    {
+      "case": "b2-v1-dTrue-absFalse-0-k2-a-7",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v1-dTrue-absFalse-0-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 1, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 0}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}})"
+    },
+    {
+      "case": "b2-v1-dTrue-absFalse-0-k2-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v1-dTrue-absFalse-0-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 1, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 11}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}})"
+    },
+    {
+      "case": "b2-v1-dTrue-absFalse-0-k2-a11",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v1-dTrue-absFalse-0-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 1, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': -9223372036854775808}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}})"
+    },
+    {
+      "case": "b2-v1-dTrue-absFalse-0-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v1-dTrue-absFalse-0-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 1, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 9223372036854775807}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}})"
+    },
+    {
+      "case": "b2-v1-dTrue-absFalse-0-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v1-dTrue-absFalse-0-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 1, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 20, 'addend': 0}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}})"
+    },
+    {
+      "case": "b2-v1-dTrue-absFalse-0-k20-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v1-dTrue-absTrue-0-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 1, 'defined': True, 'absolute': True, 'target_value': 0, 'kind': 2, 'addend': -7}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b2-v1-dTrue-absTrue-0-k2-a-7",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v1-dTrue-absTrue-0-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 1, 'defined': True, 'absolute': True, 'target_value': 0, 'kind': 2, 'addend': 0}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b2-v1-dTrue-absTrue-0-k2-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v1-dTrue-absTrue-0-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 1, 'defined': True, 'absolute': True, 'target_value': 0, 'kind': 2, 'addend': 11}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b2-v1-dTrue-absTrue-0-k2-a11",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v1-dTrue-absTrue-0-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 1, 'defined': True, 'absolute': True, 'target_value': 0, 'kind': 2, 'addend': -9223372036854775808}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b2-v1-dTrue-absTrue-0-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v1-dTrue-absTrue-0-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 1, 'defined': True, 'absolute': True, 'target_value': 0, 'kind': 2, 'addend': 9223372036854775807}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b2-v1-dTrue-absTrue-0-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v1-dTrue-absTrue-0-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 1, 'defined': True, 'absolute': True, 'target_value': 0, 'kind': 20, 'addend': 0}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b2-v1-dTrue-absTrue-0-k20-a0",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(3, 0)], 0, 0, 0)"
+    },
+    {
+      "case": "b2-v1-dTrue-absTrue-256-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 1, 'defined': True, 'absolute': True, 'target_value': 256, 'kind': 2, 'addend': -7}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}})"
+    },
+    {
+      "case": "b2-v1-dTrue-absTrue-256-k2-a-7",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v1-dTrue-absTrue-256-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 1, 'defined': True, 'absolute': True, 'target_value': 256, 'kind': 2, 'addend': 0}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}})"
+    },
+    {
+      "case": "b2-v1-dTrue-absTrue-256-k2-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v1-dTrue-absTrue-256-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 1, 'defined': True, 'absolute': True, 'target_value': 256, 'kind': 2, 'addend': 11}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}})"
+    },
+    {
+      "case": "b2-v1-dTrue-absTrue-256-k2-a11",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v1-dTrue-absTrue-256-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 1, 'defined': True, 'absolute': True, 'target_value': 256, 'kind': 2, 'addend': -9223372036854775808}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}})"
+    },
+    {
+      "case": "b2-v1-dTrue-absTrue-256-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v1-dTrue-absTrue-256-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 1, 'defined': True, 'absolute': True, 'target_value': 256, 'kind': 2, 'addend': 9223372036854775807}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}})"
+    },
+    {
+      "case": "b2-v1-dTrue-absTrue-256-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v1-dTrue-absTrue-256-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 1, 'defined': True, 'absolute': True, 'target_value': 256, 'kind': 20, 'addend': 0}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}})"
+    },
+    {
+      "case": "b2-v1-dTrue-absTrue-256-k20-a0",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(3, 256)], 256, 256, 0)"
+    },
+    {
+      "case": "b2-v1-dFalse-absFalse-0-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 1, 'defined': False, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': -7}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b2-v1-dFalse-absFalse-0-k2-a-7",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v1-dFalse-absFalse-0-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 1, 'defined': False, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 0}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b2-v1-dFalse-absFalse-0-k2-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v1-dFalse-absFalse-0-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 1, 'defined': False, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 11}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b2-v1-dFalse-absFalse-0-k2-a11",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v1-dFalse-absFalse-0-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 1, 'defined': False, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': -9223372036854775808}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b2-v1-dFalse-absFalse-0-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v1-dFalse-absFalse-0-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 1, 'defined': False, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 9223372036854775807}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b2-v1-dFalse-absFalse-0-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v1-dFalse-absFalse-0-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 1, 'defined': False, 'absolute': False, 'target_value': 0, 'kind': 20, 'addend': 0}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b2-v1-dFalse-absFalse-0-k20-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v2-dTrue-absFalse-0-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 2, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': -7}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}})"
+    },
+    {
+      "case": "b2-v2-dTrue-absFalse-0-k2-a-7",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v2-dTrue-absFalse-0-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 2, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 0}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}})"
+    },
+    {
+      "case": "b2-v2-dTrue-absFalse-0-k2-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v2-dTrue-absFalse-0-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 2, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 11}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}})"
+    },
+    {
+      "case": "b2-v2-dTrue-absFalse-0-k2-a11",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v2-dTrue-absFalse-0-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 2, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': -9223372036854775808}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}})"
+    },
+    {
+      "case": "b2-v2-dTrue-absFalse-0-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v2-dTrue-absFalse-0-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 2, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 9223372036854775807}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}})"
+    },
+    {
+      "case": "b2-v2-dTrue-absFalse-0-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v2-dTrue-absFalse-0-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 2, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 20, 'addend': 0}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}})"
+    },
+    {
+      "case": "b2-v2-dTrue-absFalse-0-k20-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v2-dTrue-absTrue-0-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 2, 'defined': True, 'absolute': True, 'target_value': 0, 'kind': 2, 'addend': -7}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b2-v2-dTrue-absTrue-0-k2-a-7",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v2-dTrue-absTrue-0-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 2, 'defined': True, 'absolute': True, 'target_value': 0, 'kind': 2, 'addend': 0}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b2-v2-dTrue-absTrue-0-k2-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v2-dTrue-absTrue-0-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 2, 'defined': True, 'absolute': True, 'target_value': 0, 'kind': 2, 'addend': 11}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b2-v2-dTrue-absTrue-0-k2-a11",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v2-dTrue-absTrue-0-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 2, 'defined': True, 'absolute': True, 'target_value': 0, 'kind': 2, 'addend': -9223372036854775808}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b2-v2-dTrue-absTrue-0-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v2-dTrue-absTrue-0-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 2, 'defined': True, 'absolute': True, 'target_value': 0, 'kind': 2, 'addend': 9223372036854775807}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b2-v2-dTrue-absTrue-0-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v2-dTrue-absTrue-0-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 2, 'defined': True, 'absolute': True, 'target_value': 0, 'kind': 20, 'addend': 0}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b2-v2-dTrue-absTrue-0-k20-a0",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(3, 0)], 0, 0, 0)"
+    },
+    {
+      "case": "b2-v2-dTrue-absTrue-256-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 2, 'defined': True, 'absolute': True, 'target_value': 256, 'kind': 2, 'addend': -7}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}})"
+    },
+    {
+      "case": "b2-v2-dTrue-absTrue-256-k2-a-7",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v2-dTrue-absTrue-256-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 2, 'defined': True, 'absolute': True, 'target_value': 256, 'kind': 2, 'addend': 0}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}})"
+    },
+    {
+      "case": "b2-v2-dTrue-absTrue-256-k2-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v2-dTrue-absTrue-256-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 2, 'defined': True, 'absolute': True, 'target_value': 256, 'kind': 2, 'addend': 11}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}})"
+    },
+    {
+      "case": "b2-v2-dTrue-absTrue-256-k2-a11",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v2-dTrue-absTrue-256-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 2, 'defined': True, 'absolute': True, 'target_value': 256, 'kind': 2, 'addend': -9223372036854775808}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}})"
+    },
+    {
+      "case": "b2-v2-dTrue-absTrue-256-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v2-dTrue-absTrue-256-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 2, 'defined': True, 'absolute': True, 'target_value': 256, 'kind': 2, 'addend': 9223372036854775807}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}})"
+    },
+    {
+      "case": "b2-v2-dTrue-absTrue-256-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v2-dTrue-absTrue-256-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 2, 'defined': True, 'absolute': True, 'target_value': 256, 'kind': 20, 'addend': 0}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}})"
+    },
+    {
+      "case": "b2-v2-dTrue-absTrue-256-k20-a0",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(3, 256)], 256, 256, 0)"
+    },
+    {
+      "case": "b2-v2-dFalse-absFalse-0-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 2, 'defined': False, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': -7}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b2-v2-dFalse-absFalse-0-k2-a-7",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v2-dFalse-absFalse-0-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 2, 'defined': False, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 0}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b2-v2-dFalse-absFalse-0-k2-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v2-dFalse-absFalse-0-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 2, 'defined': False, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 11}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b2-v2-dFalse-absFalse-0-k2-a11",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v2-dFalse-absFalse-0-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 2, 'defined': False, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': -9223372036854775808}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b2-v2-dFalse-absFalse-0-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v2-dFalse-absFalse-0-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 2, 'defined': False, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 9223372036854775807}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b2-v2-dFalse-absFalse-0-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v2-dFalse-absFalse-0-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 2, 'visibility': 2, 'defined': False, 'absolute': False, 'target_value': 0, 'kind': 20, 'addend': 0}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_start': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}})"
+    },
+    {
+      "case": "b2-v2-dFalse-absFalse-0-k20-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v3-dTrue-absFalse-0-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}"
+    },
+    {
+      "case": "b2-v3-dTrue-absFalse-0-k2-a-7",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, -7)], {'binding': 2, 'visibility': 3, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': -7})"
+    },
+    {
+      "case": "b2-v3-dTrue-absFalse-0-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}"
+    },
+    {
+      "case": "b2-v3-dTrue-absFalse-0-k2-a0",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, 0)], {'binding': 2, 'visibility': 3, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 0})"
+    },
+    {
+      "case": "b2-v3-dTrue-absFalse-0-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}"
+    },
+    {
+      "case": "b2-v3-dTrue-absFalse-0-k2-a11",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, 11)], {'binding': 2, 'visibility': 3, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 11})"
+    },
+    {
+      "case": "b2-v3-dTrue-absFalse-0-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}"
+    },
+    {
+      "case": "b2-v3-dTrue-absFalse-0-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, -9223372036854775808)], {'binding': 2, 'visibility': 3, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': -9223372036854775808})"
+    },
+    {
+      "case": "b2-v3-dTrue-absFalse-0-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}"
+    },
+    {
+      "case": "b2-v3-dTrue-absFalse-0-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, 9223372036854775807)], {'binding': 2, 'visibility': 3, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 9223372036854775807})"
+    },
+    {
+      "case": "b2-v3-dTrue-absFalse-0-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}"
+    },
+    {
+      "case": "b2-v3-dTrue-absFalse-0-k20-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v3-dTrue-absTrue-0-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b2-v3-dTrue-absTrue-0-k2-a-7",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, -7)], 0, 0, -7)"
+    },
+    {
+      "case": "b2-v3-dTrue-absTrue-0-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b2-v3-dTrue-absTrue-0-k2-a0",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, 0)], 0, 0, 0)"
+    },
+    {
+      "case": "b2-v3-dTrue-absTrue-0-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b2-v3-dTrue-absTrue-0-k2-a11",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, 11)], 0, 0, 11)"
+    },
+    {
+      "case": "b2-v3-dTrue-absTrue-0-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b2-v3-dTrue-absTrue-0-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, -9223372036854775808)], 0, 0, -9223372036854775808)"
+    },
+    {
+      "case": "b2-v3-dTrue-absTrue-0-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b2-v3-dTrue-absTrue-0-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, 9223372036854775807)], 0, 0, 9223372036854775807)"
+    },
+    {
+      "case": "b2-v3-dTrue-absTrue-0-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b2-v3-dTrue-absTrue-0-k20-a0",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(3, 0)], 0, 0, 0)"
+    },
+    {
+      "case": "b2-v3-dTrue-absTrue-256-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}"
+    },
+    {
+      "case": "b2-v3-dTrue-absTrue-256-k2-a-7",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, -7)], 0, 256, -7)"
+    },
+    {
+      "case": "b2-v3-dTrue-absTrue-256-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}"
+    },
+    {
+      "case": "b2-v3-dTrue-absTrue-256-k2-a0",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, 0)], 0, 256, 0)"
+    },
+    {
+      "case": "b2-v3-dTrue-absTrue-256-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}"
+    },
+    {
+      "case": "b2-v3-dTrue-absTrue-256-k2-a11",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, 11)], 0, 256, 11)"
+    },
+    {
+      "case": "b2-v3-dTrue-absTrue-256-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}"
+    },
+    {
+      "case": "b2-v3-dTrue-absTrue-256-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, -9223372036854775808)], 0, 256, -9223372036854775808)"
+    },
+    {
+      "case": "b2-v3-dTrue-absTrue-256-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}"
+    },
+    {
+      "case": "b2-v3-dTrue-absTrue-256-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, 9223372036854775807)], 0, 256, 9223372036854775807)"
+    },
+    {
+      "case": "b2-v3-dTrue-absTrue-256-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}"
+    },
+    {
+      "case": "b2-v3-dTrue-absTrue-256-k20-a0",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(3, 256)], 256, 256, 0)"
+    },
+    {
+      "case": "b2-v3-dFalse-absFalse-0-k2-a-7",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b2-v3-dFalse-absFalse-0-k2-a-7",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v3-dFalse-absFalse-0-k2-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b2-v3-dFalse-absFalse-0-k2-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v3-dFalse-absFalse-0-k2-a11",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b2-v3-dFalse-absFalse-0-k2-a11",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v3-dFalse-absFalse-0-k2-a-9223372036854775808",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b2-v3-dFalse-absFalse-0-k2-a-9223372036854775808",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v3-dFalse-absFalse-0-k2-a9223372036854775807",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b2-v3-dFalse-absFalse-0-k2-a9223372036854775807",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "b2-v3-dFalse-absFalse-0-k20-a0",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 2, 'binding': 2, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "b2-v3-dFalse-absFalse-0-k20-a0",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "merged-v1-reverseFalse",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 0, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 11}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_extra': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4108, 'size': 12}, '_start': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 3, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}})"
+    },
+    {
+      "case": "merged-v1-reverseFalse",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "merged-v1-reverseTrue",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 0, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 11}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_extra': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, '_start': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4108, 'size': 12}, 'target': {'index': 3, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4108, 'size': 0}})"
+    },
+    {
+      "case": "merged-v1-reverseTrue",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "merged-v2-reverseFalse",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 0, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 11}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_extra': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4108, 'size': 12}, '_start': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 3, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}})"
+    },
+    {
+      "case": "merged-v2-reverseFalse",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "merged-v2-reverseTrue",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 0, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 11}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_extra': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, '_start': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4108, 'size': 12}, 'target': {'index': 3, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4108, 'size': 0}})"
+    },
+    {
+      "case": "merged-v2-reverseTrue",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "merged-v3-reverseFalse",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 3, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}"
+    },
+    {
+      "case": "merged-v3-reverseFalse",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, 11)], {'binding': 1, 'visibility': 0, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 11})"
+    },
+    {
+      "case": "merged-v3-reverseTrue",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 3, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4108, 'size': 0}"
+    },
+    {
+      "case": "merged-v3-reverseTrue",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, 11)], {'binding': 1, 'visibility': 0, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 11})"
+    },
+    {
+      "case": "undefined-strength-v0-reverseFalse",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 3, 'binding': 2, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}"
+    },
+    {
+      "case": "undefined-strength-v0-reverseFalse",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "undefined-strength-v0-reverseTrue",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([], {'binding': 1, 'visibility': 0, 'defined': False, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 11})"
+    },
+    {
+      "case": "undefined-strength-v0-reverseTrue",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "undefined-strength-v1-reverseFalse",
+      "tool": "lccc",
+      "passed": false,
+      "error": "(0, '')"
+    },
+    {
+      "case": "undefined-strength-v1-reverseFalse",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "undefined-strength-v1-reverseTrue",
+      "tool": "lccc",
+      "passed": false,
+      "error": "(0, '')"
+    },
+    {
+      "case": "undefined-strength-v1-reverseTrue",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "undefined-strength-v2-reverseFalse",
+      "tool": "lccc",
+      "passed": false,
+      "error": "(0, '')"
+    },
+    {
+      "case": "undefined-strength-v2-reverseFalse",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "undefined-strength-v2-reverseTrue",
+      "tool": "lccc",
+      "passed": false,
+      "error": "(0, '')"
+    },
+    {
+      "case": "undefined-strength-v2-reverseTrue",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "undefined-strength-v3-reverseFalse",
+      "tool": "lccc",
+      "passed": false,
+      "error": "(0, '')"
+    },
+    {
+      "case": "undefined-strength-v3-reverseFalse",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "undefined-strength-v3-reverseTrue",
+      "tool": "lccc",
+      "passed": false,
+      "error": "(0, '')"
+    },
+    {
+      "case": "undefined-strength-v3-reverseTrue",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "definition-strength-absFalse-v0-reverseFalse",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([(3, 4119)], {'binding': 1, 'visibility': 0, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 11})"
+    },
+    {
+      "case": "definition-strength-absFalse-v0-reverseFalse",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "definition-strength-absTrue-v0-reverseFalse",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 3, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4352, 'size': 0}"
+    },
+    {
+      "case": "definition-strength-absTrue-v0-reverseFalse",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "definition-strength-absFalse-v0-reverseTrue",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([(3, 4107)], {'binding': 1, 'visibility': 0, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 11})"
+    },
+    {
+      "case": "definition-strength-absFalse-v0-reverseTrue",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "definition-strength-absTrue-v0-reverseTrue",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 3, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}"
+    },
+    {
+      "case": "definition-strength-absTrue-v0-reverseTrue",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "definition-strength-absFalse-v2-reverseFalse",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 2, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 11}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_extra': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, '_start': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4108, 'size': 12}, 'target': {'index': 3, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4108, 'size': 0}})"
+    },
+    {
+      "case": "definition-strength-absFalse-v2-reverseFalse",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "definition-strength-absTrue-v2-reverseFalse",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 2, 'defined': True, 'absolute': True, 'target_value': 256, 'kind': 2, 'addend': 11}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_extra': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, '_start': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4108, 'size': 12}, 'target': {'index': 3, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4352, 'size': 0}})"
+    },
+    {
+      "case": "definition-strength-absTrue-v2-reverseFalse",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "definition-strength-absFalse-v2-reverseTrue",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 2, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 11}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_extra': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4108, 'size': 12}, '_start': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 3, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}})"
+    },
+    {
+      "case": "definition-strength-absFalse-v2-reverseTrue",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "definition-strength-absTrue-v2-reverseTrue",
+      "tool": "lccc",
+      "passed": false,
+      "error": "('export', {'binding': 1, 'visibility': 2, 'defined': True, 'absolute': True, 'target_value': 256, 'kind': 2, 'addend': 11}, {'': {'index': 0, 'binding': 0, 'visibility': 0, 'shndx': 0, 'value': 0, 'size': 0}, '_extra': {'index': 1, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4108, 'size': 12}, '_start': {'index': 2, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 12}, 'target': {'index': 3, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}})"
+    },
+    {
+      "case": "definition-strength-absTrue-v2-reverseTrue",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "definition-strength-absFalse-v3-reverseFalse",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 3, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4108, 'size': 0}"
+    },
+    {
+      "case": "definition-strength-absFalse-v3-reverseFalse",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, 11)], {'binding': 1, 'visibility': 3, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 11})"
+    },
+    {
+      "case": "definition-strength-absTrue-v3-reverseFalse",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 3, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4352, 'size': 0}"
+    },
+    {
+      "case": "definition-strength-absTrue-v3-reverseFalse",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, 11)], 0, 256, 11)"
+    },
+    {
+      "case": "definition-strength-absFalse-v3-reverseTrue",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 3, 'binding': 1, 'visibility': 0, 'shndx': 4, 'value': 4096, 'size': 0}"
+    },
+    {
+      "case": "definition-strength-absFalse-v3-reverseTrue",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, 11)], {'binding': 1, 'visibility': 3, 'defined': True, 'absolute': False, 'target_value': 0, 'kind': 2, 'addend': 11})"
+    },
+    {
+      "case": "definition-strength-absTrue-v3-reverseTrue",
+      "tool": "lccc",
+      "passed": false,
+      "error": "{'index': 3, 'binding': 1, 'visibility': 0, 'shndx': 1, 'value': 256, 'size': 0}"
+    },
+    {
+      "case": "definition-strength-absTrue-v3-reverseTrue",
+      "tool": "oracle",
+      "passed": false,
+      "error": "([(12884901890, 11)], 0, 256, 11)"
+    },
+    {
+      "case": "got-key-collision-reverseFalse",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([(3, 4108)], 4096, 0)"
+    },
+    {
+      "case": "got-key-collision-reverseFalse",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "got-key-collision-reverseTrue",
+      "tool": "lccc",
+      "passed": false,
+      "error": "([(3, 4096)], 4108, 0)"
+    },
+    {
+      "case": "got-key-collision-reverseTrue",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "duplicate-local-name-empty",
+      "tool": "lccc",
+      "passed": false,
+      "error": "[(8376, 6, 0)]"
+    },
+    {
+      "case": "duplicate-local-name-empty",
+      "tool": "oracle",
+      "passed": true
+    },
+    {
+      "case": "duplicate-local-name-target",
+      "tool": "lccc",
+      "passed": false,
+      "error": "[(8376, 6, 0)]"
+    },
+    {
+      "case": "duplicate-local-name-target",
+      "tool": "oracle",
+      "passed": true
+    }
+  ]
+}
