@@ -34,7 +34,7 @@ def report():
         rows.append({'name': case.name,
                      'correctness': {key: {'matches_baseline': True, 'stable_within_compiler': True}
                                      for key in ['lccc', 'gcc', 'prior']},
-                     'runs': {key: [{'ok': True} for _ in range(9)] for key in ['lccc', 'gcc', 'prior']},
+                     'runs': {key: [{'ok': True, 'stdout': 'correct\n'} for _ in range(9)] for key in ['lccc', 'gcc', 'prior']},
                      'runtime': {key: {'wall': {'median': .1}} for key in ['lccc', 'gcc', 'prior']},
                      'ratios_from_lccc': {key: {'n': 9, 'median': .9} for key in ['gcc', 'prior']}})
     return {'benchmarks': rows, 'compilers': [{'key': key} for key in ['lccc', 'gcc', 'prior']],
@@ -73,6 +73,53 @@ class ComparisonReport(unittest.TestCase):
             data = report()
             mutate(data['benchmarks'][0])
             self.assertEqual(summary.summarize(data)['comparisons']['prior']['timing_eligible'], 44)
+
+    def test_raw_warmups_and_samples_override_cached_success_flags(self):
+        for location, arm, observation in [
+            ('warmups', 'prior', {'ok': True, 'stdout': 'wrong\n'}),
+            ('warmups', 'prior', {'ok': False}),
+            ('warmups', 'gcc', {'ok': True, 'stdout': 'wrong\n'}),
+            ('warmups', 'gcc', {'ok': False}),
+            ('runs', 'prior', {'ok': True, 'stdout': 'wrong\n'}),
+            ('runs', 'gcc', {'ok': True, 'stdout': 'wrong\n'}),
+        ]:
+            with self.subTest(location=location, arm=arm, observation=observation):
+                data = report()
+                data['benchmarks'][0].setdefault(location, {}).setdefault(arm, []).append(observation)
+                result = summary.summarize(data)
+                self.assertEqual(result['comparisons']['prior']['timing_eligible'], 44)
+                self.assertFalse(result['rows'][0]['correct']['prior'])
+
+    def test_codegen_counts_preserve_aliases_and_name_stack_references_truthfully(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'result.json'
+            record = {'key': 'lccc', 'instructions': 100, 'loads': 10, 'stores': 5,
+                      'branches': 3, 'vectors': 7, 'calls': 2, 'spills': 4}
+            path.write_text(json.dumps([{'errors': [], 'records': [record]}]))
+            entry = {'exit_code': 0, 'report': str(path)}
+            index = {'results': {'linux_find_bit': entry, 'linux_find_bit_scaled': entry,
+                                 'failed': {'exit_code': 1, 'report': 'must-not-read'}}}
+            rows = summary.codegen_rows(index)
+            self.assertEqual([row['name'] for row in rows], ['linux_find_bit', 'linux_find_bit_scaled'])
+            self.assertEqual(rows[0]['stack_refs'], 4)
+            self.assertNotIn('spills', rows[0])
+            self.assertEqual(len(rows[0]['sha256']), 64)
+            self.assertEqual(rows[0]['instructions'], 100)
+
+    def test_invalid_successful_codegen_records_cannot_publish_counts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'result.json'
+            index = {'results': {'shape': {'exit_code': 0, 'report': str(path)}}}
+            good = {'key': 'lccc', 'instructions': 1, 'loads': 0, 'stores': 0,
+                    'branches': 0, 'vectors': 0, 'calls': 0, 'spills': 0}
+            for data in ([], [{'errors': ['failure'], 'records': [good]}],
+                         [{'records': []}], [{'records': [good, good]}],
+                         [{'records': [{**good, 'instructions': -1}]}],
+                         [{'records': [{**good, 'spills': None}]}]):
+                with self.subTest(data=data):
+                    path.write_text(json.dumps(data))
+                    with self.assertRaises(ValueError):
+                        summary.codegen_rows(index)
 
     def test_correctness_only_never_yields_a_timing_claim(self):
         data = report()

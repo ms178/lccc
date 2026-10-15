@@ -98,6 +98,13 @@ class UniversalContractTest(unittest.TestCase):
         self.assertEqual(self.check(local=self.local.replace(command, shortened),
                                     hosted=self.hosted.replace(command, shortened)), 1)
 
+    def test_pr824_result_record_cannot_be_removed_from_both_mirrors(self) -> None:
+        record = " --json target/redteam/boundaries.json"
+        self.assertIn(record, self.local)
+        self.assertIn(record, self.hosted)
+        self.assertEqual(self.check(local=self.local.replace(record, ""),
+                                    hosted=self.hosted.replace(record, "")), 1)
+
     def test_real_mirrors_pass(self) -> None:
         self.assertEqual(self.check(), 0)
 

@@ -371,7 +371,7 @@ gate "riscv-relocation-contract" fast \
     python3 tests/linker/check_riscv_relocation_contract.py --lccc target/fastbuild/lccc-riscv
 
 gate "pr824-boundaries" fast \
-    python3 tests/regression/check_pr824_boundaries.py --lccc target/fastbuild/lccc --cross
+    python3 tests/regression/check_pr824_boundaries.py --lccc target/fastbuild/lccc --cross --json target/redteam/boundaries.json
 
 gate "note-run-oracle-selftest" fast \
     python3 tests/linker/test_note_runs.py

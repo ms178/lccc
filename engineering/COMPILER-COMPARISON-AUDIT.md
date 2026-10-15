@@ -29,8 +29,24 @@ The regression authority is
 `tests/corpus/test_benchmark_comparison_safety.py`. The baseline Python corpus
 passed 545 tests with five skips; the competing tree passed 582 with four skips.
 Test counts are not interchangeable coverage or quality scores. The corrected
-tree's full corpus passed 576 tests in 79.628 seconds with five explicit skips;
-the focused comparison-report and workflow suite passed all 15 tests.
+tree's full corpus passed 583 tests in 76.821 seconds with five explicit skips;
+the focused safety/report suite passed all 29 tests. The strict CI/local parity
+mutation suite passed all 73 tests.
+
+An expanded 11-method replay includes all **1,296** combinations of bounded
+warm-up/timed, control/candidate states: absent, correct, different, failed,
+unstable and mixed-success observations. Both supplied runners fail nine test
+methods; the corrected runner passes all 11. The 469 failing subtests in each
+supplied runner are **not** 469 distinct compiler defects. See the
+[exact runner/protocol hashes and results](measurements/compiler-warmup-safety.json).
+
+This found a further defect in this audit's own harness: successful but wrong
+warm-up output was excluded from correctness along with its timing. Warm-ups
+now participate in output stability and execution-success checks, but never in
+timing distributions; a warm-up-only arm still cannot pass. The report also
+revalidates raw observations instead of trusting cached correctness flags.
+This closes a real false-certification path without removing self-checks,
+execution failures, samples or workloads.
 
 A native GCC 12.2 smoke run of all 65 semantic cases is also informative:
 all 65 independent `-O0` controls passed, but the optimized GCC arm failed four
@@ -118,7 +134,10 @@ records source IDs, executable hashes, versions, commands and raw outputs.
    included in the timing aggregate.
 3. **O3:** all 45 shapes, correctness-only, never a second timing claim.
 4. **Static codegen:** `benchmark_codegen.py --oracles ''`, every registry ID
-   per compiler; instruction counts are screening, not runtime or spill cause.
+   per compiler. All compiler arms run even if another fails; aggregate status
+   remains failure. Bounded rows retain whole-TU counts and raw report hashes;
+   `stack_refs` explicitly names the oracle's legacy `spills` field. Instruction
+   counts are screening, not runtime or proof of allocator spill causality.
 5. **Bounded instrumentation:** all 45 IDs using `callgrind_corpus.py`, both a
    direct candidate comparison and a separate GCC control at the same sizes.
    Raw counters, native/instrumented output checks and manifests are retained.
@@ -151,8 +170,9 @@ PMU access are unavailable. The repository swap script activated a real 2 GiB
 swap file. Network restrictions prevented installing local Debian GCC 16.2 or
 Rust; those exact tools must execute in hosted jobs. The cross-target boundary
 matrix, which requires GCC 16.2.0 explicitly, belongs in the exact Debian lane,
-not a rolling-major Ubuntu PPA lane. Old green checks and
-Python contracts do not validate the edited Rust.
+not a rolling-major Ubuntu PPA lane. Its complete result JSON is now required
+by the mirrored invocation contract and retained with the other artifacts.
+Old green checks and Python contracts do not validate the edited Rust.
 
 Before claiming completion, inspect current-head compiled tests, strict
 Clippy/rustfmt, all required cross-target and linker gates, and the named

@@ -682,14 +682,17 @@ def evaluate_correctness(entry: dict[str, Any], compiler_keys: list[str]) -> Non
     """Mark output stability and cross-compiler equivalence without hiding errors."""
     successful: dict[str, list[str]] = {}
     for key in compiler_keys:
-        runs = entry["runs"].get(key, [])
+        timed = entry["runs"].get(key, [])
+        # Warm-ups are excluded from timing, never from correctness. A wrong
+        # first execution or unstable control cannot certify later samples.
+        runs = [*entry.get("warmups", {}).get(key, []), *timed]
         outputs = [run["stdout"] for run in runs if run.get("ok")]
         if outputs:
             successful[key] = outputs
         entry["correctness"][key] = {
             "stable_within_compiler": len(set(outputs)) == 1 if outputs else None,
             "output": outputs[0] if outputs else None,
-            "all_runs_successful": bool(runs) and len(outputs) == len(runs),
+            "all_runs_successful": bool(timed) and len(outputs) == len(runs),
             "matches_baseline": None,
         }
     # When requested, GCC remains the oracle even if it failed. Falling back

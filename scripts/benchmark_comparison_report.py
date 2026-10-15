@@ -35,12 +35,18 @@ def summarize(data, floor=.020):
               'floor_s': floor, 'identity': data['compilers'], 'rows': [], 'comparisons': {}}
     for row in rows:
         item = {'name': row['name'], 'correct': {}, 'ratios': {}}
+        # Revalidate raw observations, including untimed warm-ups. Cached
+        # success flags from an older or inconsistent report are not proof.
+        validated = {'runs': row.get('runs', {}), 'warmups': row.get('warmups', {}),
+                     'correctness': {}}
+        bench.evaluate_correctness(validated, arms)
         for arm in arms:
-            runs = row.get('runs', {}).get(arm, [])
             check = row.get('correctness', {}).get(arm, {})
             item['correct'][arm] = bool(check.get('matches_baseline') is True
-                and check.get('stable_within_compiler') is True and runs
-                and all(run.get('ok') is True for run in runs))
+                and check.get('stable_within_compiler') is True
+                and validated['correctness'][arm]['matches_baseline'] is True)
+        if not item['correct']['gcc']:
+            item['correct'] = {arm: False for arm in arms}
         for arm in arms:
             if arm == 'lccc':
                 continue
@@ -73,6 +79,33 @@ def summarize(data, floor=.020):
             'interpretation': 'LCCC/reference paired median ratio; screening only; <1 faster',
         }
     return result
+
+
+def codegen_rows(index):
+    """Compact whole-TU counts, retaining shared-source registry aliases.
+
+    The oracle's legacy ``spills`` field counts stack references, not proven
+    allocator spills. Keep that limitation explicit in the published schema.
+    Failed rows remain in the index's failure inventory, never as zero counts.
+    """
+    rows = []
+    for name, entry in index['results'].items():
+        if entry.get('exit_code') != 0 or entry.get('error'):
+            continue
+        raw = Path(entry['report']).read_bytes()
+        reports = json.loads(raw)
+        if len(reports) != 1 or reports[0].get('errors'):
+            raise ValueError('invalid successful codegen report: ' + name)
+        local = [record for record in reports[0]['records'] if record['key'] == 'lccc']
+        if len(local) != 1:
+            raise ValueError('codegen report requires one local record: ' + name)
+        metrics = {field: local[0][field] for field in
+                   ('instructions', 'loads', 'stores', 'branches', 'vectors', 'calls', 'spills')}
+        if any(type(value) is not int or value < 0 for value in metrics.values()):
+            raise ValueError('invalid static count: ' + name)
+        metrics['stack_refs'] = metrics.pop('spills')
+        rows.append({'name': name, 'sha256': hashlib.sha256(raw).hexdigest(), **metrics})
+    return rows
 
 
 def notice(title, data):
