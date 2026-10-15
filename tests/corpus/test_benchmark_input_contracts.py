@@ -14,7 +14,8 @@ sys.path.insert(0, str(ROOT))
 import benchmark_codegen as codegen
 from tests.benchmark import run_benchmarks as bench
 
-REQUIRED_WRAP = {'arith_loop': '-DARITH_ITERS=64', 'loop_patterns': '-DSIZE=10000'}
+REQUIRED_WRAP = {'arith_loop': '-DARITH_ITERS=64', 'loop_patterns': '-DSIZE=10000',
+                 'switch_dispatch': '-DN=100000'}
 GCC = shutil.which('gcc-16') or shutil.which('gcc')
 
 
@@ -51,6 +52,21 @@ def loops_expected():
             f'scaled={sum(scaled)} dot={dot} prefix={prefix}\n')
 
 
+def switch_expected():
+    seed = 777
+    total = 0
+    for a in range(100000):
+        seed = (seed * 1664525 + 1013904223) & 0xffffffff
+        op, b = (seed >> 16) & 15, seed & 0xffff
+        # Apply the explicit 32-bit semantics independently of compiled C.
+        results = (a + b, a - b, a * b, a ^ b, a | b, a & b,
+                   a << (b & 7), a >> (b & 7), ~a + b, a - ~b,
+                   (a + b) * 3, (a - b) * 5, (a ^ b) + 1,
+                   (a | b) - 1, (a & b) + 2, a + b + 1)
+        total = signed(total + signed(results[op], 32), 64)
+    return f'switch_dispatch sum: {total}\n'
+
+
 class BenchmarkInputContracts(unittest.TestCase):
     def test_overflowing_sources_declare_their_required_semantics(self):
         cases = {item.name: item for item in bench.BENCHMARKS}
@@ -79,7 +95,8 @@ class BenchmarkInputContracts(unittest.TestCase):
 
     @unittest.skipUnless(GCC, 'native GCC required for the sanitizer and modular-oracle contract')
     def test_native_sanitizer_ablation_and_independent_modular_results(self):
-        expected = {'arith_loop': arithmetic_expected(), 'loop_patterns': loops_expected()}
+        expected = {'arith_loop': arithmetic_expected(), 'loop_patterns': loops_expected(),
+                    'switch_dispatch': switch_expected()}
         with tempfile.TemporaryDirectory() as temp:
             for item in bench.BENCHMARKS:
                 if item.name not in REQUIRED_WRAP:
@@ -103,6 +120,8 @@ class BenchmarkInputContracts(unittest.TestCase):
                         else:
                             self.assertNotEqual(run.returncode, 0)
                             self.assertIn('signed integer overflow', run.stderr)
+
+
 
 
 if __name__ == '__main__':

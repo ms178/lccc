@@ -29,7 +29,7 @@ The regression authority is
 `tests/corpus/test_benchmark_comparison_safety.py`. The baseline Python corpus
 passed 545 tests with five skips; the competing tree passed 582 with four skips.
 Test counts are not interchangeable coverage or quality scores. The corrected
-tree's full corpus passed 616 tests in 84.445 seconds with five explicit skips;
+tree's full corpus passed 616 tests in 84.452 seconds with five explicit skips;
 the focused safety/report/publication suite passed all 40 tests. Twenty
 LCCC-independent local gate commands passed, including the audit census,
 import scanner, documentation links, resource checks and corpus. The strict
@@ -65,10 +65,16 @@ A local GCC 12 UBSan experiment executed all **45 bounded workload IDs**, each
 with and without explicit wrapping (**90 executions**, all builds succeeded).
 `arith_loop` and `loop_patterns` both diagnose signed integer overflow without
 `-fwrapv`. The named timing and Callgrind requests already supplied it, but
-ordinary correctness-only/default native requests could omit it. Both workloads
+ordinary correctness-only/default native requests could omit it. These workloads and `switch_dispatch`
 now declare `-fwrapv` in the registry, so native and static callers receive the
-required source semantics even after contrary user options. No source, output
-check or workload was removed. New regressions require the negative sanitizer
+required source semantics even after contrary user options. A separate default-size
+sweep found the third requirement: reduced `switch_dispatch` does not diagnose
+overflow, but its full 50-million-iteration input does. Declaring wrapping fixes
+it without changing the source, size or sanitizer options. The two default-size
+45-ID sweeps and an additional full-size confirmation bring this evidence to
+**181 recorded executions**. The final default-size sweep has 44 zero exits and
+the retained GS-zero diagnostic, not an unqualified sanitizer pass. No source,
+output check or workload was removed. New regressions require the negative sanitizer
 arms to fail, the declared-contract arms to pass, and their output to match
 **independent Python 32/64-bit modular models**, not GCC's output alone.
 
