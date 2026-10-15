@@ -195,6 +195,11 @@ jobs:
           --compiler pr835=target/compiler-comparison/pr835 \
           --compiler prior=target/compiler-comparison/prior \
           --out target/compiler-comparison/witnesses
+    # Each evidence section has its own ten-notice Actions budget and is
+    # published immediately after measurement, including explicit failures.
+    - name: Publish semantic witnesses and source identities
+      if: always()
+      run: python3 scripts/publish_compiler_comparison.py --root target/compiler-comparison --section semantic
     - name: Correctness-gated paired native comparison of all registered shapes
       if: ${{ !cancelled() && steps.comparison-build.outcome == 'success' }}
       shell: bash
@@ -210,7 +215,10 @@ jobs:
           --markdown target/compiler-comparison/native.md \
           --artifact-dir target/compiler-comparison/native-artifacts
         python3 scripts/benchmark_comparison_report.py target/compiler-comparison/native.json \
-          --out target/compiler-comparison/native-summary.json --annotations
+          --out target/compiler-comparison/native-summary.json
+    - name: Publish all paired native comparisons
+      if: always()
+      run: python3 scripts/publish_compiler_comparison.py --root target/compiler-comparison --section native
     - name: Screen all shapes at O3 without making a second timing claim
       if: ${{ !cancelled() && steps.comparison-build.outcome == 'success' }}
       shell: bash
@@ -223,6 +231,9 @@ jobs:
           --opt=-O3 --cflag=-march=x86-64-v3 --cflag=-fwrapv \
           --skip-perf --strict --no-pmu-probe \
           --json target/compiler-comparison/correctness-o3.json
+    - name: Publish all O3 correctness comparisons
+      if: always()
+      run: python3 scripts/publish_compiler_comparison.py --root target/compiler-comparison --section correctness-o3
     - name: Registry-aware local codegen oracles for each exact compiler
       if: ${{ !cancelled() && steps.comparison-build.outcome == 'success' }}
       shell: bash
@@ -238,6 +249,18 @@ jobs:
           fi
         done
         exit "$status"
+    - name: Publish final whole-TU codegen counts
+      if: always()
+      run: python3 scripts/publish_compiler_comparison.py --root target/compiler-comparison --section codegen-final
+    - name: Publish main whole-TU codegen counts
+      if: always()
+      run: python3 scripts/publish_compiler_comparison.py --root target/compiler-comparison --section codegen-main
+    - name: Publish competing whole-TU codegen counts
+      if: always()
+      run: python3 scripts/publish_compiler_comparison.py --root target/compiler-comparison --section codegen-pr835
+    - name: Publish input whole-TU codegen counts
+      if: always()
+      run: python3 scripts/publish_compiler_comparison.py --root target/compiler-comparison --section codegen-prior
     - name: Bounded Callgrind comparison of every registered shape
       if: ${{ !cancelled() && steps.comparison-build.outcome == 'success' }}
       shell: bash
@@ -246,6 +269,9 @@ jobs:
         python3 scripts/callgrind_corpus.py --mine "$GITHUB_WORKSPACE/target/fastbuild/lccc" \
           --ref "$GITHUB_WORKSPACE/target/compiler-comparison/pr835" --gcc-include-command gcc-16 \
           --out target/compiler-comparison/callgrind
+    - name: Publish bounded direct Callgrind comparison
+      if: always()
+      run: python3 scripts/publish_compiler_comparison.py --root target/compiler-comparison --section callgrind
     - name: Independent GCC control for the bounded instrumentation sizes
       if: ${{ !cancelled() && steps.comparison-build.outcome == 'success' }}
       shell: bash
@@ -254,54 +280,9 @@ jobs:
         python3 scripts/callgrind_corpus.py --mine "$GITHUB_WORKSPACE/target/fastbuild/lccc" \
           --ref gcc-16 --gcc-include-command gcc-16 \
           --out target/compiler-comparison/callgrind-gcc-control
-    - name: Publish bounded API-readable evidence even after an audit failure
+    - name: Publish independent bounded GCC control
       if: always()
-      shell: bash
-      run: |
-        python3 - <<'PY'
-        import hashlib
-        import json
-        from pathlib import Path
-        import sys
-        sys.path.insert(0, 'scripts')
-        from benchmark_comparison_report import codegen_rows, notice, notice_rows, summarize
-        root = Path('target/compiler-comparison')
-        notice('compiler comparison source identity', {p.stem: p.read_text().strip() for p in sorted(root.glob('*.commit'))})
-        for name in ('native', 'correctness-o3'):
-            path = root / (name + '.json')
-            if path.exists():
-                result = summarize(json.loads(path.read_text()))
-                notice('compiler comparison ' + name, {'sha256': hashlib.sha256(path.read_bytes()).hexdigest(), 'comparisons': result['comparisons']})
-                compact = []
-                for row in result['rows']:
-                    ratios = {}
-                    for label, arm in row['ratios'].items():
-                        pair = arm['paired'] or {}
-                        ratios[label] = {'eligible': arm['eligible'], 'median': pair.get('median'), 'ci95': pair.get('median_ci95_bootstrap'), 'n': pair.get('n')}
-                    compact.append({'name': row['name'], 'correct': row['correct'], 'ratios': ratios})
-                notice_rows('compiler comparison rows ' + name, compact)
-        path = root / 'witnesses/index.json'
-        if path.exists():
-            data = json.loads(path.read_text())
-            notice('native witness comparison', {'complete': data['complete'], 'control_policy': data['control_policy'], 'summary': data['summary'], 'compilers': data['compilers'], 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
-            failed_rows = []
-            for row in data['cases']:
-                failures = {key: {'build': arm['build']['status'], 'run': arm.get('run', {}).get('status'), 'stderr_tail': arm['build']['stderr_tail'][-180:]} for key, arm in row['arms'].items() if not arm['pass']}
-                if failures:
-                    failed_rows.append({'case': row['id'], 'failures': failures})
-            notice_rows('semantic witness failures', failed_rows)
-        for path in sorted(root.glob('codegen-*/index.json')):
-            if path.exists():
-                data = json.loads(path.read_text())
-                notice('codegen audit ' + path.parent.name, {'complete': data['complete'], 'shapes': len(data['results']), 'failures': len(data['failures']), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
-                notice_rows('static whole-TU rows ' + path.parent.name, codegen_rows(data))
-        for name in ('callgrind', 'callgrind-gcc-control'):
-            path = root / name / 'index.json'
-            if path.exists():
-                data = json.loads(path.read_text())
-                notice('bounded ' + name + ' audit', {'complete': data['complete'], 'shapes': len(data['results']), 'failures': data['failures'][:2], 'failure_count': len(data['failures']), 'metric': data['metric'], 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
-                notice_rows(name + ' rows', [{'name': label, **row['metrics']} for label, row in data['results'].items()])
-        PY
+      run: python3 scripts/publish_compiler_comparison.py --root target/compiler-comparison --section callgrind-gcc-control
     - name: Retain raw commands, outputs, binaries and counter evidence
       if: always()
       uses: actions/upload-artifact@v7

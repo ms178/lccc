@@ -526,9 +526,10 @@ mod lifecycle_tests {
 
     #[test]
     fn managed_cleanup_does_not_invalidate_unmanaged_paths() {
-        let path = private_temp_dir()
-            .unwrap()
-            .join(unique_filename("lifecycle", "unmanaged", "tmp"));
+        let path =
+            private_temp_dir()
+                .unwrap()
+                .join(unique_filename("lifecycle", "unmanaged", "tmp"));
         drop(TempFile::try_new("lifecycle", "managed", "tmp").unwrap());
         write_file_exclusive(&path, b"unmanaged lifetime").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"unmanaged lifetime");

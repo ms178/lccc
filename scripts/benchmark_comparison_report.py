@@ -9,7 +9,9 @@ No number from this script is a hardware-counter or bare-metal performance claim
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stdout
 import hashlib
+import io
 import json
 import math
 from pathlib import Path
@@ -81,6 +83,38 @@ def summarize(data, floor=.020):
     return result
 
 
+COMPACT_RATIO_COLUMNS = ('eligible', 'median', 'ci95', 'n', 'above_floor', 'enough_samples')
+
+
+def compact_rows(result):
+    """Every workload and arm, without duplicating verbose raw paired samples."""
+    rows = []
+    for row in result['rows']:
+        ratios = {}
+        for label, arm in row['ratios'].items():
+            pair = arm['paired'] or {}
+            ratios[label] = [arm['eligible'], pair.get('median'),
+                             pair.get('median_ci95_bootstrap'), pair.get('n'),
+                             arm['above_floor'], arm['enough_samples']]
+        rows.append({'name': row['name'], 'correct': row['correct'], 'ratios': ratios})
+    return rows
+
+
+def bounded_notices(produce, limit=10):
+    """Actions retains only ten notices per step: fail before losing rows.
+
+    Buffer the entire section first, so a future larger schema cannot silently
+    publish a successful-looking prefix and discard the remainder.
+    """
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        status = produce()
+    if len(buffer.getvalue().splitlines()) > limit:
+        raise ValueError('evidence exceeds the per-step notice budget; split the section')
+    print(buffer.getvalue(), end='')
+    return status
+
+
 def codegen_rows(index):
     """Compact whole-TU counts, retaining shared-source registry aliases.
 
@@ -140,9 +174,12 @@ def main(argv=None):
     args.out.parent.mkdir(parents=True, exist_ok=True)
     publication.atomic_bytes(args.out, (json.dumps(result, indent=2, allow_nan=False) + '\n').encode())
     if args.annotations:
-        notice('compiler comparison aggregate', {key: value for key, value in result.items() if key not in ('rows', 'identity')})
-        for row in result['rows']:
-            notice('compiler comparison ' + row['name'], row)
+        def publish():
+            notice('compiler comparison aggregate', {
+                **{key: value for key, value in result.items() if key not in ('rows', 'identity')},
+                'ratio_columns': COMPACT_RATIO_COLUMNS})
+            notice_rows('compiler comparison rows', compact_rows(result))
+        bounded_notices(publish)
     print(json.dumps(result['comparisons'], sort_keys=True))
     return int(any(not row['correct']['lccc'] or not row['correct']['gcc'] for row in result['rows']))
 

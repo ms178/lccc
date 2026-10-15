@@ -29,8 +29,8 @@ The regression authority is
 `tests/corpus/test_benchmark_comparison_safety.py`. The baseline Python corpus
 passed 545 tests with five skips; the competing tree passed 582 with four skips.
 Test counts are not interchangeable coverage or quality scores. The corrected
-tree's full corpus passed 605 tests in 90.699 seconds with five explicit skips;
-the focused safety/report suite passed all 29 tests. The strict CI/local parity
+tree's full corpus passed 613 tests in 84.621 seconds with five explicit skips;
+the focused safety/report/publication suite passed all 37 tests. The strict CI/local parity
 mutation suite passed all 73 tests.
 
 An expanded 11-method replay includes all **1,296** combinations of bounded
@@ -173,6 +173,17 @@ success. Bounded Checks annotations make evidence readable without relying on
 an artifact-download host. Live Compiler Explorer calls remain outside CI,
 including the optional lane; offline helper coverage is not a claim of an
 ICX/multi-vendor survey.
+
+Evidence publication itself was red-teamed: byte-sized notices alone were
+insufficient. Actions retained only ten notices from each step, so a successful
+combined publication step hid later semantic, O3 and static sections. The
+[recorded API observation](measurements/compiler-notice-budget.json) preserves
+that failure without presenting the cancelled run as complete validation.
+Each section now has its own unconditional step immediately after measurement.
+The publisher buffers the complete section and rejects more than ten notices
+before emitting any successful-looking prefix. Tests recover all 45 native rows
+with five compiler arms and all 65 worst-case semantic failure rows; missing,
+partial, malformed, over-budget and required-failing sections cannot pass.
 
 The report rejects missing/duplicated shapes and unqualified timing arms.
 Primary screening aggregates exclude incorrect or unstable executions, failed
