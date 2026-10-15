@@ -1,0 +1,105 @@
+{
+  "affected_unittests": {
+    "elapsed_seconds": 29.405,
+    "exit_code": 0,
+    "methods": 146,
+    "modules": {
+      "scripts.test_ci_gate_parity": 73,
+      "tests.corpus.test_callgrind_contracts": 42,
+      "tests.corpus.test_ci_followup_collection": 2,
+      "tests.corpus.test_evidence_integrity": 7,
+      "tests.corpus.test_parallel_ci_layout": 13,
+      "tests.corpus.test_pr834_corpus_receipts": 8,
+      "tests.corpus.test_pr834_review_documentation": 1
+    }
+  },
+  "base_main_commit": "2f477ce01749824ccab73ead7ccac90abd77fa08",
+  "base_tree_equals_unmodified_implementation": true,
+  "corrected_diagnostics": {
+    "fault_states": 29,
+    "methods": 4,
+    "missing_receipt_after_success_fails_closed": true
+  },
+  "local_c_or_rust_compilation": false,
+  "local_python": "3.11.2",
+  "logs": {
+    "affected": {
+      "bytes": 2030,
+      "path": "engineering/measurements/pr837-review-affected.txt.gz",
+      "raw_sha256": "ccf4c3577b99919f034c4a267c2d75988e5908b14fc4c606f75da137883306b2",
+      "sha256": "a3732fb1dc754c39fa7bea23fe1f1f20d3e2c229b6ff7dff8c98e091d046153a"
+    },
+    "before": {
+      "bytes": 1747,
+      "path": "engineering/measurements/pr837-review-before.txt.gz",
+      "raw_sha256": "0b3f1cf1e3e328d20c996310831db2384b2880e79bf57241e35a99800cb5abc0",
+      "sha256": "437c3ed63e7bb6693b9b8277bd8052a9eea3ac36d473b916941a8de841c41b60"
+    }
+  },
+  "native_witness_execution": "CI only",
+  "preservation": {
+    "eager_lazy_differential_test_bytes_equal": true,
+    "production_vector_copy_bytes_equal": true,
+    "temp_file_noncomment_code_equal": true,
+    "unchanged_files": {
+      "engineering/evidence/pr834-corpus.json": "7b01042ea9a36452ad8be5aa075c00355396df264a107c997277bfd359481d79",
+      "engineering/evidence/pr834-followup-attachments.json": "282347a06cfb8608e69fcd9c0a43f279933616dc41c6ca42132b01cd9675aefe",
+      "engineering/evidence/pr834-measurements.json": "ce36ce80198fb9d252b81158859a07e5afe29da22a8fa5a9e5baad75b89631d8",
+      "engineering/evidence/pr834-runtime.tar.xz": "cfc5029c737949698a89330d296ec3ed06793777d5032a8508bfaf4b80025a3d",
+      "engineering/evidence/pr834-runtime.tar.xz.inventory.json.gz": "a1a77b9f6cf22a22c98760f01d8df494567fe32144f9d71015647368f34b63fb",
+      "engineering/history/PR832-REVIEW-LOG.md": "268b65ea7e29fa5c29f42efd976019afdc76e4a0c0022f2e4990635336d01aa5",
+      "scripts/check_ci_gate_parity.py": "8073a5194d068c62ecec8561b1494adc9aedb8aac11a7e0aa643da7b7f79dbbc",
+      "src/backend/x86/codegen/peephole/passes/fp_liveness.rs": "8a47cc9f7d507fe81d637e4c1061253f1ae2f1e55dd981b7136b6f9361e977eb"
+    }
+  },
+  "primary_error_reproduction": {
+    "already_rejected_malformed_json_states": 1,
+    "assertion_failures": 8,
+    "errors": 14,
+    "fault_states": 23,
+    "methods": 3,
+    "original_callgrind_sha256": "9f7468d8affc61e010919e2a1f8e4200d0291c4b5c02dcbd0733ddd5e2f19cf5"
+  },
+  "review_statistic_correction": {
+    "all_changed_lines": 6738,
+    "non_src_scripts_tests_changed_lines": 5223,
+    "percent": 77.51558325912734
+  },
+  "rust_ci_matrix": {
+    "blocked_and_full_overwrite_arms": 2,
+    "call_mnemonics": 8,
+    "prefix_patterns": 31,
+    "status": "requires compiled CI; not executed locally",
+    "tracked_upper_aliases": 16
+  },
+  "schema_version": 1,
+  "scope": "Mocked orchestration, read-only verifiers and source-invariant checks; not compiler execution or performance",
+  "standalone_checks": {
+    "closed_evidence_inventory": 69,
+    "gate_parity": {
+      "commands": 234,
+      "invocation_contracts": 24
+    },
+    "godbolt_cache_checks": 18,
+    "retained_corpus": {
+      "ELF_equal_all_rounds": 44,
+      "compiler_inputs_checked": false,
+      "compiler_profiles_included": false,
+      "files": 14639,
+      "linked_process_receipts": 3600,
+      "program_Ir_range": [
+        1,
+        1
+      ],
+      "program_pairs": 225
+    }
+  },
+  "tested_source_sha256": {
+    "scripts/callgrind_ab.py": "ee2fab8a12afb1c838fb2ed7dcb836080b1be982c6cc78df1f3367dcfd79402f",
+    "src/backend/x86/codegen/peephole/passes/vector_copy.rs": "d6f1a91e920cb3c7ec88afbca4552e36d34893c65251a336c7c8c01231a56f7d",
+    "src/backend/x86/codegen/peephole/passes/vex_promote.rs": "0b87eed59b90549047b846dbc1aa22a87d5ac020ef05c573af5630563e77a43d",
+    "src/common/temp_files.rs": "8a9b3f11ac6677130d6804466f46e72546a49d9e214df9b8caaa42cc81d2a875",
+    "tests/corpus/test_callgrind_contracts.py": "bf7faee47bb6bead1181e5b82b6aa2ea62eb7bb43f1498041a5ac9fbdaec6afe"
+  },
+  "unmodified_implementation_commit": "c1aa01619b50995b42604a94ba882b8d49aa5ab1"
+}

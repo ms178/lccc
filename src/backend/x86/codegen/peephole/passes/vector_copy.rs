@@ -1509,25 +1509,44 @@ pub(super) fn eliminate_dead_vector_copies(store: &LineStore, infos: &mut [LineI
 mod tests {
     use super::*;
 
+    const WIDE_CALL_ASM: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/regression/fixtures/peephole-wide-call/caller.s"
+    ));
+
     #[test]
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    fn pr834_wide_call_real_pipeline_native() {
-        // This is an execution contract, not a silently successful no-op on
-        // an unsupported runner. The structural companion is CPU-independent.
-        assert!(
-            std::arch::is_x86_feature_detected!("avx"),
-            "native wide-call contract requires an AVX-capable test runner"
-        );
-        use crate::common::temp_files::TempFile;
-        use std::process::Command;
-        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/regression/fixtures/peephole-wide-call");
-        let original = std::fs::read_to_string(fixtures.join("caller.s")).unwrap();
-        let optimized = run(&original);
+    fn wide_call_real_pipeline_structure() {
+        // This half must run even where the native execution contract cannot.
+        assert!(WIDE_CALL_ASM.contains("movq %rax, %rax"));
+        let optimized = run(WIDE_CALL_ASM);
         assert!(
             !optimized.contains("movq %rax, %rax"),
             "real pipeline positive control"
         );
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn pr834_wide_call_real_pipeline_native() {
+        // Deliberately fail rather than report a successful non-execution.
+        // The structural sibling above has no host ISA/toolchain dependency.
+        use crate::common::temp_files::TempFile;
+        use std::process::Command;
+        let avx = std::arch::is_x86_feature_detected!("avx");
+        let gcc = Command::new("gcc")
+            .arg("--version")
+            .output()
+            .map(|out| out.status);
+        assert!(
+            avx && gcc.as_ref().is_ok_and(|status| status.success()),
+            "native wide-call contract requires BOTH an AVX-capable x86_64-linux host \
+             AND gcc on PATH (AVX={avx}, GCC probe={gcc:?}); \
+             wide_call_real_pipeline_structure runs without either requirement"
+        );
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/regression/fixtures/peephole-wide-call");
+        let original = WIDE_CALL_ASM.to_owned();
+        let optimized = run(&original);
         let asm = TempFile::try_new("pr834", "wide-call", "s").unwrap();
         let exe = TempFile::try_new("pr834", "wide-call", "exe").unwrap();
         for (stage, code) in [("original", original), ("optimized", optimized)] {
@@ -1891,6 +1910,9 @@ mod tests {
 
     #[test]
     fn pr834_independent_narrow_copies_do_not_reanalyse_each_rewrite() {
+        // Intentional complexity-policy tripwire, not a wall-time assertion.
+        // Change this limit only with a justified cache change and updated
+        // stress evidence in the same commit, not to bless a regression.
         assert!(
             narrow_copy_stress(8) <= 1,
             "independent copies should reuse conservative liveness"

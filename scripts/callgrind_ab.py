@@ -127,9 +127,23 @@ def process_receipt(prefix):
     """
     path=Path(str(prefix)+'.json')
     info=schema.loads(path.read_text(encoding='utf-8'))
+    if not isinstance(info,dict):raise ValueError('process receipt must be a JSON object')
     info.setdefault('raw_outputs',{})
     info['receipt']=dict(path=str(path),sha256=schema.file_hash(path))
     return info
+
+
+def retain_process_receipt(prefix, *, primary_error=None):
+    """Keep receipt failures secondary to an already failed process.
+
+    An unreadable receipt never supplies a successful hash or process record.
+    Without a primary failure it remains fatal, rather than certifying execution
+    with missing evidence. Compilation and native execution share this rule.
+    """
+    try:return process_receipt(prefix)
+    except (OSError,ValueError) as error:
+        if primary_error is None:raise
+        return dict(receipt_error=str(error),receipt_path=str(prefix)+'.json')
 
 
 def compile_program(compiler,opt,source,out,*,include=None):
@@ -213,7 +227,7 @@ def _measure(args,benches,outroot,manifest,cache):
         err=None
         for side,compiler,binary in (('mine',args.mine,mbin),('ref',args.ref,rbin)):
             err=compile_program(compiler,args.opt,source,binary,include=manifest['include'])
-            entry['compilation'][side]=process_receipt(str(binary)+'.compile')
+            entry['compilation'][side]=retain_process_receipt(str(binary)+'.compile',primary_error=err)
             if err:break
         if err:entry['detail']=err;failures[bench]=err;continue
         entry['binary_sha256']=dict(mine=schema.file_hash(mbin),ref=schema.file_hash(rbin))
@@ -224,8 +238,11 @@ def _measure(args,benches,outroot,manifest,cache):
                 prefix=str(binary)+'.native'
                 try:
                     native[side],_=run_recorded([str(binary)],120,prefix)
-                finally:
-                    entry['native'][side]=process_receipt(prefix)
+                except (OSError,ValueError) as error:
+                    entry['native'][side]=retain_process_receipt(prefix,primary_error=error)
+                    raise
+                else:
+                    entry['native'][side]=retain_process_receipt(prefix)
         except (OSError,ValueError) as exc:entry['detail']=str(exc);failures[bench]=str(exc);continue
         pm,pr=native['mine'],native['ref']
         entry['correctness']=dict(mine=evidence(pm),ref=evidence(pr))
