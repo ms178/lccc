@@ -1,3 +1,9 @@
+# Live oracle-delta / Compiler Explorer execution was intentionally retired
+# from PR gates at the owner's request: network availability is not a merge
+# prerequisite. oracle_delta_gate.py --self-test validates only its controller;
+# benchmark-output-oracle and differential-correctness-oracle exercise local
+# outputs, NOT an equivalent GCC/Clang/ICX survey. External surveys remain opt-in
+# via scripts/codegen_oracle.py; no hidden replacement-coverage claim is made.
 # Independent jobs reuse one hash-checked normal compiler artifact.
 # Assertion-enabled builds stay isolated; no consumer overwrites another profile.
 name: CI
@@ -56,6 +62,8 @@ jobs:
       with:
         path: ~/.cargo/git
         key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+    - name: Verify retained evidence hashes
+      run: python3 scripts/verify_evidence_hashes.py
     - name: Install gate parsers
       run: sudo apt-get install -y --no-install-recommends python3-yaml
     - name: Build
@@ -1289,6 +1297,10 @@ jobs:
       uses: dtolnay/rust-toolchain@1.97.0
     - name: Check the tree builds on the MSRV toolchain
       run: cargo check --locked
+  benchmark:
+    name: Complete benchmark corpus
+    needs: [build]
+    uses: ./.github/workflows/bench.yml
   test:
     name: Test Suite
     runs-on: ubuntu-24.04
@@ -1301,6 +1313,7 @@ jobs:
     - backend
     - clippy
     - msrv
+    - benchmark
     if: always()
     steps:
     - name: Require every independent lane to pass

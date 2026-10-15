@@ -984,6 +984,9 @@ gate "pr-claim-fidelity" fast \
 # local consumer: on a box without it the checker fails cleanly (no
 # traceback) with a message naming the package and the install path, so
 # the failure is actionable without a separate preflight.
+# Read-only integrity check; exclusive by default (not in scheduler whitelist).
+gate "evidence-hash-integrity" fast python3 scripts/verify_evidence_hashes.py
+
 gate "ci-gate-parity" fast \
     python3 scripts/check_ci_gate_parity.py
 gate "ci-asm-diff-parity-self-test" fast \

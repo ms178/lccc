@@ -267,6 +267,48 @@ pub(crate) fn ivsr_function_scalar(func: &mut IrFunction) -> usize {
 /// (scaled-index addressing is free on x86, absent on RISC-V): the pipeline
 /// passes `matches!(target, X86_64 | I686)` and the unit wrappers pin `true`
 /// because the rule's contracts are written against x86 codegen.
+// Only topology matters to cached dominance: IVSR may rewrite a terminator's
+// value operands, but must not change block identity, terminator kind or edges.
+#[cfg(any(test, debug_assertions))]
+#[derive(Debug, PartialEq, Eq)]
+struct IvsrCfgShape {
+    labels: Vec<crate::ir::reexports::BlockId>,
+    kinds: Vec<std::mem::Discriminant<crate::ir::reexports::Terminator>>,
+    edges: Vec<Vec<crate::ir::reexports::BlockId>>,
+}
+
+#[cfg(any(test, debug_assertions))]
+fn ivsr_cfg_shape(func: &IrFunction) -> IvsrCfgShape {
+    use crate::ir::reexports::Terminator;
+    IvsrCfgShape {
+        labels: func.blocks.iter().map(|block| block.label).collect(),
+        kinds: func
+            .blocks
+            .iter()
+            .map(|block| std::mem::discriminant(&block.terminator))
+            .collect(),
+        edges: func
+            .blocks
+            .iter()
+            .map(|block| match &block.terminator {
+                Terminator::Return(_) | Terminator::Unreachable => Vec::new(),
+                Terminator::Branch(label) => vec![*label],
+                Terminator::CondBranch {
+                    true_label,
+                    false_label,
+                    ..
+                } => vec![*true_label, *false_label],
+                Terminator::IndirectBranch {
+                    possible_targets, ..
+                } => possible_targets.clone(),
+                Terminator::Switch { cases, default, .. } => std::iter::once(*default)
+                    .chain(cases.iter().map(|(_, label)| *label))
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
 pub(crate) fn ivsr_with_analysis(
     func: &mut IrFunction,
     cfg: &analysis::CfgAnalysis,
@@ -288,6 +330,9 @@ pub(crate) fn ivsr_with_analysis(
     // Merge loops with same header
     let loops = loop_analysis::merge_loops_by_header(loops);
     let debug = std::env::var("CCC_IVSR_DEBUG").is_ok();
+
+    #[cfg(debug_assertions)]
+    let original_cfg_shape = ivsr_cfg_shape(func);
 
     let mut total_reductions = 0;
 
@@ -324,6 +369,12 @@ pub(crate) fn ivsr_with_analysis(
             scalar_derived,
             ptr_add,
             x86_sib_cost,
+        );
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            ivsr_cfg_shape(func),
+            original_cfg_shape,
+            "IVSR invalidated cached dominance"
         );
         if changed > 0 {
             kept_bodies.push(natural_loop.body.clone());
@@ -5270,6 +5321,59 @@ mod tests {
             ivsr_function(&mut func),
             0,
             "native-width symbol index stays SIB"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cfg_shape_contract_tests {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, Terminator};
+
+    #[test]
+    fn topology_guard_is_stronger_than_block_count() {
+        let mut func = IrFunction::new("cfg_shape".into(), IrType::Void, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![],
+            source_spans: vec![],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(1)),
+                true_label: BlockId(0),
+                false_label: BlockId(1),
+            },
+        });
+        let original = ivsr_cfg_shape(&func);
+        if let Terminator::CondBranch { cond, .. } = &mut func.blocks[0].terminator {
+            *cond = Operand::Value(Value(2));
+        }
+        assert_eq!(
+            original,
+            ivsr_cfg_shape(&func),
+            "value rewrite keeps dominance"
+        );
+        if let Terminator::CondBranch { true_label, .. } = &mut func.blocks[0].terminator {
+            *true_label = BlockId(1);
+        }
+        assert_ne!(
+            original,
+            ivsr_cfg_shape(&func),
+            "same count, different edges"
+        );
+        func.blocks[0].terminator = Terminator::Return(None);
+        let returned = ivsr_cfg_shape(&func);
+        func.blocks[0].terminator = Terminator::Unreachable;
+        assert_ne!(
+            returned,
+            ivsr_cfg_shape(&func),
+            "same edges, different kind"
+        );
+        let unreachable = ivsr_cfg_shape(&func);
+        func.blocks[0].label = BlockId(3);
+        assert_ne!(
+            unreachable,
+            ivsr_cfg_shape(&func),
+            "same count, different identity"
         );
     }
 }

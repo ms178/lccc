@@ -42,3 +42,41 @@ numbers as screening records, not current claims; the live state is
 | 10 | `sieve` | 62.1 | 55.2 | 1.124× | ok |
 
 Geomean LCCC/GCC (all 33 kernels): before 0.692
+
+## PR832 retained artifacts: integrity is not re-execution
+
+Run **`python3 scripts/verify_evidence_hashes.py`**. The read-only, exclusive
+FAST gate checks all 69 retained `engineering/` files changed between 7f9eb225
+and merged main 63e783b, including compressed streams and the original decoded
+hashes in `pr828/RAW-LOGS.json`. Its inventory is
+`pr832-integrity.json`; every file is individually named, sized and hashed.
+Corruption, missing files, duplicate entries, escaping paths and symlinks fail.
+CI does not regenerate or refresh the inventory.
+
+These are historical records, not current performance claims. Hash agreement
+proves byte consistency, NOT that an experiment was performed or that its
+conclusion is correct. Some old dumps lack complete original command/environment
+records; those are **not independently regenerable experiments**. We will not
+invent missing commands, tool identities, dates, or human review provenance.
+
+Exact retrieval of each historical dump is possible from its pinned Git object:
+`git show 63e783b15586eca86f306bd75a52b82c57304bbb:PATH > recovered-file`.
+Use each `files[].path` in `pr832-integrity.json`; this retrieves frozen bytes,
+it does not rerun the experiment. `.gz` files are ordinary gzip streams;
+`gzip -dc FILE` reconstructs the original log, including failed tests.
+
+Re-execution recipes (produce NEW evidence; timestamps/hardware may differ):
+
+* Library: `RUSTFLAGS="$(cat target/lccc-rustflags)" cargo test --profile fastbuild --locked -j 2 --lib`.
+* Local acceptance: `bash scripts/ci_local.sh --fast`; never relabel a new run
+  as an old `*-red.log` or `*-green.log`.
+* Complete bounded Ir screen: `python3 scripts/callgrind_corpus.py --mine target/fastbuild/lccc --ref gcc-16 --gcc-include-command gcc-16 --out results/new-corpus`.
+  All 45 registered forms and checked-in sizes are required without `--only`.
+* Optional external compilers: `python3 scripts/codegen_oracle.py SOURCE --no-local --oracles gcc16.2,clang23.1,icx --flags '-O2 -march=x86-64-v3 -fwrapv' --artifact-dir results/new-oracle --json results/new-oracle/manifest.json`.
+  Record the actual source, macro sizes and accepted flags; this template does
+  not recreate historical parameters omitted from a record.
+
+Forward policy: new experiments keep the exact script/argv, source/tree and tool
+identities, raw outputs/counters, failure records and all input-size overrides.
+Large new raw sweeps live in delivery/CI artifacts; do not add another bulk
+binary/JSON dump to the compiler patch just to advertise a favorable result.

@@ -2489,15 +2489,27 @@ mod ordinary_reduction_accumulator_use_tests {
     }
 }
 
+/// Definition index borrowed only for one immutable reduction analysis. Never
+/// retain it across a transform. Malformed duplicate SSA definitions fail closed
+/// in release builds too; choosing the first/last definition is not a proof.
+type ReductionDefinitions<'a> = FxHashMap<Value, &'a Instruction>;
+
+fn reduction_definitions(func: &IrFunction) -> Option<ReductionDefinitions<'_>> {
+    let mut definitions = FxHashMap::default();
+    for inst in func.blocks.iter().flat_map(|block| &block.instructions) {
+        if let Some(dest) = inst.dest() {
+            if definitions.insert(dest, inst).is_some() {
+                return None;
+            }
+        }
+    }
+    Some(definitions)
+}
+
 /// Preserve upstream Copy-only load identity; casts and cycles are not proof.
-fn reduction_copy_root(func: &IrFunction, mut value: Value) -> Option<Value> {
+fn reduction_copy_root(definitions: &ReductionDefinitions<'_>, mut value: Value) -> Option<Value> {
     for _ in 0..=8 {
-        let definition = func
-            .blocks
-            .iter()
-            .flat_map(|b| &b.instructions)
-            .find(|i| i.dest() == Some(value));
-        match definition {
+        match definitions.get(&value).copied() {
             Some(Instruction::Copy {
                 src: Operand::Value(source),
                 ..
@@ -2515,6 +2527,7 @@ fn reduction_copy_root(func: &IrFunction, mut value: Value) -> Option<Value> {
 /// loop-carried value may survive, and only the IV/accumulator may escape.
 fn minmax_reduction_pattern_is_sound(
     func: &IrFunction,
+    definitions: &ReductionDefinitions<'_>,
     loop_blocks: &FxHashSet<usize>,
     header_idx: usize,
     body_idx: usize,
@@ -2561,8 +2574,8 @@ fn minmax_reduction_pattern_is_sound(
     let select_uses_pair = matches!(
         (true_val, false_val),
         (Operand::Value(a), Operand::Value(b))
-            if (reduction_copy_root(func, *a) == Some(load_value) && *b == accumulator_phi)
-                || (*a == accumulator_phi && reduction_copy_root(func, *b) == Some(load_value))
+            if (reduction_copy_root(definitions, *a) == Some(load_value) && *b == accumulator_phi)
+                || (*a == accumulator_phi && reduction_copy_root(definitions, *b) == Some(load_value))
     );
     if !select_uses_pair {
         return false;
@@ -2581,8 +2594,8 @@ fn minmax_reduction_pattern_is_sound(
         let cmp_uses_pair = matches!(
             (lhs, rhs),
             (Operand::Value(a), Operand::Value(b))
-                if (reduction_copy_root(func, *a) == Some(load_value) && *b == accumulator_phi)
-                    || (*a == accumulator_phi && reduction_copy_root(func, *b) == Some(load_value))
+                if (reduction_copy_root(definitions, *a) == Some(load_value) && *b == accumulator_phi)
+                    || (*a == accumulator_phi && reduction_copy_root(definitions, *b) == Some(load_value))
         );
         if !cmp_uses_pair {
             return false;
@@ -2848,6 +2861,7 @@ mod minmax_reduction_legality_tests {
     fn is_sound(func: &IrFunction, loop_blocks: &FxHashSet<usize>) -> bool {
         minmax_reduction_pattern_is_sound(
             func,
+            &reduction_definitions(func).unwrap(),
             loop_blocks,
             1,
             2,
@@ -2983,6 +2997,7 @@ mod minmax_reduction_legality_tests {
         let sound = |f: &IrFunction| {
             minmax_reduction_pattern_is_sound(
                 f,
+                &reduction_definitions(f).unwrap(),
                 &loop_blocks,
                 1,
                 2,
@@ -2995,7 +3010,10 @@ mod minmax_reduction_legality_tests {
                 false,
             )
         };
-        assert_eq!(reduction_copy_root(&func, Value(10)), Some(Value(4)));
+        assert_eq!(
+            reduction_copy_root(&reduction_definitions(&func).unwrap(), Value(10)),
+            Some(Value(4))
+        );
         assert!(sound(&func));
         func.blocks[2].instructions[3] = Instruction::Cast {
             dest: Value(10),
@@ -3008,7 +3026,10 @@ mod minmax_reduction_legality_tests {
             dest: Value(10),
             src: Operand::Value(Value(10)),
         };
-        assert_eq!(reduction_copy_root(&func, Value(10)), None);
+        assert_eq!(
+            reduction_copy_root(&reduction_definitions(&func).unwrap(), Value(10)),
+            None
+        );
         assert!(!sound(&func));
         // Copying another load is not an identity proof for the compared load.
         func.blocks[2].instructions[3] = Instruction::Copy {
@@ -3016,6 +3037,39 @@ mod minmax_reduction_legality_tests {
             src: Operand::Value(Value(99)),
         };
         assert!(!sound(&func));
+    }
+
+    #[test]
+    fn reduction_definition_index_rejects_duplicates_in_all_blocks() {
+        let (mut func, _) = legal_loop();
+        assert!(reduction_definitions(&func).is_some());
+        // A duplicate outside the candidate loop is still malformed SSA.
+        func.blocks[0].instructions.push(Instruction::Copy {
+            dest: Value(4),
+            src: Operand::Value(Value(99)),
+        });
+        assert!(reduction_definitions(&func).is_none());
+    }
+
+    #[test]
+    fn reduction_definition_index_observes_new_analysis_after_mutation() {
+        let (mut func, _) = legal_loop();
+        func.blocks[0].instructions.push(Instruction::Copy {
+            dest: Value(100),
+            src: Operand::Value(Value(4)),
+        });
+        assert_eq!(
+            reduction_copy_root(&reduction_definitions(&func).unwrap(), Value(100)),
+            Some(Value(4))
+        );
+        *func.blocks[0].instructions.last_mut().unwrap() = Instruction::Copy {
+            dest: Value(100),
+            src: Operand::Value(Value(99)),
+        };
+        assert_eq!(
+            reduction_copy_root(&reduction_definitions(&func).unwrap(), Value(100)),
+            Some(Value(99))
+        );
     }
 
     #[test]
@@ -3404,6 +3458,14 @@ fn analyze_reduction_pattern(
     allow_widening_i32: bool,
     neon: bool,
 ) -> Option<ReductionPattern> {
+    // Most failed candidates need no copy identity query. Allocate lazily, at
+    // most once, and let the borrow prevent reuse after a mutating transform.
+    let definitions = std::cell::OnceCell::new();
+    let get_definitions = || {
+        definitions
+            .get_or_init(|| reduction_definitions(func))
+            .as_ref()
+    };
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let header_idx = loop_info.header;
     let header = &func.blocks[header_idx];
@@ -3730,12 +3792,13 @@ fn analyze_reduction_pattern(
                         continue;
                     };
                     use crate::ir::reexports::IrCmpOp as C;
-                    let Some(x_val) = reduction_copy_root(func, x_val) else {
+                    let definitions = get_definitions()?;
+                    let Some(x_val) = reduction_copy_root(definitions, x_val) else {
                         continue;
                     };
                     let x_on = |o: &Operand| {
                         matches!(o, Operand::Value(v)
-                        if reduction_copy_root(func, *v) == Some(x_val))
+                        if reduction_copy_root(definitions, *v) == Some(x_val))
                     };
                     let phi_on = |o: &Operand| matches!(o, Operand::Value(v) if v.0 == dest.0);
                     // `is_max_form` and `is_min_form` are exact duals: the
@@ -4054,7 +4117,7 @@ fn analyze_reduction_pattern(
             }
             _ => return None,
         };
-        let x_val = reduction_copy_root(func, x_val)?;
+        let x_val = reduction_copy_root(get_definitions()?, x_val)?;
         let Some(x_inst) = body
             .instructions
             .iter()
@@ -4319,6 +4382,7 @@ fn analyze_reduction_pattern(
         }
         if !minmax_reduction_pattern_is_sound(
             func,
+            get_definitions()?,
             &loop_info.body,
             header_idx,
             body_idx,
@@ -19203,7 +19267,10 @@ fn transform_strict_computed_recip_reduction(
         denominator_args.push(Operand::Value(denominator));
         IntrinsicOp::StrictRecipMulAddPackedF64x4
     } else {
-        // No mutation/allocation from an unsupported DAG escapes this plan.
+        // The private allocator MAY have advanced before a later DAG operand
+        // failed. Discard its instructions AND IDs together; equality with
+        // next_value_id would be an invalid assertion. The scalar fallback
+        // owns the unchanged caller counter, so none of those IDs escape.
         vector_body_instructions = Vec::new();
         let mut lane_ivs = Vec::with_capacity(4);
         lane_ivs.push(vector_iv);
@@ -34901,6 +34968,39 @@ mod strict_packed_dag_tests {
             )]);
             assert!(builder(&f).operand(Operand::Value(Value(2)), 0).is_none());
         }
+    }
+
+    #[test]
+    fn rejected_packed_plan_discards_partially_allocated_ids() {
+        let f = function(vec![
+            bin(
+                2,
+                IrBinOp::SDiv,
+                Operand::Value(Value(0)),
+                Operand::Const(IrConst::I32(3)),
+            ),
+            bin(
+                3,
+                IrBinOp::Add,
+                Operand::Value(Value(1)),
+                Operand::Value(Value(2)),
+            ),
+        ]);
+        let before = format!("{f:?}");
+        let mut plan = builder(&f);
+        let next = plan.next;
+        assert!(plan.operand(Operand::Value(Value(3)), 0).is_none());
+        assert!(
+            plan.next > next,
+            "left broadcast allocated before right operand failed"
+        );
+        assert!(!plan.prefix.is_empty());
+        drop(plan);
+        assert_eq!(
+            format!("{f:?}"),
+            before,
+            "speculation never mutates caller IR/counter"
+        );
     }
 
     #[test]

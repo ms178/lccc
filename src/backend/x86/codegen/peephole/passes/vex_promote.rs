@@ -407,95 +407,29 @@ fn allowed_masks(body: &[&str]) -> Vec<u32> {
             labels.entry(name).or_insert(i);
         }
     }
-    // Read lines per alias.  A `%ymmN` occurrence counts as a READ unless it
-    // sits in the destination (last-operand) position of the instruction —
-    // every VEX-256 op writes its YMM destination in full, so `vpbroadcastd
-    // %xmm0, %ymm0` must not block promotion of the `movd` that feeds it
-    // (the merge the legacy encoding preserves is dead).  A `%ymmN` in any
-    // source position observes the upper half and counts.
+    // Use the same positive architectural effect model as vector DCE,
+    // including implicit state-image readers and flag-only VEX instructions.
     let mut read_lines: [Vec<usize>; 16] = std::array::from_fn(|_| Vec::new());
-    for (i, l) in body.iter().enumerate() {
-        let t = l.trim();
-        if is_insn_line(t) {
-            // Span of the final operand (AT&T: the destination).  The
-            // trimmed line ends with it, so the span is derivable from the
-            // operand's length.
-            let rest = match t.find(|c: char| c.is_ascii_whitespace()) {
-                Some(p) => t[p..].trim(),
-                None => "",
-            };
-            let last_span = split_operands(rest)
-                .last()
-                .map(|op| (t.len() - op.len(), t.len()));
-            if let Some(rest) = t.find("%ymm") {
-                let mut j = rest + 4;
-                while j < t.len() {
-                    let b = t.as_bytes()[j];
-                    if b.is_ascii_digit() {
-                        let mut k = j;
-                        let mut num = 0usize;
-                        while k < t.len() && t.as_bytes()[k].is_ascii_digit() {
-                            num = num * 10 + (t.as_bytes()[k] - b'0') as usize;
-                            k += 1;
-                        }
-                        // Position of the '%' of this occurrence.
-                        let occ_start = j - 4;
-                        let in_dst = last_span.is_some_and(|(a, _)| occ_start >= a);
-                        if num < 16 && !in_dst {
-                            read_lines[num].push(i);
-                        }
-                        j = k;
-                    } else {
-                        j += 1;
-                    }
-                }
-            }
-        }
-    }
-    // Kill mask per line: bit N set when the instruction fully overwrites
-    // the upper half of alias N (VEX/`vzeroupper`; EVEX forms — zmm
-    // operands, masking syntax, EVEX-only mnemonics with digit suffixes —
-    // deliberately never count: EVEX preserves the upper bits of XMM
-    // destinations).
-    let mut kill: Vec<u32> = vec![0; n];
-    for (i, l) in body.iter().enumerate() {
-        let t = l.trim();
-        if !is_insn_line(t) {
+    let mut kill = vec![0u32; n];
+    for (i, line) in body.iter().enumerate() {
+        let text = line.trim();
+        if !is_insn_line(text) {
             continue;
         }
-        let (mn, rest) = match t.find(|c: char| c.is_ascii_whitespace()) {
-            Some(p) => (&t[..p], t[p..].trim()),
-            None => (t, ""),
-        };
-        if mn == "vzeroupper" {
-            // Kills all 16 YMM aliases (the 0xFFFF mask, spelled for the
-            // per-alias bit width).
-            kill[i] = 0xFFFF;
-            continue;
-        }
-        if !mn.starts_with('v') || t.contains('{') || t.contains("%zmm") {
-            continue;
-        }
-        // EVEX-only encodings carry a width digit in the mnemonic
-        // (vmovdqu64, vpternlogd is EVEX-only too but never emitted; the
-        // digit rule covers every EVEX mnemonic lccc can produce).
-        if mn.chars().any(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        let last = split_operands(rest).last().copied().unwrap_or("");
-        if let Some(num) = last
-            .strip_prefix("%ymm")
-            .and_then(|r| r.parse::<u32>().ok())
+        let (mut reads, mut writes) = super::fp_liveness::upper_vector_access_line(text);
+        let (mn, operand) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+        if mn.starts_with('j')
+            && (operand.trim().starts_with('*') || !labels.contains_key(operand.trim()))
         {
-            if num < 16 {
-                kill[i] |= 1 << num;
-            }
-        } else if let Some(num) = last
-            .strip_prefix("%xmm")
-            .and_then(|r| r.parse::<u32>().ok())
-        {
-            if num < 16 {
-                kill[i] |= 1 << num;
+            // A target outside this model may observe ANY upper register.
+            // Reaching all local lines alone is not a proof about that target.
+            reads = 0xffff;
+            writes = 0;
+        }
+        kill[i] = writes;
+        for (alias, sites) in read_lines.iter_mut().enumerate() {
+            if reads & (1 << alias) != 0 {
+                sites.push(i);
             }
         }
     }
@@ -667,6 +601,30 @@ g:
         assert!(out.contains("\tvmovss %xmm2, (%rsi)\n"));
         assert!(out.contains("\tvpaddd %xmm1, %xmm2, %xmm2\n"));
         assert!(out.contains("\tvpaddd %xmm1, %xmm3, %xmm3\n"));
+    }
+
+    #[test]
+    fn pr832_implicit_upper_observers_and_flag_only_forms_do_not_hide_reads() {
+        for reader in [
+            "xsave (%rdi)",
+            "xsave64 (%rdi)",
+            "xsaveopt64 (%rdi)",
+            "xsavec64 (%rdi)",
+            "xsaves64 (%rdi)",
+            "vptest %ymm1, %ymm7",
+        ] {
+            let text = format!(
+                "g:\n    vpcmpeqd %ymm7, %ymm7, %ymm7\n    movaps %xmm5, %xmm7\n    {reader}\n    ret\n"
+            );
+            let (out, _) = run(&text);
+            assert!(out.contains("    movaps %xmm5, %xmm7"), "{reader}: {out}");
+        }
+        let text = "g:\n    vpcmpeqd %ymm7, %ymm7, %ymm7\n    movaps %xmm5, %xmm7\n    vxorps %ymm7, %ymm7, %ymm7\n    xsave64 (%rdi)\n    ret\n";
+        let (out, count) = run(text);
+        assert!(
+            count > 0 && out.contains("vmovaps"),
+            "proven upper overwrite still permits promotion: {out}"
+        );
     }
 
     #[test]

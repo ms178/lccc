@@ -77,6 +77,19 @@ class CallgrindContract(unittest.TestCase):
             with mock.patch.object(cg,'_run',return_value=result(rc=1)) as run:
                 self.assertIsNotNone(cg.compile_program('fake-cc','-O2 -DNAME="a b"','source.c',out,include='-Ifake'))
                 self.assertIn('-DNAME=a b',run.call_args.args[0]);self.assertFalse(out.exists())
+    def test_bad_compile_flags_do_not_leave_an_old_process_receipt(self):
+        with tempfile.TemporaryDirectory() as td:
+            out=Path(td)/'program'
+            for suffix in ('stdout','stderr','json'):
+                Path(str(out)+'.compile.'+suffix).write_bytes(b'stale')
+            with mock.patch.object(cg,'_run') as run:
+                self.assertIn('infrastructure',cg.compile_program('cc','-O2 -Xlinker','x.c',out,include='-Ifake'))
+                run.assert_not_called()
+            self.assertFalse(Path(str(out)+'.compile.stdout').exists())
+            self.assertFalse(Path(str(out)+'.compile.stderr').exists())
+            receipt=schema.loads(Path(str(out)+'.compile.json').read_text())
+            self.assertIn('infrastructure_error',receipt)
+
     def test_zero_exit_without_binary_is_failure(self):
         with tempfile.TemporaryDirectory() as td,mock.patch.object(cg,'_run',return_value=result()):
             self.assertIsNotNone(cg.compile_program('fake-cc','-O2','source.c',Path(td)/'missing',include='-Ifake'))
@@ -87,6 +100,25 @@ class CallgrindContract(unittest.TestCase):
                 events,error,info=cg.callgrind(path/'program',path,expected_stdout=b'ok\n')
                 self.assertIsNone(events);self.assertIn('stdout',error);self.assertFalse((path/'program.cg').exists())
                 self.assertIn('process',info)
+
+    def test_raw_streams_survive_failures_and_argv_is_retained(self):
+        with tempfile.TemporaryDirectory() as td:
+            prefix=Path(td)/'record'
+            raw=process.normalize((9,b'partial output\x00',b'diagnostic'*500))
+            with mock.patch.object(cg,'_run',return_value=raw):
+                got,info=cg.run_recorded(['tool','argument with spaces'],12,prefix)
+            self.assertEqual(got['returncode'],9)
+            for stream in ('stdout','stderr'):
+                self.assertEqual(Path(info['raw_outputs'][stream]).read_bytes(),raw[stream])
+            receipt=schema.loads(Path(str(prefix)+'.json').read_text())
+            self.assertEqual(receipt['command'],['tool','argument with spaces'])
+            with mock.patch.object(cg,'_run',side_effect=OSError('missing tool')):
+                with self.assertRaises(OSError): cg.run_recorded(['missing'],12,prefix)
+            self.assertFalse(Path(str(prefix)+'.stdout').exists())
+            self.assertFalse(Path(str(prefix)+'.stderr').exists())
+            receipt=schema.loads(Path(str(prefix)+'.json').read_text())
+            self.assertIn('infrastructure_error',receipt)
+
 
 
 class MainContract(unittest.TestCase):

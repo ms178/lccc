@@ -92,17 +92,48 @@ def parse_summary(path):
     return validate_events(dict(zip(events,totals)))
 
 
+def clear_process_record(prefix):
+    paths = {suffix: Path(str(prefix) + '.' + suffix) for suffix in ('stdout', 'stderr', 'json')}
+    for path in paths.values():
+        path.unlink(missing_ok=True)
+    return paths
+
+
+def run_recorded(command, timeout, prefix):
+    """Keep captured stdout/stderr and exact argv, including unsuccessful arms.
+
+    JSON hashes alone are not the raw evidence. Clear a prior record BEFORE
+    execution so an infrastructure exception cannot expose stale output.
+    """
+    paths = clear_process_record(prefix)
+    try:
+        result = _run(command, timeout)
+    except (OSError, ValueError) as error:
+        publication.atomic_bytes(paths['json'], schema.dumps(dict(command=command, infrastructure_error=str(error))).encode())
+        raise
+    info = dict(command=command, process=evidence(result),
+                raw_outputs={stream: str(paths[stream]) for stream in ('stdout', 'stderr')})
+    for stream in ('stdout', 'stderr'):
+        publication.atomic_bytes(paths[stream], result[stream])
+    publication.atomic_bytes(paths['json'], schema.dumps(info).encode())
+    return result, info
+
+
 def compile_program(compiler,opt,source,out,*,include=None):
     """No builtin-shadowing compile(), no eager GCC discovery, no stale binary."""
     out=Path(out);out.unlink(missing_ok=True)
-    opts=shlex.split(opt) if isinstance(opt,str) else list(opt)
+    paths=clear_process_record(str(out)+'.compile')
     try:
+        opts=shlex.split(opt) if isinstance(opt,str) else list(opt)
         include=include or gcc_include()
         frontend,linker=split_driver_flags(opts)
         # Use the native harness's ordering authority: --as-needed must see
         # the object before its libraries, in both measurement arms.
-        r=_run(shlex.split(str(compiler))+[include]+frontend+[str(source)]+linker+['-o',str(out)],180)
-    except (OSError,ValueError) as exc:return 'compile infrastructure: '+str(exc)
+        r,_=run_recorded(shlex.split(str(compiler))+[include]+frontend+[str(source)]+linker+['-o',str(out)],180,str(out)+'.compile')
+    except (OSError,ValueError) as exc:
+        if not paths['json'].exists():
+            publication.atomic_bytes(paths['json'],schema.dumps(dict(compiler=str(compiler),options=opt,infrastructure_error=str(exc))).encode())
+        return 'compile infrastructure: '+str(exc)
     if r['failure'] or r['returncode']!=0:return f"compile rc={r['returncode']} failure={r['failure']}: "+r['stderr'].decode('utf-8',errors='replace')[-400:]
     if not out.is_file() or not os.access(out,os.X_OK):return 'compiler reported success but produced no executable'
     return None
@@ -125,9 +156,8 @@ def callgrind(binary,outdir,*,cache_geometry=None,expected_stdout=None,timeout=1
     model=cache_geometry or geometry()[0]
     cmd=['valgrind','--tool=callgrind','--cache-sim=yes','--branch-sim=yes','--quiet',
          f'--I1={model["I1"]}',f'--D1={model["D1"]}',f'--LL={model["LL"]}',f'--callgrind-out-file={cg}',str(binary)]
-    try:r=_run(cmd,timeout)
+    try:r,info=run_recorded(cmd,timeout,str(cg))
     except (OSError,ValueError) as exc:return None,'Callgrind infrastructure: '+str(exc),dict(command=cmd)
-    info=dict(command=cmd,process=evidence(r))
     if r['failure'] or r['returncode']!=0:return None,f"Callgrind rc={r['returncode']} failure={r['failure']}",info
     if expected_stdout is not None and r['stdout']!=expected_stdout:return None,'instrumented stdout mismatch',info
     try:events=parse_summary(cg)
@@ -170,7 +200,9 @@ def _measure(args,benches,outroot,manifest,cache):
         if not err:err=compile_program(args.ref,args.opt,source,rbin,include=manifest['include'])
         if err:entry['detail']=err;failures[bench]=err;continue
         entry['binary_sha256']=dict(mine=schema.file_hash(mbin),ref=schema.file_hash(rbin))
-        try:pm=_run([str(mbin)],120);pr=_run([str(rbin)],120)
+        try:
+            pm,_=run_recorded([str(mbin)],120,str(mbin)+'.native')
+            pr,_=run_recorded([str(rbin)],120,str(rbin)+'.native')
         except (OSError,ValueError) as exc:entry['detail']=str(exc);failures[bench]=str(exc);continue
         entry['correctness']=dict(mine=evidence(pm),ref=evidence(pr))
         err=same_output(pm,pr)

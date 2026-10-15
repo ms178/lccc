@@ -786,7 +786,9 @@ pub enum IntrinsicOp {
     StrictRecipMulAddF64x4,
     /// Same ordered FP operation with an AVX2 I32x8 denominator input.
     /// Only its low four lanes are observed. Args: [acc, packed, base,
-    /// byte_offset, scratch]. No horizontal reassociation or extra FP lanes.
+    /// byte_offset, scratch]. The result is ONE scalar F64 accumulator: four
+    /// products are added in source order, not a packed F64x4 result.
+    /// No horizontal reassociation or extra FP lanes.
     StrictRecipMulAddPackedF64x4,
     /// Horizontal reduction: %scalar = horizontal_add(%vec) - AVX2 8×I32 → I32
     /// args[0] = source vector value; dest = scalar I32 result
@@ -2684,6 +2686,8 @@ mod memory_classification_tests {
 
     #[test]
     fn strict_reciprocal_effects_and_scalar_result() {
+        // Result width and vector-home classification must agree: one F64,
+        // despite the four input/product lanes encoded in the operation name.
         use crate::common::types::IrType;
         use crate::ir::reexports::{Instruction, Value};
         for op in [O::StrictRecipMulAddF64x4, O::StrictRecipMulAddPackedF64x4] {
