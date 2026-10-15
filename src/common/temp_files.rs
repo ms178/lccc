@@ -477,4 +477,103 @@ mod lifecycle_tests {
             io::ErrorKind::InvalidData
         );
     }
+
+    #[test]
+    fn directory_lease_reaps_empty_but_preserves_kept_files() {
+        // A private lease, not the global weak cache, makes this assertion
+        // independent of unrelated tests holding their own managed guards.
+        let directory = Arc::new(ManagedTempDirectory {
+            path: create_private_dir().unwrap(),
+            retained: AtomicBool::new(false),
+        });
+        let parent = directory.path.clone();
+        let path = parent.join("owned");
+        fs::write(&path, b"owned").unwrap();
+        let file = TempFile {
+            path,
+            keep: false,
+            _directory: Some(directory),
+        };
+        drop(file);
+        assert!(!parent.exists());
+
+        let directory = Arc::new(ManagedTempDirectory {
+            path: create_private_dir().unwrap(),
+            retained: AtomicBool::new(false),
+        });
+        let parent = directory.path.clone();
+        let path = parent.join("kept");
+        fs::write(&path, b"kept").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        let mut file = TempFile {
+            path: path.clone(),
+            keep: false,
+            _directory: Some(directory),
+        };
+        file.set_keep(true);
+        drop(file);
+        assert_eq!(fs::read(&path).unwrap(), b"kept");
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(parent).unwrap();
+    }
+
+    #[test]
+    fn managed_cleanup_does_not_invalidate_unmanaged_paths() {
+        let path = private_temp_dir()
+            .unwrap()
+            .join(unique_filename("lifecycle", "unmanaged", "tmp"));
+        drop(TempFile::try_new("lifecycle", "managed", "tmp").unwrap());
+        write_file_exclusive(&path, b"unmanaged lifetime").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"unmanaged lifetime");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn pending_reservation_survives_sibling_drop() {
+        let first = TempFile::try_new("lifecycle", "first", "tmp").unwrap();
+        let pending = TempFile::try_new("lifecycle", "pending", "tmp").unwrap();
+        drop(first);
+        fs::write(pending.path(), b"still reserved").unwrap();
+        assert_eq!(fs::read(pending.path()).unwrap(), b"still reserved");
+    }
+
+    #[test]
+    fn sequential_lifetimes_create_writable_directories() {
+        for _ in 0..3 {
+            let file = TempFile::try_new("lifecycle", "sequential", "tmp").unwrap();
+            fs::write(file.path(), b"next generation").unwrap();
+        }
+    }
+
+    #[test]
+    fn unrelated_explicit_path_cannot_reap_reserved_directory() {
+        let pending = TempFile::try_new("lifecycle", "pending", "tmp").unwrap();
+        let explicit = TempFile::with_path(temp_dir().join(format!(
+            "lccc-unrelated-{}-{}",
+            std::process::id(),
+            unique_stamp()
+        )));
+        drop(explicit);
+        fs::write(pending.path(), b"not owned by the explicit guard").unwrap();
+    }
+
+    #[test]
+    fn parallel_pending_writers_survive_an_empty_sibling() {
+        let pending: Vec<_> = (0..8)
+            .map(|_| TempFile::try_new("lifecycle", "parallel", "tmp").unwrap())
+            .collect();
+        drop(TempFile::try_new("lifecycle", "empty", "tmp").unwrap());
+        std::thread::scope(|scope| {
+            for file in pending {
+                scope.spawn(move || fs::write(file.path(), b"parallel").unwrap());
+            }
+        });
+    }
 }

@@ -139,3 +139,81 @@ class ParallelLayout(unittest.TestCase):
         redteam = yaml.safe_load((ROOT / '.github/workflows/pr826-redteam.yml').read_text())
         self.assertNotIn('causal-comparison', redteam['jobs'])
         self.assertTrue(redteam['jobs'], 'unrelated red-team checks must survive')
+
+
+class RecursiveWorkflowSemantics(unittest.TestCase):
+    def setUp(self):
+        import sys
+        spec=importlib.util.spec_from_file_location('pr834_parity',ROOT/'scripts/check_ci_gate_parity.py')
+        self.parity=importlib.util.module_from_spec(spec);sys.modules[spec.name]=self.parity;spec.loader.exec_module(self.parity)
+
+    def walk(self,root,documents):
+        for name,document in documents.items():(root/name).write_text(yaml.safe_dump(document))
+        return list(self.parity.workflow_run_steps(root/'ci.yml'))
+
+    def documents(self):
+        return {
+            'ci.yml':{'on':'pull_request','jobs':{'a':{'uses':'./.github/workflows/middle.yml'},'b':{'uses':'./.github/workflows/middle.yml'}}},
+            'middle.yml':{'on':'workflow_call','jobs':{'next':{'uses':'./.github/workflows/leaf.yml'}}},
+            'leaf.yml':{'on':'workflow_call','jobs':{'gate':{'steps':[{'run':'python3 scripts/probe.py'}]}}},
+        }
+
+    def test_nested_diamond_and_string_boolean_softness(self):
+        for value,expected in ((False,2),('false',2),('${{ false }}',2),(True,0),('true',0)):
+            with self.subTest(value=value),tempfile.TemporaryDirectory() as tmp:
+                docs=self.documents()
+                docs['middle.yml']['jobs']['next']['continue-on-error']=value
+                steps=self.walk(Path(tmp),docs)
+                self.assertEqual(len(steps),2,'diamond is not a recursive cycle')
+                self.assertEqual(sum(s.active and not s.soft for s in steps),expected)
+        with tempfile.TemporaryDirectory() as tmp:
+            docs=self.documents();docs['leaf.yml']['jobs']['gate']['steps'][0]['continue-on-error']='false'
+            self.assertTrue(all(s.active and not s.soft for s in self.walk(Path(tmp),docs)))
+
+    def test_needs_skips_propagate_but_always_can_run(self):
+        for always in (False,True):
+            with self.subTest(always=always),tempfile.TemporaryDirectory() as tmp:
+                docs=self.documents();jobs=docs['ci.yml']['jobs']
+                jobs['prep']={'if':'false','steps':[{'run':'echo skipped'}]}
+                jobs['a']['needs']='prep';jobs['b']['needs']=['a']
+                if always:jobs['b']['if']='always()'
+                steps=self.walk(Path(tmp),docs)
+                gates=[s for s in steps if 'probe.py' in s.body]
+                self.assertEqual(sum(s.active and not s.soft for s in gates),int(always))
+
+    def test_always_intermediate_does_not_erase_a_skipped_ancestor(self):
+        for after_always in (False,True):
+            with self.subTest(after_always=after_always),tempfile.TemporaryDirectory() as tmp:
+                docs=self.documents();jobs=docs['ci.yml']['jobs']
+                jobs['prep']={'if':'false','steps':[{'run':'echo skipped'}]}
+                jobs['a']['needs']='prep'
+                jobs['b'].update(needs='a',**{'if':'always()'})
+                jobs['after']={'needs':'b','uses':'./.github/workflows/leaf.yml'}
+                if after_always:jobs['after']['if']='always()'
+                gates=[s for s in self.walk(Path(tmp),docs) if 'probe.py' in s.body]
+                self.assertEqual(sum(s.active and not s.soft for s in gates),1+int(after_always))
+
+    def test_unsupported_semantics_and_bad_needs_rejected(self):
+        for mutation in ('matrix','required-input','required-secret','with','secrets','expression-soft','unknown-needs','cycle-needs'):
+            with self.subTest(mutation=mutation),tempfile.TemporaryDirectory() as tmp:
+                docs=self.documents();job=docs['ci.yml']['jobs']['a']
+                if mutation=='matrix':job['strategy']={'matrix':{'os':['ubuntu-latest']}}
+                elif mutation=='required-input':docs['middle.yml']['on']={'workflow_call':{'inputs':{'mode':{'required':True,'type':'string'}}}}
+                elif mutation=='required-secret':docs['middle.yml']['on']={'workflow_call':{'secrets':{'token':{'required':True}}}}
+                elif mutation=='with':job['with']={'mode':'strict'}
+                elif mutation=='secrets':job['secrets']='inherit'
+                elif mutation=='expression-soft':job['continue-on-error']='${{ inputs.soft }}'
+                elif mutation=='unknown-needs':job['needs']='missing'
+                elif mutation=='cycle-needs':job['needs']='b';docs['ci.yml']['jobs']['b']['needs']='a'
+                with self.assertRaises(self.parity._WorkflowError):self.walk(Path(tmp),docs)
+
+
+class OracleRetirementPolicy(unittest.TestCase):
+    def test_policy_pointer_and_named_scripts_exist(self):
+        import re
+        workflow=(ROOT/'.github/workflows/ci.yml').read_text()
+        self.assertEqual(workflow.splitlines()[0],'# Oracle policy: engineering/CI-ORACLE-POLICY.md')
+        policy=(ROOT/'engineering/CI-ORACLE-POLICY.md').read_text()
+        named=re.findall(r'`((?:scripts|tests)/[^` ]+\.(?:py|sh))`',policy)
+        self.assertGreaterEqual(len(named),4)
+        for name in named:self.assertTrue((ROOT/name).is_file(),name)

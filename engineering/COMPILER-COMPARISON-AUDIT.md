@@ -1,6 +1,6 @@
 # Compiler-candidate audit
 
-Date: 2026-10-15. Base: `f07f4c514460e4116a574773cd84b69d185bf65e`.
+Date: 2026-10-15. Current integrated main: `84a62201cc90a41c9a0eefe2faf5196f43370cfa`.
 Compared source trees: PR #835 (`4216f897460be1eef08cc0f24e8b6016cd738283`)
 and PR #836 (`3671c7c9a088226b2962ff9712c178da79e7b9d4`), followed by the
 changes in this tree. Source archives, not branch switches, isolate references.
@@ -29,7 +29,7 @@ The regression authority is
 `tests/corpus/test_benchmark_comparison_safety.py`. The baseline Python corpus
 passed 545 tests with five skips; the competing tree passed 582 with four skips.
 Test counts are not interchangeable coverage or quality scores. The corrected
-tree's full corpus passed 583 tests in 76.821 seconds with five explicit skips;
+tree's full corpus passed 605 tests in 90.699 seconds with five explicit skips;
 the focused safety/report suite passed all 29 tests. The strict CI/local parity
 mutation suite passed all 73 tests.
 
@@ -89,6 +89,23 @@ shared gaps to GCC also remain visible: `byte_load_reassembly` executes
 72,125,195 simulated instructions versus GCC's 16,834,535 (4.28436x), and
 `ring_fifo` 637,710 versus 265,362 (2.40317x). An attractive aggregate would not
 remove these weaknesses or establish a fix.
+
+## Integration with current main
+
+The remote main ref advanced during the audit. Its private-XMM liveness cache
+and staged wide-call argument fix are retained, along with the native typed
+wide-argument witness and all six temporary-lifetime tests. Those lifetime tests
+now use the fallible reservation API; unmanaged pending paths remain covered.
+The final managed implementation additionally preserves a kept-but-unwritten
+path and fails closed when secure directory creation fails.
+
+The stricter upstream evidence verifier retains its exact schema and frozen
+69-file scope. The byte-identical protected audit was restored to its canonical
+path; the independently updated report lives in
+[`PR831-COMPILER-AUDIT.md`](PR831-COMPILER-AUDIT.md). No protected measurement
+was rehashed to conceal a mismatch. Source/benchmark results recorded below
+remain qualified by their own identities; integration requires fresh hosted
+validation rather than inheritance of an earlier green check.
 
 ## Implementation decisions and their proof obligations
 

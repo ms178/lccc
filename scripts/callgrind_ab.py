@@ -119,6 +119,19 @@ def run_recorded(command, timeout, prefix):
     return result, info
 
 
+def process_receipt(prefix):
+    """Link the exact sidecar and its raw streams into the top-level manifest.
+
+    Infrastructure errors have no captured streams; they still have a receipt.
+    Missing/malformed sidecars are errors, never evidence of successful work.
+    """
+    path=Path(str(prefix)+'.json')
+    info=schema.loads(path.read_text(encoding='utf-8'))
+    info.setdefault('raw_outputs',{})
+    info['receipt']=dict(path=str(path),sha256=schema.file_hash(path))
+    return info
+
+
 def compile_program(compiler,opt,source,out,*,include=None):
     """No builtin-shadowing compile(), no eager GCC discovery, no stale binary."""
     out=Path(out);out.unlink(missing_ok=True)
@@ -196,14 +209,25 @@ def _measure(args,benches,outroot,manifest,cache):
         source=REPO/'tests/benchmark/programs'/f'{bench}.c';entry=dict(status='ERROR');manifest['results'][bench]=entry
         if not source.is_file():entry['detail']='missing-source';failures[bench]='missing-source';continue
         entry['source_sha256']=schema.file_hash(source);mbin=mdir/bench;rbin=rdir/bench
-        err=compile_program(args.mine,args.opt,source,mbin,include=manifest['include'])
-        if not err:err=compile_program(args.ref,args.opt,source,rbin,include=manifest['include'])
+        entry['compilation']={}
+        err=None
+        for side,compiler,binary in (('mine',args.mine,mbin),('ref',args.ref,rbin)):
+            err=compile_program(compiler,args.opt,source,binary,include=manifest['include'])
+            entry['compilation'][side]=process_receipt(str(binary)+'.compile')
+            if err:break
         if err:entry['detail']=err;failures[bench]=err;continue
         entry['binary_sha256']=dict(mine=schema.file_hash(mbin),ref=schema.file_hash(rbin))
+        entry['native']={}
+        native={}
         try:
-            pm,_=run_recorded([str(mbin)],120,str(mbin)+'.native')
-            pr,_=run_recorded([str(rbin)],120,str(rbin)+'.native')
+            for side,binary in (('mine',mbin),('ref',rbin)):
+                prefix=str(binary)+'.native'
+                try:
+                    native[side],_=run_recorded([str(binary)],120,prefix)
+                finally:
+                    entry['native'][side]=process_receipt(prefix)
         except (OSError,ValueError) as exc:entry['detail']=str(exc);failures[bench]=str(exc);continue
+        pm,pr=native['mine'],native['ref']
         entry['correctness']=dict(mine=evidence(pm),ref=evidence(pr))
         err=same_output(pm,pr)
         if err:entry['detail']=err;failures[bench]=err;continue

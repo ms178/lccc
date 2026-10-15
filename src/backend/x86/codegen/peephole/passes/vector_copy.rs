@@ -759,12 +759,81 @@ fn narrow_result_only(
     false
 }
 
+/// A narrow scalar self-merge rename changes reads, never writes or CFG.
+/// Removed reads leave an over-approximation: a cached DEAD answer stays
+/// sound. Added reads invalidate the source register before its next query.
+/// On a negative answer after removals, refresh and retry so precision (and
+/// emitted code) matches eager refresh. Only private XMM8..15 are queried;
+/// inferred call/return ABI masks affect XMM0..7, not these facts.
+///
+/// All other rewrites retain eager refresh. In particular this is NOT a
+/// general dirty-once-per-pass cache. Traversal is forward, functions are not
+/// revisited, and no rewrite crosses a function/basic-block barrier.
+#[derive(Default)]
+struct PropagationLiveness {
+    oracle: Option<FpLiveness>,
+    added_reads: u32,
+    removed_reads: u32,
+}
+
+impl PropagationLiveness {
+    fn refresh_at(&mut self, store: &LineStore, infos: &[LineInfo], at: usize) {
+        if let Some(oracle) = self.oracle.as_mut() {
+            oracle.refresh_at(store, infos, at);
+        }
+        self.added_reads = 0;
+        self.removed_reads = 0;
+    }
+
+    fn narrow_rename(&mut self, src: u8, dst: u8) {
+        self.added_reads |= 1 << src;
+        self.removed_reads |= 1 << dst;
+    }
+
+    fn allows_narrow_result(
+        &mut self,
+        store: &LineStore,
+        infos: &[LineInfo],
+        producer: usize,
+        register: u8,
+        width: u16,
+    ) -> bool {
+        debug_assert!(register >= 8);
+        let bit = 1 << register;
+        if self.added_reads & bit != 0 {
+            self.refresh_at(store, infos, producer);
+        }
+        let oracle = self
+            .oracle
+            .get_or_insert_with(|| FpLiveness::new(store, infos));
+        if narrow_result_only(store, infos, producer, register, width, oracle) {
+            return true;
+        }
+        if self.removed_reads & bit == 0 {
+            return false;
+        }
+        self.refresh_at(store, infos, producer);
+        self.oracle.as_ref().is_some_and(|oracle| {
+            narrow_result_only(store, infos, producer, register, width, oracle)
+        })
+    }
+}
+
 /// Substitute a vector copy's source for reads of its destination, forward
 /// through the basic block, width-checked at every step.
 pub(super) fn propagate_vector_copies(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    propagate_vector_copies_impl::<false>(store, infos)
+}
+
+// The eager instantiation is only used by differential tests. Production
+// specializes the constant away, retaining one implementation of the rewrite.
+fn propagate_vector_copies_impl<const EAGER: bool>(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
     let len = store.len();
     let mut changed = false;
-    let mut fp: Option<FpLiveness> = None;
+    let mut fp = PropagationLiveness::default();
     let mut i = 0;
     while i < len {
         if infos[i].is_nop() || infos[i].pinned {
@@ -806,20 +875,15 @@ pub(super) fn propagate_vector_copies(store: &mut LineStore, infos: &mut [LineIn
                 let narrow_merge = width > copy.width
                     && copy.dst >= 8
                     && private_scalar_self_merge(&t, copy.dst, copy.width)
-                    && narrow_result_only(
-                        store,
-                        infos,
-                        j,
-                        copy.dst,
-                        copy.width,
-                        fp.get_or_insert_with(|| FpLiveness::new(store, infos)),
-                    );
+                    && fp.allows_narrow_result(store, infos, j, copy.dst, copy.width);
                 if width != 0 && (width <= copy.width || narrow_merge) {
                     if let Some(rewritten) = replace_vec_reads(&t, copy.dst, copy.src) {
                         if rewritten != t {
                             replace_line(store, &mut infos[j], j, format!("    {rewritten}"));
-                            if let Some(oracle) = fp.as_mut() {
-                                oracle.refresh_at(store, infos, j);
+                            if narrow_merge && !EAGER {
+                                fp.narrow_rename(copy.src, copy.dst);
+                            } else {
+                                fp.refresh_at(store, infos, j);
                             }
                             changed = true;
                         }
@@ -832,9 +896,7 @@ pub(super) fn propagate_vector_copies(store: &mut LineStore, infos: &mut [LineIn
                 if let Some(rewritten) = replace_vec_reads(&t, copy.dst, copy.src) {
                     if rewritten != t {
                         replace_line(store, &mut infos[j], j, format!("    {rewritten}"));
-                        if let Some(oracle) = fp.as_mut() {
-                            oracle.refresh_at(store, infos, j);
-                        }
+                        fp.refresh_at(store, infos, j);
                         changed = true;
                     }
                 }
@@ -1448,6 +1510,51 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn pr834_wide_call_real_pipeline_native() {
+        // This is an execution contract, not a silently successful no-op on
+        // an unsupported runner. The structural companion is CPU-independent.
+        assert!(
+            std::arch::is_x86_feature_detected!("avx"),
+            "native wide-call contract requires an AVX-capable test runner"
+        );
+        use crate::common::temp_files::TempFile;
+        use std::process::Command;
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/regression/fixtures/peephole-wide-call");
+        let original = std::fs::read_to_string(fixtures.join("caller.s")).unwrap();
+        let optimized = run(&original);
+        assert!(
+            !optimized.contains("movq %rax, %rax"),
+            "real pipeline positive control"
+        );
+        let asm = TempFile::try_new("pr834", "wide-call", "s").unwrap();
+        let exe = TempFile::try_new("pr834", "wide-call", "exe").unwrap();
+        for (stage, code) in [("original", original), ("optimized", optimized)] {
+            std::fs::write(asm.path(), &code).unwrap();
+            let compiled = Command::new("gcc")
+                .args(["-O2", "-mavx", "-Werror", "-o"])
+                .arg(exe.path())
+                .arg(fixtures.join("driver.c"))
+                .arg(asm.path())
+                .output()
+                .expect("GCC typed wide-argument witness");
+            assert!(
+                compiled.status.success(),
+                "{stage}: {}",
+                String::from_utf8_lossy(&compiled.stderr)
+            );
+            let output = Command::new(exe.path()).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{stage}: {}\n{code}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert_eq!(output.stdout, b"9 2 3 4\n", "{stage}");
+        }
+    }
+
+    #[test]
     fn pr824_external_redteam_copy_preserves_architectural_zeros() {
         for overwrite in [
             "pshufd $27, %xmm5, %xmm7",
@@ -1663,6 +1770,137 @@ mod tests {
             })
             .map(|l| l.trim().to_string())
             .collect()
+    }
+
+    #[test]
+    fn pr834_narrow_cache_refreshes_added_reads_and_retries_removed_reads() {
+        for adding in [true, false] {
+            let target = if adding { 10 } else { 12 };
+            let head = "vaddsd %xmm1, %xmm12, %xmm12";
+            let op = format!("vaddsd %xmm1, %xmm{target}, %xmm{target}");
+            let text = body(&format!(
+                ".Lhead:\n    {head}\n    vxorps %xmm{target}, %xmm{target}, %xmm{target}\n    {op}\n    movq %xmm{target}, %rax\n    jnz .Lhead\n    ret\n"
+            ));
+            let mut store = LineStore::new(text);
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            let producer = (0..store.len())
+                .rfind(|&i| store.get(i).trim() == op)
+                .unwrap();
+            let header = (0..store.len())
+                .find(|&i| store.get(i).trim() == head)
+                .unwrap();
+            let mut fp = PropagationLiveness::default();
+            assert_eq!(
+                fp.allows_narrow_result(&store, &infos, producer, target, W64),
+                adding
+            );
+            let source = if adding { 10 } else { 0 };
+            replace_line(
+                &mut store,
+                &mut infos[header],
+                header,
+                format!("    vaddsd %xmm1, %xmm{source}, %xmm12"),
+            );
+            fp.narrow_rename(source, 12);
+            super::super::fp_liveness::take_refresh_count();
+            assert_eq!(
+                fp.allows_narrow_result(&store, &infos, producer, target, W64),
+                !adding
+            );
+            assert_eq!(super::super::fp_liveness::take_refresh_count(), 1);
+        }
+    }
+
+    #[test]
+    fn pr834_lazy_narrow_facts_match_eager_refresh_on_mixed_cfgs() {
+        for seed in 0..64usize {
+            let mut code = String::from(".Lhead:\n");
+            for group in 0..12 {
+                let dst = 8 + (seed + group) % 8;
+                let src = if (seed + group) % 3 == 0 {
+                    8 + (seed * 3 + group + 1) % 8
+                } else {
+                    0
+                };
+                let copy = if (seed + group) % 5 == 0 {
+                    "movapd"
+                } else {
+                    "movsd"
+                };
+                code.push_str(&format!("    {copy} %xmm{src}, %xmm{dst}\n    vaddsd %xmm1, %xmm{dst}, %xmm{dst}\n    movq %xmm{dst}, %rax\n"));
+                if (seed + group) % 2 == 0 {
+                    code.push_str(&format!("    vxorps %xmm{dst}, %xmm{dst}, %xmm{dst}\n"));
+                }
+                if (seed + group) % 7 == 0 {
+                    code.push_str(&format!("    movupd %xmm{dst}, (%rdi)\n"));
+                }
+            }
+            if seed % 2 == 0 {
+                code.push_str("    jnz .Lhead\n");
+            }
+            code.push_str("    ret\n");
+            let text = body(&code);
+            let mut lazy = LineStore::new(text.clone());
+            let mut eager = LineStore::new(text);
+            let mut li: Vec<_> = (0..lazy.len())
+                .map(|i| classify_line(lazy.get(i)))
+                .collect();
+            let mut ei = li.clone();
+            assert_eq!(
+                propagate_vector_copies_impl::<false>(&mut lazy, &mut li),
+                propagate_vector_copies_impl::<true>(&mut eager, &mut ei),
+                "seed={seed}"
+            );
+            for i in 0..lazy.len() {
+                assert_eq!(lazy.get(i), eager.get(i), "seed={seed} line={i}");
+            }
+        }
+    }
+
+    fn narrow_copy_stress(groups: usize) -> usize {
+        let mut text = String::from("    .cfi_startproc\n");
+        for _ in 0..groups {
+            text.push_str("    movsd %xmm0, %xmm10\n    vaddsd %xmm1, %xmm10, %xmm10\n    movq %xmm10, %rax\n    vxorps %xmm10, %xmm10, %xmm10\n");
+        }
+        text.push_str("    ret\n    .cfi_endproc\n");
+        let mut store = LineStore::new(text);
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        super::super::fp_liveness::take_refresh_count();
+        let start = std::time::Instant::now();
+        assert!(propagate_vector_copies(&mut store, &mut infos));
+        let elapsed = start.elapsed();
+        let refreshes = super::super::fp_liveness::take_refresh_count();
+        let forwarded = (0..store.len())
+            .filter(|&i| store.get(i).trim() == "vaddsd %xmm1, %xmm0, %xmm10")
+            .count();
+        assert_eq!(
+            forwarded, groups,
+            "stress must exercise every narrow forwarding"
+        );
+        println!(
+            "PR834_STRESS groups={groups} instructions={} refreshes={refreshes} pass_ns={}",
+            groups * 4,
+            elapsed.as_nanos()
+        );
+        refreshes
+    }
+
+    #[test]
+    fn pr834_independent_narrow_copies_do_not_reanalyse_each_rewrite() {
+        assert!(
+            narrow_copy_stress(8) <= 1,
+            "independent copies should reuse conservative liveness"
+        );
+    }
+
+    #[test]
+    #[ignore = "manual 10k-instruction compiler-cost benchmark; no timing gate"]
+    fn pr834_ten_thousand_instruction_narrow_copy_cost() {
+        narrow_copy_stress(2500);
     }
 
     #[test]

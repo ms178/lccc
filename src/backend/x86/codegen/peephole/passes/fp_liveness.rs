@@ -81,6 +81,16 @@
 //! Everything is linear in the function length except the fixpoint, which
 //! converges in a handful of rounds for structured code (bounded at 64).
 
+#[cfg(test)]
+thread_local! {
+    static REFRESH_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn take_refresh_count() -> usize {
+    REFRESH_COUNT.with(|count| count.replace(0))
+}
+
 use super::super::types::*;
 use super::helpers::is_rsp_shift_line;
 use crate::backend::peephole_common::{LineStore, last_top_level_comma};
@@ -379,6 +389,8 @@ impl FpLiveness {
         if idx >= end {
             return;
         }
+        #[cfg(test)]
+        REFRESH_COUNT.with(|count| count.set(count.get() + 1));
         self.funcs[pos - 1] = analyse(store, infos, start, end);
     }
 }
