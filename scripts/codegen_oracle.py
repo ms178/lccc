@@ -358,6 +358,7 @@ def _local_compile(executable: str, source: Path, flags: str) -> list[str]:
 
 def _compile_remote(name: str, source: str, flags: str) -> list[str]:
     cid = godbolt.resolve_compiler(name)
+    flags = godbolt.compiler_flags(cid, flags)
     # Pin the record to the *build* behind this id, not merely to the id: a
     # Compiler Explorer id is a label, and when `g162` is rebuilt against a
     # newer GCC the label survives while the emitted code does not. See
@@ -376,7 +377,7 @@ def _compile_remote(name: str, source: str, flags: str) -> list[str]:
     hit = godbolt_cache.load_lines(godbolt_cache.NS_ASM, cid, fp, flags, source)
     if hit is not None:
         return hit
-    data = godbolt.compile_on_godbolt(cid, source, flags, intel=False)
+    data = godbolt.compile_on_godbolt(cid, source, flags, intel=False, raise_on_error=True)
     if data is None:
         raise godbolt.GodboltError(f"remote compile failed: {name} ({cid})")
     lines = godbolt.assembly_lines(data)
@@ -481,6 +482,7 @@ def _record_remote(name: str, source: str, req: Request, compilers: list[dict[st
             and "--target=" not in flags):
         flags = f"{flags} --target=aarch64-linux-gnu"
     _check_arch(name, metadata, flags, req.arch)
+    flags = godbolt.compiler_flags(metadata["id"], flags)
     started = time.perf_counter()
     lines = _compile_remote(name, source, flags)
     elapsed = time.perf_counter() - started
@@ -493,6 +495,7 @@ def _record_remote(name: str, source: str, req: Request, compilers: list[dict[st
     return {
         "key": name,
         **metadata,
+        "requested_flags": req.flags,
         "flags": flags,
         "elapsed_s": elapsed,
         **asdict(_stats(body, req.arch)),

@@ -294,7 +294,7 @@ pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInf
             .strip_prefix("%xmm")
             .and_then(|d| d.parse::<u32>().ok())
             .unwrap_or(u32::MAX);
-        if !lv.xmm_dead_after(store, infos, j, src_n, &[i, j]) {
+        if !lv.deleted_write_regions_dead_after(store, infos, j, src_n, &[i, j]) {
             i += 1;
             continue;
         }
@@ -2194,7 +2194,7 @@ pub(super) fn fold_fma_memory_operand(store: &mut LineStore, infos: &mut [LineIn
         //    every path (CFG-aware; a loop-top reader through the back edge,
         //    a call reading it as an FP argument, or a merge-form
         //    redefinition all keep it live). ─────────────────────────────
-        if !lv.xmm_dead_after(store, infos, j, n, &[i, j]) {
+        if !lv.deleted_write_regions_dead_after(store, infos, j, n, &[i, j]) {
             i += 1;
             continue;
         }
@@ -2643,7 +2643,7 @@ pub(super) fn fold_zero_addend_fma213_to_132(
         // ── liveness: the FMA must be the LAST reader of the loaded value
         //    (%xmmB) on every path — CFG-aware dataflow, same contract as
         //    fold_fma_memory_operand. ─────────────────────────────────────────
-        if !lv.xmm_dead_after(store, infos, k, b, &[i, k]) {
+        if !lv.deleted_write_regions_dead_after(store, infos, k, b, &[i, k]) {
             i += 1;
             continue;
         }

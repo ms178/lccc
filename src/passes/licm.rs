@@ -558,6 +558,21 @@ fn build_value_to_base_global(
     map
 }
 
+/// Ordering effects can invalidate ordinary-load invariance even without a
+/// direct write to its address (e.g. acquire followed by a published load).
+fn orders_memory(inst: &Instruction) -> bool {
+    matches!(
+        inst,
+        Instruction::AtomicLoad { .. }
+            | Instruction::AtomicStore { .. }
+            | Instruction::AtomicRmw { .. }
+            | Instruction::AtomicCmpxchg { .. }
+            | Instruction::AtomicInc { .. }
+            | Instruction::Fence { .. }
+    ) || matches!(inst, Instruction::Intrinsic { op, .. }
+            if matches!(op, IntrinsicOp::Lfence | IntrinsicOp::Mfence | IntrinsicOp::Sfence))
+}
+
 /// Scan a loop body to determine which allocas are modified and what
 /// memory side effects the loop has (calls, stores to unknown pointers).
 fn analyze_loop_memory(
@@ -586,6 +601,7 @@ fn analyze_loop_memory(
             continue;
         }
         for inst in &func.blocks[block_idx].instructions {
+            has_calls |= orders_memory(inst);
             match inst {
                 Instruction::Store { ptr, .. } => {
                     stored_allocas.insert(ptr.0);
@@ -685,9 +701,15 @@ fn analyze_loop_memory(
                 // (by other intrinsics or loads) are not incorrectly hoisted.
                 Instruction::Intrinsic {
                     dest_ptr: Some(dptr),
+                    op,
                     ..
-                } => {
+                } if !op.writes_memory_via_args() => {
                     stored_allocas.insert(dptr.0);
+                    if let Some(&base) = value_to_base_global.get(&dptr.0) {
+                        stored_global_bases.insert(base);
+                    } else if !alloca_info.alloca_values.contains(&dptr.0) {
+                        has_unknown_derived_stores = true;
+                    }
                 }
                 // Intrinsics that write through `args[0]` instead of
                 // `dest_ptr` (jump buffers / apply areas) or that restore
@@ -739,20 +761,11 @@ fn analyze_loop_memory(
                     stored_allocas.insert(dest_ptr.0);
                     stored_allocas.insert(src_ptr.0);
                 }
-                // Every remaining opcode is memory-pure. The catch-all is
-                // guarded by the canonical predicate so the model cannot
-                // drift again silently: `may_write_memory` is an
-                // exhaustive wildcard-free match in ir::instruction.rs, so
-                // a future memory-writing variant is forced to compile-time
-                // classification there — and if this LICM model ever
-                // forgets to follow, this debug assert fires in every
-                // debug/test build instead of silently miscompiling.
-                _ => {
-                    debug_assert!(
-                        !inst.may_write_memory(),
-                        "LICM loop-memory model is missing a memory-writing opcode"
-                    );
-                }
+                // A canonical write without a complete address model is a
+                // barrier in *all* profiles, not just a debug assertion. This
+                // also covers args-side vector stores and scratch writers.
+                _ if inst.may_write_memory() => has_calls = true,
+                _ => {}
             }
         }
     }
@@ -762,6 +775,16 @@ fn analyze_loop_memory(
     // that an intrinsic might read through gep(alloca, off2).
     let mut modified_base_allocas = FxHashSet::default();
     for &stored_id in &stored_allocas {
+        // Every pointer-writing arm above participates, including inline-asm
+        // outputs, varargs and frame helpers. Recording only the SSA pointer
+        // ID misses loads from the root of a derived global destination.
+        if let Some(&base) = value_to_base_global.get(&stored_id) {
+            stored_global_bases.insert(base);
+        } else if !alloca_info.alloca_values.contains(&stored_id)
+            && !value_to_base_alloca.contains_key(&stored_id)
+        {
+            has_unknown_derived_stores = true;
+        }
         if let Some(&base) = value_to_base_alloca.get(&stored_id) {
             modified_base_allocas.insert(base);
         }
@@ -828,6 +851,8 @@ fn build_loop_alias_info(func: &IrFunction, natural_loop: &NaturalLoop) -> LoopA
                 } => {
                     complete = false;
                 }
+                // A missing write must never look like an empty store set.
+                _ if inst.may_write_memory() || orders_memory(inst) => complete = false,
                 _ => {}
             }
         }
@@ -1620,6 +1645,134 @@ mod tests {
 
         func.next_value_id = 6;
         func
+    }
+
+    #[test]
+    fn every_args_writer_blocks_both_licm_memory_models() {
+        let mut ops = crate::ir::intrinsics::VECTOR_STORES.to_vec();
+        ops.extend([
+            IntrinsicOp::StrictRecipMulAddF64x4,
+            IntrinsicOp::StrictRecipMulAddPackedF64x4,
+        ]);
+        for op in ops {
+            let mut func = make_loop_func();
+            func.blocks[2].instructions.push(Instruction::Intrinsic {
+                dest: None,
+                op,
+                dest_ptr: None,
+                args: vec![Operand::Value(Value(99)); 8],
+            });
+            let cfg = analysis::CfgAnalysis::build(&func);
+            let loops = loop_analysis::find_natural_loops(
+                func.blocks.len(),
+                &cfg.preds,
+                &cfg.succs,
+                &cfg.idom,
+            );
+            let info = analyze_allocas(&func);
+            let memory = analyze_loop_memory(
+                &func,
+                &loops[0].body,
+                &info,
+                &FxHashSet::default(),
+                &FxHashMap::default(),
+            );
+            assert!(memory.has_calls, "{op:?}: unmodeled write is a barrier");
+            assert!(!build_loop_alias_info(&func, &loops[0]).complete, "{op:?}");
+        }
+    }
+
+    #[test]
+    fn atomic_increment_is_not_an_empty_precise_store_set() {
+        let mut func = make_loop_func();
+        func.blocks[2].instructions.push(Instruction::AtomicInc {
+            ptr: Operand::Value(Value(99)),
+            offset: 0,
+            ty: IrType::I32,
+            ordering: crate::ir::reexports::AtomicOrdering::SeqCst,
+        });
+        let cfg = analysis::CfgAnalysis::build(&func);
+        let loops =
+            loop_analysis::find_natural_loops(func.blocks.len(), &cfg.preds, &cfg.succs, &cfg.idom);
+        assert!(!build_loop_alias_info(&func, &loops[0]).complete);
+    }
+
+    #[test]
+    fn inline_asm_outputs_keep_derived_global_writes_visible() {
+        let mut func = make_loop_func();
+        func.blocks[0].instructions.extend([
+            Instruction::GlobalAddr {
+                dest: Value(98),
+                name: "g".into(),
+            },
+            Instruction::Copy {
+                dest: Value(99),
+                src: Operand::Value(Value(98)),
+            },
+        ]);
+        func.blocks[2].instructions.push(Instruction::InlineAsm {
+            template: String::new(),
+            outputs: vec![("=r".into(), Value(99), None)],
+            inputs: vec![],
+            clobbers: vec![],
+            operand_types: vec![IrType::I32],
+            goto_labels: vec![],
+            input_symbols: vec![],
+            seg_overrides: vec![AddressSpace::Default],
+        });
+        let info = analyze_allocas(&func);
+        let memory = analyze_loop_memory(
+            &func,
+            &FxHashSet::from_iter([1, 2]),
+            &info,
+            &FxHashSet::from_iter([98]),
+            &FxHashMap::default(),
+        );
+        assert!(memory.stored_global_bases.contains(&98));
+    }
+
+    #[test]
+    fn acquire_load_and_fences_block_ordinary_load_motion() {
+        let ops = [
+            Instruction::AtomicLoad {
+                dest: Value(99),
+                ptr: Operand::Value(Value(98)),
+                ty: IrType::I32,
+                ordering: crate::ir::reexports::AtomicOrdering::Acquire,
+            },
+            Instruction::Fence {
+                ordering: crate::ir::reexports::AtomicOrdering::SeqCst,
+            },
+            Instruction::Intrinsic {
+                dest: None,
+                op: IntrinsicOp::Mfence,
+                dest_ptr: None,
+                args: vec![],
+            },
+        ];
+        for inst in ops {
+            let mut func = make_loop_func();
+            func.blocks[2].instructions.push(inst);
+            let cfg = analysis::CfgAnalysis::build(&func);
+            let loops = loop_analysis::find_natural_loops(
+                func.blocks.len(),
+                &cfg.preds,
+                &cfg.succs,
+                &cfg.idom,
+            );
+            let info = analyze_allocas(&func);
+            assert!(
+                analyze_loop_memory(
+                    &func,
+                    &loops[0].body,
+                    &info,
+                    &FxHashSet::default(),
+                    &FxHashMap::default()
+                )
+                .has_calls
+            );
+            assert!(!build_loop_alias_info(&func, &loops[0]).complete);
+        }
     }
 
     #[test]

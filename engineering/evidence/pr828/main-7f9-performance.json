@@ -1,0 +1,232 @@
+{
+  "candidate_commit": "a298d249d76af9fa1b4234971d18f9f44438e1d0",
+  "candidate_tree": "8eb5789a1b830bb44674994b5fe29be6754efb19",
+  "main_commit": "7f9eb225def23bda9370d3349304b9b785554fea",
+  "compilers": {
+    "candidate": {
+      "path": "/home/user/lccc/target/fastbuild/lccc",
+      "sha256": "c9b73faeb0ca91466b1efa487139407de5969d4f878a8d6cfc5c4053d8cedb44"
+    },
+    "main": {
+      "path": "/home/user/.cache/pr828-main-7f9/target/fastbuild/lccc",
+      "sha256": "d8a51efe042c10df0cac8cb02a15778d9e1e77c52a7e18b0249de2b601c340ab"
+    }
+  },
+  "results": {
+    "nbody": {
+      "ratios": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "events": {
+        "candidate": {
+          "Ir": 696087,
+          "Dr": 203070,
+          "Dw": 92151,
+          "I1mr": 1444,
+          "D1mr": 1261,
+          "D1mw": 660,
+          "ILmr": 1414,
+          "DLmr": 976,
+          "DLmw": 611,
+          "Bc": 48220,
+          "Bcm": 3467,
+          "Bi": 420,
+          "Bim": 234
+        },
+        "main": {
+          "Ir": 696087,
+          "Dr": 203070,
+          "Dw": 92151,
+          "I1mr": 1444,
+          "D1mr": 1261,
+          "D1mw": 660,
+          "ILmr": 1414,
+          "DLmr": 976,
+          "DLmw": 611,
+          "Bc": 48220,
+          "Bcm": 3467,
+          "Bi": 420,
+          "Bim": 234
+        }
+      }
+    },
+    "fannkuch": {
+      "ratios": [
+        0.9523241050414963,
+        0.9523241050414963,
+        0.9523241050414963
+      ],
+      "events": {
+        "candidate": {
+          "Ir": 1230098,
+          "Dr": 200416,
+          "Dw": 151882,
+          "I1mr": 1360,
+          "D1mr": 1238,
+          "D1mw": 650,
+          "ILmr": 1333,
+          "DLmr": 963,
+          "DLmw": 610,
+          "Bc": 156870,
+          "Bcm": 22521,
+          "Bi": 419,
+          "Bim": 232
+        },
+        "main": {
+          "Ir": 1291680,
+          "Dr": 212696,
+          "Dw": 160541,
+          "I1mr": 1360,
+          "D1mr": 1238,
+          "D1mw": 650,
+          "ILmr": 1333,
+          "DLmr": 963,
+          "DLmw": 610,
+          "Bc": 156870,
+          "Bcm": 23021,
+          "Bi": 419,
+          "Bim": 232
+        }
+      }
+    },
+    "histogram": {
+      "ratios": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "events": {
+        "candidate": {
+          "Ir": 3224725,
+          "Dr": 361392,
+          "Dw": 539320,
+          "I1mr": 1164,
+          "D1mr": 5353,
+          "D1mw": 4720,
+          "ILmr": 1145,
+          "DLmr": 937,
+          "DLmw": 4678,
+          "Bc": 353104,
+          "Bcm": 3182,
+          "Bi": 380,
+          "Bim": 216
+        },
+        "main": {
+          "Ir": 3224725,
+          "Dr": 361392,
+          "Dw": 539320,
+          "I1mr": 1164,
+          "D1mr": 5353,
+          "D1mw": 4720,
+          "ILmr": 1145,
+          "DLmr": 937,
+          "DLmw": 4678,
+          "Bc": 353104,
+          "Bcm": 3182,
+          "Bi": 380,
+          "Bim": 216
+        }
+      }
+    },
+    "libm_round_family": {
+      "ratios": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "events": {
+        "candidate": {
+          "Ir": 172370,
+          "Dr": 38881,
+          "Dw": 16300,
+          "I1mr": 1446,
+          "D1mr": 1270,
+          "D1mw": 694,
+          "ILmr": 1419,
+          "DLmr": 976,
+          "DLmw": 640,
+          "Bc": 26806,
+          "Bcm": 3432,
+          "Bi": 416,
+          "Bim": 233
+        },
+        "main": {
+          "Ir": 172370,
+          "Dr": 38881,
+          "Dw": 16300,
+          "I1mr": 1446,
+          "D1mr": 1270,
+          "D1mw": 694,
+          "ILmr": 1419,
+          "DLmr": 976,
+          "DLmw": 640,
+          "Bc": 26806,
+          "Bcm": 3432,
+          "Bi": 416,
+          "Bim": 233
+        }
+      }
+    },
+    "lz4_match_extend": {
+      "ratios": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "events": {
+        "candidate": {
+          "Ir": 1151796,
+          "Dr": 174585,
+          "Dw": 222257,
+          "I1mr": 1408,
+          "D1mr": 10963,
+          "D1mw": 3250,
+          "ILmr": 1377,
+          "DLmr": 976,
+          "DLmw": 2055,
+          "Bc": 262198,
+          "Bcm": 8249,
+          "Bi": 551,
+          "Bim": 244
+        },
+        "main": {
+          "Ir": 1151796,
+          "Dr": 174585,
+          "Dw": 222257,
+          "I1mr": 1408,
+          "D1mr": 10963,
+          "D1mw": 3250,
+          "ILmr": 1377,
+          "DLmr": 976,
+          "DLmw": 2055,
+          "Bc": 262198,
+          "Bcm": 8249,
+          "Bi": 551,
+          "Bim": 244
+        }
+      }
+    }
+  },
+  "extra_fannkuch_inputs": {
+    "6": [
+      0.9821267948769306,
+      0.9821267948769306,
+      0.9821267948769306
+    ],
+    "8": [
+      0.9651220606414428,
+      0.9651220606414428,
+      0.9651220606414428
+    ],
+    "9": [
+      0.8596563555049819,
+      0.8596563555049819,
+      0.8596563555049819
+    ]
+  },
+  "metric": "simulated Ir, NOT native cycles",
+  "raw_evidence": "artifacts/pr828-main-7f9-pairs and pr828-fannkuch-input-controls",
+  "full_acceptance": "NEW FAST PENDING"
+}

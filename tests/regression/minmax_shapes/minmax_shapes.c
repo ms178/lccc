@@ -190,13 +190,13 @@ int max_guarded(const int *a, int n) {
     return m;
 }
 
-/* Second accumulator in the same loop (an independent sum). */
-int max_with_sum(const int *a, int n, int *sum) {
+/* Second accumulator, with defined modulo arithmetic even for INT_MIN/MAX. */
+int max_with_sum(const int *a, int n, unsigned *sum) {
     int m = a[0];
-    int s = 0;
+    unsigned s = 0;
     for (int i = 0; i < n; i++) {
         if (a[i] > m) m = a[i];
-        s += a[i];
+        s += (unsigned)a[i];
     }
     *sum = s;
     return m;

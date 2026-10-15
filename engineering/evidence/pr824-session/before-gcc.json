@@ -1,0 +1,476 @@
+{
+  "complete": true,
+  "metric": "bounded whole-program simulated Ir; not runtime",
+  "selected": [
+    "binary_trees",
+    "byte_load_reassembly",
+    "expat_siphash24",
+    "expat_xml_scan",
+    "linux_find_bit",
+    "linux_find_bit_scaled",
+    "lz4_match_extend",
+    "mandelbrot",
+    "sha256_transform",
+    "sieve",
+    "spectral_norm",
+    "sqlite_varint",
+    "strlen_bench",
+    "switch_dispatch",
+    "zlib_ng_adler32_combine"
+  ],
+  "results": {
+    "sieve": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=100000",
+      "metrics": {
+        "conditional_mispredicts": [
+          3530,
+          3592
+        ],
+        "d1_misses": [
+          51858,
+          51873
+        ],
+        "i1_misses": [
+          1361,
+          1361
+        ],
+        "indirect_mispredicts": [
+          242,
+          243
+        ],
+        "ir_mine": 1622473,
+        "ir_ratio": 0.9423586365920027,
+        "ir_ref": 1721715,
+        "ll_misses": [
+          4469,
+          4488
+        ]
+      },
+      "manifest": "/home/user/artifacts/pr824-before/sieve/manifest.json"
+    },
+    "binary_trees": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DTREE_DEPTH=10",
+      "metrics": {
+        "conditional_mispredicts": [
+          207630,
+          57784
+        ],
+        "d1_misses": [
+          54324,
+          54236
+        ],
+        "i1_misses": [
+          1378,
+          1458
+        ],
+        "indirect_mispredicts": [
+          238,
+          249
+        ],
+        "ir_mine": 31600299,
+        "ir_ratio": 1.1265972038121976,
+        "ir_ref": 28049332,
+        "ll_misses": [
+          4968,
+          5066
+        ]
+      },
+      "manifest": "/home/user/artifacts/pr824-before/binary_trees/manifest.json"
+    },
+    "spectral_norm": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=128",
+      "metrics": {
+        "conditional_mispredicts": [
+          8569,
+          8641
+        ],
+        "d1_misses": [
+          1936,
+          1968
+        ],
+        "i1_misses": [
+          1422,
+          1419
+        ],
+        "indirect_mispredicts": [
+          233,
+          241
+        ],
+        "ir_mine": 8258714,
+        "ir_ratio": 3.0415307247962025,
+        "ir_ref": 2715315,
+        "ll_misses": [
+          2968,
+          2986
+        ]
+      },
+      "manifest": "/home/user/artifacts/pr824-before/spectral_norm/manifest.json"
+    },
+    "mandelbrot": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DWIDTH=128 -DHEIGHT=128",
+      "metrics": {
+        "conditional_mispredicts": [
+          15481,
+          15588
+        ],
+        "d1_misses": [
+          1889,
+          1892
+        ],
+        "i1_misses": [
+          1354,
+          1354
+        ],
+        "indirect_mispredicts": [
+          232,
+          239
+        ],
+        "ir_mine": 6005656,
+        "ir_ratio": 1.0884634749383513,
+        "ir_ref": 5517554,
+        "ll_misses": [
+          2898,
+          2915
+        ]
+      },
+      "manifest": "/home/user/artifacts/pr824-before/mandelbrot/manifest.json"
+    },
+    "strlen_bench": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DNSTRINGS=1000",
+      "metrics": {
+        "conditional_mispredicts": [
+          132012,
+          130409
+        ],
+        "d1_misses": [
+          221245,
+          221589
+        ],
+        "i1_misses": [
+          1385,
+          1389
+        ],
+        "indirect_mispredicts": [
+          251,
+          255
+        ],
+        "ir_mine": 9285506,
+        "ir_ratio": 1.1466183824831448,
+        "ir_ref": 8098166,
+        "ll_misses": [
+          5362,
+          5388
+        ]
+      },
+      "manifest": "/home/user/artifacts/pr824-before/strlen_bench/manifest.json"
+    },
+    "switch_dispatch": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=20000",
+      "metrics": {
+        "conditional_mispredicts": [
+          3291,
+          3405
+        ],
+        "d1_misses": [
+          1882,
+          1893
+        ],
+        "i1_misses": [
+          1357,
+          1359
+        ],
+        "indirect_mispredicts": [
+          18994,
+          18851
+        ],
+        "ir_mine": 553112,
+        "ir_ratio": 1.081285237287208,
+        "ir_ref": 511532,
+        "ll_misses": [
+          2899,
+          2921
+        ]
+      },
+      "manifest": "/home/user/artifacts/pr824-before/switch_dispatch/manifest.json"
+    },
+    "byte_load_reassembly": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+      "metrics": {
+        "conditional_mispredicts": [
+          23355,
+          5970
+        ],
+        "d1_misses": [
+          1962,
+          1969
+        ],
+        "i1_misses": [
+          1379,
+          1378
+        ],
+        "indirect_mispredicts": [
+          237,
+          244
+        ],
+        "ir_mine": 82410697,
+        "ir_ratio": 4.899566688388827,
+        "ir_ref": 16819997,
+        "ll_misses": [
+          2989,
+          3010
+        ]
+      },
+      "manifest": "/home/user/artifacts/pr824-before/byte_load_reassembly/manifest.json"
+    },
+    "zlib_ng_adler32_combine": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=10000",
+      "metrics": {
+        "conditional_mispredicts": [
+          5519,
+          5609
+        ],
+        "d1_misses": [
+          1915,
+          1920
+        ],
+        "i1_misses": [
+          1379,
+          1383
+        ],
+        "indirect_mispredicts": [
+          234,
+          241
+        ],
+        "ir_mine": 21844625,
+        "ir_ratio": 1.0219883551679392,
+        "ir_ref": 21374632,
+        "ll_misses": [
+          2944,
+          2969
+        ]
+      },
+      "manifest": "/home/user/artifacts/pr824-before/zlib_ng_adler32_combine/manifest.json"
+    },
+    "expat_xml_scan": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DXML_SIZE=16384 -DPASSES=4",
+      "metrics": {
+        "conditional_mispredicts": [
+          25497,
+          31847
+        ],
+        "d1_misses": [
+          2188,
+          2199
+        ],
+        "i1_misses": [
+          1365,
+          1360
+        ],
+        "indirect_mispredicts": [
+          232,
+          239
+        ],
+        "ir_mine": 1666802,
+        "ir_ratio": 1.1619385416949866,
+        "ir_ref": 1434501,
+        "ll_misses": [
+          3163,
+          3176
+        ]
+      },
+      "manifest": "/home/user/artifacts/pr824-before/expat_xml_scan/manifest.json"
+    },
+    "expat_siphash24": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=1000",
+      "metrics": {
+        "conditional_mispredicts": [
+          116269,
+          116524
+        ],
+        "d1_misses": [
+          1899,
+          1909
+        ],
+        "i1_misses": [
+          1418,
+          1384
+        ],
+        "indirect_mispredicts": [
+          1429,
+          1307
+        ],
+        "ir_mine": 15209102,
+        "ir_ratio": 0.990148385848909,
+        "ir_ref": 15360427,
+        "ll_misses": [
+          2968,
+          2958
+        ]
+      },
+      "manifest": "/home/user/artifacts/pr824-before/expat_siphash24/manifest.json"
+    },
+    "sqlite_varint": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DVALUE_COUNT=2048 -DPASSES=4",
+      "metrics": {
+        "conditional_mispredicts": [
+          12578,
+          10372
+        ],
+        "d1_misses": [
+          2234,
+          2247
+        ],
+        "i1_misses": [
+          1376,
+          1375
+        ],
+        "indirect_mispredicts": [
+          2054,
+          2061
+        ],
+        "ir_mine": 822738,
+        "ir_ratio": 1.080576526028779,
+        "ir_ref": 761388,
+        "ll_misses": [
+          3207,
+          3226
+        ]
+      },
+      "manifest": "/home/user/artifacts/pr824-before/sqlite_varint/manifest.json"
+    },
+    "linux_find_bit": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=32",
+      "metrics": {
+        "conditional_mispredicts": [
+          11859,
+          11899
+        ],
+        "d1_misses": [
+          137236,
+          137209
+        ],
+        "i1_misses": [
+          1359,
+          1361
+        ],
+        "indirect_mispredicts": [
+          232,
+          239
+        ],
+        "ir_mine": 5958099,
+        "ir_ratio": 1.1734570320578093,
+        "ir_ref": 5077390,
+        "ll_misses": [
+          6999,
+          7016
+        ]
+      },
+      "manifest": "/home/user/artifacts/pr824-before/linux_find_bit/manifest.json"
+    },
+    "linux_find_bit_scaled": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=128",
+      "metrics": {
+        "conditional_mispredicts": [
+          36567,
+          36515
+        ],
+        "d1_misses": [
+          530621,
+          530499
+        ],
+        "i1_misses": [
+          1364,
+          1366
+        ],
+        "indirect_mispredicts": [
+          232,
+          239
+        ],
+        "ir_mine": 22941993,
+        "ir_ratio": 1.182410263295355,
+        "ir_ref": 19402735,
+        "ll_misses": [
+          7004,
+          7022
+        ]
+      },
+      "manifest": "/home/user/artifacts/pr824-before/linux_find_bit_scaled/manifest.json"
+    },
+    "sha256_transform": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DBLOCK_COUNT=256 -DPASSES=2",
+      "metrics": {
+        "conditional_mispredicts": [
+          4878,
+          5015
+        ],
+        "d1_misses": [
+          1901,
+          1901
+        ],
+        "i1_misses": [
+          1385,
+          1376
+        ],
+        "indirect_mispredicts": [
+          236,
+          242
+        ],
+        "ir_mine": 1822246,
+        "ir_ratio": 0.9422273377604801,
+        "ir_ref": 1933977,
+        "ll_misses": [
+          2933,
+          2944
+        ]
+      },
+      "manifest": "/home/user/artifacts/pr824-before/sha256_transform/manifest.json"
+    },
+    "lz4_match_extend": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSRC_SIZE=16384 -DPASSES=2 -DMATCH_RICH=1",
+      "metrics": {
+        "conditional_mispredicts": [
+          8267,
+          8568
+        ],
+        "d1_misses": [
+          14191,
+          14155
+        ],
+        "i1_misses": [
+          1408,
+          1397
+        ],
+        "indirect_mispredicts": [
+          244,
+          265
+        ],
+        "ir_mine": 1153908,
+        "ir_ratio": 1.2458384167737337,
+        "ir_ref": 926210,
+        "ll_misses": [
+          4411,
+          4420
+        ]
+      },
+      "manifest": "/home/user/artifacts/pr824-before/lz4_match_extend/manifest.json"
+    }
+  },
+  "failures": [],
+  "worst_first": [
+    "byte_load_reassembly",
+    "spectral_norm",
+    "lz4_match_extend",
+    "linux_find_bit_scaled",
+    "linux_find_bit",
+    "expat_xml_scan",
+    "strlen_bench",
+    "binary_trees",
+    "mandelbrot",
+    "switch_dispatch",
+    "sqlite_varint",
+    "zlib_ng_adler32_combine",
+    "expat_siphash24",
+    "sieve",
+    "sha256_transform"
+  ]
+}

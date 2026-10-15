@@ -198,6 +198,7 @@ def main(argv: list[str] | None = None) -> int:
             "flags": args.flags,
             "local_flags": args.local_flags or args.flags,
             "oracles": oracle_names,
+            "effective_oracle_flags": {name: oracle.godbolt.compiler_flags(name, args.flags) for name in oracle_names},
             "ranked": [asdict(r) for r in ranked],
             "unranked": [asdict(r) for r in unranked],
         }, indent=2) + "\n")

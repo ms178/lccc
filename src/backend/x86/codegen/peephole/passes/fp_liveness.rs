@@ -31,19 +31,23 @@
 //!
 //! # Model
 //!
-//! One backward dataflow per function over a combined fact vector:
+//! One backward dataflow per function over a combined 128-bit fact vector:
 //!
 //! * bits `0..16`  — `%xmm0`..`%xmm15` (a `%ymmN` or `%zmmN` mention aliases
 //!   `%xmmN`: all three spellings name the same physical register's low 128
 //!   bits, and an EVEX writemask makes the destination a partial write, so it
 //!   stays a read);
-//! * bits `16..`   — frame slots, interned per function as `(base, offset,
+//! * bits `16..64` — frame slots, interned per function as `(base, offset,
 //!   byte-size)` triples.  A slot is *read* by any instruction whose text
 //!   contains a memory operand overlapping it, unless that instruction is a
 //!   plain store that *covers* it (a covering store is a kill).  Indexed
 //!   frame operands (`8(%rsp,%rax)`) and any address escape (`leaq
 //!   N(%rbp)`, raw `%rsp`/`%rbp` copies) make every slot of the function
 //!   permanently live (fail closed).
+//!
+//! * bits `64..80` and `80..96` — bits 128..256 and 256..512 of each
+//!   vector register. Legacy XMM definitions preserve both regions. VEX/EVEX
+//!   full definitions and upper-zeroing effects kill them independently.
 //!
 //! Instruction effects:
 //!
@@ -55,7 +59,9 @@
 //!   moves may be self-move-elided and therefore invisible) and kills all
 //!   sixteen (caller-saved, SysV);
 //! * `ret` reads `%xmm0` and `%xmm1` (FP return registers) and nothing else;
-//! * inline asm reads and writes everything;
+//! * implicit blend/SHA inputs and vector-state saves are reads; unknown
+//!   vector operations read all facts locally and prove no kills;
+//! * inline asm reads everything and proves no kills;
 //! * an unresolvable transfer (indirect jump, jump table, tail call to a
 //!   symbol) makes the function unanalysable — every query then answers
 //!   `None`, and callers must fall back to *not folding*.
@@ -85,7 +91,7 @@ struct FnFacts {
     /// Interned frame slots: (base family 4=%rsp / 5=%rbp, offset, size).
     slots: Vec<(u8, i32, i32)>,
     /// `Some(bits)` per line inside `[start, end)` when analysable.
-    live_out: Vec<u64>,
+    live_out: Vec<u128>,
     /// Every slot is pinned live (address escape / indexed frame access /
     /// mid-body %rsp shift).  Register facts stay exact.
     slots_opaque: bool,
@@ -97,17 +103,26 @@ pub(super) struct FpLiveness {
     funcs: Vec<FnFacts>,
 }
 
-const XMM_ALL: u64 = 0xFFFF;
+const XMM_ALL: u128 = 0xFFFF;
+// Keep slot bits 16..64 unchanged; track architectural upper regions separately.
+const YMM_HIGH_SHIFT: u32 = 64;
+const ZMM_HIGH_SHIFT: u32 = 80;
+const UPPER_ALL: u128 = (XMM_ALL << YMM_HIGH_SHIFT) | (XMM_ALL << ZMM_HIGH_SHIFT);
+const VECTOR_ALL: u128 = XMM_ALL | UPPER_ALL;
+
+fn upper_regions(low: u128) -> u128 {
+    (low << YMM_HIGH_SHIFT) | (low << ZMM_HIGH_SHIFT)
+}
 /// `%xmm0..%xmm7`: SysV FP argument registers a `call` may read implicitly.
-const CALL_READS: u64 = 0x00FF;
+const CALL_READS: u128 = 0x00FF;
 /// `%xmm0`, `%xmm1`: FP return registers live at `ret` (a two-double
 /// aggregate or `double _Complex` returns in both).
-const RET_READS: u64 = 0x0003;
+const RET_READS: u128 = 0x0003;
 /// `%xmm0` only: the ret-live set of a function whose every `ret` tail
 /// block materialises `%xmm0` and never touches `%xmm1` — the signature of
 /// a scalar FP return.  Mirrors `FileLiveness::returns_in_rax_only`.
-const RET_READS_XMM0_ONLY: u64 = 0x0001;
-const MAX_SLOTS: usize = 48; // 64 - 16 register bits
+const RET_READS_XMM0_ONLY: u128 = 0x0001;
+const MAX_SLOTS: usize = 48; // bits 16..64; upper vector regions occupy 64..96
 
 impl FpLiveness {
     /// Analyse every function in the file.  A function starts at
@@ -184,7 +199,32 @@ impl FpLiveness {
         if !f.known {
             return None;
         }
-        Some(f.live_out[idx - f.start] & (1u64 << n) != 0)
+        Some(f.live_out[idx - f.start] & (1u128 << n) != 0)
+    }
+
+    /// A VEX/EVEX XMM move writes both the low region and architectural
+    /// upper zeros. Low-XMM death alone cannot justify removing that write.
+    /// Unknown control flow refuses deletion rather than guessing about upper
+    /// observations. Legacy moves keep the established low-region query.
+    pub(super) fn reg_move_dead_after(
+        &self,
+        store: &LineStore,
+        infos: &[LineInfo],
+        idx: usize,
+        n: u32,
+    ) -> bool {
+        let t = infos[idx].trimmed(store.get(idx));
+        if !t.starts_with('v') {
+            return self.xmm_dead_after(store, infos, idx, n, &[idx]);
+        }
+        if n >= 16 {
+            return false;
+        }
+        let Some(f) = self.func_of(idx).filter(|f| f.known) else {
+            return false;
+        };
+        let low = 1u128 << n;
+        f.live_out[idx - f.start] & (low | upper_regions(low)) == 0
     }
 
     /// Same question for the `size`-byte frame slot at `offset(%base)`
@@ -208,23 +248,21 @@ impl FpLiveness {
         }
         let bits = f.live_out[idx - f.start];
         for (k, &(b, o, s)) in f.slots.iter().enumerate() {
-            if b == base && ranges_overlap(offset, size, o, s) && bits & (1u64 << (16 + k)) != 0 {
+            if b == base && ranges_overlap(offset, size, o, s) && bits & (1u128 << (16 + k)) != 0 {
                 return Some(true);
             }
         }
         Some(false)
     }
 
-    /// The question every load-folding pass asks, with the fail-closed
-    /// fallback built in: may `%xmm<n>` be observed after line `idx`?
-    ///
-    /// * Analysable function → the dataflow answer.
-    /// * Otherwise (`None`: unresolvable control flow, or no function
-    ///   delimiter) → the value is dead only when NO line of the enclosing
-    ///   text other than `owned` mentions the register at all (a proof that
-    ///   holds under any CFG), and no implicit reader can observe it: a
-    ///   `call` reads `%xmm0`–`%xmm7`, a `ret` reads `%xmm0`/`%xmm1`.
-    pub(super) fn xmm_dead_after(
+    /// Whole write-region proof for a deletion/retargeting window. A legacy
+    /// write changes at most low XMM; any VEX/EVEX write in the owned window
+    /// to the queried register can also change architectural upper zeros.
+    /// Conservatively require all upper regions dead in that case. This is intentionally stronger than
+    /// a low-128 query, including for scalar VEX producers being retargeted.
+    /// `owned` names every instruction whose write is removed or redirected;
+    /// `idx` is the last instruction of that transformation window.
+    pub(super) fn deleted_write_regions_dead_after(
         &self,
         store: &LineStore,
         infos: &[LineInfo],
@@ -232,43 +270,48 @@ impl FpLiveness {
         n: u32,
         owned: &[usize],
     ) -> bool {
+        if n >= 16 {
+            return false;
+        }
+        let Some(f) = self.func_of(idx).filter(|f| f.known) else {
+            return false;
+        };
+        let low = 1u128 << n;
+        let has_upper_write = owned.iter().any(|&i| {
+            let text = infos[i].trimmed(store.get(i));
+            let (mn, operands) = split_mnemonic(text);
+            has_implicit_vector_effects_line(text)
+                || mn.starts_with('v')
+                    && dest_operand(operands)
+                        .and_then(|dst| xmm_index(dst.split('{').next().unwrap_or(dst).trim_end()))
+                        == Some(n)
+        });
+        let footprint = low
+            | if has_upper_write {
+                upper_regions(low)
+            } else {
+                0
+            };
+        f.live_out[idx - f.start] & footprint == 0
+    }
+
+    /// Low-128 query only: not a whole-instruction deletion proof. Keep this
+    /// private so consumers cannot accidentally ignore architectural zeros.
+    /// Unknown CFG cannot prove deadness: textual register absence misses
+    /// implicit architectural readers (state saves, SHA/blends, opaque ops).
+    fn xmm_dead_after(
+        &self,
+        store: &LineStore,
+        infos: &[LineInfo],
+        idx: usize,
+        n: u32,
+        _owned: &[usize],
+    ) -> bool {
         let ans = self.xmm_live_after(idx, n);
         if ans == Some(true) && std::env::var_os("CCC_DEBUG_FP_LIVENESS").is_some() {
             self.explain_live(store, infos, idx, n);
         }
-        match ans {
-            Some(live) => !live,
-            None => {
-                if n >= 16 {
-                    return false;
-                }
-                let (lo, hi) = match self.func_of(idx) {
-                    Some(f) => (f.start, f.end),
-                    None => (0, store.len()),
-                };
-                let bit = 1u64 << n;
-                for k in lo..hi {
-                    if infos[k].is_nop() || owned.contains(&k) {
-                        continue;
-                    }
-                    if infos[k].pinned
-                        || (infos[k].kind == LineKind::Directive && !infos[k].is_steppable())
-                    {
-                        return false;
-                    }
-                    match infos[k].kind {
-                        LineKind::Call if n <= 7 => return false,
-                        LineKind::Ret if n <= 1 => return false,
-                        LineKind::InlineAsm => return false,
-                        _ => {}
-                    }
-                    if xmm_mentions(infos[k].trimmed(store.get(k))) & bit != 0 {
-                        return false;
-                    }
-                }
-                true
-            }
-        }
+        ans == Some(false)
     }
 
     /// `CCC_DEBUG_FP_LIVENESS=1`: say why `%xmmN` is live after `idx` — the
@@ -277,7 +320,7 @@ impl FpLiveness {
     /// the register inside the function.
     fn explain_live(&self, store: &LineStore, infos: &[LineInfo], idx: usize, n: u32) {
         let Some(f) = self.func_of(idx) else { return };
-        let bit = 1u64 << n;
+        let bit = 1u128 << n;
         let reader = (idx + 1..f.end).find(|&k| {
             !infos[k].is_nop()
                 && xmm_mentions(infos[k].trimmed(store.get(k))) & bit != 0
@@ -369,19 +412,13 @@ fn xmm_index(op: &str) -> Option<u32> {
 /// The `%zmm` spelling is included for the aliasing reason given on
 /// [`xmm_index`].  A mention inside an EVEX writemask suffix (`%zmm3{%k1}`)
 /// counts as a mention too, which is what keeps masked writes conservative.
-fn xmm_mentions(t: &str) -> u64 {
-    vector_mentions(t, true)
-}
-
-/// A function using wide lanes cannot treat legacy SSE writes as whole-family
-/// kills. This shares the exact register-token parser with the low-lane model.
-fn vector_mentions(t: &str, include_xmm: bool) -> u64 {
+fn xmm_mentions(t: &str) -> u128 {
     let b = t.as_bytes();
-    let mut mask = 0u64;
+    let mut mask = 0u128;
     let mut i = 0;
     while i + 4 < b.len() {
         if b[i] == b'%'
-            && ((include_xmm && b[i + 1] == b'x') || b[i + 1] == b'y' || b[i + 1] == b'z')
+            && (b[i + 1] == b'x' || b[i + 1] == b'y' || b[i + 1] == b'z')
             && b[i + 2] == b'm'
             && b[i + 3] == b'm'
         {
@@ -394,7 +431,7 @@ fn vector_mentions(t: &str, include_xmm: bool) -> u64 {
                 nd += 1;
             }
             if nd > 0 && n < 16 && !(j < b.len() && b[j].is_ascii_digit()) {
-                mask |= 1u64 << n;
+                mask |= 1u128 << n;
             }
             i = j;
         } else {
@@ -404,7 +441,6 @@ fn vector_mentions(t: &str, include_xmm: bool) -> u64 {
     mask
 }
 
-/// Split `t` into (mnemonic, operand text).
 /// True when `t` writes its destination XMM register WITHOUT reading it
 /// (see `is_full_xmm_def`). Exported for `vector_copy::propagate_vector_copies`:
 /// before renaming reads at a destination write it must distinguish true full
@@ -416,6 +452,18 @@ pub(super) fn is_full_xmm_def_line(t: &str) -> bool {
     is_full_xmm_def(mn, ops)
 }
 
+/// True when textual vector operands do not describe all register effects.
+/// Copy propagation, bracket coalescing and private-upper-lane proofs must
+/// stop at these effects too; preserving a feeder in DCE alone is insufficient.
+pub(super) fn has_implicit_vector_effects_line(t: &str) -> bool {
+    let (mn, operands) = split_mnemonic(t);
+    let base = mn.strip_prefix('v').unwrap_or(mn);
+    state_image_register_reads(mn).is_some()
+        || matches!(base, "pcmpistrm" | "pcmpestrm" | "zeroupper" | "zeroall")
+        || implicit_fp_reads(mn, operands, xmm_mentions(t)) & VECTOR_ALL != 0
+}
+
+/// Split `t` into (mnemonic, operand text).
 fn split_mnemonic(t: &str) -> (&str, &str) {
     match t.find(|c: char| c.is_ascii_whitespace()) {
         Some(p) => (&t[..p], t[p..].trim()),
@@ -481,29 +529,372 @@ fn is_full_xmm_def(mn: &str, operands: &str) -> bool {
         "cvtsi2sd" | "cvtsi2ss" | "cvtsi2sdq" | "cvtsi2ssq" | "cvtsi2sdl" | "cvtsi2ssl"
         | "cvtsd2ss" | "cvtss2sd" | "sqrtsd" | "sqrtss" | "roundsd" | "roundss" | "rcpss"
         | "rsqrtss" => false,
-        // Legacy destructive ALU (add/sub/mul/div/min/max/and/or/xor/…): READ.
-        _ => {
-            if let Some(v) = mn.strip_prefix('v') {
-                // VEX three-operand (and the VEX scalar conversions, which
-                // take an explicit merge source operand — the destination
-                // is still defined from the operands only).  Everything
-                // VEX that names a destination writes it fully, EXCEPT
-                // the masked-merge / blend-into-dest families that read it:
-                // `vblendv*` reads only sources; `vfmadd*` reads the dest
-                // as an operand (213/231/132 all name it among the
-                // multiplicands or the addend).
-                let is_fma = v.starts_with("fmadd")
-                    || v.starts_with("fmsub")
-                    || v.starts_with("fnmadd")
-                    || v.starts_with("fnmsub");
-                let is_gather = v.contains("gather");
-                let is_insert = v.starts_with("insert") || v.starts_with("pinsr");
-                !(is_fma || is_gather || is_insert)
-            } else {
-                false
-            }
-        }
+        // Admit source-only VEX definitions positively. A leading `v` is NOT
+        // an effect certificate: VPCMP{E,I}STR{I,M} reads both explicit vector
+        // operands and writes implicit outputs, and future instructions may
+        // have similar hidden dependencies. Unknown forms prove no kill.
+        _ => mn.strip_prefix('v').is_some_and(source_only_vex_opcode),
     }
+}
+
+/// Exact source-only VEX definitions. The same operand families have no
+/// hidden vector inputs in legacy SSE spelling (but may read their explicit
+/// destination there); keep admission and kill proofs separate.
+fn source_only_vex_opcode(base: &str) -> bool {
+    matches!(
+        base,
+        "addpd"
+            | "addps"
+            | "addsd"
+            | "addss"
+            | "subpd"
+            | "subps"
+            | "subsd"
+            | "subss"
+            | "mulpd"
+            | "mulps"
+            | "mulsd"
+            | "mulss"
+            | "divpd"
+            | "divps"
+            | "divsd"
+            | "divss"
+            | "minpd"
+            | "minps"
+            | "minsd"
+            | "minss"
+            | "maxpd"
+            | "maxps"
+            | "maxsd"
+            | "maxss"
+            | "andpd"
+            | "andps"
+            | "andnpd"
+            | "andnps"
+            | "orpd"
+            | "orps"
+            | "xorpd"
+            | "xorps"
+            | "sqrtpd"
+            | "sqrtps"
+            | "sqrtsd"
+            | "sqrtss"
+            | "rcpps"
+            | "rcpss"
+            | "rsqrtps"
+            | "rsqrtss"
+            | "cmppd"
+            | "cmpps"
+            | "cmpsd"
+            | "cmpss"
+            | "roundpd"
+            | "roundps"
+            | "roundsd"
+            | "roundss"
+            | "haddpd"
+            | "haddps"
+            | "hsubpd"
+            | "hsubps"
+            | "addsubpd"
+            | "addsubps"
+            | "cvtsi2sd"
+            | "cvtsi2sdq"
+            | "cvtsi2sdl"
+            | "cvtsi2ss"
+            | "cvtsi2ssq"
+            | "cvtsi2ssl"
+            | "cvtss2sd"
+            | "cvtsd2ss"
+            | "cvtph2ps"
+            | "cvtps2ph"
+            | "movlhps"
+            | "movhlps"
+            | "movdqa32"
+            | "movdqu32"
+            | "pshufd"
+            | "pshufhw"
+            | "pshuflw"
+            | "pshufb"
+            | "shufps"
+            | "shufpd"
+            | "unpckhpd"
+            | "unpckhps"
+            | "unpcklpd"
+            | "unpcklps"
+            | "punpckhbw"
+            | "punpckhwd"
+            | "punpckhdq"
+            | "punpckhqdq"
+            | "punpcklbw"
+            | "punpcklwd"
+            | "punpckldq"
+            | "punpcklqdq"
+            | "blendpd"
+            | "blendps"
+            | "blendvpd"
+            | "blendvps"
+            | "pblendw"
+            | "pblendvb"
+            | "pblendd"
+            | "permpd"
+            | "permps"
+            | "permd"
+            | "permq"
+            | "permw"
+            | "permb"
+            | "perm2f128"
+            | "perm2i128"
+            | "permilpd"
+            | "permilps"
+            | "extractf128"
+            | "extracti128"
+            | "pand"
+            | "pandn"
+            | "por"
+            | "pxor"
+            | "pandd"
+            | "pandq"
+            | "pandnd"
+            | "pandnq"
+            | "pord"
+            | "porq"
+            | "pxord"
+            | "pxorq"
+            | "paddb"
+            | "paddw"
+            | "paddd"
+            | "paddq"
+            | "paddsb"
+            | "paddsw"
+            | "paddusb"
+            | "paddusw"
+            | "psubb"
+            | "psubw"
+            | "psubd"
+            | "psubq"
+            | "psubsb"
+            | "psubsw"
+            | "psubusb"
+            | "psubusw"
+            | "pmullw"
+            | "pmulld"
+            | "pmulhw"
+            | "pmulhuw"
+            | "pmulhrsw"
+            | "pmuldq"
+            | "pmuludq"
+            | "pmaddwd"
+            | "pmaddubsw"
+            | "psadbw"
+            | "mpsadbw"
+            | "pcmpeqb"
+            | "pcmpeqw"
+            | "pcmpeqd"
+            | "pcmpeqq"
+            | "pcmpgtb"
+            | "pcmpgtw"
+            | "pcmpgtd"
+            | "pcmpgtq"
+            | "psllw"
+            | "pslld"
+            | "psllq"
+            | "pslldq"
+            | "psllvd"
+            | "psllvq"
+            | "psrlw"
+            | "psrld"
+            | "psrlq"
+            | "psrldq"
+            | "psrlvd"
+            | "psrlvq"
+            | "psraw"
+            | "psrad"
+            | "psravd"
+            | "pminsb"
+            | "pminsw"
+            | "pminsd"
+            | "pminub"
+            | "pminuw"
+            | "pminud"
+            | "pmaxsb"
+            | "pmaxsw"
+            | "pmaxsd"
+            | "pmaxub"
+            | "pmaxuw"
+            | "pmaxud"
+            | "pabsb"
+            | "pabsw"
+            | "pabsd"
+            | "pavgb"
+            | "pavgw"
+            | "packsswb"
+            | "packssdw"
+            | "packuswb"
+            | "packusdw"
+            | "phaddw"
+            | "phaddd"
+            | "phaddsw"
+            | "phsubw"
+            | "phsubd"
+            | "phsubsw"
+            | "palignr"
+            | "psignb"
+            | "psignw"
+            | "psignd"
+            | "pmovsxbw"
+            | "pmovsxbd"
+            | "pmovsxbq"
+            | "pmovsxwd"
+            | "pmovsxwq"
+            | "pmovsxdq"
+            | "pmovzxbw"
+            | "pmovzxbd"
+            | "pmovzxbq"
+            | "pmovzxwd"
+            | "pmovzxwq"
+            | "pmovzxdq"
+            | "pclmulqdq"
+            | "aesenc"
+            | "aesenclast"
+            | "aesdec"
+            | "aesdeclast"
+            | "aesimc"
+            | "aeskeygenassist"
+    )
+}
+
+/// FMA3 reads its explicit destination. An exact family/order/type spelling
+/// admits explicit inputs, never a full-definition kill.
+fn fma3_opcode(base: &str) -> bool {
+    ["fmaddsub", "fmsubadd", "fmadd", "fmsub", "fnmadd", "fnmsub"]
+        .iter()
+        .find_map(|prefix| base.strip_prefix(prefix))
+        .is_some_and(|tail| {
+            matches!(
+                tail,
+                "132pd"
+                    | "132ps"
+                    | "132sd"
+                    | "132ss"
+                    | "213pd"
+                    | "213ps"
+                    | "213sd"
+                    | "213ss"
+                    | "231pd"
+                    | "231ps"
+                    | "231sd"
+                    | "231ss"
+            )
+        })
+}
+
+/// Known explicit-input forms which do not necessarily define a whole
+/// destination. Unknown mnemonics cannot certify the absence of hidden inputs.
+pub(super) fn known_explicit_vector_inputs(mn: &str, operands: &str) -> bool {
+    let base = mn.strip_prefix('v').unwrap_or(mn);
+    is_full_xmm_def(mn, operands)
+        || source_only_vex_opcode(base)
+        || fma3_opcode(base)
+        || matches!(
+            base,
+            "movsd"
+                | "movss"
+                | "cvtsi2sd"
+                | "cvtsi2sdq"
+                | "cvtsi2sdl"
+                | "cvtsi2ss"
+                | "cvtsi2ssq"
+                | "cvtsi2ssl"
+                | "cvtsd2ss"
+                | "cvtss2sd"
+                | "cvtsd2si"
+                | "cvtsd2siq"
+                | "cvtsd2sil"
+                | "cvttsd2si"
+                | "cvttsd2siq"
+                | "cvttsd2sil"
+                | "cvtss2si"
+                | "cvtss2siq"
+                | "cvtss2sil"
+                | "cvttss2si"
+                | "cvttss2siq"
+                | "cvttss2sil"
+                | "ucomisd"
+                | "ucomiss"
+                | "comisd"
+                | "comiss"
+                | "ptest"
+                | "testpd"
+                | "testps"
+                | "pcmpistri"
+                | "pcmpistrm"
+                | "pcmpestri"
+                | "pcmpestrm"
+                | "insertps"
+                | "pinsrb"
+                | "pinsrw"
+                | "pinsrd"
+                | "pinsrq"
+                | "insertf128"
+                | "inserti128"
+                | "gatherdpd"
+                | "gatherdps"
+                | "gatherqpd"
+                | "gatherqps"
+                | "pgatherdd"
+                | "pgatherdq"
+                | "pgatherqd"
+                | "pgatherqq"
+                | "movhpd"
+                | "movhps"
+                | "movlpd"
+                | "movlps"
+                | "sha1msg1"
+                | "sha1msg2"
+                | "sha1nexte"
+                | "sha1rnds4"
+                | "sha256msg1"
+                | "sha256msg2"
+                | "zeroupper"
+                | "zeroall"
+        )
+}
+
+/// Reads of vector registers by architectural state-image instructions.
+/// Even restores with no register inputs have non-textual vector writes.
+fn state_image_register_reads(mn: &str) -> Option<u128> {
+    match mn {
+        "fxsave" | "fxsave64" | "fxsaveq" => Some(XMM_ALL),
+        "xsave" | "xsave64" | "xsaveq" | "xsaveopt" | "xsaveopt64" | "xsaveoptq" | "xsavec"
+        | "xsavec64" | "xsaves" | "xsaves64" => Some(VECTOR_ALL),
+        "fxrstor" | "fxrstor64" | "fxrstorq" | "xrstor" | "xrstor64" | "xrstorq" | "xrstors"
+        | "xrstors64" => Some(0),
+        _ => None,
+    }
+}
+
+/// Architectural implicit reads, plus a local fail-closed effect for vector
+/// instructions not admitted above. Do not turn unknown operations into kills
+/// or veto the whole function: later known definitions still retire facts.
+fn implicit_fp_reads(mn: &str, operands: &str, mentioned: u128) -> u128 {
+    const SLOT_ALL: u128 = ((1u128 << 64) - 1) & !XMM_ALL;
+    if matches!(mn, "blendvpd" | "blendvps" | "pblendvb" | "sha256rnds2") {
+        return 1;
+    }
+    if let Some(mut reads) = state_image_register_reads(mn) {
+        // State images are not scalar accesses: FXSAVE has a 512-byte layout;
+        // XSAVE's footprint also depends on enabled features and its mask.
+        // The scalar-slot model cannot prove byte-precise kills. A frame image
+        // conservatively reads all slot facts HERE, not throughout the function.
+        if operands.contains("(%rsp") || operands.contains("(%rbp") {
+            reads |= SLOT_ALL;
+        }
+        return reads;
+    }
+    if (mn.starts_with('v') || mentioned != 0) && !known_explicit_vector_inputs(mn, operands) {
+        return u128::MAX;
+    }
+    0
 }
 
 /// Destination operand of `t` (the last top-level operand), if any.
@@ -574,15 +965,14 @@ fn frame_operand(op: &str) -> Result<Option<(u8, i32)>, ()> {
     }
 }
 
-/// Byte width of the memory access an instruction performs on its frame
-/// operand.  Precise for the mnemonics the FP passes create; conservative
-/// (16) for anything vector-shaped, 8 for unknown GP-width forms.
-fn access_width(mn: &str, operands: &str, op: &str) -> i32 {
+/// Conservative READ extent. None means unbounded/unsupported, never zero.
+/// This superset is NOT proof that an instruction overwrites all these bytes.
+fn read_extent(mn: &str, operands: &str) -> Option<i32> {
     if let Some(sz) = match mn {
         "movsd" | "vmovsd" | "addsd" | "subsd" | "mulsd" | "divsd" | "minsd" | "maxsd"
         | "sqrtsd" | "ucomisd" | "comisd" | "vaddsd" | "vsubsd" | "vmulsd" | "vdivsd"
         | "vminsd" | "vmaxsd" | "vsqrtsd" | "vucomisd" | "vcomisd" | "cvtsd2ss" | "vcvtsd2ss"
-        | "cvttsd2si" | "cvtsd2si" | "vcvttsd2si" | "vcvtsd2si" | "movq" | "vmovq"
+        | "cvttsd2si" | "cvtsd2si" | "vcvttsd2si" | "vcvtsd2si" | "movq" | "movabsq" | "vmovq"
         | "cvtsi2sdq" | "cvtsi2ssq" | "pushq" | "popq" | "cmpq" | "testq" | "addq" | "subq"
         | "andq" | "orq" | "xorq" | "imulq" | "leaq" | "incq" | "decq" | "negq" | "notq"
         | "shlq" | "shrq" | "sarq" | "cmovq" => Some(8),
@@ -599,16 +989,37 @@ fn access_width(mn: &str, operands: &str, op: &str) -> i32 {
         | "movsbl" | "movzbq" | "movsbq" | "movzbw" | "movsbw" => Some(1),
         _ => None,
     } {
-        return sz;
+        return Some(sz);
     }
     if mn.starts_with("set") {
-        return 1;
+        return Some(1);
     }
-    let _ = op;
-    // Unknown mnemonic: over-approximate the extent.  A wider READ can only
-    // keep more slots live (conservative); kills come from listed plain
-    // stores only, so no unknown form ever produces a false kill.
-    if operands.contains("%ymm") { 32 } else { 16 }
+    // State images, gathers/scatters and other unmodelled footprints make
+    // slots opaque. Vector spelling alone is not an instruction contract.
+    if !known_explicit_vector_inputs(mn, operands)
+        || mn.contains("gather")
+        || mn.contains("scatter")
+    {
+        return None;
+    }
+    if operands.contains("%zmm") {
+        Some(64)
+    } else if operands.contains("%ymm") {
+        Some(32)
+    } else if operands.contains("%xmm") {
+        Some(16)
+    } else {
+        None
+    }
+}
+
+/// Guaranteed contiguous overwrite, deliberately separate from read extent.
+/// A mask can preserve every byte; it therefore proves no covering overwrite.
+fn overwrite_extent(mn: &str, operands: &str) -> Option<i32> {
+    if !is_plain_store(mn) || operands.contains(['{', '}']) {
+        return None;
+    }
+    read_extent(mn, operands)
 }
 
 /// A plain store mnemonic: memory destination is written and NOT read.
@@ -691,7 +1102,7 @@ fn is_plain_store(mn: &str) -> bool {
 ///    (rsp adjustments, pushes/pops) and the GP half of relay pairs, with
 ///    a step budget that covers the full 8-register staging window.  This
 ///    keeps the hand-emitted libcall sites sound too.
-fn call_xmm_reads(store: &LineStore, infos: &[LineInfo], start: usize, n: usize) -> u64 {
+fn call_xmm_reads(store: &LineStore, infos: &[LineInfo], start: usize, n: usize) -> u128 {
     // Phase 0: the authority marker. `# LCCC_CALL_FP <n>` is published by
     // `emit_call_instruction_impl` within a few lines after the call text
     // (same discharge contract as `# LCCC_CALL_ARGS`); it survives every
@@ -705,7 +1116,7 @@ fn call_xmm_reads(store: &LineStore, infos: &[LineInfo], start: usize, n: usize)
         if let Some(rest) = mk.strip_prefix("# LCCC_CALL_FP ") {
             if let Ok(v) = rest.trim().parse::<u32>() {
                 if v <= 8 {
-                    return (1u64 << v) - 1;
+                    return (1u128 << v) - 1;
                 }
             }
             break; // illegible marker: fall through to the heuristics
@@ -727,7 +1138,7 @@ fn call_xmm_reads(store: &LineStore, infos: &[LineInfo], start: usize, n: usize)
     // Phase 1: the census, if any, within the few lines before the call.
     let mut k = n;
     let mut steps = 0;
-    let mut census: Option<u64> = None;
+    let mut census: Option<u128> = None;
     while k > start && steps < 8 {
         k -= 1;
         if infos[k].kind == LineKind::Empty
@@ -755,7 +1166,7 @@ fn call_xmm_reads(store: &LineStore, infos: &[LineInfo], start: usize, n: usize)
             .and_then(|num| num.parse::<u32>().ok())
             .filter(|&c| c <= 8)
         {
-            census = Some((1u64 << cnt) - 1);
+            census = Some((1u128 << cnt) - 1);
         }
         break; // first %rax-family line decides
     }
@@ -787,7 +1198,7 @@ fn call_xmm_reads(store: &LineStore, infos: &[LineInfo], start: usize, n: usize)
     // registers, up to two lines per relay-staged argument) plus the
     // transparent adjustments. Anything real that is not staging still
     // breaks the walk — the contiguous-window soundness guard stands.
-    let mut written = 0u64;
+    let mut written = 0u128;
     let mut k = n;
     let mut steps = 0;
     while k > start && steps < 24 {
@@ -853,7 +1264,7 @@ fn call_xmm_reads(store: &LineStore, infos: &[LineInfo], start: usize, n: usize)
                 | "xorpd"
         );
         match dest_operand(operands).and_then(xmm_index) {
-            Some(d) if staging => written |= 1u64 << d,
+            Some(d) if staging => written |= 1u128 << d,
             _ => {
                 // GP half of a relay pair: `movq %xmmN, %rax` — an xmm
                 // SOURCE with a GP destination. It defines no xmm register
@@ -894,7 +1305,7 @@ fn call_xmm_reads(store: &LineStore, infos: &[LineInfo], start: usize, n: usize)
 ///
 /// The per-`ret` classes are unioned; a single unclassifiable `ret` makes
 /// the whole function conservative.
-fn ret_xmm_reads(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> u64 {
+fn ret_xmm_reads(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> u128 {
     // Compiler-emitted functions publish the exact set in the prologue
     // (`prologue.rs::ret_xmm_mask`); the marker is authoritative.
     for n in start..end {
@@ -903,7 +1314,7 @@ fn ret_xmm_reads(store: &LineStore, infos: &[LineInfo], start: usize, end: usize
         }
         let t = infos[n].trimmed(store.get(n));
         if let Some(m) = t.strip_prefix("# LCCC_RET_XMM ") {
-            if let Ok(mask) = m.trim().parse::<u64>() {
+            if let Ok(mask) = m.trim().parse::<u128>() {
                 return mask & RET_READS;
             }
         }
@@ -911,7 +1322,7 @@ fn ret_xmm_reads(store: &LineStore, infos: &[LineInfo], start: usize, end: usize
             break; // marker precedes the body; no point scanning further
         }
     }
-    let mut union = 0u64;
+    let mut union = 0u128;
     let mut saw_ret = false;
     for n in start..end {
         if infos[n].is_nop() || infos[n].kind != LineKind::Ret {
@@ -979,8 +1390,84 @@ fn debug_unknown(store: &LineStore, n: usize, why: &str) {
 
 #[derive(Clone, Copy)]
 struct Effect {
-    reads: u64,
-    writes: u64,
+    reads: u128,
+    writes: u128,
+}
+
+/// Upper-region observations from explicit operands. EVEX masks do not
+/// hide the register identity; conservatively retain every masked lane.
+fn upper_mentions(text: &str) -> u128 {
+    let mut bits = 0;
+    for (prefix, regions) in [("%ymm", 1u8), ("%zmm", 3u8)] {
+        for tail in text.split(prefix).skip(1) {
+            let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
+            if let Ok(n) = tail[..digits].parse::<u32>()
+                && n < 16
+            {
+                bits |= 1u128 << (YMM_HIGH_SHIFT + n);
+                if regions == 3 {
+                    bits |= 1u128 << (ZMM_HIGH_SHIFT + n);
+                }
+            }
+        }
+    }
+    bits
+}
+
+/// The upper-state projection of the instruction effect. A legacy XMM
+/// overwrite NEVER kills these regions. Known VEX/EVEX full definitions
+/// overwrite their active width and zero all higher regions; unknown or
+/// destructive operations retain explicit reads and prove no upper kills.
+fn upper_effect(t: &str) -> Effect {
+    let (mn, operands) = split_mnemonic(t);
+    if mn == "vzeroupper" || mn == "vzeroall" {
+        return Effect {
+            reads: 0,
+            writes: UPPER_ALL,
+        };
+    }
+    let mut reads = upper_mentions(operands);
+    let mut writes = 0;
+    let Some(dst) = dest_operand(operands) else {
+        return Effect { reads, writes };
+    };
+    // GAS permits whitespace before/inside EVEX decorations. Strip the
+    // decoration and trailing whitespace, but retain its partial-write flag.
+    let bare_dst = dst.split('{').next().unwrap_or(dst).trim_end();
+    let Some(n) = xmm_index(bare_dst) else {
+        return Effect { reads, writes };
+    };
+    let low = 1u128 << n;
+    let srcs = last_top_level_comma(operands.as_bytes())
+        .map(|c| &operands[..c])
+        .unwrap_or("");
+    let zero_idiom = matches!(
+        mn,
+        "vxorpd" | "vxorps" | "vpxor" | "vpxord" | "vpxorq" | "vpcmpeqd" | "vpcmpeqb"
+    ) && operand_list(operands)
+        .iter()
+        .all(|op| xmm_index(op) == Some(n));
+    if mn.starts_with('v') && (is_full_xmm_def(mn, operands) || zero_idiom) {
+        let all_upper = upper_regions(low);
+        if dst.contains('{') {
+            // Masked active lanes are not a full def. Bits above VL still
+            // become zero, even for a merge-masked destination.
+            writes = if bare_dst.starts_with("%xmm") {
+                all_upper
+            } else if bare_dst.starts_with("%ymm") {
+                low << ZMM_HIGH_SHIFT
+            } else {
+                0
+            };
+        } else {
+            writes = all_upper;
+            reads = (reads & !all_upper) | upper_mentions(srcs);
+            if zero_idiom {
+                reads &= !all_upper;
+            }
+        }
+    }
+    Effect { reads, writes }
 }
 
 /// Analyse one function.
@@ -990,7 +1477,7 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
         start,
         end,
         slots: Vec::new(),
-        live_out: vec![u64::MAX; n_lines],
+        live_out: vec![u128::MAX; n_lines],
         slots_opaque: false,
         known: false,
     };
@@ -1009,13 +1496,11 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
     let mut rsp_shift_in_body = false;
     let mut opaque = false;
     let mut in_prologue = true;
-    let mut wide_registers = 0u64;
     for n in start..end {
         if infos[n].is_nop() {
             continue;
         }
         let t = infos[n].trimmed(store.get(n));
-        wide_registers |= vector_mentions(t, false);
         match infos[n].kind {
             LineKind::Label => {
                 if let Some(name) = t.strip_suffix(':') {
@@ -1156,12 +1641,12 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
         let mut ops: Vec<(usize, bool)> = Vec::new();
 
         let (eff, edges) = match infos[n].kind {
-            // DIRECTIVE-LAW: bails -- inert directives were removed above;
-            // remaining directives can encode arbitrary control flow.
+            // Inert metadata was removed above. Remaining directives can
+            // encode arbitrary instructions or control flow: fail closed.
             LineKind::Directive => return facts,
             LineKind::InlineAsm => (
                 Effect {
-                    reads: u64::MAX,
+                    reads: u128::MAX,
                     writes: 0,
                 },
                 fall,
@@ -1175,15 +1660,18 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
             ),
             LineKind::Ret => (
                 Effect {
-                    reads: ret_reads,
+                    reads: ret_reads | upper_regions(ret_reads),
                     writes: 0,
                 },
                 Vec::new(),
             ),
             LineKind::Call => (
                 Effect {
-                    reads: call_xmm_reads(store, infos, start, n) | xmm_mentions(t),
-                    writes: XMM_ALL,
+                    reads: call_xmm_reads(store, infos, start, n)
+                        | xmm_mentions(t)
+                        | upper_regions(CALL_READS)
+                        | upper_mentions(t),
+                    writes: VECTOR_ALL,
                 },
                 fall,
             ),
@@ -1225,19 +1713,19 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
                 let (mn, operands) = split_mnemonic(t);
                 let mentioned = xmm_mentions(t);
                 let mut reads = mentioned;
-                let mut writes = 0u64;
+                let mut writes = 0u128;
                 let dest = dest_operand(operands);
                 // An EVEX writemask (`%zmm3{%k1}`, with or without `{z}`) makes
                 // the destination write PARTIAL: merge-masking leaves the
-                // inactive lanes at their old value and zero-masking zeroes only
-                // the active ones.  Neither is a full definition, so the
-                // destination must stay a read.  `xmm_index` already declines
+                // inactive lanes at their old value. Zero-masking instead zeros
+                // inactive lanes and is a full definition, but this low-region
+                // model conservatively retains that destination too.  `xmm_index` already declines
                 // the masked spelling; this guard states the reason and keeps
                 // the answer correct if that parser ever learns to strip masks.
-                let masked_dest = dest.is_some_and(|d| d.contains("{%k"));
+                let masked_dest = dest.is_some_and(|d| d.contains('{'));
                 if let Some(d) = dest.filter(|_| !masked_dest) {
                     if let Some(dn) = xmm_index(d) {
-                        let bit = 1u64 << dn;
+                        let bit = 1u128 << dn;
                         let srcs = match last_top_level_comma(operands.as_bytes()) {
                             Some(c) => &operands[..c],
                             None => "",
@@ -1262,14 +1750,7 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
                             && operand_list(operands)
                                 .iter()
                                 .all(|o| xmm_index(o) == Some(dn));
-                        // Legacy SSE preserves bits above 127. If this family
-                        // is ever used as YMM/ZMM, keep that dependence even
-                        // for a low-lane zero idiom. VEX/EVEX full definitions
-                        // zero the upper lanes and retain their normal kill.
-                        let preserves_wide = !mn.starts_with('v') && wide_registers & bit != 0;
-                        if preserves_wide {
-                            reads |= bit;
-                        } else if zero_idiom {
+                        if zero_idiom {
                             writes |= bit;
                             reads &= !bit;
                         } else if is_full_xmm_def(mn, operands) {
@@ -1280,10 +1761,6 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
                         }
                         // else: merge / destructive form — dest stays read.
                     }
-                }
-                // `blendv*` (legacy) reads %xmm0 implicitly.
-                if mn == "blendvpd" || mn == "blendvps" || mn == "pblendvb" {
-                    reads |= 1;
                 }
                 // Frame slot traffic.
                 if !opaque {
@@ -1305,9 +1782,15 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
                                     opaque = true;
                                     break;
                                 }
-                                let width = access_width(mn, operands, op);
                                 let is_dest = k + 1 == n_ops && n_ops >= 2;
-                                let is_write = is_dest && is_plain_store(mn);
+                                let overwrite =
+                                    is_dest.then(|| overwrite_extent(mn, operands)).flatten();
+                                let Some(width) = overwrite.or_else(|| read_extent(mn, operands))
+                                else {
+                                    opaque = true;
+                                    break;
+                                };
+                                let is_write = overwrite.is_some();
                                 match intern(&mut facts.slots, base, off, width) {
                                     Some(si) => ops.push((si, is_write)),
                                     None => {
@@ -1319,7 +1802,18 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
                         }
                     }
                 }
-                (Effect { reads, writes }, fall)
+                if mn == "vzeroall" {
+                    writes |= XMM_ALL;
+                    reads &= !XMM_ALL;
+                }
+                let upper = upper_effect(t);
+                (
+                    Effect {
+                        reads: reads | upper.reads | implicit_fp_reads(mn, operands, mentioned),
+                        writes: writes | upper.writes,
+                    },
+                    fall,
+                )
             }
         };
         effects.push(eff);
@@ -1335,14 +1829,14 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
     // any textual trace in this function.
     if !opaque {
         let slots = facts.slots.clone();
-        let rsp_slot_mask: u64 = slots
+        let rsp_slot_mask: u128 = slots
             .iter()
             .enumerate()
             .filter(|(_, s)| s.0 == 4)
-            .fold(0u64, |m, (k, _)| m | (1u64 << (16 + k)));
+            .fold(0u128, |m, (k, _)| m | (1u128 << (16 + k)));
         for (pos, ops) in slot_ops.iter().enumerate() {
-            let mut r = 0u64;
-            let mut w = 0u64;
+            let mut r = 0u128;
+            let mut w = 0u128;
             if infos[lines[pos]].kind == LineKind::Call {
                 r |= rsp_slot_mask;
             }
@@ -1353,13 +1847,13 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
                         continue;
                     }
                     if is_write {
-                        if o <= o2 && o + s >= o2 + s2 {
-                            w |= 1u64 << (16 + k); // covering store kills
+                        if o <= o2 && i64::from(o) + i64::from(s) >= i64::from(o2) + i64::from(s2) {
+                            w |= 1u128 << (16 + k); // covering store kills
                         } else {
-                            r |= 1u64 << (16 + k); // partial write: old bytes live
+                            r |= 1u128 << (16 + k); // partial write: old bytes live
                         }
                     } else {
-                        r |= 1u64 << (16 + k);
+                        r |= 1u128 << (16 + k);
                     }
                 }
             }
@@ -1374,15 +1868,15 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
     for (pos, &n) in lines.iter().enumerate() {
         line_pos[idx_of(n)] = pos;
     }
-    let mut live_in = vec![0u64; lines.len()];
-    let mut live_out = vec![0u64; lines.len()];
+    let mut live_in = vec![0u128; lines.len()];
+    let mut live_out = vec![0u128; lines.len()];
     let mut changed = true;
     let mut rounds = 0;
     while changed && rounds < 64 {
         changed = false;
         rounds += 1;
         for pos in (0..lines.len()).rev() {
-            let mut out = 0u64;
+            let mut out = 0u128;
             for &s in &succs[pos] {
                 // A successor line index may be a label (in `lines`) — map it.
                 let sp = line_pos[idx_of(s)];
@@ -1400,7 +1894,7 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
                     }
                     match found {
                         Some(p) => out |= live_in[p],
-                        None => out |= ret_reads,
+                        None => out |= ret_reads | upper_regions(ret_reads),
                     }
                 } else {
                     out |= live_in[sp];
@@ -1431,7 +1925,7 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
     }
     // Materialise per-line facts; directive/nop lines inherit the facts of
     // the next real line so a query "after line k" is well-defined for any k.
-    let mut carry = 0u64;
+    let mut carry = 0u128;
     for n in (start..end).rev() {
         let p = line_pos[idx_of(n)];
         if p != usize::MAX {
@@ -1470,46 +1964,262 @@ mod tests {
     }
 
     #[test]
-    fn legacy_xmm_def_preserves_live_upper_lanes() {
-        for wide in ["ymm", "zmm"] {
-            for overwrite in [
-                "pshufd $0, %xmm3, %xmm7",
-                "pshufhw $0, %xmm3, %xmm7",
-                "pshuflw $0, %xmm3, %xmm7",
-                "movaps %xmm3, %xmm7",
-                "pxor %xmm7, %xmm7",
-            ] {
-                let body = format!(
-                    "    vmovapd %xmm2, %xmm7\n    {overwrite}\n    vmovupd %{wide}7, (%rdi)\n"
-                );
-                let (store, infos, lv) = build(&body);
-                let i = line_of(&store, "vmovapd");
-                assert_eq!(lv.xmm_live_after(i, 7), Some(true), "{body}");
-                assert!(!lv.xmm_dead_after(&store, &infos, i, 7, &[i]), "{body}");
-            }
+    fn decorated_destination_spacing_keeps_whole_write_obligations() {
+        for suffix in ["{%k1}", " {%k1}", "\t{%k1}", " { %k1 }"] {
+            let producer = format!("vaddpd %xmm4, %xmm4, %xmm2{suffix}");
+            let (store, infos, lv) = build(&format!(
+                "    {producer}\n    movaps %xmm5, %xmm2\n    vextractf128 $1, %ymm2, %xmm0\n"
+            ));
+            let at = line_of(&store, &producer);
+            assert!(
+                !lv.deleted_write_regions_dead_after(&store, &infos, at, 2, &[at]),
+                "EVEX XMM upper-zero write remains observable: {suffix:?}"
+            );
         }
-        // VEX writes zero the upper lanes; a full VEX overwrite DOES kill.
-        let (store, _, lv) = build(
-            "    vmovapd %xmm2, %xmm7\n    vpshufd $0, %xmm3, %xmm7\n    vmovupd %ymm7, (%rdi)\n",
-        );
-        assert_eq!(
-            lv.xmm_live_after(line_of(&store, "vmovapd"), 7),
-            Some(false)
-        );
-        // Legacy-only scalar/128-bit functions retain the profitable kill.
-        let (store, _, lv) = build(
-            "    movapd %xmm2, %xmm7\n    pshufd $0, %xmm3, %xmm7\n    movupd %xmm7, (%rdi)\n",
-        );
-        assert_eq!(lv.xmm_live_after(line_of(&store, "movapd"), 7), Some(false));
     }
 
     #[test]
-    fn raw_bytes_cannot_prove_fp_register_dead() {
-        // movupd %xmm7,(%rdi), hidden in .byte: no textual %xmm7 use exists.
-        for opaque in [".byte 0x66,0x0f,0x11,0x3f", ".long 0", ".p2align 4,0xcc"] {
-            let (store, infos, lv) = build(&format!("    movapd %xmm2, %xmm7\n    {opaque}\n"));
-            let i = line_of(&store, "movapd");
-            assert!(!lv.xmm_dead_after(&store, &infos, i, 7, &[i]), "{opaque}");
+    fn decorated_destination_spacing_keeps_merge_masked_upper_inputs() {
+        for suffix in ["{%k1}", " {%k1}", "\t{%k1}", " { %k1 }"] {
+            let (store, infos, lv) = build(&format!(
+                "    vmovaps %xmm6, %xmm2\n    movaps %xmm5, %xmm2\n    vaddpd %ymm4, %ymm4, %ymm2{suffix}\n    movaps %xmm5, %xmm2\n    vextractf128 $1, %ymm2, %xmm0\n"
+            ));
+            let at = line_of(&store, "vmovaps %xmm6, %xmm2");
+            assert!(
+                !lv.reg_move_dead_after(&store, &infos, at, 2),
+                "mask may be zero: old upper lanes are still inputs: {suffix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn frame_read_across_i32_endpoint_keeps_store_live() {
+        let (store, _, lv) = build(
+            "    movsd %xmm7, 2147483644(%rbp)\n    vmovupd 2147483640(%rbp), %ymm2\n    movl $1, %eax\n",
+        );
+        let def = line_of(&store, "movsd %xmm7, 2147483644");
+        assert_eq!(lv.slot_live_after(def, 5, 2147483644, 8), Some(true));
+        // A disjoint negative displacement must not become a false alias.
+        assert_eq!(lv.slot_live_after(def, 5, i32::MIN, 8), Some(false));
+    }
+
+    #[test]
+    fn architectural_implicit_vector_inputs_remain_live() {
+        // Legacy variable blends already model XMM0: keep positive controls
+        // alongside SHA256RNDS2, whose message input is implicit too.
+        for op in [
+            "blendvpd %xmm5, %xmm7",
+            "blendvps %xmm5, %xmm7",
+            "pblendvb %xmm5, %xmm7",
+            "sha256rnds2 %xmm5, %xmm7",
+        ] {
+            let (store, _, lv) = build(&format!(
+                "    movaps %xmm6, %xmm0\n    {op}\n    movaps %xmm5, %xmm0\n    movl $1, %eax\n"
+            ));
+            let def = line_of(&store, "movaps %xmm6, %xmm0");
+            assert_eq!(
+                lv.xmm_live_after(def, 0),
+                Some(true),
+                "implicit XMM0 input: {op}"
+            );
+        }
+    }
+
+    #[test]
+    fn pr824_external_redteam_unknown_cfg_keeps_implicit_inputs() {
+        for op in [
+            "fxsave64 (%rdi)",
+            "xsaveopt64 (%rdi)",
+            "blendvpd %xmm5, %xmm7",
+            "sha256rnds2 %xmm5, %xmm7",
+        ] {
+            let n = if op.starts_with("fxsave") || op.starts_with("xsave") {
+                3
+            } else {
+                0
+            };
+            let (store, infos, lv) = build(&format!(
+                "    movapd %xmm2, %xmm{n}\n    {op}\n    jmp *%rax\n"
+            ));
+            let def = line_of(&store, &format!("movapd %xmm2, %xmm{n}"));
+            assert!(!lv.xmm_dead_after(&store, &infos, def, n, &[def]), "{op}");
+        }
+    }
+
+    #[test]
+    fn pr824_external_redteam_zmm_read_and_masked_store_footprints() {
+        for (op, offset) in [
+            ("vmovdqu32 0(%rsp), %zmm7", 48),
+            ("vmovupd %ymm1, 0(%rsp){%k1}", 16),
+        ] {
+            let (store, _, lv) = build(&format!(
+                "    movsd %xmm6, {offset}(%rsp)\n    {op}\n    movsd {offset}(%rsp), %xmm0\n"
+            ));
+            let def = line_of(&store, &format!("movsd %xmm6, {offset}(%rsp)"));
+            assert_eq!(lv.slot_live_after(def, 4, offset, 8), Some(true), "{op}");
+        }
+        let (store, _, lv) = build(
+            "    movsd %xmm6, 48(%rsp)\n    vmovdqu32 0(%rsp), %zmm7\n    vmovupd %zmm7, (%rdi)\n",
+        );
+        let def = line_of(&store, "movsd %xmm6, 48(%rsp)");
+        assert_eq!(lv.slot_live_after(def, 4, 48, 8), Some(true));
+    }
+
+    #[test]
+    fn pattern_e_keeps_store_overlapped_by_zmm_read() {
+        let (mut store, mut infos, _) = build(
+            "    movq %rax, -64(%rbp)\n    movq %rax, %xmm0\n    vmovdqu32 -112(%rbp), %zmm7\n    vmovupd %zmm7, (%rdi)\n",
+        );
+        let i = line_of(&store, "movq %rax, -64(%rbp)");
+        super::super::local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
+        assert!(!infos[i].is_nop(), "byte 48 of the ZMM footprint is read");
+        let (mut store, mut infos, _) = build(
+            "    movq %rax, -64(%rbp)\n    movq %rax, %xmm0\n    vmovupd -112(%rbp), %ymm7\n    vmovupd %ymm7, (%rdi)\n",
+        );
+        let i = line_of(&store, "movq %rax, -64(%rbp)");
+        super::super::local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
+        assert!(
+            infos[i].is_nop(),
+            "byte 48 is outside the YMM read: useful deletion remains"
+        );
+    }
+
+    #[test]
+    fn read_boundaries_and_guaranteed_overwrites_are_distinct() {
+        for (reg, width) in [("xmm", 16), ("ymm", 32), ("zmm", 64)] {
+            for offset in [15, 16, 31, 32, 47, 48, 63, 64] {
+                let (store, _, lv) = build(&format!(
+                    "    movb $1, {offset}(%rsp)\n    vmovupd 0(%rsp), %{reg}7\n    vmovupd %{reg}7, (%rdi)\n"
+                ));
+                let i = line_of(&store, "movb $1");
+                assert_eq!(
+                    lv.slot_live_after(i, 4, offset, 1),
+                    Some(offset < width),
+                    "read {reg} at {offset}"
+                );
+                for mask in ["", "{%k1}"] {
+                    let (store, _, lv) = build(&format!(
+                        "    movb $1, {offset}(%rsp)\n    vmovupd %{reg}7, 0(%rsp){mask}\n    movzbl {offset}(%rsp), %eax\n"
+                    ));
+                    let i = line_of(&store, "movb $1");
+                    assert_eq!(
+                        lv.slot_live_after(i, 4, offset, 1),
+                        Some(!mask.is_empty() || offset >= width),
+                        "write {reg}{mask} at {offset}"
+                    );
+                }
+            }
+        }
+        for op in [
+            "fxrstor64 0(%rsp)",
+            "xrstor64 0(%rsp)",
+            "vfutureload 0(%rsp), %xmm7",
+        ] {
+            let (store, _, lv) = build(&format!("    movsd %xmm6, 512(%rsp)\n    {op}\n"));
+            let i = line_of(&store, "movsd %xmm6");
+            assert_eq!(
+                lv.slot_live_after(i, 4, 512, 8),
+                Some(true),
+                "unknown extent: {op}"
+            );
+        }
+    }
+
+    #[test]
+    fn architectural_state_saves_observe_vector_inputs() {
+        for mn in [
+            "fxsave",
+            "fxsave64",
+            "fxsaveq",
+            "xsave",
+            "xsave64",
+            "xsaveq",
+            "xsaveopt",
+            "xsaveopt64",
+            "xsaveoptq",
+            "xsavec",
+            "xsavec64",
+            "xsaves",
+            "xsaves64",
+        ] {
+            let (store, _, lv) = build(&format!(
+                "    movaps %xmm6, %xmm7\n    {mn} (%rdi)\n    movaps %xmm5, %xmm7\n    movl $1, %eax\n"
+            ));
+            let def = line_of(&store, "movaps %xmm6, %xmm7");
+            assert_eq!(
+                lv.xmm_live_after(def, 7),
+                Some(true),
+                "implicit state save: {mn}"
+            );
+            let (store, infos, lv) = build(&format!(
+                "    vmovaps %xmm6, %xmm7\n    movaps %xmm5, %xmm7\n    {mn} (%rdi)\n    vzeroupper\n    movl $1, %eax\n"
+            ));
+            let def = line_of(&store, "vmovaps %xmm6, %xmm7");
+            assert_eq!(
+                lv.reg_move_dead_after(&store, &infos, def, 7),
+                mn.starts_with("fxsave"),
+                "XSAVE observes the upper zeros too; FXSAVE only the overwritten low region: {mn}"
+            );
+        }
+    }
+
+    #[test]
+    fn unadmitted_vector_effects_fail_closed_locally() {
+        // Synthetic mnemonics test the admission contract, not an executable ISA.
+        for op in ["vfutureop %xmm5, %xmm7", "futureop %xmm5, %xmm7"] {
+            let (store, _, lv) = build(&format!(
+                "    movaps %xmm6, %xmm0\n    {op}\n    movaps %xmm5, %xmm0\n    movl $1, %eax\n"
+            ));
+            let def = line_of(&store, "movaps %xmm6, %xmm0");
+            assert_eq!(
+                lv.xmm_live_after(def, 0),
+                Some(true),
+                "unknown implicit inputs: {op}"
+            );
+            assert!(!is_full_xmm_def_line(op));
+        }
+        // No global function veto: a later ordinary overwrite still kills a
+        // value defined AFTER the opaque instruction.
+        let (store, _, lv) = build(
+            "    vfutureop %xmm5, %xmm7\n    movaps %xmm6, %xmm0\n    movaps %xmm5, %xmm0\n    movl $1, %eax\n",
+        );
+        let def = line_of(&store, "movaps %xmm6, %xmm0");
+        assert_eq!(lv.xmm_live_after(def, 0), Some(false));
+    }
+
+    #[test]
+    fn architectural_state_images_have_non_scalar_frame_footprints() {
+        for mn in [
+            "fxsave",
+            "fxsave64",
+            "fxsaveq",
+            "fxrstor",
+            "fxrstor64",
+            "fxrstorq",
+            "xsave",
+            "xsave64",
+            "xsaveq",
+            "xsaveopt",
+            "xsaveopt64",
+            "xsaveoptq",
+            "xsavec",
+            "xsavec64",
+            "xsaves",
+            "xsaves64",
+            "xrstor",
+            "xrstor64",
+            "xrstorq",
+            "xrstors",
+            "xrstors64",
+        ] {
+            let (store, _, lv) = build(&format!(
+                "    movsd %xmm7, -32(%rbp)\n    {mn} -512(%rbp)\n    movl $1, %eax\n"
+            ));
+            let def = line_of(&store, "movsd %xmm7, -32(%rbp)");
+            assert!(
+                !lv.slot_dead_after(def, 5, -32, 8),
+                "variable-size frame state image: {mn}"
+            );
         }
     }
 
@@ -2255,5 +2965,52 @@ mod tests {
         );
         lv.refresh_at(&store, &infos, n + 1);
         assert_eq!(lv.xmm_live_after(n, 5), Some(true));
+    }
+    #[test]
+    fn legacy_xmm_def_preserves_live_upper_lanes() {
+        for wide in ["ymm", "zmm"] {
+            for overwrite in [
+                "pshufd $0, %xmm3, %xmm7",
+                "pshufhw $0, %xmm3, %xmm7",
+                "pshuflw $0, %xmm3, %xmm7",
+                "movaps %xmm3, %xmm7",
+                "pxor %xmm7, %xmm7",
+            ] {
+                let body = format!(
+                    "    vmovapd %xmm2, %xmm7\n    {overwrite}\n    vmovupd %{wide}7, (%rdi)\n"
+                );
+                let (store, infos, lv) = build(&body);
+                let i = line_of(&store, "vmovapd");
+                assert_eq!(
+                    lv.xmm_live_after(i, 7),
+                    Some(false),
+                    "low XMM region is dead: {body}"
+                );
+                assert!(!lv.reg_move_dead_after(&store, &infos, i, 7), "{body}");
+            }
+        }
+        // VEX writes zero the upper lanes; a full VEX overwrite DOES kill.
+        let (store, _, lv) = build(
+            "    vmovapd %xmm2, %xmm7\n    vpshufd $0, %xmm3, %xmm7\n    vmovupd %ymm7, (%rdi)\n",
+        );
+        assert_eq!(
+            lv.xmm_live_after(line_of(&store, "vmovapd"), 7),
+            Some(false)
+        );
+        // Legacy-only scalar/128-bit functions retain the profitable kill.
+        let (store, _, lv) = build(
+            "    movapd %xmm2, %xmm7\n    pshufd $0, %xmm3, %xmm7\n    movupd %xmm7, (%rdi)\n",
+        );
+        assert_eq!(lv.xmm_live_after(line_of(&store, "movapd"), 7), Some(false));
+    }
+
+    #[test]
+    fn raw_bytes_cannot_prove_fp_register_dead() {
+        // movupd %xmm7,(%rdi), hidden in .byte: no textual %xmm7 use exists.
+        for opaque in [".byte 0x66,0x0f,0x11,0x3f", ".long 0", ".p2align 4,0xcc"] {
+            let (store, infos, lv) = build(&format!("    movapd %xmm2, %xmm7\n    {opaque}\n"));
+            let i = line_of(&store, "movapd");
+            assert!(!lv.xmm_dead_after(&store, &infos, i, 7, &[i]), "{opaque}");
+        }
     }
 }

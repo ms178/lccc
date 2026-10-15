@@ -5883,9 +5883,13 @@ def _ie_to_le_forms_test(args, oracles):
         note = "\t.section .note.x,\"a\",@note\n\t.p2align 2\n\t.long 4, 4, 1\n\t.ascii \"LCCC\"\n\t.long 0\n"
         with open(os.path.join(td, "note.s"), "w") as f:
             f.write(note)
-        r = sh([CC, "-c", "ief2.s", "note.s"], cwd=td)
-        if r.returncode != 0:
-            return Result(name, "FAIL", f"assemble ief2.s: {r.stderr.decode()[:300]}")
+        # Use the same pinned assembler as ief.s above. GCC can prefer its
+        # configured absolute system as over PATH, silently downgrading this
+        # second APX/MOVRS fixture to an older assembler.
+        for stem in ("ief2", "note"):
+            r = sh(["as", "--64", stem + ".s", "-o", stem + ".o"], cwd=td)
+            if r.returncode != 0:
+                return Result(name, "FAIL", f"assemble {stem}.s: {r.stderr.decode()[:300]}")
         r = sh([lccc_ld, "-T", "s.ld", "ief.o", "-o", "full.img"], cwd=td)
         if r.returncode == 0 or b"a -T link has no GOT" not in r.stderr:
             return Result(name, "FAIL", f"-T with an unconvertible GOTTPOFF: rc {r.returncode} "
@@ -6172,7 +6176,10 @@ def _plain_gotpcrel_test(args, oracles):
                             ("ext.c", "int ext = 3;\n")):
             with open(os.path.join(td, fname), "w") as f:
                 f.write(text)
-        r = sh([CC, "-Wa,-mrelax-relocations=no", "-c", "pg.s"], cwd=td)
+        # Invoke GAS directly: distro GCC may configure an absolute assembler
+        # path that ignores PATH. This fixture needs the pinned GAS (MOVRS),
+        # not the compiler driver's private assembler. Keep the C driver for C.
+        r = sh(["as", "--64", "-mrelax-relocations=no", "pg.s", "-o", "pg.o"], cwd=td)
         if r.returncode != 0:
             err = r.stderr.decode()[:300]
             if "movrs" in err:
@@ -6181,7 +6188,10 @@ def _plain_gotpcrel_test(args, oracles):
         rel = sh(["readelf", "-rW", "pg.o"], cwd=td).stdout.decode()
         if rel.count("R_X86_64_GOTPCREL ") != 7:
             return Result(name, "FAIL", f"assembler did not emit plain GOTPCREL:\n{rel[-600:]}")
-        for argv in (["-Wa,-mrelax-relocations=no", "-c", "sc.s"], ["-O1", "-c", "m.c"],
+        r = sh(["as", "--64", "-mrelax-relocations=no", "sc.s", "-o", "sc.o"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"assemble sc.s: {r.stderr.decode()[:300]}")
+        for argv in (["-O1", "-c", "m.c"],
                      ["-O1", "-c", "ext.c"], ["-fPIC", "-shared", "ext.c", "-o", "libext.so"]):
             r = sh([CC] + argv, cwd=td)
             if r.returncode != 0:
@@ -7856,14 +7866,14 @@ def _cxx_eh_local_type_test(args, oracles):
     with tempfile.TemporaryDirectory() as td:
         with open(os.path.join(td, "lt.cpp"), "w") as f:
             f.write(CXX_EH_LOCAL_TYPE_SRC)
-        r = sh(["g++", "-c", "-O1", "lt.cpp"], cwd=td)
+        r = sh([CXX, "-c", "-O1", "lt.cpp"], cwd=td)
         if r.returncode != 0:
             return Result(name, "SKIP", "g++ compile failed")
         r = sh([args.lccc, "lt.o", "-lstdc++", "-o", "lt.lccc"], cwd=td)
         if r.returncode != 0:
             return Result(name, "FAIL", f"lccc link failed: {r.stderr.decode()[:300]}")
         code, out = run_bin(os.path.join(td, "lt.lccc"), [], td)
-        r2 = sh(["g++", "lt.o", "-lstdc++", "-o", "lt.ref"], cwd=td)
+        r2 = sh([CXX, "lt.o", "-lstdc++", "-o", "lt.ref"], cwd=td)
         if r2.returncode != 0:
             return Result(name, "SKIP", "reference link failed")
         code2, out2 = run_bin(os.path.join(td, "lt.ref"), [], td)
@@ -7896,14 +7906,14 @@ def _cxx_eh_test(args, oracles):
     try:
         with open(os.path.join(td, "ex.cpp"), "w") as f:
             f.write(CXX_EH_SRC)
-        r = sh(["g++", "-c", "-O1", "ex.cpp"], cwd=td)
+        r = sh([CXX, "-c", "-O1", "ex.cpp"], cwd=td)
         if r.returncode != 0:
             return Result(name, "SKIP", "g++ compile failed")
         r = sh([args.lccc, "ex.o", "-lstdc++", "-o", "ex.lccc"], cwd=td)
         if r.returncode != 0:
             return Result(name, "FAIL", f"lccc link failed: {r.stderr.decode()[:300]}")
         code, out = run_bin(os.path.join(td, "ex.lccc"), [], td)
-        r2 = sh(["g++", "ex.o", "-o", "ex.ref"], cwd=td)
+        r2 = sh([CXX, "ex.o", "-o", "ex.ref"], cwd=td)
         code2, out2 = run_bin(os.path.join(td, "ex.ref"), [], td)
         if (code, out) != (code2, out2):
             return Result(name, "FAIL",

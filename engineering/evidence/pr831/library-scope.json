@@ -1,0 +1,20 @@
+{
+  "counts_by_module_not_native_architecture_execution": {
+    "ARM/AArch64": 199,
+    "shared/other": 2188,
+    "i686": 477,
+    "RISC-V": 100,
+    "x86-64": 1584,
+    "shared IVSR": 42,
+    "shared LICM": 13,
+    "shared vectorizer": 123
+  },
+  "total_pass": 4726,
+  "new_tests": [
+    "backend::x86::codegen::peephole::passes::fp_liveness::tests::decorated_destination_spacing_keeps_merge_masked_upper_inputs",
+    "backend::x86::codegen::peephole::passes::fp_liveness::tests::decorated_destination_spacing_keeps_whole_write_obligations",
+    "backend::x86::codegen::peephole::passes::fp_liveness::tests::frame_read_across_i32_endpoint_keeps_store_live",
+    "backend::x86::codegen::peephole::types::range_overlap_boundary_tests::range_overlap_boundary_crosses_signed_displacement_end",
+    "backend::x86::codegen::peephole::types::range_overlap_boundary_tests::range_overlap_boundary_matrix_matches_wide_interval_oracle"
+  ]
+}

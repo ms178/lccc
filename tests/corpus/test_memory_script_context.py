@@ -16,6 +16,10 @@ class MemoryScriptContext(unittest.TestCase):
 from pathlib import Path
 import sys
 args = sys.argv[1:]
+# This fixture only tests diagnostic context, never compiler correctness.
+if "-dumpfullversion" in args:
+    print("16.2.0")
+    raise SystemExit(0)
 if "-print-file-name=include" in args:
     print("/unused/include")
     raise SystemExit(0)
@@ -28,7 +32,7 @@ p.chmod(0o755)
             compiler.chmod(0o755)
             result = subprocess.run(
                 ["bash", str(ROOT / "tests/regression/check_memory_value_contracts.sh")],
-                env={**os.environ, "CCC": str(compiler), "CC_REF": str(compiler)},
+                env={**os.environ, "CCC": str(compiler), "CC_REF": str(compiler), "GCC": str(compiler)},
                 capture_output=True, text=True, timeout=30,
             )
             self.assertEqual(result.returncode, 37, result.stderr)
