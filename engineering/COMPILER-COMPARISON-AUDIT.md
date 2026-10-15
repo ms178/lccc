@@ -113,15 +113,23 @@ records source IDs, executable hashes, versions, commands and raw outputs.
    failures fail the job. This is not timing evidence.
 2. **Native workload comparison:** all 45 registry IDs, shared O2 target and
    wrapping flags, randomized paired rounds, affinity where available, one
-   warm-up and nine retained samples. The main compiler participates in the
-   semantic/static inventory rather than the timing aggregate: its old runtime
-   discovery is incompatible with a fresh GCC-16-only image.
+   warm-up and nine retained samples. The native A/B focuses on the requested
+   compiler candidates; main is an additional semantic/static baseline, not
+   included in the timing aggregate.
 3. **O3:** all 45 shapes, correctness-only, never a second timing claim.
 4. **Static codegen:** `benchmark_codegen.py --oracles ''`, every registry ID
    per compiler; instruction counts are screening, not runtime or spill cause.
 5. **Bounded instrumentation:** all 45 IDs using `callgrind_corpus.py`, both a
    direct candidate comparison and a separate GCC control at the same sizes.
    Raw counters, native/instrumented output checks and manifests are retained.
+
+All 55 size/shape macro overrides were also sensitivity-checked with local
+GCC 12.2 preprocessing across the complete 45-ID registry. Numeric zero/nonzero
+controls and a defined/undefined control for LZ4's presence-based `MATCH_RICH`
+all changed the preprocessed program. No ineffective override was found. This
+checks configuration plumbing, not compiler execution or performance; the
+[machine-readable controls](measurements/compiler-scale-controls.json) retain
+that distinction.
 
 A failure in one measurement does not suppress the other independent
 measurements after a successful build. No `continue-on-error` converts it into

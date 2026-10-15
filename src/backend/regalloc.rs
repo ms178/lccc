@@ -13174,7 +13174,11 @@ mod map_collector_tests {
                 let web = func(instructions, Terminator::Return(None));
                 let reduction = collect_x86_reduction_vector_values(&web);
                 for value in [1, 3] {
-                    assert_eq!(reduction.contains(&value), expected, "{producer:?}: {value}");
+                    assert_eq!(
+                        reduction.contains(&value),
+                        expected,
+                        "{producer:?}: {value}"
+                    );
                 }
             }
         }
