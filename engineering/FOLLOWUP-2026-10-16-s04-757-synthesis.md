@@ -131,6 +131,13 @@ Expected effect: build lane ~20.5 → ~6 min, debug ~22 → ~8 min, critical
 path (build + codegen) ~39 → ~20 min once the weekly cache is warm; first
 run of a week still pays one download to refill the cache.
 
+## Census note: RA-01 kill switch
+
+`CCC_NO_REG_OFF_SYM` disables the RA-01 sym+register SIB fold in
+`src/backend/generation.rs` (set it to compare against the unfused
+addressing form). Added with the RA-01 port; documented here so the
+audit census counts it as a named, owned knob.
+
 ## Latent main divergence surfaced by the local suite (not by hosted CI)
 
 `fenv_constant_effects` / `fenv_constant_rounding` (in main since #843)
