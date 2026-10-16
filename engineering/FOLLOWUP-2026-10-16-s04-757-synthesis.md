@@ -56,10 +56,27 @@ of PR #843). Companion to `FOLLOWUP-2026-10-16-rebase-synthesis.md` (S03).
 - **char-signedness three-way drift**: type said unsigned, macro said
   signed, limits.h followed the macro.
 
+## Closed-PR verdicts beyond #757
+
+- **#714 (loop IV un-spill + per-path flag walk): NOTHING TO PORT.**
+  Part 2 (per-path LIVE-mask flag walk) is ABSORBED on main - commit
+  `20b212e0` carries the same design and even the same `cmp; jb; ...;
+  stc; jo` example in its docstring. Part 1 (`loop_iv_spill`, 1883
+  lines) was ported experimentally and REVERTED: main's RA drift
+  already keeps the hot match-loop IV in a register (no small-loop
+  slot round-trip left in lz4_compress; measured, the pass fires 0x in
+  the corpus and its own e2e gate fails as "vacuous"). The remaining
+  lz4 gap vs gcc (1209 vs 1067 ms, 0.88x, MATCH_RICH/PASSES=2048,
+  identical checksums) is NOT the IV round trip - root cause still to
+  be found (open lead below). The outer-loop `184(%rsp)` round trips
+  that do remain are one store/reload per OUTER iteration and do not
+  fit the pass's header-opens-with-reload model.
+
 ## Still open (carried forward)
 
 - cli.rs option-contract port + capability probe (see §4 above).
-- Deep-dive queue by novelty: #714, #712, #816/817, #766/767, #709/705/706,
+- lz4_compress 0.88x vs gcc-16: profile the match kernel (not IV spill).
+- Deep-dive queue by novelty: #712, #816/817, #766/767, #709/705/706,
   #777, #833, #835, #779/778, #814, #697, #831, #828, AArch64 #761.
 - Harness: Clang-23.1 leg, godbolt-oracle script, i686-mold preset,
   `.flags` -O2 audit, ICX-2026 PPA, latest-rust attempt.
