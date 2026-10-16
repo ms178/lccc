@@ -232,6 +232,37 @@ gate "reg-off-sym-fold" fast \
 gate "array-bound-contract" fast \
     python3 scripts/check_array_bound_contract.py --lccc "$LCCC"
 
+# UB-exploitation invariant (E22): `-fno-strict-aliasing`, `-fwrapv` and
+# `-fno-strict-overflow` are tolerated because this optimizer exploits no
+# type-based aliasing or signed-overflow poison. That is a precondition, not
+# a property of the universe: the day such a concept lands in src/, the
+# tolerated spellings become silent miscompiles. The tripwire names them.
+gate "ub-exploitation-invariant" fast \
+    python3 scripts/check_no_ub_exploitation.py --root src
+
+# Sparse NOBITS `.bss` (E22): the zeros are a size, not bytes, so a 4 GiB
+# array compiles, links and runs from a ~5 KB executable, a label inside a
+# sparse tail keeps its offset, PROGBITS alignment follows GAS 2.47 exactly
+# (no-padding `.p2align 40` accepted, unholdable padding diagnosed, never a
+# signal), and negative/oversized counts follow GAS exactly.
+gate "sparse-bss-nobits" fast \
+    env CCC="$LCCC" bash tests/regression/check_sparse_bss_nobits.sh
+
+# The sparse-NOBITS equivalence proof: same probes through the in-tree
+# compiler must keep exit codes, stdout and .bss layout; a 16 GB object
+# compiles under a hard RSS ceiling and in bounded time.
+gate "sparse-bss-equivalence" fast \
+    python3 tests/regression/check_sparse_bss_equivalence.py --lccc "$LCCC"
+
+# A13/A14: a pass may synthesise a libcall only when this TU does not
+# define that symbol (per symbol: an asm label, an alias or a static
+# definition counts), and a constant-size memcpy/memset call may be
+# expanded only while the callee still is the builtin. Refusals, positive
+# controls, the -fno-builtin/-ffreestanding contract, the ungated __*_chk
+# rows and three runtime programs.
+gate "libcall-synthesis-no-selfcall" fast \
+    env CCC="$LCCC" bash tests/regression/check_libcall_synthesis_no_selfcall.sh
+
 gate "benchmark-codegen-registry" fast \
     python3 tests/regression/check_benchmark_codegen_registry.py
 
