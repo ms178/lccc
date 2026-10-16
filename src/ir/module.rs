@@ -176,6 +176,9 @@ impl GlobalInit {
 /// An IR function.
 #[derive(Debug, Clone)]
 pub struct IrFunction {
+    /// Immutable language contract for this function; clones retain it and
+    /// outlined functions inherit it. run_passes initializes it even at O0.
+    pub pass_policy: crate::common::pass_policy::PassPolicy,
     pub name: String,
     pub return_type: IrType,
     pub params: Vec<IrParam>,
@@ -345,6 +348,7 @@ impl IrFunction {
     #[cfg(test)]
     pub fn new(name: String, return_type: IrType, params: Vec<IrParam>, is_variadic: bool) -> Self {
         Self {
+            pass_policy: Default::default(),
             name,
             return_type,
             params,

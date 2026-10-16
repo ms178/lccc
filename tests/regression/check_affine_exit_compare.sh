@@ -4,7 +4,9 @@
 # defined -fwrapv loops. Check actual compiler environments, reference output,
 # counted proof-based folds, the kill switch, and the original hot-loop shape.
 # Rotation must still run when affine folding is disabled, otherwise the kill
-# control would be vacuous. Both rotated and unrotated constant-bound loops
+# control would be vacuous. CCC_NO_AFFINE_EXIT_FOLD globally owns EVERY affine
+# exit-compare producer; CCC_DISABLE_PASSES=loop_bound unschedules only the
+# early canonicalizer. Both rotated and unrotated constant-bound loops
 # should use a bare-register folded compare feeding the branch directly.
 set -euo pipefail
 
@@ -21,6 +23,9 @@ trap 'rm -rf "$work"' EXIT
 fail=0
 note() { printf '  %s\n' "$*"; }
 bad() { printf '  FAIL: %s\n' "$*" >&2; fail=1; }
+late_reports() {
+    awk '/\[AFFOLD\]/ && !/\(early unsigned\)/ {n++} END {print n+0}' "$1"
+}
 
 # ---------------------------------------------------------------- contract 1
 note "contract 1: correctness against the GCC oracle (rotation on/off/killed)"
@@ -50,6 +55,8 @@ run_case "rot-O3" "-O3 -march=x86-64-v3" "CCC_LOOP_ROTATE=1"
 run_case "rot-O1" "-O1 -march=x86-64-v3" "CCC_LOOP_ROTATE=1"
 run_case "norot-O2" "-O2 -march=x86-64-v3" ""
 run_case "killed-O2" "-O2 -march=x86-64-v3" "CCC_LOOP_ROTATE=1 CCC_NO_LOOP_ROTATE=1"
+run_case "late-disabled-O2" "-O2 -march=x86-64-v3" "CCC_LOOP_ROTATE=1 CCC_NO_AFFINE_EXIT_FOLD=1"
+run_case "both-disabled-O2" "-O2 -march=x86-64-v3" "CCC_LOOP_ROTATE=1 CCC_NO_AFFINE_EXIT_FOLD=1 CCC_DISABLE_PASSES=loop_bound"
 
 # ---------------------------------------------------------------- contract 2
 note "contract 2: the shared proof-based affine fold is counted"
@@ -57,23 +64,37 @@ CCC_LOOP_ROTATE=1 CCC_DEBUG_LOOP_ROTATE=1 CCC_DEBUG_AFFINE_FOLD=1 "$CCC" -O2 -ma
     -o "$work/rot.s" 2> "$work/rot.dbg" || bad "rotated -S build failed"
 CCC_DEBUG_LOOP_ROTATE=1 CCC_DEBUG_AFFINE_FOLD=1 "$CCC" -O2 -march=x86-64-v3 -S "$corpus" \
     -o "$work/norot.s" 2> "$work/norot.dbg" || bad "unrotated -S build failed"
-folds=$(grep -cF "[AFFOLD]" "$work/rot.dbg" || true)
-folds_off=$(grep -cF "[AFFOLD]" "$work/norot.dbg" || true)
+folds=$(late_reports "$work/rot.dbg")
+folds_off=$(late_reports "$work/norot.dbg")
 note "rotated: $folds proof-based fold report(s); unrotated: $folds_off"
 [[ $folds -gt 0 ]] || bad "no proof-based affine exit-compare fold fired after rotation"
 [[ $folds_off -gt 0 ]] || bad "the proof-based fold did not run without rotation"
 
-# One owner, one kill switch. Rotation must remain active under this control.
+# One global owner switch kills every affine producer; rotation stays active.
 CCC_LOOP_ROTATE=1 CCC_NO_AFFINE_EXIT_FOLD=1 CCC_DEBUG_LOOP_ROTATE=1 CCC_DEBUG_AFFINE_FOLD=1 "$CCC" \
     -O2 -march=x86-64-v3 -S "$corpus" -o "$work/rotkilled.s" 2> "$work/rotkilled.dbg" \
     || bad "rotated kill-switch -S build failed"
-folds_killed=$(grep -cF "[AFFOLD]" "$work/rotkilled.dbg" || true)
+folds_killed=$(late_reports "$work/rotkilled.dbg")
 note "rotated with CCC_NO_AFFINE_EXIT_FOLD=1: $folds_killed proof-based fold report(s)"
 [[ $folds_killed -eq 0 ]] \
     || bad "CCC_NO_AFFINE_EXIT_FOLD left the rotation clone fold running ($folds_killed report(s))"
 # ... and rotation itself still ran, or the line above would be vacuous.
 grep -qF "[ROT] candidate:" "$work/rotkilled.dbg" \
     || bad "rotation did not run under the fold kill switch (test would be vacuous)"
+
+# CCC_NO_AFFINE_EXIT_FOLD is the global owner switch: it must silence the
+# early unsigned canonicalizer as well, not only the late/clone producer.
+early_killed=$(grep -cF '(early unsigned)' "$work/rotkilled.dbg" || true)
+[[ $early_killed -eq 0 ]] \
+    || bad "global kill switch left the early unsigned producer running"
+CCC_LOOP_ROTATE=1 CCC_NO_AFFINE_EXIT_FOLD=1 CCC_DISABLE_PASSES=loop_bound \
+    CCC_DEBUG_LOOP_ROTATE=1 CCC_DEBUG_AFFINE_FOLD=1 "$CCC" \
+    -O2 -march=x86-64-v3 -S "$corpus" -o "$work/bothkilled.s" 2> "$work/bothkilled.dbg" \
+    || bad "both-owners-disabled -S build failed"
+all_killed=$(grep -cF '[AFFOLD]' "$work/bothkilled.dbg" || true)
+[[ $all_killed -eq 0 ]] || bad "an affine producer survived both disable controls"
+grep -qF '[ROT] candidate:' "$work/bothkilled.dbg" \
+    || bad "rotation did not run with both fold owners disabled"
 
 # ---------------------------------------------------------------- contract 3
 note "contract 3: f_const is the folded loop rotated and unrotated"

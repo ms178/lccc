@@ -82,6 +82,18 @@ def main():
                     execute(name, cc, args.root / "tests/regression/affine_control_proof.c",
                             flags, [], "affine-control-proof 5 97\n", environment,
                             abi=abi, opt=opt, rotation=rotation)
+                    execute(name, cc, args.root / "tests/optimizer/wrapv_runtime_iv.c",
+                            flags, [], "runtime signed IV: PASS 1000\n", environment,
+                            abi=abi, opt=opt, rotation=rotation)
+                    execute(name, cc, args.root / "tests/regression/signed_scale_ring_wrap.c",
+                            flags, [], "signed scale ring: PASS 16\n", environment,
+                            abi=abi, opt=opt, rotation=rotation)
+                    execute(name, cc, args.root / "tests/regression/i32_address_canonical.c",
+                            flags, [], "i32 address canonical: PASS 82\n", environment,
+                            abi=abi, opt=opt, rotation=rotation)
+                    execute(name, cc, args.root / "tests/regression/integer_pointer_width.c",
+                            flags, [], "integer pointer widths: PASS\n", environment,
+                            abi=abi, opt=opt, rotation=rotation)
                     for case, expected in enumerate(("28", "-1073665362", "1", "10")):
                         execute(name, cc, args.extra_root / "tests/regression/wrapv_domains.c",
                                 flags, [str(case)], expected + "\n", environment,

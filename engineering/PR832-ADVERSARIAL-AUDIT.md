@@ -1,4 +1,10 @@
-# PR832 versus S34 — empirical red-team audit (in progress)
+# PR832 versus S34 — historical investigation snapshot (2026-10-15)
+
+This document preserves the investigation at its stated revisions; unfinished
+items are historical debt, not current acceptance or promises of completion.
+Follow-up dispositions and current limitations are maintained in
+[PR835-REVIEW-AUDIT.md](PR835-REVIEW-AUDIT.md). Earlier intermediate candidates
+and performance losses below must not be described as the final PR835 result.
 
 ## Identities and scope
 

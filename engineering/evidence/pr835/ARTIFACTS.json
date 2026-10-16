@@ -1,8 +1,70 @@
 {
   "schema": 1,
-  "source_head": "4216f897460be1eef08cc0f24e8b6016cd738283",
-  "scope": "Imported historical evidence, not validation or performance claims for the combined compiler. Original paths and bytes remain in the pinned PR835 commit and recovery bundle.",
+  "baseline": "f07f4c514460e4116a574773cd84b69d185bf65e",
+  "original_pr": "4216f897460be1eef08cc0f24e8b6016cd738283",
+  "purpose": "Byte integrity, complete bounded scope and canonical aliases; not reproduction or hardware performance",
+  "coverage_roots": [
+    "engineering/evidence/pr821-822-redteam",
+    "engineering/evidence/pr824-redteam",
+    "engineering/evidence/pr829-830",
+    "engineering/evidence/pr833",
+    "engineering/evidence/pr835"
+  ],
+  "coverage_files": [
+    "engineering/evidence/README.md",
+    "engineering/evidence/pr832/ARTIFACTS.json",
+    "engineering/evidence/pr832/requested-screening.json"
+  ],
+  "canonical_aliases": [
+    {
+      "former_path": "engineering/evidence/pr824-redteam/oracle-versions.txt",
+      "canonical_path": "engineering/evidence/pr821-822-redteam/godbolt-audit.txt",
+      "sha256": "3e30ebad3acf8820b54ec97395f16d37a8a8e08ce54b2778d3712410f622bfe7",
+      "bytes": 856
+    },
+    {
+      "former_path": "engineering/evidence/pr824-redteam/pr824-s24-byte.txt",
+      "canonical_path": "engineering/evidence/pr824-redteam/byte-inline-after.txt",
+      "sha256": "afb3cf255dff044f2093a6bdc1988add8df6b404a7a7ca6a41b790a50b518ef7",
+      "bytes": 120
+    },
+    {
+      "former_path": "engineering/evidence/pr824-redteam/pr824-s24-affine.txt",
+      "canonical_path": "engineering/evidence/pr824-redteam/pr824-control-gate-after.txt",
+      "sha256": "d5c9be9070e66f192a8ca0aa894184e5b3bed1c307c6498678e19cf0cad85c08",
+      "bytes": 988
+    },
+    {
+      "former_path": "engineering/evidence/pr824-redteam/pr824-rotation-unsigned-after.txt",
+      "canonical_path": "engineering/evidence/pr824-redteam/pr824-control-unsigned-after.txt",
+      "sha256": "c79b7627a34e9aa7d5d7765c4684129d94f5bd7732ce730360a8b38410ee56c2",
+      "bytes": 289
+    },
+    {
+      "former_path": "engineering/evidence/pr824-redteam/pr824-s24-unsigned.txt",
+      "canonical_path": "engineering/evidence/pr824-redteam/pr824-control-unsigned-after.txt",
+      "sha256": "c79b7627a34e9aa7d5d7765c4684129d94f5bd7732ce730360a8b38410ee56c2",
+      "bytes": 289
+    },
+    {
+      "former_path": "engineering/evidence/pr824-redteam/pr824-unsigned-after.txt",
+      "canonical_path": "engineering/evidence/pr824-redteam/pr824-control-unsigned-after.txt",
+      "sha256": "c79b7627a34e9aa7d5d7765c4684129d94f5bd7732ce730360a8b38410ee56c2",
+      "bytes": 289
+    },
+    {
+      "former_path": "engineering/evidence/pr824-redteam/pr824-unsigned-before.txt",
+      "canonical_path": "engineering/evidence/pr824-redteam/pr824-rotation-unsigned-enabled.txt",
+      "sha256": "1386c084ca37634607429f4bf19d6437b1e716b47fd054b04798ed09eb00544f",
+      "bytes": 235
+    }
+  ],
   "artifacts": [
+    {
+      "path": "engineering/evidence/README.md",
+      "bytes": 10420,
+      "sha256": "534fc11833c91b057b5d86e9493e39310e1fe334edf05a5b8c8dcd71086035f3"
+    },
     {
       "path": "engineering/evidence/pr821-822-redteam/INDEX.json",
       "bytes": 5236,
@@ -86,7 +148,8 @@
     {
       "path": "engineering/evidence/pr821-822-redteam/measurements.tar.gz",
       "bytes": 252276,
-      "sha256": "2816c5dce4e276fc713a65b3a5afc3b265946013804f4adf9942c9ca9035345f"
+      "sha256": "2816c5dce4e276fc713a65b3a5afc3b265946013804f4adf9942c9ca9035345f",
+      "raw_sha256": "3489260ee9f06873a50728c6de9118f9c0d105717d80e6e72cc109bf9157f338"
     },
     {
       "path": "engineering/evidence/pr821-822-redteam/memcheck.json",
@@ -121,12 +184,14 @@
     {
       "path": "engineering/evidence/pr821-822-redteam/repeated-measurements.tar.gz",
       "bytes": 645458,
-      "sha256": "6bbc2918b26be1161b1639a7710873c67f570acfe5e0cd70a335815d9986f383"
+      "sha256": "6bbc2918b26be1161b1639a7710873c67f570acfe5e0cd70a335815d9986f383",
+      "raw_sha256": "d84691ed2897b728a1fc51acb8a46269cd23d937fc700288009be590d21f3c69"
     },
     {
       "path": "engineering/evidence/pr821-822-redteam/workloads.tar.gz",
       "bytes": 20663,
-      "sha256": "74fd05b575a341db554799058bd656e4e55c2755da7d1b8d805bc7b5730693f6"
+      "sha256": "74fd05b575a341db554799058bd656e4e55c2755da7d1b8d805bc7b5730693f6",
+      "raw_sha256": "4b0e586cfd5f029c427bd7f6eed092772be39bae0a7fcb5ade8e8342ba0e92da"
     },
     {
       "path": "engineering/evidence/pr824-redteam/EXTERNAL-RAW.json",
@@ -259,6 +324,11 @@
       "sha256": "90d624f10ae5a1358a469e9360ae2d1955ac5de67f2b4515bb618e3e4c478480"
     },
     {
+      "path": "engineering/evidence/pr824-redteam/pr824-control-unsigned-after.txt",
+      "bytes": 289,
+      "sha256": "c79b7627a34e9aa7d5d7765c4684129d94f5bd7732ce730360a8b38410ee56c2"
+    },
+    {
       "path": "engineering/evidence/pr824-redteam/pr824-gcc16-after.txt",
       "bytes": 487,
       "sha256": "7cbc785741c4c627b294a35ed4e36d432622bc9a5127a5787dec6f570ae2f589"
@@ -309,19 +379,14 @@
       "sha256": "4d79e3539c93601a9fe61cd2989f299b13bcc3349a7ef847039a69ab7af82b9b"
     },
     {
+      "path": "engineering/evidence/pr824-redteam/pr824-rotation-unsigned-enabled.txt",
+      "bytes": 235,
+      "sha256": "1386c084ca37634607429f4bf19d6437b1e716b47fd054b04798ed09eb00544f"
+    },
+    {
       "path": "engineering/evidence/pr824-redteam/pr824-signed-control-before.txt",
       "bytes": 326,
       "sha256": "9a0fa5815f98112b33d846b809c1a66ed5506df13d9c269e3ab60b2ba5e7e6a7"
-    },
-    {
-      "path": "engineering/evidence/pr824-redteam/pr824-unsigned-after.txt",
-      "bytes": 289,
-      "sha256": "c79b7627a34e9aa7d5d7765c4684129d94f5bd7732ce730360a8b38410ee56c2"
-    },
-    {
-      "path": "engineering/evidence/pr824-redteam/pr824-unsigned-before.txt",
-      "bytes": 235,
-      "sha256": "1386c084ca37634607429f4bf19d6437b1e716b47fd054b04798ed09eb00544f"
     },
     {
       "path": "engineering/evidence/pr824-redteam/pr824-unsigned-existing.txt",
@@ -557,50 +622,112 @@
       "path": "engineering/evidence/pr833/summary.json",
       "bytes": 35752,
       "sha256": "3453b4d0e0d75189dccbd902bf0e50521986e34c65cca2bc99bbb15b2525ed3e"
-    }
-  ],
-  "deduplicated": [
-    {
-      "original": "engineering/evidence/pr824-redteam/oracle-versions.txt",
-      "retained": "engineering/evidence/pr821-822-redteam/godbolt-audit.txt",
-      "bytes": 856,
-      "sha256": "3e30ebad3acf8820b54ec97395f16d37a8a8e08ce54b2778d3712410f622bfe7"
     },
     {
-      "original": "engineering/evidence/pr824-redteam/pr824-s24-byte.txt",
-      "retained": "engineering/evidence/pr824-redteam/byte-inline-after.txt",
-      "bytes": 120,
-      "sha256": "afb3cf255dff044f2093a6bdc1988add8df6b404a7a7ca6a41b790a50b518ef7"
+      "path": "engineering/evidence/pr835/README.md",
+      "bytes": 1324,
+      "sha256": "21d0532d5e75f23a8960ce4df77c83ccc059ce665ce45ca66719ebc7d47704ea"
     },
     {
-      "original": "engineering/evidence/pr824-redteam/pr824-s24-affine.txt",
-      "retained": "engineering/evidence/pr824-redteam/pr824-control-gate-after.txt",
-      "bytes": 988,
-      "sha256": "d5c9be9070e66f192a8ca0aa894184e5b3bed1c307c6498678e19cf0cad85c08"
+      "path": "engineering/evidence/pr835/byte-count-build.log.gz",
+      "bytes": 611,
+      "sha256": "00c0644ed717f40e113da5016f0568cbf25620ddb69d4641136bc236451e34f4",
+      "raw_sha256": "9078667ad6fb83787ed85e958b52c05d46e79f27fb6ee954096b0fb1ee4e94ec"
     },
     {
-      "original": "engineering/evidence/pr824-redteam/pr824-control-unsigned-after.txt",
-      "retained": "engineering/evidence/pr824-redteam/pr824-unsigned-after.txt",
-      "bytes": 289,
-      "sha256": "c79b7627a34e9aa7d5d7765c4684129d94f5bd7732ce730360a8b38410ee56c2"
+      "path": "engineering/evidence/pr835/byte-count-native.json",
+      "bytes": 11345,
+      "sha256": "8f85bc3a457e774f669d8d86ba71cc1d5d69cfb55ff598a4ad198acb6a0a62a6"
     },
     {
-      "original": "engineering/evidence/pr824-redteam/pr824-rotation-unsigned-after.txt",
-      "retained": "engineering/evidence/pr824-redteam/pr824-unsigned-after.txt",
-      "bytes": 289,
-      "sha256": "c79b7627a34e9aa7d5d7765c4684129d94f5bd7732ce730360a8b38410ee56c2"
+      "path": "engineering/evidence/pr835/byte-count-native94.json.gz",
+      "bytes": 1832,
+      "sha256": "c13818610a11fe826881b832737e2d790e9a83e6a6d91d39443fc8c81e63986e",
+      "raw_sha256": "747b5f567686579478a5815ce33ac94ed01b28ca7b1a955d608e8e02baa355d2"
     },
     {
-      "original": "engineering/evidence/pr824-redteam/pr824-s24-unsigned.txt",
-      "retained": "engineering/evidence/pr824-redteam/pr824-unsigned-after.txt",
-      "bytes": 289,
-      "sha256": "c79b7627a34e9aa7d5d7765c4684129d94f5bd7732ce730360a8b38410ee56c2"
+      "path": "engineering/evidence/pr835/byte-count-tests.log.gz",
+      "bytes": 440,
+      "sha256": "2f40d0be69a1ea530fcdcf7b7e66a898481165dbb01a781fb7d73b9188976d48",
+      "raw_sha256": "e1cf28e612f335e1b1c9f21a69deafcbd91da1a724893b45f2bc029094e56752"
     },
     {
-      "original": "engineering/evidence/pr824-redteam/pr824-rotation-unsigned-enabled.txt",
-      "retained": "engineering/evidence/pr824-redteam/pr824-unsigned-before.txt",
-      "bytes": 235,
-      "sha256": "1386c084ca37634607429f4bf19d6437b1e716b47fd054b04798ed09eb00544f"
+      "path": "engineering/evidence/pr835/checks-latest.json.gz",
+      "bytes": 2902,
+      "sha256": "c5812fce21d9737479c2f3349e9b8f678658d6d0c816fa08c327703734afae1e",
+      "raw_sha256": "a3633560ec72b3e7571c95cb80410e970aeebbbeec73df324461aee038a83ae4"
+    },
+    {
+      "path": "engineering/evidence/pr835/fenv-after.json.gz",
+      "bytes": 1654,
+      "sha256": "c42827023f3b55315a90b177b3d2c82bd02ebdfa8c6b7bf1fc21d45972376941",
+      "raw_sha256": "51e4c9ea9d8cd1557714dbbb50250a41f720bb10719199adb09e3a467285408a"
+    },
+    {
+      "path": "engineering/evidence/pr835/fenv-compiler-work.json",
+      "bytes": 35555,
+      "sha256": "b8289f75521c4353c16cd199c79e18b5d68e6ba59a97663c3b114c0a20d7d953"
+    },
+    {
+      "path": "engineering/evidence/pr835/fenv-compiler-work.log.gz",
+      "bytes": 173,
+      "sha256": "c7a24fefc449dca5f810dd6a6a6e92a42a48d859f3dc950290244f75dc1f188c",
+      "raw_sha256": "4008d9b47a36e3a3b2b12fa62acd77036e4aa0bf0d274a70f92c44f1fab5d2e4"
+    },
+    {
+      "path": "engineering/evidence/pr835/fenv-native94.json.gz",
+      "bytes": 1831,
+      "sha256": "9067b81c5d636e9f35516eb99bb2a48059474ce8745203ab5d33a8e273e0a676",
+      "raw_sha256": "13b863bf48e50d8cce17dab7e8cfaa20f8d9bbbd7cec9b935472cc8105b16265"
+    },
+    {
+      "path": "engineering/evidence/pr835/fenv-validation.log.gz",
+      "bytes": 2436,
+      "sha256": "8f7bd7258641dd8cf093f70920280865eb3c017190944a2369e8f34860aa399f",
+      "raw_sha256": "f4889a12343343d9b56cf91404d353098ac380d849340bc045bcee3002d27954"
+    },
+    {
+      "path": "engineering/evidence/pr835/integration-2f477ce.md",
+      "bytes": 2069,
+      "sha256": "0e1d64a975bab738e5819671a83a729a1dd46626965b1e25e59dd607f90364cc"
+    },
+    {
+      "path": "engineering/evidence/pr835/loop-bound-native94.json.gz",
+      "bytes": 1812,
+      "sha256": "8e404fc550f2581192c583aed10aca721719e0180dad9a4ac3833a3e9fea0927",
+      "raw_sha256": "5df3af81ede2ed006513c2115dfdd08d00031d5c48ea47eb0bdb70530e3ce619"
+    },
+    {
+      "path": "engineering/evidence/pr835/loop-bound-validation.log.gz",
+      "bytes": 685,
+      "sha256": "ba28e640d4dcec5409b5423939d1cf059affcaca95bf391069330bf2e38d6f5b",
+      "raw_sha256": "c52d27c1f27040cb2741f67e57ba3031aca96ba7fa2b3f70d7485a886690bfe9"
+    },
+    {
+      "path": "engineering/evidence/pr835/paired-callgrind-raw.tar.xz",
+      "bytes": 404452,
+      "sha256": "c71913a6d841e8113e8db148a94b2a8512cffe4a3b93a894d8fc3eb05515cca6"
+    },
+    {
+      "path": "engineering/evidence/pr835/strict-refactor-packed.json",
+      "bytes": 30239,
+      "sha256": "b46fa7500da297729350bef0b5494336d1fb1a7957057c48e25c09532996abcc"
+    },
+    {
+      "path": "engineering/evidence/pr835/strict-refactor.log.gz",
+      "bytes": 850,
+      "sha256": "07588606f16440b3093506222ccdf1879b26ea2d3dc310d3fee5dc5eef4bffa8",
+      "raw_sha256": "c6aa07c8977c66646a1c5eaef9c04d600b046bb3cca12b7a5863ce838b1aca58"
+    },
+    {
+      "path": "engineering/evidence/pr835/typed-widen-2f477ce.json.gz",
+      "bytes": 19282,
+      "sha256": "1e3b4da977a3ce4d824510a3b417cbc44b655de2b44df04b6c4a48a9ef5bafbc"
+    },
+    {
+      "path": "engineering/evidence/pr835/typed-widen-2f477ce.md",
+      "bytes": 2859,
+      "sha256": "7857cfe4ecfe79cbe003ffceb69646a40b766b212465a07ea4be9b5c3797c297"
     }
   ]
 }

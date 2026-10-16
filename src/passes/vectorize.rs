@@ -76,6 +76,11 @@
 //! - `LCCC_FORCE_AVX2=1`: Explicitly enable AVX2 (default behavior, provided for clarity)
 //! - `LCCC_DEBUG_VECTORIZE=1`: Enable debug output for vectorization pass
 
+#[path = "vectorize_byte_count_normalize.rs"]
+mod byte_count_normalize;
+#[path = "vectorize_strict_recip.rs"]
+mod strict_recip;
+
 use crate::common::fp_contract::FpContract;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
@@ -111,6 +116,9 @@ thread_local! {
     // are legal for this particular lowering.
     static X86_STRICT_RECIP_AVX2_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static STRICT_RECIP_PACK_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    // Performance-only ablation, reset for every TU from the pipeline's one
+    // disabled-pass snapshot. Language semantics remain owned by PassPolicy.
+    static BYTE_COUNT_NORMALIZE_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     // x86 SIMD register-file availability for the MIDDLE END. Every vector
     // lowering this pass emits (VecLoadI32x8, VecAndI32x8, FmaF64x4, ...)
     // becomes an xmm/ymm instruction in the backend. The Linux kernel is built
@@ -388,6 +396,10 @@ pub(crate) fn set_strict_recip_pack_enabled(enabled: bool) {
     STRICT_RECIP_PACK_ENABLED.with(|cell| cell.set(enabled));
 }
 
+pub(crate) fn set_byte_count_normalize_enabled(enabled: bool) {
+    BYTE_COUNT_NORMALIZE_ENABLED.with(|cell| cell.set(enabled));
+}
+
 fn x86_strict_recip_avx2_enabled() -> bool {
     X86_STRICT_RECIP_AVX2_AVAILABLE.with(|available| available.get())
 }
@@ -507,6 +519,10 @@ fn vectorize_with_analysis_mode(
         return 0;
     }
 
+    let normalize_byte_count = BYTE_COUNT_NORMALIZE_ENABLED.with(std::cell::Cell::get);
+    // One local snapshot replaces six reads/allocations inside candidate loops.
+    let force_sse2 = std::env::var("LCCC_FORCE_SSE2").is_ok();
+
     let mut total_changes = 0;
 
     // Process innermost loops (loops that don't contain other loops).
@@ -577,8 +593,7 @@ fn vectorize_with_analysis_mode(
         };
         if let Some(mut pattern) = matmul_pattern {
             // Select vector width: default to AVX2 (4-wide) unless explicitly disabled
-            let use_sse2 =
-                force_two_wide || std::env::var("LCCC_FORCE_SSE2").is_ok() || !x86_avx2_available();
+            let use_sse2 = force_two_wide || force_sse2 || !x86_avx2_available();
             let vec_width: i64 = if use_sse2 { 2 } else { 4 };
             // The AArch64 two-wide lowering emits both halves per iteration,
             // consuming four doubles. Use the real machine-step width for the
@@ -650,7 +665,7 @@ fn vectorize_with_analysis_mode(
         } else if !neon
             && !force_two_wide
             && !late_minmax_only()
-            && std::env::var("LCCC_FORCE_SSE2").is_err()
+            && !force_sse2
             && x86_strict_recip_avx2_enabled()
             && let Some(strict_pattern) =
                 analyze_strict_computed_recip_reduction(func, loop_info, cfg)
@@ -694,7 +709,7 @@ fn vectorize_with_analysis_mode(
         } else if !neon
             && !force_two_wide
             && !late_minmax_only()
-            && std::env::var("LCCC_FORCE_SSE2").is_err()
+            && !force_sse2
             && x86_avx2_available()
             && let Some(count_pattern) = analyze_byte_count_loop(func, loop_info, cfg)
         {
@@ -717,7 +732,21 @@ fn vectorize_with_analysis_mode(
         } else if !neon
             && !force_two_wide
             && !late_minmax_only()
-            && std::env::var("LCCC_FORCE_SSE2").is_err()
+            && !force_sse2
+            && x86_avx2_available()
+            && normalize_byte_count
+            && let n = byte_count_normalize::transform(func, loop_info, cfg)
+            && n > 0
+        {
+            if debug {
+                eprintln!("[VEC] Normalized byte-count reduction matched: {n}");
+            }
+            total_changes += n;
+            continue;
+        } else if !neon
+            && !force_two_wide
+            && !late_minmax_only()
+            && !force_sse2
             && x86_avx2_available()
             && let Some(adler_pattern) = analyze_adler_loop(func, loop_info, cfg)
         {
@@ -903,8 +932,7 @@ fn vectorize_with_analysis_mode(
             }
 
             // Try reduction pattern vectorization (sum += arr[i], sum += a[i] * b[i], etc.)
-            let use_sse2 =
-                force_two_wide || std::env::var("LCCC_FORCE_SSE2").is_ok() || !x86_avx2_available();
+            let use_sse2 = force_two_wide || force_sse2 || !x86_avx2_available();
             let vec_width: i64 = if use_sse2 { 2 } else { 4 };
 
             // Same profitability gate as the matmul path (the reduction path
@@ -18417,6 +18445,9 @@ fn find_inst_in_loop<'a>(
 // important: this is a correctness feature, not a relaxed fast-math path.
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Retain the upstream planner for differential tests of common admitted DAGs.
+// Production uses strict_recip; reference-only tests are not execution proof.
+#[cfg(test)]
 mod strict_i32_pack;
 
 #[derive(Debug)]
@@ -19064,44 +19095,42 @@ fn transform_strict_computed_recip_reduction(
     // Build every new instruction before changing the original CFG.  A future
     // extension which accidentally widens the accepted DAG therefore fails as
     // an all-or-nothing no-op rather than leaving half-versioned IR behind.
-    let mut vector_body_instructions = Vec::new();
-    let mut lane_ivs = Vec::with_capacity(4);
-    lane_ivs.push(vector_iv);
-    for lane in 1..4 {
-        let lane_iv = fresh_strict_value(&mut next_value_id);
-        vector_body_instructions.push(Instruction::BinOp {
-            dest: lane_iv,
-            op: IrBinOp::Add,
-            lhs: Operand::Value(vector_iv),
-            rhs: Operand::Const(IrConst::I32(lane)),
-            ty: IrType::I32,
-        });
-        lane_ivs.push(lane_iv);
-    }
-
-    let packed = STRICT_RECIP_PACK_ENABLED
-        .with(|cell| cell.get())
-        .then(|| {
-            strict_i32_pack::build(
-                &func.blocks[pattern.body_idx],
-                pattern.iv,
-                vector_iv,
-                pattern.denominator,
-                next_value_id,
-            )
-        })
-        .flatten();
+    let packed_plan = STRICT_RECIP_PACK_ENABLED.with(|enabled| {
+        if !enabled.get() {
+            return None;
+        }
+        strict_recip::build_plan(func, pattern, vector_iv, next_value_id)
+    });
     let mut prefix = Vec::new();
-    let mut args = vec![Operand::Value(vector_sum)];
-    let op = if let Some(plan) = packed {
+    let mut vector_body_instructions;
+    let mut denominator_args = Vec::new();
+    let intrinsic = if let Some(plan) = packed_plan {
         next_value_id = plan.next;
         prefix = plan.prefix;
-        vector_body_instructions.extend(plan.instructions);
-        args.push(Operand::Value(plan.denominator));
+        vector_body_instructions = plan.instructions;
+        denominator_args.push(Operand::Value(plan.denominator));
         IntrinsicOp::StrictRecipMulAddPackedF64x4
     } else {
-        // The packed builder owns speculative instructions and IDs. Failure
-        // leaves the caller's counter and prebuilt scalar lane IVs unchanged.
+        // The private allocator MAY have advanced before a later DAG operand
+        // failed. Discard its instructions AND IDs together; equality with
+        // next_value_id would be an invalid assertion. The scalar fallback
+        // owns the unchanged caller counter, so none of those IDs escape.
+        vector_body_instructions = Vec::new();
+        let mut lane_ivs = Vec::with_capacity(4);
+        lane_ivs.push(vector_iv);
+        for lane in 1..4 {
+            let lane_iv = fresh_strict_value(&mut next_value_id);
+            vector_body_instructions.push(Instruction::BinOp {
+                dest: lane_iv,
+                op: IrBinOp::Add,
+                lhs: Operand::Value(vector_iv),
+                rhs: Operand::Const(IrConst::I32(lane)),
+                ty: IrType::I32,
+            });
+            lane_ivs.push(lane_iv);
+        }
+
+        let mut denominators = Vec::with_capacity(4);
         for lane_iv in lane_ivs {
             let mut cache = FxHashMap::default();
             let denominator = clone_strict_i32_dag_for_lane(
@@ -19114,8 +19143,10 @@ fn transform_strict_computed_recip_reduction(
                 &mut vector_body_instructions,
                 &mut next_value_id,
             )?;
-            args.push(Operand::Value(denominator));
+            denominators.push(denominator);
         }
+
+        denominator_args.extend(denominators.into_iter().map(Operand::Value));
         IntrinsicOp::StrictRecipMulAddF64x4
     };
 
@@ -19135,6 +19166,8 @@ fn transform_strict_computed_recip_reduction(
         ty: IrType::I64,
     });
     let vector_sum_next = fresh_strict_value(&mut next_value_id);
+    let mut args = vec![Operand::Value(vector_sum)];
+    args.extend(denominator_args);
     args.extend([
         Operand::Value(pattern.source_base),
         Operand::Value(byte_offset),
@@ -19142,7 +19175,7 @@ fn transform_strict_computed_recip_reduction(
     ]);
     vector_body_instructions.push(Instruction::Intrinsic {
         dest: Some(vector_sum_next),
-        op,
+        op: intrinsic,
         dest_ptr: None,
         args,
     });
@@ -19253,7 +19286,8 @@ fn transform_strict_computed_recip_reduction(
         *value = replacement;
         *label = vector_header_label;
     }
-    let change_count = 1 + vector_header.instructions.len() + vector_body.instructions.len() + 2;
+    let change_count =
+        1 + prefix.len() + vector_header.instructions.len() + vector_body.instructions.len() + 2;
 
     // `scratch` is normally unused by the direct XMM-result lowering, but it
     // gives the code generator a sound register-pressure fallback without

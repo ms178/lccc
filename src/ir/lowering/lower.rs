@@ -33,6 +33,8 @@ use std::mem::Discriminant;
 
 /// Lowers AST to IR (alloca-based, not yet SSA).
 pub struct Lowerer {
+    /// TU-owned arithmetic policy, including runtime expression lowering.
+    pub(super) pass_policy: crate::common::pass_policy::PassPolicy,
     /// Target architecture, used for ABI-specific lowering decisions
     pub(super) target: Target,
     pub(super) next_label: u32,
@@ -188,6 +190,14 @@ pub struct Lowerer {
 pub(crate) const ZERO_INIT_STORE_LADDER_MAX: usize = 128;
 
 impl Lowerer {
+    pub(crate) fn with_pass_policy(
+        mut self,
+        policy: crate::common::pass_policy::PassPolicy,
+    ) -> Self {
+        self.pass_policy = policy;
+        self
+    }
+
     /// Create a new Lowerer with pre-populated state from semantic analysis.
     ///
     /// The sema-provided TypeContext contains typedefs, enum constants, struct layouts,
@@ -220,6 +230,7 @@ impl Lowerer {
         }
 
         Self {
+            pass_policy: Default::default(),
             target,
             next_label: 0,
             next_string: 0,
@@ -1036,6 +1047,9 @@ impl Lowerer {
             .extern_function_symbols
             .extend(extern_function_symbols);
 
+        for function in &mut self.module.functions {
+            function.pass_policy = self.pass_policy;
+        }
         (self.module, self.diagnostics.into_inner())
     }
 

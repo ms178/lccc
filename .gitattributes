@@ -24,6 +24,14 @@
 Makefile        text eol=lf
 
 # Binary — never diff or touch line endings
+# Compressed evidence archives: `* text=auto` must never normalize a byte
+# stream whose SHA-256 is pinned by the evidence inventories.
+*.gz     binary
+*.xz     binary
+*.zip    binary
+*.tar    binary
+*.bz2    binary
+*.zst    binary
 *.png    binary
 *.jpg    binary
 *.jpeg   binary

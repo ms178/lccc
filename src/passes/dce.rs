@@ -131,9 +131,6 @@ const MULTI_BIT: u32 = 1 << 31;
 /// non-zero return as a "something changed" signal to iterate cooperating
 /// passes (DCE → simplifycfg → DCE, …).
 pub(crate) fn eliminate_dead_code(func: &mut IrFunction) -> usize {
-    if super::fp_environment_blocks_reordering(func) {
-        return 0;
-    }
     if func.blocks.is_empty() {
         return 0;
     }
@@ -226,7 +223,10 @@ pub(crate) fn eliminate_dead_code(func: &mut IrFunction) -> usize {
                     multi_defs.push(vec![first, fi]);
                 }
             }
-            if is_dce_root(inst, !allow_dead_allocas) {
+            if is_dce_root(inst, !allow_dead_allocas)
+                || (func.pass_policy.fp_environment_observable
+                    && super::policy::observes_fp_environment(inst))
+            {
                 live[fi as usize] = 1;
                 worklist.push(fi);
             }

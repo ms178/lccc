@@ -2372,6 +2372,7 @@ mod tests {
         };
 
         let func = IrFunction {
+            pass_policy: Default::default(),
             name: "test".to_string(),
             params: vec![],
             return_type: IrType::I32,
@@ -2440,6 +2441,7 @@ mod tests {
     fn test_non_commutative_not_cse() {
         // Test that a - b and b - a are NOT treated as the same
         let func = IrFunction {
+            pass_policy: Default::default(),
             name: "test".to_string(),
             params: vec![],
             return_type: IrType::I32,
@@ -2516,6 +2518,7 @@ mod tests {
     fn test_constant_cse() {
         // Two identical constant expressions should be CSE'd
         let func = IrFunction {
+            pass_policy: Default::default(),
             name: "test".to_string(),
             params: vec![],
             return_type: IrType::I32,
@@ -2600,6 +2603,7 @@ mod tests {
     fn test_cast_cse() {
         // Two identical casts should be CSE'd
         let func = IrFunction {
+            pass_policy: Default::default(),
             name: "test".to_string(),
             params: vec![],
             return_type: IrType::I64,
@@ -2686,6 +2690,7 @@ mod tests {
         // GEP CSE is currently disabled (creates Copy chains with stale registers).
         // This test verifies GEPs are NOT CSE'd.
         let func = IrFunction {
+            pass_policy: Default::default(),
             name: "test".to_string(),
             params: vec![],
             return_type: IrType::Ptr,
@@ -2764,6 +2769,7 @@ mod tests {
         // rename) and its uses read the dominator's value directly.
         // CFG: block0 -> block1 (block0 dominates block1)
         let func = IrFunction {
+            pass_policy: Default::default(),
             name: "test".to_string(),
             params: vec![],
             return_type: IrType::I32,
@@ -2875,6 +2881,7 @@ mod tests {
     /// of ABI/linkage metadata that GVN never inspects.
     fn fn_of(name: &str, blocks: Vec<BasicBlock>, next_value_id: u32) -> IrFunction {
         IrFunction {
+            pass_policy: Default::default(),
             name: name.to_string(),
             params: vec![],
             return_type: IrType::I32,
@@ -3616,6 +3623,7 @@ mod tests {
         // Expressions in block1 and block2 should NOT be CSE'd with each other,
         // since neither dominates the other.
         let func = IrFunction {
+            pass_policy: Default::default(),
             name: "test".to_string(),
             params: vec![],
             return_type: IrType::I32,
@@ -3733,6 +3741,7 @@ mod tests {
     /// Helper to create a minimal IrFunction with given blocks.
     fn make_func(blocks: Vec<BasicBlock>, next_value_id: u32) -> IrFunction {
         IrFunction {
+            pass_policy: Default::default(),
             name: "test".to_string(),
             params: vec![],
             return_type: IrType::I32,

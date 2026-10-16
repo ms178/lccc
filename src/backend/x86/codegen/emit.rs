@@ -13,8 +13,8 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
 use crate::delegate_to_impl;
 use crate::ir::reexports::{
-    AtomicOrdering, AtomicRmwOp, BlockId, IntrinsicOp, IrBinOp, IrCmpOp, IrConst, IrFunction,
-    IrUnaryOp, Operand, Value,
+    AtomicOrdering, AtomicRmwOp, BlockId, Instruction, IntrinsicOp, IrBinOp, IrCmpOp, IrConst,
+    IrFunction, IrUnaryOp, Operand, Value,
 };
 use std::sync::Arc;
 
@@ -953,6 +953,10 @@ pub struct X86Codegen {
     pub(super) needs_sext_values: FxHashSet<u32>,
     /// Signed homes consumed wide WITHOUT an explicit widening Cast.
     pub(super) implicit_sext_values: FxHashSet<u32>,
+    /// Actual signed I32 definitions, independent of home/storage width.
+    /// `value_types` is widened by consumers (a GEP turns an I32 result's
+    /// storage type into Ptr), so it cannot decide def-side signedness.
+    pub(super) signed_i32_defs: FxHashSet<u32>,
     /// Values whose low-32 form is PROVABLY NON-NEGATIVE because they are
     /// the result of a Clz/Ctz/Popcount on a type of at most 32 bits
     /// (PF-16b). Any 32-bit register write zeroes bits 32..63 on x86-64,
@@ -1024,7 +1028,8 @@ pub struct X86Codegen {
     /// never skipped unless the load truly delivered the value). Cleared by
     /// every non-redirecting load and by every emitted cast.
     pub(super) fold_skip_cast: Option<u32>,
-    /// Type of each SSA value (for type-aware stack slot loads/stores).
+    /// Storage-width type of each value, widened by consuming contexts.
+    /// NOT the definition's semantic type; see signed_i32_defs.
     pub(super) value_types: FxHashMap<u32, IrType>,
     /// Value ids whose 16-byte i128 slot home is written eagerly at their
     /// definition (i128 ParamRefs, 128-bit call results) — the only
@@ -1101,6 +1106,17 @@ pub struct X86Codegen {
     /// Diagnostic/profitability mask from CCC_MI_DISABLE_KINDS. Each bit
     /// disables one IR instruction family without disabling whole functions.
     pub(super) machinst_disabled_kinds: u32,
+}
+
+/// Mature codegen canonicalizes signed I32 definitions used at pointer width.
+/// Machine ALU operations currently describe only their 32-bit result, not
+/// that extra def-side obligation. Keep those producers on the mature path
+/// until machine IR can represent the required sign-extended home explicitly.
+/// This is a per-value boundary, not a function-wide MachInst disable, and is
+/// required even without -fwrapv (a non-overflowing result can be negative).
+fn machinst_result_needs_sext(inst: &Instruction, needs_sext: &FxHashSet<u32>) -> bool {
+    inst.result_type() == Some(IrType::I32)
+        && inst.dest().is_some_and(|dest| needs_sext.contains(&dest.0))
 }
 
 const MI_BINOP: u32 = 1 << 0;
@@ -1455,6 +1471,7 @@ impl X86Codegen {
             skip_i32_sext: false,
             needs_sext_values: FxHashSet::default(),
             implicit_sext_values: FxHashSet::default(),
+            signed_i32_defs: FxHashSet::default(),
             bitop_nonneg_values: FxHashSet::default(),
             fused_cmp_dests: FxHashMap::default(),
             fused_forward_dests: FxHashSet::default(),
@@ -3339,6 +3356,13 @@ impl X86Codegen {
             self.state.park_acc(dest.0, false);
             return;
         }
+        // Every accumulator producer shares this boundary. Memory-source
+        // ALU shortcuts and unary operations can leave only the low 32 bits
+        // valid even on the mature path. A wide consumer must never observe
+        // the zero/stale upper half of a negative signed result.
+        if self.signed_i32_defs.contains(&dest.0) {
+            self.emit_sext32_for_value("eax", "rax", false, dest.0);
+        }
         // Use movl (4 bytes) for small-slot values instead of movq (8 bytes).
         // This saves 1 byte per instruction (no REX prefix) and halves memory bandwidth.
         // Only safe when all loads of this value also use 32-bit form.
@@ -3434,54 +3458,11 @@ impl X86Codegen {
         self.store_rax_to(dest);
     }
 
-    /// Store %eax (32-bit) to a value's location using movl instead of movq.
-    /// Breaks false dependencies on upper 32 bits and halves memory bandwidth
-    /// for stack spills. Only safe when all subsequent loads of this value also
-    /// use 32-bit form (movl or movslq).
+    /// Store a low-32-bit result with the destination's canonical home width.
+    /// Both entry points must share sign-extension and small-slot handling:
+    /// a bare movq preserves upper bits but cannot manufacture a missing sext.
     pub(super) fn store_eax_to(&mut self, dest: &Value) {
-        if self
-            .state
-            .value_use_counts
-            .get(dest.0 as usize)
-            .copied()
-            .unwrap_or(0)
-            == 0
-        {
-            self.state.park_acc(dest.0, false);
-            return;
-        }
-        if let Some(&reg) = self.reg_assignments.get(&dest.0) {
-            if is_xmm_reg(reg) {
-                let reg_name = phys_reg_name(reg);
-                self.state
-                    .emit_fmt(format_args!("    movq %rax, %{}", reg_name));
-            } else {
-                // GPR register: use movq to preserve all 64 bits of the accumulator.
-                // movl would zero-extend the upper 32 bits, which loses sign
-                // information for negative I32 values that later flow into 64-bit
-                // operations (pointer arithmetic, imul) through callee-saved regs.
-                let reg_name = phys_reg_name(reg);
-                self.state
-                    .out
-                    .emit_instr_reg_reg("    movq", "rax", reg_name);
-            }
-        } else if let Some(slot) = self.state.get_slot(dest.0) {
-            if self.state.is_small_slot(dest.0) {
-                // 4-byte slot: writing all 8 bytes of %rax would clobber the
-                // neighbouring slot. The low 4 bytes carry the entire value;
-                // sign-extending consumers reload with movslq (needs-sext).
-                self.state.out.emit_instr_reg_rbp("    movl", "eax", slot.0);
-            } else {
-                // No register: store 64 bits to preserve sign extension.
-                self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
-            }
-        } else if !self.state.is_accumulator_location(dest.0) {
-            panic!(
-                "x86 codegen: live value {} has no assigned location",
-                dest.0
-            );
-        }
-        self.state.park_acc(dest.0, false);
+        self.store_rax_to(dest);
     }
 
     /// Load a value to %eax using movl (32-bit) from stack, or movl %regd, %eax
@@ -7522,6 +7503,9 @@ impl ArchCodegen for X86Codegen {
         {
             return false;
         }
+        if machinst_result_needs_sext(inst, &self.needs_sext_values) {
+            return false;
+        }
         // DE MORGAN SPLIT: And/Or + Cmp dests claimed by the branch split
         // must NOT take the MachInst fast path — the branch re-emits both
         // comparisons from the recorded operands, and the And/Or emits
@@ -10907,6 +10891,109 @@ mod switch_bound_emitter_tests {
                     assert!(out.contains("subq $1, %rax"), "{out}");
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod signed_result_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn accumulator_stores_share_the_canonical_signed_home_contract() {
+        for eax_entry in [false, true] {
+            for ty in [IrType::I32, IrType::U32, IrType::I64] {
+                for wide_consumer in [false, true] {
+                    let mut cg = X86Codegen::new();
+                    // A pointer-width use deliberately widens the storage
+                    // map, but must not erase the producer's signed type.
+                    cg.value_types
+                        .insert(9, if wide_consumer { IrType::Ptr } else { ty });
+                    if ty == IrType::I32 {
+                        cg.signed_i32_defs.insert(9);
+                    }
+                    cg.reg_assignments.insert(9, PhysReg(1));
+                    cg.state.value_use_counts = vec![1; 10];
+                    cg.skip_i32_sext = !wide_consumer;
+                    if wide_consumer {
+                        cg.needs_sext_values.insert(9);
+                    }
+                    if eax_entry {
+                        cg.store_eax_to(&Value(9));
+                    } else {
+                        cg.store_rax_to(&Value(9));
+                    }
+                    let out = &cg.state.out.buf;
+                    assert_eq!(
+                        out.contains("movslq"),
+                        ty == IrType::I32 && wide_consumer,
+                        "{out}"
+                    );
+                    assert!(out.contains("movq %rax, %rbx"), "{out}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn coalesced_signed_memory_updates_refresh_the_upper_half() {
+        use crate::backend::state::StackSlot;
+        for wide_consumer in [false, true] {
+            let mut cg = X86Codegen::new();
+            cg.state.value_use_counts = vec![1; 10];
+            cg.state.value_locations.insert(1, StackSlot(-8));
+            cg.state.value_locations.insert(9, StackSlot(-8));
+            cg.reg_assignments.insert(2, PhysReg(1));
+            cg.signed_i32_defs.insert(9);
+            cg.skip_i32_sext = !wide_consumer;
+            if wide_consumer {
+                cg.needs_sext_values.insert(9);
+            }
+            cg.emit_int_binop_impl(
+                &Value(9),
+                IrBinOp::Add,
+                &Operand::Value(Value(1)),
+                &Operand::Value(Value(2)),
+                IrType::I32,
+            );
+            let out = &cg.state.out.buf;
+            assert_eq!(out.contains("addl %ebx, -8(%rbp)"), !wide_consumer, "{out}");
+            assert_eq!(out.contains("movslq"), wide_consumer, "{out}");
+            if wide_consumer {
+                assert!(out.contains("movq %rax, -8(%rbp)"), "{out}");
+            }
+        }
+    }
+
+    #[test]
+    fn signed_i32_wide_consumers_keep_the_def_side_extension() {
+        let needed: FxHashSet<u32> = [9].into_iter().collect();
+        for ty in [IrType::I32, IrType::U32, IrType::I64, IrType::U64] {
+            for op in [IrBinOp::Add, IrBinOp::Sub, IrBinOp::Mul, IrBinOp::Shl] {
+                let inst = Instruction::BinOp {
+                    dest: Value(9),
+                    op,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty,
+                };
+                assert_eq!(
+                    machinst_result_needs_sext(&inst, &needed),
+                    ty == IrType::I32
+                );
+                assert!(!machinst_result_needs_sext(&inst, &FxHashSet::default()));
+            }
+            let load = Instruction::Load {
+                dest: Value(9),
+                ptr: Value(1),
+                ty,
+                seg_override: Default::default(),
+                volatile: false,
+            };
+            assert_eq!(
+                machinst_result_needs_sext(&load, &needed),
+                ty == IrType::I32
+            );
         }
     }
 }

@@ -37,7 +37,7 @@ pub fn run(module: &mut IrModule) -> usize {
     let mut total_changes = 0;
 
     // Phase 0: bounded evaluation of direct constant calls. This is a
-    // compile-time interpreter for pure integer IR, not a general symbolic
+    // compile-time interpreter for side-effect-free typed IR, not a general symbolic
     // executor. It handles small recursive specializations such as
     // ackermann(3, 11) while refusing memory, inline asm, indirect calls,
     // unbounded loops, or calls with non-constant arguments.
@@ -124,7 +124,7 @@ pub fn run(module: &mut IrModule) -> usize {
     total_changes
 }
 
-/// Evaluate direct calls whose arguments are all compile-time integer constants.
+/// Evaluate direct calls whose arguments are all compile-time constants.
 ///
 /// This intentionally works on a small, strict IR subset. Refusing a function
 /// is the default: a single load, store, indirect call, volatile operation, or
@@ -244,6 +244,12 @@ fn eval_const_function(
 
     let result = (|| {
         let func = module.functions.get(function_idx)?;
+        // The folder's scalar evaluators do support floating operands. Never
+        // use them to bypass the instruction-local FENV folding fence, including
+        // recursive evaluation through an otherwise integer-only wrapper.
+        if super::fp_environment_blocks_reordering(func) {
+            return None;
+        }
         if func.is_declaration
             || func.is_variadic
             || func.is_weak

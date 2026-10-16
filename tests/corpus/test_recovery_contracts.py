@@ -86,6 +86,30 @@ class RecoveryContract(unittest.TestCase):
         (self.art/'SESSION_BUNDLE.json').write_text(json.dumps(metadata));bundle_path.unlink()
         return archive
 
+    def test_retained_bundle_count_and_independent_byte_budgets(self):
+        for count in (16, 17, recovery.BUNDLE_ARCHIVE_MAX_MEMBERS):
+            self.assertTrue(recovery.bundle_archive_within_budget(count, 1, count))
+        self.assertFalse(recovery.bundle_archive_within_budget(65, 1, 65))
+        self.assertFalse(recovery.bundle_archive_within_budget(1, 64*1024*1024+1, 64*1024*1024+1))
+        self.assertFalse(recovery.bundle_archive_within_budget(17, 1, 256*1024*1024+1))
+        self.assertFalse(recovery.bundle_archive_within_budget(1, -1, 1))
+
+    def test_seventeen_retained_bundles_restore_exact_history(self):
+        archive = self.pack_bundle()
+        with tarfile.open(archive, 'r:xz') as tar:
+            data = tar.extractfile('lccc-session.bundle').read()
+        with tarfile.open(archive, 'w:xz', preset=0) as tar:
+            for index in range(17):
+                name = 'lccc-session.bundle' if index == 16 else f'old-{index}.bundle'
+                item = tarfile.TarInfo(name); item.size = len(data)
+                tar.addfile(item, io.BytesIO(data))
+        meta = json.loads((self.art/'SESSION_BUNDLE.json').read_text())
+        meta['bundle_archive_sha256'] = recovery.sha(archive)
+        (self.art/'SESSION_BUNDLE.json').write_text(json.dumps(meta))
+        result = recovery.recover(self.root/'restored', self.art, offline=True, allow_source_fallback=False)
+        self.assertTrue(result['exact_history'])
+        self.assertEqual(result['head'], self.head)
+
     def test_packed_bundle_offline_exact_history_without_persistent_extraction(self):
         self.pack_bundle()
         dest=self.root/'restored'

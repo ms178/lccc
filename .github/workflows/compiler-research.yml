@@ -20,13 +20,13 @@ jobs:
     # Explicit research only: no duplicated compiler builds on ordinary PRs.
     name: Targeted Callgrind main/candidate
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       RUSTUP_TOOLCHAIN: stable
       CARGO_BUILD_JOBS: "2"
       RUSTFLAGS: -D warnings
       BASELINE_REF: ${{ inputs.baseline_ref || 'main' }}
-      RESEARCH_CASES: nbody,libm_round_family,double_reduction,zlib_ng_adler32,linux_find_bit_scaled,lz4_match_extend
+      RESEARCH_CASES: sieve,nbody,libm_round_family,double_reduction,zlib_ng_adler32,linux_find_bit_scaled,lz4_match_extend
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -46,6 +46,7 @@ jobs:
           rustfmt --version
           cargo clippy --version
       - name: Build candidate and independently archived main baseline
+        timeout-minutes: 20
         shell: bash
         run: |
           set -euo pipefail
@@ -65,6 +66,7 @@ jobs:
           sha256sum target/fastbuild/lccc "$RUNNER_TEMP/research-main-target/fastbuild/lccc" \
             > results/research/compiler-binaries.sha256
       - name: Correctness-gated bounded Callgrind main/candidate A-B
+        timeout-minutes: 8
         run: |
           python3 scripts/callgrind_corpus.py \
             --mine target/fastbuild/lccc \
@@ -72,6 +74,7 @@ jobs:
             --gcc-include-command gcc-16 \
             --only "$RESEARCH_CASES" --out results/research/callgrind-main
       - name: Supplementary Callgrind against identified native GCC
+        timeout-minutes: 8
         # Identified native GCC16; this is not measured execution of CE binaries.
         run: |
           python3 scripts/callgrind_corpus.py \

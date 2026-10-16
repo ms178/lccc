@@ -17,7 +17,7 @@ jobs:
     # External service availability is not a required PR check. Strict mode
     # makes outages visibly fail this research job, retaining its report.
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       CARGO_BUILD_JOBS: '2'
       CARGO_PROFILE_FASTBUILD_DEBUG: '0'
@@ -38,8 +38,10 @@ jobs:
             ~/.cargo/git
           key: ${{ runner.os }}-oracle-delta-cargo-${{ hashFiles('Cargo.lock') }}
       - name: Build O1 with two jobs
+        timeout-minutes: 15
         run: bash scripts/build_lccc_fast.sh
       - name: Execute three-vendor delta gate
+        timeout-minutes: 25
         run: python3 scripts/oracle_delta_gate.py --strict --report results/oracle-delta/report.json
       - uses: actions/upload-artifact@v7
         if: always()

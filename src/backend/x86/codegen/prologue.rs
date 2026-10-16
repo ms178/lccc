@@ -16,6 +16,170 @@ use crate::ir::reexports::{
     Instruction, IntrinsicOp, IrBinOp, IrCmpOp, IrFunction, Operand, Terminator, Value,
 };
 
+/// Find raw-wide home demand and semantic signed-I32 definitions before RA.
+/// Consumer-promoted storage types must not replace the producer's signed type.
+/// Copy/Phi carry whole homes, so demand propagates backwards to a fixed point;
+/// explicit integer casts instead perform their own extension at consumption.
+///
+/// Returns three sets:
+///   * `needs_sext_set`  — values whose 8-byte home must hold the canonical
+///     sign-extended form (raw-wide consumers, incl. the F128 cast source);
+///   * `implicit_sext_set` — the subset demanded WITHOUT an explicit widening
+///     Cast. Typed Cast extends its own input at consumption, so MachInst
+///     producers only need canonical wide homes for non-cast wide reads,
+///     transitively through Copy/Phi. Do not add duplicate extensions to
+///     cast-only IVs.
+///   * `signed_i32_defs` — actual signed I32 definitions, independent of
+///     consumer-widened storage types.
+fn signed_i32_home_requirements(
+    func: &IrFunction,
+) -> (FxHashSet<u32>, FxHashSet<u32>, FxHashSet<u32>) {
+    let is_64 = |t: &IrType| matches!(t, IrType::I64 | IrType::U64 | IrType::Ptr | IrType::F128);
+    let mut needs_sext_set: FxHashSet<u32> = FxHashSet::default();
+    let mut implicit_sext_set: FxHashSet<u32> = FxHashSet::default();
+    let mut signed_i32_defs = FxHashSet::default();
+    // copy_phi_srcs[dest] = list of value sources (from Copy/Phi) whose
+    // 64-bit value flows into `dest`. Built in pass 1, used in pass 2.
+    let mut copy_phi_srcs: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    let mark = |op: &Operand, set: &mut FxHashSet<u32>| {
+        if let Operand::Value(v) = op {
+            set.insert(v.0);
+        }
+    };
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if inst.result_type() == Some(IrType::I32) {
+                if let Some(dest) = inst.dest() {
+                    signed_i32_defs.insert(dest.0);
+                }
+            }
+            match inst {
+                Instruction::BinOp { ty, lhs, rhs, .. } if is_64(ty) => {
+                    mark(lhs, &mut needs_sext_set);
+                    mark(lhs, &mut implicit_sext_set);
+                    mark(rhs, &mut needs_sext_set);
+                    mark(rhs, &mut implicit_sext_set);
+                }
+                Instruction::Cmp { ty, lhs, rhs, .. } if is_64(ty) => {
+                    mark(lhs, &mut needs_sext_set);
+                    mark(lhs, &mut implicit_sext_set);
+                    mark(rhs, &mut needs_sext_set);
+                    mark(rhs, &mut implicit_sext_set);
+                }
+                Instruction::Store { ty, val, .. } if is_64(ty) => {
+                    mark(val, &mut needs_sext_set);
+                    mark(val, &mut implicit_sext_set);
+                }
+                // Integer widening casts consume the low source bits and perform
+                // their own typed extension, even for stack/accumulator/XMM homes.
+                // They do not require a canonical wide SOURCE home. Keep the x87
+                // case conservative; raw GEPs and other wide uses remain below.
+                Instruction::Cast {
+                    src,
+                    from_ty,
+                    to_ty,
+                    ..
+                } if matches!(from_ty, IrType::I32 | IrType::U32) && *to_ty == IrType::F128 => {
+                    mark(src, &mut needs_sext_set);
+                }
+                Instruction::GetElementPtr { offset, .. } => {
+                    mark(offset, &mut needs_sext_set);
+                    mark(offset, &mut implicit_sext_set);
+                }
+                Instruction::Select {
+                    ty,
+                    true_val,
+                    false_val,
+                    ..
+                } if is_64(ty) => {
+                    mark(true_val, &mut needs_sext_set);
+                    mark(true_val, &mut implicit_sext_set);
+                    mark(false_val, &mut needs_sext_set);
+                    mark(false_val, &mut implicit_sext_set);
+                }
+                Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                    for (arg, at) in info.args.iter().zip(info.arg_types.iter()) {
+                        if is_64(at) {
+                            mark(arg, &mut needs_sext_set);
+                            mark(arg, &mut implicit_sext_set);
+                        }
+                    }
+                }
+                Instruction::AtomicRmw { ty, val, .. } if is_64(ty) => {
+                    mark(val, &mut needs_sext_set);
+                    mark(val, &mut implicit_sext_set);
+                }
+                Instruction::AtomicStore { ty, val, .. } if is_64(ty) => {
+                    mark(val, &mut needs_sext_set);
+                    mark(val, &mut implicit_sext_set);
+                }
+                // Record Copy/Phi value-flow edges for the transitive closure.
+                Instruction::Copy { dest, src } => {
+                    if let Operand::Value(v) = src {
+                        copy_phi_srcs.entry(dest.0).or_default().push(v.0);
+                    }
+                }
+                Instruction::Phi { dest, incoming, .. } => {
+                    let e = copy_phi_srcs.entry(dest.0).or_default();
+                    for (op, _) in incoming {
+                        if let Operand::Value(v) = op {
+                            e.push(v.0);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // Pass 1b: 64-bit consumers that live in block terminators and
+    // instructions the pass-1 match missed:
+    //   * Return operands of 64-bit-returning functions. Lowering now keeps
+    //     width-changing pointer casts, but transformed/synthetic IR can
+    //     still expose raw-wide uses. Preserve the defensive home contract.
+    //   * AtomicCmpxchg expected/desired operands of 64-bit width.
+    for block in &func.blocks {
+        if let Terminator::Return(Some(op)) = &block.terminator {
+            if is_64(&func.return_type) {
+                mark(op, &mut needs_sext_set);
+                mark(op, &mut implicit_sext_set);
+            }
+        }
+        for inst in &block.instructions {
+            if let Instruction::AtomicCmpxchg {
+                expected,
+                desired,
+                ty,
+                ..
+            } = inst
+            {
+                if is_64(ty) {
+                    mark(expected, &mut needs_sext_set);
+                    mark(expected, &mut implicit_sext_set);
+                    mark(desired, &mut needs_sext_set);
+                    mark(desired, &mut implicit_sext_set);
+                }
+            }
+        }
+    }
+
+    // Pass 2: fixed-point transitive closure over Copy/Phi sources.
+    if !copy_phi_srcs.is_empty() {
+        for set in [&mut needs_sext_set, &mut implicit_sext_set] {
+            let mut worklist: Vec<u32> = set.iter().copied().collect();
+            while let Some(vid) = worklist.pop() {
+                if let Some(srcs) = copy_phi_srcs.get(&vid) {
+                    for &s in srcs {
+                        if set.insert(s) {
+                            worklist.push(s);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (needs_sext_set, implicit_sext_set, signed_i32_defs)
+}
+
 /// Def-chain stability classification for a va_list root (see the analysis
 /// in `calculate_stack_space_impl`): `true` only when the chain bottoms out
 /// in an Alloca, ParamRef, Call result, or a constant — i.e. an id that can
@@ -702,162 +866,12 @@ impl X86Codegen {
         // value is destroyed. The fix requires per-call save/restore, not
         // promotion. See binary size investigation in project memory.
 
-        // Compute the exact set of I32 values that are consumed in a 64-bit
-        // context and therefore need `movslq` after a 32-bit ALU op.
-        //
-        // Pass 1 (direct): mark every value that appears as an operand of a
-        // 64-bit-consuming position — 64-bit BinOp/Cmp/Store, Cast I32->I64,
-        // GEP offset, 64-bit Select, 64-bit call arg, 64-bit atomic op. This
-        // supersedes the original unsound Cast+GEP-only set.
-        //
-        // Pass 2 (transitive closure through Copy and Phi): if `w` needs sext
-        // and `w = Copy(v)` or `w = Phi(..., v, ...)`, then `v`'s 64-bit value
-        // flows into `w`'s register, so `v` needs sext too. Without this, a
-        // 32-bit ALU result `v` that is only copied to a `w` used in a 64-bit
-        // context would be wrongly skipped: the `movq %v, %w` copies the stale
-        // upper bits and the 64-bit use of `w` (when register-allocated) would
-        // read garbage. (Sound: adding values to this set only ever emits more
-        // movslq, never removes one, so it cannot miscompile.)
-        let is_64 =
-            |t: &IrType| matches!(t, IrType::I64 | IrType::U64 | IrType::Ptr | IrType::F128);
-        let mut needs_sext_set: FxHashSet<u32> = FxHashSet::default();
-        // Typed Cast already extends its own input. MachInst producers only
-        // need canonical wide homes for NON-cast wide reads, transitively
-        // through Copy/Phi. Do not add duplicate extensions to cast-only IVs.
-        let mut implicit_sext_set: FxHashSet<u32> = FxHashSet::default();
-        // copy_phi_srcs[dest] = list of value sources (from Copy/Phi) whose
-        // 64-bit value flows into `dest`. Built in pass 1, used in pass 2.
-        let mut copy_phi_srcs: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
-        let mark = |op: &Operand, set: &mut FxHashSet<u32>| {
-            if let Operand::Value(v) = op {
-                set.insert(v.0);
-            }
-        };
-        for block in &func.blocks {
-            for inst in &block.instructions {
-                match inst {
-                    Instruction::BinOp { ty, lhs, rhs, .. } if is_64(ty) => {
-                        mark(lhs, &mut needs_sext_set);
-                        mark(lhs, &mut implicit_sext_set);
-                        mark(rhs, &mut needs_sext_set);
-                        mark(rhs, &mut implicit_sext_set);
-                    }
-                    Instruction::Cmp { ty, lhs, rhs, .. } if is_64(ty) => {
-                        mark(lhs, &mut needs_sext_set);
-                        mark(lhs, &mut implicit_sext_set);
-                        mark(rhs, &mut needs_sext_set);
-                        mark(rhs, &mut implicit_sext_set);
-                    }
-                    Instruction::Store { ty, val, .. } if is_64(ty) => {
-                        mark(val, &mut needs_sext_set);
-                        mark(val, &mut implicit_sext_set);
-                    }
-                    Instruction::Cast {
-                        src,
-                        from_ty,
-                        to_ty,
-                        ..
-                    } if matches!(from_ty, IrType::I32 | IrType::U32) && is_64(to_ty) => {
-                        mark(src, &mut needs_sext_set);
-                    }
-                    Instruction::GetElementPtr { offset, .. } => {
-                        mark(offset, &mut needs_sext_set);
-                        mark(offset, &mut implicit_sext_set);
-                    }
-                    Instruction::Select {
-                        ty,
-                        true_val,
-                        false_val,
-                        ..
-                    } if is_64(ty) => {
-                        mark(true_val, &mut needs_sext_set);
-                        mark(true_val, &mut implicit_sext_set);
-                        mark(false_val, &mut needs_sext_set);
-                        mark(false_val, &mut implicit_sext_set);
-                    }
-                    Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
-                        for (arg, at) in info.args.iter().zip(info.arg_types.iter()) {
-                            if is_64(at) {
-                                mark(arg, &mut needs_sext_set);
-                                mark(arg, &mut implicit_sext_set);
-                            }
-                        }
-                    }
-                    Instruction::AtomicRmw { ty, val, .. } if is_64(ty) => {
-                        mark(val, &mut needs_sext_set);
-                        mark(val, &mut implicit_sext_set);
-                    }
-                    Instruction::AtomicStore { ty, val, .. } if is_64(ty) => {
-                        mark(val, &mut needs_sext_set);
-                        mark(val, &mut implicit_sext_set);
-                    }
-                    // Record Copy/Phi value-flow edges for the transitive closure.
-                    Instruction::Copy { dest, src } => {
-                        if let Operand::Value(v) = src {
-                            copy_phi_srcs.entry(dest.0).or_default().push(v.0);
-                        }
-                    }
-                    Instruction::Phi { dest, incoming, .. } => {
-                        let e = copy_phi_srcs.entry(dest.0).or_default();
-                        for (op, _) in incoming {
-                            if let Operand::Value(v) = op {
-                                e.push(v.0);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        // Pass 1b: 64-bit consumers that live in block terminators and
-        // instructions the pass-1 match missed. All conservative (only ever
-        // ADDS values to the sext set, which only emits more movslq):
-        //   * Return operands of 64-bit-returning functions. The lowering's
-        //     emit_implicit_cast skips Ptr targets entirely (no Cast is
-        //     inserted for `return (char*)x;`), so a raw I32 value can flow
-        //     straight into a 64-bit return — it must be sign-extended.
-        //   * AtomicCmpxchg expected/desired operands of 64-bit width.
-        for block in &func.blocks {
-            if let Terminator::Return(Some(op)) = &block.terminator {
-                if is_64(&func.return_type) {
-                    mark(op, &mut needs_sext_set);
-                    mark(op, &mut implicit_sext_set);
-                }
-            }
-            for inst in &block.instructions {
-                if let Instruction::AtomicCmpxchg {
-                    expected,
-                    desired,
-                    ty,
-                    ..
-                } = inst
-                {
-                    if is_64(ty) {
-                        mark(expected, &mut needs_sext_set);
-                        mark(expected, &mut implicit_sext_set);
-                        mark(desired, &mut needs_sext_set);
-                        mark(desired, &mut implicit_sext_set);
-                    }
-                }
-            }
-        }
-
-        // Pass 2: fixed-point transitive closure over Copy/Phi sources.
-        for set in [&mut needs_sext_set, &mut implicit_sext_set] {
-            let mut worklist: Vec<u32> = set.iter().copied().collect();
-            while let Some(vid) = worklist.pop() {
-                if let Some(srcs) = copy_phi_srcs.get(&vid) {
-                    for &s in srcs {
-                        if set.insert(s) {
-                            worklist.push(s);
-                        }
-                    }
-                }
-            }
-        }
+        let (needs_sext_set, implicit_sext_set, signed_i32_defs) =
+            signed_i32_home_requirements(func);
         self.skip_i32_sext = needs_sext_set.is_empty();
         self.needs_sext_values = needs_sext_set;
         self.implicit_sext_values = implicit_sext_set;
+        self.signed_i32_defs = signed_i32_defs;
 
         // PF-16b: Clz/Ctz/Popcount on <=32-bit types produce results in
         // [0, bitwidth] — bit 31 is provably zero, so their widening casts
@@ -2103,13 +2117,15 @@ impl X86Codegen {
                                 ..
                             }) if sv.0 == dest.0
                         );
-                        // I32 sources load via `movslq` ONLY when the sext
-                        // convention marked them (the widening cast does);
-                        // an unmarked I32 would load `movl` (zero-extend) and
-                        // skipping a SIGN-extending cast would miscompile.
-                        let i32_sext_ready =
-                            *ty != IrType::I32 || self.needs_sext_values.contains(&dest.0);
-                        if ok_ty && single_use && adjacent_cast && i32_sext_ready {
+                        // The firing fold emits the TYPE-based opcode
+                        // (movslq for I32; the width table below only admits
+                        // sign-extending I32 casts), independent of the
+                        // needs-sext convention - the convention no longer
+                        // marks widening-cast sources (casts extend
+                        // themselves), and gating on it here silently killed
+                        // every I32 load+sext fold (movslq mem,%rax;
+                        // movslq %eax,%rdx instead of movslq mem,%rdx).
+                        if ok_ty && single_use && adjacent_cast {
                             if let Some((cd, from, to)) = cast_by_src.get(&dest.0) {
                                 let width_ok = *from == *ty
                                     && matches!(
@@ -4217,4 +4233,92 @@ pub(super) fn ret_xmm_mask(
         mask |= 3; // imaginary half in %xmm1, real half in %xmm0
     }
     mask
+}
+
+#[cfg(test)]
+mod signed_home_demand_tests {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, IrConst};
+
+    fn fixture(to_ty: IrType) -> IrFunction {
+        let mut f = IrFunction::new("home_demand".into(), to_ty, vec![], false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            source_spans: vec![],
+            instructions: vec![
+                Instruction::BinOp {
+                    dest: Value(0),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Const(IrConst::I32(-2)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                },
+                Instruction::Cast {
+                    dest: Value(2),
+                    src: Operand::Value(Value(1)),
+                    from_ty: IrType::I32,
+                    to_ty,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+        });
+        f
+    }
+
+    #[test]
+    fn explicit_integer_widening_does_not_demand_a_wide_source_home() {
+        for ty in [IrType::I64, IrType::U64, IrType::Ptr] {
+            let (needed, _, signed) = signed_i32_home_requirements(&fixture(ty));
+            assert_eq!(needed, [2].into_iter().collect());
+            assert_eq!(signed, [0].into_iter().collect());
+        }
+    }
+
+    #[test]
+    fn raw_wide_return_still_propagates_through_copies() {
+        let mut f = fixture(IrType::Ptr);
+        f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(1))));
+        let (needed, _, signed) = signed_i32_home_requirements(&f);
+        assert_eq!(needed, [0, 1].into_iter().collect());
+        assert_eq!(signed, [0].into_iter().collect());
+    }
+
+    #[test]
+    fn raw_gep_and_phi_cycle_keep_the_producer_canonical() {
+        // Test the demand graph, including the non-SSA Copy cycles left by
+        // phi elimination; this is analysis coverage, not execution proof.
+        let mut f = fixture(IrType::I64);
+        f.blocks[0].instructions.extend([
+            Instruction::Phi {
+                dest: Value(3),
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Value(Value(1)), BlockId(0)),
+                    (Operand::Value(Value(4)), BlockId(1)),
+                ],
+            },
+            Instruction::Copy {
+                dest: Value(4),
+                src: Operand::Value(Value(3)),
+            },
+            Instruction::GetElementPtr {
+                dest: Value(5),
+                base: Value(2),
+                offset: Operand::Value(Value(3)),
+                ty: IrType::I8,
+            },
+        ]);
+        let (needed, _, _) = signed_i32_home_requirements(&f);
+        assert_eq!(needed, [0, 1, 2, 3, 4].into_iter().collect());
+    }
+
+    #[test]
+    fn x87_source_demand_is_unchanged() {
+        let (needed, _, _) = signed_i32_home_requirements(&fixture(IrType::F128));
+        assert_eq!(needed, [0, 1, 2].into_iter().collect());
+    }
 }

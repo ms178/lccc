@@ -15,6 +15,8 @@
 # -O2+ and on the size pipelines, with `CCC_NO_AFFINE_EXIT_FOLD=1` as the kill
 # switch.
 #
+# The early loop_bound producer has its own independent disable control and
+# is tested by check_unsigned_affine_loop.sh; this census counts late reports.
 # Contracts:
 #
 #   4. WRAPAROUND PROBES.  `wrap_affine_fold.c` / `wrap_loop_fold.c` are the
@@ -46,6 +48,9 @@
 #      runtime bound, `refuse_rt_start` runtime seed).
 # ============================================================================
 set -euo pipefail
+# Keep inherited backend/optimizer kill switches from masking a broken default.
+# CCC (the executable selector) and GCC are deliberately preserved.
+while IFS= read -r knob; do unset "$knob"; done < <(compgen -v CCC_ || true)
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 root=$(CDPATH= cd -- "$here/../.." && pwd)
@@ -70,7 +75,7 @@ case $expected in
     *) bad "gcc oracle did not report the expected success line" ;;
 esac
 
-run_case() { # name  "flags"  "compiler env assignments"
+run_case() { # name  "flags"  "COMPILER env assignments"
     local name=$1 flags=$2 envs=$3
     local -a farr=() earr=()
     read -r -a farr <<< "$flags"
@@ -207,10 +212,97 @@ CCC_LOOP_ROTATE=1 CCC_DEBUG_LOOP_ROTATE=1 CCC_DEBUG_AFFINE_FOLD=1 \
 late_folds=$(grep -E '\[AFFOLD\] [A-Za-z_][A-Za-z0-9_]*: affine exit-compare folds: [1-9]' \
     "$work/proved-rotation.log" | grep -cvF '(early unsigned)' || true)
 [[ $late_folds -gt 0 ]] || bad "no proven rotation-clone fold survived"
+
+# Dynamic signed bounds: zero trips for negatives; the final header and unsafe
+# inclusive/strided wrap cases are observed against a volatile narrow oracle.
+for mode in -m64 -m32; do
+    for opt in -O0 -O1 -O2 -O3 -Os; do
+        runtime_src=tests/optimizer/wrapv_runtime_iv.c
+        "${GCC:-gcc}" "$mode" "$opt" -fwrapv "$runtime_src" -o "$work/runtime.ref"
+        "$work/runtime.ref" > "$work/runtime.expected"
+        grep -qx 'runtime signed IV: PASS 1000' "$work/runtime.expected" || bad 'runtime IV oracle'
+        for disabled in 0 1; do
+            for rotated in 0 1; do
+                runtime_env=(env -u CCC_NO_IV_WIDEN -u CCC_LOOP_ROTATE -u CCC_NO_LOOP_ROTATE)
+                if [[ $disabled == 1 ]]; then runtime_env+=(CCC_NO_IV_WIDEN=1); fi
+                if [[ $rotated == 1 ]]; then runtime_env+=(CCC_LOOP_ROTATE=1); fi
+                CCC_VALIDATE_SSA=1 "${runtime_env[@]}" "$CCC" "$mode" "$opt" -fwrapv "$runtime_src" -o "$work/runtime.mine"
+                timeout 10 "$work/runtime.mine" > "$work/runtime.actual" || bad "runtime IV $mode $opt disabled=$disabled rotated=$rotated"
+                cmp "$work/runtime.expected" "$work/runtime.actual" || bad 'runtime IV mismatch'
+            done
+        done
+    done
+done
+# Backend scale/displacement folding must honor the same wrapping policy.
+# These are real in-object accesses, not multi-gigabyte virtual mappings.
+for mode in -m64 -m32; do
+    for opt in -O0 -O1 -O2 -O3 -Os; do
+        scale_src=tests/regression/signed_scale_ring_wrap.c
+        "$GCC" "$mode" "$opt" -fwrapv "$scale_src" -o "$work/scale.ref"
+        "$work/scale.ref" > "$work/scale.expected"
+        grep -qx 'signed scale ring: PASS 16' "$work/scale.expected" || bad 'signed scale oracle'
+        for disabled in 0 1; do
+            scale_env=(env -u CCC_NO_GEP_FOLD)
+            if [[ $disabled == 1 ]]; then scale_env+=(CCC_NO_GEP_FOLD=1); fi
+            CCC_VALIDATE_SSA=1 "${scale_env[@]}" "$CCC" "$mode" "$opt" -fno-wrapv -fwrapv "$scale_src" -o "$work/scale.mine"
+            timeout 10 "$work/scale.mine" > "$work/scale.actual" || bad "signed scale $mode $opt disabled=$disabled"
+            cmp "$work/scale.expected" "$work/scale.actual" || bad 'signed scale mismatch'
+            # Negative, non-overflowing results require sign extension under
+            # BOTH signed-overflow policies, including with folding disabled.
+            "${scale_env[@]}" "$CCC" "$mode" "$opt" -fno-wrapv -DSCALE_SAFE_ONLY "$scale_src" -o "$work/scale.safe"
+            timeout 10 "$work/scale.safe" > "$work/scale.safe.out" || bad 'signed scale nonoverflow runtime'
+            grep -qx 'signed scale ring: PASS 8' "$work/scale.safe.out" || bad 'signed scale nonoverflow mismatch'
+
+        done
+    done
+done
+# Broader signed-result boundary: unary, binary, calls, loads, conditional
+# copies and loop-carried sign changes. No signed overflow in either policy.
+canonical_src=$here/i32_address_canonical.c
+for mode in -m64 -m32; do
+    for opt in -O0 -O1 -O2 -O3 -Os; do
+        for policy in -fwrapv -fno-wrapv; do
+            for mature_only in 0 1; do
+                canonical_env=(env)
+                if [[ $mature_only == 1 ]]; then
+                    canonical_env+=(CCC_NO_MACHINST=1 CCC_NO_GEP_FOLD=1)
+                fi
+                CCC_VALIDATE_SSA=1 "${canonical_env[@]}" "$CCC" "$mode" "$opt" "$policy" \
+                    "$canonical_src" -o "$work/canonical"
+                timeout 10 "$work/canonical" > "$work/canonical.out" || bad "canonical $mode $opt $policy mature=$mature_only"
+                [[ $(cat "$work/canonical.out") == 'i32 address canonical: PASS 82' ]] || bad "canonical mismatch"
+            done
+        done
+    done
+done
+
+# Retain useful clone folding when the original whole-loop proof licenses it.
+CCC_LOOP_ROTATE=1 CCC_DEBUG_LOOP_ROTATE=1 "$CCC" -O2 -fwrapv -S "$corpus" -o "$work/proved-rotation.s" 2> "$work/proved-rotation.log"
+grep -Eq '\[ROT\] affine exit-compare folds: [1-9]' "$work/proved-rotation.log" || bad "no proven rotation-clone fold survived"
 echo '  signed control proof: m64/m32 oracle/rotation/disable matrix complete (verdict below)'
 
 if [[ $fail -ne 0 ]]; then
     echo "check_affine_loop_fold: FAILED" >&2
     exit 1
 fi
+
+# Activation tripwire, separate from the native execution proof above. Both
+# positive kernels must actually widen; merely passing while refusing is not
+# coverage of the runtime-bound theorem. The disable control must suppress it.
+for disabled in 0 1; do
+    shape_env=(env -u CCC_NO_IV_WIDEN CCC_IV_WIDEN_DEBUG=1)
+    if [[ $disabled == 1 ]]; then shape_env+=(CCC_NO_IV_WIDEN=1); fi
+    "${shape_env[@]}" "$CCC" -m64 -O2 -fwrapv -S tests/optimizer/wrapv_runtime_iv.c \
+        -o "$work/runtime-shape.s" 2> "$work/runtime-shape.log"
+    for kernel in clean_runtime clean_near_max clean_runtime_seed reversed_runtime_seed direct_runtime_seed; do
+        if [[ $disabled == 0 ]]; then
+            grep -q "\[IV-WIDEN\] $kernel: widened" "$work/runtime-shape.log" || bad "$kernel did not activate"
+        elif grep -q "\[IV-WIDEN\] $kernel: widened" "$work/runtime-shape.log"; then
+            bad "$kernel ignored disable control"
+        fi
+    done
+done
+
+[[ $fail -eq 0 ]] || { echo "check_affine_loop_fold: activation FAILED" >&2; exit 1; }
+
 echo "check_affine_loop_fold: PASS (oracle parity, default-on counted fold, nested+type-top folds, refusals pinned)"

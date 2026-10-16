@@ -95,3 +95,63 @@ Harness lessons encoded into the repo:
    the transported mold binary suffices; revisit if mold must be rebuilt.
 5. `-fwrapv` `.flags` files on main dropped `-O2` in several tests
    (test-strength regression risk) — audit remaining `.flags` diffs.
+
+## Session 3 addendum (2026-10-16, PR #842 synthesis)
+
+### What happened
+PR #842 (`3349eab0`, 288 files, competing with merged PR #841) was
+cherry-picked onto main `629cc7d6` and synthesized per-seam (39 conflicts,
+every resolution justified in the commit message of `5644af89`). Follow-up
+commits: `197a965` (evidence aliases + checked adjusted_limit + census),
+`749e14d` (gate-seam repairs incl. two gates that pinned #842's rejected
+affine-switch topology), `3b8185f` (W2 load+sext-cast fold restoration).
+
+### Key decisions (agree/disagree record vs both PRs)
+- ADOPTED from #842: PassPolicy in IrFunction (semantics.rs deleted),
+  byte_count_normalize + strict_recip vectorizers, loop_bound scheduled()
+  extraction, first_failing_iv checked math, signed_i32_defs + unified
+  3-set prologue helper, per-candidate FP policy fence, evidence tooling
+  unification, workflow timeouts.
+- KEPT from main/#841: global CCC_NO_AFFINE_EXIT_FOLD owner topology,
+  iv_widen/iv_strength_reduce -fwrapv production logic (excised #842's
+  signed_unit_header restriction that broke HEAD-pinned admissions),
+  inline-asm marker framework, dynamic gcc_versions_at, whole-loop FP
+  stability fence (now IN ADDITION to the per-candidate policy fence -
+  fesetround-class redteam protection retained at zero general cost).
+- NOT ported: #842's two iv_widen tests
+  (`wrapping_signed_strict_runtime_bounds_need_clean_unit_step_headers`,
+  `wrapping_signed_nonnegative_mask_carries_a_range_into_addition`): the
+  first pins the excised signed_unit_header production block (its expected
+  rows are wrong under main's stronger widener); the second's domain is
+  covered by main's mask-range tests + the adopted wrapv_runtime_iv
+  runtime differential matrix (check_affine_loop_fold.sh).
+
+### New regression class found by corpus A/B (fixed in 3b8185f)
+Convention/admission splits: #842 moved widening-cast sources out of
+needs_sext_values (correct), but the W2 load->cast fold admission still
+gated on that marking -> fold silently died (2 insns instead of 1 on hot
+rbtree/hash shapes), zero correctness signal. Lesson: when a convention
+set changes meaning, grep EVERY consumer of the set, not just emitters.
+Gate: tests/regression/check_load_cast_fold.sh (ci_local + ci.yml).
+
+### A/B evidence (this session)
+- bench_kernels (15 kernels, -O3): all timed functions bit-identical to
+  main; timing deltas = VM noise (equal-hash +-12%). Harness bug fixed:
+  links now probe -no-pie (PIE-default hosts measured NOTHING before).
+- 74-program corpus asm A/B after fix: 5 diffs, all improvements
+  (2x removed redundant movslq, 3x movslq->movl, cltq short form, sieve
+  newly YMM-vectorized: 39.1ms vs main 41.6ms vs gcc-16 42.4ms best-of-5).
+  Runtime outputs identical to main AND gcc-16 -O2 on every differing
+  program.
+- Final ci_local --fast: 274 passed / 0 failed / 6 skipped (--fast-only).
+
+### Provisioning additions for the restore recipe
+- binutils 2.47 built from the harness-cache-1 tarball ->
+  /opt/binutils-2.47 (+ aarch64 cross build -> /opt/binutils-a64);
+  pinned paths: ~/.cache/gas-2.47-{x86_64,aarch64}-linux-gnu/bin/{as,objcopy,objdump},
+  ~/.cache/dl/binutils-2.47.tar.xz, ~/.cache/lccc-kernel-tools/bin/relocs
+  (compile relocs_common.c+relocs_32.c+relocs_64.c with -I. and
+  tools/le_byteshift.h), ~/.cache/arm-isa-a64-2026-09/, /usr/local/bin/ld.mold
+  symlink (gcc -fuse-ld=mold fails without it), debs-bookworm multilib.
+- /home/user persists ONLY the repo; /home/user/artifacts does NOT
+  survive turn boundaries. The durable state is the pushed branch.

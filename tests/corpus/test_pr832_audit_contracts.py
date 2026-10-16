@@ -9,7 +9,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'scripts'))
-import verify_imported_evidence as evidence
+import verify_evidence_hashes as evidence
 import check_licm_ordering as ordering
 import expand_asm_fixture as fixture
 
@@ -39,7 +39,7 @@ class EvidenceTests(unittest.TestCase):
         return evidence.verify(self.root, self.manifest)
 
     def test_positive(self):
-        self.assertEqual(self.verify(), {'artifacts': 2, 'decompressed_raw_logs': 1, 'gzip_streams': 1, 'deduplicated_paths': 0})
+        self.assertEqual(self.verify(), {'artifacts': 2, 'decompressed_raw_logs': 1, 'gzip_streams': 1, 'canonical_aliases': 0})
 
     def test_malformed_inventory_types(self):
         for value in [[], None, 1, "inventory", {'schema': True},

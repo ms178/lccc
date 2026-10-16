@@ -226,7 +226,7 @@ impl Lowerer {
         // Fold constant casts at lowering time so -O0 matches GCC
         // -fno-trapping-math saturation (gcc.c-torture 20031003-1:
         // `(int)2147483648.0f` is INT_MAX, not the x86 indefinite INT_MIN).
-        let observable_fp = crate::common::semantics::fp_environment_observable()
+        let observable_fp = self.pass_policy.fp_environment_observable
             && (inner_ctype.is_floating() || target_ctype.is_floating());
         if !observable_fp {
             if let Some(c) = self.eval_const_cast(target_type, inner) {
@@ -291,7 +291,12 @@ impl Lowerer {
         // float -> Ptr cast is a C constraint violation that GCC rejects, and
         // we leave that historical behaviour untouched here.
         if to_ty == from_ty
-            || to_ty == IrType::Ptr
+            || (to_ty == IrType::Ptr
+                && !super::expr::pointer_integer_cast_changes_width(
+                    from_ty,
+                    to_ty,
+                    crate::common::types::target_ptr_size(),
+                ))
             || (from_ty == IrType::Ptr
                 && to_ty.is_integer()
                 && to_ty.size() == crate::common::types::target_ptr_size())

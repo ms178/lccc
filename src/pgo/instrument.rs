@@ -1569,6 +1569,7 @@ fn dump_helper(
         ty: IrType::I32,
     });
     let f = IrFunction {
+        pass_policy: Default::default(),
         name: name.into(),
         return_type: IrType::I32,
         params: vec![],
@@ -1636,6 +1637,7 @@ fn dump_helper(
     ] {
         if !m.functions.iter().any(|f| f.name == n) {
             m.functions.push(IrFunction {
+                pass_policy: Default::default(),
                 name: n.into(),
                 return_type: t,
                 params: vec![],
@@ -1921,6 +1923,7 @@ fn push_helper_fn(
         .map(|x| x + 1)
         .unwrap_or(label_base + 1);
     m.functions.push(IrFunction {
+        pass_policy: Default::default(),
         name: name.into(),
         return_type: IrType::I32,
         params: ps,

@@ -17,6 +17,25 @@ use crate::ir::reexports::{
     BlockId, Instruction, IrBinOp, IrCmpOp, IrConst, Operand, Terminator, Value,
 };
 
+/// Pointer/integer reinterpretation is free only at equal widths. Keep the
+/// source integer's signedness on widening and truncate on narrowing; neither
+/// a later consumer's storage type nor the incoming register's upper bits can
+/// substitute for this conversion. `pointer_size` keeps the rule testable for
+/// LP64 and ILP32 without changing thread-local target configuration.
+pub(super) fn pointer_integer_cast_changes_width(
+    from: IrType,
+    to: IrType,
+    pointer_size: usize,
+) -> bool {
+    if from == IrType::Ptr && to.is_integer() {
+        to.size() != pointer_size
+    } else if to == IrType::Ptr && from.is_integer() {
+        from.size() != pointer_size
+    } else {
+        false
+    }
+}
+
 impl Lowerer {
     /// Mask off the sign bit of a float value for truthiness testing.
     /// This ensures -0.0 is treated as falsy (same as +0.0) while NaN remains truthy.
@@ -947,6 +966,13 @@ impl Lowerer {
         if src_ty == target_ty {
             return src;
         }
+        if pointer_integer_cast_changes_width(
+            src_ty,
+            target_ty,
+            crate::common::types::target_ptr_size(),
+        ) {
+            return Operand::Value(self.emit_cast_val(src, src_ty, target_ty));
+        }
         if target_ty == IrType::Ptr || target_ty == IrType::Void {
             return src;
         }
@@ -986,5 +1012,50 @@ impl Lowerer {
         };
         let dest = self.emit_cmp_val(IrCmpOp::Ne, val, zero, src_ty);
         Operand::Value(dest)
+    }
+}
+
+#[cfg(test)]
+mod pointer_width_cast_tests {
+    use super::*;
+
+    #[test]
+    fn every_integer_width_preserves_conversion_in_both_pointer_directions() {
+        for pointer_size in [4, 8] {
+            for ty in [
+                IrType::I8,
+                IrType::U8,
+                IrType::I16,
+                IrType::U16,
+                IrType::I32,
+                IrType::U32,
+                IrType::I64,
+                IrType::U64,
+                IrType::I128,
+                IrType::U128,
+            ] {
+                for (from, to) in [(ty, IrType::Ptr), (IrType::Ptr, ty)] {
+                    assert_eq!(
+                        pointer_integer_cast_changes_width(from, to, pointer_size),
+                        ty.size() != pointer_size
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_pointer_and_invalid_float_conversions_are_not_reclassified() {
+        for pointer_size in [4, 8] {
+            for (from, to) in [
+                (IrType::Ptr, IrType::Ptr),
+                (IrType::I32, IrType::I64),
+                (IrType::F64, IrType::Ptr),
+                (IrType::Ptr, IrType::F64),
+                (IrType::Void, IrType::Ptr),
+            ] {
+                assert!(!pointer_integer_cast_changes_width(from, to, pointer_size));
+            }
+        }
     }
 }

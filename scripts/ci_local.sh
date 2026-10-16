@@ -209,6 +209,9 @@ gate "got-slot-local-addend" fast \
 gate "vex-flag-reads" fast \
     bash tests/regression/check_vex_flag_reads.sh
 
+gate "load-cast-fold" fast \
+    env CCC="$LCCC" bash tests/regression/check_load_cast_fold.sh
+
 gate "benchmark-codegen-registry" fast \
     python3 tests/regression/check_benchmark_codegen_registry.py
 
@@ -650,6 +653,13 @@ gate "strict-computed-recip-codegen" fast \
 
 gate "strict-packed-recip-bitwise" fast \
     python3 scripts/check_strict_packed_recip.py
+
+# Native execution gates; static opcode controls are supplementary tripwires.
+gate "fenv-local-effects" fast \
+    python3 scripts/check_fenv_local_optimization.py --compiler target/fastbuild/lccc --native-only --output target/pr835-fenv --json target/pr835-fenv.json
+
+gate "byte-count-normalization" fast \
+    python3 scripts/check_byte_count_normalize.py --lccc target/fastbuild/lccc --gcc gcc-16 --output target/pr835-byte-count --json target/pr835-byte-count.json
 
 gate "fp-environment-trap-order" fast \
     bash tests/regression/check_fp_environment.sh

@@ -45,10 +45,10 @@
 //!   zero-trip loops; FP division is kept out to match GCC's default
 //!   -ftrapping-math speculation policy).
 //!
-//! FP candidates are refused under observable floating environments, or when
-//! the loop contains calls/asm that may change rounding. Even a preheader
-//! multiply/conversion can raise an observable exception. Integer candidates
-//! remain eligible, including inside mixed integer/FP functions.
+//! In observable floating environments, FP operations and conversions are
+//! refused per candidate: calls may change rounding and even a preheader
+//! multiply/conversion can raise an exception. Independent integer candidates
+//! remain eligible, including in mixed functions under the same TU policy.
 //!
 //! # Profitability model
 //!
@@ -885,9 +885,9 @@ fn plan_loop(cx: &Ctx<'_>, lp: &NaturalLoop, out: &mut Vec<Rewrite>) {
     // A cross-backedge FP identity includes the rounding environment. Even
     // an equal SSA operand can produce different bits after fesetround.
     // Speculation in the preheader also changes observable exception order.
-    // This proof applies only to FP candidates: integer PRE stays enabled.
+    // Default-closed over the loop body (any call, asm, intrinsic, atomic or
+    // volatile access blocks FP candidates); integer PRE stays enabled.
     let mut fp_stable = None;
-
     // A value usable by the preheader computation: a constant, or a value
     // defined outside the loop whose definition dominates the preheader.
     let available = |o: &Operand| -> bool {
@@ -988,18 +988,31 @@ fn plan_loop(cx: &Ctx<'_>, lp: &NaturalLoop, out: &mut Vec<Rewrite>) {
         for inst in &func.blocks[eb].instructions {
             let Some(p) = Parts::of(inst) else { continue };
             let (e, op, ty) = (p.dest, p.op, p.ty);
+            // A carried result was computed in the preceding iteration's
+            // rounding environment; f(init) is also speculated on zero-trip
+            // paths. Without an FP-environment proof neither transformation
+            // preserves observable rounding/traps/flags. Keep integer PRE.
+            if func.pass_policy.fp_environment_observable
+                && super::policy::observes_fp_environment(inst)
+            {
+                explain(e, "observable FP environment");
+                continue;
+            }
+            // Independently of the TU policy, the loop body itself must not
+            // change the FP environment: a reused FP value computed before a
+            // fesetround-class call (default-closed: ANY call/asm/intrinsic)
+            // would carry the wrong rounding into later iterations.
             if ty.is_float()
                 && !*fp_stable.get_or_insert_with(|| {
-                    !super::fp_environment_observable()
-                        && lp.body.iter().all(|&b| {
-                            func.blocks[b]
-                                .instructions
-                                .iter()
-                                .all(super::loop_square::stable_fp_environment)
-                        })
+                    lp.body.iter().all(|&b| {
+                        func.blocks[b]
+                            .instructions
+                            .iter()
+                            .all(super::loop_square::stable_fp_environment)
+                    })
                 })
             {
-                explain(e, "observable or changing FP environment");
+                explain(e, "changing FP environment");
                 continue;
             }
             if cx.defs.tainted(e.0) {
@@ -1446,7 +1459,10 @@ fn run_round(func: &mut IrFunction, env: &EnvConfig, tm: &TargetModel) -> usize 
 
 pub(crate) fn run(func: &mut IrFunction) -> usize {
     let env = EnvConfig::read();
-    // The planner fences FP candidates without disabling integer PRE.
+    // FP expressions also depend on rounding mode and exception state. Reusing
+    // a previous iteration (or speculating the initial expression) is not
+    // justified by operand equality under an observable floating environment.
+    // The candidate-local guard also keeps independent integer PRE in mixed functions.
     if env.disabled || func.blocks.is_empty() {
         return 0;
     }
@@ -1686,7 +1702,6 @@ mod tests {
                 set_backedge_pre_env(self.0);
             }
         }
-        let _semantics = crate::common::semantics::TestGuard::new(Default::default());
         let _restore = Restore(EnvConfig::read());
         crate::common::types::set_target_elf_machine(EM_X86_64);
         for broad in [false, true] {
@@ -1695,38 +1710,69 @@ mod tests {
                 ..ENV_CONFIG_DEFAULT
             });
             for observable in [false, true] {
-                crate::common::semantics::replace(crate::common::semantics::Semantics {
-                    fp_environment_observable: observable,
-                    ..Default::default()
-                });
                 let mut f = fp_recurrence_two_squares();
+                f.pass_policy.fp_environment_observable = observable;
                 assert_eq!(run(&mut f), usize::from(!observable));
                 assert_eq!(count_muls(&f), if observable { 2 } else { 1 });
                 // Do not turn an FP legality fence into a global integer ban.
                 assert_eq!(run(&mut int_recurrence()), 1);
-                let mut mixed = int_recurrence();
-                mixed.blocks[1].instructions.push(binop(
-                    90,
-                    IrBinOp::Mul,
-                    Operand::Const(IrConst::F64(1.25)),
-                    Operand::Const(IrConst::F64(0.125)),
-                    IrType::F64,
-                ));
-                mixed.next_value_id = 91;
-                assert_eq!(
-                    run(&mut mixed),
-                    1,
-                    "FP policy must not ban integer PRE in mixed functions"
-                );
-                assert!(mixed.blocks[1].instructions.iter().any(|i| matches!(
-                    i,
-                    Instruction::BinOp {
-                        dest: Value(90),
-                        ty: IrType::F64,
-                        ..
-                    }
-                )));
             }
+        }
+    }
+
+    #[test]
+    fn observable_fenv_also_fences_casts_with_integer_results() {
+        crate::common::types::set_target_elf_machine(EM_X86_64);
+        for observable in [false, true] {
+            let mut f = fp_recurrence_two_squares();
+            f.return_type = IrType::I32;
+            f.pass_policy.fp_environment_observable = observable;
+            for block in &mut f.blocks {
+                for inst in &mut block.instructions {
+                    match inst {
+                        Instruction::Phi {
+                            dest: Value(2),
+                            ty,
+                            incoming,
+                        } => {
+                            *ty = IrType::I32;
+                            for (operand, _) in incoming {
+                                if matches!(operand, Operand::Const(_)) {
+                                    *operand = Operand::Const(IrConst::I32(0));
+                                }
+                            }
+                        }
+                        Instruction::BinOp { dest, lhs, .. } if dest.0 == 4 || dest.0 == 5 => {
+                            *inst = Instruction::Cast {
+                                dest: *dest,
+                                src: *lhs,
+                                from_ty: IrType::F64,
+                                to_ty: IrType::I32,
+                            };
+                        }
+                        Instruction::BinOp { dest, ty, .. } if (6..=9).contains(&dest.0) => {
+                            *ty = IrType::I32
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            assert_eq!(run(&mut f), usize::from(!observable));
+            let casts = f.blocks[1]
+                .instructions
+                .iter()
+                .filter(|inst| {
+                    matches!(
+                        inst,
+                        Instruction::Cast {
+                            from_ty: IrType::F64,
+                            to_ty: IrType::I32,
+                            ..
+                        }
+                    )
+                })
+                .count();
+            assert_eq!(casts, if observable { 2 } else { 1 });
         }
     }
 
@@ -1844,14 +1890,13 @@ mod tests {
         );
         assert_eq!(run_round(&mut changing, &env, &tm), 0);
         let (fp, integer) = {
-            let _fenv =
-                crate::common::semantics::TestGuard::new(crate::common::semantics::Semantics {
-                    fp_environment_observable: true,
-                    ..Default::default()
-                });
+            let mut fp_fn = fp_recurrence();
+            fp_fn.pass_policy.fp_environment_observable = true;
+            let mut int_fn = int_recurrence();
+            int_fn.pass_policy.fp_environment_observable = true;
             (
-                run_round(&mut fp_recurrence(), &env, &tm),
-                run_round(&mut int_recurrence(), &env, &tm),
+                run_round(&mut fp_fn, &env, &tm),
+                run_round(&mut int_fn, &env, &tm),
             )
         };
         assert_eq!(fp, 0, "even call-free speculation can change FP traps");
@@ -1926,11 +1971,7 @@ mod tests {
         });
         assert_eq!(run_round(&mut user_call, &env, &tm), 0);
         let changes = {
-            let _fenv =
-                crate::common::semantics::TestGuard::new(crate::common::semantics::Semantics {
-                    fp_environment_observable: true,
-                    ..Default::default()
-                });
+            function.pass_policy.fp_environment_observable = true;
             run_round(&mut function, &env, &tm)
         };
         assert_eq!(changes, 0, "the FENV policy still prohibits speculation");
@@ -1942,13 +1983,9 @@ mod tests {
         let mut tm = TargetModel::detect();
         tm.fp_fma = false;
         for observable in [false, true] {
-            let _guard =
-                crate::common::semantics::TestGuard::new(crate::common::semantics::Semantics {
-                    signed_overflow_wraps: false,
-                    fp_environment_observable: observable,
-                });
             let fc = |x| Operand::Const(IrConst::F64(x));
             let mut f = IrFunction::new("fp_environment".into(), IrType::F64, Vec::new(), false);
+            f.pass_policy.fp_environment_observable = observable;
             f.blocks
                 .push(block(0, vec![], Terminator::Branch(BlockId(1))));
             f.blocks.push(block(

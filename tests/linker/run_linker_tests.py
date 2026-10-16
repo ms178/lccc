@@ -6602,6 +6602,7 @@ _PT_GNU_RELRO = 0x6474E552
 _PT_GNU_PROPERTY = 0x6474E553
 _PF_W = 2  # ELF p_flags: X=1, W=2, R=4
 _SHT_NOTE = 7
+_SHF_ALLOC = 2
 
 
 def _elf_bytes_phdrs(d):
@@ -6800,10 +6801,9 @@ def _note_run_merge_test(args, oracles):
         phdrs, shdrs = _elf_bytes_phdrs(d), _elf_bytes_shdrs(d)
         if phdrs is None or shdrs is None:
             return Result(name, "FAIL", "not an ELF64 LSB file")
-        SHF_ALLOC = 2
         notes = sorted(
             ([h[3], h[4], h[5], h[6]] for h in shdrs
-             if h[1] == _SHT_NOTE and (h[2] & SHF_ALLOC) and h[5] > 0),
+             if h[1] == _SHT_NOTE and (h[2] & _SHF_ALLOC) and h[5] > 0),
             key=lambda h: h[1])
         if len(notes) < 2:
             return Result(name, "SKIP", "fixture has <2 note sections")
@@ -6829,7 +6829,7 @@ def _note_run_merge_test(args, oracles):
                 return Result(name, "FAIL", "note section at %#x not covered exactly once"
                               % off)
         for h in shdrs:
-            if h[2] & SHF_ALLOC and h[1] not in (_SHT_NOTE, 8) and h[5] > 0:
+            if h[2] & _SHF_ALLOC and h[1] not in (_SHT_NOTE, 8) and h[5] > 0:
                 if any(lo < h[4] + h[5] and h[4] < hi for lo, hi in covered):
                     return Result(name, "FAIL", "PT_NOTE covers non-note payload " + h[0])
         props = [p for p in phdrs if p[0] == _PT_GNU_PROPERTY]

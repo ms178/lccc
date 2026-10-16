@@ -7028,23 +7028,21 @@ impl X86Codegen {
                 // upper-zero rule is safe here: only the low 128 bits feed
                 // vcvtdq2pd, which fully overwrites ymm0 before its next read.
                 if packed {
-                    // Consume exactly XMM/m128. Do not use avx_load_arg
-                    // (it would overread) or a legacy scratch move inside the
-                    // AVX loop. Deferred stores were flushed above.
-                    let source = if let Operand::Value(v) = args[1] {
-                        if let Some(name) = self
-                            .vec_operand_reg(&v)
-                            .filter(|name| name.starts_with("xmm"))
-                        {
-                            format!("%{}", name)
-                        } else if let Some(mem) = self.value_ptr_mem_operand(v.0) {
-                            mem
-                        } else {
-                            self.operand_to_reg(&args[1], "rax");
-                            "(%rax)".to_string()
-                        }
-                    } else {
+                    // Read exactly XMM/m128, including all home-disabled modes.
+                    // avx_load_arg would incorrectly read a 32-byte denominator.
+                    let Operand::Value(value) = args[1] else {
                         unreachable!("packed denominator must be a vector SSA value");
+                    };
+                    let source = if let Some(name) = self
+                        .vec_operand_reg(&value)
+                        .filter(|name| name.starts_with("xmm"))
+                    {
+                        format!("%{}", name)
+                    } else if let Some(memory) = self.value_ptr_mem_operand(value.0) {
+                        memory
+                    } else {
+                        self.operand_to_reg(&args[1], "rax");
+                        "(%rax)".to_string()
                     };
                     self.state
                         .emit_fmt(format_args!("    vcvtdq2pd {}, %ymm0", source));

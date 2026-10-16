@@ -831,7 +831,15 @@ pub(super) fn classify_mov_ext(s: &str, sb: &[u8]) -> ExtKind {
 
     // Producers: movq $const, %rax
     if len >= 6 && sb[3] == b'q' && sb[4] == b' ' && sb[5] == b'$' && s.ends_with("%rax") {
-        return ExtKind::ProducerMovqConstRax;
+        // GAS accepts wide immediates under the movq spelling too. Only a
+        // signed-i32 constant proves that a following cltq is redundant.
+        // Unparsed expressions/hex spellings conservatively retain it.
+        if s[6..]
+            .rsplit_once(',')
+            .is_some_and(|(imm, _)| imm.trim().parse::<i32>().is_ok())
+        {
+            return ExtKind::ProducerMovqConstRax;
+        }
     }
 
     // Producers: movq %REG, %rax (register-to-rax copy, REG != rax)
