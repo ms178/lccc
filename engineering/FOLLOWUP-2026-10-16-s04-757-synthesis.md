@@ -130,3 +130,17 @@ covered by an existing pin test:
 Expected effect: build lane ~20.5 → ~6 min, debug ~22 → ~8 min, critical
 path (build + codegen) ~39 → ~20 min once the weekly cache is warm; first
 run of a week still pays one download to refill the cache.
+
+## Latent main divergence surfaced by the local suite (not by hosted CI)
+
+`fenv_constant_effects` / `fenv_constant_rounding` (in main since #843)
+fail the GCC runtime comparison under `run_regression_suite.sh`: lccc
+constant-folds `1.0 + DBL_MIN`-class expressions at compile time ignoring
+a dynamic `fesetround` change, GCC-16 honors it (gcc
+`3ff0000000000000`/downward vs lccc `3ff0000000000001`). Hosted CI never
+sees this because `run_regression.py` records SKIP-COMPARE when its gcc
+invocation fails to link `-lm` for the effects test. Independent of this
+session's passes (identical with `CCC_DISABLE_PASSES=byte_load` and with
+`CCC_NO_AFFINE_EXIT_FOLD=1`). Proper fix is rounding-mode-aware constant
+folding (FENV_ACCESS semantics) — queued, do not paper over with test
+deletion.
