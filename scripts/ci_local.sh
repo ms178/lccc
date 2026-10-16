@@ -263,6 +263,24 @@ gate "sparse-bss-equivalence" fast \
 gate "libcall-synthesis-no-selfcall" fast \
     env CCC="$LCCC" bash tests/regression/check_libcall_synthesis_no_selfcall.sh
 
+# Plain-`char` signedness must be one answer, not three: the type system,
+# `__CHAR_UNSIGNED__` and glibc's `CHAR_MIN`/`CHAR_MAX` (derived from that
+# macro) all follow `char_is_unsigned()`. `-funsigned-char` used to flip only
+# the type, leaving `CHAR_MIN` at -128 on x86-64.  Behavioural rows against
+# GCC, plus the AArch64/RISC-V defaults via the binary-name target selector
+# (preprocessing only).  Fast: five tiny compiles.
+gate "char-signedness" fast \
+    env CCC="$LCCC" bash tests/regression/check_char_signedness.sh
+
+# The inliner's __builtin_va_arg_pack_len() sentinel rewrite matched in the
+# wrong value space, leaving a live call to the undefined
+# __lccc_va_arg_pack_len whenever the cloned caller was offset (gzip 1.14's
+# gnulib open-safer.c under glibc fortify failed to link).  The gate asserts
+# no sentinel survives at -O0/-O1/-O2/-O3, runs the wrapper semantics
+# (one/two/zero forwarded arguments) and takes gcc as the reference.
+gate "va-arg-pack-len-folds" fast \
+    env CCC="$LCCC" bash tests/regression/check_va_arg_pack_len_folds.sh
+
 gate "benchmark-codegen-registry" fast \
     python3 tests/regression/check_benchmark_codegen_registry.py
 

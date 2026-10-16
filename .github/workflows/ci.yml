@@ -1168,6 +1168,20 @@ jobs:
         # Refusals, positive controls, the -fno-builtin/-ffreestanding
         # contract, the ungated __*_chk rows and three runtime programs.
         bash tests/regression/check_libcall_synthesis_no_selfcall.sh
+        # Plain-`char` signedness must be one answer, not three: the type
+        # system, `__CHAR_UNSIGNED__` and glibc's `CHAR_MIN`/`CHAR_MAX` (which
+        # derives from that macro) all follow `char_is_unsigned()`.
+        # `-funsigned-char` used to flip only the type, leaving CHAR_MIN at
+        # -128 on x86-64.  Behavioural rows against GCC, plus the AArch64 /
+        # RISC-V defaults via the binary-name target selector (preprocessing
+        # only).  Mirrored in scripts/ci_local.sh (parity-checked).
+        bash tests/regression/check_char_signedness.sh
+        # The inliner's __builtin_va_arg_pack_len() sentinel rewrite matched
+        # in the wrong value space, leaving a live call to the undefined
+        # __lccc_va_arg_pack_len whenever the cloned caller was offset (gzip
+        # 1.14's gnulib open-safer.c under glibc fortify failed to link).
+        # No sentinel at -O0..-O3, wrapper semantics, gcc as the reference.
+        bash tests/regression/check_va_arg_pack_len_folds.sh
         # Register-offset symbol folds: `Add(symbol, register)` bases are
         # consumed as `sym(%off,%idx)` memory operands when the derived
         # pointer dies at the accesses; the RA-01 kernel must stay dormant
