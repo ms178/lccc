@@ -1,3 +1,0 @@
-unsigned affine model: 4-bit 131072 cases, 9366 admitted; every observed condition identical
-unsigned affine model: 8-bit 300000 cases, 20828 admitted; every observed condition identical
-PASS: unsigned affine m64/m32 runtime matrix, modular model, positive shape and wrap/disable controls

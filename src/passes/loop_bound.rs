@@ -66,10 +66,14 @@ fn adjusted_limit(
     } else {
         span.checked_sub(1)? / step + 1
     };
-    let final_iv = init + trips * step;
+    // All operands are <= max < 2^64 and trips*step = (span/step)*step + step
+    // <= span + step < 2^65, so the u128 sums below cannot overflow; the
+    // checked forms make that bound a compiler-verified fact rather than a
+    // comment-only proof.
+    let final_iv = trips.checked_mul(step).and_then(|p| init.checked_add(p))?;
     // Include the exit observation: allowing just the body interval admits
     // a wrapping header sum, which can turn a terminating loop into a cycle.
-    (final_iv + offset <= max).then_some(bound as u64)
+    (final_iv.checked_add(offset)? <= max).then_some(bound as u64)
 }
 
 fn unsigned_constant(op: Operand, ty: IrType) -> Option<u64> {
