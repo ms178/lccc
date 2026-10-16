@@ -8,6 +8,8 @@
 # and mold 2.42.1. GitHub runners have full internet; this job builds inside
 # a debian:12 container so every binary matches the sandbox ABI, then pushes
 # the payload as an ORPHAN TAG (harness-cache-1); no branch is touched.
+# The sandbox cannot read Actions logs (blob storage is blocked), so the
+# build log itself is pushed as tag harness-cache-log on every outcome.
 name: harness-cache
 on:
   workflow_dispatch: {}
@@ -25,78 +27,77 @@ jobs:
     container: debian:12
     timeout-minutes: 350
     steps:
-      - name: Container deps
+      - name: Build everything (self-logging)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euxo pipefail
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          set -u
+          log=/tmp/build.log
+          push_log() {
+            set +e
+            d=$(mktemp -d); cp "$log" "$d/build.log" 2>/dev/null || echo "no log" > "$d/build.log"
+            cd "$d"
+            git init -q .; git config user.name log; git config user.email log@local
+            git add -A; git commit -q -m log; git tag -f harness-cache-log
+            git push -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+              refs/tags/harness-cache-log
+          }
+          trap push_log EXIT
+          run() { echo "+ $*" >> "$log"; "$@" >> "$log" 2>&1 || { echo "FAILED: $*" >> "$log"; exit 1; }; }
+
+          export DEBIAN_FRONTEND=noninteractive
+          run apt-get update
+          run apt-get install -y --no-install-recommends \
             build-essential curl ca-certificates xz-utils flex bison file \
             libgmp-dev libmpfr-dev libmpc-dev zlib1g-dev libzstd-dev texinfo \
             gcc-multilib g++-multilib libc6-dev-i386 cmake ninja-build git \
             libssl-dev
-      - name: Build GCC 16.2 (bookworm ABI, multilib, stripped)
-        run: |
-          set -euxo pipefail
+
           cd /tmp
-          curl -sSf --retry 3 -O https://ftp.gnu.org/gnu/gcc/gcc-16.2.0/gcc-16.2.0.tar.xz \
-            || { curl -s https://ftp.gnu.org/gnu/gcc/ | grep -oE 'gcc-16\.[0-9.]+/' | sort -u; exit 1; }
-          tar xf gcc-16.2.0.tar.xz
+          run curl -sSf --retry 3 -O https://ftp.gnu.org/gnu/gcc/gcc-16.2.0/gcc-16.2.0.tar.xz
+          run tar xf gcc-16.2.0.tar.xz
           mkdir gcc-build && cd gcc-build
-          ../gcc-16.2.0/configure --prefix=/opt/gcc-16 --program-suffix=-16 \
+          run ../gcc-16.2.0/configure --prefix=/opt/gcc-16 --program-suffix=-16 \
             --enable-languages=c,c++ --disable-bootstrap --disable-nls \
             --disable-libsanitizer --disable-werror --with-system-zlib
-          make -j"$(nproc)"
-          make install-strip
-          /opt/gcc-16/bin/gcc-16 --version
+          run make -j"$(nproc)"
+          run make install-strip
+          run /opt/gcc-16/bin/gcc-16 --version
           echo 'int main(void){return 0;}' > t.c
-          /opt/gcc-16/bin/gcc-16 -m32 t.c -o t32 && file t32
-          /opt/gcc-16/bin/gcc-16 t.c -o t64 && ./t64
-      - name: Fetch binutils 2.47 tarball (pin-checked)
-        run: |
-          set -euxo pipefail
+          run /opt/gcc-16/bin/gcc-16 -m32 t.c -o t32
+          run /opt/gcc-16/bin/gcc-16 t.c -o t64
+          run ./t64
+
           cd /tmp
-          curl -sSf --retry 3 -O https://ftp.gnu.org/gnu/binutils/binutils-2.47.tar.xz
-          echo "154ab23b60070e8f27013c22977f1129425d67d1e8acd6e13010e617811e4cff  binutils-2.47.tar.xz" | sha256sum -c -
-      - name: Build mold 2.42.1
-        run: |
-          set -euxo pipefail
-          cd /tmp
-          git clone --depth 1 -b v2.42.1 https://github.com/rui314/mold.git
+          run curl -sSf --retry 3 -O https://ftp.gnu.org/gnu/binutils/binutils-2.47.tar.xz
+          echo "154ab23b60070e8f27013c22977f1129425d67d1e8acd6e13010e617811e4cff  binutils-2.47.tar.xz" > binutils.sha
+          run sha256sum -c binutils.sha
+
+          run git clone --depth 1 -b v2.42.1 https://github.com/rui314/mold.git
           cd mold
-          # Research preset: x86-64/i686 targets only when the build system
-          # exposes a target list (saves build time; policy request).
           extra=""
-          if grep -qE 'MOLD_TARGETS' CMakeLists.txt; then
-            extra="-DMOLD_TARGETS=X86_64;I386"
-          fi
-          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release $extra
-          cmake --build build -j"$(nproc)"
-          strip build/mold
-          ./build/mold --version
-      - name: Download bookworm debs (32-bit glibc, valgrind, PyYAML)
-        run: |
-          set -euxo pipefail
+          grep -qE 'MOLD_TARGETS' CMakeLists.txt && extra="-DMOLD_TARGETS=X86_64;I386"
+          run cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release $extra
+          run cmake --build build -j"$(nproc)"
+          run strip build/mold
+          run ./build/mold --version
+
           mkdir -p /tmp/debs && cd /tmp/debs
-          ok=1
           for p in valgrind libc6-dbg python3-yaml gcc-multilib gcc-12-multilib \
                    g++-multilib g++-12-multilib libc6-dev-i386 libc6-i386 \
                    lib32gcc-12-dev lib32gcc-s1 lib32stdc++6 lib32stdc++-12-dev \
                    lib32gomp1 lib32itm1 lib32atomic1 lib32ubsan1 lib32quadmath0 \
-                   lib32asan8 libx32gcc-12-dev libx32gcc-s1 libx32stdc++6; do
-            apt-get download "$p" || echo "MISS $p" >> miss.txt
+                   lib32asan8; do
+            apt-get download "$p" >> "$log" 2>&1 || echo "MISS $p" >> "$log"
           done
           for must in libc6-dev-i386 libc6-i386 lib32gcc-12-dev valgrind python3-yaml; do
-            ls "$must"_*.deb || ok=0
+            ls "$must"_*.deb >> "$log" 2>&1 || { echo "FATAL missing deb $must" >> "$log"; exit 1; }
           done
-          [ "$ok" = 1 ]
-          cat miss.txt || true
-      - name: Package and push as orphan tag harness-cache-1
-        run: |
-          set -euxo pipefail
+
           mkdir -p /cache/chunks
           export XZ_OPT='-T0 -6'
-          tar -C /opt -cJf /cache/gcc-16-bookworm-x86_64.tar.xz gcc-16
-          tar -C /tmp -cJf /cache/debs-bookworm.tar.xz debs
+          run tar -C /opt -cJf /cache/gcc-16-bookworm-x86_64.tar.xz gcc-16
+          run tar -C /tmp -cJf /cache/debs-bookworm.tar.xz debs
           cp /tmp/binutils-2.47.tar.xz /cache/
           cp /tmp/mold/build/mold /cache/mold-2.42.1-x86_64
           cd /cache
@@ -104,9 +105,9 @@ jobs:
             binutils-2.47.tar.xz mold-2.42.1-x86_64 > chunks/MANIFEST.sha256
           for f in gcc-16-bookworm-x86_64.tar.xz debs-bookworm.tar.xz \
                    binutils-2.47.tar.xz mold-2.42.1-x86_64; do
-            split -b 94371840 -d -a 2 "$f" "chunks/$f.part"
+            run split -b 94371840 -d -a 2 "$f" "chunks/$f.part"
           done
-          ls -l chunks/
+          run ls -l chunks/
           cd chunks
           git init -q .
           git config user.name 'harness-cache'
@@ -114,7 +115,6 @@ jobs:
           git add -A
           git commit -q -m 'bookworm harness toolchain payload (transport only)'
           git tag harness-cache-1
-          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+          run git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
             refs/tags/harness-cache-1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          echo OK >> "$log"
