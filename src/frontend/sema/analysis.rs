@@ -4103,8 +4103,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
             // `int a[4611686018427387904]` is 2^64 bytes and used to wrap to a
             // zero-byte object that compiled and linked without a word.
             let elem_size = elem.size_ctx(&*self.result.type_context.borrow_struct_layouts());
-            if (n as u128) * (elem_size as u128)
-                > crate::common::types::max_object_bytes() as u128
+            if (n as u128) * (elem_size as u128) > crate::common::types::max_object_bytes() as u128
             {
                 self.diagnostics
                     .borrow_mut()

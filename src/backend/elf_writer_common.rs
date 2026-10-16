@@ -1993,8 +1993,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     // runaway positives are refused before materialization.
                     let val = val.max(0) as u64;
                     let fill_byte = *fill;
-                    let nobits_zero = fill_byte == 0
-                        && self.current_section_mut()?.section_type == SHT_NOBITS;
+                    let nobits_zero =
+                        fill_byte == 0 && self.current_section_mut()?.section_type == SHT_NOBITS;
                     if !nobits_zero {
                         if val > crate::backend::elf::MAX_DIRECTIVE_FILL as u64 {
                             return Err(format!(
