@@ -1877,8 +1877,20 @@ gate "rustfmt" fast cargo fmt --all -- --check
 # The declared rust-version floor (Cargo.toml, 1.97.0) is a measurement only
 # if something rebuilds the tree on that toolchain: the hosted `msrv` job
 # does, and this gate is its local mirror (check_ci_gate_parity.py requires
-# the pair). Needs the 1.97.0 rustup toolchain installed.
-gate "msrv-check" fast cargo +1.97.0 check --locked
+# the pair). Needs the 1.97.0 toolchain: through rustup where available,
+# otherwise directly when the active rustc already IS the declared floor
+# (restored sandboxes install a plain dist toolchain without rustup).
+msrv_check_gate() {
+    if command -v rustup >/dev/null 2>&1; then
+        cargo +1.97.0 check --locked
+    elif rustc --version | grep -q '^rustc 1\.97\.0'; then
+        cargo check --locked
+    else
+        echo "msrv-check: need rustc 1.97.0 (rustup missing, active $(rustc --version))" >&2
+        return 1
+    fi
+}
+gate "msrv-check" fast msrv_check_gate
 
 # Test and Clippy gates use the same resource policy, independently in
 # subshells. CI_LOCAL_JOBS / CARGO_BUILD_JOBS override automatic parallelism;

@@ -39,7 +39,10 @@ class RegistryTests(unittest.TestCase):
             self.assertTrue(binary.is_relative_to(root / "artifacts"))
             data = b"executable identity fixture"
             def fake_compile(command, **kwargs):
+                # A real compiler produces an executable artifact; the X_OK
+                # admission gate in compile_one rejects anything else.
                 binary.write_bytes(data)
+                binary.chmod(0o755)
                 return {"ok": True, "command": command}
             with patch.object(tool.bench, "invoke", side_effect=fake_compile), \
                  patch.object(tool.bench, "text_size", return_value=len(data)):
