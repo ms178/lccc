@@ -20,6 +20,44 @@ use crate::ir::reexports::{CallInfo, Instruction, IrFunction, IrModule, Operand,
 ///
 /// Returns the number of call sites updated.
 pub fn run(module: &mut IrModule) -> usize {
+    let fenv = module
+        .functions
+        .iter()
+        .any(|f| f.pass_policy.fp_environment_observable);
+    let fp_effectful: FxHashSet<String> = module
+        .functions
+        .iter()
+        .filter(|f| super::fp_environment_blocks_reordering(f))
+        .map(|f| f.name.clone())
+        .collect();
+    let mut total_updates = 0;
+    // Invalidate prior/declared attributes when FP environment effects are
+    // possible. This runs before importing call annotations into the fixpoint.
+    for func in &mut module.functions {
+        if !func.pass_policy.fp_environment_observable {
+            continue;
+        }
+        for inst in func.blocks.iter_mut().flat_map(|b| &mut b.instructions) {
+            let blocked = match &*inst {
+                Instruction::Call { func, info } => {
+                    fp_effectful.contains(func)
+                        || info.return_type.is_float()
+                        || info.arg_types.iter().any(|ty| ty.is_float())
+                }
+                Instruction::CallIndirect { .. } => true,
+                _ => false,
+            };
+            if blocked {
+                if let Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } =
+                    inst
+                {
+                    total_updates += usize::from(info.is_pure || info.is_const);
+                    info.is_pure = false;
+                    info.is_const = false;
+                }
+            }
+        }
+    }
     let mut pure_fns: FxHashSet<String> = FxHashSet::default();
     let mut const_fns: FxHashSet<String> = FxHashSet::default();
 
@@ -30,6 +68,11 @@ pub fn run(module: &mut IrModule) -> usize {
         "ceill", "floor", "floorf", "floorl", "trunc", "truncf", "truncl", "round", "roundf",
         "roundl", "log", "logf", "logl", "exp", "expf", "expl", "pow", "powf", "powl",
     ] {
+        if fp_effectful.contains(*name)
+            || (fenv && !["abs", "labs", "llabs", "imaxabs"].contains(name))
+        {
+            continue;
+        }
         const_fns.insert(name.to_string());
         pure_fns.insert(name.to_string());
     }
@@ -39,7 +82,9 @@ pub fn run(module: &mut IrModule) -> usize {
         "strlen", "wcslen", "strcmp", "strncmp", "wcscmp", "wcsncmp", "memcmp", "bcmp", "strchr",
         "strrchr", "strstr", "memchr",
     ] {
-        pure_fns.insert(name.to_string());
+        if !fp_effectful.contains(*name) {
+            pure_fns.insert(name.to_string());
+        }
     }
 
     // Collect initial annotations from existing CallInfo in the module
@@ -98,7 +143,6 @@ pub fn run(module: &mut IrModule) -> usize {
     }
 
     // Propagate inferred purity to all call sites
-    let mut total_updates = 0;
     for func in &mut module.functions {
         for block in &mut func.blocks {
             for inst in &mut block.instructions {

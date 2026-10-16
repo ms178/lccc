@@ -725,6 +725,12 @@ impl X86Codegen {
         // need canonical wide homes for NON-cast wide reads, transitively
         // through Copy/Phi. Do not add duplicate extensions to cast-only IVs.
         let mut implicit_sext_set: FxHashSet<u32> = FxHashSet::default();
+        // Semantic signed-I32 DEFINITIONS, independent of home/storage width.
+        // `value_types` is widened by consumers (a GEP turns an I32 result's
+        // storage type into Ptr), so it cannot decide def-side signedness;
+        // orthogonal to implicit_sext_set, which tracks wide CONSUMERS that did
+        // not arrive through a self-extending Cast.
+        let mut signed_i32_defs: FxHashSet<u32> = FxHashSet::default();
         // copy_phi_srcs[dest] = list of value sources (from Copy/Phi) whose
         // 64-bit value flows into `dest`. Built in pass 1, used in pass 2.
         let mut copy_phi_srcs: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
@@ -735,6 +741,11 @@ impl X86Codegen {
         };
         for block in &func.blocks {
             for inst in &block.instructions {
+                if inst.result_type() == Some(IrType::I32) {
+                    if let Some(dest) = inst.dest() {
+                        signed_i32_defs.insert(dest.0);
+                    }
+                }
                 match inst {
                     Instruction::BinOp { ty, lhs, rhs, .. } if is_64(ty) => {
                         mark(lhs, &mut needs_sext_set);
@@ -858,6 +869,7 @@ impl X86Codegen {
         self.skip_i32_sext = needs_sext_set.is_empty();
         self.needs_sext_values = needs_sext_set;
         self.implicit_sext_values = implicit_sext_set;
+        self.signed_i32_defs = signed_i32_defs;
 
         // PF-16b: Clz/Ctz/Popcount on <=32-bit types produce results in
         // [0, bitwidth] — bit 31 is provably zero, so their widening casts

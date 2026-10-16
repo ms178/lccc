@@ -589,21 +589,21 @@ impl X86Codegen {
         use super::emit::{phys_reg_name, phys_reg_name_32, typed_phys_reg_name};
         let dest_64 = phys_reg_name(dest_phys);
         let dest_32 = phys_reg_name_32(dest_phys);
-        let src_phys = self.operand_reg(src);
+        let mut src_phys = self.operand_reg(src);
         let src_slot = match src {
             Operand::Value(v) => self.state.get_slot(v.0).map(|sl| sl.0),
             _ => None,
         };
+        // A generic move only transfers bits; it is not a widening cast.
+        // Materialize unusual homes first, then apply the same typed extension
+        // as for a normal GPR. This also covers deferred byte/half flushes.
+        if src_phys.is_some_and(super::emit::is_xmm_reg)
+            || (src_phys.is_none() && src_slot.is_none())
+        {
+            self.operand_to_callee_reg(src, dest_phys);
+            src_phys = Some(dest_phys);
+        }
         if let Some(src_reg) = src_phys {
-            // XMM-homed source (integer bit-punned in the float domain): the
-            // extending move forms below name GP sub-registers only, and
-            // typed_phys_reg_name has no spelling for xmm indices. Stage
-            // through the generic callee-register path, which owns the
-            // xmm→GPR move.
-            if super::emit::is_xmm_reg(src_reg) {
-                self.operand_to_callee_reg(src, dest_phys);
-                return;
-            }
             // Source is in a register — emit reg-to-reg extending move.
             let src_typed = typed_phys_reg_name(src_reg, ft);
             if ft.is_signed() {
@@ -684,11 +684,6 @@ impl X86Codegen {
                         .emit_instr_rbp_reg("    movq", slot_off, dest_64),
                 }
             }
-        } else {
-            // No stable home: stage through the accumulator (the generic
-            // cast path would have done the same). Only reachable from the
-            // flush side; the record path refuses home-less sources.
-            self.operand_to_callee_reg(src, dest_phys);
         }
     }
 
@@ -1074,6 +1069,25 @@ impl X86Codegen {
         if !self.try_emit_cast_reg_direct_inner(src, from_ty, to_ty, dest_phys) {
             return false;
         }
+        // A same-width unsigned-to-signed cast may be a low-bit identity,
+        // but not a canonical wide signed home. Unlike the accumulator
+        // store path, this direct path has no later result-store boundary.
+        //
+        // Use the PRECISE gate: a wide reader that arrives through its own
+        // widening `Cast` extends its input, so canonicalising the home here
+        // as well only adds a redundant `movslq` and lengthens the live range
+        // -- measurably so when the value is a loop induction variable
+        // (spectral_norm: 4 extra `movslq` inside 2000-iteration nested
+        // loops, +6.66% simulated Ir).  `implicit_sext_values` is exactly the
+        // set of signed homes read wide WITHOUT such a self-extending cast.
+        if to_ty == IrType::I32 && matches!(from_ty, IrType::I32 | IrType::U32) {
+            self.emit_implicit_sext32_for_value(
+                super::emit::phys_reg_name_32(dest_phys),
+                super::emit::phys_reg_name(dest_phys),
+                false,
+                dest.0,
+            );
+        }
         self.note_inplace_compute(dest_phys, dest.0);
         true
     }
@@ -1253,6 +1267,108 @@ impl X86Codegen {
             _ => {
                 // Float casts, F128, etc. — not handled here.
                 return false;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod widening_home_tests {
+    use super::*;
+    use crate::backend::state::StackSlot;
+
+    fn emitter(home: u8, from: IrType) -> X86Codegen {
+        let mut cg = X86Codegen::new();
+        cg.skip_i32_sext = true;
+        cg.value_types.insert(1, from);
+        cg.state.value_use_counts = vec![1; 10];
+        cg.reg_assignments.insert(9, PhysReg(2));
+        match home {
+            0 => {
+                cg.reg_assignments.insert(1, PhysReg(1));
+            }
+            1 => {
+                cg.reg_assignments.insert(1, PhysReg(16));
+            }
+            2 => {
+                cg.state.value_locations.insert(1, StackSlot(-8));
+            }
+            _ => cg.state.park_acc(1, false),
+        }
+        cg
+    }
+
+    #[test]
+    fn explicit_i32_cast_extends_every_source_home_without_def_side_help() {
+        for home in 0..4 {
+            for to in [IrType::I64, IrType::U64, IrType::Ptr] {
+                let mut cg = emitter(home, IrType::I32);
+                cg.emit_cast_impl(&Value(9), &Operand::Value(Value(1)), IrType::I32, to);
+                let out = &cg.state.out.buf;
+                assert!(
+                    out.contains("movslq") || out.contains("cltq"),
+                    "home={home}, to={to:?}: {out}"
+                );
+            }
+        }
+    }
+
+    /// Three demand classes, not two.  `needs_sext_values` alone records a
+    /// wide reader that arrives through its own widening `Cast`; such a reader
+    /// extends its input, so canonicalising the home as well is pure overhead.
+    /// Only `implicit_sext_values` -- a wide reader with NO self-extension --
+    /// justifies the def-side `movslq`.  Collapsing the two is what costs
+    /// spectral_norm 4 redundant `movslq` inside 2000-iteration nested loops.
+    const WIDE_DEMAND: [(&str, bool, bool, bool); 3] = [
+        //            label                any_wide  self_extending  expect_sext
+        ("no-wide-reader", false, false, false),
+        ("self-extending-cast-reader", true, true, false),
+        ("implicit-wide-reader", true, false, true),
+    ];
+
+    #[test]
+    fn same_width_signed_results_honor_implicit_wide_home_demand() {
+        for home in 0..4 {
+            for from in [IrType::I32, IrType::U32] {
+                for (label, any_wide, self_extending, expect_sext) in WIDE_DEMAND {
+                    let mut cg = emitter(home, from);
+                    cg.value_types
+                        .insert(9, if any_wide { IrType::Ptr } else { IrType::I32 });
+                    cg.signed_i32_defs.insert(9);
+                    cg.skip_i32_sext = !any_wide;
+                    if any_wide {
+                        cg.needs_sext_values.insert(9);
+                        if !self_extending {
+                            cg.implicit_sext_values.insert(9);
+                        }
+                    }
+                    cg.emit_cast_impl(&Value(9), &Operand::Value(Value(1)), from, IrType::I32);
+                    let out = &cg.state.out.buf;
+                    assert_eq!(
+                        out.contains("movslq") || out.contains("cltq"),
+                        expect_sext,
+                        "home={home}, from={from:?}, demand={label}: {out}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_fallback_moves_are_typed_extensions_not_bit_copies() {
+        for home in 0..4 {
+            for (ty, mnemonic) in [
+                (IrType::I8, "movsbq"),
+                (IrType::I16, "movswq"),
+                (IrType::I32, "movslq"),
+                (IrType::U8, "movzbl"),
+                (IrType::U16, "movzwl"),
+                (IrType::U32, "movl"),
+            ] {
+                let mut cg = emitter(home, ty);
+                cg.emit_int_widen_move(&Operand::Value(Value(1)), ty, PhysReg(2));
+                let out = &cg.state.out.buf;
+                assert!(out.contains(mnemonic), "home={home}, ty={ty:?}: {out}");
             }
         }
     }

@@ -86,7 +86,7 @@ fn fold_const_global_loads(module: &mut IrModule) -> usize {
                     ..
                 } = inst
                 {
-                    if *volatile {
+                    if *volatile || (func.pass_policy.fp_environment_observable && ty.is_float()) {
                         continue;
                     }
                     if let Some(&c) = addr_map.get(&ptr.0) {
@@ -272,9 +272,7 @@ pub fn resolve_remaining_is_constant(module: &mut IrModule) {
 /// extended (for U8/U16 targets) or sign-extended (for I8/I16 targets) when
 /// used as operands of UnaryOp/BitNot instructions.
 pub(crate) fn fold_function(func: &mut IrFunction) -> usize {
-    if super::fp_environment_blocks_reordering(func) {
-        return 0;
-    }
+    let preserve_fp = super::fp_environment_blocks_reordering(func);
     let max_id = func.max_value_id() as usize;
     let mut total = 0;
 
@@ -323,6 +321,9 @@ pub(crate) fn fold_function(func: &mut IrFunction) -> usize {
         let mut folded = 0;
         for block in &mut func.blocks {
             for inst in &mut block.instructions {
+                if preserve_fp && !super::policy::local_fold_is_fenv_safe(inst) {
+                    continue;
+                }
                 if let Some(folded_inst) = try_fold_with_map(inst, &const_map) {
                     // Update the const map immediately so later instructions in
                     // the same block can see through newly-folded constants.
@@ -591,12 +592,8 @@ pub(crate) fn eval_binop_const(
     rhs: IrConst,
     ty: IrType,
 ) -> Option<IrConst> {
-    // The shared oracle is also called by SCCP and IPCP, bypassing the
-    // constant-fold pass's function fence. Host rounding/exception behavior
-    // cannot replace an operation in an observable target FP environment.
-    if ty.is_float() && crate::common::semantics::fp_environment_observable() {
-        return None;
-    }
+    // Pure mathematical oracle. Constant folding, SCCP and IPCP enforce
+    // the owning function's policy before invoking it; never read TU TLS.
 
     if ty.is_128bit() {
         let l = lhs.to_i128()?;
@@ -642,12 +639,8 @@ pub(crate) fn eval_unaryop_const(
     src_cast_to_ty: Option<IrType>,
     ty: IrType,
 ) -> Option<IrConst> {
-    // The shared oracle is also called by SCCP and IPCP, bypassing the
-    // constant-fold pass's function fence. Host rounding/exception behavior
-    // cannot replace an operation in an observable target FP environment.
-    if ty.is_float() && crate::common::semantics::fp_environment_observable() {
-        return None;
-    }
+    // Pure mathematical oracle. Constant folding, SCCP and IPCP enforce
+    // the owning function's policy before invoking it; never read TU TLS.
 
     debug_assert!(
         op != IrUnaryOp::IsConstant,
@@ -684,12 +677,8 @@ pub(crate) fn eval_cmp_const(
     rhs: IrConst,
     ty: IrType,
 ) -> Option<IrConst> {
-    // The shared oracle is also called by SCCP and IPCP, bypassing the
-    // constant-fold pass's function fence. Host rounding/exception behavior
-    // cannot replace an operation in an observable target FP environment.
-    if ty.is_float() && crate::common::semantics::fp_environment_observable() {
-        return None;
-    }
+    // Pure mathematical oracle. Constant folding, SCCP and IPCP enforce
+    // the owning function's policy before invoking it; never read TU TLS.
 
     if ty.is_128bit() {
         let l = lhs.to_i128()?;
@@ -713,12 +702,6 @@ pub(crate) fn eval_cmp_const(
 
 /// Evaluate a cast of a constant operand from `from_ty` to `to_ty`.
 pub(crate) fn eval_cast_const(src: IrConst, from_ty: IrType, to_ty: IrType) -> Option<IrConst> {
-    if (from_ty.is_float() || to_ty.is_float())
-        && crate::common::semantics::fp_environment_observable()
-    {
-        return None;
-    }
-
     if from_ty.is_128bit() || to_ty.is_128bit() {
         return fold_cast_i128(&src, from_ty, to_ty);
     }
@@ -1587,37 +1570,89 @@ mod tests {
 #[cfg(test)]
 mod observable_fp_oracle_tests {
     use super::*;
+    use crate::ir::reexports::*;
+
     #[test]
-    fn shared_evaluators_do_not_bypass_fp_environment_policy() {
-        let _guard =
-            crate::common::semantics::TestGuard::new(crate::common::semantics::Semantics {
-                signed_overflow_wraps: false,
-                fp_environment_observable: true,
-            });
-        assert!(
-            eval_binop_const(
-                IrBinOp::Add,
-                IrConst::F64(1.0),
-                IrConst::F64(f64::EPSILON / 2.0),
-                IrType::F64
-            )
-            .is_none()
-        );
-        assert!(
-            eval_cmp_const(
-                IrCmpOp::Eq,
-                IrConst::F64(1.0),
-                IrConst::F64(1.0),
-                IrType::F64
-            )
-            .is_none()
-        );
-        assert!(eval_unaryop_const(IrUnaryOp::Neg, IrConst::F64(1.0), None, IrType::F64).is_none());
-        assert!(eval_cast_const(IrConst::I32(16_777_217), IrType::I32, IrType::F32).is_none());
-        assert!(eval_cast_const(IrConst::F64(1.25), IrType::F64, IrType::I32).is_none());
-        assert_eq!(
-            eval_binop_const(IrBinOp::Add, IrConst::I32(2), IrConst::I32(3), IrType::I32),
-            Some(IrConst::I32(5))
-        );
+    fn shared_evaluator_callers_keep_each_functions_fp_policy() {
+        let value = Value(0);
+        let instructions = [
+            Instruction::BinOp {
+                dest: value,
+                op: IrBinOp::Add,
+                lhs: Operand::Const(IrConst::F64(1.0)),
+                rhs: Operand::Const(IrConst::F64(f64::EPSILON / 2.0)),
+                ty: IrType::F64,
+            },
+            Instruction::Cmp {
+                dest: value,
+                op: IrCmpOp::Eq,
+                lhs: Operand::Const(IrConst::F64(1.0)),
+                rhs: Operand::Const(IrConst::F64(1.0)),
+                ty: IrType::F64,
+            },
+            Instruction::UnaryOp {
+                dest: value,
+                op: IrUnaryOp::Neg,
+                src: Operand::Const(IrConst::F64(1.0)),
+                ty: IrType::F64,
+            },
+            Instruction::Cast {
+                dest: value,
+                src: Operand::Const(IrConst::I32(16_777_217)),
+                from_ty: IrType::I32,
+                to_ty: IrType::F32,
+            },
+            Instruction::Cast {
+                dest: value,
+                src: Operand::Const(IrConst::F64(1.25)),
+                from_ty: IrType::F64,
+                to_ty: IrType::I32,
+            },
+            Instruction::BinOp {
+                dest: value,
+                op: IrBinOp::Add,
+                lhs: Operand::Const(IrConst::I32(2)),
+                rhs: Operand::Const(IrConst::I32(3)),
+                ty: IrType::I32,
+            },
+        ];
+        // Interleave independent functions and both passes; no ambient state
+        // can make a prior observable function affect a later ordinary one.
+        for inst in instructions {
+            for observable in [true, false, true, false] {
+                for sccp in [false, true] {
+                    let mut f = IrFunction::new(
+                        "policy_oracle".into(),
+                        inst.result_type().unwrap(),
+                        vec![],
+                        false,
+                    );
+                    f.pass_policy.fp_environment_observable = observable;
+                    f.next_value_id = 1;
+                    f.next_label = 1;
+                    f.blocks.push(BasicBlock {
+                        label: BlockId(0),
+                        instructions: vec![inst.clone()],
+                        source_spans: vec![],
+                        terminator: Terminator::Return(Some(Operand::Value(value))),
+                    });
+                    let blocked =
+                        observable && crate::passes::policy::observes_fp_environment(&inst);
+                    if sccp {
+                        crate::passes::sccp::run_function(&mut f);
+                    } else {
+                        fold_function(&mut f);
+                    }
+                    let unchanged = f.blocks[0]
+                        .instructions
+                        .iter()
+                        .any(|after| format!("{after:?}") == format!("{inst:?}"));
+                    assert_eq!(
+                        unchanged, blocked,
+                        "observable={observable} sccp={sccp}: {f:?}"
+                    );
+                }
+            }
+        }
     }
 }

@@ -365,6 +365,12 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
             continue;
         }
 
+        // Multi-output/implicit operations need more than the last AT&T
+        // destination. In particular, XADD also overwrites its first operand.
+        if rax_is_zero && has_implicit_reg_usage(infos[i].trimmed(store.get(i))) {
+            rax_is_zero = false;
+        }
+
         // --- Pattern: redundant xorl %eax, %eax elimination ---
         // When %rax is already known to be zero (from a previous xorl %eax, %eax),
         // and only StoreRbp instructions intervene (which read but don't modify
@@ -1028,7 +1034,11 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
             // --- Extended scan: cltq past non-rax-clobbering instructions ---
             if next_ext == ExtKind::Cltq && !is_redundant_ext {
                 let i_writes_rax = match infos[i].kind {
-                    LineKind::Other { dest_reg } => dest_reg == 0,
+                    LineKind::Other { dest_reg } => {
+                        dest_reg == 0
+                            || dest_reg == REG_NONE
+                            || has_implicit_reg_usage(infos[i].trimmed(store.get(i)))
+                    }
                     LineKind::LoadRbp { reg, .. } => reg == 0,
                     LineKind::StoreRbp { .. } => false,
                     LineKind::Nop | LineKind::Empty => false,
@@ -1072,7 +1082,11 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                         }
                         // Check if this instruction writes to %rax (family 0)
                         let writes_rax = match infos[k].kind {
-                            LineKind::Other { dest_reg } => dest_reg == 0,
+                            LineKind::Other { dest_reg } => {
+                                dest_reg == 0
+                                    || dest_reg == REG_NONE
+                                    || has_implicit_reg_usage(infos[k].trimmed(store.get(k)))
+                            }
                             LineKind::LoadRbp { reg, .. } => reg == 0,
                             _ => true, // conservative: treat unknown as writing rax
                         };
@@ -12418,6 +12432,66 @@ mod extending_stack_tests {
             combined_local_pass(&mut store, &mut infos);
             forward_adjacent_gp_stack_loads(&mut store, &mut infos);
             assert!(store.get(1).contains("movzbl 12(%rsp), %esi"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod extension_fact_barrier_tests {
+    use super::*;
+
+    fn run(text: &str) -> String {
+        let mut store = LineStore::new(text.into());
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        combined_local_pass(&mut store, &mut infos);
+        store.build_result(|i| infos[i].is_nop())
+    }
+
+    #[test]
+    fn atomic_and_implicit_writers_kill_backward_extension_facts() {
+        for instruction in [
+            "lock xaddl %eax, -16(%rbp)",
+            "xaddl %eax, (%rdi)",
+            "xaddl %eax, %ecx",
+            "xchgq %rax, %rcx",
+            "lock cmpxchgl %edx, (%rdi)",
+            "cpuid",
+            "rdtscp",
+        ] {
+            for intervening in ["", "    movq %rax, %r8\n"] {
+                let input = format!(
+                    "    movslq -8(%rbp), %rax\n    {instruction}\n{intervening}    movl %eax, -24(%rbp)\n    cltq\n    movq %rax, -32(%rbp)\n"
+                );
+                let out = run(&input);
+                assert!(out.contains("cltq"), "{input} => {out}");
+            }
+        }
+    }
+
+    #[test]
+    fn multi_output_operation_also_kills_zero_fact() {
+        let out = run(
+            "    xorl %eax, %eax\n    xaddl %eax, %ecx\n    xorl %eax, %eax\n    movq %rax, -8(%rbp)\n",
+        );
+        assert_eq!(out.matches("xorl %eax, %eax").count(), 2, "{out}");
+    }
+
+    #[test]
+    fn constant_extension_fact_requires_signed_i32_range() {
+        for (immediate, redundant) in [
+            ("0", true),
+            ("-2147483648", true),
+            ("2147483647", true),
+            ("2147483648", false),
+            ("4294967295", false),
+            ("0x80000000", false),
+            ("-2147483649", false),
+        ] {
+            let input = format!("    movq ${immediate}, %rax\n    cltq\n    movq %rax, -8(%rbp)\n");
+            let out = run(&input);
+            assert_eq!(!out.contains("cltq"), redundant, "{input} => {out}");
         }
     }
 }

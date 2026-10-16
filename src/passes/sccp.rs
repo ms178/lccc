@@ -162,6 +162,7 @@ fn edge_key(from: u32, to: u32) -> u64 {
 }
 
 struct SccpState {
+    fp_environment_observable: bool,
     /// Lattice value per SSA value, indexed by `Value.0`.
     lattice: Vec<LatticeVal>,
     /// Whether each block (by position) has been proven reachable.
@@ -266,6 +267,7 @@ pub fn run_with_usedef(func: &mut IrFunction, usedef: &UseDefInfo) -> SccpStats 
     }
 
     let mut state = SccpState {
+        fp_environment_observable: func.pass_policy.fp_environment_observable,
         lattice: vec![LatticeVal::Top; num_values],
         block_executable: vec![false; num_blocks],
         executable_edges: FxHashSet::default(),
@@ -567,18 +569,10 @@ fn fold_despite_unknown(
 }
 
 fn evaluate_instruction(inst: &Instruction, block_idx: u32, state: &mut SccpState) {
-    // Constant operands do not prove a constant result or absence of effects
-    // in an observable FP environment. Host-rounding evaluation would erase
-    // runtime rounding and exceptions. Keep Copy/Select/Phi and integer SCCP.
-    let constrained_fp = super::fp_environment_observable()
-        && match inst {
-            Instruction::BinOp { ty, .. }
-            | Instruction::UnaryOp { ty, .. }
-            | Instruction::Cmp { ty, .. } => ty.is_float(),
-            Instruction::Cast { from_ty, to_ty, .. } => from_ty.is_float() || to_ty.is_float(),
-            _ => false,
-        };
-    if constrained_fp {
+    // The scalar evaluators are shared with constant_fold, but its policy
+    // guard is not. FP values must be overdefined, not target-rounding-time
+    // constants. Integer lattice propagation remains enabled in mixed code.
+    if state.fp_environment_observable && super::policy::observes_fp_environment(inst) {
         if let Some(dest) = inst.dest() {
             update_lattice(dest.0, LatticeVal::Bottom, state);
         }

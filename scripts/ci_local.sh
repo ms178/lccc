@@ -658,6 +658,20 @@ gate "fp-environment-trap-order" fast \
 gate "evidence-hash-integrity" fast python3 scripts/verify_evidence_hashes.py
 gate "licm-acquire-backedge-contract" fast python3 scripts/check_licm_ordering.py
 
+# Native execution gates; static opcode controls are supplementary tripwires.
+gate "fenv-local-effects" fast \
+    python3 scripts/check_fenv_local_optimization.py --compiler target/fastbuild/lccc --native-only --output target/fenv-local-effects --json target/fenv-local-effects.json
+
+gate "byte-count-normalization" fast \
+    python3 scripts/check_byte_count_normalize.py --lccc target/fastbuild/lccc --gcc gcc-16 --output target/byte-count-normalize --json target/byte-count-normalize.json
+
+# Kills both PassPolicy setter mutants.  A per-function IR contract that is
+# stored but never read collapses to one behaviour, and no amount of unit
+# testing on the struct itself catches that: each mutant must still compile
+# and then fail the same executable assertion the original passes.
+gate "pass-policy-mutants" fast \
+    python3 scripts/check_pass_policy_mutants.py --json target/pass-policy-mutants.json
+
 gate "ivsr-signed-affine-step" fast \
     env CCC="$LCCC" bash tests/regression/check_ivsr_signed_affine_step.sh
 

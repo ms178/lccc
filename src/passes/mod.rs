@@ -11,21 +11,8 @@
 //! - Os: O2 with code-size-increasing transforms disabled
 //! - Oz: Os with inlining disabled
 
-use crate::common::semantics::{fp_environment_observable, signed_overflow_wraps};
-
-/// Coarse, conservative fence for passes whose FP exception/rounding
-/// scheduling is not proven. Integer-only functions retain the normal path.
-/// Check the TU policy before scanning: FENV-off compilation pays no IR walk.
-fn fp_environment_blocks_reordering(func: &IrFunction) -> bool {
-    fp_environment_observable()
-        && func.blocks.iter().any(|block| block.instructions.iter().any(|inst| {
-            inst.result_type().is_some_and(|ty| ty.is_float())
-                || matches!(inst, Instruction::Cmp { ty, .. } | Instruction::Store { ty, .. } if ty.is_float())
-                || matches!(inst, Instruction::Cast { from_ty, .. } if from_ty.is_float())
-                // Unclassified intrinsic result types must fail closed too.
-                || matches!(inst, Instruction::Intrinsic { .. })
-        }))
-}
+mod policy;
+use policy::fp_environment_blocks_reordering;
 
 pub(crate) mod aggregate_copy_forward;
 pub(crate) mod aggregate_sroa;
@@ -1213,10 +1200,17 @@ pub(crate) fn run_passes(
     x86_avx512vl: bool,
     ra_config: &crate::backend::regalloc::RaConfig,
 ) {
-    crate::common::semantics::replace(crate::common::semantics::Semantics {
-        signed_overflow_wraps: wrap_signed_overflow,
+    // Language semantics travel WITH the IR, never as ambient worker-thread
+    // state: the policy survives Clone, is inherited by outlined functions and
+    // cannot race under the parallel pass driver. Reset per translation unit so
+    // a -fwrapv unit never leaks into the next one, and initialize even at O0.
+    let pass_policy = crate::common::pass_policy::PassPolicy::new(
+        wrap_signed_overflow,
         fp_environment_observable,
-    });
+    );
+    for func in &mut module.functions {
+        func.pass_policy = pass_policy;
+    }
     let fp_reassoc = fp_reassoc && !fp_environment_observable;
     let fp_contract = if fp_environment_observable {
         FpContract::Off
@@ -1329,6 +1323,7 @@ pub(crate) fn run_passes(
     });
     let mut disabled = std::env::var("CCC_DISABLE_PASSES").unwrap_or_default();
     vectorize::set_strict_recip_pack_enabled(!pass_disabled(&disabled, "strict_recip_pack"));
+    vectorize::set_byte_count_normalize_enabled(!pass_disabled(&disabled, "byte_count_normalize"));
     // Snapshot the map policy switches once, like the other pass-pipeline
     // knobs.  Both the pre-unroll constant-trip entry and the main vectorizer
     // must make the same decision without re-reading the environment per
@@ -1863,11 +1858,11 @@ pub(crate) fn run_passes(
         // the unroller/vectorizer make their decisions. Unlike signed affine
         // folding this proves both IV and sum nonwrapping through the final
         // exit observation, so -fwrapv does not weaken its contract.
-        if iter == 0
-            && opt_level >= 2
-            && !optimize_for_size
-            && target == crate::backend::Target::X86_64
-            && !pass_disabled(&disabled, "loop_bound")
+        // The five target-independent legality/profitability conditions are
+        // encapsulated (and unit-tested) in `loop_bound::scheduled`; the sixth
+        // is the switch topology below, which belongs to the pipeline rather
+        // than to the pass.
+        if loop_bound::scheduled(iter, opt_level, optimize_for_size, target, &disabled)
             // `CCC_NO_AFFINE_EXIT_FOLD` must cover EVERY producer of the
             // affine exit-compare fold: a switch that quietly leaves one
             // producer running turns the A/B that condemns the fold into
@@ -3794,32 +3789,62 @@ mod m16_size_policy_tests {
 #[cfg(test)]
 mod signed_wrap_policy_tests {
     use super::*;
+    use crate::common::pass_policy::PassPolicy;
+
+    fn apply(module: &mut IrModule, level: u32, wrap: bool, fenv: bool) {
+        run_passes(
+            module,
+            level,
+            crate::backend::Target::X86_64,
+            false,
+            wrap,
+            fenv,
+            false,
+            FpContract::Off,
+            X86Isa::default(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            &crate::backend::regalloc::RaConfig::default(),
+        );
+    }
 
     #[test]
-    fn arithmetic_policies_reset_independently_for_every_translation_unit_and_level() {
-        for level in [2, 0, 1, 3] {
-            for (wraps, observable) in [(true, false), (false, true), (true, true), (false, false)]
-            {
-                run_passes(
-                    &mut IrModule::new(),
-                    level,
-                    crate::backend::Target::X86_64,
-                    false,
-                    wraps,
-                    observable,
-                    false,
-                    crate::common::fp_contract::FpContract::Off,
-                    X86Isa::default(),
-                    false,
-                    false,
-                    false,
-                    false,
-                    false,
-                    false,
-                    &crate::backend::regalloc::RaConfig::default(),
-                );
-                assert_eq!(signed_overflow_wraps(), wraps);
-                assert_eq!(fp_environment_observable(), observable);
+    fn wrapping_policy_resets_for_every_translation_unit_and_level() {
+        let mut first = IrModule::new();
+        first.functions.push(IrFunction::new(
+            "first".into(),
+            crate::common::types::IrType::Void,
+            vec![],
+            false,
+        ));
+        let mut second = IrModule::new();
+        second.functions.push(first.functions[0].clone());
+        for level in 0..=3 {
+            for wrap in [false, true] {
+                for fenv in [false, true] {
+                    apply(&mut first, level, wrap, fenv);
+                    let expected = PassPolicy::new(wrap, fenv);
+                    assert_eq!(first.functions[0].pass_policy, expected);
+                    // A second TU on the SAME thread must neither inherit nor
+                    // overwrite the first TU's independent contract.
+                    apply(&mut second, 3 - level, !wrap, !fenv);
+                    assert_eq!(
+                        second.functions[0].pass_policy,
+                        PassPolicy::new(!wrap, !fenv)
+                    );
+                    assert_eq!(first.functions[0].pass_policy, expected);
+                    let moved = first.functions[0].clone();
+                    assert_eq!(
+                        std::thread::spawn(move || moved.pass_policy)
+                            .join()
+                            .unwrap(),
+                        expected
+                    );
+                }
             }
         }
     }

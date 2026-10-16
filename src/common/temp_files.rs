@@ -536,11 +536,15 @@ mod lifecycle_tests {
 
     #[test]
     fn managed_cleanup_does_not_invalidate_unmanaged_paths() {
-        let path =
-            private_temp_dir()
-                .unwrap()
-                .join(unique_filename("lifecycle", "unmanaged", "tmp"));
-        drop(TempFile::try_new("lifecycle", "managed", "tmp").unwrap());
+        // Reserve the unmanaged name without creating a file: an existing
+        // file would keep the directory nonempty and hide the lifetime bug.
+        let path = private_temp_dir()
+            .expect("unmanaged private directory")
+            .join(unique_filename("lifecycle", "unmanaged", "tmp"));
+        drop(
+            TempFile::try_new("lifecycle", "managed", "tmp")
+                .expect("test temporary-file reservation"),
+        );
         write_file_exclusive(&path, b"unmanaged lifetime").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"unmanaged lifetime");
         fs::remove_file(path).unwrap();
@@ -548,8 +552,10 @@ mod lifecycle_tests {
 
     #[test]
     fn pending_reservation_survives_sibling_drop() {
-        let first = TempFile::try_new("lifecycle", "first", "tmp").unwrap();
-        let pending = TempFile::try_new("lifecycle", "pending", "tmp").unwrap();
+        let first = TempFile::try_new("lifecycle", "first", "tmp")
+            .expect("test temporary-file reservation");
+        let pending = TempFile::try_new("lifecycle", "pending", "tmp")
+            .expect("test temporary-file reservation");
         drop(first);
         fs::write(pending.path(), b"still reserved").unwrap();
         assert_eq!(fs::read(pending.path()).unwrap(), b"still reserved");
@@ -558,14 +564,16 @@ mod lifecycle_tests {
     #[test]
     fn sequential_lifetimes_create_writable_directories() {
         for _ in 0..3 {
-            let file = TempFile::try_new("lifecycle", "sequential", "tmp").unwrap();
+            let file = TempFile::try_new("lifecycle", "sequential", "tmp")
+                .expect("test temporary-file reservation");
             fs::write(file.path(), b"next generation").unwrap();
         }
     }
 
     #[test]
     fn unrelated_explicit_path_cannot_reap_reserved_directory() {
-        let pending = TempFile::try_new("lifecycle", "pending", "tmp").unwrap();
+        let pending = TempFile::try_new("lifecycle", "pending", "tmp")
+            .expect("test temporary-file reservation");
         let explicit = TempFile::with_path(temp_dir().join(format!(
             "lccc-unrelated-{}-{}",
             std::process::id(),
@@ -578,9 +586,15 @@ mod lifecycle_tests {
     #[test]
     fn parallel_pending_writers_survive_an_empty_sibling() {
         let pending: Vec<_> = (0..8)
-            .map(|_| TempFile::try_new("lifecycle", "parallel", "tmp").unwrap())
+            .map(|_| {
+                TempFile::try_new("lifecycle", "parallel", "tmp")
+                    .expect("test temporary-file reservation")
+            })
             .collect();
-        drop(TempFile::try_new("lifecycle", "empty", "tmp").unwrap());
+        drop(
+            TempFile::try_new("lifecycle", "empty", "tmp")
+                .expect("test temporary-file reservation"),
+        );
         std::thread::scope(|scope| {
             for file in pending {
                 scope.spawn(move || fs::write(file.path(), b"parallel").unwrap());

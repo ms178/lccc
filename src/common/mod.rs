@@ -10,10 +10,11 @@ pub(crate) mod fp_contract;
 pub(crate) mod fx_hash;
 pub(crate) mod isa_features;
 pub(crate) mod long_double;
-pub(crate) mod semantics;
 pub(crate) mod source;
 pub(crate) mod symbol_table;
 pub(crate) mod temp_files;
 pub(crate) mod type_builder;
 pub(crate) mod types;
 pub(crate) mod x86_features;
+
+pub mod pass_policy;

@@ -37,7 +37,7 @@ def sha(path):
 def load(stream,limit=META_LIMIT):
     raw=stream.read(limit+1)
     require(len(raw)<=limit,'metadata limit exceeded')
-    return json.loads(raw,object_pairs_hook=integrity._pairs)
+    return json.loads(raw,object_pairs_hook=integrity.unique_object)
 
 
 def verify(root,configuration,check_inputs=False):

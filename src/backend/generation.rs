@@ -217,10 +217,10 @@ fn foldable_const_disp(c: &IrConst, allow_u32_wrap: bool) -> Option<i64> {
 /// `scale = 2` of a zero-extended index (live miscompile at -O1..-O3, pinned by
 /// `tests/regression/ivsr_scale_ring_wrap.c`).
 #[inline]
-fn scale_ring_is_linear(ty: IrType) -> bool {
+fn scale_ring_is_linear(ty: IrType, wrap_signed_overflow: bool) -> bool {
     ty.is_integer()
         && ((ty.size() as usize) >= crate::common::types::target_ptr_size()
-            || (!ty.is_unsigned() && !crate::common::semantics::signed_overflow_wraps()))
+            || (!ty.is_unsigned() && !wrap_signed_overflow))
 }
 
 fn is_i32_disp(off: i64) -> bool {
@@ -1301,7 +1301,7 @@ fn build_indexed_gep_map(
                     ty,
                     ..
                 } => {
-                    if !scale_ring_is_linear(*ty) {
+                    if !scale_ring_is_linear(*ty, func.pass_policy.wrap_signed_overflow) {
                         break;
                     }
                     let k = c.to_i64()?;
@@ -1330,7 +1330,7 @@ fn build_indexed_gep_map(
                     ty,
                     ..
                 } => {
-                    if !scale_ring_is_linear(*ty) {
+                    if !scale_ring_is_linear(*ty, func.pass_policy.wrap_signed_overflow) {
                         break;
                     }
                     let n = c.to_i64()?;
@@ -1356,7 +1356,7 @@ fn build_indexed_gep_map(
                     ty,
                     ..
                 } if a == b && shift < 3 => {
-                    if !scale_ring_is_linear(*ty) {
+                    if !scale_ring_is_linear(*ty, func.pass_policy.wrap_signed_overflow) {
                         break;
                     }
                     shift += 1;
@@ -1406,7 +1406,7 @@ fn build_indexed_gep_map(
                     ty,
                     ..
                 } => {
-                    if !scale_ring_is_linear(*ty) {
+                    if !scale_ring_is_linear(*ty, func.pass_policy.wrap_signed_overflow) {
                         break;
                     }
                     // Already saw an add(iv, const) — refuse nested adds.
@@ -1452,7 +1452,7 @@ fn build_indexed_gep_map(
                     ty,
                     ..
                 } => {
-                    if !scale_ring_is_linear(*ty) {
+                    if !scale_ring_is_linear(*ty, func.pass_policy.wrap_signed_overflow) {
                         break;
                     }
                     if pf06_add_peel_disabled {
@@ -7024,11 +7024,8 @@ mod scale_ring_tests {
 
     #[test]
     fn wrapping_signed_scale_is_computed_before_pointer_extension() {
-        let _guard =
-            crate::common::semantics::TestGuard::new(crate::common::semantics::Semantics {
-                signed_overflow_wraps: true,
-                fp_environment_observable: false,
-            });
+        // Wrapping signed overflow is now an explicit argument, not ambient state.
+        let wraps = true;
         let ptr = crate::common::types::target_ptr_size();
         for ty in [
             IrType::I8,
@@ -7041,7 +7038,7 @@ mod scale_ring_tests {
             IrType::U64,
         ] {
             assert_eq!(
-                scale_ring_is_linear(ty),
+                scale_ring_is_linear(ty, wraps),
                 ty.size() as usize >= ptr,
                 "{ty:?}"
             );
@@ -7073,14 +7070,14 @@ mod scale_ring_tests {
         ] {
             let narrow = (ty.size() as usize) < ptr;
             assert_eq!(
-                scale_ring_is_linear(ty),
+                scale_ring_is_linear(ty, false),
                 !narrow || !ty.is_unsigned(),
                 "{ty:?}"
             );
         }
         // At or above the pointer width both spellings share one ring.
         for ty in [IrType::I64, IrType::U64] {
-            assert!(scale_ring_is_linear(ty), "{ty:?}");
+            assert!(scale_ring_is_linear(ty, false), "{ty:?}");
         }
         // Non-integer rings are never a scaling instruction's ring, and are
         // refused rather than trusted.
@@ -7091,7 +7088,7 @@ mod scale_ring_tests {
             IrType::Ptr,
             IrType::Void,
         ] {
-            assert!(!scale_ring_is_linear(ty), "{ty:?}");
+            assert!(!scale_ring_is_linear(ty, false), "{ty:?}");
         }
     }
 }

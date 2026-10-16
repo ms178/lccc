@@ -615,6 +615,9 @@ jobs:
         set -euo pipefail
         python3 scripts/verify_evidence_hashes.py
         python3 scripts/check_licm_ordering.py
+        python3 scripts/check_fenv_local_optimization.py --compiler target/fastbuild/lccc --native-only --output target/fenv-local-effects --json target/fenv-local-effects.json
+        python3 scripts/check_byte_count_normalize.py --lccc target/fastbuild/lccc --gcc gcc-16 --output target/byte-count-normalize --json target/byte-count-normalize.json
+        python3 scripts/check_pass_policy_mutants.py --json target/pass-policy-mutants.json
         bash tests/regression/check_byte_accessor_inline.sh
         bash tests/regression/check_unsigned_affine_loop.sh
         python3 tests/linker/test_riscv_shared_binding.py

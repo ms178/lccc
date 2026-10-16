@@ -1783,13 +1783,6 @@ impl Driver {
         let preprocessed = preprocessor.preprocess(&source);
         let fp_environment_observable =
             self.fp_trapping_math || self.fp_rounding_math || preprocessor.fenv_access_requested;
-        // Runtime expression lowering also folds casts, before run_passes.
-        // Publish the same TU contract before entering the frontend; static
-        // initializer evaluation retains its separate translation-time rules.
-        crate::common::semantics::replace(crate::common::semantics::Semantics {
-            signed_overflow_wraps: self.wrap_signed_overflow,
-            fp_environment_observable,
-        });
         *self.last_dep_files.borrow_mut() = preprocessor.take_dep_files();
         if time_phases {
             eprintln!("[TIME] preprocess: {:.3}s", t0.elapsed().as_secs_f64());
@@ -1929,7 +1922,11 @@ impl Driver {
             sema_result.const_values,
             diagnostics,
             self.gnu89_inline,
-        );
+        )
+        .with_pass_policy(crate::common::pass_policy::PassPolicy::new(
+            self.wrap_signed_overflow,
+            fp_environment_observable,
+        ));
         let (mut module, mut diagnostics) = lowerer.lower(&ast);
         // IR lowering is a user-facing phase: it rejects ill-typed builtins,
         // target-specific intrinsics and unsupported constructs, and every one

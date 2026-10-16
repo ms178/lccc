@@ -1001,6 +1001,7 @@ fn inline_run_impl(module: &mut IrModule, size_optimized: bool, always_inline_on
                                     // Reconstruct IrFunction for callee from callee_map data
                                     // callee_map stores blocks, we need to create a dummy IrFunction
                                     let dummy = crate::ir::reexports::IrFunction {
+                                        pass_policy: Default::default(),
                                         name: callee_name.clone(),
                                         return_type: crate::common::types::IrType::I32,
                                         params: vec![],
@@ -1271,6 +1272,7 @@ fn inline_run_impl(module: &mut IrModule, size_optimized: bool, always_inline_on
                                     // Reconstruct IrFunction for callee from callee_map data
                                     // callee_map stores blocks, we need to create a dummy IrFunction
                                     let dummy = crate::ir::reexports::IrFunction {
+                                        pass_policy: Default::default(),
                                         name: callee_name.clone(),
                                         return_type: crate::common::types::IrType::I32,
                                         params: vec![],
@@ -4931,6 +4933,7 @@ mod value_reference_tests {
 
     fn user_function(instructions: Vec<Instruction>) -> IrFunction {
         IrFunction {
+            pass_policy: Default::default(),
             name: "user".into(),
             return_type: IrType::Void,
             params: vec![],
@@ -5427,6 +5430,7 @@ mod const_trip_tests {
 
     fn function(blocks: Vec<BasicBlock>) -> IrFunction {
         IrFunction {
+            pass_policy: Default::default(),
             name: "callee".into(),
             return_type: IrType::Void,
             params: vec![],

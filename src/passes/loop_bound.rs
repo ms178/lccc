@@ -12,6 +12,24 @@ use crate::ir::reexports::{
     Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand, Terminator, Value,
 };
 
+/// Target-independent legality, deliberately x86-64/O2+ non-size profitability
+/// rollout: only that downstream unroll/vector pipeline has corpus evidence.
+/// Run before its first unroll decision, independently of signed affine folding.
+/// CCC_DISABLE_PASSES=loop_bound remains the dedicated ablation switch.
+pub(super) fn scheduled(
+    iteration: usize,
+    opt_level: u32,
+    optimize_for_size: bool,
+    target: crate::backend::Target,
+    disabled: &str,
+) -> bool {
+    iteration == 0
+        && opt_level >= 2
+        && !optimize_for_size
+        && target == crate::backend::Target::X86_64
+        && !super::pass_disabled(disabled, "loop_bound")
+}
+
 fn adjusted_limit(
     init: u64,
     step: u64,
@@ -447,5 +465,223 @@ mod tests {
             Some(u64::MAX - 6)
         );
         assert_eq!(adjusted_limit(0, 1, 1, u64::MAX, 64, true), None);
+    }
+
+    // Execute the actual CFG, typed arithmetic, phi edges, comparisons and
+    // terminators; this does not reuse adjusted_limit or the matcher algebra.
+    fn interpret(f: &IrFunction) -> (Option<u64>, Vec<(u64, bool)>) {
+        let mut values = [0u64; 8];
+        let mut block = 0;
+        let mut previous = f.blocks[0].label;
+        let mut trace = Vec::new();
+        let operand = |op: Operand, values: &[u64; 8]| match op {
+            Operand::Const(c) => c.to_i64().unwrap() as u64,
+            Operand::Value(v) => values[v.0 as usize],
+        };
+        for _ in 0..1024 {
+            let b = &f.blocks[block];
+            for inst in &b.instructions {
+                let (dest, result) = match *inst {
+                    Instruction::Phi {
+                        dest,
+                        ref incoming,
+                        ty,
+                    } => {
+                        let op = incoming
+                            .iter()
+                            .find(|(_, label)| *label == previous)
+                            .unwrap()
+                            .0;
+                        let mask = u64::MAX >> (64 - ty.size() * 8);
+                        (dest, operand(op, &values) & mask)
+                    }
+                    Instruction::BinOp {
+                        dest,
+                        op: IrBinOp::Add,
+                        lhs,
+                        rhs,
+                        ty,
+                    } => {
+                        let mask = u64::MAX >> (64 - ty.size() * 8);
+                        (
+                            dest,
+                            operand(lhs, &values).wrapping_add(operand(rhs, &values)) & mask,
+                        )
+                    }
+                    Instruction::Cmp {
+                        dest,
+                        op,
+                        lhs,
+                        rhs,
+                        ty,
+                    } => {
+                        let mask = u64::MAX >> (64 - ty.size() * 8);
+                        let (l, r) = (operand(lhs, &values) & mask, operand(rhs, &values) & mask);
+                        let yes = match op {
+                            IrCmpOp::Ult => l < r,
+                            IrCmpOp::Ule => l <= r,
+                            IrCmpOp::Ugt => l > r,
+                            IrCmpOp::Uge => l >= r,
+                            _ => panic!("unsupported test comparison"),
+                        };
+                        (dest, u64::from(yes))
+                    }
+                    _ => panic!("unsupported test instruction"),
+                };
+                values[dest.0 as usize] = result;
+            }
+            let next = match b.terminator {
+                Terminator::Return(Some(op)) => return (Some(operand(op, &values)), trace),
+                Terminator::Branch(label) => label,
+                Terminator::CondBranch {
+                    cond,
+                    true_label,
+                    false_label,
+                } => {
+                    let yes = operand(cond, &values) != 0;
+                    trace.push((values[1], yes));
+                    if yes { true_label } else { false_label }
+                }
+                _ => panic!("unsupported test terminator"),
+            };
+            previous = b.label;
+            block = f.blocks.iter().position(|b| b.label == next).unwrap();
+        }
+        (None, trace) // Bounded observation of intentionally wrapping/cyclic refusals.
+    }
+
+    #[test]
+    fn interpreted_all_compare_spellings_preserve_body_and_final_header_trajectories() {
+        use crate::ir::reexports::BlockId;
+        let mut accepted = 0;
+        for ty in [IrType::U8, IrType::U16, IrType::U32, IrType::U64] {
+            let max = u64::MAX >> (64 - ty.size() * 8);
+            for (init, step, offset, limit) in [
+                (0, 1, 1, 8),
+                (2, 3, 4, 32),
+                (5, 8, 2, 32),
+                (30, 3, 1, 31),
+                (8, 1, 2, 4),
+                (0, 0, 1, 8),
+                (max - 5, 2, 2, max - 1),
+                (max - 20, 3, 2, max - 4),
+                (max - 1, 1, 2, max),
+                (max - 7, 3, 2, max),
+            ] {
+                for inclusive in [false, true] {
+                    for swapped in [false, true] {
+                        for reversed in [false, true] {
+                            for wraps in [false, true] {
+                                let mut f = fixture(
+                                    ty,
+                                    init as i64,
+                                    step as i64,
+                                    offset as i64,
+                                    limit as i64,
+                                );
+                                f.pass_policy.wrap_signed_overflow = wraps;
+                                if let Instruction::Cmp { lhs, rhs, op, .. } =
+                                    &mut f.blocks[1].instructions[2]
+                                {
+                                    if swapped {
+                                        std::mem::swap(lhs, rhs);
+                                    }
+                                    *op = match (inclusive, swapped, reversed) {
+                                        (false, false, false) | (true, true, true) => IrCmpOp::Ult,
+                                        (false, true, false) | (true, false, true) => IrCmpOp::Ugt,
+                                        (false, false, true) | (true, true, false) => IrCmpOp::Uge,
+                                        (false, true, true) | (true, false, false) => IrCmpOp::Ule,
+                                    };
+                                }
+                                if reversed {
+                                    if let Terminator::CondBranch {
+                                        true_label,
+                                        false_label,
+                                        ..
+                                    } = &mut f.blocks[1].terminator
+                                    {
+                                        std::mem::swap(true_label, false_label);
+                                    }
+                                }
+                                // Exercise label/index separation rather than identity-labelled CFGs.
+                                let relabel = |l: BlockId| BlockId(10 + l.0 * 20);
+                                for b in &mut f.blocks {
+                                    b.label = relabel(b.label);
+                                    for i in &mut b.instructions {
+                                        if let Instruction::Phi { incoming, .. } = i {
+                                            for (_, l) in incoming {
+                                                *l = relabel(*l);
+                                            }
+                                        }
+                                    }
+                                    match &mut b.terminator {
+                                        Terminator::Branch(l) => *l = relabel(*l),
+                                        Terminator::CondBranch {
+                                            true_label,
+                                            false_label,
+                                            ..
+                                        } => {
+                                            *true_label = relabel(*true_label);
+                                            *false_label = relabel(*false_label);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                f.next_label = 100;
+                                let before = interpret(&f);
+                                let original = format!("{f:?}");
+                                let n = run(&mut f);
+                                if init == 0 && step == 1 && offset == 1 && limit == 8 {
+                                    assert_eq!(
+                                        n, 1,
+                                        "every positive compare spelling must rewrite"
+                                    );
+                                }
+                                if n == 0 {
+                                    assert_eq!(format!("{f:?}"), original);
+                                } else {
+                                    accepted += 1;
+                                    assert!(before.0.is_some());
+                                }
+                                assert_eq!(
+                                    interpret(&f),
+                                    before,
+                                    "{ty:?} {init} {step} {offset} {limit} {inclusive} {swapped} {reversed}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(accepted > 100);
+    }
+
+    #[test]
+    fn scheduling_is_independent_of_signed_affine_knob() {
+        use crate::backend::Target;
+        struct Restore(bool, bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                super::super::loop_rotate::set_affine_fold_knobs(self.0, self.1);
+            }
+        }
+        let _restore = Restore(
+            super::super::loop_rotate::affine_fold_enabled(),
+            super::super::loop_rotate::affine_fold_debug(),
+        );
+        for affine in [false, true] {
+            super::super::loop_rotate::set_affine_fold_knobs(affine, false);
+            for level in 0..=5 {
+                assert_eq!(
+                    scheduled(0, level, level >= 4, Target::X86_64, ""),
+                    (2..=3).contains(&level)
+                );
+            }
+            assert!(scheduled(0, 2, false, Target::X86_64, "affine_fold"));
+            assert!(!scheduled(0, 2, false, Target::X86_64, "loop_bound"));
+            assert!(!scheduled(1, 2, false, Target::X86_64, ""));
+            assert!(!scheduled(0, 2, false, Target::Aarch64, ""));
+        }
     }
 }

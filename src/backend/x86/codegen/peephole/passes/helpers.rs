@@ -199,7 +199,7 @@ pub(super) fn has_implicit_reg_usage(trimmed: &str) -> bool {
     trimmed.starts_with("cpuid") || trimmed.starts_with("syscall") ||
     trimmed.starts_with("rdtsc") || trimmed.starts_with("rdmsr") ||
     trimmed.starts_with("wrmsr") ||
-    trimmed.starts_with("xchg") || trimmed.starts_with("cmpxchg") ||
+    trimmed.starts_with("xchg") || trimmed.starts_with("xadd") || trimmed.starts_with("cmpxchg") ||
     trimmed.starts_with("lock ") ||
     // shld/shrd use %cl implicitly (i128 shifts); treat like other shifts.
     trimmed.starts_with("shld") || trimmed.starts_with("shrd") ||

@@ -1140,6 +1140,7 @@ impl Lowerer {
         let blocks = std::mem::take(&mut self.func_mut().blocks);
         let next_label = self.next_label;
         let ir_func = crate::ir::reexports::IrFunction {
+            pass_policy: Default::default(),
             name: nf.name.clone(),
             return_type,
             params,

@@ -1450,13 +1450,10 @@ fn observable_fp_constants_keep_effects_but_integer_sccp_survives_redteam() {
         Terminator::Return(Some(Operand::Value(Value(1)))),
     )]);
     f.return_type = IrType::F64;
-    {
-        let _fenv = crate::common::semantics::TestGuard::new(crate::common::semantics::Semantics {
-            fp_environment_observable: true,
-            ..Default::default()
-        });
-        run_function(&mut f);
-    }
+    // FENV observability is an IR-carried per-function contract now, not
+    // ambient thread state, so the fixture is stamped directly.
+    f.pass_policy.fp_environment_observable = true;
+    run_function(&mut f);
     assert!(f.blocks[0].instructions.iter().any(|i| matches!(
         i,
         Instruction::BinOp {

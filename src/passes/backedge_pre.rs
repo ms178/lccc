@@ -988,9 +988,9 @@ fn plan_loop(cx: &Ctx<'_>, lp: &NaturalLoop, out: &mut Vec<Rewrite>) {
         for inst in &func.blocks[eb].instructions {
             let Some(p) = Parts::of(inst) else { continue };
             let (e, op, ty) = (p.dest, p.op, p.ty);
-            if ty.is_float()
+            if super::policy::observes_fp_environment(inst)
                 && !*fp_stable.get_or_insert_with(|| {
-                    !super::fp_environment_observable()
+                    !func.pass_policy.fp_environment_observable
                         && lp.body.iter().all(|&b| {
                             func.blocks[b]
                                 .instructions
@@ -1686,7 +1686,6 @@ mod tests {
                 set_backedge_pre_env(self.0);
             }
         }
-        let _semantics = crate::common::semantics::TestGuard::new(Default::default());
         let _restore = Restore(EnvConfig::read());
         crate::common::types::set_target_elf_machine(EM_X86_64);
         for broad in [false, true] {
@@ -1695,11 +1694,8 @@ mod tests {
                 ..ENV_CONFIG_DEFAULT
             });
             for observable in [false, true] {
-                crate::common::semantics::replace(crate::common::semantics::Semantics {
-                    fp_environment_observable: observable,
-                    ..Default::default()
-                });
                 let mut f = fp_recurrence_two_squares();
+                f.pass_policy.fp_environment_observable = observable;
                 assert_eq!(run(&mut f), usize::from(!observable));
                 assert_eq!(count_muls(&f), if observable { 2 } else { 1 });
                 // Do not turn an FP legality fence into a global integer ban.
@@ -1844,14 +1840,12 @@ mod tests {
         );
         assert_eq!(run_round(&mut changing, &env, &tm), 0);
         let (fp, integer) = {
-            let _fenv =
-                crate::common::semantics::TestGuard::new(crate::common::semantics::Semantics {
-                    fp_environment_observable: true,
-                    ..Default::default()
-                });
+            let (mut fp_f, mut int_f) = (fp_recurrence(), int_recurrence());
+            fp_f.pass_policy.fp_environment_observable = true;
+            int_f.pass_policy.fp_environment_observable = true;
             (
-                run_round(&mut fp_recurrence(), &env, &tm),
-                run_round(&mut int_recurrence(), &env, &tm),
+                run_round(&mut fp_f, &env, &tm),
+                run_round(&mut int_f, &env, &tm),
             )
         };
         assert_eq!(fp, 0, "even call-free speculation can change FP traps");
@@ -1926,11 +1920,7 @@ mod tests {
         });
         assert_eq!(run_round(&mut user_call, &env, &tm), 0);
         let changes = {
-            let _fenv =
-                crate::common::semantics::TestGuard::new(crate::common::semantics::Semantics {
-                    fp_environment_observable: true,
-                    ..Default::default()
-                });
+            function.pass_policy.fp_environment_observable = true;
             run_round(&mut function, &env, &tm)
         };
         assert_eq!(changes, 0, "the FENV policy still prohibits speculation");
@@ -1942,13 +1932,9 @@ mod tests {
         let mut tm = TargetModel::detect();
         tm.fp_fma = false;
         for observable in [false, true] {
-            let _guard =
-                crate::common::semantics::TestGuard::new(crate::common::semantics::Semantics {
-                    signed_overflow_wraps: false,
-                    fp_environment_observable: observable,
-                });
             let fc = |x| Operand::Const(IrConst::F64(x));
             let mut f = IrFunction::new("fp_environment".into(), IrType::F64, Vec::new(), false);
+            f.pass_policy.fp_environment_observable = observable;
             f.blocks
                 .push(block(0, vec![], Terminator::Branch(BlockId(1))));
             f.blocks.push(block(

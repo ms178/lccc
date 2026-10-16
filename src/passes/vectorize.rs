@@ -76,6 +76,9 @@
 //! - `LCCC_FORCE_AVX2=1`: Explicitly enable AVX2 (default behavior, provided for clarity)
 //! - `LCCC_DEBUG_VECTORIZE=1`: Enable debug output for vectorization pass
 
+#[path = "vectorize_byte_count_normalize.rs"]
+mod byte_count_normalize;
+
 use crate::common::fp_contract::FpContract;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
@@ -111,6 +114,14 @@ thread_local! {
     // are legal for this particular lowering.
     static X86_STRICT_RECIP_AVX2_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static STRICT_RECIP_PACK_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    // Byte-count normalization adapter (`vectorize_byte_count_normalize.rs`):
+    // rewrites a finite, nonzero-based byte-predicate counter into the
+    // canonical zero-IV/strict-bound shape `analyze_byte_count_loop` accepts,
+    // proving the rewrite on a private function and committing only when the
+    // existing packed analyzer AND emitter both accept it.  Its own kill
+    // switch (`CCC_DISABLE_PASSES=byte_count_normalize`) so a regression can
+    // be attributed to the adapter alone without losing the strict form.
+    static BYTE_COUNT_NORMALIZE_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     // x86 SIMD register-file availability for the MIDDLE END. Every vector
     // lowering this pass emits (VecLoadI32x8, VecAndI32x8, FmaF64x4, ...)
     // becomes an xmm/ymm instruction in the backend. The Linux kernel is built
@@ -388,6 +399,12 @@ pub(crate) fn set_strict_recip_pack_enabled(enabled: bool) {
     STRICT_RECIP_PACK_ENABLED.with(|cell| cell.set(enabled));
 }
 
+/// Set alongside `set_strict_recip_pack_enabled` so a previous compile on the
+/// same worker thread cannot leak this adapter's permission into the next one.
+pub(crate) fn set_byte_count_normalize_enabled(enabled: bool) {
+    BYTE_COUNT_NORMALIZE_ENABLED.with(|cell| cell.set(enabled));
+}
+
 fn x86_strict_recip_avx2_enabled() -> bool {
     X86_STRICT_RECIP_AVX2_AVAILABLE.with(|available| available.get())
 }
@@ -507,6 +524,13 @@ fn vectorize_with_analysis_mode(
         return 0;
     }
 
+    let normalize_byte_count = BYTE_COUNT_NORMALIZE_ENABLED.with(std::cell::Cell::get);
+    // One local snapshot replaces five `std::env::var` reads -- each an
+    // allocation plus a lock on the process environment -- inside the
+    // per-candidate-loop arm chain below.  Nothing mutates the environment
+    // during a single function's vectorization, so the snapshot is exact.
+    let force_sse2 = std::env::var("LCCC_FORCE_SSE2").is_ok();
+
     let mut total_changes = 0;
 
     // Process innermost loops (loops that don't contain other loops).
@@ -577,8 +601,7 @@ fn vectorize_with_analysis_mode(
         };
         if let Some(mut pattern) = matmul_pattern {
             // Select vector width: default to AVX2 (4-wide) unless explicitly disabled
-            let use_sse2 =
-                force_two_wide || std::env::var("LCCC_FORCE_SSE2").is_ok() || !x86_avx2_available();
+            let use_sse2 = force_two_wide || force_sse2 || !x86_avx2_available();
             let vec_width: i64 = if use_sse2 { 2 } else { 4 };
             // The AArch64 two-wide lowering emits both halves per iteration,
             // consuming four doubles. Use the real machine-step width for the
@@ -650,7 +673,7 @@ fn vectorize_with_analysis_mode(
         } else if !neon
             && !force_two_wide
             && !late_minmax_only()
-            && std::env::var("LCCC_FORCE_SSE2").is_err()
+            && !force_sse2
             && x86_strict_recip_avx2_enabled()
             && let Some(strict_pattern) =
                 analyze_strict_computed_recip_reduction(func, loop_info, cfg)
@@ -694,7 +717,7 @@ fn vectorize_with_analysis_mode(
         } else if !neon
             && !force_two_wide
             && !late_minmax_only()
-            && std::env::var("LCCC_FORCE_SSE2").is_err()
+            && !force_sse2
             && x86_avx2_available()
             && let Some(count_pattern) = analyze_byte_count_loop(func, loop_info, cfg)
         {
@@ -717,7 +740,28 @@ fn vectorize_with_analysis_mode(
         } else if !neon
             && !force_two_wide
             && !late_minmax_only()
-            && std::env::var("LCCC_FORCE_SSE2").is_err()
+            && !force_sse2
+            && x86_avx2_available()
+            && normalize_byte_count
+            && let n = byte_count_normalize::transform(func, loop_info, cfg)
+            && n > 0
+        {
+            // The strict arm above only accepts the canonical zero-IV/
+            // exact-bound shape.  This transactional adapter widens the
+            // population to finite, nonzero-based counters: it rewrites an
+            // equivalent scalar loop on a private function and commits only
+            // when `analyze_byte_count_loop` AND `transform_byte_count_
+            // reduction` both accept that canonical loop, so it cannot
+            // weaken the packed transform's own contract.
+            if debug {
+                eprintln!("[VEC] Normalized byte-count reduction matched: {n}");
+            }
+            total_changes += n;
+            continue;
+        } else if !neon
+            && !force_two_wide
+            && !late_minmax_only()
+            && !force_sse2
             && x86_avx2_available()
             && let Some(adler_pattern) = analyze_adler_loop(func, loop_info, cfg)
         {
@@ -903,8 +947,7 @@ fn vectorize_with_analysis_mode(
             }
 
             // Try reduction pattern vectorization (sum += arr[i], sum += a[i] * b[i], etc.)
-            let use_sse2 =
-                force_two_wide || std::env::var("LCCC_FORCE_SSE2").is_ok() || !x86_avx2_available();
+            let use_sse2 = force_two_wide || force_sse2 || !x86_avx2_available();
             let vec_width: i64 = if use_sse2 { 2 } else { 4 };
 
             // Same profitability gate as the matmul path (the reduction path

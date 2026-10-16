@@ -556,7 +556,7 @@ fn reduce_loop(
         let ptr_width = crate::common::types::target_ptr_size();
         let narrow_signed =
             |ty: IrType| ty.is_integer() && !ty.is_unsigned() && ty.size() < ptr_width;
-        let signed_wraps = super::signed_overflow_wraps();
+        let signed_wraps = func.pass_policy.wrap_signed_overflow;
         if signed_wraps && narrow_signed(iv.ty) && add_offset != 0 {
             // This certificate is BODY-only. The failing header can observe
             // MAX+1/MIN-1 in an affine expression even though the IV itself
@@ -1569,7 +1569,7 @@ fn find_derived_exprs(
                     | (Operand::Const(c), Operand::Value(v)) => (v, c),
                     _ => continue,
                 };
-                if super::signed_overflow_wraps()
+                if func.pass_policy.wrap_signed_overflow
                     && !ty.is_unsigned()
                     && ty.size() < crate::common::types::target_ptr_size()
                     && c.to_i64() != Some(0)
@@ -2330,7 +2330,7 @@ fn affine_add_offset_cannot_wrap(
     if !add_ty.is_integer() {
         return None;
     }
-    if super::signed_overflow_wraps()
+    if func.pass_policy.wrap_signed_overflow
         && !add_ty.is_unsigned()
         && add_ty.size() < crate::common::types::target_ptr_size()
         && raw_offset != 0
@@ -3109,11 +3109,6 @@ mod tests {
 
     #[test]
     fn wrapping_signed_pointer_recurrence_keeps_product_and_affine_fences() {
-        let _restore =
-            crate::common::semantics::TestGuard::new(crate::common::semantics::Semantics {
-                signed_overflow_wraps: true,
-                ..Default::default()
-            });
         for (product_ty, cmp_op, offset, stride, expected) in [
             (IrType::I64, IrCmpOp::Slt, 0, 24, 1),
             (IrType::I64, IrCmpOp::Sle, 0, 24, 0),
@@ -3131,6 +3126,7 @@ mod tests {
             (IrType::I64, IrCmpOp::Slt, 0, 2048, 0),
         ] {
             let mut f = cast_backedge(IrType::I32, IrType::I32);
+            f.pass_policy.wrap_signed_overflow = true;
             if let Instruction::Cmp { op, .. } = &mut f.blocks[1].instructions[1] {
                 *op = cmp_op;
             }
@@ -5504,13 +5500,9 @@ mod tests {
 
     #[test]
     fn wrapping_affine_sibling_requires_body_guard_type_and_unit_direction() {
-        let _restore =
-            crate::common::semantics::TestGuard::new(crate::common::semantics::Semantics {
-                signed_overflow_wraps: true,
-                ..Default::default()
-            });
         for variant in 0..8 {
             let mut f = affine_sibling_fixture();
+            f.pass_policy.wrap_signed_overflow = true;
             if variant == 1 {
                 let pos = f.blocks[2]
                     .instructions
