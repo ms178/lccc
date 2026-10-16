@@ -224,6 +224,14 @@ gate "generator-map" fast \
 gate "reg-off-sym-fold" fast \
     env CCC="$LCCC" bash tests/regression/check_reg_off_sym_fold.sh
 
+# Array-bound contract: a bad bound is diagnosed (never wrapped), a byte size
+# that cannot exist is rejected instead of wrapping into a bogus section, and a
+# huge `.bss` object is emitted sparsely under a hard RLIMIT_AS rather than
+# being materialised and OOM-killed. Driven under that limit so the "constant
+# memory" half is a real requirement, not a hope.
+gate "array-bound-contract" fast \
+    python3 scripts/check_array_bound_contract.py --lccc "$LCCC"
+
 gate "benchmark-codegen-registry" fast \
     python3 tests/regression/check_benchmark_codegen_registry.py
 

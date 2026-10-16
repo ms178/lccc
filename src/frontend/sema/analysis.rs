@@ -4075,7 +4075,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
         checker.infer_expr_ctype(expr).unwrap_or(CType::Int)
     }
 
-    fn eval_const_expr_as_usize(&self, expr: &Expr) -> Option<usize> {
+    fn eval_array_bound_len(&self, expr: &Expr, elem: &CType) -> Option<usize> {
         self.eval_const_expr(expr).and_then(|v| {
             if v < 0 {
                 // C standard requires array sizes to be positive (constraint violation).
@@ -4084,10 +4084,34 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
                 self.diagnostics
                     .borrow_mut()
                     .error("size of array is negative", expr.span());
-                None
-            } else {
-                Some(v as usize)
+                return None;
             }
+            // A count that does not fit the target's `usize` cannot become an
+            // element count at all: on `-m32` the conversion would truncate and
+            // `char a[4294967296]` became a zero-element array. (Unreachable on
+            // LP64, where `i64::MAX` fits a 64-bit `usize`.)
+            if (v as u128) > usize::MAX as u128 {
+                self.diagnostics
+                    .borrow_mut()
+                    .error("size of array is too large", expr.span());
+                return None;
+            }
+            let n = v as usize;
+            // The bound must describe an existing object: GCC's maximum object
+            // size, the target's PTRDIFF_MAX bytes. Tested in u128 because the
+            // product that overflows is exactly the one that must be rejected --
+            // `int a[4611686018427387904]` is 2^64 bytes and used to wrap to a
+            // zero-byte object that compiled and linked without a word.
+            let elem_size = elem.size_ctx(&*self.result.type_context.borrow_struct_layouts());
+            if (n as u128) * (elem_size as u128)
+                > crate::common::types::max_object_bytes() as u128
+            {
+                self.diagnostics
+                    .borrow_mut()
+                    .error("size of array is too large", expr.span());
+                return None;
+            }
+            Some(n)
         })
     }
 }

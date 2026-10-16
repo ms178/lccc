@@ -285,7 +285,7 @@ impl Lowerer {
                 }
             }
             CType::Array(elem_ty, Some(n)) => {
-                return self.resolve_ctype_size(elem_ty) * n;
+                return self.resolve_ctype_size(elem_ty).saturating_mul(*n);
             }
             _ => {}
         }
