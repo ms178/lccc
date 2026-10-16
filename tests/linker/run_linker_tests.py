@@ -5295,7 +5295,32 @@ def _gotpcrel_edges_test(args, oracles):
         shim = _shim_for(td, lccc_ld)
         want = "7 55 1 1 1 1 1\n"
         if sh(["as", "e.s", "-o", "e.o"], cwd=td).returncode != 0:
-            return Result(name, "FAIL", "fixture does not assemble")
+            return Result(name, "SKIP",
+                          "assembler without CODE_4_GOTPCRELX (binutils >= 2.45 needed)")
+        # The GNU cross-check needs a bfd ld that LINKS the CODE_4/REX2
+        # GOTPCRELX relocations this fixture pins. A distro ld older than
+        # the pinned 2.47 oracle dies with "unsupported relocation type
+        # 0x2b"; in that case fall back to a pinned ld.bfd (env
+        # LCCC_BFD_LD, or the conventional ~/.cache/ld-2.47 build) via a
+        # -B shim so only the linker is substituted, or skip the GNU arm
+        # honestly rather than fail on an incapable oracle.
+        gnu_b = []
+        with open(os.path.join(td, "probe.c"), "w") as f:
+            f.write("int main(void){return 0;}\n")
+        probe = sh([CC, "-no-pie", "e.o", "probe.c", "-o", "probe.gnu"], cwd=td)
+        if probe.returncode != 0:
+            modern = os.environ.get("LCCC_BFD_LD") or os.path.expanduser(
+                "~/.cache/ld-2.47/bin/ld.bfd")
+            bdir = os.path.join(td, "bfd-pinned")
+            if os.path.exists(modern):
+                os.makedirs(bdir, exist_ok=True)
+                os.symlink(modern, os.path.join(bdir, "ld"))
+                gnu_b = ["-B" + bdir]
+            if not gnu_b or sh([CC] + gnu_b + ["-no-pie", "e.o", "probe.c",
+                                               "-o", "probe.gnu"], cwd=td).returncode != 0:
+                return Result(name, "SKIP",
+                              "GNU ld cannot link CODE_4_GOTPCRELX and no pinned "
+                              "ld.bfd >= 2.45 is available (LCCC_BFD_LD)")
         errs = []
 
         def slot_target(d, relas, ins_va, disp_off, pie, what, expect):
@@ -5312,7 +5337,7 @@ def _gotpcrel_edges_test(args, oracles):
                 errs.append(f"{what}: slot {slot:#x} holds {got!r}, want {expect:#x}")
 
         for mode in ("-no-pie", "-pie", "-shared"):
-            for tag, bflag in (("lccc", ["-B" + shim]), ("gnu", [])):
+            for tag, bflag in (("lccc", ["-B" + shim]), ("gnu", gnu_b)):
                 exe = f"t{mode}.{tag}"
                 if mode == "-shared":
                     lib = f"libe.{tag}.so"

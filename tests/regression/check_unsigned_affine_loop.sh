@@ -26,8 +26,12 @@ if ! grep -Eq '\[AFFOLD\] bounded_u64: affine exit-compare folds: [1-9]' "$tmp/o
     echo 'FAIL: proved unsigned header guard did not fold' >&2
     exit 1
 fi
-# The early range-proof canonicalizer and late affine rotation are independent
-# mechanisms. Exercise all four actual configurations, not a coupled switch.
+# Switch topology: CCC_NO_AFFINE_EXIT_FOLD is the single owner and kills
+# EVERY affine exit-compare producer (a kill switch that leaves one producer
+# running turns the A/B that condemns the fold into the A/B that hides it);
+# CCC_DISABLE_PASSES=loop_bound removes only the early unsigned canonicalizer
+# for attribution, after which the late fold takes over where its weaker
+# proof allows. Exercise all four configurations.
 for early in on off; do
     for late in on off; do
         flags=()
@@ -37,15 +41,17 @@ for early in on off; do
         env -u CCC_DISABLE_PASSES -u CCC_NO_AFFINE_EXIT_FOLD \
             CCC_DEBUG_AFFINE_FOLD=1 "${flags[@]}" "$CCC" -O2 -S \
             "$root/tests/regression/unsigned_affine_loop.c" -o "$stem.s" 2> "$stem.log"
-        if [[ $early == on ]]; then
+        if [[ $late == off ]]; then
+            if grep -q '\[AFFOLD\]' "$stem.log"; then
+                echo 'FAIL: CCC_NO_AFFINE_EXIT_FOLD left an affine fold running' >&2; exit 1
+            fi
+        elif [[ $early == on ]]; then
             grep -Eq '\[AFFOLD\] bounded_u64:.*\(early unsigned\)' "$stem.log"
-        elif grep -q '(early unsigned)' "$stem.log"; then
-            echo 'FAIL: independent early disable was ignored' >&2; exit 1
-        elif [[ $late == on ]]; then
+        else
+            if grep -q '(early unsigned)' "$stem.log"; then
+                echo 'FAIL: CCC_DISABLE_PASSES=loop_bound was ignored' >&2; exit 1
+            fi
             grep -Eq '\[AFFOLD\] bounded_u64: affine exit-compare folds: [1-9]' "$stem.log"
-        fi
-        if [[ $early == off && $late == off ]] && grep -q '\[AFFOLD\]' "$stem.log"; then
-            echo 'FAIL: both fold mechanisms were disabled but a fold ran' >&2; exit 1
         fi
         env -u CCC_DISABLE_PASSES -u CCC_NO_AFFINE_EXIT_FOLD \
             "${flags[@]}" "$CCC" -O2 -fwrapv \
@@ -58,4 +64,4 @@ if grep -Eq '\[AFFOLD\] wraps_u(32|64):' "$tmp/on.log"; then
     echo 'FAIL: unsigned wraparound entry was folded' >&2
     exit 1
 fi
-echo 'PASS: unsigned affine m64/m32 runtime matrix, modular model, positive shape, wrap controls and independent 2x2 disables'
+echo 'PASS: unsigned affine m64/m32 runtime matrix, modular model, positive shape, wrap controls and the owner-switch 2x2 matrix'
