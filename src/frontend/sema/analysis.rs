@@ -3358,11 +3358,14 @@ impl SemanticAnalyzer {
         }
     }
 
-    /// An explicit cast between pointers in different named address spaces is
-    /// accepted (a deliberate conversion) but GCC 14.2 warns about it. The
-    /// rule is applied to the outermost pointer only, as GCC does:
-    /// `long *__seg_gs *` -> `long *__seg_gs *` is silent, `long *` ->
-    /// `long *__seg_gs *` warns. Wording follows GCC's two directions.
+    /// An explicit cast that *removes* or *switches* a named address space is
+    /// accepted (a deliberate conversion) but GCC 14.2 warns about it. One
+    /// direction is silent in GCC: a *null pointer constant* converted into a
+    /// named address space — the canonical per-cpu sentinel
+    /// `(typeof(&percpu_var))(void *)0` inside -Werror kernel builds. Casting
+    /// a real generic pointer into a named space does warn, and named -> named
+    /// warns even through a null constant (verified against GCC 12/14).
+    /// Wording follows GCC's two directions.
     fn check_explicit_cast_address_space(&self, cast: &Expr, inner: &Expr, span: Span) {
         let checker = super::type_checker::ExprTypeChecker {
             symbols: &self.symbol_table,
@@ -3377,6 +3380,14 @@ impl SemanticAnalyzer {
             return;
         };
         if from_space == to_space {
+            return;
+        }
+        // GCC: (T __seg_gs *)(void *)0 is silent; only a genuinely pointer-
+        // valued generic operand entering a named space warns.
+        if from_space == AddressSpace::Default
+            && to_space != AddressSpace::Default
+            && self.is_void_null_pointer_constant(inner)
+        {
             return;
         }
         let message = if to_space == AddressSpace::Default {
