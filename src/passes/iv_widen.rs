@@ -1510,7 +1510,8 @@ fn analyze_iv(
                                 };
                                 if other_is_member
                                     && (nr.is_some()
-                                        || (!cur_is_unsigned && !func.pass_policy.wrap_signed_overflow))
+                                        || (!cur_is_unsigned
+                                            && !func.pass_policy.wrap_signed_overflow))
                                 {
                                     members.push(Member::of(
                                         *dest,

@@ -6771,24 +6771,6 @@ def _note_run_oracle_test(args, oracles):
     return Result(name, "PASS", "six padding/payload boundary controls")
 
 
-def _note_run_oracle_test(args, oracles):
-    name = "note_run_oracle_contract"
-    # Test the actual upstream run counter, including virtual/file adjacency.
-    payload = (".rodata", 1, 2, 0x2748, 0x748, 7, 4)
-    cases = [([], False), ([payload], True),
-             ([(".bss", 8, 2, 0x2748, 0x748, 7, 4)], False),
-             ([(".debug", 1, 0, 0, 0x748, 7, 4)], False),
-             ([(".rodata", 1, 2, 0x2750, 0x750, 7, 4)], False),
-             ([(".rodata", 1, 2, 0x2744, 0x744, 4, 4)], False)]
-    notes = [(0x2740, 0x740, 8, 4), (0x2750, 0x750, 8, 4)]
-    for sections, split in cases:
-        occupied = [(h[4], h[4] + h[5]) for h in sections
-                    if h[1] not in (_SHT_NOTE, 8) and h[2] & _SHF_ALLOC and h[5] > 0]
-        if _note_run_count(notes, occupied) != (2 if split else 1):
-            return Result(name, "FAIL", "padding/payload distinction: " + repr(sections))
-    return Result(name, "PASS", "six padding/payload boundary controls")
-
-
 def _note_run_merge_test(args, oracles):
     """Contiguous allocated note sections share ONE PT_NOTE (lld-style).
 
@@ -6821,7 +6803,7 @@ def _note_run_merge_test(args, oracles):
             return Result(name, "FAIL", "not an ELF64 LSB file")
         notes = sorted(
             ([h[3], h[4], h[5], h[6]] for h in shdrs
-             if h[1] == _SHT_NOTE and (h[2] & SHF_ALLOC) and h[5] > 0),
+             if h[1] == _SHT_NOTE and (h[2] & _SHF_ALLOC) and h[5] > 0),
             key=lambda h: h[1])
         if len(notes) < 2:
             return Result(name, "SKIP", "fixture has <2 note sections")
@@ -6847,7 +6829,7 @@ def _note_run_merge_test(args, oracles):
                 return Result(name, "FAIL", "note section at %#x not covered exactly once"
                               % off)
         for h in shdrs:
-            if h[2] & SHF_ALLOC and h[1] not in (_SHT_NOTE, 8) and h[5] > 0:
+            if h[2] & _SHF_ALLOC and h[1] not in (_SHT_NOTE, 8) and h[5] > 0:
                 if any(lo < h[4] + h[5] and h[4] < hi for lo, hi in covered):
                     return Result(name, "FAIL", "PT_NOTE covers non-note payload " + h[0])
         props = [p for p in phdrs if p[0] == _PT_GNU_PROPERTY]

@@ -3,9 +3,10 @@
 # loops. There is no separate unchecked rotation-clone shortcut: it miscompiled
 # defined -fwrapv loops. Check actual compiler environments, reference output,
 # counted proof-based folds, the kill switch, and the original hot-loop shape.
-# Rotation must still run when its affine folding is disabled, otherwise the
-# control would be vacuous. The independent early loop_bound pass has its own
-# CCC_DISABLE_PASSES=loop_bound control and explicitly labelled diagnostics. Both rotated and unrotated constant-bound loops
+# Rotation must still run when affine folding is disabled, otherwise the kill
+# control would be vacuous. CCC_NO_AFFINE_EXIT_FOLD globally owns EVERY affine
+# exit-compare producer; CCC_DISABLE_PASSES=loop_bound unschedules only the
+# early canonicalizer. Both rotated and unrotated constant-bound loops
 # should use a bare-register folded compare feeding the branch directly.
 set -euo pipefail
 
@@ -69,7 +70,7 @@ note "rotated: $folds proof-based fold report(s); unrotated: $folds_off"
 [[ $folds -gt 0 ]] || bad "no proof-based affine exit-compare fold fired after rotation"
 [[ $folds_off -gt 0 ]] || bad "the proof-based fold did not run without rotation"
 
-# The late/clone owner has one kill switch. The early owner remains independent.
+# One global owner switch kills every affine producer; rotation stays active.
 CCC_LOOP_ROTATE=1 CCC_NO_AFFINE_EXIT_FOLD=1 CCC_DEBUG_LOOP_ROTATE=1 CCC_DEBUG_AFFINE_FOLD=1 "$CCC" \
     -O2 -march=x86-64-v3 -S "$corpus" -o "$work/rotkilled.s" 2> "$work/rotkilled.dbg" \
     || bad "rotated kill-switch -S build failed"
@@ -81,9 +82,11 @@ note "rotated with CCC_NO_AFFINE_EXIT_FOLD=1: $folds_killed proof-based fold rep
 grep -qF "[ROT] candidate:" "$work/rotkilled.dbg" \
     || bad "rotation did not run under the fold kill switch (test would be vacuous)"
 
-# The early pass must remain active when only the late owner is disabled.
-grep -qF '(early unsigned)' "$work/rotkilled.dbg" \
-    || bad "disabling the late owner also suppressed independent loop_bound"
+# CCC_NO_AFFINE_EXIT_FOLD is the global owner switch: it must silence the
+# early unsigned canonicalizer as well, not only the late/clone producer.
+early_killed=$(grep -cF '(early unsigned)' "$work/rotkilled.dbg" || true)
+[[ $early_killed -eq 0 ]] \
+    || bad "global kill switch left the early unsigned producer running"
 CCC_LOOP_ROTATE=1 CCC_NO_AFFINE_EXIT_FOLD=1 CCC_DISABLE_PASSES=loop_bound \
     CCC_DEBUG_LOOP_ROTATE=1 CCC_DEBUG_AFFINE_FOLD=1 "$CCC" \
     -O2 -march=x86-64-v3 -S "$corpus" -o "$work/bothkilled.s" 2> "$work/bothkilled.dbg" \

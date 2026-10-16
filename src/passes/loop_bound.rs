@@ -696,7 +696,10 @@ mod tests {
             }
             // `affine_fold` in CCC_DISABLE_PASSES only ablates the late fold;
             // the early producer follows the global switch alone.
-            assert_eq!(scheduled(0, 2, false, Target::X86_64, "affine_fold"), affine);
+            assert_eq!(
+                scheduled(0, 2, false, Target::X86_64, "affine_fold"),
+                affine
+            );
             assert!(!scheduled(0, 2, false, Target::X86_64, "loop_bound"));
             assert!(!scheduled(1, 2, false, Target::X86_64, ""));
             assert!(!scheduled(0, 2, false, Target::Aarch64, ""));

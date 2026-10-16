@@ -94,10 +94,14 @@ def main():
             records.append({"shape": "folded helper has no call", "passed": True})
             # Both independently scheduled producers can reach this guard.
             # Pin the complete ownership matrix, not just a shared opcode.
+            # CCC_NO_AFFINE_EXIT_FOLD is the global owner switch: it kills
+            # EVERY affine exit-compare producer. CCC_DISABLE_PASSES=loop_bound
+            # only unschedules the early canonicalizer, so the late producer
+            # still folds. Pin that settled ownership matrix.
             for name, overrides, expected_early, expected_late in [
                 ("both-enabled", {}, True, False),
-                ("early-only", {"CCC_NO_AFFINE_EXIT_FOLD": "1"}, True, False),
-                ("late-only", {"CCC_DISABLE_PASSES": "loop_bound"}, False, True),
+                ("global-kill", {"CCC_NO_AFFINE_EXIT_FOLD": "1"}, False, False),
+                ("early-disabled", {"CCC_DISABLE_PASSES": "loop_bound"}, False, True),
                 ("both-disabled", {"CCC_DISABLE_PASSES": "loop_bound",
                                    "CCC_NO_AFFINE_EXIT_FOLD": "1"}, False, False),
             ]:
