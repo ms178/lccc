@@ -1319,12 +1319,22 @@ impl Parser {
         }
 
         // Simple case: only Pointer and Array declarators. Fold into type_spec.
+        // The space mapping replicates `build_full_ctype_with_base` exactly
+        // (its `pointee_space_before`): the wrapper built at step i takes the
+        // space stored at derived[i-1] — the qualifier written after star j
+        // says the pointer values that the next-outer star points at live in
+        // that space (`struct sd * __seg_gs *sd` = the kernel's
+        // `struct sched_domain * __percpu *`: the first dereference reads %gs).
+        // The old code dropped every space, so field types lost %gs and
+        // `free_percpu(sdd->sd)` failed that GCC accepts.
         let mut result = base.clone();
+        let mut pending_space = AddressSpace::Default;
         let mut i = 0;
         while i < derived.len() {
             match &derived[i] {
-                DerivedDeclarator::Pointer(_) => {
-                    result = TypeSpecifier::Pointer(Box::new(result), AddressSpace::Default);
+                DerivedDeclarator::Pointer(space) => {
+                    result = TypeSpecifier::Pointer(Box::new(result), pending_space);
+                    pending_space = *space;
                     i += 1;
                 }
                 DerivedDeclarator::Array(_) => {

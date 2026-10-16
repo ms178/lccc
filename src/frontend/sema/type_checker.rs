@@ -988,10 +988,14 @@ impl<'a> ExprTypeChecker<'a> {
     /// Get the CType for a struct field declaration, accounting for derived declarators.
     fn resolve_field_ctype(&self, f: &StructFieldDecl) -> CType {
         let mut ctype = self.resolve_type_spec(&f.type_spec);
+        // Space mapping follows pointee_space_before (see fold_simple_derived):
+        // the wrapper built at step i takes the space stored at derived[i-1].
+        let mut pending_space = AddressSpace::Default;
         for derived in &f.derived {
             match derived {
-                DerivedDeclarator::Pointer(_) => {
-                    ctype = CType::Pointer(Box::new(ctype), AddressSpace::Default);
+                DerivedDeclarator::Pointer(space) => {
+                    ctype = CType::Pointer(Box::new(ctype), pending_space);
+                    pending_space = *space;
                 }
                 DerivedDeclarator::Array(Some(size_expr)) => {
                     let size = self.eval_const_expr(size_expr).unwrap_or(0) as usize;
@@ -1195,10 +1199,13 @@ impl<'a> ExprTypeChecker<'a> {
                     // for typeof expressions referencing earlier declarations.
                     let mut ctype =
                         self.resolve_type_spec_with_scope(&decl.type_spec, &local_scope);
+                    // pointee_space_before mapping (see fold_simple_derived).
+                    let mut pending_space = AddressSpace::Default;
                     for derived in &declarator.derived {
                         match derived {
-                            DerivedDeclarator::Pointer(_) => {
-                                ctype = CType::Pointer(Box::new(ctype), AddressSpace::Default);
+                            DerivedDeclarator::Pointer(space) => {
+                                ctype = CType::Pointer(Box::new(ctype), pending_space);
+                                pending_space = *space;
                             }
                             DerivedDeclarator::Array(Some(size_expr)) => {
                                 let size = self.eval_const_expr(size_expr).unwrap_or(0) as usize;
@@ -1244,10 +1251,13 @@ impl<'a> ExprTypeChecker<'a> {
                     }
                     let mut ctype =
                         self.resolve_type_spec_with_scope(&decl.type_spec, &local_scope);
+                    // pointee_space_before mapping (see fold_simple_derived).
+                    let mut pending_space = AddressSpace::Default;
                     for derived in &declarator.derived {
                         match derived {
-                            DerivedDeclarator::Pointer(_) => {
-                                ctype = CType::Pointer(Box::new(ctype), AddressSpace::Default);
+                            DerivedDeclarator::Pointer(space) => {
+                                ctype = CType::Pointer(Box::new(ctype), pending_space);
+                                pending_space = *space;
                             }
                             DerivedDeclarator::Array(Some(size_expr)) => {
                                 let size = self.eval_const_expr(size_expr).unwrap_or(0) as usize;

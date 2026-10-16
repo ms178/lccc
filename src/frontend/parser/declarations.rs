@@ -405,16 +405,20 @@ impl Parser {
             .position(|d| matches!(d, DerivedDeclarator::Function(_, _)));
 
         if let Some(fpos) = func_pos {
-            // Apply post-Function derivations (Array/Pointer)
+            // Apply post-Function derivations (Array/Pointer). Space mapping
+            // follows pointee_space_before: each wrapper takes the previous
+            // entry's space (a Function entry has none, so the first wrapper
+            // after it takes Default).
+            let mut pending_space = AddressSpace::Default;
             for d in &derived[fpos + 1..] {
                 match d {
                     DerivedDeclarator::Array(size_expr) => {
                         return_type =
                             TypeSpecifier::Array(Box::new(return_type), size_expr.clone());
                     }
-                    DerivedDeclarator::Pointer(_) => {
-                        return_type =
-                            TypeSpecifier::Pointer(Box::new(return_type), AddressSpace::Default);
+                    DerivedDeclarator::Pointer(space) => {
+                        return_type = TypeSpecifier::Pointer(Box::new(return_type), pending_space);
+                        pending_space = *space;
                     }
                     _ => {}
                 }
@@ -470,12 +474,14 @@ impl Parser {
                 }
             }
         } else {
-            // No Function in derived - just apply pointer derivations
+            // No Function in derived - just apply pointer derivations, with
+            // the same pointee_space_before mapping as build_full_ctype.
+            let mut pending_space = AddressSpace::Default;
             for d in derived {
                 match d {
-                    DerivedDeclarator::Pointer(_) => {
-                        return_type =
-                            TypeSpecifier::Pointer(Box::new(return_type), AddressSpace::Default);
+                    DerivedDeclarator::Pointer(space) => {
+                        return_type = TypeSpecifier::Pointer(Box::new(return_type), pending_space);
+                        pending_space = *space;
                     }
                     _ => break,
                 }
@@ -572,24 +578,39 @@ impl Parser {
             // For `int *(*fp)()`:
             //   pderived = [Pointer, Pointer, FunctionPointer([], false)]
             //   First Pointer is return-type pointer, second is syntax marker.
-            let ptr_count = pderived
+            // The syntax-marker star is the last Pointer in pderived; any
+            // further Pointers are return-type levels. Drop the marker, then
+            // apply the remaining stars with the pointee_space_before chain
+            // (see fold_simple_derived): the wrapper built at step k takes
+            // the space stored at the PREVIOUS star (the first takes
+            // Default).
+            let mut star_spaces = pderived
                 .iter()
-                .filter(|d| matches!(d, DerivedDeclarator::Pointer(_)))
-                .count();
-            // Apply all pointers except the syntax marker (last one)
-            for _ in 0..ptr_count.saturating_sub(1) {
-                full_type = TypeSpecifier::Pointer(Box::new(full_type), AddressSpace::Default);
+                .filter_map(|d| match d {
+                    DerivedDeclarator::Pointer(space) => Some(*space),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            star_spaces.pop();
+            let mut pending = AddressSpace::Default;
+            for space in star_spaces {
+                full_type = TypeSpecifier::Pointer(Box::new(full_type), pending);
+                pending = space;
             }
-            // Apply one Pointer wrapping for the function-pointer-to-pointer decay
-            full_type = TypeSpecifier::Pointer(Box::new(full_type), AddressSpace::Default);
+            // The final application is the function-pointer-to-pointer decay
+            // wrapper: the syntax-marker star's own level, whose space is the
+            // previous star's (see pointee_space_before).
+            full_type = TypeSpecifier::Pointer(Box::new(full_type), pending);
             return (full_type, Some(fptr_params), variadic);
         }
 
         // Not a function pointer - apply all derivations normally.
-        // Apply pointers
+        // Apply pointers, keeping each star's own address space
+        // (`struct sd * __seg_gs *` declares a pointer whose pointee values
+        // live in %gs — the kernel's percpu `T * __percpu *` members).
         for d in pderived {
-            if let DerivedDeclarator::Pointer(_) = d {
-                full_type = TypeSpecifier::Pointer(Box::new(full_type), AddressSpace::Default);
+            if let DerivedDeclarator::Pointer(space) = d {
+                full_type = TypeSpecifier::Pointer(Box::new(full_type), *space);
             }
         }
         // Collect array dimensions
@@ -1542,10 +1563,12 @@ impl Parser {
         mut spec: TypeSpecifier,
         derived: &[DerivedDeclarator],
     ) -> TypeSpecifier {
+        let mut pending_space = AddressSpace::Default;
         for d in derived {
             match d {
-                DerivedDeclarator::Pointer(_) => {
-                    spec = TypeSpecifier::Pointer(Box::new(spec), AddressSpace::Default);
+                DerivedDeclarator::Pointer(space) => {
+                    spec = TypeSpecifier::Pointer(Box::new(spec), pending_space);
+                    pending_space = *space;
                 }
                 DerivedDeclarator::Array(n) => {
                     spec = TypeSpecifier::Array(Box::new(spec), n.clone());

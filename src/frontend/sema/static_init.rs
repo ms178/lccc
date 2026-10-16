@@ -120,7 +120,11 @@ impl<'s> StaticInitChecker<'s> {
             if !matches!((self.ctype)(e), Some(CType::Array(..))) {
                 let mut inner = Vec::new();
                 self.collect_bad(init, &mut inner);
-                return if inner.is_empty() { Kind::Value } else { Kind::Bad };
+                return if inner.is_empty() {
+                    Kind::Value
+                } else {
+                    Kind::Bad
+                };
             }
         }
         self.value(e)

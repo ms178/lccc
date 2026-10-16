@@ -1470,10 +1470,14 @@ fn ctype_from_type_spec_with_derived(
     if derived.is_empty() {
         return ty;
     }
+    // pointee_space_before mapping (see fold_simple_derived): the wrapper
+    // built at step i takes the space stored at derived[i-1].
+    let mut pending_space = AddressSpace::Default;
     for d in derived {
         match d {
-            DerivedDeclarator::Pointer(_) => {
-                ty = CType::Pointer(Box::new(ty), AddressSpace::Default);
+            DerivedDeclarator::Pointer(space) => {
+                ty = CType::Pointer(Box::new(ty), pending_space);
+                pending_space = *space;
             }
             DerivedDeclarator::Array(Some(size_expr)) => {
                 let expr: &Expr = size_expr;
