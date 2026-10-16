@@ -165,23 +165,30 @@ fi
 
 dynsym_of() { readelf -W --dyn-syms "$1" 2>/dev/null; }
 
+# dynsym output is captured into a variable before any grep: an early-exit
+# consumer behind a live readelf pipe is exactly what the pipefail-sigpipe
+# ratchet rejects (the producer's SIGPIPE would read as the check failing).
+
 # --- Row 1: hidden definition is NOT exported --------------------------------
 craft_vis h.o hidden_fn 1 2 global
 "$LDDD" -shared -o libh.so h.o 2>err; rc=$?
+syms=$(dynsym_of libh.so)
 step "hidden definition: links"                     '(( rc == 0 ))'
-step "hidden definition: not exported"              '! dynsym_of libh.so | grep -q "hidden_fn"'
+step "hidden definition: not exported"              '! grep -q "hidden_fn" <<<"$syms"'
 
 # --- Row 2: protected definition is exported, st_other = PROTECTED -----------
 craft_vis p.o protected_fn 1 3 global
 "$LDDD" -shared -o libp.so p.o 2>err; rc=$?
+syms=$(dynsym_of libp.so)
 step "protected definition: links"                  '(( rc == 0 ))'
-step "protected definition: exported as PROTECTED"  'dynsym_of libp.so | grep -q "protected_fn" && dynsym_of libp.so | grep "protected_fn" | grep -q "PROTECTED"'
+step "protected definition: exported as PROTECTED"  'grep "protected_fn" <<<"$syms" | grep -c "PROTECTED" >/dev/null'
 
 # --- Row 3 (control): default definition is exported, st_other = DEFAULT -----
 craft_vis d.o default_fn 1 0 global
 "$LDDD" -shared -o libd.so d.o 2>err; rc=$?
-step "default definition: exported as DEFAULT"      'dynsym_of libd.so | grep -q "default_fn" && dynsym_of libd.so | grep "default_fn" | grep -q " DEFAULT "'
-step "default definition: GLOBAL binding preserved" 'dynsym_of libd.so | grep "default_fn" | grep -q "GLOBAL"'
+syms=$(dynsym_of libd.so)
+step "default definition: exported as DEFAULT"      'grep "default_fn" <<<"$syms" | grep -c " DEFAULT " >/dev/null'
+step "default definition: GLOBAL binding preserved" 'grep "default_fn" <<<"$syms" | grep -c "GLOBAL" >/dev/null'
 
 # --- Row 4: hidden reference + default definition, BOTH input orders ---------
 # TU A: default definition of merged_fn (st_other 0, global, defined).
@@ -189,11 +196,13 @@ step "default definition: GLOBAL binding preserved" 'dynsym_of libd.so | grep "d
 craft_vis a.o merged_fn 1 0 global
 craft_vis bref.o merged_fn 0 2 global   # shndx 0 = SHN_UNDEF reference
 "$LDDD" -shared -o libab.so a.o bref.o 2>err; rc=$?
+syms=$(dynsym_of libab.so)
 step "hidden ref + default def (A,B): links"        '(( rc == 0 ))'
-step "hidden ref + default def (A,B): not exported" '! dynsym_of libab.so | grep -q "merged_fn"'
+step "hidden ref + default def (A,B): not exported" '! grep -q "merged_fn" <<<"$syms"'
 "$LDDD" -shared -o libba.so bref.o a.o 2>err; rc=$?
+syms=$(dynsym_of libba.so)
 step "hidden ref + default def (B,A): links"        '(( rc == 0 ))'
-step "hidden ref + default def (B,A): not exported" '! dynsym_of libba.so | grep -q "merged_fn"'
+step "hidden ref + default def (B,A): not exported" '! grep -q "merged_fn" <<<"$syms"'
 
 if (( fail )); then
     echo "FAIL: shared-library visibility contract violated"
