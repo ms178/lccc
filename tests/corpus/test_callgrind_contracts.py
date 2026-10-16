@@ -152,28 +152,6 @@ class MainContract(unittest.TestCase):
 
 class MeasurementReceiptContract(unittest.TestCase):
     """Exercise _measure via main; mock subprocesses, not orchestration."""
-    def test_native_spawn_error_survives_secondary_receipt_read_failure(self):
-        with tempfile.TemporaryDirectory() as td:
-            root=Path(td)
-            original=cg.process_receipt
-            def receipt(prefix):
-                if prefix.endswith('.native'):
-                    raise ValueError('injected receipt read error')
-                return original(prefix)
-            def run(command, timeout):
-                if '-o' in command:
-                    binary=Path(command[command.index('-o')+1])
-                    binary.write_bytes(b'fake executable');binary.chmod(0o755)
-                    return result()
-                raise OSError('injected native spawn error')
-            with mock.patch.object(cg,'_run',side_effect=run),\
-                 mock.patch.object(cg,'gcc_include',return_value='-Ifake'),\
-                 mock.patch.object(cg,'tool_identity',return_value={'mock':True}),\
-                 mock.patch.object(cg,'process_receipt',side_effect=receipt):
-                self.assertEqual(cg.main(['mock-mine','mock-ref','-O2','fib','--out-root',str(root)]),2)
-            entry=schema.loads((root/'manifest.json').read_text())['results']['fib']
-            self.assertIn('injected native spawn error',entry['detail'])
-            self.assertIn('injected receipt read error',entry['receipt_errors']['mine'])
     def test_compile_and_native_receipts_survive_success_and_error_arms(self):
         for failure in (None, 'compile-mine', 'compile-ref', 'native-mine', 'native-ref', 'infrastructure-ref', 'compile-infrastructure', 'flags'):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as td:
@@ -212,6 +190,102 @@ class MeasurementReceiptContract(unittest.TestCase):
                             for stream in ('stdout','stderr'):
                                 raw=Path(info['raw_outputs'][stream]).read_bytes()
                                 self.assertEqual(hashlib.sha256(raw).hexdigest(),info['process'][stream+'_sha256'])
+
+
+class ReceiptFailureDiagnostics(unittest.TestCase):
+    """A secondary evidence-read failure must not hide why execution failed."""
+
+    def measurement(self, root, *, phase, side, fault, primary=OSError):
+        original_receipt = cg.process_receipt
+
+        def run(command, timeout):
+            if '-o' in command:
+                binary = Path(command[command.index('-o') + 1])
+                current = 'mine' if binary.parent.name == 'aa' else 'ref'
+                if phase == 'compile' and current == side:
+                    return process.normalize((1, b'', b'primary compiler diagnostic'))
+                binary.write_bytes(b'fake executable; never executed')
+                binary.chmod(0o755)
+                return result()
+            current = 'mine' if Path(command[0]).parent.name == 'aa' else 'ref'
+            if phase == 'native' and current == side and primary is not None:
+                raise primary('primary native launch failure')
+            return result()
+
+        def receipt(prefix):
+            path = Path(str(prefix) + '.json')
+            current = 'mine' if path.parent.name == 'aa' else 'ref'
+            if str(prefix).endswith('.' + phase) and current == side:
+                if fault == 'missing':
+                    path.unlink()
+                elif fault == 'malformed':
+                    path.write_text('{not JSON')
+                elif fault == 'non-object':
+                    path.write_text('[]')
+                else:
+                    raise AssertionError('unknown fixture fault')
+            return original_receipt(prefix)
+
+        with mock.patch.object(cg, '_run', side_effect=run), \
+                mock.patch.object(cg, 'gcc_include', return_value='-Ifake'), \
+                mock.patch.object(cg, 'tool_identity', return_value={'mock': True}), \
+                mock.patch.object(cg, 'process_receipt', side_effect=receipt), \
+                mock.patch.object(cg, 'callgrind') as instrument:
+            code = cg.main(['mock-mine', 'mock-ref', '-O2', 'fib', '--out-root', str(root)])
+        instrument.assert_not_called()
+        return code, schema.loads((root / 'manifest.json').read_text())
+
+    def test_native_launch_error_survives_secondary_receipt_failure(self):
+        for side in ('mine', 'ref'):
+            for primary in (OSError, ValueError):
+                for fault in ('missing', 'malformed', 'non-object'):
+                    with self.subTest(side=side, primary=primary, fault=fault), \
+                            tempfile.TemporaryDirectory() as td:
+                        code, doc = self.measurement(Path(td), phase='native', side=side,
+                                                     fault=fault, primary=primary)
+                        entry = doc['results']['fib']
+                        self.assertEqual(code, 2)
+                        self.assertEqual(entry['status'], 'ERROR')
+                        self.assertIn('primary native launch failure', entry['detail'])
+                        self.assertEqual(doc['failures']['fib'], entry['detail'])
+                        receipt = entry['native'][side]
+                        self.assertTrue(receipt['receipt_error'])
+                        self.assertNotIn('receipt', receipt)
+                        self.assertNotIn('metrics', entry)
+
+    def test_compiler_failure_survives_secondary_receipt_failure(self):
+        for side in ('mine', 'ref'):
+            for fault in ('missing', 'malformed', 'non-object'):
+                with self.subTest(side=side, fault=fault), tempfile.TemporaryDirectory() as td:
+                    code, doc = self.measurement(Path(td), phase='compile', side=side, fault=fault)
+                    entry = doc['results']['fib']
+                    self.assertEqual(code, 2)
+                    self.assertIn('compile rc=1', entry['detail'])
+                    self.assertIn('primary compiler diagnostic', entry['detail'])
+                    self.assertTrue(entry['compilation'][side]['receipt_error'])
+                    self.assertNotIn('metrics', entry)
+
+    def test_receipt_failure_without_primary_error_is_not_suppressed(self):
+        for content in ('[]', 'null', '42', '"text"', '{not JSON'):
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as td:
+                prefix = Path(td) / 'record'
+                Path(str(prefix) + '.json').write_text(content)
+                with self.assertRaises(ValueError):
+                    cg.process_receipt(prefix)
+                with self.assertRaises(ValueError):
+                    cg.retain_process_receipt(prefix)
+
+    def test_missing_evidence_after_success_is_still_fatal(self):
+        for side in ('mine', 'ref'):
+            for fault in ('missing', 'malformed', 'non-object'):
+                with self.subTest(side=side, fault=fault), tempfile.TemporaryDirectory() as td:
+                    code, doc = self.measurement(Path(td), phase='native', side=side,
+                                                 fault=fault, primary=None)
+                    self.assertEqual(code, 2)
+                    self.assertIn('fib', doc['failures'])
+                    self.assertEqual(doc['results']['fib']['status'], 'ERROR')
+                    self.assertNotIn('metrics', doc['results']['fib'])
+                    self.assertNotIn('geomean_ir_mine_over_ref', doc)
 
 
 class ArgumentVectorContract(unittest.TestCase):

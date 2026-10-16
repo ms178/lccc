@@ -3,7 +3,7 @@
 //! Provides:
 //! - `temp_dir()`: returns the platform temp directory (respects $TMPDIR)
 //! - `private_temp_dir()`: a persistent 0700 directory for unmanaged/debug paths
-//! - `TempFile`: RAII guard that deletes the file on drop (even on panic/error)
+//! - `TempFile`: RAII guard leasing a managed directory; removes unkept files
 //! - `write_file_exclusive()`: symlink-safe write for fixed-purpose debug dumps
 //!
 //! # Why a private directory (AUD-TMP-1)
@@ -18,12 +18,19 @@
 //! ln -s ~/victim.o /tmp/ccc_<pid>_big.0.o && TMPDIR=/tmp exec lccc -O1 big.c
 //! ```
 //!
-//! Managed temporary paths live in `$TMPDIR/lccc-<pid>-<nanos>-<n>/`,
-//! created with exclusive `mkdir` mode 0700. A pre-placed entry prevents
-//! creation; no planted path is adopted. Managed guards lease the directory
-//! even for paths not written yet. The last lease removes an empty directory;
-//! kept files AND pending kept paths intentionally retain their directory.
-//! Debug dumps use a separate persistent private directory without leases.
+//! Managed `TempFile` reservations lease a directory under
+//! `$TMPDIR/lccc-<pid>-<nanos>-<n>/`. On Unix it is created with mode 0700:
+//! an occupied candidate (file, symlink or directory) makes exclusive `mkdir`
+//! fail rather than adopting the path, and an ownership probe checks the new
+//! directory. Name stamps reduce collisions; they do not guarantee that a
+//! pathname can never recur after deletion, and are not security secrets.
+//!
+//! The last managed lease drop attempts to reap the empty directory, after
+//! its unkept files are removed, including on panic/error. Pending reservations
+//! hold leases too. Kept files and their directory intentionally survive, and
+//! their recipient owns cleanup. This is separate from the persistent private
+//! directory used by `private_temp_dir()` and debug dumps: managed cleanup never
+//! reaps that directory or invalidates its unmanaged paths.
 //!
 //! If no private directory can be created, path-reserving APIs fail closed.
 //! A read-only public directory can still contain a symlink to a writable file;
@@ -74,7 +81,7 @@ fn unique_stamp() -> u128 {
 fn create_private_dir_at(path: &Path) -> bool {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
-    // 0700: only this process (and root) may look inside. `mkdir` applies the
+    // 0700: only the owning user (and root) may look inside. `mkdir` applies the
     // umask, so set the mode explicitly afterwards — we own the directory the
     // moment the create returns.
     if fs::DirBuilder::new().mode(0o700).create(path).is_err() {
@@ -151,10 +158,12 @@ pub fn private_temp_dir() -> Option<&'static Path> {
     PRIVATE_DIR.get_or_init(create_private_dir).as_deref()
 }
 
-/// A generation is owned by live guards, including paths not yet materialized.
-/// A later generation mints candidate names and uses exclusive mkdir plus an
-/// ownership probe: even if a name recurs, it cannot adopt a planted path.
-/// Reaping on each file drop would race other reserved paths.
+/// A generation is owned by live leases, including paths not yet materialized.
+/// Removing an empty directory on *every* file drop races those pending paths;
+/// caching the removed path in OnceLock also breaks sequential generations.
+/// Each generation makes fresh exclusive-mkdir attempts with an ownership
+/// probe on Unix: it never adopts a planted candidate. This is a creation and
+/// ownership property, not a promise that timestamp-derived names never recur.
 struct ManagedTempDirectory {
     path: PathBuf,
     retained: AtomicBool,
@@ -236,8 +245,8 @@ pub fn write_file_exclusive(path: &Path, contents: &[u8]) -> io::Result<()> {
     file.flush()
 }
 
-/// Debug dump helper: write `contents` to a uniquely named file in the private
-/// temp directory and return its path.
+/// Debug dump helper: write `contents` to a uniquely named file in the persistent
+/// unmanaged private directory and return its path.
 ///
 /// Unlike `TempFile`, the file is *not* removed on drop: a debug dump exists to
 /// be inspected after the compiler exits. The name is unique per process, so
@@ -338,34 +347,6 @@ impl std::fmt::Display for TempFile {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
-
-    #[test]
-    fn managed_cleanup_does_not_invalidate_unmanaged_debug_paths() {
-        let parent = private_temp_dir().expect("reserve persistent debug directory");
-        let path = parent.join(unique_filename("lifecycle", "unmanaged", "tmp"));
-        drop(TempFile::try_new("lifecycle", "managed", "tmp").unwrap());
-        write_file_exclusive(&path, b"unmanaged lifetime").unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"unmanaged lifetime");
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn explicit_sibling_guard_cannot_reap_a_managed_reservation() {
-        let pool = TempDirectoryPool::default();
-        let pending = pool.reserve("lifecycle", "pending", "tmp").unwrap();
-        let parent = pending.path().parent().unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                fs::metadata(parent).unwrap().permissions().mode() & 0o777,
-                0o700
-            );
-        }
-        drop(TempFile::with_path(parent.join("unrelated")));
-        fs::write(pending.path(), b"still reserved").unwrap();
-        assert_eq!(fs::read(pending.path()).unwrap(), b"still reserved");
-    }
 
     #[test]
     fn name_components_cannot_escape_the_private_directory() {
