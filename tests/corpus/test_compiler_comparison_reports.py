@@ -34,10 +34,14 @@ def report():
         rows.append({'name': case.name,
                      'correctness': {key: {'matches_baseline': True, 'stable_within_compiler': True}
                                      for key in ['lccc', 'gcc', 'prior']},
-                     'runs': {key: [{'ok': True, 'stdout': 'correct\n'} for _ in range(9)] for key in ['lccc', 'gcc', 'prior']},
-                     'runtime': {key: {'wall': {'median': .1}} for key in ['lccc', 'gcc', 'prior']},
+                     'runs': {key: [{'ok': True, 'stdout': 'correct\n', 'wall_s': .09 if key == 'lccc' else .1} for _ in range(9)] for key in ['lccc', 'gcc', 'prior']},
+                     'runtime': {key: {'wall': {'median': .09 if key == 'lccc' else .1}} for key in ['lccc', 'gcc', 'prior']},
                      'ratios_from_lccc': {key: {'n': 9, 'median': .9} for key in ['gcc', 'prior']}})
-    return {'benchmarks': rows, 'compilers': [{'key': key} for key in ['lccc', 'gcc', 'prior']],
+    for row in rows:
+        row['rounds'] = [{'round': index, 'order': ['lccc', 'gcc', 'prior'],
+                          'runs': {arm: row['runs'][arm][index] for arm in ['lccc', 'gcc', 'prior']}}
+                         for index in range(9)]
+    return {'complete': True, 'benchmarks': rows, 'compilers': [{'key': key} for key in ['lccc', 'gcc', 'prior']],
             'settings': {'skip_perf': False}}
 
 

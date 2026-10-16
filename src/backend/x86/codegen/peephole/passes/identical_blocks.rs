@@ -37,8 +37,16 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 //      merged blocks and all their predecessors to be "clean" (single-entry,
 //      no internal labels), so the register values at entry are path-independent.
 
-/// True for the alignment directives (`.p2align`, `.align`, `.balign`, any
-/// argument forms). These are LAYOUT annotations, not code: they neither
+/// Pseudo predecessor label for a function's entry region (`func_id`).
+/// A NUL byte can never appear in a real assembler label, so the pseudo
+/// label cannot collide with any block label.
+fn entry_pseudo_label(func_id: u32) -> String {
+    format!("\u{0}fn{func_id}")
+}
+
+/// True only for single-statement, default-fill alignment directives.
+/// Explicit fill bytes can execute instructions and are not transparent.
+/// The admitted forms are layout annotations: they neither
 /// define registers nor flags nor split semantic basic blocks. The block
 /// model must treat them as transparent — a `.p2align` between a guard's
 /// `jae` and the loop-head label historically severed the fall-through
@@ -51,17 +59,11 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 /// registers (reproducer: tests/regression/vectorize_int_map_lanes.c at
 /// -O2 -march=x86-64-v3 with hot-loop alignment; SIGSEGV in `vmovdqu
 /// %ymm0,(%rdi)` inside `fill`, 20/20 runs).
-/// Pseudo predecessor label for a function's entry region (`func_id`).
-/// A NUL byte can never appear in a real assembler label, so the pseudo
-/// label cannot collide with any block label.
-fn entry_pseudo_label(func_id: u32) -> String {
-    format!("\u{0}fn{func_id}")
-}
-
 fn is_alignment_directive(trimmed: &str) -> bool {
-    trimmed.starts_with(".p2align")
+    (trimmed.starts_with(".p2align")
         || trimmed.starts_with(".align")
-        || trimmed.starts_with(".balign")
+        || trimmed.starts_with(".balign"))
+        && crate::backend::peephole_common::inert_directive(trimmed)
 }
 
 /// True for lines that carry no block identity: NOPs and
@@ -613,7 +615,7 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
 
     // Precompute per-block soundness flags ONCE (not per candidate pair).
     // flag_dep[i]: block reads incoming EFLAGS before establishing its own.
-    // clean[i]:    block is a single-entry straight-line basic block.
+    // clean[i]:    single-entry straight-line block with a modeled exit.
     // preds_clean[i]: all predecessor blocks are clean basic blocks.
     let nblocks = blocks.len();
     let mut flag_dep = vec![false; nblocks];
@@ -622,7 +624,15 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
     for bi in 0..nblocks {
         let (bs, be, ref bl, _) = blocks[bi];
         flag_dep[bi] = block_is_flag_dependent(store, infos, bs, be);
-        clean[bi] = block_is_clean(store, infos, bs, be);
+        // None is also the sentinel for an UNMODELED fall-through (e.g. a
+        // scan stopped at an opaque directive). Two such sentinels do not
+        // prove a common successor: merging the equal prefixes would route
+        // both entries into the canonical prefix's different opaque tail.
+        let exit_known = matches!(
+            block_terminator[bi],
+            LineKind::Jmp | LineKind::JmpIndirect | LineKind::Ret
+        ) || fallthrough[bi].is_some();
+        clean[bi] = exit_known && block_is_clean(store, infos, bs, be);
         let mut all_clean = true;
         if let Some(pset) = preds.get(bl) {
             for pl in pset {
@@ -1123,6 +1133,103 @@ mod tests {
             1,
             "debug marker was not preserved exactly once:\n{out}"
         );
+    }
+
+    #[test]
+    fn s97_effectful_alignment_is_not_block_identity() {
+        for text in [
+            ".p2align 4,0xf8",
+            ".p2align 4,0xf9",
+            ".align 16,0xcc",
+            ".balign 16,0x90",
+            ".p2align 4; clc",
+            ".p2align_future 4",
+        ] {
+            assert!(
+                !super::is_alignment_directive(text),
+                "opaque padding: {text}"
+            );
+        }
+        for text in [
+            ".p2align 4",
+            ".p2align 4,,10",
+            ".balign 16",
+            ".align 16 # ; clc",
+        ] {
+            assert!(super::is_alignment_directive(text), "safe padding: {text}");
+        }
+    }
+
+    #[test]
+    fn s97_unknown_fallthrough_is_not_a_shared_exit() {
+        let original = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/regression/fixtures/peephole-padding-effects/caller.s"
+        ));
+        for (first, second) in [
+            (".p2align 4,0xf8", ".p2align 4,0xf9"),
+            (".byte 0xf8", ".byte 0xf9"),
+            (
+                ".cfi_def_cfa_offset 8\n    clc",
+                ".cfi_def_cfa_offset 8\n    stc",
+            ),
+        ] {
+            let asm = original
+                .replace(".p2align 4,0xf8", first)
+                .replace(".p2align 4,0xf9", second);
+            let mut store = super::LineStore::new(asm);
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|index| super::classify_line(store.get(index)))
+                .collect();
+            assert!(
+                !super::merge_identical_blocks(&mut store, &mut infos),
+                "a truncated prefix has an unknown exit, not a shared exit: {first}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn s97_custom_padding_real_pipeline_native() {
+        use crate::common::temp_files::TempFile;
+        use std::process::Command;
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/regression/fixtures/peephole-padding-effects");
+        let original = std::fs::read_to_string(fixtures.join("caller.s")).unwrap();
+        let optimized = run(&original);
+        let mut store = super::LineStore::new(original.clone());
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|index| super::classify_line(store.get(index)))
+            .collect();
+        super::merge_identical_blocks(&mut store, &mut infos);
+        let isolated = store.build_result(|index| infos[index].is_nop());
+        let assembly = TempFile::try_new("padding", "witness", "s").unwrap();
+        let executable = TempFile::try_new("padding", "witness", "exe").unwrap();
+        for (stage, code) in [
+            ("original", original),
+            ("isolated", isolated),
+            ("optimized", optimized),
+        ] {
+            std::fs::write(assembly.path(), &code).unwrap();
+            let compiled = Command::new("gcc")
+                .args(["-O2", "-Werror", "-no-pie", "-o"])
+                .arg(executable.path())
+                .arg(fixtures.join("driver.c"))
+                .arg(assembly.path())
+                .output()
+                .unwrap();
+            assert!(
+                compiled.status.success() && compiled.stderr.is_empty(),
+                "{stage}: {}",
+                String::from_utf8_lossy(&compiled.stderr)
+            );
+            let result = Command::new(executable.path()).output().unwrap();
+            assert!(
+                result.status.success(),
+                "{stage}: {:?}\n{code}",
+                result.status.code()
+            );
+        }
     }
 
     /// Direct classification contract: debug markers vs padding vs code.

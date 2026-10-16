@@ -1,0 +1,10 @@
+{
+  "before_sha256": "be46422711cdd1bb838e727fa6ffe57132d0df5ff87f73d5402742d536feeb2e",
+  "before_commit": "49b110aec25a2c2705b40a397dbbccc6b8d4aad3",
+  "red_methods": 6,
+  "red_failing_subcases": 15,
+  "green_report_tests": 18,
+  "green_correctness_safety_tests": 11,
+  "green_timing_provenance_tests": 9,
+  "scope": "report validation, not generated-code performance"
+}

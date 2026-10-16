@@ -17,6 +17,20 @@ class EvidenceIntegrity(unittest.TestCase):
     def test_real_inventory(self):
         self.assertEqual(m.verify(ROOT, ROOT/m.DEFAULT), 69)
 
+    def test_restored_capture_keeps_original_bytes_and_closed_scope(self):
+        # Original PR832 capture at 63e783b, not a hash refreshed from the
+        # rewritten current review document. Verified against that Git blob.
+        retained = 'engineering/PR831-AUDIT.md'
+        expected = 'e3af0932bb02500031d3289d6aaff7979a3e389bdffa27e6baf0571811961956'
+        self.assertEqual(hashlib.sha256((ROOT/retained).read_bytes()).hexdigest(), expected)
+        data = json.loads((ROOT/m.DEFAULT).read_text())
+        row = next(row for row in data['files'] if row['path'] == retained)
+        self.assertEqual(row['sha256'], expected)
+        scope = json.loads((ROOT/m.SCOPE).read_text())
+        self.assertIn(retained, scope['paths'])
+        self.assertNotIn('engineering/PR831-COMPILER-AUDIT.md', scope['paths'])
+        self.assertEqual(m.verify(ROOT, ROOT/m.DEFAULT), 69)
+
     def test_mutations_fail_closed(self):
         for mutation in ('bytes', 'missing', 'duplicate', 'raw', 'empty', 'escape', 'symlink'):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:

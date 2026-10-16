@@ -1176,6 +1176,7 @@ def main() -> int:
     environment = controlled_environment()
 
     report: dict[str, Any] = {
+        "complete": False,
         "schema": "lccc-bench-v2",
         "metadata": metadata,
         "settings": {
@@ -1201,6 +1202,19 @@ def main() -> int:
         "runner_warnings": affinity_warnings,
     }
 
+    def publish_report() -> None:
+        if args.json:
+            # Reuse the repository's bounded, atomic publication contract.
+            # Direct CLI execution does not otherwise import repository tools.
+            if str(REPO_ROOT) not in sys.path:
+                sys.path.insert(0, str(REPO_ROOT))
+            from tools.corpus.publication import atomic_bytes
+            args.json.parent.mkdir(parents=True, exist_ok=True)
+            atomic_bytes(args.json, (json.dumps(report, indent=2, sort_keys=True) + "\n").encode())
+
+    # Invalidate any old successful receipt before executing a new experiment.
+    # Each completed case survives interruption, but cannot certify completion.
+    publish_report()
     with tempfile.TemporaryDirectory(prefix="lccc_bench_", dir=str(work_root)) as temporary:
         work = Path(temporary)
         for index, benchmark in enumerate(benchmarks):
@@ -1208,6 +1222,7 @@ def main() -> int:
             entry = run_benchmark(benchmark, compilers, args, work, artifacts,
                                   affinity_prefix, environment, args.seed + index * 100003)
             report["benchmarks"].append(entry)
+            publish_report()
 
     report["aggregate_lccc_vs_gcc"] = aggregate_lccc_vs_gcc(report["benchmarks"])
     report["aggregate_lccc_vs_best_reference"] = aggregate_lccc_vs_best_reference(report["benchmarks"])
@@ -1216,9 +1231,10 @@ def main() -> int:
     if args.markdown:
         args.markdown.parent.mkdir(parents=True, exist_ok=True)
         args.markdown.write_text(render_markdown(report), encoding="utf-8")
-    if args.json:
-        args.json.parent.mkdir(parents=True, exist_ok=True)
-        args.json.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+    # Completion means all selected cases were attempted, not that their
+    # outputs were correct. Preserve failures and the strict nonzero exit.
+    report["complete"] = True
+    publish_report()
 
     failures: list[str] = []
     for entry in report["benchmarks"]:

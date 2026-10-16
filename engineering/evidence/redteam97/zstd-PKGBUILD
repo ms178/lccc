@@ -1,0 +1,1065 @@
+# Maintainer: ms178
+pkgname=zstd
+pkgver=1.5.7
+pkgrel=16
+pkgdesc='Zstandard - Fast real-time compression algorithm'
+url='https://facebook.github.io/zstd/'
+arch=('x86_64')
+license=('BSD-3-Clause' 'GPL-2.0-only')
+depends=('glibc' 'libgcc' 'libstdc++' 'zlib' 'xz' 'lz4')
+makedepends=('cmake' 'ninja' 'clang' 'llvm' 'lld' 'mimalloc' 'python' 'diffutils' 'util-linux')
+provides=('libzstd.so' "zstd=$pkgver" 'libzstd.so=1-64')
+options=('!debug' '!lto' '!strip')
+source=(
+  "https://github.com/facebook/zstd/releases/download/v$pkgver/zstd-$pkgver.tar.zst"
+  "https://github.com/facebook/zstd/releases/download/v$pkgver/zstd-$pkgver.tar.zst.sig"
+  'ms178-1.patch'
+)
+sha256sums=(
+  '5b331d961d6989dc21bb03397fc7a2a4d86bc65a14adc5ffbbce050354e30fd2'
+  '78c9fabf945f301630a4020fadd34b9ecc16ef42ee279dd63a5a923e71d40449'
+  'aa15486d10778c9d00a9b6273101e11feb952aca0b66432a53625dfb67390d8e'
+)
+validpgpkeys=('4EF4AC63455FC9F4545D9B7DEF8FE99528B52FFD')
+
+_setup_llvm_ultimate() {
+  export CC=clang CXX=clang++
+  export AR=llvm-ar NM=llvm-nm RANLIB=llvm-ranlib
+  export READELF=llvm-readelf OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
+  local tool major tool_major bolt_dir merge_dir
+  local tools=(clang clang++ ld.lld llvm-ar llvm-nm llvm-ranlib llvm-readelf llvm-objcopy llvm-objdump llvm-strip llvm-profdata llvm-bolt merge-fdata)
+  for tool in "${tools[@]}"; do
+    command -v "$tool" >/dev/null || { error "llvm-ultimate tool '$tool' is missing from PATH"; return 1; }
+  done
+  major=$(clang -dumpversion | cut -d. -f1)
+  [[ $major == 24 ]] || { error "llvm-ultimate Clang 24 is required (found $major at $(command -v clang))"; return 1; }
+  for tool in llvm-ar llvm-nm llvm-ranlib llvm-readelf llvm-objcopy llvm-objdump llvm-strip llvm-profdata llvm-bolt; do
+    tool_major=$("$tool" --version | sed -nE 's/.*LLVM version ([0-9]+).*/\1/p' | head -n1)
+    [[ $tool_major == "$major" ]] || { error "$tool version $tool_major doesn't match Clang $major"; return 1; }
+  done
+  tool_major=$(ld.lld --version | sed -nE 's/.*LLD ([0-9]+).*/\1/p' | head -n1)
+  [[ $tool_major == "$major" ]] || { error "ld.lld version $tool_major doesn't match Clang $major"; return 1; }
+  CC=$(command -v clang); CXX=$(command -v clang++)
+  AR=$(command -v llvm-ar); NM=$(command -v llvm-nm); RANLIB=$(command -v llvm-ranlib)
+  READELF=$(command -v llvm-readelf); OBJCOPY=$(command -v llvm-objcopy)
+  OBJDUMP=$(command -v llvm-objdump); STRIP=$(command -v llvm-strip)
+  export CC CXX AR NM RANLIB READELF OBJCOPY OBJDUMP STRIP
+  bolt_dir=$(dirname "$(command -v llvm-bolt)")
+  merge_dir=$(dirname "$(command -v merge-fdata)")
+  [[ $bolt_dir == "$merge_dir" ]] || { error 'llvm-bolt and merge-fdata come from different toolchains'; return 1; }
+  clang --version >/dev/null
+  ld.lld --version >/dev/null
+  llvm-bolt --version >/dev/null
+  msg "Using llvm-ultimate from $(command -v clang)"
+}
+
+prepare() {
+  cd "$srcdir/$pkgname-$pkgver" || return
+  patch -Np1 -i "$srcdir/ms178-1.patch"
+}
+
+_setup_stage() {
+  local build_dir=$1 cflags=$2 cxxflags=$3 exe_ldflags=$4 shared_ldflags=$5
+  local build_static=$6 build_shared=$7 link_shared=$8
+  CPPFLAGS='' CFLAGS='' CXXFLAGS='' LDFLAGS='' \
+  cmake -S "$srcdir/$pkgname-$pkgver/build/cmake" -B "$build_dir" -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" \
+    -DCMAKE_AR="$AR" -DCMAKE_RANLIB="$RANLIB" \
+    -DCMAKE_C_FLAGS="$cflags" -DCMAKE_CXX_FLAGS="$cxxflags" \
+    -DCMAKE_EXE_LINKER_FLAGS="$exe_ldflags" \
+    -DCMAKE_SHARED_LINKER_FLAGS="$shared_ldflags" \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib \
+    -DZSTD_MULTITHREAD_SUPPORT=ON \
+    -DZSTD_LEGACY_SUPPORT=ON \
+    -DZSTD_ZLIB_SUPPORT=ON -DZSTD_LZMA_SUPPORT=ON -DZSTD_LZ4_SUPPORT=ON \
+    -DZSTD_BUILD_TESTS=OFF -DZSTD_BUILD_CONTRIB=OFF \
+    -DZSTD_BUILD_STATIC="$build_static" -DZSTD_BUILD_SHARED="$build_shared" \
+    -DZSTD_PROGRAMS_LINK_SHARED="$link_shared"
+}
+
+_build_stage() {
+  local build_dir=$1 log="$1/compile.log"; shift
+  if ! cmake --build "$build_dir" --parallel "$(nproc)" --target "$@" >"$log" 2>&1; then
+    cat "$log" >&2; return 1
+  fi
+  cat "$log"
+}
+
+_gen_corpus() {
+  local corpus=$1 patch_hash revision tmp source_root
+  source_root="$srcdir/$pkgname-$pkgver"
+  patch_hash=$(sha256sum "$srcdir/ms178-1.patch" | cut -d' ' -f1)
+  revision="zstd-ms178-v2-$pkgver-$patch_hash"
+  tmp="$corpus.tmp.$$"
+  if [[ -f $corpus/.done ]] && [[ $(<"$corpus/.done") == "$revision" ]]; then return 0; fi
+  rm -rf "$corpus" "$corpus.tmp."*
+  mkdir -p "$tmp/small"
+  LC_ALL=C cat "$source_root"/lib/compress/*.c "$source_root"/lib/decompress/*.c "$source_root"/lib/common/*.c > "$tmp/source_c.txt"
+  LC_ALL=C cat "$source_root"/lib/*.h "$source_root"/lib/*/*.h > "$tmp/source_h.txt"
+  LC_ALL=C cat "$source_root"/doc/*.md "$source_root"/*.md > "$tmp/docs.md"
+  python - "$tmp" "$source_root/tests/legacy.c" <<'PY'
+import json,random,re,sys
+from pathlib import Path
+p=Path(sys.argv[1]); random.seed(7)
+ips=[f'10.0.{random.randrange(256)}.{random.randrange(256)}' for _ in range(200)]
+paths=['/api/v1/users','/static/app.js','/health','/index.html','/api/v1/orders']
+with (p/'access.log').open('w') as f:
+ for i in range(120000): f.write(f'{random.choice(ips)} - - [27/Jul/2026:{random.randrange(24):02}:{random.randrange(60):02}:{random.randrange(60):02} +0000] "GET {random.choice(paths)} HTTP/1.1" {random.choice([200,200,200,304,404,500])} {random.randrange(100,90000)}\n')
+random.seed(9)
+(p/'data.json').write_text(json.dumps([{'id':i,'user':f'user_{random.randrange(5000)}','active':bool(random.randrange(2)),'score':round(random.random()*100,3)} for i in range(60000)]))
+random.seed(11)
+with (p/'table.csv').open('w') as f:
+ f.write('id,name,dept,salary,city,date\n')
+ for i in range(200000): f.write(f'{i},name{i%9000},dept{i%40},{30000+random.randrange(90001)},city{i%300},2026-{random.randrange(1,13):02}-{random.randrange(1,29):02}\n')
+random.seed(12345); (p/'random.bin').write_bytes(random.randbytes(3_000_000))
+(p/'rle.txt').write_bytes(b'A'*2_000_000)
+b=(p/'source_c.txt').read_bytes()[:1_000_000]
+with (p/'ldm_dup.bin').open('wb') as f:
+ for i in range(6): f.write(b); f.write(f'\n/* variant {i} */\n'.encode())
+b=(p/'data.json').read_bytes(); random.seed(3)
+for i in range(400):
+ off=random.randrange(len(b)-9000); (p/'small'/f's{i:03}.json').write_bytes(b[off:off+random.randrange(500,8001)])
+# tests/legacy.c contains concatenated frames made by zstd 0.4 through 0.8.
+# The configured legacy level supports 0.5 onward, so retain those four frames.
+src=Path(sys.argv[2]).read_text()
+part=src.split('const char* const COMPRESSED =',1)[1].split('const char* const EXPECTED =',1)[0]
+legacy=bytes(int(x,16) for x in re.findall(r'\\x([0-9A-Fa-f]{2})',part))
+assert len(legacy)==917
+legacy=legacy[legacy.index(bytes.fromhex('25 b5 2f fd')):]
+(p/'legacy-supported.zst').write_bytes(legacy)
+poem=("snowden is snowed in / he's now then in his snow den / when does the snow end?\n"
+      "goodbye little dog / you dug some holes in your day / they'll be hard to fill.\n"
+      "when life shuts a door, / just open it. it’s a door. / that is how doors work.\n")
+(p/'legacy-supported.expected').write_text(poem*4)
+# Nested files drive recursive, file-list, and mirrored-output CLI paths.
+(p/'tree'/'alpha').mkdir(parents=True)
+(p/'tree'/'beta'/'nested').mkdir(parents=True)
+(p/'tree'/'alpha'/'source.txt').write_bytes((p/'source_c.txt').read_bytes()[:180000])
+(p/'tree'/'beta'/'data.json').write_bytes((p/'data.json').read_bytes()[:160000])
+(p/'tree'/'beta'/'nested'/'table.csv').write_bytes((p/'table.csv').read_bytes()[:140000])
+PY
+  cp /usr/bin/bash "$tmp/elf.bin"
+  printf '%s\n' "$revision" > "$tmp/.done"
+  mv "$tmp" "$corpus"
+}
+
+_write_harness() {
+  cat > "$1" <<'HARNESS_EOF'
+#define ZSTD_STATIC_LINKING_ONLY
+#define ZDICT_STATIC_LINKING_ONLY
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <zstd.h>
+#include <zdict.h>
+
+static void* xmalloc(size_t n){ void* p=malloc(n?n:1); if(!p){fprintf(stderr,"oom\n");exit(1);} return p; }
+static unsigned g_roundtrips;
+static void check_zstd(size_t code, const char* where) {
+    if (ZSTD_isError(code)) { fprintf(stderr, "%s: %s\n", where, ZSTD_getErrorName(code)); exit(2); }
+}
+#define CHECK(call) check_zstd((call), #call)
+static void check_dict(size_t code, const char* where) { if (ZDICT_isError(code)) { fprintf(stderr, "%s: %s\n", where, ZDICT_getErrorName(code)); exit(8); } }
+#define CHECK_DICT(call) check_dict((call), #call)
+static void verify(const void* src, size_t srcSize, const void* dst, size_t dSize) {
+    if (dSize != srcSize || memcmp(src,dst,srcSize)!=0) { fprintf(stderr,"verified roundtrip mismatch\n"); exit(9); }
+    ++g_roundtrips;
+}
+
+static char* slurp(const char* fn, size_t* out){
+    FILE* f=fopen(fn,"rb"); if(!f) return NULL;
+    fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
+    if(sz<=0){fclose(f);return NULL;}
+    char* b=(char*)xmalloc((size_t)sz);
+    size_t rd=fread(b,1,(size_t)sz,f); fclose(f);
+    if(rd!=(size_t)sz){free(b);return NULL;}
+    *out=rd; return b;
+}
+
+static void roundtrip(ZSTD_CCtx* cctx, ZSTD_DCtx* dctx,
+                      const void* src, size_t srcSize, void* dst, size_t dstCap,
+                      void* rt, size_t rtCap, int strategy, int mml, int slog,
+                      int wlog, int rowMF, const void* dict, size_t dictSize,
+                      int usePrefix, int level)
+{
+    size_t cSize, dSize;
+    CHECK(ZSTD_CCtx_reset(cctx, ZSTD_reset_session_and_parameters));
+    CHECK(ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, level));
+    if (strategy) CHECK(ZSTD_CCtx_setParameter(cctx, ZSTD_c_strategy, strategy));
+    if (mml)  CHECK(ZSTD_CCtx_setParameter(cctx, ZSTD_c_minMatch, mml));
+    if (slog) CHECK(ZSTD_CCtx_setParameter(cctx, ZSTD_c_searchLog, slog));
+    if (wlog) CHECK(ZSTD_CCtx_setParameter(cctx, ZSTD_c_windowLog, wlog));
+    CHECK(ZSTD_CCtx_setParameter(cctx, ZSTD_c_useRowMatchFinder, rowMF));
+    if (dict && dictSize) {
+        if (usePrefix) CHECK(ZSTD_CCtx_refPrefix(cctx, dict, dictSize));
+        else           CHECK(ZSTD_CCtx_loadDictionary(cctx, dict, dictSize));
+    }
+    cSize = ZSTD_compress2(cctx, dst, dstCap, src, srcSize);
+    CHECK(cSize);
+    CHECK(ZSTD_DCtx_reset(dctx, ZSTD_reset_session_and_parameters));
+    CHECK(ZSTD_DCtx_setParameter(dctx, ZSTD_d_windowLogMax, 31));
+    if (dict && dictSize) {
+        if (usePrefix) CHECK(ZSTD_DCtx_refPrefix(dctx, dict, dictSize));
+        else           CHECK(ZSTD_DCtx_loadDictionary(dctx, dict, dictSize));
+    }
+    dSize = ZSTD_decompressDCtx(dctx, rt, rtCap, dst, cSize);
+    CHECK(dSize);
+    if (dSize != srcSize || memcmp(rt, src, srcSize) != 0) { fprintf(stderr,"roundtrip mismatch\n"); exit(3); }
+    ++g_roundtrips;
+}
+
+static void stream_roundtrip(ZSTD_CCtx* cctx, ZSTD_DCtx* dctx,
+                             const void* src, size_t srcSize,
+                             int level, int wlog, int nbWorkers, size_t chunk)
+{
+    size_t outCap=ZSTD_CStreamOutSize(); char* outBuf=(char*)xmalloc(outCap);
+    size_t dOutCap=ZSTD_DStreamOutSize(); char* dOut=(char*)xmalloc(dOutCap);
+    size_t cCap=ZSTD_compressBound(srcSize)+4096, cUsed=0, pos=0, dUsed=0;
+    char* cBuf=(char*)xmalloc(cCap); char* decoded=(char*)xmalloc(srcSize);
+    CHECK(ZSTD_CCtx_reset(cctx, ZSTD_reset_session_and_parameters));
+    CHECK(ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, level));
+    if (wlog) CHECK(ZSTD_CCtx_setParameter(cctx, ZSTD_c_windowLog, wlog));
+    if (nbWorkers) CHECK(ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, nbWorkers));
+    CHECK(ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, 1));
+    while (pos < srcSize) {
+        size_t take = (srcSize-pos < chunk) ? (srcSize-pos) : chunk;
+        ZSTD_inBuffer in = { (const char*)src+pos, take, 0 };
+        int last = (pos+take >= srcSize);
+        for (;;) {
+            ZSTD_outBuffer out = { outBuf, outCap, 0 };
+            size_t r = ZSTD_compressStream2(cctx, &out, &in, last?ZSTD_e_end:ZSTD_e_continue);
+            CHECK(r);
+            if (cUsed+out.pos > cCap) { fprintf(stderr,"stream compressed overflow\n"); exit(5); }
+            memcpy(cBuf+cUsed, outBuf, out.pos); cUsed += out.pos;
+            if (last) { if (r==0) break; } else if (in.pos==in.size) break;
+        }
+        pos += take;
+    }
+    {   ZSTD_inBuffer din = { cBuf, cUsed, 0 };
+        CHECK(ZSTD_DCtx_reset(dctx, ZSTD_reset_session_and_parameters));
+        CHECK(ZSTD_DCtx_setParameter(dctx, ZSTD_d_windowLogMax, 31));
+        while (din.pos < din.size) {
+            ZSTD_outBuffer dout = { dOut, dOutCap, 0 };
+            size_t r = ZSTD_decompressStream(dctx, &dout, &din);
+            CHECK(r);
+            if (dUsed+dout.pos > srcSize) { fprintf(stderr,"stream decoded overflow\n"); exit(6); }
+            memcpy(decoded+dUsed,dOut,dout.pos); dUsed+=dout.pos;
+            if (r==0 && din.pos==din.size) break;
+        }
+    }
+    if (dUsed != srcSize || memcmp(decoded,src,srcSize)!=0) { fprintf(stderr,"stream roundtrip mismatch\n"); exit(7); }
+    ++g_roundtrips;
+    free(decoded); free(outBuf); free(dOut); free(cBuf);
+}
+
+int main(int argc, char** argv)
+{
+    const char* corpus = (argc>1)?argv[1]:".";
+    char path[4096]; size_t srcSize=0, dictSrcSize=0;
+    char *src, *dictSrc; ZSTD_CCtx* cctx; ZSTD_DCtx* dctx;
+    void *dst,*rt,*dictBuf=NULL; size_t dstCap,rtCap,dictSize=0;
+    int strat,mml,slog,rowMF,w;
+
+    snprintf(path,sizeof(path),"%s/source_c.txt",corpus);
+    src=slurp(path,&srcSize);
+    if(!src){fprintf(stderr,"cannot read %s\n",path);return 1;}
+    if(srcSize>(2u<<20)) srcSize=2u<<20;
+
+    snprintf(path,sizeof(path),"%s/source_h.txt",corpus);
+    dictSrc=slurp(path,&dictSrcSize);
+    if(!dictSrc){dictSrc=src;dictSrcSize=srcSize;}
+    if(dictSrcSize>(512u<<10)) dictSrcSize=512u<<10;
+
+    dstCap=ZSTD_compressBound(srcSize); dst=xmalloc(dstCap);
+    rtCap=srcSize+1024; rt=xmalloc(rtCap);
+    cctx=ZSTD_createCCtx(); dctx=ZSTD_createDCtx();
+    if(!cctx||!dctx) return 1;
+
+    /* a real dictionary, built with the COVER dictBuilder */
+    {   size_t nbSamples=512, sampleSize=2048, i;
+        size_t* sizes=(size_t*)xmalloc(nbSamples*sizeof(size_t));
+        char* samples=(char*)xmalloc(nbSamples*sampleSize);
+        for(i=0;i<nbSamples;i++){
+            size_t off=(i*7919)%(srcSize>sampleSize?srcSize-sampleSize:1);
+            memcpy(samples+i*sampleSize, src+off, sampleSize); sizes[i]=sampleSize;
+        }
+        dictSize=110*1024; dictBuf=xmalloc(dictSize);
+        {   size_t r=ZDICT_trainFromBuffer(dictBuf,dictSize,samples,sizes,(unsigned)nbSamples);
+            dictSize = ZDICT_isError(r)?0:r; }
+        free(samples); free(sizes);
+    }
+
+    /* 1. noDict: strategy x minMatch x searchLog x rowMatchFinder */
+    for(strat=1;strat<=9;strat++)
+      for(mml=3;mml<=7;mml++)
+        for(slog=1;slog<=7;slog+=2)
+          for(rowMF=1;rowMF<=2;rowMF++)
+            roundtrip(cctx,dctx,src,srcSize,dst,dstCap,rt,rtCap,strat,mml,slog,18,rowMF,NULL,0,0,3);
+
+    /* 2. dictMatchState, including all row-matchfinder instantiations */
+    if(dictSize){
+        static const size_t chunks[]={1024,8*1024,24*1024,96*1024,512*1024};
+        size_t ci;
+        for(ci=0;ci<sizeof(chunks)/sizeof(chunks[0]);ci++){
+            size_t n = chunks[ci]<srcSize?chunks[ci]:srcSize;
+            for(strat=1;strat<=9;strat++)
+              for(mml=3;mml<=7;mml++)
+                for(rowMF=1;rowMF<=2;rowMF++)
+                  for(w=15;w<=19;w+=2)
+                    roundtrip(cctx,dctx,src,n,dst,dstCap,rt,rtCap,strat,mml,0,w,rowMF,dictBuf,dictSize,0,5);
+            /* rowLog == BOUNDED(4,searchLog,6) and mls == MAX(4,MIN(6,minMatch)):
+             * sweep BOTH, and force-attach so dictMode stays dictMatchState
+             * regardless of srcSize vs attachDictSizeCutoffs. */
+            for(strat=3;strat<=5;strat++)
+              for(slog=4;slog<=6;slog++)
+                for(mml=4;mml<=6;mml++){
+                    CHECK(ZSTD_CCtx_reset(cctx,ZSTD_reset_session_and_parameters));
+                    CHECK(ZSTD_CCtx_setParameter(cctx,ZSTD_c_compressionLevel,5));
+                    CHECK(ZSTD_CCtx_setParameter(cctx,ZSTD_c_strategy,strat));
+                    CHECK(ZSTD_CCtx_setParameter(cctx,ZSTD_c_searchLog,slog));
+                    CHECK(ZSTD_CCtx_setParameter(cctx,ZSTD_c_minMatch,mml));
+                    CHECK(ZSTD_CCtx_setParameter(cctx,ZSTD_c_windowLog,17));
+                    CHECK(ZSTD_CCtx_setParameter(cctx,ZSTD_c_useRowMatchFinder,1));
+                    CHECK(ZSTD_CCtx_setParameter(cctx,ZSTD_c_forceAttachDict,ZSTD_dictForceAttach));
+                    CHECK(ZSTD_CCtx_loadDictionary(cctx,dictBuf,dictSize));
+                    {   size_t s=ZSTD_compress2(cctx,dst,dstCap,src,n); size_t d;
+                        CHECK(s); CHECK(ZSTD_DCtx_reset(dctx,ZSTD_reset_session_and_parameters));
+                        CHECK(ZSTD_DCtx_loadDictionary(dctx,dictBuf,dictSize));
+                        d=ZSTD_decompressDCtx(dctx,rt,rtCap,dst,s); CHECK(d); verify(src,n,rt,d); }
+                }
+        }
+    }
+
+    /* 3. extDict via refPrefix (the only reliable driver of extDict mode) */
+    for(strat=1;strat<=9;strat++)
+      for(mml=3;mml<=7;mml++)
+        for(rowMF=1;rowMF<=2;rowMF++)
+          roundtrip(cctx,dctx,src,srcSize>(256u<<10)?(256u<<10):srcSize,dst,dstCap,rt,rtCap,
+                    strat,mml,0,18,rowMF,dictSrc,dictSrcSize,1,5);
+    for(strat=3;strat<=5;strat++)
+      for(slog=4;slog<=6;slog++)
+        for(mml=4;mml<=6;mml++)
+          roundtrip(cctx,dctx,src,srcSize>(256u<<10)?(256u<<10):srcSize,dst,dstCap,rt,rtCap,
+                    strat,mml,slog,17,1,dictSrc,dictSrcSize,1,5);
+
+    /* 4. super-block path (ZSTD_compressSuperBlock / ZSTD_compressSubBlock) */
+    {   int lv; unsigned t;
+        for(lv=3;lv<=19;lv+=4)
+          for(t=1340;t<=8192;t*=2){
+            size_t const n=srcSize>(512u<<10)?(512u<<10):srcSize;
+            CHECK(ZSTD_CCtx_reset(cctx,ZSTD_reset_session_and_parameters));
+            CHECK(ZSTD_CCtx_setParameter(cctx,ZSTD_c_compressionLevel,lv));
+            CHECK(ZSTD_CCtx_setParameter(cctx,ZSTD_c_targetCBlockSize,(int)t));
+            {   size_t s=ZSTD_compress2(cctx,dst,dstCap,src,n); size_t d;
+                CHECK(s); CHECK(ZSTD_DCtx_reset(dctx,ZSTD_reset_session_and_parameters));
+                d=ZSTD_decompressDCtx(dctx,rt,rtCap,dst,s); CHECK(d); verify(src,n,rt,d); }
+          }
+    }
+
+    /* 5. streaming: window wrap, flush, and multi-threaded */
+    {   int lv;
+        for(lv=1;lv<=19;lv+=3){
+            stream_roundtrip(cctx,dctx,src,srcSize,lv,0,0,64*1024);
+            stream_roundtrip(cctx,dctx,src,srcSize,lv,15,0,16*1024);  /* tiny window -> wrap */
+        }
+        stream_roundtrip(cctx,dctx,src,srcSize,3,0,2,128*1024);
+        stream_roundtrip(cctx,dctx,src,srcSize,9,0,4,128*1024);
+        stream_roundtrip(cctx,dctx,src,srcSize,15,0,2,256*1024);
+    }
+
+    /* 6. long distance matching */
+    {   int lv,hrl;
+        for(lv=1;lv<=19;lv+=6)
+          for(hrl=0;hrl<=7;hrl+=7){
+            CHECK(ZSTD_CCtx_reset(cctx,ZSTD_reset_session_and_parameters));
+            CHECK(ZSTD_CCtx_setParameter(cctx,ZSTD_c_compressionLevel,lv));
+            CHECK(ZSTD_CCtx_setParameter(cctx,ZSTD_c_enableLongDistanceMatching,1));
+            CHECK(ZSTD_CCtx_setParameter(cctx,ZSTD_c_windowLog,27));
+            if(hrl) CHECK(ZSTD_CCtx_setParameter(cctx,ZSTD_c_ldmHashRateLog,hrl));
+            {   size_t s=ZSTD_compress2(cctx,dst,dstCap,src,srcSize); size_t d;
+                CHECK(s); CHECK(ZSTD_DCtx_reset(dctx,ZSTD_reset_session_and_parameters));
+                CHECK(ZSTD_DCtx_setParameter(dctx,ZSTD_d_windowLogMax,31));
+                d=ZSTD_decompressDCtx(dctx,rt,rtCap,dst,s); CHECK(d); verify(src,srcSize,rt,d); }
+          }
+    }
+
+    /* 7. negative (fast) levels, one-shot API, size queries, error table */
+    {   static const int fastLevels[] = {-1,-3,-5,-10,-20,-50,-100};
+        size_t li;
+        for(li=0; li<sizeof(fastLevels)/sizeof(fastLevels[0]); ++li){
+            int const lv=fastLevels[li];
+            size_t s=ZSTD_compress(dst,dstCap,src,srcSize,lv); size_t d;
+            CHECK(s); d=ZSTD_decompress(rt,rtCap,dst,s); CHECK(d); verify(src,srcSize,rt,d);
+        }
+        {   int const lv=ZSTD_minCLevel(); size_t s=ZSTD_compress(dst,dstCap,src,srcSize,lv); size_t d;
+            CHECK(s); d=ZSTD_decompress(rt,rtCap,dst,s); CHECK(d); verify(src,srcSize,rt,d); }
+
+        {   size_t s=ZSTD_compress(dst,dstCap,src,srcSize,3);
+            if(!ZSTD_isError(s)){
+                (void)ZSTD_findDecompressedSize(dst,s);
+                (void)ZSTD_frameHeaderSize(dst,s);
+                {   ZSTD_frameHeader zfh; (void)ZSTD_getFrameHeader(&zfh,dst,s); }
+            } }
+        {   unsigned e; for(e=1;e<64;e++) (void)ZSTD_getErrorName((size_t)-(long)e); }
+        (void)ZSTD_estimateCCtxSize(9);
+        (void)ZSTD_estimateCStreamSize(9);
+        (void)ZSTD_estimateDCtxSize();
+    }
+
+    /* 8. CDict/DDict reuse (the long-lived-application pattern) */
+    if(dictSize){
+        int lv;
+        for(lv=1;lv<=19;lv+=6){
+            ZSTD_CDict* cd=ZSTD_createCDict(dictBuf,dictSize,lv);
+            ZSTD_DDict* dd=ZSTD_createDDict(dictBuf,dictSize);
+            if(!cd||!dd){ fprintf(stderr,"CDict/DDict allocation failed\n"); exit(10); }
+            {   int k;
+                for(k=0;k<8;k++){
+                    size_t n=(size_t)(1024<<k)<srcSize?(size_t)(1024<<k):srcSize;
+                    size_t s,d;
+                    CHECK(ZSTD_CCtx_reset(cctx,ZSTD_reset_session_and_parameters));
+                    s=ZSTD_compress_usingCDict(cctx,dst,dstCap,src,n,cd); CHECK(s);
+                    CHECK(ZSTD_DCtx_reset(dctx,ZSTD_reset_session_and_parameters));
+                    d=ZSTD_decompress_usingDDict(dctx,rt,rtCap,dst,s,dd); CHECK(d); verify(src,n,rt,d);
+                } }
+            ZSTD_freeCDict(cd); ZSTD_freeDDict(dd);
+        }
+    }
+
+    /* 9. dedicatedDictSearch. Requires ZSTD_createCDict_advanced2() with
+     *    enableDedicatedDictSearch, hashLog > chainLog and strategy in
+     *    [greedy..lazy2]; unreachable from the CLI. */
+    if(dictSize){
+        int lv;
+        for(lv=1;lv<=12;lv++)
+          for(strat=3;strat<=5;strat++)
+            for(rowMF=1;rowMF<=2;rowMF++)
+              for(mml=4;mml<=6;mml++)
+                for(slog=4;slog<=6;slog++){
+                    ZSTD_CCtx_params* p=ZSTD_createCCtxParams();
+                    ZSTD_CDict* cd;
+                    if(!p){ fprintf(stderr,"CCtxParams allocation failed\n"); exit(11); }
+                    CHECK(ZSTD_CCtxParams_setParameter(p,ZSTD_c_compressionLevel,lv));
+                    CHECK(ZSTD_CCtxParams_setParameter(p,ZSTD_c_enableDedicatedDictSearch,1));
+                    CHECK(ZSTD_CCtxParams_setParameter(p,ZSTD_c_strategy,strat));
+                    CHECK(ZSTD_CCtxParams_setParameter(p,ZSTD_c_minMatch,mml));
+                    CHECK(ZSTD_CCtxParams_setParameter(p,ZSTD_c_searchLog,slog));
+                    CHECK(ZSTD_CCtxParams_setParameter(p,ZSTD_c_useRowMatchFinder,rowMF));
+                    CHECK(ZSTD_CCtxParams_setParameter(p,ZSTD_c_hashLog,22));
+                    CHECK(ZSTD_CCtxParams_setParameter(p,ZSTD_c_chainLog,16));
+                    CHECK(ZSTD_CCtxParams_setParameter(p,ZSTD_c_windowLog,18));
+                    cd=ZSTD_createCDict_advanced2(dictBuf,dictSize,ZSTD_dlm_byRef,
+                                                  ZSTD_dct_auto,p,ZSTD_defaultCMem);
+                    if(!cd){ fprintf(stderr,"dedicated CDict allocation failed\n"); exit(12); }
+                    {   int k;
+                        for(k=10;k<=16;k+=2){
+                            size_t n=((size_t)1<<k)<srcSize?((size_t)1<<k):srcSize;
+                            size_t s,d;
+                            CHECK(ZSTD_CCtx_reset(cctx,ZSTD_reset_session_and_parameters));
+                            s=ZSTD_compress_usingCDict(cctx,dst,dstCap,src,n,cd); CHECK(s);
+                            CHECK(ZSTD_DCtx_reset(dctx,ZSTD_reset_session_and_parameters));
+                            CHECK(ZSTD_DCtx_loadDictionary(dctx,dictBuf,dictSize));
+                            d=ZSTD_decompressDCtx(dctx,rt,rtCap,dst,s); CHECK(d); verify(src,n,rt,d);
+                        }
+                    }
+                    ZSTD_freeCDict(cd); ZSTD_freeCCtxParams(p);
+                }
+    }
+
+    /* 10. dictBuilder back-ends the CLI defaults never touch */
+    {   size_t nbSamples=256, sampleSize=2048, i;
+        size_t* sizes=(size_t*)xmalloc(nbSamples*sizeof(size_t));
+        char* samples=(char*)xmalloc(nbSamples*sampleSize);
+        void* outDict=xmalloc(64*1024);
+        for(i=0;i<nbSamples;i++){
+            size_t off=(i*6151)%(srcSize>sampleSize?srcSize-sampleSize:1);
+            memcpy(samples+i*sampleSize,src+off,sampleSize); sizes[i]=sampleSize;
+        }
+        {   ZDICT_cover_params_t cp; memset(&cp,0,sizeof(cp));
+            cp.k=50; cp.d=8; cp.steps=4; cp.nbThreads=1; cp.zParams.compressionLevel=3;
+            CHECK_DICT(ZDICT_trainFromBuffer_cover(outDict,64*1024,samples,sizes,(unsigned)nbSamples,cp)); }
+        {   ZDICT_cover_params_t cp; memset(&cp,0,sizeof(cp));
+            cp.steps=2; cp.nbThreads=1; cp.zParams.compressionLevel=3;
+            CHECK_DICT(ZDICT_optimizeTrainFromBuffer_cover(outDict,64*1024,samples,sizes,(unsigned)nbSamples,&cp)); }
+        {   ZDICT_fastCover_params_t fp; memset(&fp,0,sizeof(fp));
+            fp.k=50; fp.d=8; fp.f=20; fp.steps=4; fp.nbThreads=1; fp.zParams.compressionLevel=3;
+            CHECK_DICT(ZDICT_trainFromBuffer_fastCover(outDict,64*1024,samples,sizes,(unsigned)nbSamples,fp)); }
+        {   ZDICT_fastCover_params_t fp; memset(&fp,0,sizeof(fp));
+            fp.steps=2; fp.nbThreads=1; fp.zParams.compressionLevel=3;
+            CHECK_DICT(ZDICT_optimizeTrainFromBuffer_fastCover(outDict,64*1024,samples,sizes,(unsigned)nbSamples,&fp)); }
+        {   ZDICT_legacy_params_t lp; memset(&lp,0,sizeof(lp));
+            lp.selectivityLevel=9; lp.zParams.compressionLevel=3;
+            CHECK_DICT(ZDICT_trainFromBuffer_legacy(outDict,64*1024,samples,sizes,(unsigned)nbSamples,lp)); }
+        free(samples); free(sizes); free(outDict);
+    }
+
+    ZSTD_freeCCtx(cctx); ZSTD_freeDCtx(dctx);
+    free(dst); free(rt); free(dictBuf);
+    if(dictSrc!=src) free(dictSrc);
+    free(src);
+    if (g_roundtrips < 1000) { fprintf(stderr,"insufficient successful matrix coverage: %u\n", g_roundtrips); return 4; }
+    printf("zstd_train: %u verified roundtrips\n", g_roundtrips);
+    return 0;
+}
+HARNESS_EOF
+}
+
+_compile_harness() {
+  local build_dir=$1 cflags=$2 ldflags=$3 output=$4 obj="$4.o"
+  local -a ca la
+  read -r -a ca <<< "$cflags"
+  read -r -a la <<< "$ldflags"
+  "$CC" "${ca[@]}" -DNDEBUG -I "$srcdir/$pkgname-$pkgver/lib" \
+    -I "$srcdir/$pkgname-$pkgver/lib/dictBuilder" -Wno-deprecated-declarations \
+    -c "$srcdir/zstd_train.c" -o "$obj"
+  "$CC" "${la[@]}" "$obj" "$build_dir/lib/libzstd.a" -pthread -o "$output"
+}
+
+_run_profiled_harness() {
+  local profile_pattern=$1 exe=$2 corpus=$3 log=$4
+  if ! LLVM_PROFILE_FILE="$profile_pattern" "$exe" "$corpus" >"$log" 2>&1; then
+    cat "$log" >&2
+    error "profile harness failed: $exe"
+    return 1
+  fi
+  cat "$log"
+}
+
+_run_cli_workload() (
+  set -e
+  local zstd=$1 corpus=$2 work=$3
+  mkdir -p "$work"
+  _profile_log_clean() {
+    :
+  }
+  _run() {
+    if ! "$zstd" "$@" >"$work/last-command.log" 2>&1; then
+      error "training command failed: $zstd $*"
+      cat "$work/last-command.log" >&2; exit 1
+    fi
+    _profile_log_clean "$work/last-command.log"
+  }
+  _pipe_roundtrip() {
+    local tag=$1 input=$2; shift 2
+    local clog="$work/$tag-compress.log" dlog="$work/$tag-decompress.log"
+    if ! "$zstd" -q "$@" -c < "$input" > "$work/$tag.zst" 2>"$clog"; then
+      error "training pipe compression failed: $tag"; cat "$clog" >&2; exit 1
+    fi
+    _profile_log_clean "$clog"
+    if ! "$zstd" -q -d -c < "$work/$tag.zst" > "$work/$tag.out" 2>"$dlog"; then
+      error "training pipe decompression failed: $tag"; cat "$dlog" >&2; exit 1
+    fi
+    _profile_log_clean "$dlog"
+    cmp -s "$input" "$work/$tag.out" || { error "training pipe roundtrip mismatch: $tag"; exit 1; }
+  }
+  _roundtrip() {
+    local tag=$1 input=$2 arg i; shift 2
+    local -a compress_args=("$@") decode_args=()
+    for ((i=0; i<${#compress_args[@]}; ++i)); do
+      arg=${compress_args[$i]}
+      case $arg in
+        -D)
+          ((++i < ${#compress_args[@]})) || { error 'missing dictionary argument'; exit 1; }
+          decode_args+=(-D "${compress_args[$i]}") ;;
+        --patch-from=*) decode_args+=("$arg") ;;
+      esac
+    done
+    _run -q -f "${compress_args[@]}" "$input" -o "$work/$tag.zst"
+    _run -q -t "${decode_args[@]}" "$work/$tag.zst"
+    _run -q -d -f "${decode_args[@]}" "$work/$tag.zst" -o "$work/$tag.out"
+    cmp -s "$input" "$work/$tag.out" || { error "training roundtrip mismatch: $tag"; exit 1; }
+  }
+
+  local level window threads dict format mirrored
+  # Equal input/block counts across every positive strategy, with a second pass
+  # for the common fast levels rather than the old 18x overweighting of level 19.
+  for level in {1..19}; do
+    _roundtrip "source-l$level" "$corpus/source_c.txt" "-$level"
+    _roundtrip "log-l$level" "$corpus/access.log" "-$level"
+  done
+  for level in 1 3 5; do
+    _roundtrip "json-common-l$level" "$corpus/data.json" "-$level"
+    _roundtrip "csv-common-l$level" "$corpus/table.csv" "-$level"
+  done
+  for level in 20 21 22; do _roundtrip "ultra-l$level" "$corpus/docs.md" --ultra "-$level"; done
+  for level in 1 3 5 7 20 50 100; do _roundtrip "fast-$level" "$corpus/table.csv" "--fast=$level"; done
+
+  for window in 20 24 27; do
+    for level in 3 12 19; do _roundtrip "ldm-w$window-l$level" "$corpus/ldm_dup.bin" "--long=$window" "-$level"; done
+  done
+
+  rm -f "$work"/dict.*
+  _run -q --train "$corpus"/small/*.json -o "$work/dict.default" --maxdict=112640
+  _run -q --train-cover=k=50,d=8,steps=4 "$corpus"/small/*.json -o "$work/dict.cover" --maxdict=112640
+  _run -q --train-fastcover=k=50,d=8,f=20,steps=4 "$corpus"/small/*.json -o "$work/dict.fast" --maxdict=112640
+  _run -q --train-legacy=s=9 "$corpus"/small/*.json -o "$work/dict.legacy" --maxdict=65536
+  for dict in "$work/dict.default" "$work/dict.cover" "$work/dict.fast" "$work/dict.legacy"; do
+    [[ -s $dict ]] || { error "dictionary trainer produced no output: $dict"; exit 1; }
+    for level in 1 3 9 12 19; do
+      _roundtrip "dict-$(basename "$dict")-l$level" "$corpus/data.json" "-$level" -D "$dict"
+    done
+  done
+  _roundtrip dict-mmap "$corpus/data.json" -7 -D "$work/dict.cover" --mmap-dict
+  _roundtrip dict-no-mmap "$corpus/data.json" -7 -D "$work/dict.cover" --no-mmap-dict
+  _roundtrip dict-no-id "$corpus/data.json" -7 -D "$work/dict.cover" --no-dictID
+
+  for level in 1 3 9 13 16 19; do
+    _roundtrip "patch-l$level" "$corpus/source_c.txt" "-$level" "--patch-from=$corpus/source_h.txt"
+  done
+
+  for threads in 2 4 8 16; do
+    for level in 1 3 9; do _roundtrip "mt-t$threads-l$level" "$corpus/access.log" "-T$threads" "-$level"; done
+    _roundtrip "mt-ldm-t$threads" "$corpus/ldm_dup.bin" "-T$threads" --long=27 -6
+  done
+  for level in 0 3 6 9; do _roundtrip "overlap-$level" "$corpus/table.csv" -T4 -9 "--zstd=overlapLog=$level"; done
+  _roundtrip rsyncable "$corpus/access.log" -T4 -9 --rsyncable
+  _roundtrip single-thread "$corpus/access.log" -6 --single-thread
+  _roundtrip auto-physical "$corpus/table.csv" -3 -T0 --auto-threads=physical
+  _roundtrip auto-logical "$corpus/table.csv" -3 -T0 --auto-threads=logical
+  _roundtrip adapt "$corpus/access.log" -T2 --adapt=min=1,max=9
+  _roundtrip row-on "$corpus/table.csv" -7 --row-match-finder
+  _roundtrip row-off "$corpus/table.csv" -7 --no-row-match-finder
+  _roundtrip literals-on "$corpus/source_c.txt" -9 --compress-literals
+  _roundtrip literals-off "$corpus/source_c.txt" -9 --no-compress-literals
+  _roundtrip size-hint "$corpus/source_c.txt" -6 --size-hint=2000000
+  _roundtrip explicit-async "$corpus/access.log" -3 --asyncio
+  _roundtrip no-async "$corpus/access.log" -3 --no-asyncio
+
+  for level in 1 9 19; do
+    _roundtrip "random-l$level" "$corpus/random.bin" "-$level"
+    _roundtrip "rle-l$level" "$corpus/rle.txt" "-$level"
+    _roundtrip "elf-l$level" "$corpus/elf.bin" "-$level"
+  done
+
+  rm -rf "$work/small-zst" "$work/small-out"; mkdir -p "$work/small-zst" "$work/small-out"
+  _run -q -5 -f "$corpus"/small/s0[0-3]*.json --output-dir-flat "$work/small-zst"
+  _run -q -d -f "$work"/small-zst/*.zst --output-dir-flat "$work/small-out"
+
+  _roundtrip no-check "$corpus/source_c.txt" -9 --no-check
+  _roundtrip no-content-size "$corpus/source_c.txt" -9 --no-content-size
+  _roundtrip target-block "$corpus/source_c.txt" -9 --target-compressed-block-size=2048
+
+  _pipe_roundtrip pipe "$corpus/source_c.txt" -6
+  _pipe_roundtrip stream-size "$corpus/source_c.txt" -6 --stream-size="$(stat -c %s "$corpus/source_c.txt")"
+
+  # Concatenated frames and the CLI's own multi-file-to-stdout path.
+  cat "$work/source-l1.zst" "$work/source-l3.zst" > "$work/multi.zst"
+  _run -q -d -f "$work/multi.zst" -o "$work/multi.out"
+  cat "$corpus/source_c.txt" "$corpus/source_c.txt" > "$work/multi.ref"
+  cmp -s "$work/multi.ref" "$work/multi.out" || { error 'concatenated frame mismatch'; exit 1; }
+  if ! "$zstd" -q -f -3 -c "$corpus/tree/alpha/source.txt" "$corpus/tree/beta/data.json" \
+      > "$work/multi-created.zst" 2> "$work/multi-created.log"; then
+    error 'multi-file stdout compression failed'; cat "$work/multi-created.log" >&2; exit 1
+  fi
+  _profile_log_clean "$work/multi-created.log"
+  _run -q -d -f "$work/multi-created.zst" -o "$work/multi-created.out"
+  cat "$corpus/tree/alpha/source.txt" "$corpus/tree/beta/data.json" > "$work/multi-created.ref"
+  cmp -s "$work/multi-created.ref" "$work/multi-created.out" || { error 'multi-file stdout mismatch'; exit 1; }
+  _run -q -l "$work/source-l1.zst" "$work/source-l3.zst" "$work/multi-created.zst"
+  _run -q -t "$work/source-l1.zst"
+
+  # Administrative and parameter-reporting paths are real CLI use cases, but
+  # each runs only once so they cannot distort hot compression/decompression counts.
+  _run --version
+  _run -h
+  _run --help
+  _roundtrip show-cparams "$corpus/source_c.txt" -3 --show-default-cparams
+  _roundtrip verbose-cparams "$corpus/source_c.txt" -3 -vvv
+
+  # Optional format frontends are shipped by this package. Keep their profile
+  # weight tiny while covering and verifying every enabled adapter.
+  for format in gzip xz lzma lz4; do
+    _roundtrip "format-$format" "$corpus/source_c.txt" -3 "--format=$format"
+  done
+
+  # File-management paths: pass-through, sparse modes, source removal,
+  # file lists, recursive traversal, mirrored output, and compressed-file exclusion.
+  _run -q -d -f --pass-through "$corpus/docs.md" -o "$work/pass-through.out"
+  cmp -s "$corpus/docs.md" "$work/pass-through.out" || { error 'pass-through mismatch'; exit 1; }
+  _run -q -d -f --sparse "$work/rle-l9.zst" -o "$work/sparse.out"
+  cmp -s "$corpus/rle.txt" "$work/sparse.out" || { error 'sparse decode mismatch'; exit 1; }
+  _run -q -d -f --no-sparse "$work/rle-l9.zst" -o "$work/no-sparse.out"
+  cmp -s "$corpus/rle.txt" "$work/no-sparse.out" || { error 'non-sparse decode mismatch'; exit 1; }
+
+  cp "$corpus/tree/alpha/source.txt" "$work/remove-source.txt"
+  _run -q -f -5 --rm "$work/remove-source.txt" -o "$work/remove-source.zst"
+  [[ ! -e $work/remove-source.txt && -s $work/remove-source.zst ]] || { error '--rm compression failed'; exit 1; }
+  _run -q -d -f --rm "$work/remove-source.zst" -o "$work/remove-source.out"
+  [[ ! -e $work/remove-source.zst ]] || { error '--rm decompression retained source'; exit 1; }
+  cmp -s "$corpus/tree/alpha/source.txt" "$work/remove-source.out" || { error '--rm roundtrip mismatch'; exit 1; }
+
+  find "$corpus/tree" -type f -print | LC_ALL=C sort > "$work/filelist"
+  rm -rf "$work/filelist-zst" "$work/filelist-out"; mkdir -p "$work/filelist-zst" "$work/filelist-out"
+  _run -q -f --filelist "$work/filelist" --output-dir-flat "$work/filelist-zst"
+  _run -q -d -f "$work/filelist-zst"/*.zst --output-dir-flat "$work/filelist-out"
+  cmp -s "$corpus/tree/alpha/source.txt" "$work/filelist-out/source.txt" || { error 'file-list source mismatch'; exit 1; }
+  cmp -s "$corpus/tree/beta/data.json" "$work/filelist-out/data.json" || { error 'file-list JSON mismatch'; exit 1; }
+  cmp -s "$corpus/tree/beta/nested/table.csv" "$work/filelist-out/table.csv" || { error 'file-list CSV mismatch'; exit 1; }
+
+  rm -rf "$work/mirror-zst"; mkdir -p "$work/mirror-zst"
+  (cd "$corpus" && _run -q -r -f tree --output-dir-mirror "$work/mirror-zst")
+  mirrored=$(find "$work/mirror-zst" -type f -name 'source.txt.zst' -print -quit)
+  [[ -n $mirrored ]] || { error 'mirrored recursive output missing'; exit 1; }
+  _run -q -d -f "$mirrored" -o "$work/mirror-source.out"
+  cmp -s "$corpus/tree/alpha/source.txt" "$work/mirror-source.out" || { error 'mirrored recursive mismatch'; exit 1; }
+
+  rm -rf "$work/exclude"; mkdir -p "$work/exclude"
+  _run -q -f -3 --exclude-compressed "$corpus/tree/alpha/source.txt" "$work/source-l3.zst" \
+    --output-dir-flat "$work/exclude"
+  [[ -s $work/exclude/source.txt.zst ]] || { error 'exclude-compressed source output missing'; exit 1; }
+
+  # Exercise every legacy decoder enabled by ZSTD_LEGACY_LEVEL=5 and verify the
+  # concatenated zstd 0.5/0.6/0.7/0.8 output against upstream's known plaintext.
+  _run -q -t "$corpus/legacy-supported.zst"
+  _run -q -d -f "$corpus/legacy-supported.zst" -o "$work/legacy-supported.out"
+  cmp -s "$corpus/legacy-supported.expected" "$work/legacy-supported.out" || {
+    error 'legacy decompression mismatch'; exit 1;
+  }
+
+  _run -q -b1 -e5 -i0 "$corpus/source_h.txt"
+  _run -q -b1 -e3 -i0
+)
+
+_merge_raw_profiles() {
+  local dir=$1 output=$2
+  local -a profiles
+  mapfile -d '' profiles < <(find "$dir" -type f -name '*.profraw' -print0 | sort -z)
+  ((${#profiles[@]})) || { error "no profiles in $dir"; return 1; }
+  local log="$output.merge.log"
+  if ! llvm-profdata merge --failure-mode=any "${profiles[@]}" -o "$output" 2>"$log"; then
+    cat "$log" >&2
+    return 1
+  fi
+}
+
+_validate_profile() {
+  local profile=$1 label=$2 showcs=${3:-0}
+  local report="$srcdir/$label-profile.log"
+  local -a args=(show --counts --detailed-summary)
+  ((showcs)) && args+=(--showcs)
+  llvm-profdata "${args[@]}" "$profile" | tee "$report"
+  local total maximum
+  total=$(awk '$1=="Total" && $2=="functions:" {print $3}' "$report")
+  maximum=$(awk '$1=="Maximum" && $2=="function" && $3=="count:" {print $4}' "$report")
+  [[ $total =~ ^[0-9]+$ && $maximum =~ ^[0-9]+$ ]] || { error "cannot parse $label profile"; return 1; }
+  ((total >= 300 && maximum > 0)) || { error "$label profile is too weak ($total functions, max $maximum)"; return 1; }
+}
+
+build() {
+  _setup_llvm_ultimate
+  local source_root="$srcdir/$pkgname-$pkgver"
+  local corpus="$srcdir/corpus" work="$srcdir/work"
+  local raw1="$srcdir/pgo-raw" raw2="$srcdir/cspgo-raw"
+  local profile1="$srcdir/pgo.profdata" profile2="$srcdir/combined.profdata"
+  local build1="$srcdir/build-pgo" build2="$srcdir/build-cspgo" final="$srcdir/build-final"
+  local common_c="${CPPFLAGS:-} $CFLAGS -flto=full"
+  local common_cxx="${CPPFLAGS:-} $CXXFLAGS -flto=full"
+  # Full-LTO code generation is performed by Clang at link time. Propagate the
+  # target and optimization CFLAGS there, otherwise it silently falls back to generic x86-64.
+  local common_ld="$CFLAGS $LDFLAGS -fuse-ld=lld -flto=full -pthread"
+  # zstd's hottest indirect-call sites observe up to 28 distinct targets.
+  # Allocate ample value-profile slots at BOTH compile and Full-LTO link time;
+  # the harness link otherwise falls back to LLVM's small default and silently
+  # drops targets with "Running out of static counters" warnings.
+  local value_profile_flags="-mllvm -vp-counters-per-site=128 -Xclang -mllvm -Xclang -runtime-counter-relocation -Xclang -mllvm -Xclang -enable-vtable-value-profiling"
+  local pgo_c="$common_c -fprofile-generate=$raw1 -fprofile-update=atomic $value_profile_flags"
+  local pgo_cxx="$common_cxx -fprofile-generate=$raw1 -fprofile-update=atomic $value_profile_flags"
+  local pgo_ld="$common_ld -fprofile-generate=$raw1 $value_profile_flags"
+  local cs_c cs_cxx cs_ld final_c final_cxx final_exe_ld final_shared_ld
+
+  rm -rf "$raw1" "$raw2" "$build1" "$build2" "$final" "$work" "$srcdir/bolt"
+  rm -f "$profile1" "$profile2" "$srcdir"/*-profile.log "$srcdir"/*-harness.log \
+    "$srcdir"/*.merge.log "$srcdir/zstd_train"* "$srcdir/final-check.zst"
+  mkdir -p "$raw1" "$raw2" "$work"
+  _gen_corpus "$corpus"
+  _write_harness "$srcdir/zstd_train.c"
+
+  msg 'Stage 1: Full-LTO IR-PGO instrumentation'
+  _setup_stage "$build1" "$pgo_c" "$pgo_cxx" "$pgo_ld" "$pgo_ld" ON OFF OFF
+  _build_stage "$build1" libzstd_static zstd
+  LLVM_PROFILE_FILE="$raw1/%m_%p.profraw" _run_cli_workload "$build1/programs/zstd" "$corpus" "$work/pgo-cli"
+  _compile_harness "$build1" "$pgo_c" "$pgo_ld" "$srcdir/zstd_train_pgo"
+  _run_profiled_harness "$raw1/%m_%p.profraw" "$srcdir/zstd_train_pgo" "$corpus" \
+    "$srcdir/pgo-harness.log"
+  _merge_raw_profiles "$raw1" "$profile1"
+  _validate_profile "$profile1" ir-pgo
+
+  msg 'Stage 2: Full-LTO context-sensitive instrumentation'
+  cs_c="$common_c -fprofile-use=$profile1 -fcs-profile-generate=$raw2 -fprofile-update=atomic $value_profile_flags"
+  cs_cxx="$common_cxx -fprofile-use=$profile1 -fcs-profile-generate=$raw2 -fprofile-update=atomic $value_profile_flags"
+  # Correct LTO CS workflow: the regular profile is a compile option. The linker
+  # receives only the request for post-inline context-sensitive instrumentation.
+  cs_ld="$common_ld -fcs-profile-generate=$raw2 -fno-profile-use $value_profile_flags"
+  _setup_stage "$build2" "$cs_c" "$cs_cxx" "$cs_ld" "$cs_ld" ON OFF OFF
+  _build_stage "$build2" libzstd_static zstd
+  LLVM_PROFILE_FILE="$raw2/%m_%p.profraw" _run_cli_workload "$build2/programs/zstd" "$corpus" "$work/cspgo-cli"
+  _compile_harness "$build2" "$cs_c" "$cs_ld" "$srcdir/zstd_train_cspgo"
+  _run_profiled_harness "$raw2/%m_%p.profraw" "$srcdir/zstd_train_cspgo" "$corpus" \
+    "$srcdir/cspgo-harness.log"
+  _merge_raw_profiles "$raw2" "$srcdir/cs-only.profdata"
+  local combined_merge_log="$profile2.merge.log"
+  if ! llvm-profdata merge --failure-mode=any "$profile1" "$srcdir/cs-only.profdata" \
+      -o "$profile2" 2>"$combined_merge_log"; then
+    cat "$combined_merge_log" >&2; return 1
+  fi
+  _validate_profile "$profile2" combined
+  _validate_profile "$profile2" cs 1
+
+  msg 'Stage 3: final Full-LTO + CS-PGO build'
+  final_c="$common_c -fprofile-use=$profile2"
+  final_cxx="$common_cxx -fprofile-use=$profile2"
+  # The combined profile is embedded into bitcode via CMAKE_C_FLAGS. Passing it
+  # again to LLD as a generic profile causes a second CS-use pass and hash discards.
+  final_exe_ld="$common_ld -fno-profile-use -Wl,--emit-relocs"
+  final_shared_ld="$common_ld -fno-profile-use"
+  # Build both libraries so the CLI can be whole-program optimized against the
+  # static archive while the package still provides the ABI-compatible shared library.
+  _setup_stage "$final" "$final_c" "$final_cxx" "$final_exe_ld" "$final_shared_ld" ON ON OFF
+  _build_stage "$final" libzstd_static libzstd_shared zstd \
+    zstdcat unzstd zstdmt zstd.1 zstdcat.1 unzstd.1 zstdgrep.1 zstdless.1
+
+  local exe="$final/programs/zstd" bdir="$srcdir/bolt" instrumented="$srcdir/bolt/zstd.instrumented"
+  mkdir -p "$bdir/fdata"
+  cp -a "$exe" "$bdir/zstd.prebolt"
+  llvm-bolt "$bdir/zstd.prebolt" -o "$instrumented" \
+    --instrument --instrumentation-file="$bdir/fdata/zstd.fdata" \
+    --instrumentation-file-append-pid --instrumentation-binpath="$instrumented"
+  _run_cli_workload "$instrumented" "$corpus" "$work/bolt-cli"
+  local -a fdata
+  mapfile -d '' fdata < <(find "$bdir/fdata" -type f -name '*.fdata' -print0 | sort -z)
+  ((${#fdata[@]})) || { error 'BOLT produced no profile'; return 1; }
+  merge-fdata "${fdata[@]}" > "$bdir/merged.fdata"
+  local fdata_lines
+  fdata_lines=$(wc -l < "$bdir/merged.fdata")
+  ((fdata_lines >= 10000)) || { error "BOLT profile is too sparse ($fdata_lines records)"; return 1; }
+
+  # The user's LDFLAGS may already run LLVM's ext-TSP placement during Full LTO.
+  # Reapplying ext-TSP with a different (BOLT) profile can then improve locality
+  # while adding enough branches to regress dynamic instruction cost. Build the
+  # three safe layouts and select the one with the lowest profile-derived cost:
+  # machine instructions + 4 * taken branches. This keeps BOLT function ordering,
+  # hot/cold splitting, safe ICF, and PLT optimization in every candidate.
+  local -a bolt_algorithms=(ext-tsp branch-predictor none) instruction_stats taken_stats
+  local -A bolt_binaries=() bolt_logs=() bolt_scores=() bolt_input_scores=()
+  local alg candidate candidate_log input_score output_score
+  local best_alg='' best_binary='' bolt_log='' best_score=0 best_input_score=0
+  for alg in "${bolt_algorithms[@]}"; do
+    candidate="$bdir/zstd.bolt.$alg"
+    candidate_log="$bdir/opt-$alg.log"
+    if ! llvm-bolt "$bdir/zstd.prebolt" -o "$candidate" \
+        --data="$bdir/merged.fdata" --no-huge-pages \
+        --reorder-blocks="$alg" --reorder-functions=cdsort \
+        --split-functions --split-strategy=cdsplit --split-all-cold --split-eh \
+        --icf=safe --plt=hot \
+        --dyno-stats --print-profile-stats --verify-cfg >"$candidate_log" 2>&1; then
+      cat "$candidate_log" >&2
+      error "BOLT candidate failed: $alg"
+      return 1
+    fi
+    mapfile -t instruction_stats < <(sed -nE \
+      's/^[[:space:]]*([0-9]+)[[:space:]]+:[[:space:]]+executed instructions.*$/\1/p' "$candidate_log")
+    mapfile -t taken_stats < <(sed -nE \
+      's/^[[:space:]]*([0-9]+)[[:space:]]+:[[:space:]]+taken branches.*$/\1/p' "$candidate_log")
+    ((${#instruction_stats[@]} >= 2 && ${#taken_stats[@]} >= 2)) || {
+      error "cannot parse BOLT dynostats for $alg"; return 1;
+    }
+    input_score=$((instruction_stats[0] + 4 * taken_stats[0]))
+    output_score=$((instruction_stats[${#instruction_stats[@]}-1] + 4 * taken_stats[${#taken_stats[@]}-1]))
+    printf 'BOLT candidate %-16s: input-cost=%s output-cost=%s\n' "$alg" "$input_score" "$output_score"
+    bolt_binaries[$alg]=$candidate
+    bolt_logs[$alg]=$candidate_log
+    bolt_scores[$alg]=$output_score
+    bolt_input_scores[$alg]=$input_score
+    if [[ -z $best_alg ]] || ((output_score < best_score)); then
+      best_alg=$alg
+      best_binary=$candidate
+      bolt_log=$candidate_log
+      best_score=$output_score
+      best_input_score=$input_score
+    fi
+  done
+  # Benchmark every correct candidate on one allowed CPU of the build host.
+  # Rotating order avoids systematically favoring the first or last candidate;
+  # three one-second-per-level samples provide a robust median on hybrid CPUs.
+  command -v taskset >/dev/null || { error 'taskset is required for BOLT candidate benchmarking'; return 1; }
+  local bench_dir="$bdir/bench" cpu_list cpu round start_ns end_ns elapsed median fastest=0 best_time=0
+  local -a bench_order
+  local -A bolt_medians=()
+  mkdir -p "$bench_dir"
+  cpu_list=$(awk '$1=="Cpus_allowed_list:" {print $2}' /proc/self/status)
+  cpu=${cpu_list%%,*}; cpu=${cpu%%-*}
+  [[ $cpu =~ ^[0-9]+$ ]] || { error "cannot select a benchmark CPU from $cpu_list"; return 1; }
+  for round in 0 1 2; do
+    case $round in
+      0) bench_order=(ext-tsp branch-predictor none) ;;
+      1) bench_order=(branch-predictor none ext-tsp) ;;
+      2) bench_order=(none ext-tsp branch-predictor) ;;
+    esac
+    for alg in "${bench_order[@]}"; do
+      chmod --reference="$exe" "${bolt_binaries[$alg]}"
+      start_ns=$(date +%s%N)
+      if ! taskset -c "$cpu" "${bolt_binaries[$alg]}" -q -b1 -e5 -i1 \
+          "$corpus/source_c.txt" >"$bench_dir/$alg-$round.log" 2>&1; then
+        cat "$bench_dir/$alg-$round.log" >&2
+        error "BOLT benchmark failed: $alg round $round"
+        return 1
+      fi
+      end_ns=$(date +%s%N)
+      elapsed=$((end_ns - start_ns))
+      printf '%s\n' "$elapsed" >> "$bench_dir/$alg.times"
+    done
+  done
+  for alg in "${bolt_algorithms[@]}"; do
+    median=$(LC_ALL=C sort -n "$bench_dir/$alg.times" | sed -n '2p')
+    [[ $median =~ ^[0-9]+$ ]] || { error "cannot parse BOLT benchmark median for $alg"; return 1; }
+    bolt_medians[$alg]=$median
+    printf 'BOLT benchmark %-16s: median=%s ns\n' "$alg" "$median"
+    if ((fastest == 0 || median < fastest)); then fastest=$median; fi
+  done
+  # Treat results within 0.5 percent as a statistical tie, then use deterministic
+  # dynostats to break that tie. Larger measured wins take precedence.
+  best_alg=''; best_score=0
+  for alg in "${bolt_algorithms[@]}"; do
+    median=${bolt_medians[$alg]}
+    if ((median * 1000 <= fastest * 1005)); then
+      output_score=${bolt_scores[$alg]}
+      if [[ -z $best_alg ]] || ((output_score < best_score)); then
+        best_alg=$alg
+        best_score=$output_score
+      fi
+    fi
+  done
+  best_binary=${bolt_binaries[$best_alg]}
+  bolt_log=${bolt_logs[$best_alg]}
+  best_input_score=${bolt_input_scores[$best_alg]}
+  best_time=${bolt_medians[$best_alg]}
+  # A large modeled regression indicates corrupt or grossly misleading profile
+  # data even if a noisy wall-clock sample happened to look fast.
+  ((best_score * 100 <= best_input_score * 101)) || {
+    error "selected BOLT layout regresses modeled cost ($best_score versus $best_input_score)"; return 1;
+  }
+  cp -a "$best_binary" "$bdir/zstd.bolt"
+  printf 'Selected BOLT block layout: %s (median %s ns)\n' "$best_alg" "$best_time"
+  cat "$bolt_log"
+
+  local counts profiled total bias
+  counts=$(sed -nE 's/.* ([0-9]+) out of ([0-9]+) functions in the binary.*/\1 \2/p' "$bolt_log" | tail -1)
+  read -r profiled total <<< "$counts"
+  bias=$(sed -nE 's/.*Profile bias score: ([0-9.]+)%.*/\1/p' "$bolt_log" | tail -1)
+  [[ $profiled =~ ^[0-9]+$ && $total =~ ^[0-9]+$ && $bias =~ ^[0-9]+([.][0-9]+)?$ ]] || {
+    error 'cannot parse BOLT quality metrics'; return 1;
+  }
+  # Function percentages are not invariant under Full-LTO: aggressive inlining
+  # leaves callable cold copies in the denominator while moving hot executions
+  # into callers. Therefore this is only a gross-corruption floor; real quality
+  # is enforced by workload correctness, fdata density, bias, and CFG-flow gaps.
+  ((profiled >= 200 && profiled * 100 >= total * 40)) || {
+    error "BOLT function-profile sanity gate failed ($profiled/$total)"; return 1;
+  }
+  awk -v b="$bias" 'BEGIN{exit !(b<=0.1)}' || {
+    error "BOLT profile bias too high ($bias)"; return 1;
+  }
+  grep -Eq 'function CFG discontinuity 0[.]00%.*call graph flow conservation gap 0[.]00%.*CFG flow conservation gap 0[.]00%' "$bolt_log" || {
+    error 'BOLT profile has a nonzero CFG or call-graph quality gap'; return 1;
+  }
+  chmod --reference="$exe" "$bdir/zstd.bolt"
+  install -m755 "$bdir/zstd.bolt" "$exe"
+
+  "$exe" -q -f -9 "$corpus/source_c.txt" -o "$srcdir/final-check.zst"
+  "$exe" -q -t "$srcdir/final-check.zst"
+  "$exe" -q -d -c "$srcdir/final-check.zst" | cmp -s - "$corpus/source_c.txt"
+  "$exe" -q -t "$corpus/legacy-supported.zst"
+  "$exe" -q -d -f "$corpus/legacy-supported.zst" -o "$srcdir/final-legacy.out"
+  cmp -s "$srcdir/final-legacy.out" "$corpus/legacy-supported.expected" || {
+    error 'BOLTed legacy-decoder verification failed'; return 1;
+  }
+  rm -f "$srcdir/final-legacy.out"
+}
+
+check() {
+  _setup_llvm_ultimate
+  local zstd="$srcdir/build-final/programs/zstd" corpus="$srcdir/corpus" f level rc=0
+  for f in source_c.txt access.log random.bin rle.txt elf.bin; do
+    for level in 1 3 9 19; do
+      "$zstd" -q -f "-$level" "$corpus/$f" -o "$srcdir/check.zst"
+      "$zstd" -q -t "$srcdir/check.zst"
+      "$zstd" -q -d -f "$srcdir/check.zst" -o "$srcdir/check.out"
+      cmp -s "$srcdir/check.out" "$corpus/$f" || { error "roundtrip failed: $f level $level"; rc=1; }
+    done
+  done
+  "$zstd" -q -f -T4 --long=27 -9 "$corpus/ldm_dup.bin" -o "$srcdir/check.zst"
+  "$zstd" -q -d -c "$srcdir/check.zst" | cmp -s - "$corpus/ldm_dup.bin" || rc=1
+  "$zstd" -q -f -9 "--patch-from=$corpus/source_h.txt" "$corpus/source_c.txt" -o "$srcdir/check.zst"
+  "$zstd" -q -d -f "--patch-from=$corpus/source_h.txt" "$srcdir/check.zst" -o "$srcdir/check.out"
+  cmp -s "$srcdir/check.out" "$corpus/source_c.txt" || rc=1
+
+  "$zstd" -q -t "$corpus/legacy-supported.zst" || rc=1
+  "$zstd" -q -d -f "$corpus/legacy-supported.zst" -o "$srcdir/check.out" || rc=1
+  cmp -s "$srcdir/check.out" "$corpus/legacy-supported.expected" || rc=1
+
+  local format
+  for format in gzip xz lzma lz4; do
+    "$zstd" -q -f --format="$format" "$corpus/source_c.txt" -o "$srcdir/check.$format" || rc=1
+    "$zstd" -q -d -f "$srcdir/check.$format" -o "$srcdir/check.out" || rc=1
+    cmp -s "$srcdir/check.out" "$corpus/source_c.txt" || rc=1
+  done
+  if command -v /usr/bin/zstd >/dev/null; then
+    /usr/bin/zstd -q -f -9 "$corpus/source_c.txt" -o "$srcdir/system.zst"
+    "$zstd" -q -d -c "$srcdir/system.zst" | cmp -s - "$corpus/source_c.txt" || rc=1
+    "$zstd" -q -f -9 "$corpus/source_c.txt" -o "$srcdir/check.zst"
+    /usr/bin/zstd -q -d -c "$srcdir/check.zst" | cmp -s - "$corpus/source_c.txt" || rc=1
+  fi
+  rm -f "$srcdir/check.zst" "$srcdir/check.out" "$srcdir/check."{gzip,xz,lzma,lz4} "$srcdir/system.zst"
+  return "$rc"
+}
+
+package() {
+  _setup_llvm_ultimate
+  DESTDIR="$pkgdir" cmake --install "$srcdir/build-final"
+  rm -f "$pkgdir/usr/lib/libzstd.a"
+
+  # The static archive is Full-LTO LLVM 24 bitcode used only to produce the
+  # whole-program CLI. Do not ship it or leave CMake metadata pointing at a
+  # toolchain-specific archive that is absent from the package.
+  local cmake_dir="$pkgdir/usr/lib/cmake/zstd"
+  rm -f "$cmake_dir"/zstdTargets-*.cmake
+  cat > "$cmake_dir/zstdTargets.cmake" <<EOF
+if(TARGET zstd::libzstd_shared)
+  return()
+endif()
+get_filename_component(_IMPORT_PREFIX "\${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
+add_library(zstd::libzstd_shared SHARED IMPORTED)
+set_target_properties(zstd::libzstd_shared PROPERTIES
+  IMPORTED_LOCATION "\${_IMPORT_PREFIX}/lib/libzstd.so.$pkgver"
+  IMPORTED_SONAME "libzstd.so.1"
+  INTERFACE_INCLUDE_DIRECTORIES "\${_IMPORT_PREFIX}/include")
+add_library(zstd::libzstd INTERFACE IMPORTED)
+set_target_properties(zstd::libzstd PROPERTIES
+  INTERFACE_INCLUDE_DIRECTORIES "\${_IMPORT_PREFIX}/include"
+  INTERFACE_LINK_LIBRARIES "zstd::libzstd_shared")
+unset(_IMPORT_PREFIX)
+EOF
+
+  ln -sfn zstd "$pkgdir/usr/bin/zstdcat"
+  ln -sfn zstd "$pkgdir/usr/bin/unzstd"
+  ln -sfn zstd "$pkgdir/usr/bin/zstdmt"
+  install -Dm644 "$srcdir/$pkgname-$pkgver/LICENSE" -t "$pkgdir/usr/share/licenses/$pkgname"
+  local file_path
+  while IFS= read -r -d '' file_path; do
+    case "$(LC_ALL=C file -bi "$file_path")" in
+      application/x-sharedlib*)
+        "$STRIP" --strip-unneeded "$file_path" ;;
+      application/x-pie-executable*|application/x-executable*)
+        "$STRIP" --strip-all "$file_path" ;;
+    esac
+  done < <(find "$pkgdir" -type f \( -name '*.so*' -o -perm -u+x \) -print0)
+  local packaged_zstd="$pkgdir/usr/bin/zstd" package_smoke="$srcdir/package-smoke.zst"
+  "$packaged_zstd" --version >/dev/null
+  "$packaged_zstd" -q -f -3 "$srcdir/corpus/tree/alpha/source.txt" -o "$package_smoke"
+  "$packaged_zstd" -q -d -c "$package_smoke" | cmp -s - "$srcdir/corpus/tree/alpha/source.txt"
+  rm -f "$package_smoke"
+}
+
+# vim: ts=2 sw=2 et:

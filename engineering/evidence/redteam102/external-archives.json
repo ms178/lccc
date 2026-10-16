@@ -1,0 +1,44 @@
+{
+  "flag_control": {
+    "archive": "S102-FLAG-CONTROL.tar.xz",
+    "archive_sha256": "ef03097bffc8ad170b076e159aca9a60077fb9be5c2788c1014e7a46234b49ed",
+    "elf_sha256": "ec821ce0aab8d208c81dde388e44372ca1bad6354b7a1a6616a06d67674d68ec"
+  },
+  "zstd_inputs": {
+    "archive": "S101-ZSTD-INPUTS.tar.xz",
+    "bytes": 1764572,
+    "sha256": "b4af1b6c850b672e554f1b349da674c0a5d81018c553bdf519e0492f3508fd42",
+    "members": [
+      {
+        "name": "duplicates",
+        "bytes": 1048576,
+        "sha256": "a8f2667950a4ac1532ebcefe19eb3e513ac4e7763ba47f8db0eefc0343e4165b"
+      },
+      {
+        "name": "elf",
+        "bytes": 1048576,
+        "sha256": "0e88de7e9d205e2567bf28742def0110fdda450ceb43f4e27ea1ea3a06109e53"
+      },
+      {
+        "name": "json",
+        "bytes": 1048576,
+        "sha256": "30d8818fe515ab64baa6493efc095914ecc61ab9d36ebaad12c582c86f1d72db"
+      },
+      {
+        "name": "random",
+        "bytes": 1048576,
+        "sha256": "1c6b74a17967830c8dec4e8b07564863bb0497582f7d7b12abe86e69267cc0ef"
+      },
+      {
+        "name": "rle",
+        "bytes": 1048576,
+        "sha256": "4e29ad18ab9f42d7c233500771a39d7c852b200baf328fd00fbbe3fecea1eb56"
+      },
+      {
+        "name": "source",
+        "bytes": 1048576,
+        "sha256": "14ae7e4c9d743cea05ecf539bbc7b9c8ba9e172b97a04a06f1eb24ca9f1b39ab"
+      }
+    ]
+  }
+}

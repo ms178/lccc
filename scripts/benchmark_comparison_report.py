@@ -24,7 +24,77 @@ from tests.benchmark import run_benchmarks as bench
 from tools.corpus import publication
 
 
+def _positive_finite(value):
+    return type(value) in (int, float) and math.isfinite(value) and value > 0
+
+
+def _same_number(left, right):
+    return (_positive_finite(left) and _positive_finite(right)
+            and math.isclose(left, right, rel_tol=1e-12, abs_tol=0.0))
+
+
+def _timing_observations(row, arms):
+    """Require the two raw representations to describe the same paired runs.
+
+    A cached count is not a pairing certificate. Canonical round IDs are
+    contiguous, execution order is a permutation of the observed arms, and
+    flattening the rounds must reproduce each arm's timed observations exactly.
+    Warm-ups remain exclusively in the correctness check, never this ledger.
+    """
+    rounds = row.get('rounds')
+    if not isinstance(rounds, list) or not rounds:
+        return {}, 'missing timed round ledger'
+    flattened = {arm: [] for arm in arms}
+    for index, record in enumerate(rounds):
+        if not isinstance(record, dict) or type(record.get('round')) is not int or record['round'] != index:
+            return {}, 'invalid or reordered round IDs'
+        runs, order = record.get('runs'), record.get('order')
+        if (not isinstance(runs, dict) or not isinstance(order, list)
+                or any(not isinstance(arm, str) for arm in order)
+                or len(order) != len(set(order)) or set(order) != set(runs)
+                or not set(runs).issubset(arms)):
+            return {}, 'round order does not identify its observations'
+        for arm, observation in runs.items():
+            flattened[arm].append(observation)
+    medians = {}
+    for arm in arms:
+        observations = flattened[arm]
+        if not observations or observations != row.get('runs', {}).get(arm):
+            continue
+        if not all(isinstance(run, dict) and run.get('ok') is True
+                   and _positive_finite(run.get('wall_s')) for run in observations):
+            continue
+        median = statistics.median(run['wall_s'] for run in observations)
+        if _positive_finite(median):
+            medians[arm] = median
+    return medians, None
+
+
+def _paired_summary(rounds, numerator, denominator, cache):
+    pairs = [(record['round'], record['runs'][numerator]['wall_s']
+              / record['runs'][denominator]['wall_s']) for record in rounds
+             if numerator in record['runs'] and denominator in record['runs']]
+    if not pairs or not all(_positive_finite(value) for _, value in pairs):
+        return None
+    values = tuple(value for _, value in pairs)
+    # Recompute uncertainty too: copying a cached CI would leave a second
+    # false-certification route. Equal samples can share the deterministic
+    # calculation, avoiding repeated bootstrap work in large repeated fixtures.
+    if values not in cache:
+        seed = bench.stable_seed('comparison-report-pairs-v1', *map(repr, values))
+        cache[values] = bench.summarize(list(values), seed)
+    return {**cache[values], 'raw': [{'round': index, 'ratio': value} for index, value in pairs],
+            'interpretation': 'LCCC/reference; recomputed from matching raw rounds'}
+
+
 def summarize(data, floor=.020):
+    if data.get('complete') is not True:
+        raise ValueError('incomplete benchmark report')
+    if not _positive_finite(floor):
+        raise ValueError('timing floor must be positive and finite')
+    if type(data['settings']['skip_perf']) is not bool:
+        raise ValueError('skip_perf must be a boolean')
+    stats_cache = {}
     expected = {item.name for item in bench.BENCHMARKS}
     rows = data['benchmarks']
     names = [row['name'] for row in rows]
@@ -49,21 +119,31 @@ def summarize(data, floor=.020):
                 and validated['correctness'][arm]['matches_baseline'] is True)
         if not item['correct']['gcc']:
             item['correct'] = {arm: False for arm in arms}
+        medians, ledger_error = _timing_observations(row, arms)
         for arm in arms:
             if arm == 'lccc':
                 continue
-            ratio = row.get('ratios_from_lccc', {}).get(arm)
+            cached = row.get('ratios_from_lccc', {}).get(arm)
+            if cached and not _positive_finite(cached.get('median')):
+                raise ValueError('nonpositive/nonfinite timing ratio')
+            ratio = (_paired_summary(row['rounds'], 'lccc', arm, stats_cache)
+                     if 'lccc' in medians and arm in medians else None)
             wall_a = row.get('runtime', {}).get('lccc', {}).get('wall') or {}
             wall_b = row.get('runtime', {}).get(arm, {}).get('wall') or {}
-            above_floor = wall_a.get('median', 0) >= floor and wall_b.get('median', 0) >= floor
-            enough_samples = bool(ratio and 7 <= ratio.get('n', 0)
-                                  <= min(len(row.get('runs', {}).get('lccc', [])),
-                                         len(row.get('runs', {}).get(arm, []))))
+            consistent = bool(ratio and cached and type(cached.get('n')) is int
+                              and cached['n'] == ratio['n']
+                              and _same_number(cached.get('median'), ratio['median'])
+                              and _same_number(wall_a.get('median'), medians['lccc'])
+                              and _same_number(wall_b.get('median'), medians[arm]))
+            above_floor = medians.get('lccc', 0) >= floor and medians.get(arm, 0) >= floor
+            enough_samples = bool(ratio and ratio['n'] >= 7)
             eligible = bool(not result['skip_perf'] and item['correct']['lccc']
                             and item['correct'][arm] and item['correct']['gcc']
-                            and above_floor and enough_samples)
+                            and above_floor and enough_samples and consistent)
             item['ratios'][arm] = {'eligible': eligible, 'above_floor': above_floor,
-                                   'enough_samples': enough_samples, 'paired': ratio}
+                                   'enough_samples': enough_samples, 'paired': ratio,
+                                   'cached_statistics_consistent': consistent,
+                                   'round_ledger_error': ledger_error}
         result['rows'].append(item)
     for arm in arms:
         if arm == 'lccc':

@@ -1,0 +1,12 @@
+==95899== Callgrind, a call-graph generating cache profiler
+==95899== Copyright (C) 2002-2017, and GNU GPL'd, by Josef Weidendorfer et al.
+==95899== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info
+==95899== Command: /home/user/.cache/redteam94/native97/padding-original
+==95899== Parent PID: 95891
+==95899== 
+==95899== For interactive control, run 'callgrind_control -h'.
+==95899== 
+==95899== Events    : Ir
+==95899== Collected : 117999
+==95899== 
+==95899== I   refs:      117,999

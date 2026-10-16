@@ -1,0 +1,12 @@
+==95910== Callgrind, a call-graph generating cache profiler
+==95910== Copyright (C) 2002-2017, and GNU GPL'd, by Josef Weidendorfer et al.
+==95910== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info
+==95910== Command: /home/user/.cache/redteam94/native97/padding-before
+==95910== Parent PID: 95891
+==95910== 
+==95910== For interactive control, run 'callgrind_control -h'.
+==95910== 
+==95910== Events    : Ir
+==95910== Collected : 117916
+==95910== 
+==95910== I   refs:      117,916

@@ -1,0 +1,926 @@
+[
+  {
+    "family": "vector",
+    "stage": "original",
+    "compiler": "gcc16.2",
+    "expected_exit": 0,
+    "source_sha256": "53e2ea85c29dd337bab559dab25110a846636681d0376f6234ffcc825f2ac1d8",
+    "time": 1792094817.394566,
+    "flags": "-O2 -Werror",
+    "assembly_adaptation": "namespace .LBB labels to .Ls97_witness_bb to avoid compiler-generated debug-label collisions",
+    "execution": {
+      "code": 0,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [
+        {
+          "text": "16.2.0"
+        }
+      ],
+      "stderr": [],
+      "truncated": false,
+      "execTime": 19,
+      "processExecutionResultTime": 0.04504699999233708,
+      "didExecute": true,
+      "buildResult": {
+        "inputFilename": "example.c",
+        "code": 0,
+        "okToCache": true,
+        "timedOut": false,
+        "stdout": [],
+        "stderr": [],
+        "truncated": false,
+        "execTime": 99,
+        "processExecutionResultTime": 0.00665899999148678,
+        "instructionSet": "amd64",
+        "downloads": [],
+        "executableFilename": "/nosym/tmp/compiler-explorer-compilerHMuOJc/output.s",
+        "compilationOptions": [
+          "-g",
+          "-o",
+          "/app/output.s",
+          "-fno-verbose-asm",
+          "-fdiagnostics-color=always",
+          "-O2",
+          "-Werror",
+          "/app/example.c",
+          "-L./lib",
+          "-Wl,-rpath,./lib"
+        ],
+        "preparedLdPaths": [
+          "/opt/compiler-explorer/gcc-16.2.0/lib",
+          "/opt/compiler-explorer/gcc-16.2.0/lib32",
+          "/opt/compiler-explorer/gcc-16.2.0/lib64"
+        ],
+        "defaultExecOptions": {
+          "timeoutMs": 20000,
+          "maxErrorOutput": 5000,
+          "env": {
+            "LD_LIBRARY_PATH": "",
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin",
+            "HOME": "/home/ce"
+          }
+        },
+        "packageStoreTime": 86
+      }
+    },
+    "metadata": {
+      "id": "cg162",
+      "name": "x86-64 gcc 16.2",
+      "semver": "16.2",
+      "compilerType": ""
+    },
+    "pass_result": true
+  },
+  {
+    "family": "vector",
+    "stage": "original",
+    "compiler": "clang23.1",
+    "expected_exit": 0,
+    "source_sha256": "53e2ea85c29dd337bab559dab25110a846636681d0376f6234ffcc825f2ac1d8",
+    "time": 1792094819.1431768,
+    "flags": "-O2 -Werror",
+    "assembly_adaptation": "namespace .LBB labels to .Ls97_witness_bb to avoid compiler-generated debug-label collisions",
+    "execution": {
+      "code": 0,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [
+        {
+          "text": "Clang 23.1.0 (https://github.com/llvm/llvm-project.git ea7d852a70e8bdfaf601d6626a760f9771b2c4b4)"
+        }
+      ],
+      "stderr": [],
+      "truncated": false,
+      "execTime": 21,
+      "processExecutionResultTime": 0.05761000000347849,
+      "didExecute": true,
+      "buildResult": {
+        "inputFilename": "example.c",
+        "code": 0,
+        "okToCache": true,
+        "timedOut": false,
+        "stdout": [],
+        "stderr": [],
+        "truncated": false,
+        "execTime": 201,
+        "processExecutionResultTime": 0.0068509999982779846,
+        "instructionSet": "amd64",
+        "downloads": [],
+        "executableFilename": "/nosym/tmp/compiler-explorer-compilerA8GFW1/output.s",
+        "compilationOptions": [
+          "-g",
+          "-o",
+          "/app/output.s",
+          "-fno-verbose-asm",
+          "--gcc-toolchain=/opt/compiler-explorer/gcc-15.2.0",
+          "-fcolor-diagnostics",
+          "-fno-crash-diagnostics",
+          "-O2",
+          "-Werror",
+          "/app/example.c",
+          "-L./lib",
+          "-Wl,-rpath,./lib",
+          "-Wl,-rpath,/opt/compiler-explorer/gcc-15.2.0/lib64",
+          "-Wl,-rpath,/opt/compiler-explorer/gcc-15.2.0/lib32"
+        ],
+        "preparedLdPaths": [
+          "/opt/compiler-explorer/clang-23.1.0/lib",
+          "/opt/compiler-explorer/clang-23.1.0/lib32",
+          "/opt/compiler-explorer/clang-23.1.0/lib64"
+        ],
+        "defaultExecOptions": {
+          "timeoutMs": 20000,
+          "maxErrorOutput": 5000,
+          "env": {
+            "LD_LIBRARY_PATH": "",
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin",
+            "HOME": "/home/ce"
+          }
+        },
+        "packageStoreTime": 51
+      }
+    },
+    "metadata": {
+      "id": "cclang2310",
+      "name": "x86-64 clang 23.1.0",
+      "semver": "23.1.0",
+      "compilerType": "clang"
+    },
+    "pass_result": true
+  },
+  {
+    "family": "vector",
+    "stage": "original",
+    "compiler": "icx",
+    "expected_exit": 0,
+    "source_sha256": "53e2ea85c29dd337bab559dab25110a846636681d0376f6234ffcc825f2ac1d8",
+    "time": 1792094822.6569493,
+    "flags": "-O2 -Werror",
+    "assembly_adaptation": "namespace .LBB labels to .Ls97_witness_bb to avoid compiler-generated debug-label collisions",
+    "execution": {
+      "code": 0,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [
+        {
+          "text": "Intel(R) oneAPI DPC++/C++ Compiler 2024.0.0 (2024.0.0.20231017)"
+        },
+        {
+          "text": "INTEL_LLVM=20240000"
+        }
+      ],
+      "stderr": [],
+      "truncated": false,
+      "execTime": 62,
+      "processExecutionResultTime": 0.21685999998589978,
+      "didExecute": true,
+      "buildResult": {
+        "inputFilename": "example.c",
+        "code": 0,
+        "okToCache": true,
+        "timedOut": false,
+        "stdout": [],
+        "stderr": [],
+        "truncated": false,
+        "execTime": 304,
+        "processExecutionResultTime": 0.009250000002793968,
+        "instructionSet": "amd64",
+        "downloads": [],
+        "executableFilename": "/nosym/tmp/compiler-explorer-compilergEYcGx/output.s",
+        "compilationOptions": [
+          "-g",
+          "-o",
+          "/app/output.s",
+          "-fno-verbose-asm",
+          "--gcc-toolchain=/opt/compiler-explorer/gcc-13.2.0",
+          "-fcolor-diagnostics",
+          "-fno-crash-diagnostics",
+          "-O2",
+          "-Werror",
+          "/app/example.c",
+          "-L./lib",
+          "-Wl,-rpath,./lib",
+          "-Wl,-rpath,/opt/compiler-explorer/intel-cpp-2024.0.0.49524/compiler/latest/lib",
+          "-Wl,-rpath,/opt/compiler-explorer/intel-cpp-2024.0.0.49524/tbb/latest/lib",
+          "-Wl,-rpath,/opt/compiler-explorer/gcc-13.2.0/lib64",
+          "-Wl,-rpath,/opt/compiler-explorer/gcc-13.2.0/lib32"
+        ],
+        "preparedLdPaths": [
+          "/opt/compiler-explorer/intel-cpp-2024.0.0.49524/compiler/latest/lib",
+          "/opt/compiler-explorer/intel-cpp-2024.0.0.49524/tbb/latest/lib"
+        ],
+        "defaultExecOptions": {
+          "timeoutMs": 20000,
+          "maxErrorOutput": 5000,
+          "env": {
+            "LD_LIBRARY_PATH": "",
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:/opt/compiler-explorer/intel-cpp-2024.0.0.49524/compiler/latest/bin",
+            "HOME": "/home/ce"
+          }
+        },
+        "packageStoreTime": 150
+      }
+    },
+    "metadata": {
+      "id": "cicxlatest",
+      "name": "x86-64 icx (latest)",
+      "semver": "(latest)",
+      "compilerType": "clang-intel"
+    },
+    "pass_result": true
+  },
+  {
+    "family": "vector",
+    "stage": "before",
+    "compiler": "gcc16.2",
+    "expected_exit": 1,
+    "source_sha256": "ccca4d919cd2498fab6037f3c896b234bd43f9630d6cabd85958adb9186c994a",
+    "time": 1792094824.4516337,
+    "flags": "-O2 -Werror",
+    "assembly_adaptation": "namespace .LBB labels to .Ls97_witness_bb to avoid compiler-generated debug-label collisions",
+    "execution": {
+      "code": 1,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [
+        {
+          "text": "16.2.0"
+        }
+      ],
+      "stderr": [],
+      "truncated": false,
+      "execTime": 17,
+      "processExecutionResultTime": 0.02309800000512041,
+      "didExecute": true,
+      "buildResult": {
+        "inputFilename": "example.c",
+        "code": 0,
+        "okToCache": true,
+        "timedOut": false,
+        "stdout": [],
+        "stderr": [],
+        "truncated": false,
+        "execTime": 61,
+        "processExecutionResultTime": 0.0042840000096475706,
+        "instructionSet": "amd64",
+        "downloads": [],
+        "executableFilename": "/nosym/tmp/compiler-explorer-compilerD5LOgy/output.s",
+        "compilationOptions": [
+          "-g",
+          "-o",
+          "/app/output.s",
+          "-fno-verbose-asm",
+          "-fdiagnostics-color=always",
+          "-O2",
+          "-Werror",
+          "/app/example.c",
+          "-L./lib",
+          "-Wl,-rpath,./lib"
+        ],
+        "preparedLdPaths": [
+          "/opt/compiler-explorer/gcc-16.2.0/lib",
+          "/opt/compiler-explorer/gcc-16.2.0/lib32",
+          "/opt/compiler-explorer/gcc-16.2.0/lib64"
+        ],
+        "defaultExecOptions": {
+          "timeoutMs": 20000,
+          "maxErrorOutput": 5000,
+          "env": {
+            "LD_LIBRARY_PATH": "",
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin",
+            "HOME": "/home/ce"
+          }
+        },
+        "packageStoreTime": 44
+      }
+    },
+    "metadata": {
+      "id": "cg162",
+      "name": "x86-64 gcc 16.2",
+      "semver": "16.2",
+      "compilerType": ""
+    },
+    "pass_result": true
+  },
+  {
+    "family": "vector",
+    "stage": "before",
+    "compiler": "clang23.1",
+    "expected_exit": 1,
+    "source_sha256": "ccca4d919cd2498fab6037f3c896b234bd43f9630d6cabd85958adb9186c994a",
+    "time": 1792094825.0358152,
+    "flags": "-O2 -Werror",
+    "assembly_adaptation": "namespace .LBB labels to .Ls97_witness_bb to avoid compiler-generated debug-label collisions",
+    "execution": {
+      "code": 1,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [
+        {
+          "text": "Clang 23.1.0 (https://github.com/llvm/llvm-project.git ea7d852a70e8bdfaf601d6626a760f9771b2c4b4)"
+        }
+      ],
+      "stderr": [],
+      "truncated": false,
+      "execTime": 16,
+      "processExecutionResultTime": 0.025238000001991168,
+      "didExecute": true,
+      "buildResult": {
+        "inputFilename": "example.c",
+        "code": 0,
+        "okToCache": true,
+        "timedOut": false,
+        "stdout": [],
+        "stderr": [],
+        "truncated": false,
+        "execTime": 154,
+        "processExecutionResultTime": 0.006145999999716878,
+        "instructionSet": "amd64",
+        "downloads": [],
+        "executableFilename": "/nosym/tmp/compiler-explorer-compilerBBwrKW/output.s",
+        "compilationOptions": [
+          "-g",
+          "-o",
+          "/app/output.s",
+          "-fno-verbose-asm",
+          "--gcc-toolchain=/opt/compiler-explorer/gcc-15.2.0",
+          "-fcolor-diagnostics",
+          "-fno-crash-diagnostics",
+          "-O2",
+          "-Werror",
+          "/app/example.c",
+          "-L./lib",
+          "-Wl,-rpath,./lib",
+          "-Wl,-rpath,/opt/compiler-explorer/gcc-15.2.0/lib64",
+          "-Wl,-rpath,/opt/compiler-explorer/gcc-15.2.0/lib32"
+        ],
+        "preparedLdPaths": [
+          "/opt/compiler-explorer/clang-23.1.0/lib",
+          "/opt/compiler-explorer/clang-23.1.0/lib32",
+          "/opt/compiler-explorer/clang-23.1.0/lib64"
+        ],
+        "defaultExecOptions": {
+          "timeoutMs": 20000,
+          "maxErrorOutput": 5000,
+          "env": {
+            "LD_LIBRARY_PATH": "",
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin",
+            "HOME": "/home/ce"
+          }
+        },
+        "packageStoreTime": 39
+      }
+    },
+    "metadata": {
+      "id": "cclang2310",
+      "name": "x86-64 clang 23.1.0",
+      "semver": "23.1.0",
+      "compilerType": "clang"
+    },
+    "pass_result": true
+  },
+  {
+    "family": "vector",
+    "stage": "before",
+    "compiler": "icx",
+    "expected_exit": 1,
+    "source_sha256": "ccca4d919cd2498fab6037f3c896b234bd43f9630d6cabd85958adb9186c994a",
+    "time": 1792094828.2810867,
+    "flags": "-O2 -Werror",
+    "assembly_adaptation": "namespace .LBB labels to .Ls97_witness_bb to avoid compiler-generated debug-label collisions",
+    "execution": {
+      "code": 1,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [
+        {
+          "text": "Intel(R) oneAPI DPC++/C++ Compiler 2024.0.0 (2024.0.0.20231017)"
+        },
+        {
+          "text": "INTEL_LLVM=20240000"
+        }
+      ],
+      "stderr": [],
+      "truncated": false,
+      "execTime": 29,
+      "processExecutionResultTime": 0.09932900000421796,
+      "didExecute": true,
+      "buildResult": {
+        "inputFilename": "example.c",
+        "code": 0,
+        "okToCache": true,
+        "timedOut": false,
+        "stdout": [],
+        "stderr": [],
+        "truncated": false,
+        "execTime": 268,
+        "processExecutionResultTime": 0.006471000000601634,
+        "instructionSet": "amd64",
+        "downloads": [],
+        "executableFilename": "/nosym/tmp/compiler-explorer-compilerI9RRyi/output.s",
+        "compilationOptions": [
+          "-g",
+          "-o",
+          "/app/output.s",
+          "-fno-verbose-asm",
+          "--gcc-toolchain=/opt/compiler-explorer/gcc-13.2.0",
+          "-fcolor-diagnostics",
+          "-fno-crash-diagnostics",
+          "-O2",
+          "-Werror",
+          "/app/example.c",
+          "-L./lib",
+          "-Wl,-rpath,./lib",
+          "-Wl,-rpath,/opt/compiler-explorer/intel-cpp-2024.0.0.49524/compiler/latest/lib",
+          "-Wl,-rpath,/opt/compiler-explorer/intel-cpp-2024.0.0.49524/tbb/latest/lib",
+          "-Wl,-rpath,/opt/compiler-explorer/gcc-13.2.0/lib64",
+          "-Wl,-rpath,/opt/compiler-explorer/gcc-13.2.0/lib32"
+        ],
+        "preparedLdPaths": [
+          "/opt/compiler-explorer/intel-cpp-2024.0.0.49524/compiler/latest/lib",
+          "/opt/compiler-explorer/intel-cpp-2024.0.0.49524/tbb/latest/lib"
+        ],
+        "defaultExecOptions": {
+          "timeoutMs": 20000,
+          "maxErrorOutput": 5000,
+          "env": {
+            "LD_LIBRARY_PATH": "",
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:/opt/compiler-explorer/intel-cpp-2024.0.0.49524/compiler/latest/bin",
+            "HOME": "/home/ce"
+          }
+        },
+        "packageStoreTime": 52
+      }
+    },
+    "metadata": {
+      "id": "cicxlatest",
+      "name": "x86-64 icx (latest)",
+      "semver": "(latest)",
+      "compilerType": "clang-intel"
+    },
+    "pass_result": true
+  },
+  {
+    "family": "padding",
+    "stage": "original",
+    "compiler": "gcc16.2",
+    "expected_exit": 0,
+    "source_sha256": "1dddbbf0318fb569f8410ca011fb8acf7c35afd27e497ebebb81394a6f85fa09",
+    "time": 1792094829.8411725,
+    "flags": "-O2 -Werror",
+    "assembly_adaptation": "namespace .LBB labels to .Ls97_witness_bb to avoid compiler-generated debug-label collisions",
+    "execution": {
+      "code": 0,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [
+        {
+          "text": "16.2.0"
+        }
+      ],
+      "stderr": [],
+      "truncated": false,
+      "execTime": 17,
+      "processExecutionResultTime": 0.024663000003783964,
+      "didExecute": true,
+      "buildResult": {
+        "inputFilename": "example.c",
+        "code": 0,
+        "okToCache": true,
+        "timedOut": false,
+        "stdout": [],
+        "stderr": [],
+        "truncated": false,
+        "execTime": 62,
+        "processExecutionResultTime": 0.004509000005782582,
+        "instructionSet": "amd64",
+        "downloads": [],
+        "executableFilename": "/nosym/tmp/compiler-explorer-compilerxL88ZO/output.s",
+        "compilationOptions": [
+          "-g",
+          "-o",
+          "/app/output.s",
+          "-fno-verbose-asm",
+          "-fdiagnostics-color=always",
+          "-O2",
+          "-Werror",
+          "/app/example.c",
+          "-L./lib",
+          "-Wl,-rpath,./lib"
+        ],
+        "preparedLdPaths": [
+          "/opt/compiler-explorer/gcc-16.2.0/lib",
+          "/opt/compiler-explorer/gcc-16.2.0/lib32",
+          "/opt/compiler-explorer/gcc-16.2.0/lib64"
+        ],
+        "defaultExecOptions": {
+          "timeoutMs": 20000,
+          "maxErrorOutput": 5000,
+          "env": {
+            "LD_LIBRARY_PATH": "",
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin",
+            "HOME": "/home/ce"
+          }
+        },
+        "packageStoreTime": 100
+      }
+    },
+    "metadata": {
+      "id": "cg162",
+      "name": "x86-64 gcc 16.2",
+      "semver": "16.2",
+      "compilerType": ""
+    },
+    "pass_result": true
+  },
+  {
+    "family": "padding",
+    "stage": "original",
+    "compiler": "clang23.1",
+    "expected_exit": 0,
+    "source_sha256": "1dddbbf0318fb569f8410ca011fb8acf7c35afd27e497ebebb81394a6f85fa09",
+    "time": 1792094830.4639838,
+    "flags": "-O2 -Werror",
+    "assembly_adaptation": "namespace .LBB labels to .Ls97_witness_bb to avoid compiler-generated debug-label collisions",
+    "execution": {
+      "code": 0,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [
+        {
+          "text": "Clang 23.1.0 (https://github.com/llvm/llvm-project.git ea7d852a70e8bdfaf601d6626a760f9771b2c4b4)"
+        }
+      ],
+      "stderr": [],
+      "truncated": false,
+      "execTime": 23,
+      "processExecutionResultTime": 0.02447099999699276,
+      "didExecute": true,
+      "buildResult": {
+        "inputFilename": "example.c",
+        "code": 0,
+        "okToCache": true,
+        "timedOut": false,
+        "stdout": [],
+        "stderr": [],
+        "truncated": false,
+        "execTime": 94,
+        "processExecutionResultTime": 0.005430999997770414,
+        "instructionSet": "amd64",
+        "downloads": [],
+        "executableFilename": "/nosym/tmp/compiler-explorer-compilerEA2WCh/output.s",
+        "compilationOptions": [
+          "-g",
+          "-o",
+          "/app/output.s",
+          "-fno-verbose-asm",
+          "--gcc-toolchain=/opt/compiler-explorer/gcc-15.2.0",
+          "-fcolor-diagnostics",
+          "-fno-crash-diagnostics",
+          "-O2",
+          "-Werror",
+          "/app/example.c",
+          "-L./lib",
+          "-Wl,-rpath,./lib",
+          "-Wl,-rpath,/opt/compiler-explorer/gcc-15.2.0/lib64",
+          "-Wl,-rpath,/opt/compiler-explorer/gcc-15.2.0/lib32"
+        ],
+        "preparedLdPaths": [
+          "/opt/compiler-explorer/clang-23.1.0/lib",
+          "/opt/compiler-explorer/clang-23.1.0/lib32",
+          "/opt/compiler-explorer/clang-23.1.0/lib64"
+        ],
+        "defaultExecOptions": {
+          "timeoutMs": 20000,
+          "maxErrorOutput": 5000,
+          "env": {
+            "LD_LIBRARY_PATH": "",
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin",
+            "HOME": "/home/ce"
+          }
+        },
+        "packageStoreTime": 30
+      }
+    },
+    "metadata": {
+      "id": "cclang2310",
+      "name": "x86-64 clang 23.1.0",
+      "semver": "23.1.0",
+      "compilerType": "clang"
+    },
+    "pass_result": true
+  },
+  {
+    "family": "padding",
+    "stage": "original",
+    "compiler": "icx",
+    "expected_exit": 0,
+    "source_sha256": "1dddbbf0318fb569f8410ca011fb8acf7c35afd27e497ebebb81394a6f85fa09",
+    "time": 1792094832.1821635,
+    "flags": "-O2 -Werror",
+    "assembly_adaptation": "namespace .LBB labels to .Ls97_witness_bb to avoid compiler-generated debug-label collisions",
+    "execution": {
+      "code": 0,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [
+        {
+          "text": "Intel(R) oneAPI DPC++/C++ Compiler 2024.0.0 (2024.0.0.20231017)"
+        },
+        {
+          "text": "INTEL_LLVM=20240000"
+        }
+      ],
+      "stderr": [],
+      "truncated": false,
+      "execTime": 20,
+      "processExecutionResultTime": 0.03970199999457691,
+      "didExecute": true,
+      "buildResult": {
+        "inputFilename": "example.c",
+        "code": 0,
+        "okToCache": true,
+        "timedOut": false,
+        "stdout": [],
+        "stderr": [],
+        "truncated": false,
+        "execTime": 267,
+        "processExecutionResultTime": 0.008067999995546415,
+        "instructionSet": "amd64",
+        "downloads": [],
+        "executableFilename": "/nosym/tmp/compiler-explorer-compilerNqg6rf/output.s",
+        "compilationOptions": [
+          "-g",
+          "-o",
+          "/app/output.s",
+          "-fno-verbose-asm",
+          "--gcc-toolchain=/opt/compiler-explorer/gcc-13.2.0",
+          "-fcolor-diagnostics",
+          "-fno-crash-diagnostics",
+          "-O2",
+          "-Werror",
+          "/app/example.c",
+          "-L./lib",
+          "-Wl,-rpath,./lib",
+          "-Wl,-rpath,/opt/compiler-explorer/intel-cpp-2024.0.0.49524/compiler/latest/lib",
+          "-Wl,-rpath,/opt/compiler-explorer/intel-cpp-2024.0.0.49524/tbb/latest/lib",
+          "-Wl,-rpath,/opt/compiler-explorer/gcc-13.2.0/lib64",
+          "-Wl,-rpath,/opt/compiler-explorer/gcc-13.2.0/lib32"
+        ],
+        "preparedLdPaths": [
+          "/opt/compiler-explorer/intel-cpp-2024.0.0.49524/compiler/latest/lib",
+          "/opt/compiler-explorer/intel-cpp-2024.0.0.49524/tbb/latest/lib"
+        ],
+        "defaultExecOptions": {
+          "timeoutMs": 20000,
+          "maxErrorOutput": 5000,
+          "env": {
+            "LD_LIBRARY_PATH": "",
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:/opt/compiler-explorer/intel-cpp-2024.0.0.49524/compiler/latest/bin",
+            "HOME": "/home/ce"
+          }
+        },
+        "packageStoreTime": 39
+      }
+    },
+    "metadata": {
+      "id": "cicxlatest",
+      "name": "x86-64 icx (latest)",
+      "semver": "(latest)",
+      "compilerType": "clang-intel"
+    },
+    "pass_result": true
+  },
+  {
+    "family": "padding",
+    "stage": "before",
+    "compiler": "gcc16.2",
+    "expected_exit": 13,
+    "source_sha256": "6c7a24a1b0297b91c87714081e17759cf36805c703b036f2abfe21ef233a92ef",
+    "time": 1792094834.5557523,
+    "flags": "-O2 -Werror",
+    "assembly_adaptation": "namespace .LBB labels to .Ls97_witness_bb to avoid compiler-generated debug-label collisions",
+    "execution": {
+      "code": 13,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [
+        {
+          "text": "16.2.0"
+        }
+      ],
+      "stderr": [],
+      "truncated": false,
+      "execTime": 15,
+      "processExecutionResultTime": 0.031381000007968396,
+      "didExecute": true,
+      "buildResult": {
+        "inputFilename": "example.c",
+        "code": 0,
+        "okToCache": true,
+        "timedOut": false,
+        "stdout": [],
+        "stderr": [],
+        "truncated": false,
+        "execTime": 65,
+        "processExecutionResultTime": 0.012222000004840083,
+        "instructionSet": "amd64",
+        "downloads": [],
+        "executableFilename": "/nosym/tmp/compiler-explorer-compiler0xgXd5/output.s",
+        "compilationOptions": [
+          "-g",
+          "-o",
+          "/app/output.s",
+          "-fno-verbose-asm",
+          "-fdiagnostics-color=always",
+          "-O2",
+          "-Werror",
+          "/app/example.c",
+          "-L./lib",
+          "-Wl,-rpath,./lib"
+        ],
+        "preparedLdPaths": [
+          "/opt/compiler-explorer/gcc-16.2.0/lib",
+          "/opt/compiler-explorer/gcc-16.2.0/lib32",
+          "/opt/compiler-explorer/gcc-16.2.0/lib64"
+        ],
+        "defaultExecOptions": {
+          "timeoutMs": 20000,
+          "maxErrorOutput": 5000,
+          "env": {
+            "LD_LIBRARY_PATH": "",
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin",
+            "HOME": "/home/ce"
+          }
+        },
+        "packageStoreTime": 33
+      }
+    },
+    "metadata": {
+      "id": "cg162",
+      "name": "x86-64 gcc 16.2",
+      "semver": "16.2",
+      "compilerType": ""
+    },
+    "pass_result": true
+  },
+  {
+    "family": "padding",
+    "stage": "before",
+    "compiler": "clang23.1",
+    "expected_exit": 13,
+    "source_sha256": "6c7a24a1b0297b91c87714081e17759cf36805c703b036f2abfe21ef233a92ef",
+    "time": 1792094835.1041713,
+    "flags": "-O2 -Werror",
+    "assembly_adaptation": "namespace .LBB labels to .Ls97_witness_bb to avoid compiler-generated debug-label collisions",
+    "execution": {
+      "code": 13,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [
+        {
+          "text": "Clang 23.1.0 (https://github.com/llvm/llvm-project.git ea7d852a70e8bdfaf601d6626a760f9771b2c4b4)"
+        }
+      ],
+      "stderr": [],
+      "truncated": false,
+      "execTime": 20,
+      "processExecutionResultTime": 0.03137000001152046,
+      "didExecute": true,
+      "buildResult": {
+        "inputFilename": "example.c",
+        "code": 0,
+        "okToCache": true,
+        "timedOut": false,
+        "stdout": [],
+        "stderr": [],
+        "truncated": false,
+        "execTime": 71,
+        "processExecutionResultTime": 0.0050709999923128635,
+        "instructionSet": "amd64",
+        "downloads": [],
+        "executableFilename": "/nosym/tmp/compiler-explorer-compilerAeI07Y/output.s",
+        "compilationOptions": [
+          "-g",
+          "-o",
+          "/app/output.s",
+          "-fno-verbose-asm",
+          "--gcc-toolchain=/opt/compiler-explorer/gcc-15.2.0",
+          "-fcolor-diagnostics",
+          "-fno-crash-diagnostics",
+          "-O2",
+          "-Werror",
+          "/app/example.c",
+          "-L./lib",
+          "-Wl,-rpath,./lib",
+          "-Wl,-rpath,/opt/compiler-explorer/gcc-15.2.0/lib64",
+          "-Wl,-rpath,/opt/compiler-explorer/gcc-15.2.0/lib32"
+        ],
+        "preparedLdPaths": [
+          "/opt/compiler-explorer/clang-23.1.0/lib",
+          "/opt/compiler-explorer/clang-23.1.0/lib32",
+          "/opt/compiler-explorer/clang-23.1.0/lib64"
+        ],
+        "defaultExecOptions": {
+          "timeoutMs": 20000,
+          "maxErrorOutput": 5000,
+          "env": {
+            "LD_LIBRARY_PATH": "",
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin",
+            "HOME": "/home/ce"
+          }
+        },
+        "packageStoreTime": 83
+      }
+    },
+    "metadata": {
+      "id": "cclang2310",
+      "name": "x86-64 clang 23.1.0",
+      "semver": "23.1.0",
+      "compilerType": "clang"
+    },
+    "pass_result": true
+  },
+  {
+    "family": "padding",
+    "stage": "before",
+    "compiler": "icx",
+    "expected_exit": 13,
+    "source_sha256": "6c7a24a1b0297b91c87714081e17759cf36805c703b036f2abfe21ef233a92ef",
+    "time": 1792094835.7535248,
+    "flags": "-O2 -Werror",
+    "assembly_adaptation": "namespace .LBB labels to .Ls97_witness_bb to avoid compiler-generated debug-label collisions",
+    "execution": {
+      "code": 13,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [
+        {
+          "text": "Intel(R) oneAPI DPC++/C++ Compiler 2024.0.0 (2024.0.0.20231017)"
+        },
+        {
+          "text": "INTEL_LLVM=20240000"
+        }
+      ],
+      "stderr": [],
+      "truncated": false,
+      "execTime": 24,
+      "processExecutionResultTime": 0.023811999999452382,
+      "didExecute": true,
+      "buildResult": {
+        "inputFilename": "example.c",
+        "code": 0,
+        "okToCache": true,
+        "timedOut": false,
+        "stdout": [],
+        "stderr": [],
+        "truncated": false,
+        "execTime": 163,
+        "processExecutionResultTime": 0.005705999996280298,
+        "instructionSet": "amd64",
+        "downloads": [],
+        "executableFilename": "/nosym/tmp/compiler-explorer-compilerYRCaop/output.s",
+        "compilationOptions": [
+          "-g",
+          "-o",
+          "/app/output.s",
+          "-fno-verbose-asm",
+          "--gcc-toolchain=/opt/compiler-explorer/gcc-13.2.0",
+          "-fcolor-diagnostics",
+          "-fno-crash-diagnostics",
+          "-O2",
+          "-Werror",
+          "/app/example.c",
+          "-L./lib",
+          "-Wl,-rpath,./lib",
+          "-Wl,-rpath,/opt/compiler-explorer/intel-cpp-2024.0.0.49524/compiler/latest/lib",
+          "-Wl,-rpath,/opt/compiler-explorer/intel-cpp-2024.0.0.49524/tbb/latest/lib",
+          "-Wl,-rpath,/opt/compiler-explorer/gcc-13.2.0/lib64",
+          "-Wl,-rpath,/opt/compiler-explorer/gcc-13.2.0/lib32"
+        ],
+        "preparedLdPaths": [
+          "/opt/compiler-explorer/intel-cpp-2024.0.0.49524/compiler/latest/lib",
+          "/opt/compiler-explorer/intel-cpp-2024.0.0.49524/tbb/latest/lib"
+        ],
+        "defaultExecOptions": {
+          "timeoutMs": 20000,
+          "maxErrorOutput": 5000,
+          "env": {
+            "LD_LIBRARY_PATH": "",
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:/opt/compiler-explorer/intel-cpp-2024.0.0.49524/compiler/latest/bin",
+            "HOME": "/home/ce"
+          }
+        },
+        "packageStoreTime": 35
+      }
+    },
+    "metadata": {
+      "id": "cicxlatest",
+      "name": "x86-64 icx (latest)",
+      "semver": "(latest)",
+      "compilerType": "clang-intel"
+    },
+    "pass_result": true
+  }
+]
