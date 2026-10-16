@@ -883,6 +883,7 @@ fn build_outlined_function(
     let outlined_next_label = outlined_blocks.iter().map(|b| b.label.0).max().unwrap_or(0) + 1;
 
     IrFunction {
+        pass_policy: func.pass_policy,
         name: name.to_string(),
         return_type,
         params,

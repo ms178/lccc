@@ -45,7 +45,7 @@ Geomean LCCC/GCC (all 33 kernels): before 0.692
 
 ## PR832 retained artifacts: integrity is not re-execution
 
-Run **`python3 scripts/verify_evidence_hashes.py`** (all three preserved inventories). The read-only, exclusive
+Run **`python3 scripts/verify_evidence_hashes.py`** (both preserved inventories). The read-only, exclusive
 FAST gate checks all 69 retained `engineering/` files changed between 7f9eb225
 and merged main 63e783b, including compressed streams and the original decoded
 hashes in `pr828/RAW-LOGS.json`. Its inventory is
@@ -141,18 +141,13 @@ PR CI retains hermetic oracle self-tests and native GCC differential/output
 checks. Network availability is not silently counted as successful PR-time
 oracle coverage. Local full/slow CI is not part of this research protocol.
 
+## PR835 inventory and canonical duplicates
 
-## PR835 import boundary and deduplication
-
-`pr835-import-integrity.json` inventories the additional imported historical
-bytes from PR835 head `4216f897460be1eef08cc0f24e8b6016cd738283`.
-It is checked by the same FAST/hosted integrity gate. Its seven `deduplicated`
-records map former names to byte-identical retained files, with byte lengths
-and SHA256 values verified by the gate. No historical payload was rewritten.
-The pinned original commit and offline recovery bundle preserve every original
-path; copying the listed retained file reconstructs any removed duplicate.
-
-These are **historical evidence**, not runs of the newly combined compiler.
-Importing or hashing them does not close historical “in progress”/“pending”
-findings. Current synthesis validation and performance must identify its own
-source tree, compiler ELF, commands, outputs and measurement limitations.
+`pr835/ARTIFACTS.json` authenticates all retained PR835 additions, the modified
+README, follow-up reports and seven former-path aliases. The historical base
+contains 118 additions plus this modified README. Removing seven identical
+files leaves 111 original unique additions, not a legitimate requirement to
+manufacture 119 new unique files. The verifier checks every scoped file, so a
+new unlisted file or deleted inventory entry fails instead of silently escaping
+coverage. Integrity, static tripwires, IR interpretation, native execution and
+simulated performance remain distinct evidence categories.

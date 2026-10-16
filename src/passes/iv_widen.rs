@@ -1203,7 +1203,7 @@ fn analyze_iv(
     // Wrapping signed IVs need the same trajectory proof in their OWN signed
     // domain. Strict unit-step guards also admit runtime seeds/bounds; wider
     // strides require a constant threshold with room for the final step.
-    let signed_wrapping = ext == ExtKind::Se && super::signed_overflow_wraps();
+    let signed_wrapping = ext == ExtKind::Se && func.pass_policy.wrap_signed_overflow;
     let (seed_range, intercept): (Option<Range>, bool) = if ext == ExtKind::Ze || signed_wrapping {
         let proof = prove_counted_bound(
             func,
@@ -1405,7 +1405,7 @@ fn analyze_iv(
                         continue;
                     }
 
-                    if super::signed_overflow_wraps() && ext_kind_for(*ty) != cur_ext {
+                    if func.pass_policy.wrap_signed_overflow && ext_kind_for(*ty) != cur_ext {
                         narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
                         continue;
                     }
@@ -1425,7 +1425,7 @@ fn analyze_iv(
                                 // Signed members: UB theorem, no range needed.
                                 // Unsigned members: need the op provably
                                 // non-wrapping over the member's range.
-                                if cur_is_unsigned || super::signed_overflow_wraps() {
+                                if cur_is_unsigned || func.pass_policy.wrap_signed_overflow {
                                     let Some(r) = member_range(&members, cur) else {
                                         narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
                                         continue;
@@ -1510,7 +1510,7 @@ fn analyze_iv(
                                 };
                                 if other_is_member
                                     && (nr.is_some()
-                                        || (!cur_is_unsigned && !super::signed_overflow_wraps()))
+                                        || (!cur_is_unsigned && !func.pass_policy.wrap_signed_overflow))
                                 {
                                     members.push(Member::of(
                                         *dest,
@@ -1636,7 +1636,7 @@ fn analyze_iv(
                             // Shl on an unsigned member needs a non-wrapping
                             // range proof over the member's proven range.
                             let nr = if *op == IrBinOp::Shl {
-                                if cur_is_unsigned || super::signed_overflow_wraps() {
+                                if cur_is_unsigned || func.pass_policy.wrap_signed_overflow {
                                     let r = match member_range(&members, cur) {
                                         Some(r) => r,
                                         None => {
@@ -3633,6 +3633,13 @@ mod tests {
         );
     }
 
+    /// `check` under the -fwrapv TU policy: the former thread-local test
+    /// guard became a per-function PassPolicy bit.
+    fn check_wrapv(func: &mut IrFunction, expected_widened: usize) {
+        func.pass_policy.wrap_signed_overflow = true;
+        check(func, expected_widened);
+    }
+
     /// A 5-block counted loop: B0 preheader, B1 header (phi + optional cmp),
     /// B2 body, B3 latch, B4 exit. `body_insts` is inserted into B2; the
     /// optional `cmp` becomes the header exit test (B2 / B4).
@@ -3731,21 +3738,8 @@ mod tests {
         }
     }
 
-    struct WrappingGuard(crate::common::semantics::TestGuard);
-    impl WrappingGuard {
-        fn new() -> Self {
-            Self(crate::common::semantics::TestGuard::new(
-                crate::common::semantics::Semantics {
-                    signed_overflow_wraps: true,
-                    fp_environment_observable: false,
-                },
-            ))
-        }
-    }
-
     #[test]
     fn wrapping_seed_unproved_arithmetic_and_stores_stay_narrow() {
-        let _guard = WrappingGuard::new();
         for store in [false, true] {
             let mut body = vec![
                 Instruction::BinOp {
@@ -3797,8 +3791,11 @@ mod tests {
                 param_idx: 1,
                 ty: IrType::I32,
             });
+            // Snapshot under the same TU policy the run uses: the policy bit
+            // itself is part of the function's Debug output.
+            f.pass_policy.wrap_signed_overflow = true;
             let original = format!("{f:?}");
-            check(&mut f, 0);
+            check_wrapv(&mut f, 0);
             assert_eq!(format!("{f:?}"), original);
             assert!(matches!(
                 f.blocks[1].instructions[0],
@@ -3833,7 +3830,6 @@ mod tests {
 
     #[test]
     fn wrapping_signed_widening_requires_a_range_for_the_whole_closure() {
-        let _guard = WrappingGuard::new();
         for (init, bound, cmp_op, multiplier, expected) in [
             (3, 64, IrCmpOp::Slt, 4, 1),
             (1073741824, 1073741828, IrCmpOp::Slt, 4, 0),
@@ -3874,13 +3870,13 @@ mod tests {
                 dest: Value(0),
                 src: Operand::Const(IrConst::I32(init)),
             };
+            f.pass_policy.wrap_signed_overflow = true;
             check(&mut f, expected);
         }
     }
 
     #[test]
     fn wrapping_signed_mask_range_closes_index_arithmetic() {
-        let _guard = WrappingGuard::new();
         for (mask, addend, expected) in [
             (7, 1, 1),
             (0, 1, 1),
@@ -3930,13 +3926,12 @@ mod tests {
                 dest: Value(0),
                 src: Operand::Const(IrConst::I32(2)),
             };
-            check(&mut f, expected);
+            check_wrapv(&mut f, expected);
         }
     }
 
     #[test]
     fn wrapping_signed_counted_domains_and_runtime_limits() {
-        let _guard = WrappingGuard::new();
         use IrBinOp::{Add, Sub};
         use IrCmpOp::{Sge, Sgt, Sle, Slt, Ult};
         for (seed, bound, cmp, latch, step, dirty_header, expected) in [
@@ -4016,13 +4011,12 @@ mod tests {
                     },
                 );
             }
-            check(&mut f, expected);
+            check_wrapv(&mut f, expected);
         }
     }
 
     #[test]
     fn wrapping_member_products_require_both_ranges_and_preserve_subtraction() {
-        let _guard = WrappingGuard::new();
         for (op, bound, expected) in [
             (IrBinOp::Mul, 64, 1),
             (IrBinOp::Mul, 65536, 0),
@@ -4067,7 +4061,7 @@ mod tests {
                 // Latch-result users must be dominated by its definition.
                 let body = std::mem::take(&mut f.blocks[2].instructions);
                 f.blocks[3].instructions.extend(body);
-                check(&mut f, expected);
+                check_wrapv(&mut f, expected);
             }
         }
     }
@@ -4110,6 +4104,7 @@ mod tests {
                 dest: Value(0),
                 src: Operand::Const(IrConst::I32(20)),
             };
+            f.pass_policy.wrap_signed_overflow = true;
             check(&mut f, expected);
         }
     }

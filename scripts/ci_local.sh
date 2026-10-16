@@ -651,6 +651,13 @@ gate "strict-computed-recip-codegen" fast \
 gate "strict-packed-recip-bitwise" fast \
     python3 scripts/check_strict_packed_recip.py
 
+# Native execution gates; static opcode controls are supplementary tripwires.
+gate "fenv-local-effects" fast \
+    python3 scripts/check_fenv_local_optimization.py --compiler target/fastbuild/lccc --native-only --output target/pr835-fenv --json target/pr835-fenv.json
+
+gate "byte-count-normalization" fast \
+    python3 scripts/check_byte_count_normalize.py --lccc target/fastbuild/lccc --gcc gcc-16 --output target/pr835-byte-count --json target/pr835-byte-count.json
+
 gate "fp-environment-trap-order" fast \
     bash tests/regression/check_fp_environment.sh
 # Unknown scheduler names are exclusive barriers: hashing is not a concurrent

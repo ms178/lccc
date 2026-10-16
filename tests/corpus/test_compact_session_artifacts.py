@@ -43,6 +43,17 @@ class CompactTests(unittest.TestCase):
     def run_compactor(self, additions=None):
         return compact.compact_archive(self.root, self.receipt.name, additions or {}, self.scratch, preset=0)
 
+    def test_reader_budget_failure_keeps_old_publication(self):
+        self.receipt = self.root / 'BUNDLE_ARCHIVE.json'
+        self.save()
+        before = self.receipt.read_bytes()
+        old_archive = self.archive.read_bytes()
+        with patch.object(compact, 'bundle_archive_within_budget', return_value=False):
+            with self.assertRaisesRegex(ValueError, 'recovery budget'):
+                self.run_compactor()
+        self.assertEqual(self.receipt.read_bytes(), before)
+        self.assertEqual(self.archive.read_bytes(), old_archive)
+
     def test_preservation_and_repeatability(self):
         source = self.root / 'new.patch.gz'
         source.write_bytes(gzip.compress(b'new patch\n', mtime=0))

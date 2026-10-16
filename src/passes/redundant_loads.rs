@@ -348,6 +348,7 @@ mod tests {
         // Two volatile loads of the same global must both survive: each read
         // is an observable side effect (C11 5.1.2.3).
         let mut func = crate::ir::reexports::IrFunction {
+            pass_policy: Default::default(),
             name: "vol".into(),
             return_type: crate::common::types::IrType::I32,
             params: vec![],

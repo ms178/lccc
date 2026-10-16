@@ -669,6 +669,7 @@ mod tests {
             source_spans: vec![],
         };
         IrFunction {
+            pass_policy: Default::default(),
             name: "loop_fn".into(),
             return_type: IrType::I32,
             params: vec![IrParam {

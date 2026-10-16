@@ -46,6 +46,10 @@ done
 # without removing any bitwise/exception/dynamic-rounding checks above.
 "$CCC" -O2 -march=x86-64-v3 -ffp-contract=fast -S "$src" -o "$work/observable-contract.s"
 "$CCC" -O2 -march=x86-64-v3 -DNO_FENV_PRAGMA -ffp-contract=fast -S "$src" -o "$work/contract.s"
+# Independent minimal shape control, alongside the complete semantic fixture.
+shape="$root/tests/regression/fp_recurrence/contract_shape.c"
+"$CCC" -O2 -march=x86-64-v3 -ffp-contract=fast -S \
+    "$shape" -o "$work/shape-contract.s"
 for flags in '-march=x86-64' '-march=x86-64-v2' '-march=x86-64-v3 -mno-fma'; do
     # Deliberate word splitting of this fixed test-only flag list.
     "$CCC" -O2 $flags -ffp-contract=fast -DNO_FENV_PRAGMA -S "$src" -o "$work/no-fma-${flags// /_}.s"
@@ -120,7 +124,7 @@ assert mul_fma(inner_fp_loop(body('mandel-on.s', 'main'))) == mul_fma(inner_fp_l
 for name in ('twice_plus', 'scaled_fma'):
     assert not re.search(r'vfmadd\d*sd', body('observable-contract.s', name)), name
     assert re.search(r'vfmadd\d*sd', body('contract.s', name)), name
-    assert not re.search(r'vfmadd\d*sd', body('observable-contract.s', name)), name
+    assert re.search(r'vfmadd\d*sd', body('shape-contract.s', name)), (name, 'minimal positive control')
 
 def redundant_edges(file):
     lines = [line.split('#', 1)[0].rstrip() for line in (p / file).read_text().splitlines()]

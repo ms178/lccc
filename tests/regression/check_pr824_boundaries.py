@@ -18,8 +18,11 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 SOURCES = [ROOT / "tests/regression" / name for name in
            ("byte_load_preinline.c", "affine_exit_bound.c", "rotation_signed_wrap.c", "affine_optional_exit.c",
-            "wrapv_byte_address.c", "fenv_rounding_freestanding.c", "wrapv_masked_index.c")]
-SOURCE_FLAGS = {"fenv_rounding_freestanding.c": ["-frounding-math"]}
+            "wrapv_byte_address.c", "fenv_rounding_freestanding.c", "wrapv_masked_index.c",
+            "integer_pointer_width.c")]
+SOURCE_FLAGS = {"fenv_rounding_freestanding.c": ["-frounding-math"],
+                "integer_pointer_width.c": ["-DLCCC_POINTER_WIDTH_FREESTANDING=1", "-ffreestanding",
+                                            "-Wno-int-to-pointer-cast", "-Wno-pointer-to-int-cast"]}
 ENTRY = {
     "i686": ".text\n.globl _start\n_start:\ncall main\nmovl %eax,%ebx\nmovl $1,%eax\nint $0x80\n",
     "arm": ".text\n.globl _start\n_start:\nbl main\nmov x8,#93\nsvc #0\n",
@@ -68,6 +71,8 @@ def main():
             modes += [("-O2", {"CCC_LOOP_ROTATE": "1"}),
                       ("-O2", {"CCC_NO_AFFINE_EXIT_FOLD": "1"}),
                       ("-O2", {"CCC_LOOP_ROTATE": "1", "CCC_NO_AFFINE_EXIT_FOLD": "1"}),
+                      ("-O2", {"CCC_DISABLE_PASSES": "loop_bound"}),
+                      ("-O2", {"CCC_DISABLE_PASSES": "loop_bound", "CCC_NO_AFFINE_EXIT_FOLD": "1"}),
                       ("-O2", {"CCC_DISABLE_PASSES": "byte_load"})]
             for arch, compiler, extra, runner in targets:
                 for source in SOURCES:
@@ -87,16 +92,28 @@ def main():
             run([args.lccc, "-O2", "-S", str(SOURCES[0]), "-o", str(asm)])
             assert not re.search(r"\bcallq?\s+body_le64\b", asm.read_text()), "cheap folded helper stayed out of line"
             records.append({"shape": "folded helper has no call", "passed": True})
-            # The unsigned optimization uses the existing owner/kill switch.
-            run([args.lccc, "-O2", "-S", str(SOURCES[1]), "-o", str(asm)])
-            text = asm.read_text()
-            body = text.split("hot_guard_64:\n", 1)[1].split(".size hot_guard_64", 1)[0]
-            assert re.search(r"cmpq\s+\$248,", body), body
-            run([args.lccc, "-O2", "-S", str(SOURCES[1]), "-o", str(asm)],
-                dict(clean, CCC_NO_AFFINE_EXIT_FOLD="1"))
-            body = asm.read_text().split("hot_guard_64:\n", 1)[1].split(".size hot_guard_64", 1)[0]
-            assert not re.search(r"cmpq\s+\$248,", body), "affine kill switch ignored"
-            records.append({"shape": "unsigned fold and kill control", "passed": True})
+            # Both independently scheduled producers can reach this guard.
+            # Pin the complete ownership matrix, not just a shared opcode.
+            for name, overrides, expected_early, expected_late in [
+                ("both-enabled", {}, True, False),
+                ("early-only", {"CCC_NO_AFFINE_EXIT_FOLD": "1"}, True, False),
+                ("late-only", {"CCC_DISABLE_PASSES": "loop_bound"}, False, True),
+                ("both-disabled", {"CCC_DISABLE_PASSES": "loop_bound",
+                                   "CCC_NO_AFFINE_EXIT_FOLD": "1"}, False, False),
+            ]:
+                command = [args.lccc, "-O2", "-S", str(SOURCES[1]), "-o", str(asm)]
+                result = run(command, dict(clean, CCC_DEBUG_AFFINE_FOLD="1", **overrides))
+                body = asm.read_text().split("hot_guard_64:\n", 1)[1].split(".size hot_guard_64", 1)[0]
+                folded = bool(re.search(r"cmpq\s+\$248,", body))
+                reports = [line for line in result.stderr.splitlines()
+                           if line.startswith("[AFFOLD] hot_guard_64:")]
+                early = any("(early unsigned)" in line for line in reports)
+                late = any("(early unsigned)" not in line for line in reports)
+                assert (early, late) == (expected_early, expected_late), (name, reports)
+                assert folded == (expected_early or expected_late), (name, body)
+                records.append({"shape": "independent unsigned fold owners", "mode": name,
+                                "env": overrides, "command": command, "early": early,
+                                "late": late, "passed": True})
     except (AssertionError, OSError, ValueError, IndexError, subprocess.TimeoutExpired) as failure:
         error = str(failure)
     summary = {"passed": len(records), "failed": int(error is not None), "skipped": 0,

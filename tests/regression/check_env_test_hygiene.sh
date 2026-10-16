@@ -65,7 +65,9 @@ MARKER='FIX''ME'
 # The budget is the count, not the count rounded up: a ratchet with slack in it
 # silently permits growth: a budget of 153 over 151 reads passes while allowing
 # two more env reads than the code has, with nothing to stop a third.
-ENV_READ_BUDGET=151
+# PR835 follow-up: pipeline-owned byte-count ablation plus one SSE2 snapshot
+# instead of six repeated candidate-loop reads; measured 147 sites.
+ENV_READ_BUDGET=147
 
 fail=0
 report() { # report <label> <offending lines>

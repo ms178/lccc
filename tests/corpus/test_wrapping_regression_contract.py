@@ -17,7 +17,7 @@ spec.loader.exec_module(runner)
 class WrappingContracts(unittest.TestCase):
     def test_real_discovery_and_both_compiler_commands(self):
         cases = {t.name: t for t in runner.discover([ROOT / 'tests/regression'])}
-        for name in ('affine_control_proof', 'wrapv_domains', 'ivw_wrapv_range', 'ivw_signed_mask'):
+        for name in ('affine_control_proof', 'wrapv_domains', 'ivw_wrapv_range', 'ivw_signed_mask', 'signed_scale_ring_wrap'):
             case = cases[name]
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
                 self.assertFalse(case.no_compare, 'keep the independent oracle enabled')

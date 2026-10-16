@@ -205,11 +205,12 @@ fn foldable_const_disp(c: &IrConst, allow_u32_wrap: bool) -> Option<i64> {
 /// ring. A scaling instruction (`shl`, `mul`, `add(v, v)`) or a displacement
 /// `add`/`sub` may therefore only be peeled away when its ring IS the pointer
 /// ring or wider -- there the two rings coincide -- or when it is a narrower
-/// SIGNED ring under the default non-wrapping language contract (C17 6.5/5, the same
-/// theorem `iv_strength_reduce::offset_product_cannot_overflow` rests on).
-/// Under -fwrapv the signed narrow result must also be computed BEFORE
-/// extension: sext(i32(i * 4)) is not sext(i) * 4. Keep that producer and use
-/// its extended result as an unscaled index; do not disable all SIB folding.
+/// SIGNED ring only when this function does not promise wrapping overflow.
+/// Under that non-wrapping policy, C17 6.5/5 supplies the same
+/// theorem `iv_strength_reduce::offset_product_cannot_overflow` rests on.
+/// With -fwrapv, signed narrow products and displacements must be materialized
+/// in their own ring before extension, just like the unsigned case. Reading
+/// the function-owned policy also keeps sequential translation units isolated.
 /// An UNSIGNED narrower ring wraps by definition, and peeling it reinterprets
 /// that wrap as pointer arithmetic: `buf[i*2]` with `uint32_t i` reached
 /// `buf[0x100000000]` instead of `buf[0]` once `2*i` exceeded 2^32, because the
@@ -217,10 +218,10 @@ fn foldable_const_disp(c: &IrConst, allow_u32_wrap: bool) -> Option<i64> {
 /// `scale = 2` of a zero-extended index (live miscompile at -O1..-O3, pinned by
 /// `tests/regression/ivsr_scale_ring_wrap.c`).
 #[inline]
-fn scale_ring_is_linear(ty: IrType) -> bool {
+fn scale_ring_is_linear(ty: IrType, wrap_signed_overflow: bool) -> bool {
     ty.is_integer()
         && ((ty.size() as usize) >= crate::common::types::target_ptr_size()
-            || (!ty.is_unsigned() && !crate::common::semantics::signed_overflow_wraps()))
+            || (!ty.is_unsigned() && !wrap_signed_overflow))
 }
 
 fn is_i32_disp(off: i64) -> bool {
@@ -1301,7 +1302,7 @@ fn build_indexed_gep_map(
                     ty,
                     ..
                 } => {
-                    if !scale_ring_is_linear(*ty) {
+                    if !scale_ring_is_linear(*ty, func.pass_policy.wrap_signed_overflow) {
                         break;
                     }
                     let k = c.to_i64()?;
@@ -1330,7 +1331,7 @@ fn build_indexed_gep_map(
                     ty,
                     ..
                 } => {
-                    if !scale_ring_is_linear(*ty) {
+                    if !scale_ring_is_linear(*ty, func.pass_policy.wrap_signed_overflow) {
                         break;
                     }
                     let n = c.to_i64()?;
@@ -1356,7 +1357,7 @@ fn build_indexed_gep_map(
                     ty,
                     ..
                 } if a == b && shift < 3 => {
-                    if !scale_ring_is_linear(*ty) {
+                    if !scale_ring_is_linear(*ty, func.pass_policy.wrap_signed_overflow) {
                         break;
                     }
                     shift += 1;
@@ -1406,7 +1407,7 @@ fn build_indexed_gep_map(
                     ty,
                     ..
                 } => {
-                    if !scale_ring_is_linear(*ty) {
+                    if !scale_ring_is_linear(*ty, func.pass_policy.wrap_signed_overflow) {
                         break;
                     }
                     // Already saw an add(iv, const) — refuse nested adds.
@@ -1452,7 +1453,7 @@ fn build_indexed_gep_map(
                     ty,
                     ..
                 } => {
-                    if !scale_ring_is_linear(*ty) {
+                    if !scale_ring_is_linear(*ty, func.pass_policy.wrap_signed_overflow) {
                         break;
                     }
                     if pf06_add_peel_disabled {
@@ -7024,11 +7025,6 @@ mod scale_ring_tests {
 
     #[test]
     fn wrapping_signed_scale_is_computed_before_pointer_extension() {
-        let _guard =
-            crate::common::semantics::TestGuard::new(crate::common::semantics::Semantics {
-                signed_overflow_wraps: true,
-                fp_environment_observable: false,
-            });
         let ptr = crate::common::types::target_ptr_size();
         for ty in [
             IrType::I8,
@@ -7041,7 +7037,7 @@ mod scale_ring_tests {
             IrType::U64,
         ] {
             assert_eq!(
-                scale_ring_is_linear(ty),
+                scale_ring_is_linear(ty, true),
                 ty.size() as usize >= ptr,
                 "{ty:?}"
             );
@@ -7055,7 +7051,7 @@ mod scale_ring_tests {
 
     /// The SIB peel is value-preserving only for rings the CPU's address
     /// arithmetic can reproduce: the pointer ring itself, anything wider, and
-    /// narrower SIGNED rings (no wrap in a defined program). An unsigned
+    /// narrower SIGNED rings only without the wrapping policy. An unsigned
     /// narrower ring wraps by definition -- `add(uint32 i, uint32 i)` peeled to
     /// `scale = 2` of a zero-extended index read `buf[0x100000000]` instead of
     /// `buf[0]`, a live miscompile at -O1..-O3 (IVSR-WRAP-2, pinned by
@@ -7073,14 +7069,16 @@ mod scale_ring_tests {
         ] {
             let narrow = (ty.size() as usize) < ptr;
             assert_eq!(
-                scale_ring_is_linear(ty),
+                scale_ring_is_linear(ty, false),
                 !narrow || !ty.is_unsigned(),
                 "{ty:?}"
             );
+            assert_eq!(scale_ring_is_linear(ty, true), !narrow, "wrapping {ty:?}");
         }
         // At or above the pointer width both spellings share one ring.
         for ty in [IrType::I64, IrType::U64] {
-            assert!(scale_ring_is_linear(ty), "{ty:?}");
+            assert!(scale_ring_is_linear(ty, false), "{ty:?}");
+            assert!(scale_ring_is_linear(ty, true), "wrapping {ty:?}");
         }
         // Non-integer rings are never a scaling instruction's ring, and are
         // refused rather than trusted.
@@ -7091,7 +7089,8 @@ mod scale_ring_tests {
             IrType::Ptr,
             IrType::Void,
         ] {
-            assert!(!scale_ring_is_linear(ty), "{ty:?}");
+            assert!(!scale_ring_is_linear(ty, false), "{ty:?}");
+            assert!(!scale_ring_is_linear(ty, true), "wrapping {ty:?}");
         }
     }
 }

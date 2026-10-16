@@ -1175,14 +1175,15 @@ impl X86Codegen {
                             // fall through to the register path otherwise
                             // (I8/I16 ALU ops have use_32bit == false).
                             let dest_is_small = self.state.is_small_slot(dest.0);
-                            // A 32-bit in-place store cannot repair the upper
-                            // half of a canonical signed 64-bit home. Use the
-                            // accumulator path when a wide consumer needs it.
-                            if (!dest_is_small || use_32bit)
-                                && !(use_32bit
-                                    && !is_unsigned
-                                    && self.implicit_sext_values.contains(&dest.0))
-                            {
+                            // A 32-bit memory update of an 8-byte signed
+                            // home leaves its old upper half untouched. If a
+                            // wide consumer needs the canonical sign, use the
+                            // accumulator path and its shared extending store.
+                            let needs_canonical_store = use_32bit
+                                && !is_unsigned
+                                && !dest_is_small
+                                && self.needs_sext_values.contains(&dest.0);
+                            if (!dest_is_small || use_32bit) && !needs_canonical_store {
                                 let sref = self.slot_ref(dest_slot.0);
                                 // Try register source: op %reg, mem
                                 if let Some(rhs_phys) = self

@@ -23,8 +23,15 @@ import lzma
 import os
 from pathlib import Path, PurePosixPath
 import shutil
+import sys
 import tarfile
 import tempfile
+
+
+# The recovery helper is also a standalone deliverable, so keep the shared
+# extraction budget there rather than giving it a new package dependency.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lccc_recover import bundle_archive_within_budget
 
 
 def digest(path):
@@ -157,6 +164,12 @@ def compact_archive(root, receipt_name, additions, scratch, *, preset=9):
                     raise ValueError('output verification failed')
         if verify:
             raise ValueError('output lost a member')
+        if receipt_name == 'BUNDLE_ARCHIVE.json':
+            total = 0
+            for count, row in enumerate(members, 1):
+                total += row['bytes']
+                if not bundle_archive_within_budget(count, row['bytes'], total):
+                    raise ValueError('bundle archive exceeds recovery budget; old publication retained')
         sha = digest(output)
         destination = root / (receipt_name.removesuffix('.json').lower() + '.' + sha[:16] + '.tar.xz')
         os.replace(output, destination)

@@ -790,6 +790,7 @@ def main(argv=None) -> int:
             lb = bench_local(path, a.O, a.bench)
             row = {"program": prog, "lccc": lb, "oracles": [], "status": "PASS", "why": []}
             refs = [x.strip() for x in a.local_ref.split(",") if x.strip()]
+            remote_results = []
             for c in cids:
                 o = bench_remote(c, source, a.O, a.bench, a.timeout)
                 # A REBUILT binary earns the right to be timed only by first
@@ -807,9 +808,22 @@ def main(argv=None) -> int:
                         o["reason"] = ("re-assembled binary does not reproduce "
                                        "Compiler Explorer's own execution; the "
                                        "asm view is not self-contained")
-                row["oracles"].append(o)
+                remote_results.append(o)
             if not lb["ok"]:
                 row["status"], _ = "ERROR", row["why"].append(f"lccc: {lb['reason']}")
+            local_results = []
+            for r in refs:
+                rb = bench_local(path, a.O, a.bench, cc=r)
+                if rb["ok"] and _norm(rb["stdout"]) != _norm(lb["stdout"]):
+                    rb["ok"] = False
+                    rb["sec"] = None
+                    rb["reason"] = "local reference compiler output differs"
+                local_results.append(rb)
+            # Keep the result array in the same order as the header above:
+            # local references first, then the remote CE oracles.  Otherwise
+            # every timing is real but printed under a different compiler's
+            # name.
+            row["oracles"] = [*local_results, *remote_results]
             for o in row["oracles"]:
                 if not o["ok"]:
                     row["why"].append(f"{o['id']} SKIP: {o['reason']}")
@@ -821,13 +835,6 @@ def main(argv=None) -> int:
                     # failure that is already in `why`.
                     row["status"] = "DIVERGES"
                     row["why"].append(f"{o['id']}: output differs when run locally")
-            for r in refs:
-                rb = bench_local(path, a.O, a.bench, cc=r)
-                if rb["ok"] and _norm(rb["stdout"]) != _norm(lb["stdout"]):
-                    rb["ok"] = False
-                    rb["sec"] = None
-                    rb["reason"] = "local reference compiler output differs"
-                row["oracles"].append(rb)
             ref = next((o for o in row["oracles"] if o["id"] == "gcc"), None)
             rel = None
             if lb["ok"] and ref and ref["ok"] and ref["sec"]:

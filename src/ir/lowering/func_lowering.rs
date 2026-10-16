@@ -1043,6 +1043,7 @@ impl Lowerer {
         let next_label = self.next_label;
 
         let ir_func = IrFunction {
+            pass_policy: Default::default(),
             // GCC __asm__("symbol") asm labels: a function DEFINITION must be
             // emitted under the asm label, not its C name. The declaration
             // (e.g. `extern int __printf__(...) __asm__("rpl_printf")` from

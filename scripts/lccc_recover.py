@@ -26,6 +26,21 @@ SHA=re.compile(r'^[0-9a-f]{40}$');DIGEST=re.compile(r'^[0-9a-f]{64}$')
 UPSTREAM='https://github.com/ms178/lccc.git'
 
 
+# Checkpoint retention outgrew the old 16-name ceiling. Keep the independent
+# byte limits unchanged: increasing the bounded metadata count must not allow
+# a larger member or a larger decompressed archive. The producer uses this
+# same predicate before publishing a new bundle inventory.
+BUNDLE_ARCHIVE_MAX_MEMBERS = 64
+BUNDLE_ARCHIVE_MAX_MEMBER_BYTES = 64 * 1024 * 1024
+BUNDLE_ARCHIVE_MAX_TOTAL_BYTES = 256 * 1024 * 1024
+
+
+def bundle_archive_within_budget(count, member_bytes, total_bytes):
+    return (0 < count <= BUNDLE_ARCHIVE_MAX_MEMBERS
+            and 0 <= member_bytes <= BUNDLE_ARCHIVE_MAX_MEMBER_BYTES
+            and 0 <= total_bytes <= BUNDLE_ARCHIVE_MAX_TOTAL_BYTES)
+
+
 def git(repo,*args,input=None):
     p=subprocess.run(['git','-C',str(repo),*args],input=input,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=120)
     if p.returncode:raise ValueError('git '+args[0]+': '+p.stderr.decode('utf-8',errors='replace')[-2000:])
@@ -283,7 +298,7 @@ def resolve_bundle(stage,artifacts,b):
                 name(member.name)
                 require(member.isfile() and member.name not in names,'unsafe/duplicate bundle archive member')
                 names.add(member.name);total+=member.size
-                require(len(names)<=16 and 0<=member.size<=64*1024*1024 and total<=256*1024*1024,
+                require(bundle_archive_within_budget(len(names), member.size, total),
                         'bundle archive budget exceeded')
                 if member.name==b['bundle']:selected=member
             require(selected is not None,'named bundle absent from archive')

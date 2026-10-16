@@ -213,8 +213,8 @@ def cmd_matrix(a: argparse.Namespace) -> int:
 def cmd_compare(a: argparse.Namespace) -> int:
     src = Path(a.probe)
     cols = ["lccc"] + [o.strip() for o in a.oracles.split(",") if o.strip()]
-    if len(set(cols)) != len(cols) or any(not re.fullmatch(r"[A-Za-z0-9_.-]+", c) for c in cols):
-        raise ValueError("oracle labels must be unique and path-safe")
+    if len(cols) < 2 or len(set(cols)) != len(cols) or any(not re.fullmatch(r"[A-Za-z0-9_.-]+", c) for c in cols):
+        raise ValueError("oracle labels must be nonempty, unique and path-safe")
     if a.save:
         Path(a.save).mkdir(parents=True, exist_ok=True)
         for c in cols:
@@ -233,12 +233,11 @@ def cmd_compare(a: argparse.Namespace) -> int:
             print(f"error: {o}: {e}", file=sys.stderr)
             errors[o] = str(e)
             outputs[o] = ""
-            failed = True
     for c in cols:
         functions = split_functions(outputs[c])
         if not functions or (a.function and a.function not in functions):
             print(f"{c}: requested function/assembly missing", file=sys.stderr)
-            failed = True
+            errors.setdefault(c, "requested function/assembly missing")
         for fn, body in functions.items():
             if a.function and fn != a.function:
                 continue
