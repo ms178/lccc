@@ -17,13 +17,14 @@
 //!
 //! * `Value`: an arithmetic constant (literals, enumerators, `sizeof`,
 //!   folded integer arithmetic, the value of a const object whose initializer
-//!   was constant, `?:` on a constant condition).
+//!   was constant, `?:` on a constant condition, and a compound literal in
+//!   full-initializer position, whose own initializers are all constant).
 //! * `Address(root)`: an address constant. `root` names the static object
 //!   the address is into, so `&a.x - &a.y`-style differences can be checked
 //!   for a common object; `None` for string literals and function designators.
 //! * `Bad`: anything else, including the address of an automatic object, the
-//!   value of a non-const object, calls, assignments, comma, and compound
-//!   literals (which are automatic in block scope).
+//!   value of a non-const object, calls, assignments, comma, and a block-scope
+//!   compound literal used as an operand or address (decayed `(int[]){1,2}`).
 //!
 //! The rules were measured against GCC 16.2 (see
 //! `tests/regression/static_local/`), including the GNU folding of const
@@ -85,7 +86,7 @@ impl<'s> StaticInitChecker<'s> {
     fn collect_bad(&self, init: &Initializer, out: &mut Vec<Span>) {
         match init {
             Initializer::Expr(e) => {
-                if self.value(e) == Kind::Bad {
+                if self.leaf_kind(e) == Kind::Bad {
                     out.push(e.span());
                 }
             }
@@ -95,6 +96,34 @@ impl<'s> StaticInitChecker<'s> {
                 }
             }
         }
+    }
+
+    /// The kind of a full initializer expression of one subobject.
+    ///
+    /// A compound literal in initializer position is the braced list itself:
+    /// GCC creates no block-scope object for it (`static rs_t s =
+    /// { .lock = (inner_t){ 0, 1 } };`, `static int x = (int){5};`,
+    /// `static int *p = (int *){0};` are all accepted when the literal's own
+    /// initializers are constant — the Linux kernel's RATELIMIT_STATE_INIT
+    /// depends on this). An ARRAY-typed literal is treated conservatively as
+    /// its decayed address (the common `(int[]){1,2}` -> static-pointer shape
+    /// is exactly that, and GCC rejects it); the rarer array-literal-
+    /// initializes-array-object form is then rejected too — safe direction,
+    /// tracked as a known deviation.
+    ///
+    /// Any other use of a block-scope compound literal — an operand of
+    /// arithmetic, a cast, or `&(T){...}` — references the automatic object
+    /// and stays non-constant (GCC 16.2 rejects `(int){5} + 1` and
+    /// `&(T){...}` with "initializer element is not constant").
+    fn leaf_kind<'e>(&self, e: &'e Expr) -> Kind<'e> {
+        if let Expr::CompoundLiteral(_, init, _) = e {
+            if !matches!((self.ctype)(e), Some(CType::Array(..))) {
+                let mut inner = Vec::new();
+                self.collect_bad(init, &mut inner);
+                return if inner.is_empty() { Kind::Value } else { Kind::Bad };
+            }
+        }
+        self.value(e)
     }
 
     /// The kind of an expression used as a value (after array and function
