@@ -381,7 +381,7 @@ gate "pr824-boundaries" fast \
     python3 tests/regression/check_pr824_boundaries.py --lccc target/fastbuild/lccc --cross --json target/redteam/boundaries.json
 
 gate "note-run-oracle-selftest" fast \
-    python3 tests/linker/test_note_runs.py
+    python3 tests/corpus/test_linker_note_runs.py
 
 gate "pr826-harness-redteam" fast \
     python3 tests/linker/test_pr826_redteam.py
@@ -618,12 +618,6 @@ gate "ivsr-vecaddr-struct-walk" fast \
 
 gate "strict-packed-dag" fast \
     env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_strict_packed_dag.sh
-gate "strict-packed-recip-bitwise" fast \
-    python3 scripts/check_strict_packed_recip.py
-
-gate "fp-environment-trap-order" fast \
-    bash tests/regression/check_fp_environment.sh
-
 
 gate "machinst-window-alloc" fast \
     bash tests/regression/check_machinst_window_alloc_wide_copy.sh

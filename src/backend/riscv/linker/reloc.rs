@@ -450,8 +450,7 @@ fn apply_one_reloc(
             }
         }
         R_RISCV_PCREL_HI20 => {
-            let target = s as i64 + a;
-            let offset_val = target - p as i64;
+            let offset_val = super::displacement::checked_auipc_delta(s, a, p)?;
             patch_u_type(data, off, offset_val as u32);
         }
         R_RISCV_PCREL_LO12_I => {
@@ -490,7 +489,7 @@ fn apply_one_reloc(
         }
         R_RISCV_GOT_HI20 => {
             let got_entry_vaddr = lookup_got_entry(sym, obj_idx, a, ctx);
-            let offset_val = got_entry_vaddr as i64 + a - p as i64;
+            let offset_val = super::displacement::checked_auipc_delta(got_entry_vaddr, a, p)?;
             patch_u_type(data, off, offset_val as u32);
         }
         R_RISCV_CALL_PLT => {
@@ -516,7 +515,7 @@ fn apply_one_reloc(
                 } else {
                     s as i64
                 };
-                let offset_val = target + a - p as i64;
+                let offset_val = super::displacement::checked_auipc_delta(target as u64, a, p)?;
                 let hi = ((offset_val + 0x800) >> 12) & 0xFFFFF;
                 let lo = offset_val & 0xFFF;
                 if off + 8 <= data.len() {
@@ -698,7 +697,7 @@ fn apply_one_reloc(
         }
         R_RISCV_TLS_GOT_HI20 => {
             let got_entry_vaddr = lookup_got_entry(sym, obj_idx, a, ctx);
-            let offset_val = got_entry_vaddr as i64 + a - p as i64;
+            let offset_val = super::displacement::checked_auipc_delta(got_entry_vaddr, a, p)?;
             patch_u_type(data, off, offset_val as u32);
         }
         other => {

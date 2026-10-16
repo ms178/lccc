@@ -1311,7 +1311,7 @@ jobs:
     - name: Temp-file symlink hardening
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_temp_symlink.sh
     - name: Note-run oracle boundary tests
-      run: python3 tests/linker/test_note_runs.py
+      run: python3 tests/corpus/test_linker_note_runs.py
     - name: RISC-V shared symbol binding and visibility
       run: |
         python3 tests/linker/test_riscv_shared_binding.py

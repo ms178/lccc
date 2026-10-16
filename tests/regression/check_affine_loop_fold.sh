@@ -102,7 +102,7 @@ count_reports() { # env...
     out=$(timeout 900 env "$@" "$CCC" -O2 -march=x86-64-v3 -S "$corpus" -o /dev/null 2>&1 >/dev/null) || {
         printf '%s\n' "$out" >&2; return 1;
     }
-    printf '%s\n' "$out" | grep -Ec '^\[(AFFOLD|ROT)\] .*affine exit-compare folds: [1-9][0-9]*$' || true
+    printf '%s\n' "$out" | grep -Ec '^\[AFFOLD\] .*affine exit-compare folds: [1-9][0-9]*$' || true
 }
 n_def=$(count_reports CCC_DEBUG_AFFINE_FOLD=1)
 n_rot=$(count_reports CCC_DEBUG_AFFINE_FOLD=1 CCC_LOOP_ROTATE=1)

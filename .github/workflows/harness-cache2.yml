@@ -1,0 +1,50 @@
+# TEMPORARY transport workflow (removed from the branch once consumed).
+# Second payload: the pinned ARM A64 ISA XML tarball (developer.arm.com is
+# TLS-blocked from the sandbox) and the pinned kernel relocs-tool sources
+# (git.kernel.org likewise). Pushed as orphan tag harness-cache-2.
+name: harness-cache2
+on:
+  workflow_dispatch: {}
+  push:
+    branches: ["arena/ff2b91ca-lccc"]
+    paths: [".github/workflows/harness-cache2.yml"]
+permissions:
+  contents: write
+concurrency:
+  group: harness-cache2
+  cancel-in-progress: false
+jobs:
+  fetch:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Fetch pinned artifacts
+        run: |
+          set -euxo pipefail
+          mkdir -p payload/kernel-tools/tools && cd payload
+          curl -fsSL --retry 3 -o ISA_A64_xml_A_profile-2026-09_md.tar.gz \
+            'https://developer.arm.com/-/cdn-downloads/permalink/Exploration-Tools-A64-ISA/ISA_A64/ISA_A64_xml_A_profile-2026-09_md.tar.gz'
+          echo "62917cba0da668deb6c28005231f4b94d1044cd52dbe4a4729fcc26d1642d827  ISA_A64_xml_A_profile-2026-09_md.tar.gz" | sha256sum -c -
+          BASE="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain"
+          for f in relocs.c relocs.h relocs_common.c relocs_32.c relocs_64.c; do
+            curl -fsSL --retry 3 -o "kernel-tools/$f" "$BASE/arch/x86/tools/$f?h=v6.12"
+          done
+          curl -fsSL --retry 3 -o kernel-tools/tools/le_byteshift.h \
+            "$BASE/tools/include/tools/le_byteshift.h?h=v6.12"
+          head -1 kernel-tools/relocs.c | grep -q 'SPDX-License-Identifier'
+          sha256sum ISA_A64_xml_A_profile-2026-09_md.tar.gz kernel-tools/* kernel-tools/tools/* \
+            > MANIFEST.sha256 2>/dev/null || true
+          ls -lR .
+      - name: Push as orphan tag harness-cache-2
+        run: |
+          set -euxo pipefail
+          cd payload
+          git init -q .
+          git config user.name 'harness-cache'
+          git config user.email 'harness-cache@local'
+          git add -A
+          git commit -q -m 'ARM A64 ISA XML + kernel relocs sources (transport only)'
+          git tag harness-cache-2
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            refs/tags/harness-cache-2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

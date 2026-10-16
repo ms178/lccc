@@ -9,7 +9,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'scripts'))
-import verify_evidence_hashes as evidence
+import verify_imported_evidence as evidence
 import check_licm_ordering as ordering
 import expand_asm_fixture as fixture
 

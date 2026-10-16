@@ -18,7 +18,7 @@ if os.environ.get('FAIL_BUILD'):
     print('forced compiler failure', file=sys.stderr); sys.exit(7)
 p = pathlib.Path(sys.argv[sys.argv.index('-o')+1])
 if str(p) == '/dev/null':
-    print('affine exit-compare folds: 1', file=sys.stderr); sys.exit(0)
+    print('[AFFOLD] probe: affine exit-compare folds: 1', file=sys.stderr); sys.exit(0)
 p.write_text("#!/usr/bin/env python3\\nimport os,json\\nwith open(os.environ['TRACE'],'a') as f: f.write(json.dumps({'phase':'run','rotate':os.environ.get('CCC_LOOP_ROTATE')})+'\\\\n')\\nprint('ok')\\nraise SystemExit(int(os.environ.get('FAIL_RUN','0')))\\n")
 p.chmod(0o755)
 '''

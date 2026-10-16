@@ -1868,6 +1868,11 @@ pub(crate) fn run_passes(
             && !optimize_for_size
             && target == crate::backend::Target::X86_64
             && !pass_disabled(&disabled, "loop_bound")
+            // `CCC_NO_AFFINE_EXIT_FOLD` must cover EVERY producer of the
+            // affine exit-compare fold: a switch that quietly leaves one
+            // producer running turns the A/B that condemns the fold into
+            // the A/B that hides it.
+            && loop_rotate::affine_fold_enabled()
         {
             let n = timed_pass!(
                 "loop_bound",
