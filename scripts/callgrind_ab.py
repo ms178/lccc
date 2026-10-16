@@ -224,8 +224,15 @@ def _measure(args,benches,outroot,manifest,cache):
                 prefix=str(binary)+'.native'
                 try:
                     native[side],_=run_recorded([str(binary)],120,prefix)
-                finally:
-                    entry['native'][side]=process_receipt(prefix)
+                except BaseException:
+                    # The spawn/runner exception is primary. A broken receipt
+                    # must not replace it, but must remain visible for triage.
+                    try:
+                        entry['native'][side]=process_receipt(prefix)
+                    except Exception as receipt_error:
+                        entry.setdefault('receipt_errors', {})[side]=str(receipt_error)
+                    raise
+                entry['native'][side]=process_receipt(prefix)
         except (OSError,ValueError) as exc:entry['detail']=str(exc);failures[bench]=str(exc);continue
         pm,pr=native['mine'],native['ref']
         entry['correctness']=dict(mine=evidence(pm),ref=evidence(pr))

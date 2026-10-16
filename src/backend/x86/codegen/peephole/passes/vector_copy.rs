@@ -1509,25 +1509,35 @@ pub(super) fn eliminate_dead_vector_copies(store: &LineStore, infos: &mut [LineI
 mod tests {
     use super::*;
 
-    #[test]
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    fn pr834_wide_call_real_pipeline_native() {
-        // This is an execution contract, not a silently successful no-op on
-        // an unsupported runner. The structural companion is CPU-independent.
-        assert!(
-            std::arch::is_x86_feature_detected!("avx"),
-            "native wide-call contract requires an AVX-capable test runner"
-        );
-        use crate::common::temp_files::TempFile;
-        use std::process::Command;
+    fn pr834_wide_call_fixture() -> (std::path::PathBuf, String, String) {
         let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/regression/fixtures/peephole-wide-call");
         let original = std::fs::read_to_string(fixtures.join("caller.s")).unwrap();
         let optimized = run(&original);
+        (fixtures, original, optimized)
+    }
+
+    #[test]
+    fn pr834_wide_call_real_pipeline_structural() {
+        let (_, _, optimized) = pr834_wide_call_fixture();
         assert!(
             !optimized.contains("movq %rax, %rax"),
             "real pipeline positive control"
         );
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn pr834_wide_call_real_pipeline_native() {
+        use crate::common::temp_files::TempFile;
+        use std::process::Command;
+        let avx = std::arch::is_x86_feature_detected!("avx");
+        let gcc = Command::new("gcc").arg("--version").output();
+        assert!(
+            avx && gcc.as_ref().is_ok_and(|out| out.status.success()),
+            "native wide-call contract requires AVX-capable x86_64-linux and gcc on PATH (AVX: {avx}, gcc: {gcc:?})"
+        );
+        let (fixtures, original, optimized) = pr834_wide_call_fixture();
         let asm = TempFile::try_new("pr834", "wide-call", "s").unwrap();
         let exe = TempFile::try_new("pr834", "wide-call", "exe").unwrap();
         for (stage, code) in [("original", original), ("optimized", optimized)] {

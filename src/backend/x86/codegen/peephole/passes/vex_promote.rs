@@ -341,6 +341,59 @@ fn label_name(l: &str) -> Option<&str> {
     Some(&t[..t.len() - 1])
 }
 
+/// Skip legacy instruction-prefix tokens, not substrings of mnemonics. The
+/// emitter normally writes a bare mnemonic, but GAS accepts prefixes as
+/// separate tokens. Both read modelling and CFG construction must use this
+/// same decoded instruction; treating a prefixed jump as fall-through can
+/// incorrectly make a real observer unreachable.
+fn unprefixed_insn(mut text: &str) -> (&str, &str) {
+    loop {
+        let (mn, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+        if !matches!(
+            mn,
+            "bnd"
+                | "notrack"
+                | "lock"
+                | "rep"
+                | "repe"
+                | "repz"
+                | "repne"
+                | "repnz"
+                | "data16"
+                | "addr16"
+                | "addr32"
+                | "rex"
+                | "rex.W"
+                | "rex.w"
+                | "rex64"
+                | "xacquire"
+                | "xrelease"
+                | "cs"
+                | "ds"
+                | "es"
+                | "fs"
+                | "gs"
+                | "ss"
+        ) || rest.trim().is_empty()
+        {
+            return (mn, rest.trim());
+        }
+        text = rest.trim_start();
+    }
+}
+
+fn is_call(mn: &str) -> bool {
+    matches!(
+        mn,
+        "call" | "callq" | "callw" | "calll" | "lcall" | "lcallq" | "lcallw" | "lcalll"
+    )
+}
+
+fn is_conditional_branch(mn: &str) -> bool {
+    (mn.len() > 1 && mn.starts_with('j'))
+        || matches!(mn, "loop" | "loope" | "loopz" | "loopne" | "loopnz")
+}
+
 /// Successor line indices of `i` inside one function body.  Direct `jmp`/
 /// `jcc` targets resolve through `labels`; an unresolved or indirect branch
 /// conservatively reaches every line (fail closed).
@@ -361,10 +414,7 @@ fn successor_lines(
         fall(&mut v);
         return v;
     }
-    let (mn, rest) = match t.find(|c: char| c.is_ascii_whitespace()) {
-        Some(p) => (&t[..p], t[p..].trim()),
-        None => (t, ""),
-    };
+    let (mn, rest) = unprefixed_insn(t);
     match mn {
         "ret" | "retq" | "iret" | "iretq" | "ud2" => Vec::new(),
         "jmp" | "jmpq" => {
@@ -376,7 +426,7 @@ fn successor_lines(
                 (0..n).collect()
             }
         }
-        _ if mn.len() > 1 && mn.starts_with('j') => {
+        _ if is_conditional_branch(mn) => {
             let mut v = Vec::new();
             fall(&mut v);
             if rest.starts_with('*') {
@@ -418,10 +468,19 @@ fn allowed_masks(body: &[&str]) -> Vec<u32> {
         if !is_insn_line(text) {
             continue;
         }
-        let (mut reads, mut writes) = super::fp_liveness::upper_vector_access_line(text);
-        let (mn, operand) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
-        if matches!(mn, "call" | "callq")
-            || mn.starts_with('j')
+        let (mn, operand) = unprefixed_insn(text);
+        // Prefixes are encoding modifiers, not the decoded operation. Feed
+        // the same canonical instruction to the effect model and the CFG;
+        // otherwise `rex.W xsave` loses its implicit YMM reads while a
+        // prefixed transfer gets a different successor graph.
+        let decoded = if operand.is_empty() {
+            mn.to_string()
+        } else {
+            format!("{mn} {operand}")
+        };
+        let (mut reads, mut writes) = super::fp_liveness::upper_vector_access_line(&decoded);
+        if is_call(mn)
+            || is_conditional_branch(mn)
                 && (operand.trim().starts_with('*') || !labels.contains_key(operand.trim()))
         {
             // A target outside this model may observe ANY upper register.
@@ -573,6 +632,79 @@ mod tests {
                 "full overwrite remains a positive control: {out}"
             );
         }
+    }
+
+    #[test]
+    fn prefixed_external_transfers_observe_upper_arguments() {
+        for transfer in [
+            "notrack call *%rax",
+            "bnd call witness",
+            "lcall witness",
+            "notrack jmp *%rax",
+            "data16 call witness",
+            "bnd notrack call *%rax",
+        ] {
+            let src = format!(
+                "f:\n    vmovupd (%rdi), %ymm0\n    addsd %xmm2, %xmm0\n    {transfer}\n    ret\n"
+            );
+            let (out, _) = run(&src);
+            assert!(
+                out.contains("    addsd %xmm2, %xmm0\n"),
+                "{transfer}: {out}"
+            );
+            let killed = src.replace(
+                transfer,
+                &format!("vxorps %ymm0, %ymm0, %ymm0\n    {transfer}"),
+            );
+            let (out, count) = run(&killed);
+            assert!(count > 0 && out.contains("vaddsd"), "{transfer}: {out}");
+        }
+    }
+
+    #[test]
+    fn prefixed_local_jump_uses_the_real_cfg_not_fallthrough() {
+        // A jump over a full overwrite still reaches the YMM reader. The
+        // unprefixed reader is local: an external-target mask alone cannot
+        // compensate for incorrectly modelling the jump as fall-through.
+        let src = "f:\n    vmovupd (%rdi), %ymm0\n    addsd %xmm2, %xmm0\n    bnd jmp .Lread\n    vxorps %ymm0, %ymm0, %ymm0\n.Lread:\n    vmovupd %ymm0, (%rsi)\n    ret\n";
+        let (out, _) = run(src);
+        assert!(out.contains("    addsd %xmm2, %xmm0\n"), "{out}");
+    }
+
+    #[test]
+    fn loop_family_taken_edges_reach_upper_register_readers() {
+        for branch in ["loop", "loope", "loopz", "loopne", "loopnz"] {
+            let src = format!(
+                "f:\n    vmovupd (%rdi), %ymm0\n    addsd %xmm2, %xmm0\n    {branch} .Lread\n    vxorps %ymm0, %ymm0, %ymm0\n    jmp .Ldone\n.Lread:\n    vmovupd %ymm0, (%rsi)\n.Ldone:\n    ret\n"
+            );
+            let (out, _) = run(&src);
+            assert!(
+                out.contains("    addsd %xmm2, %xmm0\n"),
+                "{branch} taken edge lost: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_decoding_is_shared_with_upper_effect_modelling() {
+        for prefix in ["data16", "rep", "rex.W", "rex.w"] {
+            let src = format!(
+                "f:\n    vmovupd (%rsi), %ymm0\n    addsd %xmm2, %xmm0\n    {prefix} xsave (%rdi)\n    ret\n"
+            );
+            let (out, _) = run(&src);
+            assert!(
+                out.contains("    addsd %xmm2, %xmm0\n"),
+                "{prefix} hid xsave's implicit upper-register read: {out}"
+            );
+
+            let killed = src.replace(
+                &format!("    {prefix} xsave"),
+                &format!("    vxorps %ymm0, %ymm0, %ymm0\n    {prefix} xsave"),
+            );
+            let (out, count) = run(&killed);
+            assert!(count > 0 && out.contains("vaddsd"), "{prefix}: {out}");
+        }
+        assert_eq!(unprefixed_insn("rex.W jmp .Lx"), ("jmp", ".Lx"));
     }
 
     #[test]

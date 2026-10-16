@@ -227,6 +227,11 @@ gate "linker-oracle-versions" fast \
 gate "i686-run-policy" fast \
     bash tests/regression/check_i386_run_policy.sh
 
+# A14-13: the type-name vector attribute must use target scalar widths and
+# typedef chains, with invalid element types/counts diagnosed.
+gate "ext-vector-element-size" fast \
+    env CCC="$LCCC" bash tests/regression/check_ext_vector_size.sh
+
 gate "a9987-salvage" fast \
     env CCC="$LCCC" bash tests/regression/check_a9987_salvage.sh
 

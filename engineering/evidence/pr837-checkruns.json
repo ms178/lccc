@@ -1,0 +1,86 @@
+{
+  "source": "https://api.github.com/repos/ms178/lccc/commits/036f60ee3fa87f46bd50b0b50862b3147e8d46a6/check-runs?per_page=100",
+  "head": "036f60ee3fa87f46bd50b0b50862b3147e8d46a6",
+  "raw_workspace_sha256": "d160d99d4429388b6374e90eb60be5423113995dda86a87c986ba93fcd576d92",
+  "total_count": 13,
+  "checks": [
+    {
+      "name": "Test Suite",
+      "status": "completed",
+      "conclusion": "success",
+      "completed_at": "2026-10-15T18:28:11Z"
+    },
+    {
+      "name": "Complete benchmark corpus / LCCC vs GCC",
+      "status": "completed",
+      "conclusion": "success",
+      "completed_at": "2026-10-15T18:26:24Z"
+    },
+    {
+      "name": "Frontend and ABI contracts",
+      "status": "completed",
+      "conclusion": "success",
+      "completed_at": "2026-10-15T18:18:58Z"
+    },
+    {
+      "name": "SSA regression corpus",
+      "status": "completed",
+      "conclusion": "success",
+      "completed_at": "2026-10-15T18:17:49Z"
+    },
+    {
+      "name": "Codegen and runtime contracts",
+      "status": "completed",
+      "conclusion": "success",
+      "completed_at": "2026-10-15T18:27:44Z"
+    },
+    {
+      "name": "Assembler and linker contracts",
+      "status": "completed",
+      "conclusion": "success",
+      "completed_at": "2026-10-15T18:28:05Z"
+    },
+    {
+      "name": "MSRV check (declared rust-version floor)",
+      "status": "completed",
+      "conclusion": "success",
+      "completed_at": "2026-10-15T18:09:51Z"
+    },
+    {
+      "name": "Assertion-enabled units and corpus",
+      "status": "completed",
+      "conclusion": "success",
+      "completed_at": "2026-10-15T18:15:50Z"
+    },
+    {
+      "name": "Build once and unit tests",
+      "status": "completed",
+      "conclusion": "success",
+      "completed_at": "2026-10-15T18:14:00Z"
+    },
+    {
+      "name": "Clippy",
+      "status": "completed",
+      "conclusion": "success",
+      "completed_at": "2026-10-15T18:09:32Z"
+    },
+    {
+      "name": "Rust 1.99 relocation value contracts",
+      "status": "completed",
+      "conclusion": "success",
+      "completed_at": "2026-10-15T18:08:53Z"
+    },
+    {
+      "name": "Debian GCC 16.2 and Rust 1.99 contracts",
+      "status": "completed",
+      "conclusion": "success",
+      "completed_at": "2026-10-15T18:15:38Z"
+    },
+    {
+      "name": "Debian GCC 16.2 / Rust 1.99 corpus",
+      "status": "completed",
+      "conclusion": "success",
+      "completed_at": "2026-10-15T18:13:02Z"
+    }
+  ]
+}

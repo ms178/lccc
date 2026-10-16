@@ -11,8 +11,17 @@ Also reports a paired win-rate (how often the optimised arm was faster in the
 same adjacent pair), which is far more robust than comparing two minima when
 the effect is smaller than the run-to-run spread.
 """
-import argparse, re, statistics, subprocess, sys, tempfile, os
+import argparse, json, math, re, statistics, subprocess, sys, tempfile, os
 from pathlib import Path
+
+
+class BuildFailure(RuntimeError):
+    """A compiler invocation failed; ``record`` is the complete receipt."""
+
+    def __init__(self, message, record):
+        super().__init__(message)
+        self.record = record
+
 
 def build(cc, kern, out, flags, repo, env=None, program=None, defines=()):
     """Compile one arm.
@@ -33,9 +42,32 @@ def build(cc, kern, out, flags, repo, env=None, program=None, defines=()):
     run_env = dict(os.environ)
     run_env.update(env or {})
     cmd = [cc, *flags, *[f"-D{d}" for d in defines], "-w", *src, "-o", out]
-    r = subprocess.run(cmd, capture_output=True, text=True, env=run_env)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, env=run_env)
+    except (OSError, subprocess.SubprocessError) as exc:
+        record = {
+            "compiler": cc,
+            "command": cmd,
+            "env_overrides": dict(env or {}),
+            "returncode": None,
+            "stdout": "",
+            "stderr": "",
+            "error": str(exc),
+        }
+        raise BuildFailure(f"build invocation failed for {cc} {program or kern}: {exc}", record) from exc
+    record = {
+        "compiler": cc,
+        "command": cmd,
+        "env_overrides": dict(env or {}),
+        "returncode": r.returncode,
+        "stdout": r.stdout,
+        "stderr": r.stderr,
+    }
     if r.returncode != 0:
-        sys.exit(f"build failed for {cc} {program or kern}: {r.stderr[:400]}")
+        raise BuildFailure(
+            f"build failed for {cc} {program or kern}: {r.stderr[:400]}", record
+        )
+    return record
 
 def sample_program(binary, cpu, reps=1):
     """Time a standalone program.
@@ -53,7 +85,7 @@ def sample_program(binary, cpu, reps=1):
         r = subprocess.run(["taskset", "-c", cpu, binary], capture_output=True, text=True)
         dt = time.monotonic() - t0
         if r.returncode != 0:
-            sys.exit(f"{binary} exited {r.returncode}: {r.stderr[:200]}")
+            raise ValueError(f"{binary} exited {r.returncode}: {r.stderr[:200]}")
         out = r.stdout.strip()
         best = dt if best is None else min(best, dt)
     return best, out
@@ -61,10 +93,37 @@ def sample_program(binary, cpu, reps=1):
 
 def sample(binary, cpu):
     r = subprocess.run(["taskset", "-c", cpu, binary], capture_output=True, text=True)
-    m = re.search(r"([0-9.]+)\s+(\d+)", r.stdout)
+    if r.returncode != 0:
+        raise ValueError(f"{binary} exited {r.returncode}: {r.stderr[:200]}")
+    m = re.fullmatch(r"\s*([0-9.]+)\s+(\d+)\s*", r.stdout)
     if not m:
-        sys.exit(f"cannot parse driver output: {r.stdout!r}")
+        raise ValueError(f"cannot parse driver output: {r.stdout!r}")
     return float(m.group(1)), int(m.group(2))
+
+def checked_sample(take, binary, expected, records, round_index, arm, order, phase):
+    """Every invocation gets a receipt, including exceptions and bad output."""
+    try:
+        elapsed, checksum = take(binary)
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        records.append(
+            dict(
+                round=round_index,
+                arm=arm,
+                order=order,
+                phase=phase,
+                rc=None,
+                error=str(exc),
+            )
+        )
+        raise
+    record = dict(round=round_index, arm=arm, order=order, phase=phase,
+                  rc=0, checksum=str(checksum), seconds=elapsed)
+    records.append(record)
+    if not math.isfinite(elapsed) or elapsed <= 0:
+        raise ValueError(f"invalid sample time: {record}")
+    if expected is not None and checksum != expected:
+        raise ValueError(f"CORRECTNESS: inconsistent checksum: {record}; expected {expected}")
+    return elapsed, checksum
 
 def main():
     ap = argparse.ArgumentParser()
@@ -72,6 +131,7 @@ def main():
     ap.add_argument("--kernel", help="kernel name (tests/bench/k_<name>.c); "
                                      "required unless --program is given")
     ap.add_argument("--samples", type=int, default=41)
+    ap.add_argument("--json", help="save complete raw warmup and timed sample records")
     ap.add_argument("--flags", default="-O3 -march=x86-64-v3")
     ap.add_argument("--cpu", default="0")
     # Default to the repository this script lives in. The old absolute
@@ -96,30 +156,56 @@ def main():
     defines = [d for d in a.defines.split(",") if d]
     a_env = dict(kv.split("=", 1) for kv in a.a_env.split(",") if kv)
     b_env = dict(kv.split("=", 1) for kv in a.b_env.split(",") if kv)
+    if a.samples <= 0:
+        ap.error("--samples must be positive")
     ta, tb = [], []
-    ta_c = tb_c = None
-    wins = 0
+    ta_c = None
+    records = []
+    build_records = []
     take = (lambda b: sample_program(b, a.cpu)) if a.program else (lambda b: sample(b, a.cpu))
-    with tempfile.TemporaryDirectory() as d:
-        ba, bb = os.path.join(d, "a"), os.path.join(d, "b")
-        build(a.a, a.kernel, ba, flags, a.repo, env=a_env,
-              program=a.program, defines=defines)
-        build(a.b, a.kernel, bb, flags, a.repo, env=b_env,
-              program=a.program, defines=defines)
-        # warm the page cache / branch predictors equally
-        for _ in range(3):
-            take(ba); take(bb)
-        for i in range(a.samples):
-            if i % 2 == 0:
-                ta.append(take(ba)[0]); tb.append(take(bb)[0])
-            else:
-                tb.append(take(bb)[0]); ta.append(take(ba)[0])
-        # checksums must agree
-        _, ta_c = take(ba); _, tb_c = take(bb)
-
-    if ta_c != tb_c:
-        print(f"CHECKSUM MISMATCH: base={ta_c} opt={tb_c}", file=sys.stderr)
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            ba, bb = os.path.join(d, "a"), os.path.join(d, "b")
+            for arm, compiler, binary, arm_env in (
+                ("a", a.a, ba, a_env),
+                ("b", a.b, bb, b_env),
+            ):
+                try:
+                    record = build(
+                        compiler,
+                        a.kernel,
+                        binary,
+                        flags,
+                        a.repo,
+                        env=arm_env,
+                        program=a.program,
+                        defines=defines,
+                    )
+                except BuildFailure as exc:
+                    record = exc.record
+                    record["arm"] = arm
+                    build_records.append(record)
+                    raise
+                record["arm"] = arm
+                build_records.append(record)
+            for phase, count in (('warmup',3),('timed',a.samples)):
+                for i in range(count):
+                    order = (('a',ba,ta),('b',bb,tb)) if i%2 == 0 else (('b',bb,tb),('a',ba,ta))
+                    for position,(arm,binary,times) in enumerate(order):
+                        elapsed,checksum = checked_sample(take,binary,ta_c,records,i,arm,position,phase)
+                        if ta_c is None: ta_c = checksum
+                        if phase == 'timed': times.append(elapsed)
+    except (BuildFailure, ValueError, OSError, subprocess.SubprocessError) as exc:
+        if a.json:
+            Path(a.json).write_text(json.dumps({'verdict':'correctness-or-infrastructure-failure',
+                                               'detail':str(exc),'builds':build_records,
+                                               'samples':records},indent=2)+'\n')
+        print(f'CORRECTNESS/INFRASTRUCTURE FAILURE: {exc}',file=sys.stderr)
         return 2
+    if a.json:
+        Path(a.json).write_text(json.dumps({'verdict':'sample-complete',
+                                           'checksum':str(ta_c),'builds':build_records,
+                                           'samples':records},indent=2)+'\n')
 
     pairs = [(x, y) for x, y in zip(ta, tb)]
     wins = sum(1 for x, y in pairs if y < x)

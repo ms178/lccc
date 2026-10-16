@@ -152,6 +152,28 @@ class MainContract(unittest.TestCase):
 
 class MeasurementReceiptContract(unittest.TestCase):
     """Exercise _measure via main; mock subprocesses, not orchestration."""
+    def test_native_spawn_error_survives_secondary_receipt_read_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td)
+            original=cg.process_receipt
+            def receipt(prefix):
+                if prefix.endswith('.native'):
+                    raise ValueError('injected receipt read error')
+                return original(prefix)
+            def run(command, timeout):
+                if '-o' in command:
+                    binary=Path(command[command.index('-o')+1])
+                    binary.write_bytes(b'fake executable');binary.chmod(0o755)
+                    return result()
+                raise OSError('injected native spawn error')
+            with mock.patch.object(cg,'_run',side_effect=run),\
+                 mock.patch.object(cg,'gcc_include',return_value='-Ifake'),\
+                 mock.patch.object(cg,'tool_identity',return_value={'mock':True}),\
+                 mock.patch.object(cg,'process_receipt',side_effect=receipt):
+                self.assertEqual(cg.main(['mock-mine','mock-ref','-O2','fib','--out-root',str(root)]),2)
+            entry=schema.loads((root/'manifest.json').read_text())['results']['fib']
+            self.assertIn('injected native spawn error',entry['detail'])
+            self.assertIn('injected receipt read error',entry['receipt_errors']['mine'])
     def test_compile_and_native_receipts_survive_success_and_error_arms(self):
         for failure in (None, 'compile-mine', 'compile-ref', 'native-mine', 'native-ref', 'infrastructure-ref', 'compile-infrastructure', 'flags'):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as td:

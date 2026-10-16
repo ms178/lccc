@@ -80,6 +80,48 @@ historical ratios.
 An item with no reproducer does not belong here.
 
 
+## PR837 post-merge P0 triage — 2026-10-15
+
+Review AI's snapshot of 9/12 pending CI jobs is superseded: API evidence for
+merged PR #837 head `036f60e` records **13/13 completed/success**, including
+the assembler/linker, codegen/runtime and complete benchmark corpus jobs.
+This does not establish bug-free code or a performance victory. Independent
+review, scope and the new regressions are in
+[`engineering/pr837/AUDIT-RESPONSE.md`](engineering/pr837/AUDIT-RESPONSE.md).
+
+Current follow-up changes (validation status must be read from the external
+acceptance receipt, not inferred from this queue): prefixed call/branch upper
+vector observation AND prefixed local-jump CFG edges; TempFile documentation,
+native structural sibling/one prerequisite diagnostic, receipt-error
+preservation and evidence storage policy. **P0 A14-02** now checks every
+sample, including warmups, in `bench_kernels.py`, `ab_interleaved.py` and
+`paired_ab.py`, rejecting failed/partial/divergent outputs before ratios.
+**P0 A14-03** no longer treats a normalized timed-function hash as a waiver:
+callee/data/layout changes remain investigable even with the same hash.
+**P0 A14-15** rejects unsupported RISC-V data expressions rather than producing
+zero or dropping an extra symbol; `.byte` expressions were separately found to
+emit zero and now use checked/deferred evaluation. Added four-width negative
+and positive assembler tests; macro/numeric-label and cross-section matrix
+needs further target-specific study.
+
+**Already present on merged main, not new claims of this patch:** A14-17's
+unknown-relocation application arm returns `Err` even in shared mode; the
+RISC-V relocation contract ran **466 PASS, 0 FAIL** locally against the merged
+compiler. A14-20's PGO helper comments/code already retain the file lock
+through checked `fclose` rather than unlocking before buffered flush; repeat
+its fault-injected two-writer evidence before closing the full P0 item. Their
+old queue text below describes the earlier *reproducer*, not the current
+upstream implementation.
+
+**Still open, no fabricated completion:** A14-01 scanner; A14-13 remaining
+boolean and non-power-of-two vector layouts (the scalar/typedef type-name
+width subcase is repaired below); A14-16 unsupported driver flags; A14-35 AArch64 shared
+visibility; complete fresh all45/worst15 paired correctness+Callgrind and
+compiler costs; Raptor Lake/14700KF native/PMU runs; full/slow hosted follow-up
+CI and a real 20-postmerge-PR operational cohort. The latest patch does not
+imply a 10/10 guarantee or superiority over GCC/Clang/ICX. Complete these
+separately with execution contracts; do not delete their old failure cases.
+
 ## PR834 follow-up queue — 2026-10-15 (delivery scope)
 
 **Immediate delivery:** fix the reproduced TempFile lifetime failure, retain all
@@ -557,21 +599,38 @@ full regression and fast CI; identical outputs for deterministic test inputs,
 with compile-time/RSS reported. No promised performance gain from refactoring.
 **Relation:** AUD-MONO-1; fix evidence integrity before using its ratchet as proof.
 
-### A14-13 · P0 · R — i686 ext_vector_type type-name path doubles long-vector size
+### A14-13 · P0 · PARTIAL — ext_vector_type layout/element-count semantics
 
-**Where:** `src/frontend/parser/expressions.rs::{apply_pending_vector_attr,estimate_type_size}`
-hardcodes `Long`/`UnsignedLong` to 8 bytes and `LongDouble` to 16.
-**Reproducer:** `scripts/audit_contract_probes.py --compiler-probes --check`,
-records `A14-13-vector-size`. `typedef long v4l __attribute__((ext_vector_type(4)))`
-has correct size 16, but `sizeof((long __attribute__((ext_vector_type(4)))){0})`
-is 32 on `lccc -m32`, versus 16 on Clang. Executables fail the size check at
-both -O0 and -O2; this is not only a pretty-printing discrepancy.
-**Implement:** resolve element type and target data layout consistently in
-attribute/type-name and declaration paths. Replace the rough-size fallback with
-semantic type resolution, checked multiplication and supported-element diagnostics.
-**Accept:** m32/m64, signed/unsigned long, typedef aliases, casts, compound
-literals and sizeof all agree with Clang; illegal element types fail cleanly.
-Do not globally shrink vector_size bytes, which already has a different contract.
+**Type-name width subcase repaired on the post-PR836 rebase:**
+`apply_pending_vector_attr` now uses target scalar widths, follows typedef
+chains and checks multiplication instead of assuming LP64 or guessing unknown
+objects are four bytes. The parser diagnoses invalid/nonconstant/negative/zero
+counts; unresolvable pointer/void element types fail closed. A distinct i686
+long-double *vector storage* width of 16 per lane is retained (scalar sizeof is
+12). The separate declaration sizing path is unchanged. An O0/O2 × m32/m64
+runtime regression, both declaration and type-name positive controls and five
+negative attribute cases are in `tests/regression/check_ext_vector_size.sh` and
+the FAST gate. Clang 23.1.4 accepted all four positive programs; the rebased
+baseline LCCC returned 2 on m32 and 3 on m64, then returned 0 after repair.
+Red-teaming the first fix exposed a valid `ext_vector_type(sizeof(alias_long))`
+count rejected by the newly strict parser; both m32/m64 Clang accepted it.
+The attribute now reuses the existing typedef-aware constant-expression
+fallback; declaration and type-name count variants are permanent positive
+controls. This is targeted evidence only until the rebased whole FAST/fmt/Clippy
+gates pass.
+Original reproducer: `scripts/audit_contract_probes.py --compiler-probes --check`.
+
+**Remaining P0 (new red-team findings, NOT closed by the subcase):** `_Bool`
+`ext_vector_type(4)` currently has LCCC size 4 but Clang 23.1.4 size 1 on
+both m32/m64; a three-lane `unsigned long` vector has a padded Clang size of
+16 on m32 versus LCCC's 12. Declaration and type-name paths both need to
+represent logical lane count independently of storage bytes before simply
+rounding vector bytes; doing that only in the parser would turn three logical
+lanes into four and silently change operations. Add negative/positive runtime
+and ABI tests for those cases, not a guessed size substitution. Also audit
+parser-time `_Static_assert` versus lowered runtime sizeof (the original
+static assertions accepted a source whose executable returned wrong widths).
+Do not globally shrink `vector_size` bytes; it has a different contract.
 
 ### A14-14 · CLOSED — AArch64 ADR silently truncates out-of-range immediate offsets
 

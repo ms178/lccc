@@ -1932,8 +1932,19 @@ impl Parser {
         } else {
             Some(&self.struct_tag_alignments)
         };
-        if let Some(nelem) = Self::eval_const_int_expr_with_enums(&expr, enums, tag_aligns) {
-            self.attrs.parsing_ext_vector_nelem = Some(nelem as usize);
+        match Self::eval_const_int_expr_with_enums(&expr, enums, tag_aligns)
+            // The static evaluator cannot see parser-side typedef sizes.
+            // Match vector_size(expr)'s typedef-aware constant-expression
+            // fallback rather than rejecting a valid sizeof(alias_t) count.
+            .or_else(|| self.eval_vector_size_with_typedefs(&expr))
+            .and_then(|nelem| usize::try_from(nelem).ok())
+            .filter(|&nelem| nelem != 0)
+        {
+            Some(nelem) => self.attrs.parsing_ext_vector_nelem = Some(nelem),
+            None => self.emit_error(
+                "ext_vector_type requires a positive integer constant expression",
+                expr.span(),
+            ),
         }
         if matches!(self.peek(), TokenKind::RParen) {
             self.advance();

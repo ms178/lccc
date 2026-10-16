@@ -861,7 +861,43 @@ impl ElfWriter {
                                 self.base.emit_placeholder(1)?;
                             }
                         }
-                        _ => self.base.emit_bytes(&[0u8])?,
+                        DataValue::Expression(expr) => {
+                            let resolved = self.base.resolve_expr_aliases(expr);
+                            let resolved = self.base.resolve_expr_labels(&resolved);
+                            match crate::backend::asm_expr::parse_integer_expr(&resolved) {
+                                Ok(v) => {
+                                    self.base.nobits_guard(v != 0)?;
+                                    self.base.emit_bytes(&[v as u8])?;
+                                }
+                                Err(_) => {
+                                    let section = self.base.current_section.clone();
+                                    let offset = self.base.current_offset();
+                                    self.deferred_exprs.push(DeferredExpr {
+                                        section,
+                                        offset,
+                                        size: 1,
+                                        expr: expr.clone(),
+                                    });
+                                    self.base.emit_placeholder(1)?;
+                                }
+                            }
+                        }
+                        DataValue::SymbolDiff {
+                            sym_a,
+                            sym_b,
+                            addend,
+                        } => {
+                            let (base_a, extra_a) = decompose_symbol_addend(sym_a);
+                            let (base_b, extra_b) = decompose_symbol_addend(sym_b);
+                            self.base.add_reloc(
+                                RelocType::Add8.elf_type(),
+                                base_a,
+                                *addend + extra_a,
+                            );
+                            self.base
+                                .add_reloc(RelocType::Sub8.elf_type(), base_b, extra_b);
+                            self.base.emit_placeholder(1)?;
+                        }
                     }
                 }
                 Ok(())
@@ -1171,13 +1207,16 @@ impl ElfWriter {
                     // .2byte expressions in .alternative reference labels placed
                     // in .text (or a subsection merged into .text).
                     let cross_resolved = self.base.resolve_expr_cross_section(&def.expr);
-                    // TODO: emit a warning on Err instead of silently producing 0.
-                    // This fallback handles cases where macro argument splitting
-                    // produces single-symbol expressions (e.g., ".Lnum_889_0"
-                    // from "889f - 888f" being split by whitespace in macro args).
-                    // Proper fix: make split_macro_args respect parameter count.
-                    crate::backend::asm_expr::parse_integer_expr(&cross_resolved)
-                        .unwrap_or_default()
+                    // An unresolved expression is not a numeric zero. The
+                    // placeholder may only be patched with a proven constant;
+                    // otherwise the assembler must reject rather than emit an
+                    // apparently successful but incorrect object.
+                    crate::backend::asm_expr::parse_integer_expr(&cross_resolved).map_err(|e| {
+                        format!(
+                            "unresolved RISC-V data expression '{}' in section '{}' at offset {} ({}): {}",
+                            def.expr, def.section, def.offset, cross_resolved, e
+                        )
+                    })?
                 }
             };
             if let Some(section) = self.base.sections.get_mut(&def.section) {
@@ -2051,6 +2090,18 @@ mod branch_range_tests {
             );
             assert_eq!(relocs[0].addend, 0, "wrong addend for `{asm}`");
         }
+    }
+
+    #[test]
+    fn symbol_difference_trailing_minus_is_an_add_relocation_addend() {
+        let w = assemble(".data\nA:\n.byte 0,0,0,0\nB:\n.byte 0,0,0,0\n.long A-B-4\n")
+            .expect("symbol difference must assemble");
+        let relocs = &w.base.sections[".data"].relocs;
+        assert_eq!(relocs.len(), 2, "ADD32 and SUB32 are both required");
+        assert_eq!(relocs[0].symbol_name, "A");
+        assert_eq!(relocs[0].addend, -4, "the trailing -4 applies to A-B");
+        assert_eq!(relocs[1].symbol_name, "B");
+        assert_eq!(relocs[1].addend, 0, "B must not absorb and invert -4");
     }
 
     /// A surplus operand used to be discarded silently, so a malformed branch

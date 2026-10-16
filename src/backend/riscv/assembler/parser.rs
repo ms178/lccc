@@ -49,7 +49,7 @@ pub enum Operand {
 /// A data value in a .byte/.short/.long/.quad directive.
 /// Can be a literal integer, a symbol reference (with optional addend),
 /// or a symbol difference expression (A - B, with optional addend on A).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataValue {
     /// A literal integer value.
     Integer(i64),
@@ -852,16 +852,13 @@ fn parse_single_data_value(s: &str) -> Result<DataValue, String> {
             let sym_a_raw = strip_outer_parens(s[..minus_pos].trim());
             let rest = s[minus_pos + 1..].trim();
 
-            // rest might be "B" or "B + offset"
-            let (sym_b_raw, addend) = if let Some(plus_pos) = rest.find('+') {
-                let b = rest[..plus_pos].trim();
-                let add_str = rest[plus_pos + 1..].trim();
-                let add_val: i64 = add_str.parse().unwrap_or(0);
-                (b, add_val)
-            } else {
-                (rest, 0i64)
-            };
-            let sym_b = strip_outer_parens(sym_b_raw);
+            // `A - B +/- K` is left-associative: K is an addend on the
+            // complete difference, never an embedded addend on B. Keeping
+            // `B-4` in sym_b would make the writer subtract `(B - 4)` and
+            // silently reverse the sign to `A - B + 4`.
+            let (sym_b_raw, addend) = parse_symbol_addend(rest)
+                .map_err(|_| format!("invalid symbol-difference addend in data expression: {s}"))?;
+            let sym_b = strip_outer_parens(&sym_b_raw);
 
             // Verify sym_b looks like a symbol (or a numeric label ref)
             if !sym_b.is_empty() {
@@ -879,7 +876,7 @@ fn parse_single_data_value(s: &str) -> Result<DataValue, String> {
 
         if is_sym_start {
             // Not a symbol diff — parse as symbol reference with optional addend
-            let (sym, addend) = parse_symbol_addend(s);
+            let (sym, addend) = parse_symbol_addend(s)?;
             return Ok(DataValue::Symbol { name: sym, addend });
         } else if could_be_numeric_ref && is_numeric_label_ref(s) {
             // Standalone numeric label reference like "2f" or "1b"
@@ -907,7 +904,7 @@ fn parse_single_data_value(s: &str) -> Result<DataValue, String> {
                     // Check if right side looks like a symbol
                     let r_first = right.chars().next().unwrap_or('\0');
                     if r_first.is_ascii_alphabetic() || r_first == '_' || r_first == '.' {
-                        let (sym, extra_addend) = parse_symbol_addend(right);
+                        let (sym, extra_addend) = parse_symbol_addend(right)?;
                         return Ok(DataValue::Symbol {
                             name: sym,
                             addend: offset + extra_addend,
@@ -940,23 +937,19 @@ fn find_symbol_diff_minus(expr: &str) -> Option<usize> {
     asm_preprocess::find_symbol_diff_minus(expr)
 }
 
-fn parse_symbol_addend(s: &str) -> (String, i64) {
-    if let Some(plus_pos) = s.find('+') {
-        let sym = s[..plus_pos].trim().to_string();
-        let off: i64 = s[plus_pos + 1..].trim().parse().unwrap_or(0);
-        (sym, off)
-    } else if let Some(minus_pos) = s.find('-') {
-        if minus_pos > 0 {
-            let sym = s[..minus_pos].trim().to_string();
-            let off_str = &s[minus_pos..];
-            let off: i64 = off_str.parse().unwrap_or(0);
-            (sym, off)
-        } else {
-            (s.to_string(), 0)
+fn parse_symbol_addend(s: &str) -> Result<(String, i64), String> {
+    if let Some(pos) = s.find(['+', '-']) {
+        if pos > 0 {
+            let sym = s[..pos].trim();
+            let offset = parse_data_value_int(&s[pos..])
+                .map_err(|_| format!("unsupported symbolic data expression: {s}"))?;
+            if sym.is_empty() {
+                return Err(format!("missing symbol in data expression: {s}"));
+            }
+            return Ok((sym.to_string(), offset));
         }
-    } else {
-        (s.to_string(), 0)
     }
+    Ok((s.to_string(), 0))
 }
 
 fn parse_instruction(line: &str) -> Result<AsmStatement, String> {
@@ -1295,6 +1288,22 @@ mod tests {
             .into_iter()
             .filter(|s| matches!(s, AsmStatement::Directive(_)))
             .count()
+    }
+
+    #[test]
+    fn symbol_difference_trailing_addend_keeps_its_sign() {
+        for (expr, want) in [("A-B-4", -4), ("A - B + 4", 4), ("A-B", 0)] {
+            let value = parse_single_data_value(expr).expect("symbol difference must parse");
+            assert_eq!(
+                value,
+                DataValue::SymbolDiff {
+                    sym_a: "A".into(),
+                    sym_b: "B".into(),
+                    addend: want,
+                },
+                "{expr}"
+            );
+        }
     }
 
     /// The RISC-V front end reaches the shared expansion ceilings.
