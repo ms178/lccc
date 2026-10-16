@@ -730,28 +730,39 @@ pub(crate) fn gcc_versions_at(base: &str) -> Vec<String> {
 fn find_gcc_lib_dir(arch: &DirectLdArchConfig) -> Option<String> {
     // Plain bases: `<base>/<ver>` itself is eligible, plus any multilib
     // sub-directory variants (only relevant when the base is multilib-aware).
-    for base in arch.gcc_lib_base_paths {
-        for ver in gcc_versions_at(base) {
-            let dir = format!("{}/{}", base, ver);
-            let mut candidates = vec![dir.clone()];
-            for sub in arch.gcc_multilib_subdirs {
-                candidates.push(format!("{}/{}", dir, sub));
-            }
-            for cand in candidates {
-                if let Some(resolved) = resolve_sysroot_file_dir(&cand, "crtbegin.o") {
-                    return Some(resolved);
-                }
-            }
-        }
+    if let Some(resolved) =
+        probe_gcc_bases(arch.gcc_lib_base_paths, arch.gcc_multilib_subdirs, true)
+    {
+        return Some(resolved);
     }
     // Multilib-only bases: the plain `<base>/<ver>` directory belongs to a
     // different ELF class (e.g. the amd64 GCC dir when targeting i686), so
     // only its `<ver>/<subdir>` variants may satisfy the probe.
-    for base in arch.gcc_multilib_base_paths {
+    probe_gcc_bases(
+        arch.gcc_multilib_base_paths,
+        arch.gcc_multilib_subdirs,
+        false,
+    )
+}
+
+/// Probe `<base>/<ver>[/<subdir>]` directories for crtbegin.o, newest GCC
+/// version first. `native` admits the plain `<base>/<ver>` directory itself;
+/// multilib-only bases must never admit their native crtbegin.o (it has the
+/// wrong ELF class).
+#[cfg(not(feature = "gcc_linker"))]
+fn probe_gcc_bases(bases: &[&str], subdirs: &[&str], native: bool) -> Option<String> {
+    for base in bases {
         for ver in gcc_versions_at(base) {
-            for sub in arch.gcc_multilib_subdirs {
-                let dir = format!("{}/{}/{}", base, ver, sub);
+            let dir = format!("{base}/{ver}");
+            if native {
                 if let Some(resolved) = resolve_sysroot_file_dir(&dir, "crtbegin.o") {
+                    return Some(resolved);
+                }
+            }
+            for sub in subdirs {
+                if let Some(resolved) =
+                    resolve_sysroot_file_dir(&format!("{dir}/{sub}"), "crtbegin.o")
+                {
                     return Some(resolved);
                 }
             }

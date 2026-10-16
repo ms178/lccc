@@ -1680,17 +1680,14 @@ mod tests {
 
     #[test]
     fn observable_fenv_blocks_fp_pre_even_with_broad_research_switch() {
-        struct Restore(bool, EnvConfig);
+        struct Restore(EnvConfig);
         impl Drop for Restore {
             fn drop(&mut self) {
-                super::super::FP_ENVIRONMENT_OBSERVABLE.with(|cell| cell.set(self.0));
-                set_backedge_pre_env(self.1);
+                set_backedge_pre_env(self.0);
             }
         }
-        let _restore = Restore(
-            super::super::FP_ENVIRONMENT_OBSERVABLE.with(std::cell::Cell::get),
-            EnvConfig::read(),
-        );
+        let _semantics = crate::common::semantics::TestGuard::new(Default::default());
+        let _restore = Restore(EnvConfig::read());
         crate::common::types::set_target_elf_machine(EM_X86_64);
         for broad in [false, true] {
             set_backedge_pre_env(EnvConfig {
@@ -1698,7 +1695,10 @@ mod tests {
                 ..ENV_CONFIG_DEFAULT
             });
             for observable in [false, true] {
-                super::super::FP_ENVIRONMENT_OBSERVABLE.with(|cell| cell.set(observable));
+                crate::common::semantics::replace(crate::common::semantics::Semantics {
+                    fp_environment_observable: observable,
+                    ..Default::default()
+                });
                 let mut f = fp_recurrence_two_squares();
                 assert_eq!(run(&mut f), usize::from(!observable));
                 assert_eq!(count_muls(&f), if observable { 2 } else { 1 });
@@ -1843,10 +1843,17 @@ mod tests {
             },
         );
         assert_eq!(run_round(&mut changing, &env, &tm), 0);
-        let previous = super::super::FP_ENVIRONMENT_OBSERVABLE.with(|v| v.replace(true));
-        let fp = run_round(&mut fp_recurrence(), &env, &tm);
-        let integer = run_round(&mut int_recurrence(), &env, &tm);
-        super::super::FP_ENVIRONMENT_OBSERVABLE.with(|v| v.set(previous));
+        let (fp, integer) = {
+            let _fenv =
+                crate::common::semantics::TestGuard::new(crate::common::semantics::Semantics {
+                    fp_environment_observable: true,
+                    ..Default::default()
+                });
+            (
+                run_round(&mut fp_recurrence(), &env, &tm),
+                run_round(&mut int_recurrence(), &env, &tm),
+            )
+        };
         assert_eq!(fp, 0, "even call-free speculation can change FP traps");
         assert!(integer > 0, "do not disable integer PRE with FP policy");
         assert!(run_round(&mut fp_recurrence(), &env, &tm) > 0);
@@ -1918,9 +1925,14 @@ mod tests {
             },
         });
         assert_eq!(run_round(&mut user_call, &env, &tm), 0);
-        let previous = super::super::FP_ENVIRONMENT_OBSERVABLE.with(|v| v.replace(true));
-        let changes = run_round(&mut function, &env, &tm);
-        super::super::FP_ENVIRONMENT_OBSERVABLE.with(|v| v.set(previous));
+        let changes = {
+            let _fenv =
+                crate::common::semantics::TestGuard::new(crate::common::semantics::Semantics {
+                    fp_environment_observable: true,
+                    ..Default::default()
+                });
+            run_round(&mut function, &env, &tm)
+        };
         assert_eq!(changes, 0, "the FENV policy still prohibits speculation");
     }
 

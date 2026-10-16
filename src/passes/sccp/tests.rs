@@ -1450,9 +1450,13 @@ fn observable_fp_constants_keep_effects_but_integer_sccp_survives_redteam() {
         Terminator::Return(Some(Operand::Value(Value(1)))),
     )]);
     f.return_type = IrType::F64;
-    let previous = super::super::FP_ENVIRONMENT_OBSERVABLE.with(|v| v.replace(true));
-    run_function(&mut f);
-    super::super::FP_ENVIRONMENT_OBSERVABLE.with(|v| v.set(previous));
+    {
+        let _fenv = crate::common::semantics::TestGuard::new(crate::common::semantics::Semantics {
+            fp_environment_observable: true,
+            ..Default::default()
+        });
+        run_function(&mut f);
+    }
     assert!(f.blocks[0].instructions.iter().any(|i| matches!(
         i,
         Instruction::BinOp {
