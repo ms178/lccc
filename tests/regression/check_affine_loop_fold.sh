@@ -199,8 +199,13 @@ for mode in -m64 -m32; do
     done
 done
 # Retain useful clone folding when the original whole-loop proof licenses it.
-CCC_LOOP_ROTATE=1 CCC_DEBUG_LOOP_ROTATE=1 "$CCC" -O2 -fwrapv -S "$corpus" -o "$work/proved-rotation.s" 2> "$work/proved-rotation.log"
-grep -Eq '\[ROT\] affine exit-compare folds: [1-9]' "$work/proved-rotation.log" || bad "no proven rotation-clone fold survived"
+# Fold reports use the [AFFOLD] grammar under CCC_DEBUG_AFFINE_FOLD; the early
+# unsigned canonicalizer's "(early unsigned)" reports are a different
+# mechanism and must not satisfy this rotation-clone assertion.
+CCC_LOOP_ROTATE=1 CCC_DEBUG_LOOP_ROTATE=1 CCC_DEBUG_AFFINE_FOLD=1 \
+    "$CCC" -O2 -fwrapv -S "$corpus" -o "$work/proved-rotation.s" 2> "$work/proved-rotation.log"
+grep -E '\[AFFOLD\] [A-Za-z_][A-Za-z0-9_]*: affine exit-compare folds: [1-9]' "$work/proved-rotation.log" \
+    | grep -vF '(early unsigned)' | grep -q . || bad "no proven rotation-clone fold survived"
 echo '  signed control proof: m64/m32 oracle/rotation/disable matrix complete (verdict below)'
 
 if [[ $fail -ne 0 ]]; then

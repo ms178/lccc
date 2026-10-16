@@ -67,7 +67,11 @@ note "rotated: $folds proof-based fold report(s); unrotated: $folds_off"
 CCC_LOOP_ROTATE=1 CCC_NO_AFFINE_EXIT_FOLD=1 CCC_DEBUG_LOOP_ROTATE=1 CCC_DEBUG_AFFINE_FOLD=1 "$CCC" \
     -O2 -march=x86-64-v3 -S "$corpus" -o "$work/rotkilled.s" 2> "$work/rotkilled.dbg" \
     || bad "rotated kill-switch -S build failed"
-folds_killed=$(grep -cF "[AFFOLD]" "$work/rotkilled.dbg" || true)
+# The early unsigned canonicalizer (loop_bound) reports with an explicit
+# "(early unsigned)" suffix and is governed by CCC_DISABLE_PASSES=loop_bound,
+# not by this kill switch; check_unsigned_affine_loop.sh pins that 2x2
+# independence. Count only the late rotation-clone folds this switch owns.
+folds_killed=$(grep -F "[AFFOLD]" "$work/rotkilled.dbg" | grep -cvF "(early unsigned)" || true)
 note "rotated with CCC_NO_AFFINE_EXIT_FOLD=1: $folds_killed proof-based fold report(s)"
 [[ $folds_killed -eq 0 ]] \
     || bad "CCC_NO_AFFINE_EXIT_FOLD left the rotation clone fold running ($folds_killed report(s))"

@@ -1,4 +1,5 @@
 """Required workload semantics are shared by every caller, never inferred from GCC output."""
+import os
 import shlex
 import shutil
 import subprocess
@@ -16,7 +17,32 @@ from tests.benchmark import run_benchmarks as bench
 
 REQUIRED_WRAP = {'arith_loop': '-DARITH_ITERS=64', 'loop_patterns': '-DSIZE=10000',
                  'switch_dispatch': '-DN=100000'}
-GCC = shutil.which('gcc-16') or shutil.which('gcc')
+def _gcc_with_ubsan_runtime():
+    """Newest GCC that can actually LINK -fsanitize=undefined.
+
+    A from-source oracle GCC is often configured --disable-libsanitizer to
+    keep the bootstrap small, so selection by name alone would pick a
+    compiler whose driver accepts the flag but whose link step dies with
+    `cannot find -lubsan`. Probe the full compile+link pipeline instead.
+    """
+    for name in ('gcc-16', 'gcc'):
+        path = shutil.which(name)
+        if not path:
+            continue
+        try:
+            probe = subprocess.run(
+                [path, '-std=gnu17', '-fsanitize=undefined', '-x', 'c', '-',
+                 '-o', os.devnull],
+                input='int main(void){return 0;}',
+                capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if probe.returncode == 0:
+            return path
+    return None
+
+
+GCC = _gcc_with_ubsan_runtime()
 
 
 def signed(value, bits):
