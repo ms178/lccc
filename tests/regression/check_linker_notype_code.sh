@@ -96,6 +96,34 @@ check_one() { # $1 = gcc -m flag or "", $2 = caller stem, $3 = extra link flags
     "$GCC" $m -c "$tmp/$stem.s" -o "$tmp/$stem.o"
     # shellcheck disable=SC2086
     "$GCC" $m $pie -B"$tmp/shim" "$tmp/$stem.o" -L"$tmp" -lnfn -o "$tmp/$stem"
+    # Pin the ELF32 REL entry-size contract independently of readelf's
+    # version. Older readers silently accepted the missing DT_RELENT when
+    # only JMPREL was emitted, so grepping their output was insufficient.
+    python3 - "$tmp/$stem" <<'PYELF'
+import struct, sys
+from pathlib import Path
+b = Path(sys.argv[1]).read_bytes()
+if b[:4] != b"\x7fELF" or b[5] != 1:
+    raise SystemExit("FAIL: expected little-endian ELF")
+if b[4] == 1:
+    phoff = struct.unpack_from("<I", b, 28)[0]
+    stride, count = struct.unpack_from("<HH", b, 42)
+    dynamic = []
+    for i in range(count):
+        ph = struct.unpack_from("<8I", b, phoff + i * stride)
+        if ph[0] == 2:
+            dynamic.append(ph)
+    if len(dynamic) != 1:
+        raise SystemExit("FAIL: expected one PT_DYNAMIC")
+    ph = dynamic[0]
+    tags = list(struct.iter_unpack("<iI", b[ph[1]:ph[1]+ph[4]]))
+    if (20, 17) not in tags or not any(t == 23 for t, _ in tags):
+        raise SystemExit("FAIL: fixture must exercise REL-format JMPREL")
+    if [v for t, v in tags if t == 19] != [8]:
+        raise SystemExit("FAIL: JMPREL requires exactly one DT_RELENT=8")
+elif b[4] != 2:
+    raise SystemExit("FAIL: unexpected ELF class")
+PYELF
     # Both callees PLT-routed (a JUMP_SLOT each), neither copied (a COPY
     # of code bytes into BSS would hand out an NX address). --use-dynamic:
     # the i386 output carries no section headers, so plain -r shows nothing.

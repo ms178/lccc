@@ -17,8 +17,8 @@ CLI examples::
 
 Aliases are pinned where a fixed release exists. ``icx`` deliberately resolves
 through Compiler Explorer's ``cicxlatest`` channel; every comparison manifest
-records the resolved id/name so a future rerun cannot silently claim it used the
-same compiler.  Assembly is requested in AT&T syntax to match LCCC and permit
+records the resolved id/name. These identify a channel/version label, not a
+compiler binary; a moving channel may change between runs.  Assembly is requested in AT&T syntax to match LCCC and permit
 operand-side load/store analysis in codegen_oracle.py (compare and --rank).
 """
 from __future__ import annotations
@@ -220,15 +220,17 @@ def compiler_fingerprint(compiler_id: str, *, now: float | None = None) -> str:
     cache miss. Two shapes come back:
 
     ``"<name>|<semver>"``
-        A release channel. The version identifies the build, so the record is
-        pinned and never expires; if the id is ever repointed, the version
-        moves and the old records leave the key space.
+        A release channel. The reported version is keyed and never expires.
+        Metadata changes invalidate old records; a rebuild that keeps the
+        same name/version is NOT detected. This is not a binary-build pin.
 
     ``"moving|<name>|<window>"``
         A moving channel, whose version string is a placeholder that never
         changes however often the build does. Pinning on it would be a lie,
         so the window counter rolls over every MOVING_CHANNEL_TTL seconds and
-        the record is quietly re-fetched instead.
+        the record is quietly re-fetched instead. Changes within that window
+        are not detected. Use a cold cache plus explicit version probes for
+        fresh evidence; even a version string is not a compiler-binary hash.
 
     Never raises. An offline run or an unrecognised id degrades to
     FINGERPRINT_UNKNOWN, so the cache keeps working and simply loses its
@@ -291,20 +293,30 @@ def compilation_error(data: Any) -> str | None:
 
 
 def compiler_flags(compiler_id: str, flags: str) -> str:
-    """Spell an explicitly requested Haswell CPU in ICC classic's dialect.
+    """Translate explicit Haswell and contraction-off options for classic ICC.
 
-    No x86-64-v3 or arbitrary CPU translation: classic ICC rejected that flag
-    in the actual hosted survey. Callers choose the common Haswell profile,
-    and must retain requested/effective options and validate the response.
-    All workload macros, optimization and overflow options remain unchanged.
+    This is option admission, not a claim of cross-vendor FP equivalence.
+    Requested/effective flags are both retained. Arbitrary CPU names and
+    contraction modes are NOT guessed. Ambiguous override sets fail closed.
     """
     cid = resolve_compiler(compiler_id)
     tokens = shlex.split(flags)
-    if re.fullmatch(r"cicc[0-9]+", cid) and "-march=haswell" in tokens:
+    if not re.fullmatch(r"cicc[0-9]+", cid):
+        return flags
+    changed = False
+    if "-march=haswell" in tokens:
         if sum(t.startswith(("-march=", "-x", "-ax")) for t in tokens) != 1:
             raise GodboltError("ambiguous ICC target options; refusing profile translation")
-        return shlex.join(["-xCORE-AVX2" if t == "-march=haswell" else t for t in tokens])
-    return flags
+        tokens = ["-xCORE-AVX2" if t == "-march=haswell" else t for t in tokens]
+        changed = True
+    if "-ffp-contract=off" in tokens:
+        if any((t.startswith("-ffp-contract=") and t != "-ffp-contract=off")
+               or t in ("-fma", "-ffast-math", "-Ofast", "-funsafe-math-optimizations")
+               or t.startswith("-fp-model") for t in tokens):
+            raise GodboltError("ambiguous ICC FP options; refusing contraction translation")
+        tokens = ["-no-fma" if t == "-ffp-contract=off" else t for t in tokens]
+        changed = True
+    return shlex.join(tokens) if changed else flags
 
 
 def compile_on_godbolt(compiler_id: str, source: str, flags: str,

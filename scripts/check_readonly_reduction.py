@@ -8,6 +8,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -30,7 +31,10 @@ def main():
     try:
         with tempfile.TemporaryDirectory(prefix='lccc-readonly-guard-') as tmp:
             for label, compiler, opt, extra in arms:
-                cc = str(Path(compiler).resolve())
+                resolved = shutil.which(compiler)
+                if resolved is None:
+                    raise FileNotFoundError(f'compiler is not executable or not on PATH: {compiler}')
+                cc = str(Path(resolved).resolve())
                 identity = subprocess.check_output([cc, '--version'], text=True)
                 for abi, flags in [('x86-64-v3', ['-march=x86-64-v3']),
                                    ('i686-SSE2', ['-m32', '-march=i686', '-msse2'])]:

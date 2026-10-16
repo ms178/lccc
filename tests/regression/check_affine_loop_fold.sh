@@ -95,12 +95,14 @@ run_case "O3-rot"           "-O3 -march=x86-64-v3" "CCC_LOOP_ROTATE=1"
 
 # ---------------------------------------------------------------- contract 2
 note "contract 2: default-on reporting, independent of rotation, kill switch"
+# The early unsigned normalizer has an independent disable switch and a
+# distinct "(early unsigned)" suffix. Count only late/rotation fold reports.
 count_reports() { # env...
     local out
     out=$(timeout 900 env "$@" "$CCC" -O2 -march=x86-64-v3 -S "$corpus" -o /dev/null 2>&1 >/dev/null) || {
         printf '%s\n' "$out" >&2; return 1;
     }
-    printf '%s\n' "$out" | grep -c "affine exit-compare folds:" || true
+    printf '%s\n' "$out" | grep -Ec '^\[AFFOLD\] .*affine exit-compare folds: [1-9][0-9]*$' || true
 }
 n_def=$(count_reports CCC_DEBUG_AFFINE_FOLD=1)
 n_rot=$(count_reports CCC_DEBUG_AFFINE_FOLD=1 CCC_LOOP_ROTATE=1)
@@ -171,6 +173,41 @@ for probe in wrap_affine_fold wrap_loop_fold; do
         || bad "$probe: kill switch changed the answer ($out vs $out_off)"
     echo "  wrap probe $probe: exact, and identical with the fold killed"
 done
+
+python3 "$here/affine_control_model.py"
+# -fwrapv gives both signed-overflow witnesses defined wrapping semantics.
+# Known outputs are pinned as well as GCC agreement; the disabled arm isolates
+# the affine pass rather than accepting a shared wrong optimized answer.
+for mode in -m64 -m32; do
+    for opt in -O0 -O1 -O2 -O3 -Os; do
+        src=tests/regression/affine_control_proof.c
+        "${GCC:-gcc}" "$mode" "$opt" -fwrapv -Wall -Wextra -Werror "$src" -o "$work/control.ref"
+        "$work/control.ref" > "$work/control.expected"
+        grep -qx 'affine-control-proof 5 97' "$work/control.expected" || bad "control-proof: bad oracle"
+        for rotated in 0 1; do
+            for disabled in 0 1; do
+                # Unset both for a clean default; AFFOLD is presence-based, so "0" still disables it.
+                control_env=(env -u CCC_NO_AFFINE_EXIT_FOLD -u CCC_LOOP_ROTATE)
+                if [[ $rotated == 1 ]]; then control_env+=(CCC_LOOP_ROTATE=1); fi
+                if [[ $disabled == 1 ]]; then control_env+=(CCC_NO_AFFINE_EXIT_FOLD=1); fi
+                CCC_VERIFY_IR=abort CCC_VALIDATE_SSA=1 "${control_env[@]}" \
+                    "$CCC" "$mode" "$opt" -fwrapv "$src" -o "$work/control.mine"
+                timeout 10 "$work/control.mine" > "$work/control.actual" || bad "control-proof $mode $opt rotated=$rotated disabled=$disabled: runtime failed"
+                cmp "$work/control.expected" "$work/control.actual" || bad "control-proof $mode $opt rotated=$rotated disabled=$disabled: mismatch"
+            done
+        done
+    done
+done
+# Retain useful clone folding when the original whole-loop proof licenses it.
+# Fold reports use the [AFFOLD] grammar under CCC_DEBUG_AFFINE_FOLD; the early
+# unsigned canonicalizer's "(early unsigned)" reports are a different
+# mechanism and must not satisfy this rotation-clone assertion.
+CCC_LOOP_ROTATE=1 CCC_DEBUG_LOOP_ROTATE=1 CCC_DEBUG_AFFINE_FOLD=1 \
+    "$CCC" -O2 -fwrapv -S "$corpus" -o "$work/proved-rotation.s" 2> "$work/proved-rotation.log"
+late_folds=$(grep -E '\[AFFOLD\] [A-Za-z_][A-Za-z0-9_]*: affine exit-compare folds: [1-9]' \
+    "$work/proved-rotation.log" | grep -cvF '(early unsigned)' || true)
+[[ $late_folds -gt 0 ]] || bad "no proven rotation-clone fold survived"
+echo '  signed control proof: m64/m32 oracle/rotation/disable matrix complete (verdict below)'
 
 if [[ $fail -ne 0 ]]; then
     echo "check_affine_loop_fold: FAILED" >&2

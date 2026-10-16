@@ -567,6 +567,23 @@ fn fold_despite_unknown(
 }
 
 fn evaluate_instruction(inst: &Instruction, block_idx: u32, state: &mut SccpState) {
+    // Constant operands do not prove a constant result or absence of effects
+    // in an observable FP environment. Host-rounding evaluation would erase
+    // runtime rounding and exceptions. Keep Copy/Select/Phi and integer SCCP.
+    let constrained_fp = super::fp_environment_observable()
+        && match inst {
+            Instruction::BinOp { ty, .. }
+            | Instruction::UnaryOp { ty, .. }
+            | Instruction::Cmp { ty, .. } => ty.is_float(),
+            Instruction::Cast { from_ty, to_ty, .. } => from_ty.is_float() || to_ty.is_float(),
+            _ => false,
+        };
+    if constrained_fp {
+        if let Some(dest) = inst.dest() {
+            update_lattice(dest.0, LatticeVal::Bottom, state);
+        }
+        return;
+    }
     match inst {
         Instruction::Phi { dest, incoming, .. } => {
             let mut result = LatticeVal::Top;

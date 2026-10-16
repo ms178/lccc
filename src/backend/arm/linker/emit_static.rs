@@ -520,6 +520,7 @@ pub(super) fn emit_executable(
                     copy_reloc: false,
                     lib_sym_value: 0,
                     lib_in_exec: false,
+                    visibility: crate::backend::elf::STV_DEFAULT,
                 },
             );
         }
@@ -551,6 +552,7 @@ pub(super) fn emit_executable(
                     copy_reloc: false,
                     lib_sym_value: 0,
                     lib_in_exec: false,
+                    visibility: crate::backend::elf::STV_DEFAULT,
                 },
             );
         }
@@ -582,6 +584,7 @@ pub(super) fn emit_executable(
                     copy_reloc: false,
                     lib_sym_value: 0,
                     lib_in_exec: false,
+                    visibility: crate::backend::elf::STV_DEFAULT,
                 },
             );
         }

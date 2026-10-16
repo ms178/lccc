@@ -1,0 +1,47 @@
+{
+  "metric": "static call sites, not timing",
+  "rows": [
+    {
+      "compiler": "ours",
+      "compiler_sha256": "8fc178224a89d302cf98dd0457b23cf9ba2408165a29043acd7f4890df833e1b",
+      "abi": "m64",
+      "body_le64_call_sites": 0,
+      "assembly_sha256": "97c36d7dfeb9bb151ac51d5f6748849d83f0b672192a44db5054ed5bd11f5c98"
+    },
+    {
+      "compiler": "ours",
+      "compiler_sha256": "8fc178224a89d302cf98dd0457b23cf9ba2408165a29043acd7f4890df833e1b",
+      "abi": "m32",
+      "body_le64_call_sites": 0,
+      "assembly_sha256": "885da9431d71fe44c88d92bb1adfec83c4c1c8e29b4ce0369a34e588ca187a1c"
+    },
+    {
+      "compiler": "pr829",
+      "compiler_sha256": "85b60938ca8bc7558cddace973a3b8df347b22433842dbcb828fd6b09783c62c",
+      "abi": "m64",
+      "body_le64_call_sites": 0,
+      "assembly_sha256": "97c36d7dfeb9bb151ac51d5f6748849d83f0b672192a44db5054ed5bd11f5c98"
+    },
+    {
+      "compiler": "pr829",
+      "compiler_sha256": "85b60938ca8bc7558cddace973a3b8df347b22433842dbcb828fd6b09783c62c",
+      "abi": "m32",
+      "body_le64_call_sites": 2,
+      "assembly_sha256": "7d8dbd5a7d9ddbed2b64ebdd233e362751f67d6a55a64850b2bdc0af65a2e29a"
+    },
+    {
+      "compiler": "accepted",
+      "compiler_sha256": "bb8c56753d64c5a879e51a6e1562a2bd1ad6a7a6f26b0b9c8864a3c82a4acdd1",
+      "abi": "m64",
+      "body_le64_call_sites": 0,
+      "assembly_sha256": "97c36d7dfeb9bb151ac51d5f6748849d83f0b672192a44db5054ed5bd11f5c98"
+    },
+    {
+      "compiler": "accepted",
+      "compiler_sha256": "bb8c56753d64c5a879e51a6e1562a2bd1ad6a7a6f26b0b9c8864a3c82a4acdd1",
+      "abi": "m32",
+      "body_le64_call_sites": 2,
+      "assembly_sha256": "b26f2ce1ced482cc638970814e5a03d413dee17919b59b58411524c1022e045e"
+    }
+  ]
+}

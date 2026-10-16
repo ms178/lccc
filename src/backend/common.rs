@@ -10,6 +10,7 @@
 //! - The 64-bit data directive (`.quad` vs `.xword` vs `.dword`)
 //! - Extra assembler/linker flags
 
+use super::global_alignment::DataAlignment;
 use crate::backend::elf::{EM_386, EM_AARCH64, EM_RISCV, EM_X86_64};
 use crate::common::types::IrType;
 use crate::ir::reexports::{GlobalInit, IrConst, IrGlobal, IrModule};
@@ -679,7 +680,8 @@ fn resolve_sysroot_file_dir(dir: &str, file: &str) -> Option<String> {
 /// A fixed list ending at GCC 14 silently missed Debian GCC 16 multilib.
 /// Keep sysroot and host candidates together, but resolve each required file
 /// through the existing same-root probe; a directory alone is not a runtime.
-#[cfg(not(feature = "gcc_linker"))]
+/// Shared by the built-in linker probes and the gcc_linker search paths, so
+/// multilib eligibility stays an architecture property, never a version.
 fn installed_gcc_versions(roots: &[std::path::PathBuf]) -> Vec<String> {
     let mut versions = std::collections::BTreeMap::new();
     for root in roots {
@@ -711,8 +713,7 @@ fn installed_gcc_versions(roots: &[std::path::PathBuf]) -> Vec<String> {
     versions.into_iter().rev().map(|(_, name)| name).collect()
 }
 
-#[cfg(not(feature = "gcc_linker"))]
-fn gcc_versions_at(base: &str) -> Vec<String> {
+pub(crate) fn gcc_versions_at(base: &str) -> Vec<String> {
     let mut roots = vec![std::path::PathBuf::from(base)];
     let prefixed = with_sysroot_prefix(base);
     if prefixed != base {
@@ -729,34 +730,77 @@ fn gcc_versions_at(base: &str) -> Vec<String> {
 fn find_gcc_lib_dir(arch: &DirectLdArchConfig) -> Option<String> {
     // Plain bases: `<base>/<ver>` itself is eligible, plus any multilib
     // sub-directory variants (only relevant when the base is multilib-aware).
-    for base in arch.gcc_lib_base_paths {
-        for ver in gcc_versions_at(base) {
-            let dir = format!("{}/{}", base, ver);
-            let mut candidates = vec![dir.clone()];
-            for sub in arch.gcc_multilib_subdirs {
-                candidates.push(format!("{}/{}", dir, sub));
-            }
-            for cand in candidates {
-                if let Some(resolved) = resolve_sysroot_file_dir(&cand, "crtbegin.o") {
-                    return Some(resolved);
-                }
-            }
-        }
+    if let Some(resolved) =
+        probe_gcc_bases(arch.gcc_lib_base_paths, arch.gcc_multilib_subdirs, true)
+    {
+        return Some(resolved);
     }
     // Multilib-only bases: the plain `<base>/<ver>` directory belongs to a
     // different ELF class (e.g. the amd64 GCC dir when targeting i686), so
     // only its `<ver>/<subdir>` variants may satisfy the probe.
-    for base in arch.gcc_multilib_base_paths {
+    probe_gcc_bases(
+        arch.gcc_multilib_base_paths,
+        arch.gcc_multilib_subdirs,
+        false,
+    )
+}
+
+/// Probe `<base>/<ver>[/<subdir>]` directories for crtbegin.o, newest GCC
+/// version first. `native` admits the plain `<base>/<ver>` directory itself;
+/// multilib-only bases must never admit their native crtbegin.o (it has the
+/// wrong ELF class).
+#[cfg(not(feature = "gcc_linker"))]
+fn probe_gcc_bases(bases: &[&str], subdirs: &[&str], native: bool) -> Option<String> {
+    for base in bases {
         for ver in gcc_versions_at(base) {
-            for sub in arch.gcc_multilib_subdirs {
-                let dir = format!("{}/{}/{}", base, ver, sub);
+            let dir = format!("{base}/{ver}");
+            if native {
                 if let Some(resolved) = resolve_sysroot_file_dir(&dir, "crtbegin.o") {
+                    return Some(resolved);
+                }
+            }
+            for sub in subdirs {
+                if let Some(resolved) =
+                    resolve_sysroot_file_dir(&format!("{dir}/{sub}"), "crtbegin.o")
+                {
                     return Some(resolved);
                 }
             }
         }
     }
     None
+}
+
+#[cfg(all(test, not(feature = "gcc_linker")))]
+mod gcc_directory_tests {
+    use super::*;
+
+    #[test]
+    fn gcc16_multilib_discovery_preserves_class_and_newest_priority() -> std::io::Result<()> {
+        let temp = crate::common::temp_files::TempFile::try_new("gcc_probe", "v16", "dir")?;
+        let base = temp.to_str()?;
+        let native = format!("{base}/16");
+        let multilib = format!("{native}/32");
+        std::fs::create_dir_all(&native).unwrap();
+        std::fs::write(format!("{native}/crtbegin.o"), b"probe marker").unwrap();
+        let wrong_class = probe_gcc_bases(&[base], &["32"], false);
+        std::fs::create_dir_all(&multilib).unwrap();
+        std::fs::write(format!("{multilib}/crtbegin.o"), b"probe marker").unwrap();
+        let selected = probe_gcc_bases(&[base], &["32"], false);
+        std::fs::create_dir_all(format!("{base}/14/32")).unwrap();
+        std::fs::write(format!("{base}/14/32/crtbegin.o"), b"old probe marker").unwrap();
+        let preferred = probe_gcc_bases(&[base], &["32"], false);
+        let short = probe_gcc_bases(&[base], &[], true);
+        std::fs::remove_dir_all(base).unwrap();
+        assert_eq!(
+            wrong_class, None,
+            "native crt must not satisfy a multilib probe"
+        );
+        assert_eq!(selected, Some(multilib.clone()));
+        assert_eq!(preferred, Some(multilib));
+        assert_eq!(short, Some(native));
+        Ok(())
+    }
 }
 
 /// Discover the system CRT directory containing crt1.o.
@@ -2596,36 +2640,8 @@ pub fn emit_data_sections(
     }
 
     // Global variables
-    emit_globals(out, &module.globals, ptr_dir, pic_mode, optimize_size);
-}
-
-/// Compute effective alignment for a global.
-///
-/// Default policy (matching GCC/Clang on x86-64 and aarch64 at -O0..-O3):
-/// promote to 16 bytes when size >= 16, enabling aligned SSE/NEON access.
-/// Globals placed in custom sections are excluded from promotion because they may
-/// form contiguous arrays (e.g. the kernel's __param or .init.setup sections) where
-/// the linker expects elements at their natural stride with no extra padding.
-/// Additionally, when the user explicitly specified an alignment via __attribute__((aligned(N)))
-/// or _Alignas, we respect their choice and don't auto-promote. GCC behaves the same way:
-/// explicit aligned(8) on a 24-byte struct gives 8-byte alignment, not 16.
-///
-/// At -Os/-Oz (`optimize_size`) the promotion is skipped entirely: GCC's
-/// i386/x86-64 DATA_ALIGNMENT only promotes when `!optimize_size`, and under
-/// `-Os` a 40-byte `.bss` array gets no `.align` at all (verified against
-/// GCC 16.2 `-Os -m16 -mregparm=3`). Every promoted symbol can pad the flat
-/// image by up to 15 bytes *twice* (before itself and shifted into every
-/// later symbol), which is real budget in size-gated segments such as the
-/// Linux boot setup image. Natural ABI alignment (`g.align`) is always kept.
-fn effective_align(g: &IrGlobal, optimize_size: bool) -> usize {
-    if g.section.is_some() || g.has_explicit_align {
-        return g.align;
-    }
-    if !optimize_size && g.size >= 16 && g.align < 16 {
-        16
-    } else {
-        g.align
-    }
+    let alignment = DataAlignment::new(module, ptr_dir, optimize_size);
+    emit_globals(out, &module.globals, ptr_dir, pic_mode, &alignment);
 }
 
 /// Emit a zero-initialized global variable (used in .bss, .tbss, and custom section zero-init).
@@ -2634,12 +2650,12 @@ fn emit_zero_global(
     g: &IrGlobal,
     obj_type: &str,
     ptr_dir: PtrDirective,
-    optimize_size: bool,
+    alignment: &DataAlignment,
 ) {
     emit_symbol_directives(out, g);
     out.emit_fmt(format_args!(
         ".align {}",
-        ptr_dir.align_arg(effective_align(g, optimize_size))
+        ptr_dir.align_arg(alignment.effective(g))
     ));
     out.emit_fmt(format_args!(".type {}, {}", g.name, obj_type));
     out.emit_fmt(format_args!(".size {}, {}", g.name, g.size));
@@ -2743,7 +2759,7 @@ fn emit_globals(
     globals: &[IrGlobal],
     ptr_dir: PtrDirective,
     pic_mode: bool,
-    optimize_size: bool,
+    alignment: &DataAlignment,
 ) {
     // Phase 1: classify every global into its target section.
     let classified: Vec<GlobalSection> = globals
@@ -2816,9 +2832,9 @@ fn emit_globals(
             section_name, flags, section_type
         ));
         if matches!(g.init, GlobalInit::Zero) || g.size == 0 {
-            emit_zero_global(out, g, "@object", ptr_dir, optimize_size);
+            emit_zero_global(out, g, "@object", ptr_dir, alignment);
         } else {
-            emit_global_def(out, g, ptr_dir, optimize_size);
+            emit_global_def(out, g, ptr_dir, alignment);
         }
         out.emit("");
     }
@@ -2832,7 +2848,7 @@ fn emit_globals(
         ".section .rodata",
         false,
         ptr_dir,
-        optimize_size,
+        alignment,
     );
 
     // .data.rel.ro: const-qualified globals that need runtime relocation in
@@ -2845,7 +2861,7 @@ fn emit_globals(
         ".section .data.rel.ro,\"aw\",@progbits",
         false,
         ptr_dir,
-        optimize_size,
+        alignment,
     );
 
     // .tdata: thread-local initialized globals
@@ -2857,7 +2873,7 @@ fn emit_globals(
         ".section .tdata,\"awT\",@progbits",
         false,
         ptr_dir,
-        optimize_size,
+        alignment,
     );
 
     // .data: non-const initialized globals
@@ -2869,7 +2885,7 @@ fn emit_globals(
         ".section .data",
         false,
         ptr_dir,
-        optimize_size,
+        alignment,
     );
 
     // .comm: zero-initialized common globals (weak linkage, linker merges duplicates).
@@ -2880,7 +2896,7 @@ fn emit_globals(
                 ".comm {},{},{}",
                 g.name,
                 g.size,
-                effective_align(g, optimize_size)
+                alignment.effective(g)
             ));
         }
     }
@@ -2894,7 +2910,7 @@ fn emit_globals(
         ".section .tbss,\"awT\",@nobits",
         true,
         ptr_dir,
-        optimize_size,
+        alignment,
     );
 
     // .bss: non-TLS zero-initialized globals (includes zero-size globals with
@@ -2907,7 +2923,7 @@ fn emit_globals(
         ".section .bss",
         true,
         ptr_dir,
-        optimize_size,
+        alignment,
     );
 }
 
@@ -2921,7 +2937,7 @@ fn emit_section_group(
     section_header: &str,
     is_zero: bool,
     ptr_dir: PtrDirective,
-    optimize_size: bool,
+    alignment: &DataAlignment,
 ) {
     let mut emitted_header = false;
     for (g, sect) in globals.iter().zip(classified) {
@@ -2938,9 +2954,9 @@ fn emit_section_group(
             } else {
                 "@object"
             };
-            emit_zero_global(out, g, obj_type, ptr_dir, optimize_size);
+            emit_zero_global(out, g, obj_type, ptr_dir, alignment);
         } else {
-            emit_global_def(out, g, ptr_dir, optimize_size);
+            emit_global_def(out, g, ptr_dir, alignment);
         }
     }
     if emitted_header {
@@ -2978,11 +2994,16 @@ fn emit_symbol_directives(out: &mut AsmOutput, g: &IrGlobal) {
 }
 
 /// Emit a single global variable definition.
-fn emit_global_def(out: &mut AsmOutput, g: &IrGlobal, ptr_dir: PtrDirective, optimize_size: bool) {
+fn emit_global_def(
+    out: &mut AsmOutput,
+    g: &IrGlobal,
+    ptr_dir: PtrDirective,
+    alignment: &DataAlignment,
+) {
     emit_symbol_directives(out, g);
     out.emit_fmt(format_args!(
         ".align {}",
-        ptr_dir.align_arg(effective_align(g, optimize_size))
+        ptr_dir.align_arg(alignment.effective(g))
     ));
     let obj_type = if g.is_thread_local {
         "@tls_object"
@@ -4646,7 +4667,7 @@ mod rcx_epoch_sink_coverage_tests {
     }
 }
 
-#[cfg(all(test, not(feature = "gcc_linker")))]
+#[cfg(test)]
 mod gcc_version_discovery_tests {
     use super::installed_gcc_versions;
     #[test]

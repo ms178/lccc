@@ -28,3 +28,10 @@ oracle_require_version() {
         return 1
     fi
 }
+
+# A native bfd oracle also depends on its dynamic-tag and library-search
+# configuration. Missing/old cache stamps must not validate on version alone.
+oracle_native_layout_matches() {
+    local stamp=$1 expected=$2
+    [[ -f $stamp ]] && [[ $(cat "$stamp") == "$expected" ]]
+}

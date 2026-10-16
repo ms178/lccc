@@ -721,6 +721,10 @@ impl X86Codegen {
         let is_64 =
             |t: &IrType| matches!(t, IrType::I64 | IrType::U64 | IrType::Ptr | IrType::F128);
         let mut needs_sext_set: FxHashSet<u32> = FxHashSet::default();
+        // Typed Cast already extends its own input. MachInst producers only
+        // need canonical wide homes for NON-cast wide reads, transitively
+        // through Copy/Phi. Do not add duplicate extensions to cast-only IVs.
+        let mut implicit_sext_set: FxHashSet<u32> = FxHashSet::default();
         // copy_phi_srcs[dest] = list of value sources (from Copy/Phi) whose
         // 64-bit value flows into `dest`. Built in pass 1, used in pass 2.
         let mut copy_phi_srcs: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
@@ -734,14 +738,19 @@ impl X86Codegen {
                 match inst {
                     Instruction::BinOp { ty, lhs, rhs, .. } if is_64(ty) => {
                         mark(lhs, &mut needs_sext_set);
+                        mark(lhs, &mut implicit_sext_set);
                         mark(rhs, &mut needs_sext_set);
+                        mark(rhs, &mut implicit_sext_set);
                     }
                     Instruction::Cmp { ty, lhs, rhs, .. } if is_64(ty) => {
                         mark(lhs, &mut needs_sext_set);
+                        mark(lhs, &mut implicit_sext_set);
                         mark(rhs, &mut needs_sext_set);
+                        mark(rhs, &mut implicit_sext_set);
                     }
                     Instruction::Store { ty, val, .. } if is_64(ty) => {
                         mark(val, &mut needs_sext_set);
+                        mark(val, &mut implicit_sext_set);
                     }
                     Instruction::Cast {
                         src,
@@ -753,6 +762,7 @@ impl X86Codegen {
                     }
                     Instruction::GetElementPtr { offset, .. } => {
                         mark(offset, &mut needs_sext_set);
+                        mark(offset, &mut implicit_sext_set);
                     }
                     Instruction::Select {
                         ty,
@@ -761,20 +771,25 @@ impl X86Codegen {
                         ..
                     } if is_64(ty) => {
                         mark(true_val, &mut needs_sext_set);
+                        mark(true_val, &mut implicit_sext_set);
                         mark(false_val, &mut needs_sext_set);
+                        mark(false_val, &mut implicit_sext_set);
                     }
                     Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
                         for (arg, at) in info.args.iter().zip(info.arg_types.iter()) {
                             if is_64(at) {
                                 mark(arg, &mut needs_sext_set);
+                                mark(arg, &mut implicit_sext_set);
                             }
                         }
                     }
                     Instruction::AtomicRmw { ty, val, .. } if is_64(ty) => {
                         mark(val, &mut needs_sext_set);
+                        mark(val, &mut implicit_sext_set);
                     }
                     Instruction::AtomicStore { ty, val, .. } if is_64(ty) => {
                         mark(val, &mut needs_sext_set);
+                        mark(val, &mut implicit_sext_set);
                     }
                     // Record Copy/Phi value-flow edges for the transitive closure.
                     Instruction::Copy { dest, src } => {
@@ -806,6 +821,7 @@ impl X86Codegen {
             if let Terminator::Return(Some(op)) = &block.terminator {
                 if is_64(&func.return_type) {
                     mark(op, &mut needs_sext_set);
+                    mark(op, &mut implicit_sext_set);
                 }
             }
             for inst in &block.instructions {
@@ -818,19 +834,21 @@ impl X86Codegen {
                 {
                     if is_64(ty) {
                         mark(expected, &mut needs_sext_set);
+                        mark(expected, &mut implicit_sext_set);
                         mark(desired, &mut needs_sext_set);
+                        mark(desired, &mut implicit_sext_set);
                     }
                 }
             }
         }
 
         // Pass 2: fixed-point transitive closure over Copy/Phi sources.
-        if !copy_phi_srcs.is_empty() {
-            let mut worklist: Vec<u32> = needs_sext_set.iter().copied().collect();
+        for set in [&mut needs_sext_set, &mut implicit_sext_set] {
+            let mut worklist: Vec<u32> = set.iter().copied().collect();
             while let Some(vid) = worklist.pop() {
                 if let Some(srcs) = copy_phi_srcs.get(&vid) {
                     for &s in srcs {
-                        if needs_sext_set.insert(s) {
+                        if set.insert(s) {
                             worklist.push(s);
                         }
                     }
@@ -839,6 +857,7 @@ impl X86Codegen {
         }
         self.skip_i32_sext = needs_sext_set.is_empty();
         self.needs_sext_values = needs_sext_set;
+        self.implicit_sext_values = implicit_sext_set;
 
         // PF-16b: Clz/Ctz/Popcount on <=32-bit types produce results in
         // [0, bitwidth] — bit 31 is provably zero, so their widening casts

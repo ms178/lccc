@@ -1,0 +1,1132 @@
+{
+  "complete": true,
+  "metric": "simulated compiler work; NOT wall-clock speedup",
+  "flags": [
+    "-O2",
+    "-march=x86-64-v3",
+    "-fwrapv"
+  ],
+  "geometry": {
+    "I1": "32768,8,64",
+    "D1": "32768,8,64",
+    "LL": "33554432,16,64"
+  },
+  "geometry_overrides": {},
+  "valgrind": {
+    "command": [
+      "valgrind"
+    ],
+    "executable": "/usr/bin/valgrind",
+    "sha256": "4652774bd116cb49951ef74115ad4237cad5021b2bd4d80002f09d986ec438b9",
+    "version": "valgrind-3.24.0"
+  },
+  "binaries": {
+    "mine": {
+      "original": "/home/user/.cache/pr824-s20-tools/lccc",
+      "sha256": "7d4a995db82df26b38ce673334964f6808eb6528f0677ced76d391b320b88332"
+    },
+    "ref": {
+      "original": "/home/user/.cache/pr824-s17-tools/lccc",
+      "sha256": "7dc67222e94314306b407c24d248a2070e2f05e8bdaeacc7c8628f675aae18b4"
+    }
+  },
+  "results": [
+    {
+      "source": "/home/user/lccc/tests/regression/minmax_shapes/minmax_shapes.c",
+      "source_sha256": "7b4ad1b6237a347a2a0f62618ee75f52a2b8a9a485efdcedad59259f449bfe77",
+      "rounds": [
+        {
+          "order": [
+            "mine",
+            "ref"
+          ],
+          "arms": {
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr824-s20-compiler-work/aa/case-0-round-0.cg",
+                "/home/user/.cache/pr824-s20-compiler-work/aa/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/regression/minmax_shapes/minmax_shapes.c",
+                "-o",
+                "/home/user/.cache/pr824-s20-compiler-work/aa/case-0.s"
+              ],
+              "events": {
+                "Ir": 915421066,
+                "Dr": 201501549,
+                "Dw": 102642550,
+                "I1mr": 2353026,
+                "D1mr": 1500856,
+                "D1mw": 494296,
+                "ILmr": 45269,
+                "DLmr": 17833,
+                "DLmw": 28111,
+                "Bc": 152349138,
+                "Bcm": 6965829,
+                "Bi": 24893625,
+                "Bim": 4451382
+              },
+              "profile_sha256": "fad2316c06eb834a941d42c85ba7a1b8ed81ca77b1f0423728d26b262f2823fc",
+              "assembly_sha256": "295f7ca506dc66f244f49b4492ed4287dc4879a223d94b8ef6439e0f31a15c1b",
+              "stderr": "--370507-- warning: L3 cache found, using its data for the LL simulation.\n--370507-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--370507-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            },
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr824-s20-compiler-work/bb/case-0-round-0.cg",
+                "/home/user/.cache/pr824-s20-compiler-work/bb/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/regression/minmax_shapes/minmax_shapes.c",
+                "-o",
+                "/home/user/.cache/pr824-s20-compiler-work/bb/case-0.s"
+              ],
+              "events": {
+                "Ir": 914712447,
+                "Dr": 201400484,
+                "Dw": 102682231,
+                "I1mr": 2212876,
+                "D1mr": 1533155,
+                "D1mw": 495179,
+                "ILmr": 45398,
+                "DLmr": 17849,
+                "DLmw": 28156,
+                "Bc": 152063238,
+                "Bcm": 7038283,
+                "Bi": 24900255,
+                "Bim": 1405879
+              },
+              "profile_sha256": "3e12c2b03e7bda0a795b3b224d0f32813259b442e54919ebf640ab3e0e31fd0a",
+              "assembly_sha256": "295f7ca506dc66f244f49b4492ed4287dc4879a223d94b8ef6439e0f31a15c1b",
+              "stderr": "--370864-- warning: L3 cache found, using its data for the LL simulation.\n--370864-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--370864-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            }
+          },
+          "ir_ratio": 1.0007746904530752
+        },
+        {
+          "order": [
+            "ref",
+            "mine"
+          ],
+          "arms": {
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr824-s20-compiler-work/bb/case-0-round-1.cg",
+                "/home/user/.cache/pr824-s20-compiler-work/bb/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/regression/minmax_shapes/minmax_shapes.c",
+                "-o",
+                "/home/user/.cache/pr824-s20-compiler-work/bb/case-0.s"
+              ],
+              "events": {
+                "Ir": 914712149,
+                "Dr": 201400499,
+                "Dw": 102682241,
+                "I1mr": 2212879,
+                "D1mr": 1533143,
+                "D1mw": 495175,
+                "ILmr": 45399,
+                "DLmr": 17849,
+                "DLmw": 28149,
+                "Bc": 152063192,
+                "Bcm": 7038259,
+                "Bi": 24900258,
+                "Bim": 1405880
+              },
+              "profile_sha256": "6201843dae1889a0566904272d8ca9a5165d4df12673604beebb00c9f845fab7",
+              "assembly_sha256": "295f7ca506dc66f244f49b4492ed4287dc4879a223d94b8ef6439e0f31a15c1b",
+              "stderr": "--371060-- warning: L3 cache found, using its data for the LL simulation.\n--371060-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--371060-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            },
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr824-s20-compiler-work/aa/case-0-round-1.cg",
+                "/home/user/.cache/pr824-s20-compiler-work/aa/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/regression/minmax_shapes/minmax_shapes.c",
+                "-o",
+                "/home/user/.cache/pr824-s20-compiler-work/aa/case-0.s"
+              ],
+              "events": {
+                "Ir": 915420890,
+                "Dr": 201501541,
+                "Dw": 102642534,
+                "I1mr": 2353021,
+                "D1mr": 1500847,
+                "D1mw": 494286,
+                "ILmr": 45264,
+                "DLmr": 17833,
+                "DLmw": 28112,
+                "Bc": 152349096,
+                "Bcm": 6965829,
+                "Bi": 24893628,
+                "Bim": 4451384
+              },
+              "profile_sha256": "b23aaa9373e43d04ce2f2407857a46e2ec55f96ce8342a004a7ac5dce97f1169",
+              "assembly_sha256": "295f7ca506dc66f244f49b4492ed4287dc4879a223d94b8ef6439e0f31a15c1b",
+              "stderr": "--371185-- warning: L3 cache found, using its data for the LL simulation.\n--371185-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--371185-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            }
+          },
+          "ir_ratio": 1.0007748240807501
+        },
+        {
+          "order": [
+            "mine",
+            "ref"
+          ],
+          "arms": {
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr824-s20-compiler-work/aa/case-0-round-2.cg",
+                "/home/user/.cache/pr824-s20-compiler-work/aa/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/regression/minmax_shapes/minmax_shapes.c",
+                "-o",
+                "/home/user/.cache/pr824-s20-compiler-work/aa/case-0.s"
+              ],
+              "events": {
+                "Ir": 915420610,
+                "Dr": 201501463,
+                "Dw": 102642502,
+                "I1mr": 2353017,
+                "D1mr": 1500843,
+                "D1mw": 494284,
+                "ILmr": 45264,
+                "DLmr": 17833,
+                "DLmw": 28114,
+                "Bc": 152349069,
+                "Bcm": 6965781,
+                "Bi": 24893619,
+                "Bim": 4451382
+              },
+              "profile_sha256": "ccc8079b3e22153630040719a766c85e32fedbe2d7779e35e137907dba6b0904",
+              "assembly_sha256": "295f7ca506dc66f244f49b4492ed4287dc4879a223d94b8ef6439e0f31a15c1b",
+              "stderr": "--371189-- warning: L3 cache found, using its data for the LL simulation.\n--371189-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--371189-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            },
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr824-s20-compiler-work/bb/case-0-round-2.cg",
+                "/home/user/.cache/pr824-s20-compiler-work/bb/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/regression/minmax_shapes/minmax_shapes.c",
+                "-o",
+                "/home/user/.cache/pr824-s20-compiler-work/bb/case-0.s"
+              ],
+              "events": {
+                "Ir": 914711976,
+                "Dr": 201400433,
+                "Dw": 102682201,
+                "I1mr": 2212872,
+                "D1mr": 1533155,
+                "D1mw": 495180,
+                "ILmr": 45398,
+                "DLmr": 17849,
+                "DLmw": 28155,
+                "Bc": 152063176,
+                "Bcm": 7038268,
+                "Bi": 24900250,
+                "Bim": 1405879
+              },
+              "profile_sha256": "d521af9a91428a46e6b2fe664d32bfde2926d38c6d42c16041b54e9b0b0739d0",
+              "assembly_sha256": "295f7ca506dc66f244f49b4492ed4287dc4879a223d94b8ef6439e0f31a15c1b",
+              "stderr": "--371207-- warning: L3 cache found, using its data for the LL simulation.\n--371207-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--371207-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            }
+          },
+          "ir_ratio": 1.0007747072505804
+        }
+      ],
+      "median_ir_ratio": 1.0007747072505804
+    },
+    {
+      "source": "/home/user/lccc/tests/benchmark/programs/libm_round_family.c",
+      "source_sha256": "b70c5bacd90081c28ea74dc1142f9eacc64278d539f258da5bd1614ebc503668",
+      "rounds": [
+        {
+          "order": [
+            "mine",
+            "ref"
+          ],
+          "arms": {
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr824-s20-compiler-work/aa/case-1-round-0.cg",
+                "/home/user/.cache/pr824-s20-compiler-work/aa/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/benchmark/programs/libm_round_family.c",
+                "-o",
+                "/home/user/.cache/pr824-s20-compiler-work/aa/case-1.s"
+              ],
+              "events": {
+                "Ir": 289963028,
+                "Dr": 62490733,
+                "Dw": 33291335,
+                "I1mr": 865859,
+                "D1mr": 444651,
+                "D1mw": 225834,
+                "ILmr": 50001,
+                "DLmr": 19593,
+                "DLmw": 39296,
+                "Bc": 47668209,
+                "Bcm": 2389792,
+                "Bi": 7572796,
+                "Bim": 1880279
+              },
+              "profile_sha256": "2724abbe9cf467cc5aba7d045df5d142fafaeff49774501e838cac02c4402262",
+              "assembly_sha256": "7b8d09df2490c0a5aa3feaa9d6c045bf91ded30452d8c284b1e1d58bc8143b70",
+              "stderr": "--371222-- warning: L3 cache found, using its data for the LL simulation.\n--371222-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--371222-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            },
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr824-s20-compiler-work/bb/case-1-round-0.cg",
+                "/home/user/.cache/pr824-s20-compiler-work/bb/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/benchmark/programs/libm_round_family.c",
+                "-o",
+                "/home/user/.cache/pr824-s20-compiler-work/bb/case-1.s"
+              ],
+              "events": {
+                "Ir": 289441686,
+                "Dr": 62503000,
+                "Dw": 33324816,
+                "I1mr": 832223,
+                "D1mr": 453530,
+                "D1mw": 227562,
+                "ILmr": 50066,
+                "DLmr": 19610,
+                "DLmw": 39291,
+                "Bc": 47430420,
+                "Bcm": 2325256,
+                "Bi": 7575150,
+                "Bim": 425868
+              },
+              "profile_sha256": "fefc08ca5ea82e15d980966b07273103e40645375c398e9346ea6a22df081e94",
+              "assembly_sha256": "7b8d09df2490c0a5aa3feaa9d6c045bf91ded30452d8c284b1e1d58bc8143b70",
+              "stderr": "--371241-- warning: L3 cache found, using its data for the LL simulation.\n--371241-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--371241-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            }
+          },
+          "ir_ratio": 1.0018011987395623
+        },
+        {
+          "order": [
+            "ref",
+            "mine"
+          ],
+          "arms": {
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr824-s20-compiler-work/bb/case-1-round-1.cg",
+                "/home/user/.cache/pr824-s20-compiler-work/bb/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/benchmark/programs/libm_round_family.c",
+                "-o",
+                "/home/user/.cache/pr824-s20-compiler-work/bb/case-1.s"
+              ],
+              "events": {
+                "Ir": 289441158,
+                "Dr": 62502936,
+                "Dw": 33324806,
+                "I1mr": 832224,
+                "D1mr": 453501,
+                "D1mw": 227562,
+                "ILmr": 50066,
+                "DLmr": 19610,
+                "DLmw": 39290,
+                "Bc": 47430350,
+                "Bcm": 2325222,
+                "Bi": 7575144,
+                "Bim": 425866
+              },
+              "profile_sha256": "906588031d1834b57c671c1344eb635ba76a1c6e2a75699c6513224d03648aeb",
+              "assembly_sha256": "7b8d09df2490c0a5aa3feaa9d6c045bf91ded30452d8c284b1e1d58bc8143b70",
+              "stderr": "--371245-- warning: L3 cache found, using its data for the LL simulation.\n--371245-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--371245-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            },
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr824-s20-compiler-work/aa/case-1-round-1.cg",
+                "/home/user/.cache/pr824-s20-compiler-work/aa/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/benchmark/programs/libm_round_family.c",
+                "-o",
+                "/home/user/.cache/pr824-s20-compiler-work/aa/case-1.s"
+              ],
+              "events": {
+                "Ir": 289962456,
+                "Dr": 62490624,
+                "Dw": 33291280,
+                "I1mr": 865859,
+                "D1mr": 444682,
+                "D1mw": 225839,
+                "ILmr": 50001,
+                "DLmr": 19593,
+                "DLmw": 39304,
+                "Bc": 47668150,
+                "Bcm": 2389754,
+                "Bi": 7572786,
+                "Bim": 1880279
+              },
+              "profile_sha256": "f1237258aaf952cb016db5753915658534f00d81a6f49fbf6de59e467142553f",
+              "assembly_sha256": "7b8d09df2490c0a5aa3feaa9d6c045bf91ded30452d8c284b1e1d58bc8143b70",
+              "stderr": "--371249-- warning: L3 cache found, using its data for the LL simulation.\n--371249-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--371249-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            }
+          },
+          "ir_ratio": 1.0018010500082368
+        },
+        {
+          "order": [
+            "mine",
+            "ref"
+          ],
+          "arms": {
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr824-s20-compiler-work/aa/case-1-round-2.cg",
+                "/home/user/.cache/pr824-s20-compiler-work/aa/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/benchmark/programs/libm_round_family.c",
+                "-o",
+                "/home/user/.cache/pr824-s20-compiler-work/aa/case-1.s"
+              ],
+              "events": {
+                "Ir": 289962453,
+                "Dr": 62490604,
+                "Dw": 33291258,
+                "I1mr": 865860,
+                "D1mr": 444644,
+                "D1mw": 225828,
+                "ILmr": 50001,
+                "DLmr": 19593,
+                "DLmw": 39298,
+                "Bc": 47668166,
+                "Bcm": 2389702,
+                "Bi": 7572782,
+                "Bim": 1880279
+              },
+              "profile_sha256": "378476ff1c8547595604eb09c9d26dcfef710e98a2fef2224a6cc8085c66bfab",
+              "assembly_sha256": "7b8d09df2490c0a5aa3feaa9d6c045bf91ded30452d8c284b1e1d58bc8143b70",
+              "stderr": "--371259-- warning: L3 cache found, using its data for the LL simulation.\n--371259-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--371259-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            },
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr824-s20-compiler-work/bb/case-1-round-2.cg",
+                "/home/user/.cache/pr824-s20-compiler-work/bb/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/benchmark/programs/libm_round_family.c",
+                "-o",
+                "/home/user/.cache/pr824-s20-compiler-work/bb/case-1.s"
+              ],
+              "events": {
+                "Ir": 289441225,
+                "Dr": 62502970,
+                "Dw": 33324820,
+                "I1mr": 832233,
+                "D1mr": 453540,
+                "D1mw": 227569,
+                "ILmr": 50071,
+                "DLmr": 19610,
+                "DLmw": 39290,
+                "Bc": 47430374,
+                "Bcm": 2325213,
+                "Bi": 7575145,
+                "Bim": 425866
+              },
+              "profile_sha256": "699afbec8d31bf67a3ca327a1a292482225e37a18c0e796753fb758d1cf2b7db",
+              "assembly_sha256": "7b8d09df2490c0a5aa3feaa9d6c045bf91ded30452d8c284b1e1d58bc8143b70",
+              "stderr": "--371327-- warning: L3 cache found, using its data for the LL simulation.\n--371327-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--371327-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            }
+          },
+          "ir_ratio": 1.0018008077460285
+        }
+      ],
+      "median_ir_ratio": 1.0018010500082368
+    },
+    {
+      "source": "/home/user/lccc/tests/benchmark/programs/byte_load_reassembly.c",
+      "source_sha256": "d98d60eefd244df93fd9f4a828806ce2e32be56aad4872a2672d172b14dda562",
+      "rounds": [
+        {
+          "order": [
+            "mine",
+            "ref"
+          ],
+          "arms": {
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr824-s20-compiler-work/aa/case-2-round-0.cg",
+                "/home/user/.cache/pr824-s20-compiler-work/aa/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/benchmark/programs/byte_load_reassembly.c",
+                "-o",
+                "/home/user/.cache/pr824-s20-compiler-work/aa/case-2.s"
+              ],
+              "events": {
+                "Ir": 539707221,
+                "Dr": 118714522,
+                "Dw": 59661799,
+                "I1mr": 789304,
+                "D1mr": 1181986,
+                "D1mw": 550559,
+                "ILmr": 47360,
+                "DLmr": 19304,
+                "DLmw": 45391,
+                "Bc": 89627401,
+                "Bcm": 3762824,
+                "Bi": 14935315,
+                "Bim": 1094559
+              },
+              "profile_sha256": "69a82e4e2dafd34e5fd11690404f7abab11bc2dd247ec0fdf5f65ba01581749f",
+              "assembly_sha256": "a368061957cb36aa1501445a39cee474af4f855639510aeb1faf299c886b425d",
+              "stderr": "--371331-- warning: L3 cache found, using its data for the LL simulation.\n--371331-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--371331-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            },
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr824-s20-compiler-work/bb/case-2-round-0.cg",
+                "/home/user/.cache/pr824-s20-compiler-work/bb/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/benchmark/programs/byte_load_reassembly.c",
+                "-o",
+                "/home/user/.cache/pr824-s20-compiler-work/bb/case-2.s"
+              ],
+              "events": {
+                "Ir": 632440877,
+                "Dr": 139462530,
+                "Dw": 68021019,
+                "I1mr": 785568,
+                "D1mr": 1292408,
+                "D1mw": 566812,
+                "ILmr": 47697,
+                "DLmr": 19353,
+                "DLmw": 44448,
+                "Bc": 106249748,
+                "Bcm": 4198611,
+                "Bi": 18275758,
+                "Bim": 825475
+              },
+              "profile_sha256": "e45f59916b29daec4aae95a0f1aa72efede48635d40dbae4711f33d168980208",
+              "assembly_sha256": "b3c5677d68825b3e91c560bec77453f3ea799a8a14a4ef5f40bc55400233437b",
+              "stderr": "--371342-- warning: L3 cache found, using its data for the LL simulation.\n--371342-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--371342-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            }
+          },
+          "ir_ratio": 0.853371818026873
+        },
+        {
+          "order": [
+            "ref",
+            "mine"
+          ],
+          "arms": {
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr824-s20-compiler-work/bb/case-2-round-1.cg",
+                "/home/user/.cache/pr824-s20-compiler-work/bb/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/benchmark/programs/byte_load_reassembly.c",
+                "-o",
+                "/home/user/.cache/pr824-s20-compiler-work/bb/case-2.s"
+              ],
+              "events": {
+                "Ir": 632439852,
+                "Dr": 139462509,
+                "Dw": 68021072,
+                "I1mr": 785569,
+                "D1mr": 1292381,
+                "D1mw": 566815,
+                "ILmr": 47697,
+                "DLmr": 19353,
+                "DLmw": 44440,
+                "Bc": 106249564,
+                "Bcm": 4198521,
+                "Bi": 18275772,
+                "Bim": 825475
+              },
+              "profile_sha256": "b2ea2f68775f2c97a995e6b29c10f78be55fc72a66556845a8132e1eed0415ab",
+              "assembly_sha256": "b3c5677d68825b3e91c560bec77453f3ea799a8a14a4ef5f40bc55400233437b",
+              "stderr": "--371378-- warning: L3 cache found, using its data for the LL simulation.\n--371378-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--371378-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            },
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr824-s20-compiler-work/aa/case-2-round-1.cg",
+                "/home/user/.cache/pr824-s20-compiler-work/aa/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/benchmark/programs/byte_load_reassembly.c",
+                "-o",
+                "/home/user/.cache/pr824-s20-compiler-work/aa/case-2.s"
+              ],
+              "events": {
+                "Ir": 539707943,
+                "Dr": 118714616,
+                "Dw": 59661865,
+                "I1mr": 789310,
+                "D1mr": 1182044,
+                "D1mw": 550555,
+                "ILmr": 47364,
+                "DLmr": 19304,
+                "DLmw": 45389,
+                "Bc": 89627472,
+                "Bcm": 3762841,
+                "Bi": 14935321,
+                "Bim": 1094559
+              },
+              "profile_sha256": "cccbc98128f4a27b2eeded28615ac5a0eb67bdf3e1711e93f7df43c78a327ecc",
+              "assembly_sha256": "a368061957cb36aa1501445a39cee474af4f855639510aeb1faf299c886b425d",
+              "stderr": "--371410-- warning: L3 cache found, using its data for the LL simulation.\n--371410-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--371410-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            }
+          },
+          "ir_ratio": 0.8533743427035019
+        },
+        {
+          "order": [
+            "mine",
+            "ref"
+          ],
+          "arms": {
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr824-s20-compiler-work/aa/case-2-round-2.cg",
+                "/home/user/.cache/pr824-s20-compiler-work/aa/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/benchmark/programs/byte_load_reassembly.c",
+                "-o",
+                "/home/user/.cache/pr824-s20-compiler-work/aa/case-2.s"
+              ],
+              "events": {
+                "Ir": 539709218,
+                "Dr": 118714665,
+                "Dw": 59661808,
+                "I1mr": 789302,
+                "D1mr": 1182010,
+                "D1mw": 550555,
+                "ILmr": 47359,
+                "DLmr": 19304,
+                "DLmw": 45376,
+                "Bc": 89627664,
+                "Bcm": 3762903,
+                "Bi": 14935313,
+                "Bim": 1094559
+              },
+              "profile_sha256": "9362cc0264dca11f5fac89fbda609037b4522746ab252bd2a491f6f82323ed51",
+              "assembly_sha256": "a368061957cb36aa1501445a39cee474af4f855639510aeb1faf299c886b425d",
+              "stderr": "--371426-- warning: L3 cache found, using its data for the LL simulation.\n--371426-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--371426-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            },
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr824-s20-compiler-work/bb/case-2-round-2.cg",
+                "/home/user/.cache/pr824-s20-compiler-work/bb/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/benchmark/programs/byte_load_reassembly.c",
+                "-o",
+                "/home/user/.cache/pr824-s20-compiler-work/bb/case-2.s"
+              ],
+              "events": {
+                "Ir": 632440010,
+                "Dr": 139462428,
+                "Dw": 68021001,
+                "I1mr": 785567,
+                "D1mr": 1292380,
+                "D1mw": 566823,
+                "ILmr": 47696,
+                "DLmr": 19353,
+                "DLmw": 44451,
+                "Bc": 106249624,
+                "Bcm": 4198505,
+                "Bi": 18275755,
+                "Bim": 825475
+              },
+              "profile_sha256": "869e502aa600373a6d3f07e49c2fd230bea03e40a99a064fd4be17b0e85c9ae0",
+              "assembly_sha256": "b3c5677d68825b3e91c560bec77453f3ea799a8a14a4ef5f40bc55400233437b",
+              "stderr": "--371442-- warning: L3 cache found, using its data for the LL simulation.\n--371442-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--371442-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            }
+          },
+          "ir_ratio": 0.8533761455098327
+        }
+      ],
+      "median_ir_ratio": 0.8533743427035019
+    },
+    {
+      "source": "/home/user/lccc/tests/benchmark/programs/sha256_transform.c",
+      "source_sha256": "6f55a89cfd9d59eb9a8e115eef968295ec775fa63d0545dd33517c2fdf06bf5e",
+      "rounds": [
+        {
+          "order": [
+            "mine",
+            "ref"
+          ],
+          "arms": {
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr824-s20-compiler-work/aa/case-3-round-0.cg",
+                "/home/user/.cache/pr824-s20-compiler-work/aa/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/benchmark/programs/sha256_transform.c",
+                "-o",
+                "/home/user/.cache/pr824-s20-compiler-work/aa/case-3.s"
+              ],
+              "events": {
+                "Ir": 821843859,
+                "Dr": 179342632,
+                "Dw": 88444749,
+                "I1mr": 1077011,
+                "D1mr": 1542537,
+                "D1mw": 689677,
+                "ILmr": 55449,
+                "DLmr": 19922,
+                "DLmw": 46032,
+                "Bc": 137856141,
+                "Bcm": 5568690,
+                "Bi": 22954211,
+                "Bim": 2936372
+              },
+              "profile_sha256": "61ae6ad5b0d728e949b43ff421f37c14b18b9a977dbd0fe24e69fd5c5807cd1a",
+              "assembly_sha256": "33b8b475448b47122a624fdea196b2f9634b006695fb6c43ee9f070b0f1c8042",
+              "stderr": "--371468-- warning: L3 cache found, using its data for the LL simulation.\n--371468-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--371468-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            },
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr824-s20-compiler-work/bb/case-3-round-0.cg",
+                "/home/user/.cache/pr824-s20-compiler-work/bb/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/benchmark/programs/sha256_transform.c",
+                "-o",
+                "/home/user/.cache/pr824-s20-compiler-work/bb/case-3.s"
+              ],
+              "events": {
+                "Ir": 823029399,
+                "Dr": 179492402,
+                "Dw": 88632365,
+                "I1mr": 1062568,
+                "D1mr": 1548565,
+                "D1mw": 705916,
+                "ILmr": 55604,
+                "DLmr": 19931,
+                "DLmw": 46017,
+                "Bc": 138101206,
+                "Bcm": 5725998,
+                "Bi": 22969459,
+                "Bim": 970843
+              },
+              "profile_sha256": "e2677d23788d5c300cbf8ef8d9ac336db34bc96078dac63668265ee5b1aa300d",
+              "assembly_sha256": "33b8b475448b47122a624fdea196b2f9634b006695fb6c43ee9f070b0f1c8042",
+              "stderr": "--371511-- warning: L3 cache found, using its data for the LL simulation.\n--371511-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--371511-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            }
+          },
+          "ir_ratio": 0.9985595411276432
+        },
+        {
+          "order": [
+            "ref",
+            "mine"
+          ],
+          "arms": {
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr824-s20-compiler-work/bb/case-3-round-1.cg",
+                "/home/user/.cache/pr824-s20-compiler-work/bb/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/benchmark/programs/sha256_transform.c",
+                "-o",
+                "/home/user/.cache/pr824-s20-compiler-work/bb/case-3.s"
+              ],
+              "events": {
+                "Ir": 823030307,
+                "Dr": 179492463,
+                "Dw": 88632356,
+                "I1mr": 1062557,
+                "D1mr": 1548548,
+                "D1mw": 705921,
+                "ILmr": 55604,
+                "DLmr": 19931,
+                "DLmw": 46022,
+                "Bc": 138101316,
+                "Bcm": 5725937,
+                "Bi": 22969458,
+                "Bim": 970844
+              },
+              "profile_sha256": "ab4479fd5e93345730c917f64daa760eaba414d6f3f2e9f9a2d12de937939b95",
+              "assembly_sha256": "33b8b475448b47122a624fdea196b2f9634b006695fb6c43ee9f070b0f1c8042",
+              "stderr": "--371827-- warning: L3 cache found, using its data for the LL simulation.\n--371827-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--371827-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            },
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr824-s20-compiler-work/aa/case-3-round-1.cg",
+                "/home/user/.cache/pr824-s20-compiler-work/aa/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/benchmark/programs/sha256_transform.c",
+                "-o",
+                "/home/user/.cache/pr824-s20-compiler-work/aa/case-3.s"
+              ],
+              "events": {
+                "Ir": 821845453,
+                "Dr": 179342749,
+                "Dw": 88444720,
+                "I1mr": 1077017,
+                "D1mr": 1542522,
+                "D1mw": 689648,
+                "ILmr": 55449,
+                "DLmr": 19922,
+                "DLmw": 46016,
+                "Bc": 137856366,
+                "Bcm": 5568707,
+                "Bi": 22954208,
+                "Bim": 2936372
+              },
+              "profile_sha256": "4c2b306154c2f34d8280a09c5b57be2368122ad616c81a6193fead06db3f8e91",
+              "assembly_sha256": "33b8b475448b47122a624fdea196b2f9634b006695fb6c43ee9f070b0f1c8042",
+              "stderr": "--371866-- warning: L3 cache found, using its data for the LL simulation.\n--371866-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--371866-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            }
+          },
+          "ir_ratio": 0.9985603762219658
+        },
+        {
+          "order": [
+            "mine",
+            "ref"
+          ],
+          "arms": {
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr824-s20-compiler-work/aa/case-3-round-2.cg",
+                "/home/user/.cache/pr824-s20-compiler-work/aa/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/benchmark/programs/sha256_transform.c",
+                "-o",
+                "/home/user/.cache/pr824-s20-compiler-work/aa/case-3.s"
+              ],
+              "events": {
+                "Ir": 821843020,
+                "Dr": 179342506,
+                "Dw": 88444707,
+                "I1mr": 1077011,
+                "D1mr": 1542516,
+                "D1mw": 689673,
+                "ILmr": 55449,
+                "DLmr": 19922,
+                "DLmw": 46029,
+                "Bc": 137856044,
+                "Bcm": 5568566,
+                "Bi": 22954202,
+                "Bim": 2936372
+              },
+              "profile_sha256": "750e3d2f8b632dcfdce0e1efadc5aba66441be9c6f28cfba6dbe0bcdde9db3d4",
+              "assembly_sha256": "33b8b475448b47122a624fdea196b2f9634b006695fb6c43ee9f070b0f1c8042",
+              "stderr": "--371882-- warning: L3 cache found, using its data for the LL simulation.\n--371882-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--371882-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            },
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr824-s20-compiler-work/bb/case-3-round-2.cg",
+                "/home/user/.cache/pr824-s20-compiler-work/bb/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/benchmark/programs/sha256_transform.c",
+                "-o",
+                "/home/user/.cache/pr824-s20-compiler-work/bb/case-3.s"
+              ],
+              "events": {
+                "Ir": 823029489,
+                "Dr": 179492477,
+                "Dw": 88632419,
+                "I1mr": 1062555,
+                "D1mr": 1548532,
+                "D1mw": 705902,
+                "ILmr": 55604,
+                "DLmr": 19931,
+                "DLmw": 46021,
+                "Bc": 138101204,
+                "Bcm": 5725900,
+                "Bi": 22969469,
+                "Bim": 970844
+              },
+              "profile_sha256": "d810b8559ee319c130e9e2a8fc404e25edb5bdda8825642a3598cbdf27bf2f42",
+              "assembly_sha256": "33b8b475448b47122a624fdea196b2f9634b006695fb6c43ee9f070b0f1c8042",
+              "stderr": "--371926-- warning: L3 cache found, using its data for the LL simulation.\n--371926-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--371926-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            }
+          },
+          "ir_ratio": 0.9985584125285212
+        }
+      ],
+      "median_ir_ratio": 0.9985595411276432
+    }
+  ],
+  "error": null
+}

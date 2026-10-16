@@ -92,8 +92,9 @@ impl DynamicDesc {
             v.push((DT_REL, a));
             v.push((DT_RELSZ, s));
         }
-        // PLT relocations are Elf32_Rel too, even with no .rel.dyn table.
-        // Consumers such as readelf need their entry size in that case.
+        // .rel.plt also contains Elf32_Rel records. Describe their entry
+        // size even when no .rel.dyn exists (readelf --use-dynamic must be
+        // able to decode a PLT-only executable), and never emit it twice.
         if self.rel.is_some() || self.plt.is_some() {
             v.push((DT_RELENT, 8));
         }
@@ -187,6 +188,19 @@ mod tests {
                 .collect();
             assert_eq!(tags.last(), Some(&DT_NULL));
             assert_eq!(tags.iter().filter(|&&t| t == DT_NULL).count(), 1);
+            assert_eq!(
+                d.entries()
+                    .iter()
+                    .filter(|&&(tag, _)| tag == DT_RELENT)
+                    .copied()
+                    .collect::<Vec<_>>(),
+                if d.plt.is_some() || d.rel.is_some() {
+                    vec![(DT_RELENT, 8)]
+                } else {
+                    vec![]
+                },
+                "REL entry-size metadata, presence mask {mask:#x}"
+            );
         }
     }
 

@@ -1312,11 +1312,11 @@ pub(crate) fn set_affine_fold_knobs(enabled: bool, debug: bool) {
     AFFINE_FOLD_DEBUG.with(|cell| cell.set(debug));
 }
 
-fn affine_fold_enabled() -> bool {
+pub(crate) fn affine_fold_enabled() -> bool {
     AFFINE_FOLD_ENABLED.with(|cell| cell.get())
 }
 
-fn affine_fold_debug() -> bool {
+pub(crate) fn affine_fold_debug() -> bool {
     AFFINE_FOLD_DEBUG.with(|cell| cell.get())
 }
 
@@ -1580,10 +1580,11 @@ fn affine_offset_of(func: &IrFunction, iv: u32, mut value: u32, ty: IrType) -> O
 fn loop_exit_threshold(
     func: &IrFunction,
     lp: &NaturalLoop,
-    iv: u32,
-    iv_ty: IrType,
+    shape: &IvShape,
     cfg: &CfgAnalysis,
 ) -> Option<i128> {
+    let iv = shape.iv;
+    let iv_ty = shape.ty;
     let mut exiting: Vec<(usize, &Terminator)> = Vec::new();
     for &bi in &lp.body {
         if bi >= func.blocks.len() {
@@ -1733,7 +1734,33 @@ fn loop_exit_threshold(
         _ => return None,
     } - c;
     let (lo, hi) = integer_type_bounds(iv_ty)?;
-    (t >= lo && t <= hi).then_some(t)
+    if !(lo..=hi).contains(&t) || !(lo..=hi).contains(&bound) || !(lo..=hi).contains(&c) {
+        return None;
+    }
+    // Prove the CONTROLLING expression itself, independently of whichever
+    // comparison a caller wants to fold: if `iv + c` wraps on an executed
+    // test, the exit is postponed PAST `t`, the executed IV sequence is no
+    // longer a prefix of `start, start+step, ..`, and every range
+    // certificate derived from `t` is void. Concretely (-fwrapv, step
+    // 2^30-1): `i + 1073741830 < 2147483644` wraps negative on the second
+    // test and keeps looping; affine_control_proof.c returns 95 instead of
+    // 97 without this obligation. The sequence is monotone (`step > 0`),
+    // so the first and the first-failing sums bound every executed sum.
+    if shape.start >= t {
+        return None; // the entry test already fails: nothing is certified
+    }
+    let span = t - shape.start;
+    let l = (span + shape.step - 1) / shape.step; // ceil, step > 0
+    let last = shape.start.checked_add(l.checked_mul(shape.step)?)?;
+    let first_sum = shape.start.checked_add(c)?;
+    let last_sum = last.checked_add(c)?;
+    if !(lo..=hi).contains(&last)
+        || !(lo..=hi).contains(&first_sum)
+        || !(lo..=hi).contains(&last_sum)
+    {
+        return None;
+    }
+    Some(t)
 }
 
 /// Fold every eligible affine comparison in one loop.  Returns the number of
@@ -1761,7 +1788,7 @@ fn fold_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -> usiz
     // nothing to prove with.
     let mut bound_iv: Option<(IvShape, i128)> = None;
     for shape in shapes {
-        if let Some(t) = loop_exit_threshold(func, lp, shape.iv, shape.ty, cfg) {
+        if let Some(t) = loop_exit_threshold(func, lp, &shape, cfg) {
             bound_iv = Some((shape, t));
             break;
         }
@@ -2224,6 +2251,44 @@ mod tests {
         let mut f = counted_loop(Ty::U32, 0, 4, IrCmpOp::Ult, 64, true, 1, true, true);
         assert_eq!(fold_affine_exit_compares(&mut f), 1);
         assert_eq!(folded_cmp(&f), Some((IrCmpOp::Ult, 2, 60)));
+    }
+
+    /// The controlling expression's OWN wrap postpones the exit: with
+    /// `-fwrapv`, `i + 1073741830 < 2147483644` and `step = 2^30 - 1`,
+    /// the second test computes `1073741823 + 1073741830`, which wraps
+    /// negative and keeps looping past the threshold. Every certificate
+    /// derived from that threshold is void, so the fold must refuse
+    /// (affine_control_proof.c returned 95 instead of 97 without this).
+    #[test]
+    fn refuses_a_wrapping_controlling_expression() {
+        let mut f = counted_loop(
+            Ty::I32,
+            0,
+            1_073_741_830,
+            IrCmpOp::Slt,
+            2_147_483_644,
+            true,
+            1_073_741_823,
+            true,
+            true,
+        );
+        let original = format!("{f:?}");
+        assert_eq!(fold_affine_exit_compares(&mut f), 0);
+        assert_eq!(format!("{f:?}"), original);
+        // Control: the same shape with a small step exits before the sum
+        // can wrap, and the fold still runs.
+        let mut ok = counted_loop(
+            Ty::I32,
+            0,
+            1_073_741_830,
+            IrCmpOp::Slt,
+            2_147_483_644,
+            true,
+            1,
+            true,
+            true,
+        );
+        assert_eq!(fold_affine_exit_compares(&mut ok), 1);
     }
 
     #[test]

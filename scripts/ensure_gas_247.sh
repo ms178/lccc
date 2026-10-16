@@ -257,6 +257,12 @@ _prefix_provisioned() {
 # step fell through to a 3-minute build) gets the answer from ONE predicate, so
 # "USABLE" can never disagree with the early return below.
 
+# A stale prefix may contain symlinks/hardlinks to distro tools. Repair the
+# prefix entry, never overwrite its referent (possibly a system executable).
+_install_tool() {
+    cp --remove-destination -- "$1" "$2"
+}
+
 self_test() {
     local tmp ok=0
     tmp=$(mktemp -d)
@@ -553,6 +559,28 @@ target=other-target
     gate_case "absent aarch64 prefix is never provisioned" 1
     rm -rf "$prefix"
 
+    # Reprovisioning must replace links rather than write through them.
+    printf 'old system tool\n' > "$tmp/system-tool"
+    printf 'new pinned tool\n' > "$tmp/new-tool"
+    chmod 755 "$tmp/new-tool"
+    for kind in symlink hardlink dangling; do
+        rm -f "$tmp/install-dest"
+        case "$kind" in
+            symlink) ln -s "$tmp/system-tool" "$tmp/install-dest" ;;
+            hardlink) ln "$tmp/system-tool" "$tmp/install-dest" ;;
+            dangling) ln -s "$tmp/missing-tool" "$tmp/install-dest" ;;
+        esac
+        if _install_tool "$tmp/new-tool" "$tmp/install-dest" &&
+           [[ ! -L "$tmp/install-dest" && -x "$tmp/install-dest" ]] &&
+           cmp -s "$tmp/new-tool" "$tmp/install-dest" &&
+           [[ $(cat "$tmp/system-tool") == 'old system tool' && ! -e "$tmp/missing-tool" ]]; then
+            printf '  ok   install replaces %s without modifying referent\n' "$kind"
+        else
+            echo "  FAIL install through $kind" >&2
+            ok=1
+        fi
+    done
+
     if [[ $ok == 0 ]]; then
         echo "ensure_gas_247 self-test: every case lands on its verdict"
     else
@@ -698,13 +726,13 @@ cd "$build"
     --disable-werror --disable-ld --disable-gold >configure.log 2>&1
 make -j2 >make.log 2>&1
 mkdir -p "$prefix/bin"
-cp gas/as-new "$as"
-cp binutils/objdump "$od"
+_install_tool gas/as-new "$as"
+_install_tool binutils/objdump "$od"
 [[ -x binutils/objcopy ]] || {
     echo "FATAL: binutils/objcopy was not produced; the matrix cannot read .text" >&2
     exit 1
 }
-cp binutils/objcopy "$oc"
+_install_tool binutils/objcopy "$oc"
 # Install binutils' OWN system-register table next to the tools, for the
 # aarch64 sysreg gate (scripts/aarch64_sysreg_table.py holds the generated
 # table against this .def, in both directions).

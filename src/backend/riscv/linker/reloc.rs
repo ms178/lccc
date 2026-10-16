@@ -385,6 +385,35 @@ fn relocate_address64(
     value
 }
 
+/// RV64 has no 32-bit RELATIVE relocation. GNU-compatible shared linking
+/// accepts only link-time ABS constants; section offsets would lose load bias.
+fn relocate_address32(
+    symbol_value: u64,
+    addend: i64,
+    sym: &Symbol,
+    sym_idx: usize,
+    ctx: &RelocContext,
+    obj_name: &str,
+) -> Result<u32, String> {
+    if ctx.collect_relatives {
+        let global = if sym.binding() != STB_LOCAL && !sym.name.is_empty() {
+            ctx.global_syms.get(sym.name.as_str())
+        } else {
+            None
+        };
+        let absolute = global.map_or(sym.shndx == SHN_ABS || sym_idx == 0, |g| {
+            g.defined && g.section_idx.is_none()
+        });
+        if !absolute {
+            return Err(format!(
+                "R_RISCV_32 against non-absolute symbol '{}' cannot be used in an RV64 shared object ('{}')",
+                sym.name, obj_name
+            ));
+        }
+    }
+    Ok(symbol_value.wrapping_add(addend as u64) as u32)
+}
+
 /// Apply a single relocation to the merged section data.
 fn apply_one_reloc(
     rela_type: u32,
@@ -415,7 +444,7 @@ fn apply_one_reloc(
             field.copy_from_slice(&value.to_le_bytes());
         }
         R_RISCV_32 => {
-            let val = (s as i64 + a) as u32;
+            let val = relocate_address32(s, a, sym, sym_idx, ctx, obj_name)?;
             if off + 4 <= data.len() {
                 data[off..off + 4].copy_from_slice(&val.to_le_bytes());
             }

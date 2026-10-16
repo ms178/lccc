@@ -15,6 +15,7 @@ pub(crate) mod cast; // Cast and float operation classification
 pub(crate) mod cfi_synth; // Unwind info derived from final x86/i686 code
 pub(crate) mod f128_softfloat; // Shared F128 soft-float orchestration (ARM + RISC-V)
 pub(crate) mod generation; // Module/function/instruction dispatch
+mod global_alignment;
 pub(crate) mod inline_asm; // InlineAsmEmitter trait and shared framework
 mod label_identity;
 pub(crate) mod stack_layout; // Stack layout: slot assignment, alloca coalescing, regalloc helpers
@@ -392,19 +393,35 @@ impl Target {
                     "/usr/lib/gcc/riscv64-linux-gnu",
                 ],
             };
-            let gcc_versions: &[&str] = &["14", "13", "12", "11", "10", "9", "8", "7"];
 
             let mut paths: Vec<String> = Vec::new();
 
-            // Find GCC lib dir (contains crtbegin.o)
+            // Find GCC lib dir (contains crtbegin.o). Versions come from the
+            // filesystem, newest first: a fixed release allowlist silently
+            // missed Debian GCC 16 installations.
             'outer: for base in gcc_bases {
-                for ver in gcc_versions {
+                for ver in common::gcc_versions_at(base) {
                     let dir = format!("{}/{}", base, ver);
                     if std::path::Path::new(&format!("{}/crtbegin.o", dir)).exists() {
                         paths.push(dir);
                         break 'outer;
                     }
                 }
+            }
+
+            // Match the built-in linker's native-i686 multilib fallback rather
+            // than reporting only /usr/lib to CMake on GCC16 multilib hosts.
+            if matches!(self, Target::I686) && paths.is_empty() {
+                for ver in common::gcc_versions_at("/usr/lib/gcc/x86_64-linux-gnu") {
+                    let dir = format!("/usr/lib/gcc/x86_64-linux-gnu/{ver}/32");
+                    if std::path::Path::new(&format!("{dir}/crtbegin.o")).exists() {
+                        paths.push(dir);
+                        break;
+                    }
+                }
+            }
+            if matches!(self, Target::I686) && std::path::Path::new("/usr/lib32/crt1.o").exists() {
+                paths.push("/usr/lib32".to_string());
             }
 
             // Multiarch lib dirs

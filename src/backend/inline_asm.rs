@@ -134,7 +134,15 @@ pub trait InlineAsmEmitter {
     fn assign_scratch_reg(&mut self, kind: &AsmOperandKind, excluded: &[String]) -> String;
 
     /// Load an input value into its assigned register. Called during Phase 2.
-    fn load_input_to_reg(&mut self, op: &AsmOperand, val: &Operand, constraint: &str);
+    /// `operands` includes fixed-register operands whose values a temporary
+    /// used by input materialization must preserve.
+    fn load_input_to_reg(
+        &mut self,
+        op: &AsmOperand,
+        val: &Operand,
+        constraint: &str,
+        operands: &[AsmOperand],
+    );
 
     /// Pre-load a read-write ("+") output's current value into its register.
     fn preload_readwrite_output(&mut self, op: &AsmOperand, ptr: &Value);
@@ -165,21 +173,6 @@ pub trait InlineAsmEmitter {
     /// answers `true`.
     fn asm_vex_prefix_enabled(&self) -> bool {
         false
-    }
-
-    /// Comment markers emitted around the substituted inline-asm body
-    /// (`Some((open, close))`), or `None` to emit no markers.
-    ///
-    /// GCC/Clang bracket inline asm with `#APP`/`#NO_APP` so downstream
-    /// text-level tools know the region is user-authored and must not be
-    /// touched. lccc's x86 peephole runs on assembly TEXT after codegen; a
-    /// user's `movq %rax, %rax` inside an ALTERNATIVE() macro is a deliberate
-    /// length template, not a removable self-move — without markers the
-    /// peephole deleted it and the kernel's .altinstructions entries got
-    /// orig_len = 0 ("empty alternative entry", objtool). Markers are comment
-    /// lines for the target assembler, so they are semantically invisible.
-    fn asm_block_markers(&self) -> Option<(&'static str, &'static str)> {
-        None
     }
 
     /// Resolve memory operand addresses that require indirection (non-alloca pointers).
@@ -493,6 +486,7 @@ pub fn emit_inline_asm_common(
     operand_types: &[IrType],
     goto_labels: &[(String, BlockId)],
     input_symbols: &[Option<String>],
+    markers: Option<(&'static str, &'static str)>,
 ) {
     emit_inline_asm_common_impl(
         emitter,
@@ -503,6 +497,7 @@ pub fn emit_inline_asm_common(
         operand_types,
         goto_labels,
         input_symbols,
+        markers,
         &[],
     );
 }
@@ -516,6 +511,7 @@ pub fn emit_inline_asm_common_impl(
     operand_types: &[IrType],
     goto_labels: &[(String, BlockId)],
     input_symbols: &[Option<String>],
+    markers: Option<(&'static str, &'static str)>,
     seg_overrides: &[AddressSpace],
 ) {
     emitter.reset_scratch_state();
@@ -556,7 +552,6 @@ pub fn emit_inline_asm_common_impl(
     // First, expand GCC dialect alternatives {att|intel} -> att
     let expanded = expand_dialect_alternatives(template);
     let lines: Vec<&str> = expanded.split('\n').collect();
-    let markers = emitter.asm_block_markers();
     let body_nonempty = !lines.iter().all(|l| l.trim().is_empty());
     if let Some((open, _)) = markers {
         if body_nonempty {
@@ -1164,7 +1159,7 @@ fn load_inputs(
         if operands[op_idx].reg.is_empty() {
             continue;
         }
-        emitter.load_input_to_reg(&operands[op_idx], val, constraint);
+        emitter.load_input_to_reg(&operands[op_idx], val, constraint, operands);
     }
 
     // x87 FPU stack inputs must be loaded in reverse stack order: st(1) first, then st(0),
@@ -1197,7 +1192,12 @@ fn load_inputs(
     }
     for (inp_idx, _) in &x87_inputs {
         let op_idx = outputs.len() + inp_idx;
-        emitter.load_input_to_reg(&operands[op_idx], &inputs[*inp_idx].1, &inputs[*inp_idx].0);
+        emitter.load_input_to_reg(
+            &operands[op_idx],
+            &inputs[*inp_idx].1,
+            &inputs[*inp_idx].0,
+            operands,
+        );
     }
 }
 

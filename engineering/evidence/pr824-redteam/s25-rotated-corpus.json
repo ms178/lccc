@@ -1,0 +1,1406 @@
+{
+  "complete": true,
+  "metric": "bounded whole-program simulated Ir; not runtime",
+  "selected": [
+    "aarch64_select_patterns",
+    "ackermann",
+    "arith_loop",
+    "ascii_case_fold",
+    "binary_search",
+    "binary_trees",
+    "bitops",
+    "byte_load_reassembly",
+    "chacha20_block",
+    "constant_recursion",
+    "double_reduction",
+    "expat_siphash24",
+    "expat_xml_scan",
+    "fannkuch",
+    "fib",
+    "glibc_memcmp",
+    "glibc_strstr",
+    "gzip_crc32",
+    "hash_table",
+    "histogram",
+    "libm_round_family",
+    "linux_find_bit",
+    "linux_find_bit_scaled",
+    "linux_rbtree",
+    "loop_patterns",
+    "lz4_compress",
+    "lz4_match_extend",
+    "mandelbrot",
+    "matmul",
+    "nbody",
+    "percpu_ptr_walk",
+    "qsort",
+    "ring_fifo",
+    "sha256_transform",
+    "sieve",
+    "spectral_norm",
+    "sqlite_varint",
+    "strlen_bench",
+    "struct_copy",
+    "switch_dispatch",
+    "tce_sum",
+    "tls_seg_access",
+    "zlib_ng_adler32",
+    "zlib_ng_adler32_combine",
+    "zstd_count"
+  ],
+  "results": {
+    "arith_loop": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DARITH_ITERS=20000",
+      "metrics": {
+        "conditional_mispredicts": [
+          3362,
+          3362
+        ],
+        "d1_misses": [
+          1887,
+          1887
+        ],
+        "i1_misses": [
+          1405,
+          1405
+        ],
+        "indirect_mispredicts": [
+          258,
+          258
+        ],
+        "ir_mine": 2186746,
+        "ir_ratio": 1.0,
+        "ir_ref": 2186746,
+        "ll_misses": [
+          2929,
+          2929
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/arith_loop/manifest.json"
+    },
+    "fib": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DFIB_N=25",
+      "metrics": {
+        "conditional_mispredicts": [
+          3377,
+          3377
+        ],
+        "d1_misses": [
+          1886,
+          1886
+        ],
+        "i1_misses": [
+          1390,
+          1390
+        ],
+        "indirect_mispredicts": [
+          259,
+          259
+        ],
+        "ir_mine": 147183,
+        "ir_ratio": 1.0,
+        "ir_ref": 147183,
+        "ll_misses": [
+          2918,
+          2918
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/fib/manifest.json"
+    },
+    "matmul": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=48",
+      "metrics": {
+        "conditional_mispredicts": [
+          3574,
+          3574
+        ],
+        "d1_misses": [
+          3242,
+          3242
+        ],
+        "i1_misses": [
+          1488,
+          1488
+        ],
+        "indirect_mispredicts": [
+          260,
+          260
+        ],
+        "ir_mine": 310642,
+        "ir_ratio": 1.0,
+        "ir_ref": 310642,
+        "ll_misses": [
+          3888,
+          3888
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/matmul/manifest.json"
+    },
+    "qsort": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=10000",
+      "metrics": {
+        "conditional_mispredicts": [
+          78828,
+          78828
+        ],
+        "d1_misses": [
+          7676,
+          7676
+        ],
+        "i1_misses": [
+          1441,
+          1441
+        ],
+        "indirect_mispredicts": [
+          266,
+          266
+        ],
+        "ir_mine": 3503079,
+        "ir_ratio": 1.0,
+        "ir_ref": 3503079,
+        "ll_misses": [
+          4213,
+          4213
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/qsort/manifest.json"
+    },
+    "sieve": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=100000",
+      "metrics": {
+        "conditional_mispredicts": [
+          3576,
+          3576
+        ],
+        "d1_misses": [
+          51935,
+          51935
+        ],
+        "i1_misses": [
+          1396,
+          1396
+        ],
+        "indirect_mispredicts": [
+          266,
+          266
+        ],
+        "ir_mine": 1723639,
+        "ir_ratio": 1.0,
+        "ir_ref": 1723639,
+        "ll_misses": [
+          4486,
+          4486
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/sieve/manifest.json"
+    },
+    "tce_sum": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+      "metrics": {
+        "conditional_mispredicts": [
+          3352,
+          3352
+        ],
+        "d1_misses": [
+          1887,
+          1887
+        ],
+        "i1_misses": [
+          1387,
+          1387
+        ],
+        "indirect_mispredicts": [
+          259,
+          259
+        ],
+        "ir_mine": 146737,
+        "ir_ratio": 1.0,
+        "ir_ref": 146737,
+        "ll_misses": [
+          2913,
+          2913
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/tce_sum/manifest.json"
+    },
+    "nbody": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSTEPS=1000",
+      "metrics": {
+        "conditional_mispredicts": [
+          3519,
+          3519
+        ],
+        "d1_misses": [
+          1924,
+          1924
+        ],
+        "i1_misses": [
+          1480,
+          1480
+        ],
+        "indirect_mispredicts": [
+          261,
+          261
+        ],
+        "ir_mine": 676198,
+        "ir_ratio": 1.0,
+        "ir_ref": 676198,
+        "ll_misses": [
+          3020,
+          3020
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/nbody/manifest.json"
+    },
+    "binary_trees": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DTREE_DEPTH=10",
+      "metrics": {
+        "conditional_mispredicts": [
+          301045,
+          301045
+        ],
+        "d1_misses": [
+          61127,
+          61127
+        ],
+        "i1_misses": [
+          1458,
+          1458
+        ],
+        "indirect_mispredicts": [
+          268,
+          268
+        ],
+        "ir_mine": 48459459,
+        "ir_ratio": 1.0,
+        "ir_ref": 48459459,
+        "ll_misses": [
+          5045,
+          5045
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/binary_trees/manifest.json"
+    },
+    "spectral_norm": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=128",
+      "metrics": {
+        "conditional_mispredicts": [
+          8628,
+          8628
+        ],
+        "d1_misses": [
+          1939,
+          1939
+        ],
+        "i1_misses": [
+          1464,
+          1464
+        ],
+        "indirect_mispredicts": [
+          259,
+          259
+        ],
+        "ir_mine": 8260428,
+        "ir_ratio": 1.0,
+        "ir_ref": 8260428,
+        "ll_misses": [
+          2994,
+          2994
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/spectral_norm/manifest.json"
+    },
+    "mandelbrot": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DWIDTH=128 -DHEIGHT=128",
+      "metrics": {
+        "conditional_mispredicts": [
+          15550,
+          15550
+        ],
+        "d1_misses": [
+          1890,
+          1890
+        ],
+        "i1_misses": [
+          1389,
+          1389
+        ],
+        "indirect_mispredicts": [
+          258,
+          258
+        ],
+        "ir_mine": 6006787,
+        "ir_ratio": 1.0,
+        "ir_ref": 6006787,
+        "ll_misses": [
+          2915,
+          2915
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/mandelbrot/manifest.json"
+    },
+    "hash_table": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DNUM_OPS=20000",
+      "metrics": {
+        "conditional_mispredicts": [
+          19520,
+          19520
+        ],
+        "d1_misses": [
+          98387,
+          98387
+        ],
+        "i1_misses": [
+          1398,
+          1398
+        ],
+        "indirect_mispredicts": [
+          267,
+          267
+        ],
+        "ir_mine": 7715100,
+        "ir_ratio": 1.0,
+        "ir_ref": 7715100,
+        "ll_misses": [
+          26057,
+          26057
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/hash_table/manifest.json"
+    },
+    "strlen_bench": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DNSTRINGS=1000",
+      "metrics": {
+        "conditional_mispredicts": [
+          132024,
+          132024
+        ],
+        "d1_misses": [
+          221296,
+          221296
+        ],
+        "i1_misses": [
+          1429,
+          1429
+        ],
+        "indirect_mispredicts": [
+          276,
+          276
+        ],
+        "ir_mine": 9286502,
+        "ir_ratio": 1.0,
+        "ir_ref": 9286502,
+        "ll_misses": [
+          5381,
+          5381
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/strlen_bench/manifest.json"
+    },
+    "switch_dispatch": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=20000",
+      "metrics": {
+        "conditional_mispredicts": [
+          3354,
+          3354
+        ],
+        "d1_misses": [
+          1889,
+          1889
+        ],
+        "i1_misses": [
+          1396,
+          1396
+        ],
+        "indirect_mispredicts": [
+          19020,
+          19020
+        ],
+        "ir_mine": 554259,
+        "ir_ratio": 1.0,
+        "ir_ref": 554259,
+        "ll_misses": [
+          2921,
+          2921
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/switch_dispatch/manifest.json"
+    },
+    "struct_copy": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=2000",
+      "metrics": {
+        "conditional_mispredicts": [
+          3452,
+          3452
+        ],
+        "d1_misses": [
+          1923,
+          1923
+        ],
+        "i1_misses": [
+          1493,
+          1493
+        ],
+        "indirect_mispredicts": [
+          260,
+          260
+        ],
+        "ir_mine": 372230,
+        "ir_ratio": 1.0,
+        "ir_ref": 372230,
+        "ll_misses": [
+          3027,
+          3027
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/struct_copy/manifest.json"
+    },
+    "loop_patterns": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSIZE=16384",
+      "metrics": {
+        "conditional_mispredicts": [
+          3498,
+          3498
+        ],
+        "d1_misses": [
+          10541,
+          10541
+        ],
+        "i1_misses": [
+          1413,
+          1413
+        ],
+        "indirect_mispredicts": [
+          262,
+          262
+        ],
+        "ir_mine": 944814,
+        "ir_ratio": 1.0,
+        "ir_ref": 944814,
+        "ll_misses": [
+          4987,
+          4987
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/loop_patterns/manifest.json"
+    },
+    "fannkuch": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DFANNKUCH_N=7",
+      "metrics": {
+        "conditional_mispredicts": [
+          23076,
+          23076
+        ],
+        "d1_misses": [
+          1897,
+          1897
+        ],
+        "i1_misses": [
+          1395,
+          1395
+        ],
+        "indirect_mispredicts": [
+          258,
+          258
+        ],
+        "ir_mine": 1291786,
+        "ir_ratio": 1.0,
+        "ir_ref": 1291786,
+        "ll_misses": [
+          2923,
+          2923
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/fannkuch/manifest.json"
+    },
+    "ackermann": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DACK_N=6",
+      "metrics": {
+        "conditional_mispredicts": [
+          3365,
+          3365
+        ],
+        "d1_misses": [
+          1887,
+          1887
+        ],
+        "i1_misses": [
+          1386,
+          1386
+        ],
+        "indirect_mispredicts": [
+          258,
+          258
+        ],
+        "ir_mine": 146880,
+        "ir_ratio": 1.0,
+        "ir_ref": 146880,
+        "ll_misses": [
+          2911,
+          2911
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/ackermann/manifest.json"
+    },
+    "constant_recursion": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DACK_N=6",
+      "metrics": {
+        "conditional_mispredicts": [
+          3346,
+          3346
+        ],
+        "d1_misses": [
+          1886,
+          1886
+        ],
+        "i1_misses": [
+          1385,
+          1385
+        ],
+        "indirect_mispredicts": [
+          258,
+          258
+        ],
+        "ir_mine": 146585,
+        "ir_ratio": 1.0,
+        "ir_ref": 146585,
+        "ll_misses": [
+          2912,
+          2912
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/constant_recursion/manifest.json"
+    },
+    "bitops": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=20000",
+      "metrics": {
+        "conditional_mispredicts": [
+          3388,
+          3388
+        ],
+        "d1_misses": [
+          1888,
+          1888
+        ],
+        "i1_misses": [
+          1391,
+          1391
+        ],
+        "indirect_mispredicts": [
+          259,
+          259
+        ],
+        "ir_mine": 1267804,
+        "ir_ratio": 1.0,
+        "ir_ref": 1267804,
+        "ll_misses": [
+          2916,
+          2916
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/bitops/manifest.json"
+    },
+    "double_reduction": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DREDUCTION_PASSES=1",
+      "metrics": {
+        "conditional_mispredicts": [
+          3381,
+          3381
+        ],
+        "d1_misses": [
+          526305,
+          526305
+        ],
+        "i1_misses": [
+          1400,
+          1400
+        ],
+        "indirect_mispredicts": [
+          259,
+          259
+        ],
+        "ir_mine": 30424415,
+        "ir_ratio": 1.0,
+        "ir_ref": 30424415,
+        "ll_misses": [
+          199535,
+          199535
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/double_reduction/manifest.json"
+    },
+    "ascii_case_fold": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+      "metrics": {
+        "conditional_mispredicts": [
+          3245,
+          3245
+        ],
+        "d1_misses": [
+          4992,
+          4992
+        ],
+        "i1_misses": [
+          1219,
+          1219
+        ],
+        "indirect_mispredicts": [
+          238,
+          238
+        ],
+        "ir_mine": 2241492,
+        "ir_ratio": 1.0,
+        "ir_ref": 2241492,
+        "ll_misses": [
+          4775,
+          4775
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/ascii_case_fold/manifest.json"
+    },
+    "binary_search": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+      "metrics": {
+        "conditional_mispredicts": [
+          5306,
+          5306
+        ],
+        "d1_misses": [
+          2113,
+          2113
+        ],
+        "i1_misses": [
+          1217,
+          1217
+        ],
+        "indirect_mispredicts": [
+          238,
+          238
+        ],
+        "ir_mine": 606272,
+        "ir_ratio": 1.0,
+        "ir_ref": 606272,
+        "ll_misses": [
+          2982,
+          2982
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/binary_search/manifest.json"
+    },
+    "ring_fifo": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+      "metrics": {
+        "conditional_mispredicts": [
+          3240,
+          3240
+        ],
+        "d1_misses": [
+          1920,
+          1920
+        ],
+        "i1_misses": [
+          1209,
+          1209
+        ],
+        "indirect_mispredicts": [
+          238,
+          238
+        ],
+        "ir_mine": 624284,
+        "ir_ratio": 1.0,
+        "ir_ref": 624284,
+        "ll_misses": [
+          2784,
+          2784
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/ring_fifo/manifest.json"
+    },
+    "aarch64_select_patterns": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSELECT_ITERS=20000",
+      "metrics": {
+        "conditional_mispredicts": [
+          3390,
+          3390
+        ],
+        "d1_misses": [
+          1892,
+          1892
+        ],
+        "i1_misses": [
+          1393,
+          1393
+        ],
+        "indirect_mispredicts": [
+          257,
+          257
+        ],
+        "ir_mine": 867089,
+        "ir_ratio": 1.0,
+        "ir_ref": 867089,
+        "ll_misses": [
+          2919,
+          2919
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/aarch64_select_patterns/manifest.json"
+    },
+    "histogram": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+      "metrics": {
+        "conditional_mispredicts": [
+          3255,
+          3255
+        ],
+        "d1_misses": [
+          10145,
+          10145
+        ],
+        "i1_misses": [
+          1210,
+          1210
+        ],
+        "indirect_mispredicts": [
+          238,
+          238
+        ],
+        "ir_mine": 3226272,
+        "ir_ratio": 1.0,
+        "ir_ref": 3226272,
+        "ll_misses": [
+          6848,
+          6848
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/histogram/manifest.json"
+    },
+    "gzip_crc32": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DDATA_SIZE=16384 -DPASSES=4",
+      "metrics": {
+        "conditional_mispredicts": [
+          3403,
+          3403
+        ],
+        "d1_misses": [
+          2197,
+          2197
+        ],
+        "i1_misses": [
+          1398,
+          1398
+        ],
+        "indirect_mispredicts": [
+          259,
+          259
+        ],
+        "ir_mine": 802250,
+        "ir_ratio": 1.0,
+        "ir_ref": 802250,
+        "ll_misses": [
+          3194,
+          3194
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/gzip_crc32/manifest.json"
+    },
+    "libm_round_family": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=256 -DPASSES=4",
+      "metrics": {
+        "conditional_mispredicts": [
+          3490,
+          3490
+        ],
+        "d1_misses": [
+          1961,
+          1961
+        ],
+        "i1_misses": [
+          1491,
+          1491
+        ],
+        "indirect_mispredicts": [
+          259,
+          259
+        ],
+        "ir_mine": 171663,
+        "ir_ratio": 1.0,
+        "ir_ref": 171663,
+        "ll_misses": [
+          3062,
+          3062
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/libm_round_family/manifest.json"
+    },
+    "tls_seg_access": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=100",
+      "metrics": {
+        "conditional_mispredicts": [
+          3467,
+          3467
+        ],
+        "d1_misses": [
+          1897,
+          1897
+        ],
+        "i1_misses": [
+          1396,
+          1396
+        ],
+        "indirect_mispredicts": [
+          258,
+          258
+        ],
+        "ir_mine": 212585,
+        "ir_ratio": 1.0,
+        "ir_ref": 212585,
+        "ll_misses": [
+          2932,
+          2932
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/tls_seg_access/manifest.json"
+    },
+    "percpu_ptr_walk": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=1000",
+      "metrics": {
+        "conditional_mispredicts": [
+          4382,
+          4382
+        ],
+        "d1_misses": [
+          1895,
+          1895
+        ],
+        "i1_misses": [
+          1409,
+          1409
+        ],
+        "indirect_mispredicts": [
+          264,
+          264
+        ],
+        "ir_mine": 286155,
+        "ir_ratio": 1.0,
+        "ir_ref": 286155,
+        "ll_misses": [
+          2941,
+          2941
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/percpu_ptr_walk/manifest.json"
+    },
+    "byte_load_reassembly": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+      "metrics": {
+        "conditional_mispredicts": [
+          23403,
+          23403
+        ],
+        "d1_misses": [
+          1958,
+          1958
+        ],
+        "i1_misses": [
+          1412,
+          1412
+        ],
+        "indirect_mispredicts": [
+          263,
+          263
+        ],
+        "ir_mine": 72111780,
+        "ir_ratio": 1.0,
+        "ir_ref": 72111780,
+        "ll_misses": [
+          3007,
+          3007
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/byte_load_reassembly/manifest.json"
+    },
+    "zlib_ng_adler32": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DDATA_SIZE=16384 -DPASSES=4",
+      "metrics": {
+        "conditional_mispredicts": [
+          3437,
+          3437
+        ],
+        "d1_misses": [
+          2183,
+          2183
+        ],
+        "i1_misses": [
+          1416,
+          1416
+        ],
+        "indirect_mispredicts": [
+          259,
+          259
+        ],
+        "ir_mine": 465099,
+        "ir_ratio": 1.0,
+        "ir_ref": 465099,
+        "ll_misses": [
+          3197,
+          3197
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/zlib_ng_adler32/manifest.json"
+    },
+    "zlib_ng_adler32_combine": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=10000",
+      "metrics": {
+        "conditional_mispredicts": [
+          5576,
+          5576
+        ],
+        "d1_misses": [
+          1917,
+          1917
+        ],
+        "i1_misses": [
+          1416,
+          1416
+        ],
+        "indirect_mispredicts": [
+          260,
+          260
+        ],
+        "ir_mine": 21855021,
+        "ir_ratio": 1.0,
+        "ir_ref": 21855021,
+        "ll_misses": [
+          2965,
+          2965
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/zlib_ng_adler32_combine/manifest.json"
+    },
+    "expat_xml_scan": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DXML_SIZE=16384 -DPASSES=4",
+      "metrics": {
+        "conditional_mispredicts": [
+          25564,
+          25564
+        ],
+        "d1_misses": [
+          2179,
+          2179
+        ],
+        "i1_misses": [
+          1400,
+          1400
+        ],
+        "indirect_mispredicts": [
+          258,
+          258
+        ],
+        "ir_mine": 1686311,
+        "ir_ratio": 1.0,
+        "ir_ref": 1686311,
+        "ll_misses": [
+          3183,
+          3183
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/expat_xml_scan/manifest.json"
+    },
+    "expat_siphash24": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=1000",
+      "metrics": {
+        "conditional_mispredicts": [
+          116323,
+          116323
+        ],
+        "d1_misses": [
+          1907,
+          1907
+        ],
+        "i1_misses": [
+          1456,
+          1456
+        ],
+        "indirect_mispredicts": [
+          1455,
+          1455
+        ],
+        "ir_mine": 15202217,
+        "ir_ratio": 1.0,
+        "ir_ref": 15202217,
+        "ll_misses": [
+          2991,
+          2991
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/expat_siphash24/manifest.json"
+    },
+    "sqlite_varint": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DVALUE_COUNT=2048 -DPASSES=4",
+      "metrics": {
+        "conditional_mispredicts": [
+          11486,
+          11486
+        ],
+        "d1_misses": [
+          2230,
+          2230
+        ],
+        "i1_misses": [
+          1416,
+          1416
+        ],
+        "indirect_mispredicts": [
+          2080,
+          2080
+        ],
+        "ir_mine": 825242,
+        "ir_ratio": 1.0,
+        "ir_ref": 825242,
+        "ll_misses": [
+          3231,
+          3231
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/sqlite_varint/manifest.json"
+    },
+    "linux_find_bit": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=32",
+      "metrics": {
+        "conditional_mispredicts": [
+          11924,
+          11924
+        ],
+        "d1_misses": [
+          137236,
+          137236
+        ],
+        "i1_misses": [
+          1396,
+          1396
+        ],
+        "indirect_mispredicts": [
+          258,
+          258
+        ],
+        "ir_mine": 5959273,
+        "ir_ratio": 1.0,
+        "ir_ref": 5959273,
+        "ll_misses": [
+          7018,
+          7018
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/linux_find_bit/manifest.json"
+    },
+    "linux_find_bit_scaled": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=128",
+      "metrics": {
+        "conditional_mispredicts": [
+          36631,
+          36631
+        ],
+        "d1_misses": [
+          530621,
+          530621
+        ],
+        "i1_misses": [
+          1396,
+          1396
+        ],
+        "indirect_mispredicts": [
+          258,
+          258
+        ],
+        "ir_mine": 22943081,
+        "ir_ratio": 1.0,
+        "ir_ref": 22943081,
+        "ll_misses": [
+          7020,
+          7020
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/linux_find_bit_scaled/manifest.json"
+    },
+    "glibc_memcmp": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=16",
+      "metrics": {
+        "conditional_mispredicts": [
+          3451,
+          3451
+        ],
+        "d1_misses": [
+          25355,
+          25355
+        ],
+        "i1_misses": [
+          1398,
+          1398
+        ],
+        "indirect_mispredicts": [
+          258,
+          258
+        ],
+        "ir_mine": 724111,
+        "ir_ratio": 1.0,
+        "ir_ref": 724111,
+        "ll_misses": [
+          4972,
+          4972
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/glibc_memcmp/manifest.json"
+    },
+    "chacha20_block": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DBLOCK_COUNT=256 -DPASSES=2",
+      "metrics": {
+        "conditional_mispredicts": [
+          3908,
+          3908
+        ],
+        "d1_misses": [
+          1895,
+          1895
+        ],
+        "i1_misses": [
+          1414,
+          1414
+        ],
+        "indirect_mispredicts": [
+          261,
+          261
+        ],
+        "ir_mine": 420306,
+        "ir_ratio": 1.0,
+        "ir_ref": 420306,
+        "ll_misses": [
+          2941,
+          2941
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/chacha20_block/manifest.json"
+    },
+    "sha256_transform": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DBLOCK_COUNT=256 -DPASSES=2",
+      "metrics": {
+        "conditional_mispredicts": [
+          4418,
+          4418
+        ],
+        "d1_misses": [
+          1904,
+          1904
+        ],
+        "i1_misses": [
+          1423,
+          1423
+        ],
+        "indirect_mispredicts": [
+          261,
+          261
+        ],
+        "ir_mine": 1886983,
+        "ir_ratio": 1.0,
+        "ir_ref": 1886983,
+        "ll_misses": [
+          2955,
+          2955
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/sha256_transform/manifest.json"
+    },
+    "linux_rbtree": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DNODE_COUNT=1024 -DLOOKUP_ROUNDS=2",
+      "metrics": {
+        "conditional_mispredicts": [
+          18043,
+          18043
+        ],
+        "d1_misses": [
+          2541,
+          2541
+        ],
+        "i1_misses": [
+          1416,
+          1416
+        ],
+        "indirect_mispredicts": [
+          262,
+          262
+        ],
+        "ir_mine": 516266,
+        "ir_ratio": 1.0,
+        "ir_ref": 516266,
+        "ll_misses": [
+          3456,
+          3456
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/linux_rbtree/manifest.json"
+    },
+    "zstd_count": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DBUFFER_SIZE=16384 -DQUERY_COUNT=1024 -DPASSES=2",
+      "metrics": {
+        "conditional_mispredicts": [
+          5468,
+          5468
+        ],
+        "d1_misses": [
+          2188,
+          2188
+        ],
+        "i1_misses": [
+          1411,
+          1411
+        ],
+        "indirect_mispredicts": [
+          262,
+          262
+        ],
+        "ir_mine": 458162,
+        "ir_ratio": 1.0,
+        "ir_ref": 458162,
+        "ll_misses": [
+          3194,
+          3194
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/zstd_count/manifest.json"
+    },
+    "lz4_compress": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSRC_SIZE=16384 -DPASSES=2",
+      "metrics": {
+        "conditional_mispredicts": [
+          10654,
+          10654
+        ],
+        "d1_misses": [
+          5926,
+          5926
+        ],
+        "i1_misses": [
+          1430,
+          1430
+        ],
+        "indirect_mispredicts": [
+          273,
+          273
+        ],
+        "ir_mine": 635696,
+        "ir_ratio": 1.0,
+        "ir_ref": 635696,
+        "ll_misses": [
+          4501,
+          4501
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/lz4_compress/manifest.json"
+    },
+    "lz4_match_extend": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSRC_SIZE=16384 -DPASSES=2 -DMATCH_RICH=1",
+      "metrics": {
+        "conditional_mispredicts": [
+          8313,
+          8313
+        ],
+        "d1_misses": [
+          14194,
+          14194
+        ],
+        "i1_misses": [
+          1447,
+          1447
+        ],
+        "indirect_mispredicts": [
+          273,
+          273
+        ],
+        "ir_mine": 1155250,
+        "ir_ratio": 1.0,
+        "ir_ref": 1155250,
+        "ll_misses": [
+          4430,
+          4430
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/lz4_match_extend/manifest.json"
+    },
+    "glibc_strstr": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DHAYSTACK_LEN=16384 -DQUERY_COUNT=32 -DPASSES=2",
+      "metrics": {
+        "conditional_mispredicts": [
+          9494,
+          9494
+        ],
+        "d1_misses": [
+          2191,
+          2191
+        ],
+        "i1_misses": [
+          1417,
+          1417
+        ],
+        "indirect_mispredicts": [
+          262,
+          262
+        ],
+        "ir_mine": 3645287,
+        "ir_ratio": 1.0,
+        "ir_ref": 3645287,
+        "ll_misses": [
+          3201,
+          3201
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-s25-rotated-corpus/glibc_strstr/manifest.json"
+    }
+  },
+  "failures": [],
+  "worst_first": [
+    "arith_loop",
+    "fib",
+    "matmul",
+    "qsort",
+    "sieve",
+    "tce_sum",
+    "nbody",
+    "binary_trees",
+    "spectral_norm",
+    "mandelbrot",
+    "hash_table",
+    "strlen_bench",
+    "switch_dispatch",
+    "struct_copy",
+    "loop_patterns",
+    "fannkuch",
+    "ackermann",
+    "constant_recursion",
+    "bitops",
+    "double_reduction",
+    "ascii_case_fold",
+    "binary_search",
+    "ring_fifo",
+    "aarch64_select_patterns",
+    "histogram",
+    "gzip_crc32",
+    "libm_round_family",
+    "tls_seg_access",
+    "percpu_ptr_walk",
+    "byte_load_reassembly",
+    "zlib_ng_adler32",
+    "zlib_ng_adler32_combine",
+    "expat_xml_scan",
+    "expat_siphash24",
+    "sqlite_varint",
+    "linux_find_bit",
+    "linux_find_bit_scaled",
+    "glibc_memcmp",
+    "chacha20_block",
+    "sha256_transform",
+    "linux_rbtree",
+    "zstd_count",
+    "lz4_compress",
+    "lz4_match_extend",
+    "glibc_strstr"
+  ]
+}

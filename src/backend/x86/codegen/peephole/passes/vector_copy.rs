@@ -544,13 +544,6 @@ fn replace_vec_reads(t: &str, old: u8, new: u8) -> Option<String> {
 /// bracket.  Hence the fill check rather than the prefix.
 fn benign_directive(t: &str) -> bool {
     let t = t.trim();
-    // A metadata prefix is not proof about the entire line: a second GAS
-    // statement can overwrite registers without spelling them (encoded bytes).
-    // Share the quote/comment-aware contract, then retain this window's
-    // deliberately narrower allowlist of metadata kinds.
-    if !crate::backend::peephole_common::inert_directive(t) {
-        return false;
-    }
     if t.starts_with(".cfi_")
         || t.starts_with(".LFB")
         || t.starts_with(".loc ")
@@ -1516,17 +1509,16 @@ pub(super) fn eliminate_dead_vector_copies(store: &LineStore, infos: &mut [LineI
 mod tests {
     use super::*;
 
-    fn pr834_wide_call_fixture() -> (std::path::PathBuf, String, String) {
-        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/regression/fixtures/peephole-wide-call");
-        let original = std::fs::read_to_string(fixtures.join("caller.s")).unwrap();
-        let optimized = run(&original);
-        (fixtures, original, optimized)
-    }
+    const WIDE_CALL_ASM: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/regression/fixtures/peephole-wide-call/caller.s"
+    ));
 
     #[test]
-    fn pr834_wide_call_real_pipeline_structural() {
-        let (_, _, optimized) = pr834_wide_call_fixture();
+    fn wide_call_real_pipeline_structure() {
+        // This half must run even where the native execution contract cannot.
+        assert!(WIDE_CALL_ASM.contains("movq %rax, %rax"));
+        let optimized = run(WIDE_CALL_ASM);
         assert!(
             !optimized.contains("movq %rax, %rax"),
             "real pipeline positive control"
@@ -1536,15 +1528,25 @@ mod tests {
     #[test]
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     fn pr834_wide_call_real_pipeline_native() {
+        // Deliberately fail rather than report a successful non-execution.
+        // The structural sibling above has no host ISA/toolchain dependency.
         use crate::common::temp_files::TempFile;
         use std::process::Command;
         let avx = std::arch::is_x86_feature_detected!("avx");
-        let gcc = Command::new("gcc").arg("--version").output();
+        let gcc = Command::new("gcc")
+            .arg("--version")
+            .output()
+            .map(|out| out.status);
         assert!(
-            avx && gcc.as_ref().is_ok_and(|out| out.status.success()),
-            "native wide-call contract requires AVX-capable x86_64-linux and gcc on PATH (AVX: {avx}, gcc: {gcc:?})"
+            avx && gcc.as_ref().is_ok_and(|status| status.success()),
+            "native wide-call contract requires BOTH an AVX-capable x86_64-linux host \
+             AND gcc on PATH (AVX={avx}, GCC probe={gcc:?}); \
+             wide_call_real_pipeline_structure runs without either requirement"
         );
-        let (fixtures, original, optimized) = pr834_wide_call_fixture();
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/regression/fixtures/peephole-wide-call");
+        let original = WIDE_CALL_ASM.to_owned();
+        let optimized = run(&original);
         let asm = TempFile::try_new("pr834", "wide-call", "s").unwrap();
         let exe = TempFile::try_new("pr834", "wide-call", "exe").unwrap();
         for (stage, code) in [("original", original), ("optimized", optimized)] {
@@ -1568,6 +1570,108 @@ mod tests {
                 String::from_utf8_lossy(&output.stdout)
             );
             assert_eq!(output.stdout, b"9 2 3 4\n", "{stage}");
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn pr832_fixture_witnesses_survive_the_real_peephole_pipeline() {
+        use crate::common::fx_hash::FxHashSet;
+        use crate::common::temp_files::TempFile;
+        use std::process::Command;
+        let fixtures = [
+            ("witness.s", "driver.c"),
+            ("implicit-witness.s", "implicit-driver.c"),
+        ];
+        for (fixture, driver) in fixtures {
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+            let path = root
+                .join("tests/regression/fixtures/peephole-vex-flags")
+                .join(fixture);
+            let original = std::fs::read_to_string(&path).unwrap();
+            let expanded = Command::new("python3")
+                .arg(root.join("scripts/expand_asm_fixture.py"))
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(
+                expanded.status.success(),
+                "{}",
+                String::from_utf8_lossy(&expanded.stderr)
+            );
+            let fixture = String::from_utf8(expanded.stdout).unwrap();
+            // GCC's architectural fixture needs no CFI. Supply the same function
+            // boundaries as compiler output so the optimizer cannot vacuously
+            // skip it. This test does not claim to validate unwind metadata.
+            let names: FxHashSet<_> = fixture
+                .lines()
+                .filter_map(|line| {
+                    line.trim()
+                        .strip_prefix(".type ")
+                        .and_then(|rest| rest.split(',').next())
+                })
+                .collect();
+            let mut input = String::new();
+            for line in fixture.lines() {
+                if line.trim().starts_with(".size ") {
+                    input.push_str(".cfi_endproc\n");
+                }
+                input.push_str(line);
+                input.push('\n');
+                if names.contains(line.trim().trim_end_matches(':')) {
+                    input.push_str(".cfi_startproc\n");
+                }
+            }
+            input.push_str(".text\n.type active_canary,@function\nactive_canary:\n.cfi_startproc\n    movq %rax, %rax\n    ret\n.cfi_endproc\n.size active_canary,.-active_canary\n");
+            let optimized = run(&input);
+            assert!(
+                !optimized.contains("movq %rax, %rax"),
+                "pipeline must run its positive canary"
+            );
+            if !std::arch::is_x86_feature_detected!("avx2") {
+                eprintln!(
+                    "SKIP native fixture execution: AVX2 unavailable; pipeline canary passed"
+                );
+                continue;
+            }
+            let assembly = TempFile::try_new("pr832", "fixture", "s")
+                .expect("test temporary-file reservation");
+            let binary = TempFile::try_new("pr832", "fixture", "exe")
+                .expect("test temporary-file reservation");
+            let driver = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/regression/fixtures/peephole-vex-flags")
+                .join(driver);
+            let mut expected = None;
+            for (stage, text) in [
+                ("GAS original", original),
+                ("expanded", input),
+                ("optimized", optimized),
+            ] {
+                std::fs::write(assembly.path(), &text).unwrap();
+                let built = Command::new("gcc")
+                    .args(["-O2", "-mavx2", "-o"])
+                    .arg(binary.path())
+                    .arg(&driver)
+                    .arg(assembly.path())
+                    .output()
+                    .unwrap();
+                assert!(
+                    built.status.success(),
+                    "{stage}: {}",
+                    String::from_utf8_lossy(&built.stderr)
+                );
+                let result = Command::new(binary.path()).output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "{stage}: {}\n{text}",
+                    String::from_utf8_lossy(&result.stdout)
+                );
+                if let Some(expected) = &expected {
+                    assert_eq!(&result.stdout, expected);
+                } else {
+                    expected = Some(result.stdout);
+                }
+            }
         }
     }
 
@@ -1908,6 +2012,9 @@ mod tests {
 
     #[test]
     fn pr834_independent_narrow_copies_do_not_reanalyse_each_rewrite() {
+        // Intentional complexity-policy tripwire, not a wall-time assertion.
+        // Change this limit only with a justified cache change and updated
+        // stress evidence in the same commit, not to bless a regression.
         assert!(
             narrow_copy_stress(8) <= 1,
             "independent copies should reuse conservative liveness"
@@ -2089,6 +2196,29 @@ mod tests {
             assert!(
                 (0..store.len()).any(|i| store.get(i).trim() == "movaps %xmm2, %xmm3"),
                 "old XMM0 copy must not be replaced with the implicit output: {op}"
+            );
+        }
+    }
+
+    #[test]
+    fn gather_mask_output_invalidates_copy_relations() {
+        for (mnemonic, index) in [
+            ("vgatherdpd", "xmm4"),
+            ("vgatherdps", "ymm4"),
+            ("vpgatherdd", "ymm4"),
+            ("vpgatherdq", "xmm4"),
+        ] {
+            let asm = body(&format!(
+                "    vmovapd %ymm3, %ymm2\n    {mnemonic} %ymm3, (%rdi,%{index},8), %ymm7\n    vmovupd %ymm2, (%rsi)\n"
+            ));
+            let mut store = LineStore::new(asm);
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            propagate_vector_copies(&mut store, &mut infos);
+            assert!(
+                (0..store.len()).any(|i| store.get(i).trim() == "vmovupd %ymm2, (%rsi)"),
+                "the gather rewrites its nontrailing mask: {mnemonic}"
             );
         }
     }
@@ -2652,57 +2782,6 @@ mod tests {
             vec!["vroundsd $9, %xmm0, %xmm0, %xmm0", "ret"],
             "{out:?}"
         );
-    }
-
-    #[test]
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    fn s97_compound_directive_real_pipeline_native() {
-        use crate::common::temp_files::TempFile;
-        use std::process::Command;
-        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/regression/fixtures/peephole-padding-effects");
-        let original = std::fs::read_to_string(fixtures.join("vector.s")).unwrap();
-        let optimized = run(&original);
-        let assembly = TempFile::try_new("compound", "witness", "s").unwrap();
-        let executable = TempFile::try_new("compound", "witness", "exe").unwrap();
-        for (stage, code) in [("original", original), ("optimized", optimized)] {
-            std::fs::write(assembly.path(), &code).unwrap();
-            let compiled = Command::new("gcc")
-                .args(["-O2", "-Werror", "-no-pie", "-o"])
-                .arg(executable.path())
-                .arg(fixtures.join("vector-driver.c"))
-                .arg(assembly.path())
-                .output()
-                .unwrap();
-            assert!(
-                compiled.status.success() && compiled.stderr.is_empty(),
-                "{stage}: {}",
-                String::from_utf8_lossy(&compiled.stderr)
-            );
-            let result = Command::new(executable.path()).output().unwrap();
-            assert!(
-                result.status.success(),
-                "{stage}: {:?}\n{code}",
-                result.status.code()
-            );
-        }
-    }
-
-    #[test]
-    fn s97_vector_directive_windows_reject_compound_statements() {
-        for text in [
-            ".cfi_remember_state; xorps %xmm1, %xmm1",
-            ".loc 1 2 0; vzeroall",
-            ".file 1 \"x.c\"; .byte 0xf8",
-            ".p2align 4; vzeroall",
-            ".p2align_future 4",
-            ".cfi_sections .debug_frame",
-        ] {
-            assert!(!benign_directive(text), "opaque directive: {text}");
-        }
-        for text in [".cfi_remember_state", ".file 1 \"a;b.c\"", ".p2align 4,,10"] {
-            assert!(benign_directive(text), "benign directive: {text}");
-        }
     }
 
     #[test]

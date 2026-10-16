@@ -1,6 +1,6 @@
 //! Flags-aware x86-64 peepholes.
 //!
-//! Three transforms that need an explicit model of the EFLAGS lifetime, which
+//! Transforms that need an explicit model of the EFLAGS lifetime, which
 //! the other peephole passes deliberately avoid touching:
 //!
 //! 1. [`fold_copy_add_into_lea`] — `movl %A,%D; addl $imm,%D` → `leal imm(%A),%D`,
@@ -12,15 +12,17 @@
 //!    instruction between the `setCC` and the `cmov` writes flags, the `cmov`
 //!    can consume the ORIGINAL comparison directly: the `setCC`, the `movzbl`
 //!    and the `test` all disappear (three instructions).
-//! 3. [`fold_copy_and_mask_into_movz`] — `movl %A,%D; andl $255,%D` →
+//! 3. [`fold_conditional_increment`] — count zero/nonzero using carry, after
+//!    proving the temporary and every changed flag dead.
+//! 4. [`fold_copy_and_mask_into_movz`] — `movl %A,%D; andl $255,%D` →
 //!    `movzbl %Al,%D` (likewise `$65535` → `movzwl`).
 //!
 //! # The flags model
 //!
 //! `flags_effect` classifies a line as WRITES / READS / NEUTRAL, and anything
 //! unrecognised is treated as *both* a reader and a writer. Transform 1 needs
-//! "the flags this `add` writes are dead" (a later writer is reached before any
-//! reader); transforms 1 and 2 both bail out at control flow, because a
+//! "the flags this `add` writes are dead" (definite kills cover every flag
+//! before any reader; a partial writer is not a complete kill); transforms 1 and 2 both bail out at control flow, because a
 //! conditional branch elsewhere may consume flags that were set before a label.
 
 use super::super::types::*;
@@ -57,46 +59,33 @@ pub(super) const F_AF: u8 = 1 << 5;
 /// costs a missed fold.
 pub(super) const F_ALL: u8 = F_ZF | F_CF | F_SF | F_OF | F_PF | F_AF;
 
-/// The flags a writer instruction can clobber, as a bitmask.
-///
-/// [`walk_flag_consumers`] used to treat every `FlagsEffect::Writes` as a
-/// total clobber.  That is sound but far too coarse for a rewrite that
-/// PROVES it preserves ZF and CF, because two very common flag setters write
-/// only CF:
-///
-/// ```asm
-///     cmpl  %r9d, %r8d
-///     jb    .Lkeep        ; an allowed ZF/CF consumer; pushes .Lkeep
-///     addl  $1, %eax      ; a real clobber, on the fall-through only
-/// .Lkeep:
-///     stc                 ; writes CF -- and ONLY CF
-///     jo    .Loverflow    ; reads OF, which `stc` left intact
-/// ```
-///
-/// Stopping at `stc` hides `jo` from the walk, and `jo` observes exactly the
-/// OF that a narrowing `cmp` changes.  So the fold was admitted on a path
-/// where it is observable.  This function lets such a writer be stepped over
-/// without pretending it clobbered everything.
-///
-/// Only three families are narrowed, and each is a direct SDM statement:
-/// `stc`/`clc`/`cmc` define CF alone; `sahf` loads SF/ZF/AF/PF/CF from AH and
-/// explicitly leaves OF alone; `cld`/`std` touch DF, which is not one of the
-/// six arithmetic flags.  Everything else -- including `shld`/`shrd`/`bt*`,
-/// which do write OF and AF, and every unrecognised mnemonic -- returns
-/// [`F_ALL`], so no existing call can become less conservative than before.
+/// Arithmetic flags definitely replaced or made architecturally undefined.
+/// Neither case preserves a defined dependency on the incoming flag value.
+/// A possible write is not a kill: INC preserves CF, SAHF preserves OF,
+/// and a variable/zero-count shift can preserve every flag. Unknown writers
+/// therefore kill nothing. Partial writers never retire surviving flags.
 pub(super) fn flags_written_mask(t: &str) -> u8 {
     let base = t.strip_prefix('v').unwrap_or(t);
-    let mnem = base
-        .split(|c: char| c == ' ' || c == '\t')
-        .next()
-        .unwrap_or(base);
+    let mnem = base.split_whitespace().next().unwrap_or(base);
+    let stem = if matches!(mnem, "sub" | "mul" | "imul" | "call") {
+        mnem
+    } else {
+        mnem.strip_suffix(['b', 'w', 'l', 'q']).unwrap_or(mnem)
+    };
     match mnem {
         "stc" | "clc" | "cmc" => F_CF,
-        // SDM: "LAHF/SAHF ... The OF flag is not affected."
-        "sahf" => F_SF | F_ZF | F_PF | F_AF | F_CF,
-        // Direction flag only; none of the six arithmetic flags change.
-        "cld" | "std" => 0,
-        _ => F_ALL,
+        "sahf" => F_SF | F_ZF | F_AF | F_PF | F_CF,
+        "comiss" | "comisd" | "ucomiss" | "ucomisd" | "ptest" => F_ALL,
+        _ => match stem {
+            "add" | "sub" | "cmp" | "test" | "and" | "or" | "xor" | "neg" | "xadd" | "cmpxchg"
+            | "popcnt" | "popf" | "call" => F_ALL,
+            "inc" | "dec" => F_ALL & !F_CF,
+            "mul" | "imul" | "div" | "idiv" | "bsf" | "bsr" | "lzcnt" | "tzcnt" | "andn"
+            | "blsi" | "blsmsk" | "blsr" | "bzhi" | "bextr" => F_ALL,
+            // BT family leaves ZF unchanged; the other non-CF flags are undefined.
+            "bt" | "bts" | "btr" | "btc" => F_ALL & !F_ZF,
+            _ => 0,
+        },
     }
 }
 
@@ -312,7 +301,7 @@ pub(super) fn flags_effect(t: &str) -> FlagsEffect {
     const WRITERS: &[&str] = &[
         "add", "sub", "and", "or", "xor", "cmp", "test", "inc", "dec", "neg", "imul", "mul", "div",
         "idiv", "shl", "shr", "sar", "sal", "rol", "ror", "bt", "bsf", "bsr", "popcnt", "lzcnt",
-        "tzcnt", "cmpxchg", "xadd", "lock", "andn", "bextr", "bzhi", "blsi", "blsmsk", "blsr",
+        "tzcnt", "cmpxchg", "xadd", "andn", "bextr", "bzhi", "blsi", "blsmsk", "blsr",
     ];
     if WRITERS.iter().any(|p| suffix_exact_writer(base, p)) {
         return FlagsEffect::Writes;
@@ -493,6 +482,7 @@ fn fp_data_op(base: &str) -> bool {
 /// this shape).
 pub(super) fn flags_dead_after(store: &LineStore, infos: &[LineInfo], from: usize) -> bool {
     let mut n = from;
+    let mut live = F_ALL;
     while n < store.len() {
         if infos[n].is_nop() {
             n += 1;
@@ -515,7 +505,12 @@ pub(super) fn flags_dead_after(store: &LineStore, infos: &[LineInfo], from: usiz
         let t = infos[n].trimmed(store.get(n));
         match flags_effect(t) {
             FlagsEffect::Reads => return false,
-            FlagsEffect::Writes => return true,
+            FlagsEffect::Writes => {
+                live &= !flags_written_mask(t);
+                if live == 0 {
+                    return true;
+                }
+            }
             FlagsEffect::Neutral => {}
         }
         // push/pop are barriers for the register scans but leave flags alone.
@@ -1794,27 +1789,27 @@ fn flags_are_block_local(
     fstart: usize,
     fend: usize,
 ) -> bool {
-    let mut written = false;
+    let mut written = 0;
     for n in fstart..fend {
         if super::helpers::steps_over_line(&infos[n], infos[n].trimmed(store.get(n))) {
             continue;
         }
         if infos[n].kind == LineKind::Label {
-            written = false;
+            written = 0;
             continue;
         }
         let t = infos[n].trimmed(store.get(n));
         match flags_effect(t) {
             FlagsEffect::Reads => {
-                if !written {
+                if written != F_ALL {
                     return false;
                 }
             }
-            FlagsEffect::Writes => written = true,
+            FlagsEffect::Writes => written |= flags_written_mask(t),
             FlagsEffect::Neutral => {}
         }
         if matches!(infos[n].kind, LineKind::Call) {
-            written = true; // a call leaves the flags undefined
+            written = F_ALL; // a call leaves the flags undefined
         }
     }
     true
@@ -2108,8 +2103,8 @@ pub(super) fn walk_flag_consumers_seeded(
                     let changed = F_ALL & !preserved;
                     // Every flag in question redefined -> the walk is over on
                     // this path.  Anything less (a partial writer, an
-                    // unknown-effect line that `flags_written_mask` charges
-                    // with F_ALL is fine) keeps the walk going: the surviving
+                    // unknown-effect line that kills no proven flags)
+                    // keeps the walk going: the surviving
                     // flags still hold the values under test.
                     if changed == 0 || flags_written_mask(t) & changed == changed {
                         break;
@@ -2655,6 +2650,69 @@ mod tests {
 
     fn run(asm: &str) -> String {
         peephole_optimize(asm.to_string())
+    }
+
+    #[test]
+    fn partial_flag_writers_do_not_kill_surviving_flags() {
+        for writer in [
+            "incq %rdx",
+            "decq %rdx",
+            "stc",
+            "clc",
+            "cld",
+            "std",
+            "sahf",
+            "shlq %cl, %rdx",
+            "shrq $0, %rdx",
+            "shlq $64, %rdx",
+            "rolq $0, %rdx",
+            "shldq %cl, %rax, %rdx",
+            "btl $1, %edx",
+            "lock adcq $0, (%rdi)",
+        ] {
+            let text = format!("    {writer}\n    pushfq\n    popq %rax\n    ret\n");
+            let store = LineStore::new(text);
+            let infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            assert!(!super::flags_dead_after(&store, &infos, 0), "{writer}");
+        }
+    }
+
+    #[test]
+    fn complete_flag_writes_and_return_end_lifetime() {
+        for tail in [
+            "addq $1, %rdx\n    pushfq",
+            "cmpq $0, %rdx\n    pushfq",
+            "incq %rdx\n    clc\n    pushfq",
+            "shlq %cl, %rdx\n    ret",
+        ] {
+            let text = format!("    {tail}\n");
+            let store = LineStore::new(text);
+            let infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            assert!(super::flags_dead_after(&store, &infos, 0), "{tail}");
+        }
+    }
+
+    #[test]
+    fn partial_writers_do_not_hide_cfg_flag_consumers() {
+        for writer in ["incq %rdx", "shlq %cl, %rdx", "cld"] {
+            let text = format!(
+                "foo:\n.cfi_startproc\n    cmpq $0, %rax\n    {writer}\n    setb %al\n    ret\n.cfi_endproc\n"
+            );
+            let facts = facts_from(&text, "cmpq");
+            assert!(facts.proved && facts.saw_non_zf, "{writer}");
+            let local = format!(
+                "foo:\n.cfi_startproc\n    {writer}\n    setb %al\n    ret\n.cfi_endproc\n"
+            );
+            let (store, infos) = build(&local);
+            assert!(
+                !super::flags_are_block_local(&store, &infos, 0, store.len()),
+                "{writer}"
+            );
+        }
     }
 
     /// Register push/pop (any operand-size suffix) never touch EFLAGS per the
@@ -4150,5 +4208,192 @@ mod widened_copy_tracking_tests {
         ));
         assert!(!out.contains("setne"), "fold did not fire: {out}");
         assert!(out.contains("ne .Lx") || out.contains("e .Lx"), "{out}");
+    }
+}
+
+/// Fold `lea 1(acc), tmp; cmp $0, x; cmovne tmp, acc` to
+/// `cmp $1, x; sbb $-1, acc` (CMOVE uses ADC $0 instead).
+/// For any x bit pattern, unsigned x < 1 iff x == 0. Thus CF selects
+/// exactly the original increment, including modular overflow. Memory is
+/// read once at the original width/address; no access is moved across another
+/// memory operation. The temporary must die, and every changed flag must die.
+/// Both 32-bit forms zero-extend the accumulator even on a false condition.
+pub(super) fn fold_conditional_increment(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    let mut liveness = None;
+    for i in 0..store.len() {
+        if infos[i].is_nop() || infos[i].pinned {
+            continue;
+        }
+        let Some(j) = next_real(infos, i, store.len()) else {
+            continue;
+        };
+        let Some(k) = next_real(infos, j, store.len()) else {
+            continue;
+        };
+        if infos[j].pinned || infos[k].pinned {
+            continue;
+        }
+        let first = infos[i].trimmed(store.get(i));
+        let second = infos[j].trimmed(store.get(j));
+        let (lea, cmp, cmp_idx) = if first.starts_with("lea") {
+            (first, second, j)
+        } else {
+            (second, first, i)
+        };
+        let Some((cc, width @ ('l' | 'q'), src, dst)) = parse_cmov(infos[k].trimmed(store.get(k)))
+        else {
+            continue;
+        };
+        if !matches!(cc, "e" | "ne") {
+            continue;
+        }
+        let lea_args = match width {
+            'l' => lea.strip_prefix("leal "),
+            _ => lea.strip_prefix("leaq "),
+        };
+        let Some((address, tmp)) = lea_args.and_then(split_two_operands) else {
+            continue;
+        };
+        let Some(base) = address.strip_prefix("1(").and_then(|s| s.strip_suffix(')')) else {
+            continue;
+        };
+        let (Some(acc_fam), Some(tmp_fam)) = (plain_gp_operand(base), plain_gp_operand(tmp)) else {
+            continue;
+        };
+        if acc_fam == tmp_fam
+            || matches!(acc_fam, 4 | 5)
+            || matches!(tmp_fam, 4 | 5)
+            || !names_family_at_width(tmp, tmp_fam, width == 'q')
+            || !names_family_at_width(dst, acc_fam, width == 'q')
+            || src != tmp
+            || !(names_family_at_width(base, acc_fam, true)
+                || (width == 'l' && names_family_at_width(base, acc_fam, false)))
+        {
+            continue;
+        }
+        let Some((cmp_mnem, args)) = cmp.split_once(' ') else {
+            continue;
+        };
+        if !matches!(cmp_mnem, "cmpb" | "cmpw" | "cmpl" | "cmpq") {
+            continue;
+        }
+        let Some(("$0", operand)) = split_two_operands(args) else {
+            continue;
+        };
+        // The removed LEA must not supply the compared value or its address.
+        if infos[cmp_idx].reg_refs & (1u16 << tmp_fam) != 0
+            || !flags_dead_after(store, infos, k + 1)
+        {
+            continue;
+        }
+        let lv = liveness.get_or_insert_with(|| FileLiveness::new(store, infos));
+        if !super::relay_and_lea::provably_dead_lv(lv, store, infos, k, tmp_fam, &[i, j, k]) {
+            continue;
+        }
+        let compare = format!("    {cmp_mnem} $1, {operand}");
+        let update = if cc == "ne" {
+            format!("    sbb{width} $-1, {dst}")
+        } else {
+            format!("    adc{width} $0, {dst}")
+        };
+        let lea_idx = if cmp_idx == i { j } else { i };
+        mark_nop(&mut infos[lea_idx]);
+        replace_line(store, &mut infos[cmp_idx], cmp_idx, compare);
+        replace_line(store, &mut infos[k], k, update);
+        lv.refresh_at(store, infos, k);
+        changed = true;
+    }
+    changed
+}
+
+#[cfg(test)]
+mod conditional_increment_tests {
+    use super::*;
+
+    fn fold(body: &str) -> (bool, String) {
+        let text = format!("foo:\n.cfi_startproc\n{body}\n.cfi_endproc\n");
+        let mut store = LineStore::new(text);
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let changed = fold_conditional_increment(&mut store, &mut infos);
+        let out = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (changed, out)
+    }
+
+    #[test]
+    fn count_eq_ne_at_both_accumulator_widths_and_all_compare_widths() {
+        for (width, acc, tmp) in [('l', "%eax", "%r9d"), ('q', "%rax", "%r9")] {
+            for cmp_width in ['b', 'w', 'l', 'q'] {
+                for (cc, expected) in [("ne", "sbb"), ("e", "adc")] {
+                    for lea_first in [false, true] {
+                        let lea = format!("    lea{width} 1(%rax), {tmp}\n");
+                        let cmp = format!("    cmp{cmp_width} $0, (%rdi)\n");
+                        let body = if lea_first {
+                            format!("{lea}{cmp}")
+                        } else {
+                            format!("{cmp}{lea}")
+                        };
+                        let (changed, out) =
+                            fold(&format!("{body}    cmov{cc}{width} {tmp}, {acc}\n    ret"));
+                        assert!(changed, "{out}");
+                        assert!(out.contains(&format!("{expected}{width}")), "{out}");
+                        assert!(out.contains(&format!("cmp{cmp_width} $1")), "{out}");
+                        assert!(!out.contains("lea"), "{out}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn refuses_live_temporary_flags_aliases_and_unmodelled_shapes() {
+        let valid = "    leal 1(%rax), %r9d\n    cmpb $0, (%rdi)\n    cmovnel %r9d, %eax\n    ret";
+        for body in [
+            valid.replace("    ret", "    movl %r9d, %eax\n    ret"),
+            valid.replace("    ret", "    incq %rdx\n    adcl $0, %eax\n    ret"),
+            valid.replace("    ret", "    shlq %cl, %rdx\n    sete %al\n    ret"),
+            valid.replace("    ret", "    lahf\n    ret"),
+            valid.replace("(%rdi)", "(%r9)"),
+            valid.replace("cmpb $0, (%rdi)", "cmpl $0, %r9d"),
+            valid.replace("1(%rax)", "2(%rax)"),
+            valid.replace("1(%rax)", "1(%r9)"),
+            valid.replace("$0", "$2"),
+            valid.replace("cmovnel", "cmovgel"),
+            valid.replace("leal", "leaq"),
+            valid.replace("    cmpb", ".Ljoin:\n    cmpb"),
+            valid.replace("%r9d", "%esp"),
+            valid.replace("%eax", "%ax"),
+        ] {
+            assert!(!fold(&body).0, "{body}");
+        }
+    }
+
+    #[test]
+    fn temporary_live_across_backedge_is_not_dead() {
+        let (changed, _) = fold(
+            ".Lloop:\n    movl %r9d, (%rdi)\n    leal 1(%rax), %r9d\n    cmpb $0, (%rsi)\n    cmovnel %r9d, %eax\n    cmpl $9, %eax\n    jne .Lloop\n    ret",
+        );
+        assert!(!changed);
+    }
+
+    #[test]
+    fn conditional_increment_identity_is_exact_in_each_narrow_ring() {
+        for x in 0u16..=255 {
+            for acc in 0u16..=255 {
+                let carry = u8::from(x < 1);
+                let a = acc as u8;
+                assert_eq!(
+                    a.wrapping_add(u8::from(x != 0)),
+                    a.wrapping_sub(255).wrapping_sub(carry)
+                );
+                assert_eq!(a.wrapping_add(u8::from(x == 0)), a.wrapping_add(carry));
+            }
+        }
     }
 }

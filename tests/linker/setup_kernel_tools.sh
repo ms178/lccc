@@ -62,13 +62,25 @@ fi
 
 BASE="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain"
 
-echo "fetching arch/x86/tools/relocs sources at $KVER"
-for f in relocs.c relocs.h relocs_common.c relocs_32.c relocs_64.c; do
-  curl -fsSL -o "$SRC/$f" "$BASE/arch/x86/tools/$f?h=$KVER"
+# Pre-placed sources are adopted instead of refetched (the same offline
+# pattern ensure_gas_247.sh and ensure_arm_a64_xml.sh use): a sandbox with
+# no route to git.kernel.org stages these files out of band, and the SPDX
+# sanity check below still rejects anything that is not kernel source.
+have_all=1
+for f in relocs.c relocs.h relocs_common.c relocs_32.c relocs_64.c tools/le_byteshift.h; do
+  [[ -s "$SRC/$f" ]] || have_all=0
 done
-# relocs.h includes <tools/le_byteshift.h> from the kernel's tools/include.
-curl -fsSL -o "$SRC/tools/le_byteshift.h" \
-     "$BASE/tools/include/tools/le_byteshift.h?h=$KVER"
+if [[ $have_all == 1 ]]; then
+  echo "adopting pre-placed relocs sources in $SRC"
+else
+  echo "fetching arch/x86/tools/relocs sources at $KVER"
+  for f in relocs.c relocs.h relocs_common.c relocs_32.c relocs_64.c; do
+    curl -fsSL -o "$SRC/$f" "$BASE/arch/x86/tools/$f?h=$KVER"
+  done
+  # relocs.h includes <tools/le_byteshift.h> from the kernel's tools/include.
+  curl -fsSL -o "$SRC/tools/le_byteshift.h" \
+       "$BASE/tools/include/tools/le_byteshift.h?h=$KVER"
+fi
 
 # Sanity: a rate-limited or redirected fetch yields an HTML error page that
 # compiles into a wall of nonsense. Catch it here with a clear message.

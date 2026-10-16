@@ -1,0 +1,397 @@
+{
+  "complete": true,
+  "results": [
+    {
+      "name": "byte_load_reassembly",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--error-exitcode=99",
+        "--leak-check=full",
+        "--errors-for-leak-kinds=definite,indirect",
+        "--log-file=/home/user/.cache/pr824-s24-memcheck/byte_load_reassembly.log",
+        "/home/user/.cache/pr824-s24-corpus/byte_load_reassembly/aa/byte_load_reassembly"
+      ],
+      "binary_sha256": "6f7cea7c4de1a6b8defdba149b7d06b9bd296c0d36b8f51a707efcac81ea10d3",
+      "ok": true,
+      "returncode": 0,
+      "log": "==24462== Memcheck, a memory error detector\n==24462== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==24462== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==24462== Command: /home/user/.cache/pr824-s24-corpus/byte_load_reassembly/aa/byte_load_reassembly\n==24462== Parent PID: 24461\n==24462== \n==24462== \n==24462== HEAP SUMMARY:\n==24462==     in use at exit: 0 bytes in 0 blocks\n==24462==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==24462== \n==24462== All heap blocks were freed -- no leaks are possible\n==24462== \n==24462== For lists of detected and suppressed errors, rerun with: -s\n==24462== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "stderr": ""
+    },
+    {
+      "name": "spectral_norm",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--error-exitcode=99",
+        "--leak-check=full",
+        "--errors-for-leak-kinds=definite,indirect",
+        "--log-file=/home/user/.cache/pr824-s24-memcheck/spectral_norm.log",
+        "/home/user/.cache/pr824-s24-corpus/spectral_norm/aa/spectral_norm"
+      ],
+      "binary_sha256": "b08b5cda65dbbf36a913c015b5c7572eabd957cca6f486d8b7bc1dfafd19e3e3",
+      "ok": true,
+      "returncode": 0,
+      "log": "==24463== Memcheck, a memory error detector\n==24463== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==24463== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==24463== Command: /home/user/.cache/pr824-s24-corpus/spectral_norm/aa/spectral_norm\n==24463== Parent PID: 24461\n==24463== \n==24463== \n==24463== HEAP SUMMARY:\n==24463==     in use at exit: 0 bytes in 0 blocks\n==24463==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==24463== \n==24463== All heap blocks were freed -- no leaks are possible\n==24463== \n==24463== For lists of detected and suppressed errors, rerun with: -s\n==24463== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "stderr": ""
+    },
+    {
+      "name": "expat_siphash24",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--error-exitcode=99",
+        "--leak-check=full",
+        "--errors-for-leak-kinds=definite,indirect",
+        "--log-file=/home/user/.cache/pr824-s24-memcheck/expat_siphash24.log",
+        "/home/user/.cache/pr824-s24-corpus/expat_siphash24/aa/expat_siphash24"
+      ],
+      "binary_sha256": "d67c758ed1bad43e3d1f3901deffd7655d18f7137b0683ece488079b3974d772",
+      "ok": true,
+      "returncode": 0,
+      "log": "==24464== Memcheck, a memory error detector\n==24464== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==24464== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==24464== Command: /home/user/.cache/pr824-s24-corpus/expat_siphash24/aa/expat_siphash24\n==24464== Parent PID: 24461\n==24464== \n==24464== \n==24464== HEAP SUMMARY:\n==24464==     in use at exit: 0 bytes in 0 blocks\n==24464==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==24464== \n==24464== All heap blocks were freed -- no leaks are possible\n==24464== \n==24464== For lists of detected and suppressed errors, rerun with: -s\n==24464== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "stderr": ""
+    },
+    {
+      "name": "sha256_transform",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--error-exitcode=99",
+        "--leak-check=full",
+        "--errors-for-leak-kinds=definite,indirect",
+        "--log-file=/home/user/.cache/pr824-s24-memcheck/sha256_transform.log",
+        "/home/user/.cache/pr824-s24-corpus/sha256_transform/aa/sha256_transform"
+      ],
+      "binary_sha256": "2babed6dc55adb86f54303469afea1c6dd8685d3609970a5d0793a26d020658b",
+      "ok": true,
+      "returncode": 0,
+      "log": "==24465== Memcheck, a memory error detector\n==24465== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==24465== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==24465== Command: /home/user/.cache/pr824-s24-corpus/sha256_transform/aa/sha256_transform\n==24465== Parent PID: 24461\n==24465== \n==24465== \n==24465== HEAP SUMMARY:\n==24465==     in use at exit: 0 bytes in 0 blocks\n==24465==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==24465== \n==24465== All heap blocks were freed -- no leaks are possible\n==24465== \n==24465== For lists of detected and suppressed errors, rerun with: -s\n==24465== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "stderr": ""
+    },
+    {
+      "name": "expat_xml_scan",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--error-exitcode=99",
+        "--leak-check=full",
+        "--errors-for-leak-kinds=definite,indirect",
+        "--log-file=/home/user/.cache/pr824-s24-memcheck/expat_xml_scan.log",
+        "/home/user/.cache/pr824-s24-corpus/expat_xml_scan/aa/expat_xml_scan"
+      ],
+      "binary_sha256": "0d17d43f4d57b7184ac60b75ce40a47bd8c83bf63ddbe366e485c92b514226ac",
+      "ok": true,
+      "returncode": 0,
+      "log": "==24466== Memcheck, a memory error detector\n==24466== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==24466== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==24466== Command: /home/user/.cache/pr824-s24-corpus/expat_xml_scan/aa/expat_xml_scan\n==24466== Parent PID: 24461\n==24466== \n==24466== \n==24466== HEAP SUMMARY:\n==24466==     in use at exit: 0 bytes in 0 blocks\n==24466==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==24466== \n==24466== All heap blocks were freed -- no leaks are possible\n==24466== \n==24466== For lists of detected and suppressed errors, rerun with: -s\n==24466== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "stderr": ""
+    },
+    {
+      "name": "linux_find_bit_scaled",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--error-exitcode=99",
+        "--leak-check=full",
+        "--errors-for-leak-kinds=definite,indirect",
+        "--log-file=/home/user/.cache/pr824-s24-memcheck/linux_find_bit_scaled.log",
+        "/home/user/.cache/pr824-s24-corpus/linux_find_bit_scaled/aa/linux_find_bit"
+      ],
+      "binary_sha256": "90c54b8cec7d7348f87a345a6897b99c52f0f9a85b8dec604ba972bcd5b69478",
+      "ok": true,
+      "returncode": 0,
+      "log": "==24467== Memcheck, a memory error detector\n==24467== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==24467== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==24467== Command: /home/user/.cache/pr824-s24-corpus/linux_find_bit_scaled/aa/linux_find_bit\n==24467== Parent PID: 24461\n==24467== \n==24467== \n==24467== HEAP SUMMARY:\n==24467==     in use at exit: 0 bytes in 0 blocks\n==24467==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==24467== \n==24467== All heap blocks were freed -- no leaks are possible\n==24467== \n==24467== For lists of detected and suppressed errors, rerun with: -s\n==24467== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "stderr": ""
+    },
+    {
+      "name": "linux_find_bit",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--error-exitcode=99",
+        "--leak-check=full",
+        "--errors-for-leak-kinds=definite,indirect",
+        "--log-file=/home/user/.cache/pr824-s24-memcheck/linux_find_bit.log",
+        "/home/user/.cache/pr824-s24-corpus/linux_find_bit/aa/linux_find_bit"
+      ],
+      "binary_sha256": "a0f038c0e5c746e79c2a01bd638cd7426327d39120ffbb30dd6897867a50c6a3",
+      "ok": true,
+      "returncode": 0,
+      "log": "==24468== Memcheck, a memory error detector\n==24468== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==24468== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==24468== Command: /home/user/.cache/pr824-s24-corpus/linux_find_bit/aa/linux_find_bit\n==24468== Parent PID: 24461\n==24468== \n==24468== \n==24468== HEAP SUMMARY:\n==24468==     in use at exit: 0 bytes in 0 blocks\n==24468==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==24468== \n==24468== All heap blocks were freed -- no leaks are possible\n==24468== \n==24468== For lists of detected and suppressed errors, rerun with: -s\n==24468== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "stderr": ""
+    },
+    {
+      "name": "sieve",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--error-exitcode=99",
+        "--leak-check=full",
+        "--errors-for-leak-kinds=definite,indirect",
+        "--log-file=/home/user/.cache/pr824-s24-memcheck/sieve.log",
+        "/home/user/.cache/pr824-s24-corpus/sieve/aa/sieve"
+      ],
+      "binary_sha256": "8aeb925416ef26a1e772acac9dd8a2fe1519f733d7d65a57e9223ad86004dd85",
+      "ok": true,
+      "returncode": 0,
+      "log": "==24469== Memcheck, a memory error detector\n==24469== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==24469== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==24469== Command: /home/user/.cache/pr824-s24-corpus/sieve/aa/sieve\n==24469== Parent PID: 24461\n==24469== \n==24469== \n==24469== HEAP SUMMARY:\n==24469==     in use at exit: 0 bytes in 0 blocks\n==24469==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==24469== \n==24469== All heap blocks were freed -- no leaks are possible\n==24469== \n==24469== For lists of detected and suppressed errors, rerun with: -s\n==24469== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "stderr": ""
+    },
+    {
+      "name": "binary_trees",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--error-exitcode=99",
+        "--leak-check=full",
+        "--errors-for-leak-kinds=definite,indirect",
+        "--log-file=/home/user/.cache/pr824-s24-memcheck/binary_trees.log",
+        "/home/user/.cache/pr824-s24-corpus/binary_trees/aa/binary_trees"
+      ],
+      "binary_sha256": "cb4dd80871b887162c83d2b4a89bac921dc830c22247b27585255ff204c0aefb",
+      "ok": true,
+      "returncode": 0,
+      "log": "==24470== Memcheck, a memory error detector\n==24470== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==24470== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==24470== Command: /home/user/.cache/pr824-s24-corpus/binary_trees/aa/binary_trees\n==24470== Parent PID: 24461\n==24470== \n==24470== \n==24470== HEAP SUMMARY:\n==24470==     in use at exit: 0 bytes in 0 blocks\n==24470==   total heap usage: 135,855 allocs, 135,855 frees, 2,177,760 bytes allocated\n==24470== \n==24470== All heap blocks were freed -- no leaks are possible\n==24470== \n==24470== For lists of detected and suppressed errors, rerun with: -s\n==24470== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "stderr": ""
+    },
+    {
+      "name": "lz4_match_extend",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--error-exitcode=99",
+        "--leak-check=full",
+        "--errors-for-leak-kinds=definite,indirect",
+        "--log-file=/home/user/.cache/pr824-s24-memcheck/lz4_match_extend.log",
+        "/home/user/.cache/pr824-s24-corpus/lz4_match_extend/aa/lz4_compress"
+      ],
+      "binary_sha256": "2357d70805587eb06c1e41c4b759555a83b97b31124922ca308c3ae94b7fef1b",
+      "ok": true,
+      "returncode": 0,
+      "log": "==24471== Memcheck, a memory error detector\n==24471== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==24471== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==24471== Command: /home/user/.cache/pr824-s24-corpus/lz4_match_extend/aa/lz4_compress\n==24471== Parent PID: 24461\n==24471== \n==24471== \n==24471== HEAP SUMMARY:\n==24471==     in use at exit: 0 bytes in 0 blocks\n==24471==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==24471== \n==24471== All heap blocks were freed -- no leaks are possible\n==24471== \n==24471== For lists of detected and suppressed errors, rerun with: -s\n==24471== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "stderr": ""
+    },
+    {
+      "name": "mandelbrot",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--error-exitcode=99",
+        "--leak-check=full",
+        "--errors-for-leak-kinds=definite,indirect",
+        "--log-file=/home/user/.cache/pr824-s24-memcheck/mandelbrot.log",
+        "/home/user/.cache/pr824-s24-corpus/mandelbrot/aa/mandelbrot"
+      ],
+      "binary_sha256": "7756fc8c6bd3f4a9ea2e5f1a4b1d535802e10a9e738445d0f9877f146dff28bb",
+      "ok": true,
+      "returncode": 0,
+      "log": "==24472== Memcheck, a memory error detector\n==24472== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==24472== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==24472== Command: /home/user/.cache/pr824-s24-corpus/mandelbrot/aa/mandelbrot\n==24472== Parent PID: 24461\n==24472== \n==24472== \n==24472== HEAP SUMMARY:\n==24472==     in use at exit: 0 bytes in 0 blocks\n==24472==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==24472== \n==24472== All heap blocks were freed -- no leaks are possible\n==24472== \n==24472== For lists of detected and suppressed errors, rerun with: -s\n==24472== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "stderr": ""
+    },
+    {
+      "name": "sqlite_varint",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--error-exitcode=99",
+        "--leak-check=full",
+        "--errors-for-leak-kinds=definite,indirect",
+        "--log-file=/home/user/.cache/pr824-s24-memcheck/sqlite_varint.log",
+        "/home/user/.cache/pr824-s24-corpus/sqlite_varint/aa/sqlite_varint"
+      ],
+      "binary_sha256": "e25846d2a9a9c420f309716a0ff71c756ddfabec0fd24ccf7e3e7ef2b7eef896",
+      "ok": true,
+      "returncode": 0,
+      "log": "==24473== Memcheck, a memory error detector\n==24473== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==24473== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==24473== Command: /home/user/.cache/pr824-s24-corpus/sqlite_varint/aa/sqlite_varint\n==24473== Parent PID: 24461\n==24473== \n==24473== \n==24473== HEAP SUMMARY:\n==24473==     in use at exit: 0 bytes in 0 blocks\n==24473==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==24473== \n==24473== All heap blocks were freed -- no leaks are possible\n==24473== \n==24473== For lists of detected and suppressed errors, rerun with: -s\n==24473== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "stderr": ""
+    },
+    {
+      "name": "zlib_ng_adler32_combine",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--error-exitcode=99",
+        "--leak-check=full",
+        "--errors-for-leak-kinds=definite,indirect",
+        "--log-file=/home/user/.cache/pr824-s24-memcheck/zlib_ng_adler32_combine.log",
+        "/home/user/.cache/pr824-s24-corpus/zlib_ng_adler32_combine/aa/zlib_ng_adler32_combine"
+      ],
+      "binary_sha256": "9f5a7aa328a9b141f36bd8e2cc0537ec6e5badee92f13c7f585dbea4b77bc6ad",
+      "ok": true,
+      "returncode": 0,
+      "log": "==24474== Memcheck, a memory error detector\n==24474== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==24474== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==24474== Command: /home/user/.cache/pr824-s24-corpus/zlib_ng_adler32_combine/aa/zlib_ng_adler32_combine\n==24474== Parent PID: 24461\n==24474== \n==24474== \n==24474== HEAP SUMMARY:\n==24474==     in use at exit: 0 bytes in 0 blocks\n==24474==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==24474== \n==24474== All heap blocks were freed -- no leaks are possible\n==24474== \n==24474== For lists of detected and suppressed errors, rerun with: -s\n==24474== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "stderr": ""
+    },
+    {
+      "name": "strlen_bench",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--error-exitcode=99",
+        "--leak-check=full",
+        "--errors-for-leak-kinds=definite,indirect",
+        "--log-file=/home/user/.cache/pr824-s24-memcheck/strlen_bench.log",
+        "/home/user/.cache/pr824-s24-corpus/strlen_bench/aa/strlen_bench"
+      ],
+      "binary_sha256": "9dc14e1fbfb9dd87357aaaeaab840657bfc7366d9709f7ec69dccd3287f383f2",
+      "ok": true,
+      "returncode": 0,
+      "log": "==24475== Memcheck, a memory error detector\n==24475== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==24475== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==24475== Command: /home/user/.cache/pr824-s24-corpus/strlen_bench/aa/strlen_bench\n==24475== Parent PID: 24461\n==24475== \n==24475== \n==24475== HEAP SUMMARY:\n==24475==     in use at exit: 0 bytes in 0 blocks\n==24475==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==24475== \n==24475== All heap blocks were freed -- no leaks are possible\n==24475== \n==24475== For lists of detected and suppressed errors, rerun with: -s\n==24475== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "stderr": ""
+    },
+    {
+      "name": "switch_dispatch",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--error-exitcode=99",
+        "--leak-check=full",
+        "--errors-for-leak-kinds=definite,indirect",
+        "--log-file=/home/user/.cache/pr824-s24-memcheck/switch_dispatch.log",
+        "/home/user/.cache/pr824-s24-corpus/switch_dispatch/aa/switch_dispatch"
+      ],
+      "binary_sha256": "e39f58051e3cc379c5a90ffc601ea936291c1c95d86101ef0823a66510722728",
+      "ok": true,
+      "returncode": 0,
+      "log": "==24476== Memcheck, a memory error detector\n==24476== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==24476== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==24476== Command: /home/user/.cache/pr824-s24-corpus/switch_dispatch/aa/switch_dispatch\n==24476== Parent PID: 24461\n==24476== \n==24476== \n==24476== HEAP SUMMARY:\n==24476==     in use at exit: 0 bytes in 0 blocks\n==24476==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==24476== \n==24476== All heap blocks were freed -- no leaks are possible\n==24476== \n==24476== For lists of detected and suppressed errors, rerun with: -s\n==24476== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "stderr": ""
+    },
+    {
+      "name": "byte-bounds-m64-O2",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--error-exitcode=99",
+        "--leak-check=full",
+        "--errors-for-leak-kinds=definite,indirect",
+        "--log-file=/home/user/.cache/pr824-s24-memcheck/byte-bounds-m64-O2.log",
+        "/home/user/.cache/pr824-s24-memcheck/byte-bounds-m64-O2"
+      ],
+      "binary_sha256": "a1eb8a702ddde7d8e8ec206c7b752537aff337dd9ab3e9dd80316e6917825326",
+      "ok": true,
+      "returncode": 0,
+      "log": "==24479== Memcheck, a memory error detector\n==24479== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==24479== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==24479== Command: /home/user/.cache/pr824-s24-memcheck/byte-bounds-m64-O2\n==24479== Parent PID: 24461\n==24479== \n==24479== \n==24479== HEAP SUMMARY:\n==24479==     in use at exit: 0 bytes in 0 blocks\n==24479==   total heap usage: 0 allocs, 0 frees, 0 bytes allocated\n==24479== \n==24479== All heap blocks were freed -- no leaks are possible\n==24479== \n==24479== For lists of detected and suppressed errors, rerun with: -s\n==24479== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "stderr": ""
+    },
+    {
+      "name": "byte-bounds-m64-O3",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--error-exitcode=99",
+        "--leak-check=full",
+        "--errors-for-leak-kinds=definite,indirect",
+        "--log-file=/home/user/.cache/pr824-s24-memcheck/byte-bounds-m64-O3.log",
+        "/home/user/.cache/pr824-s24-memcheck/byte-bounds-m64-O3"
+      ],
+      "binary_sha256": "a1eb8a702ddde7d8e8ec206c7b752537aff337dd9ab3e9dd80316e6917825326",
+      "ok": true,
+      "returncode": 0,
+      "log": "==24482== Memcheck, a memory error detector\n==24482== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==24482== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==24482== Command: /home/user/.cache/pr824-s24-memcheck/byte-bounds-m64-O3\n==24482== Parent PID: 24461\n==24482== \n==24482== \n==24482== HEAP SUMMARY:\n==24482==     in use at exit: 0 bytes in 0 blocks\n==24482==   total heap usage: 0 allocs, 0 frees, 0 bytes allocated\n==24482== \n==24482== All heap blocks were freed -- no leaks are possible\n==24482== \n==24482== For lists of detected and suppressed errors, rerun with: -s\n==24482== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "stderr": ""
+    },
+    {
+      "name": "byte-bounds-m32-O2",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--error-exitcode=99",
+        "--leak-check=full",
+        "--errors-for-leak-kinds=definite,indirect",
+        "--log-file=/home/user/.cache/pr824-s24-memcheck/byte-bounds-m32-O2.log",
+        "/home/user/.cache/pr824-s24-memcheck/byte-bounds-m32-O2"
+      ],
+      "binary_sha256": "e170575e1aefa28de920e1ef8b47dce8e45facddfe2f6731f5c6e5ee027d6148",
+      "ok": true,
+      "returncode": 0,
+      "log": "==24485== Memcheck, a memory error detector\n==24485== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==24485== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==24485== Command: /home/user/.cache/pr824-s24-memcheck/byte-bounds-m32-O2\n==24485== Parent PID: 24461\n==24485== \n==24485== \n==24485== HEAP SUMMARY:\n==24485==     in use at exit: 0 bytes in 0 blocks\n==24485==   total heap usage: 0 allocs, 0 frees, 0 bytes allocated\n==24485== \n==24485== All heap blocks were freed -- no leaks are possible\n==24485== \n==24485== For lists of detected and suppressed errors, rerun with: -s\n==24485== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "stderr": ""
+    },
+    {
+      "name": "byte-bounds-m32-O3",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--error-exitcode=99",
+        "--leak-check=full",
+        "--errors-for-leak-kinds=definite,indirect",
+        "--log-file=/home/user/.cache/pr824-s24-memcheck/byte-bounds-m32-O3.log",
+        "/home/user/.cache/pr824-s24-memcheck/byte-bounds-m32-O3"
+      ],
+      "binary_sha256": "e170575e1aefa28de920e1ef8b47dce8e45facddfe2f6731f5c6e5ee027d6148",
+      "ok": true,
+      "returncode": 0,
+      "log": "==24488== Memcheck, a memory error detector\n==24488== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==24488== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==24488== Command: /home/user/.cache/pr824-s24-memcheck/byte-bounds-m32-O3\n==24488== Parent PID: 24461\n==24488== \n==24488== \n==24488== HEAP SUMMARY:\n==24488==     in use at exit: 0 bytes in 0 blocks\n==24488==   total heap usage: 0 allocs, 0 frees, 0 bytes allocated\n==24488== \n==24488== All heap blocks were freed -- no leaks are possible\n==24488== \n==24488== For lists of detected and suppressed errors, rerun with: -s\n==24488== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "stderr": ""
+    },
+    {
+      "name": "unsigned-affine-m64-O2",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--error-exitcode=99",
+        "--leak-check=full",
+        "--errors-for-leak-kinds=definite,indirect",
+        "--log-file=/home/user/.cache/pr824-s24-memcheck/unsigned-affine-m64-O2.log",
+        "/home/user/.cache/pr824-s24-memcheck/unsigned-affine-m64-O2"
+      ],
+      "binary_sha256": "48a41584dec620d1c55bd350deb202f226f52b459d9e284eebc0e9e036946afe",
+      "ok": true,
+      "returncode": 0,
+      "log": "==24491== Memcheck, a memory error detector\n==24491== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==24491== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==24491== Command: /home/user/.cache/pr824-s24-memcheck/unsigned-affine-m64-O2\n==24491== Parent PID: 24461\n==24491== \n==24491== \n==24491== HEAP SUMMARY:\n==24491==     in use at exit: 0 bytes in 0 blocks\n==24491==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==24491== \n==24491== All heap blocks were freed -- no leaks are possible\n==24491== \n==24491== For lists of detected and suppressed errors, rerun with: -s\n==24491== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "stderr": ""
+    },
+    {
+      "name": "unsigned-affine-m64-O3",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--error-exitcode=99",
+        "--leak-check=full",
+        "--errors-for-leak-kinds=definite,indirect",
+        "--log-file=/home/user/.cache/pr824-s24-memcheck/unsigned-affine-m64-O3.log",
+        "/home/user/.cache/pr824-s24-memcheck/unsigned-affine-m64-O3"
+      ],
+      "binary_sha256": "48a41584dec620d1c55bd350deb202f226f52b459d9e284eebc0e9e036946afe",
+      "ok": true,
+      "returncode": 0,
+      "log": "==24494== Memcheck, a memory error detector\n==24494== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==24494== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==24494== Command: /home/user/.cache/pr824-s24-memcheck/unsigned-affine-m64-O3\n==24494== Parent PID: 24461\n==24494== \n==24494== \n==24494== HEAP SUMMARY:\n==24494==     in use at exit: 0 bytes in 0 blocks\n==24494==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==24494== \n==24494== All heap blocks were freed -- no leaks are possible\n==24494== \n==24494== For lists of detected and suppressed errors, rerun with: -s\n==24494== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "stderr": ""
+    },
+    {
+      "name": "unsigned-affine-m32-O2",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--error-exitcode=99",
+        "--leak-check=full",
+        "--errors-for-leak-kinds=definite,indirect",
+        "--log-file=/home/user/.cache/pr824-s24-memcheck/unsigned-affine-m32-O2.log",
+        "/home/user/.cache/pr824-s24-memcheck/unsigned-affine-m32-O2"
+      ],
+      "binary_sha256": "5d306fda0a419afddb27255e8a1da619dabde138471473e0a7a5c54e3d2a5a5f",
+      "ok": true,
+      "returncode": 0,
+      "log": "==24497== Memcheck, a memory error detector\n==24497== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==24497== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==24497== Command: /home/user/.cache/pr824-s24-memcheck/unsigned-affine-m32-O2\n==24497== Parent PID: 24461\n==24497== \n==24497== \n==24497== HEAP SUMMARY:\n==24497==     in use at exit: 0 bytes in 0 blocks\n==24497==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==24497== \n==24497== All heap blocks were freed -- no leaks are possible\n==24497== \n==24497== For lists of detected and suppressed errors, rerun with: -s\n==24497== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "stderr": ""
+    },
+    {
+      "name": "unsigned-affine-m32-O3",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--error-exitcode=99",
+        "--leak-check=full",
+        "--errors-for-leak-kinds=definite,indirect",
+        "--log-file=/home/user/.cache/pr824-s24-memcheck/unsigned-affine-m32-O3.log",
+        "/home/user/.cache/pr824-s24-memcheck/unsigned-affine-m32-O3"
+      ],
+      "binary_sha256": "5d306fda0a419afddb27255e8a1da619dabde138471473e0a7a5c54e3d2a5a5f",
+      "ok": true,
+      "returncode": 0,
+      "log": "==24500== Memcheck, a memory error detector\n==24500== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==24500== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==24500== Command: /home/user/.cache/pr824-s24-memcheck/unsigned-affine-m32-O3\n==24500== Parent PID: 24461\n==24500== \n==24500== \n==24500== HEAP SUMMARY:\n==24500==     in use at exit: 0 bytes in 0 blocks\n==24500==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==24500== \n==24500== All heap blocks were freed -- no leaks are possible\n==24500== \n==24500== For lists of detected and suppressed errors, rerun with: -s\n==24500== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "stderr": ""
+    }
+  ],
+  "errors": []
+}

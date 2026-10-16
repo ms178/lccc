@@ -2091,7 +2091,7 @@ mod tests {
         // stages between the load and the `testb`.  mov/lea staging touches
         // neither flags nor memory nor the loaded family, so the compare
         // slides past it.
-        let out = run(concat!(
+        let asm = concat!(
             "foo:\n",
             ".cfi_startproc\n",
             ".LBB1:\n",
@@ -2105,10 +2105,17 @@ mod tests {
             "    movl %r10d, %eax\n",
             "    ret\n",
             ".cfi_endproc\n",
-        ));
+        );
+        let out = run_fold(asm);
         assert!(out.contains("cmpb $0, (%r11,%r8)"), "{out}");
         assert!(!out.contains("movsbq"), "{out}");
         assert!(out.contains("cmovnel %esi, %r10d"), "{out}");
+        // The full pipeline additionally consumes the folded memory test in
+        // the carry-count peephole. Keep the isolated pass contract above.
+        let final_out = run(asm);
+        assert!(final_out.contains("cmpb $1, (%r11,%r8)"), "{final_out}");
+        assert!(final_out.contains("sbbl $-1, %r10d"), "{final_out}");
+        assert!(!final_out.contains("movsbq"), "{final_out}");
     }
 
     #[test]

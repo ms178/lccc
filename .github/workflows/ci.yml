@@ -461,6 +461,8 @@ jobs:
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_audit_loop_contracts.sh
     - name: IVSR integer-domain contracts
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_ivsr_domains.sh
+    - name: Signed affine-step and signed index home contracts
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ivsr_signed_affine_step.sh
     - name: IVSR vecaddr struct-walk shape and contracts
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_ivsr_vecaddr_struct_walk.sh
     - name: IV-widen exposed-latch trajectory gates
@@ -503,6 +505,10 @@ jobs:
       run: python3 tests/regression/check_pgo_io.py --lccc target/fastbuild/lccc
     - name: RISC-V relocation rejection and positive controls
       run: python3 tests/linker/check_riscv_relocation_contract.py --lccc target/fastbuild/lccc-riscv
+    - name: RISC-V shared-binding mutation controls
+      run: python3 tests/linker/test_riscv_shared_binding.py
+    - name: RISC-V shared-binding relocation algebra
+      run: python3 tests/linker/check_riscv_shared_binding.py --lccc target/fastbuild/lccc-riscv
     - name: Relocation and PGO harness red-team tests
       run: python3 tests/linker/test_pr826_redteam.py
     - name: ISA-sensitive intrinsic feature gate
@@ -601,6 +607,18 @@ jobs:
         tar -xzf lccc-fast.tar.gz
         test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
         sha256sum -c target/ci-build.sha256
+    - name: Preserved synthesis and ordering contracts
+      env:
+        CCC: target/fastbuild/lccc
+        GCC: gcc-16
+      run: |
+        set -euo pipefail
+        python3 scripts/verify_evidence_hashes.py
+        python3 scripts/check_licm_ordering.py
+        bash tests/regression/check_byte_accessor_inline.sh
+        bash tests/regression/check_unsigned_affine_loop.sh
+        python3 tests/linker/test_riscv_shared_binding.py
+        python3 tests/linker/check_riscv_shared_binding.py --lccc target/fastbuild/lccc-riscv
     - name: Benchmark output gate (workload kernels vs GCC oracle)
       env:
         GCC_BIN: gcc-16
@@ -616,6 +634,27 @@ jobs:
       run: bash tests/regression/check_i386_regparm_small_struct_abi.sh
     - name: Scoped-noreturn diagnostic gate
       run: bash tests/regression/check_scoped_noreturn_diagnostics.sh
+    # AUD-DRV-1: `-o -` is a stream, not a filename, wherever GCC says so
+    # (measured on GCC 14.2); the gate's --self-test rejects a fake compiler
+    # with the old file-named-`-` behavior.
+    - name: Dash-output stdout gate
+      run: bash tests/regression/check_dash_output.sh
+    # AUD-SILENT-ZERO-1: x86-only intrinsics are a lowering-time diagnostic
+    # on aarch64/riscv64, never silent zeros (mutation-tested sweep).
+    - name: foreign-intrinsics rejected gate
+      run: python3 scripts/check_foreign_intrinsics.py
+    # PR #821 F1: user-authored AArch64 assembly is exempt from the
+    # -mgeneral-regs-only SIMD guard via #APP/#NO_APP provenance brackets.
+    - name: AArch64 inline-asm provenance gate
+      run: bash tests/regression/check_arm_inline_asm_provenance.sh
+    # PR #821 F3: shared-library ADR relocations prove the section-relative
+    # precondition through the SECTION MAP.
+    - name: AArch64 shared ADR contract gate
+      run: bash tests/regression/check_arm_adr_shared_contract.sh
+    # PR #821 F2: gABI-merged visibility drives export, st_other and the
+    # ADR predicate; input contract and emitted ELF cannot disagree.
+    - name: AArch64 shared visibility gate
+      run: bash tests/regression/check_arm_visibility_shared.sh
     - name: i386 call-staging assembly gate
       run: bash tests/regression/check_i386_call_staging_asm.sh
     - name: Loop-inversion census
@@ -664,6 +703,10 @@ jobs:
         CCC: target/fastbuild/lccc
         GCC: gcc-16
       run: bash tests/regression/check_strict_packed_dag.sh
+    - name: Strict packed reciprocal bitwise oracle
+      run: python3 scripts/check_strict_packed_recip.py
+    - name: Observable FP environment semantics
+      run: bash tests/regression/check_fp_environment.sh
     - name: Verify MachInst narrow-slot window allocation
       env:
         CCC: target/fastbuild/lccc
@@ -1153,6 +1196,9 @@ jobs:
         python3 scripts/test_godbolt_cache.py
         python3 scripts/test_glibc_check_triage.py
         python3 scripts/test_oracle_delta_gate.py
+        # Live CE delta execution moved to scheduled/manual oracle-delta.yml:
+        # network outages must not masquerade as PR-time oracle coverage.
+        # Hermetic self-tests and local differential/output gates stay required.
         python3 scripts/oracle_delta_gate.py --self-test
         python3 scripts/glibc_check_triage.py --self-test
         bash tests/regression/check_copy_alias_sizes.sh
@@ -1286,7 +1332,7 @@ jobs:
     - name: Temp-file symlink hardening
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_temp_symlink.sh
     - name: Note-run oracle boundary tests
-      run: python3 tests/linker/test_note_runs.py
+      run: python3 tests/corpus/test_linker_note_runs.py
     - name: RISC-V shared symbol binding and visibility
       run: |
         python3 tests/linker/test_riscv_shared_binding.py

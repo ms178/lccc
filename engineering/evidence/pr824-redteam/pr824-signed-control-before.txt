@@ -1,0 +1,11 @@
+Frozen S22 before repair, GCC 16.2, -fwrapv; expected failures:
+gcc-16
+affine-control-proof 5 97
+exit=0
+/home/user/.cache/pr824-s22-tools/lccc
+[AFFOLD] optional_guard: affine exit-compare folds: 1
+[AFFOLD] wrapping_guard: affine exit-compare folds: 1
+affine-control-proof 2 95
+exit=1
+affine-control-proof 5 97
+disabled_exit=0

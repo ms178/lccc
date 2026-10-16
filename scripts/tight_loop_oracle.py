@@ -13,16 +13,18 @@ immediately above it, then compare:
     K = ceil_log2(EXACT encoded body span), clamped to 3..=6, with
     bodies over one cache line rejected to the ordinary cascade.
 
-Exact per-loop equality is NOT expected: the compilers generate
-different instruction sequences, so the two inputs to the same rule
-differ. What this census establishes is (a) every loop GCC aligns as a
-tight loop is also tight-aligned by lccc at a bucket no weaker than the
-hardware goal, (b) lccc never aligns a body its own assembler measures
-above 64 bytes, and (c) the histogram deltas over the whole corpus.
+This is a directive histogram, not a matched-loop or performance proof.
+Different compilers may remove, clone, or vectorize different loops. Aggregate
+bucket counts cannot establish per-loop equivalence or a hardware speedup.
+Compiler/source failures make the survey incomplete and return nonzero; partial
+diagnostics are retained. Both local modes and vendors receive the same ISA.
 
-Usage: scripts/tight_loop_oracle.py LCCC [-O2] [--oracles gcc16.2,clang] [bench...]
+Usage: scripts/tight_loop_oracle.py LCCC --opt=-O2 --oracles gcc16.2,clang,icx [bench...]
 """
 import argparse
+import hashlib
+import json
+import shlex
 import os
 import re
 import subprocess
@@ -32,7 +34,6 @@ from collections import Counter
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-INCLUDE = "-I/usr/lib/gcc/x86_64-linux-gnu/14/include"
 PROGRAMS = REPO / "tests/benchmark/programs"
 
 sys.path.insert(0, str(REPO / "scripts"))
@@ -40,15 +41,34 @@ import godbolt as gb  # noqa: E402
 
 LABEL_RE = re.compile(r"^([.\w]+):\s*$")
 JMP_RE = re.compile(r"^\s*(?:jmp|j[a-z]{1,3}|loop[a-z]*)\s+([.\w]+)\b")
-P2A_RE = re.compile(r"\.p2align\s+(\d+)(?:\s*,,\s*(\d+))?")
+P2A_RE = re.compile(r"\.p2align\s+(\d+)(?:\s*,[^,\n#]*(?:,\s*([^#\n]+))?)?")
 FUNC_RE = re.compile(r"^([A-Za-z_][\w.$]*):\s*$")
 DUMP_RE = re.compile(r"loop_align: func=(\S+) header=L(\d+) tight=yes")
 OK_RE = re.compile(r"\[TIGHT\] sec\d+ header=(\.\S+) span=(\d+) log2=(\d+)")
 NO_RE = re.compile(r"\[TIGHT\] sec\d+ header=(\.\S+) reject=(\S+)")
 
 
+def alignment_group(lines, label_index):
+    """Parse only contiguous non-byte-emitting directives before this label."""
+    best, bounded = None, False
+    for line in reversed(lines[:label_index]):
+        text = line.strip()
+        match = P2A_RE.match(text)
+        if match:
+            exponent, max_skip = match.groups()
+            if max_skip is None:
+                best = max(best, int(exponent)) if best is not None else int(exponent)
+            else:
+                bounded = True
+        elif not text or text.startswith(("#", "//", ".cfi_", ".loc ")):
+            continue
+        else:
+            break
+    return best if best is not None else ("cascade" if bounded else None)
+
+
 def oracle_headers(lines):
-    """label -> (function, strongest unconditional log2 or None)."""
+    """label -> (function, unconditional log2, bounded cascade, or None)."""
     label_line, func_of = {}, {}
     cur = None
     for i, l in enumerate(lines):
@@ -68,21 +88,8 @@ def oracle_headers(lines):
                 headers[tgt] = label_line[tgt]
     out = {}
     for lab, li in headers.items():
-        best = None
-        j = li - 1
-        # Walk only the contiguous directive/comment/blank run.
-        while j >= 0:
-            t = lines[j].strip()
-            if not t or t.startswith((".", "//", "#", ".cfi", ".L")):
-                am = P2A_RE.search(t)
-                if am:
-                    k, skip = int(am.group(1)), am.group(2)
-                    if skip is None:
-                        best = k  # unconditional dominates
-                j -= 1
-                continue
-            break
-        out[lab] = (func_of.get(lab), best)
+        bucket = alignment_group(lines, li)
+        out[lab] = (func_of.get(lab), bucket)
     return out
 
 
@@ -100,31 +107,19 @@ def directive_groups(lines):
             headers[m.group(1)] = label_line[m.group(1)]
     out = {}
     for lab, li in headers.items():
-        best, uncond = None, False
-        j = li - 1
-        while j >= 0 and (".p2align" in lines[j] or not lines[j].strip()):
-            am = P2A_RE.search(lines[j])
-            if am:
-                k, skip = int(am.group(1)), am.group(2)
-                if skip is None:
-                    uncond = True
-                    best = k
-                elif best is None:
-                    best = k
-            j -= 1
-        out[lab] = best if uncond else ("cascade" if best else None)
+        out[lab] = alignment_group(lines, li)
     return out
 
 
-def lccc_decisions(lccc, opt, src):
+def lccc_decisions(lccc, flags, src, include):
     """Histogram of effective strongest log2 for every loop header in
     integrated mode: tight accepts from CCC_DEBUG_TIGHT override the
     portable cascade groups parsed from -S text; plus reject reasons."""
     with tempfile.TemporaryDirectory() as td:
         # 1. portable text: cascade groups per header
         sfile = Path(td) / "p.s"
-        r = subprocess.run([str(lccc), INCLUDE, opt, "-S", str(src), "-o", str(sfile)],
-                           capture_output=True, text=True)
+        r = subprocess.run([str(lccc), "-I" + include, *shlex.split(flags), "-S", str(src), "-o", str(sfile)],
+                           capture_output=True, text=True, timeout=60)
         if r.returncode:
             return None, None, r.stderr[-300:]
         groups = directive_groups(sfile.read_text(errors="replace").splitlines())
@@ -133,8 +128,8 @@ def lccc_decisions(lccc, opt, src):
         env["CCC_DEBUG_TIGHT"] = "1"
         env["CCC_DUMP_ALIGN"] = "1"
         obj = Path(td) / "p.o"
-        r2 = subprocess.run([str(lccc), INCLUDE, opt, "-c", str(src), "-o", str(obj)],
-                            capture_output=True, text=True, env=env)
+        r2 = subprocess.run([str(lccc), "-I" + include, *shlex.split(flags), "-c", str(src), "-o", str(obj)],
+                            capture_output=True, text=True, env=env, timeout=60)
         if r2.returncode:
             return None, None, r2.stderr[-300:]
         accepted, rejected = {}, {}
@@ -149,24 +144,38 @@ def lccc_decisions(lccc, opt, src):
                 rejected[m.group(1)] = m.group(2)
     effective = {}
     for lab, bucket in groups.items():
-        effective[lab] = accepted.get(lab, (0, bucket if isinstance(bucket, int) else 3))[1] \
-            if lab in accepted else (bucket if bucket is not None else 3)
+        effective[lab] = accepted[lab][1] if lab in accepted else (
+            bucket if bucket is not None else "unaligned")
     # Tight labels can exist only in -c debug; ensure every accept is in.
     for lab, (_, k) in accepted.items():
         effective[lab] = k
     return effective, rejected, None
 
 
-def main():
+def bucket_name(value):
+    return f"2^{value}" if isinstance(value, int) else value
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("lccc", type=Path)
     ap.add_argument("--opt", default="-O2")
     ap.add_argument("--oracles", default="gcc16.2,clang,icx")
     ap.add_argument("--march", default="raptorlake")
+    ap.add_argument("--gcc", default="gcc-16", help="builtin-header provider")
+    ap.add_argument("--json", type=Path, help="coverage, flags and error receipt")
     ap.add_argument("programs", nargs="*")
-    args = ap.parse_args()
+    args = ap.parse_intermixed_args(argv)
     names = args.programs or sorted(p.stem for p in PROGRAMS.glob("*.c"))
-    oracles = [o for o in args.oracles.split(",") if o]
+    oracles = [o.strip() for o in args.oracles.split(",") if o.strip()]
+    if not names or len(names) != len(set(names)) or not oracles or len(oracles) != len(set(oracles)):
+        ap.error("nonempty unique program and oracle selections required")
+    include = subprocess.check_output([args.gcc, "-print-file-name=include"], text=True, timeout=15).strip()
+    if not include or not Path(include).is_dir():
+        ap.error("GCC did not identify an existing builtin-header directory")
+    flags = f"{args.opt} -march={args.march}"
+    errors = []
+    sources = {}
 
     totals = {o: Counter() for o in oracles}
     lccc_hist = Counter()
@@ -174,23 +183,34 @@ def main():
     rows = []
     for name in names:
         src = PROGRAMS / f"{name}.c"
-        if not src.exists():
+        if not src.is_file():
+            errors.append({"program": name, "compiler": "source", "error": "missing source"})
             continue
         source = src.read_text(errors="replace")
+        sources[name] = hashlib.sha256(src.read_bytes()).hexdigest()
         ohists = {}
         for o in oracles:
-            res = gb.compile_on_godbolt(
-                o, source, f"{args.opt} -march={args.march}", keep_directives=True)
-            if res is None:
-                ohists[o] = Counter(err=1)
+            try:
+                res = gb.compile_on_godbolt(o, source, flags, keep_directives=True,
+                                            intel=False, raise_on_error=True)
+                if res is None:
+                    raise gb.GodboltError("missing oracle response")
+            except (gb.GodboltError, ValueError) as exc:
+                errors.append({"program": name, "compiler": o, "error": str(exc)})
+                ohists[o] = Counter()
                 continue
             hs = oracle_headers(gb.assembly_lines(res))
-            c = Counter(("cascade" if k is None else k) for (_, k) in hs.values())
+            c = Counter(("unaligned" if k is None else k) for (_, k) in hs.values())
             ohists[o] = c
             totals[o].update(c)
-        effective, rejected, err = lccc_decisions(args.lccc, args.opt, src)
-        if err:
+        try:
+            effective, rejected, err = lccc_decisions(args.lccc, flags, src, include)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            effective, rejected, err = None, None, str(exc)
+        if effective is None or rejected is None:
+            err = err or "local compiler failed without a diagnostic"
             print(f"{name}: lccc compile failed {err.strip()[:80]}")
+            errors.append({"program": name, "compiler": "lccc", "error": err})
             continue
         lc = Counter(("cascade" if k == "cascade" else k) for k in effective.values())
         for why in rejected.values():
@@ -206,22 +226,35 @@ def main():
             c = oh[o]
             items = sorted(c.items(), key=lambda kv: (isinstance(kv[0], str), kv[0]))
             cells.append(
-                " ".join((f"cas:{v}" if k == "cascade" else f"2^{k}:{v}") for k, v in items)
+                " ".join((f"cas:{v}" if k == "cascade" else f"{bucket_name(k)}:{v}") for k, v in items)
                 or "-"
             )
         print(f"{name:{width}s}  " + "  ".join(f"{x:>22s}" for x in cells)
-              + "  " + f"{(' '.join(f'2^{k}:{v}' for k, v in sorted(lc.items())) or '-'):>16s}")
+              + "  " + f"{(' '.join(f'{bucket_name(k)}:{v}' for k, v in sorted(lc.items(), key=lambda kv: (isinstance(kv[0], str), kv[0]))) or '-'):>16s}")
     print("\n=== corpus totals (loop-header strongest unconditional alignment) ===")
     for o in oracles:
         c = totals[o]
         items = sorted(c.items(), key=lambda kv: (isinstance(kv[0], str), kv[0]))
         print(
             f"  {o:9s}: "
-            + " ".join((f"cascade:{v}" if k == "cascade" else f"2^{k}:{v}") for k, v in items)
+            + " ".join((f"cascade:{v}" if k == "cascade" else f"{bucket_name(k)}:{v}") for k, v in items)
         )
-    print("  lccc     : " + " ".join(f"2^{k}:{v}" for k, v in sorted(lccc_hist.items()))
+    print("  lccc     : " + " ".join(f"{bucket_name(k)}:{v}" for k, v in sorted(lccc_hist.items(), key=lambda kv: (isinstance(kv[0], str), kv[0])))
           + "   rejects: " + " ".join(f"{k}:{v}" for k, v in sorted(lccc_reject.items())))
+
+    for error in errors:
+        print(f"ERROR: {error}", file=sys.stderr)
+    if args.json:
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        report = {"complete": not errors, "metric": "alignment directives, not performance or same-loop equivalence",
+                  "flags": flags, "include": include, "local": str(args.lccc), "oracles": oracles,
+                  "source_sha256": sources, "errors": errors,
+                  "rows": [{"program": n, "oracle_histograms": oh, "local_histogram": lc} for n, oh, lc in rows]}
+        temporary = args.json.with_suffix(".tmp")
+        temporary.write_text(json.dumps(report, indent=2) + "\n")
+        temporary.replace(args.json)
+    return int(bool(errors))
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

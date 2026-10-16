@@ -36,14 +36,19 @@ for arch in x86-64 x86-64-v3; do
         [[ $mode != no_double ]] || disabled=fp_double
         CCC_DISABLE_PASSES="$disabled" CCC_VALIDATE_SSA=1 CCC_VERIFY_IR=abort \
             "$CCC" -O2 -march="$arch" -DNO_FENV_PRAGMA -ffp-contract=off -S "$src" -o "$work/$arch-$mode.s"
+        # Runtime checks above retain FENV_ACCESS; shape benefits below use
+        # a separately compiled non-observable environment, with this control.
+        CCC_DISABLE_PASSES="$disabled" "$CCC" -O2 -march="$arch" \
+            -ffp-contract=off -S "$src" -o "$work/$arch-observable-$mode.s"
     done
 done
-# A positive FMA contract needs FENV_ACCESS OFF. Retain the ON negative control.
+# The active FENV policy forbids automatic contraction. Test both sides,
+# without removing any bitwise/exception/dynamic-rounding checks above.
 "$CCC" -O2 -march=x86-64-v3 -ffp-contract=fast -S "$src" -o "$work/observable-contract.s"
 "$CCC" -O2 -march=x86-64-v3 -DNO_FENV_PRAGMA -ffp-contract=fast -S "$src" -o "$work/contract.s"
 for flags in '-march=x86-64' '-march=x86-64-v2' '-march=x86-64-v3 -mno-fma'; do
     # Deliberate word splitting of this fixed test-only flag list.
-    "$CCC" -O2 $flags -ffp-contract=fast -S "$src" -o "$work/no-fma-${flags// /_}.s"
+    "$CCC" -O2 $flags -ffp-contract=fast -DNO_FENV_PRAGMA -S "$src" -o "$work/no-fma-${flags// /_}.s"
 done
 for mode in on no_square; do
     disabled=""
@@ -85,6 +90,7 @@ for arch in ('x86-64', 'x86-64-v3'):
     before = muls(body(f'{arch}-no_square.s', 'square_loop'))
     after = muls(body(f'{arch}-on.s', 'square_loop'))
     assert before >= 2 and after == before-1, (arch, before, after)
+    assert muls(body(f'{arch}-observable-on.s', 'square_loop')) == muls(body(f'{arch}-observable-no_square.s', 'square_loop')), (arch, 'observable square')
     assert muls(body(f'{arch}-on.s', 'changing_round')) == muls(body(f'{arch}-no_square.s', 'changing_round')), arch
     assert muls(body(f'{arch}-on.s', 'twice_plus')) == 0, (arch, 'strict doubling')
     assert muls(body(f'{arch}-no_double.s', 'twice_plus')) == 1, (arch, 'strict control')
@@ -114,6 +120,7 @@ assert mul_fma(inner_fp_loop(body('mandel-on.s', 'main'))) == mul_fma(inner_fp_l
 for name in ('twice_plus', 'scaled_fma'):
     assert not re.search(r'vfmadd\d*sd', body('observable-contract.s', name)), name
     assert re.search(r'vfmadd\d*sd', body('contract.s', name)), name
+    assert not re.search(r'vfmadd\d*sd', body('observable-contract.s', name)), name
 
 def redundant_edges(file):
     lines = [line.split('#', 1)[0].rstrip() for line in (p / file).read_text().splitlines()]

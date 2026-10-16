@@ -1165,6 +1165,11 @@ fn peephole_optimize_inner(
                 changed |= c;
             }
         }
+        if !sk("conditional_increment") {
+            let c = flag_peepholes::fold_conditional_increment(&mut store, &mut infos);
+            trace("fold_conditional_increment", pass_count, c, &store, &infos);
+            changed |= c;
+        }
         // Sound dead-write elimination (LEAs, widened copies, setCC) and
         // repeated-load reuse; both use the relay/lea deadness proofs.
         // Whole-function copy coalescing: rename the destination family to the

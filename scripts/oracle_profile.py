@@ -24,6 +24,7 @@ unsigned long long popcnt(unsigned long long a) { return _mm_popcnt_u64(a); }
 __m128i sse41(__m128i a,__m128i b) { return _mm_min_epi32(a,b); }
 unsigned sse42(unsigned a,unsigned b) { return _mm_crc32_u32(a,b); }
 '''
+CONTRACTION_SOURCE = "double no_contract(double a, double b, double c) { return a*b+c; }\n"
 FEATURES = {
     'AVX2': r'\bvpaddd\b[^\n]*%ymm', 'FMA': r'\bvfmadd(?:132|213|231)ps\b',
     'F16C': r'\bvcvtph2ps\b', 'BMI1': r'\bandnq?\b', 'BMI2': r'\bpdepq?\b',
@@ -56,8 +57,23 @@ def verify(oracles, flags):
             row['assembly'] = lines
             row['stderr'] = result.get('stderr', [])
             row['ok'] = all(row['features'].values())
+            if '-ffp-contract=off' in shlex.split(flags):
+                probe = godbolt.compile_on_godbolt(cid, CONTRACTION_SOURCE, flags,
+                                                    raise_on_error=True)
+                if probe is None:
+                    raise godbolt.GodboltError('missing contraction probe response')
+                asm = godbolt.assembly_lines(probe)
+                body = '\n'.join(asm)
+                separate = (bool(re.search(r'\bv?mulsd\b', body))
+                            and bool(re.search(r'\bv?addsd\b', body))
+                            and not re.search(r'\bv?f(?:madd|msub|nmadd|nmsub)', body))
+                row['contraction_off'] = {
+                    'source': CONTRACTION_SOURCE, 'assembly': asm,
+                    'assembly_sha256': hashlib.sha256(body.encode()).hexdigest(),
+                    'ok': bool(separate), 'stderr': probe.get('stderr', [])}
+                row['ok'] = row['ok'] and bool(separate)
             if not row['ok']:
-                row['error'] = 'missing representative ISA instruction(s)'
+                row['error'] = 'missing representative ISA instruction(s) or contraction-off witness'
         except (godbolt.GodboltError, ValueError) as error:
             row['ok'] = False
             row['error'] = str(error)

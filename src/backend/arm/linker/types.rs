@@ -41,6 +41,13 @@ pub struct GlobalSymbol {
     /// for dynamic symbols; lets the COPY-vs-PLT classifier tell untyped
     /// data (copy) from untyped code (PLT) when `info` is `STT_NOTYPE`.
     pub lib_in_exec: bool,
+    /// Merged `STV_*` visibility (gABI: the most constraining of all
+    /// references and the definition — see
+    /// `linker_common::merge_object_visibility`).  Drives the shared
+    /// emitter's export decision, the `st_other` byte of dynsym entries and
+    /// the ADR admission predicate, so the input-visibility contract and the
+    /// emitted ELF can no longer disagree (PR #821 F2).
+    pub visibility: u8,
 }
 
 impl GlobalSymbolOps for GlobalSymbol {
@@ -62,6 +69,12 @@ impl GlobalSymbolOps for GlobalSymbol {
     fn size(&self) -> u64 {
         self.size
     }
+    fn visibility(&self) -> u8 {
+        self.visibility
+    }
+    fn set_visibility(&mut self, visibility: u8) {
+        self.visibility = visibility;
+    }
     fn new_defined(obj_idx: usize, sym: &Elf64Symbol) -> Self {
         GlobalSymbol {
             value: sym.value,
@@ -76,6 +89,7 @@ impl GlobalSymbolOps for GlobalSymbol {
             copy_reloc: false,
             lib_sym_value: 0,
             lib_in_exec: false,
+            visibility: sym.visibility(),
         }
     }
     fn new_common(obj_idx: usize, sym: &Elf64Symbol) -> Self {
@@ -92,6 +106,7 @@ impl GlobalSymbolOps for GlobalSymbol {
             copy_reloc: false,
             lib_sym_value: 0,
             lib_in_exec: false,
+            visibility: sym.visibility(),
         }
     }
     fn new_undefined(sym: &Elf64Symbol) -> Self {
@@ -108,6 +123,7 @@ impl GlobalSymbolOps for GlobalSymbol {
             copy_reloc: false,
             lib_sym_value: 0,
             lib_in_exec: false,
+            visibility: sym.visibility(),
         }
     }
     fn set_common_bss(&mut self, bss_offset: u64) {
@@ -128,6 +144,10 @@ impl GlobalSymbolOps for GlobalSymbol {
             copy_reloc: false,
             lib_sym_value: dsym.value,
             lib_in_exec: dsym.in_exec_segment,
+            // Shared-library symbols are resolved against, not linked in:
+            // their visibility does not constrain this link unit (the merge
+            // pass deliberately skips them), so DEFAULT is the sound value.
+            visibility: crate::backend::elf::STV_DEFAULT,
         }
     }
 }

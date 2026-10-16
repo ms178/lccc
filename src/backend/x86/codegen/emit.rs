@@ -951,6 +951,8 @@ pub struct X86Codegen {
     /// Set of value IDs that need sign-extension because they're used in 64-bit
     /// contexts (Cast to I64, GEP operands). Values NOT in this set can skip movslq.
     pub(super) needs_sext_values: FxHashSet<u32>,
+    /// Signed homes consumed wide WITHOUT an explicit widening Cast.
+    pub(super) implicit_sext_values: FxHashSet<u32>,
     /// Values whose low-32 form is PROVABLY NON-NEGATIVE because they are
     /// the result of a Clz/Ctz/Popcount on a type of at most 32 bits
     /// (PF-16b). Any 32-bit register write zeroes bits 32..63 on x86-64,
@@ -1452,6 +1454,7 @@ impl X86Codegen {
             optimize_for_size: false,
             skip_i32_sext: false,
             needs_sext_values: FxHashSet::default(),
+            implicit_sext_values: FxHashSet::default(),
             bitop_nonneg_values: FxHashSet::default(),
             fused_cmp_dests: FxHashMap::default(),
             fused_forward_dests: FxHashSet::default(),
@@ -2392,6 +2395,21 @@ impl X86Codegen {
         self.state
             .out
             .emit_instr_reg_reg("    movslq", name_32, name_64);
+    }
+
+    /// Accumulator results need canonical upper bits only for implicit wide
+    /// readers. Explicit widening Casts perform their own extension; adding
+    /// one here too makes adjacent movslq pairs and longer live ranges.
+    pub(super) fn emit_implicit_sext32_for_value(
+        &mut self,
+        name_32: &str,
+        name_64: &str,
+        is_unsigned: bool,
+        dest_id: u32,
+    ) {
+        if self.implicit_sext_values.contains(&dest_id) {
+            self.emit_sext32_for_value(name_32, name_64, is_unsigned, dest_id);
+        }
     }
 
     /// Emit a comparison instruction, optionally using 32-bit form for I32/U32 types.
@@ -7322,6 +7340,16 @@ impl X86Codegen {
 }
 
 impl ArchCodegen for X86Codegen {
+    /// Provenance markers for user inline-asm bodies: `#APP`/`#NO_APP`.
+    /// `#` starts a comment in this target's GAS syntax, so the markers are
+    /// invisible to the assembler, to objdump, and to this backend's text
+    /// peephole alike; downstream scanners (the -mno-sse /
+    /// -mgeneral-regs-only SIMD guard) use them to exempt user-authored
+    /// text from the compiler-generated code policy.
+    fn asm_block_markers(&self) -> Option<(&'static str, &'static str)> {
+        Some(("#APP", "#NO_APP"))
+    }
+
     fn supports_switch_bounds(&self) -> bool {
         true
     }
@@ -8128,6 +8156,52 @@ impl ArchCodegen for X86Codegen {
             &mut self.machinst_buf,
         );
         if lowered {
+            // Typed S32 ALU/load/select writes zero the upper register half.
+            // The IR permits implicit wide consumers (notably pointer-index
+            // products), so preserve the same canonical signed-home contract
+            // as the classic emitter. Copy/Phi closure is already represented
+            // in implicit_sext_values. Narrow-only and unsigned results need no
+            // extra instruction; explicit Cast lowering already canonicalizes.
+            use crate::ir::reexports::Instruction;
+            let signed_dest = match inst {
+                Instruction::BinOp {
+                    dest,
+                    ty: IrType::I32,
+                    ..
+                }
+                | Instruction::UnaryOp {
+                    dest,
+                    ty: IrType::I32,
+                    ..
+                }
+                | Instruction::Load {
+                    dest,
+                    ty: IrType::I32,
+                    ..
+                }
+                | Instruction::Select {
+                    dest,
+                    ty: IrType::I32,
+                    ..
+                } => Some(*dest),
+                _ => None,
+            };
+            if let Some(dest) = signed_dest
+                && self.implicit_sext_values.contains(&dest.0)
+            {
+                use super::machinst::{MachInst, MachOperand, MachReg, OpSize};
+                let dst = ra_fresh
+                    .get(&dest.0)
+                    .copied()
+                    .map(MachReg::Phys)
+                    .unwrap_or(MachReg::Vreg(dest.0));
+                self.machinst_buf.push(MachInst::Movsx {
+                    src: MachOperand::Reg(dst),
+                    dst,
+                    from_size: OpSize::S32,
+                    to_size: OpSize::S64,
+                });
+            }
             self.machinst_buf_ir.push(inst.clone());
         }
         lowered
@@ -9286,6 +9360,7 @@ impl ArchCodegen for X86Codegen {
     ) {
         // Lazy flush: inline asm may clobber XMM registers or read slots.
         self.flush_pending_vec_store_impl();
+        let markers = self.asm_block_markers();
         emit_inline_asm_common(
             self,
             template,
@@ -9295,6 +9370,7 @@ impl ArchCodegen for X86Codegen {
             operand_types,
             goto_labels,
             input_symbols,
+            markers,
         );
         self.emit_callee_saved_clobber_annotations(clobbers);
         // SOUNDNESS (audit F5): the asm template may write any register in
@@ -9325,6 +9401,7 @@ impl ArchCodegen for X86Codegen {
     ) {
         // Lazy flush: inline asm may clobber XMM registers or read slots.
         self.flush_pending_vec_store_impl();
+        let markers = self.asm_block_markers();
         crate::backend::inline_asm::emit_inline_asm_common_impl(
             self,
             template,
@@ -9334,6 +9411,7 @@ impl ArchCodegen for X86Codegen {
             operand_types,
             goto_labels,
             input_symbols,
+            markers,
             seg_overrides,
         );
         self.emit_callee_saved_clobber_annotations(clobbers);

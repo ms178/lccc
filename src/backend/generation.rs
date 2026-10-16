@@ -3536,10 +3536,31 @@ pub fn generate_module(
 
     // Top-level asm("...") (e.g. musl `_start`). Switch to .text first so
     // labels/code land in the correct section.
+    //
+    // File-scope `__asm__` is user-authored text — the same provenance class
+    // as function-body inline asm — so it gets the target's `#APP`/`#NO_APP`
+    // brackets: the driver's -mgeneral-regs-only SIMD scanner must exempt a
+    // top-level `__asm__("movi v0.16b, #0")` exactly like a function-body
+    // one, and the x86 text peephole must never rewrite a top-level user
+    // template.  One deliberate, documented divergence from gcc's .s shape
+    // (gcc emits top-level asm unmarked): the markers are assembler comment
+    // lines, semantically invisible to GAS/objdump/objcopy.
     if !module.toplevel_asm.is_empty() {
         cg.state().emit(".text");
+        let markers = cg.asm_block_markers();
+        let nonempty = module.toplevel_asm.iter().any(|s| !s.trim().is_empty());
+        if let Some((open, _)) = markers {
+            if nonempty {
+                cg.state().emit(open);
+            }
+        }
         for asm_str in &module.toplevel_asm {
-            cg.state().emit(asm_str);
+            cg.emit_toplevel_asm(asm_str);
+        }
+        if let Some((_, close)) = markers {
+            if nonempty {
+                cg.state().emit(close);
+            }
         }
     }
 

@@ -406,9 +406,9 @@ fn normalize_step_const(c: IrConst, phi_ty: IrType) -> Option<(i128, IrConst)> {
 // ---------------------------------------------------------------------------
 
 /// A provable mathematical value range over the member's *narrow* value
-/// domain, in i128 to avoid overflow during range arithmetic. Only meaningful
-/// for unsigned (`Ze`) members; signed members rely on the
-/// signed-overflow-is-UB theorem instead and keep `range = None`.
+/// domain, in i128 to avoid overflow during range arithmetic. Unsigned and
+/// wrapping signed members need explicit ranges; non-wrapping signed members
+/// may instead rely on the signed-overflow-is-UB theorem.
 #[derive(Debug, Clone, Copy)]
 struct Range {
     lo: i128,
@@ -1200,9 +1200,9 @@ fn analyze_iv(
     let wide_ty = wide_ty_for(phi_ty);
     let step = plan_step_operand(func, phi_dest, latch_dest)?;
 
-    // Wrapping signed IVs also need a real counted-range proof. The first
-    // supported subset has a nonnegative constant seed, positive constant
-    // stride and a nonnegative constant signed bound. No signed UB is used.
+    // Wrapping signed IVs need the same trajectory proof in their OWN signed
+    // domain. Strict unit-step guards also admit runtime seeds/bounds; wider
+    // strides require a constant threshold with room for the final step.
     let signed_wrapping = ext == ExtKind::Se && super::signed_overflow_wraps();
     let (seed_range, intercept): (Option<Range>, bool) = if ext == ExtKind::Ze || signed_wrapping {
         let proof = prove_counted_bound(
@@ -1241,7 +1241,8 @@ fn analyze_iv(
         let wrap_closed = if delta > 0 {
             proof.range.hi + delta <= max
         } else if delta < 0 {
-            proof.range.lo + delta >= 0
+            let min = if signed_wrapping { -max - 1 } else { 0 };
+            proof.range.lo + delta >= min
         } else {
             true
         };
@@ -1264,12 +1265,26 @@ fn analyze_iv(
 
     // The latch result is a member too: `a[i++]`-style uses read it.
     let latch_ty = latch_step_ty(func, latch_dest).unwrap_or(phi_ty);
+    let latch_range = if !intercept && latch_ty == phi_ty {
+        seed_range.and_then(|r| {
+            let Operand::Const(c) = step else { return None };
+            let cr = const_as_range(c, latch_ty)?;
+            let op = if latch_is_sub {
+                IrBinOp::Sub
+            } else {
+                IrBinOp::Add
+            };
+            binop_range(op, r, cr).filter(|nr| nr.within(latch_ty))
+        })
+    } else {
+        None
+    };
     members.push(Member::of(
         latch_dest,
         MemberKind::LatchResult,
         latch_ty,
         ext,
-        None,
+        latch_range,
     ));
 
     let mut cmps: Vec<CmpAction> = Vec::new();
@@ -1478,14 +1493,24 @@ fn analyze_iv(
                                 queue.push((*dest, true, cur_exact));
                                 continue;
                             }
-                            // Two-member arithmetic: sound for signed members
-                            // (UB theorem); the other operand must be an
-                            // admitted member.
+                            // Two-member arithmetic requires admitted operands.
+                            // Modular domains need an explicit no-wrap interval
+                            // for BOTH values and an exact (non-intercept) plan;
+                            // ordinary signed C may instead use the UB theorem.
                             if let Operand::Value(ov) = other {
                                 let other_is_member = members.iter().any(|m| m.value.0 == ov.0);
-                                if !cur_is_unsigned
-                                    && !super::signed_overflow_wraps()
-                                    && other_is_member
+                                let nr = if !intercept && other_is_member {
+                                    member_range(&members, cur).and_then(|a| {
+                                        let b = member_range(&members, *ov)?;
+                                        let (a, b) = if cur_lhs { (a, b) } else { (b, a) };
+                                        binop_range(*op, a, b).filter(|r| r.within(*ty))
+                                    })
+                                } else {
+                                    None
+                                };
+                                if other_is_member
+                                    && (nr.is_some()
+                                        || (!cur_is_unsigned && !super::signed_overflow_wraps()))
                                 {
                                     members.push(Member::of(
                                         *dest,
@@ -1495,7 +1520,7 @@ fn analyze_iv(
                                         },
                                         *ty,
                                         ext,
-                                        None,
+                                        nr,
                                     ));
                                     queue.push((*dest, true, cur_exact));
                                     continue;
@@ -1533,10 +1558,10 @@ fn analyze_iv(
                                     const_as_range(*c, *ty),
                                 ) {
                                     (IrBinOp::And, _, _, Some(cr)) if cr.lo >= 0 => {
-                                        // With a nonnegative mask, the sign bit is
-                                        // clear: x & c ∈ [0, c] for signed AND
-                                        // unsigned x. This range also licenses a
-                                        // subsequent bounded add under -fwrapv.
+                                        // A nonnegative mask clears the sign bit even
+                                        // for signed x: x & c is a subset of c's bits.
+                                        // This also supplies a signed -fwrapv range
+                                        // for subsequent arithmetic, e.g. (i & 7)+1.
                                         Some(Range { lo: 0, hi: cr.hi })
                                     }
                                     (IrBinOp::Or, true, Some(_r), Some(cr)) => {
@@ -2064,7 +2089,7 @@ fn const_as_range(c: IrConst, ty: IrType) -> Option<Range> {
     Some(Range { lo: v, hi: v })
 }
 
-/// Range arithmetic in i128 over unsigned members. `None` = not computable.
+/// Range arithmetic in i128 over bounded narrow integers. `None` = not computable.
 fn binop_range(op: IrBinOp, a: Range, b: Range) -> Option<Range> {
     match op {
         IrBinOp::Add => Some(Range {
@@ -2330,10 +2355,8 @@ fn prove_counted_bound(
     }
     let mag: i128 = delta.abs();
     let signed = !is_unsigned_ty(phi_ty);
-    if signed && (delta <= 0 || resolve_init_const(func, init, phi_ty)? < 0) {
-        return None;
-    }
     let max = type_max_i128(defining_type(func, phi_dest)?);
+    let min = if signed { -max - 1 } else { 0 };
 
     // Theorem 5′ structural trajectory gates.
     if !body_entry_closed(lp, preds) {
@@ -2400,19 +2423,13 @@ fn prove_counted_bound(
         if !operand_is_const_or_loop_invariant(other, lp, func, phi_dest) {
             continue;
         }
-        // For the signed subset, the nonnegative seed/positive step and
-        // final signed-domain room proof make signed and unsigned order
-        // identical throughout the trajectory. Require the original signed
-        // typed comparison and a constant nonnegative threshold; never infer
-        // an unsigned range from an arbitrary signed predicate.
+        // Predicate names below only normalise direction/polarity; endpoints
+        // remain mathematical SIGNED values in [min, max], not unsigned bits.
+        // The original comparison must agree with the phi's signed domain.
+        // A strict unit-step guard confines every continuing signed value
+        // even for a runtime limit (negative limits included).
         let bound_op = if signed {
             if *cmp_ty != phi_ty {
-                return None;
-            }
-            let Operand::Const(c) = *other else {
-                return None;
-            };
-            if const_as_range(c, phi_ty)?.lo < 0 {
                 return None;
             }
             match op {
@@ -2464,7 +2481,7 @@ fn prove_counted_bound(
         // under a strict `phi < thr ≤ max` test, latch ≤ max).
         match thr {
             Some(t) => {
-                if !bound_leaves_room(t, max, mag) {
+                if !bound_leaves_room(t - min, max - min, mag) {
                     return None;
                 }
             }
@@ -2488,33 +2505,45 @@ fn prove_counted_bound(
         // own test). A runtime seed or runtime threshold admits only the
         // full domain — tight enough that the first arithmetic fold overflows
         // and the intercept confines what remains.
-        let init_const = if latch_exposed {
-            resolve_init_const(func, init, phi_ty)
+        let init_const = resolve_init_const(func, init, phi_ty);
+        // Monotonicity also supplies the seed-side endpoint for a signed
+        // constant seed. Unknown seeds retain the full type endpoint. Keep
+        // empty entry intervals conservative by including the seed endpoint.
+        let floor = if signed {
+            init_const.unwrap_or(min)
         } else {
-            None
+            min
+        };
+        let ceiling = if signed {
+            init_const.unwrap_or(max)
+        } else {
+            max
         };
         let range = match (is_upper, latch_exposed) {
             (true, false) => Range {
-                lo: 0,
-                hi: thr.map(|t| (t - 1).min(max)).unwrap_or(max - 1),
+                lo: floor,
+                hi: thr.map(|t| (t - 1).min(max)).unwrap_or(max - 1).max(floor),
             },
             (true, true) => match (init_const, thr) {
                 (Some(c), Some(t)) => Range {
-                    lo: 0,
+                    lo: if signed { c } else { min },
                     hi: c.max(t - 1 + mag).min(max),
                 },
-                _ => Range { lo: 0, hi: max },
+                _ => Range { lo: min, hi: max },
             },
             (false, false) => Range {
-                lo: thr.map(|t| (t + 1).max(0)).unwrap_or(1),
-                hi: max,
+                lo: thr
+                    .map(|t| (t + 1).max(min))
+                    .unwrap_or(min + 1)
+                    .min(ceiling),
+                hi: ceiling,
             },
             (false, true) => match (init_const, thr) {
                 (Some(c), Some(t)) => Range {
-                    lo: c.min(t + 1 - mag).max(0),
-                    hi: max,
+                    lo: c.min(t + 1 - mag).max(min),
+                    hi: if signed { c } else { max },
                 },
-                _ => Range { lo: 0, hi: max },
+                _ => Range { lo: min, hi: max },
             },
         };
         return Some(CountedProof {
@@ -3715,13 +3744,102 @@ mod tests {
     }
 
     #[test]
+    fn wrapping_seed_unproved_arithmetic_and_stores_stay_narrow() {
+        let _guard = WrappingGuard::new();
+        for store in [false, true] {
+            let mut body = vec![
+                Instruction::BinOp {
+                    dest: Value(8),
+                    op: IrBinOp::Sub,
+                    lhs: Operand::Value(Value(60)),
+                    rhs: Operand::Value(Value(1)),
+                    ty: IrType::I32,
+                },
+                Instruction::Cast {
+                    dest: Value(10),
+                    src: Operand::Value(Value(1)),
+                    from_ty: IrType::I32,
+                    to_ty: IrType::I64,
+                },
+                gep_inst(11, 10, IrType::I32),
+                Instruction::Cast {
+                    dest: Value(12),
+                    src: Operand::Value(Value(8)),
+                    from_ty: IrType::I32,
+                    to_ty: IrType::I64,
+                },
+                gep_inst(13, 12, IrType::I32),
+            ];
+            if store {
+                body.push(Instruction::Store {
+                    val: Operand::Value(Value(1)),
+                    ptr: Value(11),
+                    ty: IrType::I32,
+                    volatile: true,
+                    seg_override: crate::common::types::AddressSpace::Default,
+                });
+            }
+            let mut f = counting_loop(
+                "partial_wrapping",
+                IrType::I32,
+                IrBinOp::Add,
+                body,
+                Some(Instruction::Cmp {
+                    dest: Value(99),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(64)),
+                    ty: IrType::I32,
+                }),
+            );
+            f.blocks[0].instructions.push(Instruction::ParamRef {
+                dest: Value(60),
+                param_idx: 1,
+                ty: IrType::I32,
+            });
+            let original = format!("{f:?}");
+            check(&mut f, 0);
+            assert_eq!(format!("{f:?}"), original);
+            assert!(matches!(
+                f.blocks[1].instructions[0],
+                Instruction::Phi {
+                    ty: IrType::I32,
+                    ..
+                }
+            ));
+            assert!(f.blocks[2].instructions.iter().any(|i| matches!(
+                i,
+                Instruction::BinOp {
+                    dest: Value(8),
+                    op: IrBinOp::Sub,
+                    ty: IrType::I32,
+                    rhs: Operand::Value(Value(1)),
+                    ..
+                }
+            )));
+            if store {
+                assert!(f.blocks[2].instructions.iter().any(|i| matches!(
+                    i,
+                    Instruction::Store {
+                        val: Operand::Value(Value(1)),
+                        ty: IrType::I32,
+                        volatile: true,
+                        ..
+                    }
+                )));
+            }
+        }
+    }
+
+    #[test]
     fn wrapping_signed_widening_requires_a_range_for_the_whole_closure() {
         let _guard = WrappingGuard::new();
         for (init, bound, cmp_op, multiplier, expected) in [
             (3, 64, IrCmpOp::Slt, 4, 1),
             (1073741824, 1073741828, IrCmpOp::Slt, 4, 0),
             (3, i32::MAX, IrCmpOp::Sle, 1, 0),
-            (-1, 64, IrCmpOp::Slt, 4, 0),
+            (-1, 64, IrCmpOp::Slt, 4, 1),
+            (i32::MIN, -2147483640, IrCmpOp::Slt, 4, 0),
             (3, 64, IrCmpOp::Ult, 4, 0),
         ] {
             let mut f = counting_loop(
@@ -3761,52 +3879,196 @@ mod tests {
     }
 
     #[test]
-    fn wrapping_mask_range_licenses_only_nonoverflowing_arithmetic() {
+    fn wrapping_signed_mask_range_closes_index_arithmetic() {
         let _guard = WrappingGuard::new();
-        for (mask, offset, expected) in [
+        for (mask, addend, expected) in [
             (7, 1, 1),
             (0, 1, 1),
-            (i32::MAX, 0, 1),
+            (i32::MAX - 1, 1, 1),
             (i32::MAX, 1, 0),
+            (7, i32::MAX, 0),
             (-1, 1, 0),
+            (-8, 1, 0),
             (i32::MIN, 1, 0),
         ] {
             let mut f = counting_loop(
-                "signed_mask_range",
+                "wrapping_mask_range",
                 IrType::I32,
                 IrBinOp::Add,
                 vec![
                     Instruction::BinOp {
-                        dest: Value(9),
+                        dest: Value(8),
                         op: IrBinOp::And,
                         lhs: Operand::Value(Value(1)),
                         rhs: Operand::Const(IrConst::I32(mask)),
                         ty: IrType::I32,
                     },
                     Instruction::BinOp {
-                        dest: Value(10),
+                        dest: Value(9),
                         op: IrBinOp::Add,
-                        lhs: Operand::Value(Value(9)),
-                        rhs: Operand::Const(IrConst::I32(offset)),
+                        lhs: Operand::Value(Value(8)),
+                        rhs: Operand::Const(IrConst::I32(addend)),
                         ty: IrType::I32,
                     },
                     Instruction::Cast {
-                        dest: Value(11),
-                        src: Operand::Value(Value(10)),
+                        dest: Value(10),
+                        src: Operand::Value(Value(9)),
                         from_ty: IrType::I32,
                         to_ty: IrType::I64,
                     },
-                    gep_inst(12, 11, IrType::I8),
+                    gep_inst(11, 10, IrType::I8),
                 ],
                 Some(Instruction::Cmp {
                     dest: Value(99),
-                    op: IrCmpOp::Sle,
+                    op: IrCmpOp::Slt,
                     lhs: Operand::Value(Value(1)),
                     rhs: Operand::Const(IrConst::I32(64)),
                     ty: IrType::I32,
                 }),
             );
+            f.blocks[0].instructions[0] = Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(2)),
+            };
             check(&mut f, expected);
+        }
+    }
+
+    #[test]
+    fn wrapping_signed_counted_domains_and_runtime_limits() {
+        let _guard = WrappingGuard::new();
+        use IrBinOp::{Add, Sub};
+        use IrCmpOp::{Sge, Sgt, Sle, Slt, Ult};
+        for (seed, bound, cmp, latch, step, dirty_header, expected) in [
+            (Some(0), None, Slt, Add, 1, false, 1),
+            (None, None, Slt, Add, 1, false, 1),
+            (Some(-64), Some(-1), Slt, Add, 1, false, 1),
+            (Some(7), Some(0), Sge, Sub, 1, false, 1),
+            (None, Some(0), Sge, Sub, 1, false, 1),
+            (None, None, Sgt, Sub, 1, false, 1),
+            (Some(-1), Some(-64), Sge, Sub, 1, false, 1),
+            (Some(i32::MIN), Some(i32::MIN), Sge, Sub, 1, false, 0),
+            (
+                Some(i32::MIN + 4),
+                Some(i32::MIN + 2),
+                Sge,
+                Sub,
+                2,
+                false,
+                1,
+            ),
+            (Some(i32::MIN + 4), Some(i32::MIN), Sge, Sub, 2, false, 0),
+            (Some(i32::MAX), Some(i32::MAX), Sle, Add, 1, false, 0),
+            (Some(0), None, Sle, Add, 1, false, 0),
+            (Some(0), None, Slt, Add, 2, false, 0),
+            (Some(0), None, Ult, Add, 1, false, 0),
+            (None, None, Slt, Add, 1, true, 0),
+            (None, Some(64), Slt, Add, 1, true, 0),
+        ] {
+            let mut f = counting_loop(
+                "signed_counted_domains",
+                IrType::I32,
+                latch,
+                vec![
+                    Instruction::Cast {
+                        dest: Value(10),
+                        src: Operand::Value(Value(1)),
+                        from_ty: IrType::I32,
+                        to_ty: IrType::I64,
+                    },
+                    gep_inst(11, 10, IrType::I8),
+                ],
+                Some(Instruction::Cmp {
+                    dest: Value(99),
+                    op: cmp,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: bound
+                        .map(|v| Operand::Const(IrConst::I32(v)))
+                        .unwrap_or(Operand::Value(Value(60))),
+                    ty: IrType::I32,
+                }),
+            );
+            f.blocks[0].instructions[0] = match seed {
+                Some(v) => Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I32(v)),
+                },
+                None => Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::I32,
+                },
+            };
+            f.blocks[0].instructions.push(Instruction::ParamRef {
+                dest: Value(60),
+                param_idx: 1,
+                ty: IrType::I32,
+            });
+            if let Instruction::BinOp { rhs, .. } = &mut f.blocks[3].instructions[0] {
+                *rhs = Operand::Const(IrConst::I32(step));
+            }
+            if dirty_header {
+                f.blocks[1].instructions.insert(
+                    1,
+                    Instruction::Copy {
+                        dest: Value(90),
+                        src: Operand::Const(IrConst::I32(0)),
+                    },
+                );
+            }
+            check(&mut f, expected);
+        }
+    }
+
+    #[test]
+    fn wrapping_member_products_require_both_ranges_and_preserve_subtraction() {
+        let _guard = WrappingGuard::new();
+        for (op, bound, expected) in [
+            (IrBinOp::Mul, 64, 1),
+            (IrBinOp::Mul, 65536, 0),
+            (IrBinOp::Add, 64, 1),
+            (IrBinOp::Add, i32::MAX - 1, 0),
+            (IrBinOp::Sub, 64, 1),
+        ] {
+            for latch_first in [false, true] {
+                let (a, b) = if latch_first { (5, 1) } else { (1, 5) };
+                let mut f = counting_loop(
+                    "wrapping_two_member",
+                    IrType::I32,
+                    IrBinOp::Add,
+                    vec![
+                        Instruction::BinOp {
+                            dest: Value(9),
+                            op,
+                            lhs: Operand::Value(Value(a)),
+                            rhs: Operand::Value(Value(b)),
+                            ty: IrType::I32,
+                        },
+                        Instruction::Cast {
+                            dest: Value(10),
+                            src: Operand::Value(Value(9)),
+                            from_ty: IrType::I32,
+                            to_ty: IrType::I64,
+                        },
+                        gep_inst(11, 10, IrType::I8),
+                    ],
+                    Some(Instruction::Cmp {
+                        dest: Value(99),
+                        op: IrCmpOp::Slt,
+                        lhs: Operand::Value(Value(1)),
+                        rhs: Operand::Const(IrConst::I32(bound)),
+                        ty: IrType::I32,
+                    }),
+                );
+                f.blocks[0].instructions[0] = Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I32(2)),
+                };
+                // Latch-result users must be dominated by its definition.
+                let body = std::mem::take(&mut f.blocks[2].instructions);
+                f.blocks[3].instructions.extend(body);
+                check(&mut f, expected);
+            }
         }
     }
 

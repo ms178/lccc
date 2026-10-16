@@ -238,6 +238,9 @@ gate "a9987-salvage" fast \
 gate "memory-value-contracts" fast \
     env CCC="$LCCC" bash tests/regression/check_memory_value_contracts.sh
 
+gate "byte-accessor-inline" fast \
+    env CCC="$LCCC" bash tests/regression/check_byte_accessor_inline.sh
+
 gate "audit-loop-contracts" fast \
     env CCC="$LCCC" bash tests/regression/check_audit_loop_contracts.sh
 
@@ -281,8 +284,6 @@ gate "const-volatile-objects" fast \
 # siblings chain (no second recurrence).  Pins the SHAPE (zero stride
 # multiplies, one hoisted base materialisation) and the correctness of the
 # transform at every opt level, ILP32, and under the ptr-add kill switch.
-gate "ivsr-vecaddr-struct-walk" fast \
-    env CCC="$LCCC" bash tests/regression/check_ivsr_vecaddr_struct_walk.sh
 
 # Executed miscompile regression for the iv_widen trajectory gates and the
 # exposed-latch intercept: runtime ring-top seeds over a 2^32-span marker
@@ -380,7 +381,7 @@ gate "pr824-boundaries" fast \
     python3 tests/regression/check_pr824_boundaries.py --lccc target/fastbuild/lccc --cross --json target/redteam/boundaries.json
 
 gate "note-run-oracle-selftest" fast \
-    python3 tests/linker/test_note_runs.py
+    python3 tests/corpus/test_linker_note_runs.py
 
 gate "pr826-harness-redteam" fast \
     python3 tests/linker/test_pr826_redteam.py
@@ -517,6 +518,9 @@ gate "regression-corpus-ssa" slow \
     env CCC_VALIDATE_SSA=1 python3 tests/regression/run_regression.py \
         --lccc "$LCCC" -j 2 --gcc gcc-16 --json regression-results.json
 
+gate "benchmark-output-oracle-selftest" fast \
+    python3 tests/corpus/test_benchmark_output_gate.py
+
 gate "benchmark-output-oracle" slow \
     bash scripts/check_benchmark_outputs.sh
 
@@ -572,6 +576,54 @@ gate "repro-replay" fast \
 gate "scoped-noreturn-diagnostics" fast \
     bash tests/regression/check_scoped_noreturn_diagnostics.sh
 
+# `lccc -S -o - x.c` used to create a file literally named `-`, silently
+# dropping the assembly from any pipeline's point of view.  GCC 14.2 pins the
+# contract cell by cell (the table lives in the gate): -S/-E stream to stdout
+# and create no dash file, -c fails cleanly, -MF - streams the dep rule to
+# stdout with the GCC-derived object target, a derived .d is skipped when the
+# output is stdout, and the full-link -o - keeps GCC's file-named-`-` parity.
+# The gate is a mutation test: its --self-test rejects a fake compiler with
+# the old behavior.
+gate "dash-output-stdout" fast \
+    bash tests/regression/check_dash_output.sh
+
+# AUD-SILENT-ZERO-1 (gate): no x86-only builtin may compile cleanly on a
+# non-x86 backend.  Main's check_x86_intrinsic_feature fires the located
+# diagnostic at lowering; this sweep re-derives the x86-only name set from
+# sema/builtins.rs, tries every arity 0..2 on lccc-arm and lccc-riscv, and
+# asserts no clean compile and no internal-error text (mutation-tested via
+# --self-test against a fake silent-zero compiler).
+gate "foreign-intrinsics-rejected" fast \
+    python3 scripts/check_foreign_intrinsics.py
+
+# PR #821 F1 (2026-10-14 review): the -mgeneral-regs-only SIMD guard must
+# exempt USER-authored AArch64 assembly (ordinary inline asm, naked-function
+# raw bodies, top-level file-scope asm) while still rejecting every
+# compiler-generated FP/SIMD reference, and the exemption must not leak past
+# the #APP/#NO_APP brackets.  All rows compile real C through lccc-arm; the
+# mutation self-test rejects the pre-fix compiler (which ate user SIMD) and
+# a marker-less emitter.
+gate "arm-inline-asm-provenance" fast \
+    bash tests/regression/check_arm_inline_asm_provenance.sh
+
+# PR #821 F3 (2026-10-14 review): in a shared library, "non-preemptible"
+# does not prove "section-relative" — the null symbol (index 0), a local
+# undefined symbol and a discarded-section symbol all resolve to S = 0 and
+# would bake the load bias into the ADR.  The gate links hand-crafted ELF
+# objects (no cross binutils needed) and pins the link-time diagnostics plus
+# the valid-local control and the NONE-relocation carve-out.
+gate "arm-adr-shared-contract" fast \
+    bash tests/regression/check_arm_adr_shared_contract.sh
+
+# PR #821 F2 (2026-10-14 review): input visibility and the emitted ELF must
+# agree.  The gABI-merged visibility (most constraining STV_* of all
+# references and the definition, order-independent) drives the export
+# decision, the dynsym st_other byte and the ADR predicate — hidden
+# definitions are not exported, protected ones are exported but bind
+# internally, default stays preemptible.
+gate "arm-visibility-shared" fast \
+    bash tests/regression/check_arm_visibility_shared.sh
+
 # i386 register-argument staging, on the emitted assembly plus the cross-compiler
 # boundary: no capture may spoil an ABI source register before its last read, a
 # 12-byte packed argument is never moved 16 bytes at a time, and caller/callee halves
@@ -596,13 +648,24 @@ gate "differential-fuzz-smoke" fast \
 gate "strict-computed-recip-codegen" fast \
     bash tests/regression/check_strict_computed_recip_codegen.sh
 
-gate "strict-packed-dag" fast \
-    env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_strict_packed_dag.sh
 gate "strict-packed-recip-bitwise" fast \
     python3 scripts/check_strict_packed_recip.py
 
 gate "fp-environment-trap-order" fast \
     bash tests/regression/check_fp_environment.sh
+# Unknown scheduler names are exclusive barriers: hashing is not a concurrent
+# installer/compiler task. Network CE comparisons are deliberately NOT local CI.
+gate "evidence-hash-integrity" fast python3 scripts/verify_evidence_hashes.py
+gate "licm-acquire-backedge-contract" fast python3 scripts/check_licm_ordering.py
+
+gate "ivsr-signed-affine-step" fast \
+    env CCC="$LCCC" bash tests/regression/check_ivsr_signed_affine_step.sh
+
+gate "ivsr-vecaddr-struct-walk" fast \
+    env CCC="$LCCC" bash tests/regression/check_ivsr_vecaddr_struct_walk.sh
+
+gate "strict-packed-dag" fast \
+    env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_strict_packed_dag.sh
 
 gate "machinst-window-alloc" fast \
     bash tests/regression/check_machinst_window_alloc_wide_copy.sh
@@ -937,6 +1000,9 @@ gate "select-from-compare" fast \
 gate "affine-loop-fold" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_affine_loop_fold.sh
 
+gate "unsigned-affine-loop" fast \
+    env CCC="$LCCC" bash tests/regression/check_unsigned_affine_loop.sh
+
 # The FMA contract gate.  It is registered here because a regression test that
 # nothing runs is the defect it was written to fix: the audit found the packed
 # matmul arm contracting unconditionally, the fix shipped, and nothing pinned
@@ -1019,7 +1085,6 @@ gate "pr-claim-fidelity" fast \
     python3 scripts/check_pr_claim_fidelity.py
 
 # Read-only integrity check; exclusive by default (not in scheduler whitelist).
-gate "evidence-hash-integrity" fast python3 scripts/verify_evidence_hashes.py
 
 gate "ci-resource-isolation" fast \
     python3 scripts/test_ci_resources.py
@@ -1854,8 +1919,20 @@ gate "rustfmt" fast cargo fmt --all -- --check
 # The declared rust-version floor (Cargo.toml, 1.97.0) is a measurement only
 # if something rebuilds the tree on that toolchain: the hosted `msrv` job
 # does, and this gate is its local mirror (check_ci_gate_parity.py requires
-# the pair). Needs the 1.97.0 rustup toolchain installed.
-gate "msrv-check" fast cargo +1.97.0 check --locked
+# the pair). Needs the 1.97.0 toolchain: through rustup where available,
+# otherwise directly when the active rustc already IS the declared floor
+# (restored sandboxes install a plain dist toolchain without rustup).
+msrv_check_gate() {
+    if command -v rustup >/dev/null 2>&1; then
+        cargo +1.97.0 check --locked
+    elif rustc --version | grep -q '^rustc 1\.97\.0'; then
+        cargo check --locked
+    else
+        echo "msrv-check: need rustc 1.97.0 (rustup missing, active $(rustc --version))" >&2
+        return 1
+    fi
+}
+gate "msrv-check" fast msrv_check_gate
 
 # Test and Clippy gates use the same resource policy, independently in
 # subshells. CI_LOCAL_JOBS / CARGO_BUILD_JOBS override automatic parallelism;

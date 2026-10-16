@@ -45,6 +45,11 @@
 //!   zero-trip loops; FP division is kept out to match GCC's default
 //!   -ftrapping-math speculation policy).
 //!
+//! FP candidates are refused under observable floating environments, or when
+//! the loop contains calls/asm that may change rounding. Even a preheader
+//! multiply/conversion can raise an observable exception. Integer candidates
+//! remain eligible, including inside mixed integer/FP functions.
+//!
 //! # Profitability model
 //!
 //! Fusion-aware and target-aware: the top expression must be an instruction
@@ -877,6 +882,11 @@ fn plan_loop(cx: &Ctx<'_>, lp: &NaturalLoop, out: &mut Vec<Rewrite>) {
     };
     let preheader_label = func.blocks[preheader].label;
     let latch_label = func.blocks[latch].label;
+    // A cross-backedge FP identity includes the rounding environment. Even
+    // an equal SSA operand can produce different bits after fesetround.
+    // Speculation in the preheader also changes observable exception order.
+    // This proof applies only to FP candidates: integer PRE stays enabled.
+    let mut fp_stable = None;
 
     // A value usable by the preheader computation: a constant, or a value
     // defined outside the loop whose definition dominates the preheader.
@@ -978,12 +988,18 @@ fn plan_loop(cx: &Ctx<'_>, lp: &NaturalLoop, out: &mut Vec<Rewrite>) {
         for inst in &func.blocks[eb].instructions {
             let Some(p) = Parts::of(inst) else { continue };
             let (e, op, ty) = (p.dest, p.op, p.ty);
-            // A carried result was computed in the preceding iteration's
-            // rounding environment; f(init) is also speculated on zero-trip
-            // paths. Without an FP-environment proof neither transformation
-            // preserves observable rounding/traps/flags. Keep integer PRE.
-            if ty.is_float() && super::fp_environment_observable() {
-                explain(e, "observable FP environment");
+            if ty.is_float()
+                && !*fp_stable.get_or_insert_with(|| {
+                    !super::fp_environment_observable()
+                        && lp.body.iter().all(|&b| {
+                            func.blocks[b]
+                                .instructions
+                                .iter()
+                                .all(super::loop_square::stable_fp_environment)
+                        })
+                })
+            {
+                explain(e, "observable or changing FP environment");
                 continue;
             }
             if cx.defs.tainted(e.0) {
@@ -1430,6 +1446,7 @@ fn run_round(func: &mut IrFunction, env: &EnvConfig, tm: &TargetModel) -> usize 
 
 pub(crate) fn run(func: &mut IrFunction) -> usize {
     let env = EnvConfig::read();
+    // The planner fences FP candidates without disabling integer PRE.
     if env.disabled || func.blocks.is_empty() {
         return 0;
     }
@@ -1609,6 +1626,110 @@ mod tests {
             .count()
     }
 
+    fn fp_recurrence_two_squares() -> IrFunction {
+        let f64c = |v| Operand::Const(IrConst::F64(v));
+        let mut f = IrFunction::new("fp_rounding".into(), IrType::F64, Vec::new(), false);
+        f.blocks
+            .push(block(0, vec![], Terminator::Branch(BlockId(1))));
+        f.blocks.push(block(
+            1,
+            vec![
+                Instruction::Phi {
+                    dest: Value(1),
+                    ty: IrType::F64,
+                    incoming: vec![(f64c(1.0), BlockId(0)), (val(3), BlockId(1))],
+                },
+                Instruction::Phi {
+                    dest: Value(2),
+                    ty: IrType::F64,
+                    incoming: vec![(f64c(0.0), BlockId(0)), (val(9), BlockId(1))],
+                },
+                Instruction::Phi {
+                    dest: Value(10),
+                    ty: IrType::U64,
+                    incoming: vec![(i64c(0), BlockId(0)), (val(11), BlockId(1))],
+                },
+                binop(4, IrBinOp::Mul, val(1), val(1), IrType::F64),
+                binop(3, IrBinOp::Add, val(1), f64c(0.125), IrType::F64),
+                binop(5, IrBinOp::Mul, val(3), val(3), IrType::F64),
+                // Two uses of each square pin an otherwise profitable candidate:
+                // neither side can hide in an FMA, even on the broad-FP path.
+                binop(6, IrBinOp::Add, val(4), val(5), IrType::F64),
+                binop(7, IrBinOp::Sub, val(4), val(5), IrType::F64),
+                binop(8, IrBinOp::Add, val(2), val(6), IrType::F64),
+                binop(9, IrBinOp::Add, val(8), val(7), IrType::F64),
+                binop(11, IrBinOp::Add, val(10), i64c(1), IrType::U64),
+                Instruction::Cmp {
+                    dest: Value(12),
+                    op: crate::ir::reexports::IrCmpOp::Ult,
+                    lhs: val(11),
+                    rhs: i64c(1000),
+                    ty: IrType::U64,
+                },
+            ],
+            Terminator::CondBranch {
+                cond: val(12),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+        ));
+        f.blocks
+            .push(block(2, vec![], Terminator::Return(Some(val(9)))));
+        f
+    }
+
+    #[test]
+    fn observable_fenv_blocks_fp_pre_even_with_broad_research_switch() {
+        struct Restore(EnvConfig);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                set_backedge_pre_env(self.0);
+            }
+        }
+        let _semantics = crate::common::semantics::TestGuard::new(Default::default());
+        let _restore = Restore(EnvConfig::read());
+        crate::common::types::set_target_elf_machine(EM_X86_64);
+        for broad in [false, true] {
+            set_backedge_pre_env(EnvConfig {
+                fp_broad: broad,
+                ..ENV_CONFIG_DEFAULT
+            });
+            for observable in [false, true] {
+                crate::common::semantics::replace(crate::common::semantics::Semantics {
+                    fp_environment_observable: observable,
+                    ..Default::default()
+                });
+                let mut f = fp_recurrence_two_squares();
+                assert_eq!(run(&mut f), usize::from(!observable));
+                assert_eq!(count_muls(&f), if observable { 2 } else { 1 });
+                // Do not turn an FP legality fence into a global integer ban.
+                assert_eq!(run(&mut int_recurrence()), 1);
+                let mut mixed = int_recurrence();
+                mixed.blocks[1].instructions.push(binop(
+                    90,
+                    IrBinOp::Mul,
+                    Operand::Const(IrConst::F64(1.25)),
+                    Operand::Const(IrConst::F64(0.125)),
+                    IrType::F64,
+                ));
+                mixed.next_value_id = 91;
+                assert_eq!(
+                    run(&mut mixed),
+                    1,
+                    "FP policy must not ban integer PRE in mixed functions"
+                );
+                assert!(mixed.blocks[1].instructions.iter().any(|i| matches!(
+                    i,
+                    Instruction::BinOp {
+                        dest: Value(90),
+                        ty: IrType::F64,
+                        ..
+                    }
+                )));
+            }
+        }
+    }
+
     #[test]
     fn integer_square_is_carried_across_the_backedge() {
         let mut f = int_recurrence();
@@ -1661,6 +1782,158 @@ mod tests {
         assert!(q.0 >= 14 && f.next_value_id > q.0);
         // Idempotent: a second run finds nothing new.
         assert_eq!(run(&mut f), 0);
+    }
+
+    fn fp_recurrence() -> IrFunction {
+        let mut f = int_recurrence();
+        f.return_type = IrType::F64;
+        for inst in &mut f.blocks[1].instructions {
+            match inst {
+                Instruction::Phi { dest, ty, incoming } if dest.0 != 10 => {
+                    *ty = IrType::F64;
+                    incoming[0].0 = Operand::Const(IrConst::F64(0.125));
+                }
+                Instruction::BinOp {
+                    dest,
+                    op,
+                    lhs,
+                    rhs,
+                    ty,
+                } if dest.0 != 11 => {
+                    *ty = IrType::F64;
+                    if !matches!(op, IrBinOp::Mul) {
+                        *op = IrBinOp::Add;
+                    }
+                    if dest.0 == 3 {
+                        *lhs = val(4);
+                        *rhs = Operand::Const(IrConst::F64(0.25));
+                    } else if matches!(rhs, Operand::Const(_)) {
+                        *rhs = Operand::Const(IrConst::F64(0.5));
+                    }
+                }
+                _ => {}
+            }
+        }
+        f.blocks[2].instructions.clear();
+        f.blocks[2].terminator = Terminator::Return(Some(val(9)));
+        f
+    }
+
+    #[test]
+    fn fp_backedge_reuse_requires_stable_environment_redteam() {
+        let mut tm = TargetModel::detect();
+        tm.fp_fma = false;
+        let env = EnvConfig {
+            fp_broad: true,
+            ..ENV_CONFIG_DEFAULT
+        };
+        assert!(run_round(&mut fp_recurrence(), &env, &tm) > 0);
+        let mut changing = fp_recurrence();
+        changing.blocks[1].instructions.insert(
+            3,
+            Instruction::Call {
+                func: "fesetround".into(),
+                info: crate::ir::reexports::CallInfo {
+                    args: vec![Operand::Const(IrConst::I32(0))],
+                    arg_types: vec![IrType::I32],
+                    num_fixed_args: 1,
+                    return_type: IrType::I32,
+                    ..Default::default()
+                },
+            },
+        );
+        assert_eq!(run_round(&mut changing, &env, &tm), 0);
+        let (fp, integer) = {
+            let _fenv =
+                crate::common::semantics::TestGuard::new(crate::common::semantics::Semantics {
+                    fp_environment_observable: true,
+                    ..Default::default()
+                });
+            (
+                run_round(&mut fp_recurrence(), &env, &tm),
+                run_round(&mut int_recurrence(), &env, &tm),
+            )
+        };
+        assert_eq!(fp, 0, "even call-free speculation can change FP traps");
+        assert!(integer > 0, "do not disable integer PRE with FP policy");
+        assert!(run_round(&mut fp_recurrence(), &env, &tm) > 0);
+    }
+    #[test]
+    fn fp_reuse_crosses_ir_storage_but_not_user_copy_calls() {
+        let mut tm = TargetModel::detect();
+        tm.fp_fma = false;
+        let env = EnvConfig {
+            fp_broad: true,
+            ..ENV_CONFIG_DEFAULT
+        };
+        let mut function = fp_recurrence();
+        let at = function.blocks[1]
+            .instructions
+            .iter()
+            .position(|i| !matches!(i, Instruction::Phi { .. }))
+            .unwrap();
+        function.blocks[1].instructions.splice(
+            at..at,
+            [
+                Instruction::Alloca {
+                    dest: Value(70),
+                    ty: IrType::Ptr,
+                    size: 48,
+                    align: 8,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Alloca {
+                    dest: Value(71),
+                    ty: IrType::Ptr,
+                    size: 48,
+                    align: 8,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Memcpy {
+                    dest: Value(70),
+                    src: Value(71),
+                    size: 48,
+                },
+            ],
+        );
+        function.next_value_id = function.next_value_id.max(72);
+        let mut transformed = function.clone();
+        assert!(run_round(&mut transformed, &env, &tm) > 0);
+        assert_eq!(
+            transformed
+                .blocks
+                .iter()
+                .flat_map(|b| &b.instructions)
+                .filter(|i| matches!(i, Instruction::Memcpy { .. }))
+                .count(),
+            1
+        );
+        let mut volatile = function.clone();
+        if let Instruction::Alloca { volatile, .. } = &mut volatile.blocks[1].instructions[at] {
+            *volatile = true;
+        }
+        assert_eq!(run_round(&mut volatile, &env, &tm), 0);
+        let mut user_call = function.clone();
+        user_call.blocks[1].instructions.push(Instruction::Call {
+            func: "memcpy".into(),
+            info: crate::ir::reexports::CallInfo {
+                return_type: IrType::Ptr,
+                is_pure: true,
+                ..Default::default()
+            },
+        });
+        assert_eq!(run_round(&mut user_call, &env, &tm), 0);
+        let changes = {
+            let _fenv =
+                crate::common::semantics::TestGuard::new(crate::common::semantics::Semantics {
+                    fp_environment_observable: true,
+                    ..Default::default()
+                });
+            run_round(&mut function, &env, &tm)
+        };
+        assert_eq!(changes, 0, "the FENV policy still prohibits speculation");
     }
 
     #[test]

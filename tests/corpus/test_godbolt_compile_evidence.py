@@ -93,6 +93,24 @@ class CompileEvidence(unittest.TestCase):
             with self.subTest(extra=extra), self.assertRaises(godbolt.GodboltError):
                 godbolt.compiler_flags("cicc2021100", flags + " " + extra)
 
+    def test_classic_icc_contraction_off_is_explicit_and_fail_closed(self):
+        flags = "-O2 -march=haswell -fwrapv -ffp-contract=off -DN=800"
+        actual = godbolt.compiler_flags("cicc2021100", flags)
+        self.assertEqual(actual, "-O2 -xCORE-AVX2 -fwrapv -no-fma -DN=800")
+        self.assertEqual(godbolt.compiler_flags("cicc2021100", actual), actual)
+        self.assertEqual(godbolt.compiler_flags("cicc2021100", "-O2 -ffp-contract=off"),
+                         "-O2 -no-fma")
+        for compiler in ("cg162", "cclang2310", "cicxlatest"):
+            self.assertEqual(godbolt.compiler_flags(compiler, flags), flags)
+        for extra in ("-fma", "-ffp-contract=fast", "-ffast-math", "-Ofast",
+                      "-fp-model fast=2", "-funsafe-math-optimizations"):
+            with self.subTest(extra=extra), self.assertRaises(godbolt.GodboltError):
+                godbolt.compiler_flags("cicc2021100", flags + " " + extra)
+        embedded = "-O2 -DMESSAGE='-ffp-contract=off'"
+        self.assertEqual(godbolt.compiler_flags("cicc2021100", embedded), embedded)
+        unsupported = "-O2 -ffp-contract=on"
+        self.assertEqual(godbolt.compiler_flags("cicc2021100", unsupported), unsupported)
+
     def test_response_records_requested_and_effective_cpu_options(self):
         flags = "-O2 -march=haswell -fwrapv"
         with patch.object(godbolt, "resolve_compiler", return_value="cicc2021100"), \

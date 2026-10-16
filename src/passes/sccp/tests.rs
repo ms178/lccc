@@ -1428,3 +1428,48 @@ fn inline_asm_outputs_are_overdefined_not_fabricated() {
         "an asm result must never be fabricated into a constant"
     );
 }
+
+#[test]
+fn observable_fp_constants_keep_effects_but_integer_sccp_survives_redteam() {
+    let mut f = func_of(vec![blk(
+        0,
+        vec![
+            add(
+                1,
+                Operand::Const(IrConst::F64(1.0)),
+                Operand::Const(IrConst::F64(2f64.powi(-53))),
+                IrType::F64,
+            ),
+            add(
+                2,
+                Operand::Const(IrConst::I32(1)),
+                Operand::Const(IrConst::I32(2)),
+                IrType::I32,
+            ),
+        ],
+        Terminator::Return(Some(Operand::Value(Value(1)))),
+    )]);
+    f.return_type = IrType::F64;
+    {
+        let _fenv = crate::common::semantics::TestGuard::new(crate::common::semantics::Semantics {
+            fp_environment_observable: true,
+            ..Default::default()
+        });
+        run_function(&mut f);
+    }
+    assert!(f.blocks[0].instructions.iter().any(|i| matches!(
+        i,
+        Instruction::BinOp {
+            dest: Value(1),
+            ty: IrType::F64,
+            ..
+        }
+    )));
+    assert!(f.blocks[0].instructions.iter().any(|i| matches!(
+        i,
+        Instruction::Copy {
+            dest: Value(2),
+            src: Operand::Const(IrConst::I32(3))
+        }
+    )));
+}

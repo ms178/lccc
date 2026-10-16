@@ -1,0 +1,23 @@
+.FF..............
+======================================================================
+FAIL: test_local_failure_fails_dump (__main__.AssemblyDumpVerdict.test_local_failure_fails_dump)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/lccc/scripts/test_codegen_oracle.py", line 226, in test_local_failure_fails_dump
+    self.assertNotEqual(self.run_dump(local_error=True), 0)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 == 0
+
+======================================================================
+FAIL: test_requested_vendor_failure_fails_dump (__main__.AssemblyDumpVerdict.test_requested_vendor_failure_fails_dump)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/lccc/scripts/test_codegen_oracle.py", line 229, in test_requested_vendor_failure_fails_dump
+    self.assertNotEqual(self.run_dump(remote_error=True), 0)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 == 0
+
+----------------------------------------------------------------------
+Ran 17 tests in 0.047s
+
+FAILED (failures=2)

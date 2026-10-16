@@ -1,0 +1,26 @@
+   Compiling lccc v0.1.0 (/home/user/lccc)
+    Finished `fastbuild` profile [optimized] target(s) in 3m 08s
+     Running unittests src/lib.rs (target/fastbuild/deps/lccc-2790982c43eeadfa)
+
+running 2 tests
+
+thread 'backend::x86::codegen::peephole::passes::vector_copy::tests::masked_moves_do_not_establish_unconditional_copy_facts' (366549) panicked at src/backend/x86/codegen/peephole/passes/vector_copy.rs:1490:17:
+assertion `left == right` failed: vmovdqa64 %xmm1, %xmm2{%k1}
+  left: Some(VecCopy { src: 1, dst: 2, width: 128, zeroes_above: true })
+ right: None
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test backend::x86::codegen::peephole::passes::vector_copy::tests::masked_moves_do_not_establish_unconditional_copy_facts ... FAILED
+
+thread 'backend::x86::codegen::peephole::passes::vector_copy::tests::masked_move_source_must_not_replace_the_masked_result' (366548) panicked at src/backend/x86/codegen/peephole/passes/vector_copy.rs:1505:13:
+assertion failed: !propagate_vector_copies(&mut store, &mut infos)
+test backend::x86::codegen::peephole::passes::vector_copy::tests::masked_move_source_must_not_replace_the_masked_result ... FAILED
+
+failures:
+
+failures:
+    backend::x86::codegen::peephole::passes::vector_copy::tests::masked_move_source_must_not_replace_the_masked_result
+    backend::x86::codegen::peephole::passes::vector_copy::tests::masked_moves_do_not_establish_unconditional_copy_facts
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 4727 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

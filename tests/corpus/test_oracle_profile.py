@@ -32,6 +32,20 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(len(row['assembly_sha256']), 64)
         self.assertIn('NOT runtime', report['metric'])
 
+    def test_contraction_off_requires_separate_mul_and_add(self):
+        for instructions, expected in ((['vmulsd %xmm1, %xmm0, %xmm0',
+                                         'vaddsd %xmm2, %xmm0, %xmm0'], True),
+                                       (['vfmadd213sd %xmm2, %xmm1, %xmm0'], False),
+                                       ([], False)):
+            responses = [{'code': 0, 'asm': [{'text': x} for x in text]}
+                         for text in (ASSEMBLY, instructions)]
+            with self.subTest(instructions=instructions), \
+                    patch.object(godbolt, 'compiler_metadata', return_value={'id': 'cicc2021100'}), \
+                    patch.object(godbolt, '_request_json', side_effect=responses):
+                result = profile.verify(['icc'], '-O2 -march=haswell -ffp-contract=off')
+            self.assertEqual(result['complete'], expected)
+            self.assertEqual(result['compilers']['icc']['contraction_off']['ok'], expected)
+
     def test_each_missing_feature_fails_admission(self):
         for n in range(len(ASSEMBLY)):
             with self.subTest(n=n):

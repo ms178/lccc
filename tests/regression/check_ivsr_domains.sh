@@ -66,7 +66,9 @@ for opt in -O0 -O1 -O2 -O3 -Os -Oz; do
     for width in native i686; do
         flags=()
         if [[ $width == i686 ]]; then flags=(-m32 -msse2 -I"$inc"); fi
-        "$ccc" "$opt" -fwrapv "${flags[@]}" tests/regression/ivw_wrapv_range.c -o "$td/wrapv-range"
-        "$td/wrapv-range"
+        for test in ivw_wrapv_range ivw_wrapv_signed ivw_wrapv_mixed; do
+            "$ccc" "$opt" -fwrapv "${flags[@]}" tests/regression/"$test".c -o "$td/wrapv-range"
+            "$td/wrapv-range"
+        done
     done
 done

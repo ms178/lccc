@@ -309,6 +309,17 @@ fn ivsr_cfg_shape(func: &IrFunction) -> IvsrCfgShape {
     }
 }
 
+#[cfg(any(test, debug_assertions))]
+fn ivsr_cfg_unchanged(func: &IrFunction, cfg: &analysis::CfgAnalysis) -> bool {
+    if func.blocks.len() != cfg.num_blocks {
+        return false;
+    }
+    let labels = analysis::build_label_map(func);
+    let (_, successors) = analysis::build_cfg(func, &labels);
+    labels.len() == cfg.num_blocks
+        && (0..cfg.num_blocks).all(|i| successors.row(i) == cfg.succs.row(i))
+}
+
 pub(crate) fn ivsr_with_analysis(
     func: &mut IrFunction,
     cfg: &analysis::CfgAnalysis,
@@ -316,6 +327,11 @@ pub(crate) fn ivsr_with_analysis(
     ptr_add: bool,
     x86_sib_cost: bool,
 ) -> usize {
+    #[cfg(debug_assertions)]
+    assert!(
+        ivsr_cfg_unchanged(func, cfg),
+        "IVSR received stale CFG analysis"
+    );
     if cfg.num_blocks < 2 {
         return 0;
     }
@@ -371,9 +387,8 @@ pub(crate) fn ivsr_with_analysis(
             x86_sib_cost,
         );
         #[cfg(debug_assertions)]
-        assert_eq!(
-            ivsr_cfg_shape(func),
-            original_cfg_shape,
+        assert!(
+            ivsr_cfg_shape(func) == original_cfg_shape && ivsr_cfg_unchanged(func, cfg),
             "IVSR invalidated cached dominance"
         );
         if changed > 0 {
@@ -541,10 +556,48 @@ fn reduce_loop(
         let ptr_width = crate::common::types::target_ptr_size();
         let narrow_signed =
             |ty: IrType| ty.is_integer() && !ty.is_unsigned() && ty.size() < ptr_width;
-        if super::signed_overflow_wraps() && (narrow_signed(iv.ty) || narrow_signed(mul_ty)) {
-            // A pointer-width recurrence must not skip a defined signed wrap
-            // in either the source counter or its pre-extension product.
-            // Pointer-width rings and already-certified unsigned paths remain.
+        let signed_wraps = super::signed_overflow_wraps();
+        if signed_wraps && narrow_signed(iv.ty) && add_offset != 0 {
+            // This certificate is BODY-only. The failing header can observe
+            // MAX+1/MIN-1 in an affine expression even though the IV itself
+            // never wraps. Only iv+step with guarded address uses is admitted;
+            // find_affine separately checks the Add's own type and placement.
+            let header_use = addr_uses.iter().any(|use_| match use_ {
+                AddrUse::Gep(block, ..) | AddrUse::Vec(block, ..) => *block == header,
+            });
+            if add_offset != iv.step || header_use {
+                continue;
+            }
+        }
+        if signed_wraps
+            && (narrow_signed(mul_ty)
+                || (narrow_signed(iv.ty)
+                    && !signed_unit_iv_can_recur(
+                        func,
+                        natural_loop,
+                        iv,
+                        &back_blocks,
+                        mul_ty,
+                        0, // trajectory only; affine permission is independently checked above
+                    )))
+        {
+            // Never skip a defined wrap in a pre-extension product or Add.
+            // A strict, same-domain header guard can independently prove that
+            // the signed IV itself does not wrap. Narrower products remain
+            // fenced; a body-only iv+step Add has its own proof above.
+            continue;
+        }
+        // The new signed-trajectory permission is not itself a cost proof.
+        // On x86, replacing a free SIB scale or cheap power-of-two shift
+        // with an extra carried pointer can lose to register pressure. Native
+        // paired runs regressed for SIB scales even when simulated instruction
+        // counts improved; shift-only products had inconsistent native results.
+        // Keep these newly admitted recurrences for non-power-of-two products;
+        // do not inherit the older unsigned/address-Add exceptions without a
+        // separate profitability proof. This is an x86 cost rule, not a range
+        // proof or a claim that other targets have scaled-index addressing.
+        if signed_wraps && narrow_signed(iv.ty) && x86_sib_cost && (stride as u64).is_power_of_two()
+        {
             continue;
         }
         // A narrow unsigned counter is modular: zero-extending it into an
@@ -1516,6 +1569,19 @@ fn find_derived_exprs(
                     | (Operand::Const(c), Operand::Value(v)) => (v, c),
                     _ => continue,
                 };
+                if super::signed_overflow_wraps()
+                    && !ty.is_unsigned()
+                    && ty.size() < crate::common::types::target_ptr_size()
+                    && c.to_i64() != Some(0)
+                    && func.blocks[natural_loop.header]
+                        .instructions
+                        .iter()
+                        .any(|inst| inst.dest() == Some(Value(cid)))
+                {
+                    // The controlling test has not yet rejected the failing
+                    // IV. Do not borrow a body-only range for a header Add.
+                    continue;
+                }
                 if let (Some(idx), Some(raw_k)) = (find_iv(v.0), c.to_i64())
                     && let Some(k) = affine_add_offset_cannot_wrap(
                         func,
@@ -1978,6 +2044,111 @@ struct UnsignedIvBound {
     bounded: bool,
 }
 
+/// Certify ONLY the trajectory of a narrow signed unit-step IV under -fwrapv.
+///
+/// For `i < limit`, an executed +1 step starts at most at MAX-1; for
+/// `i > limit`, an executed -1 step starts at least at MIN+1. This holds for
+/// every same-domain limit and every initial value, including negative values,
+/// zero trips and the terminating header visit. No body-only numeric interval
+/// is borrowed to justify a header/exit computation.
+///
+/// The existing derived-cast closure must preserve values. A plain product in
+/// the pointer ring is then linear even on the terminating visit. This proof
+/// does NOT by itself justify a narrower product or a pre-extension affine
+/// Add. The separate body-only affine check admits iv+step; header expressions
+/// and all other narrow signed affine offsets remain fenced.
+fn signed_unit_iv_can_recur(
+    func: &IrFunction,
+    lp: &NaturalLoop,
+    iv: &BasicIV,
+    back_blocks: &[usize],
+    mul_ty: IrType,
+    add_offset: i64,
+) -> bool {
+    use crate::ir::reexports::{IrCmpOp as C, Terminator};
+    let ptr = crate::common::types::target_ptr_size();
+    if !iv.ty.is_integer()
+        || iv.ty.is_unsigned()
+        || iv.ty.size() == 0
+        || iv.ty.size() >= ptr
+        || !mul_ty.is_integer()
+        || mul_ty.size() != ptr
+        || add_offset != 0
+        || back_blocks.len() != 1
+        || back_blocks.contains(&lp.header)
+        || !matches!(iv.step, -1 | 1)
+    {
+        return false;
+    }
+    let header = &func.blocks[lp.header];
+    let Terminator::CondBranch {
+        cond: Operand::Value(cond),
+        true_label,
+        false_label,
+    } = header.terminator
+    else {
+        return false;
+    };
+    let inside = |label| {
+        func.blocks
+            .iter()
+            .position(|b| b.label == label)
+            .is_some_and(|i| lp.body.contains(&i))
+    };
+    let true_inside = inside(true_label);
+    if true_inside == inside(false_label) {
+        return false;
+    }
+    for inst in &header.instructions {
+        let Instruction::Cmp {
+            dest,
+            op,
+            lhs,
+            rhs,
+            ty,
+        } = inst
+        else {
+            continue;
+        };
+        if *dest != cond || *ty != iv.ty {
+            continue;
+        }
+        let reverse = |op| match op {
+            C::Slt => Some(C::Sgt),
+            C::Sgt => Some(C::Slt),
+            C::Sle => Some(C::Sge),
+            C::Sge => Some(C::Sle),
+            _ => None,
+        };
+        let (mut op, other) = if *lhs == Operand::Value(iv.phi_dest) {
+            (*op, rhs)
+        } else if *rhs == Operand::Value(iv.phi_dest) {
+            let Some(op) = reverse(*op) else {
+                return false;
+            };
+            (op, lhs)
+        } else {
+            return false;
+        };
+        if let Operand::Value(v) = other
+            && !is_loop_invariant(v.0, &lp.body, func)
+        {
+            return false;
+        }
+        if !true_inside {
+            op = match op {
+                C::Slt => C::Sge,
+                C::Sgt => C::Sle,
+                C::Sle => C::Sgt,
+                C::Sge => C::Slt,
+                _ => return false,
+            };
+        }
+        return matches!((op, iv.step), (C::Slt, 1) | (C::Sgt, -1));
+    }
+    false
+}
+
 /// Local no-wrap proof for a narrow unsigned IV.
 ///
 /// The HEADER's exit test must guard every taken backedge, compare this exact
@@ -2164,7 +2335,19 @@ fn affine_add_offset_cannot_wrap(
         && add_ty.size() < crate::common::types::target_ptr_size()
         && raw_offset != 0
     {
-        return None;
+        // For strict ascending i<limit, body i<=MAX-1, hence i+1 fits.
+        // Dually strict descending i>limit gives i>=MIN+1, hence i-1 fits.
+        // No initial-value assumption, constant endpoint, or signed UB is
+        // needed. The caller must keep the Add/address use out of the header.
+        let pointer_integer = if crate::common::types::target_ptr_size() == 8 {
+            IrType::I64
+        } else {
+            IrType::I32
+        };
+        return (add_ty == iv.ty
+            && raw_offset == iv.step
+            && signed_unit_iv_can_recur(func, lp, iv, back_blocks, pointer_integer, 0))
+        .then_some(raw_offset);
     }
     let narrow_unsigned =
         add_ty.is_unsigned() && (add_ty.size() as usize) < crate::common::types::target_ptr_size();
@@ -2763,6 +2946,248 @@ mod tests {
                 "{op:?} {truth_stays} {step}"
             );
             assert!(unsigned_iv_bound(&f, &lp, &iv, &[1]).is_none());
+        }
+    }
+
+    #[test]
+    fn signed_unit_certificate_requires_exact_guard_and_pointer_product() {
+        let lp = NaturalLoop {
+            header: 1,
+            body: [1, 2].into_iter().collect(),
+        };
+        for (op, truth_stays, step, expected) in [
+            (IrCmpOp::Slt, true, 1, true),
+            (IrCmpOp::Sge, false, 1, true),
+            (IrCmpOp::Sgt, true, -1, true),
+            (IrCmpOp::Sle, false, -1, true),
+            (IrCmpOp::Sle, true, 1, false),
+            (IrCmpOp::Sge, true, -1, false),
+            (IrCmpOp::Ult, true, 1, false),
+            (IrCmpOp::Ugt, true, -1, false),
+            (IrCmpOp::Slt, true, 2, false),
+            (IrCmpOp::Sgt, true, -2, false),
+            (IrCmpOp::Slt, false, 1, false),
+            (IrCmpOp::Slt, true, -1, false),
+        ] {
+            let mut f = cast_backedge(IrType::I32, IrType::I32);
+            if let Instruction::Cmp { op: cmp, .. } = &mut f.blocks[1].instructions[1] {
+                *cmp = op;
+            }
+            if !truth_stays {
+                f.blocks[1].terminator = Terminator::CondBranch {
+                    cond: Operand::Value(Value(5)),
+                    true_label: BlockId(40),
+                    false_label: BlockId(30),
+                };
+            }
+            let iv = BasicIV {
+                phi_dest: Value(0),
+                ty: IrType::I32,
+                init: Operand::Value(Value(100)),
+                step,
+            };
+            assert_eq!(
+                signed_unit_iv_can_recur(&f, &lp, &iv, &[2], IrType::I64, 0),
+                expected
+            );
+            for (backs, product, offset) in [
+                (vec![1], IrType::I64, 0),
+                (vec![1, 2], IrType::I64, 0),
+                (vec![2], IrType::I32, 0),
+                (vec![2], IrType::U32, 0),
+                (vec![2], IrType::I64, 1),
+                (vec![2], IrType::I64, -1),
+            ] {
+                assert!(!signed_unit_iv_can_recur(
+                    &f, &lp, &iv, &backs, product, offset
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn signed_unit_certificate_checks_condition_identity_domain_and_invariance() {
+        let lp = NaturalLoop {
+            header: 1,
+            body: [1, 2].into_iter().collect(),
+        };
+        let iv = BasicIV {
+            phi_dest: Value(0),
+            ty: IrType::I32,
+            init: Operand::Const(IrConst::I32(i32::MIN)),
+            step: 1,
+        };
+        let mut original = cast_backedge(IrType::I32, IrType::I32);
+        if let Instruction::Cmp { op, .. } = &mut original.blocks[1].instructions[1] {
+            *op = IrCmpOp::Slt;
+        }
+        assert!(signed_unit_iv_can_recur(
+            &original,
+            &lp,
+            &iv,
+            &[2],
+            IrType::I64,
+            0
+        ));
+        for variant in 0..7 {
+            let mut f = original.clone();
+            if let Instruction::Cmp {
+                dest,
+                lhs,
+                rhs,
+                ty,
+                op,
+            } = &mut f.blocks[1].instructions[1]
+            {
+                match variant {
+                    0 => *dest = Value(99),
+                    1 => *ty = IrType::U32,
+                    2 => *lhs = Operand::Value(Value(3)),
+                    3 => *rhs = Operand::Value(Value(3)),
+                    4 => {
+                        std::mem::swap(lhs, rhs);
+                        *op = IrCmpOp::Sgt;
+                    }
+                    5 => *rhs = Operand::Value(Value(99)),
+                    _ => *rhs = Operand::Const(IrConst::I32(i32::MAX)),
+                }
+            }
+            if variant == 5 {
+                f.blocks[0].instructions.push(Instruction::Copy {
+                    dest: Value(99),
+                    src: Operand::Const(IrConst::I32(i32::MAX)),
+                });
+            }
+            assert_eq!(
+                signed_unit_iv_can_recur(&f, &lp, &iv, &[2], IrType::I64, 0),
+                variant >= 4
+            );
+        }
+        let mut f = original;
+        f.blocks[1].terminator = Terminator::CondBranch {
+            cond: Operand::Value(Value(5)),
+            true_label: BlockId(30),
+            false_label: BlockId(30),
+        };
+        assert!(!signed_unit_iv_can_recur(
+            &f,
+            &lp,
+            &iv,
+            &[2],
+            IrType::I64,
+            0
+        ));
+    }
+
+    #[test]
+    fn strict_signed_unit_guard_exhausts_the_small_signed_domain() {
+        // Exhaust every initial/limit pair in an eight-bit signed domain.
+        // This checks the trajectory, including its terminating header value,
+        // rather than assuming a body-only interval also covers the exit.
+        for initial in i8::MIN..=i8::MAX {
+            for limit in i8::MIN..=i8::MAX {
+                for step in [-1_i16, 1] {
+                    let mut narrow = initial;
+                    let mut wide = i16::from(initial);
+                    loop {
+                        assert_eq!(i16::from(narrow), wide);
+                        let enters = if step > 0 {
+                            narrow < limit
+                        } else {
+                            narrow > limit
+                        };
+                        if !enters {
+                            break;
+                        }
+                        wide += step;
+                        narrow = narrow.wrapping_add(step as i8);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wrapping_signed_pointer_recurrence_keeps_product_and_affine_fences() {
+        let _restore =
+            crate::common::semantics::TestGuard::new(crate::common::semantics::Semantics {
+                signed_overflow_wraps: true,
+                ..Default::default()
+            });
+        for (product_ty, cmp_op, offset, stride, expected) in [
+            (IrType::I64, IrCmpOp::Slt, 0, 24, 1),
+            (IrType::I64, IrCmpOp::Sle, 0, 24, 0),
+            (IrType::I64, IrCmpOp::Ult, 0, 24, 0),
+            (IrType::I32, IrCmpOp::Slt, 0, 24, 0),
+            (IrType::I64, IrCmpOp::Slt, 1, 24, 1),
+            (IrType::I64, IrCmpOp::Slt, 2, 24, 0),
+            (IrType::I64, IrCmpOp::Slt, -1, 24, 0),
+            (IrType::I64, IrCmpOp::Slt, 0, 1, 0),
+            (IrType::I64, IrCmpOp::Slt, 0, 2, 0),
+            (IrType::I64, IrCmpOp::Slt, 0, 4, 0),
+            (IrType::I64, IrCmpOp::Slt, 0, 8, 0),
+            (IrType::I64, IrCmpOp::Slt, 0, 3, 1),
+            (IrType::I64, IrCmpOp::Slt, 0, 16, 0),
+            (IrType::I64, IrCmpOp::Slt, 0, 2048, 0),
+        ] {
+            let mut f = cast_backedge(IrType::I32, IrType::I32);
+            if let Instruction::Cmp { op, .. } = &mut f.blocks[1].instructions[1] {
+                *op = cmp_op;
+            }
+            f.blocks[0].instructions.push(Instruction::Copy {
+                dest: Value(10),
+                src: Operand::Const(IrConst::I64(4096)),
+            });
+            f.blocks[2].instructions.extend([
+                Instruction::BinOp {
+                    dest: Value(12),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(offset)),
+                    ty: IrType::I32,
+                },
+                Instruction::Cast {
+                    dest: Value(7),
+                    src: Operand::Value(if offset == 0 { Value(0) } else { Value(12) }),
+                    from_ty: IrType::I32,
+                    to_ty: product_ty,
+                },
+                Instruction::BinOp {
+                    dest: Value(8),
+                    op: IrBinOp::Mul,
+                    lhs: Operand::Value(Value(7)),
+                    rhs: Operand::Const(const_for_int_ty(product_ty, stride).unwrap()),
+                    ty: product_ty,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(9),
+                    base: Value(10),
+                    offset: Operand::Value(Value(8)),
+                    ty: IrType::I32,
+                },
+                Instruction::Load {
+                    dest: Value(11),
+                    ptr: Value(9),
+                    ty: IrType::I32,
+                    volatile: true,
+                    seg_override: AddressSpace::Default,
+                },
+            ]);
+            f.next_value_id = 13;
+            if product_ty == IrType::I64
+                && cmp_op == IrCmpOp::Slt
+                && offset == 0
+                && (stride as u64).is_power_of_two()
+            {
+                let mut no_sib = f.clone();
+                let cfg = analysis::CfgAnalysis::build(&no_sib);
+                assert_eq!(ivsr_with_analysis(&mut no_sib, &cfg, false, true, false), 1);
+            }
+            assert_eq!(
+                ivsr_function(&mut f),
+                expected,
+                "{product_ty:?} {cmp_op:?} {offset} stride={stride}"
+            );
         }
     }
 
@@ -4957,8 +5382,7 @@ mod tests {
     /// the `i` group's pointer IV — `GEP(parent, 56)` at its use — with NO
     /// second pointer phi, no second init, and no latch step of its own.
     /// This is the nbody pair-loop j-init shape.
-    #[test]
-    fn affine_sibling_chains_to_parent_recurrence() {
+    fn affine_sibling_fixture() -> IrFunction {
         let body = vec![
             Instruction::Cast {
                 dest: Value(5),
@@ -5027,7 +5451,12 @@ mod tests {
                 ty: IrType::I32,
             },
         ];
-        let mut func = loop_fixture(body, 14, 15);
+        loop_fixture(body, 14, 15)
+    }
+
+    #[test]
+    fn affine_sibling_chains_to_parent_recurrence() {
+        let mut func = affine_sibling_fixture();
         let changes = ivsr_function(&mut func);
         assert_eq!(
             changes, 2,
@@ -5071,6 +5500,118 @@ mod tests {
             )),
             "sibling use must chain: GEP(pointer IV, 56)"
         );
+    }
+
+    #[test]
+    fn wrapping_affine_sibling_requires_body_guard_type_and_unit_direction() {
+        let _restore =
+            crate::common::semantics::TestGuard::new(crate::common::semantics::Semantics {
+                signed_overflow_wraps: true,
+                ..Default::default()
+            });
+        for variant in 0..8 {
+            let mut f = affine_sibling_fixture();
+            if variant == 1 {
+                let pos = f.blocks[2]
+                    .instructions
+                    .iter()
+                    .position(|i| i.dest() == Some(Value(9)))
+                    .unwrap();
+                let add = f.blocks[2].instructions.remove(pos);
+                f.blocks[1].instructions.push(add);
+            }
+            if variant == 6 {
+                // A well-typed unsigned sibling is not licensed by a signed
+                // trajectory proof: (unsigned)i + 1 may wrap at i == -1.
+                f.next_value_id = 16;
+                f.blocks[2].instructions.insert(
+                    0,
+                    Instruction::Cast {
+                        dest: Value(15),
+                        src: Operand::Value(Value(3)),
+                        from_ty: IrType::I32,
+                        to_ty: IrType::U32,
+                    },
+                );
+            }
+            for i in &mut f.blocks[2].instructions {
+                if let Instruction::BinOp {
+                    dest: Value(9),
+                    lhs,
+                    rhs,
+                    ty,
+                    ..
+                } = i
+                {
+                    if variant == 2 {
+                        *rhs = Operand::Const(IrConst::I32(2));
+                    }
+                    if variant == 5 || variant == 7 {
+                        *rhs = Operand::Const(IrConst::I32(-1));
+                    }
+                    if variant == 6 {
+                        *ty = IrType::U32;
+                        *lhs = Operand::Value(Value(15));
+                    }
+                }
+                if variant == 6 {
+                    if let Instruction::Cast {
+                        dest: Value(10),
+                        from_ty,
+                        ..
+                    } = i
+                    {
+                        *from_ty = IrType::U32;
+                    }
+                }
+                if let Instruction::BinOp {
+                    dest: Value(14),
+                    rhs,
+                    ..
+                } = i
+                {
+                    if variant == 3 {
+                        *rhs = Operand::Const(IrConst::I32(2));
+                    }
+                    if variant == 7 {
+                        *rhs = Operand::Const(IrConst::I32(-1));
+                    }
+                }
+            }
+            for i in &mut f.blocks[1].instructions {
+                if let Instruction::Cmp { op, .. } = i {
+                    if variant == 4 {
+                        *op = IrCmpOp::Sle;
+                    }
+                    if variant == 7 {
+                        *op = IrCmpOp::Sgt;
+                    }
+                }
+            }
+            let expected = match variant {
+                0 | 7 => 2,
+                3 | 4 => 0,
+                _ => 1,
+            };
+            assert_eq!(ivsr_function(&mut f), expected, "variant {variant}");
+            if expected == 2 {
+                assert_eq!(
+                    f.blocks[1]
+                        .instructions
+                        .iter()
+                        .filter(|i| matches!(
+                            i,
+                            Instruction::Phi {
+                                ty: IrType::Ptr,
+                                ..
+                            }
+                        ))
+                        .count(),
+                    1,
+                    "affine sibling shares, rather than adds, a recurrence"
+                );
+            }
+        }
     }
 
     /// SIB cost rule pin: a GEP-only group whose stride is SIB-scaleable
@@ -5391,5 +5932,34 @@ mod cfg_shape_contract_tests {
             ivsr_cfg_shape(&func),
             "same count, different identity"
         );
+    }
+}
+
+#[cfg(test)]
+mod dominance_snapshot_contract {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, Terminator};
+
+    #[test]
+    fn checks_edges_as_well_as_block_count() {
+        let mut f = IrFunction::new("cfg".into(), IrType::Void, vec![], false);
+        for id in 0..2 {
+            f.blocks.push(BasicBlock {
+                label: BlockId(id),
+                instructions: vec![],
+                source_spans: vec![],
+                terminator: Terminator::Return(None),
+            });
+        }
+        let cfg = analysis::CfgAnalysis::build(&f);
+        assert!(ivsr_cfg_unchanged(&f, &cfg));
+        f.blocks[0].terminator = Terminator::Branch(BlockId(1));
+        assert!(
+            !ivsr_cfg_unchanged(&f, &cfg),
+            "same block count is not enough"
+        );
+        f.blocks[0].terminator = Terminator::Return(None);
+        f.blocks.push(f.blocks[1].clone());
+        assert!(!ivsr_cfg_unchanged(&f, &cfg));
     }
 }

@@ -1175,7 +1175,14 @@ impl X86Codegen {
                             // fall through to the register path otherwise
                             // (I8/I16 ALU ops have use_32bit == false).
                             let dest_is_small = self.state.is_small_slot(dest.0);
-                            if !dest_is_small || use_32bit {
+                            // A 32-bit in-place store cannot repair the upper
+                            // half of a canonical signed 64-bit home. Use the
+                            // accumulator path when a wide consumer needs it.
+                            if (!dest_is_small || use_32bit)
+                                && !(use_32bit
+                                    && !is_unsigned
+                                    && self.implicit_sext_values.contains(&dest.0))
+                            {
                                 let sref = self.slot_ref(dest_slot.0);
                                 // Try register source: op %reg, mem
                                 if let Some(rhs_phys) = self
@@ -1284,6 +1291,12 @@ impl X86Codegen {
                                 mnem, suffix, imm, acc
                             ));
                             if use_32bit {
+                                self.emit_implicit_sext32_for_value(
+                                    "eax",
+                                    "rax",
+                                    is_unsigned,
+                                    dest.0,
+                                );
                                 self.store_eax_to(dest);
                             } else {
                                 self.store_rax_to(dest);
@@ -1303,6 +1316,12 @@ impl X86Codegen {
                                 mnem, suffix, name, acc
                             ));
                             if use_32bit {
+                                self.emit_implicit_sext32_for_value(
+                                    "eax",
+                                    "rax",
+                                    is_unsigned,
+                                    dest.0,
+                                );
                                 self.store_eax_to(dest);
                             } else {
                                 self.store_rax_to(dest);
@@ -1322,6 +1341,7 @@ impl X86Codegen {
                             mnem, suffix, src_name, acc
                         ));
                         if use_32bit {
+                            self.emit_implicit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
                             self.store_eax_to(dest);
                         } else {
                             self.store_rax_to(dest);
@@ -1340,6 +1360,7 @@ impl X86Codegen {
                         if use_32bit {
                             self.state
                                 .emit_fmt(format_args!("    {}l {}, %eax", mnem, sref));
+                            self.emit_implicit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
                             self.store_eax_to(dest);
                         } else {
                             self.state
@@ -1383,6 +1404,12 @@ impl X86Codegen {
                                     mnem, suffix, imm, acc
                                 ));
                                 if use_32bit {
+                                    self.emit_implicit_sext32_for_value(
+                                        "eax",
+                                        "rax",
+                                        is_unsigned,
+                                        dest.0,
+                                    );
                                     self.store_eax_to(dest);
                                 } else {
                                     self.store_rax_to(dest);
@@ -1403,6 +1430,12 @@ impl X86Codegen {
                                     mnem, suffix, name, acc
                                 ));
                                 if use_32bit {
+                                    self.emit_implicit_sext32_for_value(
+                                        "eax",
+                                        "rax",
+                                        is_unsigned,
+                                        dest.0,
+                                    );
                                     self.store_eax_to(dest);
                                 } else {
                                     self.store_rax_to(dest);
@@ -1417,6 +1450,12 @@ impl X86Codegen {
                                 mnem, suffix, src_name, acc
                             ));
                             if use_32bit {
+                                self.emit_implicit_sext32_for_value(
+                                    "eax",
+                                    "rax",
+                                    is_unsigned,
+                                    dest.0,
+                                );
                                 self.store_eax_to(dest);
                             } else {
                                 self.store_rax_to(dest);
@@ -1434,6 +1473,12 @@ impl X86Codegen {
                             if use_32bit {
                                 self.state
                                     .emit_fmt(format_args!("    {}l {}, %eax", mnem, sref));
+                                self.emit_implicit_sext32_for_value(
+                                    "eax",
+                                    "rax",
+                                    is_unsigned,
+                                    dest.0,
+                                );
                                 self.store_eax_to(dest);
                             } else {
                                 self.state
@@ -1501,6 +1546,7 @@ impl X86Codegen {
                                 scale,
                                 s = src
                             ));
+                            self.emit_implicit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
                             self.store_eax_to(dest);
                         } else {
                             self.state.emit_fmt(format_args!(
@@ -1515,6 +1561,7 @@ impl X86Codegen {
                     if use_32bit {
                         self.state
                             .emit_fmt(format_args!("    imull ${}, %{}, %eax", imm, src));
+                        self.emit_implicit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
                         self.store_eax_to(dest);
                     } else {
                         self.state
@@ -1527,6 +1574,7 @@ impl X86Codegen {
                     self.operand_to_eax(lhs);
                     self.state
                         .emit_fmt(format_args!("    imull ${}, %eax, %eax", imm));
+                    self.emit_implicit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
                     self.store_eax_to(dest);
                 } else {
                     self.operand_to_rax(lhs);
@@ -1644,6 +1692,7 @@ impl X86Codegen {
             }
             self.state.reg_cache.invalidate_acc();
             if use_32bit {
+                self.emit_implicit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
                 self.store_eax_to(dest);
             } else {
                 self.store_rax_to(dest);
@@ -1673,6 +1722,7 @@ impl X86Codegen {
             }
             self.state.reg_cache.invalidate_acc();
             if use_32bit {
+                self.emit_implicit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
                 self.store_eax_to(dest);
             } else {
                 self.store_rax_to(dest);
@@ -1795,6 +1845,7 @@ impl X86Codegen {
 
         self.state.reg_cache.invalidate_acc();
         if use_32bit {
+            self.emit_implicit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
             self.store_eax_to(dest);
         } else {
             self.store_rax_to(dest);

@@ -1,0 +1,24 @@
+  ok: (a) an all-ICE sweep is a FAIL, not a satisfied budget
+  ok: (b) an all-agreeing sweep is the pass shape, and says which cells it swept
+  ok: (c) one wrong configuration is named, counted, and not absorbed
+  ok: (d) suspect configurations that fail to compile never reach the SKIP branch
+  ok: (e) a control that diverges is a new defect, not this budget
+  ok: (f) a stale nonzero budget fails instead of passing a repaid class
+  ok: (g) a refused control on a working toolchain is a FAIL, not a skip
+self-test: ok
+  p2:-m32 -mregparm=1 -O0                  lccc=16   gcc=16   ok (pinned to agree)
+  p2:-m32 -mregparm=1 -O2                  lccc=16   gcc=16   ok (pinned to agree)
+  p2:-m32 -mregparm=2 -O0                  lccc=16   gcc=16   ok (pinned to agree)
+  p2:-m32 -mregparm=2 -O2                  lccc=16   gcc=16   ok (pinned to agree)
+  p2:-m32 -mregparm=3 -O0                  lccc=16   gcc=16   ok (pinned to agree)
+  p2:-m32 -mregparm=3 -O2                  lccc=16   gcc=16   ok (pinned to agree)
+  p2p:-m32 -mregparm=1 -O0                 lccc=16   gcc=16   ok (pinned to agree)
+  p2p:-m32 -mregparm=1 -O2                 lccc=16   gcc=16   ok (pinned to agree)
+  p2p:-m32 -mregparm=2 -O0                 lccc=16   gcc=16   ok (pinned to agree)
+  p2p:-m32 -mregparm=2 -O2                 lccc=16   gcc=16   ok (pinned to agree)
+  p2p:-m32 -mregparm=3 -O0                 lccc=16   gcc=16   ok (pinned to agree)
+  p2p:-m32 -mregparm=3 -O2                 lccc=16   gcc=16   ok (pinned to agree)
+  sens:-m32 -mregparm=3 -O2                lccc=178  gcc=178  sensitivity ok (poisoned byte reads as 178, subobject as 16)
+small-struct regparm ABI:
+ 0 divergent suspect configuration(s)  (budget 0, 0 configuration(s) disagreed with gcc in total),  0 compile failure(s) (budget 0),  0 control divergence(s) (budget 0),  27 executed, 0 skipped because gcc rejected the flags,  sensitivity arm: 3 of 3 cells measured
+check_i386_regparm_small_struct_abi: PASS (closed class held: 24 cells agree with the oracle, sensitivity of the fixture verified, budget 0)

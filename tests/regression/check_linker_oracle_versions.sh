@@ -27,4 +27,17 @@ printf '#!/bin/sh\necho "GNU ld 2.47"; exit 7\n' > "$td/ld"
 if oracle_require_version "$td/ld" 2.47 >"$td/log" 2>&1; then
     echo 'FAIL: failed executable accepted'; exit 1
 fi
+layout='new-dtags=1;sysroot=/;lib-path=/lib/example'
+if oracle_native_layout_matches "$td/layout" "$layout"; then
+    echo 'FAIL: absent native-layout stamp accepted'; exit 1
+fi
+printf '%s\n' 'new-dtags=0;sysroot=;lib-path=/lib/example' > "$td/layout"
+if oracle_native_layout_matches "$td/layout" "$layout"; then
+    echo 'FAIL: stale native-layout configuration accepted'; exit 1
+fi
+printf '%s\n' "$layout" > "$td/layout"
+oracle_native_layout_matches "$td/layout" "$layout"
+if oracle_native_layout_matches "$td/layout" "$layout:/other"; then
+    echo 'FAIL: changed native library path accepted'; exit 1
+fi
 echo 'linker oracle versions: PASS'

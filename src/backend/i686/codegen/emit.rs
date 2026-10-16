@@ -2249,6 +2249,16 @@ impl I686Codegen {
 // ─── ArchCodegen trait implementation ────────────────────────────────────────
 
 impl ArchCodegen for I686Codegen {
+    /// Provenance markers for user inline-asm bodies: `#APP`/`#NO_APP`.
+    /// `#` starts a comment in this target's GAS syntax, so the markers are
+    /// invisible to the assembler, to objdump, and to this backend's text
+    /// peephole alike; downstream scanners (the -mno-sse /
+    /// -mgeneral-regs-only SIMD guard) use them to exempt user-authored
+    /// text from the compiler-generated code policy.
+    fn asm_block_markers(&self) -> Option<(&'static str, &'static str)> {
+        Some(("#APP", "#NO_APP"))
+    }
+
     fn is_value_reg_assigned(&self, vid: u32) -> bool {
         self.reg_assignments.contains_key(&vid)
     }
@@ -3359,6 +3369,7 @@ impl ArchCodegen for I686Codegen {
         // Inline assembly may clobber the full x87 stack; drop the cached
         // copy before the user's template is emitted.
         self.flush_x87_pending_copy();
+        let markers = self.asm_block_markers();
         crate::backend::inline_asm::emit_inline_asm_common(
             self,
             template,
@@ -3368,6 +3379,7 @@ impl ArchCodegen for I686Codegen {
             operand_types,
             goto_labels,
             input_symbols,
+            markers,
         );
     }
 

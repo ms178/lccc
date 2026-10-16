@@ -17787,16 +17787,11 @@ fn map_max_executed_iv(limit: &Operand, iv_ty: IrType, exit_cmp_op: IrCmpOp) -> 
     }
 }
 
-/// Preserve address bits modulo pointer width; narrower arithmetic needs a range proof.
-fn map_pointer_domain_fits(max: i128, ty: IrType) -> bool {
-    ty.is_integer()
-        && (ty.size() as usize >= crate::common::types::target_ptr_size()
-            || nonnegative_range_fits_integer_type(max, ty))
-}
-
-/// Follow Copy/Cast glue that preserves the eventual address bits. Pointer-width
-/// arithmetic is a ring; narrower intermediates need a full range proof. This
-/// does not establish a recoverable byte counter or scalar-remainder bound.
+/// Trace an offset operand's Copy/Cast chain back to the map IV, requiring
+/// every cast to preserve all values in [0, max_iv]. The structural matcher
+/// admits some same-width signedness casts; those are only safe here when the
+/// accepted trip range proves the values nonnegative and representable in both
+/// types.
 fn map_iv_cast_chain_preserves_range(
     func: &IrFunction,
     mut value: Value,
@@ -17829,8 +17824,8 @@ fn map_iv_cast_chain_preserves_range(
                 from_ty,
                 to_ty,
                 ..
-            } if map_pointer_domain_fits(max_iv, *from_ty)
-                && map_pointer_domain_fits(max_iv, *to_ty) =>
+            } if nonnegative_range_fits_integer_type(max_iv, *from_ty)
+                && nonnegative_range_fits_integer_type(max_iv, *to_ty) =>
             {
                 value = *src;
             }
@@ -17841,8 +17836,8 @@ fn map_iv_cast_chain_preserves_range(
 }
 
 /// Prove that the exact canonical byte-offset expression accepted by
-/// `offset_is_canonical_unit_stride` computes `iv * elem_size` modulo pointer
-/// width, without narrower intermediate wrap/truncation on source iterations. This matters
+/// `offset_is_canonical_unit_stride` computes `iv * elem_size` without
+/// intermediate wrap/truncation for every source iteration. This matters
 /// especially for map loops: their packed transform uses a separate I64 byte
 /// IV, while a U32 `i+i`, `i*2`, or `i<<1` in the original GEP wraps before
 /// being widened on LP64. The scalar remainder keeps the original expression,
@@ -17903,8 +17898,8 @@ fn map_gep_offset_arithmetic_is_safe(
                 from_ty,
                 to_ty,
                 ..
-            } if map_pointer_domain_fits(max_offset, *from_ty)
-                && map_pointer_domain_fits(max_offset, *to_ty) =>
+            } if nonnegative_range_fits_integer_type(max_offset, *from_ty)
+                && nonnegative_range_fits_integer_type(max_offset, *to_ty) =>
             {
                 value = *src;
             }
@@ -17927,7 +17922,7 @@ fn map_gep_offset_arithmetic_is_safe(
                 let Some(scaled_iv) = scaled_iv else {
                     return false;
                 };
-                return map_pointer_domain_fits(max_offset, *ty)
+                return nonnegative_range_fits_integer_type(max_offset, *ty)
                     && map_iv_cast_chain_preserves_range(func, scaled_iv, iv, iv_ty, max_iv);
             }
             Instruction::BinOp {
@@ -17937,7 +17932,7 @@ fn map_gep_offset_arithmetic_is_safe(
                 ty,
                 ..
             } if shift.to_i64() == Some(i64::from(elem_size.trailing_zeros())) => {
-                return map_pointer_domain_fits(max_offset, *ty)
+                return nonnegative_range_fits_integer_type(max_offset, *ty)
                     && map_iv_cast_chain_preserves_range(func, *scaled_iv, iv, iv_ty, max_iv);
             }
             Instruction::BinOp {
@@ -17947,7 +17942,7 @@ fn map_gep_offset_arithmetic_is_safe(
                 ty,
                 ..
             } if elem_size == 2 && lhs == rhs => {
-                return map_pointer_domain_fits(max_offset, *ty)
+                return nonnegative_range_fits_integer_type(max_offset, *ty)
                     && map_iv_cast_chain_preserves_range(func, *lhs, iv, iv_ty, max_iv);
             }
             _ => return false,
@@ -17961,14 +17956,11 @@ mod map_offset_wrap_tests {
     use super::*;
 
     #[test]
-    fn dynamic_u64_versioning_separates_address_bits_from_byte_bounds() {
+    fn dynamic_u64_versioning_proves_only_the_guarded_offset_range() {
         let dynamic = Operand::Value(Value(77));
         let bound = map_offset_proof_limit(IrType::U64, &dynamic, IrCmpOp::Ult, 2);
         let (wide, iv, gep) = offset_function(IrType::U64, IrType::U64, None, true);
-        // Address bits may wrap in the pointer ring. The byte counter cannot:
-        // its quotient still needs the separately tested runtime range guard.
-        assert!(safe(&wide, iv, gep, IrType::U64, &dynamic, IrCmpOp::Ult));
-        assert!(!dynamic_map_byte_limit_supported(IrType::U64, 2));
+        assert!(!safe(&wide, iv, gep, IrType::U64, &dynamic, IrCmpOp::Ult));
         assert!(safe(&wide, iv, gep, IrType::U64, &bound, IrCmpOp::Ult));
         // Runtime versioning must not excuse a narrower intermediate cast.
         let (narrow, iv, gep) = offset_function(IrType::U64, IrType::U32, Some(IrType::U32), true);
@@ -18116,32 +18108,6 @@ mod map_offset_wrap_tests {
         op: IrCmpOp,
     ) -> bool {
         map_gep_offset_arithmetic_is_safe(func, gep, iv, iv_ty, limit, op, 2)
-    }
-
-    #[test]
-    fn pointer_width_wrap_is_safe_for_addresses_not_remainder_recovery() {
-        let dynamic = Operand::Value(Value(99));
-        for ty in [IrType::I64, IrType::U64] {
-            let cmp = if ty == IrType::I64 {
-                IrCmpOp::Slt
-            } else {
-                IrCmpOp::Ult
-            };
-            for multiply in [false, true] {
-                let (func, iv, gep) = offset_function(ty, IrType::I64, Some(IrType::I64), multiply);
-                assert!(safe(&func, iv, gep, ty, &dynamic, cmp));
-            }
-            // An address recurrence may wrap but a byte bound/resume may not.
-            assert!(!dynamic_map_byte_limit_supported(ty, 2));
-        }
-        let (narrow, iv, gep) = offset_function(IrType::U64, IrType::U32, Some(IrType::U32), true);
-        assert!(!safe(&narrow, iv, gep, IrType::U64, &dynamic, IrCmpOp::Ult));
-        // Concrete high-bit counterexample: address bits remain exact, but
-        // shifting them back loses the high element bits. Keep the element IV.
-        let elements = (1u64 << 63) + 8;
-        let bytes = elements.wrapping_mul(2);
-        assert_eq!(bytes, 16);
-        assert_ne!(bytes >> 1, elements);
     }
 
     #[test]
@@ -19125,16 +19091,17 @@ fn transform_strict_computed_recip_reduction(
             )
         })
         .flatten();
+    let mut prefix = Vec::new();
     let mut args = vec![Operand::Value(vector_sum)];
-    // The 128-bit builder owns speculative instructions and IDs. A rejected
-    // plan leaves this caller's scalar lane instructions/counter unchanged
-    // (PR834's transactional-allocation contract).
-    let op = if let Some((denominator, instructions, next)) = packed {
-        next_value_id = next;
-        vector_body_instructions.extend(instructions);
-        args.push(Operand::Value(denominator));
+    let op = if let Some(plan) = packed {
+        next_value_id = plan.next;
+        prefix = plan.prefix;
+        vector_body_instructions.extend(plan.instructions);
+        args.push(Operand::Value(plan.denominator));
         IntrinsicOp::StrictRecipMulAddPackedF64x4
     } else {
+        // The packed builder owns speculative instructions and IDs. Failure
+        // leaves the caller's counter and prebuilt scalar lane IVs unchanged.
         for lane_iv in lane_ivs {
             let mut cache = FxHashMap::default();
             let denominator = clone_strict_i32_dag_for_lane(
@@ -19291,6 +19258,11 @@ fn transform_strict_computed_recip_reduction(
     // `scratch` is normally unused by the direct XMM-result lowering, but it
     // gives the code generator a sound register-pressure fallback without
     // borrowing an allocator-owned XMM register or dynamically moving %rsp.
+    // Loop-invariant packed constants/broadcasts run once: the matcher proved
+    // every external leaf dominates the preheader (strict_external_value_available).
+    func.blocks[pattern.preheader_idx]
+        .instructions
+        .extend(prefix);
     func.blocks[pattern.header_idx].instructions = rewritten_header_instructions;
     func.blocks[pattern.preheader_idx]
         .instructions

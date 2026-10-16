@@ -42,6 +42,7 @@ DEFAULT_LCCC = os.environ.get(
 CC = os.environ.get("LINKTEST_CC", "gcc")
 CXX = os.environ.get("LINKTEST_CXX", "g++")
 
+
 def _escape_github_annotation_data(value: str) -> str:
     """Escape untrusted multiline text before embedding it in an Actions command."""
     return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
@@ -3330,12 +3331,35 @@ my_start:
                     f"(want (0, '1\\n'))")
             # GNU ld must agree.
             r2 = sh(["ld", "-T", "t.lds", "entry.o", obj, access_obj, "-o", "ref." + model], cwd=td)
+            if r2.returncode != 0:
+                return Result(name, "FAIL", model + ": GNU ld control failed: " + r2.stderr.decode()[:300])
             if r2.returncode == 0:
                 code2, out2 = run_bin(os.path.join(td, "ref." + model), [], td)
                 if (code, out) != (code2, out2):
                     return Result(name, "FAIL",
                         f"{model}: lccc {(code, out)!r} != GNU ld {(code2, out2)!r}")
-        return Result(name, "PASS")
+            # Sensitivity control: the reader must actually observe the TLS
+            # template, not merely return success after installing a TCB.
+            data = bytearray(open(os.path.join(td, out_b), "rb").read())
+            sections = _elf_bytes_shdrs(data)
+            tdata = next((h for h in sections or [] if h[0] == ".tdata"), None)
+            if tdata is None:
+                return Result(name, "FAIL", model + ": missing TLS template")
+            off, size = tdata[4], tdata[5]
+            template = data[off:off + size]
+            needle = (11).to_bytes(4, "little")
+            if template.count(needle) != 1:
+                return Result(name, "FAIL", model + ": ambiguous TLS poison site")
+            site = off + template.index(needle)
+            data[site:site + 4] = (10).to_bytes(4, "little")
+            poisoned = os.path.join(td, "poison." + model)
+            with open(poisoned, "wb") as f:
+                f.write(data)
+            os.chmod(poisoned, 0o755)
+            bad = run_bin(poisoned, [], td)
+            if bad != (1, "0\n"):
+                return Result(name, "FAIL", f"{model}: TLS poison insensitive: {bad!r}")
+        return Result(name, "PASS", "GD/LD native + GNU ld controls + two TLS poisons")
     except Exception as e:
         return Result(name, "FAIL", f"harness exception: {e!r}")
     finally:
@@ -5271,7 +5295,32 @@ def _gotpcrel_edges_test(args, oracles):
         shim = _shim_for(td, lccc_ld)
         want = "7 55 1 1 1 1 1\n"
         if sh(["as", "e.s", "-o", "e.o"], cwd=td).returncode != 0:
-            return Result(name, "FAIL", "fixture does not assemble")
+            return Result(name, "SKIP",
+                          "assembler without CODE_4_GOTPCRELX (binutils >= 2.45 needed)")
+        # The GNU cross-check needs a bfd ld that LINKS the CODE_4/REX2
+        # GOTPCRELX relocations this fixture pins. A distro ld older than
+        # the pinned 2.47 oracle dies with "unsupported relocation type
+        # 0x2b"; in that case fall back to a pinned ld.bfd (env
+        # LCCC_BFD_LD, or the conventional ~/.cache/ld-2.47 build) via a
+        # -B shim so only the linker is substituted, or skip the GNU arm
+        # honestly rather than fail on an incapable oracle.
+        gnu_b = []
+        with open(os.path.join(td, "probe.c"), "w") as f:
+            f.write("int main(void){return 0;}\n")
+        probe = sh([CC, "-no-pie", "e.o", "probe.c", "-o", "probe.gnu"], cwd=td)
+        if probe.returncode != 0:
+            modern = os.environ.get("LCCC_BFD_LD") or os.path.expanduser(
+                "~/.cache/ld-2.47/bin/ld.bfd")
+            bdir = os.path.join(td, "bfd-pinned")
+            if os.path.exists(modern):
+                os.makedirs(bdir, exist_ok=True)
+                os.symlink(modern, os.path.join(bdir, "ld"))
+                gnu_b = ["-B" + bdir]
+            if not gnu_b or sh([CC] + gnu_b + ["-no-pie", "e.o", "probe.c",
+                                               "-o", "probe.gnu"], cwd=td).returncode != 0:
+                return Result(name, "SKIP",
+                              "GNU ld cannot link CODE_4_GOTPCRELX and no pinned "
+                              "ld.bfd >= 2.45 is available (LCCC_BFD_LD)")
         errs = []
 
         def slot_target(d, relas, ins_va, disp_off, pie, what, expect):
@@ -5288,7 +5337,7 @@ def _gotpcrel_edges_test(args, oracles):
                 errs.append(f"{what}: slot {slot:#x} holds {got!r}, want {expect:#x}")
 
         for mode in ("-no-pie", "-pie", "-shared"):
-            for tag, bflag in (("lccc", ["-B" + shim]), ("gnu", [])):
+            for tag, bflag in (("lccc", ["-B" + shim]), ("gnu", gnu_b)):
                 exe = f"t{mode}.{tag}"
                 if mode == "-shared":
                     lib = f"libe.{tag}.so"
@@ -6169,7 +6218,6 @@ def _plain_gotpcrel_test(args, oracles):
     is refused now (a -T link has no GOT).
     """
     name = "plain_gotpcrel_relaxation"
-    assembler = os.environ.get("LCCC_TEST_ASSEMBLER", "as")
     td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
     try:
         for fname, text in (("pg.s", _PLAIN_GOTPCREL_ASM),
@@ -6185,7 +6233,7 @@ def _plain_gotpcrel_test(args, oracles):
         # Invoke GAS directly: distro GCC may configure an absolute assembler
         # path that ignores PATH. This fixture needs the pinned GAS (MOVRS),
         # not the compiler driver's private assembler. Keep the C driver for C.
-        r = sh([assembler, "--64", "-mrelax-relocations=no", "pg.s", "-o", "pg.o"], cwd=td)
+        r = sh(["as", "--64", "-mrelax-relocations=no", "pg.s", "-o", "pg.o"], cwd=td)
         if r.returncode != 0:
             err = r.stderr.decode()[:300]
             if "movrs" in err:
@@ -6194,7 +6242,7 @@ def _plain_gotpcrel_test(args, oracles):
         rel = sh(["readelf", "-rW", "pg.o"], cwd=td).stdout.decode()
         if rel.count("R_X86_64_GOTPCREL ") != 7:
             return Result(name, "FAIL", f"assembler did not emit plain GOTPCREL:\n{rel[-600:]}")
-        r = sh([assembler, "--64", "-mrelax-relocations=no", "sc.s", "-o", "sc.o"], cwd=td)
+        r = sh(["as", "--64", "-mrelax-relocations=no", "sc.s", "-o", "sc.o"], cwd=td)
         if r.returncode != 0:
             return Result(name, "FAIL", f"assemble sc.s: {r.stderr.decode()[:300]}")
         for argv in (["-O1", "-c", "m.c"],
@@ -6572,7 +6620,7 @@ def _elf_bytes_phdrs(d):
 
 
 def _elf_bytes_shdrs(d):
-    """Parse all section headers; returns (name, type, flags, addr, off, size, link, info, align)."""
+    """Parse all section headers; returns list of (name, type, flags, addr, off, size, align)."""
     e_shoff, = struct.unpack_from("<Q", d, 0x28)
     e_shentsize, e_shnum, e_shstrndx = struct.unpack_from("<HHH", d, 0x3A)
     hdrs = []
@@ -6680,25 +6728,46 @@ def _relro_nobits_pad_test(args, oracles):
                       % (r_fsz, r_msz, w2[2], w2[3]))
 
 
-def _note_run_count(notes, occupied):
-    """Count note spans; short non-note data is not alignment padding.
+def _allocated_note_runs(shdrs):
+    """Maximal file/virtual-contiguous note runs, excluding actual payload gaps.
 
-    notes: sorted (virtual address, file offset, size, alignment).
-    occupied: nonempty allocated, file-backed NON-note intervals.
+    A small distance is not proof of padding: even a one-byte allocated
+    PROGBITS section between notes must split the run. NOBITS and empty
+    sections have no file payload, and nonallocated debug data is unrelated.
     """
-    if not notes:
-        return 0
-    runs = 1
-    prev_addr_end = notes[0][0] + notes[0][2]
-    prev_end = notes[0][1] + notes[0][2]
-    for addr, off, size, _align in notes[1:]:
-        gap = off - prev_end
-        data_in_gap = any(lo < off and prev_end < hi for lo, hi in occupied)
-        if gap < 0 or gap > 8 or addr - prev_addr_end != gap or data_in_gap:
-            runs += 1
-        prev_end = max(prev_end, off + size)
-        prev_addr_end = max(prev_addr_end, addr + size)
+    sections = sorted((h for h in shdrs if h[2] & 2 and h[5] > 0 and h[1] != 8),
+                      key=lambda h: h[4])
+    runs = []
+    previous = None
+    for h in sections:
+        if h[1] != _SHT_NOTE:
+            previous = None
+            continue
+        if (previous is None or not 0 <= h[4] - (previous[4] + previous[5]) <= 8
+                or h[3] - h[4] != previous[3] - previous[4]):
+            runs.append([])
+        runs[-1].append(h)
+        previous = h
     return runs
+def _note_gap_has_payload(shdrs, start, end):
+    """Alignment holes may join notes; allocated non-note file bytes may not."""
+    return any(h[1] not in (_SHT_NOTE, 8) and h[2] & 2 and h[5] > 0
+               and h[4] < end and start < h[4] + h[5] for h in shdrs)
+
+
+def _note_run_oracle_test(args, oracles):
+    name = "note_run_oracle_contract"
+    # name, type, flags, address, offset, size, alignment
+    payload = (".rodata", 1, 2, 0x2748, 0x748, 7, 4)
+    cases = [([], False), ([payload], True),
+             ([(".bss", 8, 2, 0x2748, 0x748, 7, 4)], False),
+             ([(".debug", 1, 0, 0, 0x748, 7, 4)], False),
+             ([(".rodata", 1, 2, 0x2750, 0x750, 7, 4)], False),
+             ([(".rodata", 1, 2, 0x2744, 0x744, 4, 4)], False)]
+    for sections, expected in cases:
+        if _note_gap_has_payload(sections, 0x748, 0x750) != expected:
+            return Result(name, "FAIL", "padding/payload distinction: " + repr(sections))
+    return Result(name, "PASS", "six padding/payload boundary controls")
 
 
 def _note_run_merge_test(args, oracles):
@@ -6733,17 +6802,14 @@ def _note_run_merge_test(args, oracles):
             return Result(name, "FAIL", "not an ELF64 LSB file")
         SHF_ALLOC = 2
         notes = sorted(
-            ([h[3], h[4], h[5], h[8]] for h in shdrs
+            ([h[3], h[4], h[5], h[6]] for h in shdrs
              if h[1] == _SHT_NOTE and (h[2] & SHF_ALLOC) and h[5] > 0),
             key=lambda h: h[1])
         if len(notes) < 2:
             return Result(name, "SKIP", "fixture has <2 note sections")
-        # Short gaps can contain real .rodata, not just alignment bytes.
-        # Folding that data into PT_NOTE would make the note reader interpret
-        # arbitrary string bytes as a note header. SHT_NOBITS has no file span.
-        occupied = [(h[4], h[4] + h[5]) for h in shdrs
-                    if h[1] not in (_SHT_NOTE, 8) and h[2] & SHF_ALLOC and h[5] > 0]
-        runs = _note_run_count(notes, occupied)
+        # Independent expectation: genuine alignment gaps may be covered,
+        # but a tiny .rodata payload is not padding inside a PT_NOTE stream.
+        runs = len(_allocated_note_runs(shdrs))
         ptn = [p for p in phdrs if p[0] == _PT_NOTE]
         if len(ptn) != runs:
             return Result(name, "FAIL",
@@ -6754,12 +6820,18 @@ def _note_run_merge_test(args, oracles):
             if fsz != msz:
                 return Result(name, "FAIL", "PT_NOTE fsz %#x != msz %#x"
                               % (fsz, msz))
+            if _note_gap_has_payload(shdrs, off, off + fsz):
+                return Result(name, "FAIL", "PT_NOTE includes non-note payload")
             covered.append((off, off + fsz))
         covered.sort()
         for _, off, sz, _ in notes:
             if sum(lo <= off and off + sz <= hi for lo, hi in covered) != 1:
                 return Result(name, "FAIL", "note section at %#x not covered exactly once"
                               % off)
+        for h in shdrs:
+            if h[2] & SHF_ALLOC and h[1] not in (_SHT_NOTE, 8) and h[5] > 0:
+                if any(lo < h[4] + h[5] and h[4] < hi for lo, hi in covered):
+                    return Result(name, "FAIL", "PT_NOTE covers non-note payload " + h[0])
         props = [p for p in phdrs if p[0] == _PT_GNU_PROPERTY]
         prop_secs = [h for h in shdrs if h[0] == ".note.gnu.property"]
         if prop_secs:
@@ -11142,6 +11214,7 @@ def _registry(args, oracles):
         one("build_id_note", _build_id_note_test, "notes"),
         one("relro_nobits_pad", _relro_nobits_pad_test, "layout"),
         one("note_run_merge", _note_run_merge_test, "notes"),
+        one("note_run_oracle_contract", _note_run_oracle_test, "notes"),
         one("gnu_hash_sizing", _gnu_hash_sizing_test, "dynamic"),
         one("crossarch_gnu_hash_relro", _crossarch_gnu_hash_relro_test, "dynamic"),
         one("static_pie_refused", _static_pie_refusal_test, "driver"),

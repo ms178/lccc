@@ -60,6 +60,13 @@ def verify(out, options, *, merged_visibility=None, definition_offset=0, places=
             assert symbol["shndx"] == 0 and symbol["value"] == 0, symbol
     relas = sec.get(".rela.dyn", (None, b""))[1]
     entries = [struct.unpack_from("<QQq", relas, i) for i in range(0, len(relas), 24)]
+    if kind == 1:
+        assert options["absolute"] and defined, options
+        assert not entries, entries
+        data = sec[".data"][1]
+        assert struct.unpack_from("<I", data)[0] == (value + addend) & 0xffffffff, data
+        assert data[4:16] == b"\xa5" * 12, data
+        return
     if kind == 20:
         assert places == 1 and addend == 0
         # The canonical GOT_HI20 form has zero addend. Its HI20 must address
@@ -93,24 +100,46 @@ def verify(out, options, *, merged_visibility=None, definition_offset=0, places=
             for override in (0, 0x12345678):
                 loaded = (override + at[0][1]) & MASK
                 assert loaded == (override + addend) & MASK
-        elif absolute:
-            assert not at and initial == (value + addend) & MASK, (at, initial, value, addend)
         else:
-            assert len(at) == 1 and at[0][0] == 3, (at, options)
-            assert at[0][1] & MASK == (value + addend) & MASK, (at, value, addend)
+            # A PROTECTED dynamic symbol may use either a symbolic relocation
+            # or (for section-relative definitions) RELATIVE. The loader binds
+            # the symbolic form locally too. Compare loaded addresses, not one
+            # linker's preferred relocation spelling. ABS must never gain B.
+            assert len(at) <= 1, (at, options)
             for base in (0x100000, 0x700000000):
-                assert (base + at[0][1]) & MASK == (base + value + addend) & MASK
+                expected = (value + addend + (0 if absolute else base)) & MASK
+                if not at:
+                    loaded = initial
+                elif at[0][0] == 3:
+                    loaded = (base + at[0][1]) & MASK
+                else:
+                    symbol = symbols.get("target")
+                    assert symbol is not None and vis == 3, (at, options)
+                    assert at[0][0] == (symbol["index"] << 32) | 2, (at, symbol)
+                    if symbol["shndx"] == 0:
+                        assert binding == 2 and not defined, (symbol, options)
+                        resolved = 0
+                    else:
+                        resolved = symbol["value"] + (0 if symbol["shndx"] == 0xfff1 else base)
+                    loaded = (resolved + at[0][1]) & MASK
+                assert loaded == expected, (at, initial, base, loaded, expected, options)
 
 
 def cases():
     for binding, visibility, defined in [(0, 0, True)] + [
             (b, v, d) for b in (1, 2) for v in range(4) for d in (True, False)]:
         for absolute, target_value in [(False, 0)] + ([(True, 0), (True, 256)] if defined else []):
-            for kind in (2, 20):
-                for addend in ((-7, 0, 11, -(1 << 63), (1 << 63) - 1) if kind == 2 else (0,)):
+            for kind in (1, 2, 20):
+                addends = (-7, 0, 11, -(1 << 63), (1 << 63) - 1) if kind != 20 else (0,)
+                for addend in addends:
                     options = dict(binding=binding, visibility=visibility, defined=defined,
                                    absolute=absolute, target_value=target_value, kind=kind, addend=addend)
                     accept = not (binding == 1 and visibility != 0 and not defined)
+                    if kind == 1:
+                        options["payload"] = bytes(4) + b"\xa5" * 12
+                        # R_RISCV_32 writes the low 32 bits of S+A, including
+                        # extreme RELA addends; GNU ld does not range-reject ABS.
+                        accept = defined and absolute
                     yield f"b{binding}-v{visibility}-d{defined}-abs{absolute}-{target_value}-k{kind}-a{addend}", options, accept
 
 
@@ -119,6 +148,8 @@ def main():
     ap.add_argument("--lccc", required=True)
     ap.add_argument("--oracle")
     ap.add_argument("--json", type=Path)
+    ap.add_argument("--only-riscv32", action="store_true",
+                    help="run only the RV64 shared R_RISCV_32 contract")
     args = ap.parse_args()
     if not __debug__:
         ap.error("assertions are required; do not run this correctness gate with python -O")
@@ -150,6 +181,8 @@ def measure(args, records, versions):
     with tempfile.TemporaryDirectory(prefix="lccc-rv-binding-") as tmp:
         root = Path(tmp)
         for name, options, accept in cases():
+            if args.only_riscv32 and options["kind"] != 1:
+                continue
             src = root / (name + ".o")
             src.write_bytes(fixture(**options))
             for tool, command in tools.items():
@@ -160,11 +193,14 @@ def measure(args, records, versions):
                     if accept:
                         verify(out, options)
                     elif tool == "lccc":
-                        assert "undefined non-default-visible" in diagnostic, diagnostic
+                        assert ("R_RISCV_32" in diagnostic or "undefined non-default-visible" in diagnostic
+                                if options["kind"] == 1 else "undefined non-default-visible" in diagnostic), diagnostic
                     records.append(dict(case=name, tool=tool, passed=True))
                 except (AssertionError, OSError, subprocess.TimeoutExpired, ValueError,
                         struct.error, KeyError, IndexError) as error:
                     records.append(dict(case=name, tool=tool, passed=False, error=str(error)))
+        if args.only_riscv32:
+            return
         # A reference in another TU constrains the definition, in both orders.
         # Each .data contribution carries an R_RISCV_64 to the same target.
         for vis in (1, 2, 3):
