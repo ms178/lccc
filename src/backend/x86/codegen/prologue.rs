@@ -2117,13 +2117,15 @@ impl X86Codegen {
                                 ..
                             }) if sv.0 == dest.0
                         );
-                        // I32 sources load via `movslq` ONLY when the sext
-                        // convention marked them (the widening cast does);
-                        // an unmarked I32 would load `movl` (zero-extend) and
-                        // skipping a SIGN-extending cast would miscompile.
-                        let i32_sext_ready =
-                            *ty != IrType::I32 || self.needs_sext_values.contains(&dest.0);
-                        if ok_ty && single_use && adjacent_cast && i32_sext_ready {
+                        // The firing fold emits the TYPE-based opcode
+                        // (movslq for I32; the width table below only admits
+                        // sign-extending I32 casts), independent of the
+                        // needs-sext convention - the convention no longer
+                        // marks widening-cast sources (casts extend
+                        // themselves), and gating on it here silently killed
+                        // every I32 load+sext fold (movslq mem,%rax;
+                        // movslq %eax,%rdx instead of movslq mem,%rdx).
+                        if ok_ty && single_use && adjacent_cast {
                             if let Some((cd, from, to)) = cast_by_src.get(&dest.0) {
                                 let width_ok = *from == *ty
                                     && matches!(

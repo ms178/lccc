@@ -429,6 +429,8 @@ jobs:
       run: python3 scripts/check_no_conflict_markers.py
     - name: Verify native VEX flag-read architectural controls
       run: bash tests/regression/check_vex_flag_reads.sh
+    - name: Verify W2 load->cast fold structure and runtime
+      run: bash tests/regression/check_load_cast_fold.sh
     - name: Verify benchmark codegen registry and evidence (mock only)
       run: python3 tests/regression/check_benchmark_codegen_registry.py
     - name: Verify GCC provisioning contracts (mock only)

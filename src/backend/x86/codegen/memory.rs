@@ -1041,7 +1041,18 @@ impl X86Codegen {
         if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
             if let Some(p_reg) = self.reg_assignments.get(&ptr.0).copied() {
                 if !is_xmm_reg(p_reg) && !self.state.is_alloca(ptr.0) {
-                    let load_instr = self.mov_load_for_value(ty, dest.0);
+                    // W2 fold: the load REPLACES the consumer cast, so the
+                    // extension must come from the TYPE (movslq for I32 -
+                    // the admission's width table only folds sign-extending
+                    // I32 casts), not from the needs-sext convention: a
+                    // widening cast no longer marks its source (the cast
+                    // extends itself), so the convention would pick movl
+                    // and zero-extend a sign-extending fold.
+                    let load_instr = if fold_target.is_some() {
+                        Self::mov_load_for_type(ty)
+                    } else {
+                        self.mov_load_for_value(ty, dest.0)
+                    };
                     let p_name = phys_reg_name(p_reg);
                     let use_32bit_dest = matches!(load_instr, "movl" | "movzbl" | "movzwl");
                     let use_16bit_dest = load_instr == "movw";
@@ -1119,7 +1130,13 @@ impl X86Codegen {
             && !self.state.is_alloca(ptr.0)
             && self.state.acc_has_verified(ptr.0, false)
         {
-            let load_instr = self.mov_load_for_value(ty, dest.0);
+            // Same type-vs-convention distinction as the register-pointer
+            // path above: a firing W2 fold supplies the cast's extension.
+            let load_instr = if fold_target.is_some() {
+                Self::mov_load_for_type(ty)
+            } else {
+                self.mov_load_for_value(ty, dest.0)
+            };
             let use_32bit_dest = matches!(load_instr, "movl" | "movzbl" | "movzwl");
             let use_16bit_dest = load_instr == "movw";
             let use_8bit_dest = load_instr == "movb";

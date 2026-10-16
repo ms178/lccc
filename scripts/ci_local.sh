@@ -209,6 +209,9 @@ gate "got-slot-local-addend" fast \
 gate "vex-flag-reads" fast \
     bash tests/regression/check_vex_flag_reads.sh
 
+gate "load-cast-fold" fast \
+    env CCC="$LCCC" bash tests/regression/check_load_cast_fold.sh
+
 gate "benchmark-codegen-registry" fast \
     python3 tests/regression/check_benchmark_codegen_registry.py
 

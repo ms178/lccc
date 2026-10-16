@@ -146,7 +146,14 @@ def build_arm(arm: str, cc: str, env_extra: dict[str, str], cflags: list[str],
     # of equal linked layout, callee implementations, relocations or data.
     digest = timed_function_hash(kobj)
     # Link with the reference compiler so the linker is identical across arms.
-    link_cmd = [REFERENCE_CC, str(kobj), str(driver_obj), "-o", str(out), "-lm"]
+    # Kernel objects are compiled without -fPIC on purpose (benchmark fidelity:
+    # absolute addressing is part of the measured codegen), so a PIE-default
+    # host driver (Debian/Ubuntu gcc) rejects them with R_X86_64_32S errors.
+    # _reference_no_pie() probes once whether the driver accepts -no-pie and
+    # only then requests a non-PIE link; a driver without the flag keeps the
+    # historical command line unchanged.
+    link_cmd = [REFERENCE_CC, *_reference_no_pie(),
+                str(kobj), str(driver_obj), "-o", str(out), "-lm"]
     try:
         r = subprocess.run(link_cmd, capture_output=True, text=True)
     except (OSError, subprocess.SubprocessError) as exc:
@@ -249,6 +256,25 @@ def checked_samples(records: list[dict], arms: list[str], rounds: int) -> tuple[
 
 
 REFERENCE_CC = "cc"
+_NO_PIE: list | None = None
+
+
+def _reference_no_pie() -> list:
+    """Probe once whether REFERENCE_CC accepts -no-pie; cache the answer."""
+    global _NO_PIE
+    if _NO_PIE is None:
+        probe = None
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                src = Path(td) / "probe.c"
+                src.write_text("int main(void){return 0;}\n")
+                probe = subprocess.run(
+                    [REFERENCE_CC, "-no-pie", str(src), "-o", str(Path(td) / "probe")],
+                    capture_output=True, text=True)
+        except (OSError, subprocess.SubprocessError):
+            probe = None
+        _NO_PIE = ["-no-pie"] if probe is not None and probe.returncode == 0 else []
+    return _NO_PIE
 
 
 def main() -> int:
