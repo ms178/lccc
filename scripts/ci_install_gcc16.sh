@@ -62,6 +62,22 @@ apt_retry() {
     return "$rc"
 }
 
+# Hosted runners re-download ~300 MB of PPA debs on every job (launchpad
+# serves at a few hundred KB/s; measured 15 minutes per job). When
+# LCCC_CI_APT_ARCHIVE_DIR is set, apt keeps its downloaded .debs in that
+# directory so the workflow can persist them in actions/cache; a warm cache
+# turns the install into pure local dpkg work. apt still consults the live
+# index first, so a stale cache only costs the delta download, never
+# correctness or the rolling-major version policy.
+archive_opts=()
+if [[ -n ${LCCC_CI_APT_ARCHIVE_DIR:-} ]]; then
+    mkdir -p "${LCCC_CI_APT_ARCHIVE_DIR}/partial"
+    archive_opts=(
+        -o "Dir::Cache::archives=${LCCC_CI_APT_ARCHIVE_DIR}"
+        -o APT::Keep-Downloaded-Packages=true
+    )
+fi
+
 if ! toolchain_ready; then
     if [[ $MODE == --multilib ]]; then
         as_root dpkg --add-architecture i386
@@ -83,7 +99,7 @@ if ! toolchain_ready; then
         apt_retry apt-get update
     fi
     if ! apt_retry apt-get install -y --no-install-recommends \
-            -o Acquire::Retries=3 "${packages[@]}"; then
+            -o Acquire::Retries=3 "${archive_opts[@]}" "${packages[@]}"; then
         echo "ci_install_gcc16: install failed; per-package resolver state follows" >&2
         for package in "${packages[@]}"; do
             apt-cache policy "$package" >&2 || true
@@ -92,6 +108,11 @@ if ! toolchain_ready; then
         as_root apt-get install -y --no-install-recommends --dry-run \
             "${packages[@]}" >&2 || true
         exit 1
+    fi
+    if [[ -n ${LCCC_CI_APT_ARCHIVE_DIR:-} ]] && (( EUID != 0 )); then
+        # apt wrote the debs as root; hand them back so the post-job cache
+        # upload (which runs unprivileged) can read every file.
+        as_root chown -R "$(id -un):$(id -gn)" "$LCCC_CI_APT_ARCHIVE_DIR" || true
     fi
 fi
 

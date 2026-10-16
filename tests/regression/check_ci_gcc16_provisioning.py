@@ -157,6 +157,20 @@ class ProvisioningTests(unittest.TestCase):
         result, _ = self.invoke(LCCC_CI_GCC_VERSION="", VERSION="16.3.0", GXX_VERSION="16.3.0")
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_archive_dir_keeps_debs_for_the_workflow_cache(self):
+        with tempfile.TemporaryDirectory() as outer:
+            archive = Path(outer) / "apt-archive"
+            result, commands = self.invoke(LCCC_CI_APT_ARCHIVE_DIR=str(archive))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((archive / "partial").is_dir())
+            install = next(c for c in commands if c[:2] == ["apt-get", "install"])
+            self.assertIn(f"Dir::Cache::archives={archive}", install)
+            self.assertIn("APT::Keep-Downloaded-Packages=true", install)
+            # apt update must not be redirected: the index stays live so a
+            # stale deb cache can never pin an outdated toolchain.
+            update = next(c for c in commands if c[:2] == ["apt-get", "update"])
+            self.assertNotIn(f"Dir::Cache::archives={archive}", update)
+
 
 if __name__ == "__main__":
     unittest.main()

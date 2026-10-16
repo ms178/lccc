@@ -95,3 +95,38 @@ of PR #843). Companion to `FOLLOWUP-2026-10-16-rebase-synthesis.md` (S03).
   prints seconds).
 - Commit messages with backticks must go through `-F file`, never `-m` with
   a double-quoted heredoc-less string (shell substitution ate `ro.off`).
+
+## CI overhaul (2026-10-16, cost-driven)
+
+Measured on run 38967786415: the ubuntu-toolchain-r PPA download dominated
+wall time — "Install GCC 16 and i686" cost 15.2 min in build, 15.0 min in
+debug, ~4 min elsewhere (~37 runner-minutes per run), while the actual
+build (2.1 min) and tests were small. Changes, each with its contract
+covered by an existing pin test:
+
+- `scripts/ci_install_gcc16.sh` honors `LCCC_CI_APT_ARCHIVE_DIR`: apt keeps
+  its downloaded debs there (`Dir::Cache::archives` +
+  `APT::Keep-Downloaded-Packages`), the workflow persists the directory in
+  `actions/cache` under a weekly key with a prefix restore. apt still reads
+  the live index first, so a stale cache costs only the delta download and
+  can never pin an outdated toolchain (rolling-major policy unchanged).
+  Mock coverage: `tests/regression/check_ci_gcc16_provisioning.py`
+  (archive-dir test asserts the option set and that `apt-get update` stays
+  unredirected).
+- Removed true duplicates from `ci.yml`: the RISC-V shared-binding pair ran
+  three times (frontend named steps, codegen pr835 block, backend step) and
+  `scripts/check_strict_packed_recip.py` twice with identical effective
+  configuration (CCC default equals the backend env). One copy each
+  remains; `scripts/test_ci_gate_parity.py` stays green.
+- The label-gated "Named candidate semantic and performance audit" job
+  moved from `pr826-redteam.yml` (which triggers on every PR push and thus
+  showed a permanent skipped check) into `compiler-comparison.yml`,
+  triggered only by the `compiler-comparison` label event or
+  `workflow_dispatch`. Opt-in semantics and token scope are unchanged and
+  still pinned by `tests/corpus/test_compiler_comparison_reports.py`.
+  Note: after labeling, later pushes do not re-run the audit automatically;
+  re-apply the label or dispatch.
+
+Expected effect: build lane ~20.5 → ~6 min, debug ~22 → ~8 min, critical
+path (build + codegen) ~39 → ~20 min once the weekly cache is warm; first
+run of a week still pays one download to refill the cache.

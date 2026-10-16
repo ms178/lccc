@@ -21,7 +21,19 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Compute weekly apt cache key
+        id: apt-epoch
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+      - name: Cache GCC 16 package downloads
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/lccc-apt
+          key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
+          restore-keys: |
+            lccc-apt-debs-v1-${{ runner.os }}-
       - name: Install GCC 16
+        env:
+          LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
         run: bash scripts/ci_install_gcc16.sh --base
 
       - uses: actions/download-artifact@v8

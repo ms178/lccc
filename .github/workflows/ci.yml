@@ -27,7 +27,19 @@ jobs:
         components: rustfmt, clippy
     - name: Enable temporary CI swap file
       run: bash scripts/ci_enable_swap.sh
+    - name: Compute weekly apt cache key
+      id: apt-epoch
+      run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+    - name: Cache GCC 16 package downloads
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc-apt
+        key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
+        restore-keys: |
+          lccc-apt-debs-v1-${{ runner.os }}-
     - name: Install GCC 16 and i686 C runtime/development files
+      env:
+        LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
       run: |
         bash scripts/ci_install_gcc16.sh --multilib
         sudo apt-get install -y --no-install-recommends qemu-user
@@ -145,7 +157,19 @@ jobs:
         components: rustfmt, clippy
     - name: Enable temporary CI swap file
       run: bash scripts/ci_enable_swap.sh
+    - name: Compute weekly apt cache key
+      id: apt-epoch
+      run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+    - name: Cache GCC 16 package downloads
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc-apt
+        key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
+        restore-keys: |
+          lccc-apt-debs-v1-${{ runner.os }}-
     - name: Install GCC 16 and i686 C runtime/development files
+      env:
+        LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
       run: |
         bash scripts/ci_install_gcc16.sh --multilib
         sudo apt-get install -y --no-install-recommends qemu-user
@@ -227,7 +251,19 @@ jobs:
         components: rustfmt, clippy
     - name: Enable temporary CI swap file
       run: bash scripts/ci_enable_swap.sh
+    - name: Compute weekly apt cache key
+      id: apt-epoch
+      run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+    - name: Cache GCC 16 package downloads
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc-apt
+        key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
+        restore-keys: |
+          lccc-apt-debs-v1-${{ runner.os }}-
     - name: Install GCC 16 and i686 C runtime/development files
+      env:
+        LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
       run: |
         bash scripts/ci_install_gcc16.sh --multilib
         sudo apt-get install -y --no-install-recommends qemu-user
@@ -364,7 +400,19 @@ jobs:
         components: rustfmt, clippy
     - name: Enable temporary CI swap file
       run: bash scripts/ci_enable_swap.sh
+    - name: Compute weekly apt cache key
+      id: apt-epoch
+      run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+    - name: Cache GCC 16 package downloads
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc-apt
+        key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
+        restore-keys: |
+          lccc-apt-debs-v1-${{ runner.os }}-
     - name: Install GCC 16 and i686 C runtime/development files
+      env:
+        LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
       run: |
         set +e
         install_log="$RUNNER_TEMP/gcc16-multilib-install.log"
@@ -578,7 +626,19 @@ jobs:
         components: rustfmt, clippy
     - name: Enable temporary CI swap file
       run: bash scripts/ci_enable_swap.sh
+    - name: Compute weekly apt cache key
+      id: apt-epoch
+      run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+    - name: Cache GCC 16 package downloads
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc-apt
+        key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
+        restore-keys: |
+          lccc-apt-debs-v1-${{ runner.os }}-
     - name: Install GCC 16 and i686 C runtime/development files
+      env:
+        LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
       run: |
         bash scripts/ci_install_gcc16.sh --multilib
         sudo apt-get install -y --no-install-recommends qemu-user
@@ -631,8 +691,6 @@ jobs:
         python3 scripts/check_byte_count_normalize.py --lccc target/fastbuild/lccc --gcc gcc-16 --output target/pr835-byte-count --json target/pr835-byte-count.json
         bash tests/regression/check_byte_accessor_inline.sh
         bash tests/regression/check_unsigned_affine_loop.sh
-        python3 tests/linker/test_riscv_shared_binding.py
-        python3 tests/linker/check_riscv_shared_binding.py --lccc target/fastbuild/lccc-riscv
     - name: Benchmark output gate (workload kernels vs GCC oracle)
       env:
         GCC_BIN: gcc-16
@@ -814,10 +872,6 @@ jobs:
       env:
         CCC: target/fastbuild/lccc
       run: bash tests/regression/check_fp_environment.sh
-    - name: Verify packed integer reciprocal bitwise semantics
-      env:
-        CCC: target/fastbuild/lccc
-      run: python3 scripts/check_strict_packed_recip.py
     needs:
     - build
   backend:
@@ -839,7 +893,19 @@ jobs:
         components: rustfmt, clippy
     - name: Enable temporary CI swap file
       run: bash scripts/ci_enable_swap.sh
+    - name: Compute weekly apt cache key
+      id: apt-epoch
+      run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+    - name: Cache GCC 16 package downloads
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc-apt
+        key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
+        restore-keys: |
+          lccc-apt-debs-v1-${{ runner.os }}-
     - name: Install GCC 16 and i686 C runtime/development files
+      env:
+        LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
       run: |
         bash scripts/ci_install_gcc16.sh --multilib
         sudo apt-get install -y --no-install-recommends qemu-user
@@ -1403,10 +1469,6 @@ jobs:
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_temp_symlink.sh
     - name: Note-run oracle boundary tests
       run: python3 tests/corpus/test_linker_note_runs.py
-    - name: RISC-V shared symbol binding and visibility
-      run: |
-        python3 tests/linker/test_riscv_shared_binding.py
-        python3 tests/linker/check_riscv_shared_binding.py --lccc target/fastbuild/lccc-riscv
     needs:
     - build
   clippy:
