@@ -1205,9 +1205,44 @@ pub(crate) fn collect_folded_gep_links_all(
         let unfiltered = build_global_addr_map(func, &no_exclusions, None);
         if !unfiltered.is_empty() {
             let reg_off = build_reg_offset_sym_map(func, &unfiltered);
-            for (dest, info) in &m {
-                if let Some(ro) = reg_off.get(&info.base.0) {
-                    out.entry(ro.off.0).or_default().push(*dest);
+            // The symbol arm is only ever TAKEN after the deadening pass
+            // removed the `Add`, and deadening statically requires (a) every
+            // use of the `Add` to be the base of a mapped indexed GEP and
+            // (b) no store consumer among those GEPs.  Both tests are
+            // RA-independent, so an `Add` that fails them here can NEVER
+            // need the offset register at the access — linking it anyway
+            // extended `cur`'s interval through the whole window loop and
+            // moved the allocation of a DORMANT build (one extra
+            // register copy in ra01_global_match, pinned by row 2 of
+            // check_reg_off_sym_fold.sh).  An `Add` that passes them may
+            // still be refused dynamically; its links are then the
+            // documented harmless over-constraint.
+            if !reg_off.is_empty() {
+                let mut base_gep_uses: FxHashMap<u32, u32> = FxHashMap::default();
+                for info in m.values() {
+                    if reg_off.contains_key(&info.base.0) {
+                        *base_gep_uses.entry(info.base.0).or_insert(0) += 1;
+                    }
+                }
+                let mut store_fed: FxHashSet<u32> = FxHashSet::default();
+                for block in &func.blocks {
+                    for inst in &block.instructions {
+                        if let Instruction::Store { ptr, .. } = inst {
+                            if let Some(info) = m.get(&ptr.0) {
+                                store_fed.insert(info.base.0);
+                            }
+                        }
+                    }
+                }
+                for (dest, info) in &m {
+                    let Some(ro) = reg_off.get(&info.base.0) else {
+                        continue;
+                    };
+                    let total = use_counts.get(info.base.0 as usize).copied().unwrap_or(0);
+                    let gep_uses = base_gep_uses.get(&info.base.0).copied().unwrap_or(0);
+                    if total == gep_uses && !store_fed.contains(&info.base.0) {
+                        out.entry(ro.off.0).or_default().push(*dest);
+                    }
                 }
             }
         }

@@ -215,6 +215,15 @@ gate "load-cast-fold" fast \
 gate "generator-map" fast \
     env CCC="$LCCC" bash tests/regression/check_generator_map.sh
 
+# Register-offset symbol folds (`Add(symbol, register)` -> `sym(%off,%idx)`):
+# the sliding-window shape `const u8 *m = window + cur; m[i]` must fold the
+# symbol into the memory operand where the derived pointer has no other use,
+# must shrink the function when it does, must leave the RA-01 kernel dormant
+# where it cannot pay (measured: identical body), must agree with GCC on
+# every program's output, and must refuse PIC (no third SIB slot).
+gate "reg-off-sym-fold" fast \
+    env CCC="$LCCC" bash tests/regression/check_reg_off_sym_fold.sh
+
 gate "benchmark-codegen-registry" fast \
     python3 tests/regression/check_benchmark_codegen_registry.py
 
