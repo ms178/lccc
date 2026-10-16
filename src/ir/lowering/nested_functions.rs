@@ -1254,19 +1254,8 @@ impl Lowerer {
 
     /// Resolve a plain identifier to a visible nested function in the
     /// current function (scope map lookup).
-    ///
-    /// At file scope there is no enclosing function and therefore no nested
-    /// functions: const-expression evaluation of file-scope constructs (array
-    /// type sizes, enum values, static initializers) legitimately reaches this
-    /// lookup for call-shaped expressions, and must observe "no nested
-    /// function" rather than assume a function context. Returning `None` there
-    /// is semantically exact, not a fallback.
     pub(super) fn lookup_nested_function(&self, name: &str) -> Option<NestedFnEntry> {
-        self.func_state
-            .as_ref()?
-            .nested_functions
-            .get(name)
-            .cloned()
+        self.func().nested_functions.get(name).cloned()
     }
 
     /// The key under which the *signature* of a call to `name` is recorded.
