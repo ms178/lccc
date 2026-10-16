@@ -3300,7 +3300,8 @@ mod pr824_external_redteam {
             ".type f, @function\nf:\n movq %rax, 48(%rsp)\n movq %rax, %xmm0\n vmovdqu32 0(%rsp), %zmm3\n vmovdqu32 %zmm3, (%rdi)\n ret\n.size f, .-f\n",
         );
         let facts = FpLiveness::new(&store, &infos);
-        eprintln!("slot_live_after={:?}", facts.slot_live_after(3, 4, 48, 8));
+        // Bytes 48..55 overlap the 64-byte ZMM load from 0(%rsp): live.
+        assert_eq!(facts.slot_live_after(3, 4, 48, 8), Some(true));
         local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
         assert!(
             !infos[2].is_nop(),
@@ -3347,7 +3348,6 @@ mod pr824_external_redteam {
     fn whole_pipeline_must_preserve_upper_zeroing() {
         let asm = ".type f, @function\nf:\n vmovapd %xmm6, %xmm7\n pshufd $27, %xmm5, %xmm7\n vmovupd %ymm7, (%rdi)\n ret\n.size f, .-f\n";
         let out = super::super::peephole_optimize(asm.to_owned());
-        eprintln!("WHOLE_PIPELINE_OUTPUT_BEGIN\n{out}WHOLE_PIPELINE_OUTPUT_END");
         assert!(
             out.contains("vmovapd") || out.contains("vpshufd"),
             "neither original nor replacement upper-zeroing operation remains"
