@@ -38,7 +38,8 @@ of PR #843). Companion to `FOLLOWUP-2026-10-16-rebase-synthesis.md` (S03).
    from a seg-qualified access (directly or as GEP base).
 4. **Option contract NOT ported** (deliberate): `LCCC_STRICT_OPTIONS`, the
    fail-closed data-model/dialect rows, the `-D_FORTIFY_SOURCE` diagnostic
-   and `scripts/lccc_capability_probe.py` belong to 757's cli.rs hygiene part
+   and PR 757's capability-probe script (`lccc_capability_probe.py`, never
+   landed on main) belong to 757's cli.rs hygiene part
    (deferred). `docs/builtin-libcall-policy.md` §"Option contract" documents
    the CURRENT behaviour and names the gap. Measured today:
    `-funsigned-char`/`-std=<unknown>`/`-fno-plt`/`-D_FORTIFY_SOURCE=2` are

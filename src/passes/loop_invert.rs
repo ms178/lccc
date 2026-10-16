@@ -107,6 +107,12 @@ fn is_duplicable(inst: &Instruction) -> bool {
 pub(crate) struct LoopInvertConfig {
     pub enabled: bool,
     pub debug: bool,
+    /// Run the VALUE-bounded affine exit-compare fold on the duplicated
+    /// bottom test (`CCC_NO_AFFINE_EXIT_FOLD` owns every producer of that
+    /// fold, so the driver resolves it and passes it down, like `enabled`).
+    pub affine_fold: bool,
+    /// Report the fold through `CCC_DEBUG_AFFINE_FOLD`, resolved the same way.
+    pub affine_fold_debug: bool,
 }
 
 impl LoopInvertConfig {
@@ -117,8 +123,18 @@ impl LoopInvertConfig {
     /// driver" claim structural: the ratchet
     /// in `tests/regression/check_env_test_hygiene.sh` can then fall and stay
     /// down, instead of counting a read that happens to have no caller today.
-    pub const fn new(enabled: bool, debug: bool) -> Self {
-        Self { enabled, debug }
+    pub const fn new(
+        enabled: bool,
+        debug: bool,
+        affine_fold: bool,
+        affine_fold_debug: bool,
+    ) -> Self {
+        Self {
+            enabled,
+            debug,
+            affine_fold,
+            affine_fold_debug,
+        }
     }
 
     /// Configuration used by the unit tests: no environment access at all.
@@ -127,6 +143,8 @@ impl LoopInvertConfig {
         Self {
             enabled: true,
             debug: false,
+            affine_fold: true,
+            affine_fold_debug: false,
         }
     }
 
@@ -135,6 +153,18 @@ impl LoopInvertConfig {
         Self {
             enabled: false,
             debug: false,
+            affine_fold: true,
+            affine_fold_debug: false,
+        }
+    }
+
+    #[cfg(test)]
+    const fn no_affine_fold() -> Self {
+        Self {
+            enabled: true,
+            debug: false,
+            affine_fold: false,
+            affine_fold_debug: false,
         }
     }
 }
@@ -167,6 +197,9 @@ pub(crate) fn invert_loops_with(func: &mut IrFunction, cfg: LoopInvertConfig) ->
             break;
         };
         apply(func, &plan);
+        if cfg.affine_fold {
+            fold_value_bound_after_invert(func, &plan, cfg.affine_fold_debug);
+        }
         rotated += 1;
         if rotated > 64 {
             break; // pathological input guard
@@ -178,6 +211,9 @@ pub(crate) fn invert_loops_with(func: &mut IrFunction, cfg: LoopInvertConfig) ->
 struct Plan {
     header: usize,
     latch: usize,
+    /// The loop body (header included) at `find_one` time; the value-bound
+    /// fold's invariance scans need it after the CFG changed.
+    body: Vec<usize>,
 }
 
 fn find_one(func: &IrFunction, debug: bool) -> Option<Plan> {
@@ -322,6 +358,7 @@ fn find_one(func: &IrFunction, debug: bool) -> Option<Plan> {
         return Some(Plan {
             header: h,
             latch: t,
+            body: lp.body.iter().copied().collect(),
         });
     }
     None
@@ -398,6 +435,330 @@ fn apply(func: &mut IrFunction, plan: &Plan) {
     latch.instructions.extend(cloned);
     latch.terminator = term;
     func.next_value_id = func.next_value_id.max(next_id);
+}
+
+/// AFFOLD-INV: fold the freshly duplicated bottom test `x + C <strict> n`
+/// into `x <strict> t`, `t = n - C` computed once in the guard block.
+///
+/// This is the machine-level sibling of `loop_rotate::fold_loop_value_bound`
+/// (same proof, post-phi-elim shape).  Soundness in exact arithmetic — no
+/// use of signed-overflow UB, so `-fwrapv` code is served faithfully:
+///
+/// * The GUARD is the retained header itself: inversion just duplicated its
+///   `add x, C ; cmp , n` into the latch, so the body edge carries the fact
+///   `x_entry + C <strict> n`.  That fact is exact only when the guard's own
+///   add cannot have wrapped, which is why `x` must enter with a CONSTANT
+///   seed: the loop's unique outside predecessor must end by `x = start`
+///   with `start + C` representable.  Without that, a prior inner-loop exit
+///   value of `x` re-entering under `-fwrapv` wraps the guard sum and the
+///   folded latch diverges from the original.
+/// * `t = n - C` cannot underflow on any path that executes the latch test:
+///   the guard established `n >= start + C + 1 > type_min + C`.
+/// * STRICT compare and STEP + 1 only, for the same reasons as the SSA
+///   fold: `<=` with `n == type_max` turns a legally infinite `-fwrapv`
+///   loop finite, and a wider step overshoots into a wrapping sum near
+///   `type_max`.
+/// * By induction (base from the guard, step from the previous latch test
+///   being true) every latch-time `x + C` is `<= n <= type_max`, so the
+///   original wrapping add was exact and both compares decide identically.
+/// * `n` is a value the loop never writes; the increment is the loop's ONLY
+///   write to `x` (`tmp = x + 1; x = tmp` in the latch, before the test),
+///   so every circuit advances `x` exactly once.
+///
+/// The rewrite deletes the duplicated add (its single consumer was the
+/// duplicated compare) — the hot latch drops from `lea; cmp; jcc` to
+/// `cmp; jcc` against a register computed once.
+fn fold_value_bound_after_invert(func: &mut IrFunction, plan: &Plan, debug: bool) -> bool {
+    use crate::ir::reexports::{IrBinOp, IrCmpOp, IrConst};
+    use crate::passes::loop_rotate::{integer_constant, integer_type_bounds};
+
+    const MAX_C: i128 = i64::MAX as i128;
+    let (h, t) = (plan.header, plan.latch);
+    let label_pos = |l: BlockId| func.blocks.iter().position(|b| b.label == l);
+    let in_loop = |l: BlockId| label_pos(l).is_some_and(|i| plan.body.contains(&i));
+
+    // Normalize a compare to `(affine_value, bound_value, strict_op)`.
+    let normalize = |lhs: &Operand,
+                     op: IrCmpOp,
+                     rhs: &Operand|
+     -> Option<(Value, Value, IrCmpOp)> {
+        match (lhs, op, rhs) {
+            (Operand::Value(a), IrCmpOp::Slt | IrCmpOp::Ult, Operand::Value(n)) => {
+                Some((*a, *n, op))
+            }
+            (Operand::Value(n), IrCmpOp::Sgt, Operand::Value(a)) => Some((*a, *n, IrCmpOp::Slt)),
+            (Operand::Value(n), IrCmpOp::Ugt, Operand::Value(a)) => Some((*a, *n, IrCmpOp::Ult)),
+            _ => None,
+        }
+    };
+
+    // ── The guard (retained header): `t0 = x0 + C ; cc0 = cmp(t0, n)`,
+    // continue on the TRUE edge.
+    let Terminator::CondBranch {
+        cond: Operand::Value(cc0),
+        true_label,
+        false_label,
+    } = func.blocks[h].terminator
+    else {
+        return false;
+    };
+    if !in_loop(true_label) || in_loop(false_label) {
+        return false;
+    }
+    let hb = &func.blocks[h];
+    let Some(Instruction::Cmp {
+        lhs, op, rhs, ty, ..
+    }) = hb.instructions.iter().find(|i| i.dest() == Some(cc0))
+    else {
+        return false;
+    };
+    let ty = *ty;
+    let Some((t0, nv, strict_op)) = normalize(lhs, *op, rhs) else {
+        return false;
+    };
+    if ty.is_unsigned() != matches!(strict_op, IrCmpOp::Ult) {
+        return false; // domain mismatch
+    }
+    let Some((lo, hi)) = integer_type_bounds(ty) else {
+        return false;
+    };
+    // The affine add in the guard: `t0 = x0 + C`.
+    let add_of =
+        |block: &crate::ir::reexports::BasicBlock, dest: Value| -> Option<(usize, Value, i128)> {
+            block
+                .instructions
+                .iter()
+                .enumerate()
+                .find_map(|(i, inst)| match inst {
+                    Instruction::BinOp {
+                        dest: d,
+                        op: IrBinOp::Add,
+                        lhs,
+                        rhs,
+                        ty: add_ty,
+                    } if *d == dest && *add_ty == ty => match (lhs, rhs) {
+                        (Operand::Value(v), Operand::Const(k))
+                        | (Operand::Const(k), Operand::Value(v)) => {
+                            Some((i, *v, integer_constant(*k, ty)?))
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                })
+        };
+    let Some((_, x0, c)) = add_of(hb, t0) else {
+        return false;
+    };
+    if !(1..=MAX_C).contains(&c) || x0 == nv {
+        return false;
+    }
+    if hb
+        .instructions
+        .iter()
+        .any(|i| i.dest() == Some(x0) || i.dest() == Some(nv))
+    {
+        return false; // the guard must only READ the IV and the bound
+    }
+
+    // ── Constant seed: unique outside predecessor whose LAST write to `x0`
+    // is `x0 = start` (every loop entry re-executes it).
+    let header_label = func.blocks[h].label;
+    let mut preds = func.blocks.iter().enumerate().filter(|(bi, b)| {
+        !plan.body.contains(bi)
+            && match &b.terminator {
+                Terminator::Branch(l) => *l == header_label,
+                Terminator::CondBranch {
+                    true_label,
+                    false_label,
+                    ..
+                } => *true_label == header_label || *false_label == header_label,
+                _ => false,
+            }
+    });
+    let (Some((p, _)), None) = (preds.next(), preds.next()) else {
+        return false;
+    };
+    let start = func.blocks[p]
+        .instructions
+        .iter()
+        .rev()
+        .find(|i| i.dest() == Some(x0))
+        .and_then(|i| match i {
+            Instruction::Copy {
+                src: Operand::Const(k),
+                ..
+            } => integer_constant(*k, ty),
+            _ => None,
+        });
+    let Some(start) = start else {
+        return false;
+    };
+    let first = start + c;
+    if !(lo..=hi).contains(&first) {
+        return false;
+    }
+
+    // ── The loop writes `x0` exactly once — `tmp = x0 + 1 ; x0 = tmp` in the
+    // latch, before the duplicated test — and never writes `n`.
+    let body: Vec<usize> = plan.body.iter().copied().filter(|&bi| bi != h).collect();
+    let mut x0_writes: Vec<(usize, usize)> = Vec::new();
+    for &bi in &body {
+        for (ii, inst) in func.blocks[bi].instructions.iter().enumerate() {
+            if inst.dest() == Some(nv) {
+                return false;
+            }
+            if inst.dest() == Some(x0) {
+                x0_writes.push((bi, ii));
+            }
+        }
+    }
+    let [(wb, wi)] = x0_writes[..] else {
+        return false;
+    };
+    if wb != t {
+        return false;
+    }
+    let plus_one = |lhs: &Operand, rhs: &Operand| -> bool {
+        match (lhs, rhs) {
+            (Operand::Value(v), Operand::Const(k)) | (Operand::Const(k), Operand::Value(v)) => {
+                *v == x0 && integer_constant(*k, ty) == Some(1)
+            }
+            _ => false,
+        }
+    };
+    // Either phi-elim's `tmp = x0 + 1 ; x0 = tmp`, or the coalesced direct
+    // `x0 = x0 + 1`.  Both read the pre-increment `x0` exactly once.
+    let step_ok = match &func.blocks[t].instructions[wi] {
+        Instruction::BinOp {
+            op: IrBinOp::Add,
+            lhs,
+            rhs,
+            ty: add_ty,
+            ..
+        } => *add_ty == ty && plus_one(lhs, rhs),
+        Instruction::Copy {
+            src: Operand::Value(tmp),
+            ..
+        } => {
+            let tmp = *tmp;
+            let feeds = func.blocks[t].instructions[..wi].iter().any(|inst| {
+                matches!(inst, Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Add,
+                    lhs,
+                    rhs,
+                    ty: add_ty,
+                } if *dest == tmp && *add_ty == ty && plus_one(lhs, rhs))
+            });
+            let tmp_writes = body
+                .iter()
+                .flat_map(|&bi| func.blocks[bi].instructions.iter())
+                .filter(|i| i.dest() == Some(tmp))
+                .count();
+            feeds && tmp_writes == 1
+        }
+        _ => false,
+    };
+    if !step_ok {
+        return false;
+    }
+
+    // ── The duplicated bottom test in the latch, AFTER the increment.
+    let Terminator::CondBranch {
+        cond: Operand::Value(cc1),
+        true_label: tl1,
+        false_label: fl1,
+    } = func.blocks[t].terminator
+    else {
+        return false;
+    };
+    if !in_loop(tl1) || in_loop(fl1) {
+        return false;
+    }
+    let tb = &func.blocks[t];
+    let Some((icmp, (clhs, cop, crhs))) =
+        tb.instructions
+            .iter()
+            .enumerate()
+            .find_map(|(i, inst)| match inst {
+                Instruction::Cmp {
+                    dest,
+                    lhs,
+                    op,
+                    rhs,
+                    ty: cmp_ty,
+                } if *dest == cc1 && *cmp_ty == ty => Some((i, (*lhs, *op, *rhs))),
+                _ => None,
+            })
+    else {
+        return false;
+    };
+    let Some((t1, nv1, strict1)) = normalize(&clhs, cop, &crhs) else {
+        return false;
+    };
+    if nv1 != nv || strict1 != strict_op {
+        return false;
+    }
+    let Some((iadd, x1, c1)) = add_of(tb, t1) else {
+        return false;
+    };
+    if x1 != x0 || c1 != c || !(wi < iadd && iadd < icmp) {
+        return false;
+    }
+    // Single consumers (structural for a fresh clone; verified cheaply).
+    let t1_uses: usize = func
+        .blocks
+        .iter()
+        .flat_map(|b| b.instructions.iter())
+        .map(|i| {
+            let mut n = 0;
+            i.for_each_used_value(|v| {
+                if v == t1.0 {
+                    n += 1;
+                }
+            });
+            n
+        })
+        .sum();
+    if t1_uses != 1 {
+        return false;
+    }
+
+    // ── All obligations hold: hoist `t = n - C` into the guard and fold.
+    let tsub = Value(func.sound_next_value_id());
+    let sub = Instruction::BinOp {
+        dest: tsub,
+        op: IrBinOp::Sub,
+        lhs: Operand::Value(nv),
+        rhs: Operand::Const(IrConst::from_i64(c as i64, ty)),
+        ty,
+    };
+    let guard = &mut func.blocks[h];
+    if guard.source_spans.len() == guard.instructions.len() {
+        if let Some(sp) = guard.source_spans.last().copied() {
+            guard.source_spans.push(sp);
+        }
+    }
+    guard.instructions.push(sub);
+    let latch = &mut func.blocks[t];
+    if latch.source_spans.len() == latch.instructions.len() {
+        latch.source_spans.remove(iadd);
+    }
+    latch.instructions.remove(iadd);
+    let icmp = icmp - 1; // the removed add preceded the compare
+    if let Instruction::Cmp { lhs, op, rhs, .. } = &mut latch.instructions[icmp] {
+        *lhs = Operand::Value(x0);
+        *op = strict_op;
+        *rhs = Operand::Value(tsub);
+    }
+    func.next_value_id = func.next_value_id.max(tsub.0 + 1);
+    if debug {
+        eprintln!(
+            "[AFFOLD] {}: value-bound fold (inverted latch): v{} + {} <strict> v{} -> v{} <strict> (v{} - {})",
+            func.name, x0.0, c, nv.0, x0.0, nv.0, c
+        );
+    }
+    true
 }
 
 fn set_dest(inst: &mut Instruction, new: Value) {
@@ -743,5 +1104,245 @@ mod tests {
         let mut f = counted_loop();
         let n = invert_loops_with(&mut f, LoopInvertConfig::disabled());
         assert_eq!(n, 0);
+    }
+
+    // ── AFFOLD-INV: the value-bound fold on the duplicated bottom test ──────
+    //
+    // The behavioural algebra (trip equivalence at the type extremes) is
+    // pinned by `loop_rotate::affine_value_bound_tests` and by the runtime
+    // gate `check_affine_value_bound.sh`; these tests pin the machine-level
+    // STRUCTURE — where the subtraction lands, that the duplicated add dies,
+    // which operands the rewritten compare reads — and every refusal clause.
+
+    const IV: u32 = 20;
+    const N: u32 = 30;
+    const TMP: u32 = 21;
+
+    /// `for (iv = seed; iv + 4 < n; iv++)` post-phi-elim:
+    ///   0 preheader : n = param0 ; iv = seed       -> 1
+    ///   1 header    : t0 = iv + 4 ; cc = t0 < n    ? 2 : 4
+    ///   2 body      : -> 3
+    ///   3 latch     : tmp = iv + 1 ; iv = tmp      -> 1
+    ///   4 exit
+    fn vb_loop(seed: Operand, step: i32, cmp_op: IrCmpOp, direct_inc: bool) -> IrFunction {
+        let ty = IrType::I32;
+        let affine = Instruction::BinOp {
+            dest: Value(11),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(IV)),
+            rhs: Operand::Const(IrConst::I32(4)),
+            ty,
+        };
+        let test = Instruction::Cmp {
+            dest: Value(10),
+            op: cmp_op,
+            lhs: Operand::Value(Value(11)),
+            rhs: Operand::Value(Value(N)),
+            ty,
+        };
+        let latch_insts = if direct_inc {
+            vec![Instruction::BinOp {
+                dest: Value(IV),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(IV)),
+                rhs: Operand::Const(IrConst::I32(step)),
+                ty,
+            }]
+        } else {
+            vec![
+                Instruction::BinOp {
+                    dest: Value(TMP),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(IV)),
+                    rhs: Operand::Const(IrConst::I32(step)),
+                    ty,
+                },
+                Instruction::Copy {
+                    dest: Value(IV),
+                    src: Operand::Value(Value(TMP)),
+                },
+            ]
+        };
+        func_of(vec![
+            blk(
+                0,
+                vec![
+                    Instruction::ParamRef {
+                        dest: Value(N),
+                        param_idx: 0,
+                        ty,
+                    },
+                    Instruction::Copy {
+                        dest: Value(IV),
+                        src: seed,
+                    },
+                ],
+                br(1),
+            ),
+            blk(1, vec![affine, test], cond(10, 2, 4)),
+            blk(2, vec![], br(3)),
+            blk(3, latch_insts, br(1)),
+            blk(4, vec![], ret()),
+        ])
+    }
+
+    fn const_seed() -> Operand {
+        Operand::Const(IrConst::I32(0))
+    }
+
+    /// The latch's compare, as `(lhs, op, rhs)`.
+    fn latch_cmp(f: &IrFunction) -> (Operand, IrCmpOp, Operand) {
+        f.blocks[3]
+            .instructions
+            .iter()
+            .find_map(|i| match i {
+                Instruction::Cmp { lhs, op, rhs, .. } => Some((*lhs, *op, *rhs)),
+                _ => None,
+            })
+            .expect("inverted latch must carry a compare")
+    }
+
+    /// The guard's hoisted `n - 4`, if present.
+    fn guard_sub(f: &IrFunction) -> Option<(u32, i64)> {
+        f.blocks[1].instructions.iter().find_map(|i| match i {
+            Instruction::BinOp {
+                dest,
+                op: IrBinOp::Sub,
+                lhs: Operand::Value(n),
+                rhs: Operand::Const(k),
+                ..
+            } if n.0 == N => Some((dest.0, k.to_i64().unwrap())),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn vb_inv_folds_the_duplicated_test() {
+        for direct in [false, true] {
+            let mut f = vb_loop(const_seed(), 1, IrCmpOp::Slt, direct);
+            assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 1);
+            let (sub_dest, sub_k) = guard_sub(&f).expect("hoisted n - 4 in the guard");
+            assert_eq!(sub_k, 4);
+            // The duplicated add is gone; the compare reads the post-increment
+            // IV against the pre-folded bound.
+            let adds_of_4 = f.blocks[3]
+                .instructions
+                .iter()
+                .filter(|i| {
+                    matches!(
+                        i,
+                        Instruction::BinOp {
+                            op: IrBinOp::Add,
+                            rhs: Operand::Const(IrConst::I32(4)),
+                            ..
+                        }
+                    )
+                })
+                .count();
+            assert_eq!(adds_of_4, 0, "the duplicated affine add must die");
+            assert_eq!(
+                latch_cmp(&f),
+                (
+                    Operand::Value(Value(IV)),
+                    IrCmpOp::Slt,
+                    Operand::Value(Value(sub_dest))
+                )
+            );
+            // The guard's own test is untouched (it still decides entry).
+            assert!(f.blocks[1].instructions.iter().any(|i| matches!(
+                i,
+                Instruction::Cmp {
+                    lhs: Operand::Value(v),
+                    ..
+                } if v.0 == 11
+            )));
+        }
+    }
+
+    #[test]
+    fn vb_inv_obeys_the_affold_kill_switch() {
+        // CCC_NO_AFFINE_EXIT_FOLD owns every producer: inversion must still
+        // happen, the fold must not.
+        let mut f = vb_loop(const_seed(), 1, IrCmpOp::Slt, false);
+        assert_eq!(
+            invert_loops_with(&mut f, LoopInvertConfig::no_affine_fold()),
+            1
+        );
+        assert!(guard_sub(&f).is_none());
+    }
+
+    #[test]
+    fn vb_inv_refuses_a_non_constant_seed() {
+        // The -fwrapv re-entry trap: an IV that lives across outer
+        // iterations re-enters with an unknown value, the guard's own add
+        // may have wrapped, and the folded latch diverges.  Seed from a
+        // parameter instead of a constant: invert, but never fold.
+        let mut f = vb_loop(Operand::Value(Value(40)), 1, IrCmpOp::Slt, false);
+        f.blocks[0].instructions.insert(
+            0,
+            Instruction::ParamRef {
+                dest: Value(40),
+                param_idx: 1,
+                ty: IrType::I32,
+            },
+        );
+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 1);
+        assert!(guard_sub(&f).is_none());
+    }
+
+    #[test]
+    fn vb_inv_refuses_step_two() {
+        let mut f = vb_loop(const_seed(), 2, IrCmpOp::Slt, false);
+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 1);
+        assert!(guard_sub(&f).is_none());
+    }
+
+    #[test]
+    fn vb_inv_refuses_non_strict_compare() {
+        let mut f = vb_loop(const_seed(), 1, IrCmpOp::Sle, false);
+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 1);
+        assert!(guard_sub(&f).is_none());
+    }
+
+    #[test]
+    fn vb_inv_refuses_unsigned_compare_on_signed_domain_mismatch() {
+        // `ult` on a SIGNED i32 type: the domain check must refuse.
+        let mut f = vb_loop(const_seed(), 1, IrCmpOp::Ult, false);
+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 1);
+        assert!(guard_sub(&f).is_none());
+    }
+
+    #[test]
+    fn vb_inv_refuses_a_bound_written_in_the_loop() {
+        let mut f = vb_loop(const_seed(), 1, IrCmpOp::Slt, false);
+        f.blocks[2].instructions.push(Instruction::Copy {
+            dest: Value(N),
+            src: Operand::Const(IrConst::I32(7)),
+        });
+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 1);
+        assert!(guard_sub(&f).is_none());
+    }
+
+    #[test]
+    fn vb_inv_refuses_two_outside_entries() {
+        // A second edge into the header: the constant seed no longer
+        // dominates every entry, so the guard fact is unproven on one path.
+        let mut f = vb_loop(const_seed(), 1, IrCmpOp::Slt, false);
+        f.blocks.push(blk(
+            5,
+            vec![Instruction::Copy {
+                dest: Value(IV),
+                src: Operand::Const(IrConst::I32(1)),
+            }],
+            br(1),
+        ));
+        // Make it reachable so CfgAnalysis keeps it: entry now forks.
+        f.blocks[0].terminator = Terminator::CondBranch {
+            cond: Operand::Value(Value(N)),
+            true_label: BlockId(1),
+            false_label: BlockId(5),
+        };
+        assert_eq!(invert_loops_with(&mut f, LoopInvertConfig::testing()), 1);
+        assert!(guard_sub(&f).is_none());
     }
 }

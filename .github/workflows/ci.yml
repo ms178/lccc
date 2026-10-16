@@ -1218,6 +1218,10 @@ jobs:
         # FileLiveness backward-edge fix the fusion refused the rotated
         # setcc shape and the `leaq` temporary stayed per-iteration.
         bash tests/regression/check_affine_exit_compare.sh
+        # AFFOLD-VB: value-bounded affine exit-compare fold -- GCC runtime
+        # parity at the underflow edges, fire count on the guarded shapes,
+        # refusals, and the CCC_NO_AFFINE_EXIT_FOLD kill switch.
+        bash tests/regression/check_affine_value_bound.sh
         # MINMAX-1: integer min/max reductions lower to packed vpmin/vpmax
         # on AVX2, and every shape the transform does not model (unsigned,
         # 16-bit, float, guarded, multi-accumulator) stays scalar AND stays

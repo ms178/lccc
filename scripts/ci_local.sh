@@ -925,6 +925,14 @@ gate "vec-chain-exit-phi" fast \
 gate "affine-exit-compare" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_affine_exit_compare.sh
 
+# AFFOLD-VB: the VALUE-bounded affine exit-compare fold (`iv + C < n` ->
+# `iv < n - C` behind the zero-trip guard).  Pins runtime parity with GCC at
+# the LONG_MIN underflow edges, the fire count on the guarded do-while
+# shapes, the refusals (non-strict, step 2, unguarded top-test), and the
+# CCC_NO_AFFINE_EXIT_FOLD ownership.
+gate "affine-value-bound" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_affine_value_bound.sh
+
 gate "minmax-reduction" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_minmax_reduction.sh
 
