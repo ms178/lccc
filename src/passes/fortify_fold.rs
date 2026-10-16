@@ -611,7 +611,11 @@ fn classify(
 
 /// Entry point: fold every eligible hardened or plain stdio call in the
 /// module.  `size_t_is_u32` selects fwrite's size_t width (ILP32 targets).
-pub fn run(module: &mut IrModule, size_t_is_u32: bool) {
+pub fn run(
+    module: &mut IrModule,
+    size_t_is_u32: bool,
+    libcalls: &crate::passes::libcall::LibcallAllowance,
+) {
     let strings: FxHashMap<String, String> = module
         .string_literals
         .iter()
@@ -685,6 +689,18 @@ pub fn run(module: &mut IrModule, size_t_is_u32: bool) {
                     next_val,
                     &fresh,
                 ) {
+                    // A13: neither replace the original call (the TU may
+                    // define or withdraw the callee the fold assumes) nor
+                    // synthesise a call to a stdio function this TU defines
+                    // (or a withdrawn one).  The decision is dropped whole,
+                    // so the original printf call stays.
+                    if !crate::passes::libcall::stdio_fold_permitted(
+                        callee,
+                        &decision.insts,
+                        libcalls,
+                    ) {
+                        continue;
+                    }
                     if decision.new_literal.is_some() {
                         literal_counter += 1;
                     }
@@ -800,7 +816,11 @@ mod tests {
         let mut module = IrModule::default();
         module.string_literals = strings;
         module.functions = vec![func];
-        run(&mut module, false);
+        run(
+            &mut module,
+            false,
+            &crate::passes::libcall::LibcallAllowance::unrestricted(),
+        );
         module.functions.pop().unwrap()
     }
 

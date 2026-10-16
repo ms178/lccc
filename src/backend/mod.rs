@@ -17,6 +17,7 @@ pub(crate) mod f128_softfloat; // Shared F128 soft-float orchestration (ARM + RI
 pub(crate) mod generation; // Module/function/instruction dispatch
 mod global_alignment;
 pub(crate) mod inline_asm; // InlineAsmEmitter trait and shared framework
+pub(crate) mod libcall_policy; // A13/A14: TU definitions vs the builtin contract
 mod label_identity;
 pub(crate) mod stack_layout; // Stack layout: slot assignment, alloca coalescing, regalloc helpers
 pub(crate) mod state; // CodegenState, StackSlot, SlotAddr

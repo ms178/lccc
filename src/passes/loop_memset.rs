@@ -90,10 +90,10 @@ impl ShortName for Instruction {
 
 /// Run to a small fixed point (a transformed loop cannot expose a new one,
 /// but the loop bounds the sweep defensively, mirroring sibling passes).
-pub fn run(func: &mut IrFunction) -> usize {
+pub fn run(func: &mut IrFunction, libcalls: &crate::passes::libcall::LibcallAllowance) -> usize {
     let mut total = 0;
     for _ in 0..4 {
-        let n = run_once(func);
+        let n = run_once(func, libcalls);
         if n == 0 {
             break;
         }
@@ -120,10 +120,16 @@ fn fresh_labels(
     )
 }
 
-fn run_once(func: &mut IrFunction) -> usize {
+fn run_once(func: &mut IrFunction, libcalls: &crate::passes::libcall::LibcallAllowance) -> usize {
     let Some(plan) = find_idiom(func) else {
         return 0;
     };
+    // A13: never synthesise a call to a `memset` this TU defines (or a
+    // withdrawn one).  The loop itself is `plan`-matched only for the
+    // constant-fill shape, so refusing costs nothing else.
+    if !libcalls.may_use("memset") {
+        return 0;
+    }
     apply_idiom(func, plan)
 }
 
@@ -2100,7 +2106,10 @@ mod tests {
     #[test]
     fn zero_loop_is_recognized_and_rewritten() {
         let mut f = zero_loop_func(1024);
-        let n = run(&mut f);
+        let n = run(
+            &mut f,
+            &crate::passes::libcall::LibcallAllowance::unrestricted(),
+        );
         assert_eq!(n, 1, "the zero loop must transform");
 
         // The header block is gone; G and M exist; P branches to G.
@@ -2149,7 +2158,14 @@ mod tests {
         // signature) — the loop could be a zero-trip-unsafe do-while.
         let mut f = zero_loop_func(1024);
         f.blocks[1].terminator = Terminator::Branch(BlockId(2));
-        assert_eq!(run(&mut f), 0, "unguarded loop must refuse");
+        assert_eq!(
+            run(
+                &mut f,
+                &crate::passes::libcall::LibcallAllowance::unrestricted()
+            ),
+            0,
+            "unguarded loop must refuse"
+        );
     }
 
     #[test]
@@ -2175,7 +2191,14 @@ mod tests {
             seg_override: crate::common::types::AddressSpace::Default,
             volatile: false,
         });
-        assert_eq!(run(&mut f), 0, "copy loop must refuse");
+        assert_eq!(
+            run(
+                &mut f,
+                &crate::passes::libcall::LibcallAllowance::unrestricted()
+            ),
+            0,
+            "copy loop must refuse"
+        );
     }
 
     #[test]
@@ -2187,7 +2210,14 @@ mod tests {
                 *val = Operand::Const(IrConst::I8(i8::from_be_bytes([0xAA])));
             }
         }
-        assert_eq!(run(&mut f), 1, "uniform byte fill must transform");
+        assert_eq!(
+            run(
+                &mut f,
+                &crate::passes::libcall::LibcallAllowance::unrestricted()
+            ),
+            1,
+            "uniform byte fill must transform"
+        );
     }
 
     #[test]
@@ -2201,7 +2231,14 @@ mod tests {
                 *ty = IrType::U32;
             }
         }
-        assert_eq!(run(&mut f), 0, "wide nonzero pattern must refuse");
+        assert_eq!(
+            run(
+                &mut f,
+                &crate::passes::libcall::LibcallAllowance::unrestricted()
+            ),
+            0,
+            "wide nonzero pattern must refuse"
+        );
     }
 
     #[test]
@@ -2217,6 +2254,13 @@ mod tests {
                 }
             }
         }
-        assert_eq!(run(&mut f), 0, "non-memset-able constant must refuse");
+        assert_eq!(
+            run(
+                &mut f,
+                &crate::passes::libcall::LibcallAllowance::unrestricted()
+            ),
+            0,
+            "non-memset-able constant must refuse"
+        );
     }
 }

@@ -1365,6 +1365,42 @@ impl Driver {
                 arg if arg == "-fno-exceptions" => {
                     self.exceptions = false;
                 }
+                // ---- A13: which library calls an optimisation may create ----
+                // A pass may replace user code with a call to a standard
+                // library function (`loop_idiom` -> memcpy/memmove,
+                // `loop_memset` -> memset, `fortify_fold` -> puts/fwrite/...).
+                // That is only sound while the callee really is the library
+                // function: a translation unit that defines `memcpy` (glibc's
+                // own string routines do) makes the synthesised call resolve
+                // into a definition the compiled code is part of — unbounded
+                // self-recursion, or a silently ignored user definition.
+                // These arms record the CLI half of the policy; the passes
+                // consult it together with the TU's own definitions
+                // (`passes::libcall::LibcallAllowance`).
+                //
+                // Semantics follow GCC: `-ffreestanding` implies
+                // `-fno-builtin`; `-fbuiltin`/`-fhosted` clear the *blanket*
+                // withdrawal (last one wins); a per-name `-fno-builtin-<fn>`
+                // is sticky (GCC keeps it even after a later `-fbuiltin`) and
+                // is never cleared by the blanket arms.
+                //
+                // `-ffreestanding` additionally flips `__STDC_HOSTED__` to 0
+                // (C11 4p6) — Linux's arch/x86/boot and most firmware pass
+                // this flag, and headers branch on the macro.
+                arg if arg == "-ffreestanding" => {
+                    self.freestanding = true;
+                    self.builtin_policy.withdraw_all();
+                }
+                arg if arg == "-fhosted" => {
+                    self.freestanding = false;
+                    self.builtin_policy.restore_all();
+                }
+                arg if arg == "-fbuiltin" => self.builtin_policy.restore_all(),
+                arg if arg == "-fno-builtin" => self.builtin_policy.withdraw_all(),
+                arg if arg.starts_with("-fno-builtin-") => {
+                    self.builtin_policy
+                        .withdraw_one(&arg["-fno-builtin-".len()..]);
+                }
                 // Plain-char signedness overrides (GCC-compatible): these
                 // re-record the process-global AFTER the target default was
                 // installed, so they win regardless of order relative to it.
