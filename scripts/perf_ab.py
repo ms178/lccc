@@ -217,6 +217,15 @@ PRESETS: dict[str, dict[str, Any]] = {
 }
 
 
+def format_elapsed_change(ratio_b_over_a: float) -> str:
+    """Describe B/A as an elapsed-time delta, not its reciprocal speedup."""
+    delta = 100.0 * (ratio_b_over_a - 1.0)
+    if delta == 0:
+        return "B and A have equal elapsed time"
+    direction = "higher" if delta > 0 else "lower"
+    return f"B elapsed time is {abs(delta):.2f}% {direction} than A"
+
+
 def matched_link_flags(flags: list[str], *compilers: str) -> list[str]:
     """Put automatic libm linkage in BOTH arms and in the reported flags.
 
@@ -901,17 +910,15 @@ def main() -> int:
                     f"VERDICT: NO MEASURABLE DIFFERENCE ({pct:+.2f}%, below "
                     f"{args.min_delta:.1f}% noise threshold)"
                 )
-            elif pct > 0:
-                print(f"VERDICT: configuration A is {pct:.2f}% FASTER overall (B/A = {geomean_val:.4f})")
             else:
-                print(f"VERDICT: configuration A is {-pct:.2f}% SLOWER overall (B/A = {geomean_val:.4f})")
+                print(f"VERDICT: {format_elapsed_change(geomean_val)} (B/A = {geomean_val:.4f})")
 
             a_faster = sorted((item for item in movers if item[0] > 1.0), reverse=True)
             a_slower = sorted(item for item in movers if item[0] < 1.0)
             if a_faster:
-                print("  A faster on: " + ", ".join(f"{n} ({100 * (r - 1):+.1f}%)" for r, n in a_faster[:5]))
+                print("  B elapsed-time increases: " + ", ".join(f"{n} ({100 * (r - 1):+.1f}%)" for r, n in a_faster[:5]))
             if a_slower:
-                print("  A slower on: " + ", ".join(f"{n} ({100 * (r - 1):+.1f}%)" for r, n in a_slower[:5]))
+                print("  B elapsed-time reductions: " + ", ".join(f"{n} ({100 * (r - 1):+.1f}%)" for r, n in a_slower[:5]))
 
         if skipped:
             print(f"\nExcluded startup-floor benchmarks ({len(skipped)}): {', '.join(skipped)}")

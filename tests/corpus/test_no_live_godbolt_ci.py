@@ -1,4 +1,5 @@
-"""Live CE research is not a GitHub CI gate; offline helper tests remain."""
+"""Live CE is isolated from push/PR gates; scheduled/manual research stays strict."""
+from copy import deepcopy
 from pathlib import Path
 import re
 import shlex
@@ -28,15 +29,61 @@ def live_invocations(run):
     return found
 
 
+def validate_workflow(workflow, name):
+    invocations = [tool for job in workflow.get('jobs', {}).values()
+                   for step in job.get('steps', [])
+                   for tool in live_invocations(step.get('run', ''))]
+    if name != 'oracle-delta.yml':
+        assert not invocations, 'live CE in an ordinary workflow'
+        return
+    assert set(workflow['on']) == {'schedule', 'workflow_dispatch'}
+    assert workflow['on']['schedule'], 'research schedule must not be empty'
+    assert invocations == ['oracle_delta_gate'], 'one explicit live delta survey'
+    jobs = workflow['jobs']
+    assert set(jobs) == {'oracle-delta'}
+    job = jobs['oracle-delta']
+    assert not job.get('continue-on-error'), 'outages must be visible research failures'
+    steps = job['steps']
+    live = next(step for step in steps if live_invocations(step.get('run', '')))
+    argv = shlex.split(live['run'])
+    assert '--strict' in argv and '--report' in argv
+    assert not live.get('continue-on-error')
+    assert '||' not in argv, 'do not hide a research producer failure'
+    assert any(step.get('uses', '').startswith('actions/upload-artifact@')
+               and step.get('if') == 'always()' for step in steps)
+
+
 class NoLiveGodboltCI(unittest.TestCase):
-    def test_actual_workflows_do_not_execute_live_oracles(self):
+    def test_live_oracles_are_isolated_from_required_ci(self):
         for path in (ROOT / '.github/workflows').glob('*.yml'):
             workflow = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
             with self.subTest(workflow=path.name):
-                self.assertNotIn('oracle-delta', workflow.get('jobs', {}))
-                for job in workflow.get('jobs', {}).values():
-                    for step in job.get('steps', []):
-                        self.assertEqual(live_invocations(step.get('run', '')), [])
+                validate_workflow(workflow, path.name)
+
+    def test_research_cannot_become_an_automatic_pr_gate(self):
+        original = yaml.load((ROOT / '.github/workflows/oracle-delta.yml').read_text(),
+                             Loader=yaml.BaseLoader)
+        for event in ('push', 'pull_request', 'pull_request_target', 'workflow_call'):
+            changed = deepcopy(original)
+            changed['on'][event] = {}
+            with self.subTest(event=event), self.assertRaises(AssertionError):
+                validate_workflow(changed, 'oracle-delta.yml')
+
+    def test_research_failures_and_missing_artifacts_are_not_silenced(self):
+        original = yaml.load((ROOT / '.github/workflows/oracle-delta.yml').read_text(),
+                             Loader=yaml.BaseLoader)
+        for mutation in ('non-strict', 'allowed-failure', 'lost-artifact'):
+            changed = deepcopy(original)
+            job = changed['jobs']['oracle-delta']
+            if mutation == 'non-strict':
+                for step in job['steps']:
+                    if 'run' in step: step['run'] = step['run'].replace('--strict', '')
+            elif mutation == 'allowed-failure':
+                job['continue-on-error'] = 'true'
+            else:
+                for step in job['steps']: step.pop('if', None)
+            with self.subTest(mutation=mutation), self.assertRaises(AssertionError):
+                validate_workflow(changed, 'oracle-delta.yml')
 
     def test_live_compiler_calls_fail_the_policy_even_in_a_step_with_tests(self):
         for tool in ('godbolt', 'codegen_oracle', 'benchmark_codegen', 'loop_density_oracle',

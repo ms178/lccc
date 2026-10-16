@@ -6557,20 +6557,36 @@ impl X86Codegen {
                     self.flush_pending_vec_store_impl();
                     self.state.invalidate_vec_peephole();
                     self.operand_to_reg(&args[0], "rax");
+                    // A new I32x4 value owns its allocated register's whole
+                    // family. Write its VEX definition directly there: routing
+                    // through generic SSE store staging leaves a legacy copy
+                    // when late VEX promotion is deliberately disabled.
+                    let home = if self.avx2_enabled {
+                        dest.and_then(|d| self.dest_xmm_home_name(&d))
+                    } else {
+                        None
+                    };
+                    let target = home.unwrap_or("xmm0");
                     if self.avx2_enabled {
-                        // This intrinsic owns scratch xmm0. Its upper half
-                        // is dead after the pending-store flush: emit VEX at
+                        // This intrinsic owns its new home or scratch xmm0.
+                        // Upper bits are dead: emit VEX at
                         // source instead of hoping a later text pass can
                         // prove the kill across a packed conversion/backedge.
-                        self.state.emit("    vmovd %eax, %xmm0");
-                        self.state.emit("    vpshufd $0x00, %xmm0, %xmm0");
+                        self.state
+                            .emit_fmt(format_args!("    vmovd %eax, %{}", target));
+                        self.state
+                            .emit_fmt(format_args!("    vpshufd $0x00, %{}, %{}", target, target));
                     } else {
                         self.state.emit("    movd %eax, %xmm0");
                         self.state.emit("    pshufd $0x00, %xmm0, %xmm0");
                     }
                     if let Some(d) = dest {
                         self.state.vector_values.insert(d.0);
-                        self.sse_store_dest(d, "xmm0");
+                        if home.is_some() {
+                            self.sse_commit_dest_direct(d, target);
+                        } else {
+                            self.sse_store_dest(d, "xmm0");
+                        }
                     }
                 }
             }
@@ -6990,6 +7006,9 @@ impl X86Codegen {
                 // scratch].  The scalar denominator DAG is cloned by the pass
                 // for each lane; packing only its already-computed I32 leaves
                 // C's signed-div/mod semantics to the ordinary scalar IR.
+                // The packed variant instead has [acc, I32x4, base, offset,
+                // scratch]; its four lanes have already been computed by
+                // equivalent lane-wise modular integer operations.
                 let packed = matches!(op, IntrinsicOp::StrictRecipMulAddPackedF64x4);
                 assert_eq!(
                     args.len(),

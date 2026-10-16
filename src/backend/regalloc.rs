@@ -6167,7 +6167,6 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                 | O::VecFnmaF32x4
                 | O::VecAddI32x4
                 | O::VecAddI32x8
-                | O::StrictRecipMulAddPackedF64x4
                 | O::VecAddI8x32
                 | O::VecAddF32x4
                 | O::VecAddF32x8
@@ -8666,7 +8665,7 @@ fn collect_f64_values(func: &IrFunction, fp_extract_homes: bool) -> FxHashSet<u3
                         | O::VecHorizontalAddF64x4
                         | O::VecHorizontalAddF64x2
                         | O::StrictRecipMulAddF64x4
-                        | O::StrictRecipMulAddPackedF64x4
+                                | O::StrictRecipMulAddPackedF64x4
                         | O::VecHorizontalAddF32x8
                         | O::VecHorizontalAddF32x4
                 ) || (fp_extract_homes

@@ -2684,6 +2684,45 @@ mod cli_tests {
     }
 
     #[test]
+    fn wrap_trapping_and_rounding_flags_are_independent() {
+        for wraps in [false, true] {
+            for trapping in [false, true] {
+                for rounding in [false, true] {
+                    let flags = [
+                        if wraps { "-fwrapv" } else { "-fno-wrapv" },
+                        if trapping {
+                            "-ftrapping-math"
+                        } else {
+                            "-fno-trapping-math"
+                        },
+                        if rounding {
+                            "-frounding-math"
+                        } else {
+                            "-fno-rounding-math"
+                        },
+                    ];
+                    for reverse in [false, true] {
+                        let mut ordered = flags.to_vec();
+                        if reverse {
+                            ordered.reverse();
+                        }
+                        let args: Vec<String> = std::iter::once("lccc")
+                            .chain(ordered)
+                            .chain(["x.c"])
+                            .map(str::to_owned)
+                            .collect();
+                        let mut driver = Driver::new();
+                        driver.parse_cli_args(&args).unwrap();
+                        assert_eq!(driver.wrap_signed_overflow, wraps, "{args:?}");
+                        assert_eq!(driver.fp_trapping_math, trapping, "{args:?}");
+                        assert_eq!(driver.fp_rounding_math, rounding, "{args:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn signed_wrap_option_is_explicit_and_last_wins() {
         for (flags, expected) in [
             (vec!["-O3"], false),
@@ -2899,6 +2938,28 @@ mod cli_tests {
         ];
         nfm_off.parse_cli_args(&args).unwrap();
         assert!(nfm_off.fp_contract == FpContract::Off);
+    }
+
+    #[test]
+    fn rounding_policy_is_independent_and_last_wins_redteam() {
+        for (flags, rounding, trapping) in [
+            (vec!["-frounding-math", "-fno-trapping-math"], true, false),
+            (vec!["-ftrapping-math", "-fno-rounding-math"], false, true),
+            (vec!["-frounding-math", "-fno-rounding-math"], false, false),
+            (vec!["-fno-rounding-math", "-frounding-math"], true, false),
+            (vec!["-frounding-math", "-ffast-math"], false, false),
+            (vec!["-ffast-math", "-frounding-math"], true, false),
+        ] {
+            let mut driver = Driver::new();
+            let args: Vec<String> = std::iter::once("lccc")
+                .chain(flags)
+                .chain(std::iter::once("x.c"))
+                .map(str::to_owned)
+                .collect();
+            driver.parse_cli_args(&args).unwrap();
+            assert_eq!(driver.fp_rounding_math, rounding, "{args:?}");
+            assert_eq!(driver.fp_trapping_math, trapping, "{args:?}");
+        }
     }
 
     #[test]

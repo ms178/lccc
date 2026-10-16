@@ -308,7 +308,13 @@ impl InlineAsmEmitter for X86Codegen {
         }
     }
 
-    fn load_input_to_reg(&mut self, op: &AsmOperand, val: &Operand, _constraint: &str) {
+    fn load_input_to_reg(
+        &mut self,
+        op: &AsmOperand,
+        val: &Operand,
+        _constraint: &str,
+        _operands: &[AsmOperand],
+    ) {
         let reg = &op.reg;
         let ty = op.operand_type;
 
@@ -1124,7 +1130,7 @@ mod tied_operand_no_slot_tests {
         let mut cg = X86Codegen::new();
         cg.reg_assignments.insert(43, PhysReg(3)); // r13, fresh home
         let op = tied_rcx_operand();
-        cg.load_input_to_reg(&op, &Operand::Value(Value(43)), "0");
+        cg.load_input_to_reg(&op, &Operand::Value(Value(43)), "0", &[]);
         let text = emitted(&cg);
         assert_eq!(text, "movq %r13, %rcx");
     }
@@ -1136,7 +1142,7 @@ mod tied_operand_no_slot_tests {
         let mut cg = X86Codegen::new();
         cg.state.park_acc(43, false);
         let op = tied_rcx_operand();
-        cg.load_input_to_reg(&op, &Operand::Value(Value(43)), "0");
+        cg.load_input_to_reg(&op, &Operand::Value(Value(43)), "0", &[]);
         let text = emitted(&cg);
         assert_eq!(text, "movq %rax, %rcx");
     }
@@ -1151,7 +1157,7 @@ mod tied_operand_no_slot_tests {
         cg.reg_assignments.insert(43, PhysReg(10)); // r11
         let mut op = tied_rcx_operand();
         op.reg = "r11".to_string();
-        cg.load_input_to_reg(&op, &Operand::Value(Value(43)), "0");
+        cg.load_input_to_reg(&op, &Operand::Value(Value(43)), "0", &[]);
         let text = emitted(&cg);
         assert_eq!(text, "");
     }
@@ -1165,7 +1171,7 @@ mod tied_operand_no_slot_tests {
         cg.reg_assignments.insert(7, PhysReg(3)); // r13
         let mut op = tied_rcx_operand();
         op.operand_type = IrType::U8;
-        cg.load_input_to_reg(&op, &Operand::Value(Value(7)), "0");
+        cg.load_input_to_reg(&op, &Operand::Value(Value(7)), "0", &[]);
         let text = emitted(&cg);
         assert_eq!(text, "movq %r13, %rcx");
     }

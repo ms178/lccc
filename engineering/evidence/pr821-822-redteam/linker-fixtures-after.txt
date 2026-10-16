@@ -1,0 +1,17 @@
+
+[PASS] script_tls_gd_ld_relaxation
+    GD/LD native + GNU ld controls + two TLS poisons
+
+== linker tests: 1 pass, 0 fail, 0 warn, 0 skip (oracles: bfd lld) ==
+
+[PASS] note_run_merge
+    3 notes in 2 PT_NOTE run(s)
+[PASS] note_run_oracle_contract
+    six padding/payload boundary controls
+
+== linker tests: 2 pass, 0 fail, 0 warn, 0 skip (oracles: bfd lld) ==
+
+[PASS] script_tls_gd_ld_relaxation
+    GD/LD native + GNU ld controls + two TLS poisons
+
+== linker tests: 1 pass, 0 fail, 0 warn, 0 skip (oracles: bfd lld) ==

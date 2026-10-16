@@ -1,0 +1,2782 @@
+{
+  "complete": true,
+  "rows": [
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O1",
+      "rotation": false,
+      "source": "affine_control_proof.c",
+      "source_sha256": "737061257fbc2a8e87f8eaca463cd78ca9987af0b2bbf37f1f2b9e3941d65e81",
+      "args": [],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O1",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/affine_control_proof.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O1-0-affine_control_proof-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "affine-control-proof 5 97\n",
+      "run": {
+        "status": 0,
+        "stdout": "affine-control-proof 5 97\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O1",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "0"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O1",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O1-0-wrapv_domains-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "28\n",
+      "run": {
+        "status": 0,
+        "stdout": "28\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O1",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "1"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O1",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O1-0-wrapv_domains-1"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "-1073665362\n",
+      "run": {
+        "status": 0,
+        "stdout": "-1073665362\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O1",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "2"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O1",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O1-0-wrapv_domains-2"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "1\n",
+      "run": {
+        "status": 0,
+        "stdout": "1\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O1",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "3"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O1",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O1-0-wrapv_domains-3"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "10\n",
+      "run": {
+        "status": 0,
+        "stdout": "10\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O1",
+      "rotation": true,
+      "source": "affine_control_proof.c",
+      "source_sha256": "737061257fbc2a8e87f8eaca463cd78ca9987af0b2bbf37f1f2b9e3941d65e81",
+      "args": [],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O1",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/affine_control_proof.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O1-1-affine_control_proof-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "affine-control-proof 5 97\n",
+      "run": {
+        "status": 0,
+        "stdout": "affine-control-proof 5 97\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O1",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "0"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O1",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O1-1-wrapv_domains-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "28\n",
+      "run": {
+        "status": 0,
+        "stdout": "28\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O1",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "1"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O1",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O1-1-wrapv_domains-1"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "-1073665362\n",
+      "run": {
+        "status": 0,
+        "stdout": "-1073665362\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O1",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "2"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O1",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O1-1-wrapv_domains-2"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "1\n",
+      "run": {
+        "status": 0,
+        "stdout": "1\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O1",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "3"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O1",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O1-1-wrapv_domains-3"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "10\n",
+      "run": {
+        "status": 0,
+        "stdout": "10\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O2",
+      "rotation": false,
+      "source": "affine_control_proof.c",
+      "source_sha256": "737061257fbc2a8e87f8eaca463cd78ca9987af0b2bbf37f1f2b9e3941d65e81",
+      "args": [],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O2",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/affine_control_proof.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O2-0-affine_control_proof-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "affine-control-proof 5 97\n",
+      "run": {
+        "status": 0,
+        "stdout": "affine-control-proof 5 97\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O2",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "0"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O2",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O2-0-wrapv_domains-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "28\n",
+      "run": {
+        "status": 0,
+        "stdout": "28\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O2",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "1"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O2",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O2-0-wrapv_domains-1"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "-1073665362\n",
+      "run": {
+        "status": 0,
+        "stdout": "-1073665362\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O2",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "2"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O2",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O2-0-wrapv_domains-2"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "1\n",
+      "run": {
+        "status": 0,
+        "stdout": "1\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O2",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "3"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O2",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O2-0-wrapv_domains-3"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "10\n",
+      "run": {
+        "status": 0,
+        "stdout": "10\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O2",
+      "rotation": true,
+      "source": "affine_control_proof.c",
+      "source_sha256": "737061257fbc2a8e87f8eaca463cd78ca9987af0b2bbf37f1f2b9e3941d65e81",
+      "args": [],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O2",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/affine_control_proof.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O2-1-affine_control_proof-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "affine-control-proof 5 97\n",
+      "run": {
+        "status": 0,
+        "stdout": "affine-control-proof 5 97\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O2",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "0"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O2",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O2-1-wrapv_domains-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "28\n",
+      "run": {
+        "status": 0,
+        "stdout": "28\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O2",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "1"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O2",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O2-1-wrapv_domains-1"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "-1073665362\n",
+      "run": {
+        "status": 0,
+        "stdout": "-1073665362\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O2",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "2"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O2",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O2-1-wrapv_domains-2"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "1\n",
+      "run": {
+        "status": 0,
+        "stdout": "1\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O2",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "3"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O2",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O2-1-wrapv_domains-3"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "10\n",
+      "run": {
+        "status": 0,
+        "stdout": "10\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O3",
+      "rotation": false,
+      "source": "affine_control_proof.c",
+      "source_sha256": "737061257fbc2a8e87f8eaca463cd78ca9987af0b2bbf37f1f2b9e3941d65e81",
+      "args": [],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O3",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/affine_control_proof.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O3-0-affine_control_proof-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "affine-control-proof 5 97\n",
+      "run": {
+        "status": 0,
+        "stdout": "affine-control-proof 5 97\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O3",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "0"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O3",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O3-0-wrapv_domains-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "28\n",
+      "run": {
+        "status": 0,
+        "stdout": "28\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O3",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "1"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O3",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O3-0-wrapv_domains-1"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "-1073665362\n",
+      "run": {
+        "status": 0,
+        "stdout": "-1073665362\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O3",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "2"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O3",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O3-0-wrapv_domains-2"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "1\n",
+      "run": {
+        "status": 0,
+        "stdout": "1\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O3",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "3"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O3",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O3-0-wrapv_domains-3"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "10\n",
+      "run": {
+        "status": 0,
+        "stdout": "10\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O3",
+      "rotation": true,
+      "source": "affine_control_proof.c",
+      "source_sha256": "737061257fbc2a8e87f8eaca463cd78ca9987af0b2bbf37f1f2b9e3941d65e81",
+      "args": [],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O3",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/affine_control_proof.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O3-1-affine_control_proof-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "affine-control-proof 5 97\n",
+      "run": {
+        "status": 0,
+        "stdout": "affine-control-proof 5 97\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O3",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "0"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O3",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O3-1-wrapv_domains-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "28\n",
+      "run": {
+        "status": 0,
+        "stdout": "28\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O3",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "1"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O3",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O3-1-wrapv_domains-1"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "-1073665362\n",
+      "run": {
+        "status": 0,
+        "stdout": "-1073665362\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O3",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "2"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O3",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O3-1-wrapv_domains-2"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "1\n",
+      "run": {
+        "status": 0,
+        "stdout": "1\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-O3",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "3"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O3",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--O3-1-wrapv_domains-3"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "10\n",
+      "run": {
+        "status": 0,
+        "stdout": "10\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-Os",
+      "rotation": false,
+      "source": "affine_control_proof.c",
+      "source_sha256": "737061257fbc2a8e87f8eaca463cd78ca9987af0b2bbf37f1f2b9e3941d65e81",
+      "args": [],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-Os",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/affine_control_proof.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--Os-0-affine_control_proof-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "affine-control-proof 5 97\n",
+      "run": {
+        "status": 0,
+        "stdout": "affine-control-proof 5 97\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-Os",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "0"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-Os",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--Os-0-wrapv_domains-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "28\n",
+      "run": {
+        "status": 0,
+        "stdout": "28\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-Os",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "1"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-Os",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--Os-0-wrapv_domains-1"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "-1073665362\n",
+      "run": {
+        "status": 0,
+        "stdout": "-1073665362\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-Os",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "2"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-Os",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--Os-0-wrapv_domains-2"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "1\n",
+      "run": {
+        "status": 0,
+        "stdout": "1\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-Os",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "3"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-Os",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--Os-0-wrapv_domains-3"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "10\n",
+      "run": {
+        "status": 0,
+        "stdout": "10\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-Os",
+      "rotation": true,
+      "source": "affine_control_proof.c",
+      "source_sha256": "737061257fbc2a8e87f8eaca463cd78ca9987af0b2bbf37f1f2b9e3941d65e81",
+      "args": [],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-Os",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/affine_control_proof.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--Os-1-affine_control_proof-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "affine-control-proof 5 97\n",
+      "run": {
+        "status": 0,
+        "stdout": "affine-control-proof 5 97\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-Os",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "0"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-Os",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--Os-1-wrapv_domains-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "28\n",
+      "run": {
+        "status": 0,
+        "stdout": "28\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-Os",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "1"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-Os",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--Os-1-wrapv_domains-1"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "-1073665362\n",
+      "run": {
+        "status": 0,
+        "stdout": "-1073665362\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-Os",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "2"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-Os",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--Os-1-wrapv_domains-2"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "1\n",
+      "run": {
+        "status": 0,
+        "stdout": "1\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "64",
+      "opt": "-Os",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "3"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-Os",
+        "-m64",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-64--Os-1-wrapv_domains-3"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "10\n",
+      "run": {
+        "status": 0,
+        "stdout": "10\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O1",
+      "rotation": false,
+      "source": "affine_control_proof.c",
+      "source_sha256": "737061257fbc2a8e87f8eaca463cd78ca9987af0b2bbf37f1f2b9e3941d65e81",
+      "args": [],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O1",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/affine_control_proof.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O1-0-affine_control_proof-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "affine-control-proof 5 97\n",
+      "run": {
+        "status": 0,
+        "stdout": "affine-control-proof 5 97\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O1",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "0"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O1",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O1-0-wrapv_domains-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "28\n",
+      "run": {
+        "status": 0,
+        "stdout": "28\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O1",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "1"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O1",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O1-0-wrapv_domains-1"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "-1073665362\n",
+      "run": {
+        "status": 0,
+        "stdout": "-1073665362\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O1",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "2"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O1",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O1-0-wrapv_domains-2"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "1\n",
+      "run": {
+        "status": 0,
+        "stdout": "1\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O1",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "3"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O1",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O1-0-wrapv_domains-3"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "10\n",
+      "run": {
+        "status": 0,
+        "stdout": "10\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O1",
+      "rotation": true,
+      "source": "affine_control_proof.c",
+      "source_sha256": "737061257fbc2a8e87f8eaca463cd78ca9987af0b2bbf37f1f2b9e3941d65e81",
+      "args": [],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O1",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/affine_control_proof.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O1-1-affine_control_proof-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "affine-control-proof 5 97\n",
+      "run": {
+        "status": 0,
+        "stdout": "affine-control-proof 5 97\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O1",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "0"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O1",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O1-1-wrapv_domains-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "28\n",
+      "run": {
+        "status": 0,
+        "stdout": "28\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O1",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "1"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O1",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O1-1-wrapv_domains-1"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "-1073665362\n",
+      "run": {
+        "status": 0,
+        "stdout": "-1073665362\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O1",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "2"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O1",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O1-1-wrapv_domains-2"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "1\n",
+      "run": {
+        "status": 0,
+        "stdout": "1\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O1",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "3"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O1",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O1-1-wrapv_domains-3"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "10\n",
+      "run": {
+        "status": 0,
+        "stdout": "10\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O2",
+      "rotation": false,
+      "source": "affine_control_proof.c",
+      "source_sha256": "737061257fbc2a8e87f8eaca463cd78ca9987af0b2bbf37f1f2b9e3941d65e81",
+      "args": [],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O2",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/affine_control_proof.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O2-0-affine_control_proof-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "affine-control-proof 5 97\n",
+      "run": {
+        "status": 0,
+        "stdout": "affine-control-proof 5 97\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O2",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "0"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O2",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O2-0-wrapv_domains-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "28\n",
+      "run": {
+        "status": 0,
+        "stdout": "28\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O2",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "1"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O2",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O2-0-wrapv_domains-1"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "-1073665362\n",
+      "run": {
+        "status": 0,
+        "stdout": "-1073665362\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O2",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "2"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O2",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O2-0-wrapv_domains-2"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "1\n",
+      "run": {
+        "status": 0,
+        "stdout": "1\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O2",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "3"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O2",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O2-0-wrapv_domains-3"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "10\n",
+      "run": {
+        "status": 0,
+        "stdout": "10\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O2",
+      "rotation": true,
+      "source": "affine_control_proof.c",
+      "source_sha256": "737061257fbc2a8e87f8eaca463cd78ca9987af0b2bbf37f1f2b9e3941d65e81",
+      "args": [],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O2",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/affine_control_proof.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O2-1-affine_control_proof-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "affine-control-proof 5 97\n",
+      "run": {
+        "status": 0,
+        "stdout": "affine-control-proof 5 97\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O2",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "0"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O2",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O2-1-wrapv_domains-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "28\n",
+      "run": {
+        "status": 0,
+        "stdout": "28\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O2",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "1"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O2",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O2-1-wrapv_domains-1"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "-1073665362\n",
+      "run": {
+        "status": 0,
+        "stdout": "-1073665362\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O2",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "2"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O2",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O2-1-wrapv_domains-2"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "1\n",
+      "run": {
+        "status": 0,
+        "stdout": "1\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O2",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "3"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O2",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O2-1-wrapv_domains-3"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "10\n",
+      "run": {
+        "status": 0,
+        "stdout": "10\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O3",
+      "rotation": false,
+      "source": "affine_control_proof.c",
+      "source_sha256": "737061257fbc2a8e87f8eaca463cd78ca9987af0b2bbf37f1f2b9e3941d65e81",
+      "args": [],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O3",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/affine_control_proof.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O3-0-affine_control_proof-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "affine-control-proof 5 97\n",
+      "run": {
+        "status": 0,
+        "stdout": "affine-control-proof 5 97\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O3",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "0"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O3",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O3-0-wrapv_domains-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "28\n",
+      "run": {
+        "status": 0,
+        "stdout": "28\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O3",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "1"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O3",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O3-0-wrapv_domains-1"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "-1073665362\n",
+      "run": {
+        "status": 0,
+        "stdout": "-1073665362\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O3",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "2"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O3",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O3-0-wrapv_domains-2"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "1\n",
+      "run": {
+        "status": 0,
+        "stdout": "1\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O3",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "3"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O3",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O3-0-wrapv_domains-3"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "10\n",
+      "run": {
+        "status": 0,
+        "stdout": "10\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O3",
+      "rotation": true,
+      "source": "affine_control_proof.c",
+      "source_sha256": "737061257fbc2a8e87f8eaca463cd78ca9987af0b2bbf37f1f2b9e3941d65e81",
+      "args": [],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O3",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/affine_control_proof.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O3-1-affine_control_proof-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "affine-control-proof 5 97\n",
+      "run": {
+        "status": 0,
+        "stdout": "affine-control-proof 5 97\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O3",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "0"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O3",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O3-1-wrapv_domains-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "28\n",
+      "run": {
+        "status": 0,
+        "stdout": "28\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O3",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "1"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O3",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O3-1-wrapv_domains-1"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "-1073665362\n",
+      "run": {
+        "status": 0,
+        "stdout": "-1073665362\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O3",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "2"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O3",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O3-1-wrapv_domains-2"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "1\n",
+      "run": {
+        "status": 0,
+        "stdout": "1\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-O3",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "3"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O3",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--O3-1-wrapv_domains-3"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "10\n",
+      "run": {
+        "status": 0,
+        "stdout": "10\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-Os",
+      "rotation": false,
+      "source": "affine_control_proof.c",
+      "source_sha256": "737061257fbc2a8e87f8eaca463cd78ca9987af0b2bbf37f1f2b9e3941d65e81",
+      "args": [],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-Os",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/affine_control_proof.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--Os-0-affine_control_proof-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "affine-control-proof 5 97\n",
+      "run": {
+        "status": 0,
+        "stdout": "affine-control-proof 5 97\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-Os",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "0"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-Os",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--Os-0-wrapv_domains-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "28\n",
+      "run": {
+        "status": 0,
+        "stdout": "28\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-Os",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "1"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-Os",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--Os-0-wrapv_domains-1"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "-1073665362\n",
+      "run": {
+        "status": 0,
+        "stdout": "-1073665362\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-Os",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "2"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-Os",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--Os-0-wrapv_domains-2"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "1\n",
+      "run": {
+        "status": 0,
+        "stdout": "1\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-Os",
+      "rotation": false,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "3"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-Os",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--Os-0-wrapv_domains-3"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "10\n",
+      "run": {
+        "status": 0,
+        "stdout": "10\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-Os",
+      "rotation": true,
+      "source": "affine_control_proof.c",
+      "source_sha256": "737061257fbc2a8e87f8eaca463cd78ca9987af0b2bbf37f1f2b9e3941d65e81",
+      "args": [],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-Os",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/affine_control_proof.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--Os-1-affine_control_proof-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "affine-control-proof 5 97\n",
+      "run": {
+        "status": 0,
+        "stdout": "affine-control-proof 5 97\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-Os",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "0"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-Os",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--Os-1-wrapv_domains-0"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "28\n",
+      "run": {
+        "status": 0,
+        "stdout": "28\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-Os",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "1"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-Os",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--Os-1-wrapv_domains-1"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "-1073665362\n",
+      "run": {
+        "status": 0,
+        "stdout": "-1073665362\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-Os",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "2"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-Os",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--Os-1-wrapv_domains-2"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "1\n",
+      "run": {
+        "status": 0,
+        "stdout": "1\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "abi": "32",
+      "opt": "-Os",
+      "rotation": true,
+      "source": "wrapv_domains.c",
+      "source_sha256": "d6aa95d630313ab515a4986988640fab5e25883ed32fe62338f2bfb729ad5f39",
+      "args": [
+        "3"
+      ],
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-Os",
+        "-m32",
+        "-msse2",
+        "-fwrapv",
+        "/home/user/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-32--Os-1-wrapv_domains-3"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "expected": "10\n",
+      "run": {
+        "status": 0,
+        "stdout": "10\n",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "opt": "-O0",
+      "source": "strict_recip_traps.c",
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O0",
+        "-march=x86-64-v3",
+        "-ffp-contract=off",
+        "/home/user/lccc/tests/regression/strict_recip_traps.c",
+        "-lm",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-trap"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "run": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "opt": "-O1",
+      "source": "strict_recip_traps.c",
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O1",
+        "-march=x86-64-v3",
+        "-ffp-contract=off",
+        "/home/user/lccc/tests/regression/strict_recip_traps.c",
+        "-lm",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-trap"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "run": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "opt": "-O2",
+      "source": "strict_recip_traps.c",
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O2",
+        "-march=x86-64-v3",
+        "-ffp-contract=off",
+        "/home/user/lccc/tests/regression/strict_recip_traps.c",
+        "-lm",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-trap"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "run": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "opt": "-O3",
+      "source": "strict_recip_traps.c",
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-O3",
+        "-march=x86-64-v3",
+        "-ffp-contract=off",
+        "/home/user/lccc/tests/regression/strict_recip_traps.c",
+        "-lm",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-trap"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "run": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "opt": "-Os",
+      "source": "strict_recip_traps.c",
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-Os",
+        "-march=x86-64-v3",
+        "-ffp-contract=off",
+        "/home/user/lccc/tests/regression/strict_recip_traps.c",
+        "-lm",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-trap"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "run": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "pass": true
+    },
+    {
+      "compiler": "candidate",
+      "opt": "-Oz",
+      "source": "strict_recip_traps.c",
+      "command": [
+        "/home/user/.cache/pr829-tools/candidate/lccc",
+        "-Oz",
+        "-march=x86-64-v3",
+        "-ffp-contract=off",
+        "/home/user/lccc/tests/regression/strict_recip_traps.c",
+        "-lm",
+        "-o",
+        "/home/user/.cache/pr829-evidence/native-candidate/candidate-trap"
+      ],
+      "build": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "run": {
+        "status": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      "pass": true
+    }
+  ],
+  "compilers": {
+    "candidate": {
+      "path": "/home/user/.cache/pr829-tools/candidate/lccc",
+      "sha256": "6bc657480b9cce3d7f523bf473d532e488ce32ce20271d01eafaef1c8f8a63e1"
+    }
+  },
+  "note": "Native correctness, not performance. Signed-overflow witnesses explicitly use -fwrapv. SIGFPE ordering tested natively, not under Valgrind.",
+  "summary": {
+    "candidate": {
+      "pass": 86,
+      "fail": 0
+    }
+  }
+}

@@ -65,6 +65,7 @@ pub(crate) mod licm;
 pub(crate) mod load_forward;
 pub(crate) mod loop_align;
 pub(crate) mod loop_analysis;
+pub(crate) mod loop_bound;
 pub(crate) mod loop_carried_forward;
 pub(crate) mod loop_idiom;
 pub(crate) mod loop_invert;
@@ -823,11 +824,14 @@ fn run_inline_phase(
     // for chains exposed by later simplification. This is the SAME checked
     // load plan (width/order/volatility/alias-window proofs), not a new matcher.
     // Profitability is measured on x86-64; other targets and size profiles
-    // retain their existing placement. Both switches preserve late-only A/B.
+    // retain their existing placement. The legacy postinline switch also
+    // suppresses this additional scheduling opportunity, without disabling
+    // primary inlining itself. Preserve that existing diagnostic contract.
     if target == crate::backend::Target::X86_64
         && !size_profile
         && !pass_disabled(disabled, "byte_load")
         && !pass_disabled(disabled, "byte_load_early")
+        && !pass_disabled(disabled, "postinline")
     {
         module.for_each_function(|f| byte_load::run_function(f, target));
         iphase_dump!("byte-load-before-inline");
@@ -1623,6 +1627,29 @@ pub(crate) fn run_passes(
     }
     preloop_dump!("rec2iter");
 
+    // Cost the compact form of byte-decoding accessors, not their expanded
+    // shifts/ORs. Reuse the existing legality proof before the already-bounded
+    // second inliner; do not raise any inline threshold. Limit this extra walk
+    // to straight-line private helpers on the i686 target. Size
+    // profiles retain their existing scheduling and inlining decisions.
+    if !optimize_for_size
+        && target == crate::backend::Target::I686
+        && !pass_disabled(&disabled, "byte_load")
+        && !pass_disabled(&disabled, "postinline")
+    {
+        module.for_each_function(|func| {
+            if !func.is_static || func.blocks.len() != 1 {
+                return 0;
+            }
+            // Do not DCE parameter homes here: the second inliner still
+            // uses those ABI bridges for surviving ParamRef instructions.
+            // The fold itself removes its consumed chain; normal cleanup
+            // after inlining removes any remaining dead copies/addresses.
+            byte_load::run_function(func, target)
+        });
+        preloop_dump!("byte-accessors-before-inline");
+    }
+
     // Post-structural inlining: TCE and recursion-to-iteration can turn a
     // previously recursive static helper into a small, ordinary loop. A second
     // bounded inlining pass exposes constant call arguments and lets the scalar
@@ -1827,6 +1854,24 @@ pub(crate) fn run_passes(
             let n = timed_pass!(
                 "vec_arx",
                 run_on_visited(module, &dirty, &mut changed, vec_arx::vec_arx_function)
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Put proven finite unsigned affine guards in IV-vs-bound form before
+        // the unroller/vectorizer make their decisions. Unlike signed affine
+        // folding this proves both IV and sum nonwrapping through the final
+        // exit observation, so -fwrapv does not weaken its contract.
+        if iter == 0
+            && opt_level >= 2
+            && !optimize_for_size
+            && target == crate::backend::Target::X86_64
+            && !pass_disabled(&disabled, "loop_bound")
+        {
+            let n = timed_pass!(
+                "loop_bound",
+                run_on_visited(module, &dirty, &mut changed, loop_bound::run)
             );
             total_changes += n;
             total_changes_excl_dce += n;

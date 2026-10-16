@@ -183,7 +183,9 @@ for opt in -O0 -O2; do
         # forms (four printed lines).
         "$CCC" $opt valid_gcc.c -o "lccc-gcc$opt.bin" || fail "gcc-comparable file failed"
         ./"lccc-gcc$opt.bin" > "lccc-gcc$opt.txt"
-        gcc $opt valid_gcc.c -o "gcc$opt.bin" || fail "oracle build failed at $opt"
+        # This executable passes 256-bit vectors by value. Give GCC the AVX
+        # ABI explicitly, rather than accepting a -Wpsabi fallback warning.
+        gcc $opt -mavx -Werror=psabi valid_gcc.c -o "gcc$opt.bin" || fail "oracle build failed at $opt"
         ./"gcc$opt.bin" > "gcc$opt.txt"
         [[ $(wc -l < "gcc$opt.txt") == 8 ]] || fail "oracle output shape changed at $opt"
         cmp "lccc-gcc$opt.txt" "gcc$opt.txt" \

@@ -424,6 +424,7 @@ def compile_one(compiler: CompilerSpec, benchmark: Benchmark, source: Path,
     result["binary_bytes"] = output.stat().st_size if result["ok"] and output.is_file() else 0
     result["text_bytes"] = text_size(output) if result["ok"] and output.is_file() else 0
     result["source_sha256"] = sha256_file(source)
+    result["binary_sha256"] = sha256_file(output) if result["ok"] and output.is_file() else None
     save_compile_artifacts(artifact_dir, benchmark, compiler, source, output, result)
     return result
 

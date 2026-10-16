@@ -385,6 +385,35 @@ fn relocate_address64(
     value
 }
 
+/// RV64 has no 32-bit RELATIVE relocation. GNU-compatible shared linking
+/// accepts only link-time ABS constants; section offsets would lose load bias.
+fn relocate_address32(
+    symbol_value: u64,
+    addend: i64,
+    sym: &Symbol,
+    sym_idx: usize,
+    ctx: &RelocContext,
+    obj_name: &str,
+) -> Result<u32, String> {
+    if ctx.collect_relatives {
+        let global = if sym.binding() != STB_LOCAL && !sym.name.is_empty() {
+            ctx.global_syms.get(sym.name.as_str())
+        } else {
+            None
+        };
+        let absolute = global.map_or(sym.shndx == SHN_ABS || sym_idx == 0, |g| {
+            g.defined && g.section_idx.is_none()
+        });
+        if !absolute {
+            return Err(format!(
+                "R_RISCV_32 against non-absolute symbol '{}' cannot be used in an RV64 shared object ('{}')",
+                sym.name, obj_name
+            ));
+        }
+    }
+    Ok(symbol_value.wrapping_add(addend as u64) as u32)
+}
+
 /// Apply a single relocation to the merged section data.
 fn apply_one_reloc(
     rela_type: u32,
@@ -415,13 +444,14 @@ fn apply_one_reloc(
             field.copy_from_slice(&value.to_le_bytes());
         }
         R_RISCV_32 => {
-            let val = (s as i64 + a) as u32;
+            let val = relocate_address32(s, a, sym, sym_idx, ctx, obj_name)?;
             if off + 4 <= data.len() {
                 data[off..off + 4].copy_from_slice(&val.to_le_bytes());
             }
         }
         R_RISCV_PCREL_HI20 => {
-            let offset_val = super::displacement::checked_auipc_delta(s, a, p)?;
+            let target = s as i64 + a;
+            let offset_val = target - p as i64;
             patch_u_type(data, off, offset_val as u32);
         }
         R_RISCV_PCREL_LO12_I => {
@@ -460,7 +490,7 @@ fn apply_one_reloc(
         }
         R_RISCV_GOT_HI20 => {
             let got_entry_vaddr = lookup_got_entry(sym, obj_idx, a, ctx);
-            let offset_val = super::displacement::checked_auipc_delta(got_entry_vaddr, a, p)?;
+            let offset_val = got_entry_vaddr as i64 + a - p as i64;
             patch_u_type(data, off, offset_val as u32);
         }
         R_RISCV_CALL_PLT => {
@@ -486,7 +516,7 @@ fn apply_one_reloc(
                 } else {
                     s as i64
                 };
-                let offset_val = super::displacement::checked_auipc_delta(target as u64, a, p)?;
+                let offset_val = target + a - p as i64;
                 let hi = ((offset_val + 0x800) >> 12) & 0xFFFFF;
                 let lo = offset_val & 0xFFF;
                 if off + 8 <= data.len() {
@@ -668,7 +698,7 @@ fn apply_one_reloc(
         }
         R_RISCV_TLS_GOT_HI20 => {
             let got_entry_vaddr = lookup_got_entry(sym, obj_idx, a, ctx);
-            let offset_val = super::displacement::checked_auipc_delta(got_entry_vaddr, a, p)?;
+            let offset_val = got_entry_vaddr as i64 + a - p as i64;
             patch_u_type(data, off, offset_val as u32);
         }
         other => {

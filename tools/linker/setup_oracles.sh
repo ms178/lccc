@@ -119,22 +119,26 @@ if [ "$WITH_WILD" = 1 ]; then
 fi
 
 # ── GNU ld 2.47 (primary oracle) ────────────────────────────────────────────
-# Match the native Linux link environment, not upstream's historical RPATH
-# default and prefix-only search paths. Otherwise GNU alone fails TEXTREL /
-# RUNPATH and standalone -lc fixtures on a Debian multiarch host. Emulation
-# scripts prepend their lib32/lib64 suffixes to these base paths as usual.
-BFD_NATIVE_LIB_DIRS='/usr/local/lib /lib /usr/lib'
-multiarch=$(gcc -print-multiarch 2>/dev/null || true)
-if [[ "$multiarch" =~ ^[A-Za-z0-9_-]+$ ]]; then
-    BFD_NATIVE_LIB_DIRS="$BFD_NATIVE_LIB_DIRS /lib/$multiarch /usr/lib/$multiarch"
+
+# Match the native driver/runtime layout, not the upstream configure
+# defaults (which omit Debian multiarch libc and default to old dtags).
+# Version equality alone does not make that a usable native oracle.
+native_multiarch=$(gcc -print-multiarch)
+native_lib_path=/usr/local/lib:/lib:/usr/lib:/lib64:/usr/lib64
+if [ -n "$native_multiarch" ] && [ -d "/lib/$native_multiarch" ]; then
+    native_lib_path="/usr/local/lib/$native_multiarch:/lib/$native_multiarch:/usr/lib/$native_multiarch:$native_lib_path"
 fi
-BFD_CONFIG="new-dtags;configure-native-lib-dirs=$BFD_NATIVE_LIB_DIRS"
-BFD_CONFIG_FILE="$PREFIX/bfd-$BINUTILS_VER/lccc-build-config.txt"
+# The native x86 linker also serves direct elf_i386 links without a GCC
+# driver supplying -L. Include installed multilib roots in its search policy.
+for libdir in /lib32 /usr/lib32 /lib/i386-linux-gnu /usr/lib/i386-linux-gnu; do
+    [ ! -d "$libdir" ] || native_lib_path="$native_lib_path:$libdir"
+done
+bfd_layout="new-dtags=1;sysroot=/;lib-path=$native_lib_path"
+bfd_layout_stamp="$PREFIX/bfd-$BINUTILS_VER/.native-layout"
 if [ -x "$PREFIX/bfd-$BINUTILS_VER/bin/ld" ] &&
-   [ "$(cat "$BFD_CONFIG_FILE" 2>/dev/null || true)" = "$BFD_CONFIG" ]; then
+   oracle_native_layout_matches "$bfd_layout_stamp" "$bfd_layout"; then
     note "ld    : $("$PREFIX/bfd-$BINUTILS_VER/bin/ld" --version | head -1) (restored from $ARTIFACTS)"
 else
-    need make gcc g++
     TARBALL="$SRC/binutils-$BINUTILS_VER.tar.xz"
     [ -f "$TARBALL" ] || { note "ld    : fetching binutils $BINUTILS_VER"; \
         curl -fsSL -o "$TARBALL" "https://ftp.gnu.org/gnu/binutils/binutils-$BINUTILS_VER.tar.xz"; }
@@ -144,22 +148,15 @@ else
     }
     BT="$SRC/binutils-$BINUTILS_VER"
     rm -rf "$BT"; tar -xf "$TARBALL" -C "$SRC"
-    # genscripts substitutes @NATIVE_LIB_DIRS@ at configure time; a make
-    # variable override does not affect it. Upstream exposes no configure
-    # switch for these native defaults. Adjust only that configuration line,
-    # preserving each emulation's own lib32/lib64 suffix handling.
-    grep -Fx "NATIVE_LIB_DIRS='/usr/local/lib /lib /usr/lib'" "$BT/ld/configure.tgt" >/dev/null
-    sed -i "s|^NATIVE_LIB_DIRS='/usr/local/lib /lib /usr/lib'$|NATIVE_LIB_DIRS='$BFD_NATIVE_LIB_DIRS'|" \
-        "$BT/ld/configure.tgt"
     ( cd "$BT"
       ./configure --prefix="$PREFIX/bfd-$BINUTILS_VER" \
+          --enable-new-dtags --with-sysroot=/ --with-lib-path="$native_lib_path" \
           --disable-nls --disable-gdb --disable-gdbserver --disable-sim \
           --disable-libquadmath --enable-64-bit-bfd --disable-werror \
-          --enable-new-dtags \
           CFLAGS='-O2 -g0' CXXFLAGS='-O2 -g0'
       make -j"$JOBS" all-ld && make install-strip-ld )
     rm -rf "$BT"
-    printf '%s\n' "$BFD_CONFIG" > "$BFD_CONFIG_FILE"
+    printf '%s\n' "$bfd_layout" > "$bfd_layout_stamp"
     cache_prefix "bfd-$BINUTILS_VER"
     note "ld    : $("$PREFIX/bfd-$BINUTILS_VER/bin/ld" --version | head -1) (built)"
 fi

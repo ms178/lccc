@@ -31,19 +31,17 @@ class MassReadCensus(unittest.TestCase):
         with self.assertRaises(ValueError):
             census.census(text)
 
-    def test_redteam_duplicate_load_vector_lengths(self):
-        for line in ('vmovddup 32(%rsi), %ymm7', 'vmovupd 32(%rsi), %ymm7'):
-            self.rejected(ASM.replace('movupd %xmm5', line + '\n movupd %xmm5'))
-        for line in ('vmovddup 32(%rsi), %xmm7', 'vmovddup 0(%rsi), %ymm7'):
-            self.assertEqual(census.census(ASM.replace('movupd %xmm5', line + '\n movupd %xmm5'))['mass_reads'], 2)
+    def test_duplicate_loads_observe_high_lanes_not_the_holes(self):
+        for reg, width in [('xmm7', 8), ('ymm7', 32), ('zmm7', 64)]:
+            self.assertEqual(census.width('vmovddup', ['0(%rsi)', '%' + reg]), width)
+        self.assertEqual(list(census.read_offsets('vmovddup', ['0(%rsi)', '%ymm7'])),
+                         list(range(8)) + list(range(16, 24)))
+        self.rejected(ASM.replace('movupd %xmm5', 'vmovddup 32(%rsi), %ymm7\n movupd %xmm5'))
 
-    def test_redteam_unary_imul_cannot_keep_implicit_destination_facts(self):
-        for instruction in ('imulq %rcx', 'imull %ecx', 'imulw %cx', 'imulb %cl'):
-            text = ASM.replace('.loop:', 'leaq 8(%r11), %rax\n.loop:')
-            self.rejected(text.replace('movupd %xmm5', instruction + '\n movsd (%rax), %xmm7\n movupd %xmm5'))
-        for instruction in ('imulq %rax, %rcx', 'imulq $3, %rax, %rcx'):
-            text = ASM.replace('.loop:', 'leaq 8(%r11), %rax\n.loop:')
-            self.assertEqual(census.census(text.replace('movupd %xmm5', instruction + '\n movsd (%rax), %xmm7\n movupd %xmm5'))['mass_reads'], 2)
+    def test_unary_imul_retires_both_implicit_address_results(self):
+        for accumulator in ['rax', 'rdx']:
+            extra = f'movq %r11, %{accumulator}\n addq $8, %{accumulator}\n imulq %r15\n movsd (%{accumulator}), %xmm7\n '
+            self.rejected(ASM.replace('movupd %xmm5', extra + 'movupd %xmm5'))
 
     def test_displacement_and_hoisted_pointer_are_the_same_field(self):
         row = census.census(ASM)

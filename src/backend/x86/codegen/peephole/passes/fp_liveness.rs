@@ -466,7 +466,7 @@ pub(super) fn is_full_xmm_def_line(t: &str) -> bool {
     is_full_xmm_def(mn, ops)
 }
 
-/// True when textual vector operands do not describe all register effects.
+/// True when textual source/trailing-destination roles miss register effects.
 /// Copy propagation, bracket coalescing and private-upper-lane proofs must
 /// stop at these effects too; preserving a feeder in DCE alone is insufficient.
 pub(super) fn has_implicit_vector_effects_line(t: &str) -> bool {
@@ -1078,6 +1078,12 @@ pub(super) fn read_extent(mn: &str, operands: &str) -> Option<i32> {
     {
         return None;
     }
+    // Narrowing EVEX conversions produce a YMM result from a full ZMM-sized
+    // memory source. The destination spelling alone would undercount the
+    // read by 32 bytes and could delete a live high-half frame store.
+    if matches!(mn, "vcvtpd2ps" | "vcvtpd2dq" | "vcvttpd2dq") && operands.contains("%ymm") {
+        return Some(64);
+    }
     if operands.contains("%zmm") {
         Some(64)
     } else if operands.contains("%ymm") {
@@ -1125,6 +1131,12 @@ fn is_plain_store(mn: &str) -> bool {
             | "vmovups"
             | "vmovdqa"
             | "vmovdqu"
+            | "vmovdqa32"
+            | "vmovdqa64"
+            | "vmovdqu8"
+            | "vmovdqu16"
+            | "vmovdqu32"
+            | "vmovdqu64"
             | "movabsq"
     )
 }
@@ -3226,6 +3238,274 @@ mod tests {
             let (store, infos, lv) = build(&format!("    movapd %xmm2, %xmm7\n    {opaque}\n"));
             let i = line_of(&store, "movapd");
             assert!(!lv.xmm_dead_after(&store, &infos, i, 7, &[i]), "{opaque}");
+        }
+    }
+}
+
+// Independent PR824 audit tests. Append to fp_liveness.rs in a disposable tree.
+#[cfg(test)]
+mod pr824_external_redteam {
+    use super::super::{dead_code, local_patterns, vector_copy};
+    use super::*;
+
+    fn build(asm: &str) -> (LineStore, Vec<LineInfo>) {
+        let store = LineStore::new(asm.to_owned());
+        let infos = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        (store, infos)
+    }
+
+    #[test]
+    fn fxsave_direct_cfg_control_retains_feeder() {
+        let (store, mut infos) = build(
+            ".type f, @function\nf:\n movapd %xmm2, %xmm3\n fxsave64 (%rdi)\n ret\n.size f, .-f\n",
+        );
+        dead_code::eliminate_dead_fp_moves(&store, &mut infos);
+        assert!(!infos[2].is_nop(), "FXSAVE observes XMM3");
+    }
+
+    #[test]
+    fn fxsave_unknown_cfg_must_retain_feeder() {
+        let (store, mut infos) = build(
+            ".type f, @function\nf:\n movapd %xmm2, %xmm3\n fxsave64 (%rdi)\n jmp *%rax\n.size f, .-f\n",
+        );
+        let facts = FpLiveness::new(&store, &infos);
+        assert_eq!(
+            facts.xmm_live_after(2, 3),
+            None,
+            "exercise the unknown-CFG path"
+        );
+        dead_code::eliminate_dead_fp_moves(&store, &mut infos);
+        assert!(
+            !infos[2].is_nop(),
+            "incorrectly deleted XMM3 feeder observed by FXSAVE"
+        );
+    }
+
+    #[test]
+    fn ymm_slot_control_retains_overlapped_store() {
+        let (mut store, mut infos) = build(
+            ".type f, @function\nf:\n movq %rax, 24(%rsp)\n movq %rax, %xmm0\n vmovdqu 0(%rsp), %ymm3\n vmovdqu %ymm3, (%rdi)\n ret\n.size f, .-f\n",
+        );
+        let facts = FpLiveness::new(&store, &infos);
+        assert_eq!(facts.slot_live_after(3, 4, 24, 8), Some(true));
+        local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
+        assert!(!infos[2].is_nop(), "YMM load observes the store");
+    }
+
+    #[test]
+    fn zmm_slot_must_retain_overlapped_store() {
+        let (mut store, mut infos) = build(
+            ".type f, @function\nf:\n movq %rax, 48(%rsp)\n movq %rax, %xmm0\n vmovdqu32 0(%rsp), %zmm3\n vmovdqu32 %zmm3, (%rdi)\n ret\n.size f, .-f\n",
+        );
+        let facts = FpLiveness::new(&store, &infos);
+        eprintln!("slot_live_after={:?}", facts.slot_live_after(3, 4, 48, 8));
+        local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
+        assert!(
+            !infos[2].is_nop(),
+            "incorrectly deleted store read by bytes 48..55 of the ZMM load"
+        );
+    }
+    #[test]
+    fn new_dead_fp_pass_upper_zeroing_positive_control() {
+        let (store, mut infos) = build(
+            ".type f, @function\nf:\n vmovapd %xmm6, %xmm7\n pshufd $27, %xmm5, %xmm7\n vmovupd %ymm7, (%rdi)\n ret\n.size f, .-f\n",
+        );
+        dead_code::eliminate_dead_fp_moves(&store, &mut infos);
+        assert!(
+            !infos[2].is_nop(),
+            "new consumer correctly checks upper regions"
+        );
+    }
+
+    #[test]
+    fn vector_copy_consumer_must_preserve_vex_upper_zeroing() {
+        let (store, mut infos) = build(
+            ".type f, @function\nf:\n vmovapd %xmm6, %xmm7\n pshufd $27, %xmm5, %xmm7\n vmovupd %ymm7, (%rdi)\n ret\n.size f, .-f\n",
+        );
+        vector_copy::eliminate_dead_vector_copies(&store, &mut infos);
+        assert!(
+            !infos[2].is_nop(),
+            "old deletion consumer must also check the newly separate upper regions"
+        );
+    }
+
+    #[test]
+    fn vector_copy_consumer_full_vex_overwrite_control() {
+        let (store, mut infos) = build(
+            ".type f, @function\nf:\n vmovapd %xmm6, %xmm7\n vpshufd $27, %xmm5, %xmm7\n vmovupd %ymm7, (%rdi)\n ret\n.size f, .-f\n",
+        );
+        vector_copy::eliminate_dead_vector_copies(&store, &mut infos);
+        assert!(
+            infos[2].is_nop(),
+            "real full-width/upper-zero overwrite permits deletion"
+        );
+    }
+
+    #[test]
+    fn whole_pipeline_must_preserve_upper_zeroing() {
+        let asm = ".type f, @function\nf:\n vmovapd %xmm6, %xmm7\n pshufd $27, %xmm5, %xmm7\n vmovupd %ymm7, (%rdi)\n ret\n.size f, .-f\n";
+        let out = super::super::peephole_optimize(asm.to_owned());
+        eprintln!("WHOLE_PIPELINE_OUTPUT_BEGIN\n{out}WHOLE_PIPELINE_OUTPUT_END");
+        assert!(
+            out.contains("vmovapd") || out.contains("vpshufd"),
+            "neither original nor replacement upper-zeroing operation remains"
+        );
+    }
+}
+
+#[cfg(test)]
+mod competing_effect_redteam {
+    use super::super::{dead_code, local_patterns, vector_copy};
+    use super::*;
+    fn build(asm: &str) -> (LineStore, Vec<LineInfo>) {
+        let store = LineStore::new(asm.to_owned());
+        let infos = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        (store, infos)
+    }
+    #[test]
+    fn masked_vector_copy_is_not_an_unconditional_identity() {
+        for suffix in ["{%k1}", "{%k1}{z}"] {
+            let asm = format!(
+                ".type f, @function\nf:\n vmovapd %xmm2, %xmm3{suffix}\n vmovupd %xmm3, (%rdi)\n ret\n.size f, .-f\n"
+            );
+            let (mut store, mut infos) = build(&asm);
+            vector_copy::propagate_vector_copies(&mut store, &mut infos);
+            assert!(
+                store.get(3).contains("%xmm3"),
+                "masked copy propagated as whole identity: {suffix}, {}",
+                store.get(3)
+            );
+        }
+    }
+    #[test]
+    fn masked_memory_store_is_not_a_guaranteed_overwrite() {
+        let (mut store, mut infos) = build(
+            ".type f, @function\nf:\n movq %rax, 8(%rsp)\n movq %rax, %xmm0\n vmovupd %xmm2, 0(%rsp){%k1}\n movsd 8(%rsp), %xmm1\n movsd %xmm1, (%rdi)\n ret\n.size f, .-f\n",
+        );
+        local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
+        assert!(
+            !infos[2].is_nop(),
+            "masked store cannot kill preceding value when the lane is disabled"
+        );
+    }
+    #[test]
+    fn opaque_tailcall_preserves_fp_argument_staging() {
+        let (store, mut infos) = build(
+            ".type f, @function\nf:\n movapd %xmm2, %xmm3\n jmp foreign_callee\n.size f, .-f\n",
+        );
+        dead_code::eliminate_dead_fp_moves(&store, &mut infos);
+        assert!(
+            !infos[2].is_nop(),
+            "tail callee implicitly reads XMM3 argument"
+        );
+    }
+    #[test]
+    fn unknown_memory_footprint_cannot_certify_slot_dead() {
+        let (mut store, mut infos) = build(
+            ".type f, @function\nf:\n movq %rax, 48(%rsp)\n movq %rax, %xmm0\n vmystery 0(%rsp), %xmm3\n ret\n.size f, .-f\n",
+        );
+        local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
+        assert!(
+            !infos[2].is_nop(),
+            "unknown footprint must not certify dead frame bytes"
+        );
+    }
+    #[test]
+    fn complete_unmasked_store_retires_prior_value_control() {
+        let (mut store, mut infos) = build(
+            ".type f, @function\nf:\n movq %rax, 8(%rsp)\n movq %rax, %xmm0\n vmovupd %xmm2, 0(%rsp)\n movsd 8(%rsp), %xmm1\n movsd %xmm1, (%rdi)\n ret\n.size f, .-f\n",
+        );
+        local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
+        assert!(
+            infos[2].is_nop(),
+            "real covering overwrite should allow the optimization"
+        );
+    }
+}
+
+#[cfg(test)]
+mod frame_coverage_redteam {
+    use super::*;
+
+    fn facts(text: String) -> FpLiveness {
+        let store = LineStore::new(text);
+        let infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        FpLiveness::new(&store, &infos)
+    }
+
+    #[test]
+    fn every_boundary_of_xmm_ymm_zmm_reads_is_covered() {
+        for (reg, width) in [("xmm3", 16), ("ymm3", 32), ("zmm3", 64)] {
+            for off in -8..=72 {
+                let lv = facts(format!(
+                    ".type f, @function\nf:\n movq %rax, {off}(%rsp)\n movq %rax, %xmm0\n vmovdqu32 0(%rsp), %{reg}\n vmovdqu32 %{reg}, (%rdi)\n ret\n.size f, .-f\n"
+                ));
+                let overlap = off < width && off + 8 > 0;
+                assert_eq!(
+                    lv.slot_live_after(3, 4, off, 8),
+                    Some(overlap),
+                    "{reg}, offset={off}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn overwrite_requires_full_byte_coverage_and_no_mask() {
+        for (reg, width) in [("xmm2", 16), ("ymm2", 32), ("zmm2", 64)] {
+            for mask in ["", "{%k1}"] {
+                for off in -8..=72 {
+                    let lv = facts(format!(
+                        ".type f, @function\nf:\n movq %rax, {off}(%rsp)\n movq %rax, %xmm0\n vmovdqu32 %{reg}, 0(%rsp){mask}\n movq {off}(%rsp), %rax\n ret\n.size f, .-f\n"
+                    ));
+                    let covered = mask.is_empty() && off >= 0 && off + 8 <= width;
+                    assert_eq!(
+                        lv.slot_live_after(3, 4, off, 8),
+                        Some(!covered),
+                        "{reg}, mask={mask}, offset={off}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unmodelled_nonvector_memory_extent_is_not_sixteen_bytes() {
+        let lv = facts(".type f, @function\nf:\n movq %rax, 24(%rsp)\n movq %rax, %xmm0\n fldenv 0(%rsp)\n ret\n.size f, .-f\n".into());
+        assert_eq!(lv.slot_live_after(3, 4, 24, 8), Some(true));
+    }
+}
+
+#[cfg(test)]
+mod narrowing_conversion_redteam {
+    use super::*;
+
+    #[test]
+    fn evex_narrowing_memory_sources_cover_all_sixty_four_bytes() {
+        for mnemonic in ["vcvtpd2ps", "vcvtpd2dq", "vcvttpd2dq"] {
+            for mask in ["", "{%k1}", "{%k1}{z}"] {
+                for offset in -8..=72 {
+                    let store = LineStore::new(format!(
+                        ".type f, @function\nf:\n movq %rax, {offset}(%rsp)\n movq %rax, %xmm0\n {mnemonic} 0(%rsp), %ymm2{mask}\n vmovupd %ymm2, (%rdi)\n ret\n.size f, .-f\n"
+                    ));
+                    let infos: Vec<_> = (0..store.len())
+                        .map(|i| classify_line(store.get(i)))
+                        .collect();
+                    let facts = FpLiveness::new(&store, &infos);
+                    let overlap = offset < 64 && offset + 8 > 0;
+                    assert_eq!(
+                        facts.slot_live_after(3, 4, offset, 8),
+                        Some(overlap),
+                        "{mnemonic}, {mask}, offset={offset}"
+                    );
+                }
+            }
         }
     }
 }

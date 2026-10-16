@@ -9,4 +9,29 @@ __attribute__((noinline)) static unsigned f4(const unsigned *p) { unsigned sum=0
 __attribute__((noinline)) static unsigned f5(const unsigned *p) { unsigned sum=0; int trips=0; for(int i=(2147483644);i<=(2147483647);i+=(2)) { sum+=p[(unsigned)(i*(1))&63U]; if(++trips==32) break; } return sum; }
 __attribute__((noinline)) static unsigned f6(const unsigned *p) { unsigned sum=0; int trips=0; for(int i=(-2147483648);i<=(31);i+=(1)) { sum+=p[(unsigned)(i*(4))&63U]; if(++trips==32) break; } return sum; }
 __attribute__((noinline)) static unsigned f7(const unsigned *p) { unsigned sum=0; int trips=0; for(int i=(1073741824);i<=(1073741827);i+=(1)) { sum+=p[(unsigned)(i*(4))&63U]; if(++trips==32) break; } return sum; }
-int main(void) { unsigned p[64]; for(unsigned i=0;i<64;++i)p[i]=i*37+11; unsigned sum=f0(p)+f1(p)+f2(p)+f3(p)+f4(p)+f5(p)+f6(p)+f7(p); if(sum!=206604U)return 1; puts("ivw_wrapv_range: PASS"); return 0; }
+/* Mask ranges must remain valid for derived negative members as well as
+   positive IVs. Negative masks and overflowing additions must not acquire
+   the nonnegative-mask certificate. */
+__attribute__((noinline)) static unsigned f8(const unsigned *p) {
+    unsigned sum = 0;
+    for (int i = 2; i <= 64; ++i) sum += p[(i & 7) + 1];
+    return sum;
+}
+__attribute__((noinline)) static unsigned f9(const unsigned *p) {
+    unsigned sum = 0;
+    for (int i = 2; i <= 64; ++i) sum += p[((i - 128) & 7) + 1];
+    return sum;
+}
+__attribute__((noinline)) static unsigned f10(const unsigned *p) {
+    unsigned sum = 0;
+    for (int i = 2; i <= 64; ++i)
+        sum += p[(unsigned)((i & 2147483647) + 2147483647) & 63U];
+    return sum;
+}
+__attribute__((noinline)) static unsigned f11(const unsigned *p) {
+    unsigned sum = 0;
+    for (int i = 2; i <= 64; ++i)
+        sum += p[(unsigned)(((i - 128) & -8) + 1) & 63U];
+    return sum;
+}
+int main(void) { unsigned p[64]; for(unsigned i=0;i<64;++i)p[i]=i*37+11; unsigned sum=f0(p)+f1(p)+f2(p)+f3(p)+f4(p)+f5(p)+f6(p)+f7(p)+f8(p)+f9(p)+f10(p)+f11(p); if(sum!=373767U)return 1; puts("ivw_wrapv_range: PASS"); return 0; }

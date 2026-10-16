@@ -17,9 +17,36 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 import benchmark_codegen as tool
+from perf_ab import format_elapsed_change
 
 
 class RegistryTests(unittest.TestCase):
+    def test_elapsed_ratio_names_its_actual_denominator(self):
+        self.assertEqual(format_elapsed_change(0.5), "B elapsed time is 50.00% lower than A")
+        self.assertEqual(format_elapsed_change(2.0), "B elapsed time is 100.00% higher than A")
+        self.assertEqual(format_elapsed_change(1.0), "B and A have equal elapsed time")
+
+    def test_native_artifact_identity_and_persistent_output_path(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            source = root / "input.c"
+            source.write_text("int main(void) { return 0; }\n")
+            compiler = tool.bench.CompilerSpec("lccc", "fixture", "fixture-cc", ())
+            benchmark = tool.bench.BENCHMARKS[0]
+            binary = tool.bench.output_path(root / "temporary-work", root / "artifacts",
+                                           benchmark, compiler)
+            self.assertTrue(binary.is_relative_to(root / "artifacts"))
+            data = b"executable identity fixture"
+            def fake_compile(command, **kwargs):
+                binary.write_bytes(data)
+                return {"ok": True, "command": command}
+            with patch.object(tool.bench, "invoke", side_effect=fake_compile), \
+                 patch.object(tool.bench, "text_size", return_value=len(data)):
+                result = tool.bench.compile_one(compiler, benchmark, source, binary, None)
+            self.assertEqual(result["binary_sha256"], hashlib.sha256(data).hexdigest())
+            self.assertEqual(binary.read_bytes(), data)
+
     def invoke(self, directory, oracle, only="linux_find_bit,linux_find_bit_scaled,lz4_compress,lz4_match_extend"):
         with patch.object(tool.subprocess, "check_output", side_effect=[str(directory), "GCC mock identity"]), \
                 patch.object(tool.codegen_oracle, "main", side_effect=oracle), \

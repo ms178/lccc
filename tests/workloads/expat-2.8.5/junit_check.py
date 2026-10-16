@@ -118,7 +118,7 @@ class ReportError(ValueError):
 
 
 _ATTR_STATUS = {
-    "failed": "failure", "notrun": "skipped", "skipped": "skipped",
+    "fail": "failure", "failed": "failure", "notrun": "skipped", "skipped": "skipped",
     "timeout": "failure", "passed": "pass", "disabled": "skipped",
 }
 
@@ -158,25 +158,27 @@ def _validate_counts(root: ET.Element) -> None:
     Counters are optional in JUnit. When present, validate each suite against
     its own subtree, including nested suites; an aggregate failure must not
     disappear simply because a truncated report omitted its failing testcase.
-    Disabled is a subset of skipped, not an additional set of executed tests.
+    CTest counts disabled tests separately from runtime skips in its summary,
+    although both remain non-passing outcomes for the workload comparison.
     """
     for suite in root.iter():
         if suite.tag not in ALLOWED_ROOTS:
             continue
         cases = list(suite.iter("testcase"))
         counts = Counter(_status_of(case) for case in cases)
+        disabled = sum(any((case.get(attr) or "").strip().lower() == "disabled"
+                           for attr in ("status", "result")) for case in cases)
         expected = {"tests": len(cases), "failures": counts["failure"],
-                    "errors": counts["error"], "skipped": counts["skipped"]}
-        for attribute in (*expected, "disabled"):
+                    "errors": counts["error"], "skipped": counts["skipped"] - disabled,
+                    "disabled": disabled}
+        for attribute in expected:
             value = suite.get(attribute)
             if value is None:
                 continue
             if re.fullmatch(r"[0-9]+", value) is None:
                 raise ReportError(f"invalid suite {attribute}={value!r}")
             actual = int(value)
-            valid = (actual <= counts["skipped"] if attribute == "disabled"
-                     else actual == expected[attribute])
-            if not valid:
+            if actual != expected[attribute]:
                 raise ReportError(f"suite {attribute}={value} disagrees with testcase records")
 
 
@@ -389,6 +391,29 @@ def self_test() -> int:
         if parse_junit(path)[0].status != "failure":
             raise AssertionError("nested matching failure counts lost")
         ok += 1
+    # Captured from a real CTest producer; the .cmake companion replays all
+    # four outcomes without a compiler. Never weaken fail/skip verdicts.
+    producer = Path(__file__).with_name("ctest-3.31.6-outcomes.xml")
+    observed = parse_junit(producer)
+    if [case.status for case in observed] != ["pass", "failure", "skipped", "skipped"]:
+        raise AssertionError("real CTest outcomes were not preserved")
+    expect("real CTest failures/skips remain non-passing", True, compare(observed, observed))
+    with tempfile.TemporaryDirectory(prefix="lccc-junit-producer-") as tmp:
+        path = Path(tmp) / "report.xml"
+        original = producer.read_text()
+        for old, new in [('skipped="1"', 'skipped="2"'),
+                         ('disabled="1"', 'disabled="0"'),
+                         ('status="disabled"', 'status="notrun"'),
+                         ('status="fail"', 'status="passed"')]:
+            if old not in original:
+                raise AssertionError("producer mutation did not land")
+            path.write_text(original.replace(old, new))
+            try:
+                parse_junit(path)
+            except ReportError:
+                ok += 1
+            else:
+                raise AssertionError("mutated producer report accepted: " + new)
     config_problems = compare_config({"EXPAT_BUILD_TESTS": "ON"}, {"EXPAT_BUILD_TESTS": "OFF"})
     if not config_problems:
         raise AssertionError("a feature switch that differs must be a problem")

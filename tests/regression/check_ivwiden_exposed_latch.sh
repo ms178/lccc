@@ -59,4 +59,25 @@ for opt in -O0 -O1 -O2 -O3; do
     esac
     echo "PASS"
 done
-echo "IVWIDEN-EXPOSED-LATCH: PASS"
+# Signed mask-range closure under explicit wrapping. Keep both ABI arms,
+# the disabled pass and a positive mechanism canary; negative kernels include
+# sign-bit masks and a following addition whose independent range can wrap.
+mask_src=tests/regression/ivw_signed_mask.c
+for abi in -m64 -m32; do
+    for opt in -O1 -O2 -O3 -Os; do
+        "${GCC:-gcc}" "$abi" "$opt" -fwrapv "$mask_src" -o "$td/mask.ref"
+        "$td/mask.ref" > "$td/mask.expected"
+        grep -qx 'ivw-signed-mask 770224292' "$td/mask.expected"
+        for mode in default disabled; do
+            run_env=(env -u CCC_NO_IV_WIDEN CCC_VALIDATE_SSA=1)
+            [[ $mode == disabled ]] && run_env+=(CCC_NO_IV_WIDEN=1)
+            "${run_env[@]}" "$ccc" "$abi" "$opt" -fwrapv "$mask_src" -o "$td/mask.test"
+            timeout 10 "$td/mask.test" > "$td/mask.actual"
+            cmp "$td/mask.expected" "$td/mask.actual"
+        done
+    done
+done
+env -u CCC_NO_IV_WIDEN CCC_IV_WIDEN_DEBUG=1 "$ccc" -O2 -fwrapv -S \
+    "$mask_src" -o "$td/mask.s" 2> "$td/mask.log"
+grep -Eq '\[IV-WIDEN\] positive: widened [1-9]' "$td/mask.log"
+echo "IVWIDEN-EXPOSED-LATCH: PASS (including signed-mask ABI/disable matrix)"

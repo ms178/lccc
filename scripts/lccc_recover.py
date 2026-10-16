@@ -117,6 +117,8 @@ def bundle_metadata(path):
     r=read_json(path);require(r['format']=='lccc-session-bundle-v1','unknown session bundle format')
     for f in ('head','tree','base'):digest(r[f],SHA)
     digest(r['bundle_sha256'],DIGEST);name(r['bundle'])
+    if 'bundle_archive' in r or 'bundle_archive_sha256' in r:
+        name(r.get('bundle_archive'));digest(r.get('bundle_archive_sha256'),DIGEST)
     require(isinstance(r['branch'],str) and not r['branch'].startswith('-'),'unsafe branch')
     return r
 
@@ -161,7 +163,10 @@ def neutralize_archive_attrs(member):
 
 def extract(archive,stage,r):
     require(Path(archive).is_file() and not Path(archive).is_symlink() and sha(archive)==r['archive_sha256'],'source archive hash mismatch/missing')
-    with tarfile.open(archive,'r:gz') as t:
+    # The recipe authenticates the exact compressed bytes. Permit lossless xz
+    # transcodes as well as the publisher's gzip default; member checks below
+    # apply identically to every supported tar compression.
+    with tarfile.open(archive,'r:*') as t:
         members=t.getmembers();require(len(members)<=20000 and sum(m.size for m in members)<=512*1024*1024,'source archive extraction budget exceeded')
         seen=set()
         for member in members:
@@ -254,8 +259,44 @@ def ensure_base_ancestry(repo,upstream,base):
         git(repo,'fetch','-q','--no-tags',upstream,base)
 
 
+def resolve_bundle(stage,artifacts,b):
+    """Materialize only the authenticated bundle in private temporary storage.
+
+    A corrupt standalone bundle never silently falls back to another copy.
+    The optional solid archive saves duplicate pack payloads across checkpoints;
+    no archive paths, links, owners or permissions are applied to the filesystem.
+    """
+    bundle=artifacts/b['bundle']
+    if bundle.exists() or bundle.is_symlink():
+        require(bundle.is_file() and not bundle.is_symlink() and sha(bundle)==b['bundle_sha256'],
+                'session bundle identity mismatch')
+        return bundle
+    require('bundle_archive' in b,'session bundle missing')
+    archive=artifacts/b['bundle_archive']
+    require(archive.is_file() and not archive.is_symlink() and sha(archive)==b['bundle_archive_sha256'],
+            'bundle archive identity mismatch/missing')
+    destination=stage/'session.bundle'
+    try:
+        with tarfile.open(archive,'r:*') as tar:
+            names=set();total=0;selected=None
+            for member in tar:
+                name(member.name)
+                require(member.isfile() and member.name not in names,'unsafe/duplicate bundle archive member')
+                names.add(member.name);total+=member.size
+                require(len(names)<=16 and 0<=member.size<=64*1024*1024 and total<=256*1024*1024,
+                        'bundle archive budget exceeded')
+                if member.name==b['bundle']:selected=member
+            require(selected is not None,'named bundle absent from archive')
+            with tar.extractfile(selected) as source,destination.open('xb') as output:
+                shutil.copyfileobj(source,output,1024*1024)
+    except tarfile.TarError as exc:
+        raise ValueError('invalid bundle archive') from exc
+    require(sha(destination)==b['bundle_sha256'],'archived bundle identity mismatch')
+    return destination
+
+
 def exact_restore(stage,artifacts,b,recipe,upstream,offline,patch):
-    bundle=artifacts/b['bundle'];require(bundle.is_file() and not bundle.is_symlink() and sha(bundle)==b['bundle_sha256'],'session bundle identity mismatch/missing')
+    bundle=resolve_bundle(stage,artifacts,b)
     require(recipe is None or (recipe['head'],recipe['tree'],recipe['base'],recipe['branch'])==(b['head'],b['tree'],b['base'],b['branch']),'bundle/source generations differ; use latest verified source fallback')
     method='upstream-base';repo=stage/'lccc';network_error=None
     if not offline:

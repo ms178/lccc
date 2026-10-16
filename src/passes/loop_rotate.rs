@@ -1312,11 +1312,11 @@ pub(crate) fn set_affine_fold_knobs(enabled: bool, debug: bool) {
     AFFINE_FOLD_DEBUG.with(|cell| cell.set(debug));
 }
 
-fn affine_fold_enabled() -> bool {
+pub(crate) fn affine_fold_enabled() -> bool {
     AFFINE_FOLD_ENABLED.with(|cell| cell.get())
 }
 
-fn affine_fold_debug() -> bool {
+pub(crate) fn affine_fold_debug() -> bool {
     AFFINE_FOLD_DEBUG.with(|cell| cell.get())
 }
 

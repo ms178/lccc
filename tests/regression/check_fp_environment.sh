@@ -58,3 +58,15 @@ for opt in -O0 -O1 -O2 -O3 -Os -Oz; do
         echo "Declared F64 precision and float.h: $opt $width PASS"
     done
 done
+
+# Runtime rounding and exceptions must not be folded by SCCP even when both
+# arithmetic operands are literal constants. Keep the pragma and flag routes.
+for opt in -O0 -O1 -O2 -O3 -Os -Oz; do
+    for mode in pragma flag; do
+        flags=()
+        [[ $mode != flag ]] || flags=(-DNO_FENV_PRAGMA -frounding-math)
+        "$ccc" "$opt" -ffp-contract=off "${flags[@]}" tests/regression/fenv_constant_effects.c -lm -o "$td/constants"
+        "$td/constants"
+        echo "FP constant-operand environment effects: $opt $mode PASS"
+    done
+done

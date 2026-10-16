@@ -341,11 +341,11 @@ def _local_compile(executable: str, source: Path, flags: str) -> list[str]:
 def _compile_remote(name: str, source: str, flags: str) -> list[str]:
     cid = godbolt.resolve_compiler(name)
     flags = godbolt.compiler_flags(cid, flags)
-    # Pin the record to the *build* behind this id, not merely to the id: a
-    # Compiler Explorer id is a label, and when `g162` is rebuilt against a
-    # newer GCC the label survives while the emitted code does not. See
-    # godbolt.compiler_fingerprint. Costs nothing on a warm compiler-list
-    # cache -- godbolt.list_compilers holds the metadata for 24h.
+    # Key on reported version metadata (or a moving-channel time window),
+    # not only the compiler id. This detects metadata drift, NOT a rebuild
+    # retaining the same version string; see godbolt.compiler_fingerprint.
+    # The compiler-list cache itself lasts 24h. Fresh acceptance evidence
+    # should retain version probes and distinguish cache reuse from a fetch.
     fp = godbolt.compiler_fingerprint(cid)
     # One remote-compile path for every report mode, through the cache shared
     # with tools/oracle/godbolt_oracle.py and scripts/encdiff.py

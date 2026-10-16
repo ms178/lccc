@@ -1,0 +1,57 @@
+{
+  "scope": "S29 pre-FAST candidate versus PR829; not final post-byte-repair compiler",
+  "complete": true,
+  "metric": "simulated compiler work; NOT wall-clock speedup",
+  "binaries": {
+    "mine": {
+      "original": "/home/user/.cache/pr829-tools/accepted/lccc",
+      "sha256": "bb8c56753d64c5a879e51a6e1562a2bd1ad6a7a6f26b0b9c8864a3c82a4acdd1"
+    },
+    "ref": {
+      "original": "/home/user/.cache/pr829-tools/pr829/lccc",
+      "sha256": "85b60938ca8bc7558cddace973a3b8df347b22433842dbcb828fd6b09783c62c"
+    }
+  },
+  "sources": [
+    {
+      "source": "spectral_norm.c",
+      "sha256": "21a48dccebcbc3b9496263f62df260d278051c3cd1a528ed99c8b66bef481e6a",
+      "median_ir_ratio": 1.0009884295783886,
+      "ratios": [
+        1.0009881511577718,
+        1.0009903512601417,
+        1.0009884295783886
+      ]
+    },
+    {
+      "source": "tls_seg_access.c",
+      "sha256": "02e6d2bcd07b2e1fc253b53d316d522e7b3d912ae634b6fad2c10dc93a1d4835",
+      "median_ir_ratio": 0.9993118880253663,
+      "ratios": [
+        0.9993118880253663,
+        0.9993119718867045,
+        0.9993114523583059
+      ]
+    },
+    {
+      "source": "sieve.c",
+      "sha256": "2fd99e297a95711800c1bf4b2facd7e5e09efa740b113c86837e3d0cd22f069b",
+      "median_ir_ratio": 0.9993031486500553,
+      "ratios": [
+        0.9993029526529834,
+        0.9993051683455544,
+        0.9993031486500553
+      ]
+    },
+    {
+      "source": "byte_load_reassembly.c",
+      "sha256": "d98d60eefd244df93fd9f4a828806ce2e32be56aad4872a2672d172b14dda562",
+      "median_ir_ratio": 1.0001433975118494,
+      "ratios": [
+        1.0001443961513916,
+        1.0001433975118494,
+        1.0001408816173836
+      ]
+    }
+  ]
+}

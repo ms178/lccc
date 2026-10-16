@@ -43,7 +43,7 @@ def census_operation_known(mn, ops):
     # operations and unknown opcodes must fail even if the loop header later
     # re-establishes every address fact. This is an intraprocedural census.
     if any('{' in op or '}' in op for op in ops):
-        return False  # masked/broadcast forms need their own effect proof
+        return False
     if mn.startswith('imul'):
         return (mn in ('imulb', 'imulw', 'imull', 'imulq') and
                 (len(ops) == 1 or mn != 'imulb' and
@@ -102,6 +102,13 @@ def transfer(line, facts, constants=frozenset()):
     parts = line.split(None, 1)
     mn = parts[0]
     ops = operands(parts[1]) if len(parts) > 1 else []
+    # One-operand multiply defines the architectural accumulator pair, not
+    # its explicit source. Never preserve an address residue in RDX:RAX.
+    if mn in ('imulb', 'imulw', 'imull', 'imulq') and len(ops) == 1:
+        facts.pop('rax', None)
+        if mn != 'imulb':
+            facts.pop('rdx', None)
+        return facts
     if mn.startswith('call'):
         return {k: v for k, v in facts.items() if isinstance(k, str) and k not in CALLER_SAVED}
     if mn.startswith(('push', 'pop')):
@@ -119,14 +126,6 @@ def transfer(line, facts, constants=frozenset()):
     if mn in ('movsb','movsw','movsl','movsd','movsq') and not ops:
         return {}
     if not ops or mn.startswith('j') or mn in ('ret', 'retq', 'nop', 'nopl', 'nopw'):
-        return facts
-    if mn in ('imulb', 'imulw', 'imull', 'imulq') and len(ops) == 1:
-        # Unary IMUL reads its explicit source; it writes AX or DX:AX /
-        # EDX:EAX / RDX:RAX, not that source. Partial writes invalidate
-        # the corresponding full-width address fact too.
-        facts.pop('rax', None)
-        if mn != 'imulb':
-            facts.pop('rdx', None)
         return facts
     destination = reg(ops[-1])
     value = None
@@ -189,6 +188,13 @@ def transfer(line, facts, constants=frozenset()):
 
 
 def width(mn, ops):
+    if mn == 'vmovddup':
+        # XMM reads one qword; YMM/ZMM duplicate each even qword, including
+        # the high 128-bit lanes. This is a bounding extent, not contiguous.
+        if any('%zmm' in op for op in ops):
+            return 64
+        if any('%ymm' in op for op in ops):
+            return 32
     if mn.endswith('sd') or mn in ('movlpd', 'movhpd', 'vmovlpd', 'vmovhpd', 'movq', 'vmovq', 'movddup', 'vmovddup', 'vbroadcastsd', 'vpbroadcastq'):
         return 8
     if mn.endswith('ss') or mn in ('movl', 'movd', 'vmovd'):
@@ -208,12 +214,12 @@ def width(mn, ops):
     raise ValueError(f'unmodelled memory footprint: {mn}')
 
 
-def read_ranges(mn, ops):
-    """Possibly read byte intervals; duplicate loads are not contiguous."""
-    if mn in ('movddup', 'vmovddup'):
-        vector_bytes = 64 if any('%zmm' in op for op in ops) else 32 if any('%ymm' in op for op in ops) else 16
-        return [(offset, 8) for offset in range(0, vector_bytes, 16)]
-    return [(0, width(mn, ops))]
+def read_offsets(mn, ops):
+    """Observed bytes, preserving holes in lane-duplication footprints."""
+    size = width(mn, ops)
+    if mn == 'vmovddup' and size > 8:
+        return (lane + byte for lane in range(0, size, 16) for byte in range(8))
+    return range(size)
 
 
 def census(text):
@@ -278,8 +284,8 @@ def census(text):
                 store = bool(MOV.fullmatch(mn) and i == len(ops) - 1)
                 if kind == 'body':
                     size = width(mn, ops)
-                    touches_mass = any(48 <= (offset + start + j) % 56 <= 55
-                                       for start, extent in read_ranges(mn, ops) for j in range(extent))
+                    touches_mass = any(48 <= (offset + j) % 56 <= 55
+                                       for j in read_offsets(mn, ops))
                     rows.append({'line': line, 'mass_read': touches_mass and not store,
                                  'velocity_store': store and offset == 24 and size == 16})
                 elif kind == 'unknown':

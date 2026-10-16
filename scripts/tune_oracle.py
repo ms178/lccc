@@ -20,12 +20,12 @@ those decisions *observable* and *comparable*:
 
 Examples:
 
-    scripts/tune_oracle.py dump --lccc target/fastbuild/lccc raptorlake
+    scripts/tune_oracle.py --lccc target/fastbuild/lccc dump raptorlake
     scripts/tune_oracle.py dump --all --json > /tmp/rows.json
-    scripts/tune_oracle.py matrix --lccc target/fastbuild/lccc \\
+    scripts/tune_oracle.py --lccc target/fastbuild/lccc matrix \\
         --tunes generic,skylake,raptorlake,gracemont,znver3 --flags=-O2 \\
         tests/bench/cpu_model/tune_probe.c
-    scripts/tune_oracle.py compare --lccc target/fastbuild/lccc \\
+    scripts/tune_oracle.py --lccc target/fastbuild/lccc compare \\
         --flags="-O2 -march=x86-64-v3 -mtune=raptorlake" \\
         --oracles gcc16.2,clang,icx tests/bench/cpu_model/tune_probe.c
 
@@ -233,8 +233,13 @@ def cmd_compare(a: argparse.Namespace) -> int:
             print(f"error: {o}: {e}", file=sys.stderr)
             errors[o] = str(e)
             outputs[o] = ""
+            failed = True
     for c in cols:
-        for fn, body in split_functions(outputs[c]).items():
+        functions = split_functions(outputs[c])
+        if not functions or (a.function and a.function not in functions):
+            print(f"{c}: requested function/assembly missing", file=sys.stderr)
+            failed = True
+        for fn, body in functions.items():
             if a.function and fn != a.function:
                 continue
             table.setdefault(fn, OrderedDict())[c] = classify(body)

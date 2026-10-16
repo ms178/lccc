@@ -1,0 +1,124 @@
+name: Targeted compiler research
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_ref:
+        description: Baseline commit or main ref to archive and build (never checked out over the candidate)
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compiler-research-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  evidence:
+    # Explicit research only: no duplicated compiler builds on ordinary PRs.
+    name: Targeted Callgrind main/candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RUSTUP_TOOLCHAIN: stable
+      CARGO_BUILD_JOBS: "2"
+      RUSTFLAGS: -D warnings
+      BASELINE_REF: ${{ inputs.baseline_ref || 'main' }}
+      RESEARCH_CASES: nbody,libm_round_family,double_reduction,zlib_ng_adler32,linux_find_bit_scaled,lz4_match_extend
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Activate swap before compiler builds and instrumentation
+        run: bash scripts/ci_enable_swap.sh
+      - name: Install and identify instrumentation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends valgrind python3-yaml
+          bash scripts/ci_install_gcc16.sh --base
+          valgrind --version
+          gcc-16 --version
+          rustc -Vv
+          cargo --version
+          rustfmt --version
+          cargo clippy --version
+      - name: Build candidate and independently archived main baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results/research "$RUNNER_TEMP/research-main"
+          git fetch --no-tags -- origin "$BASELINE_REF"
+          git rev-parse FETCH_HEAD > results/research/baseline.sha
+          git rev-parse HEAD > results/research/candidate.sha
+          git archive FETCH_HEAD | tar -x -C "$RUNNER_TEMP/research-main"
+          cargo build --profile fastbuild --locked --bin lccc -j 2 \
+            --config 'target.x86_64-unknown-linux-gnu.linker="gcc"'
+          (
+            cd "$RUNNER_TEMP/research-main"
+            CARGO_TARGET_DIR="$RUNNER_TEMP/research-main-target" \
+              cargo build --profile fastbuild --locked --bin lccc -j 2 \
+              --config 'target.x86_64-unknown-linux-gnu.linker="gcc"'
+          )
+          sha256sum target/fastbuild/lccc "$RUNNER_TEMP/research-main-target/fastbuild/lccc" \
+            > results/research/compiler-binaries.sha256
+      - name: Correctness-gated bounded Callgrind main/candidate A-B
+        run: |
+          python3 scripts/callgrind_corpus.py \
+            --mine target/fastbuild/lccc \
+            --ref "$RUNNER_TEMP/research-main-target/fastbuild/lccc" \
+            --gcc-include-command gcc-16 \
+            --only "$RESEARCH_CASES" --out results/research/callgrind-main
+      - name: Supplementary Callgrind against identified native GCC
+        # Identified native GCC16; this is not measured execution of CE binaries.
+        run: |
+          python3 scripts/callgrind_corpus.py \
+            --mine target/fastbuild/lccc --ref gcc-16 --gcc-include-command gcc-16 \
+            --only "$RESEARCH_CASES" --out results/research/callgrind-gcc
+      - name: Publish bounded measurement verdicts and full-report hashes
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          root = Path('results/research')
+          root.mkdir(parents=True, exist_ok=True)
+          summary = {'metric': 'bounded simulated Ir; NOT native cycles or universal superiority',
+                     'head': (root / 'candidate.sha').read_text().strip() if (root / 'candidate.sha').exists() else None,
+                     'baseline': (root / 'baseline.sha').read_text().strip() if (root / 'baseline.sha').exists() else None,
+                     'artifact': 'compiler-research', 'callgrind': {}}
+          selected = set(os.environ['RESEARCH_CASES'].split(','))
+          for arm in ('main', 'gcc'):
+              path = root / f'callgrind-{arm}' / 'index.json'
+              if not path.exists():
+                  summary['callgrind'][arm] = {'available': False}
+                  continue
+              raw = path.read_bytes()
+              data = json.loads(raw)
+              complete = data['complete'] and not data['failures'] and set(data['results']) == selected
+              summary['callgrind'][arm] = {
+                  'complete': complete,
+                  'report_sha256': hashlib.sha256(raw).hexdigest(),
+                  'ratios': {name: row['metrics']['ir_ratio'] for name, row in data['results'].items()},
+                  'failed_cases': [row['name'] for row in data['failures']],
+              }
+          text = json.dumps(summary, separators=(',', ':'))
+          assert len(text.encode()) <= 3900, 'checks API annotation budget exceeded'
+          escaped = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print(f'::notice title=Compiler research evidence::{escaped}')
+          (root / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
+              stream.write('```json\n' + json.dumps(summary, indent=2) + '\n```\n')
+          PY
+      - name: Retain all identities, flags, counters, assembly and failures
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: compiler-research
+          path: results/research/
+          if-no-files-found: warn

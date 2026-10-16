@@ -32,6 +32,22 @@ class SharedBindingTests(unittest.TestCase):
         with patch.object(gate, "sections", return_value=image):
             gate.verify(Path("unused"), options)
 
+    def test_protected_symbolic_relocation_is_bound_locally(self):
+        self.verify(self.image(visibility=3), visibility=3)
+
+    def test_protected_absolute_symbolic_relocation_has_no_load_bias(self):
+        self.verify(self.image(visibility=3, absolute=True), visibility=3,
+                    absolute=True, target_value=0x1000)
+
+    def test_absolute_relative_relocation_is_not_equivalent(self):
+        with self.assertRaises(AssertionError):
+            self.verify(self.image(info=3, visibility=3, absolute=True),
+                        visibility=3, absolute=True, target_value=0x1000)
+
+    def test_protected_symbolic_wrong_addend_is_rejected(self):
+        with self.assertRaises(AssertionError):
+            self.verify(self.image(visibility=3, addend=11), visibility=3)
+
     def test_symbolic_relocation_is_accepted(self):
         self.verify(self.image())
 
@@ -61,6 +77,26 @@ class SharedBindingTests(unittest.TestCase):
         image[".rela.dyn"] = (image[".rela.dyn"][0], b"")
         image[".data"] = (image[".data"][0], struct.pack("<QQ", 249, 0))
         self.verify(image, binding=0, absolute=True, target_value=256)
+
+    def test_rv64_shared_32_requires_absolute(self):
+        rows = [(o, accept) for _, o, accept in gate.cases() if o["kind"] == 1]
+        self.assertTrue(rows)
+        self.assertTrue(any(accept for _, accept in rows))
+        self.assertTrue(any(not accept for _, accept in rows))
+        for options, accept in rows:
+            self.assertEqual(accept, options["defined"] and options["absolute"])
+
+    def test_absolute_32_checks_four_bytes_and_neighbor(self):
+        image = self.image(absolute=True)
+        image[".dynsym"] = (image[".dynsym"][0], bytes(24))
+        image[".rela.dyn"] = (image[".rela.dyn"][0], b"")
+        correct = struct.pack("<I", 249) + b"\xa5" * 12
+        image[".data"] = (image[".data"][0], correct)
+        self.verify(image, binding=0, absolute=True, target_value=256, kind=1)
+        for corrupt in (struct.pack("<I", 248) + correct[4:], correct[:4] + bytes(4) + correct[8:]):
+            image[".data"] = (image[".data"][0], corrupt)
+            with self.assertRaises(AssertionError):
+                self.verify(image, binding=0, absolute=True, target_value=256, kind=1)
 
     def test_reserved_got_header_is_not_the_requested_slot(self):
         image = self.image(addend=0)

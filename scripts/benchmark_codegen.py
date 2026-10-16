@@ -51,11 +51,13 @@ def main(argv=None):
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
     known = {item.name for item in bench.BENCHMARKS}
+    if len(known) != len(bench.BENCHMARKS):
+        parser.error("duplicate benchmark registry identifiers")
     selected = set(args.only.split(",")) if args.only else known
     if not selected or selected - known:
         parser.error("empty/unknown corpus selection")
     include = subprocess.check_output([args.gcc, "-print-file-name=include"], text=True).strip()
-    if not Path(include).is_dir():
+    if not include or not Path(include).is_dir():
         parser.error("GCC did not identify an existing builtin-header directory")
     version = subprocess.check_output([args.gcc, "--version"], text=True)
     args.out.mkdir(parents=True, exist_ok=True)

@@ -25,12 +25,18 @@ fn square_zero(operand: Operand, ty: IrType) -> Option<Operand> {
     }
 }
 
-fn stable_fp_environment(inst: &Instruction) -> bool {
+pub(super) fn stable_fp_environment(inst: &Instruction) -> bool {
     // Default-closed: in particular calls (even pure calls), asm, intrinsics
     // such as LDMXCSR, atomics and nonlocal transfers cannot cross the proof.
     matches!(
         inst,
         Instruction::Phi { .. }
+            // Static storage declarations and the IR's non-volatile byte-copy
+            // operation have no rounding/control-register effects. This does
+            // NOT admit a user call named memcpy, dynamic stack operations,
+            // volatile accesses or arbitrary intrinsics.
+            | Instruction::Alloca { volatile: false, semantic_volatile: false, .. }
+            | Instruction::Memcpy { .. }
             | Instruction::BinOp { .. }
             | Instruction::UnaryOp { .. }
             | Instruction::Cmp { .. }
@@ -69,7 +75,7 @@ fn has_fp_square(func: &IrFunction) -> bool {
 }
 
 pub(crate) fn run(func: &mut IrFunction) -> usize {
-    if !has_fp_square(func) {
+    if super::fp_environment_blocks_reordering(func) || !has_fp_square(func) {
         return 0;
     }
     if func.blocks.is_empty() || !super::gvn::find_multi_def_values(func).is_empty() {

@@ -1,0 +1,15 @@
+==13129== Memcheck, a memory error detector
+==13129== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.
+==13129== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info
+==13129== Command: /home/user/.cache/control-check
+==13129== 
+affine-control-proof 5 97
+==13129== 
+==13129== HEAP SUMMARY:
+==13129==     in use at exit: 0 bytes in 0 blocks
+==13129==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated
+==13129== 
+==13129== All heap blocks were freed -- no leaks are possible
+==13129== 
+==13129== For lists of detected and suppressed errors, rerun with: -s
+==13129== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)

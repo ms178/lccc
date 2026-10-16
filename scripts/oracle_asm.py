@@ -12,7 +12,7 @@ measurement you cannot afford to lose when you are chasing a gap that the
 survey just quantified.
 
 This tool therefore goes through :func:`codegen_oracle._compile_remote`, the
-SAME cache namespace the survey uses (``att-v2``), so a deep-dive after
+SAME cache namespace the survey uses (``att-v4``), so a deep-dive after
 ``--rank`` is offline: zero network requests, byte-identical assembly to the
 survey's numbers, and no 429 risk.  It reuses the survey's own
 ``_function_body`` / ``_stats`` implementations, so counts printed here match
@@ -26,7 +26,9 @@ Usage::
 Writes ``<out>/{lccc,gcc16.2,clang,icc,icx}.s`` (whole function bodies, AT&T)
 and prints the shared statistic columns.  Any requested compile or function-extraction failure returns non-zero.
 Failed requested outputs are removed, so an old assembly file cannot silently
-masquerade as current evidence.
+masquerade as current evidence, and all error rows are retained in the report:
+a missing vendor must not look like a successful comparison with weaker
+competition.
 """
 from __future__ import annotations
 
@@ -105,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
               f"{stats.spills:>6} {stats.branches:>6} {stats.vectors:>4}")
         if out:
             (out / f"{key}.s").write_text("\n".join(body) + "\n")
-    return int(any(body is None for _, body, _ in records))
+    return int(any(body is None or error is not None for _, body, error in records))
 
 
 if __name__ == "__main__":
