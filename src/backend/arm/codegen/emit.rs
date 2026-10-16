@@ -2690,6 +2690,16 @@ pub(super) const ARM_ARG_REGS: [&str; 8] = ["x0", "x1", "x2", "x3", "x4", "x5", 
 const ARM_TMP_REGS: [&str; 8] = ["x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16"];
 
 impl ArchCodegen for ArmCodegen {
+    /// Provenance markers for user inline-asm bodies: `#APP`/`#NO_APP`.
+    /// `#` starts a comment in this target's GAS syntax, so the markers are
+    /// invisible to the assembler, to objdump, and to this backend's text
+    /// peephole alike; downstream scanners (the -mno-sse /
+    /// -mgeneral-regs-only SIMD guard) use them to exempt user-authored
+    /// text from the compiler-generated code policy.
+    fn asm_block_markers(&self) -> Option<(&'static str, &'static str)> {
+        Some(super::asm_emitter::USER_ASM_MARKERS)
+    }
+
     fn is_value_reg_assigned(&self, vid: u32) -> bool {
         self.reg_assignments.contains_key(&vid)
     }
@@ -3368,6 +3378,7 @@ impl ArchCodegen for ArmCodegen {
         goto_labels: &[(String, BlockId)],
         input_symbols: &[Option<String>],
     ) {
+        let markers = self.asm_block_markers();
         emit_inline_asm_common(
             self,
             template,
@@ -3377,6 +3388,7 @@ impl ArchCodegen for ArmCodegen {
             operand_types,
             goto_labels,
             input_symbols,
+            markers,
         );
     }
     fn emit_intrinsic(

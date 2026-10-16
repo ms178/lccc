@@ -39,16 +39,15 @@ fn const_for_asm_operand(c: &IrConst, operand_type: &IrType) -> i64 {
     }
 }
 
-// Comments understood by both the native assembler and GAS. Keep the same
-// delimiters on extended, naked and file-scope user text; operand setup and
-// output writeback remain outside the extended-asm region.
-pub(super) const USER_ASM_MARKERS: (&str, &str) = ("//APP", "//NO_APP");
+// Provenance delimiters understood by both the native assembler (whose
+// parser drops `//…` and `#…` lines alike) and GAS (which special-cases
+// `#APP`/`#NO_APP` on every target). One spelling across extended, naked
+// and file-scope user text, shared with x86/i686 so downstream scanners
+// need a single grammar; operand setup and output writeback remain outside
+// the extended-asm region.
+pub(super) const USER_ASM_MARKERS: (&str, &str) = ("#APP", "#NO_APP");
 
 impl InlineAsmEmitter for ArmCodegen {
-    fn asm_block_markers(&self) -> Option<(&'static str, &'static str)> {
-        Some(USER_ASM_MARKERS)
-    }
-
     fn asm_state(&mut self) -> &mut CodegenState {
         &mut self.state
     }

@@ -28,9 +28,6 @@ impl InlineAsmEmitter for X86Codegen {
     // (kernel ALTERNATIVE()/jump-label templates) must reach the assembler
     // byte-for-byte. `#` starts a comment in AT&T syntax, so the markers are
     // invisible to GAS and to lccc's integrated assembler alike.
-    fn asm_block_markers(&self) -> Option<(&'static str, &'static str)> {
-        Some(("#APP", "#NO_APP"))
-    }
 
     fn asm_vex_prefix_enabled(&self) -> bool {
         self.isa.avx

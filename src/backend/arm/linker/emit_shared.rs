@@ -3,6 +3,7 @@
 //! Emits an ELF64 shared library (ET_DYN) with PIC relocations, PLT stubs
 //! for external function calls, and a `.dynamic` section for the dynamic linker.
 
+use crate::backend::elf::{STB_LOCAL, STV_DEFAULT};
 use crate::common::fx_hash::FxHashMap;
 
 use super::elf::*;
@@ -23,6 +24,19 @@ pub(super) fn emit_shared_library(
     pending_defsyms: &[(String, String, usize)],
 ) -> Result<(), String> {
     let base_addr: u64 = 0;
+    // Binding constraints come from the gABI-merged visibility on each
+    // GlobalSymbol (`linker_common::merge_object_visibility`, run by
+    // link_shared after dynamic resolution): the most constraining STV_* of
+    // all references and the definition, order-independent.  There is
+    // deliberately no name-only side table here — a hidden reference to a
+    // dynamic resolution lands on the same globals entry and constrains it
+    // (PR #821 F2).
+    let not_exportable = |g: &GlobalSymbol| {
+        matches!(
+            g.visibility & 0x3,
+            crate::backend::elf::STV_HIDDEN | crate::backend::elf::STV_INTERNAL
+        )
+    };
 
     let mut dynstr = DynStrTab::new();
     for lib in needed_sonames {
@@ -41,6 +55,13 @@ pub(super) fn emit_shared_library(
                 && !g.is_dynamic
                 && (g.info >> 4) != 0
                 && g.section_idx != SHN_UNDEF
+                // HIDDEN/INTERNAL definitions are not part of the .so's
+                // dynamic interface: exporting them as GLOBAL DEFAULT in
+                // dynsym is exactly the input-visibility vs emitted-ELF
+                // disagreement review F2 names.  PROTECTED stays exported
+                // (it must be resolvable, but binds internally — its
+                // st_other is written below).
+                && !not_exportable(g)
         })
         .map(|(n, _)| n.clone())
         .collect();
@@ -722,6 +743,7 @@ pub(super) fn emit_shared_library(
             copy_reloc: false,
             lib_sym_value: 0,
             lib_in_exec: false,
+            visibility: crate::backend::elf::STV_DEFAULT,
         });
         if entry.defined_in.is_none() && !entry.is_dynamic {
             entry.value = sym.value;
@@ -996,7 +1018,11 @@ pub(super) fn emit_shared_library(
             if gsym.defined_in.is_some() && !gsym.is_dynamic && gsym.section_idx != SHN_UNDEF {
                 if ds + 5 < out.len() {
                     out[ds + 4] = gsym.info;
-                    out[ds + 5] = 0;
+                    // The merged visibility rides in st_other: PROTECTED
+                    // definitions are exported but bind internally, DEFAULT
+                    // stays preemptible.  HIDDEN/INTERNAL never reach this
+                    // arm (they are not exported above).
+                    out[ds + 5] = gsym.visibility & 0x3;
                 }
                 // Absolute symbols (`--defsym k=77`) carry SHN_ABS so the
                 // loader uses the value verbatim; section-defined symbols use
@@ -1202,15 +1228,77 @@ pub(super) fn emit_shared_library(
                         }
                     }
                     R_AARCH64_ADR_PREL_LO21 => {
-                        // Until AArch64 serializes and honors merged visibility
-                        // consistently across dynsym/GOT/PLT, non-local ADR
-                        // targets are unsupported, even if marked hidden.
-                        let s = reloc::resolve_shared_adr_target(
-                            obj_idx, sym, section_map, output_sections,
-                        ).ok_or_else(|| format!(
-                            "ADR relocation requires a local allocated section-relative symbol: object {}, section {}, offset {:#x}, symbol {} ('{}')",
-                            obj_idx, sec_idx, rela.offset, si, sym.name
-                        ))?;
+                        // Load bias cancels only for a locally bound,
+                        // section-relative target. ADR cannot implement symbol
+                        // interposition or an absolute address in an ET_DYN.
+                        //
+                        // "Non-preemptible" alone does NOT establish the
+                        // section-relative precondition (review F3, model
+                        // counterexample + linked-object reproducer): symbol
+                        // index 0, a named local UNDEFINED symbol and a symbol
+                        // whose defining input section was discarded all
+                        // resolve to a numeric S = 0 that passes the signed-
+                        // displacement check while baking the load bias into
+                        // the instruction — at runtime the ADR yields B + S
+                        // instead of S (P = 0x10000, B = 0x70000000 -> the
+                        // register holds 0x70000000, not 0).  The precondition
+                        // is the SECTION MAPPING, so verify it explicitly
+                        // instead of inferring it from the resolved address:
+                        // address zero can be a legitimate resolution.
+                        if rela.sym_idx == 0 {
+                            return Err(format!(
+                                "ADR relocation at {:#x} references the null symbol (index 0); \
+                                 a same-section label or local symbol is required",
+                                p
+                            ));
+                        }
+                        let global = globals_snap.get(sym.name.as_str());
+                        // Preemption rule for an ET_DYN (PR #821 F2, with
+                        // the review's binding contract): a GLOBAL/WEAK
+                        // symbol is ADR-eligible only when the merged
+                        // visibility is non-default (HIDDEN/PROTECTED/
+                        // INTERNAL bind internally) AND the resolution is a
+                        // local definition (not dynamic, not undefined).
+                        // A DEFAULT-visibility global stays interposable in
+                        // a shared object even when this link defines it —
+                        // an executable may interpose it — so it can never
+                        // take a link-time displacement.
+                        let (vis, resolved_locally) = global
+                            .map(|g| (g.visibility & 0x3, g.defined_in.is_some() && !g.is_dynamic))
+                            .unwrap_or((STV_DEFAULT, false));
+                        let preemptible =
+                            sym.binding() != STB_LOCAL && (vis == STV_DEFAULT || !resolved_locally);
+                        if preemptible || sym.shndx == SHN_ABS {
+                            return Err(format!(
+                                "ADR relocation requires a locally bound section-relative symbol: '{}'",
+                                sym.name
+                            ));
+                        }
+                        // The section-relative precondition is structural
+                        // for the symbols resolve_sym() serves through the
+                        // SECTION MAP (locals and section symbols): their
+                        // input section must have survived the merge, or S
+                        // degenerates to 0/garbage and the encoded
+                        // displacement resolves to the load bias at runtime.
+                        // Named global/weak symbols resolve through the
+                        // globals table instead — their degenerate cases
+                        // (undefined, dynamic, ABS) are already rejected by
+                        // the preemptible/ABS checks above, and a hidden
+                        // UNDEFINED reference whose definition lives in
+                        // another input is legitimate (merged into one
+                        // GlobalSymbol by registration).
+                        let resolves_via_section_map =
+                            sym.is_local() || sym.sym_type() == STT_SECTION;
+                        if resolves_via_section_map
+                            && !section_map.contains_key(&(obj_idx, sym.shndx as usize))
+                        {
+                            return Err(format!(
+                                "ADR relocation requires a symbol in a surviving section: '{}' \
+                                 (undefined, common, or its input section was discarded; S would be 0 \
+                                 and the encoded displacement would resolve to the load bias at runtime)",
+                                sym.name
+                            ));
+                        }
                         let delta = (s as i64).wrapping_add(a).wrapping_sub(p as i64);
                         reloc::encode_adr(&mut out, fp, delta)?;
                     }

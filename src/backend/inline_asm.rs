@@ -175,21 +175,6 @@ pub trait InlineAsmEmitter {
         false
     }
 
-    /// Comment markers emitted around the substituted inline-asm body
-    /// (`Some((open, close))`), or `None` to emit no markers.
-    ///
-    /// GCC/Clang bracket inline asm with `#APP`/`#NO_APP` so downstream
-    /// text-level tools know the region is user-authored and must not be
-    /// touched. lccc's x86 peephole runs on assembly TEXT after codegen; a
-    /// user's `movq %rax, %rax` inside an ALTERNATIVE() macro is a deliberate
-    /// length template, not a removable self-move — without markers the
-    /// peephole deleted it and the kernel's .altinstructions entries got
-    /// orig_len = 0 ("empty alternative entry", objtool). Markers are comment
-    /// lines for the target assembler, so they are semantically invisible.
-    fn asm_block_markers(&self) -> Option<(&'static str, &'static str)> {
-        None
-    }
-
     /// Resolve memory operand addresses that require indirection (non-alloca pointers).
     /// `excluded` contains registers claimed by specific-register constraints,
     /// used to avoid conflicts when allocating a temp register for the address.
@@ -501,6 +486,7 @@ pub fn emit_inline_asm_common(
     operand_types: &[IrType],
     goto_labels: &[(String, BlockId)],
     input_symbols: &[Option<String>],
+    markers: Option<(&'static str, &'static str)>,
 ) {
     emit_inline_asm_common_impl(
         emitter,
@@ -511,6 +497,7 @@ pub fn emit_inline_asm_common(
         operand_types,
         goto_labels,
         input_symbols,
+        markers,
         &[],
     );
 }
@@ -524,6 +511,7 @@ pub fn emit_inline_asm_common_impl(
     operand_types: &[IrType],
     goto_labels: &[(String, BlockId)],
     input_symbols: &[Option<String>],
+    markers: Option<(&'static str, &'static str)>,
     seg_overrides: &[AddressSpace],
 ) {
     emitter.reset_scratch_state();
@@ -564,7 +552,6 @@ pub fn emit_inline_asm_common_impl(
     // First, expand GCC dialect alternatives {att|intel} -> att
     let expanded = expand_dialect_alternatives(template);
     let lines: Vec<&str> = expanded.split('\n').collect();
-    let markers = emitter.asm_block_markers();
     let body_nonempty = !lines.iter().all(|l| l.trim().is_empty());
     if let Some((open, _)) = markers {
         if body_nonempty {

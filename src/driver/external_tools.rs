@@ -427,17 +427,36 @@ impl Driver {
         out
     }
 
-    pub(super) fn write_dep_file(&self, input_file: &str, output_file: &str) -> Result<(), String> {
+    ///
+    /// The caller supplies the two names GCC keeps apart (both measured on
+    /// gcc 14.2, pinned cell-by-cell by tests/regression/check_dash_output.sh):
+    ///
+    /// * `dep_file_base` — where a *derived* dep file (bare -MD/-MMD, no -MF)
+    ///   lands: the explicit -o value when the phase honors one (`-E -o -`
+    ///   -> `-.d`), else the input (`-E -MD x.c` -> `x.d`).
+    /// * `rule_target` — the target the rule is FOR: the would-be object
+    ///   ([`Self::dep_rule_object_target`]) for the preprocessor path (an
+    ///   explicit `-o` does NOT override it there — `-E -o - -MF -` still
+    ///   rules `x.o:`), and the -o value verbatim for -S/-c/link (`-S -o -
+    ///   -MD` rules `-:`, matching cc1's use of the output name).  A -MT
+    ///   target still wins over both, exactly like GCC.
+    pub(super) fn write_dep_file(
+        &self,
+        input_file: &str,
+        dep_file_base: &str,
+        rule_target: &str,
+    ) -> Result<(), String> {
         if let Some(ref dep_path) = self.dep_file {
             let dep_path = if dep_path.is_empty() {
-                // Derive from output: replace extension with .d
-                let p = std::path::Path::new(output_file);
+                // Derive from the phase's dep-file base: replace the
+                // extension with .d
+                let p = std::path::Path::new(dep_file_base);
                 p.with_extension("d").to_string_lossy().into_owned()
             } else {
                 dep_path.clone()
             };
             // Prefer the -MT/-MQ target when given (glibc passes -MT $@).
-            let target = self.dep_target.as_deref().unwrap_or(output_file);
+            let target = self.dep_target.as_deref().unwrap_or(rule_target);
             // GCC-format rule: source first, then every header actually
             // opened during preprocessing in first-open order (preprocessor
             // dep tracking), with -MMD applying GCC's directory-based
@@ -493,5 +512,42 @@ impl Driver {
         } else {
             Ok(())
         }
+    }
+
+    /// Dep-file writing for the -S/-c phases, with GCC 14.2's measured
+    /// target rule (pinned by tests/regression/check_dash_output.sh):
+    /// an explicit -o IS both the derived dep-file base and the rule target
+    /// (`-S -o - -MD` -> `-.d` ruling `-:`; `-c -o obj1.o -MD` ->
+    /// `obj1.d` ruling `obj1.o:`), while without -o both derive from the
+    /// INPUT (`-S -MD x.c` -> `x.d` ruling `x.o:`, even though the phase
+    /// product is x.s).
+    pub(super) fn write_dep_file_gcc_semantics(
+        &self,
+        input_file: &str,
+        out_path: &str,
+    ) -> Result<(), String> {
+        if self.output_path_set {
+            self.write_dep_file(input_file, out_path, out_path)
+        } else {
+            self.write_dep_file(
+                input_file,
+                input_file,
+                &Self::dep_rule_object_target(input_file),
+            )
+        }
+    }
+
+    /// The would-be object name GCC derives from an input file
+    /// (`x.c` -> `x.o`, `dir/s1.S` -> `dir/s1.o`): the dep-rule target for
+    /// the preprocessor (-E) path — where an explicit -o does not override
+    /// it — and for -S/-c without an explicit -o (both measured, gcc 14.2).
+    pub(super) fn dep_rule_object_target(input_file: &str) -> String {
+        if input_file == "-" {
+            return "stdin.o".to_string();
+        }
+        std::path::Path::new(input_file)
+            .with_extension("o")
+            .to_string_lossy()
+            .into_owned()
     }
 }

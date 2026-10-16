@@ -576,6 +576,54 @@ gate "repro-replay" fast \
 gate "scoped-noreturn-diagnostics" fast \
     bash tests/regression/check_scoped_noreturn_diagnostics.sh
 
+# `lccc -S -o - x.c` used to create a file literally named `-`, silently
+# dropping the assembly from any pipeline's point of view.  GCC 14.2 pins the
+# contract cell by cell (the table lives in the gate): -S/-E stream to stdout
+# and create no dash file, -c fails cleanly, -MF - streams the dep rule to
+# stdout with the GCC-derived object target, a derived .d is skipped when the
+# output is stdout, and the full-link -o - keeps GCC's file-named-`-` parity.
+# The gate is a mutation test: its --self-test rejects a fake compiler with
+# the old behavior.
+gate "dash-output-stdout" fast \
+    bash tests/regression/check_dash_output.sh
+
+# AUD-SILENT-ZERO-1 (gate): no x86-only builtin may compile cleanly on a
+# non-x86 backend.  Main's check_x86_intrinsic_feature fires the located
+# diagnostic at lowering; this sweep re-derives the x86-only name set from
+# sema/builtins.rs, tries every arity 0..2 on lccc-arm and lccc-riscv, and
+# asserts no clean compile and no internal-error text (mutation-tested via
+# --self-test against a fake silent-zero compiler).
+gate "foreign-intrinsics-rejected" fast \
+    python3 scripts/check_foreign_intrinsics.py
+
+# PR #821 F1 (2026-10-14 review): the -mgeneral-regs-only SIMD guard must
+# exempt USER-authored AArch64 assembly (ordinary inline asm, naked-function
+# raw bodies, top-level file-scope asm) while still rejecting every
+# compiler-generated FP/SIMD reference, and the exemption must not leak past
+# the #APP/#NO_APP brackets.  All rows compile real C through lccc-arm; the
+# mutation self-test rejects the pre-fix compiler (which ate user SIMD) and
+# a marker-less emitter.
+gate "arm-inline-asm-provenance" fast \
+    bash tests/regression/check_arm_inline_asm_provenance.sh
+
+# PR #821 F3 (2026-10-14 review): in a shared library, "non-preemptible"
+# does not prove "section-relative" — the null symbol (index 0), a local
+# undefined symbol and a discarded-section symbol all resolve to S = 0 and
+# would bake the load bias into the ADR.  The gate links hand-crafted ELF
+# objects (no cross binutils needed) and pins the link-time diagnostics plus
+# the valid-local control and the NONE-relocation carve-out.
+gate "arm-adr-shared-contract" fast \
+    bash tests/regression/check_arm_adr_shared_contract.sh
+
+# PR #821 F2 (2026-10-14 review): input visibility and the emitted ELF must
+# agree.  The gABI-merged visibility (most constraining STV_* of all
+# references and the definition, order-independent) drives the export
+# decision, the dynsym st_other byte and the ADR predicate — hidden
+# definitions are not exported, protected ones are exported but bind
+# internally, default stays preemptible.
+gate "arm-visibility-shared" fast \
+    bash tests/regression/check_arm_visibility_shared.sh
+
 # i386 register-argument staging, on the emitted assembly plus the cross-compiler
 # boundary: no capture may spoil an ABI source register before its last read, a
 # 12-byte packed argument is never moved 16 bytes at a time, and caller/callee halves

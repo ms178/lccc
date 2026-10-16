@@ -1862,12 +1862,48 @@ pub trait ArchCodegen {
         self.state().emit(template);
     }
 
+    /// Comment markers emitted around the substituted inline-asm body
+    /// (`Some((open, close))`), or `None` to emit no markers.
+    ///
+    /// GCC/Clang bracket inline asm with `#APP`/`#NO_APP` so downstream
+    /// text-level tools know the region is user-authored and must not be
+    /// touched. lccc's x86 peephole runs on assembly TEXT after codegen; a
+    /// user's `movq %rax, %rax` inside an ALTERNATIVE() macro is a deliberate
+    /// length template, not a removable self-move — without markers the
+    /// peephole deleted it and the kernel's .altinstructions entries got
+    /// orig_len = 0 ("empty alternative entry", objtool). Markers are comment
+    /// lines for the target assembler, so they are semantically invisible.
+    fn asm_block_markers(&self) -> Option<(&'static str, &'static str)> {
+        None
+    }
+
     /// Emit raw inline assembly template for naked functions (no operand substitution).
+    ///
+    /// The body is the user's own text, so it gets the same `#APP`/`#NO_APP`
+    /// provenance brackets as operand-bearing inline asm on targets that
+    /// mark their blocks (x86/i686/AArch64): a naked function's SIMD
+    /// instructions must not trip the driver's `-mgeneral-regs-only`
+    /// scanner, and (x86) the text peephole must not "optimize" a naked
+    /// template line.  There is no operand setup or output store to keep
+    /// outside the brackets — the whole body IS user text.
     fn emit_raw_inline_asm(&mut self, template: &str) {
-        for line in template.lines() {
+        let markers = self.asm_block_markers();
+        let lines: Vec<&str> = template.lines().collect();
+        let body_nonempty = lines.iter().any(|l| !l.trim().is_empty());
+        if let Some((open, _)) = markers {
+            if body_nonempty {
+                self.state().emit_fmt(format_args!("{}", open));
+            }
+        }
+        for line in &lines {
             let trimmed = line.trim();
             if !trimmed.is_empty() {
                 self.state().emit_fmt(format_args!("    {}", trimmed));
+            }
+        }
+        if let Some((_, close)) = markers {
+            if body_nonempty {
+                self.state().emit_fmt(format_args!("{}", close));
             }
         }
     }

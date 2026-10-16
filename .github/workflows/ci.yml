@@ -634,6 +634,27 @@ jobs:
       run: bash tests/regression/check_i386_regparm_small_struct_abi.sh
     - name: Scoped-noreturn diagnostic gate
       run: bash tests/regression/check_scoped_noreturn_diagnostics.sh
+    # AUD-DRV-1: `-o -` is a stream, not a filename, wherever GCC says so
+    # (measured on GCC 14.2); the gate's --self-test rejects a fake compiler
+    # with the old file-named-`-` behavior.
+    - name: Dash-output stdout gate
+      run: bash tests/regression/check_dash_output.sh
+    # AUD-SILENT-ZERO-1: x86-only intrinsics are a lowering-time diagnostic
+    # on aarch64/riscv64, never silent zeros (mutation-tested sweep).
+    - name: foreign-intrinsics rejected gate
+      run: python3 scripts/check_foreign_intrinsics.py
+    # PR #821 F1: user-authored AArch64 assembly is exempt from the
+    # -mgeneral-regs-only SIMD guard via #APP/#NO_APP provenance brackets.
+    - name: AArch64 inline-asm provenance gate
+      run: bash tests/regression/check_arm_inline_asm_provenance.sh
+    # PR #821 F3: shared-library ADR relocations prove the section-relative
+    # precondition through the SECTION MAP.
+    - name: AArch64 shared ADR contract gate
+      run: bash tests/regression/check_arm_adr_shared_contract.sh
+    # PR #821 F2: gABI-merged visibility drives export, st_other and the
+    # ADR predicate; input contract and emitted ELF cannot disagree.
+    - name: AArch64 shared visibility gate
+      run: bash tests/regression/check_arm_visibility_shared.sh
     - name: i386 call-staging assembly gate
       run: bash tests/regression/check_i386_call_staging_asm.sh
     - name: Loop-inversion census
