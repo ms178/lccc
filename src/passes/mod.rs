@@ -1342,6 +1342,13 @@ pub(crate) fn run_passes(
     vectorize::set_no_map_i64_unroll(no_map_i64_unroll);
     vectorize::set_no_map_zero_rem(no_map_zero_rem);
     vectorize::set_no_bytecmp_vec(no_bytecmp_vec);
+    // Generator-map vectorizer (vectorize_generator_map.rs): kill switch and
+    // the `[VEC-GEN]` trace, resolved here like the switches above.
+    vectorize::set_generator_map_policy(
+        std::env::var_os("CCC_NO_GENERATOR_MAP").is_none()
+            && std::env::var_os("LCCC_FORCE_SSE2").is_none(),
+        std::env::var_os("LCCC_DEBUG_VECTORIZE").is_some(),
+    );
     // The affine exit-compare fold's knobs, same rule as the byte-compare arm:
     // resolved here (the ratchet in check_env_test_hygiene.sh excludes this
     // file) and handed to the pass, never read per loop.

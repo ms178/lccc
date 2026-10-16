@@ -94,6 +94,11 @@
 //!      a different address. Arithmetic folds decline by themselves: the
 //!      seed-inclusive `[0, max]` range overflows the narrow type at the
 //!      first `+mag`.
+//!    * A paired counter may prove a testless zero-seeded `i += 1` from a
+//!      sibling `j -= 1` with a strict, clean-header guard. The guarded range
+//!      bounds the number of body passes; the candidate's final latch value
+//!      may wrap only if it feeds its own header phi and that phi has no
+//!      header, exit-merge, or post-loop observer.
 //!    * Signed predicates (`Slt`/`Sle`/`Sgt`/`Sge`) on an UNSIGNED phi
 //!      decline the whole proof: a signed test does not confine an unsigned
 //!      value (`0xFFFFFFFF <s 64` is true), so no unsigned range follows
@@ -653,7 +658,7 @@ fn try_widen_loop(
         changed |= canonicalise_latch_twin(func, latch, latch_val, phi_dest);
     }
 
-    let candidates: Vec<PhiCandidate> =
+    let mut candidates: Vec<PhiCandidate> =
         collect_widenable_phis(func, lp, preheader_label, latch, latch_label);
     if candidates.is_empty() {
         return LoopOutcome {
@@ -663,6 +668,19 @@ fn try_widen_loop(
     }
 
     let uses = build_use_map(func);
+    // Try mirror-shaped counters before their directly guarded siblings.
+    // Otherwise the sibling may be widened first, erasing the narrow phi the
+    // conservative mirror proof needs. The order is changed only in loops that
+    // contain such a counter: reordering every loop with a testless candidate
+    // (the previous key) moved widening where no mirror proof could fire. The
+    // proof does not depend on the order, so this only protects its input.
+    // Stable sorting preserves header order within both classes.
+    if candidates
+        .iter()
+        .any(|cand| is_mirror_shaped(func, cand, &uses))
+    {
+        candidates.sort_by_key(|cand| u8::from(!is_mirror_shaped(func, cand, &uses)));
+    }
 
     for cand in &candidates {
         let hoist = PreheaderSite { preheader, dom };
@@ -978,6 +996,22 @@ fn canonicalise_latch_twin(
     true
 }
 
+/// A testless counter seeded with constant zero: the shape the sibling mirror
+/// proof starts from. "Testless" means no comparison reads the phi directly;
+/// a guarded counter is the sibling, not the mirror.
+fn is_mirror_shaped(func: &IrFunction, cand: &PhiCandidate, uses: &UseMap) -> bool {
+    let guarded = uses.get(&cand.phi_dest.0).is_some_and(|value_uses| {
+        value_uses.iter().any(|(bi, ii)| {
+            *ii != usize::MAX
+                && matches!(
+                    func.blocks.get(*bi).and_then(|b| b.instructions.get(*ii)),
+                    Some(Instruction::Cmp { .. })
+                )
+        })
+    });
+    !guarded && resolve_init_const(func, cand.init_op, cand.phi_ty) == Some(0)
+}
+
 fn collect_widenable_phis(
     func: &IrFunction,
     lp: &NaturalLoop,
@@ -1218,6 +1252,7 @@ fn analyze_iv(
             init,
             latch_is_sub,
             step,
+            latch_dest,
         )?;
         // The exposed-latch intercept activates when the first body pass runs
         // at a seed the proof could not confine AND the proof's range cannot
@@ -1246,10 +1281,15 @@ fn analyze_iv(
         } else {
             true
         };
-        if signed_wrapping && !wrap_closed {
+        // The mirror theorem permits only the final exiting latch result to
+        // cross the narrow boundary, and only after proving it unobservable.
+        // Upstream's own `min` above is kept: it is never below the type
+        // minimum, so it is at least as conservative as the rejected change.
+        let latch_closed = wrap_closed || proof.exit_latch_dead;
+        if signed_wrapping && !latch_closed {
             return None;
         }
-        (Some(proof.range), proof.latch_exposed && !wrap_closed)
+        (Some(proof.range), proof.latch_exposed && !latch_closed)
     } else {
         (None, false)
     };
@@ -2158,6 +2198,10 @@ struct CountedProof {
     /// (`hi + mag` wraps the narrow type), `analyze_iv` activates the
     /// exposed-latch intercept.
     latch_exposed: bool,
+    /// The candidate's latch result feeds only its own header phi, while the
+    /// phi is read only in non-header loop blocks. With a strict sibling
+    /// guard this proves that a final exiting wrap is unobservable.
+    exit_latch_dead: bool,
 }
 
 /// Resolve the seed operand to a constant, through the single `Copy{src:
@@ -2275,14 +2319,262 @@ fn normalise_bound_threshold(
 /// neither may leave the narrow domain, else the narrow recurrence wraps
 /// where the wide one does not. One interval test covers both directions
 /// because `thr` is the exit threshold either way. The endpoints cannot
-/// overflow: `mag >= 1`, `max = 2^w - 1` with `w <= 32`, all in i128.
+/// overflow: `mag >= 1` and the passed type maximum is at most `2^32 - 1`,
+/// all represented in i128. Signed descending proofs use their signed minimum
+/// separately rather than this zero-based interval test.
 fn bound_leaves_room(thr: i128, max: i128, mag: i128) -> bool {
     thr >= mag - 1 && thr <= max - mag + 1
 }
 
-/// Theorems 5/5′ for unsigned IVs: prove the loop is a counted loop whose
-/// exit test confines the IV to a no-wrap range under a constant step, and
-/// classify the trajectory (phi-guarded vs latch-exposed).
+/// Maximum recursion depth for a sibling-bound proof. Valid proofs bottom
+/// out at the directly guarded decrementing phi; the cap also makes malformed
+/// or adversarial header-phi graphs strictly bounded.
+const MAX_SIBLING_PROOF_DEPTH: usize = 4;
+
+#[allow(clippy::too_many_arguments)]
+fn prove_counted_bound(
+    func: &IrFunction,
+    lp: &NaturalLoop,
+    preds: &FlatAdj,
+    succs: &FlatAdj,
+    uses: &UseMap,
+    dom: &DominanceChecker,
+    phi_dest: Value,
+    phi_ty: IrType,
+    latch: usize,
+    init: Operand,
+    latch_is_sub: bool,
+    step: Operand,
+    latch_dest: Value,
+) -> Option<CountedProof> {
+    let mut active = FxHashSet::default();
+    prove_counted_bound_recursive(
+        func,
+        lp,
+        preds,
+        succs,
+        uses,
+        dom,
+        phi_dest,
+        phi_ty,
+        latch,
+        init,
+        latch_is_sub,
+        step,
+        latch_dest,
+        &mut active,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_counted_bound_recursive(
+    func: &IrFunction,
+    lp: &NaturalLoop,
+    preds: &FlatAdj,
+    succs: &FlatAdj,
+    uses: &UseMap,
+    dom: &DominanceChecker,
+    phi_dest: Value,
+    phi_ty: IrType,
+    latch: usize,
+    init: Operand,
+    latch_is_sub: bool,
+    step: Operand,
+    latch_dest: Value,
+    active: &mut FxHashSet<u32>,
+    depth: usize,
+) -> Option<CountedProof> {
+    if depth >= MAX_SIBLING_PROOF_DEPTH || !active.insert(phi_dest.0) {
+        return None;
+    }
+    let proof = prove_counted_bound_direct(
+        func,
+        lp,
+        preds,
+        succs,
+        uses,
+        dom,
+        phi_dest,
+        phi_ty,
+        latch,
+        init,
+        latch_is_sub,
+        step,
+    )
+    .or_else(|| {
+        prove_sibling_mirror_bound(
+            func,
+            lp,
+            preds,
+            succs,
+            uses,
+            dom,
+            phi_dest,
+            phi_ty,
+            latch,
+            init,
+            latch_is_sub,
+            step,
+            latch_dest,
+            active,
+            depth,
+        )
+    });
+    active.remove(&phi_dest.0);
+    proof
+}
+
+/// A zero-seeded `+1` IV is bounded by a sibling `-1` IV whose clean-header
+/// guard proves every body value lies in `[L, H]`: the sibling begins no higher
+/// than H and can execute at most `H - L + 1` passes, so the candidate body
+/// values lie in `[0, H - L]`. The candidate's final latch value may wrap only
+/// when it feeds its own header phi and that phi has no header, exit-merge, or
+/// post-loop observer.
+#[allow(clippy::too_many_arguments)]
+fn prove_sibling_mirror_bound(
+    func: &IrFunction,
+    lp: &NaturalLoop,
+    preds: &FlatAdj,
+    succs: &FlatAdj,
+    uses: &UseMap,
+    dom: &DominanceChecker,
+    phi_dest: Value,
+    phi_ty: IrType,
+    latch: usize,
+    init: Operand,
+    latch_is_sub: bool,
+    step: Operand,
+    latch_dest: Value,
+    active: &mut FxHashSet<u32>,
+    depth: usize,
+) -> Option<CountedProof> {
+    if resolve_init_const(func, init, phi_ty) != Some(0)
+        || latch_step_ty(func, latch_dest) != Some(phi_ty)
+        || normalized_latch_delta(step, latch_is_sub, phi_ty) != Some(1)
+        || !exit_latch_is_dead(func, lp, uses, phi_dest, latch_dest, latch)
+    {
+        return None;
+    }
+
+    let preheader = lp.find_preheader(preds)?;
+    let preheader_label = func.blocks.get(preheader)?.label;
+    let latch_label = func.blocks.get(latch)?.label;
+    let max = type_max_i128(phi_ty);
+
+    for sibling in collect_widenable_phis(func, lp, preheader_label, latch, latch_label) {
+        if sibling.phi_dest == phi_dest || sibling.phi_ty != phi_ty {
+            continue;
+        }
+        if !operand_is_const_or_loop_invariant(&sibling.init_op, lp, func, sibling.phi_dest) {
+            continue;
+        }
+        let Some(sibling_step) = plan_step_operand(func, sibling.phi_dest, sibling.latch_op_dest)
+        else {
+            continue;
+        };
+        if latch_step_ty(func, sibling.latch_op_dest) != Some(phi_ty)
+            || normalized_latch_delta(sibling_step, sibling.latch_is_sub, phi_ty) != Some(-1)
+        {
+            continue;
+        }
+        let Some(sibling_proof) = prove_counted_bound_recursive(
+            func,
+            lp,
+            preds,
+            succs,
+            uses,
+            dom,
+            sibling.phi_dest,
+            sibling.phi_ty,
+            latch,
+            sibling.init_op,
+            sibling.latch_is_sub,
+            sibling_step,
+            sibling.latch_op_dest,
+            active,
+            depth + 1,
+        ) else {
+            continue;
+        };
+        if sibling_proof.latch_exposed
+            || sibling_proof.range.lo < 0
+            || !sibling_proof.range.within(phi_ty)
+        {
+            continue;
+        }
+        let candidate_hi = sibling_proof.range.hi - sibling_proof.range.lo;
+        if !(0..=max).contains(&candidate_hi) {
+            continue;
+        }
+        return Some(CountedProof {
+            range: Range {
+                lo: 0,
+                hi: candidate_hi,
+            },
+            latch_exposed: false,
+            exit_latch_dead: true,
+        });
+    }
+    None
+}
+
+fn normalized_latch_delta(step: Operand, is_sub: bool, phi_ty: IrType) -> Option<i128> {
+    let Operand::Const(c) = step else {
+        return None;
+    };
+    let step = normalize_step_const(c, phi_ty)?.0;
+    Some(if is_sub { -step } else { step })
+}
+
+/// The candidate latch result must have exactly one use: its own matching
+/// header-phi incoming. The candidate phi itself must be used only in
+/// non-header blocks inside the loop, so a final wrapped value cannot be read
+/// by the exit test, an exit merge, or post-loop code.
+fn exit_latch_is_dead(
+    func: &IrFunction,
+    lp: &NaturalLoop,
+    uses: &UseMap,
+    phi_dest: Value,
+    latch_dest: Value,
+    latch: usize,
+) -> bool {
+    let Some(latch_uses) = uses.get(&latch_dest.0) else {
+        return false;
+    };
+    if latch_uses.is_empty() {
+        return false;
+    }
+    let Some(latch_label) = func.blocks.get(latch).map(|b| b.label) else {
+        return false;
+    };
+    for &(bi, ii) in latch_uses {
+        if bi != lp.header || ii == usize::MAX {
+            return false;
+        }
+        let Some(Instruction::Phi { dest, incoming, .. }) =
+            func.blocks.get(bi).and_then(|b| b.instructions.get(ii))
+        else {
+            return false;
+        };
+        if *dest != phi_dest
+            || !incoming.iter().any(|(op, from)| {
+                *from == latch_label && matches!(op, Operand::Value(v) if *v == latch_dest)
+            })
+        {
+            return false;
+        }
+    }
+    uses.get(&phi_dest.0).is_none_or(|phi_uses| {
+        phi_uses
+            .iter()
+            .all(|(bi, _)| *bi != lp.header && lp.body.contains(bi))
+    })
+}
+
+/// Theorems 5/5′ for unsigned IVs and the strict signed unit-decrement
+/// sibling case: prove the loop is counted, its direct guard bounds body
+/// values, and classify the trajectory (phi-guarded vs latch-exposed).
 ///
 /// The per-iteration delta is `-step` for a `Sub` latch and `+step` for an
 /// `Add` latch.  Writing `mag = |delta|` and `max = 2^w - 1`:
@@ -2327,7 +2619,7 @@ fn bound_leaves_room(thr: i128, max: i128, mag: i128) -> bool {
 /// Proving the stride here widens the IV, after which the fold is both legal
 /// and free -- the counted loop keeps its `k(%base,%iv)` addressing instead
 /// of paying a narrow `leal` per unrolled access.
-fn prove_counted_bound(
+fn prove_counted_bound_direct(
     func: &IrFunction,
     lp: &NaturalLoop,
     preds: &FlatAdj,
@@ -2498,6 +2790,11 @@ fn prove_counted_bound(
         let cmp_is_header = bi == lp.header;
         let cmp_is_latch = bi == latch;
         let latch_exposed = cmp_is_latch || !cmp_is_header || !header_clean;
+        // The signed decrement proof is intentionally strict-header only: an
+        // untested negative seed could execute body work outside its range.
+        if signed && delta < 0 && latch_exposed {
+            return None;
+        }
 
         // Strict (phi-guarded) vs seed-inclusive (latch-exposed) range. The
         // seed-inclusive upper bound is `max(seed, thr-1+mag)`: the untested
@@ -2550,6 +2847,7 @@ fn prove_counted_bound(
         return Some(CountedProof {
             range,
             latch_exposed,
+            exit_latch_dead: false,
         });
     }
     None
@@ -3730,6 +4028,91 @@ mod tests {
         func
     }
 
+    /// A testless incrementing counter paired with a directly guarded,
+    /// decrementing sibling. The guarded phi is deliberately first in the
+    /// header to exercise the testless-first candidate order.
+    fn paired_counting_loop(name: &str, expose_i_after_loop: bool) -> IrFunction {
+        let body = vec![
+            Instruction::Cast {
+                dest: Value(10),
+                src: Operand::Value(Value(1)),
+                from_ty: IrType::I32,
+                to_ty: IrType::I64,
+            },
+            gep_inst(11, 10, IrType::I32),
+        ];
+        let mut func = counting_loop(
+            name,
+            IrType::I32,
+            IrBinOp::Add,
+            body,
+            Some(Instruction::Cmp {
+                dest: Value(99),
+                op: IrCmpOp::Sge,
+                lhs: Operand::Value(Value(2)),
+                rhs: Operand::Const(IrConst::I32(0)),
+                ty: IrType::I32,
+            }),
+        );
+        func.blocks[0].instructions[0] = Instruction::Copy {
+            dest: Value(0),
+            src: Operand::Const(IrConst::I32(0)),
+        };
+        func.blocks[0].instructions.extend([
+            Instruction::GlobalAddr {
+                dest: Value(51),
+                name: "arr_j".to_string(),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(60),
+                name: "j_seed".to_string(),
+            },
+            Instruction::Load {
+                dest: Value(61),
+                ptr: Value(60),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+                volatile: true,
+            },
+        ]);
+        func.blocks[1].instructions.insert(
+            0,
+            Instruction::Phi {
+                dest: Value(2),
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Value(Value(61)), BlockId(0)),
+                    (Operand::Value(Value(6)), BlockId(3)),
+                ],
+            },
+        );
+        func.blocks[2].instructions.extend([
+            Instruction::Cast {
+                dest: Value(12),
+                src: Operand::Value(Value(2)),
+                from_ty: IrType::I32,
+                to_ty: IrType::I64,
+            },
+            Instruction::GetElementPtr {
+                dest: Value(13),
+                base: Value(51),
+                offset: Operand::Value(Value(12)),
+                ty: IrType::I32,
+            },
+        ]);
+        func.blocks[3].instructions.push(Instruction::BinOp {
+            dest: Value(6),
+            op: IrBinOp::Sub,
+            lhs: Operand::Value(Value(2)),
+            rhs: Operand::Const(IrConst::I32(1)),
+            ty: IrType::I32,
+        });
+        if expose_i_after_loop {
+            func.blocks[4].terminator = Terminator::Return(Some(Operand::Value(Value(1))));
+        }
+        func
+    }
+
     fn gep_inst(dest: u32, offset: u32, ty: IrType) -> Instruction {
         Instruction::GetElementPtr {
             dest: Value(dest),
@@ -3827,6 +4210,111 @@ mod tests {
                 )));
             }
         }
+    }
+
+    #[test]
+    fn paired_counter_widens_testless_incrementing_iv_first() {
+        let mut func = paired_counting_loop("paired_count", false);
+        check_wrapv(&mut func, 2);
+        for value in [1, 2] {
+            assert!(
+                func.blocks[1].instructions.iter().any(|inst| matches!(
+                    inst,
+                    Instruction::Phi {
+                        dest,
+                        ty: IrType::I64,
+                        ..
+                    } if *dest == Value(value)
+                )),
+                "paired phi %{value} was not widened"
+            );
+        }
+    }
+
+    #[test]
+    fn paired_counter_refuses_if_incrementing_phi_escapes_on_exit() {
+        let mut func = paired_counting_loop("paired_count_escape", true);
+        check_wrapv(&mut func, 1);
+        assert!(func.blocks[1].instructions.iter().any(|inst| matches!(
+            inst,
+            Instruction::Phi {
+                dest: Value(1),
+                ty: IrType::I32,
+                ..
+            }
+        )));
+        assert!(func.blocks[1].instructions.iter().any(|inst| matches!(
+            inst,
+            Instruction::Phi {
+                dest: Value(2),
+                ty: IrType::I64,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn paired_counter_requires_zero_seed_unit_step_and_header_deadness() {
+        let mut nonzero = paired_counting_loop("paired_nonzero", false);
+        nonzero.blocks[0].instructions[0] = Instruction::Copy {
+            dest: Value(0),
+            src: Operand::Const(IrConst::I32(1)),
+        };
+        check_wrapv(&mut nonzero, 1);
+        assert!(nonzero.blocks[1].instructions.iter().any(|inst| matches!(
+            inst,
+            Instruction::Phi {
+                dest: Value(1),
+                ty: IrType::I32,
+                ..
+            }
+        )));
+
+        // A stride-2 sibling is outside the mirror proof's unit-step subset,
+        // so the testless counter must stay narrow. The guarded sibling may
+        // still be widened by the ordinary single-counter path, which proves
+        // its own range; the pin is on the testless phi, not on the total.
+        let mut strided = paired_counting_loop("paired_strided", false);
+        if let Instruction::BinOp { rhs, .. } = &mut strided.blocks[3].instructions[1] {
+            *rhs = Operand::Const(IrConst::I32(2));
+        }
+        check_wrapv(&mut strided, 1);
+        assert!(
+            strided.blocks[1].instructions.iter().any(|inst| matches!(
+                inst,
+                Instruction::Phi {
+                    dest: Value(1),
+                    ty: IrType::I32,
+                    ..
+                }
+            )),
+            "testless counter must not be widened through a stride-2 sibling"
+        );
+
+        let mut header_observed = paired_counting_loop("paired_header_use", false);
+        header_observed.blocks[1]
+            .instructions
+            .push(Instruction::Cmp {
+                dest: Value(98),
+                op: IrCmpOp::Sge,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I32(0)),
+                ty: IrType::I32,
+            });
+        check_wrapv(&mut header_observed, 1);
+        assert!(
+            header_observed.blocks[1]
+                .instructions
+                .iter()
+                .any(|inst| matches!(
+                    inst,
+                    Instruction::Phi {
+                        dest: Value(1),
+                        ty: IrType::I32,
+                        ..
+                    }
+                ))
+        );
     }
 
     #[test]

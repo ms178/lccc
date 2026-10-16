@@ -212,6 +212,9 @@ gate "vex-flag-reads" fast \
 gate "load-cast-fold" fast \
     env CCC="$LCCC" bash tests/regression/check_load_cast_fold.sh
 
+gate "generator-map" fast \
+    env CCC="$LCCC" bash tests/regression/check_generator_map.sh
+
 gate "benchmark-codegen-registry" fast \
     python3 tests/regression/check_benchmark_codegen_registry.py
 
@@ -293,6 +296,11 @@ gate "const-volatile-objects" fast \
 # buffer, gcc-parity matrix (-O0..-O3 x {default, kill switch, -m32 SKIP}).
 gate "ivwiden-exposed-latch" fast \
     env CCC="$LCCC" bash tests/regression/check_ivwiden_exposed_latch.sh
+# Paired-counter (sibling mirror) proof: gcc-16 runtime-edge parity with and
+# without the kill switch, plus an assertion that the proof still changes the
+# constant-threshold loop (a silent refusal would otherwise pass unnoticed).
+gate "ivw-paired-counter" fast \
+    env CCC="$LCCC" bash tests/regression/check_ivw_paired_counter.sh
 gate "zlib-maketrees" fast \
     env CCC="$LCCC" bash tests/regression/check_zlib_maketrees.sh
 gate "fp-extract-homes" fast \

@@ -431,6 +431,8 @@ jobs:
       run: bash tests/regression/check_vex_flag_reads.sh
     - name: Verify W2 load->cast fold structure and runtime
       run: bash tests/regression/check_load_cast_fold.sh
+    - name: Verify generator-map vectorizer (fires, matches gcc-16, kill switch)
+      run: bash tests/regression/check_generator_map.sh
     - name: Verify benchmark codegen registry and evidence (mock only)
       run: python3 tests/regression/check_benchmark_codegen_registry.py
     - name: Verify GCC provisioning contracts (mock only)
@@ -469,6 +471,8 @@ jobs:
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_ivsr_vecaddr_struct_walk.sh
     - name: IV-widen exposed-latch trajectory gates
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_ivwiden_exposed_latch.sh
+    - name: IV-widen paired-counter mirror proof (gcc-16 parity and proof-firing assertion)
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ivw_paired_counter.sh
     - name: zlib-ng complete Huffman table (late constant GEP)
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_zlib_maketrees.sh
     - name: Scalar lane types, stack boundaries and opt-in homes

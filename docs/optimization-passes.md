@@ -40,6 +40,12 @@ passes; the backend peepholes are documented per backend
 - **Stencil vectorizer** — constant-tap affine loops, bit-exact vs scalar
   (`CCC_NO_STENCIL_VEC`).
 - **Map expression trees** — elementwise FP/int map loops (`CCC_NO_MAP_VEC`).
+- **Generator-map vectorizer** (`vectorize_generator_map.rs`) — counted
+  loops that store a byte computed from the induction variable alone
+  (`dst[i] = (u8)F(i)`, no source loads), AVX2 only, 32 elements per packed
+  iteration with a scalar tail. Kill switch `CCC_NO_GENERATOR_MAP`; the
+  `[VEC-GEN]` trace under `LCCC_DEBUG_VECTORIZE`. Gate:
+  `tests/regression/check_generator_map.sh`.
 - **Widening + masked conditional-sum reductions** — I32->I64 `paddq`
   pipelines, VEX-only bodies (9x AVX-SSE transition penalty avoided).
 - **Loop rotation** (`loop_rotate.rs`, IR) — **opt-in** at the IR level

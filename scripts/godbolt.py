@@ -480,6 +480,101 @@ def _compile_local(executable: str, source: Path, flags: str) -> list[str]:
             raise GodboltError(f"local compile failed: {error}") from error
 
 
+# ---------------------------------------------------------------------------
+# Local oracles: compilers that run on this host, not on Compiler Explorer.
+#
+# CE's `cicxlatest` channel is ICX 2024.0.0 whatever its label says, so the
+# current Intel release can only be measured locally. A local oracle is OPT-IN:
+# it is never part of DEFAULT_ORACLES, which must run on GitHub runners that
+# have no Intel toolchain. Each binary is identified by its own macro probe
+# (never by a moving label) and every compile goes through _compile_local, not
+# compile_on_godbolt; the survey canary in oracle_profile depends on that.
+LOCAL_ORACLES: dict[str, dict[str, Any]] = {
+    "icx2026.1.1": {
+        "name": "Intel oneAPI DPC++/C++ 2026.1.1 (local)",
+        "semver": "2026.1.1",
+        "compilerType": "local-icx",
+        "env": "LCCC_ICX_BIN",
+        "provision": "ensure_icx_2026.sh",
+        "probe_macro": "__INTEL_LLVM_COMPILER",
+        "probe_value": "20260101",
+    },
+}
+_LOCAL_BINARIES: dict[str, Path] = {}
+_LOCAL_LOCK = threading.Lock()
+
+
+def _probe_macro(binary: str, macro: str) -> str | None:
+    """Value of a predefined macro as the compiler itself reports it."""
+    result = subprocess.run(
+        [binary, "-E", "-dM", "-x", "c", os.devnull],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode:
+        return None
+    for line in result.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0] == "#define" and parts[1] == macro:
+            return parts[2].strip()
+    return None
+
+
+def local_oracle_binary(name: str) -> Path:
+    """Resolve, probe and cache the binary of a local oracle.
+
+    $LCCC_ICX_BIN (or the spec's env variable) wins; otherwise the provisioner
+    in scripts/ prints the verified binary path. A binary whose probe does not
+    match the pinned release is refused, whatever its path says.
+    """
+    spec = LOCAL_ORACLES[name]
+    with _LOCAL_LOCK:
+        cached = _LOCAL_BINARIES.get(name)
+        if cached is not None:
+            return cached
+        explicit = os.environ.get(spec["env"])
+        if explicit:
+            binary = explicit
+        else:
+            provisioner = Path(__file__).resolve().parent / spec["provision"]
+            result = subprocess.run([str(provisioner)], capture_output=True, text=True, timeout=3600)
+            if result.returncode:
+                raise GodboltError(f"{name}: provisioning failed: {result.stderr.strip()}")
+            binary = result.stdout.strip().splitlines()[-1]
+        probed = _probe_macro(binary, spec["probe_macro"])
+        if probed != spec["probe_value"]:
+            raise GodboltError(
+                f"{name}: {binary} probes {spec['probe_macro']}={probed!r}, "
+                f"expected {spec['probe_value']!r}"
+            )
+        path = Path(binary).resolve()
+        _LOCAL_BINARIES[name] = path
+        return path
+
+
+def local_oracle_metadata(name: str) -> dict[str, Any]:
+    """Provenance record for a local oracle, including the binary digest."""
+    spec = LOCAL_ORACLES[name]
+    binary = local_oracle_binary(name)
+    digest = hashlib.sha256()
+    with binary.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return {
+        "id": name,
+        "name": spec["name"],
+        "semver": spec["semver"],
+        "compilerType": spec["compilerType"],
+        "binary": str(binary),
+        "binary_sha256": digest.hexdigest(),
+        "probe": f"{spec['probe_macro']}={spec['probe_value']}",
+    }
+
+
+def compile_local_oracle(name: str, source: Path, flags: str) -> list[str]:
+    """Assembly lines from a local oracle; never touches Compiler Explorer."""
+    return _compile_local(str(local_oracle_binary(name)), source, flags)
+
+
 def command_list(args: argparse.Namespace) -> int:
     pattern = re.compile(args.filter, re.IGNORECASE) if args.filter else None
     rows = []

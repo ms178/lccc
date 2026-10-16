@@ -10,6 +10,8 @@ from __future__ import annotations
 import hashlib
 import re
 import shlex
+import tempfile
+from pathlib import Path
 
 import godbolt
 
@@ -41,28 +43,41 @@ def verify(oracles, flags):
               'source_sha256': hashlib.sha256(SOURCE.encode()).hexdigest(),
               'source': SOURCE, 'requested_flags': flags, 'compilers': {}, 'complete': False}
     for name in oracles:
-        cid = godbolt.resolve_compiler(name)
-        row = {'id': cid, 'requested_flags': flags}
+        local = name in godbolt.LOCAL_ORACLES
+        cid = name if local else godbolt.resolve_compiler(name)
+        row = {'id': cid, 'requested_flags': flags, 'local': local}
         report['compilers'][name] = row
         try:
-            row['metadata'] = godbolt.compiler_metadata(cid)
-            row['effective_flags'] = godbolt.compiler_flags(cid, flags)
-            result = godbolt.compile_on_godbolt(cid, SOURCE, flags, raise_on_error=True)
-            if result is None:
-                raise godbolt.GodboltError('missing response')
-            lines = godbolt.assembly_lines(result)
+            if local:
+                row['metadata'] = godbolt.local_oracle_metadata(name)
+                row['effective_flags'] = flags
+
+                def compile_text(source_text, _name=name, _flags=flags):
+                    # Local oracles compile a file on this host; the CE survey
+                    # canary must never see them. Source goes to a private dir.
+                    with tempfile.TemporaryDirectory(prefix='lccc-profile-') as td:
+                        src = Path(td) / 'profile.c'
+                        src.write_text(source_text)
+                        return godbolt.compile_local_oracle(_name, src, _flags), []
+            else:
+                row['metadata'] = godbolt.compiler_metadata(cid)
+                row['effective_flags'] = godbolt.compiler_flags(cid, flags)
+
+                def compile_text(source_text, _cid=cid, _flags=flags):
+                    result = godbolt.compile_on_godbolt(_cid, source_text, _flags,
+                                                        raise_on_error=True)
+                    if result is None:
+                        raise godbolt.GodboltError('missing response')
+                    return godbolt.assembly_lines(result), result.get('stderr', [])
+            lines, stderr = compile_text(SOURCE)
             text = '\n'.join(lines)
             row['features'] = {key: bool(re.search(pattern, text)) for key, pattern in FEATURES.items()}
             row['assembly_sha256'] = hashlib.sha256(text.encode()).hexdigest()
             row['assembly'] = lines
-            row['stderr'] = result.get('stderr', [])
+            row['stderr'] = stderr
             row['ok'] = all(row['features'].values())
             if '-ffp-contract=off' in shlex.split(flags):
-                probe = godbolt.compile_on_godbolt(cid, CONTRACTION_SOURCE, flags,
-                                                    raise_on_error=True)
-                if probe is None:
-                    raise godbolt.GodboltError('missing contraction probe response')
-                asm = godbolt.assembly_lines(probe)
+                asm, probe_stderr = compile_text(CONTRACTION_SOURCE)
                 body = '\n'.join(asm)
                 separate = (bool(re.search(r'\bv?mulsd\b', body))
                             and bool(re.search(r'\bv?addsd\b', body))
@@ -70,7 +85,7 @@ def verify(oracles, flags):
                 row['contraction_off'] = {
                     'source': CONTRACTION_SOURCE, 'assembly': asm,
                     'assembly_sha256': hashlib.sha256(body.encode()).hexdigest(),
-                    'ok': bool(separate), 'stderr': probe.get('stderr', [])}
+                    'ok': bool(separate), 'stderr': probe_stderr}
                 row['ok'] = row['ok'] and bool(separate)
             if not row['ok']:
                 row['error'] = 'missing representative ISA instruction(s) or contraction-off witness'

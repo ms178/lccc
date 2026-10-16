@@ -485,6 +485,38 @@ def _record_remote(name: str, source: str, req: Request, compilers: list[dict[st
     }
 
 
+def _record_local_oracle(name: str, req: Request) -> dict[str, Any]:
+    """A host-run oracle (see godbolt.LOCAL_ORACLES), measured like a remote one.
+
+    Local channels are x86-64 only: the ICX binary is refused for any other
+    --arch, the same mislabelling guard `_check_arch` applies to CE channels.
+    The identity comes from the binary's own probe, not from a moving label.
+    """
+    if req.arch != "x86":
+        raise godbolt.GodboltError(
+            f"{name} is a local x86-64 oracle; --arch {req.arch} was requested"
+        )
+    metadata = godbolt.local_oracle_metadata(name)
+    started = time.perf_counter()
+    lines = godbolt.compile_local_oracle(name, req.source, req.flags)
+    elapsed = time.perf_counter() - started
+    body = _function_body(lines, req.function)
+    if body is None:
+        raise godbolt.GodboltError(
+            f"function '{req.function}' was not emitted by {name} "
+            "(likely inlined or removed)"
+        )
+    return {
+        "key": name,
+        **metadata,
+        "requested_flags": req.flags,
+        "flags": req.flags,
+        "elapsed_s": elapsed,
+        **asdict(_stats(body, req.arch)),
+        "assembly": body,
+    }
+
+
 def _measure(req: Request, executable: str | None, oracles: list[str],
              compilers: list[dict[str, Any]]) -> dict[str, Any]:
     source = req.source.read_text()
@@ -497,7 +529,10 @@ def _measure(req: Request, executable: str | None, oracles: list[str],
             errors.append({"compiler": "lccc", "error": f"{type(exc).__name__}: {exc}"})
     for name in oracles:
         try:
-            records.append(_record_remote(name, source, req, compilers))
+            if name in godbolt.LOCAL_ORACLES:
+                records.append(_record_local_oracle(name, req))
+            else:
+                records.append(_record_remote(name, source, req, compilers))
         except Exception as exc:  # noqa: BLE001 -- one compiler must not kill the batch
             cid = godbolt.resolve_compiler(name)
             errors.append({"compiler": name, "id": cid, "error": f"{type(exc).__name__}: {exc}"})
