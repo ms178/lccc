@@ -193,7 +193,11 @@ def main():
                        '.section .debug_target,"",%progbits\n.local target\ntarget: .quad 1\n')
         run(["-c", src, "-o", obj])
         p = run(["-nostdlib", "-shared", obj, "-o", exe], False)
-        assert "local allocated section-relative" in p.stderr, p.stderr
+        # Either refusal spelling is a correct fail-closed outcome: the old
+        # resolver named the "local allocated section-relative" precondition;
+        # the section-map predicate names the surviving-section proof.
+        assert ("local allocated section-relative" in p.stderr
+                or "symbol in a surviving section" in p.stderr), p.stderr
         checks += 1
         # Same-name local symbols must retain object identity, not consult a
         # global name-only visibility/address table. Decode both input orders.
@@ -213,8 +217,13 @@ def main():
                 _, _, target, _ = mapped_marker(exe, data_mark)
                 assert p + displacement(struct.unpack_from("<I", data, site)[0]) == target
                 checks += 1
-        # AArch64 does not yet serialize/enforce merged ELF visibility across
-        # dynsym/GOT/PLT. Bound shared ADR to true locals, in either input order.
+        # AArch64 now enforces the gABI-merged visibility across dynsym/GOT/
+        # PLT (PR #821 F2/F3): a HIDDEN or PROTECTED definition binds locally,
+        # so a shared ADR to it is link-time resolvable in either input order.
+        # A DEFAULT-visibility global stays interposable in an ET_DYN and must
+        # still be refused. The deep semantics (export sets, st_other bytes,
+        # degenerate section shapes) are pinned by check_arm_visibility_shared
+        # and check_arm_adr_shared_contract.
         definition, definition_obj = w / "definition.s", w / "definition.o"
         src.write_text(".text\n.global _start\n_start: adr x0,target\nret\n")
         run(["-c", src, "-o", obj])
@@ -222,9 +231,15 @@ def main():
             definition.write_text(f".data\n.global target\n.{visibility} target\ntarget: .quad 1\n")
             run(["-c", definition, "-o", definition_obj])
             for inputs in [[obj, definition_obj], [definition_obj, obj]]:
-                p = run(["-shared", "-nostdlib", *inputs, "-o", w / "hidden.so"], False)
-                assert "local allocated section-relative" in p.stderr, p.stderr
+                run(["-shared", "-nostdlib", *inputs, "-o", w / "hidden.so"])
                 checks += 1
+        definition.write_text(".data\n.global target\ntarget: .quad 1\n")
+        run(["-c", definition, "-o", definition_obj])
+        for inputs in [[obj, definition_obj], [definition_obj, obj]]:
+            p = run(["-shared", "-nostdlib", *inputs, "-o", w / "default.so"], False)
+            assert p.returncode != 0, "DEFAULT-visibility ADR target must stay refused"
+            assert "locally bound section-relative" in p.stderr, p.stderr
+            checks += 1
         # Same-section ADRP must account for the final merged section's page.
         definition.write_text(".text\n.space 4080\n")
         run(["-c", definition, "-o", definition_obj])

@@ -41,8 +41,10 @@ def check_user_asm(w):
         for mode in ([], ["-mgeneral-regs-only"]):
             compile(["-O2", *mode, "-S", source, "-o", assembly])
             text = assembly.read_text()
-            assert "//APP" in text and "//NO_APP" in text, (name, text)
-            assert text.index("//APP") < text.index("movi v0.16b") < text.index("//NO_APP"), text
+            # One marker grammar across targets: #APP/#NO_APP (GAS special-
+            # cases it everywhere; the native parser drops #-lines too).
+            assert "#APP" in text and "#NO_APP" in text, (name, text)
+            assert text.index("#APP") < text.index("movi v0.16b") < text.index("#NO_APP"), text
             compile(["-O2", *mode, "-c", source, "-o", w / "user.o"])
             gas = shutil.which("aarch64-linux-gnu-as")
             if gas:
