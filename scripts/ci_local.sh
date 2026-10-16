@@ -1898,6 +1898,12 @@ gate "godbolt-oracle-selftest" fast \
 gate "godbolt-cache-selftest" fast \
     python3 scripts/test_godbolt_cache.py
 
+gate "local-oracles-selftest" fast \
+    python3 scripts/test_local_oracles.py
+
+gate "icx-provision-selftest" fast \
+    python3 scripts/test_icx_provision.py
+
 # MS-11: glibc `make check` triage classifier (miscompile / unsupported /
 # environment). Fixture-driven, offline.
 gate "glibc-triage-selftest" fast \

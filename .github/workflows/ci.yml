@@ -435,6 +435,10 @@ jobs:
       run: bash tests/regression/check_generator_map.sh
     - name: Verify benchmark codegen registry and evidence (mock only)
       run: python3 tests/regression/check_benchmark_codegen_registry.py
+    - name: Verify local oracle identity and ICX provisioning (offline, mock only)
+      run: |
+        python3 scripts/test_local_oracles.py
+        python3 scripts/test_icx_provision.py
     - name: Verify GCC provisioning contracts (mock only)
       run: python3 tests/regression/check_ci_gcc16_provisioning.py
     - name: Verify swap provisioning contracts (mock only)

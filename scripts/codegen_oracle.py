@@ -721,7 +721,7 @@ def _fetch_compiler_list(oracles: list[str]) -> list[dict[str, Any]]:
     metadata instead of killing the batch: each oracle then reports its own
     compile error, and compare mode still exits non-zero on it.
     """
-    if not oracles:
+    if not any(name not in godbolt.LOCAL_ORACLES for name in oracles):
         return []
     try:
         return godbolt.list_compilers("c")

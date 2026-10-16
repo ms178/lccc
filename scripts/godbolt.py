@@ -29,6 +29,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 import sys
@@ -483,24 +484,20 @@ def _compile_local(executable: str, source: Path, flags: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # Local oracles: compilers that run on this host, not on Compiler Explorer.
 #
-# CE's `cicxlatest` channel is ICX 2024.0.0 whatever its label says, so the
-# current Intel release can only be measured locally. A local oracle is OPT-IN:
-# it is never part of DEFAULT_ORACLES, which must run on GitHub runners that
-# have no Intel toolchain. Each binary is identified by its own macro probe
-# (never by a moving label) and every compile goes through _compile_local, not
-# compile_on_godbolt; the survey canary in oracle_profile depends on that.
+# Local release-line channels are OPT-IN, never DEFAULT_ORACLES. A fresh
+# prefix selects the newest authenticated Intel APT build in that line;
+# manifests and measurement records retain the actual patch/build identity.
 LOCAL_ORACLES: dict[str, dict[str, Any]] = {
-    "icx2026.1.1": {
-        "name": "Intel oneAPI DPC++/C++ 2026.1.1 (local)",
-        "semver": "2026.1.1",
+    "icx2026.2": {
+        "name": "Intel oneAPI DPC++/C++ 2026.2.x (local)",
+        "release_line": "2026.2",
         "compilerType": "local-icx",
         "env": "LCCC_ICX_BIN",
         "provision": "ensure_icx_2026.sh",
         "probe_macro": "__INTEL_LLVM_COMPILER",
-        "probe_value": "20260101",
     },
 }
-_LOCAL_BINARIES: dict[str, Path] = {}
+_LOCAL_BINARIES: dict[str, tuple[tuple[str | None, ...], Path, tuple[int, ...], str]] = {}
 _LOCAL_LOCK = threading.Lock()
 
 
@@ -519,55 +516,102 @@ def _probe_macro(binary: str, macro: str) -> str | None:
     return None
 
 
-def local_oracle_binary(name: str) -> Path:
-    """Resolve, probe and cache the binary of a local oracle.
+def _binary_identity(path: Path) -> tuple[int, ...]:
+    stat = path.stat()
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
 
-    $LCCC_ICX_BIN (or the spec's env variable) wins; otherwise the provisioner
-    in scripts/ prints the verified binary path. A binary whose probe does not
-    match the pinned release is refused, whatever its path says.
-    """
+
+def _local_semver(spec: dict[str, Any], probed: str | None) -> str:
+    if probed is None or not re.fullmatch(r"[0-9]{8}", probed):
+        raise GodboltError(f"missing or invalid {spec['probe_macro']} probe: {probed!r}")
+    value = int(probed)
+    major, minor, patch = value // 10000, value // 100 % 100, value % 100
+    if f"{major}.{minor}" != spec["release_line"]:
+        raise GodboltError(
+            f"compiler probes {spec['probe_macro']}={probed!r}, "
+            f"expected release line {spec['release_line']}"
+        )
+    return f"{major}.{minor}.{patch}"
+
+
+def _validated_local_oracle(name: str) -> tuple[Path, str]:
     spec = LOCAL_ORACLES[name]
     with _LOCAL_LOCK:
-        cached = _LOCAL_BINARIES.get(name)
-        if cached is not None:
-            return cached
         explicit = os.environ.get(spec["env"])
-        if explicit:
-            binary = explicit
-        else:
-            provisioner = Path(__file__).resolve().parent / spec["provision"]
-            result = subprocess.run([str(provisioner)], capture_output=True, text=True, timeout=3600)
-            if result.returncode:
-                raise GodboltError(f"{name}: provisioning failed: {result.stderr.strip()}")
-            binary = result.stdout.strip().splitlines()[-1]
-        probed = _probe_macro(binary, spec["probe_macro"])
-        if probed != spec["probe_value"]:
-            raise GodboltError(
-                f"{name}: {binary} probes {spec['probe_macro']}={probed!r}, "
-                f"expected {spec['probe_value']!r}"
-            )
-        path = Path(binary).resolve()
-        _LOCAL_BINARIES[name] = path
-        return path
+        context = (explicit, os.environ.get("LCCC_ICX_PREFIX"), os.environ.get("LCCC_ICX_MIRROR"))
+        cached = _LOCAL_BINARIES.get(name)
+        try:
+            binary = None
+            if explicit is not None:
+                if not explicit.strip():
+                    raise GodboltError(f"{spec['env']} must not be empty")
+                binary = shutil.which(os.path.expanduser(explicit))
+                if binary is None:
+                    raise GodboltError(f"{spec['env']} is not an executable: {explicit}")
+            if cached is not None and cached[0] == context and explicit is None:
+                _, path, identity, _ = cached
+                if _binary_identity(path) == identity:
+                    binary = str(path)
+            # Always reprobe: some filesystems have coarse timestamps, so
+            # stat identity alone cannot prove an executable is unchanged.
+            if binary is None:
+                provisioner = Path(__file__).resolve().parent / spec["provision"]
+                result = subprocess.run([str(provisioner)], capture_output=True, text=True, timeout=3600)
+                if result.returncode:
+                    raise GodboltError(f"{name}: provisioning failed: {result.stderr.strip()}")
+                lines = result.stdout.strip().splitlines()
+                if len(lines) != 1:
+                    raise GodboltError(f"{name}: provisioner must print exactly one binary path")
+                binary = lines[0]
+            path = Path(binary).resolve()
+            before = _binary_identity(path)
+            probed = _probe_macro(str(path), spec["probe_macro"])
+            _local_semver(spec, probed)
+            if _binary_identity(path) != before:
+                raise GodboltError(f"{name}: compiler changed during version probe")
+            assert probed is not None
+            _LOCAL_BINARIES[name] = (context, path, before, probed)
+            return path, probed
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise GodboltError(f"{name}: compiler resolution/probe failed: {error}") from error
+
+
+def local_oracle_binary(name: str) -> Path:
+    """Resolve and probe an opt-in local release line; invalidate changed binaries."""
+    return _validated_local_oracle(name)[0]
 
 
 def local_oracle_metadata(name: str) -> dict[str, Any]:
-    """Provenance record for a local oracle, including the binary digest."""
+    """Record the actual patch release, binary digest and available APT lock."""
     spec = LOCAL_ORACLES[name]
-    binary = local_oracle_binary(name)
+    binary, probed = _validated_local_oracle(name)
+    before = _binary_identity(binary)
     digest = hashlib.sha256()
     with binary.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
-    return {
+    if _binary_identity(binary) != before:
+        raise GodboltError(f"{name}: compiler changed while hashing provenance")
+    metadata = {
         "id": name,
         "name": spec["name"],
-        "semver": spec["semver"],
+        "semver": _local_semver(spec, probed),
         "compilerType": spec["compilerType"],
         "binary": str(binary),
         "binary_sha256": digest.hexdigest(),
-        "probe": f"{spec['probe_macro']}={spec['probe_value']}",
+        "probe": f"{spec['probe_macro']}={probed}",
     }
+    for parent in binary.parents:
+        manifest = parent / ".lccc-icx.json"
+        if manifest.is_file():
+            locked = json.loads(manifest.read_text())
+            if ((parent / locked["binary"]).resolve() != binary
+                    or locked["binary_sha256"] != metadata["binary_sha256"]
+                    or locked["semver"] != metadata["semver"]):
+                raise GodboltError(f"{name}: provisioning manifest disagrees with compiler")
+            metadata["provisioning"] = locked
+            break
+    return metadata
 
 
 def compile_local_oracle(name: str, source: Path, flags: str) -> list[str]:
