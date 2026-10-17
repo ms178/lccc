@@ -112,6 +112,14 @@ impl Lowerer {
         let words = vector_ct.i686_ext_vector_gp_word_count()?;
         let (elem_ct, lanes) = vector_ct.vector_info()?;
         let elem_size = elem_ct.size();
+        // Invariant: the GP return bundle is bounded at 12 bytes (three 32-bit
+        // words) for sub-i32 lanes and at 8 bytes (one 64-bit word) for a
+        // single 8-byte lane. Any future widening must update the I128 bundle
+        // store and the ECX word spill in the backend before reaching here.
+        debug_assert!(
+            words <= 3 && ((elem_size <= 4 && words == lanes) || (elem_size == 8 && lanes == 1)),
+            "i686 ExtVector GP return: words={words} elem_size={elem_size} lanes={lanes} exceeds the EAX:EDX:ECX bundle",
+        );
         let bundle_ty = match words {
             1 => IrType::I32,
             2 => IrType::I64,

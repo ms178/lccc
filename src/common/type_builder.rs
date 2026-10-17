@@ -275,9 +275,12 @@ pub trait TypeConvertContext {
                 let elem_ctype = self.resolve_type_spec_to_ctype(inner);
                 match ExtVectorLayout::new(&elem_ctype, *lanes) {
                     Some(layout) => CType::ExtVector(Box::new(elem_ctype), layout),
-                    // Parser/sema diagnose unsupported element types and invalid
-                    // lane counts. Keep malformed AST recovery non-panicking.
-                    None => CType::Vector(Box::new(elem_ctype), 0),
+                    // Parser/sema diagnose unsupported element types and
+                    // invalid lane counts. For malformed recovery, treat the
+                    // attribute the same way GCC treats unknown attributes:
+                    // fall back to the scalar element type so downstream
+                    // layout code never sees a zero-byte Vector.
+                    None => elem_ctype,
                 }
             }
         }

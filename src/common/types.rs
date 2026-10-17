@@ -344,9 +344,25 @@ pub struct ExtVectorLayout {
 }
 
 impl ExtVectorLayout {
-    /// Build the x86 ext-vector layout used by the supported scalar element
-    /// types. Returns None for invalid lane types, zero lanes, or overflow.
+    /// Build the ext-vector layout for the target lccc currently emits code
+    /// for (x86-32 and x86-64). The power-of-two padded size, 16-byte x87
+    /// long-double lane stride, and bit-packed `_Bool` lanes are all measured
+    /// against clang-19 on Intel. Returns None for invalid lane types, zero
+    /// lanes, unsupported backends, or size overflow; callers are expected to
+    /// treat None as "attribute not recognized on this target" and fall back
+    /// to the scalar element (matching GCC's unknown-attribute semantics).
+    ///
+    /// When ARM or RISC-V support for `ext_vector_type` lands, this constructor
+    /// must branch on `target_elf_machine()` (or grow a per-backend hook)
+    /// because both targets use different padding/alignment rules; the current
+    /// x86 numbers will silently miscompile those ABIs.
     pub fn new(element: &CType, lanes: usize) -> Option<Self> {
+        // The layout arithmetic below is only validated for x86-64 (EM_386=3,
+        // EM_X86_64=62). Other backends must provide their own rules.
+        let machine = crate::common::types::target_elf_machine();
+        if machine != 3 && machine != 62 {
+            return None;
+        }
         if lanes == 0 {
             return None;
         }

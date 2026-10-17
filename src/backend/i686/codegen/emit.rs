@@ -1044,6 +1044,23 @@ impl I686Codegen {
         force_stack: &[bool],
         is_variadic: bool,
     ) -> (Vec<I686FastcallSlot>, usize) {
+        // Every (scalarized) parameter slot needs a parallel force_stack entry
+        // so i686 ExtVector lanes cannot silently fall back to the register
+        // path when a future caller forgets the argument. The slices are
+        // allowed to be empty in legacy unit tests that predate these
+        // parameters, which always means "no lanes forced, no aggregates".
+        debug_assert!(
+            force_stack.is_empty() || force_stack.len() == param_tys.len(),
+            "fastcall_layout: force_stack length {} must match param_tys length {}",
+            force_stack.len(),
+            param_tys.len(),
+        );
+        debug_assert!(
+            struct_sizes.is_empty() || struct_sizes.len() == param_tys.len(),
+            "fastcall_layout: struct_sizes length {} must match param_tys length {}",
+            struct_sizes.len(),
+            param_tys.len(),
+        );
         let mut slots = Vec::with_capacity(param_tys.len());
         let mut regs_free = [true, true];
         let mut chain_broken = is_variadic;

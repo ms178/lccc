@@ -1476,7 +1476,8 @@ fn ctype_from_type_spec(spec: &TypeSpecifier, types: &TypeContext) -> CType {
             let elem_ctype = ctype_from_type_spec(inner, types);
             match ExtVectorLayout::new(&elem_ctype, *lanes) {
                 Some(layout) => CType::ExtVector(Box::new(elem_ctype), layout),
-                None => CType::Vector(Box::new(elem_ctype), 0),
+                // Malformed recovery: drop the attribute, keep the scalar.
+                None => elem_ctype,
             }
         }
         _ => CType::Int, // fallback

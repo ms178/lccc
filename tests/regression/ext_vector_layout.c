@@ -190,3 +190,21 @@ int main(void) {
 
     return 0;
 }
+
+
+/* Compile-time-only shape checks that lock down the padded-storage and
+ * bit-packing rules for shapes too large for the register-return ABI: bool
+ * vectors of 9/17/33 lanes exercise the ceil(N/8) byte payload rule across
+ * byte/half-word/word/dword boundaries, and s8x7 exercises the seven-lane
+ * signed-char padding that the u8x3 rule generalizes to. These are
+ * compile-time only so a backend that does not yet lower vectors wider than
+ * 16 bytes still passes the gate. */
+typedef _Bool bool33 __attribute__((ext_vector_type(33)));
+typedef signed char s8x7 __attribute__((ext_vector_type(7)));
+typedef unsigned short u16x3 __attribute__((ext_vector_type(3)));
+_Static_assert(sizeof(bool33) == 5, "bool33 occupies five bytes (ceil(33/8))");
+_Static_assert(_Alignof(bool33) == 8, "bool33 alignment follows next-power-of-two storage");
+_Static_assert(sizeof(s8x7) == 8, "s8x7 padded to next power of two (7 -> 8)");
+_Static_assert(_Alignof(s8x7) == 8, "s8x7 alignment is 8 bytes");
+_Static_assert(sizeof(u16x3) == 8, "u16x3 is padded to eight bytes (3*2 -> 8)");
+_Static_assert(_Alignof(u16x3) == 8, "u16x3 alignment is eight bytes");

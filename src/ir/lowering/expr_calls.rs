@@ -703,6 +703,13 @@ impl Lowerer {
             .vector_info()
             .expect("ExtVector must carry its logical lane count");
         let elem_size = elem_ct.size();
+        // See try_i686_ext_vector_gp_return: bundle is bounded at three 32-bit
+        // words or one 64-bit word. Callee and caller must agree, otherwise
+        // the ECX word spill in the backend writes to an unrelated slot.
+        debug_assert!(
+            words <= 3 && ((elem_size <= 4 && words == lanes) || (elem_size == 8 && lanes == 1)),
+            "i686 ExtVector GP return unpack: words={words} elem_size={elem_size} lanes={lanes} exceeds the EAX:EDX:ECX bundle",
+        );
         let size = self.ctype_size(vector_ct);
         let align = self.ctype_align(vector_ct);
 
