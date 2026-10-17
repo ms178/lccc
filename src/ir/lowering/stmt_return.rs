@@ -562,6 +562,36 @@ impl Lowerer {
         // exactly the object's bytes: a whole-word load would over-read 1..7
         // bytes past a small struct (see `load_bytes_exact`).
         let seg = self.aggregate_lvalue_space(e);
+        // For one-lane FP vectors (double1/float1) the IR return type is F64/F32
+        // so the value stays in the SSE domain. Load as the FP type directly
+        // instead of via an I64 bit-pattern load, which would force an XMM→GPR
+        // movq + reverse movq bounce and a ~3-cycle cross-domain stall on
+        // Intel uarchs (Raptor Lake/Cove). Narrow integer one-lanes (1/2/4-byte)
+        // still use the integer load path which the return-type cast then
+        // zexts/sexts to match the caller's parameter register class.
+        let ret_ty = self.func().return_type;
+        if struct_size == 8 && ret_ty == IrType::F64 {
+            let dest = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest,
+                ptr: addr,
+                ty: IrType::F64,
+                seg_override: seg,
+            });
+            return Some(Operand::Value(dest));
+        }
+        if struct_size == 4 && ret_ty == IrType::F32 {
+            let dest = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest,
+                ptr: addr,
+                ty: IrType::F32,
+                seg_override: seg,
+            });
+            return Some(Operand::Value(dest));
+        }
         let dest = self.load_bytes_exact(addr, 0, struct_size, seg);
         Some(Operand::Value(dest))
     }

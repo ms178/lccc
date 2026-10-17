@@ -633,14 +633,14 @@ impl Lowerer {
             }
             UnaryOp::Neg => {
                 let inner_ct = self.expr_ctype(inner);
-                // Integer-element vector negation: element-wise.  The scalar
-                // path would negate the vector's address (PR 110817 family).
+                // Vector negation: element-wise for both integer AND floating
+                // lanes. Floating-point negation toggles the sign bit of each
+                // lane. Falling through to the scalar path negates the
+                // VECTOR'S STACK-ADDRESS (PR 110817 family) — the backend emits
+                // `neg %rdi` on the alloca pointer and then loads through the
+                // resulting garbage address, segfaulting at runtime.
                 if inner_ct.is_vector() {
-                    if let Some((elem, _)) = inner_ct.vector_info() {
-                        if !elem.is_floating() {
-                            return self.lower_vector_unary(IrUnaryOp::Neg, inner, &inner_ct);
-                        }
-                    }
+                    return self.lower_vector_unary(IrUnaryOp::Neg, inner, &inner_ct);
                 }
                 if inner_ct.is_complex() {
                     let val = self.lower_expr(inner);

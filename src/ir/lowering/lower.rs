@@ -1274,8 +1274,49 @@ impl Lowerer {
                         && abi.sret_size.is_none()
                         && abi.two_reg_size.is_none()
                     {
-                        // A small vector travels as packed I64 data, not a pointer.
-                        ret_ty = IrType::I64;
+                        // A small register-return vector packs into the
+                        // IR carrier whose register class matches its
+                        // psABI eightbyte:
+                        //   - one FP lane (f32x1 / f64x1) -> F32/F64 so the
+                        //     value stays in the SSE domain (no movq
+                        //     XMM↔GPR bounce and a 3-cycle stall on Raptor
+                        //     Lake from crossing register files).
+                        //   - sub-4-byte integer one-lane (u8x1/u16x1/i8x1/i16x1)
+                        //     -> I32, matching how the C frontend promotes scalar
+                        //     char/short to int for parameter and return
+                        //     registers on x86-64. The value arrives in %edi
+                        //     already widened to 32 bits per psABI caller
+                        //     obligations, and a single `movl %edi, %eax`
+                        //     returns it with the upper 32 bits zeroed,
+                        //     matching GCC/Clang's codegen for scalar
+                        //     signed/unsigned char and short.
+                        //   - 4-byte integer one-lane (u32x1/i32x1) -> I32 (a
+                        //     32-bit return in %eax; caller relies on movl's
+                        //     implicit zero-extension of the high 32 bits).
+                        //   - 8-byte one-lane integer (u64x1/i64x1) -> U64/I64
+                        //     (INTEGER psABI class, returned in %rax; the
+                        //     earlier F64 carrier bounced the value through
+                        //     %xmm0 and NaN-boxed it to 0x8000000000000000).
+                        //   - 5..=8 byte multi-lane -> I64 (packed bit
+                        //     pattern via movq in the SSE eightbyte).
+                        ret_ty = if let Some((elem, n)) = full_ret_ctype.vector_info() {
+                            if n == 1 {
+                                match elem.size() {
+                                    4 if elem.is_floating() => IrType::F32,
+                                    8 if elem.is_floating() => IrType::F64,
+                                    8 => {
+                                        if elem.is_signed() { IrType::I64 } else { IrType::U64 }
+                                    }
+                                    1 | 2 => IrType::I32,
+                                    4 => IrType::I32,
+                                    _ => IrType::I64,
+                                }
+                            } else {
+                                IrType::I64
+                            }
+                        } else {
+                            IrType::I64
+                        };
                     }
                     ret_aggregate_abi = Some(abi);
                 }

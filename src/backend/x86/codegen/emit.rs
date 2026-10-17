@@ -7037,7 +7037,17 @@ impl X86Codegen {
             IrType::U16 => ParamRefLoad::Zext(OpSize::S16),
             IrType::I8 => ParamRefLoad::Sext(OpSize::S8),
             IrType::I16 => ParamRefLoad::Sext(OpSize::S16),
-            IrType::I32 => ParamRefLoad::Sext(OpSize::S32),
+            // I32 arguments arrive in the low 32 bits of a GPR (e.g. %edi).
+            // Per the x86-64 psABI the caller ensures the high 32 bits of
+            // that register are valid sign/zero-extension (both GCC and
+            // Clang zero-extend via `movl %..., %reg` for their 32-bit
+            // argument moves, which leaves the high half zeroed). Load
+            // with a plain 32-bit mov (Raw32) -- no movslq -- so identity
+            // functions like `int id(int x){return x;}` and the narrow-
+            // vector one-lane carriers (u8x1/i8x1/u16x1/i16x1/u32x1/i32x1,
+            // which ride I32 internally) compile to a single `movl %edi,
+            // %eax`, matching scalar char/short/int codegen.
+            IrType::I32 => ParamRefLoad::Raw32,
             IrType::U32 => ParamRefLoad::Raw32,
             IrType::I64 | IrType::U64 | IrType::Ptr => ParamRefLoad::Raw64,
             _ => return None,
@@ -7263,16 +7273,21 @@ impl X86Codegen {
                 if let ParamDst::Reg(r) = dst {
                     if r == abi {
                         // The destination IS the incoming register: the
-                        // value is already in place. Only a 64-bit type is
-                        // truly in place — a narrower type needs the
-                        // extending move, and the emitter's size-blind
-                        // self-move elision would drop it, so those stay on
-                        // the text path (whose round trip materializes the
-                        // extension).
-                        if OpSize::from_ir_type(ty) == OpSize::S64 {
-                            return Ok(());
+                        // value is already in place. 64-bit types are
+                        // trivially in place; I32/U32 are also in place
+                        // because both GCC and Clang (and our own caller
+                        // side) load 32-bit arguments with a 32-bit mov
+                        // that implicitly zero-extends the high half, so
+                        // the register already holds a properly formed
+                        // value and no extending move is required. Narrower
+                        // types (I8/I16/U8/U16) still need an explicit
+                        // zext/sext to widen them; the emitter's size-
+                        // blind self-move elision would drop the extension,
+                        // so those stay on the text path.
+                        match OpSize::from_ir_type(ty) {
+                            OpSize::S64 | OpSize::S32 => return Ok(()),
+                            _ => return Err("ParamRef(narrow-self)"),
                         }
-                        return Err("ParamRef(narrow-self)");
                     }
                 }
                 // The marker names the sized incoming register, spelled

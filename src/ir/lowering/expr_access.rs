@@ -1169,8 +1169,21 @@ impl Lowerer {
             return Operand::Value(addr);
         }
         if self.struct_value_size(expr).is_some() {
-            let addr = self.compute_array_element_addr(base, index);
-            return Operand::Value(addr);
+            // Small one-lane vectors (≤8 bytes) that are returned as a
+            // scalar register carrier (F32/F64/I8/U8/.../I64) come back in
+            // a register, not as a pointer to an aggregate — the subscript
+            // must load from a temporary alloca, not compute an address
+            // against the packed value. Without this, did(a)[0] would
+            // treat the returned F64 bit-pattern as an address and
+            // dereference it -> segfault.
+            let base_ctype = self.expr_ctype(base);
+            let base_is_small_vec_call = matches!(base, Expr::FunctionCall(..))
+                && base_ctype.is_vector()
+                && base_ctype.size() <= 8;
+            if !base_is_small_vec_call {
+                let addr = self.compute_array_element_addr(base, index);
+                return Operand::Value(addr);
+            }
         }
         if self.expr_ctype(base).is_bitpacked_bool_vector() {
             if let Some(lv) = self.lower_lvalue(expr) {
@@ -1181,10 +1194,38 @@ impl Lowerer {
         {
             let elem_ct = self.expr_ctype(expr);
             if elem_ct.is_complex() || elem_ct.is_vector() {
-                let addr = self.compute_array_element_addr(base, index);
-                return Operand::Value(addr);
+                let base_ctype = self.expr_ctype(base);
+                let base_is_small_vec_call = matches!(base, Expr::FunctionCall(..))
+                    && base_ctype.is_vector()
+                    && base_ctype.size() <= 8;
+                if !base_is_small_vec_call {
+                    let addr = self.compute_array_element_addr(base, index);
+                    return Operand::Value(addr);
+                }
             }
         }
+        // Small one-lane vector call result: the base is a packed scalar
+        // register value (F32/F64/I8/U8/.../I64), not an address. We need
+        // lane 0, which is the same bits re-interpreted as the element type.
+        // Lower the packed value, bitcast it to the element IR type, and
+        // return that — this avoids dereferencing the register value as an
+        // address (which was the did(a)[0] segfault).
+        let base_ctype = self.expr_ctype(base);
+        if matches!(base, Expr::FunctionCall(..))
+            && base_ctype.is_vector()
+            && base_ctype.size() <= 8
+        {
+            if let Some((elem_ct, n)) = base_ctype.vector_info() {
+                if n == 1 {
+                    let src = self.lower_expr(base);
+                    let src_ty = self.value_ir_type(base);
+                    let dst_ty = IrType::from_ctype(elem_ct);
+                    let cast = self.emit_implicit_cast(src, src_ty, dst_ty);
+                    return cast;
+                }
+            }
+        }
+
         // The element's space is the subscript's own space: the pointee of a
         // pointer operand, the object of an array operand (member arrays of
         // segment-qualified structs have Array CType), or, for the
