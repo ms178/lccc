@@ -1931,14 +1931,25 @@ impl Driver {
                     self.cf_protection_value = None;
                 }
                 arg if arg.starts_with("-fpatchable-function-entry=") => {
-                    let val = &arg["-fpatchable-function-entry=".len()..];
-                    let parts: Vec<&str> = val.split(',').collect();
-                    let total: u32 = parts[0].parse().unwrap_or(0);
-                    let before: u32 = if parts.len() > 1 {
-                        parts[1].parse().unwrap_or(0)
-                    } else {
-                        0
+                    let value = &arg["-fpatchable-function-entry=".len()..];
+                    let parts: Vec<&str> = value.split(',').collect();
+                    let invalid = || {
+                        format!(
+                            "invalid value '{}' for '{}'; expected N[,M] with 0 <= M <= N",
+                            value, arg
+                        )
                     };
+                    if parts.is_empty() || parts.len() > 2 {
+                        return Err(invalid());
+                    }
+                    let total = parts[0].parse::<u32>().map_err(|_| invalid())?;
+                    let before = match parts.get(1) {
+                        Some(part) => part.parse::<u32>().map_err(|_| invalid())?,
+                        None => 0,
+                    };
+                    if before > total {
+                        return Err(invalid());
+                    }
                     self.patchable_function_entry = Some((total, before));
                 }
                 "-fomit-frame-pointer" => self.omit_frame_pointer = true,

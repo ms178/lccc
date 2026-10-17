@@ -21,7 +21,9 @@ for flag in \
     -fno-profile-arcs -fno-test-coverage -fno-branch-probabilities -fno-auto-profile \
     -finstrument-functions-exclude-file-list=generated.c \
     -finstrument-functions-exclude-function-list=helper \
-    -fprofile-update=unknown -fdiagnostics-color=unknown; do
+    -fprofile-update=unknown -fdiagnostics-color=unknown \
+    -fpatchable-function-entry=bogus -fpatchable-function-entry=2,0,1 \
+    -fpatchable-function-entry=1,2; do
     for order in before after; do
         args=("$flag" -v)
         [[ $order == before ]] && args=(-v "$flag")
