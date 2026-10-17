@@ -1282,17 +1282,21 @@ impl Lowerer {
                         //     XMM↔GPR bounce and a 3-cycle stall on Raptor
                         //     Lake from crossing register files).
                         //   - sub-4-byte integer one-lane (u8x1/u16x1/i8x1/i16x1)
-                        //     -> I32, matching how the C frontend promotes scalar
-                        //     char/short to int for parameter and return
-                        //     registers on x86-64. The value arrives in %edi
-                        //     already widened to 32 bits per psABI caller
-                        //     obligations, and a single `movl %edi, %eax`
-                        //     returns it with the upper 32 bits zeroed,
-                        //     matching GCC/Clang's codegen for scalar
-                        //     signed/unsigned char and short.
-                        //   - 4-byte integer one-lane (u32x1/i32x1) -> I32 (a
-                        //     32-bit return in %eax; caller relies on movl's
-                        //     implicit zero-extension of the high 32 bits).
+                        //     -> U8/U16/I8/I16, matching how the C frontend
+                        //     represents scalar char/short. The backend's
+                        //     operand_to_rax_i32 return path emits a width-
+                        //     appropriate zero/sign-extending movzbl/movswl/
+                        //     movsbl/movswl into %eax (one uop), matching
+                        //     GCC/Clang's scalar char identity codegen.
+                        //     Narrow *ParamRef* loads are a plain 32-bit mov
+                        //     because the x86-64 psABI §3.2.3 requires the
+                        //     *caller* to have widened narrow arguments to
+                        //     32 bits (GCC/Clang use `movl`, which zero-
+                        //     extends to 64 bits as a side effect), so the
+                        //     callee never re-extends.
+                        //   - 4-byte integer one-lane (u32x1/i32x1) -> U32/I32
+                        //     (a 32-bit return in %eax; movl zero-extends the
+                        //     high 32 bits per x86-64 semantics).
                         //   - 8-byte one-lane integer (u64x1/i64x1) -> U64/I64
                         //     (INTEGER psABI class, returned in %rax; the
                         //     earlier F64 carrier bounced the value through
@@ -1305,10 +1309,18 @@ impl Lowerer {
                                     4 if elem.is_floating() => IrType::F32,
                                     8 if elem.is_floating() => IrType::F64,
                                     8 => {
-                                        if elem.is_signed() { IrType::I64 } else { IrType::U64 }
+                                        if elem.is_signed() {
+                                            IrType::I64
+                                        } else {
+                                            IrType::U64
+                                        }
                                     }
-                                    1 | 2 => IrType::I32,
-                                    4 => IrType::I32,
+                                    1 if !elem.is_signed() => IrType::U8,
+                                    2 if !elem.is_signed() => IrType::U16,
+                                    4 if !elem.is_signed() => IrType::U32,
+                                    1 if elem.is_signed() => IrType::I8,
+                                    2 if elem.is_signed() => IrType::I16,
+                                    4 if elem.is_signed() => IrType::I32,
                                     _ => IrType::I64,
                                 }
                             } else {

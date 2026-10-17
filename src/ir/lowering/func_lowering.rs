@@ -289,18 +289,18 @@ impl Lowerer {
             // struct_size stays None so the scalar Phase 1b emits a ParamRef
             // + Store; eightbyte_classes stay empty since a true scalar
             // uses the is_float/is_i64_pair/IntReg classification, not the
-            // eightbyte walk. The matching ty (F32/F64/I32/I64/U64) selects
-            // the correct register class: is_float routes F32/F64 through
-            // FloatReg (%xmm), I64/U64 through I64RegPair (which for a
-            // one-eightbyte value lowers to a single GP register load via
-            // movq), and sub-4-byte integer one-lanes through I32 (IntReg)
-            // -- matching how the C frontend promotes scalar char/short to
-            // int for parameter passing on x86-64. The backend's ParamRef
-            // load for I32 emits a plain `movl %edi, %reg`, which is what
-            // we want (no redundant movsbq/movswq sign-extension on the
-            // callee side -- psABI places the onus of high-bit validity on
-            // the caller, and GCC/Clang sign/zero-extend into the full
-            // register before the call).
+            // eightbyte walk. The matching ty (F32/F64/U8/U16/U32/I8/I16/
+            // I32/I64/U64) selects the correct register class: is_float
+            // routes F32/F64 through FloatReg (%xmm), I64/U64 through
+            // I64RegPair (one-eightbyte value lowers to a single GP reg
+            // via movq), and narrow integers (sub-4-byte) through IntReg
+            // using their precise signed/unsigned type. The backend's
+            // ParamRef load for narrow integer types is a plain 32-bit
+            // mov (Raw32) -- psABI §3.2.3 places onus of high-bit validity
+            // on the caller (GCC/Clang use `movl` which zero-extends to 64
+            // bits as a side effect), so the callee does not need to
+            // re-sign-extend. Returns emit a width-appropriate movzbl/
+            // movzwl/movsbl/movswl into %eax via operand_to_rax_i32.
             if !crate::common::types::target_is_32bit() && param_ctype.is_vector() {
                 let vsz = self.sizeof_type(&param.type_spec);
                 let sysv = self.sysv_arg_abi(&param_ctype);
@@ -325,9 +325,18 @@ impl Lowerer {
                                     // backend routes it through the GP
                                     // register file without a cross-domain
                                     // movq bounce.
-                                    if elem.is_signed() { IrType::I64 } else { IrType::U64 }
+                                    if elem.is_signed() {
+                                        IrType::I64
+                                    } else {
+                                        IrType::U64
+                                    }
                                 }
-                                1 | 2 | 4 => IrType::I32,
+                                1 if !elem.is_signed() => IrType::U8,
+                                2 if !elem.is_signed() => IrType::U16,
+                                4 if !elem.is_signed() => IrType::U32,
+                                1 if elem.is_signed() => IrType::I8,
+                                2 if elem.is_signed() => IrType::I16,
+                                4 if elem.is_signed() => IrType::I32,
                                 _ => IrType::I64,
                             }
                         } else {
@@ -345,7 +354,7 @@ impl Lowerer {
                     params.push(IrParam {
                         ty: scalar_ty,
                         noalias: false,
-                        struct_size: None,           // scalar, not by-ref aggregate
+                        struct_size: None, // scalar, not by-ref aggregate
                         struct_align: None,
                         param_align: None,
                         struct_eightbyte_classes: Vec::new(), // use scalar classification

@@ -3288,27 +3288,70 @@ impl X86Codegen {
                     let name = phys_reg_name(reg);
                     if is_xmm_reg(reg) {
                         self.state.emit_fmt(format_args!("    movq %{name}, %rax"));
-                    } else if self.value_types.get(&v.0).is_some_and(|t| t.size() <= 4) {
-                        let name32 = phys_reg_name_32(reg);
-                        // Identity `movl %eax, %eax` is a 2-byte no-op (and a
-                        // false dependency). Skip it when the value is already
-                        // in the return register.
-                        if name32 != "eax" {
-                            self.state
-                                .emit_fmt(format_args!("    movl %{name32}, %eax"));
-                        }
                     } else {
-                        self.state.emit_fmt(format_args!("    movq %{name}, %rax"));
+                        // Pick the right width-extending move for the value's
+                        // type: unsigned 8/16 use movzbl/movzwl (zero-extend
+                        // to 32 bits), signed 8/16 use movsbl/movswl (sign-
+                        // extend to 32 bits), 32-bit uses movl (implicit
+                        // zero-extend to 64 bits per x86-64), and 64-bit
+                        // uses movq. Identity moves into %eax are skipped.
+                        match self.value_types.get(&v.0).copied().unwrap_or(IrType::I64) {
+                            IrType::I8 => {
+                                let name8 = typed_phys_reg_name(reg, IrType::I8);
+                                let instr = if name8 == "al" {
+                                    "    movsbl %al, %eax".to_string()
+                                } else {
+                                    format!("    movsbl %{name8}, %eax")
+                                };
+                                self.state.emit(&instr);
+                            }
+                            IrType::U8 => {
+                                let name8 = typed_phys_reg_name(reg, IrType::U8);
+                                let instr = if name8 == "al" {
+                                    "    movzbl %al, %eax".to_string()
+                                } else {
+                                    format!("    movzbl %{name8}, %eax")
+                                };
+                                self.state.emit(&instr);
+                            }
+                            IrType::I16 => {
+                                // movswl requires a 16-bit source register name
+                                let name16 = typed_phys_reg_name(reg, IrType::I16);
+                                self.state
+                                    .emit_fmt(format_args!("    movswl %{name16}, %eax"));
+                            }
+                            IrType::U16 => {
+                                let name16 = typed_phys_reg_name(reg, IrType::U16);
+                                self.state
+                                    .emit_fmt(format_args!("    movzwl %{name16}, %eax"));
+                            }
+                            IrType::I32 | IrType::U32 => {
+                                let name32 = phys_reg_name_32(reg);
+                                // `movl %eax,%eax` is a 2-byte no-op false-
+                                // dependency; skip when already in place.
+                                if name32 != "eax" {
+                                    self.state
+                                        .emit_fmt(format_args!("    movl %{name32}, %eax"));
+                                }
+                            }
+                            _ => {
+                                self.state.emit_fmt(format_args!("    movq %{name}, %rax"));
+                            }
+                        }
                     }
                 } else if let Some(slot) = self.state.get_slot(v.0) {
                     // value_to_reg is a 64-bit loader and historically calls
                     // emitted `movq slot, %eax` when passed a 32-bit register.
-                    // For a small integer return use a width-consistent load.
+                    // For a small integer return use a width-consistent load
+                    // directly into %eax (32-bit dest so upper bits are
+                    // zeroed per x86-64 semantics). movsbq/movswq require a
+                    // 64-bit destination, so signed 8/16 use movsbl/movswl
+                    // (sign-extend to 32 bits) instead.
                     match self.value_types.get(&v.0).copied().unwrap_or(IrType::I64) {
                         IrType::I8 => {
                             self.state
                                 .out
-                                .emit_instr_rbp_reg("    movsbq", slot.0, "eax")
+                                .emit_instr_rbp_reg("    movsbl", slot.0, "eax")
                         }
                         IrType::U8 => {
                             self.state
@@ -3318,7 +3361,7 @@ impl X86Codegen {
                         IrType::I16 => {
                             self.state
                                 .out
-                                .emit_instr_rbp_reg("    movswq", slot.0, "eax")
+                                .emit_instr_rbp_reg("    movswl", slot.0, "eax")
                         }
                         IrType::U16 => {
                             self.state
@@ -4271,31 +4314,43 @@ impl X86Codegen {
                 // was stored with movb/movw/movl would pull stale bytes out
                 // of the slot's upper half and corrupt any later 64-bit
                 // consumer.
-                //   * I8:  movsbq (signed) / movzbl (unsigned)
-                //   * I16: movswq (signed) / movzwl (unsigned)
+                //   * I8:  movsbl (sign-extend to 32, zero-extend to 64)
+                //   * U8:  movzbl (zero-extend to 32)
+                //   * I16: movswl (sign-extend to 32)
+                //   * U16: movzwl (zero-extend to 32)
                 //   * I32: movslq when the value is consumed in a 64-bit
                 //          context (needs-sext analysis), else movl
                 //   * U32/F32: movl (zero-extends implicitly)
+                //
+                // For narrow signed/unsigned values we intentionally sign/
+                // zero-extend only to 32 bits into %eXX — the x86-64 ISA
+                // zero-extends bits 32..63 automatically when writing a 32-
+                // bit register, which gives a well-defined 64-bit value
+                // without creating a 64-bit dependency chain.
                 let ty = self.value_types.get(&val.0).copied().unwrap_or(IrType::I64);
                 let needs_sext = ty == IrType::I32
                     && !self.needs_sext_values.is_empty()
                     && self.needs_sext_values.contains(&val.0);
+                let reg32 = reg_name_to_32(reg);
                 match ty {
-                    IrType::I8 => self.state.out.emit_instr_rbp_reg("    movsbq", slot.0, reg),
-                    IrType::U8 => {
-                        self.state
-                            .out
-                            .emit_instr_rbp_reg("    movzbl", slot.0, reg_name_to_32(reg))
-                    }
-                    IrType::I16 => self.state.out.emit_instr_rbp_reg("    movswq", slot.0, reg),
-                    IrType::U16 => {
-                        self.state
-                            .out
-                            .emit_instr_rbp_reg("    movzwl", slot.0, reg_name_to_32(reg))
-                    }
+                    IrType::I8 => self
+                        .state
+                        .out
+                        .emit_instr_rbp_reg("    movsbl", slot.0, reg32),
+                    IrType::U8 => self
+                        .state
+                        .out
+                        .emit_instr_rbp_reg("    movzbl", slot.0, reg32),
+                    IrType::I16 => self
+                        .state
+                        .out
+                        .emit_instr_rbp_reg("    movswl", slot.0, reg32),
+                    IrType::U16 => self
+                        .state
+                        .out
+                        .emit_instr_rbp_reg("    movzwl", slot.0, reg32),
                     _ if needs_sext => self.state.out.emit_instr_rbp_reg("    movslq", slot.0, reg),
                     _ => {
-                        let reg32 = reg_name_to_32(reg);
                         self.state.out.emit_instr_rbp_reg("    movl", slot.0, reg32);
                     }
                 }
@@ -4533,7 +4588,7 @@ impl X86Codegen {
                                 IrType::I8 => {
                                     self.state
                                         .out
-                                        .emit_instr_rbp_reg("    movsbq", slot.0, "rax")
+                                        .emit_instr_rbp_reg("    movsbl", slot.0, "eax")
                                 }
                                 IrType::U8 => {
                                     self.state
@@ -4543,7 +4598,7 @@ impl X86Codegen {
                                 IrType::I16 => {
                                     self.state
                                         .out
-                                        .emit_instr_rbp_reg("    movswq", slot.0, "rax")
+                                        .emit_instr_rbp_reg("    movswl", slot.0, "eax")
                                 }
                                 IrType::U16 => {
                                     self.state
@@ -4617,12 +4672,22 @@ impl X86Codegen {
     /// Get the load instruction mnemonic for a given type.
     pub(super) fn mov_load_for_type(ty: IrType) -> &'static str {
         match ty {
-            IrType::I8 => "movsbq",
-            IrType::U8 => "movzbl", // movzbl zero-extends to 64-bit implicitly (saves REX vs movzbq)
-            IrType::I16 => "movswq",
-            IrType::U16 => "movzwl", // movzwl zero-extends to 64-bit implicitly (saves REX vs movzwq)
+            // For narrow signed integer loads in x86-64, sign-extend only
+            // to 32 bits (movsbl/movswl), not all the way to 64 bits.
+            // Writing to %eax zero-extends bits 32..63 implicitly, giving
+            // a well-defined value without creating a 64-bit dependency
+            // chain. A movsbq to %rax would sign-extend to 64 bits and
+            // force downstream readers to consume the full 64-bit value,
+            // which adds a uop and can cause partial-register stalls on
+            // Raptor Lake when the caller only looks at bits 0..7. GCC 12
+            // and Clang 23 both use movsbl for signed char identity
+            // returns on x86-64.
+            IrType::I8 => "movsbl",
+            IrType::U8 => "movzbl", // movzbl zero-extends to 32 bits implicitly (saves REX vs movzbq)
+            IrType::I16 => "movswl",
+            IrType::U16 => "movzwl", // movzwl zero-extends to 32 bits implicitly (saves REX vs movzwq)
             IrType::I32 => "movslq",
-            IrType::U32 | IrType::F32 => "movl", // movl zero-extends to 64-bit implicitly
+            IrType::U32 | IrType::F32 => "movl", // movl zero-extends to 64 bits implicitly
             _ => "movq",
         }
     }
@@ -4667,8 +4732,9 @@ impl X86Codegen {
     /// `%rax` zero/sign-extended for the `store_rax_to` spill that follows.
     pub(super) fn load_dest_reg(ty: IrType) -> &'static str {
         match ty {
-            IrType::I8 | IrType::I16 => "%rax", // movsbq/movswq -> 64-bit dest
-            IrType::U8 | IrType::U16 => "%eax", // movzbl/movzwl -> 32-bit dest
+            // movsbl/movswl/movzbl/movzwl all write a 32-bit dest (%eax)
+            // and zero-extend to 64 bits implicitly in x86-64.
+            IrType::I8 | IrType::I16 | IrType::U8 | IrType::U16 => "%eax",
             IrType::U32 | IrType::F32 => "%eax",
             _ => "%rax",
         }
@@ -7033,22 +7099,29 @@ impl X86Codegen {
     /// the text path, which owns the SSE and x87 domains).
     fn paramref_reg_load_form(load_ty: IrType) -> Option<ParamRefLoad> {
         Some(match load_ty {
+            // For sub-8/16-bit parameters the *caller* has placed the
+            // value in the low 8/16 bits of the argument GPR per the
+            // psABI (bits 8..63 are UNDEFINED for 8-bit args, bits
+            // 16..63 for 16-bit args -- GCC/Clang happen to zero-extend
+            // via movl, but the callee CANNOT rely on this: the psABI
+            // only guarantees extension to 32 bits, not the signedness
+            // choice). We therefore emit a width-appropriate extending
+            // move at the callee side: movzbl/movzwl for unsigned,
+            // movsbl/movswl for signed -- these are one-uop fused-
+            // load+extend forms that match GCC/Clang's own identity-
+            // function codegen.
             IrType::U8 => ParamRefLoad::Zext(OpSize::S8),
             IrType::U16 => ParamRefLoad::Zext(OpSize::S16),
             IrType::I8 => ParamRefLoad::Sext(OpSize::S8),
             IrType::I16 => ParamRefLoad::Sext(OpSize::S16),
-            // I32 arguments arrive in the low 32 bits of a GPR (e.g. %edi).
-            // Per the x86-64 psABI the caller ensures the high 32 bits of
-            // that register are valid sign/zero-extension (both GCC and
-            // Clang zero-extend via `movl %..., %reg` for their 32-bit
-            // argument moves, which leaves the high half zeroed). Load
-            // with a plain 32-bit mov (Raw32) -- no movslq -- so identity
-            // functions like `int id(int x){return x;}` and the narrow-
-            // vector one-lane carriers (u8x1/i8x1/u16x1/i16x1/u32x1/i32x1,
-            // which ride I32 internally) compile to a single `movl %edi,
-            // %eax`, matching scalar char/short/int codegen.
-            IrType::I32 => ParamRefLoad::Raw32,
-            IrType::U32 => ParamRefLoad::Raw32,
+            // I32/U32 arguments arrive in the low 32 bits of the arg
+            // register; per the psABI the caller has filled the high
+            // 32 bits via `movl` (which zero-extends to 64 bits as a
+            // side effect), so a plain 32-bit mov is sufficient and
+            // avoids the spurious movslq the old code emitted (which
+            // would both re-do the extension and create a false 64-bit
+            // dependency on Raptor Lake).
+            IrType::I32 | IrType::U32 => ParamRefLoad::Raw32,
             IrType::I64 | IrType::U64 | IrType::Ptr => ParamRefLoad::Raw64,
             _ => return None,
         })
@@ -7061,13 +7134,30 @@ impl X86Codegen {
                 src,
                 dst,
                 from_size: from,
-                to_size: OpSize::S64,
+                // movzbl/movzwl zero-extend to 32 bits implicitly in x86-64
+                // (which itself zero-extends to 64 bits). Use S32 dest so
+                // the emitter emits `movzbl %dil,%eax` rather than
+                // `movzbq %dil,%rax` (saves a REX prefix, smaller enc.).
+                to_size: OpSize::S32,
             },
             ParamRefLoad::Sext(from) => MachInst::Movsx {
                 src,
                 dst,
                 from_size: from,
-                to_size: OpSize::S64,
+                // For sub-32-bit signed sources (S8/S16) we sign-extend
+                // to 32 bits with movsbl/movswl; a 32-bit mov into %eax
+                // zero-extends to 64 bits, leaving the high bits DEFINED
+                // as zero. We NEVER sign-extend all the way to 64 bits
+                // here: the function's return-type is an I8/I16 (not an
+                // I64), so consumers expect a 32-bit zero-extended
+                // result. Doing a movsbq would force a 64-bit dependency
+                // chain and produce wrong bits for callers that only
+                // look at the low 32 bits.
+                to_size: if matches!(from, OpSize::S8 | OpSize::S16) {
+                    OpSize::S32
+                } else {
+                    OpSize::S64
+                },
             },
             ParamRefLoad::Raw32 => MachInst::Mov {
                 src,
@@ -7273,21 +7363,23 @@ impl X86Codegen {
                 if let ParamDst::Reg(r) = dst {
                     if r == abi {
                         // The destination IS the incoming register: the
-                        // value is already in place. 64-bit types are
-                        // trivially in place; I32/U32 are also in place
-                        // because both GCC and Clang (and our own caller
-                        // side) load 32-bit arguments with a 32-bit mov
-                        // that implicitly zero-extends the high half, so
-                        // the register already holds a properly formed
-                        // value and no extending move is required. Narrower
-                        // types (I8/I16/U8/U16) still need an explicit
-                        // zext/sext to widen them; the emitter's size-
-                        // blind self-move elision would drop the extension,
-                        // so those stay on the text path.
-                        match OpSize::from_ir_type(ty) {
-                            OpSize::S64 | OpSize::S32 => return Ok(()),
-                            _ => return Err("ParamRef(narrow-self)"),
+                        // value is already in place. Only a 64-bit type
+                        // is truly in place -- a narrower type needs the
+                        // extending mov, and the emitter's size-blind
+                        // self-move elision would drop it, so those stay
+                        // on the text path (whose round trip materializes
+                        // the extension). 32-bit types are also considered
+                        // "in place" because the x86-64 psABI requires the
+                        // caller to widen narrow args to 32 bits (via movl
+                        // which zero-extends to 64 bits as a side effect)
+                        // so the register already holds a properly formed
+                        // value; the callee-side Raw32 mov is a self-move
+                        // (movl %edi,%edi) that the elision below would
+                        // drop anyway.
+                        if matches!(OpSize::from_ir_type(ty), OpSize::S64 | OpSize::S32) {
+                            return Ok(());
                         }
+                        return Err("ParamRef(narrow-self)");
                     }
                 }
                 // The marker names the sized incoming register, spelled

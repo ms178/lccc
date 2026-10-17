@@ -2130,7 +2130,7 @@ impl Lowerer {
     /// Complex types return in FP registers (F64 for both ComplexFloat and ComplexDouble),
     /// not as Ptr which is what IrType::from_ctype gives.
     fn vector_return_carrier(ct: &CType, is_32bit: bool) -> IrType {
-        use crate::common::types::{target_elf_machine, CType};
+        use crate::common::types::{CType, target_elf_machine};
         let size = ct.size();
         if is_32bit {
             // i386 returns everything through sret (IrType::Ptr); the i686
@@ -2152,13 +2152,19 @@ impl Lowerer {
                         (8, true, _) => IrType::F64,
                         (8, false, true) => IrType::I64,
                         (8, false, false) => IrType::U64,
-                        // Sub-4-byte integer one-lanes ride I32 so the
-                        // call reads the return value in %eax with a
-                        // single movl (matching scalar char/short returns
-                        // in both GCC and Clang -- no redundant movsbq/
-                        // movzbl combination, and the caller's 32-bit
-                        // movl zero-extends the high half).
-                        (1 | 2 | 4, _, _) => IrType::I32,
+                        // Sub-4-byte integer one-lanes ride their precise
+                        // signed/unsigned IR type. The backend's call-return
+                        // path zero/sign-extends to 32 bits in %eax (matching
+                        // scalar char/short returns in both GCC and Clang --
+                        // a single movzbl/movzwl/movsbl/movswl), and ParamRef
+                        // loads are a plain 32-bit mov per psABI caller
+                        // widening obligations.
+                        (1, _, false) => IrType::U8,
+                        (2, _, false) => IrType::U16,
+                        (4, _, false) => IrType::U32,
+                        (1, _, true) => IrType::I8,
+                        (2, _, true) => IrType::I16,
+                        (4, _, true) => IrType::I32,
                         _ => IrType::I64,
                     };
                 }
