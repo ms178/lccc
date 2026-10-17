@@ -849,7 +849,6 @@ fn scaled_significand_to_f64(sign: bool, m: u128, e: i64) -> f64 {
 
 pub fn x87_bytes_to_f64(bytes: &[u8; 16]) -> f64 {
     let d = x87_decompose(bytes);
-    let sign_u64 = if d.sign { 1u64 } else { 0u64 };
 
     if d.is_zero() {
         return if d.sign { -0.0 } else { 0.0 };
@@ -865,62 +864,11 @@ pub fn x87_bytes_to_f64(bytes: &[u8; 16]) -> f64 {
         return f64::NAN;
     }
 
-    // Normal number
-    // x87: value = mantissa64 * 2^(exp15 - 16383 - 63)
-    // f64: value = (1 + mantissa52/2^52) * 2^(exp11 - 1023)
-    let unbiased = d.unbiased_exp();
-
-    // f64 exponent range: -1022 to 1023
-    if unbiased > 1023 {
-        return if d.sign {
-            f64::NEG_INFINITY
-        } else {
-            f64::INFINITY
-        };
-    }
-    if unbiased < -1074 {
-        return if d.sign { -0.0 } else { 0.0 };
-    }
-
-    // Extract top 52 mantissa bits (below the integer bit)
-    // mantissa64 bit 63 = integer bit (=1 for normals)
-    // We want bits 62..11 (52 bits) for the f64 mantissa
-    let mantissa52 = (d.mantissa >> 11) & 0x000F_FFFF_FFFF_FFFF;
-
-    // Round to nearest: check bit 10 (the first dropped bit)
-    let round_bit = (d.mantissa >> 10) & 1;
-    let sticky = d.mantissa & 0x3FF; // bits 9..0
-    let mantissa52 = if round_bit == 1 && (sticky != 0 || mantissa52 & 1 != 0) {
-        mantissa52 + 1
-    } else {
-        mantissa52
-    };
-
-    // Handle mantissa overflow from rounding
-    if mantissa52 > 0x000F_FFFF_FFFF_FFFF {
-        let f64_biased_exp = (unbiased + 1024) as u64;
-        if f64_biased_exp >= 0x7FF {
-            return if d.sign {
-                f64::NEG_INFINITY
-            } else {
-                f64::INFINITY
-            };
-        }
-        let f64_bits = (sign_u64 << 63) | (f64_biased_exp << 52);
-        return f64::from_bits(f64_bits);
-    }
-
-    if unbiased >= -1022 {
-        let f64_biased_exp = (unbiased + 1023) as u64;
-        let f64_bits = (sign_u64 << 63) | (f64_biased_exp << 52) | mantissa52;
-        f64::from_bits(f64_bits)
-    } else {
-        // Subnormal in f64. The old `mantissa as f64 * 2f64.powi(unbiased-63)`
-        // returned 0.0 for every one of these: the 64-bit significand is
-        // ~2^63, so it needs a 2^(unbiased-63) factor as small as 2^-1086 and
-        // `powi` underflows long before the product is formed.
-        scaled_significand_to_f64(d.sign, d.mantissa as u128, unbiased as i64 - 63)
-    }
+    // value = mantissa64 * 2^(unbiased - 63). One correctly rounded
+    // (half-even) narrowing covers every range; the former cut-off returned
+    // 0 below 2^-1074 although values in (2^-1075, 2^-1074) round up to the
+    // smallest subnormal.
+    scaled_significand_to_f64(d.sign, d.mantissa as u128, i64::from(d.unbiased_exp()) - 63)
 }
 
 /// Convert x87 80-bit bytes `[u8; 16]` to IEEE 754 binary128 bytes (16 bytes, little-endian).
@@ -1140,7 +1088,6 @@ fn encode_x87_from_scaled(sign: bool, m: u128, e: i64) -> [u8; 16] {
 /// Convert f128 bytes to f64 (lossy narrowing).
 pub fn f128_bytes_to_f64(f128_bytes: &[u8; 16]) -> f64 {
     let (sign, biased_exp, mantissa) = f128_decompose(f128_bytes);
-    let sign_u64 = if sign { 1u64 } else { 0u64 };
 
     if biased_exp == 0 && mantissa == 0 {
         return if sign { -0.0 } else { 0.0 };
@@ -1157,32 +1104,19 @@ pub fn f128_bytes_to_f64(f128_bytes: &[u8; 16]) -> f64 {
         };
     }
 
-    // Normal f128: value = (-1)^sign * 2^(biased_exp - 16383) * (1 + stored_mantissa/2^112)
-    // Note: f128_decompose already adds the implicit bit, so mantissa has bit 112 set.
-    let unbiased = (biased_exp - 16383) as i64;
-
-    if (-1022..=1023).contains(&unbiased) {
-        let f64_biased_exp = (unbiased + 1023) as u64;
-        // Take top 52 bits of the 112-bit stored mantissa (strip implicit bit first)
-        let stored = mantissa & ((1u128 << 112) - 1);
-        let mantissa52 = (stored >> 60) as u64;
-        let f64_bits = (sign_u64 << 63) | (f64_biased_exp << 52) | mantissa52;
-        f64::from_bits(f64_bits)
-    } else if unbiased > 1023 {
-        if sign {
-            f64::NEG_INFINITY
-        } else {
-            f64::INFINITY
-        }
+    // value = mantissa * 2^(e - 112), with e the unbiased exponent (a
+    // subnormal has the raw significand and the minimum normal exponent,
+    // -16382). One correctly rounded (half-even) narrowing covers the normal,
+    // subnormal, overflow and underflow ranges; the normal range used to
+    // truncate the 112-bit significand to 52 bits, so `(double)q` and every
+    // folded long double -> double conversion on binary128 targets could be
+    // one ulp low.
+    let e = if biased_exp == 0 {
+        -16382
     } else {
-        // Subnormal in f64 (or underflow). The old
-        // `mantissa as f64 * 2f64.powi(unbiased-112)` returned 0.0 for every
-        // one of these: the significand carries the implicit bit (~2^112), so
-        // it needs a 2^(unbiased-112) factor as small as 2^-1135 and `powi`
-        // underflows before the product is formed. Narrowing any long double
-        // below 2^-1022 to `double` therefore produced 0.0.
-        scaled_significand_to_f64(sign, mantissa, unbiased - 112)
-    }
+        biased_exp - 16383
+    };
+    scaled_significand_to_f64(sign, mantissa, i64::from(e) - 112)
 }
 
 /// Convert a signed i64 to f128 bytes with full precision.
