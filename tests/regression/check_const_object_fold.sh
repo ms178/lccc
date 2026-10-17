@@ -37,10 +37,10 @@ int main(void) { printf("%d\n", readg()); return 0; }
 EOF
 "$CCC" -O2 -S "$td/fold.c" -o "$td/fold.s"
 body=$(sed -n '/^readg:/,/ret/p' "$td/fold.s")
-echo "$body" | grep -q '\$39' \
+grep -q '\$39' <<<"$body" \
     || fail "readg() did not fold g[2]+s.b to \$39:
 $body"
-echo "$body" | grep -Eq '(g|s)[+(]' \
+grep -Eq '(g|s)[+(]' <<<"$body" \
     && fail "readg() folded but still loads from the object:
 $body"
 "$CCC" -O2 "$td/fold.c" -o "$td/fold" && out=$("$td/fold")
@@ -56,7 +56,7 @@ int main(void) { bump(); printf("%d\n", readm()); return 0; }
 EOF
 "$CCC" -O2 -S "$td/mut.c" -o "$td/mut.s"
 mbody=$(sed -n '/^readm:/,/ret/p' "$td/mut.s")
-echo "$mbody" | grep -q 'm+8' \
+grep -q 'm+8' <<<"$mbody" \
     || fail "readm() must LOAD the mutable m[2], got:
 $mbody"
 "$CCC" -O2 "$td/mut.c" -o "$td/mut" && out=$("$td/mut")
@@ -72,7 +72,7 @@ int main(void) { setT(41); printf("%lu\n", readT()); return 0; }
 EOF
 "$CCC" -O2 -S "$td/tls.c" -o "$td/tls.s"
 tbody=$(sed -n '/^readT:/,/ret/p' "$td/tls.s")
-echo "$tbody" | grep -q '%fs:t@TPOFF' \
+grep -q '%fs:t@TPOFF' <<<"$tbody" \
     || fail "readT() must read TLS through %fs, got:
 $tbody"
 "$CCC" -O2 "$td/tls.c" -o "$td/tls" && out=$("$td/tls")

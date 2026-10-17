@@ -12,7 +12,7 @@
 use super::lower::Lowerer;
 use crate::common::const_arith;
 use crate::common::const_eval as shared_const_eval;
-use crate::common::types::{CType, IrType, max_object_bytes};
+use crate::common::types::{max_object_bytes, CType, IrType};
 use crate::frontend::parser::ast::{
     BinOp, DerivedDeclarator, Expr, Initializer, SizeofArg, StructFieldDecl, TypeSpecifier, UnaryOp,
 };
@@ -582,14 +582,22 @@ impl Lowerer {
                 Some((neg, c, e)) => Dec::Finite(neg, c as u128, e),
                 None => {
                     let (neg, is_nan) = bid32_special(v);
-                    if is_nan { Dec::Nan(neg) } else { Dec::Inf(neg) }
+                    if is_nan {
+                        Dec::Nan(neg)
+                    } else {
+                        Dec::Inf(neg)
+                    }
                 }
             },
             IrConst::D64(v) => match decode_bid64(v) {
                 Some((neg, c, e)) => Dec::Finite(neg, c as u128, e),
                 None => {
                     let (neg, is_nan) = bid64_special(v);
-                    if is_nan { Dec::Nan(neg) } else { Dec::Inf(neg) }
+                    if is_nan {
+                        Dec::Nan(neg)
+                    } else {
+                        Dec::Inf(neg)
+                    }
                 }
             },
             IrConst::I128(v) => {
@@ -599,7 +607,11 @@ impl Lowerer {
                     Some((neg, c, e)) => Dec::Finite(neg, c, e),
                     None => {
                         let (neg, is_nan) = bid128_special_hi(hi);
-                        if is_nan { Dec::Nan(neg) } else { Dec::Inf(neg) }
+                        if is_nan {
+                            Dec::Nan(neg)
+                        } else {
+                            Dec::Inf(neg)
+                        }
                     }
                 }
             }
@@ -786,6 +798,20 @@ impl Lowerer {
                         _ => return None,
                     };
                     let layout = layouts.get(&*key)?;
+                    // A volatile-qualified MEMBER keeps its access even when
+                    // the containing object is const (C11 6.7.3p7): `struct
+                    // cs { const volatile int f; }; const struct cs csv` must
+                    // load `csv.f` every time.  GCC folds this shape; lccc
+                    // deliberately does not (check_const_volatile_objects.sh
+                    // pins the divergence), so the image fold declines here.
+                    if layout
+                        .fields
+                        .iter()
+                        .find(|f| f.name == *field_name)
+                        .is_some_and(|f| f.base_volatile || f.object_volatile)
+                    {
+                        return None;
+                    }
                     let (field_offset, field_ty, bit_offset, bit_width) =
                         layout.field_offset_with_bitfield(field_name, &*layouts)?;
                     offset = offset.checked_add(field_offset)?;
