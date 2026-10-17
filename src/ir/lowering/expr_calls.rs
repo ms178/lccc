@@ -568,14 +568,23 @@ impl Lowerer {
             return self.unpack_i686_ext_vector_reg_return(dest, call_ret_ty, vector_ct);
         }
         // X87-class aggregate (`struct { long double }`): the call produced
-        // the long double from %st(0); give it the aggregate's storage.
-        if ret_abi.x87 {
+        // the long double from %st(0); give it the aggregate's storage. The
+        // two-lane `long double` ext vector also pops lane 1 from %st(1)
+        // (`GetReturnF128Second`, as for `_Complex long double`) into the
+        // 32-byte, 32-aligned vector object.
+        if ret_abi.x87 || ret_abi.x87_pair {
+            let lane1 = ret_abi.x87_pair.then(|| {
+                let lane1 = self.fresh_value();
+                self.emit(Instruction::GetReturnF128Second { dest: lane1 });
+                lane1
+            });
+            let (size, align) = if ret_abi.x87_pair { (32, 32) } else { (16, 16) };
             let alloca = self.fresh_value();
             self.emit(Instruction::Alloca {
                 dest: alloca,
                 ty: IrType::F128,
-                size: 16,
-                align: 16,
+                size,
+                align,
                 volatile: false,
                 semantic_volatile: false,
             });
@@ -586,6 +595,16 @@ impl Lowerer {
                 ty: IrType::F128,
                 seg_override: AddressSpace::Default,
             });
+            if let Some(lane1) = lane1 {
+                let lane1_ptr = self.emit_gep_offset(alloca, 16, IrType::F128);
+                self.emit(Instruction::Store {
+                    volatile: false,
+                    val: Operand::Value(lane1),
+                    ptr: lane1_ptr,
+                    ty: IrType::F128,
+                    seg_override: AddressSpace::Default,
+                });
+            }
             return Operand::Value(alloca);
         }
 
@@ -1517,6 +1536,22 @@ impl Lowerer {
                     Some(ref ct @ CType::Struct(_)) | Some(ref ct @ CType::Union(_)) => self
                         .get_struct_layout_for_ctype(ct)
                         .map(|layout| layout.align),
+                    // Vectors carry their natural alignment (size for ext
+                    // vectors: 32 for 32-byte, 64 for 64-byte). The x86-64
+                    // backend uses this both for the per-argument padding in
+                    // the outgoing area and to trigger the GCC ≥ 4.6 dynamic
+                    // %rsp realignment (emit_call_stack_args_impl): a
+                    // MEMORY-class argument with alignment A > 16 must sit at
+                    // an address ≡ 0 (mod A), because every callee — GCC,
+                    // Clang and lccc's own prologue/va_arg — rounds the
+                    // incoming slot up to A. Without it a 32-byte vector was
+                    // pushed at the 16-aligned %rsp and the callee read 16
+                    // bytes of garbage on half of all stack residues
+                    // (ABI-EXTVEC-VA-1). The parameter side already records
+                    // `ctype_align` for vector params (func_lowering), so the
+                    // caller and callee layouts agree. i686 (cap 4) and ARM
+                    // (cap 16) clamp this through `stack_arg_align_cap`.
+                    Some(ref ct) if ct.is_vector() => Some(self.ctype_align(ct)),
                     // _Float128/_Decimal128 args are 16-byte TFmode carriers:
                     // the i686 stack layout aligns them to 16 in the outgoing
                     // area (GCC i386 psABI), mirroring the struct_align Some(16)
@@ -1648,7 +1683,7 @@ impl Lowerer {
         let mut indirect_ret_ty = self.get_func_ptr_return_ir_type(func);
         if ret_abi.two_reg_size.is_some() {
             indirect_ret_ty = IrType::I128;
-        } else if ret_abi.x87 {
+        } else if ret_abi.x87 || ret_abi.x87_pair {
             indirect_ret_ty = IrType::F128;
         }
 

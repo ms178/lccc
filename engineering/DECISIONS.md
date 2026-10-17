@@ -3697,4 +3697,9 @@ re-baselining.
   legs (lccc reads an unwritten slot), so those carry class `flaky`:
   counted, never judged, retired only by the fix. Defects are documented with reproductions in
   `engineering/FOLLOWUP-2026-10-17-ext-vector-grid.md`
-  (ABI-EXTVEC-VA-1, ABI-EXTVEC-LD-1, ABI-EXTVEC-I386-O2-1).
+  (ABI-EXTVEC-VA-1, ABI-EXTVEC-LD-1, ABI-EXTVEC-I386-O2-1 — all three
+  since fixed; the x86-64 `long double` lane conventions are pinned
+  against GCC's x87 struct / `_Complex long double` spellings in
+  `check_gnu_vector_align_abi.sh` because Clang's `X86_64ABIInfo` hands
+  a MEMORY-class *vector* return to LLVM direct, which scalarizes
+  `<2 x x86_fp80>` onto `%st(0)/%st(1)`; `SysvPassing::X87Pair`).

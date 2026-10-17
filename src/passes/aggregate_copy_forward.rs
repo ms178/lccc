@@ -1168,16 +1168,38 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         return reverse_changes + eliminate_dead_aggregate_field_stores(func);
     }
 
-    fn resolve_source(mut source: Value, candidates: &FxHashMap<u32, CopyCandidate>) -> Value {
+    /// Where a read through `ptr` must go once every candidate copy is
+    /// deleted: the first pointer that is NOT inside a forwarded temporary,
+    /// plus the GEP path (outermost first) to re-apply on top of it.
+    ///
+    /// A candidate's source may itself be a path INTO another candidate
+    /// (`tmp2 = memcpy(tmp1 + 16)` after `tmp1 = memcpy(obj)`), so following
+    /// only exact-root chains left `tmp2`'s reads pointing at `tmp1 + 16`
+    /// while `tmp1`'s defining copy was removed: the second 16-byte XMM
+    /// image of every i686 ext_vector_type argument wider than 16 bytes was
+    /// read from uninitialized stack at -O2 (ABI-EXTVEC-I386-O2-1). Each
+    /// hop prepends that hop's path, so the result is `obj + 16` here.
+    fn resolve_read(
+        ptr: Value,
+        paths: &FxHashMap<u32, (u32, Vec<(Operand, crate::common::types::IrType)>)>,
+        candidates: &FxHashMap<u32, CopyCandidate>,
+    ) -> (Value, Vec<(Operand, crate::common::types::IrType)>) {
+        let mut base = ptr;
+        let mut suffix: Vec<(Operand, crate::common::types::IrType)> = Vec::new();
         let mut seen = FxHashSet::default();
-        while seen.insert(source.0) {
-            if let Some(next) = candidates.get(&source.0) {
-                source = next.source;
-            } else {
+        while seen.insert(base.0) {
+            let Some((root, path)) = paths.get(&base.0) else {
                 break;
-            }
+            };
+            let Some(candidate) = candidates.get(root) else {
+                break;
+            };
+            let mut next = path.clone();
+            next.extend(suffix);
+            suffix = next;
+            base = candidate.source;
         }
-        source
+        (base, suffix)
     }
 
     if std::env::var("CCC_DEBUG_AGGFWD").is_ok() {
@@ -1206,33 +1228,40 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                     continue;
                 }
             }
-            if let Instruction::Memcpy { src, .. } = &mut inst {
-                if let Some(candidate) = candidates.get(&src.0) {
-                    *src = resolve_source(candidate.source, &candidates);
-                    changes += 1;
-                }
-            }
-            if let Instruction::Load { ptr, .. } = &mut inst {
-                if let Some((root, path)) = paths.get(&ptr.0) {
-                    if let Some(candidate) = candidates.get(root) {
-                        let mut base = resolve_source(candidate.source, &candidates);
-                        for (offset, ty) in path {
-                            let dest = Value(func.next_value_id);
-                            func.next_value_id += 1;
-                            out.push(Instruction::GetElementPtr {
-                                dest,
-                                base,
-                                offset: offset.clone(),
-                                ty: *ty,
-                            });
-                            if has_spans {
-                                spans.push(old_spans[ii]);
-                            }
-                            base = dest;
+            // Every read of a forwarded temporary — a Load through a tracked
+            // pointer path, or a Memcpy whose SOURCE is the temporary or a
+            // path into it — is redirected to the same path off the original
+            // object. The validation above admitted exactly these shapes
+            // (`src.0 == value` for any path-derived value), so the rewrite
+            // must cover them all; a Memcpy reading `tmp + 16` used to be
+            // left pointing at the deleted copy.
+            let read_ptr = match &mut inst {
+                Instruction::Memcpy { src, .. } => Some(src),
+                Instruction::Load { ptr, .. } => Some(ptr),
+                _ => None,
+            };
+            if let Some(ptr) = read_ptr {
+                let forwarded = paths
+                    .get(&ptr.0)
+                    .is_some_and(|(root, _)| candidates.contains_key(root));
+                if forwarded {
+                    let (mut base, path) = resolve_read(*ptr, &paths, &candidates);
+                    for (offset, ty) in path {
+                        let dest = Value(func.next_value_id);
+                        func.next_value_id += 1;
+                        out.push(Instruction::GetElementPtr {
+                            dest,
+                            base,
+                            offset,
+                            ty,
+                        });
+                        if has_spans {
+                            spans.push(old_spans[ii]);
                         }
-                        *ptr = base;
-                        changes += 1;
+                        base = dest;
                     }
+                    *ptr = base;
+                    changes += 1;
                 }
             }
             out.push(inst);
@@ -1537,6 +1566,149 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    fn alloca(dest: u32, size: usize) -> Instruction {
+        Instruction::Alloca {
+            dest: Value(dest),
+            ty: IrType::Ptr,
+            size,
+            align: 16,
+            volatile: false,
+            semantic_volatile: false,
+        }
+    }
+
+    /// Every read of memory rooted at an alloca in `func`, as
+    /// `(root, byte offset)` after folding constant GEP chains, for Loads
+    /// and for Memcpy sources. Panics on a read through an undefined value.
+    fn resolved_reads(func: &IrFunction) -> Vec<(u32, i64)> {
+        let mut defs: FxHashMap<u32, (u32, i64)> = FxHashMap::default();
+        let mut reads = Vec::new();
+        for inst in &func.blocks[0].instructions {
+            match inst {
+                Instruction::Alloca { dest, .. } => {
+                    defs.insert(dest.0, (dest.0, 0));
+                }
+                Instruction::GetElementPtr {
+                    dest,
+                    base,
+                    offset: Operand::Const(c),
+                    ..
+                } => {
+                    let (root, off) = defs[&base.0];
+                    defs.insert(dest.0, (root, off + c.to_i64().unwrap()));
+                }
+                Instruction::Load { ptr, .. } => reads.push(defs[&ptr.0]),
+                Instruction::Memcpy { src, .. } => reads.push(defs[&src.0]),
+                _ => {}
+            }
+        }
+        reads
+    }
+
+    /// `tmp1 = memcpy(obj); tmp2 = memcpy(tmp1 + 16); read tmp2` — the
+    /// second candidate's source is a PATH into the first. Both copies are
+    /// deleted, so every surviving read must resolve to `obj + 16 + ...`,
+    /// never to the dead `tmp1` (ABI-EXTVEC-I386-O2-1: the second XMM image
+    /// of an i686 ext_vector_type argument read uninitialized stack).
+    #[test]
+    fn forwards_reads_through_a_path_into_another_forwarded_temporary() {
+        let (obj, tmp1, tmp1_hi, tmp2, slot, out, field, loaded) = (0, 1, 2, 3, 4, 7, 5, 6);
+        let mut func = IrFunction::new("chain".into(), IrType::I32, vec![], false);
+        func.next_value_id = 8;
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                alloca(obj, 32),
+                alloca(tmp1, 32),
+                alloca(tmp2, 16),
+                alloca(slot, 8),
+                // `out` is a LOADED pointer: a Memcpy into it is not a
+                // candidate, so that copy survives and only its source
+                // must be rewritten.
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(out),
+                    ptr: Value(slot),
+                    ty: IrType::Ptr,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Const(IrConst::I32(7)),
+                    ptr: Value(obj),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::Memcpy {
+                    dest: Value(tmp1),
+                    src: Value(obj),
+                    size: 32,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(tmp1_hi),
+                    base: Value(tmp1),
+                    offset: Operand::Const(IrConst::I32(16)),
+                    ty: IrType::Ptr,
+                },
+                Instruction::Memcpy {
+                    dest: Value(tmp2),
+                    src: Value(tmp1_hi),
+                    size: 16,
+                },
+                // A Memcpy READING the chained temporary (the i686 XMM piece
+                // copy) and a Load through a path into it.
+                Instruction::Memcpy {
+                    dest: Value(out),
+                    src: Value(tmp2),
+                    size: 16,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(field),
+                    base: Value(tmp2),
+                    offset: Operand::Const(IrConst::I32(4)),
+                    ty: IrType::I32,
+                },
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(loaded),
+                    ptr: Value(field),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(loaded)))),
+            source_spans: vec![],
+        });
+
+        assert!(run(&mut func) > 0);
+        let insts = &func.blocks[0].instructions;
+        // Both temporaries' defining copies are gone ...
+        assert!(!insts.iter().any(|inst| matches!(
+            inst,
+            Instruction::Memcpy { dest, .. } if dest.0 == tmp1 || dest.0 == tmp2
+        )));
+        // ... the surviving copy into `out` still exists ...
+        assert!(insts.iter().any(|inst| matches!(
+            inst,
+            Instruction::Memcpy { dest, size: 16, .. } if dest.0 == out
+        )));
+        // ... and nothing reads the temporaries any more: the copy into
+        // `out` reads `obj + 16`, the field load reads `obj + 16 + 4`.
+        let reads = resolved_reads(&func);
+        assert!(
+            !reads.iter().any(|(root, _)| *root == tmp1 || *root == tmp2),
+            "a read still targets a deleted temporary: {reads:?}"
+        );
+        assert!(
+            reads.contains(&(obj, 16)),
+            "out copy must read obj+16: {reads:?}"
+        );
+        assert!(
+            reads.contains(&(obj, 20)),
+            "field load must read obj+20: {reads:?}"
+        );
     }
 }
 

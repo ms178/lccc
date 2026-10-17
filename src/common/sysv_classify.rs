@@ -68,6 +68,13 @@ pub enum SysvPassing {
     /// X87 + X87UP (a lone `long double` member): passed in memory, returned
     /// in `%st(0)`.
     X87,
+    /// Two consecutive `long double` lanes (Clang's `<2 x x86_fp80>`, the
+    /// two-lane `long double` ext vector): MEMORY as an argument (32-byte
+    /// `byval`), but Clang hands the return to LLVM "direct"
+    /// (`getIndirectReturnResult` for a non-aggregate), where the vector is
+    /// scalarized and the x86 return convention assigns the two `f80`s to
+    /// `%st(0)` and `%st(1)` — the `_Complex long double` register pair.
+    X87Pair,
     /// MEMORY: passed on the stack, returned through a hidden pointer.
     Memory,
 }
@@ -78,7 +85,9 @@ impl SysvPassing {
     pub fn arg_classes(&self) -> Vec<EightbyteClass> {
         match self {
             SysvPassing::Regs(c) => c.clone(),
-            SysvPassing::X87 | SysvPassing::Memory => vec![EightbyteClass::Memory],
+            SysvPassing::X87 | SysvPassing::X87Pair | SysvPassing::Memory => {
+                vec![EightbyteClass::Memory]
+            }
         }
     }
 
@@ -110,6 +119,12 @@ pub fn classify_return(ty: &CType, ctx: &dyn StructLayoutProvider) -> Option<Sys
     if let CType::ExtVector(elem, layout) = ty {
         if layout.lanes == 1 && matches!(**elem, CType::Double) {
             return Some(SysvPassing::Regs(vec![EightbyteClass::Sse]));
+        }
+        // 256 bits is MEMORY without AVX, but a vector is not an aggregate
+        // for Clang's ABI code, so the return goes "direct" to LLVM, which
+        // scalarizes `<2 x x86_fp80>` into the x87 register pair.
+        if layout.lanes == 2 && matches!(**elem, CType::LongDouble) {
+            return Some(SysvPassing::X87Pair);
         }
     }
     classify(ty, ctx)
@@ -325,4 +340,44 @@ fn ext_vector_leaf(
         16 => (vec![Sse, SseUp], 128),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod long_double_vector_tests {
+    use super::*;
+    use crate::common::fx_hash::FxHashMap;
+    use crate::common::types::{ExtVectorLayout, RcLayout};
+
+    fn ld_vec(lanes: usize) -> CType {
+        let layout = ExtVectorLayout::new(&CType::LongDouble, lanes)
+            .expect("x86 long double ext vector layout");
+        CType::ExtVector(Box::new(CType::LongDouble), layout)
+    }
+
+    /// ABI-EXTVEC-LD-1: the `long double` lane conventions Clang's
+    /// `X86_64ABIInfo` produces (and that GCC's x87 struct / `_Complex long
+    /// double` conventions share) — one lane is the X87 class, two lanes are
+    /// MEMORY as an argument but the `%st(0)/%st(1)` pair on return, three
+    /// lanes are MEMORY in both positions (LLVM sret-demotes the "direct"
+    /// `<3 x x86_fp80>` return, which is the hidden pointer lccc uses).
+    #[test]
+    fn long_double_lanes_classify_like_clang() {
+        let ctx: FxHashMap<String, RcLayout> = FxHashMap::default();
+        assert_eq!(classify(&ld_vec(1), &ctx), Some(SysvPassing::X87));
+        assert_eq!(classify_return(&ld_vec(1), &ctx), Some(SysvPassing::X87));
+
+        assert_eq!(classify(&ld_vec(2), &ctx), Some(SysvPassing::Memory));
+        assert_eq!(
+            classify_return(&ld_vec(2), &ctx),
+            Some(SysvPassing::X87Pair)
+        );
+        assert_eq!(
+            SysvPassing::X87Pair.arg_classes(),
+            vec![EightbyteClass::Memory]
+        );
+        assert!(!SysvPassing::X87Pair.one_xmm());
+
+        assert_eq!(classify(&ld_vec(3), &ctx), Some(SysvPassing::Memory));
+        assert_eq!(classify_return(&ld_vec(3), &ctx), Some(SysvPassing::Memory));
+    }
 }

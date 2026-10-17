@@ -337,9 +337,10 @@ impl<'a> SemaConstEval<'a> {
                 size.map(|s| IrConst::I64(s as i64))
             }
 
-            // _Alignof - C11 standard, returns minimum ABI alignment
+            // _Alignof - C11 standard: GCC's min_align_of_type (TYPE_ALIGN
+            // capped at BIGGEST_ALIGNMENT for non-user-aligned types).
             Expr::Alignof(ts, _) => {
-                let align = self.alignof_type_spec(ts);
+                let align = self.c11_alignof_type_spec(ts);
                 Some(IrConst::I64(align as i64))
             }
 
@@ -358,9 +359,14 @@ impl<'a> SemaConstEval<'a> {
                 // Check for explicit alignment on a variable identifier
                 if let Expr::Identifier(name, _) = inner_expr.as_ref() {
                     if let Some(sym) = self.symbols.lookup(name) {
-                        if let Some(explicit_align) = sym.explicit_alignment {
-                            let natural = sym.ty.align_ctx(&*self.types.borrow_struct_layouts());
-                            return Some(IrConst::I64(natural.max(explicit_align) as i64));
+                        // A typedef-level `aligned` replaces the natural
+                        // alignment; a declaration-level request only raises.
+                        let natural = sym.type_align.unwrap_or_else(|| {
+                            sym.ty.align_ctx(&*self.types.borrow_struct_layouts())
+                        });
+                        if sym.type_align.is_some() || sym.explicit_alignment.is_some() {
+                            let explicit = sym.explicit_alignment.unwrap_or(0);
+                            return Some(IrConst::I64(natural.max(explicit) as i64));
                         }
                     }
                 }
@@ -373,11 +379,13 @@ impl<'a> SemaConstEval<'a> {
             Expr::GnuAlignofExpr(inner_expr, _) => {
                 if let Expr::Identifier(name, _) = inner_expr.as_ref() {
                     if let Some(sym) = self.symbols.lookup(name) {
-                        if let Some(explicit_align) = sym.explicit_alignment {
-                            let natural = sym
-                                .ty
-                                .preferred_align_ctx(&*self.types.borrow_struct_layouts());
-                            return Some(IrConst::I64(natural.max(explicit_align) as i64));
+                        let natural = sym.type_align.unwrap_or_else(|| {
+                            sym.ty
+                                .preferred_align_ctx(&*self.types.borrow_struct_layouts())
+                        });
+                        if sym.type_align.is_some() || sym.explicit_alignment.is_some() {
+                            let explicit = sym.explicit_alignment.unwrap_or(0);
+                            return Some(IrConst::I64(natural.max(explicit) as i64));
                         }
                     }
                 }
@@ -1011,13 +1019,7 @@ impl<'a> SemaConstEval<'a> {
                                 &*self.types.borrow_struct_layouts(),
                                 reverse_sso.is_some_and(|v| v),
                             );
-                        if let Some(a) = struct_aligned {
-                            if *a > layout.align {
-                                layout.align = *a;
-                                let mask = layout.align - 1;
-                                layout.size = (layout.size + mask) & !mask;
-                            }
-                        }
+                        layout.apply_struct_aligned(*struct_aligned);
                         return Some(layout.size);
                     }
                 }
@@ -1048,13 +1050,7 @@ impl<'a> SemaConstEval<'a> {
                             &*self.types.borrow_struct_layouts(),
                             reverse_sso.is_some_and(|v| v),
                         );
-                        if let Some(a) = struct_aligned {
-                            if *a > layout.align {
-                                layout.align = *a;
-                                let mask = layout.align - 1;
-                                layout.size = (layout.size + mask) & !mask;
-                            }
-                        }
+                        layout.apply_struct_aligned(*struct_aligned);
                         return Some(layout.size);
                     }
                 }
@@ -1107,6 +1103,24 @@ impl<'a> SemaConstEval<'a> {
     }
 
     /// Compute alignof for a type specifier.
+    /// C11 `_Alignof(type-name)`: `alignof_type_spec` (GCC TYPE_ALIGN) capped
+    /// at `BIGGEST_ALIGNMENT` unless the type is user-aligned — GCC's
+    /// `min_align_of_type`; see `CType::c11_alignof_ctx`. Mirrors
+    /// `FunctionLowering::c11_alignof_type`.
+    fn c11_alignof_type_spec(&self, spec: &TypeSpecifier) -> usize {
+        let align = self.alignof_type_spec(spec);
+        if align <= crate::common::types::target_biggest_alignment() {
+            return align;
+        }
+        if let TypeSpecifier::TypedefName(name) = spec {
+            if self.types.typedef_alignments.contains_key(name) {
+                return align;
+            }
+        }
+        let ctype = self.ctype_from_type_spec(spec);
+        align.min(ctype.c11_alignof_ctx(&*self.types.borrow_struct_layouts()))
+    }
+
     fn alignof_type_spec(&self, spec: &TypeSpecifier) -> usize {
         use crate::common::types::target_ptr_size;
         let ptr_sz = target_ptr_size();
@@ -1186,11 +1200,7 @@ impl<'a> SemaConstEval<'a> {
                                 &*self.types.borrow_struct_layouts(),
                                 reverse_sso.is_some_and(|v| v),
                             );
-                        if let Some(a) = struct_aligned {
-                            if *a > layout.align {
-                                layout.align = *a;
-                            }
-                        }
+                        layout.apply_struct_aligned(*struct_aligned);
                         return layout.align;
                     }
                 }
@@ -1221,11 +1231,7 @@ impl<'a> SemaConstEval<'a> {
                             &*self.types.borrow_struct_layouts(),
                             reverse_sso.is_some_and(|v| v),
                         );
-                        if let Some(a) = struct_aligned {
-                            if *a > layout.align {
-                                layout.align = *a;
-                            }
-                        }
+                        layout.apply_struct_aligned(*struct_aligned);
                         return layout.align;
                     }
                 }
@@ -1236,7 +1242,11 @@ impl<'a> SemaConstEval<'a> {
                 enum_type.align_ctx(&*self.types.borrow_struct_layouts())
             }
             TypeSpecifier::TypedefName(name) => {
-                if let Some(ctype) = self.types.typedefs.get(name) {
+                // A typedef-level `aligned(N)` replaces the alignment (may
+                // lower it) — same rule as `FunctionLowering::alignof_type`.
+                if let Some(&td_align) = self.types.typedef_alignments.get(name) {
+                    td_align
+                } else if let Some(ctype) = self.types.typedefs.get(name) {
                     ctype.align_ctx(&*self.types.borrow_struct_layouts())
                 } else {
                     crate::common::types::target_ptr_size()
@@ -1250,7 +1260,11 @@ impl<'a> SemaConstEval<'a> {
                     crate::common::types::target_ptr_size() // fallback
                 }
             }
-            TypeSpecifier::Vector(_, total_bytes) => (*total_bytes).min(16),
+            // GCC TYPE_ALIGN of a vector (full size on x86); the C11
+            // _Alignof cap lives in `c11_alignof_type_spec`.
+            TypeSpecifier::Vector(_, total_bytes) => {
+                crate::common::types::vector_type_align(*total_bytes)
+            }
             TypeSpecifier::ExtVector(inner, lanes) => {
                 let element = self.ctype_from_type_spec(inner);
                 ExtVectorLayout::new(&element, *lanes)
@@ -1278,7 +1292,10 @@ impl<'a> SemaConstEval<'a> {
             TypeSpecifier::ComplexDouble => 8,
             TypeSpecifier::Array(elem, _) => self.preferred_alignof_type_spec(elem),
             TypeSpecifier::TypedefName(name) => {
-                if let Some(ctype) = self.types.typedefs.get(name) {
+                // Typedef `aligned(N)` replaces the alignment (may lower it).
+                if let Some(&td_align) = self.types.typedef_alignments.get(name) {
+                    td_align
+                } else if let Some(ctype) = self.types.typedefs.get(name) {
                     ctype.preferred_align_ctx(&*self.types.borrow_struct_layouts())
                 } else {
                     target_ptr_size()
@@ -1297,7 +1314,9 @@ impl<'a> SemaConstEval<'a> {
                     target_ptr_size()
                 }
             }
-            TypeSpecifier::Vector(_, total_bytes) => (*total_bytes).min(16),
+            TypeSpecifier::Vector(_, total_bytes) => {
+                crate::common::types::vector_type_align(*total_bytes)
+            }
             TypeSpecifier::ExtVector(inner, lanes) => {
                 let element = self.ctype_from_type_spec(inner);
                 ExtVectorLayout::new(&element, *lanes)
@@ -1333,11 +1352,11 @@ impl<'a> SemaConstEval<'a> {
                         .align_ctx(&*self.types.borrow_struct_layouts());
                     natural.max(typedef_alignment(ts).unwrap_or(0))
                 });
-                let field_alignment = crate::common::types::strictest_alignment([
-                    f.alignment,
-                    typedef_alignment(&f.type_spec),
-                    alignas_type,
-                ]);
+                let field_alignment =
+                    crate::common::types::strictest_alignment([f.alignment, alignas_type]);
+                // A typedef-level `aligned` REPLACES the type's alignment
+                // (it may lower it); see `StructField::type_align`.
+                let type_align = typedef_alignment(&f.type_spec);
                 // C11 6.7.2.1p13: unnamed non-aggregate members are constraint
                 // violations GCC ignores entirely; drop from layout + init.
                 if f.name.is_none()
@@ -1355,6 +1374,7 @@ impl<'a> SemaConstEval<'a> {
                     ty,
                     bit_width,
                     alignment: field_alignment,
+                    type_align,
                     is_packed: f.is_packed,
                     base_volatile: f.base_volatile,
                     object_volatile: f.object_volatile,

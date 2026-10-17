@@ -760,6 +760,80 @@ impl Preprocessor {
                 | "__fd_arg__"
                 | "tls_model"
                 | "__tls_model__"
+                // Type attributes the parser implements (parse.rs attribute
+                // dispatch) but that were missing here, so feature-tested
+                // code (`#if __has_attribute(vector_size)`) silently fell
+                // back to its scalar path under lccc while GCC 16 and Clang
+                // answer 1 for every one of them (GCC: all but
+                // `ext_vector_type`/`address_space`; Clang: all but the
+                // GCC-only `mode`/`symver`/`scalar_storage_order`).
+                | "vector_size"
+                | "__vector_size__"
+                | "ext_vector_type"
+                | "__ext_vector_type__"
+                | "mode"
+                | "__mode__"
+                | "address_space"
+                | "__address_space__"
+                | "scalar_storage_order"
+                | "__scalar_storage_order__"
+                | "common"
+                | "__common__"
+                | "weakref"
+                | "__weakref__"
+                | "symver"
+                | "__symver__"
+                | "gnu_inline"
+                | "__gnu_inline__"
+                | "fastcall"
+                | "__fastcall__"
+                | "regparm"
+                | "__regparm__"
+                | "naked"
+                | "__naked__"
         )
+    }
+}
+
+#[cfg(test)]
+mod has_attribute_tests {
+    use super::*;
+
+    /// Every attribute the parser's attribute dispatch implements must be
+    /// reported by `__has_attribute`, otherwise feature-tested code takes
+    /// its fallback path under lccc. The list mirrors the named arms in
+    /// `parse.rs` (`parse_gnu_attribute_list`); extend both together.
+    #[test]
+    fn parser_implemented_attributes_are_reported() {
+        for name in [
+            "aligned",
+            "packed",
+            "vector_size",
+            "ext_vector_type",
+            "mode",
+            "address_space",
+            "scalar_storage_order",
+            "common",
+            "weakref",
+            "symver",
+            "gnu_inline",
+            "fastcall",
+            "regparm",
+            "naked",
+            "cleanup",
+            "transparent_union",
+            "may_alias",
+        ] {
+            assert!(
+                Preprocessor::is_supported_attribute(name),
+                "__has_attribute({name}) must be 1"
+            );
+            let underscored = format!("__{name}__");
+            assert!(
+                Preprocessor::is_supported_attribute(&underscored),
+                "__has_attribute({underscored}) must be 1"
+            );
+        }
+        assert!(!Preprocessor::is_supported_attribute("no_such_attribute"));
     }
 }
