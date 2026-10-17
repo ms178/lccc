@@ -167,8 +167,13 @@ impl Lowerer {
                         {
                             return sig.return_type;
                         }
-                        // Small legacy vector_size returns (≤8 bytes) use I64.
-                        return IrType::I64;
+                        // x86-64 small vectors: return the carrier chosen in
+                        // `register_function_sig` (F32/F64 for one-lane FP,
+                        // U8/U16/U32/I8/I16/I32 for sub-4-byte integer one-
+                        // lanes, I64 for 5-8 byte packed shapes). Do NOT force
+                        // I64 here -- doing so clobbers the SSE-domain carrier
+                        // and forces an XMM↔GPR movq bounce.
+                        return sig.return_type;
                     }
                 }
             }
@@ -267,6 +272,96 @@ impl Lowerer {
                         is_f128_sse: false,
                     });
                     param_kinds.push(ParamKind::ComplexDecomposed(real_idx, imag_idx));
+                    continue;
+                }
+            }
+
+            // x86-64 small vectors (<=8 bytes) that classify as a single
+            // register (single SSE eightbyte, or single Integer eightbyte):
+            // carry as a matching scalar IR type rather than as a Ptr
+            // aggregate. Without this, one-lane FP vectors (f32x1/f64x1)
+            // and 1/2/4-byte integer one-lanes spill to the stack through
+            // the by-reference parameter path, forcing an XMM→mem→XMM round
+            // trip and an unnecessary frame. Multi-lane small vectors
+            // (e.g. u16x4, u8x8) pack their bit pattern in an I64 via the
+            // struct SSE/Int eightbyte carrier.
+            //
+            // struct_size stays None so the scalar Phase 1b emits a ParamRef
+            // + Store; eightbyte_classes stay empty since a true scalar
+            // uses the is_float/is_i64_pair/IntReg classification, not the
+            // eightbyte walk. The matching ty (F32/F64/U8/U16/U32/I8/I16/
+            // I32/I64/U64) selects the correct register class: is_float
+            // routes F32/F64 through FloatReg (%xmm), I64/U64 through
+            // I64RegPair (one-eightbyte value lowers to a single GP reg
+            // via movq), and narrow integers (sub-4-byte) through IntReg
+            // using their precise signed/unsigned type. The backend's
+            // ParamRef load for narrow integer types is a plain 32-bit
+            // mov (Raw32) -- psABI §3.2.3 places onus of high-bit validity
+            // on the caller (GCC/Clang use `movl` which zero-extends to 64
+            // bits as a side effect), so the callee does not need to
+            // re-sign-extend. Returns emit a width-appropriate movzbl/
+            // movzwl/movsbl/movswl into %eax via operand_to_rax_i32.
+            if !crate::common::types::target_is_32bit() && param_ctype.is_vector() {
+                let vsz = self.sizeof_type(&param.type_spec);
+                let sysv = self.sysv_arg_abi(&param_ctype);
+                let single_reg = matches!(
+                    sysv.as_ref().map(|(c, one_xmm)| (c.as_slice(), *one_xmm)),
+                    Some(([crate::common::types::EightbyteClass::Sse], false))
+                        | Some(([crate::common::types::EightbyteClass::Integer], false))
+                );
+                if vsz <= 8 && single_reg {
+                    let scalar_ty = if let Some((elem, n)) = param_ctype.vector_info() {
+                        if n == 1 {
+                            match elem.size() {
+                                4 if elem.is_floating() => IrType::F32,
+                                8 if elem.is_floating() => IrType::F64,
+                                8 => {
+                                    // 8-byte one-lane integer vector (u64x1
+                                    // / i64x1): per psABI (and GCC 16.2's
+                                    // GNU-vector u64x1 convention) the
+                                    // eightbyte is INTEGER class, arriving
+                                    // in a GP register (%rdi). Use the
+                                    // matching integer carrier so the
+                                    // backend routes it through the GP
+                                    // register file without a cross-domain
+                                    // movq bounce.
+                                    if elem.is_signed() {
+                                        IrType::I64
+                                    } else {
+                                        IrType::U64
+                                    }
+                                }
+                                1 if !elem.is_signed() => IrType::U8,
+                                2 if !elem.is_signed() => IrType::U16,
+                                4 if !elem.is_signed() => IrType::U32,
+                                1 if elem.is_signed() => IrType::I8,
+                                2 if elem.is_signed() => IrType::I16,
+                                4 if elem.is_signed() => IrType::I32,
+                                _ => IrType::I64,
+                            }
+                        } else {
+                            // Multi-lane small vectors (e.g. u16x4, u8x8):
+                            // pack the bit pattern in I64. The psABI still
+                            // classifies these as SSE eightbytes and routes
+                            // them through %xmm0-7; the backend performs the
+                            // I64↔XMM bitcast at the boundary.
+                            IrType::I64
+                        }
+                    } else {
+                        IrType::I64
+                    };
+                    let ir_idx = params.len();
+                    params.push(IrParam {
+                        ty: scalar_ty,
+                        noalias: false,
+                        struct_size: None, // scalar, not by-ref aggregate
+                        struct_align: None,
+                        param_align: None,
+                        struct_eightbyte_classes: Vec::new(), // use scalar classification
+                        riscv_float_class: None,
+                        is_f128_sse: false,
+                    });
+                    param_kinds.push(ParamKind::Normal(ir_idx));
                     continue;
                 }
             }

@@ -562,6 +562,74 @@ impl Lowerer {
         // exactly the object's bytes: a whole-word load would over-read 1..7
         // bytes past a small struct (see `load_bytes_exact`).
         let seg = self.aggregate_lvalue_space(e);
+        // One-lane ≤8-byte vectors are scalar-carrier values per the psABI
+        // (I8/I16/I32/I64/U8/.../F32/F64), not aggregates, but their lvalue
+        // is still a by-reference vector object (identifiers return the
+        // alloca address). Handle them here so the load uses the correctly
+        // signed integer type: `load_bytes_exact` always zexts from U8/U16/
+        // U32, which flips i8x1=-1 to 255 on return.
+        //
+        // For FP one-lanes (double/float) use the dedicated F64/F32 loads
+        // below; for integer one-lanes load with signed or unsigned byte/
+        // word/long/doubleword matching the element type. Multi-lane and
+        // >8-byte vectors continue through load_bytes_exact.
+        if expr_ct.is_vector() {
+            if let Some((elem, n)) = expr_ct.vector_info() {
+                if n == 1 && struct_size <= 8 {
+                    let ty = match elem.size() {
+                        4 if elem.is_floating() => IrType::F32,
+                        8 if elem.is_floating() => IrType::F64,
+                        1 if elem.is_signed() => IrType::I8,
+                        2 if elem.is_signed() => IrType::I16,
+                        4 if elem.is_signed() => IrType::I32,
+                        8 if elem.is_signed() => IrType::I64,
+                        1 => IrType::U8,
+                        2 => IrType::U16,
+                        4 => IrType::U32,
+                        _ => IrType::U64,
+                    };
+                    let dest = self.fresh_value();
+                    self.emit(Instruction::Load {
+                        volatile: false,
+                        dest,
+                        ptr: addr,
+                        ty,
+                        seg_override: seg,
+                    });
+                    return Some(Operand::Value(dest));
+                }
+            }
+        }
+        // For one-lane FP vectors (double1/float1) the IR return type is F64/F32
+        // so the value stays in the SSE domain. Load as the FP type directly
+        // instead of via an I64 bit-pattern load, which would force an XMM→GPR
+        // movq + reverse movq bounce and a ~3-cycle cross-domain stall on
+        // Intel uarchs (Raptor Lake/Cove). Narrow integer one-lanes (1/2/4-byte)
+        // still use the integer load path which the return-type cast then
+        // zexts/sexts to match the caller's parameter register class.
+        let ret_ty = self.func().return_type;
+        if struct_size == 8 && ret_ty == IrType::F64 {
+            let dest = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest,
+                ptr: addr,
+                ty: IrType::F64,
+                seg_override: seg,
+            });
+            return Some(Operand::Value(dest));
+        }
+        if struct_size == 4 && ret_ty == IrType::F32 {
+            let dest = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest,
+                ptr: addr,
+                ty: IrType::F32,
+                seg_override: seg,
+            });
+            return Some(Operand::Value(dest));
+        }
         let dest = self.load_bytes_exact(addr, 0, struct_size, seg);
         Some(Operand::Value(dest))
     }

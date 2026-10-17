@@ -3,6 +3,7 @@
 use super::emit::{
     HomeWrite, X86_APX_EGPRS, X86_ARG_REGS, X86_CALLEE_SAVED, X86_CALLEE_SAVED_WITH_RBP,
     X86_CALLER_SAVED, X86Codegen, collect_inline_asm_callee_saved_x86, is_xmm_reg, phys_reg_name,
+    phys_reg_name_32,
 };
 use crate::backend::call_abi::{ParamClass, classify_params};
 use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
@@ -3299,8 +3300,35 @@ impl X86Codegen {
                                 let dest_reg = phys_reg_name(phys_reg);
                                 if let ParamClass::IntReg { reg_idx } = class {
                                     let source = X86_ARG_REGS[reg_idx];
+                                    // Use a width-appropriate mov for small
+                                    // integer parameters (U8/U16/I8/I16/I32/
+                                    // U32): a 32-bit movl zero-extends the
+                                    // high 32 bits per x86-64 semantics and
+                                    // avoids the 64-bit dependency chain a
+                                    // movq would create. This matches GCC/
+                                    // Clang argument-homing codegen.
+                                    let w = func.params[i].ty.size();
                                     if is_caller_saved_gpr {
                                         gpr_prestores.push((i, source, source, dest_reg, phys_reg));
+                                    } else if w <= 4 {
+                                        // 32-bit mov: zero-extends high half.
+                                        // Convert 64-bit ABI reg names (rdi,...)
+                                        // to their 32-bit forms (edi,...).
+                                        let src32 = match source {
+                                            "rdi" => "edi",
+                                            "rsi" => "esi",
+                                            "rdx" => "edx",
+                                            "rcx" => "ecx",
+                                            "r8" => "r8d",
+                                            "r9" => "r9d",
+                                            other => other,
+                                        };
+                                        let dst32 = phys_reg_name_32(phys_reg);
+                                        self.state
+                                            .out
+                                            .emit_fmt(format_args!("    movl %{src32}, %{dst32}"));
+                                        self.state.param_pre_stored.insert(i);
+                                        self.param_source_regs.insert(phys_reg.0, source);
                                     } else {
                                         self.state
                                             .out
@@ -3727,15 +3755,64 @@ impl X86Codegen {
                 if let Some(idx) = ready {
                     let (param_idx, source, original_source, dest, home) = pending.remove(idx);
                     if source != dest {
-                        self.state.out.emit_instr_reg_reg("    movq", source, dest);
+                        // Pick width-appropriate mov: movl for <=4-byte int
+                        // params (zero-extends high half per x86-64), movq
+                        // for 64-bit / pointer params.
+                        let w = func.params[param_idx].ty.size();
+                        if w <= 4 {
+                            /// Convert a 64-bit GP register name to its
+                            /// 32-bit form (e.g. rdi -> edi). Identity for
+                            /// names already in 32-bit form (eax, ecx, ...)
+                            /// and for callee-saved regs we never emit movl
+                            /// to in this code path.
+                            fn to32(n: &str) -> &str {
+                                match n {
+                                    "rdi" => "edi",
+                                    "rsi" => "esi",
+                                    "rdx" => "edx",
+                                    "rcx" => "ecx",
+                                    "r8" => "r8d",
+                                    "r9" => "r9d",
+                                    "rax" => "eax",
+                                    "rbx" => "ebx",
+                                    "rbp" => "ebp",
+                                    other => other,
+                                }
+                            }
+                            let s = to32(source);
+                            let d = to32(dest);
+                            if s != d {
+                                self.state.out.emit_fmt(format_args!("    movl %{s}, %{d}"));
+                            }
+                        } else {
+                            self.state.out.emit_instr_reg_reg("    movq", source, dest);
+                        }
                     }
                     self.state.param_pre_stored.insert(param_idx);
                     self.param_source_regs.insert(home.0, original_source);
                 } else {
-                    // Parallel-copy cycle. RAX is excluded from allocation and
-                    // is not an incoming integer argument register.
+                    // Parallel-copy cycle. RAX is excluded from allocation
+                    // and is not an incoming integer argument register. Use
+                    // movl when the param is small to preserve the 32-bit
+                    // mov invariant (zero-extend to 64 bits, no false 64-bit
+                    // dependency).
+                    let (param_idx, ..) = pending[0];
                     let source = pending[0].1;
-                    self.state.out.emit_instr_reg_reg("    movq", source, "rax");
+                    let w = func.params[param_idx].ty.size();
+                    if w <= 4 {
+                        let s = match source {
+                            "rdi" => "edi",
+                            "rsi" => "esi",
+                            "rdx" => "edx",
+                            "rcx" => "ecx",
+                            "r8" => "r8d",
+                            "r9" => "r9d",
+                            other => other,
+                        };
+                        self.state.out.emit_fmt(format_args!("    movl %{s}, %eax"));
+                    } else {
+                        self.state.out.emit_instr_reg_reg("    movq", source, "rax");
+                    }
                     pending[0].1 = "rax";
                 }
             }

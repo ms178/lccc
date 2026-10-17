@@ -1274,8 +1274,61 @@ impl Lowerer {
                         && abi.sret_size.is_none()
                         && abi.two_reg_size.is_none()
                     {
-                        // A small vector travels as packed I64 data, not a pointer.
-                        ret_ty = IrType::I64;
+                        // A small register-return vector packs into the
+                        // IR carrier whose register class matches its
+                        // psABI eightbyte:
+                        //   - one FP lane (f32x1 / f64x1) -> F32/F64 so the
+                        //     value stays in the SSE domain (no movq
+                        //     XMM↔GPR bounce and a 3-cycle stall on Raptor
+                        //     Lake from crossing register files).
+                        //   - sub-4-byte integer one-lane (u8x1/u16x1/i8x1/i16x1)
+                        //     -> U8/U16/I8/I16, matching how the C frontend
+                        //     represents scalar char/short. The backend's
+                        //     operand_to_rax_i32 return path emits a width-
+                        //     appropriate zero/sign-extending movzbl/movswl/
+                        //     movsbl/movswl into %eax (one uop), matching
+                        //     GCC/Clang's scalar char identity codegen.
+                        //     Narrow *ParamRef* loads are a plain 32-bit mov
+                        //     because the x86-64 psABI §3.2.3 requires the
+                        //     *caller* to have widened narrow arguments to
+                        //     32 bits (GCC/Clang use `movl`, which zero-
+                        //     extends to 64 bits as a side effect), so the
+                        //     callee never re-extends.
+                        //   - 4-byte integer one-lane (u32x1/i32x1) -> U32/I32
+                        //     (a 32-bit return in %eax; movl zero-extends the
+                        //     high 32 bits per x86-64 semantics).
+                        //   - 8-byte one-lane integer (u64x1/i64x1) -> U64/I64
+                        //     (INTEGER psABI class, returned in %rax; the
+                        //     earlier F64 carrier bounced the value through
+                        //     %xmm0 and NaN-boxed it to 0x8000000000000000).
+                        //   - 5..=8 byte multi-lane -> I64 (packed bit
+                        //     pattern via movq in the SSE eightbyte).
+                        ret_ty = if let Some((elem, n)) = full_ret_ctype.vector_info() {
+                            if n == 1 {
+                                match elem.size() {
+                                    4 if elem.is_floating() => IrType::F32,
+                                    8 if elem.is_floating() => IrType::F64,
+                                    8 => {
+                                        if elem.is_signed() {
+                                            IrType::I64
+                                        } else {
+                                            IrType::U64
+                                        }
+                                    }
+                                    1 if !elem.is_signed() => IrType::U8,
+                                    2 if !elem.is_signed() => IrType::U16,
+                                    4 if !elem.is_signed() => IrType::U32,
+                                    1 if elem.is_signed() => IrType::I8,
+                                    2 if elem.is_signed() => IrType::I16,
+                                    4 if elem.is_signed() => IrType::I32,
+                                    _ => IrType::I64,
+                                }
+                            } else {
+                                IrType::I64
+                            }
+                        } else {
+                            IrType::I64
+                        };
                     }
                     ret_aggregate_abi = Some(abi);
                 }

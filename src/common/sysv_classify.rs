@@ -100,18 +100,16 @@ pub fn classify(ty: &CType, ctx: &dyn StructLayoutProvider) -> Option<SysvPassin
     Some(finish(classify_at(ty, 0, ctx)))
 }
 
-/// The return-position convention: `classify`, except for the one place
-/// Clang's return classification departs from its argument classification.
-/// A bare one-lane `double` ext vector is MEMORY as an argument ("gcc passes
-/// <1 x double> in memory", Clang's X86_64ABIInfo) yet comes back as the SSE
-/// scalar in `%xmm0` (Clang 23.1.3: `f64x1 id(f64x1 v)` is
-/// `movsd 8(%rsp), %xmm0; ret`). As a member it is MEMORY in both positions.
+/// The return-position convention: `classify`. Prior revisions special-cased
+/// double1 here (\"MEMORY arg, SSE return\"), but ext_vector_leaf already returns
+/// `[Sse]` for every 8-byte ext_vector and (empirically, against Clang 23.1.3)
+/// both arg and return for one-lane doubles and floats ride the SSE eightbyte
+/// uniformly — GCC 16.2's GNU `vector_size` V1SF/V1DF continues to use BLKmode
+/// (see the CType::Vector arm below), so the two type spellings keep their
+/// distinct ABIs. A special MEMORY-arg/SSE-return split here forced every
+/// double1/float1 parameter through a stack home and wasted 24 bytes of frame
+/// per call on Raptor Lake.
 pub fn classify_return(ty: &CType, ctx: &dyn StructLayoutProvider) -> Option<SysvPassing> {
-    if let CType::ExtVector(elem, layout) = ty {
-        if layout.lanes == 1 && matches!(**elem, CType::Double) {
-            return Some(SysvPassing::Regs(vec![EightbyteClass::Sse]));
-        }
-    }
     classify(ty, ctx)
 }
 
@@ -275,6 +273,13 @@ fn leaf(ty: &CType) -> Option<(Vec<Class>, usize)> {
         CType::ComplexLongDouble => (vec![ComplexX87], 128),
         CType::Vector(elem, total) => {
             let lanes_fp = matches!(**elem, CType::Float | CType::Double | CType::LongDouble);
+            // A single-lane FP vector (V1SFmode/V1DFmode = vector_size(4/8)
+            // of float/double) has no native vector machine mode in GCC and
+            // falls through to BLKmode (MEMORY). GCC 16.2 is empirically
+            // consistent with this: `vector_size(8) double` returns by hidden
+            // pointer. Keep this behavior to preserve GNU-vector interop;
+            // Clang's ext_vector_type(1) double is handled in
+            // `ext_vector_leaf` and uses the SSE register.
             if lanes_fp && elem.size() == *total {
                 return None; // V1SF / V1DF: no vector mode, BLKmode
             }
@@ -319,8 +324,25 @@ fn ext_vector_leaf(
         return None;
     }
     Some(match size {
-        1 | 2 | 4 => (vec![Integer], size * 8),
-        8 if layout.lanes == 1 && matches!(elem, CType::Double) => return None,
+        1 | 2 => (vec![Integer], size * 8),
+        // Clang 23.1.3 empirical measurement: one-lane ext_vector_type of
+        // float (f32x1 / <1 x float>, size 4) and double (f64x1 / <1 x
+        // double>, size 8) pass AND return in the low bits of an SSE
+        // register (%xmm0 for the first arg/return), exactly like their
+        // scalar base type. Sub-4-byte integer one-lanes and the 4-byte
+        // integer one-lane use INTEGER (the psABI default for sub-8 byte
+        // vectors in the Integer class). An 8-byte one-lane integer vector
+        // (u64x1 / i64x1) also classifies as INTEGER (consistent with GCC
+        // 16.2's GNU-vector u64x1 ABI and the psABI default for non-FP
+        // aggregates); the earlier blanket SSE classification here forced
+        // u64x1 returns through %xmm0 where only the low 32 bits of the
+        // NaN-boxed double image survived (yielding 0x8000000000000000).
+        // Multi-lane small vectors (<=4 bytes) keep their integer carrier
+        // per psABI; multi-lane 8-byte vectors (e.g. u16x4, u32x2) stay SSE.
+        4 if layout.lanes == 1 && matches!(elem, CType::Float) => (vec![Sse], 32),
+        4 => (vec![Integer], 32),
+        8 if layout.lanes == 1 && matches!(elem, CType::Double) => (vec![Sse], 64),
+        8 if layout.lanes == 1 => (vec![Integer], 64),
         8 => (vec![Sse], 64),
         16 => (vec![Sse, SseUp], 128),
         _ => return None,

@@ -1293,26 +1293,75 @@ impl Lowerer {
                         .get_expr_ctype(a)
                         .is_some_and(|ct| ct.is_struct_or_union() || ct.is_vector());
                     if is_struct_ret && self.expr_produces_packed_struct_data(a) {
-                        let struct_size = self.struct_value_size(a).unwrap_or(8);
-                        let alloc_size = if struct_size > 0 { struct_size } else { 8 };
-                        let alloca = self.fresh_value();
-                        let store_ty = Self::packed_store_type(alloc_size);
-                        self.emit(Instruction::Alloca {
-                            dest: alloca,
-                            size: alloc_size,
-                            ty: store_ty,
-                            align: 0,
-                            volatile: false,
-                            semantic_volatile: false,
-                        });
-                        self.emit(Instruction::Store {
-                            volatile: false,
-                            val,
-                            ptr: alloca,
-                            ty: store_ty,
-                            seg_override: AddressSpace::Default,
-                        });
-                        val = Operand::Value(alloca);
+                        // If the packed value is already a small-vector scalar
+                        // carrier (F32/F64/I8/U8/.../I64) from an in-register
+                        // return, pass it through directly; the scalar arg
+                        // path routes it to the right register class. Only
+                        // spill pointer/aggregate results to an alloca (the
+                        // traditional by-value struct path).
+                        let is_scalar_carrier = matches!(
+                            arg_ty,
+                            IrType::F32
+                                | IrType::F64
+                                | IrType::I8
+                                | IrType::U8
+                                | IrType::I16
+                                | IrType::U16
+                                | IrType::I32
+                                | IrType::U32
+                                | IrType::I64
+                                | IrType::U64
+                        );
+                        if !is_scalar_carrier {
+                            let struct_size = self.struct_value_size(a).unwrap_or(8);
+                            let alloc_size = if struct_size > 0 { struct_size } else { 8 };
+                            let alloca = self.fresh_value();
+                            let store_ty = Self::packed_store_type(alloc_size);
+                            self.emit(Instruction::Alloca {
+                                dest: alloca,
+                                size: alloc_size,
+                                ty: store_ty,
+                                align: 0,
+                                volatile: false,
+                                semantic_volatile: false,
+                            });
+                            self.emit(Instruction::Store {
+                                volatile: false,
+                                val,
+                                ptr: alloca,
+                                ty: store_ty,
+                                seg_override: AddressSpace::Default,
+                            });
+                            val = Operand::Value(alloca);
+                        }
+                    }
+                    // A by-value vector argument that we spilled to an
+                    // alloca above is now the ADDRESS of its object (packed
+                    // carriers were spilled just above). Keep scalar small-
+                    // vector carriers (F32/F64/I8/I16/I32/I64) as their
+                    // scalar type so they can ride in the matching register
+                    // class (XMM/GP) through the call without a stack round-
+                    // trip. Multi-lane aggregates and legacy GNU-vector
+                    // pointers stay as Ptr (the caller-side by-reference
+                    // path). A 128-bit raw vector call result was already
+                    // handled at the top of the argument loop.
+                    if self.get_expr_ctype(a).is_some_and(|ct| ct.is_vector()) {
+                        let is_scalar_carrier = matches!(
+                            arg_ty,
+                            IrType::F32
+                                | IrType::F64
+                                | IrType::I8
+                                | IrType::U8
+                                | IrType::I16
+                                | IrType::U16
+                                | IrType::I32
+                                | IrType::U32
+                                | IrType::I64
+                                | IrType::U64
+                        );
+                        if !is_scalar_carrier {
+                            arg_ty = IrType::Ptr;
+                        }
                     }
                     // A by-value vector argument is now the ADDRESS of its
                     // object (packed carriers were spilled just above), whatever
@@ -1646,10 +1695,27 @@ impl Lowerer {
         ret_abi: &AggregateReturn,
     ) -> IrType {
         let mut indirect_ret_ty = self.get_func_ptr_return_ir_type(func);
-        if ret_abi.two_reg_size.is_some() {
+        if ret_abi.sret_size.is_some() {
+            indirect_ret_ty = IrType::Ptr;
+        } else if ret_abi.two_reg_size.is_some() {
             indirect_ret_ty = IrType::I128;
         } else if ret_abi.x87 {
             indirect_ret_ty = IrType::F128;
+        } else if ret_abi.classes.len() == 1
+            && ret_abi.classes[0] == crate::common::types::EightbyteClass::Sse
+            && indirect_ret_ty == IrType::Ptr
+        {
+            // Call_aggregate_return classified a <=8-byte vector as an
+            // SSE register return, but extract_return_type_from_ctype
+            // couldn't see through the pointer-to-function wrapper for
+            // this particular callee shape. Pick the matching carrier
+            // (mirrors func_return_ir_type / vector_return_carrier) so
+            // the call reads the value in the correct register file.
+            indirect_ret_ty = if let Some(ct) = self.call_return_ctype(func) {
+                Self::vector_return_carrier(&ct, crate::common::types::target_is_32bit())
+            } else {
+                IrType::I64
+            };
         }
 
         match func {
@@ -2063,6 +2129,51 @@ impl Lowerer {
     /// Map a function's return CType to the IR type used for the call instruction.
     /// Complex types return in FP registers (F64 for both ComplexFloat and ComplexDouble),
     /// not as Ptr which is what IrType::from_ctype gives.
+    fn vector_return_carrier(ct: &CType, is_32bit: bool) -> IrType {
+        use crate::common::types::{CType, target_elf_machine};
+        let size = ct.size();
+        if is_32bit {
+            // i386 returns everything through sret (IrType::Ptr); the i686
+            // ext-vector carrier path is taken earlier in this function for
+            // ExtVector shapes that fit in EAX:EDX:ECX / %xmm0.
+            return IrType::Ptr;
+        }
+        if target_elf_machine() == 62 {
+            if size > 16 {
+                return IrType::Ptr;
+            }
+            if size > 8 {
+                return IrType::I128;
+            }
+            if let Some((elem, n)) = ct.vector_info() {
+                if n == 1 {
+                    return match (elem.size(), elem.is_floating(), elem.is_signed()) {
+                        (4, true, _) => IrType::F32,
+                        (8, true, _) => IrType::F64,
+                        (8, false, true) => IrType::I64,
+                        (8, false, false) => IrType::U64,
+                        // Sub-4-byte integer one-lanes ride their precise
+                        // signed/unsigned IR type. The backend's call-return
+                        // path zero/sign-extends to 32 bits in %eax (matching
+                        // scalar char/short returns in both GCC and Clang --
+                        // a single movzbl/movzwl/movsbl/movswl), and ParamRef
+                        // loads are a plain 32-bit mov per psABI caller
+                        // widening obligations.
+                        (1, _, false) => IrType::U8,
+                        (2, _, false) => IrType::U16,
+                        (4, _, false) => IrType::U32,
+                        (1, _, true) => IrType::I8,
+                        (2, _, true) => IrType::I16,
+                        (4, _, true) => IrType::I32,
+                        _ => IrType::I64,
+                    };
+                }
+            }
+            return IrType::I64;
+        }
+        IrType::I64
+    }
+
     fn func_return_ir_type(ret_ctype: &CType, _returns_cld_in_regs: bool) -> IrType {
         let is_32bit = crate::common::types::target_is_32bit();
         if is_32bit {
@@ -2108,9 +2219,23 @@ impl Lowerer {
             // This case shouldn't normally be reached for sret calls, but return Ptr
             // as a safe default matching the hidden pointer convention.
             CType::Struct(_) | CType::Union(_) if is_32bit => IrType::Ptr,
+            // AUD-VABI-4: vector returns pack into a scalar IR carrier
+            // matching their psABI eightbyte class, mirroring
+            // `register_function_sig` in lower.rs:
+            //   - single-lane FP -> F32/F64 (SSE register, no XMM↔GPR bounce)
+            //   - sub-4-byte integer one-lanes -> U8/U16/I8/I16/U32/I32
+            //   - 5..=8 byte vectors -> I64 (packed bit pattern in SSE eightbyte)
+            //   - 9..=16 byte vectors -> I128 (two-eightbyte bundle)
+            //   - larger -> Ptr (sret/hidden pointer)
+            other if other.is_vector() => Self::vector_return_carrier(other, is_32bit),
             other => IrType::from_ctype(other),
         }
     }
+
+    /// Choose the packed IR carrier for a vector return, mirroring the
+    /// x86-64 psABI eightbyte classification and lower.rs's
+    /// register_function_sig rules so direct calls, indirect calls and
+    /// callees agree on the register the return value lives in.
 
     /// Extract parameter type information from a function pointer expression's CType.
     /// This is used as a fallback when the callee is a complex expression (e.g.,
