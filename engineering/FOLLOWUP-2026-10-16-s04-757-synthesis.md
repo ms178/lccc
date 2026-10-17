@@ -164,3 +164,51 @@ lives in `tests/regression/check_fp_environment.sh` in both CI mirrors.
 Hosted `run_regression.py` had always recorded SKIP-COMPARE here (its gcc
 invocation fails to link `-lm`), which is why the divergence only
 surfaced through the local suite.
+
+## Closed-PR audit S04, part 2: #816 / #766 / #753 / #747
+
+Method: a mega-import PR's wholesale diff vs main is noise (empty merge
+base); the PR's own delta is `tip^..tip` (or GitHub's base..head), and each
+touched file is then classified against current HEAD as identical /
+diverged / missing, with behavioral probes deciding "diverged".
+
+* **#766 (AArch64 operand-exact encoders): superseded.** Main's
+  operand-legality matrix holds 10,411 rows vs the PR's 6,103; the PR has
+  **zero** instruction texts main lacks and zero verdict conflicts (its 93
+  "unique" keys are group renames). Both directions re-verified here:
+  all 10,411 rows agree with GNU as 2.47 AND with `lccc-arm`.
+* **#747: strict subset of #753** (its capability probe differs by one
+  comment date). Covered by the #753 port.
+* **#753 (libcall gates, sparse .bss, option contract): partially
+  superseded, rest ported.** Libcall no-self-call gates, sparse NOBITS
+  `.bss`, `va_arg_pack` folds and the file-scope-VLA diagnosis were
+  already absorbed via the newer #757 synthesis (gates pass on HEAD).
+  Ported: the measured unknown-option contract (`LCCC_STRICT_OPTIONS`)
+  and `scripts/lccc_capability_probe.py` (129/312 capabilities, 81.4% of
+  the Clang-C corpus unlocked vs 2% before). Three divergences from the
+  PR, each measured: `-funsigned-char` and `-fshort-wchar` are
+  implemented in HEAD and stay accepted; the `-gz=` method grammar is
+  enforced at the `-gz` arms (the PR's own warn-and-accept arms shadowed
+  its generic selector arm, so its `-gz=bogus must error` test could
+  never have passed as written).
+* **#816 (audit sweep + const-object folding): one feature ported, rest
+  superseded.** The vector-ABI carrier, x86 traps, census ratchet,
+  `__builtin_shuffle` 3-arg, temp-file guard (HEAD's `try_new` is the
+  stronger io::Result form) and oracle/script revisions all exist in
+  newer form on HEAD (52 of 122 PR files byte-identical, the rest
+  HEAD-newer by provenance checks). Ported: `const_object_images.rs` -
+  reads of const objects' elements/members fold to immediates
+  (`static const int g[4]; g[2]+s.b` -> `movl $39`, GCC-identical, x86-64
+  and i686) and `static int v = t[1];` is accepted (51-row
+  file-scope-init matrix vs GCC 16 passes). **Red-team finding fixed in
+  the port:** the PR imaged every non-volatile global and relied on sema
+  for const-ness - sound in its base, a miscompile on HEAD where
+  `eval_const_expr` also runs on runtime expressions (20 regression
+  failures: TLS sums dropped, `__seg_gs` reads folded). The image
+  registration now requires const + default address space + non-TLS, and
+  `tests/regression/check_const_object_fold.sh` pins fold and exclusions
+  in both CI mirrors.
+
+Open follow-up: LCCC accepts `&(0, inc)` (address of an rvalue function
+pointer; GCC 16: "lvalue required as unary '&' operand") - accepts-invalid
+class, sema fix candidate for a later session.

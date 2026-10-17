@@ -332,6 +332,13 @@ gate "designator-init" fast \
 gate "file-scope-init" fast \
     env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_file_scope_init.sh
 
+# Const-object read folding (closed PR #816, re-gated): const element/member
+# reads fold to immediates; mutable statics, TLS and volatile-qualified
+# accesses keep their loads. The exclusions are what kept 20 regression
+# tests from miscompiling when the port first landed.
+gate "const-object-fold" fast \
+    env CCC="$LCCC" bash tests/regression/check_const_object_fold.sh
+
 gate "typedef-volatile-codegen" fast \
     env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_typedef_volatile_codegen.sh
 

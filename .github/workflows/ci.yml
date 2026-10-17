@@ -591,6 +591,8 @@ jobs:
       run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_designator_init.sh
     - name: File-scope constant initializers
       run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_file_scope_init.sh
+    - name: Const-object read folding
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_const_object_fold.sh
     - name: Typedef-volatile code generation
       run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_typedef_volatile_codegen.sh
     - name: Named-space brace-elided initializers

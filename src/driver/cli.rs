@@ -3687,10 +3687,11 @@ mod cli_tests {
             .map(|s| s.to_string())
             .collect();
         d2.parse_cli_args(&args2).ok();
-        assert!(d2
-            .linker_ordered_items
-            .iter()
-            .any(|i| i == "-Wl,--export-dynamic"));
+        assert!(
+            d2.linker_ordered_items
+                .iter()
+                .any(|i| i == "-Wl,--export-dynamic")
+        );
     }
 
     #[test]
@@ -3702,10 +3703,11 @@ mod cli_tests {
             .map(|s| s.to_string())
             .collect();
         d.parse_cli_args(&args).ok();
-        assert!(d
-            .linker_ordered_items
-            .iter()
-            .any(|i| i == "-Wl,-e,__libc_main"));
+        assert!(
+            d.linker_ordered_items
+                .iter()
+                .any(|i| i == "-Wl,-e,__libc_main")
+        );
         // -eSYMBOL compact form.
         let mut d2 = Driver::new();
         let args2: Vec<String> = ["lccc", "-emain", "x.c"]
