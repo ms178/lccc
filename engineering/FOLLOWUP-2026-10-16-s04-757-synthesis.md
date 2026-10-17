@@ -223,3 +223,16 @@ build does not fit the VM (4.5 GB free). Nearest reachable compiler is
 clang 22.1.8 inside the `ziglang==0.17.0` wheel (`python3 -m ziglang cc`),
 usable as an *interim, explicitly-unpinned* comparison point only; no
 gate references it because gates pin exact oracle versions.
+
+## Clang-C corpus: first measured execution grid (via the capability probe)
+
+`run_clang_c_corpus.py --compiler-family lccc` + probe capabilities now
+EXECUTES 377 invocations (outcome-only): 248 PASS / 128 FAIL / 1 ERROR,
+where before the probe the grid executed nothing for this family. The
+remaining 4,753 UNSUPPORTED are structural, not capability, blockers
+(2,658 "RUN pipeline/redirection/stage not implemented", 2,189 "RUN
+requires exactly one %s input", plus non-x86 architecture
+prerequisites) - a corpus-runner work item, not a driver one. The 128
+FAILs are un-triaged acceptance/diagnostic deltas vs the Clang corpus'
+expectations: triage material for a later session, report saved as a
+session artifact (`clang_c_corpus_outcome.json`).
