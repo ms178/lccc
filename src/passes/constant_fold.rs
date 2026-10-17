@@ -115,7 +115,12 @@ pub fn fold_strlen_literals(module: &mut IrModule) -> usize {
     let literals: crate::common::fx_hash::FxHashMap<String, usize> = module
         .string_literals
         .iter()
-        .map(|(label, value)| (label.clone(), value.chars().count()))
+        .map(|(label, value)| {
+            (
+                label.clone(),
+                crate::common::const_eval::narrow_string_strlen(value),
+            )
+        })
         .collect();
     if literals.is_empty() {
         return 0;

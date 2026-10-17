@@ -40,6 +40,12 @@ class TraceContract(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             gate.validate_trace(counts, True)
 
+    def test_duplicate_positive_is_rejected_when_all_kernels_are_present(self):
+        counts = Counter({name: 1 for name in gate.POSITIVES})
+        counts['gen_b'] += 1
+        with self.assertRaisesRegex(RuntimeError, 'gen_b.*2'):
+            gate.validate_trace(counts, True)
+
     def test_unexpected_or_forbidden_kernel_is_rejected(self):
         for name in ('gen_g', 'gen_volatile', 'gen_constant', 'unknown'):
             counts = Counter({name: 1, **{k: 1 for k in gate.POSITIVES}})

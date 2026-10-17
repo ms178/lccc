@@ -31,7 +31,8 @@ history (upstream merges pin the exact commits each entry describes).
 | [`2026-08.md`](2026-08.md) | 2026-08-18..08-31 | boot-quest start, matmul trilogy, SCCP adoption, IR-verifier birth, Regehr corpus |
 | [`2026-09-W1.md`](2026-09-W1.md) | 2026-09-01..09-05 | IR-verify-zero → MachInst build-out → Tier-2 audit → RA cost-model wave |
 | [`2026-09-W2.md`](2026-09-W2.md) | 2026-09-06..09-12 | Rust modernisation, PF-17/OP-05 epics, GLA Phase 1 + remat, i686 addressing/casts/encoder audits |
-| [`2026-09-W3.md`](2026-09-W3.md) | 2026-09-13..today | linker arc (PIE, CET, .gnu.hash, ICF), flag-consumer walk, BB-SLP |
+| [`2026-09-W3.md`](2026-09-W3.md) | 2026-09-13..09-30 | linker arc (PIE, CET, .gnu.hash, ICF), flag-consumer walk, BB-SLP |
+| [`2026-10.md`](2026-10.md) | 2026-10-01..today | PR836/837 integration, evidence-provenance follow-through, current backlog reconciliation |
 
 ## Disposition of deleted sources
 

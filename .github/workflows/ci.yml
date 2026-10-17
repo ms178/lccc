@@ -739,6 +739,10 @@ jobs:
       run: python3 scripts/loop_invert_census.py --lccc target/fastbuild/lccc --quiet
     - name: Record tag identity gate (nested same-tag structs)
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_record_tag_identity.sh
+    - name: Enum tag scope compatibility
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_enum_tag_scope_compat.sh
+    - name: Embedded-NUL strlen contract
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_strlen_embedded_nul.sh
     - name: Volatile destructuring ratchet
       run: |
         python3 scripts/check_volatile_destructuring.py --self-test

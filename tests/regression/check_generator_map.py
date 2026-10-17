@@ -32,12 +32,15 @@ def capture_trace(command: list[str], env: dict[str, str]) -> Counter:
 
 
 def validate_trace(counts: Counter, enabled: bool) -> None:
-    expected = POSITIVES if enabled else set()
-    if set(counts) != expected:
-        raise RuntimeError(f'generator trace mismatch: expected {sorted(expected)}, got {dict(counts)}')
+    # Each positive fixture has exactly one candidate loop and must produce
+    # exactly one trace event. Comparing only the key set lets a duplicate
+    # transformation event pass whenever all expected functions are present.
+    expected = Counter({name: 1 for name in POSITIVES}) if enabled else Counter()
     unexpected = set(counts) & REFUSALS
     if unexpected:
         raise RuntimeError(f'forbidden shapes were vectorized: {sorted(unexpected)}')
+    if counts != expected:
+        raise RuntimeError(f'generator trace mismatch: expected {dict(expected)}, got {dict(counts)}')
 
 
 def main() -> int:

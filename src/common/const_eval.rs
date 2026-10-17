@@ -61,6 +61,16 @@ pub fn eval_literal(expr: &Expr) -> Option<IrConst> {
     }
 }
 
+/// Return the logical C length of an LCCC-decoded narrow string literal.
+///
+/// Narrow literals are represented as Rust chars rather than UTF-8 bytes, so
+/// `str::len()` is not the compiler's existing execution-character length
+/// model. The C string length ends at the first embedded NUL, even though the
+/// literal's array object can contain later characters.
+pub(crate) fn narrow_string_strlen(text: &str) -> usize {
+    text.chars().take_while(|&c| c != '\0').count()
+}
+
 /// Evaluate a compile-time builtin function call in a constant expression.
 ///
 /// Handles all pure builtins that can be folded at compile time:
@@ -85,7 +95,7 @@ pub fn eval_builtin_call(
             // returns the UTF-8 encoded size and over-counts bytes >= 0x80
             // (expat symptom: strlen("\xEF\xBB\xBF...") folded 3 too long).
             if let Some(crate::frontend::parser::ast::Expr::StringLiteral(text, _)) = args.first() {
-                Some(IrConst::I64(text.chars().count() as i64))
+                Some(IrConst::I64(narrow_string_strlen(text) as i64))
             } else {
                 None
             }
@@ -1018,4 +1028,27 @@ pub fn eval_binop_with_types(
         lhs_unsigned,
         rhs_unsigned,
     )
+}
+
+#[cfg(test)]
+mod string_length_tests {
+    use super::{eval_builtin_call, narrow_string_strlen};
+    use crate::common::source::Span;
+    use crate::frontend::parser::ast::Expr;
+    use crate::ir::constants::IrConst;
+
+    #[test]
+    fn narrow_strlen_stops_at_first_embedded_nul() {
+        assert_eq!(narrow_string_strlen("ab\0cd"), 2);
+        let literal = Expr::StringLiteral("ab\0cd".to_string(), Span::dummy());
+        assert_eq!(
+            eval_builtin_call("strlen", &[literal], &|_| None),
+            Some(IrConst::I64(2))
+        );
+    }
+
+    #[test]
+    fn narrow_strlen_uses_existing_character_count_for_plain_literals() {
+        assert_eq!(narrow_string_strlen("abcd"), 4);
+    }
 }

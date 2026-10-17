@@ -86,6 +86,12 @@ pub struct TypeScopeFrame {
     /// last-write-first, so a name written twice inside one scope is restored
     /// correctly without scanning the log.
     pub enums_changed: Vec<(String, Option<i64>)>,
+    /// Enum tag definitions introduced or shadowed in this scope.  Tag
+    /// identity is lexical: an inner `enum E` must not overwrite the completed
+    /// outer `enum E` after this frame is popped.
+    pub enum_types_added: Vec<String>,
+    pub enum_types_shadowed: Vec<(String, crate::common::types::EnumType)>,
+    pub enum_types_tracked: FxHashSet<String>,
     /// Keys newly inserted into `struct_layouts`.
     pub struct_layouts_added: Vec<String>,
     /// Keys that were overwritten in `struct_layouts`: (key, previous_value).
@@ -113,6 +119,9 @@ impl TypeScopeFrame {
     fn new() -> Self {
         Self {
             enums_changed: Vec::new(),
+            enum_types_added: Vec::new(),
+            enum_types_shadowed: Vec::new(),
+            enum_types_tracked: FxHashSet::default(),
             struct_layouts_added: Vec::new(),
             struct_layouts_shadowed: Vec::new(),
             record_alias_added: Vec::new(),
@@ -166,10 +175,10 @@ pub struct TypeContext {
     /// Set of typedef names that alias enum types.
     /// Used to treat enum-typedef bitfields as unsigned (GCC compat).
     pub enum_typedefs: FxHashSet<String>,
-    /// Packed enum type info, keyed by tag name.
-    /// Stored when a packed enum definition is processed so that forward
-    /// references can look up the correct size.
-    pub packed_enum_types: FxHashMap<String, crate::common::types::EnumType>,
+    /// Completed named enum definitions, keyed by tag name. Each scope frame
+    /// records additions and shadowed values so body-less references resolve
+    /// to the definition visible at that exact lexical point.
+    pub enum_types: FxHashMap<String, crate::common::types::EnumType>,
     /// Return CType for known functions
     pub func_return_ctypes: FxHashMap<String, CType>,
     /// Cache for CType of named struct/union types.
@@ -204,7 +213,7 @@ impl TypeContext {
             func_ptr_typedefs: FxHashSet::default(),
             func_ptr_typedef_info: FxHashMap::default(),
             enum_typedefs: FxHashSet::default(),
-            packed_enum_types: FxHashMap::default(),
+            enum_types: FxHashMap::default(),
             func_return_ctypes: FxHashMap::default(),
             ctype_cache: RefCell::new(FxHashMap::default()),
             scope_stack: RefCell::new(Vec::new()),
@@ -537,6 +546,12 @@ impl TypeContext {
                     }
                 }
             }
+            for key in frame.enum_types_added {
+                self.enum_types.remove(&key);
+            }
+            for (key, value) in frame.enum_types_shadowed {
+                self.enum_types.insert(key, value);
+            }
             let layouts = self.struct_layouts.get_mut();
             for key in frame.struct_layouts_added {
                 layouts.remove(&key);
@@ -607,6 +622,25 @@ impl TypeContext {
             frame.enums_changed.push((name.clone(), previous));
         }
         self.enum_constants.insert(name, value);
+    }
+
+    /// Insert a completed enum tag definition, tracking lexical shadowing so
+    /// body-less references after scope exit recover the outer definition.
+    pub fn insert_enum_type_scoped(
+        &mut self,
+        name: String,
+        enum_type: crate::common::types::EnumType,
+    ) {
+        if let Some(frame) = self.scope_stack.get_mut().last_mut() {
+            if frame.enum_types_tracked.insert(name.clone()) {
+                if let Some(previous) = self.enum_types.get(&name).cloned() {
+                    frame.enum_types_shadowed.push((name.clone(), previous));
+                } else {
+                    frame.enum_types_added.push(name.clone());
+                }
+            }
+        }
+        self.enum_types.insert(name, enum_type);
     }
 
     /// Insert a struct layout, tracking the change in the current scope frame
@@ -794,5 +828,58 @@ mod record_alias_tests {
         let b = ctx.next_struct_variant_id();
         assert_ne!(a, b);
         assert!(b > a, "ids must not repeat: {a} then {b}");
+    }
+}
+
+#[cfg(test)]
+mod enum_type_scope_tests {
+    use super::TypeContext;
+    use crate::common::types::EnumType;
+
+    fn enum_type(name: &str, variant: (&str, i64), is_packed: bool) -> EnumType {
+        EnumType {
+            name: Some(name.to_string()),
+            variants: vec![(variant.0.to_string(), variant.1)],
+            is_packed,
+        }
+    }
+
+    #[test]
+    fn shadowed_enum_tag_restores_outer_definition() {
+        let mut ctx = TypeContext::new();
+        let outer = enum_type("E", ("NEG", -1), false);
+        let inner = enum_type("E", ("ZERO", 0), false);
+        ctx.insert_enum_type_scoped("E".into(), outer.clone());
+
+        ctx.push_scope();
+        ctx.insert_enum_type_scoped("E".into(), inner.clone());
+        assert_eq!(ctx.enum_types.get("E"), Some(&inner));
+        ctx.pop_scope();
+
+        assert_eq!(ctx.enum_types.get("E"), Some(&outer));
+    }
+
+    #[test]
+    fn enum_tag_introduced_in_scope_is_removed_and_nested_shadowing_unwinds() {
+        let mut ctx = TypeContext::new();
+        let outer = enum_type("E", ("NEG", -1), false);
+        let inner = enum_type("E", ("ZERO", 0), false);
+        let nested = enum_type("E", ("SMALL", 1), true);
+        ctx.insert_enum_type_scoped("E".into(), outer.clone());
+
+        ctx.push_scope();
+        ctx.insert_enum_type_scoped("E".into(), inner.clone());
+        ctx.push_scope();
+        ctx.insert_enum_type_scoped("E".into(), nested);
+        ctx.pop_scope();
+        assert_eq!(ctx.enum_types.get("E"), Some(&inner));
+        ctx.pop_scope();
+        assert_eq!(ctx.enum_types.get("E"), Some(&outer));
+
+        ctx.push_scope();
+        ctx.insert_enum_type_scoped("Local".into(), enum_type("Local", ("L", -1), false));
+        assert!(ctx.enum_types.contains_key("Local"));
+        ctx.pop_scope();
+        assert!(!ctx.enum_types.contains_key("Local"));
     }
 }
