@@ -1002,6 +1002,30 @@ impl Lowerer {
         src
     }
 
+    /// Convert `val`, the lowered value of `e` with IR type `ir_ty`, to
+    /// _Bool: `e != 0` (C11 6.3.1.2) as an I32 0/1. Every conversion site
+    /// that still has its source expression must use this rather than
+    /// `emit_bool_normalize_typed`, which sees only the IR type: decimal
+    /// and _Float128 values live in integer carriers that do not encode
+    /// zero uniquely (-0.0Q, BID zeros with any exponent such as 0.00DD),
+    /// so a carrier test is wrong for them. Binary-float carriers skip the
+    /// C type lookup (`IrType::is_float` is not the test: it includes the
+    /// decimal carriers D32/D64).
+    pub(super) fn emit_expr_bool_conversion(
+        &mut self,
+        val: Operand,
+        ir_ty: IrType,
+        e: &Expr,
+    ) -> Operand {
+        if !matches!(ir_ty, IrType::F32 | IrType::F64 | IrType::F128) {
+            let ct = self.expr_ctype(e);
+            if ct.is_soft_float() {
+                return self.lower_soft_float_truthiness(val, &ct);
+            }
+        }
+        self.emit_bool_normalize_typed(val, ir_ty)
+    }
+
     /// Normalize a value for _Bool storage at the given source type.
     /// Emits (val != 0) for integers, (val != 0.0) for floats.
     /// This must be called BEFORE any truncation to avoid losing high bits.

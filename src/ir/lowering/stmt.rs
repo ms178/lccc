@@ -1585,7 +1585,7 @@ impl Lowerer {
         if is_bool {
             let val = self.lower_expr(expr);
             let expr_ty = self.get_expr_type(expr);
-            self.emit_bool_normalize_typed(val, expr_ty)
+            self.emit_expr_bool_conversion(val, expr_ty, expr)
         } else {
             self.lower_and_cast_init_expr(expr, target_ty)
         }

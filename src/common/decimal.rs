@@ -853,6 +853,16 @@ pub fn f128_to_int(bits: u128, target_bits: u32, target_unsigned: bool) -> Optio
 mod tests {
     use super::*;
 
+    /// Canonical +0 of each width: GCC's encodings of `0.DF`, `0.DD` and
+    /// `0.DL` (the lowering's truth tests compare against these).
+    #[test]
+    fn integer_zero_is_the_canonical_bid_zero() {
+        assert_eq!(encode_int_bid32(0, false), 0x3280_0000);
+        assert_eq!(encode_int_bid64(0, false), 0x31C0_0000_0000_0000);
+        assert_eq!(encode_int_bid128(0, false), (0x3040_0000_0000_0000, 0));
+        assert_eq!(decode_bid128(0x3040_0000_0000_0000, 0), Some((false, 0, 0)));
+    }
+
     /// Split a u64 magnitude into most-significant-first decimal digits.
     fn digs(mut v: u64) -> Vec<u8> {
         if v == 0 {

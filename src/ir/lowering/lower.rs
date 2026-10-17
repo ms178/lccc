@@ -2548,7 +2548,7 @@ impl Lowerer {
         let expr_ty = self.get_expr_type(e);
         let val = self.lower_expr(e);
         let val = if target_is_bool {
-            self.emit_bool_normalize_typed(val, expr_ty)
+            self.emit_expr_bool_conversion(val, expr_ty, e)
         } else {
             self.emit_implicit_cast(val, expr_ty, target_ty)
         };
@@ -3622,13 +3622,18 @@ impl Lowerer {
 
     /// Canonical +0 encodings (biased exponent, zero coefficient) — the
     /// exact bit patterns GCC emits for `0.DF/0.DD/0.DL` literals.
+    // Derived from the literal encoder, the single source of the BID
+    // layouts: a hand-rolled BID128 zero once put the exponent field at bit
+    // 49 of the LOW word (the field is bits 113..126), so every _Decimal128
+    // truth test compared with a tiny nonzero value and `!0.0DL` was 0.
     fn dec_zero32() -> u32 {
-        (96u32) << 23 // bias 96
+        crate::common::decimal::encode_int_bid32(0, false)
     }
     fn dec_zero64() -> u64 {
-        (398u64) << 53 // bias 398
+        crate::common::decimal::encode_int_bid64(0, false)
     }
     fn dec_zero128() -> i128 {
-        ((6176u128) << 49) as i128 // bias 6176
+        let (hi, lo) = crate::common::decimal::encode_int_bid128(0, false);
+        ((u128::from(hi) << 64) | u128::from(lo)) as i128
     }
 }

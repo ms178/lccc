@@ -801,57 +801,18 @@ impl I686Codegen {
 
     pub(super) fn emit_i128_to_float_call_impl(
         &mut self,
-        src: &Operand,
-        from_signed: bool,
+        _src: &Operand,
+        _from_signed: bool,
         to_ty: IrType,
     ) {
-        self.emit_load_acc_pair(src);
-        if from_signed {
-            self.state.emit("    pushl %edx");
-            self.state.emit("    pushl %eax");
-            self.state.emit("    fildq (%esp)");
-            if to_ty == IrType::F32 {
-                self.state.emit("    fstps (%esp)");
-                self.state.emit("    movl (%esp), %eax");
-            } else {
-                self.state.emit("    fstpl (%esp)");
-                self.state.emit("    movl (%esp), %eax");
-            }
-            self.state.emit("    addl $8, %esp");
-        } else {
-            let label_id = self.state.next_label_id();
-            let big_label = format!(".Lu64_to_f_big_{}", label_id);
-            let done_label = format!(".Lu64_to_f_done_{}", label_id);
-
-            self.state.emit("    pushl %edx");
-            self.state.emit("    pushl %eax");
-            self.state.emit("    testl %edx, %edx");
-            emit!(self.state, "    js {}", big_label);
-            self.state.emit("    fildq (%esp)");
-            emit!(self.state, "    jmp {}", done_label);
-            emit!(self.state, "{}:", big_label);
-            self.state.emit("    movl (%esp), %eax");
-            self.state.emit("    movl 4(%esp), %edx");
-            self.state.emit("    shrl $1, %eax");
-            self.state.emit("    movl %edx, %ecx");
-            self.state.emit("    shrl $1, %edx");
-            self.state.emit("    andl $1, %ecx");
-            self.state.emit("    shll $31, %ecx");
-            self.state.emit("    orl %ecx, %eax");
-            self.state.emit("    movl %eax, (%esp)");
-            self.state.emit("    movl %edx, 4(%esp)");
-            self.state.emit("    fildq (%esp)");
-            self.state.emit("    fadd %st(0), %st(0)");
-            emit!(self.state, "{}:", done_label);
-            if to_ty == IrType::F32 {
-                self.state.emit("    fstps (%esp)");
-                self.state.emit("    movl (%esp), %eax");
-            } else {
-                self.state.emit("    fstpl (%esp)");
-                self.state.emit("    movl (%esp), %eax");
-            }
-            self.state.emit("    addl $8, %esp");
-        }
+        // C has no 128-bit integer types on i686 (the frontend rejects
+        // __int128, as GCC does), and lowering converts the 128-bit
+        // _Float128/_Decimal128 carriers through soft-float and libbid
+        // helpers, never with an IR integer-to-float cast. libgcc has no
+        // i386 __floattidf to call, and the former x87 sequence converted
+        // only the low 64 bits and returned a double's low dword: fail
+        // loudly instead of miscompiling if a lowering bug ever emits one.
+        panic!("i686: a 128-bit integer to {to_ty:?} conversion has no lowering");
     }
 
     pub(super) fn emit_float_to_i128_call_impl(

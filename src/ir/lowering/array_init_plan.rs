@@ -717,7 +717,7 @@ impl Lowerer {
                     let v = self.lower_expr(e);
                     let src = self.get_expr_type(e);
                     if geo.is_bool {
-                        self.emit_bool_normalize_typed(v, src)
+                        self.emit_expr_bool_conversion(v, src, e)
                     } else {
                         self.emit_implicit_cast(v, src, geo.base_ty)
                     }

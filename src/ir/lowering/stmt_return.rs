@@ -109,7 +109,7 @@ impl Lowerer {
         let expr_ct = self.expr_ctype(e);
         if self.func_mut().return_is_bool {
             // For _Bool return, normalize at the source type before any truncation.
-            self.emit_bool_normalize_typed(val, expr_ty)
+            self.emit_expr_bool_conversion(val, expr_ty, e)
         } else if let Some(ret_ct) = self.func_mut().return_ctype.clone() {
             if ret_ct == CType::Float128
                 || expr_ct == CType::Float128

@@ -225,7 +225,7 @@ impl Lowerer {
             // Truncating first (e.g. 0x100 -> U8 = 0) then normalizing gives wrong results.
             let rhs_val = self.lower_expr(rhs);
             let rhs_ty = self.value_ir_type(rhs);
-            self.emit_bool_normalize_typed(rhs_val, rhs_ty)
+            self.emit_expr_bool_conversion(rhs_val, rhs_ty, rhs)
         } else {
             let rhs_val = self.lower_expr(rhs);
             let rhs_ty = self.value_ir_type(rhs);
@@ -453,7 +453,7 @@ impl Lowerer {
         // (any nonzero becomes 1) BEFORE bitfield truncation. Without this,
         // e.g. `s.bool_bf = 2` would mask 2 (0b10) to 1 bit = 0, not 1.
         let store_val = if is_bool {
-            let normalized = self.emit_bool_normalize_typed(rhs_val, rhs_ty);
+            let normalized = self.emit_expr_bool_conversion(rhs_val, rhs_ty, rhs);
             self.emit_implicit_cast(normalized, IrType::I32, storage_ty)
         } else {
             self.emit_implicit_cast(rhs_val, rhs_ty, storage_ty)

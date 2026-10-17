@@ -543,7 +543,7 @@ impl Lowerer {
             // Truncating first (e.g. 0x100 -> U8 = 0) then normalizing gives wrong results.
             let val = self.lower_expr(expr);
             let expr_ty = self.value_ir_type(expr);
-            self.emit_bool_normalize_typed(val, expr_ty)
+            self.emit_expr_bool_conversion(val, expr_ty, expr)
         } else {
             let val = self.lower_expr(expr);
             let expr_ty = self.value_ir_type(expr);
@@ -1117,7 +1117,7 @@ impl Lowerer {
                 let val = if field.ty == CType::Bool {
                     let v = self.lower_expr(e);
                     let et = self.get_expr_type(e);
-                    self.emit_bool_normalize_typed(v, et)
+                    self.emit_expr_bool_conversion(v, et, e)
                 } else {
                     self.lower_and_cast_init_expr(e, field_ty)
                 };
@@ -1310,7 +1310,7 @@ impl Lowerer {
                     // _Bool array elements: normalize (any nonzero -> 1) per C11 6.3.1.2
                     let val = self.lower_expr(e);
                     let expr_ty = self.get_expr_type(e);
-                    let val = self.emit_bool_normalize_typed(val, expr_ty);
+                    let val = self.emit_expr_bool_conversion(val, expr_ty, e);
                     self.emit_array_element_store(
                         alloca,
                         val,
@@ -1381,7 +1381,7 @@ impl Lowerer {
                 let val = self.lower_expr(e);
                 let expr_ty = self.get_expr_type(e);
                 let val = if matches!(elem_ct, CType::Bool) {
-                    self.emit_bool_normalize_typed(val, expr_ty)
+                    self.emit_expr_bool_conversion(val, expr_ty, e)
                 } else {
                     self.emit_implicit_cast(val, expr_ty, elem_ir_ty)
                 };
@@ -1415,7 +1415,7 @@ impl Lowerer {
             let expr_ty = self.get_expr_type(expr);
             // For _Bool, normalize before any truncation to preserve high bits
             let val = if da.is_bool {
-                self.emit_bool_normalize_typed(val, expr_ty)
+                self.emit_expr_bool_conversion(val, expr_ty, expr)
             } else {
                 self.emit_implicit_cast(val, expr_ty, da.var_ty)
             };

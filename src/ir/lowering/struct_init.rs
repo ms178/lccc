@@ -1189,7 +1189,7 @@ impl Lowerer {
                     let first = self.lower_expr(e);
                     let first_ty = self.get_expr_type(e);
                     let first = if matches!(elem_ty, CType::Bool) {
-                        self.emit_bool_normalize_typed(first, first_ty)
+                        self.emit_expr_bool_conversion(first, first_ty, e)
                     } else {
                         self.emit_implicit_cast(first, first_ty, elem_ir_ty)
                     };
@@ -1225,7 +1225,10 @@ impl Lowerer {
                         let val = self.lower_expr(expr);
                         let src_ty = self.get_expr_type(expr);
                         let (val, val_ty) = if matches!(elem_ty, CType::Bool) {
-                            (self.emit_bool_normalize_typed(val, src_ty), IrType::I32)
+                            (
+                                self.emit_expr_bool_conversion(val, src_ty, expr),
+                                IrType::I32,
+                            )
                         } else {
                             (self.emit_implicit_cast(val, src_ty, elem_ir_ty), elem_ir_ty)
                         };
@@ -1255,27 +1258,27 @@ impl Lowerer {
         field: &StructFieldLayout,
     ) {
         let field_ty = IrType::from_ctype(&field.ty);
-        let (val, expr_ty) = match &item.init {
-            Initializer::Expr(e) => {
+        let src_expr = match &item.init {
+            Initializer::Expr(e) => Some(e),
+            // Scalar with arbitrarily nested braces: {5} or {{{5}}}
+            Initializer::List(sub_items) => Self::unwrap_nested_init_expr(sub_items),
+        };
+        let (val, expr_ty) = match src_expr {
+            Some(e) => {
                 let et = self.get_expr_type(e);
                 (self.lower_expr(e), et)
             }
-            Initializer::List(sub_items) => {
-                // Scalar with arbitrarily nested braces: {5} or {{{5}}}
-                if let Some(e) = Self::unwrap_nested_init_expr(sub_items) {
-                    let et = self.get_expr_type(e);
-                    (self.lower_expr(e), et)
-                } else {
-                    (
-                        Operand::Const(IrConst::ptr_int(0)),
-                        crate::common::types::target_int_ir_type(),
-                    )
-                }
-            }
+            None => (
+                Operand::Const(IrConst::ptr_int(0)),
+                crate::common::types::target_int_ir_type(),
+            ),
         };
         // For _Bool fields, normalize (any nonzero -> 1) before truncation (C11 6.3.1.2).
         let val = if field.ty == CType::Bool {
-            self.emit_bool_normalize_typed(val, expr_ty)
+            match src_expr {
+                Some(e) => self.emit_expr_bool_conversion(val, expr_ty, e),
+                None => self.emit_bool_normalize_typed(val, expr_ty),
+            }
         } else {
             self.emit_implicit_cast(val, expr_ty, field_ty)
         };
