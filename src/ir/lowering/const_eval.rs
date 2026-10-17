@@ -358,9 +358,12 @@ impl Lowerer {
             // Handle compile-time builtin function calls in constant expressions.
             Expr::FunctionCall(func, args, _) => {
                 if let Expr::Identifier(name, _) = func.as_ref() {
-                    shared_const_eval::eval_builtin_call(name.as_str(), args, &|e| {
-                        self.eval_const_expr(e)
-                    })
+                    shared_const_eval::eval_builtin_call_with_mode(
+                        name.as_str(),
+                        args,
+                        &|e| self.eval_const_expr(e),
+                        !self.no_builtins,
+                    )
                 } else {
                     None
                 }

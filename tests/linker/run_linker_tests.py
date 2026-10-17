@@ -6601,8 +6601,8 @@ _PT_NOTE = 4
 _PT_GNU_RELRO = 0x6474E552
 _PT_GNU_PROPERTY = 0x6474E553
 _PF_W = 2  # ELF p_flags: X=1, W=2, R=4
-_SHT_NOTE = 7
 _SHF_ALLOC = 2
+_SHT_NOTE = 7
 
 
 def _elf_bytes_phdrs(d):
@@ -6750,10 +6750,18 @@ def _allocated_note_runs(shdrs):
         runs[-1].append(h)
         previous = h
     return runs
+
+
+def _note_span_has_payload(occupied, start, end):
+    """Does a nonempty half-open file span intersect allocated non-note data?"""
+    return start < end and any(lo < end and start < hi for lo, hi in occupied)
+
+
 def _note_gap_has_payload(shdrs, start, end):
     """Alignment holes may join notes; allocated non-note file bytes may not."""
-    return any(h[1] not in (_SHT_NOTE, 8) and h[2] & 2 and h[5] > 0
-               and h[4] < end and start < h[4] + h[5] for h in shdrs)
+    occupied = [(h[4], h[4] + h[5]) for h in shdrs
+                if h[1] not in (_SHT_NOTE, 8) and h[2] & _SHF_ALLOC and h[5] > 0]
+    return _note_span_has_payload(occupied, start, end)
 
 
 def _note_run_oracle_test(args, oracles):

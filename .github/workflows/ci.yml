@@ -441,6 +441,8 @@ jobs:
       run: bash tests/regression/check_rust_toolchain_selector.sh
     - name: Verify restored linker oracle versions
       run: bash tests/regression/check_linker_oracle_versions.sh
+    - name: Check driver option contracts
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_driver_option_contract.sh
     - name: Check the recursion-to-iteration pass
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_rec2iter.sh
     - name: Check FP-contraction parity with GCC

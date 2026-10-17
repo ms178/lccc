@@ -179,6 +179,8 @@ pub struct Lowerer {
     /// as an inline-only definition (no external def emitted), matching the behaviour
     /// of GCC in GNU89 mode. The default (false) uses C99 inline semantics.
     pub(super) gnu89_inline: bool,
+    /// Whether ordinary hosted-library names remain calls instead of builtins.
+    pub(super) no_builtins: bool,
 }
 
 /// Largest zero-initialised aggregate region lowered as an explicit store
@@ -195,6 +197,11 @@ impl Lowerer {
         policy: crate::common::pass_policy::PassPolicy,
     ) -> Self {
         self.pass_policy = policy;
+        self
+    }
+
+    pub(crate) fn with_no_builtins(mut self, no_builtins: bool) -> Self {
+        self.no_builtins = no_builtins;
         self
     }
 
@@ -270,6 +277,7 @@ impl Lowerer {
             diagnostics: RefCell::new(diagnostics),
             materialized_compound_literals: FxHashMap::default(),
             gnu89_inline,
+            no_builtins: false,
         }
     }
 

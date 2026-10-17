@@ -76,6 +76,21 @@ pub fn eval_builtin_call(
     args: &[Expr],
     eval_fn: &dyn Fn(&Expr) -> Option<IrConst>,
 ) -> Option<IrConst> {
+    eval_builtin_call_with_mode(name, args, eval_fn, true)
+}
+
+/// Evaluate builtins while honoring `-fno-builtin` for ordinary library names.
+/// Explicit `__builtin_*` spellings remain available in both hosted and
+/// freestanding modes.
+pub fn eval_builtin_call_with_mode(
+    name: &str,
+    args: &[Expr],
+    eval_fn: &dyn Fn(&Expr) -> Option<IrConst>,
+    allow_nonprefixed_builtins: bool,
+) -> Option<IrConst> {
+    if name == "strlen" && !allow_nonprefixed_builtins {
+        return None;
+    }
     match name {
         "__builtin_strlen" | "strlen" => {
             // String literal -> compile-time length (without the NUL).
@@ -85,7 +100,9 @@ pub fn eval_builtin_call(
             // returns the UTF-8 encoded size and over-counts bytes >= 0x80
             // (expat symptom: strlen("\xEF\xBB\xBF...") folded 3 too long).
             if let Some(crate::frontend::parser::ast::Expr::StringLiteral(text, _)) = args.first() {
-                Some(IrConst::I64(text.chars().count() as i64))
+                Some(IrConst::I64(
+                    text.chars().take_while(|&c| c != '\0').count() as i64,
+                ))
             } else {
                 None
             }

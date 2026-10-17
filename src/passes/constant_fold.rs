@@ -104,18 +104,25 @@ fn fold_const_global_loads(module: &mut IrModule) -> usize {
 }
 
 /// Fold `strlen`/`__builtin_strlen` calls whose argument is a string-literal
-/// global into the literal's byte length. glibc's startup.h pattern
+/// global into the literal's byte length. `allow_hosted_builtins` follows
+/// `-fno-builtin`: ordinary `strlen` folding is disabled there, while an
+/// explicit `__builtin_strlen` remains a compiler builtin. glibc's startup.h pattern
 /// `__builtin_constant_p (__builtin_strlen (message))` with a string-literal
 /// message becomes 1 after inlining; without this, the branch to
 /// `_startup_fatal_not_constant` survives into static links. Runs after
 /// inlining so parameter -> literal propagation has already happened.
-pub fn fold_strlen_literals(module: &mut IrModule) -> usize {
+pub fn fold_strlen_literals(module: &mut IrModule, allow_hosted_builtins: bool) -> usize {
     // Narrow string literals store one C byte per Rust char, so the byte
     // length is chars().count(); String::len() over-counts bytes >= 0x80.
     let literals: crate::common::fx_hash::FxHashMap<String, usize> = module
         .string_literals
         .iter()
-        .map(|(label, value)| (label.clone(), value.chars().count()))
+        .map(|(label, value)| {
+            (
+                label.clone(),
+                value.chars().take_while(|&c| c != '\0').count(),
+            )
+        })
         .collect();
     if literals.is_empty() {
         return 0;
@@ -144,7 +151,9 @@ pub fn fold_strlen_literals(module: &mut IrModule) -> usize {
         for block in &mut func.blocks {
             for inst in &mut block.instructions {
                 if let Instruction::Call { func: callee, info } = inst {
-                    if callee != "strlen" && callee != "__builtin_strlen" {
+                    if callee != "__builtin_strlen"
+                        && (callee != "strlen" || !allow_hosted_builtins)
+                    {
                         continue;
                     }
                     let Some(dest) = info.dest else { continue };

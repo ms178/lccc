@@ -68,6 +68,28 @@ use crate::ir::reexports::{
     Value,
 };
 
+thread_local! {
+    static HOSTED_BUILTINS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// TU-scoped, thread-local policy; restoring on drop prevents cross-invocation
+/// leakage on early returns and in test workers.
+pub(super) struct BuiltinScope(bool);
+impl BuiltinScope {
+    pub(super) fn enter(enabled: bool) -> Self {
+        Self(HOSTED_BUILTINS.replace(enabled))
+    }
+}
+impl Drop for BuiltinScope {
+    fn drop(&mut self) {
+        HOSTED_BUILTINS.set(self.0);
+    }
+}
+
+fn builtin_allowed(name: &str) -> bool {
+    name.starts_with("__") || HOSTED_BUILTINS.get()
+}
+
 /// Run algebraic simplification on the module.
 /// Returns the number of instructions simplified.
 pub fn run(module: &mut IrModule) -> usize {
@@ -295,15 +317,17 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
                     _ => {}
                 },
                 Instruction::Call { func, info } => {
-                    if matches!(
-                        func.as_str(),
-                        "fabs"
-                            | "fabsf"
-                            | "fabsl"
-                            | "__builtin_fabs"
-                            | "__builtin_fabsf"
-                            | "__builtin_fabsl"
-                    ) {
+                    if builtin_allowed(func)
+                        && matches!(
+                            func.as_str(),
+                            "fabs"
+                                | "fabsf"
+                                | "fabsl"
+                                | "__builtin_fabs"
+                                | "__builtin_fabsf"
+                                | "__builtin_fabsl"
+                        )
+                    {
                         if let Some(d) = info.dest {
                             let id = d.0 as usize;
                             if id < is_fabs.len() {
@@ -3132,6 +3156,9 @@ fn simplify_math_call(
     args: &[Operand],
     return_type: IrType,
 ) -> Option<Instruction> {
+    if !builtin_allowed(func) {
+        return None;
+    }
     // Check unary intrinsic table first (sqrt, sqrtf, fabs, fabsf).
     for &(name, intrinsic_op) in UNARY_INTRINSICS {
         if func == name {

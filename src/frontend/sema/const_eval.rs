@@ -58,6 +58,8 @@ pub struct SemaConstEval<'a> {
     pub const_values: Option<&'a FxHashMap<ExprId, IrConst>>,
     /// Pre-computed expression types from bottom-up sema walk.
     pub expr_types: Option<&'a FxHashMap<ExprId, CType>>,
+    /// Whether ordinary hosted-library builtin folds are disabled.
+    pub no_builtins: bool,
 }
 
 impl<'a> SemaConstEval<'a> {
@@ -443,9 +445,12 @@ impl<'a> SemaConstEval<'a> {
                         }
                         return None;
                     }
-                    shared_const_eval::eval_builtin_call(name.as_str(), args, &|e| {
-                        self.eval_const_expr(e)
-                    })
+                    shared_const_eval::eval_builtin_call_with_mode(
+                        name.as_str(),
+                        args,
+                        &|e| self.eval_const_expr(e),
+                        !self.no_builtins,
+                    )
                 } else {
                     None
                 }
@@ -635,6 +640,7 @@ impl<'a> SemaConstEval<'a> {
             types: self.types,
             functions: self.functions,
             expr_types: self.expr_types,
+            no_builtins: self.no_builtins,
         };
         checker.infer_expr_ctype(expr)
     }

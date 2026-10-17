@@ -6,9 +6,8 @@
 //! like `--dumpmachine` and `--version`.
 //!
 //! Design: The parser is a simple `while` loop with a flat `match` on each
-//! argument. No external parser library is used. Unknown flags are silently
-//! ignored (matching GCC's behavior for unrecognized `-f` and `-m` flags),
-//! which is critical for build system compatibility.
+//! argument. Unknown `-f` options are rejected so build-system capability
+//! probes cannot mistake an ignored request for implemented functionality.
 
 use super::pipeline::{CliDefine, CompileMode, Driver};
 use crate::backend::Target;
@@ -1981,6 +1980,34 @@ impl Driver {
                 }
                 "-fasynchronous-unwind-tables" | "-funwind-tables" => self.no_unwind_tables = false,
                 "-fno-jump-tables" => self.no_jump_tables = true,
+                "-ffreestanding" => {
+                    self.freestanding = true;
+                    self.no_builtins = true;
+                }
+                "-fhosted" => {
+                    self.freestanding = false;
+                    self.no_builtins = false;
+                }
+                "-fno-builtin" => self.no_builtins = true,
+                "-fbuiltin" => self.no_builtins = false,
+                arg if arg.starts_with("-fno-builtin-") => {
+                    return Err(format!(
+                        "per-function builtin control is unsupported: {}",
+                        arg
+                    ));
+                }
+                "-fno-tree-vectorize" => self.disable_tree_vectorize = true,
+                "-ftree-vectorize" => self.disable_tree_vectorize = false,
+                arg if matches!(
+                    arg,
+                    "-fno-tree-loop-vectorize"
+                        | "-fno-tree-slp-vectorize"
+                        | "-ftree-loop-vectorize"
+                        | "-ftree-slp-vectorize"
+                ) =>
+                {
+                    return Err(format!("per-vectorizer control is unsupported: {}", arg));
+                }
                 "-ffunction-sections" => self.function_sections = true,
                 "-fno-function-sections" => self.function_sections = false,
                 "-fdata-sections" => self.data_sections = true,
@@ -2100,7 +2127,14 @@ impl Driver {
                         arg
                     ));
                 }
-                arg if arg.starts_with("-f") => {}
+                arg if arg.starts_with("-f") => {
+                    use super::option_table::{Class, lookup};
+                    match lookup(arg) {
+                        Some(c) if c.class == Class::BenignNoop => {}
+                        Some(c) => return Err(format!("{}: {}", arg, c.rationale)),
+                        None => return Err(format!("unrecognized command-line option '{}'", arg)),
+                    }
+                }
 
                 // Linker flags
                 "-static" => self.static_link = true,
@@ -2332,6 +2366,82 @@ mod cli_tests {
         // args[0] is argv[0] (used for target detection from the binary name).
         let args = vec!["ccc".to_string(), flag.to_string(), "x.c".to_string()];
         d.parse_cli_args(&args).map(|_| ())
+    }
+
+    #[test]
+    fn hosted_freestanding_and_builtin_flags_are_explicit_and_ordered() {
+        let mut d = Driver::new();
+        d.parse_cli_args(&["ccc".into(), "-ffreestanding".into(), "x.c".into()])
+            .unwrap();
+        assert!(d.freestanding);
+        assert!(d.no_builtins);
+
+        let mut d = Driver::new();
+        d.parse_cli_args(&[
+            "ccc".into(),
+            "-ffreestanding".into(),
+            "-fbuiltin".into(),
+            "x.c".into(),
+        ])
+        .unwrap();
+        assert!(d.freestanding);
+        assert!(!d.no_builtins);
+
+        let mut d = Driver::new();
+        d.parse_cli_args(&[
+            "ccc".into(),
+            "-fhosted".into(),
+            "-fno-builtin".into(),
+            "x.c".into(),
+        ])
+        .unwrap();
+        assert!(!d.freestanding);
+        assert!(d.no_builtins);
+
+        let mut d = Driver::new();
+        d.parse_cli_args(&[
+            "ccc".into(),
+            "-fno-builtin".into(),
+            "-ffreestanding".into(),
+            "-fhosted".into(),
+            "x.c".into(),
+        ])
+        .unwrap();
+        assert!(!d.freestanding);
+        assert!(!d.no_builtins);
+    }
+
+    #[test]
+    fn tree_vectorize_switch_is_last_one_wins_and_partial_controls_are_refused() {
+        let mut d = Driver::new();
+        d.parse_cli_args(&[
+            "ccc".into(),
+            "-fno-tree-vectorize".into(),
+            "-ftree-vectorize".into(),
+            "x.c".into(),
+        ])
+        .unwrap();
+        assert!(!d.disable_tree_vectorize);
+
+        let mut d = Driver::new();
+        d.parse_cli_args(&[
+            "ccc".into(),
+            "-ftree-vectorize".into(),
+            "-fno-tree-vectorize".into(),
+            "x.c".into(),
+        ])
+        .unwrap();
+        assert!(d.disable_tree_vectorize);
+
+        for flag in [
+            "-fno-builtin-strlen",
+            "-fno-tree-loop-vectorize",
+            "-fno-tree-slp-vectorize",
+            "-ftree-loop-vectorize",
+            "-ftree-slp-vectorize",
+        ] {
+            assert!(try_flag(flag).is_err(), "{flag} must be explicitly refused");
+        }
     }
 
     /// `-mno-<feature>` must be ACCEPTED for any ISA extension LCCC never

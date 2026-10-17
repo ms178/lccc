@@ -60,6 +60,8 @@ pub struct ExprTypeChecker<'a> {
     /// Pre-computed expression types from bottom-up sema walk (memoization cache).
     /// When set, `infer_expr_ctype` checks this map before recursing.
     pub expr_types: Option<&'a FxHashMap<ExprId, CType>>,
+    /// Whether hosted-library builtin aliases are disabled for constant queries.
+    pub no_builtins: bool,
 }
 
 impl<'a> ExprTypeChecker<'a> {
@@ -896,6 +898,7 @@ impl<'a> ExprTypeChecker<'a> {
             functions: self.functions,
             const_values: None,
             expr_types: self.expr_types,
+            no_builtins: self.no_builtins,
         };
         evaluator.eval_const_expr(expr)?.to_i64()
     }
