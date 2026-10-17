@@ -868,9 +868,23 @@ impl<'a> ExprTypeChecker<'a> {
             }
             TypeSpecifier::FunctionPointer(ret, params, variadic) => {
                 let ret_ct = self.resolve_type_spec(ret);
+                // Full per-parameter conversion (param_decl_to_ctype_with): a
+                // nested function-pointer parameter inside the type name
+                // (`void(*)(void *, int (*fun)(unsigned int))`) rides on
+                // ParamDecl.fptr_params; resolving `p.type_spec` alone yields
+                // `int *` and rejects GCC-legal calls (tracepoint
+                // __traceiter_cpuhp_enter probe dispatch).
                 let param_cts: Vec<(CType, Option<String>)> = params
                     .iter()
-                    .map(|p| (self.resolve_type_spec(&p.type_spec), p.name.clone()))
+                    .map(|p| {
+                        (
+                            crate::common::type_builder::param_decl_to_ctype_with(
+                                &|ts| self.resolve_type_spec(ts),
+                                p,
+                            ),
+                            p.name.clone(),
+                        )
+                    })
                     .collect();
                 CType::Pointer(
                     Box::new(CType::Function(Box::new(FunctionType {
