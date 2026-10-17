@@ -233,13 +233,7 @@ impl Lowerer {
                     reverse_sso.is_some_and(|v| v),
                 );
                 // Apply struct-level __attribute__((aligned(N))): sets minimum alignment
-                if let Some(a) = struct_aligned {
-                    if *a > layout.align {
-                        layout.align = *a;
-                        let mask = layout.align - 1;
-                        layout.size = (layout.size + mask) & !mask;
-                    }
-                }
+                layout.apply_struct_aligned(*struct_aligned);
                 let key = self.struct_layout_key(tag, false);
                 // Record runtime sizeof for structs with VLA members so
                 // sizeof(struct s) / sizeof(typedef_of_s) is not a compile-time
@@ -286,13 +280,7 @@ impl Lowerer {
                     reverse_sso.is_some_and(|v| v),
                 );
                 // Apply struct-level __attribute__((aligned(N))): sets minimum alignment
-                if let Some(a) = struct_aligned {
-                    if *a > layout.align {
-                        layout.align = *a;
-                        let mask = layout.align - 1;
-                        layout.size = (layout.size + mask) & !mask;
-                    }
-                }
+                layout.apply_struct_aligned(*struct_aligned);
                 let key = self.struct_layout_key(tag, true);
                 self.insert_struct_layout_scoped(key.clone(), layout);
                 if tag.is_some() {
@@ -448,13 +436,7 @@ impl Lowerer {
                 max_field_align,
                 reverse_sso,
             );
-            if let Some(a) = struct_aligned {
-                if a > layout.align {
-                    layout.align = a;
-                    let mask = layout.align - 1;
-                    layout.size = (layout.size + mask) & !mask;
-                }
-            }
+            layout.apply_struct_aligned(struct_aligned);
             self.types.insert_struct_layout_from_ref(&key, layout);
         }
     }

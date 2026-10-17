@@ -342,14 +342,17 @@ impl Lowerer {
                     }
                     let alignment = crate::common::types::strictest_alignment([
                         f.alignment,
-                        self.typedef_alignment_for_type_spec(&f.type_spec).copied(),
                         f.alignas_type.as_ref().map(|ts| self.alignof_type(ts)),
                     ]);
+                    // A typedef-level `aligned` REPLACES the type's alignment
+                    // (it may lower it); see `StructField::type_align`.
+                    let type_align = self.typedef_alignment_for_type_spec(&f.type_spec).copied();
                     Some(StructField {
                         name: f.name.clone().unwrap_or_default(),
                         ty,
                         bit_width,
                         alignment,
+                        type_align,
                         is_packed: f.is_packed,
                         base_volatile: f.base_volatile,
                         object_volatile: f.object_volatile,
@@ -372,13 +375,7 @@ impl Lowerer {
                 )
             };
             // Apply struct-level __attribute__((aligned(N))): sets minimum alignment
-            if let Some(a) = struct_aligned {
-                if a > layout.align {
-                    layout.align = a;
-                    let mask = layout.align - 1;
-                    layout.size = (layout.size + mask) & !mask;
-                }
-            }
+            layout.apply_struct_aligned(struct_aligned);
             let key = if let Some(tag) = name {
                 format!("{}.{}", prefix, tag)
             } else {
@@ -418,6 +415,7 @@ impl Lowerer {
                     is_union,
                     is_transparent_union: false,
                     reverse_sso,
+                    user_align: false,
                 };
                 self.types.insert_struct_layout_from_ref(&key, empty_layout);
             }
@@ -438,6 +436,7 @@ impl Lowerer {
                 is_union,
                 is_transparent_union: false,
                 reverse_sso,
+                user_align: false,
             };
             self.types.insert_struct_layout_from_ref(&key, empty_layout);
             wrap(key)

@@ -1,6 +1,6 @@
 # Follow-up: ext_vector_type ABI grid — first measured run against Clang 23.1.3
 
-**Status: open.** Measured on 2026-10-17 by the hosted "Frontend and ABI
+**Status: open (ABI-EXTVEC-VA-1 and ABI-EXTVEC-I386-O2-1 fixed; LD-1 and the Clang oracle class open).** Measured on 2026-10-17 by the hosted "Frontend and ABI
 contracts" job (ubuntu-24.04, lccc fastbuild, Clang 23.1.3 from
 `scripts/ci_install_clang_oracle.sh`, GCC 16 as the linker driver).
 `tests/regression/check_ext_vector_abi_grid.sh` ran 848 legs over 53 shapes
@@ -36,43 +36,78 @@ they are lccc bugs, and so a future oracle bump that fixes them shows up as
 "expected failure did not occur" and gets re-measured deliberately. The
 pinned leg is in `tests/regression/lib/clang_oracle.sh`.
 
-## Class `lccc` / `flaky` — open lccc defects (56 deterministic + 72 flaky checks)
+## Class `lccc` / `flaky` — lccc defects (56 deterministic + 72 flaky checks at first measurement; VA-1 since fixed)
 
 Clang agrees with itself on these; lccc does not meet it.
 
-### ABI-EXTVEC-VA-1 — x86-64 `va_arg` of ext vectors wider than 16 bytes (72 flaky checks)
+### ABI-EXTVEC-VA-1 — x86-64 MEMORY-class vector arguments wider than 16 bytes (72 flaky checks) — **FIXED**
 
 **Nondeterministic.** Two hosted runs of the same binaries failed different
 subsets of the same legs: `hashva` on -m64 for `u8x32 u16x12 u16x16 u32x5
 u32x8 u32x16 u64x3 u64x4 u64x8 f32x5 f32x8 f32x16 f64x3 f64x4 f64x8` (and
-`ldx1 ldx2 ldx3`), at -O0 and -O2, whenever **lccc compiled the callee**
-(clang→lccc and lccc→lccc). The value read varies between runs, so lccc's
-`va_arg` reads a slot the caller never wrote — stack garbage — rather than a
-consistently wrong slot. The direction matters:
+`ldx1 ldx2 ldx3`), at -O0 and -O2, on the legs `clang:lccc` and
+`lccc:lccc`, never on `lccc:clang`.
 
-- lccc caller → Clang `va_arg` (lccc:clang) never fails `hashva` for these
-  shapes: lccc's variadic **caller** places the vector where the SysV ABI
-  says (class MEMORY, natural alignment, in the overflow area).
-- lccc `va_arg` fails against both callers: the **callee** half is wrong.
+**Correction to the first write-up.** The grid's leg name is
+`<provider>:<caller>` (`check_ext_vector_abi_grid.sh` links
+`p-$prov.o c-$call.o`), so `clang:lccc` is a Clang callee under an **lccc
+caller**, and `lccc:clang` — the leg that never failed — is lccc's `va_arg`
+under a Clang caller. The first write-up read the pair the other way round
+and sent the reader to the callee; the defect was in the **caller**.
 
-These rows are class `flaky` in `grid_expectations.txt`: the gate counts
-them but cannot judge them. The i386 rows for the same shapes are class
-`oracle` (Clang disagrees with itself there), so there is no i386 reference.
+**Root cause.** lccc modelled a vector type's alignment as the C11
+`_Alignof` figure (16 bytes: GCC's `min_align_of_type` caps non-user-aligned
+types at `BIGGEST_ALIGNMENT`) and used that one number everywhere. GCC and
+Clang give the type `TYPE_ALIGN == size` ("always naturally align vectors",
+`layout_type`), uncapped on x86, and only the C11 operator reports the
+capped figure. A MEMORY-class argument of such a type sits at a multiple of
+its **full** alignment ("the ABI for passing parameters with 32-byte
+alignment has changed in GCC 4.6" — the caller realigns `%rsp` so the
+outgoing area satisfies it). Every callee — Clang, GCC, lccc's own prologue
+and `va_arg` — rounds the slot address up to 32 (or 64); lccc's caller wrote
+the vector at a 16-aligned slot, so on the stack residue 16 mod 32 the
+callee read 16 bytes that were never written: stack garbage, hence the
+run-to-run variation. The same model error made `struct { int z; v32 v; }`
+48 bytes with `v` at 16 (GCC: 64 bytes, `v` at 32), gave 32/64-byte vector
+objects 16-byte alignment, and made `_Alignof(T32[2])` and `_Alignof(x)`
+(object, not type) 16 instead of 32.
 
-Reproduce (x86-64; run several times, the verdict varies):
+**Fix.** `src/common/types.rs` now distinguishes the GCC/Clang alignment of
+a vector type (its size) from the C11 `_Alignof(type)` figure (capped at
+16, 32 under `-mavx`, 64 under `-mavx512f`); struct layout, object
+alignment, `__alignof__`, `_Alignof(expr)` and `_Alignof(array)` use the
+former; the x86-64 caller's `struct_arg_aligns` rounds the slot of a
+MEMORY-class vector argument to the full alignment and realigns the outgoing
+area. The same change carries `aligned(N)` on a typedef as the type's exact
+alignment (it may lower it, GCC semantics) and makes `_Alignof(var)` of a
+typedef-aligned variable report the typedef's figure.
 
-    lccc     -m64 -O0 -DPROVIDER -DELEM=unsigned -DLANES=8 -c tests/regression/ext_vector_abi/abi_grid.c -o p.o   # lccc callee (the failing half)
-    clang-23 -m64 -O0            -DELEM=unsigned -DLANES=8 -c tests/regression/ext_vector_abi/abi_grid.c -o c.o
-    gcc -m64 -no-pie p.o c.o -o t && for i in 1 2 3 4 5; do ./t; done   # "FAIL hashva" on some runs
+**Verification** (all against GCC 16; no Clang oracle in the fixing
+environment, so the Clang-side grid rows below are retired on the strength
+of the identical Clang convention — `byval ... align 32` — and the
+measured `lccc:clang`-never-fails pattern):
 
-Where to look: the `va_arg` lowering for `CType::ExtVector` (and `Vector`)
-of class MEMORY. The SysV rule: round `overflow_arg_area` up to the type's
-alignment when it exceeds 8 (16 for 32-byte vectors; 32 is NOT required by
-the psABI, which caps at 16 — Clang follows the cap), read the object there,
-then advance by the size rounded up to 8. A read from the register save
-area, or an advance by the unpadded lane size instead of the storage size,
-both produce exactly this stack-dependent garbage. Compare with the GNU
-`__attribute__((vector_size(32)))` path, which the SysV gate covers.
+- `tests/regression/check_gnu_vector_align_abi.sh` (CI gate): 39 layout and
+  alignof constants compared verbatim across `-m64`, `-mavx`, `-mavx2`,
+  `-mavx512f`, `-m32`, `-m32 -mavx`; x86-64 runtime cross matrix (va_arg,
+  named-after-six-GP, first-stack-argument; 32- and 64-byte vectors; -O0
+  and -O2; four pairings; both stack residues) — 46/46; the pre-fix compiler
+  fails 18 of them.
+- Corpus tests `tests/regression/gnu_vector_overalign_layout.c` and
+  `tests/regression/typedef_aligned_lowers_alignment.c` (run_regression.py,
+  GCC reference output).
+- The 60 non-`long double` `flaky` rows are retired from
+  `grid_expectations.txt`. The 12 `ldx*` `hashva` rows are re-attributed to
+  ABI-EXTVEC-LD-1 (class unchanged): `ldx1` is 16 bytes and cannot have been
+  this defect, and the `ldx` shapes fail every other by-value check under
+  LD-1.
+
+**Residual, tracked separately: ABI-GNUVEC-I386-1** — on i386 GCC passes
+16-byte GNU vectors in `%xmm0-2` for fixed arguments and keeps 32/64-byte
+vectors in memory at their full alignment with a realigned `%esp` (DRAP via
+`%ecx`); lccc's i686 call sequence packs them 4-byte granular. lccc agrees
+with itself; both cross legs diverge, and `check_gnu_vector_align_abi.sh`
+latches exactly that verdict so it is re-measured on every run.
 
 ### ABI-EXTVEC-LD-1 — `long double` ext vectors by value, x86-64 (29 deterministic)
 
@@ -84,16 +119,36 @@ return. Clang passes/returns these as consecutive x87 `long double`s
 pointer for more). Reproduce with `-DELEM="long double" -DLANES=1`, any
 leg containing lccc.
 
-### ABI-EXTVEC-I386-O2-1 — i386 -O2 only: 32/64-byte by-value vectors (27)
+### ABI-EXTVEC-I386-O2-1 — i386 -O2 only: 32/64-byte by-value vectors (27) — **FIXED**
 
-`hash2` fails for `u8x32 u16x16 u32x8 u32x16 u64x4 u64x8 f32x8 f32x16 f64x4
-f64x8` on -m32 at **-O2 only** (the same legs pass at -O0), in every leg
-that contains lccc, including lccc → lccc. The classification is therefore
-right and an optimisation is wrong: suspect the i686 call-argument staging
-or vector copy elimination for by-value arguments larger than one XMM
-image. Reproduce with `-m32 -O2 -DELEM="unsigned long long" -DLANES=4`;
-bisect with `CCC_NO_*` knobs on the lccc provider leg first (callee side)
-and then the caller leg.
+`hash2` failed for `u8x32 u16x16 u32x8 u32x16 u64x4 u64x8 f32x8 f32x16 f64x4
+f64x8` on -m32 at **-O2 only**, in every leg that contains lccc, including
+lccc → lccc.
+
+**Root cause** (not an ABI defect; a generic IR miscompile that the i386
+ext-vector carrier happened to expose). `aggregate_copy_forward` deletes a
+`memcpy(tmp, obj)` whose temporary is only read, redirecting the reads to
+`obj`. Its chain resolution followed a candidate's source only when that
+source was *exactly* another candidate root. The i686 call lowering copies
+a 32-byte vector argument into a 16-aligned `image` and then the two XMM
+pieces from `image` and `image + 16`; after inlining, `piece1 = memcpy(image
++ 16)` is a candidate whose source is a **path into** the candidate
+`image`. `image`'s copy was deleted, `piece1`'s reads were redirected to
+`image + 16` — uninitialized stack. The callee prologue (reassembling the
+vector from its pieces) has the same shape, which is why both halves failed
+independently. The same hole hits plain C on x86-64: an inlined function
+copying sub-objects out of a by-value struct (`p.hi = o.y`) read zeros.
+
+**Fix.** `resolve_read` unwinds `(root, path)` through candidate sources,
+prepending each hop's path, and the rewrite applies it to both Loads and
+Memcpy sources (the validation already admitted both shapes).
+
+**Verification.** `abi_grid.c` lccc ↔ lccc, 23 shapes × {-m32, -m64} ×
+{-O0, -O2}² = 184 legs, 0 failures (20 before); corpus test
+`tests/regression/agg_copy_forward_subobject_chain.c` (x86-64 and i686,
+GCC 16 reference; the previous compiler prints `0`/garbage for `p.hi`);
+pass unit test `forwards_reads_through_a_path_into_another_forwarded_temporary`.
+The 27 rows are retired.
 
 ## Retiring an entry
 

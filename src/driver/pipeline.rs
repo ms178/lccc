@@ -753,6 +753,27 @@ impl Driver {
         // to use.  (`__builtin_cpu_supports` is a *runtime* CPUID question
         // and deliberately does NOT consult this set — see `cpu_probe`.)
         crate::common::x86_features::set_effective(self.effective_x86_features());
+        // GCC's BIGGEST_ALIGNMENT, the cap C11 `_Alignof` applies to
+        // non-user-aligned types (`min_align_of_type`): 16 on x86, 32 under
+        // TARGET_AVX, 64 under TARGET_AVX512F. It follows the *requested*
+        // ISA (the `__AVX__`/`__AVX512F__` predefine state, same gate as
+        // `set_extended_simd_macros`), not the codegen permission set, so
+        // `_Alignof(v32)` is 16 by default and 32 with `-mavx` exactly like
+        // GCC 16.2. Non-x86 targets keep 16 (their vector TYPE_ALIGN is
+        // already capped at 16 in `vector_type_align`, so the value is moot).
+        crate::common::types::set_target_biggest_alignment(
+            if matches!(self.target, Target::X86_64 | Target::I686) && !self.no_sse {
+                if self.enable_avx512f {
+                    64
+                } else if self.enable_avx {
+                    32
+                } else {
+                    16
+                }
+            } else {
+                16
+            },
+        );
         // 4-byte width-partitioned spill slots are only enabled where the
         // backend's store/load paths are proven width-consistent.  x86-64
         // narrows ≤32-bit spills; i686 naturally accesses every non-wide

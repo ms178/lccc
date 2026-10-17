@@ -1517,6 +1517,22 @@ impl Lowerer {
                     Some(ref ct @ CType::Struct(_)) | Some(ref ct @ CType::Union(_)) => self
                         .get_struct_layout_for_ctype(ct)
                         .map(|layout| layout.align),
+                    // Vectors carry their natural alignment (size for ext
+                    // vectors: 32 for 32-byte, 64 for 64-byte). The x86-64
+                    // backend uses this both for the per-argument padding in
+                    // the outgoing area and to trigger the GCC ≥ 4.6 dynamic
+                    // %rsp realignment (emit_call_stack_args_impl): a
+                    // MEMORY-class argument with alignment A > 16 must sit at
+                    // an address ≡ 0 (mod A), because every callee — GCC,
+                    // Clang and lccc's own prologue/va_arg — rounds the
+                    // incoming slot up to A. Without it a 32-byte vector was
+                    // pushed at the 16-aligned %rsp and the callee read 16
+                    // bytes of garbage on half of all stack residues
+                    // (ABI-EXTVEC-VA-1). The parameter side already records
+                    // `ctype_align` for vector params (func_lowering), so the
+                    // caller and callee layouts agree. i686 (cap 4) and ARM
+                    // (cap 16) clamp this through `stack_arg_align_cap`.
+                    Some(ref ct) if ct.is_vector() => Some(self.ctype_align(ct)),
                     // _Float128/_Decimal128 args are 16-byte TFmode carriers:
                     // the i686 stack layout aligns them to 16 in the outgoing
                     // area (GCC i386 psABI), mirroring the struct_align Some(16)

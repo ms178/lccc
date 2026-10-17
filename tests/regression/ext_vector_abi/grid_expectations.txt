@@ -12,18 +12,32 @@
 #   class `lccc`: Clang agrees with itself and lccc does not meet it,
 #     deterministically -- an open lccc ABI defect, tracked under the id:
 #     ABI-EXTVEC-LD-1      long double ext vectors by value, x86-64
-#     ABI-EXTVEC-I386-O2-1 i386 -O2 only: by-value ext vectors of 32/64
-#                          bytes (hash2) -- passes at -O0, so an optimizer
-#                          or call-staging defect, not a classification one
-#   class `flaky`: an open lccc defect whose outcome varies between runs:
-#     ABI-EXTVEC-VA-1      x86-64 va_arg of an ext vector wider than 16
-#                          bytes (and of long double vectors) reads a slot
-#                          the caller never wrote, so the value depends on
-#                          stack contents. The gate neither requires nor
-#                          forbids the failure; it counts how many occurred.
-#                          Retire these lines with the fix. The lccc caller
-#                          half is right: lccc:clang never fails hashva for
-#                          the non-long-double shapes.
+#   Retired (fixed): ABI-EXTVEC-I386-O2-1 -- not an ABI defect at all but
+#     an aggregate_copy_forward miscompile: a forwarded temporary whose
+#     source was a PATH into another forwarded temporary (`image + 16`, the
+#     second XMM piece of a 32/64-byte i386 ext vector argument) kept
+#     reading the deleted copy. Both halves (lccc caller and lccc callee)
+#     were wrong independently at -O2 and are fixed; see
+#     tests/regression/agg_copy_forward_subobject_chain.c (plain structs,
+#     x86-64 too) and the pass unit test.
+#   class `flaky`: an open lccc defect whose outcome varies between runs.
+#     The gate neither requires nor forbids the failure; it counts how many
+#     occurred. Only the long double vector `hashva` legs remain here, under
+#     ABI-EXTVEC-LD-1: the long double shapes fail every other by-value check
+#     deterministically, and `ldx1` (16 bytes) was never touched by the
+#     alignment defect below, so these are the LD-1 defect seen through
+#     va_arg, not an alignment bug. They stay `flaky` until the hosted Clang
+#     run re-measures them.
+#   Retired (fixed): ABI-EXTVEC-VA-1 -- the lccc CALLER placed a MEMORY-class
+#     vector argument wider than 16 bytes at a 16-byte-aligned stack slot
+#     because the type's alignment was modelled as the capped `_Alignof`
+#     figure instead of its size; every callee (Clang, GCC, lccc's own
+#     prologue and va_arg) rounds the slot up to the full alignment, so on
+#     half of all stack residues the callee read 16 bytes that were never
+#     written. The provider:caller pattern recorded here (clang:lccc and
+#     lccc:lccc failed hashva, lccc:clang never did) is the caller-side
+#     signature. Covered deterministically, against the GCC 16 oracle, by
+#     tests/regression/check_gnu_vector_align_abi.sh.
 # See engineering/FOLLOWUP-2026-10-17-ext-vector-grid.md.
 64 -O0 ldx1 clang:clang hashva oracle ORACLE-CLANG-2313-1
 64 -O0 ldx1 clang:lccc ident lccc ABI-EXTVEC-LD-1
@@ -137,31 +151,22 @@
 32 -O2 bx8 clang:clang hashva oracle ORACLE-CLANG-2313-1
 32 -O2 bx8 clang:lccc hashva oracle ORACLE-CLANG-2313-1
 32 -O2 f32x16 clang:clang hashva oracle ORACLE-CLANG-2313-1
-32 -O2 f32x16 clang:lccc hash2 lccc ABI-EXTVEC-I386-O2-1
 32 -O2 f32x16 clang:lccc hashva oracle ORACLE-CLANG-2313-1
-32 -O2 f32x16 lccc:clang hash2 lccc ABI-EXTVEC-I386-O2-1
 32 -O2 f32x16 lccc:lccc hashva oracle ORACLE-CLANG-2313-1
 32 -O2 f32x2 clang:clang hashva oracle ORACLE-CLANG-2313-1
 32 -O2 f32x2 clang:lccc hashva oracle ORACLE-CLANG-2313-1
 32 -O2 f32x5 clang:clang hashva oracle ORACLE-CLANG-2313-1
 32 -O2 f32x5 clang:lccc hashva oracle ORACLE-CLANG-2313-1
 32 -O2 f32x8 clang:clang hashva oracle ORACLE-CLANG-2313-1
-32 -O2 f32x8 clang:lccc hash2 lccc ABI-EXTVEC-I386-O2-1
 32 -O2 f32x8 clang:lccc hashva oracle ORACLE-CLANG-2313-1
-32 -O2 f32x8 lccc:clang hash2 lccc ABI-EXTVEC-I386-O2-1
-32 -O2 f32x8 lccc:lccc hash2 lccc ABI-EXTVEC-I386-O2-1
 32 -O2 f32x8 lccc:lccc hashva oracle ORACLE-CLANG-2313-1
 32 -O2 f64x3 clang:clang hashva oracle ORACLE-CLANG-2313-1
 32 -O2 f64x3 clang:lccc hashva oracle ORACLE-CLANG-2313-1
 32 -O2 f64x4 clang:clang hashva oracle ORACLE-CLANG-2313-1
-32 -O2 f64x4 clang:lccc hash2 lccc ABI-EXTVEC-I386-O2-1
 32 -O2 f64x4 clang:lccc hashva oracle ORACLE-CLANG-2313-1
-32 -O2 f64x4 lccc:clang hash2 lccc ABI-EXTVEC-I386-O2-1
 32 -O2 f64x4 lccc:lccc hashva oracle ORACLE-CLANG-2313-1
 32 -O2 f64x8 clang:clang hashva oracle ORACLE-CLANG-2313-1
-32 -O2 f64x8 clang:lccc hash2 lccc ABI-EXTVEC-I386-O2-1
 32 -O2 f64x8 clang:lccc hashva oracle ORACLE-CLANG-2313-1
-32 -O2 f64x8 lccc:clang hash2 lccc ABI-EXTVEC-I386-O2-1
 32 -O2 f64x8 lccc:lccc hashva oracle ORACLE-CLANG-2313-1
 32 -O2 ldx1 clang:clang hashva oracle ORACLE-CLANG-2313-1
 32 -O2 ldx1 clang:lccc hashva oracle ORACLE-CLANG-2313-1
@@ -181,52 +186,34 @@
 32 -O2 u16x12 clang:clang hashva oracle ORACLE-CLANG-2313-1
 32 -O2 u16x12 clang:lccc hashva oracle ORACLE-CLANG-2313-1
 32 -O2 u16x16 clang:clang hashva oracle ORACLE-CLANG-2313-1
-32 -O2 u16x16 clang:lccc hash2 lccc ABI-EXTVEC-I386-O2-1
 32 -O2 u16x16 clang:lccc hashva oracle ORACLE-CLANG-2313-1
-32 -O2 u16x16 lccc:clang hash2 lccc ABI-EXTVEC-I386-O2-1
-32 -O2 u16x16 lccc:lccc hash2 lccc ABI-EXTVEC-I386-O2-1
 32 -O2 u16x16 lccc:lccc hashva oracle ORACLE-CLANG-2313-1
 32 -O2 u16x2 clang:clang hashva oracle ORACLE-CLANG-2313-1
 32 -O2 u16x2 clang:lccc hashva oracle ORACLE-CLANG-2313-1
 32 -O2 u16x3 clang:clang hashva oracle ORACLE-CLANG-2313-1
 32 -O2 u16x3 clang:lccc hashva oracle ORACLE-CLANG-2313-1
 32 -O2 u32x16 clang:clang hashva oracle ORACLE-CLANG-2313-1
-32 -O2 u32x16 clang:lccc hash2 lccc ABI-EXTVEC-I386-O2-1
 32 -O2 u32x16 clang:lccc hashva oracle ORACLE-CLANG-2313-1
-32 -O2 u32x16 lccc:clang hash2 lccc ABI-EXTVEC-I386-O2-1
-32 -O2 u32x16 lccc:lccc hash2 lccc ABI-EXTVEC-I386-O2-1
 32 -O2 u32x16 lccc:lccc hashva oracle ORACLE-CLANG-2313-1
 32 -O2 u32x5 clang:clang hashva oracle ORACLE-CLANG-2313-1
 32 -O2 u32x5 clang:lccc hashva oracle ORACLE-CLANG-2313-1
 32 -O2 u32x8 clang:clang hashva oracle ORACLE-CLANG-2313-1
-32 -O2 u32x8 clang:lccc hash2 lccc ABI-EXTVEC-I386-O2-1
 32 -O2 u32x8 clang:lccc hashva oracle ORACLE-CLANG-2313-1
-32 -O2 u32x8 lccc:clang hash2 lccc ABI-EXTVEC-I386-O2-1
-32 -O2 u32x8 lccc:lccc hash2 lccc ABI-EXTVEC-I386-O2-1
 32 -O2 u32x8 lccc:lccc hashva oracle ORACLE-CLANG-2313-1
 32 -O2 u64x3 clang:clang hashva oracle ORACLE-CLANG-2313-1
 32 -O2 u64x3 clang:lccc hashva oracle ORACLE-CLANG-2313-1
 32 -O2 u64x4 clang:clang hashva oracle ORACLE-CLANG-2313-1
-32 -O2 u64x4 clang:lccc hash2 lccc ABI-EXTVEC-I386-O2-1
 32 -O2 u64x4 clang:lccc hashva oracle ORACLE-CLANG-2313-1
-32 -O2 u64x4 lccc:clang hash2 lccc ABI-EXTVEC-I386-O2-1
-32 -O2 u64x4 lccc:lccc hash2 lccc ABI-EXTVEC-I386-O2-1
 32 -O2 u64x4 lccc:lccc hashva oracle ORACLE-CLANG-2313-1
 32 -O2 u64x8 clang:clang hashva oracle ORACLE-CLANG-2313-1
-32 -O2 u64x8 clang:lccc hash2 lccc ABI-EXTVEC-I386-O2-1
 32 -O2 u64x8 clang:lccc hashva oracle ORACLE-CLANG-2313-1
-32 -O2 u64x8 lccc:clang hash2 lccc ABI-EXTVEC-I386-O2-1
-32 -O2 u64x8 lccc:lccc hash2 lccc ABI-EXTVEC-I386-O2-1
 32 -O2 u64x8 lccc:lccc hashva oracle ORACLE-CLANG-2313-1
 32 -O2 u8x2 clang:clang hashva oracle ORACLE-CLANG-2313-1
 32 -O2 u8x2 clang:lccc hashva oracle ORACLE-CLANG-2313-1
 32 -O2 u8x3 clang:clang hashva oracle ORACLE-CLANG-2313-1
 32 -O2 u8x3 clang:lccc hashva oracle ORACLE-CLANG-2313-1
 32 -O2 u8x32 clang:clang hashva oracle ORACLE-CLANG-2313-1
-32 -O2 u8x32 clang:lccc hash2 lccc ABI-EXTVEC-I386-O2-1
 32 -O2 u8x32 clang:lccc hashva oracle ORACLE-CLANG-2313-1
-32 -O2 u8x32 lccc:clang hash2 lccc ABI-EXTVEC-I386-O2-1
-32 -O2 u8x32 lccc:lccc hash2 lccc ABI-EXTVEC-I386-O2-1
 32 -O2 u8x32 lccc:lccc hashva oracle ORACLE-CLANG-2313-1
 32 -O2 u8x4 clang:clang hashva oracle ORACLE-CLANG-2313-1
 32 -O2 u8x4 clang:lccc hashva oracle ORACLE-CLANG-2313-1
@@ -234,75 +221,15 @@
 32 -O2 u8x5 clang:lccc hashva oracle ORACLE-CLANG-2313-1
 32 -O2 u8x7 clang:clang hashva oracle ORACLE-CLANG-2313-1
 32 -O2 u8x7 clang:lccc hashva oracle ORACLE-CLANG-2313-1
-64 -O0 u8x32 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 u8x32 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 u16x12 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 u16x12 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 u16x16 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 u16x16 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 u32x5 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 u32x5 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 u32x8 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 u32x8 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 u32x16 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 u32x16 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 u64x3 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 u64x3 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 u64x4 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 u64x4 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 u64x8 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 u64x8 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 f32x5 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 f32x5 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 f32x8 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 f32x8 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 f32x16 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 f32x16 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 f64x3 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 f64x3 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 f64x4 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 f64x4 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 f64x8 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 f64x8 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 ldx1 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 ldx1 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 ldx2 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 ldx2 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 ldx3 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O0 ldx3 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 u8x32 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 u8x32 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 u16x12 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 u16x12 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 u16x16 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 u16x16 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 u32x5 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 u32x5 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 u32x8 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 u32x8 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 u32x16 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 u32x16 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 u64x3 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 u64x3 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 u64x4 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 u64x4 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 u64x8 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 u64x8 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 f32x5 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 f32x5 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 f32x8 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 f32x8 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 f32x16 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 f32x16 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 f64x3 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 f64x3 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 f64x4 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 f64x4 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 f64x8 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 f64x8 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 ldx1 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 ldx1 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 ldx2 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 ldx2 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 ldx3 clang:lccc hashva flaky ABI-EXTVEC-VA-1
-64 -O2 ldx3 lccc:lccc hashva flaky ABI-EXTVEC-VA-1
+64 -O0 ldx1 clang:lccc hashva flaky ABI-EXTVEC-LD-1
+64 -O0 ldx1 lccc:lccc hashva flaky ABI-EXTVEC-LD-1
+64 -O0 ldx2 clang:lccc hashva flaky ABI-EXTVEC-LD-1
+64 -O0 ldx2 lccc:lccc hashva flaky ABI-EXTVEC-LD-1
+64 -O0 ldx3 clang:lccc hashva flaky ABI-EXTVEC-LD-1
+64 -O0 ldx3 lccc:lccc hashva flaky ABI-EXTVEC-LD-1
+64 -O2 ldx1 clang:lccc hashva flaky ABI-EXTVEC-LD-1
+64 -O2 ldx1 lccc:lccc hashva flaky ABI-EXTVEC-LD-1
+64 -O2 ldx2 clang:lccc hashva flaky ABI-EXTVEC-LD-1
+64 -O2 ldx2 lccc:lccc hashva flaky ABI-EXTVEC-LD-1
+64 -O2 ldx3 clang:lccc hashva flaky ABI-EXTVEC-LD-1
+64 -O2 ldx3 lccc:lccc hashva flaky ABI-EXTVEC-LD-1

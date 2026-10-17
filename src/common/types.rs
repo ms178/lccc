@@ -24,6 +24,47 @@ thread_local! {
     /// width-consistent for small types (see state::is_small_slot); every
     /// other backend keeps the 8-byte fallback until it is audited.
     static TARGET_SMALL_SLOTS: Cell<bool> = const { Cell::new(false) };
+    /// GCC's `BIGGEST_ALIGNMENT` in bytes for the current target: the cap
+    /// C11 `_Alignof(type)` applies to types that have no *user*
+    /// alignment (`min_align_of_type`). x86: 16, 32 under `-mavx`, 64
+    /// under `-mavx512f`. See `CType::c11_alignof_ctx`.
+    static TARGET_BIGGEST_ALIGNMENT: Cell<usize> = const { Cell::new(16) };
+}
+
+/// Set GCC's `BIGGEST_ALIGNMENT` (bytes) for the current target/ISA. Must
+/// be called before any `_Alignof` evaluation.
+pub fn set_target_biggest_alignment(bytes: usize) {
+    debug_assert!(bytes.is_power_of_two());
+    TARGET_BIGGEST_ALIGNMENT.with(|c| c.set(bytes));
+}
+
+/// GCC's `BIGGEST_ALIGNMENT` (bytes) for the current target/ISA.
+pub fn target_biggest_alignment() -> usize {
+    TARGET_BIGGEST_ALIGNMENT.with(|c| c.get())
+}
+
+/// `TYPE_ALIGN` of a GCC `vector_size(total_size)` type.
+///
+/// GCC's `layout_type` aligns every vector type naturally — to its full
+/// size — "to prevent ABI changes depending on whether or not native
+/// vector modes are supported", clamped only by the target hook
+/// `TARGET_VECTOR_ALIGNMENT`. On x86 (both -m64 and -m32) the hook is the
+/// default (uncapped: `__alignof__` of a 32/64/128/256-byte vector is
+/// 32/64/128/256 with or without AVX — GCC 16.2), and that value drives
+/// struct layout (`struct { int z; v32 v; }` is 64 bytes with `v` at 32),
+/// variable alignment (`.align 32`), and parameter passing (the
+/// "ABI for passing parameters with 32-byte alignment has changed in GCC
+/// 4.6" note). Only C11 `_Alignof` reports a smaller number, via
+/// `min_align_of_type`'s `BIGGEST_ALIGNMENT` cap — see
+/// [`CType::c11_alignof_ctx`]. AArch64 overrides the hook to cap at 16
+/// (`aarch64_vector_alignment`); ARM and RISC-V keep the historical 16
+/// cap here until measured against a reference compiler.
+pub fn vector_type_align(total_size: usize) -> usize {
+    match target_elf_machine() {
+        // EM_X86_64 / EM_386
+        62 | 3 => total_size,
+        _ => total_size.min(16),
+    }
 }
 
 /// Set whether the current target allows 4-byte spill slots (x86-64 only).
@@ -460,9 +501,18 @@ pub struct StructField {
     pub name: String,
     pub ty: CType,
     pub bit_width: Option<u32>,
-    /// Per-field alignment override from _Alignas(N) or __attribute__((aligned(N))).
-    /// When set, this overrides the natural alignment of the field's type.
+    /// Per-field alignment request from `_Alignas(N)` or
+    /// `__attribute__((aligned(N)))` on the member itself. Can only RAISE the
+    /// member's alignment above its type's (GCC: a member `aligned` below the
+    /// type alignment is ignored unless `packed`).
     pub alignment: Option<usize>,
+    /// The field type's own `TYPE_ALIGN` when it comes from a typedef that
+    /// carries `__attribute__((aligned(N)))`: REPLACES the natural alignment
+    /// (GCC: "when used on a typedef, the aligned attribute can both increase
+    /// and decrease alignment" — `typedef double D4 aligned(4)` makes
+    /// `struct { char c; D4 d; }` 12 bytes with `d` at 4; GCC 16.2 -m64/-m32).
+    /// A member-level `alignment` still raises above this.
+    pub type_align: Option<usize>,
     /// Per-field __attribute__((packed)) - forces this field's alignment to 1.
     pub is_packed: bool,
     /// Volatile base type of the field (element or pointee access). See `StructFieldDecl`.
@@ -619,6 +669,18 @@ pub struct StructLayout {
     /// big-endian one) — i.e. the storage order is REVERSED relative to the
     /// target's native byte order.
     pub reverse_sso: bool,
+    /// GCC `TYPE_USER_ALIGN`: the record's alignment was raised by an
+    /// explicit request — a struct-level `aligned(N)` (any N), a field with
+    /// `_Alignas`/`aligned` at or above its type's natural alignment, or a
+    /// field whose type is itself user-aligned (nested record, array of
+    /// one). C11 `_Alignof` does not apply the `BIGGEST_ALIGNMENT` cap to
+    /// user-aligned types (`min_align_of_type`), so `_Alignof(struct {
+    /// _Alignas(32) int x; })` is 32 while `_Alignof(struct { v32 v; })`
+    /// is 16 without AVX. A field whose explicit alignment is BELOW its
+    /// type's does not count: GCC's `do_type_align` overwrites that
+    /// field's `DECL_USER_ALIGN` with the type's (measured: `struct { v32 v
+    /// __attribute__((aligned(8))); }` → `_Alignof` 16).
+    pub user_align: bool,
 }
 
 /// Builder for struct layout computation with bitfield state tracking.
@@ -632,6 +694,8 @@ struct StructLayoutBuilder {
     in_bitfield: bool,
     is_packed_1: bool,
     reverse_sso: bool,
+    /// See `StructLayout::user_align`.
+    user_align: bool,
 }
 
 impl StructLayoutBuilder {
@@ -646,6 +710,7 @@ impl StructLayoutBuilder {
             in_bitfield: false,
             is_packed_1: max_field_align == Some(1),
             reverse_sso,
+            user_align: false,
         }
     }
 
@@ -656,7 +721,7 @@ impl StructLayoutBuilder {
         max_field_align: Option<usize>,
         ctx: &dyn StructLayoutProvider,
     ) -> (usize, usize) {
-        let natural_align = field.ty.align_ctx(ctx);
+        let natural_align = field.type_align.unwrap_or_else(|| field.ty.align_ctx(ctx));
         let field_align = if field.is_packed {
             // Per-field __attribute__((packed)) forces alignment to 1
             1
@@ -671,6 +736,7 @@ impl StructLayoutBuilder {
         };
         let field_size = field.ty.size_ctx(ctx);
         self.max_align = self.max_align.max(field_align);
+        self.user_align |= field_contributes_user_align(field, natural_align, ctx);
         (field_align, field_size)
     }
 
@@ -896,7 +962,29 @@ impl StructLayoutBuilder {
             is_union: false,
             is_transparent_union: false,
             reverse_sso: self.reverse_sso,
+            user_align: self.user_align,
         }
+    }
+}
+
+/// GCC `DECL_USER_ALIGN` of a record field as it feeds `TYPE_USER_ALIGN`
+/// of the enclosing record (`update_alignment_for_field` after
+/// `layout_decl`/`do_type_align`). See `StructLayout::user_align`.
+fn field_contributes_user_align(
+    field: &StructField,
+    natural_align: usize,
+    ctx: &dyn StructLayoutProvider,
+) -> bool {
+    if field.is_packed {
+        return false;
+    }
+    // A typedef-level `aligned` sets TYPE_USER_ALIGN on the typedef'd type.
+    if field.type_align.is_some() {
+        return true;
+    }
+    match field.alignment {
+        Some(explicit) if explicit >= natural_align => true,
+        _ => field.ty.has_user_align(ctx),
     }
 }
 
@@ -911,6 +999,7 @@ impl StructLayout {
             is_union: false,
             is_transparent_union: false,
             reverse_sso: false,
+            user_align: false,
         }
     }
 
@@ -923,6 +1012,24 @@ impl StructLayout {
             is_union: true,
             is_transparent_union: false,
             reverse_sso: false,
+            user_align: false,
+        }
+    }
+
+    /// Apply a struct-level `__attribute__((aligned(N)))` / `_Alignas`
+    /// request: raises the record alignment (and re-rounds its size) when
+    /// `N` exceeds the natural alignment, and marks the record user-aligned
+    /// in either case (GCC sets `TYPE_USER_ALIGN` for any explicit request,
+    /// so `_Alignof(struct __attribute__((aligned(8))) { v32 v; })` is 32,
+    /// uncapped, while the attribute-less record reports 16 without AVX).
+    pub fn apply_struct_aligned(&mut self, struct_aligned: Option<usize>) {
+        let Some(a) = struct_aligned else {
+            return;
+        };
+        self.user_align = true;
+        if a > self.align {
+            self.align = a;
+            self.size = align_up(self.size, a);
         }
     }
 
@@ -1067,10 +1174,11 @@ impl StructLayout {
     ) -> Self {
         let mut max_size = 0usize;
         let mut max_align = 1usize;
+        let mut user_align = false;
         let mut field_layouts = Vec::with_capacity(fields.len());
 
         for field in fields {
-            let natural_align = field.ty.align_ctx(ctx);
+            let natural_align = field.type_align.unwrap_or_else(|| field.ty.align_ctx(ctx));
             // Per-field alignment handling
             let field_align = if field.is_packed {
                 // Per-field __attribute__((packed)) forces alignment to 1
@@ -1086,6 +1194,7 @@ impl StructLayout {
             let field_size = field.ty.size_ctx(ctx);
             max_align = max_align.max(field_align);
             max_size = max_size.max(field_size);
+            user_align |= field_contributes_user_align(field, natural_align, ctx);
 
             // For union bitfield members, set bit_offset to 0 (all fields start at byte 0)
             // and propagate bit_width so extraction is performed on read.
@@ -1160,6 +1269,7 @@ impl StructLayout {
             is_union: true,
             is_transparent_union: false,
             reverse_sso,
+            user_align,
         }
     }
 
@@ -1996,10 +2106,60 @@ impl CType {
             // Aligned as its compatible type: an 8-byte enum is 4-aligned on
             // i386 like `long long` (GCC 16.2 `_Alignof`, -m32).
             CType::Enum(e) => e.compatible_ctype().align_ctx(ctx),
-            // GCC vector_size alignment retains its target-specific cap.
-            CType::Vector(_, total_size) => (*total_size).min(16),
+            // GCC TYPE_ALIGN of a vector is its full size on x86 (struct
+            // layout, parameter passing, variable alignment, __alignof__);
+            // the 16-byte figure C11 _Alignof reports is a separate cap
+            // (`c11_alignof_ctx`), not the type's alignment.
+            CType::Vector(_, total_size) => vector_type_align(*total_size),
             // Clang ext_vector_type alignment follows its padded storage size.
             CType::ExtVector(_, layout) => layout.alignment,
+        }
+    }
+
+    /// GCC `TYPE_USER_ALIGN`: whether this type's alignment was raised by an
+    /// explicit request somewhere inside it (record attribute, `_Alignas`
+    /// field, nested such record, array of one). Typedef-level `aligned`
+    /// overrides are not part of `CType` and are handled by the callers that
+    /// consult `typedef_alignments`.
+    pub fn has_user_align(&self, ctx: &dyn StructLayoutProvider) -> bool {
+        match self {
+            CType::Array(elem, _) => elem.has_user_align(ctx),
+            CType::Struct(key) | CType::Union(key) => {
+                ctx.get_struct_layout(key).is_some_and(|l| l.user_align)
+            }
+            _ => false,
+        }
+    }
+
+    /// C11 `_Alignof(type)` — GCC's `min_align_of_type`: the type's
+    /// alignment, capped at `BIGGEST_ALIGNMENT` unless the type is
+    /// user-aligned. The cap only ever bites for GCC `vector_size` types
+    /// wider than the enabled vector ISA (and records/arrays containing one):
+    /// `_Alignof(v32)` is 16 by default, 32 under `-mavx`; `__alignof__(v32)`
+    /// and the struct-layout/ABI alignment stay 32 (GCC 16.2, -m64 and -m32).
+    /// Clang `ext_vector_type` types are not capped (Clang has no such rule
+    /// and GCC has no such type), nor is `_Alignof(expr)` — GCC's
+    /// `c_alignof_expr` reads the uncapped `DECL_ALIGN`/`TYPE_ALIGN`.
+    pub fn c11_alignof_ctx(&self, ctx: &dyn StructLayoutProvider) -> usize {
+        let align = self.align_ctx(ctx);
+        let cap = target_biggest_alignment();
+        if align <= cap || !self.contains_gnu_vector(ctx) || self.has_user_align(ctx) {
+            align
+        } else {
+            cap
+        }
+    }
+
+    /// Whether a GCC `vector_size` type occurs inside this type (directly, as
+    /// an array element, or as a record member at any depth).
+    fn contains_gnu_vector(&self, ctx: &dyn StructLayoutProvider) -> bool {
+        match self {
+            CType::Vector(..) => true,
+            CType::Array(elem, _) => elem.contains_gnu_vector(ctx),
+            CType::Struct(key) | CType::Union(key) => ctx
+                .get_struct_layout(key)
+                .is_some_and(|l| l.fields.iter().any(|f| f.ty.contains_gnu_vector(ctx))),
+            _ => false,
         }
     }
 

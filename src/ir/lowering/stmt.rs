@@ -411,6 +411,7 @@ impl Lowerer {
         if explicit_align > 0 {
             local_info.var.explicit_alignment = Some(explicit_align);
         }
+        local_info.var.type_align = self.typedef_alignment_for_type_spec(type_spec).copied();
         local_info.vla_size = vla_size;
         if vla_size.is_some() {
             let strides = self.compute_vla_local_strides(type_spec, &declarator.derived);
@@ -670,11 +671,13 @@ impl Lowerer {
             is_thread_local: decl.is_thread_local(),
         });
 
+        let type_align = self.typedef_alignment_for_type_spec(type_spec).copied();
         // Update the pre-registered global info with explicit alignment if present
-        if let Some(ea) = explicit_align {
-            if let Some(ginfo) = self.globals.get_mut(&static_name) {
+        if let Some(ginfo) = self.globals.get_mut(&static_name) {
+            if let Some(ea) = explicit_align {
                 ginfo.var.explicit_alignment = Some(ea);
             }
+            ginfo.var.type_align = type_align;
         }
 
         // Store type info in locals (with static_global_name set so each use site
@@ -683,6 +686,7 @@ impl Lowerer {
         if let Some(ea) = explicit_align {
             local_info.var.explicit_alignment = Some(ea);
         }
+        local_info.var.type_align = type_align;
         self.insert_local_scoped(declarator.name.clone(), local_info);
         self.next_static_local += 1;
 

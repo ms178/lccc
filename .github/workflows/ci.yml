@@ -584,6 +584,8 @@ jobs:
       run: python3 tests/regression/check_vector_arg_forms.py --lccc target/fastbuild/lccc --cc gcc-16
     - name: Wide-vector ABI debt (latched)
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_vector_abi_wide.sh
+    - name: GNU vector_size alignment model and MEMORY-class vector argument ABI against GCC 16
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_gnu_vector_align_abi.sh
     - name: LCCC vs GCC compatibility suite
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_compat_suite.sh
     - name: IVSR/univsr loop-strength-reduction probe contracts

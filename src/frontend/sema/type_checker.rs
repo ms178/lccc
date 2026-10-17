@@ -940,11 +940,11 @@ impl<'a> ExprTypeChecker<'a> {
                         .align_ctx(&*self.types.borrow_struct_layouts());
                     natural.max(typedef_alignment(ts).unwrap_or(0))
                 });
-                let alignment = crate::common::types::strictest_alignment([
-                    f.alignment,
-                    typedef_alignment(&f.type_spec),
-                    alignas_type,
-                ]);
+                let alignment =
+                    crate::common::types::strictest_alignment([f.alignment, alignas_type]);
+                // A typedef-level `aligned` REPLACES the type's alignment
+                // (it may lower it); see `StructField::type_align`.
+                let type_align = typedef_alignment(&f.type_spec);
                 Some(StructField {
                     name: f.name.clone().unwrap_or_default(),
                     ty,
@@ -953,6 +953,7 @@ impl<'a> ExprTypeChecker<'a> {
                         .as_ref()
                         .and_then(|bw| self.eval_const_expr(bw).map(|v| v as u32)),
                     alignment,
+                    type_align,
                     is_packed: f.is_packed,
                     base_volatile: f.base_volatile,
                     object_volatile: f.object_volatile,
@@ -978,13 +979,7 @@ impl<'a> ExprTypeChecker<'a> {
         };
 
         // Apply struct-level __attribute__((aligned(N)))
-        if let Some(a) = struct_aligned {
-            if a > layout.align {
-                layout.align = a;
-                let mask = layout.align - 1;
-                layout.size = (layout.size + mask) & !mask;
-            }
-        }
+        layout.apply_struct_aligned(struct_aligned);
 
         let id = self.types.next_anon_struct_id();
         let key = format!("__anon_struct_{}", id);
