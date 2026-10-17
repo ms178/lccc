@@ -359,14 +359,18 @@ pub fn param_decl_to_ctype_with(
         // per declarator star — the parenthesised group's own stars
         // (`long (**op)(req)` has two) AND any leading stars (`long *(*op)(req)`
         // has one, and it qualifies the RETURN pointer). fptr_inner_ptr_depth
-        // counts the parenthesised group's stars, so exactly that many levels
-        // come off before the function type; the remainder stays on the return.
-        // The old single strip turned `long (**op)(req)` into a function
-        // RETURNING long* at one level too few (crypto/ahash.c
-        // ahash_do_req_chain's `int (*const *op)(struct ahash_request *)`).
+        // counts the parenthesised group's stars — 0 when the parameter list
+        // directly follows a leading star (`void *lookup_elem(struct bpf_map *,
+        // u32)`, a function parameter decaying to a pointer) — so strip
+        // max(that, 1) levels: one for the implicit is_func_ptr wrap, plus the
+        // extra group stars. The old single strip turned `long (**op)(req)`
+        // into a function RETURNING long* one level short
+        // (crypto/ahash.c ahash_do_req_chain); stripping zero made
+        // `void *f(map, u32)` return void** (kernel/bpf/devmap.c
+        // __bpf_xdp_redirect_map's lookup_elem).
         let return_ctype = resolve(&param.type_spec);
         let mut actual_return = return_ctype;
-        for _ in 0..param.fptr_inner_ptr_depth {
+        for _ in 0..param.fptr_inner_ptr_depth.max(1) {
             if let CType::Pointer(inner, _) = actual_return {
                 actual_return = *inner;
             } else {
