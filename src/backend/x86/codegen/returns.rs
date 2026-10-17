@@ -6,12 +6,6 @@ use crate::common::types::IrType;
 use crate::ir::reexports::{IrConst, Operand, Value};
 
 impl X86Codegen {
-    /// True when `val` is the value the FP machinery materialised directly in
-    /// %xmm0 instead of through a spill slot.
-    fn is_direct_fp_result(&self, val: &Operand) -> bool {
-        matches!(val, Operand::Value(v) if self.state.direct_fp_result == Some(v.0))
-    }
-
     pub(super) fn emit_return_impl(&mut self, val: Option<&Operand>, frame_size: i64) {
         use crate::backend::state::SlotAddr;
         if let Some(val) = val {
@@ -19,30 +13,9 @@ impl X86Codegen {
             if matches!(
                 ret_ty,
                 IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64
-            ) && self.is_direct_fp_result(val)
+            ) && matches!(val, Operand::Value(v)
+                    if self.state.direct_fp_result == Some(v.0))
             {
-                // The fast path requires the FP result to actually sit in
-                // %xmm0. `direct_fp_result` marks a value the FP machinery
-                // produced in *some* XMM register, and with an SSE-class
-                // vector return the register allocator is free to pick
-                // another one (measured: lccc -O1 `abi_f64x1` returned %xmm2
-                // and the lccc->lccc leg of check_ext_vector_abi.sh failed),
-                // so an explicit home elsewhere must go through the FP loader.
-                // `fresh_home_of` is not authoritative here: it can report the
-                // intended %xmm0 while the emitter materialised another XMM.
-                //
-                // An ABSENT assignment is different: every producer of
-                // `direct_fp_result` writes %xmm0 by construction
-                // (`emit_fixed_distance` and friends). Those values never get
-                // a slot, so diverting them through the loader read an
-                // unwritten slot and returned 0.0 for the packed f32x8/f64x4
-                // distance kernels at -O2.
-                if let Operand::Value(v) = val {
-                    let home = self.reg_assignments.get(&v.0).copied();
-                    if home.is_some_and(|reg| reg != super::machinst::XMM0_SCRATCH) {
-                        self.load_fp_to_xmm0(val, ret_ty);
-                    }
-                }
                 self.emit_epilogue_and_ret_impl(frame_size);
                 return;
             }
@@ -155,23 +128,6 @@ impl X86Codegen {
         ) {
             if let Some(val) = val {
                 self.load_fp_to_xmm0(val, ret_ty);
-            }
-            self.emit_epilogue_and_ret_impl(frame_size);
-            return;
-        }
-        // AUD-VABI-2: an 8-byte vector return is ONE SSE eightbyte — the low 64
-        // bits of %xmm0 — not an accumulator return. The IR carries the bit
-        // container as I64/U64, so the generic path below would hand the value
-        // back in %rax; clang-19 and gcc-16 both keep it in %xmm0 (measured:
-        // `id_u32x2`, `id_u64x1`, `id_f32x2`, `id_f64x1` are all a bare `ret`
-        // with the argument register also being the return register). Clang's
-        // caller reads %xmm0, so an %rax return is a silent ABI mismatch.
-        if self.func_ret_classes.len() == 1
-            && self.func_ret_classes[0] == crate::common::types::EightbyteClass::Sse
-            && matches!(ret_ty, IrType::I64 | IrType::U64)
-        {
-            if let Some(val) = val {
-                self.load_bits64_to_xmm0(val);
             }
             self.emit_epilogue_and_ret_impl(frame_size);
             return;
