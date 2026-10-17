@@ -61,7 +61,10 @@ pub fn eval_literal(expr: &Expr) -> Option<IrConst> {
     }
 }
 
-/// Evaluate a compile-time builtin function call in a constant expression.
+/// Evaluate compiler builtins in constant expressions while honoring
+/// `-fno-builtin` for ordinary hosted-library aliases. Explicit
+/// `__builtin_*` spellings remain available in both hosted and freestanding
+/// modes.
 ///
 /// Handles all pure builtins that can be folded at compile time:
 /// - __builtin_choose_expr, __builtin_constant_p, __builtin_expect
@@ -71,17 +74,6 @@ pub fn eval_literal(expr: &Expr) -> Option<IrConst> {
 /// - __builtin_parity{,l,ll}, __builtin_clrsb{,l,ll}
 ///
 /// `eval_fn` is the caller's recursive eval_const_expr function.
-pub fn eval_builtin_call(
-    name: &str,
-    args: &[Expr],
-    eval_fn: &dyn Fn(&Expr) -> Option<IrConst>,
-) -> Option<IrConst> {
-    eval_builtin_call_with_mode(name, args, eval_fn, true)
-}
-
-/// Evaluate builtins while honoring `-fno-builtin` for ordinary library names.
-/// Explicit `__builtin_*` spellings remain available in both hosted and
-/// freestanding modes.
 pub fn eval_builtin_call_with_mode(
     name: &str,
     args: &[Expr],

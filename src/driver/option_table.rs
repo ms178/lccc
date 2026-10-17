@@ -97,6 +97,17 @@ pub(super) fn lookup(arg: &str) -> Option<Contract> {
         "LTO IR production and link-time consumption are not implemented."
     } else if arg.starts_with("-fsanitize") {
         "The requested sanitizer instrumentation is not implemented."
+    } else if arg.starts_with("-fno-profile")
+        || matches!(
+            arg,
+            "-fno-auto-profile" | "-fno-test-coverage" | "-fno-branch-probabilities"
+        )
+    {
+        "Disabling individual profile modes is not implemented."
+    } else if arg.starts_with("-finstrument-functions-exclude-file-list")
+        || arg.starts_with("-finstrument-functions-exclude-function-list")
+    {
+        "Function-instrumentation exclusion lists are not implemented."
     } else if arg.starts_with("-fvisibility=") {
         "Default symbol visibility selection is not implemented."
     } else {
@@ -123,8 +134,14 @@ mod tests {
             "-flto=auto",
             "-fsanitize=address",
             "-fvisibility=hidden",
+            "-fno-profile-arcs",
+            "-fno-test-coverage",
+            "-fno-branch-probabilities",
+            "-fno-auto-profile",
+            "-finstrument-functions-exclude-file-list=generated.c",
+            "-finstrument-functions-exclude-function-list=helper",
         ] {
-            assert_eq!(lookup(flag).unwrap().class, Class::Refused);
+            assert_eq!(lookup(flag).unwrap().class, Class::Refused, "{flag}");
         }
         assert!(lookup("-fdefinitely-not-a-flag").is_none());
     }
