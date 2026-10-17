@@ -21,7 +21,7 @@ for flag in \
     -fno-profile-arcs -fno-test-coverage -fno-branch-probabilities -fno-auto-profile \
     -finstrument-functions-exclude-file-list=generated.c \
     -finstrument-functions-exclude-function-list=helper \
-    -fprofile-update=unknown -fdiagnostics-color=unknown \
+    -fprofile-update=unknown -fdiagnostics-color=unknown -fprofile-dir= \
     -fpatchable-function-entry=bogus -fpatchable-function-entry=2,0,1 \
     -fpatchable-function-entry=1,2; do
     for order in before after; do
@@ -36,6 +36,25 @@ for flag in \
 done
 for flag in -fno-stack-protector -fno-stack-clash-protection -fno-lto -fsanitize=none -fno-strict-aliasing -fno-trapv; do
     "$CCC" "$flag" -c "$td/plain.c" -o "$td/noop.o"
+done
+
+cat > "$td/pgo.c" <<'EOF'
+int main(void) { return 0; }
+EOF
+for order in before after; do
+    profile_dir="$td/pgo-$order"
+    mkdir -p "$profile_dir"
+    if [[ $order == before ]]; then
+        pgo_flags=(-fprofile-dir="$profile_dir" -fprofile-generate)
+    else
+        pgo_flags=(-fprofile-generate -fprofile-dir="$profile_dir")
+    fi
+    "$CCC" "${pgo_flags[@]}" "$td/pgo.c" -o "$td/pgo-$order.bin"
+    "$td/pgo-$order.bin"
+    if [[ -z $(find "$profile_dir" -maxdepth 1 -name '*.profraw' -print -quit) ]]; then
+        echo "FAIL: -fprofile-dir before/after -fprofile-generate wrote no profile in $profile_dir" >&2
+        exit 1
+    fi
 done
 
 cat > "$td/hosted.c" <<'EOF'

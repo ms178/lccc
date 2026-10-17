@@ -1055,6 +1055,9 @@ impl Driver {
     /// Parse the main argument list (everything after argv[0]).
     fn parse_main_args(&mut self, args: &[String]) -> Result<(), String> {
         let mut explicit_language: Option<String> = None;
+        // Sticky profile directory: GCC applies -fprofile-dir regardless of
+        // whether it appears before or after a profile-use/generate switch.
+        let mut pgo_profile_dir: Option<String> = None;
         let mut i = 0;
         while i < args.len() {
             // x86 ISA flags are routed through the shared applicator FIRST:
@@ -1846,7 +1849,10 @@ impl Driver {
                 }
 
                 // PGO flags (instrumented profiling)
-                "-fprofile-generate" => self.pgo_generate = Some(".".to_string()),
+                "-fprofile-generate" => {
+                    self.pgo_generate =
+                        Some(pgo_profile_dir.clone().unwrap_or_else(|| ".".to_string()));
+                }
                 arg if arg.starts_with("-fprofile-generate=") => {
                     let path = arg["-fprofile-generate=".len()..].to_string();
                     self.pgo_generate = Some(if path.is_empty() {
@@ -1855,7 +1861,9 @@ impl Driver {
                         path
                     });
                 }
-                "-fprofile-use" => self.pgo_use = Some(".".to_string()),
+                "-fprofile-use" => {
+                    self.pgo_use = Some(pgo_profile_dir.clone().unwrap_or_else(|| ".".to_string()));
+                }
                 arg if arg.starts_with("-fprofile-use=") => {
                     let path = arg["-fprofile-use=".len()..].to_string();
                     self.pgo_use = Some(if path.is_empty() {
@@ -1864,8 +1872,10 @@ impl Driver {
                         path
                     });
                 }
-                "-fprofile-arcs" => self.pgo_generate = Some(".".to_string()),
-                "-ftest-coverage" => self.pgo_generate = Some(".".to_string()),
+                "-fprofile-arcs" | "-ftest-coverage" => {
+                    self.pgo_generate =
+                        Some(pgo_profile_dir.clone().unwrap_or_else(|| ".".to_string()));
+                }
                 arg if arg.starts_with("-fprofile-update=") => {
                     // GCC 7+/LLVM 17+ semantics: single (default, non-atomic),
                     // atomic (lock-prefixed), prefer-atomic (atomic when the
@@ -1883,10 +1893,17 @@ impl Driver {
                     });
                 }
                 "-fbranch-probabilities" => {
-                    self.pgo_use = Some(self.pgo_use.clone().unwrap_or_else(|| ".".to_string()))
+                    if self.pgo_use.is_none() {
+                        self.pgo_use =
+                            Some(pgo_profile_dir.clone().unwrap_or_else(|| ".".to_string()));
+                    }
                 }
                 arg if arg.starts_with("-fprofile-dir=") => {
                     let path = arg["-fprofile-dir=".len()..].to_string();
+                    if path.is_empty() {
+                        return Err(format!("{}: profile directory must not be empty", arg));
+                    }
+                    pgo_profile_dir = Some(path.clone());
                     if self.pgo_generate.is_some() {
                         self.pgo_generate = Some(path.clone());
                     }
@@ -1894,7 +1911,9 @@ impl Driver {
                         self.pgo_use = Some(path);
                     }
                 }
-                "-fauto-profile" => self.pgo_use = Some(".".to_string()),
+                "-fauto-profile" => {
+                    self.pgo_use = Some(pgo_profile_dir.clone().unwrap_or_else(|| ".".to_string()));
+                }
                 arg if arg.starts_with("-fauto-profile=") => {
                     let path = arg["-fauto-profile=".len()..].to_string();
                     self.pgo_use = Some(path);
@@ -2420,6 +2439,72 @@ mod cli_tests {
         .unwrap();
         assert!(!d.freestanding);
         assert!(!d.no_builtins);
+    }
+
+    #[test]
+    fn profile_directory_is_order_independent_and_mode_paths_override_in_order() {
+        let cases: &[(&[&str], Option<&str>, Option<&str>)] = &[
+            (
+                &["-fprofile-dir=/tmp/profile", "-fprofile-generate"],
+                Some("/tmp/profile"),
+                None,
+            ),
+            (
+                &["-fprofile-generate", "-fprofile-dir=/tmp/profile"],
+                Some("/tmp/profile"),
+                None,
+            ),
+            (
+                &["-fprofile-dir=/tmp/profile", "-fprofile-use"],
+                None,
+                Some("/tmp/profile"),
+            ),
+            (
+                &["-fprofile-use", "-fprofile-dir=/tmp/profile"],
+                None,
+                Some("/tmp/profile"),
+            ),
+            (
+                &[
+                    "-fprofile-dir=/tmp/profile",
+                    "-fprofile-generate=/tmp/generate",
+                ],
+                Some("/tmp/generate"),
+                None,
+            ),
+            (
+                &[
+                    "-fprofile-generate=/tmp/generate",
+                    "-fprofile-dir=/tmp/profile",
+                ],
+                Some("/tmp/profile"),
+                None,
+            ),
+            (
+                &["-fprofile-dir=/tmp/profile", "-fprofile-use=/tmp/use"],
+                None,
+                Some("/tmp/use"),
+            ),
+            (
+                &["-fprofile-use=/tmp/use", "-fprofile-dir=/tmp/profile"],
+                None,
+                Some("/tmp/profile"),
+            ),
+        ];
+        for &(flags, expected_generate, expected_use) in cases {
+            let mut args = vec!["ccc".to_string()];
+            args.extend(flags.iter().map(|flag| (*flag).to_string()));
+            args.push("x.c".to_string());
+            let mut driver = Driver::new();
+            driver.parse_cli_args(&args).unwrap();
+            assert_eq!(
+                driver.pgo_generate.as_deref(),
+                *expected_generate,
+                "{flags:?}"
+            );
+            assert_eq!(driver.pgo_use.as_deref(), *expected_use, "{flags:?}");
+        }
+        assert!(try_flag("-fprofile-dir=").is_err());
     }
 
     #[test]
