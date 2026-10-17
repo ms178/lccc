@@ -3227,10 +3227,10 @@ mod cli_tests {
             driver.parse_cli_args(&args).unwrap();
             assert_eq!(
                 driver.pgo_generate.as_deref(),
-                *expected_generate,
+                expected_generate,
                 "{flags:?}"
             );
-            assert_eq!(driver.pgo_use.as_deref(), *expected_use, "{flags:?}");
+            assert_eq!(driver.pgo_use.as_deref(), expected_use, "{flags:?}");
         }
         assert!(try_flag("-fprofile-dir=").is_err());
     }
