@@ -518,8 +518,8 @@ impl Lowerer {
             let effective_packed = *is_packed
                 || name
                     .as_ref()
-                    .and_then(|n| self.types.packed_enum_types.get(n))
-                    .is_some();
+                    .and_then(|n| self.types.enum_types.get(n))
+                    .is_some_and(|enum_type| enum_type.is_packed);
             if effective_packed {
                 let ctype = self.type_spec_to_ctype(ts);
                 return ctype.size_ctx(&*self.types.borrow_struct_layouts());

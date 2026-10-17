@@ -513,37 +513,33 @@ impl type_builder::TypeConvertContext for Lowerer {
         variants: &Option<Vec<EnumVariant>>,
         is_packed: bool,
     ) -> CType {
-        // Check if this is a forward reference to a known packed enum
-        let effective_packed = is_packed
-            || name
-                .as_ref()
-                .and_then(|n| self.types.packed_enum_types.get(n))
-                .is_some();
+        // Body-less references reuse the definition visible in this scope.
+        // Besides packed size, its values carry the signedness chosen for the
+        // enum's compatible integer type (a negative value means `int`; an
+        // all-nonnegative enum through UINT_MAX means `unsigned int`).
+        let completed = name.as_ref().and_then(|n| self.types.enum_types.get(n));
+        let effective_packed = is_packed || completed.is_some_and(|et| et.is_packed);
         if !effective_packed {
-            // Non-packed enum: normally int (4 bytes), but if any variant
-            // value exceeds i32 range while fitting in u32, use unsigned int.
-            // Values like `1U << 31` (0x80000000) require unsigned int.
-            let needs_unsigned = if let Some(vars) = variants {
+            let variant_values = if let Some(vars) = variants {
+                let mut values = Vec::with_capacity(vars.len());
                 let mut next_val: i64 = 0;
-                let mut result = false;
                 for v in vars {
                     if let Some(val) = self.enum_variant_value(v) {
                         next_val = val;
                     }
-                    if next_val > i32::MAX as i64 {
-                        result = true;
-                    }
+                    values.push((v.name.clone(), next_val));
                     next_val += 1;
                 }
-                result
+                values
             } else {
-                false
+                completed.map(|et| et.variants.clone()).unwrap_or_default()
             };
-            return if needs_unsigned {
-                CType::UInt
-            } else {
-                CType::Int
-            };
+            return crate::common::types::EnumType {
+                name: name.clone(),
+                variants: variant_values,
+                is_packed: false,
+            }
+            .compatible_ctype();
         }
         // For packed enums, compute the minimum integer type from variant values
         let variant_values: Vec<i64> = if let Some(vars) = variants {
@@ -559,7 +555,7 @@ impl type_builder::TypeConvertContext for Lowerer {
             values
         } else if let Some(n) = name {
             // Forward reference: look up stored packed enum info
-            if let Some(et) = self.types.packed_enum_types.get(n) {
+            if let Some(et) = self.types.enum_types.get(n) {
                 et.variants.iter().map(|(_, v)| *v).collect()
             } else {
                 return CType::Char; // packed enum with no known variants, default 1 byte

@@ -177,7 +177,7 @@ continues to extend it (e.g., adding struct layouts discovered during lowering).
 | `func_ptr_typedefs` | `FxHashSet<String>` | Set of typedef names that are function pointer types. |
 | `func_ptr_typedef_info` | `FxHashMap<String, FunctionTypedefInfo>` | Function pointer typedef metadata. |
 | `enum_typedefs` | `FxHashSet<String>` | Typedef names that alias enum types (for unsigned bitfield treatment). |
-| `packed_enum_types` | `FxHashMap<String, EnumType>` | Packed enum definitions for forward-reference size lookups. |
+| `enum_types` | `FxHashMap<String, EnumType>` | Completed named enum definitions for body-less references; scope-popped so shadowed tags cannot leak. |
 | `func_return_ctypes` | `FxHashMap<String, CType>` | Cached return types for known functions. |
 | `ctype_cache` | `RefCell<FxHashMap<String, CType>>` | Cache for named struct/union CType resolution. |
 | `scope_stack` | `RefCell<Vec<TypeScopeFrame>>` | Undo-log frames for scope management. |

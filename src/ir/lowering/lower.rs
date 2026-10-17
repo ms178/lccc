@@ -2625,18 +2625,19 @@ impl Lowerer {
                     variant_values.push((variant.name.clone(), next_val));
                     next_val += 1;
                 }
-                // Store packed enum info for forward-reference lookups
-                if *is_packed {
-                    if let Some(tag) = name {
-                        self.types.packed_enum_types.insert(
-                            tag.clone(),
-                            crate::common::types::EnumType {
-                                name: Some(tag.clone()),
-                                variants: variant_values,
-                                is_packed: true,
-                            },
-                        );
-                    }
+                // Keep completed definitions available for later body-less
+                // references, including non-packed enums whose negative
+                // values determine signed/unsigned compatibility.  The shared
+                // type context tracks tag shadowing on its lexical scope stack.
+                if let Some(tag) = name {
+                    self.types.insert_enum_type_scoped(
+                        tag.clone(),
+                        crate::common::types::EnumType {
+                            name: Some(tag.clone()),
+                            variants: variant_values,
+                            is_packed: *is_packed,
+                        },
+                    );
                 }
             }
             TypeSpecifier::Struct(_, Some(fields), ..)

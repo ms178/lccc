@@ -1077,6 +1077,10 @@ gate "regression-corpus-link" fast \
 # answer is 300) with every corpus and unit test green.
 gate "record-tag-identity" fast \
     env CCC="$LCCC" bash tests/regression/check_record_tag_identity.sh
+gate "enum-tag-scope-compat" fast \
+    env CCC="$LCCC" bash tests/regression/check_enum_tag_scope_compat.sh
+gate "strlen-embedded-nul" fast \
+    env CCC="$LCCC" bash tests/regression/check_strlen_embedded_nul.sh
 
 gate "copy-alias-sizes" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_copy_alias_sizes.sh

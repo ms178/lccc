@@ -787,7 +787,7 @@ impl<'a> ExprTypeChecker<'a> {
                     }
                     vals
                 } else if let Some(n) = name {
-                    if let Some(et) = self.types.packed_enum_types.get(n) {
+                    if let Some(et) = self.types.enum_types.get(n) {
                         et.variants.iter().map(|(_, v)| *v).collect()
                     } else {
                         Vec::new()

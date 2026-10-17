@@ -893,7 +893,7 @@ impl<'a> SemaConstEval<'a> {
     ) -> crate::common::types::EnumType {
         // Try looking up previously registered packed enum
         if let Some(tag) = name {
-            if let Some(et) = self.types.packed_enum_types.get(tag) {
+            if let Some(et) = self.types.enum_types.get(tag) {
                 return et.clone();
             }
         }
@@ -1035,8 +1035,8 @@ impl<'a> SemaConstEval<'a> {
                 let effective_packed = *is_packed
                     || name
                         .as_ref()
-                        .and_then(|n| self.types.packed_enum_types.get(n))
-                        .is_some();
+                        .and_then(|n| self.types.enum_types.get(n))
+                        .is_some_and(|enum_type| enum_type.is_packed);
                 if !effective_packed {
                     Some(4)
                 } else {
@@ -1212,8 +1212,8 @@ impl<'a> SemaConstEval<'a> {
                 let effective_packed = *is_packed
                     || name
                         .as_ref()
-                        .and_then(|n| self.types.packed_enum_types.get(n))
-                        .is_some();
+                        .and_then(|n| self.types.enum_types.get(n))
+                        .is_some_and(|enum_type| enum_type.is_packed);
                 if !effective_packed {
                     4
                 } else {
@@ -1426,7 +1426,7 @@ fn ctype_from_type_spec(spec: &TypeSpecifier, types: &TypeContext) -> CType {
         TypeSpecifier::Enum(name, variants, true) => {
             // Packed enum: look up from type context or compute from variants
             if let Some(tag) = name {
-                if let Some(et) = types.packed_enum_types.get(tag) {
+                if let Some(et) = types.enum_types.get(tag) {
                     return CType::Enum(et.clone());
                 }
             }
