@@ -1799,7 +1799,6 @@ impl Lowerer {
         }
     }
 
-
     /// Vector `++`/`--` for byte-strided `vector_size` objects.
     ///
     /// This is the historical lowering, kept byte-for-byte: each lane is

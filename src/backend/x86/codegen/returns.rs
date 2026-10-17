@@ -16,8 +16,10 @@ impl X86Codegen {
         use crate::backend::state::SlotAddr;
         if let Some(val) = val {
             let ret_ty = self.current_return_type;
-            if matches!(ret_ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64)
-                && self.is_direct_fp_result(val)
+            if matches!(
+                ret_ty,
+                IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64
+            ) && self.is_direct_fp_result(val)
             {
                 // The fast path requires the FP result to actually sit in
                 // %xmm0. `direct_fp_result` marks a value the FP machinery
