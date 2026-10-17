@@ -2377,9 +2377,23 @@ impl CType {
         }
     }
 
-    /// Whether this is an arithmetic type (integer, floating-point, or complex).
+    /// Whether values of this type live in an integer carrier and take
+    /// their arithmetic, comparisons, conversions and truthiness from
+    /// library helpers: the decimal types (libbid) and _Float128 (libgcc
+    /// soft-float). Raw IR integer operations on such a carrier are wrong.
+    pub fn is_soft_float(&self) -> bool {
+        self.is_decimal() || matches!(self, CType::Float128)
+    }
+
+    /// Whether this is an arithmetic type (integer, real floating, or
+    /// complex). _Float128 is a real floating type (C23 6.2.5) and so
+    /// arithmetic, although `is_floating()` excludes it: that predicate
+    /// gates hardware FP codegen, which binary128 never reaches.
     pub fn is_arithmetic(&self) -> bool {
-        self.is_integer() || self.is_floating() || self.is_complex()
+        self.is_integer()
+            || self.is_floating()
+            || matches!(self, CType::Float128)
+            || self.is_complex()
     }
 
     /// SysV AMD64 by-value argument convention of a struct, union or vector
@@ -2933,6 +2947,18 @@ impl CType {
                 return r.clone();
             }
             // one decimal + one binary float: binary float wins (see above)
+        }
+
+        // _Float128 (IEEE binary128) holds every value of every standard
+        // floating type on every lccc target (x87 extended has the same
+        // exponent range and 64 < 113 significand bits; elsewhere long
+        // double is binary128 itself or double), so it is the common type of
+        // any mix with a real arithmetic type, integers included (C23
+        // 6.3.1.8; GCC: the interchange type wins over a long double of the
+        // same format). Without this arm a float or double operand won and
+        // an integer one was ranked like `int`.
+        if matches!(&l, CType::Float128) || matches!(&r, CType::Float128) {
+            return CType::Float128;
         }
 
         // Non-complex: standard type hierarchy

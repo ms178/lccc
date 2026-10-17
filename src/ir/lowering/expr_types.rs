@@ -431,8 +431,10 @@ impl Lowerer {
             "__builtin_inf" | "__builtin_huge_val" => Some(IrType::F64),
             "__builtin_inff" | "__builtin_huge_valf" => Some(IrType::F32),
             "__builtin_infl" | "__builtin_huge_vall" => Some(IrType::F128),
+            // _Float128 constants are binary128 bit patterns in the U128
+            // carrier (F128 is the x87 long double type).
             "__builtin_inff128" | "__builtin_huge_valf128" | "__builtin_nanf128" => {
-                Some(IrType::F128)
+                Some(IrType::U128)
             }
             "__builtin_nan" => Some(IrType::F64),
             "__builtin_nanf" => Some(IrType::F32),

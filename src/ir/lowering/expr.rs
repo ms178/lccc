@@ -184,11 +184,11 @@ impl Lowerer {
     /// For complex types, tests (real != 0) || (imag != 0) per C11 6.3.1.2.
     pub(super) fn lower_condition_expr(&mut self, expr: &Expr) -> Operand {
         let expr_ct = self.expr_ctype(expr);
-        if expr_ct.is_decimal() {
-            // C23 decimal truthiness: `if (d)` is `(d != 0)` under decimal
-            // semantics (so -0 tests false like +0).
+        if expr_ct.is_soft_float() {
+            // Decimal / _Float128 truthiness: `if (d)` is `(d != 0)` under the
+            // type's semantics (so -0 tests false like +0).
             let val = self.lower_expr(expr);
-            return self.lower_decimal_truthiness(val, &expr_ct);
+            return self.lower_soft_float_truthiness(val, &expr_ct);
         }
         if expr_ct.is_complex() {
             let val = self.lower_expr(expr);

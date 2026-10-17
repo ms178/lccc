@@ -430,7 +430,7 @@ impl Lowerer {
         // runtime path emits `val != 0`; the fold must mirror it, including
         // NaN -> 1, ±0.0 -> 0, negative integers -> 1).  Decimal constants
         // fold through BID-decoded truthiness (+0 == -0), exactly what the
-        // runtime lower_decimal_truthiness computes.
+        // runtime lower_soft_float_truthiness computes.
         if target_ct == CType::Bool {
             let is_nonzero = match &src_val {
                 IrConst::F32(v) => *v != 0.0,

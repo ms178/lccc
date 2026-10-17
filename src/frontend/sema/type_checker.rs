@@ -1110,6 +1110,13 @@ impl<'a> ExprTypeChecker<'a> {
             | "__builtin_fabsl"
             | "__builtin_nextafterl" => Some(CType::LongDouble),
 
+            // _Float128 builtins (sema/builtins.rs): binary128 results.
+            "__builtin_inff128"
+            | "__builtin_huge_valf128"
+            | "__builtin_nanf128"
+            | "__builtin_copysignf128"
+            | "__builtin_fabsf128" => Some(CType::Float128),
+
             // Integer-returning builtins
             "__builtin_fpclassify"
             | "__builtin_isnan"

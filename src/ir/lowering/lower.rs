@@ -2341,16 +2341,13 @@ impl Lowerer {
             return self.convert_decimal_scalar(src, src_ty, src_ct, target_ct);
         }
         if *target_ct == CType::Float128 {
-            // A source that is ALREADY the 128-bit carrier — an I128 constant
-            // payload (a `1.5F128` literal or a `__builtin_*f128` result) or a
-            // U128-typed value (a _Float128 variable) — must be copied
-            // bit-exactly. Anything else is a genuine value conversion
-            // (double/int/... -> binary128) via the soft-float helpers.
-            // (An unsigned __int128 constant would also take the identity path
-            // instead of __floatuntitf — a rare corner.)
-            let already_carrier =
-                matches!(&src, Operand::Const(IrConst::I128(_))) || src_ty == IrType::U128;
-            if already_carrier {
+            // The C type decides: a _Float128 source (a variable, a `1.5F128`
+            // literal's I128 payload, a `__builtin_*f128` result) is already
+            // the binary128 carrier and is copied bit-exactly; every other
+            // source is a value conversion through the soft-float helpers.
+            // The IR type cannot decide, because unsigned __int128 shares
+            // the U128 carrier: `(_Float128)u128` must call __floatuntitf.
+            if *src_ct == CType::Float128 {
                 return src;
             }
             return self.convert_to_f128(src, src_ct);
@@ -2422,6 +2419,8 @@ impl Lowerer {
                     None,
                 )
             }
+            // An enum converts as its compatible integer type (C11 6.3.1.1).
+            CType::Enum(e) => return self.convert_to_f128(val, &e.compatible_ctype()),
             CType::Float128 => return val,
             _ => return val,
         };
@@ -2454,14 +2453,21 @@ impl Lowerer {
             CType::Double => ("__trunctfdf2", IrType::F64, Vec::new()),
             // x87 long double: returned in st(0) (the backend's F128 return path).
             CType::LongDouble => ("__trunctfxf2", IrType::F128, Vec::new()),
-            CType::Bool
-            | CType::Char
+            // Conversion to _Bool is `value != 0` (C11 6.3.1.2), not a
+            // truncation: (_Bool)0.5Q is 1, and a NaN is nonzero too.
+            CType::Bool => {
+                let truth = self.lower_soft_float_truthiness(val, &CType::Float128);
+                return self.emit_implicit_cast(truth, IrType::I32, IrType::from_ctype(to_ct));
+            }
+            // An enum converts as its compatible integer type.
+            CType::Enum(e) => return self.convert_from_f128(val, &e.compatible_ctype()),
+            CType::Char
             | CType::UChar
             | CType::Short
             | CType::UShort
             | CType::Int
             | CType::UInt => {
-                let signed = matches!(to_ct, CType::Bool | CType::Char | CType::Short | CType::Int);
+                let signed = matches!(to_ct, CType::Char | CType::Short | CType::Int);
                 (
                     if signed { "__fixtfsi" } else { "__fixunstfsi" },
                     IrType::I32,
@@ -2496,6 +2502,12 @@ impl Lowerer {
             ret_classes,
             false,
         );
+        // char/short results come back as the helper's int: narrow them to
+        // the target's own IR type so the operand type matches its C type.
+        let target_ir = IrType::from_ctype(to_ct);
+        if to_ct.is_integer() && target_ir != ret_ty {
+            return self.emit_implicit_cast(Operand::Value(dest), ret_ty, target_ir);
+        }
         Operand::Value(dest)
     }
 
@@ -3492,11 +3504,12 @@ impl Lowerer {
     ///
     /// The LHS is evaluated exactly once through the lvalue machinery (like
     /// the generic path); both sides convert to the UAC common type and the
-    /// operation runs through the libbid helpers. When UAC picks a binary
-    /// float (the decimal-vs-binary rule), the operation is a plain IR float
-    /// op on the converted values. The result converts back to the LHS type
-    /// before the store (mirroring `narrow_from_op`).
-    pub(super) fn lower_decimal_compound_assign(
+    /// operation runs through the libbid helpers (decimal common type) or
+    /// the libgcc soft-float helpers (_Float128). When UAC picks another
+    /// binary float (the decimal-vs-binary rule), the operation is a plain
+    /// IR float op on the converted values. The result converts back to the
+    /// LHS type before the store (mirroring `narrow_from_op`).
+    pub(super) fn lower_libcall_compound_assign(
         &mut self,
         op: &ast::BinOp,
         lhs: &Expr,
@@ -3513,29 +3526,7 @@ impl Lowerer {
             let l = self.convert_scalar_ctype(loaded, lhs_ir, lhs_ct, common_ct);
             let r = self.convert_scalar_ctype(rhs_val, rhs_ir, rhs_ct, common_ct);
             let common_ir = IrType::from_ctype(common_ct);
-            let result = if let Some(w) = Self::decimal_width(common_ct) {
-                let s = Self::dec_suffix(w);
-                let name = match op {
-                    ast::BinOp::Add => "add",
-                    ast::BinOp::Sub => "sub",
-                    ast::BinOp::Mul => "mul",
-                    ast::BinOp::Div => "div",
-                    _ => unreachable!("non-arithmetic decimal compound op: {op:?}"),
-                };
-                let dec_ty = Self::dec_ty(w);
-                self.emit_decimal_call(
-                    &format!("__bid_{name}{s}3"),
-                    vec![(l, dec_ty, w == 128), (r, dec_ty, w == 128)],
-                    dec_ty,
-                    w == 128,
-                )
-            } else {
-                // Binary-float common type: plain IR float arithmetic on the
-                // converted values (IrBinOp::{Add, Sub, Mul, Div} lower by
-                // operand type, exactly like the generic float path).
-                let ir_op = Self::binop_to_ir(*op, false);
-                self.emit_binop_val(ir_op, l, r, common_ir)
-            };
+            let result = self.emit_arith_in_ctype(op, l, r, common_ct);
             let store_val =
                 self.convert_scalar_ctype(Operand::Value(result), common_ir, common_ct, lhs_ct);
             self.store_lvalue_typed(&lv, store_val, lhs_ir);
@@ -3544,9 +3535,64 @@ impl Lowerer {
         rhs_val
     }
 
-    /// Truthiness test for a decimal operand (`x != 0` under decimal
-    /// semantics, where +0 == -0). Used by conditions and logical operators.
-    pub(super) fn lower_decimal_truthiness(&mut self, val: Operand, ct: &CType) -> Operand {
+    /// `l op r` for Add/Sub/Mul/Div with both operands already converted to
+    /// the floating common type `common_ct`: libbid helpers for a decimal
+    /// type, libgcc soft-float helpers for _Float128, a plain IR float op
+    /// otherwise (IrBinOp::{Add, Sub, Mul, Div} lower by operand type).
+    pub(super) fn emit_arith_in_ctype(
+        &mut self,
+        op: &ast::BinOp,
+        l: Operand,
+        r: Operand,
+        common_ct: &CType,
+    ) -> Value {
+        if let Some(w) = Self::decimal_width(common_ct) {
+            let s = Self::dec_suffix(w);
+            let name = match op {
+                ast::BinOp::Add => "add",
+                ast::BinOp::Sub => "sub",
+                ast::BinOp::Mul => "mul",
+                ast::BinOp::Div => "div",
+                _ => unreachable!("non-arithmetic decimal compound op: {op:?}"),
+            };
+            let dec_ty = Self::dec_ty(w);
+            return self.emit_decimal_call(
+                &format!("__bid_{name}{s}3"),
+                vec![(l, dec_ty, w == 128), (r, dec_ty, w == 128)],
+                dec_ty,
+                w == 128,
+            );
+        }
+        if *common_ct == CType::Float128 {
+            let helper = match op {
+                ast::BinOp::Add => "__addtf3",
+                ast::BinOp::Sub => "__subtf3",
+                ast::BinOp::Mul => "__multf3",
+                ast::BinOp::Div => "__divtf3",
+                _ => unreachable!("non-arithmetic _Float128 compound op: {op:?}"),
+            };
+            return self.emit_f128_binop_call(helper, l, r);
+        }
+        let ir_op = Self::binop_to_ir(*op, false);
+        self.emit_binop_val(ir_op, l, r, IrType::from_ctype(common_ct))
+    }
+
+    /// Truthiness test for a decimal or _Float128 operand (`x != 0` under
+    /// the type's own semantics: +0 == -0, and a NaN is true), as an I32
+    /// 0/1. Used by conditions, logical operators and conversion to _Bool.
+    /// Testing the integer carrier instead is wrong for -0 and, when the
+    /// test narrows the carrier, for every value whose low bits are zero.
+    pub(super) fn lower_soft_float_truthiness(&mut self, val: Operand, ct: &CType) -> Operand {
+        if *ct == CType::Float128 {
+            let ne = self.emit_f128_cmp_call("__netf2", val, Operand::Const(IrConst::I128(0)));
+            let z = self.emit_cmp_val(
+                IrCmpOp::Ne,
+                Operand::Value(ne),
+                Operand::Const(IrConst::I64(0)),
+                IrType::I32,
+            );
+            return Operand::Value(z);
+        }
         let Some(w) = Self::decimal_width(ct) else {
             return val;
         };

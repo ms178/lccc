@@ -262,11 +262,11 @@ impl Lowerer {
 
         // C standard: conversion to _Bool yields 0 or 1
         if target_ctype == CType::Bool {
-            if inner_ctype.is_decimal() {
-                // decimal zero test: +0 == -0 compares equal (IEEE 754
+            if inner_ctype.is_soft_float() {
+                // decimal / _Float128 zero test: +0 == -0 compares equal (IEEE 754
                 // totalOrder semantics do NOT apply here; plain ==/!= does)
                 let dsrc = self.lower_expr(inner);
-                return self.lower_decimal_truthiness(dsrc, &inner_ctype);
+                return self.lower_soft_float_truthiness(dsrc, &inner_ctype);
             }
             if from_ty.is_float() {
                 let zero = match from_ty {

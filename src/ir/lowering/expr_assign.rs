@@ -476,6 +476,18 @@ impl Lowerer {
         ))
     }
 
+    /// The C integer type of a promoted bitfield value's IR type.
+    fn promoted_int_ctype(ty: IrType) -> CType {
+        match ty {
+            IrType::U32 => CType::UInt,
+            IrType::I64 => CType::LongLong,
+            IrType::U64 => CType::ULongLong,
+            IrType::I128 => CType::Int128,
+            IrType::U128 => CType::UInt128,
+            _ => CType::Int,
+        }
+    }
+
     /// Try to lower compound assignment to a bitfield member (e.g., s.bf += val).
     pub(super) fn try_lower_bitfield_compound_assign(
         &mut self,
@@ -498,6 +510,50 @@ impl Lowerer {
 
         let rhs_val = self.lower_expr(rhs);
         let rhs_ty = self.value_ir_type(rhs);
+
+        // A floating right operand (binary, _Float128 or decimal) makes the
+        // floating type the common type (C11 6.5.16.2p3, 6.3.1.8): the field
+        // value converts to it, the operation runs there, and only the
+        // result converts back to the field. Converting the operand to the
+        // field's integer type first truncated it (`bf *= 0.5` gave 0, not
+        // bf / 2).
+        let rhs_ct = self.expr_ctype(rhs);
+        if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
+            && (rhs_ct.is_floating() || rhs_ct.is_soft_float())
+        {
+            let field_ct = Self::promoted_int_ctype(current_ty);
+            let common_ct = CType::usual_arithmetic_conversion(&field_ct, &rhs_ct);
+            let l = self.convert_scalar_ctype(current_val, current_ty, &field_ct, &common_ct);
+            let r = self.convert_scalar_ctype(rhs_val, rhs_ty, &rhs_ct, &common_ct);
+            let result = self.emit_arith_in_ctype(op, l, r, &common_ct);
+            let common_ir = IrType::from_ctype(&common_ct);
+            let store_val = if is_bool && common_ct.is_floating() {
+                // Conversion to _Bool is `!= 0` (C11 6.3.1.2), in the
+                // floating type itself.
+                let truth = self.emit_bool_normalize_typed(Operand::Value(result), common_ir);
+                self.emit_implicit_cast(truth, IrType::I32, storage_ty)
+            } else {
+                // _Float128 and decimal conversions to _Bool compare with
+                // zero themselves.
+                let target_ct = if is_bool { CType::Bool } else { field_ct };
+                let back = self.convert_scalar_ctype(
+                    Operand::Value(result),
+                    common_ir,
+                    &common_ct,
+                    &target_ct,
+                );
+                self.emit_implicit_cast(back, IrType::from_ctype(&target_ct), storage_ty)
+            };
+            self.store_bitfield(
+                field_addr, storage_ty, bit_offset, bit_width, store_val, is_vol, sso, seg,
+            );
+            return Some(self.truncate_to_bitfield_value(
+                store_val,
+                storage_ty,
+                bit_width,
+                storage_ty.is_signed(),
+            ));
+        }
 
         let is_unsigned = storage_ty.is_unsigned();
         let ir_op = Self::binop_to_ir(*op, is_unsigned);
@@ -1199,17 +1255,18 @@ impl Lowerer {
 
     /// Standard scalar compound assignment.
     fn lower_scalar_compound_assign(&mut self, op: &BinOp, lhs: &Expr, rhs: &Expr) -> Operand {
-        // C23 decimals: route Add/Sub/Mul/Div through the libbid helpers.
-        // Raw IR integer arithmetic on BID carriers (or raw IR casts) is a
-        // silent miscompile; remainder/bitwise/shift fall through to the
-        // generic path, mirroring lower_decimal_binop's `_` arm.
+        // C23 decimals and _Float128: route Add/Sub/Mul/Div through the
+        // libbid / soft-float helpers. Both live in integer carriers, so raw
+        // IR arithmetic or casts on them are a silent miscompile (`q += 1`
+        // added 1 to the bit pattern). Remainder, bitwise and shift operands
+        // of these types are constraint violations diagnosed by sema.
         if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
             let lhs_ct = self.expr_ctype(lhs);
             let rhs_ct = self.expr_ctype(rhs);
-            if lhs_ct.is_decimal() || rhs_ct.is_decimal() {
+            if lhs_ct.is_soft_float() || rhs_ct.is_soft_float() {
                 let common_ct = CType::usual_arithmetic_conversion(&lhs_ct, &rhs_ct);
                 return self
-                    .lower_decimal_compound_assign(op, lhs, rhs, &lhs_ct, &rhs_ct, &common_ct);
+                    .lower_libcall_compound_assign(op, lhs, rhs, &lhs_ct, &rhs_ct, &common_ct);
             }
         }
         let ty = self.get_expr_type(lhs);
@@ -1251,11 +1308,14 @@ impl Lowerer {
 
             let result = self.emit_binop_val(ir_op, loaded_promoted, actual_rhs, op_ty);
 
-            let store_val = self.narrow_from_op(Operand::Value(result), ty, lhs_ir_ty, op_ty);
+            // Conversion to _Bool is `result != 0` in the operation type
+            // (C11 6.3.1.2): normalizing after narrowing truncated first, so
+            // `b += 0.5` stored 0.
             let store_val = if self.is_bool_lvalue(lhs) {
-                self.emit_bool_normalize_typed(store_val, op_ty)
+                let truth = self.emit_bool_normalize_typed(Operand::Value(result), op_ty);
+                self.emit_implicit_cast(truth, IrType::I32, ty)
             } else {
-                store_val
+                self.narrow_from_op(Operand::Value(result), ty, lhs_ir_ty, op_ty)
             };
             self.store_lvalue_typed(&lv, store_val, ty);
             return store_val;
