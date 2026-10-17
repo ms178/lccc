@@ -4,6 +4,7 @@
 //! Extracted from expr.rs to keep expression lowering manageable.
 
 use super::lower::Lowerer;
+use crate::common::const_eval as shared_const_eval;
 use crate::common::types::{AddressSpace, CType, IrType, widened_op_type};
 use crate::frontend::parser::ast::{BinOp, Expr, PostfixOp, UnaryOp};
 use crate::ir::reexports::{
@@ -79,6 +80,42 @@ impl Lowerer {
             let rhs_dec = self.expr_ctype(rhs).is_decimal();
             if lhs_dec || rhs_dec {
                 return self.lower_decimal_binop(op, lhs, rhs);
+            }
+        }
+
+        // _Float128 constant arithmetic and comparisons fold exactly: the
+        // binary128 soft-float helpers round like libgcc's __addtf3, __lttf2
+        // & co. in round-to-nearest, so a constant operation need not become
+        // a library call. An observable floating-point environment keeps it
+        // at run time (the rounding mode or exception flags may differ).
+        if matches!(
+            op,
+            BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::Div
+                | BinOp::Eq
+                | BinOp::Ne
+                | BinOp::Lt
+                | BinOp::Le
+                | BinOp::Gt
+                | BinOp::Ge
+        ) && !self.pass_policy.fp_environment_observable
+        {
+            let (lct, rct) = (self.expr_ctype(lhs), self.expr_ctype(rhs));
+            let real = |ct: &CType| ct.is_arithmetic() && !ct.is_complex();
+            if (lct == CType::Float128 || rct == CType::Float128) && real(&lct) && real(&rct) {
+                if let Some(v) = self
+                    .eval_const_expr(lhs)
+                    .zip(self.eval_const_expr(rhs))
+                    .and_then(|(l, r)| {
+                        let a = shared_const_eval::f128_bytes_of(&l, Some(&lct))?;
+                        let b = shared_const_eval::f128_bytes_of(&r, Some(&rct))?;
+                        shared_const_eval::fold_f128_binop(op, &a, &b)
+                    })
+                {
+                    return Operand::Const(v);
+                }
             }
         }
 
@@ -996,7 +1033,7 @@ impl Lowerer {
             let common_ct = CType::usual_arithmetic_conversion(&then_ct, &else_ct);
             let common_ir = IrType::from_ctype(&common_ct);
             if let Some(const_val) = self.eval_const_expr(cond) {
-                let (live_expr, live_ct) = if const_val.is_nonzero() {
+                let (live_expr, live_ct) = if self.const_truth(&const_val, cond) {
                     (then_expr, &then_ct)
                 } else {
                     (else_expr, &else_ct)
@@ -1031,7 +1068,7 @@ impl Lowerer {
         // dead branches bloat the IR beyond inlining limits and cause linker
         // errors when always_inline functions can't be inlined.
         if let Some(const_val) = self.eval_const_expr(cond) {
-            let is_true = const_val.is_nonzero();
+            let is_true = self.const_truth(&const_val, cond);
             if is_true {
                 let then_val = self.lower_aggregate_rvalue(then_expr);
                 if result_is_complex {
@@ -1540,7 +1577,7 @@ impl Lowerer {
         for op in &ops {
             match self.eval_const_expr(op) {
                 Some(c) => {
-                    let truthy = c.is_nonzero();
+                    let truthy = self.const_truth(&c, op);
                     // `||` short-circuits on true; `&&` on false.
                     if truthy != is_and {
                         for &k in &kept {

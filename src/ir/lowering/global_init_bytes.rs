@@ -1700,8 +1700,7 @@ impl Lowerer {
             }
             if let Initializer::Expr(ref e) = item.init {
                 if let Some(val) = self.eval_const_expr(e) {
-                    let e_ty = self.get_expr_type(e);
-                    let val = self.coerce_const_to_type_with_src(val, elem_ir_ty, e_ty);
+                    let val = self.coerce_init_const(val, e, elem_ir_ty, Some(elem_ty));
                     self.write_const_to_bytes(bytes, byte_offset, &val, elem_ir_ty);
                 }
             }

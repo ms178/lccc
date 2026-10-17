@@ -557,12 +557,7 @@ impl Lowerer {
             ElemInit::Unit(u) => return Some(IrConst::from_i64(i64::from(u), geo.base_ty)),
             ElemInit::Expr(e) => {
                 let raw = self.eval_const_expr(e)?;
-                if geo.is_bool {
-                    raw.bool_normalize()
-                } else {
-                    let src = self.get_expr_type(e);
-                    self.coerce_const_to_type_with_src(raw, geo.base_ty, src)
-                }
+                self.coerce_init_const(raw, e, geo.base_ty, geo.is_bool.then_some(&CType::Bool))
             }
         };
         Some(Self::maybe_promote_long_double(c, geo.is_long_double))

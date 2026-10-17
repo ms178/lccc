@@ -433,12 +433,17 @@ impl Lowerer {
             "__builtin_infl" | "__builtin_huge_vall" => Some(IrType::F128),
             // _Float128 constants are binary128 bit patterns in the U128
             // carrier (F128 is the x87 long double type).
-            "__builtin_inff128" | "__builtin_huge_valf128" | "__builtin_nanf128" => {
-                Some(IrType::U128)
-            }
-            "__builtin_nan" => Some(IrType::F64),
-            "__builtin_nanf" => Some(IrType::F32),
-            "__builtin_nanl" => Some(IrType::F128),
+            "__builtin_inff128"
+            | "__builtin_huge_valf128"
+            | "__builtin_nanf128"
+            | "__builtin_nansf128"
+            | "__builtin_infq"
+            | "__builtin_huge_valq"
+            | "__builtin_nanq"
+            | "__builtin_nansq" => Some(IrType::U128),
+            "__builtin_nan" | "__builtin_nans" => Some(IrType::F64),
+            "__builtin_nanf" | "__builtin_nansf" => Some(IrType::F32),
+            "__builtin_nanl" | "__builtin_nansl" => Some(IrType::F128),
             "__builtin_fma"
             | "__builtin_trunc"
             | "__builtin_rint"
@@ -538,7 +543,10 @@ impl Lowerer {
             // _Float128-specific builtins: results are 16-byte binary128 BIT
             // PATTERNS (U128). Returning F128 here makes the caller cast
             // F128->U128 via __fixunstfti, corrupting the value.
-            "__builtin_copysignf128" | "__builtin_fabsf128" => Some(IrType::U128),
+            "__builtin_copysignf128"
+            | "__builtin_fabsf128"
+            | "__builtin_copysignq"
+            | "__builtin_fabsq" => Some(IrType::U128),
             // Integer-returning classification builtins
             "__builtin_fpclassify"
             | "__builtin_isnan"

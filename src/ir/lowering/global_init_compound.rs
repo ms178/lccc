@@ -274,7 +274,7 @@ impl Lowerer {
                     self.emit_expr_to_compound(elements, expr, ptr_size, None);
                 } else if let Some(val) = self.eval_const_expr(expr) {
                     let elem_ir_ty = IrType::from_ctype(elem_ty);
-                    let coerced = val.coerce_to(elem_ir_ty);
+                    let coerced = self.coerce_init_const(val, expr, elem_ir_ty, Some(elem_ty));
                     self.push_const_as_bytes(elements, &coerced, elem_size);
                 } else {
                     push_zero_bytes(elements, elem_size);
@@ -327,11 +327,7 @@ impl Lowerer {
         // For typed scalar fields, try const eval with coercion first
         if let Some(ty) = coerce_ty {
             if let Some(val) = self.eval_const_expr(expr) {
-                let coerced = if *ty == CType::Bool {
-                    val.bool_normalize()
-                } else {
-                    val.coerce_to(IrType::from_ctype(ty))
-                };
+                let coerced = self.coerce_init_const(val, expr, IrType::from_ctype(ty), Some(ty));
                 self.push_const_as_bytes(elements, &coerced, element_size);
                 return;
             }

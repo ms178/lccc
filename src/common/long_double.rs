@@ -865,11 +865,15 @@ pub fn x87_bytes_to_f128_bytes(x87: &[u8; 16]) -> [u8; 16] {
         return make_f128_zero(d.sign);
     }
     if d.is_special() {
-        return if d.is_inf() {
-            make_f128_infinity(d.sign)
-        } else {
-            make_f128_nan(d.sign)
-        };
+        if d.is_inf() {
+            return make_f128_infinity(d.sign);
+        }
+        // NaN: the 63 fraction bits (quiet bit and payload) move top-aligned
+        // into the 112-bit fraction, so `f128_bytes_to_x87_bytes` restores
+        // them exactly.
+        let frac = u128::from(d.mantissa & 0x7FFF_FFFF_FFFF_FFFF) << 49;
+        let sign_bit = if d.sign { 1u128 << 127 } else { 0 };
+        return (sign_bit | (0x7FFFu128 << 112) | frac).to_le_bytes();
     }
 
     // Normal number
@@ -1081,11 +1085,16 @@ pub fn f128_bytes_to_x87_bytes(f128_bytes: &[u8; 16]) -> [u8; 16] {
         return make_x87_zero(sign);
     }
     if biased_exp == 0x7FFF {
-        return if mantissa == 0 {
-            make_x87_infinity(sign)
-        } else {
-            make_x87_nan(sign)
-        };
+        if mantissa == 0 {
+            return make_x87_infinity(sign);
+        }
+        // NaN: keep the top 63 fraction bits (quiet bit and payload, the
+        // inverse of `x87_bytes_to_f128_bytes`). A payload that lives only in
+        // the low 49 bits leaves nothing; the quiet bit keeps it a NaN.
+        let frac = (mantissa & ((1u128 << 112) - 1)) >> 49;
+        let frac = if frac == 0 { 1u128 << 62 } else { frac };
+        let se = 0x7FFFu128 | if sign { 0x8000 } else { 0 };
+        return ((se << 64) | (1u128 << 63) | frac).to_le_bytes();
     }
 
     // Unify both f128 classes into `value == m * 2^e`.

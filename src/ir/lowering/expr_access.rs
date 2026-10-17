@@ -194,6 +194,24 @@ impl Lowerer {
             return Operand::Value(alloca);
         }
 
+        // Fold constant casts at lowering time so -O0 matches GCC
+        // -fno-trapping-math saturation (gcc.c-torture 20031003-1:
+        // `(int)2147483648.0f` is INT_MAX, not the x86 indefinite INT_MIN).
+        // This precedes the decimal and _Float128 runtime paths: their
+        // constant conversions fold exactly (shared value helpers) instead of
+        // calling libbid/libgcc at run time. Any floating side -- binary,
+        // _Float128 or decimal, whose rounding modes are all part of the
+        // floating-point environment -- keeps the conversion at run time
+        // when that environment is observable (FENV_ACCESS, -frounding-math).
+        let is_fp = |ct: &CType| ct.is_floating() || *ct == CType::Float128 || ct.is_decimal();
+        let observable_fp = self.pass_policy.fp_environment_observable
+            && (is_fp(&inner_ctype) || is_fp(&target_ctype));
+        if !observable_fp {
+            if let Some(c) = self.eval_const_cast(target_type, inner) {
+                return Operand::Const(c);
+            }
+        }
+
         // C23 decimal floating point casts: route through the libbid
         // (__bid_*) conversion helpers, exactly like GCC.
         if (inner_ctype.is_decimal() || target_ctype.is_decimal()) && target_ctype != CType::Bool {
@@ -221,17 +239,6 @@ impl Lowerer {
         if target_ctype == CType::Float128 && inner_ctype != CType::Float128 {
             let src = self.lower_expr(inner);
             return self.convert_to_f128(src, &inner_ctype);
-        }
-
-        // Fold constant casts at lowering time so -O0 matches GCC
-        // -fno-trapping-math saturation (gcc.c-torture 20031003-1:
-        // `(int)2147483648.0f` is INT_MAX, not the x86 indefinite INT_MIN).
-        let observable_fp = self.pass_policy.fp_environment_observable
-            && (inner_ctype.is_floating() || target_ctype.is_floating());
-        if !observable_fp {
-            if let Some(c) = self.eval_const_cast(target_type, inner) {
-                return Operand::Const(c);
-            }
         }
 
         let src = self.lower_expr(inner);

@@ -188,6 +188,22 @@ impl Lowerer {
                                 | Some(CType::Decimal128)
                         )
                     };
+                    // A _Float128 side (with no decimal side: mixing is a
+                    // constraint violation, C23 6.5.2) folds exactly in
+                    // binary128, the common type (C23 6.3.1.8).
+                    let (l_ct, r_ct) = (self.get_expr_ctype(lhs), self.get_expr_ctype(rhs));
+                    let is_f128 = |ct: &Option<CType>| matches!(ct, Some(CType::Float128));
+                    let is_dec = |ct: &Option<CType>| ct.as_ref().is_some_and(CType::is_decimal);
+                    if (is_f128(&l_ct) || is_f128(&r_ct)) && !is_dec(&l_ct) && !is_dec(&r_ct) {
+                        if let (Some(a), Some(b)) = (
+                            shared_const_eval::f128_bytes_of(&l, l_ct.as_ref()),
+                            shared_const_eval::f128_bytes_of(&r, r_ct.as_ref()),
+                        ) {
+                            if let Some(v) = shared_const_eval::fold_f128_binop(op, &a, &b) {
+                                return Some(v);
+                            }
+                        }
+                    }
                     if !wide_float_side(lhs) && !wide_float_side(rhs) {
                         // Use infer_expr_type (C semantic types) for proper usual arithmetic
                         // conversions. get_expr_type returns IR storage types (IntLiteral → I64)
@@ -219,16 +235,16 @@ impl Lowerer {
                     //     `(*q = 10) || 60` stores to *q before 60 is considered).
                     //     Folding to 1 drops that store -> UNSOUND. Only fold via
                     //     the RHS when the LHS is a known (pure) constant.
-                    let l_nonzero = l.as_ref().is_some_and(|v| v.is_nonzero())
+                    let l_nonzero = l.as_ref().is_some_and(|v| self.const_truth(v, lhs))
                         || Self::expr_is_always_nonzero(lhs);
-                    let r_nonzero = r.as_ref().is_some_and(|v| v.is_nonzero())
+                    let r_nonzero = r.as_ref().is_some_and(|v| self.const_truth(v, rhs))
                         || Self::expr_is_always_nonzero(rhs);
                     if l_nonzero || (r_nonzero && l.is_some()) {
                         return Some(IrConst::I64(1));
                     }
                     // Both are zero constants => result is 0 (both pure).
-                    if l.as_ref().is_some_and(|v| !v.is_nonzero())
-                        && r.as_ref().is_some_and(|v| !v.is_nonzero())
+                    if l.as_ref().is_some_and(|v| !self.const_truth(v, lhs))
+                        && r.as_ref().is_some_and(|v| !self.const_truth(v, rhs))
                     {
                         return Some(IrConst::I64(0));
                     }
@@ -241,17 +257,17 @@ impl Lowerer {
                     //   - RHS known-zero but LHS UNKNOWN: the LHS must still be
                     //     evaluated for side effects -> UNSOUND to fold to 0.
                     //     Only fold via the RHS when the LHS is a known constant.
-                    if l.as_ref().is_some_and(|v| !v.is_nonzero())
-                        || (r.as_ref().is_some_and(|v| !v.is_nonzero()) && l.is_some())
+                    if l.as_ref().is_some_and(|v| !self.const_truth(v, lhs))
+                        || (r.as_ref().is_some_and(|v| !self.const_truth(v, rhs)) && l.is_some())
                     {
                         return Some(IrConst::I64(0));
                     }
                     // Both sides known nonzero (constants or always-nonzero pure
                     // expressions such as string literals): result is 1. Both
                     // operands are side-effect-free here, so folding is sound.
-                    let l_nonzero = l.as_ref().is_some_and(|v| v.is_nonzero())
+                    let l_nonzero = l.as_ref().is_some_and(|v| self.const_truth(v, lhs))
                         || Self::expr_is_always_nonzero(lhs);
-                    let r_nonzero = r.as_ref().is_some_and(|v| v.is_nonzero())
+                    let r_nonzero = r.as_ref().is_some_and(|v| self.const_truth(v, rhs))
                         || Self::expr_is_always_nonzero(rhs);
                     if l_nonzero && r_nonzero {
                         return Some(IrConst::I64(1));
@@ -326,7 +342,7 @@ impl Lowerer {
             Expr::Conditional(cond, then_e, else_e, _) => {
                 // Ternary in constant expr: evaluate condition and pick branch
                 let cond_val = self.eval_const_expr(cond)?;
-                if cond_val.is_nonzero() {
+                if self.const_truth(&cond_val, cond) {
                     self.eval_const_expr(then_e)
                 } else {
                     self.eval_const_expr(else_e)
@@ -334,7 +350,7 @@ impl Lowerer {
             }
             Expr::GnuConditional(cond, else_e, _) => {
                 let cond_val = self.eval_const_expr(cond)?;
-                if cond_val.is_nonzero() {
+                if self.const_truth(&cond_val, cond) {
                     Some(cond_val) // condition value is used as result
                 } else {
                     self.eval_const_expr(else_e)
@@ -342,7 +358,11 @@ impl Lowerer {
             }
             Expr::UnaryOp(UnaryOp::LogicalNot, inner, _) => {
                 if let Some(val) = self.eval_const_expr(inner) {
-                    Some(IrConst::I64(if val.is_nonzero() { 0 } else { 1 }))
+                    Some(IrConst::I64(if self.const_truth(&val, inner) {
+                        0
+                    } else {
+                        1
+                    }))
                 } else if Self::expr_is_always_nonzero(inner) {
                     // !("string_literal") is always 0
                     Some(IrConst::I64(0))
@@ -396,6 +416,12 @@ impl Lowerer {
     }
 
     /// Evaluate a cast expression at compile time.
+    /// The C truth value of a folded constant, decided by `expr`'s C type
+    /// (see `common::const_eval::const_truth`).
+    pub(super) fn const_truth(&self, val: &IrConst, expr: &Expr) -> bool {
+        shared_const_eval::const_truth(val, self.get_expr_ctype(expr).as_ref())
+    }
+
     pub(super) fn eval_const_cast(
         &self,
         target_type: &TypeSpecifier,
@@ -403,26 +429,13 @@ impl Lowerer {
     ) -> Option<IrConst> {
         let target_ir_ty = self.type_spec_to_ir(target_type);
 
-        // _Float128 (IEEE binary128, carried as IrType::U128) cannot be produced
-        // by the integer/float bit-cast machinery: the 16 bytes ARE the binary128
-        // payload, and double→_Float128 must go through __extenddftf2 (and
-        // _Float128→double through __trunctfdf2). Folding either direction here
-        // as an integer or f64 cast produced garbage (`_Float128 a = 100.0`
-        // stored the I128 bit pattern {100,0} instead of calling __extenddftf2,
-        // and `(double)1.5F128` folded the binary128 bits as an integer).
-        // Decline both directions so the runtime soft-float call path handles
-        // them exactly like GCC.
+        // _Float128 (IEEE binary128, carried as IrType::U128) is never an
+        // integer or f64 bit-cast: the 16 bytes ARE the binary128 payload.
+        // Both directions convert by value through the shared exact helpers
+        // (`(double)1.5Q` is 1.5, `(_Float128)3` is binary128 3.0), which
+        // round exactly like libgcc's __trunctfdf2/__extenddftf2 & co.
         let target_ct = self.type_spec_to_ctype(target_type);
         let src_ct = self.get_expr_ctype(inner);
-        if target_ct == CType::Float128 || src_ct == Some(CType::Float128) {
-            // ... except _Float128 -> decimal: the BID master conversion
-            // below folds it exactly (static initializers have no runtime
-            // soft-float path to defer to).
-            if !(src_ct == Some(CType::Float128) && target_ct.is_decimal()) {
-                return None;
-            }
-        }
-
         let src_val = self.eval_const_expr(inner)?;
 
         // C11 6.3.1.2p1: conversion to _Bool yields 0 or 1.  The constant
@@ -432,19 +445,11 @@ impl Lowerer {
         // fold through BID-decoded truthiness (+0 == -0), exactly what the
         // runtime lower_soft_float_truthiness computes.
         if target_ct == CType::Bool {
-            let is_nonzero = match &src_val {
-                IrConst::F32(v) => *v != 0.0,
-                IrConst::F64(v) => *v != 0.0,
-                IrConst::LongDouble(v, _) => *v != 0.0,
-                IrConst::I8(v) => *v != 0,
-                IrConst::I16(v) => *v != 0,
-                IrConst::I32(v) => *v != 0,
-                IrConst::I64(v) => *v != 0,
-                IrConst::I128(v) => *v != 0,
-                IrConst::Zero => false,
-                IrConst::D32(_) | IrConst::D64(_) => src_val.is_nonzero(),
-            };
-            return Some(IrConst::I8(if is_nonzero { 1 } else { 0 }));
+            // The C type decides: a long double's value (not its f64
+            // shadow: 1e-400L is true), and the I128 carrier of -0.0Q or
+            // -0.0DL is false.
+            let truth = shared_const_eval::const_truth(&src_val, src_ct.as_ref());
+            return Some(IrConst::I8(i8::from(truth)));
         }
 
         // Decimal-target casts fold through the BID master conversion, so
@@ -465,9 +470,40 @@ impl Lowerer {
             return None;
         }
 
-        // Handle float source types: use value-based conversion, not bit manipulation
-        if let IrConst::LongDouble(fv, bytes) = &src_val {
-            return IrConst::cast_long_double_to_target(*fv, bytes, target_ir_ty);
+        // _Float128 target: the exact binary128 value of the source.
+        if target_ct == CType::Float128 {
+            let bytes = shared_const_eval::f128_bytes_of(&src_val, src_ct.as_ref())?;
+            return Some(IrConst::I128(u128::from_le_bytes(bytes) as i128));
+        }
+        // _Float128 or long double source: convert its binary128 value (a long
+        // double's in the target format, never its f64 shadow). NaN and
+        // infinity to an integer stay unfolded, as for double (IEEE invalid
+        // at run time); a static initializer then takes sema's GCC-style
+        // fold.
+        let f128_src = match (&src_ct, &src_val) {
+            (Some(CType::Float128), _) => {
+                shared_const_eval::f128_bytes_of(&src_val, src_ct.as_ref())
+            }
+            (_, IrConst::LongDouble(_, bytes)) => {
+                Some(crate::common::long_double::long_double_value_bytes(bytes))
+            }
+            _ => None,
+        };
+        if let Some(bytes) = f128_src {
+            let nonfinite = (u128::from_le_bytes(bytes) >> 112) & 0x7FFF == 0x7FFF;
+            if nonfinite && target_ct.is_integer() {
+                return None;
+            }
+            return match shared_const_eval::f128_to_ctype(&bytes, &target_ct)? {
+                c @ (IrConst::F32(_)
+                | IrConst::F64(_)
+                | IrConst::LongDouble(..)
+                | IrConst::I128(_)) => Some(c),
+                c => {
+                    let bits = c.to_i64()? as u64;
+                    self.cast_bits_to_ir_const(bits, !target_ct.is_unsigned(), target_ir_ty)
+                }
+            };
         }
         if let Some(fv) = src_val.to_f64() {
             if matches!(&src_val, IrConst::F32(_) | IrConst::F64(_)) {
@@ -1175,6 +1211,73 @@ impl Lowerer {
         c.to_i64()
     }
 
+    /// The value of `val`, the folded initializer `e`, in a static object of
+    /// IR type `dst_ir` (C type `dst_ct` when the caller knows it). Converts
+    /// BY VALUE wherever the IR-type coercion would read carrier bits: a
+    /// `_Bool`, decimal or `_Float128` destination, and a `_Float128`,
+    /// `long double` or decimal source (`int i = 2.75Q` is 2, not the low
+    /// bits of the binary128 pattern). Everything else keeps the IR coercion.
+    pub(super) fn coerce_init_const(
+        &self,
+        val: IrConst,
+        e: &Expr,
+        dst_ir: IrType,
+        dst_ct: Option<&CType>,
+    ) -> IrConst {
+        let src_ct = self.get_expr_ctype(e);
+        let dst = dst_ct.cloned().or_else(|| scalar_ctype_of_ir(dst_ir));
+        if let Some(c) = dst
+            .as_ref()
+            .and_then(|dst| Self::convert_const_by_value(&val, src_ct.as_ref(), dst, dst_ir))
+        {
+            return c;
+        }
+        val.coerce_to_with_src(dst_ir, Some(self.get_expr_type(e)))
+    }
+
+    /// The by-value half of [`Self::coerce_init_const`]; `None` when the IR
+    /// coercion is already value-correct.
+    fn convert_const_by_value(
+        val: &IrConst,
+        src_ct: Option<&CType>,
+        dst: &CType,
+        dst_ir: IrType,
+    ) -> Option<IrConst> {
+        if *dst == CType::Bool {
+            return Some(IrConst::I8(i8::from(shared_const_eval::const_truth(
+                val, src_ct,
+            ))));
+        }
+        if dst.is_decimal() {
+            let width = match dst {
+                CType::Decimal32 => 32,
+                CType::Decimal64 => 64,
+                _ => 128,
+            };
+            return const_arith::const_to_bid(val, src_ct?, width);
+        }
+        if *dst == CType::Float128 {
+            let bytes = shared_const_eval::f128_bytes_of(val, src_ct)?;
+            return Some(IrConst::I128(u128::from_le_bytes(bytes) as i128));
+        }
+        let src_binary128 = match (src_ct, val) {
+            (Some(CType::Float128), _) => shared_const_eval::f128_bytes_of(val, src_ct),
+            (_, IrConst::LongDouble(_, bytes)) => {
+                Some(crate::common::long_double::long_double_value_bytes(bytes))
+            }
+            _ => None,
+        };
+        if let Some(bytes) = src_binary128 {
+            // A static initializer must be constant: out-of-range, NaN and
+            // infinite values fold the way GCC folds them (saturation).
+            return shared_const_eval::f128_to_ctype(&bytes, dst).map(|c| c.coerce_to(dst_ir));
+        }
+        if src_ct.is_some_and(CType::is_decimal) {
+            return Self::cast_bid_to_ir_type(val, dst_ir, dst);
+        }
+        None
+    }
+
     /// Coerce a constant to the target type, using the source expression's type for signedness.
     pub(super) fn coerce_const_to_type_with_src(
         &self,
@@ -1361,4 +1464,25 @@ impl Lowerer {
         }
         self.type_spec_is_vla(&field.type_spec)
     }
+}
+
+/// The C scalar type an unambiguous IR storage type denotes, for by-value
+/// constant conversion. 128-bit storage is ambiguous (`__int128`,
+/// `_Float128`, `_Decimal128`) and so is a pointer; callers that may store
+/// those pass the C type explicitly.
+fn scalar_ctype_of_ir(ty: IrType) -> Option<CType> {
+    Some(match ty {
+        IrType::I8 => CType::Char,
+        IrType::U8 => CType::UChar,
+        IrType::I16 => CType::Short,
+        IrType::U16 => CType::UShort,
+        IrType::I32 => CType::Int,
+        IrType::U32 => CType::UInt,
+        IrType::I64 => CType::LongLong,
+        IrType::U64 => CType::ULongLong,
+        IrType::F32 => CType::Float,
+        IrType::F64 => CType::Double,
+        IrType::F128 => CType::LongDouble,
+        _ => return None,
+    })
 }

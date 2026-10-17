@@ -223,21 +223,14 @@ impl Lowerer {
                     }
                 }
             }
-            // _Float128 (binary128): the initializer must become the IEEE
-            // binary128 BIT PATTERN (via the exact long_double-module
-            // conversions), never an integer/float bit-cast of the U128
-            // carrier (`_Float128 g = 100.0` used to emit the I128 {100,0}).
-            if target_ct == CType::Float128 {
-                if let Some(bits) = Self::const_to_f128_bits(&val) {
-                    return GlobalInit::Scalar(IrConst::I128(bits as i128));
-                }
-            }
+            // _Float128 targets and _Float128 / long double / decimal sources
+            // convert by value (`coerce_init_const`), never by carrier bits.
             return GlobalInit::Scalar(self.coerce_scalar_const(
                 val,
                 expr,
                 base_ty,
+                Some(&target_ct),
                 is_long_double_target,
-                is_bool_target,
             ));
         }
 
@@ -321,12 +314,13 @@ impl Lowerer {
         // so each is folded here instead of falling through to the
         // non-constant diagnostic below.
         if let Some(v) = self.eval_global_relational(expr) {
+            let target_ct = self.type_spec_to_ctype(type_spec);
             return GlobalInit::Scalar(self.coerce_scalar_const(
                 IrConst::I64(v),
                 expr,
                 base_ty,
+                Some(&target_ct),
                 is_long_double_target,
-                is_bool_target,
             ));
         }
 
@@ -518,49 +512,16 @@ impl Lowerer {
 
     /// Coerce a scalar constant to the target type, handling bool normalization
     /// and long double promotion.
-    /// Convert a const-evaluated scalar to the IEEE binary128 (u128) bit
-    /// pattern of `_Float128`. Uses the exact widening conversions from the
-    /// long_double module (f64 → binary128 is lossless; i64/u64/i128 are exact).
-    /// An `I128` source is taken as an existing binary128 payload (e.g. a
-    /// `1.5F128` literal or a `_Float128`-typed constant).
-    fn const_to_f128_bits(val: &IrConst) -> Option<u128> {
-        use crate::common::long_double::{
-            f64_to_f128_bytes_lossless, i64_to_f128_bytes, i128_to_f128_bytes, u64_to_f128_bytes,
-            u128_to_f128_bytes,
-        };
-        let le = |b: [u8; 16]| u128::from_le_bytes(b);
-        Some(match val {
-            IrConst::F64(v) => le(f64_to_f128_bytes_lossless(*v)),
-            IrConst::F32(v) => le(f64_to_f128_bytes_lossless(*v as f64)),
-            IrConst::LongDouble(v, _) => le(f64_to_f128_bytes_lossless(*v)),
-            IrConst::I64(v) => le(i64_to_f128_bytes(*v)),
-            IrConst::I32(v) => le(i64_to_f128_bytes(*v as i64)),
-            IrConst::I16(v) => le(i64_to_f128_bytes(*v as i64)),
-            IrConst::I8(v) => le(i64_to_f128_bytes(*v as i64)),
-            IrConst::I128(v) => *v as u128, // already a binary128 payload
-            // Decimal FP bit containers: pass BID bits through unchanged
-            // (only reachable for Decimal128 globals, which use this exact
-            // payload path; D32/D64 targets never call this helper).
-            IrConst::D64(v) => *v as u128,
-            IrConst::D32(v) => *v as u128,
-            IrConst::Zero => le(i64_to_f128_bytes(0)),
-        })
-    }
-
     fn coerce_scalar_const(
         &self,
         val: IrConst,
         expr: &Expr,
         base_ty: IrType,
+        target_ct: Option<&CType>,
         is_long_double_target: bool,
-        is_bool_target: bool,
     ) -> IrConst {
         let src_ty = self.get_expr_type(expr);
-        let val = if is_bool_target {
-            val.bool_normalize()
-        } else {
-            self.coerce_const_to_type_with_src(val, base_ty, src_ty)
-        };
+        let val = self.coerce_init_const(val, expr, base_ty, target_ct);
         if is_long_double_target {
             Self::promote_to_long_double_with_signedness(val, src_ty)
         } else {
@@ -847,9 +808,8 @@ impl Lowerer {
     ) -> Option<GlobalInit> {
         let expr = Self::unwrap_nested_init_expr(items)?;
         if let Some(val) = self.eval_const_expr(expr) {
-            let expr_ty = self.get_expr_type(expr);
             return Some(GlobalInit::Scalar(
-                self.coerce_const_to_type_with_src(val, base_ty, expr_ty),
+                self.coerce_init_const(val, expr, base_ty, None),
             ));
         }
         self.eval_global_addr_expr(expr)
@@ -862,7 +822,7 @@ impl Lowerer {
             .map(|item| {
                 if let Initializer::Expr(expr) = &item.init {
                     self.eval_const_expr(expr)
-                        .map(|v| v.coerce_to(base_ty))
+                        .map(|v| self.coerce_init_const(v, expr, base_ty, None))
                         .unwrap_or_else(|| {
                             self.diagnose_non_constant(expr);
                             self.zero_const(base_ty)
@@ -1422,8 +1382,7 @@ impl Lowerer {
                     IrConst::I64(0)
                 });
                 let val =
-                    self.coerce_const_to_type_with_src(val, elem_ir_ty, self.get_expr_type(e));
-                let val = if is_bool { val.bool_normalize() } else { val };
+                    self.coerce_init_const(val, e, elem_ir_ty, is_bool.then_some(&CType::Bool));
                 match lane_stride {
                     Some(stride) if vec_ct.is_x87_lane_vector() => {
                         // x87 lanes are 10 bytes apart: write the 16-byte
@@ -1560,12 +1519,7 @@ impl Lowerer {
                 let raw = self
                     .eval_const_expr(expr)
                     .unwrap_or(self.zero_const(base_ty));
-                if is_bool_target {
-                    raw.bool_normalize()
-                } else {
-                    let expr_ty = self.get_expr_type(expr);
-                    self.coerce_const_to_type_with_src(raw, base_ty, expr_ty)
-                }
+                self.coerce_init_const(raw, expr, base_ty, is_bool_target.then_some(&CType::Bool))
             }
             Initializer::List(sub_items) => {
                 let mut sub_vals = Vec::new();
@@ -2340,12 +2294,12 @@ impl Lowerer {
                     self.inline_string_to_values(s, string_sub_count, base_ty, &mut tmp);
                     Self::overwrite_or_extend_values(values, flat_idx, tmp, &zero_fn);
                 } else if let Some(val) = self.eval_const_expr(expr) {
-                    values[flat_idx] = if is_bool_target {
-                        val.bool_normalize()
-                    } else {
-                        let expr_ty = self.get_expr_type(expr);
-                        self.coerce_const_to_type_with_src(val, base_ty, expr_ty)
-                    };
+                    values[flat_idx] = self.coerce_init_const(
+                        val,
+                        expr,
+                        base_ty,
+                        is_bool_target.then_some(&CType::Bool),
+                    );
                 }
             }
         }
@@ -2400,12 +2354,12 @@ impl Lowerer {
                     self.inline_string_to_values(s, sub_elem_count, base_ty, values);
                     *current_outer_idx += 1;
                 } else if let Some(val) = self.eval_const_expr(expr) {
-                    values.push(if is_bool_target {
-                        val.bool_normalize()
-                    } else {
-                        let expr_ty = self.get_expr_type(expr);
-                        self.coerce_const_to_type_with_src(val, base_ty, expr_ty)
-                    });
+                    values.push(self.coerce_init_const(
+                        val,
+                        expr,
+                        base_ty,
+                        is_bool_target.then_some(&CType::Bool),
+                    ));
                     let relative_pos = values.len() - start_len;
                     if sub_elem_count > 0 {
                         *current_outer_idx = relative_pos.div_ceil(sub_elem_count);
@@ -2633,12 +2587,12 @@ impl Lowerer {
                     }
                     values.push(IrConst::I64(0));
                 } else if let Some(val) = self.eval_const_expr(expr) {
-                    values.push(if is_bool_target {
-                        val.bool_normalize()
-                    } else {
-                        let expr_ty = self.get_expr_type(expr);
-                        self.coerce_const_to_type_with_src(val, base_ty, expr_ty)
-                    });
+                    values.push(self.coerce_init_const(
+                        val,
+                        expr,
+                        base_ty,
+                        is_bool_target.then_some(&CType::Bool),
+                    ));
                 } else {
                     values.push(self.zero_const(base_ty));
                 }

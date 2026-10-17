@@ -1062,6 +1062,7 @@ impl<'a> ExprTypeChecker<'a> {
             "__builtin_inf"
             | "__builtin_huge_val"
             | "__builtin_nan"
+            | "__builtin_nans"
             | "__builtin_fma"
             | "__builtin_trunc"
             | "__builtin_rint"
@@ -1086,6 +1087,7 @@ impl<'a> ExprTypeChecker<'a> {
             "__builtin_inff"
             | "__builtin_huge_valf"
             | "__builtin_nanf"
+            | "__builtin_nansf"
             | "__builtin_fmaf"
             | "__builtin_truncf"
             | "__builtin_rintf"
@@ -1107,6 +1109,7 @@ impl<'a> ExprTypeChecker<'a> {
             "__builtin_infl"
             | "__builtin_huge_vall"
             | "__builtin_nanl"
+            | "__builtin_nansl"
             | "__builtin_fabsl"
             | "__builtin_nextafterl" => Some(CType::LongDouble),
 
@@ -1114,8 +1117,15 @@ impl<'a> ExprTypeChecker<'a> {
             "__builtin_inff128"
             | "__builtin_huge_valf128"
             | "__builtin_nanf128"
+            | "__builtin_nansf128"
             | "__builtin_copysignf128"
-            | "__builtin_fabsf128" => Some(CType::Float128),
+            | "__builtin_fabsf128"
+            | "__builtin_infq"
+            | "__builtin_huge_valq"
+            | "__builtin_nanq"
+            | "__builtin_nansq"
+            | "__builtin_copysignq"
+            | "__builtin_fabsq" => Some(CType::Float128),
 
             // Integer-returning builtins
             "__builtin_fpclassify"

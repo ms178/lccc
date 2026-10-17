@@ -543,20 +543,22 @@ pub fn eval_builtin_call_with_mode(
         // for an empty payload is 0x7ff4000000000000 / 0x7fa00000.
         "__builtin_nans" => Some(nan_f64(nan_payload(args)?, true)),
         "__builtin_nansf" => Some(nan_f32(nan_payload(args)?, true)),
-        // A long double NaN keeps its canonical bit pattern: the payload of
-        // `__builtin_nanl("7")` lives in the x87 significand
-        // (0xc000000000000007) while lccc carries a long double as
-        // `(f64 approximation, binary128 bytes)`, so the *value* is exact (a
-        // NaN) but its payload is not preserved.  The alternative -- declining
-        // -- would reject a program GCC accepts, which is worse.
-        "__builtin_nanl" | "nanl" => {
-            let _ = nan_payload(args)?;
-            Some(IrConst::long_double(f64::NAN))
+        // A long double NaN keeps its payload in the target format (x87:
+        // `nanl("7")` is 0x7fff:c000000000000007; binary128: low significand
+        // bits). The constant's binary128 bytes carry it losslessly: the
+        // x87<->binary128 NaN mappings are top-aligned and inverse.
+        "__builtin_nanl" | "nanl" => Some(nan_long_double(nan_payload(args)?, false)),
+        "__builtin_nansl" | "nansl" => Some(nan_long_double(nan_payload(args)?, true)),
+        // _Float128 (and GCC's x86 `q` spellings for __float128): the
+        // binary128 bits ride the I128 carrier.
+        "__builtin_nanf128" | "__builtin_nanq" | "nanf128" => {
+            Some(nan_f128(nan_payload(args)?, false))
         }
-        "__builtin_nansl" | "nansl" => {
-            let _ = nan_payload(args)?;
-            Some(IrConst::long_double(f64::from_bits(0x7ff4_0000_0000_0000)))
-        }
+        "__builtin_nansf128" | "__builtin_nansq" => Some(nan_f128(nan_payload(args)?, true)),
+        "__builtin_inff128"
+        | "__builtin_infq"
+        | "__builtin_huge_valf128"
+        | "__builtin_huge_valq" => Some(IrConst::I128((0x7FFFu128 << 112) as i128)),
         _ => None,
     }
 }
@@ -620,37 +622,54 @@ fn nan_payload_digits(digits: &str, radix: u32) -> Option<u64> {
     Some(value)
 }
 
+/// The trailing significand of a NaN with `frac_bits` fraction bits carrying
+/// `payload`, as GCC encodes it (real.c `encode_ieee_*`, measured against
+/// GCC 16.2): a quiet NaN sets the top fraction bit over the payload; a
+/// signaling NaN clears it, and when nothing is left (empty payload, or one
+/// whose bits all fall outside the field) uses the canonical signaling bit
+/// just below it -- never the all-zero fraction, which would be infinity
+/// (`nans("0x10000000000000")` is 0x7ff4000000000000).
+fn nan_significand(payload: u64, signaling: bool, frac_bits: u32) -> u128 {
+    let quiet = 1u128 << (frac_bits - 1);
+    let p = u128::from(payload) & ((1u128 << frac_bits) - 1);
+    if !signaling {
+        return quiet | p;
+    }
+    match p & !quiet {
+        0 => quiet >> 1,
+        p => p,
+    }
+}
+
 /// A `double` NaN carrying `payload`: quiet for `__builtin_nan`, signaling for
-/// `__builtin_nans`, with GCC's canonical bit patterns for an empty payload.
+/// `__builtin_nans`. See [`nan_significand`].
 fn nan_f64(payload: u64, signaling: bool) -> IrConst {
-    const MANTISSA: u64 = 0x000f_ffff_ffff_ffff;
-    const QUIET: u64 = 0x0008_0000_0000_0000;
-    const CANONICAL_SIGNALING: u64 = 0x0004_0000_0000_0000;
-    let bits = if signaling {
-        match payload {
-            0 => 0x7ff0_0000_0000_0000 | CANONICAL_SIGNALING,
-            p => 0x7ff0_0000_0000_0000 | (p & MANTISSA),
-        }
-    } else {
-        0x7ff0_0000_0000_0000 | QUIET | (payload & MANTISSA)
-    };
-    IrConst::F64(f64::from_bits(bits))
+    let frac = nan_significand(payload, signaling, 52) as u64;
+    IrConst::F64(f64::from_bits(0x7ff0_0000_0000_0000 | frac))
 }
 
 /// [`nan_f64`] in `float` precision.
 fn nan_f32(payload: u64, signaling: bool) -> IrConst {
-    const MANTISSA: u64 = 0x007f_ffff;
-    const QUIET: u64 = 0x0040_0000;
-    const CANONICAL_SIGNALING: u64 = 0x0020_0000;
-    let bits = if signaling {
-        match payload {
-            0 => 0x7f80_0000 | CANONICAL_SIGNALING,
-            p => 0x7f80_0000 | (p & MANTISSA),
-        }
+    let frac = nan_significand(payload, signaling, 23) as u32;
+    IrConst::F32(f32::from_bits(0x7f80_0000 | frac))
+}
+
+/// [`nan_f64`] for `_Float128`: the binary128 bits in the I128 carrier.
+fn nan_f128(payload: u64, signaling: bool) -> IrConst {
+    IrConst::I128(((0x7FFFu128 << 112) | nan_significand(payload, signaling, 112)) as i128)
+}
+
+/// [`nan_f64`] for `long double` in the target format: x87 extended (explicit
+/// integer bit, 63 fraction bits) or binary128.
+fn nan_long_double(payload: u64, signaling: bool) -> IrConst {
+    use super::long_double as ld;
+    let bytes = if super::types::target_long_double_is_f128() {
+        ((0x7FFFu128 << 112) | nan_significand(payload, signaling, 112)).to_le_bytes()
     } else {
-        0x7f80_0000 | QUIET | (payload & MANTISSA)
+        let sig = (1u128 << 63) | nan_significand(payload, signaling, 63);
+        ld::x87_bytes_to_f128_bytes(&((0x7FFFu128 << 64) | sig).to_le_bytes())
     };
-    IrConst::F32(f32::from_bits(bits as u32))
+    IrConst::long_double_with_bytes(f64::NAN, bytes)
 }
 
 /// The `f64` value of `val`, when `val` *is* that value exactly: an integer
