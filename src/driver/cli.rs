@@ -1592,8 +1592,6 @@ impl Driver {
                 arg if arg == "-finstrument-functions" => {
                     self.instrument_functions = true;
                 }
-                arg if arg == "-finstrument-functions-exclude-file-list" => {}
-                arg if arg == "-finstrument-functions-exclude-function-list" => {}
                 // `-ffreestanding` (C11 4p6): the program may execute in a
                 // freestanding environment, so `__STDC_HOSTED__` is 0. Linux's
                 // arch/x86/boot and most firmware pass this; before this arm
@@ -2102,8 +2100,14 @@ impl Driver {
                     // target supports it — x86-64 always does).
                     let m = arg["-fprofile-update=".len()..].to_string();
                     self.pgo_update = Some(match m.as_str() {
+                        "single" => "single".to_string(),
                         "atomic" | "prefer-atomic" => "atomic".to_string(),
-                        _ => "single".to_string(),
+                        _ => {
+                            return Err(format!(
+                                "invalid value '{}' for '{}'; expected single, atomic, or prefer-atomic",
+                                m, arg
+                            ));
+                        }
                     });
                 }
                 "-fbranch-probabilities" => {
@@ -2123,12 +2127,6 @@ impl Driver {
                     let path = arg["-fauto-profile=".len()..].to_string();
                     self.pgo_use = Some(path);
                 }
-                "-fno-profile-arcs"
-                | "-fno-test-coverage"
-                | "-fno-branch-probabilities"
-                | "-fno-auto-profile" => {}
-                arg if arg.starts_with("-fno-profile") => {}
-
                 // Feature flags. Full PIC and PIE have different x86-64 data
                 // relocation rules, so preserve the last explicit mode rather
                 // than collapsing both flags into one boolean.
@@ -2318,10 +2316,12 @@ impl Driver {
                 }
                 arg if arg.starts_with("-fdiagnostics-color=") => {
                     let value = &arg["-fdiagnostics-color=".len()..];
-                    if let Some(mode) = ColorMode::from_flag(value) {
-                        self.color_mode = mode;
-                    }
-                    // Unknown values silently ignored (matching GCC)
+                    self.color_mode = ColorMode::from_flag(value).ok_or_else(|| {
+                        format!(
+                            "invalid value '{}' for '{}'; expected auto, always, or never",
+                            value, arg
+                        )
+                    })?;
                 }
                 // Function-entry mcount instrumentation: `-pg` is the trigger
                 // that activates emission (see McountInstrumentation). The

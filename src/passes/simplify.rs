@@ -68,32 +68,18 @@ use crate::ir::reexports::{
     Value,
 };
 
-thread_local! {
-    static HOSTED_BUILTINS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
-}
-
-/// TU-scoped, thread-local policy; restoring on drop prevents cross-invocation
-/// leakage on early returns and in test workers.
-pub(super) struct BuiltinScope(bool);
-impl BuiltinScope {
-    pub(super) fn enter(enabled: bool) -> Self {
-        Self(HOSTED_BUILTINS.replace(enabled))
-    }
-}
-impl Drop for BuiltinScope {
-    fn drop(&mut self) {
-        HOSTED_BUILTINS.set(self.0);
-    }
-}
-
-fn builtin_allowed(name: &str) -> bool {
-    name.starts_with("__") || HOSTED_BUILTINS.get()
+/// Whether a math name is eligible for builtin folding in this translation unit.
+/// Compiler-prefixed builtin spellings remain available in every mode.
+fn builtin_allowed(name: &str, allow_hosted_builtins: bool) -> bool {
+    allow_hosted_builtins
+        || name.starts_with("__builtin_")
+        || matches!(name, "__fabstf2" | "__copysigntf3")
 }
 
 /// Run algebraic simplification on the module.
 /// Returns the number of instructions simplified.
-pub fn run(module: &mut IrModule) -> usize {
-    run_with_config(module, false)
+pub fn run(module: &mut IrModule, allow_hosted_builtins: bool) -> usize {
+    run_with_config(module, false, allow_hosted_builtins)
 }
 
 /// `fill_use_counts` enables the reassociation single-use profitability
@@ -106,15 +92,25 @@ pub fn run(module: &mut IrModule) -> usize {
 /// canonicalization for downstream vectorizer pattern matching, and blocking
 /// them changes which shape reaches the vectorizer (affine_map_vectorization
 /// regressed when the guard was active at -O2).
-pub fn run_with_config(module: &mut IrModule, fill_use_counts: bool) -> usize {
-    module.for_each_function(|f| simplify_function_with_config(f, fill_use_counts))
+pub fn run_with_config(
+    module: &mut IrModule,
+    fill_use_counts: bool,
+    allow_hosted_builtins: bool,
+) -> usize {
+    module.for_each_function(|f| {
+        simplify_function_with_config(f, fill_use_counts, allow_hosted_builtins)
+    })
 }
 
-pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
-    simplify_function_with_config(func, false)
+pub(crate) fn simplify_function(func: &mut IrFunction, allow_hosted_builtins: bool) -> usize {
+    simplify_function_with_config(func, false, allow_hosted_builtins)
 }
 
-fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -> usize {
+fn simplify_function_with_config(
+    func: &mut IrFunction,
+    fill_use_counts: bool,
+    allow_hosted_builtins: bool,
+) -> usize {
     if super::fp_environment_blocks_reordering(func) {
         return 0;
     }
@@ -317,7 +313,7 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
                     _ => {}
                 },
                 Instruction::Call { func, info } => {
-                    if builtin_allowed(func)
+                    if builtin_allowed(func, allow_hosted_builtins)
                         && matches!(
                             func.as_str(),
                             "fabs"
@@ -1056,7 +1052,7 @@ fn try_simplify_with_types(
         }
         Instruction::Call { func, info } => {
             if let Some(d) = info.dest {
-                simplify_math_call(d, func, &info.args, info.return_type)
+                simplify_math_call(d, func, &info.args, info.return_type, allow_hosted_builtins)
             } else {
                 None
             }
@@ -3155,8 +3151,9 @@ fn simplify_math_call(
     func: &str,
     args: &[Operand],
     return_type: IrType,
+    allow_hosted_builtins: bool,
 ) -> Option<Instruction> {
-    if !builtin_allowed(func) {
+    if !builtin_allowed(func, allow_hosted_builtins) {
         return None;
     }
     // Check unary intrinsic table first (sqrt, sqrtf, fabs, fabsf).
@@ -3292,7 +3289,7 @@ fn simplify_math_call(
 /// external reference and fail to link (LCCC links no libgcc). Running the
 /// same folding here makes `_Float128` math builtins work at every opt level.
 /// Semantics-preserving: the fold is a rename to the backend's own intrinsic.
-pub fn fold_math_intrinsic_calls(module: &mut IrModule) {
+pub fn fold_math_intrinsic_calls(module: &mut IrModule, allow_hosted_builtins: bool) {
     for func in &mut module.functions {
         if super::fp_environment_blocks_reordering(func) {
             continue;
@@ -3301,9 +3298,13 @@ pub fn fold_math_intrinsic_calls(module: &mut IrModule) {
             for inst in &mut block.instructions {
                 if let Instruction::Call { func: callee, info } = inst {
                     if let Some(d) = info.dest {
-                        if let Some(new_inst) =
-                            simplify_math_call(d, callee, &info.args, info.return_type)
-                        {
+                        if let Some(new_inst) = simplify_math_call(
+                            d,
+                            callee,
+                            &info.args,
+                            info.return_type,
+                            allow_hosted_builtins,
+                        ) {
                             *inst = new_inst;
                         }
                     }
@@ -3317,6 +3318,16 @@ pub fn fold_math_intrinsic_calls(module: &mut IrModule) {
 mod tests {
     use super::*;
     use crate::ir::reexports::CallInfo;
+
+    #[test]
+    fn no_builtins_allows_explicit_interfaces_not_arbitrary_double_underscore_names() {
+        assert!(builtin_allowed("__builtin_fabs", false));
+        assert!(builtin_allowed("__fabstf2", false));
+        assert!(builtin_allowed("__copysigntf3", false));
+        assert!(builtin_allowed("sqrt", true));
+        assert!(!builtin_allowed("sqrt", false));
+        assert!(!builtin_allowed("__user_math_wrapper", false));
+    }
 
     // === Test helpers ===
 
