@@ -170,6 +170,23 @@ pub struct TypeContext {
     /// Stored when a packed enum definition is processed so that forward
     /// references can look up the correct size.
     pub packed_enum_types: FxHashMap<String, crate::common::types::EnumType>,
+    /// Completed enum definitions, keyed by tag name.
+    ///
+    /// `packed_enum_types` only ever holds *packed* bodies, but every body-less
+    /// `enum tag` reference must resolve to the same `EnumType` the definition
+    /// produced -- most importantly with the variant VALUES intact, because
+    /// `EnumType::compatible_ctype` derives the enum's compatible integer type
+    /// (C11 6.7.2.2p4) from the presence of a negative enumerator.  Resolving a
+    /// reference to a variants-less `EnumType` made `enum md_submodule_id *`
+    /// (first enumerator `ID_LINEAR = LEVEL_LINEAR`, i.e. -1) look compatible
+    /// with `unsigned int *` instead of `int *`, and the kernel's
+    /// `kstrtoint(buf, 10, &id)` call in drivers/md/md.c was rejected.  GCC's
+    /// rule: an enum with any negative enumerator is compatible with `int`,
+    /// so a reference to a completed body must carry those variants.  Like
+    /// `packed_enum_types`, the map is not scope-popped; the tag namespace
+    /// collisions it could mis-resolve require a shadowing inner-scope
+    /// redefinition that no real translation unit exercises.
+    pub enum_types: FxHashMap<String, crate::common::types::EnumType>,
     /// Return CType for known functions
     pub func_return_ctypes: FxHashMap<String, CType>,
     /// Cache for CType of named struct/union types.
@@ -205,6 +222,7 @@ impl TypeContext {
             func_ptr_typedef_info: FxHashMap::default(),
             enum_typedefs: FxHashSet::default(),
             packed_enum_types: FxHashMap::default(),
+            enum_types: FxHashMap::default(),
             func_return_ctypes: FxHashMap::default(),
             ctype_cache: RefCell::new(FxHashMap::default()),
             scope_stack: RefCell::new(Vec::new()),
