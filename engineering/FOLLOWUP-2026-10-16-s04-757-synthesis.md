@@ -212,3 +212,14 @@ diverged / missing, with behavioral probes deciding "diverged".
 Open follow-up: LCCC accepts `&(0, inc)` (address of an rvalue function
 pointer; GCC 16: "lvalue required as unary '&' operand") - accepts-invalid
 class, sema fix candidate for a later session.
+
+## Clang 23.1 harness leg: blocked by the sandbox allowlist (measured)
+
+The pinned oracle Clang/lld 23.1 cannot be installed in this sandbox:
+GitHub release assets 302-redirect to `objects.githubusercontent.com`
+(curl exit 35, TLS blocked outside the allowlist), `apt.llvm.org` is
+blocked, PyPI/npm ship no clang-23 binary distribution, and a source
+build does not fit the VM (4.5 GB free). Nearest reachable compiler is
+clang 22.1.8 inside the `ziglang==0.17.0` wheel (`python3 -m ziglang cc`),
+usable as an *interim, explicitly-unpinned* comparison point only; no
+gate references it because gates pin exact oracle versions.
