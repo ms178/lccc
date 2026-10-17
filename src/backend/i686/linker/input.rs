@@ -565,11 +565,25 @@ impl Resolver<'_> {
         p: &str,
         script_dir: &Path,
     ) -> Result<Option<(String, Vec<u8>)>, String> {
-        let mut tries: Vec<String> = Vec::with_capacity(2);
+        let mut tries: Vec<String> = Vec::with_capacity(3);
         if p.starts_with('/') {
             let prefixed = with_sysroot_prefix(p);
             if prefixed != p {
                 tries.push(prefixed);
+            }
+            // GNU ld strips a baked-in sysroot prefix from script names: a
+            // tree whose script absolute names were pre-resolved against this
+            // very `LCCC_SYSROOT` must keep linking under it instead of only
+            // offering the doubled `$SYSROOT/$SYSROOT/...` candidate.
+            if let Ok(root) = std::env::var("LCCC_SYSROOT") {
+                let root = root.trim_end_matches('/');
+                if !root.is_empty() {
+                    if let Some(stripped) = p.strip_prefix(root) {
+                        if !stripped.is_empty() {
+                            tries.push(stripped.to_string());
+                        }
+                    }
+                }
             }
             tries.push(p.to_string());
         } else {

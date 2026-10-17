@@ -87,6 +87,22 @@ pub fn resolve_script_path(
         if prefixed != named && Path::new(&prefixed).is_file() {
             return Some(prefixed);
         }
+        // GNU ld strips a baked-in sysroot prefix from script names: a
+        // script pre-resolved against `$SYSROOT` (its absolute names patched
+        // to the sysroot tree) must keep linking when the very same
+        // `LCCC_SYSROOT` is applied again, instead of producing the
+        // doubled `$SYSROOT/$SYSROOT/...` candidate and only that.  Strip
+        // and retry before the as-written fallback.
+        if let Ok(root) = std::env::var("LCCC_SYSROOT") {
+            if !root.is_empty() {
+                let root = root.trim_end_matches('/');
+                if let Some(stripped) = named.strip_prefix(root) {
+                    if !stripped.is_empty() && Path::new(stripped).is_file() {
+                        return Some(stripped.to_string());
+                    }
+                }
+            }
+        }
         return Path::new(named).is_file().then(|| named.to_string());
     }
     // Written as early returns rather than an iterator chain on purpose:
@@ -257,6 +273,34 @@ mod tests {
     }
 
     #[test]
+    fn script_path_with_baked_sysroot_prefix_is_stripped() {
+        use crate::test_support::EnvGuard;
+        let root = temp_root("strip");
+        let rootfs = root.join("rootfs");
+        std::fs::create_dir_all(rootfs.join("lib32")).unwrap();
+        std::fs::write(rootfs.join("lib32/libc.so.6"), b"").unwrap();
+        let libs: Vec<String> = Vec::new();
+        let _guard = EnvGuard::set("LCCC_SYSROOT", &rootfs.display().to_string());
+        // The script baked the sysroot into its absolute names (a tree that
+        // was pre-resolved against this very sysroot): the doubled candidate
+        // `$SYSROOT/$SYSROOT/lib32/libc.so.6` misses, and GNU-ld-style
+        // prefix stripping must rescue the as-written name.
+        let baked = format!("{}/lib32/libc.so.6", rootfs.display());
+        // Order of attempts, GNU-ld-faithful: the doubled sysroot-prefixed
+        // candidate misses; the stripped name is probed in the host
+        // namespace (this sandbox has no host /lib32, so it misses too);
+        // the as-written name — the sysroot tree itself — resolves.  A host
+        // that mirrors the rootfs at / would see the stripped form win,
+        // which is exactly GNU ld's behaviour.
+        assert_eq!(
+            resolve_script_path(&baked, None, &libs),
+            Some(baked.clone()),
+            "a script name that already carries the sysroot prefix must not resolve to the doubled $SYSROOT/$SYSROOT/... candidate"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn script_path_prefixes_absolute_names_with_the_sysroot() {
         use crate::test_support::EnvGuard;
         let root = temp_root("sysroot");
