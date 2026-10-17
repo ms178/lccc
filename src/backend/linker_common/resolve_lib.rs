@@ -87,6 +87,17 @@ pub fn resolve_script_path(
         if prefixed != named && Path::new(&prefixed).is_file() {
             return Some(prefixed);
         }
+        // GNU ld strips a baked-in sysroot prefix from linker-script names: a
+        // script pre-resolved against `$SYSROOT` (its absolute names patched
+        // to the sysroot tree) must keep linking when the very same
+        // `LCCC_SYSROOT` is applied again, instead of producing the
+        // doubled `$SYSROOT/$SYSROOT/...` candidate and only that. The shared
+        // helper requires a path-component boundary before probing the host.
+        if let Some(stripped) = crate::backend::common::strip_sysroot_prefix(named) {
+            if Path::new(&stripped).is_file() {
+                return Some(stripped);
+            }
+        }
         return Path::new(named).is_file().then(|| named.to_string());
     }
     // Written as early returns rather than an iterator chain on purpose:
@@ -253,6 +264,37 @@ mod tests {
             resolve_script_path(&file.display().to_string(), None, &libs),
             Some(file.display().to_string())
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn script_path_with_baked_sysroot_prefix_prefers_the_stripped_file() {
+        use crate::test_support::EnvGuard;
+        let root = temp_root("strip");
+        let rootfs = root.join("rootfs");
+        let stripped = root.join("host-space/lib32/libc.so.6");
+        std::fs::create_dir_all(stripped.parent().unwrap()).unwrap();
+        std::fs::write(&stripped, b"host-side fixture").unwrap();
+
+        // Build an as-written path containing both the sysroot and the
+        // absolute stripped path. Its sysroot-prefixed candidate is the
+        // doubled path; the stripped path is an isolated temp fixture, not a
+        // host-dependent location such as /lib32/libc.so.6.
+        let stripped_relative = stripped.strip_prefix("/").unwrap();
+        let baked = rootfs.join(stripped_relative);
+        std::fs::create_dir_all(baked.parent().unwrap()).unwrap();
+        std::fs::write(&baked, b"baked-in fixture").unwrap();
+        let baked = baked.display().to_string();
+        let expected = stripped.display().to_string();
+        let rootfs = rootfs.display().to_string();
+        let _guard = EnvGuard::set("LCCC_SYSROOT", &rootfs);
+
+        assert_eq!(
+            resolve_script_path(&baked, None, &[]),
+            Some(expected),
+            "a baked-in sysroot prefix should be stripped before the as-written fallback"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
