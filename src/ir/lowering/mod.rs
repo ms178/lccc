@@ -46,5 +46,6 @@ pub(crate) mod structs;
 pub(crate) mod types;
 mod types_ctype;
 mod types_seed;
+mod vector_array_init;
 
 pub(crate) use lower::Lowerer;

@@ -6,6 +6,7 @@
 
 use super::definitions::{DeclAnalysis, FuncSig, GlobalInfo};
 use super::lower::Lowerer;
+use super::vector_array_init::VectorArrayInitPlan;
 use crate::common::type_builder::TypeConvertContext;
 use crate::common::types::{AddressSpace, CType, IrType};
 use crate::frontend::parser::ast::{
@@ -55,10 +56,7 @@ impl Lowerer {
 
         if !self.globals.contains_key(&declarator.name) {
             let mut ext_da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
-            let elem_size = ext_da.c_type.as_ref().map_or(0, |ct| ct.size());
-            if let Some(vs) = decl.resolve_vector_size(elem_size) {
-                ext_da.apply_vector_size(vs);
-            }
+            ext_da.apply_decl_vector_type(decl);
             // A block-scope `extern` names an object with linkage, so it is
             // placed exactly like its file-scope declaration (global_decl.rs).
             // Skipping this left `extern long __seg_gs x;` in generic memory.
@@ -302,11 +300,14 @@ impl Lowerer {
             }
         }
 
-        // Track CType for pointer-returning and struct-returning functions.
-        // Without this, member access on a call result (e.g., `func().field`)
-        // cannot resolve the struct layout and falls back to offset 0.
+        // Track CType for pointer/aggregate returns and i686 ext-vector GP
+        // returns. Without the vector CType, callers cannot unpack EAX:EDX:ECX
+        // lane words back into the object representation.
         let mut return_ctype = None;
-        if ret_ty == IrType::Ptr {
+        if ret_ty == IrType::Ptr
+            || (ptr_count == 0
+                && matches!(self.type_spec_to_ctype(ret_type_spec), CType::ExtVector(..)))
+        {
             let base_ctype = self.type_spec_to_ctype(ret_type_spec);
             let ret_ctype = if ptr_count > 0 {
                 let mut ct = base_ctype;
@@ -341,15 +342,33 @@ impl Lowerer {
                 sret_size = s;
                 two_reg_ret_size = t;
             }
-            // Vector types use the same by-value return convention as structs
+            // i686 Clang ext-vectors with up to three integer GP words return
+            // in EAX/EDX/ECX. All other ext-vector and vector_size return
+            // classification remains unchanged here.
             if ret_ct.is_vector() {
                 let size = self.sizeof_type(ret_type_spec);
-                let (s, t) = Self::classify_struct_return(size);
-                sret_size = s;
-                two_reg_ret_size = t;
-                // Small vector returns (<=8 bytes, no sret/two_reg) need I64 return type
-                if s.is_none() && t.is_none() {
-                    ret_ty = IrType::I64;
+                if crate::common::types::target_is_32bit() && matches!(ret_ct, CType::ExtVector(..))
+                {
+                    if let Some(words) = ret_ct.i686_ext_vector_gp_word_count() {
+                        sret_size = None;
+                        two_reg_ret_size = None;
+                        ret_ty = match words {
+                            1 => IrType::I32,
+                            2 => IrType::I64,
+                            3 => IrType::I128,
+                            _ => unreachable!("i686 ext-vector GP return word count is bounded"),
+                        };
+                    } else {
+                        sret_size = Some(size);
+                    }
+                } else {
+                    let (s, t) = Self::classify_struct_return(size);
+                    sret_size = s;
+                    two_reg_ret_size = t;
+                    // Small vector returns (<=8 bytes, no sret/two_reg) need I64.
+                    if s.is_none() && t.is_none() {
+                        ret_ty = IrType::I64;
+                    }
                 }
             }
             if matches!(ret_ct, CType::ComplexLongDouble) {
@@ -373,8 +392,22 @@ impl Lowerer {
             }
         }
 
-        // Compute SysV eightbyte classification for two-register struct returns
-        let ret_eightbyte_classes = if two_reg_ret_size.is_some() && ptr_count == 0 {
+        // Return carrier classes are normally SysV eightbytes. On i686 an
+        // ExtVector with three GP words uses three INTEGER markers for its
+        // EAX:EDX:ECX return bundle.
+        let ret_eightbyte_classes = if ptr_count == 0
+            && crate::common::types::target_is_32bit()
+            && self
+                .type_spec_to_ctype(ret_type_spec)
+                .i686_ext_vector_gp_word_count()
+                == Some(3)
+        {
+            vec![
+                crate::common::types::EightbyteClass::Integer,
+                crate::common::types::EightbyteClass::Integer,
+                crate::common::types::EightbyteClass::Integer,
+            ]
+        } else if two_reg_ret_size.is_some() && ptr_count == 0 {
             let ret_ct = self.type_spec_to_ctype(ret_type_spec);
             if ret_ct.is_struct_or_union() || ret_ct.is_vector() {
                 if let Some(layout) = self.get_struct_layout_for_type(ret_type_spec) {
@@ -545,50 +578,53 @@ impl Lowerer {
             self.lower_complex_var_init(expr, alloca, da, decl);
         } else if let Some(ref ct) = da.c_type {
             if ct.is_vector() {
-                // Vector init from expression: memcpy from source to destination.
-                // When the source is a function call returning a small vector (<=8 bytes),
-                // the return value is packed data in a register (I64), not a pointer.
-                // We must spill it to an alloca before memcpy.
-                let total_size = ct.size();
-                let is_small_vec_call = self.rhs_is_small_vector_call(expr, total_size);
-                let src = self.lower_aggregate_rvalue(expr);
-                let src_val = self.operand_to_value(src);
-                if is_small_vec_call {
-                    // Packed register value: store to alloca, then memcpy from alloca
-                    let tmp_alloca = self.fresh_value();
-                    let store_ty = Self::packed_store_type(total_size);
-                    self.emit(Instruction::Alloca {
-                        dest: tmp_alloca,
-                        size: total_size,
-                        ty: store_ty,
-                        align: 0,
-                        volatile: false,
-                        semantic_volatile: false,
-                    });
-                    self.emit(Instruction::Store {
-                        volatile: false,
-                        val: Operand::Value(src_val),
-                        ptr: tmp_alloca,
-                        ty: store_ty,
-                        seg_override: AddressSpace::Default,
-                    });
-                    self.emit(Instruction::Memcpy {
-                        dest: alloca,
-                        src: tmp_alloca,
-                        size: total_size,
-                    });
-                } else {
-                    self.emit(Instruction::Memcpy {
-                        dest: alloca,
-                        src: src_val,
-                        size: total_size,
-                    });
-                }
+                self.copy_vector_expr_to_alloca(expr, alloca, ct);
             } else {
                 self.lower_scalar_init_expr(expr, alloca, da, decl);
             }
         } else {
             self.lower_scalar_init_expr(expr, alloca, da, decl);
+        }
+    }
+
+    /// Copy a vector expression into its destination object. Small vector
+    /// calls return packed register data rather than an address; spill those
+    /// values using the same size-correct path used for ordinary vector copy
+    /// initialization.
+    fn copy_vector_expr_to_alloca(&mut self, expr: &Expr, destination: Value, vector_ct: &CType) {
+        let total_size = vector_ct.size();
+        let is_small_vec_call = self.rhs_is_small_vector_call(expr, total_size);
+        let src = self.lower_aggregate_rvalue(expr);
+        let src_val = self.operand_to_value(src);
+        if is_small_vec_call {
+            let tmp_alloca = self.fresh_value();
+            let store_ty = Self::packed_store_type(total_size);
+            self.emit(Instruction::Alloca {
+                dest: tmp_alloca,
+                size: total_size,
+                ty: store_ty,
+                align: 0,
+                volatile: false,
+                semantic_volatile: false,
+            });
+            self.emit(Instruction::Store {
+                volatile: false,
+                val: Operand::Value(src_val),
+                ptr: tmp_alloca,
+                ty: store_ty,
+                seg_override: AddressSpace::Default,
+            });
+            self.emit(Instruction::Memcpy {
+                dest: destination,
+                src: tmp_alloca,
+                size: total_size,
+            });
+        } else {
+            self.emit(Instruction::Memcpy {
+                dest: destination,
+                src: src_val,
+                size: total_size,
+            });
         }
     }
 
@@ -807,8 +843,8 @@ impl Lowerer {
                 declarator_name,
             );
         } else if let Some(ref ct) = da.c_type {
-            if let Some((elem_ct, num_elems)) = ct.vector_info() {
-                self.lower_vector_init_list(items, alloca, elem_ct, num_elems);
+            if ct.is_vector() {
+                self.lower_vector_init_list(items, alloca, ct);
             } else {
                 // Scalar with braces: int x = { 1 };
                 self.lower_scalar_braced_init(items, alloca, da);
@@ -913,6 +949,20 @@ impl Lowerer {
         decl: &Declaration,
         declarator_name: &str,
     ) {
+        // Ext-vector arrays use a shared dimension/designator planner. Zero
+        // the complete C object first, then write each initialized vector at
+        // its padded C stride; the pointer IR carrier is never an array stride.
+        if let Some(array_type) = da
+            .c_type
+            .as_ref()
+            .map(|ty| self.complete_array_ctype(ty, da.alloc_size))
+        {
+            if let Some(plan) = self.plan_vector_array_init(items, &array_type) {
+                self.lower_local_vector_array_plan(plan, alloca, da.alloc_size);
+                return;
+            }
+        }
+
         // Arrays of scalars of any rank, including `{ "str" }` for character
         // arrays: resolved by the array planner.
         if let Some(geo) = da
@@ -961,6 +1011,36 @@ impl Lowerer {
         } else {
             // 1D array of scalars
             self.lower_1d_array_init(items, alloca, da, decl);
+        }
+    }
+
+    /// Emit stores/copies for the row-major vector leaves selected by the
+    /// shared initializer planner. Missing entries and all padding are already
+    /// zero from the whole-object initialization.
+    fn lower_local_vector_array_plan(
+        &mut self,
+        plan: VectorArrayInitPlan,
+        alloca: Value,
+        allocation_size: usize,
+    ) {
+        self.zero_init_alloca(alloca, allocation_size);
+        let vector_size = plan.vector_type.size();
+        for (index, init) in plan.elements.into_iter().enumerate() {
+            let Some(init) = init else { continue };
+            let offset = index.saturating_mul(vector_size);
+            let vector_alloca = if offset == 0 {
+                alloca
+            } else {
+                self.emit_gep_offset(alloca, offset, IrType::I8)
+            };
+            match init {
+                Initializer::List(vector_items) => {
+                    self.lower_vector_init_list(&vector_items, vector_alloca, &plan.vector_type);
+                }
+                Initializer::Expr(expr) => {
+                    self.copy_vector_expr_to_alloca(&expr, vector_alloca, &plan.vector_type);
+                }
+            }
         }
     }
 
@@ -1489,28 +1569,32 @@ impl Lowerer {
         }
     }
 
-    /// Vector init list: `v4hi a = {1, 2, 3, 4};`
-    /// Stores each element at elem_size * index offset from the alloca.
+    /// Initialize a vector object, preserving padded storage and packed bool
+    /// lane representation. The CType supplies logical lane count independently
+    /// of total storage bytes.
     pub(super) fn lower_vector_init_list(
         &mut self,
         items: &[InitializerItem],
         alloca: Value,
-        elem_ct: &CType,
-        num_elems: usize,
+        vector_ct: &CType,
     ) {
+        let Some((elem_ct, num_elems)) = vector_ct.vector_info() else {
+            return;
+        };
         let elem_ir_ty = IrType::from_ctype(elem_ct);
-        let elem_size = elem_ct.size();
-        // Zero-init first if fewer initializers than elements
-        if items.len() < num_elems {
-            // Saturating, so a bogus element count can only over-reserve the
-            // alloca, never under-reserve it and leave the zero fill (or the
-            // initializers that follow) writing past the allocation.
-            self.zero_init_alloca(alloca, elem_size.saturating_mul(num_elems));
+        let total_size = self.ctype_size(vector_ct);
+        // Packed bool lane stores are read-modify-write, padding is not written
+        // by any lane, and a short initializer list leaves C-mandated zero
+        // lanes; clear the object in exactly those cases, sized by the object.
+        // (main sized this as `elem_size * num_elems`: that under-clears the
+        // padding byte of `u8x3` and over-clears past a bit-packed `bool4`,
+        // whose object is smaller than lanes * elem_size.)
+        if items.len() < num_elems
+            || crate::ir::lowering::lower::vector_temp_needs_zero_init(vector_ct, num_elems)
+        {
+            self.zero_init_alloca(alloca, total_size);
         }
-        for (idx, item) in items.iter().enumerate() {
-            if idx >= num_elems {
-                break;
-            }
+        for (idx, item) in items.iter().enumerate().take(num_elems) {
             let init_expr = match &item.init {
                 Initializer::Expr(e) => Some(e),
                 Initializer::List(sub_items) => Self::unwrap_nested_init_expr(sub_items),
@@ -1518,9 +1602,24 @@ impl Lowerer {
             if let Some(e) = init_expr {
                 let val = self.lower_expr(e);
                 let expr_ty = self.get_expr_type(e);
-                let val = self.emit_implicit_cast(val, expr_ty, elem_ir_ty);
-                let offset = idx * elem_size;
-                self.emit_array_element_store(alloca, val, offset, elem_ir_ty);
+                let val = if matches!(elem_ct, CType::Bool) {
+                    self.emit_bool_normalize_typed(val, expr_ty)
+                } else {
+                    self.emit_implicit_cast(val, expr_ty, elem_ir_ty)
+                };
+                self.store_vector_lane(
+                    alloca,
+                    vector_ct,
+                    idx,
+                    val,
+                    if matches!(elem_ct, CType::Bool) {
+                        IrType::I32
+                    } else {
+                        elem_ir_ty
+                    },
+                    AddressSpace::Default,
+                    false,
+                );
             }
         }
     }

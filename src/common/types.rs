@@ -315,10 +315,103 @@ pub enum CType {
     Union(RcStr),
     Enum(EnumType),
     /// GCC vector extension type: __attribute__((vector_size(N))).
-    /// Stores (element_type, total_size_in_bytes).
-    /// E.g., `typedef int v4si __attribute__((vector_size(16)))` -> Vector(Int, 16)
-    /// has 4 elements of type int, total size 16 bytes.
+    /// Stores (element_type, total_size_in_bytes). The byte-size contract is
+    /// intentionally distinct from Clang's element-count-based ext_vector_type.
+    /// E.g., `typedef int v4si __attribute__((vector_size(16)))` -> Vector(Int, 16).
     Vector(Box<CType>, usize),
+    /// Clang vector extension type: __attribute__((ext_vector_type(N))).
+    /// The layout stores logical lanes separately from padded object storage;
+    /// Bool lanes are packed as bits. Do not infer lane count from storage size.
+    ExtVector(Box<CType>, ExtVectorLayout),
+}
+
+/// Target-specific object layout for a Clang `ext_vector_type`.
+///
+/// `vector_size` retains its legacy byte-width semantics in `CType::Vector`.
+/// This descriptor is only used for `ext_vector_type`, whose object may be
+/// padded beyond its logical lanes and whose `_Bool` lanes are bit-packed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExtVectorLayout {
+    pub lanes: usize,
+    pub storage_size: usize,
+    pub alignment: usize,
+    /// Byte stride of a non-bitpacked lane. On i686, long-double vector lanes
+    /// occupy 16 bytes although scalar sizeof(long double) is 12.
+    pub element_storage_size: usize,
+    /// Clang stores `_Bool` ext-vector lanes as consecutive bits, least
+    /// significant lane first within each byte.
+    pub bitpacked_bool: bool,
+}
+
+impl ExtVectorLayout {
+    /// Build the ext-vector layout for the target lccc currently emits code
+    /// for (x86-32 and x86-64). The power-of-two padded size, 16-byte x87
+    /// long-double lane stride, and bit-packed `_Bool` lanes are all measured
+    /// against clang-19 on Intel. Returns None for invalid lane types, zero
+    /// lanes, unsupported backends, or size overflow; callers are expected to
+    /// treat None as "attribute not recognized on this target" and fall back
+    /// to the scalar element (matching GCC's unknown-attribute semantics).
+    ///
+    /// When ARM or RISC-V support for `ext_vector_type` lands, this constructor
+    /// must branch on `target_elf_machine()` (or grow a per-backend hook)
+    /// because both targets use different padding/alignment rules; the current
+    /// x86 numbers will silently miscompile those ABIs.
+    pub fn new(element: &CType, lanes: usize) -> Option<Self> {
+        // The layout arithmetic below is only validated for x86-64 (EM_386=3,
+        // EM_X86_64=62). Other backends must provide their own rules.
+        let machine = crate::common::types::target_elf_machine();
+        if machine != 3 && machine != 62 {
+            return None;
+        }
+        if lanes == 0 {
+            return None;
+        }
+        let bitpacked_bool = matches!(element, CType::Bool);
+        let element_storage_size = if bitpacked_bool {
+            0
+        } else {
+            match element {
+                CType::Char
+                | CType::UChar
+                | CType::Short
+                | CType::UShort
+                | CType::Int
+                | CType::UInt
+                | CType::Long
+                | CType::ULong
+                | CType::LongLong
+                | CType::ULongLong
+                | CType::Int128
+                | CType::UInt128
+                | CType::Float
+                | CType::Double
+                | CType::LongDouble => {
+                    if matches!(element, CType::LongDouble) {
+                        16
+                    } else {
+                        element.size()
+                    }
+                }
+                _ => return None,
+            }
+        };
+        let payload_size = if bitpacked_bool {
+            lanes.checked_add(7)?.checked_div(8)?
+        } else {
+            lanes.checked_mul(element_storage_size)?
+        };
+        let storage_size = payload_size.checked_next_power_of_two()?;
+        if storage_size == 0 {
+            return None;
+        }
+        Some(Self {
+            lanes,
+            storage_size,
+            alignment: storage_size,
+            element_storage_size,
+            bitpacked_bool,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1181,8 +1274,7 @@ impl StructLayout {
                     }
                 }
             }
-            // Vector types: classify element-wise according to the element type.
-            // float/double vectors -> SSE, integer vectors -> INTEGER.
+            // Byte-sized GCC vectors keep their historical classification.
             CType::Vector(elem_ty, total_size) => {
                 let elem_size = elem_ty.size();
                 if elem_size > 0 {
@@ -1200,6 +1292,30 @@ impl StructLayout {
                     let eb_idx = base_offset / 8;
                     if eb_idx < n_eightbytes {
                         classes[eb_idx] = classes[eb_idx].merge(EightbyteClass::Integer);
+                    }
+                }
+            }
+            // ext_vector_type has an explicit lane count and may have padded
+            // storage. Classify only its logical lanes; padding contributes no
+            // additional fields. Packed bool vectors occupy integer bytes.
+            CType::ExtVector(elem_ty, layout) => {
+                if layout.bitpacked_bool {
+                    let first = base_offset / 8;
+                    let last = (base_offset + layout.storage_size.saturating_sub(1)) / 8;
+                    for eb_idx in first..=last {
+                        if eb_idx < n_eightbytes {
+                            classes[eb_idx] = classes[eb_idx].merge(EightbyteClass::Integer);
+                        }
+                    }
+                } else if layout.element_storage_size > 0 {
+                    for i in 0..layout.lanes {
+                        Self::classify_field_type(
+                            elem_ty,
+                            base_offset + i * layout.element_storage_size,
+                            classes,
+                            n_eightbytes,
+                            ctx,
+                        );
                     }
                 }
             }
@@ -1760,6 +1876,13 @@ impl std::fmt::Display for CType {
                 // GCC-style vector type display
                 write!(f, "__attribute__((vector_size({}))) {}", total_size, elem)
             }
+            CType::ExtVector(elem, layout) => {
+                write!(
+                    f,
+                    "__attribute__((ext_vector_type({}))) {}",
+                    layout.lanes, elem
+                )
+            }
         }
     }
 }
@@ -1925,6 +2048,7 @@ impl CType {
             }
             CType::Enum(e) => e.packed_size(),
             CType::Vector(_, total_size) => *total_size,
+            CType::ExtVector(_, layout) => layout.storage_size,
         }
     }
 
@@ -1999,8 +2123,10 @@ impl CType {
                 ctx.get_struct_layout(key).map(|l| l.align).unwrap_or(1)
             }
             CType::Enum(e) => e.packed_size(),
-            // GCC caps vector alignment at 16 bytes on x86-64
+            // GCC vector_size alignment retains its target-specific cap.
             CType::Vector(_, total_size) => (*total_size).min(16),
+            // Clang ext_vector_type alignment follows its padded storage size.
+            CType::ExtVector(_, layout) => layout.alignment,
         }
     }
 
@@ -2122,21 +2248,101 @@ impl CType {
         if !self.is_vector() {
             return None;
         }
+        // Clang lowers packed `_Bool` ext vectors through an integer carrier
+        // on x86-64 (e.g. ext_vector_type(4) is an i8 argument/return), not an
+        // SSE register. This classification is separate from vector_size.
+        if self.is_bitpacked_bool_vector() {
+            return match self.size() {
+                1..=8 => Some((vec![EightbyteClass::Integer], false)),
+                _ => None,
+            };
+        }
+        // A ONE-element floating-point vector (`ext_vector_type(1)` of
+        // `double`, 8 bytes) keeps the legacy INTEGER carrier. Clang and GCC
+        // classify this shape as MEMORY (clang-19 compiles `id(T a){return a;}`
+        // to `movsd 8(%rsp),%xmm0` -- the argument arrives on the stack), so
+        // there is no interop to be won by moving it to SSE; and LCCC's own
+        // FP return path cannot guarantee %xmm0 for it yet: at -O1 the callee
+        // materialises the result with `vaddsd ...,%xmm2,%xmm2` and emits no
+        // move, so an SSE classification returns a stale register and breaks
+        // lccc->lccc itself (measured FAIL of f64x1 in
+        // tests/regression/check_ext_vector_abi.sh). The INTEGER carrier is
+        // self-consistent on both sides; the gap is tracked, not hidden.
+        if let CType::ExtVector(elem, layout) = self {
+            if layout.lanes == 1
+                && matches!(**elem, CType::Double | CType::Float | CType::LongDouble)
+            {
+                return match self.size() {
+                    1..=8 => Some((vec![EightbyteClass::Integer], false)),
+                    _ => None,
+                };
+            }
+        }
         match self.size() {
+            // Smaller than an eightbyte: INTEGER class, carried in the low
+            // bytes of ONE general-purpose register. Measured with both
+            // oracles on x86-64: clang-19 `id_u8x1`/`id_u8x2`/`id_u16x2`/
+            // `id_u32x1`/`id_f32x1` and gcc-16 `vector_size(1,2,4)` shapes all
+            // arrive in %edi and leave in %eax. The old rule classified these
+            // as SSE and LCCC passed them in %xmm0, which no oracle does.
+            1..=4 => Some((vec![EightbyteClass::Integer], false)),
             // One SSE eightbyte: the low 64 bits of ONE xmm register.
-            1..=8 => Some((vec![EightbyteClass::Sse], false)),
-            // SSE + SSEUP: the full 128 bits of ONE xmm register.
-            16 => Some((vec![EightbyteClass::Sse, EightbyteClass::Sse], true)),
+            5..=8 => Some((vec![EightbyteClass::Sse], false)),
+            // SSE + SSEUP: the full 128 bits of ONE xmm register. An
+            // ext_vector_type(3) object is padded to 16 bytes and still uses a
+            // single %xmm0 (clang-19 `id_u32x3`/`id_f32x3`), so 9..=16 is one
+            // register, not the two-register struct form.
+            9..=16 => Some((vec![EightbyteClass::Sse, EightbyteClass::Sse], true)),
             _ => None,
         }
     }
 
     pub fn is_vector(&self) -> bool {
-        matches!(self, CType::Vector(_, _))
+        matches!(self, CType::Vector(_, _) | CType::ExtVector(_, _))
     }
 
-    /// For a vector type, returns (element_type, num_elements).
-    /// Returns None for non-vector types.
+    /// Whether this is a bit-packed bool ext-vector. `vector_size` types are
+    /// deliberately excluded and retain their existing byte-stride semantics.
+    pub fn is_bitpacked_bool_vector(&self) -> bool {
+        matches!(self, CType::ExtVector(_, layout) if layout.bitpacked_bool)
+    }
+
+    /// Number of 32-bit i386 GP return words used for a Clang integer
+    /// ext-vector. The i386 Clang ABI scalarizes each logical lane and returns
+    /// up to three words in EAX, EDX, and ECX; larger vectors use sret. This
+    /// is deliberately limited to ExtVector and does not change vector_size.
+    pub fn i686_ext_vector_gp_word_count(&self) -> Option<usize> {
+        let CType::ExtVector(elem, layout) = self else {
+            return None;
+        };
+        if !elem.is_integer() {
+            return None;
+        }
+        let elem_size = elem.size();
+        if elem_size == 0 {
+            return None;
+        }
+        let words_per_lane = elem_size.checked_add(3)?.checked_div(4)?;
+        let words = layout.lanes.checked_mul(words_per_lane)?;
+        (1..=3).contains(&words).then_some(words)
+    }
+
+    /// Storage stride for one logical vector lane, or None for a packed bool
+    /// ext-vector whose lane addresses are bit positions rather than bytes.
+    pub fn vector_element_storage_size(&self) -> Option<usize> {
+        match self {
+            CType::Vector(elem, _) => Some(elem.size()),
+            CType::ExtVector(_, layout) if !layout.bitpacked_bool => {
+                Some(layout.element_storage_size)
+            }
+            CType::ExtVector(_, _) => None,
+            _ => None,
+        }
+    }
+
+    /// For a vector type, returns (element_type, logical lane count).
+    /// Returns None for non-vector types. Ext-vector lane count is never
+    /// inferred from padded object storage.
     pub fn vector_info(&self) -> Option<(&CType, usize)> {
         match self {
             CType::Vector(elem, total_size) => {
@@ -2147,6 +2353,7 @@ impl CType {
                     None
                 }
             }
+            CType::ExtVector(elem, layout) => Some((elem.as_ref(), layout.lanes)),
             _ => None,
         }
     }
@@ -2855,7 +3062,7 @@ impl IrType {
             CType::Pointer(_, _) | CType::Array(_, _) | CType::Function(_) => IrType::Ptr,
             CType::Struct(_) | CType::Union(_) => IrType::Ptr,
             // Vectors are treated as aggregate types (pointer to stack slot)
-            CType::Vector(_, _) => IrType::Ptr,
+            CType::Vector(_, _) | CType::ExtVector(_, _) => IrType::Ptr,
         }
     }
 }

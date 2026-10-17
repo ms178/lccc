@@ -4214,6 +4214,16 @@ pub(super) fn ret_xmm_mask(
     if ret_is_f128_sse {
         return 1;
     }
+    // AUD-VABI-3: ONE SSE eightbyte is returned in the low half of %xmm0 no
+    // matter what the IR type of the bit container is. The 8-byte vector
+    // shapes carry `I64`/`U64` (they are opaque bit containers), so the type
+    // match below answers 0 and every consumer of this mask -- the late text
+    // peephole's FP liveness oracle (`fp_liveness.rs`) first among them --
+    // then believes %xmm0 is dead across the `ret` and is entitled to delete
+    // the very move that produces the return value.
+    if ret_eightbyte_classes.len() == 1 && ret_eightbyte_classes[0] == EightbyteClass::Sse {
+        return 1;
+    }
     let mut mask = match return_type {
         IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64 => 1,
         IrType::I128 | IrType::U128 => {

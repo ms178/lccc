@@ -92,7 +92,12 @@ impl I686Codegen {
         self.is_variadic = func.is_variadic;
         self.is_fastcall = func.is_fastcall;
         self.current_return_type = func.return_type;
-
+        self.current_return_i686_ext_vector_gp3 = func.return_type == IrType::I128
+            && func.ret_eightbyte_classes.len() == 3
+            && func
+                .ret_eightbyte_classes
+                .iter()
+                .all(|class| *class == crate::common::types::EightbyteClass::Integer);
         // Effective regparm for this function: a function-level
         // `__attribute__((regparm(N)))` overrides the global -mregparm
         // flag; fastcall wins over both (GCC passes ECX/EDX and the two
@@ -116,8 +121,17 @@ impl I686Codegen {
             let param_tys: Vec<IrType> = func.params.iter().map(|p| p.ty).collect();
             let struct_sizes: Vec<Option<usize>> =
                 func.params.iter().map(|p| p.struct_size).collect();
+            let force_stack: Vec<bool> = func
+                .params
+                .iter()
+                .map(|param| {
+                    param.struct_eightbyte_classes.len() == 1
+                        && param.struct_eightbyte_classes[0]
+                            == crate::common::types::EightbyteClass::NoClass
+                })
+                .collect();
             let (slots, stack_bytes) =
-                self.fastcall_layout(&param_tys, &struct_sizes, func.is_variadic);
+                self.fastcall_layout(&param_tys, &struct_sizes, &force_stack, func.is_variadic);
             self.fastcall_slots = slots;
             self.fastcall_stack_cleanup = stack_bytes;
         } else {
@@ -610,6 +624,9 @@ impl I686Codegen {
         // `mov ..., %edx` relays in ordinary 32-bit-returning functions.
         if matches!(func.return_type, IrType::I64 | IrType::U64) || is_i128_type(func.return_type) {
             self.state.emit("# lccc-i686-return-uses-edx");
+        }
+        if self.current_return_i686_ext_vector_gp3 {
+            self.state.emit("# lccc-i686-return-uses-ecx");
         }
         // Unwind info for this frame is derived from the final instruction
         // stream after the peephole (backend::cfi_synth), so it stays exact

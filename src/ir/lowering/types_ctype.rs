@@ -126,11 +126,12 @@ impl Lowerer {
                     .collect();
                 TypeSpecifier::BareFunction(Box::new(ret_ts), param_decls, ft.variadic)
             }
-            // Vector types fall back to element type for type-spec conversion (used
-            // by implicit cast logic). This is safe because vector operations are
-            // lowered element-wise and never rely on this round-trip for sizing.
-            // TODO: Vector subscript (v[i]) and unary ops (-v, ~v) not yet implemented
+            // vector_size types historically fall back to their element type for
+            // implicit cast logic; sizing uses the original CType metadata.
             CType::Vector(elem, _) => Self::ctype_to_type_spec(elem),
+            CType::ExtVector(elem, layout) => {
+                TypeSpecifier::ExtVector(Box::new(Self::ctype_to_type_spec(elem)), layout.lanes)
+            }
         }
     }
 

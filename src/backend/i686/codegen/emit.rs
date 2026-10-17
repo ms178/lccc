@@ -43,6 +43,9 @@ pub(super) enum I686FastcallSlot {
 pub struct I686Codegen {
     pub(crate) state: CodegenState,
     pub(super) current_return_type: IrType,
+    /// Whether this function returns an i686 integer ExtVector through EAX:EDX:ECX.
+    /// The three INTEGER return markers are carried in ret_eightbyte_classes.
+    pub(super) current_return_i686_ext_vector_gp3: bool,
     /// Whether the current function is variadic
     pub(super) is_variadic: bool,
     /// Register allocation results (callee-saved registers: ebx, esi, edi)
@@ -462,6 +465,7 @@ impl I686Codegen {
         Self {
             state,
             current_return_type: IrType::I32,
+            current_return_i686_ext_vector_gp3: false,
             is_variadic: false,
             reg_assignments: FxHashMap::default(),
             divrem_tail_dests: FxHashSet::default(),
@@ -1037,8 +1041,26 @@ impl I686Codegen {
         &self,
         param_tys: &[IrType],
         struct_sizes: &[Option<usize>],
+        force_stack: &[bool],
         is_variadic: bool,
     ) -> (Vec<I686FastcallSlot>, usize) {
+        // Every (scalarized) parameter slot needs a parallel force_stack entry
+        // so i686 ExtVector lanes cannot silently fall back to the register
+        // path when a future caller forgets the argument. The slices are
+        // allowed to be empty in legacy unit tests that predate these
+        // parameters, which always means "no lanes forced, no aggregates".
+        debug_assert!(
+            force_stack.is_empty() || force_stack.len() == param_tys.len(),
+            "fastcall_layout: force_stack length {} must match param_tys length {}",
+            force_stack.len(),
+            param_tys.len(),
+        );
+        debug_assert!(
+            struct_sizes.is_empty() || struct_sizes.len() == param_tys.len(),
+            "fastcall_layout: struct_sizes length {} must match param_tys length {}",
+            struct_sizes.len(),
+            param_tys.len(),
+        );
         let mut slots = Vec::with_capacity(param_tys.len());
         let mut regs_free = [true, true];
         let mut chain_broken = is_variadic;
@@ -1057,6 +1079,18 @@ impl I686Codegen {
                 _ if is_i128_type(*ty) => 16,
                 _ => 4,
             });
+
+            // Clang i686 ExtVector lanes are scalar values in their own stack
+            // slots, but unlike aggregates they do not break fastcall's
+            // ECX/EDX eligibility chain for subsequent ordinary parameters.
+            if force_stack.get(i).copied().unwrap_or(false) {
+                slots.push(I686FastcallSlot::Stack {
+                    offset: cursor,
+                    size,
+                });
+                cursor += size as i64;
+                continue;
+            }
 
             if !chain_broken && aggregate.is_none() && self.is_fastcall_reg_eligible(*ty) {
                 if let Some(idx) = regs_free.iter().position(|&free| free) {
@@ -1600,6 +1634,7 @@ impl I686Codegen {
         args: &[Operand],
         arg_types: &[IrType],
         struct_arg_sizes: &[Option<usize>],
+        struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
         direct_name: Option<&str>,
         func_ptr: Option<&Operand>,
         dest: Option<Value>,
@@ -1609,7 +1644,14 @@ impl I686Codegen {
         let indirect = func_ptr.is_some() && direct_name.is_none();
 
         // One authoritative layout, identical to the callee-side prologue.
-        let (slots, stack_bytes) = self.fastcall_layout(arg_types, struct_arg_sizes, is_variadic);
+        let force_stack: Vec<bool> = struct_arg_classes
+            .iter()
+            .map(|classes| {
+                classes.len() == 1 && classes[0] == crate::common::types::EightbyteClass::NoClass
+            })
+            .collect();
+        let (slots, stack_bytes) =
+            self.fastcall_layout(arg_types, struct_arg_sizes, &force_stack, is_variadic);
 
         // Align the outgoing argument area to 16 bytes. The callee pops
         // exactly `stack_bytes`; the alignment padding is caller-owned.
@@ -2675,17 +2717,27 @@ impl ArchCodegen for I686Codegen {
         ret_eightbyte_classes: &[crate::common::types::EightbyteClass],
         _ret_is_f128_sse: bool,
     ) {
+        let returns_i686_ext_vector_gp3 = return_type == IrType::I128
+            && ret_eightbyte_classes.len() == 3
+            && ret_eightbyte_classes
+                .iter()
+                .all(|class| *class == crate::common::types::EightbyteClass::Integer);
         if is_fastcall {
+            let gp3_dest = returns_i686_ext_vector_gp3.then(|| dest.clone()).flatten();
             self.emit_fastcall(
                 args,
                 arg_types,
                 struct_arg_sizes,
+                struct_arg_classes,
                 direct_name,
                 func_ptr,
                 dest,
                 return_type,
                 is_variadic,
             );
+            if let Some(dest) = gp3_dest {
+                self.emit_call_store_i686_ext_vector_gp3_result_impl(&dest);
+            }
             return;
         }
         use crate::backend::call_abi::*;
@@ -2762,6 +2814,9 @@ impl ArchCodegen for I686Codegen {
         if let Some(dest) = dest {
             self.set_call_ret_eightbyte_classes(ret_eightbyte_classes);
             self.emit_call_store_result(&dest, return_type);
+            if returns_i686_ext_vector_gp3 {
+                self.emit_call_store_i686_ext_vector_gp3_result_impl(&dest);
+            }
         }
     }
 
@@ -3984,6 +4039,7 @@ mod tests {
         let (slots, bytes) = cg.fastcall_layout(
             &[IrType::I32, IrType::Ptr, IrType::I32, IrType::I32],
             &[None, Some(0), None, None],
+            &[],
             false,
         );
         assert_eq!(
@@ -4005,6 +4061,7 @@ mod tests {
         let (slots, bytes) = cg.fastcall_layout(
             &[IrType::I32, IrType::Ptr, IrType::Ptr, IrType::I32],
             &[None, Some(4), Some(0), None],
+            &[],
             false,
         );
         assert_eq!(
@@ -4020,12 +4077,42 @@ mod tests {
     }
 
     #[test]
+    fn fastcall_extvector_stack_lanes_preserve_register_chain() {
+        use I686FastcallSlot::{Reg, Stack};
+        let cg = I686Codegen::new();
+        let (slots, bytes) = cg.fastcall_layout(
+            &[
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+            ],
+            &[None, None, None, None, None],
+            &[false, true, true, true, false],
+            false,
+        );
+        assert_eq!(
+            slots,
+            vec![
+                Reg(0),
+                Stack { offset: 0, size: 4 },
+                Stack { offset: 4, size: 4 },
+                Stack { offset: 8, size: 4 },
+                Reg(1),
+            ]
+        );
+        assert_eq!(bytes, 12);
+    }
+
+    #[test]
     fn fastcall_variadic_zero_aggregate_stays_stack_only() {
         use I686FastcallSlot::Stack;
         let cg = I686Codegen::new();
         let (slots, bytes) = cg.fastcall_layout(
             &[IrType::I32, IrType::Ptr, IrType::I32],
             &[None, Some(0), None],
+            &[],
             true,
         );
         assert_eq!(

@@ -132,6 +132,23 @@ impl X86Codegen {
             self.emit_epilogue_and_ret_impl(frame_size);
             return;
         }
+        // AUD-VABI-2: an 8-byte vector return is ONE SSE eightbyte — the low 64
+        // bits of %xmm0 — not an accumulator return. The IR carries the bit
+        // container as I64/U64, so the generic path below would hand the value
+        // back in %rax; clang-19 and gcc-16 both keep it in %xmm0 (measured:
+        // `id_u32x2`, `id_u64x1`, `id_f32x2`, `id_f64x1` are all a bare `ret`
+        // with the argument register also being the return register). Clang's
+        // caller reads %xmm0, so an %rax return is a silent ABI mismatch.
+        if self.func_ret_classes.len() == 1
+            && self.func_ret_classes[0] == crate::common::types::EightbyteClass::Sse
+            && matches!(ret_ty, IrType::I64 | IrType::U64)
+        {
+            if let Some(val) = val {
+                self.load_bits64_to_xmm0(val);
+            }
+            self.emit_epilogue_and_ret_impl(frame_size);
+            return;
+        }
         crate::backend::traits::emit_return_default(self, val, frame_size);
     }
 

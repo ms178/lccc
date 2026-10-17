@@ -429,10 +429,24 @@ EOF
         # raises this budget by 1. The relay floor below (0) and this
         # budget move together: a relay may only ever be exchanged for a
         # counted copy, never added silently.
-        if [[ "$n_copies" -le 48 ]]; then
-            ok "runtime kernel carries $n_copies vector register copies (budget 48: 42 residual + 6 direct arg-staging forms, each a folded 2-instruction %rax relay worth net -1 instruction)"
+        # 2026-10-17 (ExtVector work): 48 -> 44.  The measured count falls to 42
+        # once vector temporaries stop being cleared before their lanes are
+        # written (`vector_temp_needs_zero_init` in src/ir/lowering/lower.rs).
+        # The clear was a ladder of dead stores; it inflated the IR enough to
+        # push `fma_forms` and `ymm_and_xmm_aliasing` out of line in `main`
+        # (packed_read_of_scalar_copy 40 -> 34 and ymm_and_xmm_aliasing 36 -> 30
+        # IR instructions, i.e. back to the numbers the pre-ExtVector tree
+        # reports), and the two out-of-line copies cost 7 counted copies
+        # (51 -> 49 -> 42).  The budget is the new measurement plus 2, not the
+        # measurement itself: this counter moves by several copies when
+        # unrelated inlining decisions change (the 49/42 swing above came from a
+        # 6-instruction IR difference), and a zero-slack ratchet would fail on
+        # inliner noise instead of on copy regressions.  The relay floor below
+        # is still 0 and the unit law is unchanged.
+        if [[ "$n_copies" -le 44 ]]; then
+            ok "runtime kernel carries $n_copies vector register copies (budget 44: measured 42 + 2 slack; the 42 is 36 residual + 6 direct arg-staging forms, each a folded 2-instruction %rax relay worth net -1 instruction)"
         else
-            bad "runtime kernel carries $n_copies vector register copies, budget is 48"
+            bad "runtime kernel carries $n_copies vector register copies, budget is 44"
             insns "$work/runtime.s" | grep -E "$COPY_RE" | sed -n '1,10p' | note
         fi
         # RELAY COUNTER (2026-09-26): the two-instruction `%rax` relay pairs

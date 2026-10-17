@@ -350,7 +350,9 @@ impl<'a> ExprTypeChecker<'a> {
                     // a stale slot at -O2 (lanes 2-3 duplicated lanes 0-1).
                     // Typing it correctly needs that convention rework first.
                     if name == "__builtin_shuffle" && !args.is_empty() {
-                        if let Some(ct @ CType::Vector(_, _)) = self.infer_expr_ctype(&args[0]) {
+                        if let Some(ct @ (CType::Vector(_, _) | CType::ExtVector(_, _))) =
+                            self.infer_expr_ctype(&args[0])
+                        {
                             return Some(ct);
                         }
                     }

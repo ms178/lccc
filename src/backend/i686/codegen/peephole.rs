@@ -5821,9 +5821,9 @@ fn line_reg_use_def(store: &LineStore, infos: &[LineInfo], idx: usize) -> (u16, 
             defs = caller;
         }
         LineKind::Ret | LineKind::RetN => {
-            // EAX is every scalar return.  EDX liveness for wide integer
-            // returns is added from the private function metadata by the CFG
-            // driver below.
+            // EAX is every scalar return. EDX/ECX liveness for wider ABI
+            // return bundles is added from private function metadata by the
+            // CFG driver below.
             uses |= bit(REG_EAX) | bit(REG_ESP);
         }
         LineKind::JmpIndirect => {
@@ -5937,8 +5937,8 @@ fn direct_jump_target(line: &str) -> Option<&str> {
 /// effect, because the oracle models the architectural reads the scan never
 /// saw: a regparm `call` READS `%eax/%ecx/%edx` (a load feeding such an
 /// argument survived the fold only by luck of the barrier), and `ret` READS
-/// `%eax` (+ `%edx` via the `lccc-i686-return-uses-edx` marker), so a load
-/// feeding the return value is retained.
+/// `%eax`, plus `%edx`/`%ecx` when their private return-use markers are
+/// present, so loads feeding wide and three-word returns are retained.
 ///
 /// This is the same eight-register backward dataflow used by
 /// `optimize_cfg_register_liveness`, factored out so every pass can ask the
@@ -5972,7 +5972,11 @@ impl GprLiveness {
             let return_uses_edx = (start..end).any(|i| {
                 !infos[i].is_nop() && trimmed(store, &infos[i], i) == "# lccc-i686-return-uses-edx"
             });
-            let lo = compute_gpr_live_out(store, infos, start, end, return_uses_edx);
+            let return_uses_ecx = (start..end).any(|i| {
+                !infos[i].is_nop() && trimmed(store, &infos[i], i) == "# lccc-i686-return-uses-ecx"
+            });
+            let lo =
+                compute_gpr_live_out(store, infos, start, end, return_uses_edx, return_uses_ecx);
             for local in 0..(end - start) {
                 lv.live_out[start + local] = lo[local];
                 lv.covered[start + local] = true;
@@ -5989,7 +5993,10 @@ impl GprLiveness {
             let return_uses_edx = (0..len).any(|i| {
                 !infos[i].is_nop() && trimmed(store, &infos[i], i) == "# lccc-i686-return-uses-edx"
             });
-            let lo = compute_gpr_live_out(store, infos, 0, len, return_uses_edx);
+            let return_uses_ecx = (0..len).any(|i| {
+                !infos[i].is_nop() && trimmed(store, &infos[i], i) == "# lccc-i686-return-uses-ecx"
+            });
+            let lo = compute_gpr_live_out(store, infos, 0, len, return_uses_edx, return_uses_ecx);
             for i in 0..len {
                 lv.live_out[i] = lo[i];
                 lv.covered[i] = true;
@@ -6053,6 +6060,7 @@ fn compute_gpr_live_out(
     start: usize,
     end: usize,
     return_uses_edx: bool,
+    return_uses_ecx: bool,
 ) -> Vec<u16> {
     let n = end - start;
     let mut labels = std::collections::HashMap::<&str, usize>::new();
@@ -6116,8 +6124,13 @@ fn compute_gpr_live_out(
                 }
             }
             let (mut uses, defs) = line_reg_use_def(store, infos, i);
-            if return_uses_edx && matches!(infos[i].kind, LineKind::Ret | LineKind::RetN) {
-                uses |= 1u16 << REG_EDX;
+            if matches!(infos[i].kind, LineKind::Ret | LineKind::RetN) {
+                if return_uses_edx {
+                    uses |= 1u16 << REG_EDX;
+                }
+                if return_uses_ecx {
+                    uses |= 1u16 << REG_ECX;
+                }
             }
             let input = uses | (out & !defs);
             if out != live_out[local] || input != live_in[local] {
@@ -6167,7 +6180,11 @@ fn optimize_cfg_register_liveness(
         let return_uses_edx = (start..end).any(|i| {
             !infos[i].is_nop() && trimmed(store, &infos[i], i) == "# lccc-i686-return-uses-edx"
         });
-        let live_out = compute_gpr_live_out(store, infos, start, end, return_uses_edx);
+        let return_uses_ecx = (start..end).any(|i| {
+            !infos[i].is_nop() && trimmed(store, &infos[i], i) == "# lccc-i686-return-uses-ecx"
+        });
+        let live_out =
+            compute_gpr_live_out(store, infos, start, end, return_uses_edx, return_uses_ecx);
         // Retarget accumulator update/copy-back chains when EAX is dead after
         // the copy.  The accumulator backend naturally emits
         //
@@ -6440,7 +6457,10 @@ fn optimize_cfg_register_liveness(
             }
             if consume_return_marker
                 && !infos[i].is_nop()
-                && trimmed(store, &infos[i], i) == "# lccc-i686-return-uses-edx"
+                && matches!(
+                    trimmed(store, &infos[i], i),
+                    "# lccc-i686-return-uses-edx" | "# lccc-i686-return-uses-ecx"
+                )
             {
                 infos[i].kind = LineKind::Nop;
                 changed = true;
@@ -6656,15 +6676,20 @@ fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
         // destination, the move is dead no matter how control flows.
         if !saw_alive && infos[i].kind != LineKind::Nop {
             if let Some(&(fs, fe)) = bounds.iter().find(|&&(s, e)| i >= s && i < e) {
-                // %eax/%edx carry the return value: every `ret` observes
-                // them on the caller's side, which no in-function census
-                // can see.  Refuse the fallback for the return registers
-                // unless the function has no `ret` at all (noreturn tail).
-                let ret_observes = matches!(dst_reg, REG_EAX | REG_EDX)
-                    && (fs..fe).any(|k| {
-                        matches!(infos[k].kind, LineKind::Ret | LineKind::RetN)
-                            && !infos[k].is_nop()
-                    });
+                // %eax/%edx carry scalar-wide returns, and %ecx carries the
+                // third word when the private marker is present. The caller's
+                // observation is outside this function, so the census cannot
+                // see it; refuse fallback deletion of those return values.
+                let has_ret = (fs..fe).any(|k| {
+                    matches!(infos[k].kind, LineKind::Ret | LineKind::RetN) && !infos[k].is_nop()
+                });
+                let ret_uses_ecx = (fs..fe).any(|k| {
+                    !infos[k].is_nop()
+                        && trimmed(store, &infos[k], k) == "# lccc-i686-return-uses-ecx"
+                });
+                let ret_observes = has_ret
+                    && (matches!(dst_reg, REG_EAX | REG_EDX)
+                        || (dst_reg == REG_ECX && ret_uses_ecx));
                 if !ret_observes && census_reg_reads(store, &infos, fs, fe, dst_reg, &[i]) == 0 {
                     infos[i].kind = LineKind::Nop;
                     changed = true;
@@ -16332,6 +16357,26 @@ mod tests {
         );
         assert!(wide.contains("movl %ebx, %edx"));
         assert!(!wide.contains("lccc-i686-return-uses-edx"));
+    }
+
+    #[test]
+    fn return_metadata_keeps_ecx_live_for_three_word_extvectors() {
+        let narrow =
+            peephole_optimize("narrow:\n    movl %ebx, %ecx\n    ret\n.cfi_endproc\n".to_string());
+        assert!(!narrow.contains("movl %ebx, %ecx"));
+
+        let gp3 = peephole_optimize(
+            concat!(
+                "gp3:\n",
+                "# lccc-i686-return-uses-ecx\n",
+                "    movl %ebx, %ecx\n",
+                "    ret\n",
+                ".cfi_endproc\n",
+            )
+            .to_string(),
+        );
+        assert!(gp3.contains("movl %ebx, %ecx"));
+        assert!(!gp3.contains("lccc-i686-return-uses-ecx"));
     }
 
     #[test]

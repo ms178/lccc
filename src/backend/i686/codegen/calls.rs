@@ -583,6 +583,18 @@ impl I686Codegen {
         }
     }
 
+    /// Store ECX and a deterministic padding word for a three-word i686
+    /// integer ExtVector result. The first two words are stored by the regular
+    /// I128 call-result path above.
+    pub(super) fn emit_call_store_i686_ext_vector_gp3_result_impl(&mut self, dest: &Value) {
+        if let Some(slot) = self.state.get_slot(dest.0) {
+            let sr8 = self.slot_ref_offset(slot, 8);
+            let sr12 = self.slot_ref_offset(slot, 12);
+            emit!(self.state, "    movl %ecx, {}", sr8);
+            emit!(self.state, "    movl $0, {}", sr12);
+        }
+    }
+
     pub(super) fn emit_call_store_f128_result_impl(&mut self, dest: &Value) {
         // The callee returns the F128 value on st(0); the caller must pop
         // it in every case, or the entry leaks into subsequent code (the
