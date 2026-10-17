@@ -71,6 +71,10 @@ impl Lowerer {
                 match lv.kind {
                     crate::ir::lowering::definitions::LValueKind::Variable(v)
                     | crate::ir::lowering::definitions::LValueKind::Address(v, _) => v,
+                    crate::ir::lowering::definitions::LValueKind::PackedBoolVectorLane {
+                        byte_addr: v,
+                        ..
+                    } => v,
                 }
             } else if let Expr::Identifier(ref var_name, _) = out.expr {
                 // Global register variables are pinned to specific hardware registers
@@ -277,6 +281,10 @@ impl Lowerer {
                     let ptr = match lv.kind {
                         crate::ir::lowering::definitions::LValueKind::Variable(v)
                         | crate::ir::lowering::definitions::LValueKind::Address(v, _) => v,
+                        crate::ir::lowering::definitions::LValueKind::PackedBoolVectorLane {
+                            byte_addr: v,
+                            ..
+                        } => v,
                     };
                     Operand::Value(ptr)
                 } else {

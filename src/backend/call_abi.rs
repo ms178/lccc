@@ -469,6 +469,9 @@ pub(crate) struct ArgInfo<'a> {
     /// Struct alignment in bytes (for RISC-V even-register alignment). None for non-struct.
     pub(crate) struct_align: Option<usize>,
     /// SysV per-eightbyte classification (x86-64 only). Empty if not applicable.
+    /// The exact `[NoClass]` value with no `struct_size` is also an internal
+    /// i686 marker for an ExtVector lane that is stack-passed without consuming
+    /// regparm GP registers.
     pub(crate) eightbyte_classes: &'a [crate::common::types::EightbyteClass],
     /// RISC-V LP64D float struct classification. None if not applicable.
     pub(crate) riscv_float_class: Option<crate::common::types::RiscvFloatClass>,
@@ -574,6 +577,24 @@ fn classify_args_core(
     for info in args {
         let force_gp =
             is_variadic && config.variadic_floats_in_gp && info.is_float && !info.is_long_double;
+
+        // Clang's i386 ExtVector ABI passes each logical lane in a stack slot
+        // even when the surrounding function uses regparm. Unlike ordinary
+        // aggregates, these lanes do not consume/kill the register sequence,
+        // so a following scalar can still use EAX/EDX/ECX.
+        if info.struct_size.is_none()
+            && info.eightbyte_classes.len() == 1
+            && info.eightbyte_classes[0] == crate::common::types::EightbyteClass::NoClass
+        {
+            result.push(if info.is_long_double {
+                CoreArgClass::F128Stack
+            } else if info.is_i128 {
+                CoreArgClass::I128Stack
+            } else {
+                CoreArgClass::Stack
+            });
+            continue;
+        }
 
         // GCC i386 -mregparm=N walk (see CallAbiConfig::gcc_regparm_mode).
         // Verified against gcc -m32 -mregparm=3 (GCC 14.2) on: int/int/int,

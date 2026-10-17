@@ -9,7 +9,7 @@
 //! (typedef names, struct/union, enum, typeof), so implementors provide just those
 //! via required trait methods. This ensures primitive type mapping can never diverge.
 
-use crate::common::types::{AddressSpace, CType, FunctionType};
+use crate::common::types::{AddressSpace, CType, ExtVectorLayout, FunctionType};
 use crate::frontend::parser::ast::{
     DerivedDeclarator, EnumVariant, Expr, ParamDecl, StructFieldDecl, TypeSpecifier,
 };
@@ -270,6 +270,15 @@ pub trait TypeConvertContext {
             TypeSpecifier::Vector(inner, total_bytes) => {
                 let elem_ctype = self.resolve_type_spec_to_ctype(inner);
                 CType::Vector(Box::new(elem_ctype), *total_bytes)
+            }
+            TypeSpecifier::ExtVector(inner, lanes) => {
+                let elem_ctype = self.resolve_type_spec_to_ctype(inner);
+                match ExtVectorLayout::new(&elem_ctype, *lanes) {
+                    Some(layout) => CType::ExtVector(Box::new(elem_ctype), layout),
+                    // Parser/sema diagnose unsupported element types and invalid
+                    // lane counts. Keep malformed AST recovery non-panicking.
+                    None => CType::Vector(Box::new(elem_ctype), 0),
+                }
             }
         }
     }

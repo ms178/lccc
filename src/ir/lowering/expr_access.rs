@@ -385,7 +385,9 @@ impl Lowerer {
         let vector_elem_ir_ty = {
             let ctype = self.type_spec_to_ctype(type_spec);
             match ctype {
-                CType::Vector(elem_ct, _) => Some(IrType::from_ctype(&elem_ct)),
+                CType::Vector(elem_ct, _) | CType::ExtVector(elem_ct, _) => {
+                    Some(IrType::from_ctype(&elem_ct))
+                }
                 _ => None,
             }
         };
@@ -895,9 +897,8 @@ impl Lowerer {
                 let ctype = self.type_spec_to_ctype(type_spec);
                 let is_array = matches!(ctype, CType::Array(_, _));
                 // For vector compound literals, use the vector init list path
-                if let Some((elem_ct, num_elems)) = ctype.vector_info() {
-                    let elem_ct = elem_ct.clone();
-                    self.lower_vector_init_list(items, alloca, &elem_ct, num_elems);
+                if ctype.is_vector() {
+                    self.lower_vector_init_list(items, alloca, &ctype);
                 } else if !is_array {
                     if let Some(ref layout) = struct_layout {
                         self.zero_init_alloca(alloca, layout.size);
@@ -1087,7 +1088,11 @@ impl Lowerer {
             if let CType::Pointer(pointee, _) = ct {
                 matches!(
                     pointee.as_ref(),
-                    CType::Array(_, _) | CType::Struct(_) | CType::Union(_) | CType::Vector(_, _)
+                    CType::Array(_, _)
+                        | CType::Struct(_)
+                        | CType::Union(_)
+                        | CType::Vector(_, _)
+                        | CType::ExtVector(_, _)
                 ) || pointee.is_complex()
             } else {
                 false
@@ -1127,6 +1132,7 @@ impl Lowerer {
                             | CType::Union(_)
                             | CType::Array(_, _)
                             | CType::Vector(_, _)
+                            | CType::ExtVector(_, _)
                     )
                 {
                     return self.lower_expr(inner);
@@ -1165,6 +1171,12 @@ impl Lowerer {
         if self.struct_value_size(expr).is_some() {
             let addr = self.compute_array_element_addr(base, index);
             return Operand::Value(addr);
+        }
+        if self.expr_ctype(base).is_bitpacked_bool_vector() {
+            if let Some(lv) = self.lower_lvalue(expr) {
+                let elem_ty = self.get_expr_type(expr);
+                return self.load_lvalue_typed(&lv, elem_ty);
+            }
         }
         {
             let elem_ct = self.expr_ctype(expr);
@@ -1325,6 +1337,7 @@ impl Lowerer {
                 | CType::ComplexDouble
                 | CType::ComplexLongDouble
                 | CType::Vector(_, _)
+                | CType::ExtVector(_, _)
         )
     }
 
@@ -1443,16 +1456,18 @@ impl Lowerer {
         let dst_ct = self.type_spec_to_ctype(type_spec);
         let src_ct = self.expr_ctype(src_expr);
         let (src_is_float, dst_is_float) = (
-            matches!(&src_ct, CType::Vector(elem, _) if elem.is_floating()),
-            matches!(&dst_ct, CType::Vector(elem, _) if elem.is_floating()),
+            matches!(&src_ct, CType::Vector(elem, _) | CType::ExtVector(elem, _) if elem.is_floating()),
+            matches!(&dst_ct, CType::Vector(elem, _) | CType::ExtVector(elem, _) if elem.is_floating()),
         );
-        let src_size = match &src_ct {
-            CType::Vector(_, s) => *s,
-            _ => 16,
+        let src_size = if src_ct.is_vector() {
+            src_ct.size()
+        } else {
+            16
         };
-        let dst_size = match &dst_ct {
-            CType::Vector(_, s) => *s,
-            _ => 16,
+        let dst_size = if dst_ct.is_vector() {
+            dst_ct.size()
+        } else {
+            16
         };
         if src_size != 16 || dst_size != 16 {
             panic!(

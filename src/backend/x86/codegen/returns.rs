@@ -16,8 +16,36 @@ impl X86Codegen {
             ) && matches!(val, Operand::Value(v)
                     if self.state.direct_fp_result == Some(v.0))
             {
-                self.emit_epilogue_and_ret_impl(frame_size);
-                return;
+                // The fast path is only sound when the FP result really sits in
+                // %xmm0. `direct_fp_result` marks a value the FP machinery
+                // produced in *some* XMM register, and with an SSE-class vector
+                // return the register allocator is free to pick another one:
+                // returning that would hand the caller the wrong register
+                // (measured: lccc -O1 `abi_f64x1` returned %xmm2 and the
+                // lccc->lccc leg of check_ext_vector_abi.sh failed). Fall
+                // through to the FP loader whenever the home is not %xmm0.
+                // The home must be read out of `reg_assignments` (the map the
+                // FP loaders themselves consult): `fresh_home_of` can report
+                // the intended home %xmm0 while the FP emitter materialised
+                // the value in another XMM -- trusting it is what returned
+                // %xmm2 for `abi_f64x1` at -O1.
+                if let Operand::Value(v) = val {
+                    match self.reg_assignments.get(&v.0).copied() {
+                        Some(reg)
+                            if super::emit::is_xmm_reg(reg)
+                                && super::emit::phys_reg_name(reg) == "xmm0" =>
+                        {
+                            self.emit_epilogue_and_ret_impl(frame_size);
+                            return;
+                        }
+                        None => {}
+                        Some(_) => {
+                            self.load_fp_to_xmm0(val, ret_ty);
+                            self.emit_epilogue_and_ret_impl(frame_size);
+                            return;
+                        }
+                    }
+                }
             }
             // _Float128 (IEEE binary128): the 16-byte value returns in xmm0.
             if self.func_ret_is_f128_sse {
@@ -128,6 +156,23 @@ impl X86Codegen {
         ) {
             if let Some(val) = val {
                 self.load_fp_to_xmm0(val, ret_ty);
+            }
+            self.emit_epilogue_and_ret_impl(frame_size);
+            return;
+        }
+        // AUD-VABI-2: an 8-byte vector return is ONE SSE eightbyte — the low 64
+        // bits of %xmm0 — not an accumulator return. The IR carries the bit
+        // container as I64/U64, so the generic path below would hand the value
+        // back in %rax; clang-19 and gcc-16 both keep it in %xmm0 (measured:
+        // `id_u32x2`, `id_u64x1`, `id_f32x2`, `id_f64x1` are all a bare `ret`
+        // with the argument register also being the return register). Clang's
+        // caller reads %xmm0, so an %rax return is a silent ABI mismatch.
+        if self.func_ret_classes.len() == 1
+            && self.func_ret_classes[0] == crate::common::types::EightbyteClass::Sse
+            && matches!(ret_ty, IrType::I64 | IrType::U64)
+        {
+            if let Some(val) = val {
+                self.load_bits64_to_xmm0(val);
             }
             self.emit_epilogue_and_ret_impl(frame_size);
             return;

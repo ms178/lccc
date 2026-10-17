@@ -25,6 +25,10 @@ impl Lowerer {
     /// Handles all return conventions: sret, two-register, complex decomposition,
     /// and scalar returns with implicit casts.
     pub(super) fn lower_return_expr(&mut self, e: &Expr) -> Operand {
+        if let Some(op) = self.try_i686_ext_vector_gp_return(e) {
+            return op;
+        }
+
         // Try sret return first (large structs and complex types via hidden pointer)
         if let Some(sret_alloca) = self.func().sret_ptr {
             if let Some(op) = self.try_sret_return(e, sret_alloca) {
@@ -95,6 +99,83 @@ impl Lowerer {
     fn expr_is_builtin_call(e: &Expr) -> bool {
         matches!(e, Expr::FunctionCall(callee, _, _)
             if matches!(&**callee, Expr::Identifier(n, _) if n.starts_with("__builtin_")))
+    }
+
+    /// Pack an i686 Clang integer ExtVector return into its scalar GP-register
+    /// bundle. The third word is carried in the I128 stack slot and emitted by
+    /// the backend in ECX, while the object representation remains lane-based.
+    fn try_i686_ext_vector_gp_return(&mut self, e: &Expr) -> Option<Operand> {
+        if !crate::common::types::target_is_32bit() {
+            return None;
+        }
+        let vector_ct = self.func().return_ctype.clone()?;
+        let words = vector_ct.i686_ext_vector_gp_word_count()?;
+        let (elem_ct, lanes) = vector_ct.vector_info()?;
+        let elem_size = elem_ct.size();
+        let bundle_ty = match words {
+            1 => IrType::I32,
+            2 => IrType::I64,
+            3 => IrType::I128,
+            _ => return None,
+        };
+        let source_operand = self.lower_aggregate_rvalue(e);
+        let source = self.operand_to_value(source_operand);
+        let source_space = self.aggregate_lvalue_space(e);
+        let source_volatile = self.expr_access_is_volatile(e);
+        let bundle = self.fresh_value();
+        self.emit(Instruction::Alloca {
+            dest: bundle,
+            ty: IrType::Ptr,
+            size: 16,
+            align: 4,
+            volatile: false,
+            semantic_volatile: false,
+        });
+        self.zero_init_alloca(bundle, 16);
+
+        if elem_size <= 4 {
+            debug_assert_eq!(words, lanes);
+            for lane in 0..lanes {
+                let value =
+                    self.load_vector_lane(source, &vector_ct, lane, source_space, source_volatile);
+                let source_ty = if matches!(elem_ct, CType::Bool) {
+                    IrType::I32
+                } else {
+                    IrType::from_ctype(elem_ct)
+                };
+                let word = self.emit_implicit_cast(value, source_ty, IrType::I32);
+                let ptr = self.emit_gep_offset(bundle, lane * 4, IrType::I32);
+                self.emit(Instruction::Store {
+                    volatile: false,
+                    val: word,
+                    ptr,
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                });
+            }
+        } else {
+            debug_assert_eq!(elem_size, 8);
+            debug_assert_eq!(lanes, 1);
+            let value = self.load_vector_lane(source, &vector_ct, 0, source_space, source_volatile);
+            let ptr = self.emit_gep_offset(bundle, 0, IrType::I64);
+            self.emit(Instruction::Store {
+                volatile: false,
+                val: value,
+                ptr,
+                ty: IrType::I64,
+                seg_override: AddressSpace::Default,
+            });
+        }
+
+        let packed = self.fresh_value();
+        self.emit(Instruction::Load {
+            volatile: false,
+            dest: packed,
+            ptr: bundle,
+            ty: bundle_ty,
+            seg_override: AddressSpace::Default,
+        });
+        Some(Operand::Value(packed))
     }
 
     /// Try to handle return via sret (hidden pointer for large structs/complex).
