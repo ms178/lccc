@@ -637,7 +637,15 @@ jobs:
     - name: Vector initializers inside aggregates
       run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_vector_static_init.sh
     - name: Void declarators and initializers
-      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_void_declarators.sh
+      run: |
+        set -o pipefail
+        env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_void_declarators.sh 2>&1 |
+          tee "$RUNNER_TEMP/void-declarators.log"
+    - name: Surface void-declarator failures in annotations
+      if: failure()
+      run: |
+        [ -s "$RUNNER_TEMP/void-declarators.log" ] || exit 0
+        python3 scripts/ci_annotate_log.py --title "void declarators" "$RUNNER_TEMP/void-declarators.log"
     - name: File-scope constant initializers
       run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_file_scope_init.sh
     - name: Const-object read folding
