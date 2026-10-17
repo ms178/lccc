@@ -1569,6 +1569,42 @@ impl SemanticAnalyzer {
                         );
                     }
                 }
+                // Register EVERY completed named body -- packed or not -- in the
+                // enum tag registry.  A body-less `enum tag` reference resolves
+                // through `TypeContext::enum_types` so it ends up with the same
+                // variant values (and therefore the same compatible integer
+                // type, C11 6.7.2.2p4) as the definition itself.  Before this,
+                // only packed bodies were stored, a reference to a non-packed
+                // enum carried an empty variant list, and
+                // `EnumType::compatible_ctype` then reported `unsigned int`
+                // even for enums with a negative enumerator -- which rejected
+                // the kernel's `kstrtoint(buf, 10, &submodule->id)` in
+                // drivers/md/md.c (`enum md_submodule_id` starts with
+                // `ID_LINEAR = LEVEL_LINEAR` == -1, from
+                // include/uapi/linux/raid/md_u.h).  The same evaluation rules
+                // as the packed branch: explicit values re-anchor the counter,
+                // implicit ones continue it.
+                if let Some(tag) = name {
+                    let mut variant_values = Vec::with_capacity(variants.len());
+                    let mut next_val: i64 = 0;
+                    for v in variants {
+                        if let Some(ref val_expr) = v.value {
+                            if let Some(val) = self.eval_const_expr(val_expr) {
+                                next_val = val;
+                            }
+                        }
+                        variant_values.push((v.name.clone(), next_val));
+                        next_val += 1;
+                    }
+                    self.result.type_context.enum_types.insert(
+                        tag.clone(),
+                        crate::common::types::EnumType {
+                            name: Some(tag.clone()),
+                            variants: variant_values,
+                            is_packed: *is_packed,
+                        },
+                    );
+                }
             }
             TypeSpecifier::Struct(_, Some(fields), ..)
             | TypeSpecifier::Union(_, Some(fields), ..) => {
@@ -4053,7 +4089,11 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
             || name
                 .as_ref()
                 .and_then(|n| self.result.type_context.packed_enum_types.get(n))
-                .is_some();
+                .is_some()
+            || name
+                .as_ref()
+                .and_then(|n| self.result.type_context.enum_types.get(n))
+                .is_some_and(|et| et.is_packed);
         // Sema preserves enum identity for diagnostics. Variant processing is
         // done separately via process_enum_variants (requires &mut self).
         // We carry variant values so packed_size() can compute the correct size.
@@ -4071,8 +4111,14 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
             }
             result
         } else if let Some(n) = name {
-            // Forward reference: look up previously stored packed enum info
-            if let Some(et) = self.result.type_context.packed_enum_types.get(n) {
+            // Forward reference: resolve to the completed body so the
+            // compatible type (and packed size) match the definition.  The
+            // general registry holds every named body; `packed_enum_types`
+            // predates it and stays as a fallback for callers that populated
+            // it directly.
+            if let Some(et) = self.result.type_context.enum_types.get(n) {
+                et.variants.clone()
+            } else if let Some(et) = self.result.type_context.packed_enum_types.get(n) {
                 et.variants.clone()
             } else {
                 Vec::new()
