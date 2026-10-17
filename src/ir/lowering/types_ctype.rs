@@ -6,7 +6,7 @@
 
 use super::lower::Lowerer;
 use crate::common::type_builder;
-use crate::common::types::{AddressSpace, CType, StructField, StructLayout};
+use crate::common::types::{AddressSpace, CType, StructField, StructLayout, max_object_bytes};
 use crate::frontend::parser::ast::{
     DerivedDeclarator, EnumVariant, Expr, ParamDecl, StructFieldDecl, TypeSpecifier,
 };
@@ -527,12 +527,8 @@ impl type_builder::TypeConvertContext for Lowerer {
                 let mut next_val: i64 = 0;
                 let mut result = false;
                 for v in vars {
-                    if let Some(ref expr) = v.value {
-                        if let Some(val) = self.eval_const_expr(expr) {
-                            if let Some(v) = self.const_to_i64(&val) {
-                                next_val = v;
-                            }
-                        }
+                    if let Some(val) = self.enum_variant_value(v) {
+                        next_val = val;
                     }
                     if next_val > i32::MAX as i64 {
                         result = true;
@@ -554,12 +550,8 @@ impl type_builder::TypeConvertContext for Lowerer {
             let mut values = Vec::new();
             let mut next_val: i64 = 0;
             for v in vars {
-                if let Some(ref expr) = v.value {
-                    if let Some(val) = self.eval_const_expr(expr) {
-                        if let Some(v) = self.const_to_i64(&val) {
-                            next_val = v;
-                        }
-                    }
+                if let Some(val) = self.enum_variant_value(v) {
+                    next_val = val;
                 }
                 values.push(next_val);
                 next_val += 1;
@@ -613,13 +605,28 @@ impl type_builder::TypeConvertContext for Lowerer {
         self.get_expr_ctype(expr).unwrap_or(CType::Int)
     }
 
-    fn eval_const_expr_as_usize(&self, expr: &Expr) -> Option<usize> {
+    fn eval_array_bound_len(&self, expr: &Expr, elem: &CType) -> Option<usize> {
         self.expr_as_array_size(expr).and_then(|n| {
             if n < 0 {
-                None // Negative array sizes are rejected by sema
-            } else {
-                Some(n as usize)
+                return None; // Negative array sizes are rejected by sema
             }
+            // Same two rules as sema (which has already reported them): the
+            // count must fit the target's `usize` (on `-m32` a conversion
+            // truncation is a different array -- `char a[4294967296]` became a
+            // zero-element one), and the byte size must not exceed the target's
+            // PTRDIFF_MAX. Repeated here so that lowering, which can rebuild a
+            // type from a template the sema pass never looked at (e.g. a
+            // generic selection's arm), cannot produce a `CType::Array` whose
+            // size is meaningless.
+            if (n as u128) > usize::MAX as u128 {
+                return None;
+            }
+            let n = n as usize;
+            let elem_size = elem.size_ctx(&*self.types.borrow_struct_layouts());
+            if (n as u128) * (elem_size as u128) > max_object_bytes() as u128 {
+                return None;
+            }
+            Some(n)
         })
     }
 }

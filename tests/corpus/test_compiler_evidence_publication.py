@@ -183,7 +183,7 @@ class EvidencePublication(unittest.TestCase):
         self.assertEqual(output.getvalue(), '')
 
     def test_each_section_has_its_own_unconditional_workflow_step(self):
-        workflow = yaml.load((ROOT / '.github/workflows/pr826-redteam.yml').read_text(), Loader=yaml.BaseLoader)
+        workflow = yaml.load((ROOT / '.github/workflows/compiler-comparison.yml').read_text(), Loader=yaml.BaseLoader)
         steps = workflow['jobs']['compiler-comparison']['steps']
         publish = [step for step in steps if 'scripts/publish_compiler_comparison.py' in step.get('run', '')]
         self.assertEqual(len(publish), len(publisher.SECTIONS))

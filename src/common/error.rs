@@ -181,6 +181,11 @@ pub struct WarningConfig {
     errors: crate::common::fx_hash::FxHashSet<WarningKind>,
     /// Global -Werror flag: promote ALL warnings to errors.
     pub werror_all: bool,
+    /// Global `-w` flag: inhibit ALL warning messages.  Measured against
+    /// GCC 16.2 (2026-10-17): `-w` wins regardless of position (`-w -Wall`
+    /// and `-Wall -w` are both silent, including `#warning` directives), so
+    /// this is a sticky latch that `enable`/`enable_wall` never clear.
+    inhibit_all: bool,
 }
 
 impl WarningConfig {
@@ -194,7 +199,15 @@ impl WarningConfig {
             enabled,
             errors: crate::common::fx_hash::FxHashSet::default(),
             werror_all: false,
+            inhibit_all: false,
         }
+    }
+
+    /// `-w`: inhibit every warning message from now on.  Sticky — later
+    /// `-Wall`/`-Wextra`/`-W<name>` do not re-enable anything (GCC 16.2
+    /// measured contract; see the field documentation).
+    pub fn set_inhibit_all(&mut self) {
+        self.inhibit_all = true;
     }
 
     /// Enable a specific warning.
@@ -236,7 +249,7 @@ impl WarningConfig {
 
     /// Check if a warning of the given kind should be emitted at all.
     pub fn is_enabled(&self, kind: WarningKind) -> bool {
-        self.enabled.contains(&kind)
+        !self.inhibit_all && self.enabled.contains(&kind)
     }
 
     /// Check if a warning of the given kind should be promoted to an error.
@@ -623,7 +636,12 @@ impl DiagnosticEngine {
                     };
                     self.render_warning(&annotated);
                 } else {
-                    // Warning without a kind: always emit, subject to global -Werror
+                    // Warning without a kind: emit unless `-w` inhibits all
+                    // warnings (GCC 16.2: `-w` silences unclassified user-code
+                    // warnings too), subject to global -Werror otherwise.
+                    if self.warning_config.inhibit_all {
+                        return;
+                    }
                     if self.warning_config.werror_all {
                         let promoted = Diagnostic {
                             severity: Severity::Error,

@@ -35,6 +35,23 @@ class WrappingContracts(unittest.TestCase):
                     self.assertIn('-O2', command)
                     self.assertIn('-fwrapv', command)
 
+    def test_sidecar_without_level_gains_o2_and_explicit_level_keeps_control(self):
+        cases = {t.name: t for t in runner.discover([ROOT / 'tests/regression'])}
+        # No -O in the sidecar: the -O2 default is prepended, the sidecar
+        # content survives. Replacement semantics silently ran the whole
+        # simd/vectorize family at -O0 in this runner only.
+        for name, kept in (('simd_avx2_256', '-mavx2'),
+                           ('vectorize_dot_product', '-ffast-math'),
+                           ('wrapv_byte_address', '-fwrapv')):
+            with self.subTest(name=name):
+                flags = shlex.split(cases[name].flags)
+                self.assertEqual(flags[0], '-O2', flags)
+                self.assertIn(kept, flags)
+        # An explicit level is authoritative: no second -O is injected.
+        explicit = shlex.split(cases['segment_fill_copy_alias'].flags)
+        self.assertIn('-O0', explicit)
+        self.assertEqual([f for f in explicit if f.startswith('-O')], ['-O0'])
+
     def test_bad_oracle_exit_or_output_still_fails(self):
         case = next(t for t in runner.discover([ROOT / 'tests/regression'])
                     if t.name == 'affine_control_proof')

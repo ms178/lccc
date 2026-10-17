@@ -321,11 +321,16 @@ def apply_bitdiffs(
                 im = re.fullmatch(
                     r"([A-Za-z_][A-Za-z0-9_]*)\s+IN\s+(\{.*\})", conj.strip(), re.S
                 )
-                if not im or negated is False:
+                if not im:
                     nope(f"unsupported bitdiff term: {conj.strip()[:60]!r}")
                     return None
+                # Inside a negation `IN` is one term's alternative list (the
+                # msr_imm.xml shape).  A POSITIVE top-level `f IN {a, b}`
+                # (gic_sys.xml, 2026-09) is handled below as its own op: the
+                # field must take a listed value, which is structurally the
+                # same reject form as `!=` — forbid the set's complement.
                 fname, lit = im.group(1), im.group(2)
-                op = "=="
+                op = "==" if negated else "IN"
             else:
                 fname, op, lit = cm.group(1), cm.group(2), cm.group(3).strip()
             if fname not in fields:
@@ -342,6 +347,32 @@ def apply_bitdiffs(
                     nope(f"`!=` inside a negation is not understood: {conj[:40]!r}")
                     return None
                 pattern.append(alts)
+                continue
+            if op == "IN":
+                # Positive `f IN {a, b}`: reject every field value OUTSIDE the
+                # set.  Enumerating the complement needs the whole field's
+                # value space, so refuse unenumerably wide fields instead of
+                # guessing (fail closed, like every other refusal here).
+                if fpinned & fmask:
+                    nope(f"{fname} is pinned by the diagram yet `IN`-constrained")
+                    return None
+                nbits = fmask.bit_count()
+                if nbits > 8:
+                    nope(f"positive `IN` on a {nbits}-bit field is not "
+                         f"enumerable: {conj.strip()[:40]!r}")
+                    return None
+                positions = [i for i in range(fmask.bit_length()) if fmask >> i & 1]
+                comp: "list[tuple[int, int]]" = []
+                for fv in range(1 << nbits):
+                    vv = 0
+                    for j, pos in enumerate(positions):
+                        if fv >> j & 1:
+                            vv |= 1 << pos
+                    if not any((vv & am) == av for am, av in alts):
+                        comp.append((fmask, vv))
+                # An `IN` covering the whole value space constrains nothing.
+                if comp:
+                    pattern.append(comp)
                 continue
             if op == "!=":
                 if fpinned & fmask:
@@ -526,8 +557,9 @@ def selftest() -> int:
     f_imm12 = (0xFFF << 10, 0, 0)
     f_op1 = (0b111 << 16, 0, 0)
     f_op2 = (0b111 << 19, 0, 0)
+    f_crm = (0b1111 << 8, 0, 0)
     fields = {"L": f_l, "imm3": f_imm3, "Rt": f_rt, "imm12": f_imm12,
-              "op1": f_op1, "op2": f_op2}
+              "op1": f_op1, "op2": f_op2, "CRm": f_crm}
     base: Constraint = (0, 0, fields)
 
     def enc(spec: str, why: "list[str] | None" = None):
@@ -580,8 +612,27 @@ def selftest() -> int:
     expect(enc("imm12 != 0") is None,
            "a literal narrower than its field must be refused, not zero-extended")
 
-    # Refusals must be recorded, not silent.
+    # Positive `CRm IN {0001, 0010}` (gic_sys.xml, 2026-09 package): the field
+    # must take a listed value; the complement is rejected, nothing folds.
+    v = enc("CRm IN {0001, 0010}")
+    expect(v is not None, "positive `IN {{...}}` must be understood")
+    if v is not None:
+        mask, value, rejects = v
+        expect(mask == 0 and value == 0,
+               f"positive `IN` must not fold into mask/value, got {mask:08x}/{value:08x}")
+        expect(not word_matches(0b0000 << 8, v), "CRm == 0000 must be forbidden")
+        expect(word_matches(0b0001 << 8, v), "CRm == 0001 must be legal")
+        expect(word_matches(0b0010 << 8, v), "CRm == 0010 must be legal")
+        expect(not word_matches(0b0011 << 8, v), "CRm == 0011 must be forbidden")
+        expect(not word_matches(0b1111 << 8, v), "CRm == 1111 must be forbidden")
     why: "list[str]" = []
+    expect(enc("imm12 IN {000000000000}", why) is None,
+           "positive `IN` on an unenumerably wide field must be refused")
+    expect(why and "not enumerable" in why[-1],
+           f"reason must say the field is too wide, got {why}")
+
+    # Refusals must be recorded, not silent.
+    why = []
     expect(enc("L == 0 || L == 1", why) is None, "or-predicates must be refused")
     expect(
         why and "not understood" in why[-1] and "||" in why[-1],

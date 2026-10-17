@@ -1415,7 +1415,7 @@ fn canonicalise_affine_exit_cmps(cloned: &mut [Instruction], proved_cmp: Option<
 
 /// Mathematical domain for the sequence proof. U64's upper endpoint does
 /// not fit in i64; use i128 until the final typed constant is encoded.
-fn integer_type_bounds(ty: IrType) -> Option<(i128, i128)> {
+pub(crate) fn integer_type_bounds(ty: IrType) -> Option<(i128, i128)> {
     if !ty.is_integer() || !matches!(ty.size(), 1 | 2 | 4 | 8) {
         return None;
     }
@@ -1427,7 +1427,7 @@ fn integer_type_bounds(ty: IrType) -> Option<(i128, i128)> {
     })
 }
 
-fn integer_constant(c: IrConst, ty: IrType) -> Option<i128> {
+pub(crate) fn integer_constant(c: IrConst, ty: IrType) -> Option<i128> {
     integer_type_bounds(ty)?;
     let bits = ty.size() * 8;
     let value = c.to_i128()? & ((1_i128 << bits) - 1);
@@ -1548,6 +1548,7 @@ pub(crate) fn fold_affine_exit_compares(func: &mut IrFunction) -> usize {
     let mut total = 0;
     for lp in order {
         total += fold_loop(func, lp, &cfg);
+        total += fold_loop_value_bound(func, lp, &cfg);
     }
     if total > 0 && affine_fold_debug() {
         eprintln!(
@@ -2018,6 +2019,501 @@ fn fold_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -> usiz
         }
     }
     folded
+}
+
+/// AFFOLD-VB: fold a VALUE-bounded affine exit compare, `iv + C <strict> n`,
+/// into `iv <strict> t` with `t = n - C` computed once in the guard block.
+///
+/// The constant-bound fold above certifies the whole IV range against a
+/// compile-time threshold.  With a runtime bound `n` no such range exists, so
+/// this fold rests on a different, narrower proof.  Every clause below is
+/// load-bearing; the counterexamples are in `affine_value_bound_tests`.
+///
+/// Soundness (exact integer arithmetic, no UB licence -- the IR also carries
+/// `-fwrapv` code and the proof must not care):
+///
+/// * GUARD: the loop's unique outside predecessor `P` ends in
+///   `CondBranch(k <strict> n, header, exit)` with constant `k >= start + C`
+///   (`start` the IV's constant seed).  Every execution of the folded compare
+///   is therefore dominated by the established fact `n > start + C`, so
+///   `n - C > start >= type_min`: the pre-folded bound `t` CANNOT underflow on
+///   any path that reaches the compare.  Without the guard, `n` near the type
+///   minimum wraps `t` to a huge value and the folded loop runs where the
+///   original exits immediately (`vb_refuses_unguarded`).
+/// * STRICT comparison only (`Slt`/`Ult`): with `<=` and `n == type_max` the
+///   original wrapping `iv + C` eventually laps the bound and the ORIGINAL
+///   loop never exits, while the folded one does -- a finite loop is not a
+///   faithful image of an infinite one (`vb_refuses_sle`).
+/// * STEP == 1: by induction every compare-time value `x` satisfies
+///   `x + C <= n <= type_max` -- base case from the guard, inductive step
+///   `x' = x + 1 <= n - C` from the previous compare being true -- so the
+///   original add never wraps and both compares decide identically.  A step
+///   `s > 1` overshoots the bound by up to `s - 1`, `x + C` can exceed
+///   `type_max` when `n` is near it, and the wrapped sum compares differently
+///   (`vb_refuses_step2`).
+/// * The affine temporary and the compare result are SINGLE-USE, the bound
+///   `n` is defined outside the loop (SSA: one def, loop-invariant), and the
+///   compare is the loop's unique exit test with every backedge dominated by
+///   it -- the induction needs "reaching the compare again means the previous
+///   compare was true".
+///
+/// The rewrite anchors on the LAST link of the affine chain (`a = x + C_rel`,
+/// usually the post-increment), not on the phi: `x` is already live at the
+/// compare, so no live range is lengthened, and the single-use add dies.
+fn fold_loop_value_bound(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -> usize {
+    const MAX_C: i128 = i64::MAX as i128;
+    let header_label = match func.blocks.get(lp.header) {
+        Some(b) => b.label,
+        None => return 0,
+    };
+    // Uses of every value: the affine temporary and the compare result must
+    // each have exactly one (see the single-use clause above).
+    let mut uses: FxHashMap<u32, usize> = FxHashMap::default();
+    for block in func.blocks.iter() {
+        for inst in &block.instructions {
+            inst.for_each_used_value(|v| *uses.entry(v).or_default() += 1);
+        }
+        block
+            .terminator
+            .for_each_used_value(|v| *uses.entry(v).or_default() += 1);
+    }
+    let shapes: Vec<IvShape> = loop_iv_shape(func, lp)
+        .into_iter()
+        .filter(|s| s.step == 1)
+        .collect();
+    if shapes.is_empty() {
+        return 0;
+    }
+    // Unique exit test; every backedge must pass through it (same structural
+    // requirements as `loop_exit_threshold`, for the same inductive reason).
+    let mut exiting: Vec<usize> = Vec::new();
+    for &bi in &lp.body {
+        if bi >= func.blocks.len() {
+            continue;
+        }
+        if let Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } = &func.blocks[bi].terminator
+        {
+            let tl = func.blocks.iter().position(|b| b.label == *true_label);
+            let fl = func.blocks.iter().position(|b| b.label == *false_label);
+            let inside_t = tl.is_some_and(|t| lp.body.contains(&t));
+            let inside_f = fl.is_some_and(|f| lp.body.contains(&f));
+            if inside_t != inside_f {
+                exiting.push(bi);
+            }
+        }
+    }
+    if exiting.len() != 1 {
+        return 0;
+    }
+    let test_block = exiting[0];
+    let mut saw_backedge = false;
+    for &pred in cfg.preds.row(lp.header) {
+        let pred = pred as usize;
+        if lp.body.contains(&pred) {
+            saw_backedge = true;
+            if !is_dominated_by(pred, test_block, cfg) {
+                return 0;
+            }
+        }
+    }
+    if !saw_backedge {
+        return 0;
+    }
+    let Terminator::CondBranch {
+        cond, true_label, ..
+    } = &func.blocks[test_block].terminator
+    else {
+        return 0;
+    };
+    // CONTINUE must be the true edge: the strict-less forms below are the
+    // continuation test.  Exit-on-true carries the negated operator and is
+    // out of this proof's scope.
+    let continue_inside = func
+        .blocks
+        .iter()
+        .position(|b| b.label == *true_label)
+        .is_some_and(|i| lp.body.contains(&i));
+    if !continue_inside {
+        return 0;
+    }
+    let Operand::Value(cond_v) = *cond else {
+        return 0;
+    };
+    if uses.get(&cond_v.0).copied() != Some(1) {
+        return 0;
+    }
+    // The unique outside predecessor is the guard block.
+    let mut outside_preds = cfg
+        .preds
+        .row(lp.header)
+        .iter()
+        .map(|&p| p as usize)
+        .filter(|p| !lp.body.contains(p));
+    let (Some(pre), None) = (outside_preds.next(), outside_preds.next()) else {
+        return 0;
+    };
+    // Locate the compare (inside the loop: it consumes the IV).
+    let cmp_loc = lp.body.iter().find_map(|&bi| {
+        func.blocks
+            .get(bi)?
+            .instructions
+            .iter()
+            .enumerate()
+            .find_map(|(ii, inst)| match inst {
+                Instruction::Cmp { dest, .. } if dest.0 == cond_v.0 => Some((bi, ii)),
+                _ => None,
+            })
+    });
+    let Some((cmp_bi, cmp_ii)) = cmp_loc else {
+        return 0;
+    };
+    let Instruction::Cmp {
+        lhs, op, rhs, ty, ..
+    } = func.blocks[cmp_bi].instructions[cmp_ii].clone()
+    else {
+        return 0;
+    };
+    for shape in &shapes {
+        if shape.ty != ty || !comparison_matches_domain(op, ty) {
+            continue;
+        }
+        let Some((lo, hi)) = integer_type_bounds(ty) else {
+            continue;
+        };
+        // Normalize to `affine <strict> bound`; mirrored orientation flips
+        // the operator.  Non-strict forms are refused (see `vb_refuses_sle`).
+        let (affine_op, bound_op, strict_op) = match op {
+            IrCmpOp::Slt | IrCmpOp::Ult => (&lhs, &rhs, op),
+            IrCmpOp::Sgt => (&rhs, &lhs, IrCmpOp::Slt),
+            IrCmpOp::Ugt => (&rhs, &lhs, IrCmpOp::Ult),
+            _ => continue,
+        };
+        let Operand::Value(av) = *affine_op else {
+            continue; // constant affine sides are the other fold's business
+        };
+        let Operand::Value(nv) = *bound_op else {
+            continue; // constant bounds are `fold_loop`'s business
+        };
+        if uses.get(&av.0).copied() != Some(1) {
+            continue;
+        }
+        let Some(c_total) = affine_offset_of(func, shape.iv, av.0, ty) else {
+            continue;
+        };
+        if !(1..=MAX_C).contains(&c_total) {
+            continue;
+        }
+        // The bound is loop-invariant: its single SSA def is outside the body.
+        let n_def_inside = lp.body.iter().any(|&bi| {
+            func.blocks
+                .get(bi)
+                .is_some_and(|b| b.instructions.iter().any(|i| i.dest() == Some(nv)))
+        });
+        if n_def_inside {
+            continue;
+        }
+        // Anchor on the last additive link: `av = anchor + c_rel`.
+        let Some((anchor, c_rel)) = last_add_link(func, av.0, ty) else {
+            continue;
+        };
+        if !(1..=MAX_C).contains(&c_rel) {
+            continue;
+        }
+        // Prefer the latch's post-increment as the anchor when the chain was
+        // reassociated onto the phi (`(phi + 1) + 4` folded to `phi + 5`):
+        // comparing the PRE-increment phi forces the backend to keep both the
+        // old and the new IV live across the bottom test (a `mov` + taken
+        // `jmp` per iteration), while the post-increment is the value the
+        // tight `add; cmp; jcc` latch already has in hand.  Exactness is the
+        // same induction: `phi + step <= phi + c_total <= n <= type_max`.
+        let (anchor, c_rel) = if anchor == shape.iv && c_rel == c_total && c_total > shape.step {
+            post_increment_anchor(func, cfg, lp, shape, cmp_bi, cmp_ii)
+                .map(|inc| (inc, c_total - shape.step))
+                .unwrap_or((anchor, c_rel))
+        } else {
+            (anchor, c_rel)
+        };
+        let first = match shape.start.checked_add(c_total) {
+            Some(f) if (lo..=hi).contains(&f) => f,
+            _ => continue,
+        };
+        // GUARD: a conditional branch above the loop whose edge towards the
+        // header establishes `n > first - 1` (equivalently `n >= first`).
+        if !guard_proves_bound(func, cfg, pre, header_label, nv, strict_op, ty, first) {
+            continue;
+        }
+        // All obligations hold: fold.
+        let tdest = Value(func.next_value_id);
+        func.next_value_id += 1;
+        let sub = Instruction::BinOp {
+            dest: tdest,
+            op: IrBinOp::Sub,
+            lhs: Operand::Value(nv),
+            rhs: Operand::Const(IrConst::from_i64(c_rel as i64, ty)),
+            ty,
+        };
+        let pre_block = &mut func.blocks[pre];
+        pre_block.instructions.push(sub);
+        if !pre_block.source_spans.is_empty() {
+            let span = *pre_block.source_spans.last().unwrap();
+            pre_block.source_spans.push(span);
+        }
+        if let Instruction::Cmp { lhs, op, rhs, .. } = &mut func.blocks[cmp_bi].instructions[cmp_ii]
+        {
+            *lhs = Operand::Value(Value(anchor));
+            *op = strict_op;
+            *rhs = Operand::Value(tdest);
+        }
+        if affine_fold_debug() {
+            eprintln!(
+                "[AFFOLD] {}: value-bound fold: iv v{} + {} <strict> v{} -> v{} <strict> (v{} - {})",
+                func.name, shape.iv, c_total, nv.0, anchor, nv.0, c_rel
+            );
+        }
+        return 1;
+    }
+    0
+}
+
+/// The loop's post-increment of `shape`'s phi — `inc = phi + step`, in the
+/// fold's width — provided its definition dominates the comparison at
+/// `(cmp_bi, cmp_ii)` so the rewritten compare may read it.
+fn post_increment_anchor(
+    func: &IrFunction,
+    cfg: &CfgAnalysis,
+    lp: &NaturalLoop,
+    shape: &IvShape,
+    cmp_bi: usize,
+    cmp_ii: usize,
+) -> Option<u32> {
+    for &bi in &lp.body {
+        let Some(block) = func.blocks.get(bi) else {
+            continue;
+        };
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            let Instruction::BinOp {
+                dest,
+                op: IrBinOp::Add,
+                lhs,
+                rhs,
+                ty,
+            } = inst
+            else {
+                continue;
+            };
+            if *ty != shape.ty {
+                continue;
+            }
+            let matches_inc = match (lhs, rhs) {
+                (Operand::Value(v), Operand::Const(k)) | (Operand::Const(k), Operand::Value(v)) => {
+                    v.0 == shape.iv && integer_constant(*k, shape.ty) == Some(shape.step)
+                }
+                _ => false,
+            };
+            if !matches_inc {
+                continue;
+            }
+            let dominates = if bi == cmp_bi {
+                ii < cmp_ii
+            } else {
+                is_dominated_by(cmp_bi, bi, cfg)
+            };
+            if dominates {
+                return Some(dest.0);
+            }
+        }
+    }
+    None
+}
+
+/// The last link of an affine chain: `value = x + K` (through `Copy`s), with
+/// the add in the comparison's own width.  Returns `(x, K)`.
+fn last_add_link(func: &IrFunction, mut value: u32, ty: IrType) -> Option<(u32, i128)> {
+    for _ in 0..16 {
+        let inst = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .find(|i| i.dest() == Some(Value(value)))?;
+        match inst {
+            Instruction::BinOp {
+                op: IrBinOp::Add,
+                lhs,
+                rhs,
+                ty: add_ty,
+                ..
+            } if *add_ty == ty => {
+                let (v, k) = match (lhs, rhs) {
+                    (Operand::Value(v), Operand::Const(k))
+                    | (Operand::Const(k), Operand::Value(v)) => (v, k),
+                    _ => return None,
+                };
+                return Some((v.0, integer_constant(*k, ty)?));
+            }
+            Instruction::Copy {
+                src: Operand::Value(v),
+                ..
+            } => value = v.0,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Is `n >= first` established on every path into the loop?
+///
+/// The climb: starting at the loop's unique outside predecessor, walk up
+/// through single-predecessor relay blocks (`Branch`-terminated preheaders
+/// full of phi-elim copies are the normal shape) until a `CondBranch` is
+/// found.  Exactly ONE of its edges may lead down the climbed chain; the
+/// condition on that edge must pin `n` against a constant:
+///
+/// * edge-taken-when-TRUE:  `K < n`, `n > K`  (fact `n > K`),
+///   `K <= n`, `n >= K`  (fact `n >= K`);
+/// * edge-taken-when-FALSE: the negations — `n <= K`, `K >= n` (fact
+///   `n > K`), `n < K`, `K > n` (fact `n >= K`).
+///
+/// A strict fact needs `K >= first - 1`, a non-strict one `K >= first`.  The
+/// comparison domain must match the fold's (signed guard for a signed fold:
+/// an unsigned fact says nothing about signed order).  `n` is an SSA value,
+/// so the fact established once holds at every later execution point.
+fn guard_proves_bound(
+    func: &IrFunction,
+    cfg: &CfgAnalysis,
+    pre: usize,
+    header_label: BlockId,
+    nv: Value,
+    strict_op: IrCmpOp,
+    ty: IrType,
+    first: i128,
+) -> bool {
+    let mut child_label = header_label;
+    let mut cur = pre;
+    for _ in 0..8 {
+        let Some(cur_block) = func.blocks.get(cur) else {
+            return false;
+        };
+        match &cur_block.terminator {
+            Terminator::Branch(l) if *l == child_label => {
+                // Relay block: climb to its unique predecessor.
+                let mut preds = cfg.preds.row(cur).iter().map(|&p| p as usize);
+                let (Some(p), None) = (preds.next(), preds.next()) else {
+                    return false;
+                };
+                child_label = cur_block.label;
+                cur = p;
+            }
+            Terminator::CondBranch {
+                cond,
+                true_label,
+                false_label,
+            } => {
+                let enters_true = *true_label == child_label;
+                let enters_false = *false_label == child_label;
+                if enters_true == enters_false {
+                    return false; // both or neither: no fact on the edge
+                }
+                let Operand::Value(gv) = *cond else {
+                    return false;
+                };
+                let gcmp = func.blocks.iter().find_map(|b| {
+                    b.instructions.iter().find_map(|i| match i {
+                        Instruction::Cmp {
+                            dest,
+                            lhs,
+                            op,
+                            rhs,
+                            ty: cmp_ty,
+                        } if dest.0 == gv.0 && *cmp_ty == ty => Some((*lhs, *op, *rhs)),
+                        _ => None,
+                    })
+                });
+                let Some((glhs, gop, grhs)) = gcmp else {
+                    return false;
+                };
+                // Normalize to a fact about `n` vs a constant `K` on the
+                // entering edge.  `strict` is whether the fact is `n > K`
+                // (versus `n >= K`).
+                let signed = matches!(strict_op, IrCmpOp::Slt);
+                let fact = guard_fact(glhs, gop, grhs, nv, ty, signed, enters_true);
+                let Some((k, strict)) = fact else {
+                    return false;
+                };
+                let need = if strict {
+                    first.checked_sub(1)
+                } else {
+                    Some(first)
+                };
+                return need.is_some_and(|need| k >= need);
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// The fact `n > K` (strict) or `n >= K` (non-strict) carried by `cmp` on the
+/// edge taken when the condition is `taken_on_true`, or `None` if the
+/// comparison does not pin `nv` from below in the required domain.
+fn guard_fact(
+    lhs: Operand,
+    op: IrCmpOp,
+    rhs: Operand,
+    nv: Value,
+    ty: IrType,
+    signed: bool,
+    taken_on_true: bool,
+) -> Option<(i128, bool)> {
+    let k_lhs = |k: IrConst| integer_constant(k, ty);
+    // (const K relates-to n) or (n relates-to const K), as (K, op-with-n-on-
+    // the-RIGHT): mirror the second form.
+    let (k, op) = match (lhs, rhs) {
+        (Operand::Const(k), Operand::Value(v)) if v == nv => (k_lhs(k)?, op),
+        (Operand::Value(v), Operand::Const(k)) if v == nv => {
+            let mirrored = match op {
+                IrCmpOp::Slt => IrCmpOp::Sgt,
+                IrCmpOp::Sle => IrCmpOp::Sge,
+                IrCmpOp::Sgt => IrCmpOp::Slt,
+                IrCmpOp::Sge => IrCmpOp::Sle,
+                IrCmpOp::Ult => IrCmpOp::Ugt,
+                IrCmpOp::Ule => IrCmpOp::Uge,
+                IrCmpOp::Ugt => IrCmpOp::Ult,
+                IrCmpOp::Uge => IrCmpOp::Ule,
+                _ => return None,
+            };
+            (k_lhs(k)?, mirrored)
+        }
+        _ => return None,
+    };
+    // `op` now reads `K <op> n`.  The edge's fact is `op` itself when taken
+    // on true, its negation when taken on false.
+    let effective = if taken_on_true {
+        op
+    } else {
+        match op {
+            IrCmpOp::Slt => IrCmpOp::Sge,
+            IrCmpOp::Sle => IrCmpOp::Sgt,
+            IrCmpOp::Sgt => IrCmpOp::Sle,
+            IrCmpOp::Sge => IrCmpOp::Slt,
+            IrCmpOp::Ult => IrCmpOp::Uge,
+            IrCmpOp::Ule => IrCmpOp::Ugt,
+            IrCmpOp::Ugt => IrCmpOp::Ule,
+            IrCmpOp::Uge => IrCmpOp::Ult,
+            _ => return None,
+        }
+    };
+    // Keep only lower bounds on `n`, in the matching domain.
+    match (signed, effective) {
+        (true, IrCmpOp::Slt) => Some((k, true)),   // K < n
+        (true, IrCmpOp::Sle) => Some((k, false)),  // K <= n
+        (false, IrCmpOp::Ult) => Some((k, true)),  // K < n (unsigned)
+        (false, IrCmpOp::Ule) => Some((k, false)), // K <= n (unsigned)
+        _ => None,
+    }
 }
 
 /// Prove the fold for ONE comparison and return the rewritten form, or `None`.
@@ -3265,5 +3761,522 @@ mod affine_fold_orientation_tests {
         let after = eval_folded(&insts[1], 0).expect("fold must leave a constant bound");
         assert!(after, "100 > (0 + 4) must stay true after folding");
         assert_eq!(eval_source(true, IrCmpOp::Sgt, 4, 100, 0), after);
+    }
+}
+
+#[cfg(test)]
+mod affine_value_bound_tests {
+    //! `fold_loop_value_bound` is an EQUIVALENCE under a guard, and every
+    //! clause of its proof has a counterexample when dropped.  The oracle is
+    //! therefore behavioural: a wrapping interpreter runs the loop before and
+    //! after the fold and the TRIP COUNTS must agree for every bound in a
+    //! sweep that includes the type extremes — the exact values where the
+    //! unsound variants (no guard, non-strict compare, step 2) diverge.
+    use super::*;
+    use crate::ir::reexports::BasicBlock;
+
+    const N_PARAM: u32 = 1;
+    const GUARD_CMP: u32 = 2;
+    const PHI: u32 = 3;
+    const INC: u32 = 4;
+    const AFFINE: u32 = 5;
+    const EXIT_CMP: u32 = 6;
+    const RELAY_BLOCK: u32 = 9;
+
+    struct Shape {
+        ty: IrType,
+        start: i64,
+        step: i64,
+        /// `Some(c)` chains the affine add onto the post-increment
+        /// (`(phi + step) + c`); `None` uses the reassociated `phi + c_total`.
+        chain_c: Option<i64>,
+        c_total: i64,
+        cmp_op: IrCmpOp,
+        /// Mirror the exit compare to `n <op'> affine`.
+        cmp_mirrored: bool,
+        guard: Guard,
+        relay: bool,
+    }
+
+    enum Guard {
+        /// `CondBranch(K <op> n, loop, exit)`.
+        TrueEdge(i64, IrCmpOp),
+        /// `CondBranch(n <op> K, exit, loop)` — the loop is the FALSE edge.
+        FalseEdgeMirrored(i64, IrCmpOp),
+        /// Unconditional entry: nothing proven.
+        None,
+    }
+
+    fn blk(label: u32, insts: Vec<Instruction>, term: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions: insts,
+            terminator: term,
+            source_spans: Vec::new(),
+        }
+    }
+
+    /// ```text
+    ///   0 entry:  n = param0 ; [guard cmp] ; guard-branch (or Branch)
+    ///   9 relay:  (optional) Branch -> 1
+    ///   1 loop:   phi = [start, pre], [inc, 1]
+    ///             inc = phi + step
+    ///             affine = (inc + c) | (phi + c_total)
+    ///             cmp ; CondBranch(cmp, 1, 2)   (mirrored: operands swapped)
+    ///   2 exit:   Return
+    /// ```
+    fn fixture(s: &Shape) -> IrFunction {
+        let ty = s.ty;
+        let mut f = IrFunction::new("affold_vb".into(), IrType::I32, vec![], false);
+        f.next_value_id = 50;
+        let entry_label = if s.relay {
+            BlockId(RELAY_BLOCK)
+        } else {
+            BlockId(0)
+        };
+        let loop_target = if s.relay {
+            BlockId(RELAY_BLOCK)
+        } else {
+            BlockId(1)
+        };
+        let mut entry = vec![Instruction::ParamRef {
+            dest: Value(N_PARAM),
+            param_idx: 0,
+            ty,
+        }];
+        let entry_term = match s.guard {
+            Guard::TrueEdge(k, op) => {
+                entry.push(Instruction::Cmp {
+                    dest: Value(GUARD_CMP),
+                    lhs: Operand::Const(IrConst::from_i64(k, ty)),
+                    op,
+                    rhs: Operand::Value(Value(N_PARAM)),
+                    ty,
+                });
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(GUARD_CMP)),
+                    true_label: loop_target,
+                    false_label: BlockId(2),
+                }
+            }
+            Guard::FalseEdgeMirrored(k, op) => {
+                entry.push(Instruction::Cmp {
+                    dest: Value(GUARD_CMP),
+                    lhs: Operand::Value(Value(N_PARAM)),
+                    op,
+                    rhs: Operand::Const(IrConst::from_i64(k, ty)),
+                    ty,
+                });
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(GUARD_CMP)),
+                    true_label: BlockId(2),
+                    false_label: loop_target,
+                }
+            }
+            Guard::None => Terminator::Branch(loop_target),
+        };
+        let mut body = vec![
+            Instruction::Phi {
+                dest: Value(PHI),
+                ty,
+                incoming: vec![
+                    (Operand::Const(IrConst::from_i64(s.start, ty)), entry_label),
+                    (Operand::Value(Value(INC)), BlockId(1)),
+                ],
+            },
+            Instruction::BinOp {
+                dest: Value(INC),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(PHI)),
+                rhs: Operand::Const(IrConst::from_i64(s.step, ty)),
+                ty,
+            },
+        ];
+        match s.chain_c {
+            Some(c) => body.push(Instruction::BinOp {
+                dest: Value(AFFINE),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(INC)),
+                rhs: Operand::Const(IrConst::from_i64(c, ty)),
+                ty,
+            }),
+            None => body.push(Instruction::BinOp {
+                dest: Value(AFFINE),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(PHI)),
+                rhs: Operand::Const(IrConst::from_i64(s.c_total, ty)),
+                ty,
+            }),
+        }
+        let (cmp_lhs, cmp_rhs) = if s.cmp_mirrored {
+            (
+                Operand::Value(Value(N_PARAM)),
+                Operand::Value(Value(AFFINE)),
+            )
+        } else {
+            (
+                Operand::Value(Value(AFFINE)),
+                Operand::Value(Value(N_PARAM)),
+            )
+        };
+        body.push(Instruction::Cmp {
+            dest: Value(EXIT_CMP),
+            lhs: cmp_lhs,
+            op: s.cmp_op,
+            rhs: cmp_rhs,
+            ty,
+        });
+        f.blocks.push(blk(0, entry, entry_term));
+        f.blocks.push(blk(
+            1,
+            body,
+            Terminator::CondBranch {
+                cond: Operand::Value(Value(EXIT_CMP)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+        ));
+        f.blocks.push(blk(2, vec![], Terminator::Return(None)));
+        if s.relay {
+            f.blocks
+                .push(blk(RELAY_BLOCK, vec![], Terminator::Branch(BlockId(1))));
+        }
+        f
+    }
+
+    /// Wrapping interpreter.  Returns the number of loop-block executions,
+    /// saturated at the bail-out bound so an (expected) non-terminating
+    /// variant still yields a comparable observation.
+    fn trips(f: &IrFunction, n: i128) -> u32 {
+        const BAIL: u32 = 4096;
+        let wrap = |v: i128, ty: IrType| -> i128 {
+            let (lo, hi) = integer_type_bounds(ty).unwrap();
+            let span = hi - lo + 1;
+            lo + (v - lo).rem_euclid(span)
+        };
+        let read = |op: Operand, vals: &FxHashMap<u32, i128>| -> i128 {
+            match op {
+                Operand::Const(c) => c.to_i64().map(i128::from).unwrap(),
+                Operand::Value(v) => vals[&v.0],
+            }
+        };
+        let mut vals: FxHashMap<u32, i128> = FxHashMap::default();
+        let mut at = f.blocks[0].label;
+        let mut previous = at;
+        let mut count = 0u32;
+        loop {
+            let block = f.blocks.iter().find(|b| b.label == at).unwrap();
+            if at == BlockId(1) {
+                count += 1;
+                if count >= BAIL {
+                    return BAIL;
+                }
+            }
+            let phis: Vec<(u32, i128)> = block
+                .instructions
+                .iter()
+                .filter_map(|inst| match inst {
+                    Instruction::Phi { dest, incoming, .. } => {
+                        let op = incoming.iter().find(|(_, l)| *l == previous).unwrap().0;
+                        Some((dest.0, read(op, &vals)))
+                    }
+                    _ => None,
+                })
+                .collect();
+            vals.extend(phis);
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::Phi { .. } => {}
+                    Instruction::ParamRef { dest, ty, .. } => {
+                        vals.insert(dest.0, wrap(n, *ty));
+                    }
+                    Instruction::Copy { dest, src } => {
+                        let v = read(*src, &vals);
+                        vals.insert(dest.0, v);
+                    }
+                    Instruction::BinOp {
+                        dest,
+                        op,
+                        lhs,
+                        rhs,
+                        ty,
+                    } => {
+                        let (l, r) = (read(*lhs, &vals), read(*rhs, &vals));
+                        let raw = match op {
+                            IrBinOp::Add => l + r,
+                            IrBinOp::Sub => l - r,
+                            other => panic!("fixture does not use {other:?}"),
+                        };
+                        vals.insert(dest.0, wrap(raw, *ty));
+                    }
+                    Instruction::Cmp {
+                        dest,
+                        op,
+                        lhs,
+                        rhs,
+                        ty,
+                    } => {
+                        // Signed relations read the wrapped (lo..=hi) image
+                        // directly; unsigned types already wrap into 0..=hi.
+                        let (l, r) = (wrap(read(*lhs, &vals), *ty), wrap(read(*rhs, &vals), *ty));
+                        let t = match op {
+                            IrCmpOp::Slt | IrCmpOp::Ult => l < r,
+                            IrCmpOp::Sle | IrCmpOp::Ule => l <= r,
+                            IrCmpOp::Sgt | IrCmpOp::Ugt => l > r,
+                            IrCmpOp::Sge | IrCmpOp::Uge => l >= r,
+                            other => panic!("fixture does not use {other:?}"),
+                        };
+                        vals.insert(dest.0, i128::from(t));
+                    }
+                    other => panic!("fixture does not use {other:?}"),
+                }
+            }
+            previous = at;
+            at = match block.terminator {
+                Terminator::Branch(next) => next,
+                Terminator::CondBranch {
+                    cond,
+                    true_label,
+                    false_label,
+                } => {
+                    if read(cond, &vals) != 0 {
+                        true_label
+                    } else {
+                        false_label
+                    }
+                }
+                Terminator::Return(_) => return count,
+                _ => panic!("unexpected fixture terminator"),
+            };
+        }
+    }
+
+    fn sweep(ty: IrType) -> Vec<i128> {
+        let (lo, hi) = integer_type_bounds(ty).unwrap();
+        vec![
+            lo,
+            lo + 3,
+            lo + 4,
+            lo + 5,
+            lo + 6,
+            -1,
+            0,
+            1,
+            3,
+            4,
+            5,
+            6,
+            7,
+            20,
+            hi - 5,
+            hi - 1,
+            hi,
+        ]
+        .into_iter()
+        .filter(|&v| v >= lo && v <= hi)
+        .collect()
+    }
+
+    /// Fold, assert the expected fire count, and when it fired assert trip
+    /// equivalence against the unfolded original over the whole sweep.
+    fn check(s: &Shape, expect_fold: usize) -> IrFunction {
+        let original = fixture(s);
+        let mut folded = fixture(s);
+        assert_eq!(
+            fold_affine_exit_compares(&mut folded),
+            expect_fold,
+            "unexpected fold count for {:?} c_total={} step={}",
+            s.cmp_op,
+            s.c_total,
+            s.step
+        );
+        for &n in &sweep(s.ty) {
+            assert_eq!(
+                trips(&original, n),
+                trips(&folded, n),
+                "trip divergence at n={n} for {:?} c_total={} step={}",
+                s.cmp_op,
+                s.c_total,
+                s.step
+            );
+        }
+        folded
+    }
+
+    fn base() -> Shape {
+        Shape {
+            ty: IrType::I64,
+            start: 0,
+            step: 1,
+            chain_c: Some(4),
+            c_total: 5,
+            cmp_op: IrCmpOp::Slt,
+            cmp_mirrored: false,
+            guard: Guard::TrueEdge(4, IrCmpOp::Slt),
+            relay: false,
+        }
+    }
+
+    #[test]
+    fn vb_folds_signed_postinc_chain() {
+        let folded = check(&base(), 1);
+        // The guard block gained the hoisted `n - 4`, and the compare now
+        // reads the post-increment against it.
+        let sub = folded.blocks[0]
+            .instructions
+            .iter()
+            .find_map(|i| match i {
+                Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Sub,
+                    lhs: Operand::Value(nv),
+                    rhs: Operand::Const(k),
+                    ..
+                } if nv.0 == N_PARAM => Some((dest.0, k.to_i64().unwrap())),
+                _ => None,
+            })
+            .expect("hoisted sub in the guard block");
+        assert_eq!(sub.1, 4, "the chain anchors on the post-increment");
+        let cmp = folded.blocks[1].instructions.iter().find_map(|i| match i {
+            Instruction::Cmp { lhs, op, rhs, .. } => Some((*lhs, *op, *rhs)),
+            _ => None,
+        });
+        assert_eq!(
+            cmp,
+            Some((
+                Operand::Value(Value(INC)),
+                IrCmpOp::Slt,
+                Operand::Value(Value(sub.0))
+            ))
+        );
+    }
+
+    #[test]
+    fn vb_reassociated_chain_prefers_postinc_anchor() {
+        // `phi + 5` (the shape instcombine leaves) must still anchor on the
+        // post-increment: comparing the stale phi would keep two IV values
+        // live across the bottom test.
+        let s = Shape {
+            chain_c: None,
+            ..base()
+        };
+        let folded = check(&s, 1);
+        let cmp = folded.blocks[1].instructions.iter().find_map(|i| match i {
+            Instruction::Cmp { lhs, .. } => Some(*lhs),
+            _ => None,
+        });
+        assert_eq!(cmp, Some(Operand::Value(Value(INC))));
+    }
+
+    #[test]
+    fn vb_folds_unsigned() {
+        let s = Shape {
+            ty: IrType::U64,
+            cmp_op: IrCmpOp::Ult,
+            guard: Guard::TrueEdge(4, IrCmpOp::Ult),
+            ..base()
+        };
+        check(&s, 1);
+    }
+
+    #[test]
+    fn vb_folds_mirrored_compare_and_false_edge_guard() {
+        // `n > affine` with entry `CondBranch(n <= 4, exit, loop)`: the fact
+        // on the false edge is the negation `n > 4`.
+        let s = Shape {
+            cmp_op: IrCmpOp::Sgt,
+            cmp_mirrored: true,
+            guard: Guard::FalseEdgeMirrored(4, IrCmpOp::Sle),
+            ..base()
+        };
+        check(&s, 1);
+    }
+
+    #[test]
+    fn vb_folds_through_relay_preheader() {
+        let s = Shape {
+            relay: true,
+            ..base()
+        };
+        check(&s, 1);
+    }
+
+    #[test]
+    fn vb_refuses_unguarded() {
+        // Near the signed minimum, `n - c` underflows to a huge positive
+        // bound: the sweep (which includes `lo + 3`) would catch a fold here
+        // as a trip divergence.  There must be no fold at all.
+        let s = Shape {
+            guard: Guard::None,
+            ..base()
+        };
+        check(&s, 0);
+    }
+
+    #[test]
+    fn vb_refuses_non_strict_compare() {
+        // With `<=` and `n == type_max`, the original wrapping loop never
+        // exits while the folded one would.
+        let s = Shape {
+            cmp_op: IrCmpOp::Sle,
+            ..base()
+        };
+        check(&s, 0);
+    }
+
+    #[test]
+    fn vb_refuses_step_two() {
+        // A step of 2 overshoots: near `type_max` the original `iv + c`
+        // wraps and the compares diverge.
+        let s = Shape { step: 2, ..base() };
+        check(&s, 0);
+    }
+
+    #[test]
+    fn vb_guard_strength_boundary() {
+        // `first = start + c_total = 5`.  A strict guard needs `K >= 4`:
+        // `K = 4` proves `n >= 5` and folds, `K = 3` only proves `n >= 4`
+        // and must refuse.
+        let strong = Shape {
+            guard: Guard::TrueEdge(4, IrCmpOp::Slt),
+            ..base()
+        };
+        check(&strong, 1);
+        let weak = Shape {
+            guard: Guard::TrueEdge(3, IrCmpOp::Slt),
+            ..base()
+        };
+        check(&weak, 0);
+        // Non-strict facts shift by one: `4 <= n` is too weak, `5 <= n` folds.
+        let weak_nonstrict = Shape {
+            guard: Guard::TrueEdge(4, IrCmpOp::Sle),
+            ..base()
+        };
+        check(&weak_nonstrict, 0);
+        let strong_nonstrict = Shape {
+            guard: Guard::TrueEdge(5, IrCmpOp::Sle),
+            ..base()
+        };
+        check(&strong_nonstrict, 1);
+    }
+
+    #[test]
+    fn vb_refuses_domain_mismatch() {
+        // An UNSIGNED guard fact says nothing about SIGNED order: a negative
+        // `n` is enormous unsigned, so `4 <u n` holds while `n - 4` still
+        // underflows the signed compare.
+        let s = Shape {
+            guard: Guard::TrueEdge(4, IrCmpOp::Ult),
+            ..base()
+        };
+        check(&s, 0);
+    }
+
+    #[test]
+    fn vb_kill_switch_disables() {
+        set_affine_fold_knobs(false, false);
+        let mut f = fixture(&base());
+        assert_eq!(fold_affine_exit_compares(&mut f), 0);
+        set_affine_fold_knobs(true, false);
     }
 }

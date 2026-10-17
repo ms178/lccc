@@ -142,7 +142,39 @@ impl Lowerer {
         }
 
         // Scalar constant
-        if let Some(val) = self.eval_const_expr(expr) {
+        //
+        // A *bare* read of a folded const object is answered from sema's map
+        // here: `const int cc = 5; int v = cc;` is a constant initializer
+        // under GCC's folding rule (C11 6.7.9p4 would want an integer constant
+        // expression), and GCC rejects the same read of a non-const or
+        // volatile object.  `eval_const_expr` deliberately declines
+        // identifiers -- it resolves them by name so that a lowering-local
+        // scope wins -- which is why `cc * 2` was folded and `cc` was not, and
+        // why the read was diagnosed as non-constant (measured: GCC accepts
+        // all six scalar shapes in tests/regression/file_scope_init/values.c).
+        // Sema answers exactly GCC's rule: `annotate_const_value` records the
+        // value under the read's expression id, and `declares_const_object`
+        // refuses to record a volatile object (C11 6.7.3p7).
+        // sema's recorded value is the *contract*: every initializer this
+        // compiler accepts has a constant answer recorded under the
+        // initializer's own expression id, including the shapes the lowering
+        // evaluator declines on purpose (`eval_const_expr` resolves identifiers
+        // by name so a lowering-local scope wins) and the ones it cannot
+        // express (a constant folded out of a call or out of an element of a
+        // folded const object).  The lowering recomputes when it can -- its own
+        // answer reflects lowering-local scoping -- and otherwise consumes
+        // sema's, which is the answer the program was accepted on.  `sizeof` is
+        // the one exclusion: sema evaluates it against the *declared* type,
+        // before the lowerer has resolved unsized array dimensions from the
+        // initializer, so an expression containing one is recomputed here.
+        let scalar = self.eval_const_expr(expr).or_else(|| {
+            if Self::expr_contains_sizeof(expr) {
+                None
+            } else {
+                self.lookup_sema_const(expr)
+            }
+        });
+        if let Some(val) = scalar {
             // C23 decimals: the initializer must become exact BID bits via
             // the master const conversion (integers convert by value with
             // half-even rounding, binary floats through their exact
@@ -1501,7 +1533,7 @@ impl Lowerer {
                 } else {
                     let elem_ct = self.type_spec_to_ctype(elem_ts);
                     match (self.unsized_array_len(init, &elem_ct), init) {
-                        (Some(n), _) => e_size * n,
+                        (Some(n), _) => e_size.saturating_mul(n),
                         (None, Initializer::List(items)) => {
                             e_size * self.compute_init_list_array_size(items)
                         }

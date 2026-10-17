@@ -29,6 +29,8 @@ elif name in ('gcc-16', 'g++-16'):
     elif os.environ.get('BANNER_FAIL') == '1': sys.exit(7)
     else: print(name + ' (mock Debian) 16.2.0\nCopyright')
 elif name == 'apt-get' and os.environ.get('APT_FAIL') == '1': sys.exit(9)
+elif name == 'apt-get' and os.environ.get('APT_INSTALL_FAIL') == '1' \
+        and args[:1] == ['install'] and '--dry-run' not in args: sys.exit(9)
 '''
 
 
@@ -54,7 +56,8 @@ class ProvisioningTests(unittest.TestCase):
             log = directory / "log"
             env = {**os.environ, "PATH": f"{directory}:{os.defpath}",
                    "MOCK_LOG": str(log), "MOCK_EUID": str(uid), "LCCC_CI_OS_RELEASE": str(release),
-                   "LCCC_CI_GCC_VERSION": "16.2.0", **overrides}
+                   "LCCC_CI_GCC_VERSION": "16.2.0", "LCCC_CI_APT_RETRY_DELAY": "0",
+                   **overrides}
             result = subprocess.run(["bash", str(script), mode],
                                     env=env, text=True, capture_output=True, timeout=15)
             commands = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
@@ -65,7 +68,8 @@ class ProvisioningTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual([c for c in commands if c[0] == "apt-get"], [
             ["apt-get", "update"],
-            ["apt-get", "install", "-y", "--no-install-recommends", "gcc-16", "g++-16"],
+            ["apt-get", "install", "-y", "--no-install-recommends",
+             "-o", "Acquire::Retries=3", "gcc-16", "g++-16"],
         ])
         self.assertFalse(any(c[0] == "add-apt-repository" for c in commands))
 
@@ -116,6 +120,31 @@ class ProvisioningTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertEqual(commands, [])
 
+    def test_transient_apt_failures_are_retried_then_propagate(self):
+        # Hosted-runner mirrors flake; 'apt-get update' must be attempted
+        # exactly three times before the failure propagates.
+        result, commands = self.invoke(APT_FAIL="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(commands.count(["apt-get", "update"]), 3)
+        self.assertIn("attempt 3/3", result.stderr)
+
+    def test_install_failure_names_the_resolver_state(self):
+        # PPA publication skew between gcc-16 and the lib32 binaries must
+        # leave a self-diagnosing log: three install attempts, per-package
+        # resolver state, and a --dry-run naming the broken dependency.
+        result, commands = self.invoke("--multilib", APT_INSTALL_FAIL="1")
+        self.assertNotEqual(result.returncode, 0)
+        installs = [c for c in commands
+                    if c[:2] == ["apt-get", "install"] and "--dry-run" not in c]
+        self.assertEqual(len(installs), 3)
+        self.assertIn("per-package resolver state", result.stderr)
+        for package in ("gcc-16", "g++-16", "gcc-16-multilib", "g++-16-multilib",
+                        "gcc-multilib", "g++-multilib", "libc6-dev-i386",
+                        "lib32gcc-16-dev"):
+            self.assertIn(["apt-cache", "policy", package], commands)
+        self.assertTrue(any(c[:2] == ["apt-get", "install"] and "--dry-run" in c
+                            for c in commands))
+
     def test_c_and_cxx_versions_must_match(self):
         for version in ("15.3.0", "16.1.0", "", "garbage"):
             with self.subTest(gxx=version):
@@ -127,6 +156,20 @@ class ProvisioningTests(unittest.TestCase):
     def test_rolling_major_policy_is_explicit(self):
         result, _ = self.invoke(LCCC_CI_GCC_VERSION="", VERSION="16.3.0", GXX_VERSION="16.3.0")
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_archive_dir_keeps_debs_for_the_workflow_cache(self):
+        with tempfile.TemporaryDirectory() as outer:
+            archive = Path(outer) / "apt-archive"
+            result, commands = self.invoke(LCCC_CI_APT_ARCHIVE_DIR=str(archive))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((archive / "partial").is_dir())
+            install = next(c for c in commands if c[:2] == ["apt-get", "install"])
+            self.assertIn(f"Dir::Cache::archives={archive}", install)
+            self.assertIn("APT::Keep-Downloaded-Packages=true", install)
+            # apt update must not be redirected: the index stays live so a
+            # stale deb cache can never pin an outdated toolchain.
+            update = next(c for c in commands if c[:2] == ["apt-get", "update"])
+            self.assertNotIn(f"Dir::Cache::archives={archive}", update)
 
 
 if __name__ == "__main__":

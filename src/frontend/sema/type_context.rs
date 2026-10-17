@@ -81,8 +81,11 @@ pub fn extract_fptr_typedef_info(
 /// across enum_constants, struct_layouts, ctype_cache, and typedefs.
 #[derive(Debug)]
 pub struct TypeScopeFrame {
-    /// Keys newly inserted into `enum_constants`.
-    pub enums_added: Vec<String>,
+    /// Every write to `enum_constants` in this scope, with the value it
+    /// replaced (`None` when the name did not exist before the scope).  Undone
+    /// last-write-first, so a name written twice inside one scope is restored
+    /// correctly without scanning the log.
+    pub enums_changed: Vec<(String, Option<i64>)>,
     /// Keys newly inserted into `struct_layouts`.
     pub struct_layouts_added: Vec<String>,
     /// Keys that were overwritten in `struct_layouts`: (key, previous_value).
@@ -109,7 +112,7 @@ pub struct TypeScopeFrame {
 impl TypeScopeFrame {
     fn new() -> Self {
         Self {
-            enums_added: Vec::new(),
+            enums_changed: Vec::new(),
             struct_layouts_added: Vec::new(),
             struct_layouts_shadowed: Vec::new(),
             record_alias_added: Vec::new(),
@@ -521,8 +524,18 @@ impl TypeContext {
     /// enum_constants, struct_layouts, ctype_cache, and typedefs.
     pub fn pop_scope(&mut self) {
         if let Some(frame) = self.scope_stack.get_mut().pop() {
-            for key in frame.enums_added {
-                self.enum_constants.remove(&key);
+            // Last-write-first: each entry holds the value that write
+            // replaced, so restoring in reverse rebuilds the pre-scope state
+            // exactly.  `None` marks a name this scope introduced.
+            for (key, previous) in frame.enums_changed.into_iter().rev() {
+                match previous {
+                    Some(value) => {
+                        self.enum_constants.insert(key, value);
+                    }
+                    None => {
+                        self.enum_constants.remove(&key);
+                    }
+                }
             }
             let layouts = self.struct_layouts.get_mut();
             for key in frame.struct_layouts_added {
@@ -574,12 +587,24 @@ impl TypeContext {
     }
 
     /// Insert an enum constant, tracking the change in the current scope frame.
+    ///
+    /// The previous value is recorded too, so a block-scope enum that redefines
+    /// an outer enumerator is undone at scope exit:
+    ///
+    /// ```c
+    /// enum { A = 1 };
+    /// void f(void) { enum { A = 2 }; }
+    /// enum { B = A };   /* A is 1 here, not 2 */
+    /// ```
+    ///
+    /// Restoring only *new* names let the inner value leak out of the block, so
+    /// every later use of the outer `A` -- in sema and in the lowerer, which
+    /// share this map -- silently became 2.  GCC 16.2 prints `1 1` for the
+    /// program above; lccc printed `2 2`.
     pub fn insert_enum_scoped(&mut self, name: String, value: i64) {
-        let track = !self.enum_constants.contains_key(&name);
-        if track {
-            if let Some(frame) = self.scope_stack.get_mut().last_mut() {
-                frame.enums_added.push(name.clone());
-            }
+        let previous = self.enum_constants.get(&name).copied();
+        if let Some(frame) = self.scope_stack.get_mut().last_mut() {
+            frame.enums_changed.push((name.clone(), previous));
         }
         self.enum_constants.insert(name, value);
     }

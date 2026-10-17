@@ -39,11 +39,50 @@ toolchain_ready() {
     done
 }
 
+# Hosted-runner apt is flaky (mirror races, PPA publication skew between the
+# gcc-16 core and the multilib/lib32 binaries). Retry with backoff so a
+# transient window does not fail the whole suite, and self-diagnose on the
+# final failure so the step log names the unresolvable package instead of a
+# bare apt exit code 100.
+apt_retry() {
+    local attempt rc
+    for attempt in 1 2 3; do
+        rc=0
+        as_root "$@" || rc=$?
+        if (( rc == 0 )); then
+            return 0
+        fi
+        echo "ci_install_gcc16: '$*' failed (exit $rc, attempt $attempt/3)" >&2
+        if (( attempt < 3 )); then
+            # LCCC_CI_APT_RETRY_DELAY=0 keeps the mock-driven regression
+            # gate fast; CI uses the real backoff.
+            sleep $(( attempt * ${LCCC_CI_APT_RETRY_DELAY:-25} ))
+        fi
+    done
+    return "$rc"
+}
+
+# Hosted runners re-download ~300 MB of PPA debs on every job (launchpad
+# serves at a few hundred KB/s; measured 15 minutes per job). When
+# LCCC_CI_APT_ARCHIVE_DIR is set, apt keeps its downloaded .debs in that
+# directory so the workflow can persist them in actions/cache; a warm cache
+# turns the install into pure local dpkg work. apt still consults the live
+# index first, so a stale cache only costs the delta download, never
+# correctness or the rolling-major version policy.
+archive_opts=()
+if [[ -n ${LCCC_CI_APT_ARCHIVE_DIR:-} ]]; then
+    mkdir -p "${LCCC_CI_APT_ARCHIVE_DIR}/partial"
+    archive_opts=(
+        -o "Dir::Cache::archives=${LCCC_CI_APT_ARCHIVE_DIR}"
+        -o APT::Keep-Downloaded-Packages=true
+    )
+fi
+
 if ! toolchain_ready; then
     if [[ $MODE == --multilib ]]; then
         as_root dpkg --add-architecture i386
     fi
-    as_root apt-get update
+    apt_retry apt-get update
     candidate=$(apt-cache policy gcc-16 | awk '/Candidate:/ { print $2; exit }')
     if [[ -z $candidate || $candidate == '(none)' ]]; then
         # Override is useful for mock-only tests; normal callers use the host.
@@ -57,9 +96,24 @@ if ! toolchain_ready; then
             as_root apt-get install -y --no-install-recommends software-properties-common
         fi
         as_root add-apt-repository -y ppa:ubuntu-toolchain-r/test
-        as_root apt-get update
+        apt_retry apt-get update
     fi
-    as_root apt-get install -y --no-install-recommends "${packages[@]}"
+    if ! apt_retry apt-get install -y --no-install-recommends \
+            -o Acquire::Retries=3 "${archive_opts[@]}" "${packages[@]}"; then
+        echo "ci_install_gcc16: install failed; per-package resolver state follows" >&2
+        for package in "${packages[@]}"; do
+            apt-cache policy "$package" >&2 || true
+        done
+        # Name the exact uninstallable dependency chain in the log.
+        as_root apt-get install -y --no-install-recommends --dry-run \
+            "${packages[@]}" >&2 || true
+        exit 1
+    fi
+    if [[ -n ${LCCC_CI_APT_ARCHIVE_DIR:-} ]] && (( EUID != 0 )); then
+        # apt wrote the debs as root; hand them back so the post-job cache
+        # upload (which runs unprivileged) can read every file.
+        as_root chown -R "$(id -un):$(id -gn)" "$LCCC_CI_APT_ARCHIVE_DIR" || true
+    fi
 fi
 
 version=$(gcc-16 -dumpfullversion)

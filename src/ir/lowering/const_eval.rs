@@ -12,17 +12,18 @@
 use super::lower::Lowerer;
 use crate::common::const_arith;
 use crate::common::const_eval as shared_const_eval;
-use crate::common::types::{CType, IrType};
+use crate::common::types::{CType, IrType, max_object_bytes};
 use crate::frontend::parser::ast::{
     BinOp, DerivedDeclarator, Expr, Initializer, SizeofArg, StructFieldDecl, TypeSpecifier, UnaryOp,
 };
+use crate::ir::lowering::const_object_images::{self, ConstObjectImage};
 use crate::ir::reexports::{GlobalInit, IrConst};
 
 impl Lowerer {
     /// Look up a pre-computed constant value from sema's ConstMap.
     /// Returns Some(IrConst) if sema successfully evaluated this expression
     /// at compile time during its pass.
-    fn lookup_sema_const(&self, expr: &Expr) -> Option<IrConst> {
+    pub(super) fn lookup_sema_const(&self, expr: &Expr) -> Option<IrConst> {
         self.sema_const_values.get(&expr.id()).cloned()
     }
 
@@ -32,7 +33,7 @@ impl Lowerer {
     /// dimensions from initializers. For example, `sizeof(cases) / sizeof(cases[0]) + 1`
     /// contains Sizeof nodes in the division subtree, so the entire expression must
     /// be recomputed by the lowerer.
-    fn expr_contains_sizeof(expr: &Expr) -> bool {
+    pub(super) fn expr_contains_sizeof(expr: &Expr) -> bool {
         match expr {
             Expr::Sizeof(_, _) => true,
             Expr::BinaryOp(_, lhs, rhs, _) => {
@@ -372,6 +373,14 @@ impl Lowerer {
                 let selected = self.resolve_generic_selection_expr(controlling, associations)?;
                 self.eval_const_expr(selected)
             }
+            // A read of an element or member of a global object whose
+            // initializer is a constant byte image: `table[3]`,
+            // `config.limit`, `matrix[1][2]`.  sema decides whether such a
+            // read is a constant (`static_init.rs::folded_object_read`) and
+            // rejects the program otherwise; the value here comes from the
+            // bytes the initializer emits, so it cannot disagree with what the
+            // program loads.
+            Expr::ArraySubscript(..) | Expr::MemberAccess(..) => self.eval_const_object_read(expr),
             _ => None,
         }
     }
@@ -724,6 +733,123 @@ impl Lowerer {
         }
     }
 
+    /// Fold a read of an element or member of a constant global object.
+    ///
+    /// The selectors are peeled off outermost-first, then applied
+    /// innermost-first against the object's declared type, accumulating a byte
+    /// offset into the object's image; the leaf is decoded from the image at
+    /// that offset -- the very bytes the program will load.
+    fn eval_const_object_read(&self, expr: &Expr) -> Option<IrConst> {
+        let mut selectors = Vec::new();
+        let mut cursor = expr;
+        loop {
+            match cursor {
+                Expr::ArraySubscript(base, _, _) | Expr::MemberAccess(base, _, _) => {
+                    selectors.push(cursor);
+                    cursor = base;
+                }
+                Expr::Identifier(name, _) => {
+                    let image = self.const_object_images.get(name.as_str())?;
+                    return self.read_const_object(image, &selectors);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Apply `selectors` (outermost first) to a constant object's image.
+    fn read_const_object(&self, image: &ConstObjectImage, selectors: &[&Expr]) -> Option<IrConst> {
+        let layouts = self.types.borrow_struct_layouts();
+        let mut ctype = image.ctype.clone();
+        let mut offset = 0usize;
+        for selector in selectors.iter().rev() {
+            match selector {
+                Expr::ArraySubscript(_, index, _) => {
+                    let element = match &ctype {
+                        CType::Array(element, _) => (**element).clone(),
+                        _ => return None,
+                    };
+                    let stride = self.resolve_ctype_size(&element);
+                    if stride == 0 {
+                        return None;
+                    }
+                    let index = self.eval_const_expr(index)?.to_i64()?;
+                    if index < 0 {
+                        return None;
+                    }
+                    offset = offset.checked_add((index as usize).checked_mul(stride)?)?;
+                    ctype = element;
+                }
+                Expr::MemberAccess(_, field_name, _) => {
+                    let key = match &ctype {
+                        CType::Struct(key) | CType::Union(key) => key.clone(),
+                        _ => return None,
+                    };
+                    let layout = layouts.get(&*key)?;
+                    // A volatile-qualified MEMBER keeps its access even when
+                    // the containing object is const (C11 6.7.3p7): `struct
+                    // cs { const volatile int f; }; const struct cs csv` must
+                    // load `csv.f` every time.  GCC folds this shape; lccc
+                    // deliberately does not (check_const_volatile_objects.sh
+                    // pins the divergence), so the image fold declines here.
+                    if layout
+                        .fields
+                        .iter()
+                        .find(|f| f.name == *field_name)
+                        .is_some_and(|f| f.base_volatile || f.object_volatile)
+                    {
+                        return None;
+                    }
+                    let (field_offset, field_ty, bit_offset, bit_width) =
+                        layout.field_offset_with_bitfield(field_name, &*layouts)?;
+                    offset = offset.checked_add(field_offset)?;
+                    if let (Some(bit_offset), Some(bit_width)) = (bit_offset, bit_width) {
+                        // A bitfield leaf: its storage unit is the declared
+                        // type, and the value is the field's bits, signed by
+                        // the *field's* type (`int a : 4` of all ones is -1,
+                        // `unsigned a : 4` is 15).
+                        let unit = self.resolve_ctype_size(&field_ty);
+                        let raw = const_object_images::read_le(&image.bytes, offset, unit)?;
+                        return const_object_images::extract_bitfield(
+                            raw,
+                            bit_offset,
+                            bit_width,
+                            !field_ty.is_unsigned(),
+                        );
+                    }
+                    ctype = field_ty;
+                }
+                _ => return None,
+            }
+        }
+        // The whole leaf has to be inside the image: an offset that reaches
+        // past it means the layout and the initializer disagree, and a fold
+        // would invent a value.
+        let width = self.resolve_ctype_size(&ctype);
+        if offset.checked_add(width)? > image.bytes.len() {
+            return None;
+        }
+        self.read_const_scalar(&image.bytes, offset, &ctype)
+    }
+
+    /// Decode one scalar of `ctype` out of an object's byte image.
+    fn read_const_scalar(&self, bytes: &[u8], offset: usize, ctype: &CType) -> Option<IrConst> {
+        let width = self.resolve_ctype_size(ctype);
+        let raw = const_object_images::read_le(bytes, offset, width)?;
+        match ctype {
+            CType::Float => Some(IrConst::F32(f32::from_bits(raw as u32))),
+            CType::Double => Some(IrConst::F64(f64::from_bits(raw))),
+            _ if ctype.is_integer() => match width {
+                1 => Some(IrConst::I8(raw as i8)),
+                2 => Some(IrConst::I16(raw as i16)),
+                4 => Some(IrConst::I32(raw as i32)),
+                8 => Some(IrConst::I64(raw as i64)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Evaluate an initializer to a scalar constant for use in constant expressions.
     /// Handles both direct expressions and brace-wrapped lists (including nested ones
     /// like `{ { 42 } }` which occur when a struct compound literal has a single field).
@@ -1068,6 +1194,49 @@ impl Lowerer {
             return self.const_to_i64(&val);
         }
         None
+    }
+
+    /// Array bound as a signed integer, validated *before* it can become a
+    /// `usize`.
+    ///
+    /// These callers are the last place where the bound is still signed, so the
+    /// two constraint violations that make the value unusable as a size have to
+    /// be caught here:
+    ///
+    ///  * C11 6.7.6.2p5 requires a constant array bound to be greater than
+    ///    zero. A negative value used to be `as usize`-wrapped into an
+    ///    astronomically large element count, which turned a plain compile
+    ///    error into a multi-gigabyte `.bss` reservation: with the bound
+    ///    `sizeof(...) == 8 ? 1 : -1` the compiler walked into
+    ///    "memory allocation of 17179869168 bytes failed" (SIGABRT) instead of
+    ///    reporting the bad bound. Diagnose it.
+    ///  * An array whose *byte* size exceeds `PTRDIFF_MAX` cannot exist,
+    ///    because C11 6.5.6p9 requires pointer differences to be
+    ///    representable; GCC rejects exactly that with "size of array is too
+    ///    large" and so does this check. `elem_size` of 0 skips the byte test
+    ///    for callers that only know the element count.
+    ///
+    /// Returns `None` for a rejected or non-constant bound, so callers keep
+    /// their existing unsized-array behaviour; the diagnostic is what makes
+    /// the compile fail with an explanation.
+    pub(super) fn checked_array_bound(&self, expr: &Expr, elem_size: usize) -> Option<i64> {
+        let n = self.expr_as_array_size(expr)?;
+        if n < 0 {
+            self.emit_error("size of array is negative", expr.span());
+            return None;
+        }
+        if elem_size > 0 && (n as u128) * (elem_size as u128) > max_object_bytes() as u128 {
+            self.emit_error("size of array is too large", expr.span());
+            return None;
+        }
+        Some(n)
+    }
+
+    /// [`Self::checked_array_bound`] as an element count, for the callers that
+    /// use the bound directly as a `usize`.
+    pub(super) fn array_bound_elems(&self, expr: &Expr, elem_size: usize) -> Option<usize> {
+        self.checked_array_bound(expr, elem_size)
+            .map(|n| n as usize)
     }
 
     /// Check if an expression is always non-zero at compile time, even if we

@@ -44,10 +44,37 @@ int cv_dd2 = (int)(dd * 2);
 const float ff = 0.1f;
 float cv_ff = ff * 3;
 
+
+/* Element and member reads of a const object: the fold must produce the bytes
+ * the object actually holds. */
+static const int cat[4] = {1, 2, 3, 4};
+int ce_a = cat[2];
+int ce_b = cat[1] * cat[3];
+static const struct co { int x; int y; } co_s = {7, 9};
+int ce_c = co_s.y;
+static const struct cn { int m[3]; } cn_t = {{4, 5, 6}};
+int ce_d = cn_t.m[2];
+static const struct bf { int a : 4; unsigned b : 5; } bf_v = {-3, 17};
+int ce_e = bf_v.a * 100 + (int)bf_v.b;
+static const int cmx[2][2] = {{1, 2}, {3, 4}};
+int ce_f = cmx[1][1];
+static const double cde[2] = {1.5, 2.5};
+double ce_g = cde[1];
+static const char cce[3] = "ab";
+int ce_h = cce[1];
+
+/* A folded call, and a constant condition's selected operand. */
+static const double sq = __builtin_sqrt(4.0);
+int fc_a = (int)sq;
+int fc_b = 0.5 ? 3 : (int)(long)&g;
+int fc_c = 0.0 ? (int)(long)&g : 5;
+
 int main(void) {
     printf("%d %d %d %d %d %d %d %d %d %d %d %d %d %d %lu %d\n", c5, c6, eq, ne, eqh,
            land, lnot, lor, (int)lv, ord, ordle, nul, nul2, diff, ulv, sel == &g);
     printf("%d %d %d %d %d %d %d %d %ld %g %d %.9g\n", cv_a, cv_c, cv_d, cv_e, cv_uc,
            cv_sc, cv_bb, cv_cb, cv_lg, cv_dd, cv_dd2, cv_ff);
+    printf("%d %d %d %d %d %d %g %d %d %d %d\n", ce_a, ce_b, ce_c, ce_d, ce_e, ce_f,
+           ce_g, ce_h, fc_a, fc_b, fc_c);
     return 0;
 }

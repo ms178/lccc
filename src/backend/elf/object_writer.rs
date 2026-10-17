@@ -35,6 +35,14 @@ pub struct ObjSection {
     pub sh_type: u32,
     pub sh_flags: u64,
     pub data: Vec<u8>,
+    /// Section size when it differs from `data.len()`.
+    ///
+    /// Only a NOBITS section can differ (its contents are never emitted, so an
+    /// assembler may hold a zero fill as a size instead of as bytes -- see
+    /// `elf_writer_common::Section::pad_fill`). `None` means `data.len()`, and
+    /// that is what every PROGBITS/EXEC section uses, so behaviour there is
+    /// byte-for-byte unchanged.
+    pub sh_size: Option<u64>,
     pub sh_addralign: u64,
     /// Relocations targeting this section.
     pub relocs: Vec<ObjReloc>,
@@ -351,7 +359,19 @@ pub fn write_relocatable_object(
 
     // ── Write ELF ──
     let total_size = shdr_offset + num_sections * shdr_size;
-    let mut elf = Vec::with_capacity(total_size);
+    // The object image has to exist as bytes, so a layout it cannot hold is
+    // reported rather than aborted: `Vec::with_capacity` aborts the process
+    // when the allocation fails, and a section whose alignment is wider than
+    // its own contents (`.text` + `.p2align 40`) is exactly such a layout.
+    let mut elf: Vec<u8> = Vec::new();
+    elf.try_reserve_exact(total_size).map_err(|_| {
+        format!(
+            "cannot write an object of {} bytes: this assembler materialises \
+             section contents, so the layout does not fit in memory (a section \
+             alignment wider than the section's own bytes pads the file)",
+            total_size
+        )
+    })?;
 
     // ELF header (e_ident)
     elf.extend_from_slice(&ELF_MAGIC);
@@ -557,7 +577,7 @@ pub fn write_relocatable_object(
                 section.sh_flags as u32,
                 0,
                 sh_offset,
-                section.data.len() as u32,
+                section.sh_size.unwrap_or(section.data.len() as u64) as u32,
                 0,
                 0,
                 section.sh_addralign as u32,
@@ -666,7 +686,7 @@ pub fn write_relocatable_object(
                 section.sh_flags,
                 0,
                 sh_offset,
-                section.data.len() as u64,
+                section.sh_size.unwrap_or(section.data.len() as u64),
                 0,
                 0,
                 section.sh_addralign,
