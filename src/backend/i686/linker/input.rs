@@ -557,19 +557,22 @@ impl Resolver<'_> {
     }
 
     /// Resolve a file named inside a linker script: an absolute path is
-    /// looked up under `LCCC_SYSROOT` first (GNU ld prefixes the sysroot for
-    /// scripts inside it), then as written; a relative one next to the
-    /// script, then in the library directories.
+    /// looked up under `LCCC_SYSROOT` first, then with an already-baked
+    /// sysroot prefix stripped, then as written; a relative one is tried next
+    /// to the script and then in the library directories.
     fn resolve_script_path(
         &self,
         p: &str,
         script_dir: &Path,
     ) -> Result<Option<(String, Vec<u8>)>, String> {
-        let mut tries: Vec<String> = Vec::with_capacity(2);
+        let mut tries: Vec<String> = Vec::with_capacity(3);
         if p.starts_with('/') {
             let prefixed = with_sysroot_prefix(p);
             if prefixed != p {
                 tries.push(prefixed);
+            }
+            if let Some(stripped) = crate::backend::common::strip_sysroot_prefix(p) {
+                tries.push(stripped);
             }
             tries.push(p.to_string());
         } else {

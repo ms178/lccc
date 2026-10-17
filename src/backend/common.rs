@@ -647,6 +647,51 @@ pub(crate) fn with_sysroot_prefix(path: &str) -> String {
     }
 }
 
+/// If `path` is already rooted beneath `LCCC_SYSROOT`, return its equivalent
+/// absolute host path. Require a path-component boundary: a sysroot `/opt/root`
+/// must not match `/opt/root-old/file` and turn the suffix into a relative path.
+pub(crate) fn strip_sysroot_prefix(path: &str) -> Option<String> {
+    let root = std::env::var("LCCC_SYSROOT").ok()?;
+    strip_sysroot_prefix_from(path, &root)
+}
+
+fn strip_sysroot_prefix_from(path: &str, root: &str) -> Option<String> {
+    let root = root.trim_end_matches('/');
+    if root.is_empty() {
+        return None;
+    }
+    let stripped = path.strip_prefix(root)?;
+    if !stripped.starts_with('/') {
+        return None;
+    }
+    Some(stripped.to_string())
+}
+
+#[cfg(test)]
+mod sysroot_prefix_tests {
+    use super::strip_sysroot_prefix_from;
+
+    #[test]
+    fn strips_only_a_complete_sysroot_path_component() {
+        assert_eq!(
+            strip_sysroot_prefix_from("/opt/lccc-root/usr/lib/libc.so", "/opt/lccc-root"),
+            Some("/usr/lib/libc.so".to_string())
+        );
+        assert_eq!(
+            strip_sysroot_prefix_from("/opt/lccc-root/usr/lib/libc.so", "/opt/lccc-root/"),
+            Some("/usr/lib/libc.so".to_string())
+        );
+        assert_eq!(
+            strip_sysroot_prefix_from("/opt/lccc-root-old/usr/lib/libc.so", "/opt/lccc-root"),
+            None
+        );
+        assert_eq!(
+            strip_sysroot_prefix_from("/opt/lccc-root", "/opt/lccc-root"),
+            None
+        );
+    }
+}
+
 /// Resolve the directory that actually contains `file`: the
 /// LCCC_SYSROOT-prefixed candidate first, then the host path; `None` when
 /// neither root carries the file.
