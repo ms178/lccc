@@ -1737,6 +1737,9 @@ mod tests {
         let core = classify_args_core(&args, false, false, &config);
         assert!(matches!(core.classes[0], CoreArgClass::Stack));
         assert!(matches!(core.classes[1], CoreArgClass::Stack));
-        assert!(matches!(core.classes[2], CoreArgClass::IntReg { reg_idx: 0 }));
+        assert!(matches!(
+            core.classes[2],
+            CoreArgClass::IntReg { reg_idx: 0 }
+        ));
     }
 }

@@ -2341,7 +2341,8 @@ impl CType {
     /// here is a lowering invariant violation, reported as an internal error
     /// at this one site rather than at every carrier.
     pub fn vector_lanes(&self) -> (&CType, usize) {
-        self.vector_info().expect("ExtVector must carry its logical lane count")
+        self.vector_info()
+            .expect("ExtVector must carry its logical lane count")
     }
 
     /// For a vector type, returns (element_type, logical lane count).
