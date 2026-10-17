@@ -4,7 +4,7 @@ use super::emit::I686Codegen;
 use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;
 use crate::emit;
-use crate::ir::reexports::{Operand, Value};
+use crate::ir::reexports::{IrConst, Operand, Value};
 
 impl I686Codegen {
     pub(super) fn emit_return_impl(&mut self, val: Option<&Operand>, frame_size: i64) {
@@ -13,6 +13,43 @@ impl I686Codegen {
         self.flush_x87_pending_copy();
         if let Some(val) = val {
             let ret_ty = self.current_return_type;
+            if ret_ty == IrType::I128 && self.current_return_i686_ext_vector_gp3 {
+                match val {
+                    Operand::Value(value) => {
+                        let slot = self
+                            .state
+                            .get_slot(value.0)
+                            .expect("i686 three-word ExtVector return must be stack-backed");
+                        let sr0 = self.slot_ref(slot);
+                        let sr4 = self.slot_ref_offset(slot, 4);
+                        let sr8 = self.slot_ref_offset(slot, 8);
+                        emit!(self.state, "    movl {}, %eax", sr0);
+                        emit!(self.state, "    movl {}, %edx", sr4);
+                        emit!(self.state, "    movl {}, %ecx", sr8);
+                    }
+                    Operand::Const(IrConst::I128(value)) => {
+                        emit!(self.state, "    movl ${}, %eax", *value as u32 as i32);
+                        emit!(
+                            self.state,
+                            "    movl ${}, %edx",
+                            (*value >> 32) as u32 as i32
+                        );
+                        emit!(
+                            self.state,
+                            "    movl ${}, %ecx",
+                            (*value >> 64) as u32 as i32
+                        );
+                    }
+                    Operand::Const(IrConst::Zero) => {
+                        self.state.emit("    xorl %eax, %eax");
+                        self.state.emit("    xorl %edx, %edx");
+                        self.state.emit("    xorl %ecx, %ecx");
+                    }
+                    _ => panic!("unsupported i686 three-word ExtVector return operand: {val:?}"),
+                }
+                self.emit_epilogue_and_ret(frame_size);
+                return;
+            }
             if ret_ty == IrType::I64 || ret_ty == IrType::U64 || ret_ty == IrType::D64 {
                 self.emit_load_acc_pair(val);
                 self.emit_epilogue_and_ret(frame_size);

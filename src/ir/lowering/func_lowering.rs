@@ -155,8 +155,15 @@ impl Lowerer {
                         return IrType::Ptr;
                     }
                     if rc.is_vector() {
-                        // Small vectors (≤8 bytes) must return I64 so the packed
-                        // data is returned in a register, not treated as a pointer.
+                        // i686 ExtVector signatures already carry the ABI lane
+                        // bundle type (I32/I64/I128) computed in the first pass.
+                        // Do not collapse the three-register case back to I64.
+                        if crate::common::types::target_is_32bit()
+                            && matches!(rc, CType::ExtVector(..))
+                        {
+                            return sig.return_type;
+                        }
+                        // Small legacy vector_size returns (≤8 bytes) use I64.
                         return IrType::I64;
                     }
                 }
@@ -260,13 +267,52 @@ impl Lowerer {
                 }
             }
 
+            // Clang's i686 ExtVector parameter ABI scalarizes each logical lane
+            // into ordinary scalar argument slots (including floating and x87
+            // lanes). Keep ABI carriers separate from the padded local vector
+            // object representation; the lane CType drives scalar slot width.
+            if crate::common::types::target_is_32bit()
+                && matches!(&param_ctype, CType::ExtVector(..))
+            {
+                let (elem, lanes) = param_ctype
+                    .vector_info()
+                    .expect("ExtVector must carry its logical lane count");
+                let lane_ty = if matches!(elem, CType::Bool) {
+                    IrType::I32
+                } else {
+                    IrType::from_ctype(elem)
+                };
+                let mut lane_indices = Vec::with_capacity(lanes);
+                for _ in 0..lanes {
+                    let ir_idx = params.len();
+                    params.push(IrParam {
+                        ty: lane_ty,
+                        noalias: false,
+                        struct_size: None,
+                        struct_align: None,
+                        param_align: None,
+                        // `[NoClass]` is an internal marker for an i686
+                        // ExtVector scalar lane: Clang forces these lanes to
+                        // the stack even under regparm/fastcall, without
+                        // consuming the ordinary scalar register sequence.
+                        struct_eightbyte_classes: vec![
+                            crate::common::types::EightbyteClass::NoClass,
+                        ],
+                        riscv_float_class: None,
+                        is_f128_sse: false,
+                    });
+                    lane_indices.push(ir_idx);
+                }
+                param_kinds.push(ParamKind::ExtVectorDecomposed(lane_indices));
+                continue;
+            }
+
             // Struct/union/vector parameter (pass by value), including ComplexLongDouble
             // on x86-64/RISC-V where it's not decomposed, and ComplexDouble/ComplexFloat
             // on i686 where they are passed as structs on the stack.
             // Transparent unions are passed as their first member (a pointer),
             // not as a by-value aggregate, so struct_size is None for them.
-            // Vector types (e.g. __attribute__((vector_size(N)))) are passed by value
-            // like structs: the data is copied into the callee's stack slot.
+            // vector_size keeps its historical aggregate-by-value ABI.
             let is_complex_as_struct = matches!(param_ctype, CType::ComplexLongDouble)
                 || (matches!(param_ctype, CType::ComplexDouble)
                     && !self.decomposes_complex_double())
@@ -540,6 +586,14 @@ impl Lowerer {
                         ir_allocas[*imag_ir_idx],
                     );
                 }
+                ParamKind::ExtVectorDecomposed(lane_ir_idxs) => {
+                    self.reconstruct_decomposed_ext_vector_param(
+                        orig_param,
+                        lane_ir_idxs,
+                        &ir_allocas,
+                        &info.params,
+                    );
+                }
             }
         }
 
@@ -700,6 +754,52 @@ impl Lowerer {
                 fptr_sig: None,
             },
         );
+    }
+
+    /// Reconstruct an i686 ExtVector local from scalar ABI lane parameters.
+    fn reconstruct_decomposed_ext_vector_param(
+        &mut self,
+        orig_param: &ParamDecl,
+        lane_ir_idxs: &[usize],
+        ir_allocas: &[Value],
+        ir_params: &[IrParam],
+    ) {
+        let ctype = self.type_spec_to_ctype(&orig_param.type_spec);
+        let size = self.sizeof_type(&orig_param.type_spec);
+        let align = self.ctype_align(&ctype);
+        let vector_alloca = self.fresh_value();
+        self.emit(Instruction::Alloca {
+            dest: vector_alloca,
+            ty: IrType::Ptr,
+            size,
+            align,
+            volatile: false,
+            semantic_volatile: false,
+        });
+        // This also initializes the padding and the other packed bool lanes
+        // before the first lane insertion read-modify-write.
+        self.zero_init_alloca(vector_alloca, size);
+        for (lane, &ir_idx) in lane_ir_idxs.iter().enumerate() {
+            let lane_ty = ir_params[ir_idx].ty;
+            let lane_val = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest: lane_val,
+                ptr: ir_allocas[ir_idx],
+                ty: lane_ty,
+                seg_override: AddressSpace::Default,
+            });
+            self.store_vector_lane(
+                vector_alloca,
+                &ctype,
+                lane,
+                Operand::Value(lane_val),
+                lane_ty,
+                AddressSpace::Default,
+                false,
+            );
+        }
+        self.register_struct_or_complex_param(orig_param, vector_alloca);
     }
 
     /// Register a packed complex float parameter (x86-64 only) as a local variable.

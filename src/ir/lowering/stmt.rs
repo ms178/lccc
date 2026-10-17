@@ -95,10 +95,7 @@ impl Lowerer {
             let mut da = self.analyze_declaration(type_spec, &declarator.derived);
             da.base_type_volatile = decl.is_volatile();
             da.object_volatile = declarator.attrs.object_volatile;
-            let elem_size = da.c_type.as_ref().map_or(0, |ct| ct.size());
-            if let Some(vs) = decl.resolve_vector_size(elem_size) {
-                da.apply_vector_size(vs);
-            }
+            da.apply_decl_vector_type(decl);
             self.fixup_unsized_array(&mut da, type_spec, &declarator.derived, &declarator.init);
 
             let is_complex = !da.is_pointer && !da.is_array && self.is_type_complex(type_spec);
@@ -243,8 +240,10 @@ impl Lowerer {
                 &mut resolved_ctype,
                 decl.address_space,
             );
-            if let Some(vs) = decl.resolve_vector_size(resolved_ctype.size()) {
-                resolved_ctype = CType::Vector(Box::new(resolved_ctype), vs);
+            if !resolved_ctype.is_vector() {
+                if let Some(vector_ctype) = decl.resolve_vector_ctype(resolved_ctype.clone()) {
+                    resolved_ctype = vector_ctype;
+                }
             }
             // Preserve sema's anonymous struct key for consistency with _Generic
             // type matching (see corresponding fix in lower_typedef for globals).

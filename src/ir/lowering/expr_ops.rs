@@ -1717,16 +1717,9 @@ impl Lowerer {
             Some(v) => v,
             None => return self.lower_expr(inner),
         };
-        let total_size = match vec_ct {
-            CType::Vector(_, ts) => *ts,
-            _ => return self.lower_expr(inner),
-        };
-        let elem_ir_ty = Self::vector_elem_ir_type(&elem_ct);
-        let elem_size = elem_ct.size();
+        let total_size = vec_ct.size();
+        let elem_ir_ty = Self::vector_elem_ir_type(elem_ct);
         let ir_op = if is_inc { IrBinOp::Add } else { IrBinOp::Sub };
-        // Integer elements compute in the widened op type and truncate on
-        // store (same convention as the scalar inc/dec path); float elements
-        // step by exactly 1.0 in their own width.
         let (step, binop_ty): (IrConst, IrType) = if elem_ct.is_floating() {
             match elem_ir_ty {
                 IrType::F32 => (IrConst::F32(1.0), IrType::F32),
@@ -1741,7 +1734,6 @@ impl Lowerer {
                 (IrConst::I64(1), IrType::I64)
             }
         };
-        let ptr_int_ty = crate::common::types::target_int_ir_type();
         let lv = match self.lower_lvalue(inner) {
             Some(lv) => lv,
             None => return self.lower_expr(inner),
@@ -1750,92 +1742,44 @@ impl Lowerer {
         let seg = self.lvalue_addr_space(&lv);
         let base = self.lvalue_addr(&lv);
 
-        // Post-form with a used result: element-wise snapshot of the old
-        // value before the update (C11 6.5.2.4: the result is the prior
-        // value).  Discarded post-forms need no snapshot.
         let old_copy = if !return_new && !self.discard_expr_result {
-            let old_alloca = self.emit_entry_alloca(IrType::Ptr, total_size, total_size, false);
-            for i in 0..num_elems {
-                let off = i * elem_size;
-                let src = if off > 0 {
-                    self.emit_binop_val(
-                        IrBinOp::Add,
-                        Operand::Value(base),
-                        Operand::Const(IrConst::ptr_int(off as i64)),
-                        ptr_int_ty,
-                    )
-                } else {
-                    base
-                };
-                let e = self.fresh_value();
-                self.emit(Instruction::Load {
-                    volatile,
-                    dest: e,
-                    ptr: src,
-                    ty: elem_ir_ty,
-                    seg_override: seg,
-                });
-                let dst = if off > 0 {
-                    self.emit_binop_val(
-                        IrBinOp::Add,
-                        Operand::Value(old_alloca),
-                        Operand::Const(IrConst::ptr_int(off as i64)),
-                        ptr_int_ty,
-                    )
-                } else {
-                    old_alloca
-                };
-                self.emit(Instruction::Store {
-                    volatile,
-                    val: Operand::Value(e),
-                    ptr: dst,
-                    ty: elem_ir_ty,
-                    seg_override: seg,
-                });
+            let old_alloca =
+                self.emit_entry_alloca(IrType::Ptr, total_size, self.ctype_align(vec_ct), false);
+            self.zero_init_alloca(old_alloca, total_size);
+            for lane in 0..num_elems {
+                let old = self.load_vector_lane(base, vec_ct, lane, seg, volatile);
+                self.store_vector_lane(
+                    old_alloca,
+                    vec_ct,
+                    lane,
+                    old,
+                    elem_ir_ty,
+                    AddressSpace::Default,
+                    false,
+                );
             }
             Some(old_alloca)
         } else {
             None
         };
 
-        for i in 0..num_elems {
-            let off = i * elem_size;
-            let ep = if off > 0 {
-                self.emit_binop_val(
-                    IrBinOp::Add,
-                    Operand::Value(base),
-                    Operand::Const(IrConst::ptr_int(off as i64)),
-                    ptr_int_ty,
-                )
+        for lane in 0..num_elems {
+            let current = self.load_vector_lane(base, vec_ct, lane, seg, volatile);
+            let current = if binop_ty != elem_ir_ty {
+                self.emit_implicit_cast(current, elem_ir_ty, binop_ty)
             } else {
-                base
+                current
             };
-            let e = self.fresh_value();
-            self.emit(Instruction::Load {
+            let updated = self.emit_binop_val(ir_op, current, Operand::Const(step), binop_ty);
+            self.store_vector_lane(
+                base,
+                vec_ct,
+                lane,
+                Operand::Value(updated),
+                binop_ty,
+                seg,
                 volatile,
-                dest: e,
-                ptr: ep,
-                ty: elem_ir_ty,
-                seg_override: seg,
-            });
-            let cur = if binop_ty != elem_ir_ty {
-                self.emit_implicit_cast(Operand::Value(e), elem_ir_ty, binop_ty)
-            } else {
-                Operand::Value(e)
-            };
-            let nw = self.emit_binop_val(ir_op, cur, Operand::Const(step), binop_ty);
-            let nw = if binop_ty != elem_ir_ty {
-                self.emit_implicit_cast(Operand::Value(nw), binop_ty, elem_ir_ty)
-            } else {
-                Operand::Value(nw)
-            };
-            self.emit(Instruction::Store {
-                volatile,
-                val: nw,
-                ptr: ep,
-                ty: elem_ir_ty,
-                seg_override: seg,
-            });
+            );
         }
 
         if return_new {
@@ -1843,8 +1787,6 @@ impl Lowerer {
         } else {
             match old_copy {
                 Some(old) => Operand::Value(old),
-                // Discarded post-form result: nothing reads it, the updated
-                // object's address is a valid vector-valued operand.
                 None => Operand::Value(base),
             }
         }

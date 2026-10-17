@@ -23,7 +23,7 @@ use crate::common::symbol_table::{FoldedValue, Symbol, SymbolTable};
 use crate::common::type_builder;
 use crate::common::type_builder::TypeConvertContext;
 use crate::common::types::{
-    AddressSpace, CType, FunctionType, RcLayout, StructFieldLayout, StructLayout,
+    AddressSpace, CType, ExtVectorLayout, FunctionType, RcLayout, StructFieldLayout, StructLayout,
 };
 use crate::frontend::parser::ast::{
     BinOp, BlockItem, CompoundStmt, Declaration, DerivedDeclarator, Designator, EnumVariant, Expr,
@@ -437,22 +437,30 @@ impl SemanticAnalyzer {
 
     // === Declaration analysis ===
 
-    /// Resolve a declaration's vector size: explicit total bytes
-    /// (`vector_size`), element-count × element size (`ext_vector_type`), or
-    /// a deferred expression (`vector_size(EXPR)` not evaluable at parse
-    /// time — e.g. `16 * sizeof(some_typedef)` — resolved here where typedef
-    /// sizes are known via the type context).
-    fn resolve_decl_vector_size(&self, decl: &Declaration, elem_size: usize) -> Option<usize> {
-        if let Some(vs) = decl.vector_size {
-            return Some(vs);
+    /// Resolve a declaration-level vector attribute while preserving its
+    /// distinct layout contract: `vector_size` specifies bytes, whereas
+    /// `ext_vector_type` specifies logical lanes and receives Clang padding.
+    fn resolve_decl_vector_ctype(&self, decl: &Declaration, element: CType) -> Option<CType> {
+        if let Some(bytes) = decl.vector_size {
+            return Some(CType::Vector(Box::new(element), bytes));
         }
-        if let Some(n) = decl.ext_vector_nelem {
-            return Some(n * elem_size);
+        if let Some(lanes) = decl.ext_vector_nelem {
+            return match ExtVectorLayout::new(&element, lanes) {
+                Some(layout) => Some(CType::ExtVector(Box::new(element), layout)),
+                None => {
+                    self.diagnostics.borrow_mut().error(
+                        "invalid element type or size for ext_vector_type",
+                        decl.span,
+                    );
+                    None
+                }
+            };
         }
         decl.vector_size_expr
             .as_deref()
             .and_then(|e| self.eval_const_expr(e))
-            .map(|v| v as usize)
+            .and_then(|v| usize::try_from(v).ok())
+            .map(|bytes| CType::Vector(Box::new(element), bytes))
     }
 
     /// Diagnose a file-scope array whose size is not an integer constant
@@ -624,8 +632,8 @@ impl SemanticAnalyzer {
                     &mut resolved_ctype,
                     decl.address_space,
                 );
-                // Mirror lowering's __attribute__((vector_size(N))) handling:
-                // without the Vector wrap, sema records `typedef float xmm_t
+                // Mirror lowering's vector-attribute handling: without the
+                // vector wrap, sema records `typedef float xmm_t
                 // __attribute__((vector_size(16)))` as a plain 4-byte float,
                 // and every struct layout computed through sema's
                 // TypeConvertContext (cached in the SHARED type_context
@@ -633,11 +641,12 @@ impl SemanticAnalyzer {
                 // lr_vector at offset 96 instead of 192 in the gen-as-const
                 // pipeline, and elf/dl-trampoline.S failed its
                 // "LR_VECTOR_OFFSET must be multiple of VEC_SIZE" #error.
-                let resolved_ctype =
-                    match self.resolve_decl_vector_size(decl, resolved_ctype.size()) {
-                        Some(vs) => CType::Vector(Box::new(resolved_ctype), vs),
-                        None => resolved_ctype,
-                    };
+                let resolved_ctype = if resolved_ctype.is_vector() {
+                    resolved_ctype
+                } else {
+                    self.resolve_decl_vector_ctype(decl, resolved_ctype.clone())
+                        .unwrap_or(resolved_ctype)
+                };
                 // Pointee qualifier of a pointer typedef, from the declaration's
                 // base-type `const`/`volatile`, or inherited from a typedef
                 // name it is built on (`typedef CNPT CNPT2;`).
@@ -703,11 +712,11 @@ impl SemanticAnalyzer {
         // (gcc.c-torture pr123625: SEGV + wrong checksum on both backends at
         // every opt level).  Mirrors the typedef path above; the matches!
         // guard keeps already-wrapped specifiers from being wrapped twice.
-        let base_type = match self.resolve_decl_vector_size(decl, base_type.size()) {
-            Some(vs) if !matches!(base_type, CType::Vector(_, _)) => {
-                CType::Vector(Box::new(base_type), vs)
-            }
-            _ => base_type,
+        let base_type = if base_type.is_vector() {
+            base_type
+        } else {
+            self.resolve_decl_vector_ctype(decl, base_type.clone())
+                .unwrap_or(base_type)
         };
 
         for init_decl in &decl.declarators {

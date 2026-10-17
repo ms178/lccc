@@ -7,6 +7,7 @@
 
 use crate::common::fx_hash::FxHashMap;
 use crate::common::types::{AddressSpace, CType, IrType, RcLayout, SsoMode};
+use crate::frontend::parser::ast::Declaration;
 use crate::ir::reexports::{BlockId, GlobalInit, IrConst, IrParam, Value};
 
 /// Type metadata shared between local and global variables.
@@ -210,24 +211,31 @@ pub(super) struct DeclAnalysis {
 }
 
 impl DeclAnalysis {
-    /// Apply `__attribute__((vector_size(N)))` to this declaration analysis.
-    /// When a non-typedef variable is declared with an inline vector_size attribute,
-    /// the CType, allocation size, and IR type must be updated to reflect the vector type.
-    /// Without this, the variable is treated as a plain scalar (e.g., `float` instead of
-    /// `CType::Vector(Float, 16)`), causing incorrect element-wise access and codegen.
-    pub fn apply_vector_size(&mut self, total_size: usize) {
-        // Wrap the C type in CType::Vector
-        if let Some(ref ct) = self.c_type {
-            self.c_type = Some(CType::Vector(Box::new(ct.clone()), total_size));
-        }
-        // Vectors are aggregates (like structs): passed by pointer, allocated as a blob
+    /// Apply a resolved vector CType to this declaration analysis. The caller
+    /// preserves the distinction between byte-sized `vector_size` and padded,
+    /// explicit-lane-count `ext_vector_type` before reaching this method.
+    pub fn apply_vector_ctype(&mut self, vector_ctype: CType) {
+        let total_size = vector_ctype.size();
+        self.c_type = Some(vector_ctype);
+        // Vectors are aggregates (like structs): passed by pointer, allocated as a blob.
         self.actual_alloc_size = total_size;
         self.alloc_size = total_size;
         self.var_ty = IrType::Ptr;
-        // base_ty stays as the element type (e.g., F32 for float vectors)
-        // This matches what happens when typedef resolution produces CType::Vector,
-        // which maps to IrType::Ptr via from_ctype but the element type is still
-        // accessible through the CType.
+        // base_ty stays as the element type; elementwise lowering consults c_type.
+    }
+
+    /// Apply a declaration's vector attribute when the base type has not
+    /// already been wrapped by the type-specifier/typedef path.
+    pub fn apply_decl_vector_type(&mut self, decl: &Declaration) {
+        let Some(element) = self.c_type.clone() else {
+            return;
+        };
+        if element.is_vector() {
+            return;
+        }
+        if let Some(vector_ctype) = decl.resolve_vector_ctype(element) {
+            self.apply_vector_ctype(vector_ctype);
+        }
     }
 }
 
@@ -255,6 +263,13 @@ pub(super) enum LValueKind {
     /// An address computed at runtime (e.g., arr[i], *ptr).
     /// The AddressSpace tracks segment overrides (e.g., __seg_gs for per-CPU vars).
     Address(Value, AddressSpace),
+    /// A bool lane in a bit-packed ext vector. `byte_addr` identifies its
+    /// containing byte and `bit_index` is the lane's dynamic bit position.
+    PackedBoolVectorLane {
+        byte_addr: Value,
+        bit_index: Value,
+        address_space: AddressSpace,
+    },
 }
 
 /// An lvalue access: its address plus whether the ACCESS is C-`volatile`.
@@ -317,9 +332,9 @@ pub(super) struct FuncSig {
     pub sret_size: Option<usize>,
     /// If the function returns a struct of 9-16 bytes via two registers, the struct size.
     pub two_reg_ret_size: Option<usize>,
-    /// SysV ABI eightbyte classification for the return struct (if two_reg_ret_size is set).
-    /// Used to determine which eightbytes go in GP vs SSE registers on return.
-    /// Empty if not applicable (non-struct return, sret, or non-x86-64).
+    /// Return carrier classes. SysV AMD64 uses one entry per eightbyte for
+    /// aggregate returns. On i686, three INTEGER entries mark the Clang
+    /// integer ExtVector EAX:EDX:ECX return bundle. Empty when neither applies.
     pub ret_eightbyte_classes: Vec<crate::common::types::EightbyteClass>,
     /// True if the return value is _Float128 (ONE 16-byte XMM return).
     pub ret_is_f128_sse: bool,
@@ -450,6 +465,8 @@ pub(super) enum ParamKind {
     ComplexDecomposed(usize, usize),
     /// Complex float packed into single F64 (x86-64 only)
     ComplexFloatPacked(usize),
+    /// i686 Clang ExtVector parameter scalarized into one IR scalar per lane.
+    ExtVectorDecomposed(Vec<usize>),
 }
 
 /// Result of building the IR parameter list for a function.

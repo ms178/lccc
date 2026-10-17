@@ -91,6 +91,8 @@ pub struct CallInfo {
     /// Used on RISC-V to even-align register pairs for 2×XLEN-aligned structs.
     pub struct_arg_aligns: Vec<Option<usize>>,
     /// Per-eightbyte SysV ABI classification for struct args (for x86-64 SSE-class passing).
+    /// A singleton `[NoClass]` with no `struct_arg_sizes` entry marks an i686
+    /// ExtVector lane that must stay on the stack under regparm/fastcall.
     pub struct_arg_classes: Vec<Vec<EightbyteClass>>,
     /// RISC-V LP64D float field classification for struct args.
     pub struct_arg_riscv_float_classes: Vec<Option<crate::common::types::RiscvFloatClass>>,
@@ -109,8 +111,9 @@ pub struct CallInfo {
     pub is_pure: bool,
     /// True if the callee is marked const (no memory reads or writes outside local allocas, no side effects).
     pub is_const: bool,
-    /// SysV ABI eightbyte classification for the return struct (if 9-16 byte two-reg return).
-    /// Used by the x86-64 backend to read SSE eightbytes from xmm0 instead of rdx.
+    /// Return carrier classes. SysV AMD64 uses one entry per eightbyte for
+    /// aggregate returns; on i686, three INTEGER entries mark a Clang integer
+    /// ExtVector result carried in EAX:EDX:ECX.
     pub ret_eightbyte_classes: Vec<EightbyteClass>,
 }
 

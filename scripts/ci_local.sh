@@ -304,6 +304,14 @@ gate "i686-run-policy" fast \
 gate "ext-vector-element-size" fast \
     env CCC="$LCCC" bash tests/regression/check_ext_vector_size.sh
 
+gate "ext-vector-padded-layout" fast \
+    env CCC="$LCCC" bash tests/regression/check_ext_vector_layout.sh
+
+# Cross-compiler by-value ABI for ext-vector returns and arguments: an lccc
+# provider/caller pair and clang-compiled counterparts must agree bit for bit.
+gate "ext-vector-cross-abi" fast \
+    env CCC="$LCCC" bash tests/regression/check_ext_vector_abi.sh
+
 gate "a9987-salvage" fast \
     env CCC="$LCCC" bash tests/regression/check_a9987_salvage.sh
 

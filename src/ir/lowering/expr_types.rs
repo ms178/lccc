@@ -180,7 +180,7 @@ impl Lowerer {
                     // size can be answered here instead of asserted.
                     "__builtin_shuffle" => {
                         let bytes = match self.get_expr_ctype(expr) {
-                            Some(CType::Vector(_, bytes)) => bytes,
+                            Some(ct) if ct.is_vector() => ct.size(),
                             // Not resolvable: keep the historical packed
                             // answer rather than inventing a size.
                             _ => return None,
@@ -346,6 +346,11 @@ impl Lowerer {
             return Some(self.resolve_ctype_size(&ret_ct));
         }
         if ret_ct.is_vector() {
+            if crate::common::types::target_is_32bit()
+                && ret_ct.i686_ext_vector_gp_word_count().is_some()
+            {
+                return None;
+            }
             return Some(self.resolve_ctype_size(&ret_ct));
         }
         None
@@ -826,7 +831,9 @@ impl Lowerer {
             match base_ctype {
                 CType::Array(elem, _) => return IrType::from_ctype(&elem),
                 CType::Pointer(pointee, _) => return IrType::from_ctype(&pointee),
-                CType::Vector(elem, _) => return IrType::from_ctype(&elem),
+                CType::Vector(elem, _) | CType::ExtVector(elem, _) => {
+                    return IrType::from_ctype(&elem);
+                }
                 _ => {}
             }
         }
@@ -834,7 +841,9 @@ impl Lowerer {
             match idx_ctype {
                 CType::Array(elem, _) => return IrType::from_ctype(&elem),
                 CType::Pointer(pointee, _) => return IrType::from_ctype(&pointee),
-                CType::Vector(elem, _) => return IrType::from_ctype(&elem),
+                CType::Vector(elem, _) | CType::ExtVector(elem, _) => {
+                    return IrType::from_ctype(&elem);
+                }
                 _ => {}
             }
         }
@@ -1601,7 +1610,7 @@ impl Lowerer {
                     match base_ct {
                         CType::Array(elem, _) => return Some(*elem),
                         CType::Pointer(pointee, _) => return Some(*pointee),
-                        CType::Vector(elem, _) => return Some(*elem),
+                        CType::Vector(elem, _) | CType::ExtVector(elem, _) => return Some(*elem),
                         _ => {}
                     }
                 }
@@ -1610,7 +1619,7 @@ impl Lowerer {
                     match idx_ct {
                         CType::Array(elem, _) => return Some(*elem),
                         CType::Pointer(pointee, _) => return Some(*pointee),
-                        CType::Vector(elem, _) => return Some(*elem),
+                        CType::Vector(elem, _) | CType::ExtVector(elem, _) => return Some(*elem),
                         _ => {}
                     }
                 }

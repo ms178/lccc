@@ -610,13 +610,15 @@ impl Lowerer {
                         if !declarator.name.is_empty() {
                             let base_ctype =
                                 self.build_full_ctype(&decl.type_spec, &declarator.derived);
-                            let elem_size = base_ctype.size();
-                            if let Some(vs) = decl.resolve_vector_size(elem_size) {
-                                has_vector_typedefs = true;
-                                let vec_ctype = CType::Vector(Box::new(base_ctype), vs);
-                                self.types
-                                    .typedefs
-                                    .insert(declarator.name.clone(), vec_ctype);
+                            if !base_ctype.is_vector() {
+                                if let Some(vec_ctype) =
+                                    decl.resolve_vector_ctype(base_ctype.clone())
+                                {
+                                    has_vector_typedefs = true;
+                                    self.types
+                                        .typedefs
+                                        .insert(declarator.name.clone(), vec_ctype);
+                                }
                             }
                         }
                     }
@@ -1191,12 +1193,15 @@ impl Lowerer {
             }
         }
 
-        // Track CType for pointer-returning functions
-        let return_ctype = if ret_ty == IrType::Ptr {
-            Some(full_ret_ctype.clone())
-        } else {
-            None
-        };
+        // Track CTypes used to resolve aggregate and ext-vector call results.
+        // Ext vectors can use scalar GP return registers on i686, so their
+        // CType must remain available even when the IR return is I32/I64/I128.
+        let return_ctype =
+            if ret_ty == IrType::Ptr || matches!(full_ret_ctype, CType::ExtVector(..)) {
+                Some(full_ret_ctype.clone())
+            } else {
+                None
+            };
 
         // Record complex return types for expr_ctype resolution
         if ptr_count == 0 && full_ret_ctype.is_complex() {
@@ -1215,17 +1220,36 @@ impl Lowerer {
                 sret_size = s;
                 two_reg_ret_size = t;
             }
-            // Vector types use the same by-value return convention as structs:
-            // small vectors (<=8 bytes) are packed into a register, larger ones use sret.
+            // Vector_size retains its established by-value convention. Clang's
+            // i686 ext-vector ABI instead scalarizes integer lanes into EAX,
+            // EDX, and ECX (up to three 32-bit words); larger return values use
+            // sret. Keep this classification ExtVector-specific.
             if full_ret_ctype.is_vector() {
                 let size = self.sizeof_type(ret_type_spec);
-                let (s, t) = Self::classify_struct_return(size);
-                sret_size = s;
-                two_reg_ret_size = t;
-                // Small vector returns (<=8 bytes, no sret/two_reg) need I64 return type
-                // so the packed vector data is returned in a register, not as a pointer.
-                if s.is_none() && t.is_none() {
-                    ret_ty = IrType::I64;
+                if crate::common::types::target_is_32bit()
+                    && matches!(full_ret_ctype, CType::ExtVector(..))
+                {
+                    if let Some(words) = full_ret_ctype.i686_ext_vector_gp_word_count() {
+                        sret_size = None;
+                        two_reg_ret_size = None;
+                        ret_ty = match words {
+                            1 => IrType::I32,
+                            2 => IrType::I64,
+                            3 => IrType::I128,
+                            _ => unreachable!("i686 ext-vector GP return word count is bounded"),
+                        };
+                    } else {
+                        sret_size = Some(size);
+                    }
+                } else {
+                    let (s, t) = Self::classify_struct_return(size);
+                    sret_size = s;
+                    two_reg_ret_size = t;
+                    // Small vector returns (<=8 bytes, no sret/two_reg) need
+                    // I64 so the packed value is returned in a register.
+                    if s.is_none() && t.is_none() {
+                        ret_ty = IrType::I64;
+                    }
                 }
             }
             if matches!(full_ret_ctype, CType::ComplexLongDouble) {
@@ -1263,6 +1287,16 @@ impl Lowerer {
             vec![
                 crate::common::types::EightbyteClass::Sse,
                 crate::common::types::EightbyteClass::Sse,
+            ]
+        } else if crate::common::types::target_is_32bit()
+            && full_ret_ctype.i686_ext_vector_gp_word_count() == Some(3)
+        {
+            // On i686 these three INTEGER markers encode the EAX:EDX:ECX
+            // return-word bundle; x86-64 continues to use actual eightbytes.
+            vec![
+                crate::common::types::EightbyteClass::Integer,
+                crate::common::types::EightbyteClass::Integer,
+                crate::common::types::EightbyteClass::Integer,
             ]
         } else if crate::common::types::target_elf_machine() == 62 && full_ret_ctype.is_vector() {
             // AUD-VABI-1: a vector is not a struct.  Its first eightbyte
@@ -2982,6 +3016,42 @@ impl Lowerer {
     pub(super) fn zero_init_alloca(&mut self, alloca: Value, total_size: usize) {
         self.zero_init_region(alloca, 0, total_size);
     }
+}
+
+/// True when a freshly allocated vector temporary must be cleared before its
+/// lanes are written one by one.
+///
+/// Only two situations need the pre-clear:
+///
+///  * a bit-packed bool vector (or any `bool` element): `store_vector_lane`
+///    keeps the neighbouring lanes of the shared byte with a load/and/or
+///    read-modify-write, so the byte has to hold a defined value first;
+///  * padding: when the lanes do not cover the whole object (`u8x3` is three
+///    lanes in a four-byte object), the uncovered trailing byte is observable
+///    through `sizeof` and through any whole-object copy or comparison.
+///
+/// In every other case each `store_vector_lane` writes a full element and the
+/// elements cover the object exactly, so the clear is a ladder of dead stores.
+/// Those are not free: the extra IR pushes callers past
+/// `MAX_CALLER_INSTRUCTIONS_AFTER_INLINE` and loses inlines, which is how this
+/// surfaced as extra vector register copies in the runtime kernel of
+/// `tests/regression/check_vector_copy_elimination.sh` (51 against a budget of
+/// 48 before the gating, 42 after).
+///
+/// This covers only padding and bool lanes. A caller that writes fewer values
+/// than there are lanes (a short initializer list) still has to clear, because
+/// C requires the remaining lanes to be zero.
+pub(super) fn vector_temp_needs_zero_init(vec_ct: &CType, num_elems: usize) -> bool {
+    let Some((elem_ct, _)) = vec_ct.vector_info() else {
+        return true;
+    };
+    if vec_ct.is_bitpacked_bool_vector() || matches!(elem_ct, CType::Bool) {
+        return true;
+    }
+    let stride = vec_ct
+        .vector_element_storage_size()
+        .unwrap_or_else(|| elem_ct.size().max(1));
+    num_elems.saturating_mul(stride) < vec_ct.size()
 }
 
 /// True if `name` is an x86-64 register name. Distinguishes

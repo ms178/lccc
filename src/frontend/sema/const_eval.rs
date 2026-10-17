@@ -25,7 +25,7 @@ use crate::common::const_eval as shared_const_eval;
 use crate::common::fx_hash::FxHashMap;
 use crate::common::symbol_table::{FoldedValue, SymbolTable};
 use crate::common::types::AddressSpace;
-use crate::common::types::CType;
+use crate::common::types::{CType, ExtVectorLayout};
 use crate::frontend::parser::ast::{
     BinOp, DerivedDeclarator, Expr, ExprId, SizeofArg, StructFieldDecl, TypeSpecifier, UnaryOp,
 };
@@ -1085,6 +1085,10 @@ impl<'a> SemaConstEval<'a> {
                 Some(ctype.size_ctx(&*self.types.borrow_struct_layouts()))
             }
             TypeSpecifier::Vector(_, total_bytes) => Some(*total_bytes),
+            TypeSpecifier::ExtVector(inner, lanes) => {
+                let element = ctype_from_type_spec(inner, self.types);
+                ExtVectorLayout::new(&element, *lanes).map(|layout| layout.storage_size)
+            }
             _ => None,
         }
     }
@@ -1264,6 +1268,13 @@ impl<'a> SemaConstEval<'a> {
                 }
             }
             TypeSpecifier::Vector(_, total_bytes) => (*total_bytes).min(16),
+            TypeSpecifier::ExtVector(inner, lanes) => {
+                let element = ctype_from_type_spec(inner, self.types);
+                ExtVectorLayout::new(&element, *lanes)
+                    .map_or(crate::common::types::target_ptr_size(), |layout| {
+                        layout.alignment
+                    })
+            }
             _ => crate::common::types::target_ptr_size(),
         }
     }
@@ -1299,6 +1310,11 @@ impl<'a> SemaConstEval<'a> {
                 }
             }
             TypeSpecifier::Vector(_, total_bytes) => (*total_bytes).min(16),
+            TypeSpecifier::ExtVector(inner, lanes) => {
+                let element = ctype_from_type_spec(inner, self.types);
+                ExtVectorLayout::new(&element, *lanes)
+                    .map_or_else(|| self.alignof_type_spec(spec), |layout| layout.alignment)
+            }
             _ => self.alignof_type_spec(spec),
         }
     }
@@ -1482,6 +1498,13 @@ fn ctype_from_type_spec(spec: &TypeSpecifier, types: &TypeContext) -> CType {
         TypeSpecifier::Vector(inner, total_bytes) => {
             let elem_ctype = ctype_from_type_spec(inner, types);
             CType::Vector(Box::new(elem_ctype), *total_bytes)
+        }
+        TypeSpecifier::ExtVector(inner, lanes) => {
+            let elem_ctype = ctype_from_type_spec(inner, types);
+            match ExtVectorLayout::new(&elem_ctype, *lanes) {
+                Some(layout) => CType::ExtVector(Box::new(elem_ctype), layout),
+                None => CType::Vector(Box::new(elem_ctype), 0),
+            }
         }
         _ => CType::Int, // fallback
     }

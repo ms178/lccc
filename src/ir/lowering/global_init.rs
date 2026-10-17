@@ -33,6 +33,7 @@ enum StringLitKind {
 use super::array_init_plan::ArrayGeometry;
 use super::global_init_helpers as h;
 use super::lower::Lowerer;
+use super::vector_array_init::VectorArrayInitPlan;
 use crate::common::types::{CType, IrType, RcLayout, StructLayout};
 
 // =============================================================================
@@ -686,6 +687,18 @@ impl Lowerer {
             return self.lower_complex_array_init(items, &complex_ctype, total_size, elem_size);
         }
 
+        // Arrays of ext-vectors have vector objects as their leaf
+        // subobjects. Resolve their dimensions/designators independently of the
+        // pointer-sized IR carrier, then serialize each selected vector to its
+        // C object representation.
+        if is_array {
+            if let Some(array_type) = obj_ty.map(|ty| self.complete_array_ctype(ty, total_size)) {
+                if let Some(plan) = self.plan_vector_array_init(items, &array_type) {
+                    return self.lower_vector_array_plan_to_global_init(plan, total_size);
+                }
+            }
+        }
+
         // Array of scalars of any rank: resolved by the array planner.
         if is_array {
             if let Some(geo) = obj_ty
@@ -719,8 +732,8 @@ impl Lowerer {
         // Vector initializer list: __attribute__((vector_size(N)))
         {
             let ctype = self.type_spec_to_ctype(type_spec);
-            if let Some((elem_ct, num_elems)) = ctype.vector_info() {
-                return self.lower_vector_init(items, elem_ct, num_elems);
+            if ctype.is_vector() {
+                return self.lower_vector_init(items, &ctype);
             }
         }
 
@@ -733,6 +746,29 @@ impl Lowerer {
 
         // Fallback: array of constants coerced to base_ty
         self.lower_fallback_array(items, base_ty)
+    }
+
+    /// Serialize the selected vector-object initializers into a byte array.
+    /// Each vector starts at its C object stride; omitted vectors and all
+    /// per-vector padding remain zero from the initial image.
+    fn lower_vector_array_plan_to_global_init(
+        &self,
+        plan: VectorArrayInitPlan,
+        total_size: usize,
+    ) -> GlobalInit {
+        let mut bytes = vec![0u8; total_size];
+        let vector_size = plan.vector_type.size();
+        for (index, init) in plan.elements.into_iter().enumerate() {
+            let Some(init) = init else { continue };
+            let offset = index.saturating_mul(vector_size);
+            self.write_vector_init_to_bytes(&mut bytes, offset, &plan.vector_type, &init);
+        }
+        GlobalInit::Array(
+            bytes
+                .into_iter()
+                .map(|byte| IrConst::I8(byte as i8))
+                .collect(),
+        )
     }
 
     /// Try to extract a brace-wrapped string literal: `{"hello"}` for char/wchar_t/char16_t arrays.
@@ -851,8 +887,8 @@ impl Lowerer {
         // Vector array: e.g., __attribute__((vector_size(16))) arr[]
         {
             let ctype = self.type_spec_to_ctype(type_spec);
-            if let Some((elem_ct, vec_num_elems)) = ctype.vector_info() {
-                return self.lower_vector_array_init(items, elem_ct, vec_num_elems, num_elems);
+            if ctype.is_vector() {
+                return self.lower_vector_array_init(items, &ctype, num_elems);
             }
         }
 
@@ -1247,44 +1283,44 @@ impl Lowerer {
         }
     }
 
-    /// Lower a vector array: `SV arr[] = { (SV){1,2,3,4}, (SV){5,6,7,8} }`.
+    /// Lower an array of vectors, preserving each ext-vector's padded stride.
     fn lower_vector_array_init(
         &mut self,
         items: &[InitializerItem],
-        elem_ct: &CType,
-        vec_num_elems: usize,
-        num_elems: usize,
+        vector_ct: &CType,
+        num_vectors: usize,
     ) -> GlobalInit {
+        let Some((elem_ct, lanes)) = vector_ct.vector_info() else {
+            return GlobalInit::Zero;
+        };
         let elem_ir_ty = IrType::from_ctype(elem_ct);
-        let total_scalars = num_elems * vec_num_elems;
+        let total_scalars = num_vectors.saturating_mul(lanes);
         let mut values = vec![self.zero_const(elem_ir_ty); total_scalars];
-        for (arr_idx, item) in items.iter().enumerate() {
-            if arr_idx >= num_elems {
-                break;
-            }
-            let base_offset = arr_idx * vec_num_elems;
+        for (arr_idx, item) in items.iter().enumerate().take(num_vectors) {
+            let base_offset = arr_idx * lanes;
             match &item.init {
-                Initializer::Expr(expr) => {
-                    self.collect_vector_scalars_from_expr(
-                        expr,
-                        elem_ir_ty,
-                        vec_num_elems,
-                        &mut values,
-                        base_offset,
-                    );
-                }
-                Initializer::List(sub_items) => {
-                    self.collect_vector_scalars_from_items(
-                        sub_items,
-                        elem_ir_ty,
-                        vec_num_elems,
-                        &mut values,
-                        base_offset,
-                    );
-                }
+                Initializer::Expr(expr) => self.collect_vector_scalars_from_expr(
+                    expr,
+                    elem_ir_ty,
+                    lanes,
+                    &mut values,
+                    base_offset,
+                ),
+                Initializer::List(sub_items) => self.collect_vector_scalars_from_items(
+                    sub_items,
+                    elem_ir_ty,
+                    lanes,
+                    &mut values,
+                    base_offset,
+                ),
             }
         }
-        GlobalInit::Array(values)
+        if matches!(elem_ct, CType::Bool) {
+            values
+                .iter_mut()
+                .for_each(|value| *value = value.bool_normalize());
+        }
+        self.vector_values_to_global_init(vector_ct, values, num_vectors)
     }
 
     /// Extract scalar values from a vector expression (compound literal or cast-wrapped).
@@ -1425,27 +1461,97 @@ impl Lowerer {
         }
     }
 
-    /// Lower a plain vector init list: `__attribute__((vector_size(N))) v = { 1, 2, 3, 4 }`.
-    fn lower_vector_init(
-        &mut self,
-        items: &[InitializerItem],
-        elem_ct: &CType,
-        num_elems: usize,
-    ) -> GlobalInit {
+    /// Lower a vector initializer list to target object representation.
+    fn lower_vector_init(&mut self, items: &[InitializerItem], vector_ct: &CType) -> GlobalInit {
+        let Some((elem_ct, lanes)) = vector_ct.vector_info() else {
+            return GlobalInit::Zero;
+        };
         let elem_ir_ty = IrType::from_ctype(elem_ct);
-        let mut values = vec![self.zero_const(elem_ir_ty); num_elems];
-        for (idx, item) in items.iter().enumerate() {
-            if idx >= num_elems {
-                break;
-            }
-            if let Initializer::Expr(expr) = &item.init {
-                if let Some(val) = self.eval_const_expr(expr) {
+        let mut values = vec![self.zero_const(elem_ir_ty); lanes];
+        for (idx, item) in items.iter().enumerate().take(lanes) {
+            let expr = match &item.init {
+                Initializer::Expr(expr) => Some(expr),
+                Initializer::List(sub_items) => Self::unwrap_nested_init_expr(sub_items),
+            };
+            if let Some(expr) = expr {
+                if let Some(value) = self.eval_const_expr(expr) {
                     let expr_ty = self.get_expr_type(expr);
-                    values[idx] = self.coerce_const_to_type_with_src(val, elem_ir_ty, expr_ty);
+                    let value = self.coerce_const_to_type_with_src(value, elem_ir_ty, expr_ty);
+                    values[idx] = if matches!(elem_ct, CType::Bool) {
+                        value.bool_normalize()
+                    } else {
+                        value
+                    };
                 }
             }
         }
-        GlobalInit::Array(values)
+        self.vector_values_to_global_init(vector_ct, values, 1)
+    }
+
+    /// Convert logical scalar lanes into the target vector object's global
+    /// representation. Legacy `vector_size` remains an element array. Ext
+    /// vectors emit packed bool bytes or an explicit lane/padding sequence.
+    fn vector_values_to_global_init(
+        &self,
+        vector_ct: &CType,
+        values: Vec<IrConst>,
+        vector_count: usize,
+    ) -> GlobalInit {
+        let Some((elem_ct, lanes)) = vector_ct.vector_info() else {
+            return GlobalInit::Zero;
+        };
+        let CType::ExtVector(_, layout) = vector_ct else {
+            return GlobalInit::Array(values);
+        };
+        if layout.bitpacked_bool {
+            let total_bytes = layout.storage_size.saturating_mul(vector_count);
+            let mut bytes = vec![0u8; total_bytes];
+            for vector_idx in 0..vector_count {
+                for lane in 0..lanes {
+                    let at = vector_idx * lanes + lane;
+                    if values.get(at).is_some_and(IrConst::is_nonzero) {
+                        let byte_at = vector_idx * layout.storage_size + lane / 8;
+                        if let Some(byte) = bytes.get_mut(byte_at) {
+                            *byte |= 1 << (lane % 8);
+                        }
+                    }
+                }
+            }
+            return GlobalInit::Array(
+                bytes
+                    .into_iter()
+                    .map(|byte| IrConst::I8(byte as i8))
+                    .collect(),
+            );
+        }
+
+        // `GlobalInit::Compound` treats each scalar as a self-typed object,
+        // but U8/U16/U32 constants are represented by wider IrConst variants
+        // to preserve unsigned semantics. In a vector object that fallback can
+        // widen (for example) a U32 lane to the pointer width. Serialize the
+        // complete C object representation here instead: every byte is an I8
+        // element, so lane widths, x87 long-double payloads, and zero padding
+        // cannot be inferred from the pointer-sized vector carrier.
+        let byte_len = layout.storage_size.saturating_mul(vector_count);
+        let mut bytes = vec![0u8; byte_len];
+        let lane_stride = layout.element_storage_size;
+        let elem_ir_ty = IrType::from_ctype(elem_ct);
+        for vector_idx in 0..vector_count {
+            let vector_base = vector_idx.saturating_mul(layout.storage_size);
+            for lane in 0..lanes {
+                let at = vector_idx.saturating_mul(lanes).saturating_add(lane);
+                let lane_offset = vector_base.saturating_add(lane.saturating_mul(lane_stride));
+                if let Some(value) = values.get(at) {
+                    self.write_const_to_bytes(&mut bytes, lane_offset, value, elem_ir_ty);
+                }
+            }
+        }
+        GlobalInit::Array(
+            bytes
+                .into_iter()
+                .map(|byte| IrConst::I8(byte as i8))
+                .collect(),
+        )
     }
 }
 
