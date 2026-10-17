@@ -12,7 +12,7 @@
 use super::lower::Lowerer;
 use crate::common::const_arith;
 use crate::common::const_eval as shared_const_eval;
-use crate::common::types::{max_object_bytes, CType, IrType};
+use crate::common::types::{CType, IrType, max_object_bytes};
 use crate::frontend::parser::ast::{
     BinOp, DerivedDeclarator, Expr, Initializer, SizeofArg, StructFieldDecl, TypeSpecifier, UnaryOp,
 };
@@ -582,22 +582,14 @@ impl Lowerer {
                 Some((neg, c, e)) => Dec::Finite(neg, c as u128, e),
                 None => {
                     let (neg, is_nan) = bid32_special(v);
-                    if is_nan {
-                        Dec::Nan(neg)
-                    } else {
-                        Dec::Inf(neg)
-                    }
+                    if is_nan { Dec::Nan(neg) } else { Dec::Inf(neg) }
                 }
             },
             IrConst::D64(v) => match decode_bid64(v) {
                 Some((neg, c, e)) => Dec::Finite(neg, c as u128, e),
                 None => {
                     let (neg, is_nan) = bid64_special(v);
-                    if is_nan {
-                        Dec::Nan(neg)
-                    } else {
-                        Dec::Inf(neg)
-                    }
+                    if is_nan { Dec::Nan(neg) } else { Dec::Inf(neg) }
                 }
             },
             IrConst::I128(v) => {
@@ -607,11 +599,7 @@ impl Lowerer {
                     Some((neg, c, e)) => Dec::Finite(neg, c, e),
                     None => {
                         let (neg, is_nan) = bid128_special_hi(hi);
-                        if is_nan {
-                            Dec::Nan(neg)
-                        } else {
-                            Dec::Inf(neg)
-                        }
+                        if is_nan { Dec::Nan(neg) } else { Dec::Inf(neg) }
                     }
                 }
             }
