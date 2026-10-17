@@ -6,15 +6,18 @@ use crate::common::types::IrType;
 use crate::ir::reexports::{IrConst, Operand, Value};
 
 impl X86Codegen {
+    /// True when `val` is the value the FP machinery materialised directly in
+    /// %xmm0 instead of through a spill slot.
+    fn is_direct_fp_result(&self, val: &Operand) -> bool {
+        matches!(val, Operand::Value(v) if self.state.direct_fp_result == Some(v.0))
+    }
+
     pub(super) fn emit_return_impl(&mut self, val: Option<&Operand>, frame_size: i64) {
         use crate::backend::state::SlotAddr;
         if let Some(val) = val {
             let ret_ty = self.current_return_type;
-            if matches!(
-                ret_ty,
-                IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64
-            ) && matches!(val, Operand::Value(v)
-                    if self.state.direct_fp_result == Some(v.0))
+            if matches!(ret_ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64)
+                && self.is_direct_fp_result(val)
             {
                 // The fast path requires the FP result to actually sit in
                 // %xmm0. `direct_fp_result` marks a value the FP machinery
@@ -22,7 +25,7 @@ impl X86Codegen {
                 // vector return the register allocator is free to pick
                 // another one (measured: lccc -O1 `abi_f64x1` returned %xmm2
                 // and the lccc->lccc leg of check_ext_vector_abi.sh failed),
-                // so an explicit non-xmm0 home must go through the FP loader.
+                // so an explicit home elsewhere must go through the FP loader.
                 // `fresh_home_of` is not authoritative here: it can report the
                 // intended %xmm0 while the emitter materialised another XMM.
                 //
@@ -33,21 +36,13 @@ impl X86Codegen {
                 // unwritten slot and returned 0.0 for the packed f32x8/f64x4
                 // distance kernels at -O2.
                 if let Operand::Value(v) = val {
-                    match self.reg_assignments.get(&v.0).copied() {
-                        Some(reg)
-                            if !(super::emit::is_xmm_reg(reg)
-                                && super::emit::phys_reg_name(reg) == "xmm0") =>
-                        {
-                            self.load_fp_to_xmm0(val, ret_ty);
-                            self.emit_epilogue_and_ret_impl(frame_size);
-                            return;
-                        }
-                        _ => {
-                            self.emit_epilogue_and_ret_impl(frame_size);
-                            return;
-                        }
+                    let home = self.reg_assignments.get(&v.0).copied();
+                    if home.is_some_and(|reg| reg != super::machinst::XMM0_SCRATCH) {
+                        self.load_fp_to_xmm0(val, ret_ty);
                     }
                 }
+                self.emit_epilogue_and_ret_impl(frame_size);
+                return;
             }
             // _Float128 (IEEE binary128): the 16-byte value returns in xmm0.
             if self.func_ret_is_f128_sse {
