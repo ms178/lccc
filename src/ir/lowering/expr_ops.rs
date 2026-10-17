@@ -1713,6 +1713,13 @@ impl Lowerer {
         return_new: bool,
         vec_ct: &CType,
     ) -> Operand {
+        // `vector_size` keeps its original byte-addressed sequence verbatim.
+        // The ext-vector layout work is additive: conflating the two layouts
+        // perturbed the historical IR shape of plain vectors, which the -O0
+        // slot paths and the codegen shape gates are pinned against.
+        if !matches!(vec_ct, CType::ExtVector(..)) {
+            return self.lower_byte_vector_inc_dec(inner, is_inc, return_new, vec_ct);
+        }
         let (elem_ct, num_elems) = match vec_ct.vector_info() {
             Some(v) => v,
             None => return self.lower_expr(inner),
@@ -1780,6 +1787,156 @@ impl Lowerer {
                 seg,
                 volatile,
             );
+        }
+
+        if return_new {
+            Operand::Value(base)
+        } else {
+            match old_copy {
+                Some(old) => Operand::Value(old),
+                None => Operand::Value(base),
+            }
+        }
+    }
+
+
+    /// Vector `++`/`--` for byte-strided `vector_size` objects.
+    ///
+    /// This is the historical lowering, kept byte-for-byte: each lane is
+    /// addressed with an explicit pointer add, loaded and stored with the
+    /// element type, and the widened arithmetic type follows the scalar
+    /// inc/dec convention. Ext-vectors use `lower_vector_inc_dec`, whose
+    /// padded strides and packed `_Bool` lanes cannot be expressed this way.
+    fn lower_byte_vector_inc_dec(
+        &mut self,
+        inner: &Expr,
+        is_inc: bool,
+        return_new: bool,
+        vec_ct: &CType,
+    ) -> Operand {
+        let (elem_ct, num_elems) = match vec_ct.vector_info() {
+            Some(v) => v,
+            None => return self.lower_expr(inner),
+        };
+        let total_size = match vec_ct {
+            CType::Vector(_, ts) => *ts,
+            _ => return self.lower_expr(inner),
+        };
+        let elem_ir_ty = Self::vector_elem_ir_type(elem_ct);
+        let elem_size = elem_ct.size();
+        let ir_op = if is_inc { IrBinOp::Add } else { IrBinOp::Sub };
+        // Integer elements compute in the widened op type and truncate on
+        // store (same convention as the scalar inc/dec path); float elements
+        // step by exactly 1.0 in their own width.
+        let (step, binop_ty): (IrConst, IrType) = if elem_ct.is_floating() {
+            match elem_ir_ty {
+                IrType::F32 => (IrConst::F32(1.0), IrType::F32),
+                IrType::F128 => (IrConst::long_double(1.0), IrType::F128),
+                _ => (IrConst::F64(1.0), IrType::F64),
+            }
+        } else {
+            let wt = widened_op_type(elem_ir_ty);
+            if wt == IrType::I32 {
+                (IrConst::I32(1), IrType::I32)
+            } else {
+                (IrConst::I64(1), IrType::I64)
+            }
+        };
+        let ptr_int_ty = crate::common::types::target_int_ir_type();
+        let lv = match self.lower_lvalue(inner) {
+            Some(lv) => lv,
+            None => return self.lower_expr(inner),
+        };
+        let volatile = lv.volatile || self.expr_access_is_volatile(inner);
+        let seg = self.lvalue_addr_space(&lv);
+        let base = self.lvalue_addr(&lv);
+
+        // Post-form with a used result: element-wise snapshot of the old
+        // value before the update (C11 6.5.2.4: the result is the prior
+        // value). Discarded post-forms need no snapshot.
+        let old_copy = if !return_new && !self.discard_expr_result {
+            let old_alloca = self.emit_entry_alloca(IrType::Ptr, total_size, total_size, false);
+            for i in 0..num_elems {
+                let off = i * elem_size;
+                let src = if off > 0 {
+                    self.emit_binop_val(
+                        IrBinOp::Add,
+                        Operand::Value(base),
+                        Operand::Const(IrConst::ptr_int(off as i64)),
+                        ptr_int_ty,
+                    )
+                } else {
+                    base
+                };
+                let e = self.fresh_value();
+                self.emit(Instruction::Load {
+                    volatile,
+                    dest: e,
+                    ptr: src,
+                    ty: elem_ir_ty,
+                    seg_override: seg,
+                });
+                let dst = if off > 0 {
+                    self.emit_binop_val(
+                        IrBinOp::Add,
+                        Operand::Value(old_alloca),
+                        Operand::Const(IrConst::ptr_int(off as i64)),
+                        ptr_int_ty,
+                    )
+                } else {
+                    old_alloca
+                };
+                self.emit(Instruction::Store {
+                    volatile,
+                    val: Operand::Value(e),
+                    ptr: dst,
+                    ty: elem_ir_ty,
+                    seg_override: seg,
+                });
+            }
+            Some(old_alloca)
+        } else {
+            None
+        };
+
+        for i in 0..num_elems {
+            let off = i * elem_size;
+            let ep = if off > 0 {
+                self.emit_binop_val(
+                    IrBinOp::Add,
+                    Operand::Value(base),
+                    Operand::Const(IrConst::ptr_int(off as i64)),
+                    ptr_int_ty,
+                )
+            } else {
+                base
+            };
+            let e = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile,
+                dest: e,
+                ptr: ep,
+                ty: elem_ir_ty,
+                seg_override: seg,
+            });
+            let cur = if binop_ty != elem_ir_ty {
+                self.emit_implicit_cast(Operand::Value(e), elem_ir_ty, binop_ty)
+            } else {
+                Operand::Value(e)
+            };
+            let nw = self.emit_binop_val(ir_op, cur, Operand::Const(step), binop_ty);
+            let nw = if binop_ty != elem_ir_ty {
+                self.emit_implicit_cast(Operand::Value(nw), binop_ty, elem_ir_ty)
+            } else {
+                Operand::Value(nw)
+            };
+            self.emit(Instruction::Store {
+                volatile,
+                val: nw,
+                ptr: ep,
+                ty: elem_ir_ty,
+                seg_override: seg,
+            });
         }
 
         if return_new {

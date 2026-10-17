@@ -16,31 +16,33 @@ impl X86Codegen {
             ) && matches!(val, Operand::Value(v)
                     if self.state.direct_fp_result == Some(v.0))
             {
-                // The fast path is only sound when the FP result really sits in
+                // The fast path requires the FP result to actually sit in
                 // %xmm0. `direct_fp_result` marks a value the FP machinery
-                // produced in *some* XMM register, and with an SSE-class vector
-                // return the register allocator is free to pick another one:
-                // returning that would hand the caller the wrong register
-                // (measured: lccc -O1 `abi_f64x1` returned %xmm2 and the
-                // lccc->lccc leg of check_ext_vector_abi.sh failed). Fall
-                // through to the FP loader whenever the home is not %xmm0.
-                // The home must be read out of `reg_assignments` (the map the
-                // FP loaders themselves consult): `fresh_home_of` can report
-                // the intended home %xmm0 while the FP emitter materialised
-                // the value in another XMM -- trusting it is what returned
-                // %xmm2 for `abi_f64x1` at -O1.
+                // produced in *some* XMM register, and with an SSE-class
+                // vector return the register allocator is free to pick
+                // another one (measured: lccc -O1 `abi_f64x1` returned %xmm2
+                // and the lccc->lccc leg of check_ext_vector_abi.sh failed),
+                // so an explicit non-xmm0 home must go through the FP loader.
+                // `fresh_home_of` is not authoritative here: it can report the
+                // intended %xmm0 while the emitter materialised another XMM.
+                //
+                // An ABSENT assignment is different: every producer of
+                // `direct_fp_result` writes %xmm0 by construction
+                // (`emit_fixed_distance` and friends). Those values never get
+                // a slot, so diverting them through the loader read an
+                // unwritten slot and returned 0.0 for the packed f32x8/f64x4
+                // distance kernels at -O2.
                 if let Operand::Value(v) = val {
                     match self.reg_assignments.get(&v.0).copied() {
                         Some(reg)
-                            if super::emit::is_xmm_reg(reg)
-                                && super::emit::phys_reg_name(reg) == "xmm0" =>
+                            if !(super::emit::is_xmm_reg(reg)
+                                && super::emit::phys_reg_name(reg) == "xmm0") =>
                         {
+                            self.load_fp_to_xmm0(val, ret_ty);
                             self.emit_epilogue_and_ret_impl(frame_size);
                             return;
                         }
-                        None => {}
-                        Some(_) => {
-                            self.load_fp_to_xmm0(val, ret_ty);
+                        _ => {
                             self.emit_epilogue_and_ret_impl(frame_size);
                             return;
                         }
