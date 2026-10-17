@@ -1064,6 +1064,62 @@ impl I686Codegen {
         }
     }
 
+    /// Eq/Ne of two 16-byte I128/U128 values. C has no 128-bit integers on
+    /// i686, so these are the _Float128/_Decimal128 carriers (bit-pattern
+    /// tests); the 64-bit register-pair family compared only their low 8
+    /// bytes. All four dwords are compared: OR of the dword XORs, then
+    /// ZF. An ordered comparison has no C source and fails loudly.
+    pub(super) fn emit_i128_carrier_cmp(
+        &mut self,
+        dest: &Value,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+    ) {
+        let set = match op {
+            IrCmpOp::Eq => "sete",
+            IrCmpOp::Ne => "setne",
+            _ => panic!("i686: an ordered {op:?} comparison of 128-bit integers has no lowering"),
+        };
+        for k in 0..4 {
+            let acc = if k == 0 { "edx" } else { "eax" };
+            self.emit_load_i128_dword(lhs, k, acc);
+            self.emit_load_i128_dword(rhs, k, "ecx");
+            emit!(self.state, "    xorl %ecx, %{}", acc);
+            if k > 0 {
+                self.state.emit("    orl %eax, %edx");
+            }
+        }
+        emit!(self.state, "    {} %al", set);
+        self.state.emit("    movzbl %al, %eax");
+        self.state.reg_cache.invalidate_all();
+        self.store_eax_to(dest);
+    }
+
+    /// Load dword `k` (0 = least significant) of a 16-byte operand: a
+    /// stack-slot value or an integer constant (sign-extended to 128 bits).
+    fn emit_load_i128_dword(&mut self, op: &Operand, k: i64, reg: &str) {
+        match op {
+            Operand::Value(v) => {
+                let Some(slot) = self.state.get_slot(v.0) else {
+                    panic!("i686: 128-bit value {v:?} has no stack slot");
+                };
+                let sr = self.slot_ref_offset(slot, 4 * k);
+                emit!(self.state, "    movl {}, %{}", sr, reg);
+            }
+            Operand::Const(c) => {
+                let bits: i128 = match c {
+                    IrConst::I128(v) => *v,
+                    IrConst::I64(v) => i128::from(*v),
+                    IrConst::I32(v) => i128::from(*v),
+                    other => panic!("i686: {other:?} is not a 128-bit integer constant"),
+                };
+                let word = (bits >> (32 * k)) as u32;
+                emit!(self.state, "    movl ${}, %{}", word as i32, reg);
+            }
+        }
+    }
+
     pub(super) fn emit_i128_cmp_eq_impl(&mut self, is_ne: bool) {
         self.state.emit("    cmpl (%esp), %eax");
         self.state.emit("    sete %al");
@@ -1197,5 +1253,55 @@ impl I686Codegen {
         // nothing.
         self.emit_load_operand(src);
         self.emit_store_result(dest);
+    }
+}
+
+#[cfg(test)]
+mod carrier_cmp_tests {
+    use super::*;
+
+    fn emit_cmp(op: IrCmpOp, rhs: Operand) -> (I686Codegen, String) {
+        let mut cg = I686Codegen::new();
+        cg.state.value_locations.insert(1, StackSlot(-32));
+        cg.state.value_locations.insert(2, StackSlot(-48));
+        cg.emit_i128_carrier_cmp(&Value(2), op, &Operand::Value(Value(1)), &rhs);
+        let asm = cg.state.out.buf.clone();
+        (cg, asm)
+    }
+
+    /// A 16-byte carrier compare reads every dword of both operands: the
+    /// register-pair family read only the low 8 bytes, so -0.0Q (sign in
+    /// dword 3) and 2.75Q (low 8 bytes zero) both compared equal to zero.
+    #[test]
+    fn eq_and_ne_compare_all_four_dwords() {
+        for (op, set) in [(IrCmpOp::Eq, "sete %al"), (IrCmpOp::Ne, "setne %al")] {
+            let rhs = Operand::Const(IrConst::I128((-1i128 << 64) | 5));
+            let (cg, asm) = emit_cmp(op, rhs);
+            for k in 0..4 {
+                let lhs_word = format!("movl {}, %", cg.slot_ref_offset(StackSlot(-32), 4 * k));
+                assert!(asm.contains(&lhs_word), "dword {k} of the value:\n{asm}");
+            }
+            // Constant dwords, least significant first: 5, 0, -1, -1.
+            for imm in ["movl $5, %ecx", "movl $0, %ecx", "movl $-1, %ecx"] {
+                assert!(asm.contains(imm), "{imm}:\n{asm}");
+            }
+            assert_eq!(asm.matches("xorl %ecx, %").count(), 4, "{asm}");
+            assert_eq!(asm.matches("orl %eax, %edx").count(), 3, "{asm}");
+            assert!(asm.contains(set), "{asm}");
+        }
+    }
+
+    /// An I64 constant operand is sign-extended to 128 bits.
+    #[test]
+    fn i64_constant_operand_is_sign_extended() {
+        let (_, asm) = emit_cmp(IrCmpOp::Eq, Operand::Const(IrConst::I64(-2)));
+        assert_eq!(asm.matches("movl $-2, %ecx").count(), 1, "{asm}");
+        assert_eq!(asm.matches("movl $-1, %ecx").count(), 3, "{asm}");
+    }
+
+    #[test]
+    #[should_panic(expected = "ordered")]
+    fn ordered_comparison_fails_loudly() {
+        emit_cmp(IrCmpOp::Ult, Operand::Const(IrConst::I128(0)));
     }
 }

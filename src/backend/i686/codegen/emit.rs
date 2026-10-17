@@ -2631,12 +2631,16 @@ impl ArchCodegen for I686Codegen {
             self.emit_float_cmp(dest, op, lhs, rhs, ty);
             return;
         }
-        if matches!(ty, IrType::I64 | IrType::U64) || crate::backend::generation::is_i128_type(ty) {
-            if !crate::backend::generation::is_i128_type(ty)
-                && self.try_emit_i64_cmp_fast(dest, op, lhs, rhs)
-            {
+        if crate::backend::generation::is_i128_type(ty) {
+            self.emit_i128_carrier_cmp(dest, op, lhs, rhs);
+            return;
+        }
+        if matches!(ty, IrType::I64 | IrType::U64) {
+            if self.try_emit_i64_cmp_fast(dest, op, lhs, rhs) {
                 return;
             }
+            // The register-pair compare family (`emit_i128_cmp`) is 64-bit
+            // on i686: it serves I64/U64 only.
             self.emit_i128_cmp(dest, op, lhs, rhs);
             return;
         }
