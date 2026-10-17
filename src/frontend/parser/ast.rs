@@ -1,5 +1,5 @@
 use crate::common::source::Span;
-use crate::common::types::AddressSpace;
+use crate::common::types::{AddressSpace, CType, ExtVectorLayout};
 
 /// A complete translation unit (one C source file).
 #[derive(Debug)]
@@ -605,14 +605,28 @@ impl Declaration {
         )
     }
 
-    /// Resolve the total vector size in bytes, considering both `vector_size` (total bytes)
-    /// and `ext_vector_type` (element count). `elem_size` is the sizeof the base element type.
-    /// Returns `None` if neither attribute is present.
+    /// Resolve a declaration-level vector attribute without conflating its
+    /// two layout contracts: `vector_size` is an explicit byte width, while
+    /// `ext_vector_type` is an explicit logical lane count with target padding.
+    pub fn resolve_vector_ctype(&self, element: CType) -> Option<CType> {
+        if let Some(bytes) = self.vector_size {
+            Some(CType::Vector(Box::new(element), bytes))
+        } else if let Some(lanes) = self.ext_vector_nelem {
+            ExtVectorLayout::new(&element, lanes)
+                .map(|layout| CType::ExtVector(Box::new(element), layout))
+        } else {
+            None
+        }
+    }
+
+    /// Resolve the unpadded element payload size for legacy consumers that
+    /// only need a byte count. New type/layout code should use
+    /// `resolve_vector_ctype` so ext-vector lane count and padding are retained.
     pub fn resolve_vector_size(&self, elem_size: usize) -> Option<usize> {
         if let Some(vs) = self.vector_size {
             Some(vs)
         } else {
-            self.ext_vector_nelem.map(|n| n * elem_size)
+            self.ext_vector_nelem.and_then(|n| n.checked_mul(elem_size))
         }
     }
 }
@@ -1170,6 +1184,9 @@ pub enum TypeSpecifier {
     /// Wraps the base element type and total vector size in bytes.
     /// E.g., `(__attribute__((vector_size(16))) float){...}` becomes Vector(Float, 16).
     Vector(Box<TypeSpecifier>, usize),
+    /// __attribute__((ext_vector_type(N))) applied directly in a type name.
+    /// The second field is the logical lane count, not the padded byte size.
+    ExtVector(Box<TypeSpecifier>, usize),
 }
 
 /// A field declaration in a struct/union.

@@ -21,6 +21,17 @@ enum RedeclResult {
     Proceed { prior_was_weak: bool },
 }
 
+/// Whether the declared object is a vector or an array whose leaf objects are
+/// vectors. The IR pointer carrier must not contribute pointer alignment to
+/// these C objects.
+fn is_vector_object_or_array_of_vectors(ctype: &CType) -> bool {
+    match ctype {
+        CType::Vector(..) | CType::ExtVector(..) => true,
+        CType::Array(element, _) => is_vector_object_or_array_of_vectors(element),
+        _ => false,
+    }
+}
+
 impl Lowerer {
     // --- Global declaration lowering ---
 
@@ -137,8 +148,10 @@ impl Lowerer {
                 &mut resolved_ctype,
                 self.declaration_address_space(decl.address_space, &decl.type_spec),
             );
-            if let Some(vs) = decl.resolve_vector_size(resolved_ctype.size()) {
-                resolved_ctype = CType::Vector(Box::new(resolved_ctype), vs);
+            if !resolved_ctype.is_vector() {
+                if let Some(vector_ctype) = decl.resolve_vector_ctype(resolved_ctype.clone()) {
+                    resolved_ctype = vector_ctype;
+                }
             }
             // When re-processing a typedef for an anonymous struct/union, the lowerer
             // generates a fresh `__anon_struct_N` key that differs from sema's key.
@@ -239,10 +252,7 @@ impl Lowerer {
             return false;
         }
         let mut da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
-        let elem_size = da.c_type.as_ref().map_or(0, |ct| ct.size());
-        if let Some(vs) = decl.resolve_vector_size(elem_size) {
-            da.apply_vector_size(vs);
-        }
+        da.apply_decl_vector_type(decl);
         let mut ginfo = GlobalInfo::from_analysis(&da);
         ginfo.asm_register = Some(reg_name.clone());
         ginfo.var.address_space =
@@ -289,10 +299,7 @@ impl Lowerer {
         }
         if !self.globals.contains_key(&declarator.name) {
             let mut da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
-            let elem_size = da.c_type.as_ref().map_or(0, |ct| ct.size());
-            if let Some(vs) = decl.resolve_vector_size(elem_size) {
-                da.apply_vector_size(vs);
-            }
+            da.apply_decl_vector_type(decl);
             let mut ginfo = GlobalInfo::from_analysis(&da);
             ginfo.var.address_space =
                 crate::common::type_builder::object_storage_address_space_with_object(
@@ -312,10 +319,7 @@ impl Lowerer {
         // For extern TLS variables, emit an IrGlobal so codegen uses TLS access patterns.
         if decl.is_thread_local() && !self.emitted_global_names.contains(&declarator.name) {
             let mut da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
-            let elem_size = da.c_type.as_ref().map_or(0, |ct| ct.size());
-            if let Some(vs) = decl.resolve_vector_size(elem_size) {
-                da.apply_vector_size(vs);
-            }
+            da.apply_decl_vector_type(decl);
             self.module.globals.push(IrGlobal {
                 name: declarator.name.clone(),
                 ty: da.var_ty,
@@ -429,10 +433,7 @@ impl Lowerer {
         let mut da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
         da.base_type_volatile = decl.is_volatile();
         da.object_volatile = declarator.attrs.object_volatile;
-        let elem_size = da.c_type.as_ref().map_or(0, |ct| ct.size());
-        if let Some(vs) = decl.resolve_vector_size(elem_size) {
-            da.apply_vector_size(vs);
-        }
+        da.apply_decl_vector_type(decl);
         if da.is_array_of_pointers || da.is_array_of_func_ptrs {
             da.struct_layout = None;
             da.is_struct = false;
@@ -466,7 +467,14 @@ impl Lowerer {
         }
         if !da.is_array && !da.is_pointer && da.struct_layout.is_none() {
             let c_size = self.sizeof_type(&decl.type_spec);
-            da.actual_alloc_size = c_size.max(da.var_ty.size());
+            // Vectors use a pointer IR carrier, but their object size is the
+            // target C vector layout (including padding), not sizeof(void *).
+            // The carrier is for address-based lowering only.
+            da.actual_alloc_size = if da.c_type.as_ref().is_some_and(CType::is_vector) {
+                c_size
+            } else {
+                c_size.max(da.var_ty.size())
+            };
         }
         da
     }
@@ -518,7 +526,13 @@ impl Lowerer {
 
     fn compute_global_alignment(&self, decl: &Declaration, da: &DeclAnalysis) -> (usize, bool) {
         let c_align = self.alignof_type(&decl.type_spec);
-        let natural = if c_align > 0 {
+        let is_vector_object = da
+            .c_type
+            .as_ref()
+            .is_some_and(is_vector_object_or_array_of_vectors);
+        let natural = if is_vector_object {
+            c_align.max(1)
+        } else if c_align > 0 {
             c_align.max(da.var_ty.align())
         } else {
             da.var_ty.align()

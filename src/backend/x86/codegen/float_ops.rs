@@ -47,6 +47,45 @@ impl X86Codegen {
 
     /// for constants and values without a home.
 
+    /// Move a 64-bit *bit container* (an I64/U64 IR value that the psABI
+    /// carries in the low half of `%xmm0` — an 8-byte vector return) into
+    /// `%xmm0` without routing it through the accumulator.
+    ///
+    /// The value is integer-typed in the IR, so it normally sits in a GP
+    /// register or in a stack slot, not in an FP home; the FP loader cannot be
+    /// reused because it has no GP-register case. Every path here is a single
+    /// `movq`: a GP bounce (`movq %rax, %xmm0`) is only needed when the value is
+    /// in the accumulator already, and even then the direct move from the GP
+    /// register wins.
+    pub(super) fn load_bits64_to_xmm0(&mut self, op: &Operand) {
+        if let Operand::Value(v) = op {
+            let is_alloca = self.state.is_alloca(v.0);
+            if self.state.acc_has_verified(v.0, is_alloca) {
+                self.state.emit("    movq %rax, %xmm0");
+                return;
+            }
+            // Freshness-gated home, the same resolution `operand_to_rax` uses:
+            // a stale assignment must fall through to the slot path.
+            if let Some(reg) = self.fresh_home_of(v.0) {
+                let name = phys_reg_name(reg);
+                if name != "xmm0" {
+                    self.state
+                        .emit_fmt(format_args!("    movq %{}, %xmm0", name));
+                }
+                return;
+            }
+            if let Some(slot) = self.state.get_slot(v.0) {
+                self.state
+                    .out
+                    .emit_instr_rbp_reg("    movq", slot.0, "xmm0");
+                return;
+            }
+        }
+        // Constants and anything else: materialize in %rax and move across.
+        self.operand_to_rax(op);
+        self.state.emit("    movq %rax, %xmm0");
+    }
+
     pub(super) fn load_fp_to_xmm0(&mut self, op: &Operand, ty: IrType) {
         // Decimal carriers are bit containers: D64 moves exactly like a
         // 64-bit double (movsd), D32 like a 32-bit float (movss).

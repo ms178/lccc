@@ -1,6 +1,6 @@
 use super::definitions::{LValue, LValueKind};
 use super::lower::Lowerer;
-use crate::common::types::{AddressSpace, CType, IrType};
+use crate::common::types::{AddressSpace, CType, IrType, SsoMode};
 use crate::frontend::parser::ast::{BinOp, Expr, TypeSpecifier, UnaryOp};
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, Operand, Value};
 
@@ -103,19 +103,56 @@ impl Lowerer {
                 }
             }
             Expr::ArraySubscript(base, index, _) => {
-                // base[index] -> compute address of element.
-                //
-                // The address space must be derived exactly like the LOAD
-                // path (lower_array_subscript) does: `p[i]` through a
-                // __seg_fs pointer, and `((S __seg_fs *)0)->arr[i]` through
-                // a segment-qualified member array, both store into the
-                // segment. Hardcoding Default here dropped the %fs prefix
-                // on every pointer-typed THREAD_SETMEM in glibc
-                // (__tls_init_tp: `((struct pthread __seg_fs *)0)
-                // ->specific[0] = ...` stored to the NULL page, killing
-                // every external binary at TLS-init time — LK-26).
-                // Same rule as the load path: the subscript's own space, which
-                // covers the reversed form `i[p]` (see get_addr_space_of_struct_expr).
+                // A _Bool ext-vector lane has no separately addressable byte;
+                // retain its containing-byte address and dynamic bit position
+                // so reads and read-modify-write assignments can use the packed
+                // representation without manufacturing `&v[i]`.
+                let base_ct = self.expr_ctype(base);
+                if base_ct.is_bitpacked_bool_vector() {
+                    let ptr_int_ty = crate::common::types::target_int_ir_type();
+                    let index_ty = self.value_ir_type(index);
+                    let index_val = self.lower_expr(index);
+                    let index_val = self.emit_implicit_cast(index_val, index_ty, ptr_int_ty);
+                    let byte_index = self.emit_binop_val(
+                        IrBinOp::LShr,
+                        index_val,
+                        Operand::Const(IrConst::I64(3)),
+                        ptr_int_ty,
+                    );
+                    let bit_index = self.emit_binop_val(
+                        IrBinOp::And,
+                        index_val,
+                        Operand::Const(IrConst::I64(7)),
+                        ptr_int_ty,
+                    );
+                    let base_operand = self.get_array_base_addr(base);
+                    let base_addr = self.operand_to_value(base_operand);
+                    let byte_addr = self.fresh_value();
+                    self.emit(Instruction::GetElementPtr {
+                        dest: byte_addr,
+                        base: base_addr,
+                        offset: Operand::Value(byte_index),
+                        ty: IrType::U8,
+                    });
+                    let bit_index =
+                        self.emit_implicit_cast(Operand::Value(bit_index), ptr_int_ty, IrType::U8);
+                    let Operand::Value(bit_index) = bit_index else {
+                        unreachable!("integer cast must produce a value")
+                    };
+                    return Some(LValue {
+                        kind: LValueKind::PackedBoolVectorLane {
+                            byte_addr,
+                            bit_index,
+                            address_space: self.get_addr_space_of_struct_expr(expr),
+                        },
+                        volatile: vol,
+                        sso: SsoMode::None,
+                    });
+                }
+
+                // Ordinary vector lanes and array elements are byte-addressed.
+                // The address space must be derived exactly like the LOAD path,
+                // including segment-qualified member arrays.
                 let addr_space = self.get_addr_space_of_struct_expr(expr);
                 let addr = self.compute_array_element_addr(base, index);
                 Some(LValue::address(addr, addr_space, vol))
@@ -227,8 +264,8 @@ impl Lowerer {
     /// Get the address (as a Value) from an LValue.
     pub(super) fn lvalue_addr(&self, lv: &LValue) -> Value {
         match &lv.kind {
-            LValueKind::Variable(v) => *v,
-            LValueKind::Address(v, _) => *v,
+            LValueKind::Variable(v) | LValueKind::Address(v, _) => *v,
+            LValueKind::PackedBoolVectorLane { byte_addr, .. } => *byte_addr,
         }
     }
 
@@ -237,6 +274,7 @@ impl Lowerer {
         match &lv.kind {
             LValueKind::Variable(_) => AddressSpace::Default,
             LValueKind::Address(_, seg) => *seg,
+            LValueKind::PackedBoolVectorLane { address_space, .. } => *address_space,
         }
     }
 
@@ -377,6 +415,35 @@ impl Lowerer {
 
     /// Load the value from an lvalue with a specific type.
     pub(super) fn load_lvalue_typed(&mut self, lv: &LValue, ty: IrType) -> Operand {
+        if let LValueKind::PackedBoolVectorLane {
+            byte_addr,
+            bit_index,
+            address_space,
+        } = lv.kind
+        {
+            let raw = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: lv.volatile,
+                dest: raw,
+                ptr: byte_addr,
+                ty: IrType::U8,
+                seg_override: address_space,
+            });
+            let shifted = self.emit_binop_val(
+                IrBinOp::LShr,
+                Operand::Value(raw),
+                Operand::Value(bit_index),
+                IrType::U8,
+            );
+            let bit = self.emit_binop_val(
+                IrBinOp::And,
+                Operand::Value(shifted),
+                Operand::Const(IrConst::I64(1)),
+                IrType::U8,
+            );
+            let normalized = self.emit_bool_normalize_typed(Operand::Value(bit), IrType::U8);
+            return self.emit_implicit_cast(normalized, IrType::I32, ty);
+        }
         let addr = self.lvalue_addr(lv);
         let seg_override = self.lvalue_addr_space(lv);
         let dest = self.fresh_value();
@@ -393,6 +460,61 @@ impl Lowerer {
 
     /// Store a value to an lvalue with a specific type.
     pub(super) fn store_lvalue_typed(&mut self, lv: &LValue, val: Operand, ty: IrType) {
+        if let LValueKind::PackedBoolVectorLane {
+            byte_addr,
+            bit_index,
+            address_space,
+        } = lv.kind
+        {
+            let old = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: lv.volatile,
+                dest: old,
+                ptr: byte_addr,
+                ty: IrType::U8,
+                seg_override: address_space,
+            });
+            let mask = self.emit_binop_val(
+                IrBinOp::Shl,
+                Operand::Const(IrConst::I64(1)),
+                Operand::Value(bit_index),
+                IrType::U8,
+            );
+            let inverse_mask = self.emit_binop_val(
+                IrBinOp::Xor,
+                Operand::Value(mask),
+                Operand::Const(IrConst::I64(0xff)),
+                IrType::U8,
+            );
+            let cleared = self.emit_binop_val(
+                IrBinOp::And,
+                Operand::Value(old),
+                Operand::Value(inverse_mask),
+                IrType::U8,
+            );
+            let normalized = self.emit_bool_normalize_typed(val, ty);
+            let normalized = self.emit_implicit_cast(normalized, IrType::I32, IrType::U8);
+            let shifted = self.emit_binop_val(
+                IrBinOp::Shl,
+                normalized,
+                Operand::Value(bit_index),
+                IrType::U8,
+            );
+            let combined = self.emit_binop_val(
+                IrBinOp::Or,
+                Operand::Value(cleared),
+                Operand::Value(shifted),
+                IrType::U8,
+            );
+            self.emit(Instruction::Store {
+                volatile: lv.volatile,
+                val: Operand::Value(combined),
+                ptr: byte_addr,
+                ty: IrType::U8,
+                seg_override: address_space,
+            });
+            return;
+        }
         let addr = self.lvalue_addr(lv);
         let seg_override = self.lvalue_addr_space(lv);
         // Reverse scalar_storage_order members are byte-fixed-up before write.
@@ -404,6 +526,156 @@ impl Lowerer {
             ty,
             seg_override,
         });
+    }
+
+    /// Load one logical vector lane from its object representation. Most
+    /// vectors are byte-strided; `_Bool ext_vector_type` lanes are packed into
+    /// bits and must be extracted from the containing byte.
+    pub(super) fn load_vector_lane(
+        &mut self,
+        base: Value,
+        vector_ct: &CType,
+        lane: usize,
+        seg_override: AddressSpace,
+        volatile: bool,
+    ) -> Operand {
+        let Some((elem_ct, lanes)) = vector_ct.vector_info() else {
+            return Operand::Const(IrConst::I64(0));
+        };
+        if lane >= lanes {
+            return Operand::Const(IrConst::I64(0));
+        }
+        let elem_ir_ty = IrType::from_ctype(elem_ct);
+        if vector_ct.is_bitpacked_bool_vector() {
+            let byte_ptr = self.vector_lane_byte_addr(base, lane / 8);
+            let raw = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile,
+                dest: raw,
+                ptr: byte_ptr,
+                ty: IrType::U8,
+                seg_override,
+            });
+            let shifted = if lane % 8 == 0 {
+                raw
+            } else {
+                self.emit_binop_val(
+                    IrBinOp::LShr,
+                    Operand::Value(raw),
+                    Operand::Const(IrConst::I64((lane % 8) as i64)),
+                    IrType::U8,
+                )
+            };
+            let bit = self.emit_binop_val(
+                IrBinOp::And,
+                Operand::Value(shifted),
+                Operand::Const(IrConst::I64(1)),
+                IrType::U8,
+            );
+            return self.emit_bool_normalize_typed(Operand::Value(bit), IrType::U8);
+        }
+
+        let stride = vector_ct
+            .vector_element_storage_size()
+            .unwrap_or_else(|| elem_ct.size());
+        let addr = self.vector_lane_byte_addr(base, lane.saturating_mul(stride));
+        let dest = self.fresh_value();
+        self.emit(Instruction::Load {
+            volatile,
+            dest,
+            ptr: addr,
+            ty: elem_ir_ty,
+            seg_override,
+        });
+        Operand::Value(dest)
+    }
+
+    /// Store one logical vector lane, preserving unrelated packed bool lanes.
+    pub(super) fn store_vector_lane(
+        &mut self,
+        base: Value,
+        vector_ct: &CType,
+        lane: usize,
+        val: Operand,
+        val_ty: IrType,
+        seg_override: AddressSpace,
+        volatile: bool,
+    ) {
+        let Some((elem_ct, lanes)) = vector_ct.vector_info() else {
+            return;
+        };
+        if lane >= lanes {
+            return;
+        }
+        let elem_ir_ty = IrType::from_ctype(elem_ct);
+        if vector_ct.is_bitpacked_bool_vector() {
+            let bit = (lane % 8) as u32;
+            let byte_ptr = self.vector_lane_byte_addr(base, lane / 8);
+            let old = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile,
+                dest: old,
+                ptr: byte_ptr,
+                ty: IrType::U8,
+                seg_override,
+            });
+            let mask = 1u64 << bit;
+            let cleared = self.emit_binop_val(
+                IrBinOp::And,
+                Operand::Value(old),
+                Operand::Const(IrConst::I64((!mask & 0xff) as i64)),
+                IrType::U8,
+            );
+            let normalized = self.emit_bool_normalize_typed(val, val_ty);
+            let normalized = self.emit_implicit_cast(normalized, IrType::I32, IrType::U8);
+            let shifted = if bit == 0 {
+                normalized
+            } else {
+                Operand::Value(self.emit_binop_val(
+                    IrBinOp::Shl,
+                    normalized,
+                    Operand::Const(IrConst::I64(bit as i64)),
+                    IrType::U8,
+                ))
+            };
+            let combined =
+                self.emit_binop_val(IrBinOp::Or, Operand::Value(cleared), shifted, IrType::U8);
+            self.emit(Instruction::Store {
+                volatile,
+                val: Operand::Value(combined),
+                ptr: byte_ptr,
+                ty: IrType::U8,
+                seg_override,
+            });
+            return;
+        }
+
+        let stride = vector_ct
+            .vector_element_storage_size()
+            .unwrap_or_else(|| elem_ct.size());
+        let addr = self.vector_lane_byte_addr(base, lane.saturating_mul(stride));
+        let val = self.emit_implicit_cast(val, val_ty, elem_ir_ty);
+        self.emit(Instruction::Store {
+            volatile,
+            val,
+            ptr: addr,
+            ty: elem_ir_ty,
+            seg_override,
+        });
+    }
+
+    fn vector_lane_byte_addr(&mut self, base: Value, byte_offset: usize) -> Value {
+        if byte_offset == 0 {
+            return base;
+        }
+        let addr = self.fresh_value();
+        self.emit(Instruction::GetElementPtr {
+            dest: addr,
+            base,
+            offset: Operand::Const(IrConst::ptr_int(byte_offset as i64)),
+            ty: IrType::I8,
+        });
+        addr
     }
 
     /// Compute the address of an array element: base_addr + index * elem_size.
@@ -851,6 +1123,16 @@ impl Lowerer {
         // char16_t string literals have char16_t elements (size 2)
         if matches!(base, Expr::Char16StringLiteral(_, _)) {
             return 2;
+        }
+
+        // Vector subscripts use the target lane stride, not the total vector
+        // object size. Packed bool ext-vectors are lowered through a separate
+        // bit-index path and do not have an addressable lane stride.
+        let base_ct = self.expr_ctype(base);
+        if base_ct.is_vector() {
+            return base_ct
+                .vector_element_storage_size()
+                .unwrap_or_else(|| base_ct.vector_info().map_or(1, |(elem, _)| elem.size()));
         }
 
         // Handle struct/union member access: s.field[i] or p->field[i]

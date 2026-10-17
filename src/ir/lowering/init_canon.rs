@@ -33,6 +33,7 @@
 use super::array_init_plan::ArrayGeometry;
 use super::lower::Lowerer;
 use super::string_init::StringInit;
+use super::vector_array_init::is_ext_vector_array_type;
 use crate::common::source::Span;
 use crate::common::types::{CType, InitFieldResolution, RcLayout, StructLayout};
 use crate::frontend::parser::ast::{Designator, Expr, Initializer, InitializerItem};
@@ -122,6 +123,14 @@ impl Lowerer {
             CType::Array(elem, Some(len)) => {
                 if let Some(geo) = self.scalar_array_geometry(ty) {
                     Kind::Scalars(geo)
+                } else if is_ext_vector_array_type(ty) {
+                    // A vector object is opaque at its own initializer level,
+                    // but arrays of vectors are aggregates whose dimensions
+                    // and designators can be canonicalized here.
+                    Kind::Array {
+                        elem: (**elem).clone(),
+                        len: *len,
+                    }
                 } else if matches!(self.init_kind(elem), Kind::Opaque) {
                     Kind::Opaque
                 } else {
@@ -131,7 +140,7 @@ impl Lowerer {
                     }
                 }
             }
-            CType::Array(_, None) | CType::Vector(..) => Kind::Opaque,
+            CType::Array(_, None) | CType::Vector(..) | CType::ExtVector(..) => Kind::Opaque,
             _ => Kind::Leaf,
         }
     }
@@ -587,10 +596,13 @@ impl Lowerer {
                     let whole = match init {
                         Initializer::List(_) => true,
                         Initializer::Expr(e) => {
-                            matches!(self.get_expr_ctype(e), Some(CType::Vector(..)))
+                            matches!(
+                                self.get_expr_ctype(e),
+                                Some(CType::Vector(..) | CType::ExtVector(..))
+                            )
                         }
                     };
-                    if !matches!(sub_ty, CType::Vector(..)) || !whole {
+                    if !matches!(sub_ty, CType::Vector(..) | CType::ExtVector(..)) || !whole {
                         return Err(Unsupported);
                     }
                     Self::store(root, frames, Some(Node::Raw(item.init.clone())));

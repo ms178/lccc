@@ -649,6 +649,15 @@ impl Lowerer {
         field_size: usize,
         field_is_pointer: bool,
     ) {
+        // Vector fields need their logical lane count, padded ext-vector stride,
+        // and packed-bool representation rather than scalar-sized fallback.
+        if matches!(field_ty, CType::Vector(_, _) | CType::ExtVector(_, _)) {
+            let mut bytes = vec![0u8; field_size];
+            self.write_vector_init_to_bytes(&mut bytes, 0, field_ty, init);
+            push_bytes_as_elements(elements, &bytes);
+            return;
+        }
+
         // Complex fields: emit {real, imag} as byte pairs
         if field_ty.is_complex() {
             let mut bytes = vec![0u8; field_size];
