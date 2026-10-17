@@ -57,7 +57,8 @@ def validate(workflow, benchmark):
     icx = jobs['icx-oracle']
     assert icx['needs'] == ['build']
     icx_steps = '\n'.join(s.get('run', '') for s in icx['steps'])
-    assert 'ensure_icx_2026.sh' in icx_steps and 'LCCC_TEST_REAL_ICX' in icx_steps
+    assert 'ensure_icx_2026.sh' in icx_steps
+    assert any('LCCC_TEST_REAL_ICX' in s.get('env', {}) for s in icx['steps'])
     assert any(s.get('uses', '').startswith('actions/upload-artifact@') and s.get('if') == 'always()' for s in icx['steps'])
 
 
