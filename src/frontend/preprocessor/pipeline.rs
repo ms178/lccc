@@ -90,6 +90,10 @@ pub struct Preprocessor {
     /// Line offset set by #line directive: effective_line = line_offset + (source_line - line_offset_base)
     /// When None, no #line has been issued and __LINE__ uses the source line directly.
     line_override: Option<(usize, usize)>, // (target_line, source_line_at_directive)
+    /// Set by a `#line` (or GNU linemarker) directive until the line marker
+    /// that makes diagnostics follow it is emitted: the marker's trailing
+    /// flags (`""` for `#line`, e.g. `" 1"` for `# 1 "x.h" 1`).
+    line_marker_due: Option<String>,
     /// #pragma weak directives: (symbol, optional_alias_target)
     /// - (symbol, None) means "mark symbol as weak"
     /// - (symbol, Some(target)) means "symbol is a weak alias for target"
@@ -162,6 +166,7 @@ impl Preprocessor {
             pending_injections: Vec::new(),
             macro_save_stack: FxHashMap::default(),
             line_override: None,
+            line_marker_due: None,
             weak_pragmas: Vec::new(),
             fenv_access_requested: false,
             redefine_extname_pragmas: Vec::new(),
@@ -275,10 +280,17 @@ impl Preprocessor {
         } else {
             None
         };
+        let saved_line_marker_due = if is_include {
+            self.line_marker_due.take()
+        } else {
+            None
+        };
 
         // Buffer for accumulating multi-line macro invocations
         let mut pending_line = String::with_capacity(256);
         let mut pending_newlines: usize = 0;
+        // (offset in pending_line, physical line) of each accumulated line.
+        let mut pending_starts: Vec<(usize, usize)> = Vec::new();
 
         // Physical start line of the most recently processed line; used for
         // the flat __LINE__ resolver when flushing accumulated multi-line
@@ -319,14 +331,30 @@ impl Preprocessor {
                 &join_map_rc,
             );
             let source_line_num = line_resolver.line_at(stripped_line_start);
+            // Every iteration contributes exactly one output line, so a line
+            // starting more than one physical line after its predecessor
+            // follows a line that spanned several (backslash splices, or a
+            // block comment collapsed inside a directive). Re-synchronize
+            // with blank lines -- inside a multi-line macro invocation by
+            // counting them -- so tokens and diagnostics on this and later
+            // lines keep their physical line, as `cpp` does.
+            if line_num > 0 {
+                let gap = source_line_num.saturating_sub(last_source_line_num + 1);
+                if gap > 0 {
+                    if pending_line.is_empty() {
+                        output.extend(std::iter::repeat_n('\n', gap));
+                        if !is_include {
+                            pp_output_line = pp_output_line
+                                .saturating_add(u32::try_from(gap).unwrap_or(u32::MAX));
+                        }
+                    } else {
+                        Self::pend_blank(&mut pending_line, &mut pending_newlines, gap);
+                    }
+                }
+            }
             last_source_line_num = source_line_num;
             self.macros
                 .set_line_resolver(line_resolver, self.line_override, stripped_line_start);
-            // Byte offset where THIS source line starts. Captured before the
-            // running offset moves on; downstream code must never reconstruct
-            // it by subtracting (possibly rewritten) line lengths — an inline
-            // #embed replacement can be longer than the whole prefix.
-            let current_line_start = stripped_line_start;
             stripped_line_start += line.len() + 1;
 
             // Directive handling: #if/#ifdef/#ifndef/#elif/#else/#endif must always
@@ -359,7 +387,7 @@ impl Preprocessor {
                 self.process_directive(trimmed, source_line_num + 1, hash_col);
                 // Don't add the directive line to pending_line, don't flush.
                 // Just count a newline for line numbering preservation.
-                pending_newlines += 1;
+                Self::pend_blank(&mut pending_line, &mut pending_newlines, 1);
                 continue;
             }
 
@@ -380,7 +408,7 @@ impl Preprocessor {
                     let hash_col = line.find('#').map(|i| i + 2).unwrap_or(1);
                     self.process_directive(trimmed, source_line_num + 1, hash_col);
                 }
-                pending_newlines += 1;
+                Self::pend_blank(&mut pending_line, &mut pending_newlines, 1);
                 continue;
             }
 
@@ -405,7 +433,7 @@ impl Preprocessor {
                     let hash_col = line.find('#').map(|i| i + 2).unwrap_or(1);
                     self.process_directive(trimmed, source_line_num + 1, hash_col);
                 }
-                pending_newlines += 1;
+                Self::pend_blank(&mut pending_line, &mut pending_newlines, 1);
                 continue;
             }
 
@@ -430,7 +458,7 @@ impl Preprocessor {
                         // physical lines, so per-offset resolution does not
                         // apply; the offset base is irrelevant.
                         self.macros.set_line_resolver(
-                            LineResolver::Flat(source_line_num),
+                            Self::accumulated_resolver(&pending_starts),
                             self.line_override,
                             0,
                         );
@@ -438,6 +466,9 @@ impl Preprocessor {
                         self.drain_expansion_pragmas();
                         pending_line.clear();
                         pending_line.push_str(&expanded);
+                        // Already expanded: positions no longer matter.
+                        pending_starts.clear();
+                        pending_starts.push((0, source_line_num));
                     } else if after_hash.starts_with("include") {
                         // When #include appears in the middle of a multi-line expression
                         // (e.g. a function call with args spanning lines), flush the
@@ -447,7 +478,7 @@ impl Preprocessor {
                         // physical lines, so per-offset resolution does not
                         // apply; the offset base is irrelevant.
                         self.macros.set_line_resolver(
-                            LineResolver::Flat(source_line_num),
+                            Self::accumulated_resolver(&pending_starts),
                             self.line_override,
                             0,
                         );
@@ -455,11 +486,7 @@ impl Preprocessor {
                         self.drain_expansion_pragmas();
                         let expanded =
                             self.resolve_has_macros_in_code(&expanded, source_line_num + 1);
-                        output.push_str(&expanded);
-                        output.push('\n');
-                        for _ in 1..pending_newlines {
-                            output.push('\n');
-                        }
+                        Self::push_accumulated(&mut output, &expanded, pending_newlines);
                         pending_line.clear();
                         pending_newlines = 0;
                     }
@@ -476,16 +503,27 @@ impl Preprocessor {
                     // correct file and line number. source_line_num is 0-based,
                     // and the next line of the parent file is source_line_num + 2
                     // (since the #include directive itself was source_line_num + 1).
-                    let parent_file = self
-                        .include_stack
-                        .last()
-                        .map(|p| super::includes::format_path_for_line_directive(p))
-                        .unwrap_or_else(|| self.filename.clone());
+                    // After a #line, the presumed line and file (as GCC).
+                    let parent_file = if self.line_override.is_some() {
+                        self.presumed_file_operand()
+                    } else {
+                        let file = self
+                            .include_stack
+                            .last()
+                            .map(|p| super::includes::format_path_for_line_directive(p))
+                            .unwrap_or_else(|| self.filename.clone());
+                        format!("\"{file}\"")
+                    };
                     // Flag 2 indicates returning from an include file (GCC convention)
-                    let _ = writeln!(output, "# {} \"{}\" 2", source_line_num + 2, parent_file);
+                    let next_line = self.presumed_line(source_line_num + 1);
+                    let _ = writeln!(output, "# {next_line} {parent_file} 2");
                 } else if is_include {
-                    // Included files always emit a newline for non-include directives
-                    output.push('\n');
+                    // Included files always emit a newline for non-include
+                    // directives (a #line's marker is one).
+                    match self.take_line_marker(source_line_num + 1) {
+                        Some(marker) => output.push_str(&marker),
+                        None => output.push('\n'),
+                    }
                 }
                 // Top-level: emit injected declarations from #include processing
                 if !is_include && !self.pending_injections.is_empty() {
@@ -505,7 +543,10 @@ impl Preprocessor {
                     // high (`#include <stddef.h>\nint bad = ;` blamed line 3).
                     if !emitted_include_content {
                         if !pending_line.is_empty() {
-                            pending_newlines += 1;
+                            Self::pend_blank(&mut pending_line, &mut pending_newlines, 1);
+                        } else if let Some(marker) = self.take_line_marker(source_line_num + 1) {
+                            // Stands for the directive's line.
+                            output.push_str(&marker);
                         } else {
                             output.push('\n');
                         }
@@ -532,12 +573,26 @@ impl Preprocessor {
                 self.accumulate_and_expand(
                     line,
                     source_line_num,
-                    current_line_start,
+                    &mut pending_starts,
                     &mut pending_line,
                     &mut pending_newlines,
                     &mut output,
                     &mut expanding,
                 );
+                // A #line inside the invocation: its marker goes before the
+                // flushed text's last line, which comes from this physical
+                // line (the invocation's line breaks are re-emitted). Only
+                // that line is moved, never the whole output.
+                if pending_line.is_empty() && output.len() > output_len_before {
+                    if let Some(marker) = self.take_line_marker(source_line_num) {
+                        let flushed = &output[output_len_before..output.len() - 1];
+                        let last_line =
+                            output_len_before + flushed.rfind('\n').map_or(0, |k| k + 1);
+                        let last = output.split_off(last_line);
+                        output.push_str(&marker);
+                        output.push_str(&last);
+                    }
+                }
                 // Collect macro expansion info for diagnostics.
                 // If expansion added content to the output, check if macros were used.
                 if !is_include && output.len() > output_len_before {
@@ -559,7 +614,7 @@ impl Preprocessor {
             } else {
                 // Inactive conditional block - skip the line but preserve numbering
                 if !pending_line.is_empty() {
-                    pending_newlines += 1;
+                    Self::pend_blank(&mut pending_line, &mut pending_newlines, 1);
                 } else {
                     output.push('\n');
                     if !is_include {
@@ -575,7 +630,7 @@ impl Preprocessor {
         // Flush any remaining pending line
         if !pending_line.is_empty() {
             self.macros.set_line_resolver(
-                LineResolver::Flat(last_source_line_num),
+                Self::accumulated_resolver(&pending_starts),
                 self.line_override,
                 0,
             );
@@ -609,17 +664,42 @@ impl Preprocessor {
         }
         if is_include {
             self.line_override = saved_line_override;
+            self.line_marker_due = saved_line_marker_due;
         }
 
         output
     }
 
-    /// Accumulate lines for multi-line macro invocations (unbalanced parens)
-    /// and expand when complete. This is the shared logic for both preprocess
-    /// paths, avoiding the previous duplication of ~40 lines.
-    ///
-    /// The `expanding` parameter is a reusable FxHashSet that avoids per-line
-    /// allocation for macro expansion tracking.
+    /// The presumed (`#line`-adjusted) 1-based number of 0-based physical
+    /// line `phys`, as `MacroTable::resolve_line` computes it.
+    fn presumed_line(&self, phys: usize) -> usize {
+        match self.line_override {
+            Some((target, base)) => target + phys.saturating_sub(base),
+            None => phys + 1,
+        }
+    }
+
+    /// The presumed file name as a line-marker operand: `__FILE__`'s
+    /// spelling, which `#line N "name"` sets and includes save and restore.
+    fn presumed_file_operand(&self) -> String {
+        self.macros
+            .get_file_body()
+            .map_or_else(|| format!("\"{}\"", self.filename), str::to_string)
+    }
+
+    /// The line marker a preceding `#line` made due, for the output line
+    /// that comes from 0-based physical line `next_phys`; it makes the
+    /// source manager (diagnostics, line tables) follow the directive.
+    fn take_line_marker(&mut self, next_phys: usize) -> Option<String> {
+        let flags = self.line_marker_due.take()?;
+        Some(format!(
+            "# {} {}{}\n",
+            self.presumed_line(next_phys),
+            self.presumed_file_operand(),
+            flags
+        ))
+    }
+
     /// Build the `__LINE__` resolver for one output line: comment-strip
     /// breakpoints composed with the join map, or the flat fast path.
     ///
@@ -714,11 +794,16 @@ impl Preprocessor {
         }
     }
 
+    /// Accumulate lines for multi-line macro invocations (unbalanced parens)
+    /// and expand when complete.
+    ///
+    /// The `expanding` parameter is a reusable FxHashSet that avoids per-line
+    /// allocation for macro expansion tracking.
     fn accumulate_and_expand(
         &mut self,
         line: &str,
         source_line_num: usize,
-        _line_start_abs: usize,
+        pending_starts: &mut Vec<(usize, usize)>,
         pending_line: &mut String,
         pending_newlines: &mut usize,
         output: &mut String,
@@ -728,12 +813,16 @@ impl Preprocessor {
             if Self::has_unbalanced_parens(line) {
                 *pending_line = line.to_string();
                 *pending_newlines = 1;
+                pending_starts.clear();
+                pending_starts.push((0, source_line_num));
             } else if self.ends_with_funclike_macro(line) {
                 // Line ends with a function-like macro name without '(' on same line.
                 // Per C standard, whitespace (including newlines) between macro name
                 // and '(' is allowed, so accumulate to check next line for '('.
                 *pending_line = line.to_string();
                 *pending_newlines = 1;
+                pending_starts.clear();
+                pending_starts.push((0, source_line_num));
             } else {
                 let expanded = self.macros.expand_line_reuse(line, expanding);
                 // _Pragma operators queued by this expansion are drained by
@@ -751,6 +840,8 @@ impl Preprocessor {
                 if self.ends_with_funclike_macro(&expanded) {
                     *pending_line = line.to_string();
                     *pending_newlines = 1;
+                    pending_starts.clear();
+                    pending_starts.push((0, source_line_num));
                 } else {
                     let expanded = self.resolve_has_macros_in_code(&expanded, source_line_num + 1);
                     output.push_str(&expanded);
@@ -762,6 +853,7 @@ impl Preprocessor {
             // when we were accumulating for a trailing function-like macro name.
             let needs_more = Self::has_unbalanced_parens(pending_line);
             pending_line.push('\n');
+            pending_starts.push((pending_line.len(), source_line_num));
             pending_line.push_str(line);
             *pending_newlines += 1;
 
@@ -776,7 +868,7 @@ impl Preprocessor {
                     // to the multi-line accumulated buffer; the offset base
                     // is irrelevant.
                     self.macros.set_line_resolver(
-                        LineResolver::Flat(source_line_num),
+                        Self::accumulated_resolver(pending_starts),
                         self.line_override,
                         0,
                     );
@@ -790,11 +882,7 @@ impl Preprocessor {
                     } else {
                         let expanded =
                             self.resolve_has_macros_in_code(&expanded, source_line_num + 1);
-                        output.push_str(&expanded);
-                        output.push('\n');
-                        for _ in 1..*pending_newlines {
-                            output.push('\n');
-                        }
+                        Self::push_accumulated(output, &expanded, *pending_newlines);
                         pending_line.clear();
                         *pending_newlines = 0;
                     }
@@ -815,7 +903,7 @@ impl Preprocessor {
                     // to the multi-line accumulated buffer; the offset base
                     // is irrelevant.
                     self.macros.set_line_resolver(
-                        LineResolver::Flat(source_line_num),
+                        Self::accumulated_resolver(pending_starts),
                         self.line_override,
                         0,
                     );
@@ -829,17 +917,49 @@ impl Preprocessor {
                     } else {
                         let expanded =
                             self.resolve_has_macros_in_code(&expanded, source_line_num + 1);
-                        output.push_str(&expanded);
-                        output.push('\n');
-                        for _ in 1..*pending_newlines {
-                            output.push('\n');
-                        }
+                        Self::push_accumulated(output, &expanded, *pending_newlines);
                         pending_line.clear();
                         *pending_newlines = 0;
                     }
                 }
             }
         }
+    }
+
+    /// Account for `n` source lines that belong to an accumulated multi-line
+    /// invocation without contributing text (directives, inactive lines,
+    /// lines merged into the previous one): as empty lines, so the line
+    /// breaks the expander re-emits after the invocation include them.
+    fn pend_blank(pending_line: &mut String, pending_newlines: &mut usize, n: usize) {
+        pending_line.extend(std::iter::repeat_n('\n', n));
+        *pending_newlines += n;
+    }
+
+    /// Resolver for an accumulated multi-line buffer from the start offset
+    /// and physical line of each of its lines. Comments and splices on
+    /// ordinary lines no longer merge lines, so a line's start is exact for
+    /// its bytes.
+    fn accumulated_resolver(starts: &[(usize, usize)]) -> LineResolver {
+        match starts {
+            [] => LineResolver::Flat(0),
+            [(_, line)] => LineResolver::Flat(*line),
+            _ => LineResolver::Mapped(Rc::new(LineResolverData {
+                points: starts.iter().map(|&(off, line)| (off, off, line)).collect(),
+                // Empty: the points carry physical lines.
+                join_map: Rc::from([]),
+            })),
+        }
+    }
+
+    /// Append the expansion of an accumulated multi-line invocation that
+    /// stood for `lines` physical lines, ending in exactly `lines` newlines:
+    /// the line breaks that survive expansion (those outside macro
+    /// arguments) count, and blank lines make up the rest, so the next line
+    /// keeps its physical line number.
+    fn push_accumulated(output: &mut String, expanded: &str, lines: usize) {
+        output.push_str(expanded);
+        let kept = expanded.bytes().filter(|&b| b == b'\n').count();
+        output.extend(std::iter::repeat_n('\n', lines.saturating_sub(kept).max(1)));
     }
 
     /// Check if a line ends with an identifier that is a defined function-like macro.
@@ -1449,12 +1569,20 @@ impl Preprocessor {
                 self.line_override = Some((target_line, source_line_num));
 
                 // If there's a filename argument, update __FILE__
+                let mut flags = String::new();
                 if let Some(filename_str) = parts.next() {
                     let filename = filename_str.trim_matches('"');
                     if !filename.is_empty() {
                         self.macros.set_file(format!("\"{}\"", filename));
                     }
+                    // GNU linemarker flags (1 enter, 2 return, 3 system
+                    // header, 4 extern "C") carry over to the marker.
+                    for flag in parts.filter(|f| matches!(*f, "1" | "2" | "3" | "4")) {
+                        flags.push(' ');
+                        flags.push_str(flag);
+                    }
                 }
+                self.line_marker_due = Some(flags);
             }
         }
     }
@@ -1471,15 +1599,18 @@ mod line_resolver_share_tests {
     use super::*;
     use std::time::Instant;
 
-    /// One splice so `join_map` is `Some`; one multi-line comment so
-    /// `comment_map` is `Some`; then `n` ordinary lines. The old per-line
+    /// One splice so `join_map` is `Some` (mid-token: a splice at white
+    /// space on an ordinary line is kept as a line break, without a map);
+    /// one multi-line comment so `comment_map` is `Some` (in a directive:
+    /// on an ordinary line it is split, without a map); then `n` ordinary
+    /// lines. The old per-line
     /// `Rc::from(join_map)` is Θ(n²) and hung sqlite3.c (~270k lines) in
     /// `build_line_resolver` for minutes. After the shared-Rc fix this is
     /// linear and must finish well under a second on the research VM.
     fn spliced_commented_source(n: usize) -> String {
         let mut src = String::with_capacity(n * 12 + 64);
-        src.push_str("int a = 1 + \\\n 2;\n");
-        src.push_str("/* multi\n   line comment */\n");
+        src.push_str("int a = 1\\\n2;\n");
+        src.push_str("#define M 1 /* multi\n   line comment */\n");
         for i in 0..n {
             src.push_str("int x");
             src.push_str(&i.to_string());
@@ -1503,6 +1634,7 @@ mod line_resolver_share_tests {
             "preprocess of {n} spliced+commented lines took {dt:?} \
              (quadratic join-map clone in build_line_resolver?)"
         );
+        assert!(out.contains("int a = 12;"), "lost the spliced decl");
         assert!(out.contains("int x0;"), "lost first generated decl");
         assert!(
             out.contains(&format!("int x{};", n - 1)),

@@ -122,6 +122,85 @@ impl LineResolver {
 /// Scans for `/` bytes first, then checks the following byte. Since `/` is
 /// relatively rare in C source (typically only in comments and division),
 /// this quickly skips large stretches of non-slash bytes.
+/// Lexical state at a line splice, as far as [`join_continued_lines`] needs
+/// it to decide whether the splice may be replaced by a line break.
+///
+/// Scanning starts afresh (`Code`) at every joined line, so a block comment
+/// opened on an earlier joined line is not seen. Every misjudgement is safe:
+/// taking comment text for a literal or a `//` comment only joins (the
+/// conservative choice), and taking a block comment's inside for code only
+/// splits inside a comment, which already spans lines.
+///
+/// [`join_continued_lines`]: Preprocessor::join_continued_lines
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpliceState {
+    Code,
+    Literal(u8),
+    LineComment,
+    BlockComment,
+}
+
+impl SpliceState {
+    /// The state after `bytes`, starting in `self`.
+    fn scan(mut self, bytes: &[u8]) -> Self {
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            match self {
+                Self::Code => match (b, bytes.get(i + 1)) {
+                    (b'"' | b'\'', _) => self = Self::Literal(b),
+                    (b'/', Some(b'*')) => {
+                        self = Self::BlockComment;
+                        i += 1;
+                    }
+                    (b'/', Some(b'/')) => return Self::LineComment,
+                    _ => {}
+                },
+                Self::Literal(quote) => {
+                    if b == b'\\' {
+                        i += 1;
+                    } else if b == quote {
+                        self = Self::Code;
+                    }
+                }
+                Self::BlockComment => {
+                    if b == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                        self = Self::Code;
+                        i += 1;
+                    }
+                }
+                Self::LineComment => return Self::LineComment,
+            }
+            i += 1;
+        }
+        self
+    }
+}
+
+/// First byte of `line` that is not a space or tab.
+fn first_non_blank(line: &[u8]) -> Option<u8> {
+    line.iter().copied().find(|&b| b != b' ' && b != b'\t')
+}
+
+/// First byte at or after `from` that is neither a space, a tab nor inside
+/// a block comment closed on the same line; `None` at a line end.
+fn next_token_byte(bytes: &[u8], mut from: usize) -> Option<u8> {
+    loop {
+        match bytes.get(from)? {
+            b' ' | b'\t' => from += 1,
+            b'\n' => return None,
+            b'/' if bytes.get(from + 1) == Some(&b'*') => {
+                let close = bytes[from + 2..].windows(2).position(|w| w == b"*/")?;
+                if bytes[from + 2..from + 2 + close].contains(&b'\n') {
+                    return None;
+                }
+                from += close + 4;
+            }
+            &b => return Some(b),
+        }
+    }
+}
+
 fn contains_comment_marker(bytes: &[u8]) -> bool {
     let len = bytes.len();
     if len < 2 {
@@ -192,11 +271,19 @@ impl Preprocessor {
     /// can resolve the physical line of any byte by composing with the join
     /// map from [`Self::join_continued_lines`].
     ///
-    /// Block comments are replaced with a single space (per C11 5.1.1.2
-    /// phase 3), which avoids breaking preprocessor directives that have
-    /// block comments between `#` and the directive keyword (e.g.,
-    /// `#/*...\n...*/if 1`). Uses raw byte operations to preserve UTF-8
-    /// sequences in string literals.
+    /// A block comment within one line is replaced with a single space (C11
+    /// 5.1.1.2 phase 3). A multi-line one on an ordinary line is replaced by
+    /// the newlines it spans plus spaces up to the column after its `*/`, as
+    /// `gcc -E` does: outside a directive a newline is just white space, and
+    /// every token keeps its physical line AND column, which is where
+    /// diagnostics and line tables point. Inside a directive (the output line
+    /// so far starts with `#`) the comment stays one space, since the
+    /// directive must remain one line (`#/*...\n...*/if 1`); so it does when
+    /// the text after it starts with `#` on a line that already has tokens,
+    /// where a split would turn a stray `#` into a directive. Only those
+    /// collapsed comments shift line numbering (the pipeline re-synchronizes
+    /// after the line) and need the map. Uses raw byte operations to
+    /// preserve UTF-8 sequences in string literals.
     pub(super) fn strip_block_comments(
         source: &str,
     ) -> (std::borrow::Cow<'_, str>, Option<Vec<CommentSegments>>) {
@@ -224,6 +311,10 @@ impl Preprocessor {
         // joined_offset, joined_line) in ABSOLUTE text coordinates; the
         // first entry is the output line's own start.
         let mut cur_points: Vec<(usize, usize, usize)> = vec![(0, 0, 0)];
+        // Offsets in `result` and in `source` where the current output line
+        // starts.
+        let mut line_start = 0usize;
+        let mut line_start_joined = 0usize;
 
         // Close the current output line's map entry.
         fn close_line(
@@ -243,6 +334,7 @@ impl Preprocessor {
                 b'"' | b'\'' => {
                     // Copy string/char literals verbatim (don't strip comments inside)
                     let old_i = i;
+                    let old_result_len = result.len();
                     i = copy_literal_bytes_raw(bytes, i, bytes[i], &mut result);
                     // Count newlines in the literal for source line tracking.
                     // Literal bytes are emitted verbatim, so joined offsets
@@ -250,23 +342,27 @@ impl Preprocessor {
                     for (k, &b) in bytes[old_i..i].iter().enumerate() {
                         if b == b'\n' {
                             src_line += 1;
+                            line_start = old_result_len + k + 1;
+                            line_start_joined = old_i + k + 1;
                             if has_multiline_block_comment {
                                 close_line(&mut line_map, &mut cur_points, current_output_line_src);
                                 // New output line starts right after the
-                                // literal's newline: absolute stripped
-                                // offset = result.len(), absolute joined
-                                // offset = old_i + k + 1.
-                                cur_points = vec![(result.len(), old_i + k + 1, src_line)];
+                                // literal's newline (copied verbatim, so
+                                // at stripped old_result_len + k + 1 and
+                                // joined old_i + k + 1).
+                                cur_points =
+                                    vec![(old_result_len + k + 1, old_i + k + 1, src_line)];
                             }
                             current_output_line_src = src_line;
                         }
                     }
                 }
                 b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
-                    // Block comment - replace entire comment with a single space.
-                    i += 2;
-                    result.push(b' ');
                     let comment_start_line = src_line;
+                    i += 2;
+                    // Joined offset of the first byte of the physical line
+                    // the comment ends on (its tail's column origin).
+                    let mut end_line_start = 0usize;
                     while i < len {
                         if i + 1 < len && bytes[i] == b'*' && bytes[i + 1] == b'/' {
                             i += 2;
@@ -274,32 +370,71 @@ impl Preprocessor {
                         }
                         if bytes[i] == b'\n' {
                             src_line += 1;
+                            end_line_start = i + 1;
                         }
                         i += 1;
                     }
-                    // If block comment spanned multiple lines, we need the full map.
-                    if src_line > comment_start_line && !has_multiline_block_comment {
-                        has_multiline_block_comment = true;
-                        // Retroactively build the map for all output lines so
-                        // far: they had identity mapping (output line ==
-                        // joined source line).
-                        let output_lines_so_far = result.iter().filter(|&&b| b == b'\n').count();
-                        line_map.clear();
-                        line_map.reserve(output_lines_so_far + 16);
-                        for line_idx in 0..output_lines_so_far {
-                            line_map.push(CommentSegments::Flat(line_idx));
+                    let spanned = src_line - comment_start_line;
+                    let line_so_far = &result[line_start..];
+                    let collapse = spanned > 0
+                        && (first_non_blank(line_so_far) == Some(b'#')
+                            || (first_non_blank(line_so_far).is_some()
+                                && next_token_byte(bytes, i) == Some(b'#')));
+                    if spanned == 0 || collapse {
+                        result.push(b' ');
+                    }
+                    if collapse {
+                        if !has_multiline_block_comment {
+                            has_multiline_block_comment = true;
+                            // Every earlier output line is its own joined
+                            // line: ordinary multi-line comments were split.
+                            let output_lines_so_far =
+                                result.iter().filter(|&&b| b == b'\n').count();
+                            line_map.clear();
+                            line_map.reserve(output_lines_so_far + 16);
+                            for line_idx in 0..output_lines_so_far {
+                                line_map.push(CommentSegments::Flat(line_idx));
+                            }
+                            cur_points =
+                                vec![(line_start, line_start_joined, current_output_line_src)];
+                        }
+                        // Tokens after the closing `*/` are on `src_line`,
+                        // not on the line where the comment started: a
+                        // breakpoint at the comment end (absolute stripped
+                        // offset result.len(), joined offset i) resolves
+                        // __LINE__ for them.
+                        cur_points.push((result.len(), i, src_line));
+                    } else if spanned > 0 {
+                        // One newline per spanned line; the empty lines in
+                        // between belong to the comment's inner lines.
+                        for inner in comment_start_line..src_line {
+                            result.push(b'\n');
+                            if has_multiline_block_comment {
+                                if inner == comment_start_line {
+                                    close_line(
+                                        &mut line_map,
+                                        &mut cur_points,
+                                        current_output_line_src,
+                                    );
+                                } else {
+                                    line_map.push(CommentSegments::Flat(inner));
+                                }
+                            }
+                        }
+                        line_start = result.len();
+                        line_start_joined = end_line_start;
+                        // The tail keeps its column: the spaces stand in for
+                        // the comment bytes on its last line, so stripped and
+                        // joined offsets advance in lockstep from the line
+                        // start. No padding before a line end.
+                        if !matches!(bytes.get(i), None | Some(b'\n')) {
+                            result.resize(result.len() + (i - end_line_start), b' ');
+                        }
+                        current_output_line_src = src_line;
+                        if has_multiline_block_comment {
+                            cur_points = vec![(line_start, end_line_start, src_line)];
                         }
                     }
-                    if src_line > comment_start_line {
-                        // Multi-line comment: tokens after the closing `*/`
-                        // are on `src_line`, not on the line where the
-                        // comment started. Record a breakpoint at the
-                        // comment end (absolute stripped offset =
-                        // result.len(), absolute joined offset = i) so
-                        // __LINE__ resolves them correctly.
-                        cur_points.push((result.len(), i, src_line));
-                    }
-                    // Don't emit newlines - the comment is fully replaced by one space.
                 }
                 b'/' if i + 1 < len && bytes[i + 1] == b'/' => {
                     // Line comment - skip to end of line.
@@ -310,6 +445,8 @@ impl Preprocessor {
                 }
                 b'\n' => {
                     result.push(b'\n');
+                    line_start = result.len();
+                    line_start_joined = i + 1;
                     if has_multiline_block_comment {
                         close_line(&mut line_map, &mut cur_points, current_output_line_src);
                         // New output line starts at absolute stripped
@@ -346,6 +483,14 @@ impl Preprocessor {
     /// Also handles backslash followed by trailing whitespace before newline,
     /// matching GCC/Clang behavior (GCC warns: "backslash and newline separated by space").
     ///
+    /// Where removing the splice provably cannot change the token sequence,
+    /// the physical line break is kept instead (only the backslash goes), so
+    /// the tokens after it keep their physical line and column: on an
+    /// ordinary (non-directive) line, outside literals and `//` comments, with
+    /// white space on one side of the splice, and with no `#` starting the
+    /// next line (which would make it a directive). Otherwise the lines are
+    /// joined and the pipeline re-synchronizes after the joined line.
+    ///
     /// Returns `Cow::Borrowed` when the source has no continuation backslashes
     /// (the common case), avoiding a String allocation entirely.
     ///
@@ -377,8 +522,48 @@ impl Preprocessor {
         // Physical line (0-based) of the physical line being processed.
         let mut phys: usize = 0;
 
-        for line in source.lines() {
+        // Lexical state at the end of the open joined line's last part.
+        let mut splice_state = SpliceState::Code;
+        // Whether the open joined line may be split at all (not a directive).
+        let mut splittable = false;
+        let mut lines = source.lines().peekable();
+        while let Some(line) = lines.next() {
             let bs_pos = Self::find_continuation_backslash(line);
+            if let Some(pos) = bs_pos {
+                if !continuation {
+                    splice_state = SpliceState::Code;
+                    splittable = !matches!(first_non_blank(line.as_bytes()), Some(b'#' | b'/'));
+                }
+                splice_state = splice_state.scan(&line.as_bytes()[..pos]);
+                let next = lines.peek().map_or(&b""[..], |l| l.as_bytes());
+                let boundary = pos == 0
+                    || matches!(line.as_bytes()[pos - 1], b' ' | b'\t')
+                    || matches!(next.first(), None | Some(b' ' | b'\t'));
+                if splittable
+                    && boundary
+                    && matches!(splice_state, SpliceState::Code | SpliceState::BlockComment)
+                    && first_non_blank(next) != Some(b'#')
+                {
+                    // Keep the line break: this part ends its joined line.
+                    // A block comment stays open across it (`splice_state`
+                    // is reset at the next joined line's start, which is
+                    // safe: see `SpliceState`). An earlier join on this
+                    // joined line already set `any_spliced`; a split alone
+                    // keeps the identity map.
+                    if continuation {
+                        segs.push((result.len(), phys));
+                        map.push(LineSegments::Mapped(segs.clone().into()));
+                        segs.clear();
+                    } else {
+                        map.push(LineSegments::Flat(phys));
+                    }
+                    result.push_str(&line[..pos]);
+                    result.push('\n');
+                    continuation = false;
+                    phys += 1;
+                    continue;
+                }
+            }
             if continuation {
                 // This physical line is spliced onto the open joined line.
                 if let Some(pos) = bs_pos {
@@ -481,5 +666,67 @@ pub(super) fn split_first_word(s: &str) -> (&str, &str) {
         }
     } else {
         (s, "")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_line_comments_are_split_without_a_line_map() {
+        let (text, map) =
+            Preprocessor::strip_block_comments("int a; /* x\n  y */ int b;\nint c;\n");
+        // The tail keeps its column: 6 spaces stand for the comment's bytes
+        // on its last line (`  y */`), then the source's own space.
+        assert_eq!(text, "int a; \n       int b;\nint c;\n");
+        assert!(map.is_none(), "output lines are the joined lines");
+    }
+
+    #[test]
+    fn directive_comments_collapse_and_need_the_line_map() {
+        let (text, map) =
+            Preprocessor::strip_block_comments("int a;\n#if 1 /* x\n */ && 1\nint b;\n");
+        assert_eq!(text, "int a;\n#if 1   && 1\nint b;\n");
+        let map = map.expect("a collapsed comment shifts lines");
+        assert_eq!(map.len(), 4, "one entry per output line");
+        assert!(matches!(map[0], CommentSegments::Flat(0)));
+        assert!(matches!(map[2], CommentSegments::Flat(3)));
+    }
+
+    #[test]
+    fn line_map_activated_mid_file_starts_at_the_current_line() {
+        // The first collapse happens on output line 1, whose bytes before
+        // the comment are on joined line 1 (not 0, the map's initial entry).
+        let (_, map) = Preprocessor::strip_block_comments("int a;\n#define X 1 /* x\n */ + 2\n");
+        let map = map.expect("collapsed");
+        let CommentSegments::Mapped(points) = &map[1] else {
+            panic!("line 1 has a breakpoint: {:?}", map[1]);
+        };
+        assert_eq!(
+            points[0],
+            (7, 7, 1),
+            "line start: stripped 7, joined 7, line 1"
+        );
+        assert_eq!(points[1].2, 2, "after `*/`: line 2");
+    }
+
+    #[test]
+    fn splice_state_scan() {
+        use SpliceState::*;
+        assert_eq!(Code.scan(b"int a = 1 +"), Code);
+        assert_eq!(Code.scan(b"s = \"ab"), Literal(b'"'));
+        assert_eq!(Code.scan(b"s = \"a\\\"b"), Literal(b'"'), "escaped quote");
+        assert_eq!(Code.scan(b"c = '\\''"), Code);
+        assert_eq!(Code.scan(b"x; // note"), LineComment);
+        assert_eq!(Code.scan(b"s = \"//\" "), Code, "`//` in a literal");
+        assert_eq!(Code.scan(b"x /* open"), BlockComment);
+        assert_eq!(Code.scan(b"x /* a */ y"), Code);
+        assert_eq!(
+            Literal(b'"').scan(b"cd\" + "),
+            Code,
+            "carried across a join"
+        );
+        assert_eq!(BlockComment.scan(b"still */ x"), Code);
     }
 }
