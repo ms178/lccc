@@ -2374,7 +2374,9 @@ pub(crate) fn run_passes(
         if !dis.simplify && should_run!(3, 1, 2) {
             let n = timed_pass!(
                 "simplify",
-                run_on_visited(module, &dirty, &mut changed, simplify::simplify_function)
+                run_on_visited(module, &dirty, &mut changed, |func| {
+                    simplify::simplify_function(func, !no_builtins)
+                })
             );
             cur_pass_changes[3] = n;
             total_changes += n;

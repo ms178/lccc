@@ -457,6 +457,7 @@ fn simplify_function_with_config(
                 &value_types,
                 &use_counts,
                 &cast_use_counts,
+                allow_hosted_builtins,
             ) {
                 *inst = simplified;
                 total += 1;
@@ -917,6 +918,7 @@ fn try_simplify_with_types(
     value_types: &[Option<IrType>],
     use_counts: &[u32],
     cast_use_counts: &[u32],
+    allow_hosted_builtins: bool,
 ) -> Option<Instruction> {
     match inst {
         Instruction::BinOp {
@@ -1107,6 +1109,7 @@ fn try_simplify(
         &[],
         &[],
         &[],
+        true,
     )
 }
 
@@ -1114,7 +1117,7 @@ fn try_simplify(
 /// add/sub-of-neg): threads the NegDef map with everything else empty.
 #[cfg(test)]
 fn try_simplify_neg(inst: &Instruction, neg_defs: &[Option<NegDef>]) -> Option<Instruction> {
-    try_simplify_with_types(inst, &[], &[], &[], &[], neg_defs, &[], &[], &[], &[], &[])
+    try_simplify_with_types(inst, &[], &[], &[], &[], neg_defs, &[], &[], &[], &[], true)
 }
 
 /// Simplify a Cast instruction.
