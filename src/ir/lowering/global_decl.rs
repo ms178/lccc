@@ -13,6 +13,7 @@ use crate::common::types::{CType, IrType};
 use crate::frontend::parser::ast::{
     Declaration, DerivedDeclarator, Expr, InitDeclarator, Initializer, TypeSpecifier,
 };
+use crate::ir::lowering::const_object_images::{ConstObjectImage, const_object_bytes};
 use crate::ir::reexports::{GlobalInit, IrGlobal};
 
 enum RedeclResult {
@@ -615,6 +616,43 @@ impl Lowerer {
             .or_else(|| declarator.attrs.asm_register.clone())
             .filter(|n| !crate::ir::lowering::lower::is_x86_register_name(n))
             .unwrap_or_else(|| declarator.name.clone());
+        // Keep a byte image of a CONST object whose initializer is constant
+        // and relocation-free: a later read of one of its elements or members
+        // (`static const int t[2] = {1, 2}; static int v = t[1];`) folds to the
+        // value the program loads.  A volatile object never folds (C11 6.7.3p7),
+        // and an `extern` declaration has no initializer to image.
+        //
+        // The const requirement is load-bearing (divergence from closed PR
+        // #816, whose base only consulted images from the static-initializer
+        // path where sema had already proven const-ness): HEAD's lowering
+        // calls `eval_const_expr` opportunistically on RUNTIME expressions
+        // too, so an image of a mutable object would fold reads that must
+        // observe stores (`static __thread unsigned long arr[4]` in
+        // tls_local_exec_direct folded to its zero image and dropped the
+        // whole `arr[0]+..+arr[3]` sum).  TLS and named-address-space
+        // (`__seg_gs`/`__seg_fs`) objects are excluded as well: their storage
+        // is per-thread/per-segment, so the emitted initializer does not
+        // describe what a load observes at runtime.
+        let image_storage_space =
+            crate::common::type_builder::object_storage_address_space_with_object(
+                self.declaration_address_space(decl.address_space, &decl.type_spec),
+                &declarator.derived,
+                declarator.attrs.object_space,
+            );
+        if var_is_const
+            && !decl.is_thread_local()
+            && image_storage_space == crate::common::types::AddressSpace::Default
+            && !is_extern_decl
+            && !da.base_type_volatile
+            && !da.object_volatile
+        {
+            if let Some(ctype) = da.c_type.clone() {
+                if let Some(bytes) = const_object_bytes(&init, final_size) {
+                    self.const_object_images
+                        .insert(declarator.name.clone(), ConstObjectImage { ctype, bytes });
+                }
+            }
+        }
         self.module.globals.push(IrGlobal {
             name: emit_name,
             ty: global_ty,

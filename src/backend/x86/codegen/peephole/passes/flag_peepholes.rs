@@ -497,6 +497,17 @@ pub(super) fn flags_dead_after(store: &LineStore, infos: &[LineInfo], from: usiz
             n += 1;
             continue;
         }
+        // A label is a join point, not a transfer. Other predecessors can enter
+        // it, but flags written before it reach only the fall-through path,
+        // which runs straight through the label. Any branch out of the scanned
+        // region is a `Reads` before the label is reached. Treating the label
+        // as a barrier kept a dead `shlq` alive in ring_fifo, whose `cmpl` sits
+        // one label past the shift. This check precedes the classifier, which
+        // answers `Reads` for unrecognised text such as a label line.
+        if infos[n].kind == LineKind::Label {
+            n += 1;
+            continue;
+        }
         // Returning ends the flags' lifetime: the SysV ABI does not preserve
         // EFLAGS across a call boundary.
         if infos[n].kind == LineKind::Ret {

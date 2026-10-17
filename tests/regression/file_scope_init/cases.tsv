@@ -28,3 +28,35 @@ generic_selected_addr	accept	-	int g; int *p = _Generic(0, int: &g, default: 0);
 generic_unselected_addr	accept	-	int g; int *p = _Generic(1.0, int: &g, default: 0);
 compound_literal_addr	accept	-	int *p = (int[]){1, 2, 3};
 offsetof_addr	accept	-	int *r = &((struct s2 *)0)->b;
+# A `const` object with a constant initializer may be READ in a static
+# initializer (GCC's folding rule); a non-const or volatile object may not.
+const_bare_read	accept	-	const int cc = 5; int v = cc;
+const_static_bare_read	accept	-	static const int sc = 5; int v = sc;
+const_chain_read	accept	-	const int a = 5; const int b = a; int v = b;
+const_braced_read	accept	-	const int cb = {7}; int v = cb;
+const_double_read	accept	-	const double dd = 1.5; double v = dd;
+const_conv_read	accept	-	const unsigned char uc = 300; int v = uc;
+const_bool_read	accept	-	const _Bool bb = 5; int v = bb;
+const_volatile_read	reject	not constant	const volatile int cvc = 5; int v = cvc;
+volatile_ptr_read	reject	not constant	int g; int *volatile p = &g; int *q = p;
+# An element or member of a const object is a constant in an initializer:
+# the fold reads the value out of the object's constant byte image (GCC folds
+# the same reads; a tentative or volatile object is not folded by either).
+const_array_elem_read	accept	-	static const int cat[4] = {1,2,3,4}; int v = cat[2];
+const_array_elem_arith	accept	-	static const int cae[4] = {1,2,3,4}; int v = cae[1]*cae[3];
+const_struct_member_read	accept	-	static const struct s2 csm = {7,9}; int v = csm.b;
+const_nested_aggregate_read	accept	-	struct t3 { int m[3]; }; static const struct t3 cnt = {{4,5,6}}; int v = cnt.m[2];
+const_bitfield_read	accept	-	static const struct bf { int a:4; unsigned b:5; } cbr = {-3,17}; int v = cbr.a*100 + (int)cbr.b;
+const_matrix_read	accept	-	static const int cmx[2][2] = {{1,2},{3,4}}; int v = cmx[1][1];
+const_double_elem_read	accept	-	static const double cde[2] = {1.5,2.5}; double v = cde[1];
+const_char_elem_read	accept	-	static const char cce[3] = "ab"; char v = cce[1];
+tentative_const_elem_read	reject	not constant	static const int tce[2]; int v = tce[1];
+volatile_const_elem_read	reject	not constant	static volatile const int vce[2] = {1,2}; int v = vce[1];
+nonconst_elem_read	reject	not constant	static int nce[2] = {1,2}; int v = nce[1];
+# A foldable call is a constant in its own type -- a floating one included --
+# and a constant condition keeps the operand the program keeps.
+sqrt_init_read	accept	-	static const double sd = __builtin_sqrt(4.0); int v = (int)sd;
+condition_float_true	accept	-	int cg; int v = 0.5 ? 3 : (int)(long)&cg;
+condition_float_false	accept	-	static const int cff = 1; int v = 0.0 ? (int)(long)&cff : 3;
+condition_float_bad_selected	reject	not constant	static const int cfb = 1; int v = 0.0 ? 3 : (int)(long)&cfb;
+condition_int_zero	accept	-	int ci; int v = 0 ? 3 : (int)sizeof(ci);

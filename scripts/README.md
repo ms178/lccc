@@ -362,3 +362,56 @@ The evidence directory retains commands, exact source hashes, raw original
 reports, licenses and known-wrong outputs as **negative evidence**. Do not
 update expected outputs to the wrong result or remove fail-closed checks to
 make an audit replay appear green.
+
+
+### Opt-in Intel ICX 2026.2 local oracle
+
+`codegen_oracle.py --oracles icx2026.2` and `oracle_profile.verify` can use
+Intel's 2026.2 release line locally; default remote oracle selections are
+unchanged. This release-line key is not a claim that Compiler Explorer's
+`icx` alias points at the same compiler.
+
+```sh
+scripts/ensure_icx_2026.sh
+# Or use an existing compiler instead of provisioning:
+LCCC_ICX_BIN=/absolute/path/to/icx python3 scripts/codegen_oracle.py \
+  tests/regression/generator_map_vec.c --all-functions --no-local \
+  --oracles icx2026.2
+```
+
+Provisioning requires Linux `apt-get`, `apt-cache`, `dpkg-deb`, Python 3 and
+APT's HTTPS/signature support. It uses Intel's oneAPI APT repository, **not**
+a Launchpad PPA. An isolated APT configuration fetches Intel's HTTPS-published
+signing key and authenticates repository metadata, selects the newest
+2026.2.x package build, and verifies the five downloaded archives by SHA-256.
+The same exact package build is required across the compiler/support set;
+missing or inconsistent releases fail closed, without falling back to 2026.1.
+The signing-key trust bootstrap is HTTPS, not an independently pinned fingerprint.
+
+Installation is rootless: host APT sources, installed packages and system
+keyrings are not modified. A cross-process lock protects each prefix. The
+compiler's predefined macro must agree with the package version **before**
+the staged install is atomically published. The private prefix defaults to
+`$HOME/.cache/intel-icx-2026.2`, or `$LCCC_ICX_PREFIX`; an explicit positional
+prefix overrides both. `LCCC_ICX_MIRROR` can select another HTTPS repository,
+but its metadata must still authenticate with Intel's key.
+
+`PREFIX/.lccc-icx.json` records exact package versions and archive checksums,
+repository metadata/key digests, and compiler identity. Existing prefixes are
+validated, frozen snapshots. To explicitly refresh to a newer 2026.2.x build,
+use a new prefix rather than mutating an existing measurement environment.
+Oracle manifests record the actual patch release, macro, executable digest,
+and the provisioning manifest when present; a release-line label is not binary
+provenance by itself.
+
+Offline tests run without network access or real compiler invocations:
+
+```sh
+python3 scripts/test_local_oracles.py
+python3 scripts/test_icx_provision.py
+```
+
+The real probe test requires **both** `LCCC_TEST_REAL_ICX=1` and
+`LCCC_ICX_BIN`. An explicitly requested real probe fails on a wrong or unusable
+compiler instead of being converted to a skip. No compilation is performed
+by that probe, only predefined-macro preprocessing.

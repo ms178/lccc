@@ -212,6 +212,75 @@ gate "vex-flag-reads" fast \
 gate "load-cast-fold" fast \
     env CCC="$LCCC" bash tests/regression/check_load_cast_fold.sh
 
+gate "generator-map" fast \
+    env CCC="$LCCC" bash tests/regression/check_generator_map.sh
+
+# Register-offset symbol folds (`Add(symbol, register)` -> `sym(%off,%idx)`):
+# the sliding-window shape `const u8 *m = window + cur; m[i]` must fold the
+# symbol into the memory operand where the derived pointer has no other use,
+# must shrink the function when it does, must leave the RA-01 kernel dormant
+# where it cannot pay (measured: identical body), must agree with GCC on
+# every program's output, and must refuse PIC (no third SIB slot).
+gate "reg-off-sym-fold" fast \
+    env CCC="$LCCC" bash tests/regression/check_reg_off_sym_fold.sh
+
+# Array-bound contract: a bad bound is diagnosed (never wrapped), a byte size
+# that cannot exist is rejected instead of wrapping into a bogus section, and a
+# huge `.bss` object is emitted sparsely under a hard RLIMIT_AS rather than
+# being materialised and OOM-killed. Driven under that limit so the "constant
+# memory" half is a real requirement, not a hope.
+gate "array-bound-contract" fast \
+    python3 scripts/check_array_bound_contract.py --lccc "$LCCC"
+
+# UB-exploitation invariant (E22): `-fno-strict-aliasing`, `-fwrapv` and
+# `-fno-strict-overflow` are tolerated because this optimizer exploits no
+# type-based aliasing or signed-overflow poison. That is a precondition, not
+# a property of the universe: the day such a concept lands in src/, the
+# tolerated spellings become silent miscompiles. The tripwire names them.
+gate "ub-exploitation-invariant" fast \
+    python3 scripts/check_no_ub_exploitation.py --root src
+
+# Sparse NOBITS `.bss` (E22): the zeros are a size, not bytes, so a 4 GiB
+# array compiles, links and runs from a ~5 KB executable, a label inside a
+# sparse tail keeps its offset, PROGBITS alignment follows GAS 2.47 exactly
+# (no-padding `.p2align 40` accepted, unholdable padding diagnosed, never a
+# signal), and negative/oversized counts follow GAS exactly.
+gate "sparse-bss-nobits" fast \
+    env CCC="$LCCC" bash tests/regression/check_sparse_bss_nobits.sh
+
+# The sparse-NOBITS equivalence proof: same probes through the in-tree
+# compiler must keep exit codes, stdout and .bss layout; a 16 GB object
+# compiles under a hard RSS ceiling and in bounded time.
+gate "sparse-bss-equivalence" fast \
+    python3 tests/regression/check_sparse_bss_equivalence.py --lccc "$LCCC"
+
+# A13/A14: a pass may synthesise a libcall only when this TU does not
+# define that symbol (per symbol: an asm label, an alias or a static
+# definition counts), and a constant-size memcpy/memset call may be
+# expanded only while the callee still is the builtin. Refusals, positive
+# controls, the -fno-builtin/-ffreestanding contract, the ungated __*_chk
+# rows and three runtime programs.
+gate "libcall-synthesis-no-selfcall" fast \
+    env CCC="$LCCC" bash tests/regression/check_libcall_synthesis_no_selfcall.sh
+
+# Plain-`char` signedness must be one answer, not three: the type system,
+# `__CHAR_UNSIGNED__` and glibc's `CHAR_MIN`/`CHAR_MAX` (derived from that
+# macro) all follow `char_is_unsigned()`. `-funsigned-char` used to flip only
+# the type, leaving `CHAR_MIN` at -128 on x86-64.  Behavioural rows against
+# GCC, plus the AArch64/RISC-V defaults via the binary-name target selector
+# (preprocessing only).  Fast: five tiny compiles.
+gate "char-signedness" fast \
+    env CCC="$LCCC" bash tests/regression/check_char_signedness.sh
+
+# The inliner's __builtin_va_arg_pack_len() sentinel rewrite matched in the
+# wrong value space, leaving a live call to the undefined
+# __lccc_va_arg_pack_len whenever the cloned caller was offset (gzip 1.14's
+# gnulib open-safer.c under glibc fortify failed to link).  The gate asserts
+# no sentinel survives at -O0/-O1/-O2/-O3, runs the wrapper semantics
+# (one/two/zero forwarded arguments) and takes gcc as the reference.
+gate "va-arg-pack-len-folds" fast \
+    env CCC="$LCCC" bash tests/regression/check_va_arg_pack_len_folds.sh
+
 gate "benchmark-codegen-registry" fast \
     python3 tests/regression/check_benchmark_codegen_registry.py
 
@@ -263,6 +332,13 @@ gate "designator-init" fast \
 gate "file-scope-init" fast \
     env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_file_scope_init.sh
 
+# Const-object read folding (closed PR #816, re-gated): const element/member
+# reads fold to immediates; mutable statics, TLS and volatile-qualified
+# accesses keep their loads. The exclusions are what kept 20 regression
+# tests from miscompiling when the port first landed.
+gate "const-object-fold" fast \
+    env CCC="$LCCC" bash tests/regression/check_const_object_fold.sh
+
 gate "typedef-volatile-codegen" fast \
     env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_typedef_volatile_codegen.sh
 
@@ -293,6 +369,11 @@ gate "const-volatile-objects" fast \
 # buffer, gcc-parity matrix (-O0..-O3 x {default, kill switch, -m32 SKIP}).
 gate "ivwiden-exposed-latch" fast \
     env CCC="$LCCC" bash tests/regression/check_ivwiden_exposed_latch.sh
+# Paired-counter (sibling mirror) proof: gcc-16 runtime-edge parity with and
+# without the kill switch, plus an assertion that the proof still changes the
+# constant-threshold loop (a silent refusal would otherwise pass unnoticed).
+gate "ivw-paired-counter" fast \
+    env CCC="$LCCC" bash tests/regression/check_ivw_paired_counter.sh
 gate "zlib-maketrees" fast \
     env CCC="$LCCC" bash tests/regression/check_zlib_maketrees.sh
 gate "fp-extract-homes" fast \
@@ -856,6 +937,14 @@ gate "vec-chain-exit-phi" fast \
 # objected-code shape of the 4-instruction loop it produces.
 gate "affine-exit-compare" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_affine_exit_compare.sh
+
+# AFFOLD-VB: the VALUE-bounded affine exit-compare fold (`iv + C < n` ->
+# `iv < n - C` behind the zero-trip guard).  Pins runtime parity with GCC at
+# the LONG_MIN underflow edges, the fire count on the guarded do-while
+# shapes, the refusals (non-strict, step 2, unguarded top-test), and the
+# CCC_NO_AFFINE_EXIT_FOLD ownership.
+gate "affine-value-bound" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_affine_value_bound.sh
 
 gate "minmax-reduction" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_minmax_reduction.sh
@@ -1597,6 +1686,19 @@ gate "peephole-trace-bisect" fast \
 gate "peephole-trace-bisect-selftest" fast \
     python3 scripts/peephole_trace_bisect.py --selftest
 
+# The capability probe is what turns the Clang-C corpus from "almost every RUN
+# filtered" (102 of 5 130 planned invocations executed) into a measured grid,
+# and it is only worth anything if a flag the compiler ignores can never be
+# reported as established.  The selftest drives the tool against a synthetic
+# compiler that reproduces the contract the probe depends on -- including one
+# that accepts a `-W`-spelled unknown option, one that ignores
+# LCCC_STRICT_OPTIONS, and one that keeps tolerating `-Wno-<unknown>` under
+# strict options; each mutation must abort the probe.  It also pins the
+# per-invocation coverage rule against a weighted-sum misreading.  Pure
+# Python, no toolchain, no corpus: fast.
+gate "capability-probe-selftest" fast \
+    python3 scripts/lccc_capability_probe.py --selftest
+
 # The one-move phi-diamond preinitialisation hoists the cheap incoming
 # above the branch. A memory-source init may fault on the path it lands
 # on: `c ? *p : *q` must never touch a NULL p when c selects q. The
@@ -1895,6 +1997,15 @@ gate "godbolt-oracle-selftest" fast \
 # strands an oracle out of every future sweep. Pinned offline, no network.
 gate "godbolt-cache-selftest" fast \
     python3 scripts/test_godbolt_cache.py
+
+gate "generator-trace-selftest" fast \
+    python3 tests/regression/test_generator_map_gate.py
+
+gate "local-oracles-selftest" fast \
+    python3 scripts/test_local_oracles.py
+
+gate "icx-provision-selftest" fast \
+    python3 scripts/test_icx_provision.py
 
 # MS-11: glibc `make check` triage classifier (miscompile / unsupported /
 # environment). Fixture-driven, offline.

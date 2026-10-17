@@ -1513,6 +1513,36 @@ mod tests {
     }
 
     #[test]
+    fn dead_shift_is_retired_across_a_label_before_the_flag_writer() {
+        use super::super::super::peephole_optimize;
+        // `.L2` is a join point. The fall-through path reaches `addl`, which
+        // overwrites every flag before any reader, so the shift is dead.
+        let out = peephole_optimize(
+            "f:\n.cfi_startproc\n    xorl %r10d, %r10d\n.L1:\n    movl %r10d, %r9d\n    shlq $2, %r9\n.L2:\n    addl $1, %r10d\n    cmpl $10, %r10d\n    jne .L1\n    ret\n.cfi_endproc\n"
+                .to_string(),
+        );
+        assert!(
+            !out.contains("shlq"),
+            "dead shift across a label must go: {out}"
+        );
+        assert!(out.contains(".L2:"), "the label must survive: {out}");
+    }
+
+    #[test]
+    fn label_then_flag_reader_keeps_the_shift() {
+        use super::super::super::peephole_optimize;
+        // The branch after the label reads the flags the shift produced.
+        let out = peephole_optimize(
+            "f:\n.cfi_startproc\n.L1:\n    shlq $2, %r9\n.L2:\n    jne .L1\n    ret\n.cfi_endproc\n"
+                .to_string(),
+        );
+        assert!(
+            out.contains("shlq"),
+            "flags read past a label keep the shift: {out}"
+        );
+    }
+
+    #[test]
     fn live_flags_keep_the_arithmetic() {
         use super::super::super::peephole_optimize;
         // `jne` reads the flags the `shlq` produced: the shift must survive.

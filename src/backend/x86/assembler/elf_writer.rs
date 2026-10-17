@@ -277,9 +277,22 @@ impl X86Arch for X86_64Arch {
                 | R_X86_64_CODE_4_GOTPCRELX
                 | R_X86_64_CODE_5_GOTPCRELX
                 | R_X86_64_CODE_6_GOTPCRELX
-                | 11 // GOT64
-                | 12 // GOTPCREL64
-                | 13 // GOTPC32
+                // The 64-bit GOT operator classes (binutils 2.47
+                // `include/elf/x86-64.h`): @GOT64 = 27, @GOTPCREL64 = 28,
+                // @GOTPC32 = 26.  An earlier revision listed these as
+                // 11/12/13 — but those slots are R_X86_64_32S/16/PC16, the
+                // ABSOLUTE field classes.  Classifying 32S as a GOT slot
+                // exempted every non-RIP `sym(,%reg,8)` displacement from
+                // local-label folding, so a jump table's `jmpq
+                // *.Ljt(,%rax,8)` under -fno-pie kept its `.Ljt` reloc
+                // symbol all the way to the object writer, which resolves
+                // unknown locals to symbol 0 — the table was read from
+                // absolute address 0 and every -fno-pie switch SIGSEGVed
+                // (GAS folds the same reloc to `.rodata + off`; measured,
+                // binutils 2.47).
+                | 26 // GOTPC32
+                | 27 // GOT64
+                | 28 // GOTPCREL64
         )
     }
 
@@ -403,5 +416,37 @@ mod tests {
         // (the loader errors on truly unsupported types elsewhere).
         assert!(!X86_64Arch::is_tls_reloc(52));
         assert!(!X86_64Arch::is_tls_reloc(u32::MAX));
+    }
+
+    /// GOT-slot classification pins the exact binutils numbering.  An
+    /// earlier revision listed the 64-bit GOT operators as 11/12/13 —
+    /// but those are R_X86_64_32S/16/PC16, the ABSOLUTE field classes.
+    /// Misclassifying 32S exempted every non-RIP `sym(,%reg,8)`
+    /// displacement from local-label folding: the object writer resolves
+    /// unknown `.L` symbols to index 0, so a -fno-pie switch read its
+    /// jump table from absolute address 0 and SIGSEGVed (switch_dispatch,
+    /// sqlite_varint, expat_siphash24, zlib_ng_adler32_combine — all
+    /// four reproduce from `jmpq *.Ljt(,%rax,8)`).
+    #[test]
+    fn got_slot_classification_pins_binutils_numbering() {
+        // The true GOT-slot classes: GOT32 = 3, GOTPCREL = 9,
+        // GOTPC32 = 26, GOT64 = 27, GOTPCREL64 = 28, and the relaxable
+        // GOTPCRELX family (41, 42, 43, 46, 49).
+        for t in [3, 9, 26, 27, 28, 41, 42, 43, 46, 49] {
+            assert!(
+                X86_64Arch::is_got_slot_reloc(t),
+                "reloc {t} is a GOT-slot class but classified foldable"
+            );
+        }
+        // The absolute field classes MUST fold: 1 (64), 10 (32),
+        // 11 (32S — the jump-table displacement), 12 (16), 13 (PC16),
+        // and the PC-relative pair 2 (PC32) / 24 (PC64).
+        for t in [1, 2, 10, 11, 12, 13, 24] {
+            assert!(
+                !X86_64Arch::is_got_slot_reloc(t),
+                "absolute/pcrel reloc {t} misclassified as GOT slot — \
+                 local-label folding would be disabled for it"
+            );
+        }
     }
 }

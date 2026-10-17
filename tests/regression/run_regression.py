@@ -10,6 +10,9 @@ session (and CI) runs the identical protocol.
 Conventions (per test ``NAME.c``):
 
 * ``NAME.flags`` — single line of compile flags; defaults to ``-O2``.
+  A sidecar without an explicit ``-O`` level is prepended with ``-O2``
+  (additive, matching run_regression_suite.sh); naming any ``-O`` level
+  keeps full control.
   The placeholder ``@PROFDIR@`` marks a PGO test: it is replaced by a
   per-test profile directory and the test is run as the documented
   generate → train → use roundtrip (the use build must behave
@@ -40,6 +43,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -205,6 +209,16 @@ def discover(base_dirs: list[Path]) -> list[TestCase]:
             flags = flags_file.read_text().strip() if flags_file.exists() else DEFAULT_FLAGS
             if not flags:
                 flags = DEFAULT_FLAGS
+            elif not re.search(r"(^|\s)-O\S", flags):
+                # A sidecar without an explicit -O level ADDS to the -O2
+                # default instead of replacing it. Replacement silently
+                # downgraded 69 tests (the whole simd/vectorize family among
+                # them) to -O0 in this runner while run_regression_suite.sh
+                # compiled the same sources at -O2: the two mirrors must test
+                # the same optimization level. A sidecar that names any -O
+                # level keeps full control, exactly like the suite, where the
+                # later level in `-O2 <flags>` wins.
+                flags = f"{DEFAULT_FLAGS} {flags}"
             env = parse_env(source.with_suffix(".env"))
             tests.append(
                 TestCase(name=name, source=source, flags=flags, env=env,

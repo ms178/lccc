@@ -21,7 +21,7 @@ jobs:
     container: debian:sid-slim
     timeout-minutes: 30
     env:
-      RUSTUP_TOOLCHAIN: 1.99.0
+      RUSTUP_TOOLCHAIN: 1.99.1
       CARGO_BUILD_JOBS: "2"
       RUSTFLAGS: -D warnings
     steps:
@@ -48,7 +48,7 @@ jobs:
         run: bash tests/regression/check_vex_flag_reads.sh
 
       - name: Install exact Rust compiler, formatter and linter
-        uses: dtolnay/rust-toolchain@1.99.0
+        uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: rustfmt, clippy
 
@@ -58,8 +58,8 @@ jobs:
           cargo --version
           rustfmt --version
           cargo clippy --version
-          test "$(rustc --version | cut -d' ' -f2)" = 1.99.0
-          test "$(cargo --version | cut -d' ' -f2)" = 1.99.0
+          test "$(rustc --version | cut -d' ' -f2)" = 1.99.1
+          test "$(cargo --version | cut -d' ' -f2)" = 1.99.1
 
       - name: Build compiler from this checkout
         run: cargo build --profile fastbuild --locked --bin lccc -j 2

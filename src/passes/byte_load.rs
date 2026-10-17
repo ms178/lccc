@@ -224,6 +224,33 @@ impl Ctx {
         self.peel_or_self(operand_value(op)?, 0)
     }
 
+    /// [`Self::peel`], but records every traversed `Copy` destination in
+    /// `consumed`, so the rewrite deletes chain-interior copies together
+    /// with the values they alias. `validate` then holds each recorded copy
+    /// to the same single-use/single-def/in-block proof as every other
+    /// folded value. Without this, the rewrite left behind `Copy`s whose
+    /// sources it deleted — structurally invalid SSA (ir-verify: "use of
+    /// undefined value"), and a second user of such a copy would silently
+    /// alias a deleted chain interior.
+    fn peel_consuming(&self, op: Operand, consumed: &mut Vec<Value>) -> Option<Value> {
+        let mut v = operand_value(op)?;
+        let mut budget = 0u32;
+        while budget < 8 {
+            match self.def(v) {
+                Some(Instruction::Copy { src, .. }) => match src {
+                    Operand::Value(src) => {
+                        consumed.push(v);
+                        v = *src;
+                        budget += 1;
+                    }
+                    Operand::Const(_) => return None,
+                },
+                _ => return Some(v),
+            }
+        }
+        Some(v)
+    }
+
     /// [`Self::peel`] for values that may have several definitions or none
     /// this pass knows about: those are returned unchanged (they are their own
     /// meaning), `Copy` chains are still followed.
@@ -337,7 +364,7 @@ fn match_sum(
     if depth > 64 {
         return None;
     }
-    let v = ctx.peel(op)?;
+    let v = ctx.peel_consuming(op, consumed)?;
     match ctx.def(v)? {
         Instruction::BinOp {
             dest,
@@ -391,7 +418,7 @@ fn match_cast_load(
     terms: &mut Vec<Term>,
     consumed: &mut Vec<Value>,
 ) -> Option<()> {
-    let v = ctx.peel(op)?;
+    let v = ctx.peel_consuming(op, consumed)?;
     match ctx.def(v)? {
         Instruction::Cast {
             dest,
@@ -400,7 +427,7 @@ fn match_cast_load(
             to_ty,
         } if *dest == v && wide_bits(*to_ty) == Some(bits) => {
             consumed.push(v);
-            let lv = ctx.peel(*src)?;
+            let lv = ctx.peel_consuming(*src, consumed)?;
             match ctx.def(lv)? {
                 Instruction::Load {
                     dest,
@@ -1705,5 +1732,152 @@ mod tests {
         for (_, ptr, _, _) in loads {
             assert_eq!(resolve(&f, ptr), (Value(0), 0));
         }
+    }
+
+    /// A chain whose links are joined through `Copy` aliases, the exact
+    /// shape canonicalize-copyprop leaves before the early byte-load run
+    /// (readonly_reduction_guard.c, ir-verify "use of undefined value").
+    fn copy_aliased_chain(second_copy_user: bool) -> IrFunction {
+        let p = Value(0);
+        let mut insns = vec![Instruction::ParamRef {
+            dest: p,
+            param_idx: 0,
+            ty: IrType::Ptr,
+        }];
+        // byte 0: load / cast / copy
+        insns.push(Instruction::Load {
+            dest: Value(1),
+            ptr: p,
+            ty: IrType::U8,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        });
+        insns.push(Instruction::Cast {
+            dest: Value(2),
+            src: Operand::Value(Value(1)),
+            from_ty: IrType::U8,
+            to_ty: IrType::U32,
+        });
+        insns.push(Instruction::Copy {
+            dest: Value(3),
+            src: Operand::Value(Value(2)),
+        });
+        // byte 1: gep / load / cast / shl / copy
+        insns.push(Instruction::GetElementPtr {
+            dest: Value(4),
+            base: p,
+            offset: Operand::Const(IrConst::I64(1)),
+            ty: IrType::Ptr,
+        });
+        insns.push(Instruction::Load {
+            dest: Value(5),
+            ptr: Value(4),
+            ty: IrType::U8,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        });
+        insns.push(Instruction::Cast {
+            dest: Value(6),
+            src: Operand::Value(Value(5)),
+            from_ty: IrType::U8,
+            to_ty: IrType::U32,
+        });
+        insns.push(Instruction::BinOp {
+            dest: Value(7),
+            op: IrBinOp::Shl,
+            lhs: Operand::Value(Value(6)),
+            rhs: Operand::Const(IrConst::I32(8)),
+            ty: IrType::U32,
+        });
+        insns.push(Instruction::Copy {
+            dest: Value(8),
+            src: Operand::Value(Value(7)),
+        });
+        insns.push(Instruction::BinOp {
+            dest: Value(9),
+            op: IrBinOp::Or,
+            lhs: Operand::Value(Value(3)),
+            rhs: Operand::Value(Value(8)),
+            ty: IrType::U32,
+        });
+        let result = if second_copy_user {
+            // A second user of the interior copy: folding would leave it
+            // aliasing a deleted chain value.
+            insns.push(Instruction::BinOp {
+                dest: Value(10),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(9)),
+                rhs: Operand::Value(Value(3)),
+                ty: IrType::U32,
+            });
+            Value(10)
+        } else {
+            Value(9)
+        };
+        let mut f = IrFunction::new("copy_chain".to_string(), IrType::U32, vec![], false);
+        f.next_value_id = 11;
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            source_spans: vec![],
+            instructions: insns,
+            terminator: Terminator::Return(Some(Operand::Value(result))),
+        });
+        f
+    }
+
+    /// Every value an instruction or the terminator references after the
+    /// rewrite must still have a definition: the rewrite may not leave
+    /// `Copy`s whose sources it deleted.
+    fn assert_no_dangling_operands(f: &IrFunction) {
+        let mut defined = std::collections::HashSet::new();
+        for block in &f.blocks {
+            for inst in &block.instructions {
+                if let Some(d) = inst.dest() {
+                    defined.insert(d.0);
+                }
+            }
+        }
+        for block in &f.blocks {
+            for inst in &block.instructions {
+                inst.for_each_used_value(|v| {
+                    assert!(
+                        defined.contains(&v),
+                        "instruction {inst:?} uses undefined v{v}"
+                    );
+                });
+            }
+            if let Terminator::Return(Some(Operand::Value(v))) = &block.terminator {
+                assert!(defined.contains(&v.0), "return of undefined {v:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn copy_aliased_links_die_with_the_chain() {
+        let mut f = copy_aliased_chain(false);
+        let orig = f.clone();
+        assert_eq!(run_function(&mut f, X64), 1);
+        assert_loads_stay_in_footprint(&orig, &f);
+        assert_no_dangling_operands(&f);
+        assert!(
+            !f.blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Copy { .. })),
+            "interior copies must be consumed: {:?}",
+            f.blocks[0].instructions
+        );
+    }
+
+    #[test]
+    fn a_second_user_of_an_interior_copy_refuses_the_fold() {
+        let mut f = copy_aliased_chain(true);
+        let orig = f.clone();
+        assert_eq!(run_function(&mut f, X64), 0, "{:?}", f.blocks[0]);
+        assert_eq!(
+            f.blocks[0].instructions.len(),
+            orig.blocks[0].instructions.len(),
+            "refusal must not edit the function"
+        );
     }
 }

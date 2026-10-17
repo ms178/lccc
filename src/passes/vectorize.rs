@@ -78,6 +78,8 @@
 
 #[path = "vectorize_byte_count_normalize.rs"]
 mod byte_count_normalize;
+#[path = "vectorize_generator_map.rs"]
+mod generator_map;
 #[path = "vectorize_strict_recip.rs"]
 mod strict_recip;
 
@@ -159,6 +161,9 @@ thread_local! {
     // policy bit.  Keeping it beside the map switch avoids an environment
     // lookup in every candidate loop and makes the early/main entries agree.
     static NO_MAP_I64_UNROLL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // Generator-map vectorizer policy: `(enabled, trace)`. Resolved once per
+    // pipeline run, like the map switches above.
+    static GENERATOR_MAP: std::cell::Cell<(bool, bool)> = const { std::cell::Cell::new((true, false)) };
     // ZERO-REM-1 kill switch: restored to "always emit the mirror" by
     // `CCC_NO_MAP_ZERO_REM=1`.  It exists so the dead-remainder win can be
     // re-measured at any time without rebuilding a historical tree -- the
@@ -182,6 +187,17 @@ pub(crate) fn set_no_map_vec(disabled: bool) {
 
 pub(crate) fn set_no_map_i64_unroll(disabled: bool) {
     NO_MAP_I64_UNROLL.with(|cell| cell.set(disabled));
+}
+
+/// Generator-map policy for this translation unit: `enabled` is false under the
+/// `CCC_NO_GENERATOR_MAP` kill switch or `LCCC_FORCE_SSE2`; `trace` enables the
+/// `[VEC-GEN]` line under `LCCC_DEBUG_VECTORIZE`.
+pub(crate) fn set_generator_map_policy(enabled: bool, trace: bool) {
+    GENERATOR_MAP.with(|cell| cell.set((enabled, trace)));
+}
+
+fn generator_map_policy() -> (bool, bool) {
+    GENERATOR_MAP.with(|cell| cell.get())
 }
 
 fn no_map_vec() -> bool {
@@ -31732,10 +31748,22 @@ fn vectorize_function_mode(
         return slp_changes;
     }
 
+    // Pure induction-variable generators (`dst[i] = (u8)F(i)`, no source loads)
+    // are invisible to the packed map vectorizer, which requires a load. This
+    // runs before the CFG snapshot because it appends blocks. It is AVX2-only,
+    // skipped for the late min/max rerun, and the CCC_NO_GENERATOR_MAP kill
+    // switch restores the scalar generator for A/B measurement.
+    let (gen_enabled, gen_trace) = generator_map_policy();
+    let gen_changes = if gen_enabled && !late_minmax_only() && x86_avx2_available() {
+        generator_map::transform_function(func, gen_trace)
+    } else {
+        0
+    };
+
     let cfg = CfgAnalysis::build(func);
     let loop_changes =
         vectorize_with_analysis_mode(func, &cfg, false, false, fp_reassoc, fp_contract);
-    let changes = preconv + slp_changes + loop_changes;
+    let changes = preconv + slp_changes + gen_changes + loop_changes;
 
     // The transforms replace the scalar accumulation with vector intrinsics but
     // leave the orphaned scalar load/mul/GEP/offset chain behind for the global

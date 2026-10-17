@@ -1184,7 +1184,7 @@ impl SemanticAnalyzer {
                 functions: &self.result.functions,
                 expr_types: Some(&self.result.expr_types),
             };
-            let eval = |e: &Expr| self.eval_const_expr(e);
+            let eval = |e: &Expr| self.eval_const_expr_value(e);
             let ctype = |e: &Expr| type_checker.infer_expr_ctype(e);
             let select = |controlling: &Expr, associations: &[GenericAssociation]| {
                 type_checker.generic_selection_index(controlling, associations)
@@ -3700,21 +3700,33 @@ impl SemanticAnalyzer {
 
     // === Constant expression evaluation ===
 
-    /// Try to evaluate a constant expression at compile time.
-    /// Returns None if the expression cannot be evaluated.
-    ///
-    /// This delegates to the richer SemaConstEval which returns IrConst,
-    /// then extracts the i64 value. This ensures enum values, bitfield
-    /// widths, and array sizes all use the same evaluation logic.
-    fn eval_const_expr(&self, expr: &Expr) -> Option<i64> {
-        let evaluator = SemaConstEval {
+    /// The constant evaluator, as used by enum values, bitfield widths, array
+    /// sizes, `case` labels and static-initializer folding.
+    fn sema_const_eval(&self) -> SemaConstEval<'_> {
+        SemaConstEval {
             types: &self.result.type_context,
             symbols: &self.symbol_table,
             functions: &self.result.functions,
             const_values: Some(&self.result.const_values),
             expr_types: Some(&self.result.expr_types),
-        };
-        evaluator.eval_const_expr(expr)?.to_i64()
+        }
+    }
+
+    /// Try to evaluate a constant expression at compile time, keeping the
+    /// value in its own type: an integer, a `float`/`double`, or a long
+    /// double. Returns None if the expression cannot be evaluated.
+    ///
+    /// Every consumer that needs an integer -- enum values, bitfield widths,
+    /// array sizes, `case` labels -- narrows with [`IrConst::to_i64`]; a
+    /// consumer that only asks *whether* an expression is constant must not,
+    /// or it would see a floating constant as no constant at all.
+    fn eval_const_expr_value(&self, expr: &Expr) -> Option<IrConst> {
+        self.sema_const_eval().eval_const_expr(expr)
+    }
+
+    /// Evaluate a constant expression at compile time and narrow it to `i64`.
+    fn eval_const_expr(&self, expr: &Expr) -> Option<i64> {
+        self.eval_const_expr_value(expr)?.to_i64()
     }
 
     // === Implicit declarations ===
@@ -4086,7 +4098,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
         checker.infer_expr_ctype(expr).unwrap_or(CType::Int)
     }
 
-    fn eval_const_expr_as_usize(&self, expr: &Expr) -> Option<usize> {
+    fn eval_array_bound_len(&self, expr: &Expr, elem: &CType) -> Option<usize> {
         self.eval_const_expr(expr).and_then(|v| {
             if v < 0 {
                 // C standard requires array sizes to be positive (constraint violation).
@@ -4095,10 +4107,33 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
                 self.diagnostics
                     .borrow_mut()
                     .error("size of array is negative", expr.span());
-                None
-            } else {
-                Some(v as usize)
+                return None;
             }
+            // A count that does not fit the target's `usize` cannot become an
+            // element count at all: on `-m32` the conversion would truncate and
+            // `char a[4294967296]` became a zero-element array. (Unreachable on
+            // LP64, where `i64::MAX` fits a 64-bit `usize`.)
+            if (v as u128) > usize::MAX as u128 {
+                self.diagnostics
+                    .borrow_mut()
+                    .error("size of array is too large", expr.span());
+                return None;
+            }
+            let n = v as usize;
+            // The bound must describe an existing object: GCC's maximum object
+            // size, the target's PTRDIFF_MAX bytes. Tested in u128 because the
+            // product that overflows is exactly the one that must be rejected --
+            // `int a[4611686018427387904]` is 2^64 bytes and used to wrap to a
+            // zero-byte object that compiled and linked without a word.
+            let elem_size = elem.size_ctx(&*self.result.type_context.borrow_struct_layouts());
+            if (n as u128) * (elem_size as u128) > crate::common::types::max_object_bytes() as u128
+            {
+                self.diagnostics
+                    .borrow_mut()
+                    .error("size of array is too large", expr.span());
+                return None;
+            }
+            Some(n)
         })
     }
 }
@@ -5208,8 +5243,16 @@ mod kr_prototype_tests {
 
     #[test]
     fn nested_and_indirect_kr_calls_do_not_acquire_body_prototypes() {
-        assert!(analyze("int outer(void) { int old(p) short *p; { return *p; } short a[2]; return old(&a); }").1.is_ok());
-        assert!(analyze("int old(p) short *p; { return *p; } int use(void) { short a[2]; return (&old)(&a); }").1.is_ok());
+        assert!(analyze(
+            "int outer(void) { int old(p) short *p; { return *p; } short a[2]; return old(&a); }"
+        )
+        .1
+        .is_ok());
+        assert!(analyze(
+            "int old(p) short *p; { return *p; } int use(void) { short a[2]; return (&old)(&a); }"
+        )
+        .1
+        .is_ok());
     }
 }
 

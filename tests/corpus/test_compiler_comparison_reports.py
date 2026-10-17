@@ -166,7 +166,7 @@ class ComparisonReport(unittest.TestCase):
 class HostedComparison(unittest.TestCase):
     def workflow(self):
         import yaml
-        return yaml.load((ROOT / '.github/workflows/pr826-redteam.yml').read_text(), Loader=yaml.BaseLoader)
+        return yaml.load((ROOT / '.github/workflows/compiler-comparison.yml').read_text(), Loader=yaml.BaseLoader)
 
     def test_research_is_explicitly_opted_in_without_widening_token_permissions(self):
         data = self.workflow()

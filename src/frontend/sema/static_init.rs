@@ -34,6 +34,35 @@ use crate::common::source::Span;
 use crate::common::symbol_table::SymbolTable;
 use crate::common::types::{AddressSpace, CType};
 use crate::frontend::parser::ast::{BinOp, Expr, GenericAssociation, Initializer, UnaryOp};
+use crate::ir::reexports::IrConst;
+
+/// Whether a constant is the integer zero, the null pointer constant (C11
+/// 6.3.2.3p3): a floating zero is not one.
+fn is_zero_constant(value: &IrConst) -> bool {
+    match *value {
+        IrConst::Zero => true,
+        other => other.to_i64() == Some(0),
+    }
+}
+
+/// Whether a constant condition is false: every zero, a floating zero
+/// included (C11 6.5.15p1 tests the condition against 0, and `-0.0` is 0).
+/// GCC 16.2 folds `0.0 ? a : b` by keeping `b` and `0.5 ? a : b` by keeping
+/// `a`, and rejects the *kept* operand when it is not a constant
+/// (`0.0 ? 3 : (int)(long)&g` is rejected, the same expression with `0.5` is
+/// accepted).
+fn is_false_condition(value: &IrConst) -> bool {
+    match *value {
+        IrConst::F32(v) => v == 0.0,
+        IrConst::F64(v) => v == 0.0,
+        IrConst::D32(bits) => bits & 0x7fff_ffff == 0,
+        IrConst::D64(bits) => bits & 0x7fff_ffff_ffff_ffff == 0,
+        // The f64 field of a long double constant carries the value (`-0.0L`
+        // has a set sign bit in its bytes but compares equal to zero).
+        IrConst::LongDouble(v, _) => v == 0.0,
+        ref other => is_zero_constant(other),
+    }
+}
 
 /// What an initializer expression is, for the purpose of a static initializer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,10 +74,11 @@ pub(super) enum Kind<'a> {
 
 /// Evaluates initializer expressions against the sema state. The closures
 /// keep this module free of the analyzer's borrow structure: `eval` is the
-/// integer constant evaluator and `ctype` the expression type inference.
+/// constant evaluator, answering in the expression's own type (`IrConst`),
+/// and `ctype` the expression type inference.
 pub(super) struct StaticInitChecker<'s> {
     symbols: &'s SymbolTable,
-    eval: &'s dyn Fn(&Expr) -> Option<i64>,
+    eval: &'s dyn Fn(&Expr) -> Option<IrConst>,
     ctype: &'s dyn Fn(&Expr) -> Option<CType>,
     /// The `_Generic` selection rule: the index of the selected association.
     select: &'s dyn Fn(&Expr, &[GenericAssociation]) -> Option<usize>,
@@ -57,7 +87,7 @@ pub(super) struct StaticInitChecker<'s> {
 impl<'s> StaticInitChecker<'s> {
     pub(super) fn new(
         symbols: &'s SymbolTable,
-        eval: &'s dyn Fn(&Expr) -> Option<i64>,
+        eval: &'s dyn Fn(&Expr) -> Option<IrConst>,
         ctype: &'s dyn Fn(&Expr) -> Option<CType>,
         select: &'s dyn Fn(&Expr, &[GenericAssociation]) -> Option<usize>,
     ) -> Self {
@@ -133,6 +163,12 @@ impl<'s> StaticInitChecker<'s> {
     /// The kind of an expression used as a value (after array and function
     /// designators decay).
     pub(super) fn value<'e>(&self, e: &'e Expr) -> Kind<'e> {
+        // Whatever the evaluator folds is a constant, in its own type. Asking
+        // for an `i64` here instead would make every *floating* constant
+        // invisible -- `static double y = __builtin_sqrt(4.0);` folds to
+        // `F64(2.0)` and has no `i64` form -- and sema would then reject a
+        // program it had just evaluated (GCC 16.2 accepts every row of
+        // tests/regression/file_scope_init/ that this accepts).
         if (self.eval)(e).is_some() {
             return Kind::Value;
         }
@@ -189,31 +225,34 @@ impl<'s> StaticInitChecker<'s> {
             Expr::Conditional(cond, then_e, else_e, _) => match (self.eval)(cond) {
                 // Only the selected operand is evaluated, so the other one may
                 // name an automatic object (GCC accepts `0 ? &a : 0`).
-                Some(0) => self.value(else_e),
+                Some(v) if is_false_condition(&v) => self.value(else_e),
                 Some(_) => self.value(then_e),
                 None => Kind::Bad,
             },
             // `c ?: f` yields `c` when it is nonzero, which is a constant here.
             Expr::GnuConditional(cond, else_e, _) => match (self.eval)(cond) {
-                Some(0) => self.value(else_e),
+                Some(v) if is_false_condition(&v) => self.value(else_e),
                 Some(_) => Kind::Value,
                 None => Kind::Bad,
             },
-            Expr::FunctionCall(callee, args, _) if self.folds_to_constant(callee, args) => {
-                Kind::Value
-            }
             // __builtin_choose_expr(const, a, b) is ONLY the selected operand:
             // the other one is never converted, so it may name an automatic
             // object (GCC 16.2 accepts `__builtin_choose_expr(1, 0, (int *)&a)`).
             // The kernel's PIN_GROUP(.mode = __builtin_choose_expr(
             // __builtin_constant_p((m)), (m), 0)) selects `0` for array `m`
-            // and keeps the static initializer constant.
+            // and keeps the static initializer constant. The arm exists for
+            // the same reason the Conditional and _Generic arms do: the
+            // evaluator folds choose_expr only when the SELECTED operand
+            // folds to a scalar, so an address-constant operand (a static
+            // array name, `.modes = choose_expr(bcp(m), NULL, (m))`) makes
+            // the whole call unevaluable there and only the operand
+            // classification below can accept it.
             Expr::FunctionCall(callee, args, _)
                 if matches!(callee.as_ref(), Expr::Identifier(n, _) if n == "__builtin_choose_expr")
                     && args.len() >= 3 =>
             {
                 match (self.eval)(&args[0]) {
-                    Some(0) => self.value(&args[2]),
+                    Some(v) if is_false_condition(&v) => self.value(&args[2]),
                     Some(_) => self.value(&args[1]),
                     None => Kind::Bad,
                 }
@@ -260,21 +299,6 @@ impl<'s> StaticInitChecker<'s> {
             }
             _ => Kind::Bad,
         }
-    }
-
-    /// Whether a call is folded to a constant by GCC: a pure math or bit
-    /// builtin (or the libm function it stands for) whose arguments are all
-    /// constant. `INFINITY`, `NAN`, `sqrt(4.0)`, `__builtin_isnan(1.0)` are
-    /// accepted by GCC 16.2 in static initializers; `__builtin_isnan(x)` for a
-    /// non-constant `x` is not. Calls outside the list are not folded.
-    fn folds_to_constant(&self, callee: &Expr, args: &[Expr]) -> bool {
-        let Expr::Identifier(name, _) = callee else {
-            return false;
-        };
-        if !is_foldable_builtin(name) {
-            return false;
-        }
-        args.iter().all(|a| self.value(a) != Kind::Bad)
     }
 
     /// The kind of an expression used as the operand of `&` (an lvalue whose
@@ -392,7 +416,7 @@ impl<'s> StaticInitChecker<'s> {
         a: Kind<'e>,
         b: Kind<'e>,
     ) -> Kind<'e> {
-        let is_null = |e: &Expr| (self.eval)(e) == Some(0);
+        let is_null = |e: &Expr| (self.eval)(e).is_some_and(|v| is_zero_constant(&v));
         // GCC 16.2 does not fold the ordering of an address converted to an
         // integer against the null constant: `(long)&a > 0` is "not computable
         // at load time". The pointer form `&a > 0` is folded.
@@ -485,71 +509,4 @@ fn is_label_address(e: &Expr) -> bool {
         Expr::Cast(_, inner, _, _) => is_label_address(inner),
         _ => false,
     }
-}
-
-/// The builtins GCC folds in constant expressions, by name stem. Each stem is
-/// accepted with the `__builtin_` prefix and one of `FOLDABLE_SUFFIXES`.
-const FOLDABLE_BUILTIN_STEMS: &[&str] = &[
-    "inf",
-    "nan",
-    "nans",
-    "huge_val",
-    "fabs",
-    "copysign",
-    "sqrt",
-    "floor",
-    "ceil",
-    "trunc",
-    "round",
-    "fmax",
-    "fmin",
-    "fma",
-    "isnan",
-    "isinf",
-    "isfinite",
-    "isnormal",
-    "signbit",
-    "fpclassify",
-    "clz",
-    "ctz",
-    "popcount",
-    "parity",
-    "ffs",
-    "bswap",
-    "expect",
-    "constant_p",
-];
-
-/// Precision and width suffixes of the stems above (`__builtin_nanf`,
-/// `__builtin_clzll`, `__builtin_bswap32`).
-const FOLDABLE_SUFFIXES: &[&str] = &["", "f", "l", "ll", "s", "16", "32", "64"];
-
-/// Whether `name` is a builtin, or the libm function of the same stem, that GCC
-/// folds in a constant expression. A user function that shadows one of these
-/// names is treated as the builtin. That can only accept more than GCC does,
-/// never reject a valid program.
-fn is_foldable_builtin(name: &str) -> bool {
-    if let Some(stem) = name.strip_prefix("__builtin_") {
-        return FOLDABLE_BUILTIN_STEMS.iter().any(|base| {
-            stem.strip_prefix(base)
-                .is_some_and(|suffix| FOLDABLE_SUFFIXES.contains(&suffix))
-        });
-    }
-    let base = name.trim_end_matches(['f', 'l']);
-    matches!(
-        base,
-        "sqrt"
-            | "fabs"
-            | "floor"
-            | "ceil"
-            | "trunc"
-            | "round"
-            | "fmax"
-            | "fmin"
-            | "fma"
-            | "copysign"
-            | "nan"
-            | "inf"
-            | "huge_val"
-    )
 }
