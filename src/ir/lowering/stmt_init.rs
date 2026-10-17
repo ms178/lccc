@@ -332,65 +332,8 @@ impl Lowerer {
         }
 
         // Detect struct/complex/vector returns that need special ABI handling
-        let mut sret_size = None;
-        let mut two_reg_ret_size = None;
-        if ptr_count == 0 {
-            let ret_ct = self.type_spec_to_ctype(ret_type_spec);
-            if ret_ct.is_struct_or_union() {
-                let size = self.sizeof_type(ret_type_spec);
-                let (s, t) = Self::classify_struct_return(size);
-                sret_size = s;
-                two_reg_ret_size = t;
-            }
-            // i686 Clang ext-vectors with up to three integer GP words return
-            // in EAX/EDX/ECX. All other ext-vector and vector_size return
-            // classification remains unchanged here.
-            if ret_ct.is_vector() {
-                let size = self.sizeof_type(ret_type_spec);
-                if crate::common::types::target_is_32bit() && matches!(ret_ct, CType::ExtVector(..))
-                {
-                    if let Some(words) = ret_ct.i686_ext_vector_gp_word_count() {
-                        sret_size = None;
-                        two_reg_ret_size = None;
-                        ret_ty = match words {
-                            1 => IrType::I32,
-                            2 => IrType::I64,
-                            3 => IrType::I128,
-                            _ => unreachable!("i686 ext-vector GP return word count is bounded"),
-                        };
-                    } else {
-                        sret_size = Some(size);
-                    }
-                } else {
-                    let (s, t) = Self::classify_struct_return(size);
-                    sret_size = s;
-                    two_reg_ret_size = t;
-                    // Small vector returns (<=8 bytes, no sret/two_reg) need I64.
-                    if s.is_none() && t.is_none() {
-                        ret_ty = IrType::I64;
-                    }
-                }
-            }
-            if matches!(ret_ct, CType::ComplexLongDouble) {
-                // On x86-64, _Complex long double returns via st(0)/st(1), no sret needed.
-                // On all other targets (including i686), use sret.
-                if !self.returns_complex_long_double_in_regs() {
-                    let size = self.sizeof_type(ret_type_spec);
-                    sret_size = Some(size);
-                }
-            }
-            // On i686, _Complex double (16 bytes) exceeds 8-byte reg pair, needs sret.
-            if matches!(ret_ct, CType::ComplexDouble) && !self.decomposes_complex_double() {
-                sret_size = Some(ret_ct.size());
-            }
-            // On i686, _Float128/_Decimal128 (TFmode/TDmode) is class MEMORY —
-            // hidden-pointer return, matching GCC's i386 convention.
-            if (matches!(ret_ct, CType::Float128) || ret_ct == CType::Decimal128)
-                && crate::common::types::target_is_32bit()
-            {
-                sret_size = Some(16);
-            }
-        }
+        let (sret_size, two_reg_ret_size) =
+            self.classify_abi_return(ret_type_spec, ptr_count, &mut ret_ty);
 
         // Return carrier classes are normally SysV eightbytes. On i686 an
         // ExtVector with three GP words uses three INTEGER markers for its
@@ -558,6 +501,78 @@ impl Lowerer {
     /// Lower an `Initializer::Expr` for a local variable declaration.
     /// Handles char arrays from string literals, struct copy-init, complex init,
     /// and scalar init with implicit casts.
+
+    /// Detect struct/complex/vector returns that need special ABI handling:
+    /// the `(sret_size, two_reg_ret_size)` pair for `ret_type_spec`, plus a
+    /// refined IR return type written back through `ret_ty` (i686 ext-vector
+    /// GP-word bundles and small-vector I64 returns).
+    fn classify_abi_return(
+        &self,
+        ret_type_spec: &TypeSpecifier,
+        ptr_count: usize,
+        ret_ty: &mut IrType,
+    ) -> (Option<usize>, Option<usize>) {
+        let mut sret_size = None;
+        let mut two_reg_ret_size = None;
+        if ptr_count == 0 {
+            let ret_ct = self.type_spec_to_ctype(ret_type_spec);
+            if ret_ct.is_struct_or_union() {
+                let size = self.sizeof_type(ret_type_spec);
+                let (s, t) = Self::classify_struct_return(size);
+                sret_size = s;
+                two_reg_ret_size = t;
+            }
+            // i686 Clang ext-vectors with up to three integer GP words return
+            // in EAX/EDX/ECX. All other ext-vector and vector_size return
+            // classification remains unchanged here.
+            if ret_ct.is_vector() {
+                let size = self.sizeof_type(ret_type_spec);
+                if crate::common::types::target_is_32bit() && matches!(ret_ct, CType::ExtVector(..))
+                {
+                    if let Some(words) = ret_ct.i686_ext_vector_gp_word_count() {
+                        sret_size = None;
+                        two_reg_ret_size = None;
+                        *ret_ty = match words {
+                            1 => IrType::I32,
+                            2 => IrType::I64,
+                            3 => IrType::I128,
+                            _ => unreachable!("i686 ext-vector GP return word count is bounded"),
+                        };
+                    } else {
+                        sret_size = Some(size);
+                    }
+                } else {
+                    let (s, t) = Self::classify_struct_return(size);
+                    sret_size = s;
+                    two_reg_ret_size = t;
+                    // Small vector returns (<=8 bytes, no sret/two_reg) need I64.
+                    if s.is_none() && t.is_none() {
+                        *ret_ty = IrType::I64;
+                    }
+                }
+            }
+            if matches!(ret_ct, CType::ComplexLongDouble) {
+                // On x86-64, _Complex long double returns via st(0)/st(1), no sret needed.
+                // On all other targets (including i686), use sret.
+                if !self.returns_complex_long_double_in_regs() {
+                    let size = self.sizeof_type(ret_type_spec);
+                    sret_size = Some(size);
+                }
+            }
+            // On i686, _Complex double (16 bytes) exceeds 8-byte reg pair, needs sret.
+            if matches!(ret_ct, CType::ComplexDouble) && !self.decomposes_complex_double() {
+                sret_size = Some(ret_ct.size());
+            }
+            // On i686, _Float128/_Decimal128 (TFmode/TDmode) is class MEMORY —
+            // hidden-pointer return, matching GCC's i386 convention.
+            if (matches!(ret_ct, CType::Float128) || ret_ct == CType::Decimal128)
+                && crate::common::types::target_is_32bit()
+            {
+                sret_size = Some(16);
+            }
+        }
+        (sret_size, two_reg_ret_size)
+    }
     pub(super) fn lower_local_init_expr(
         &mut self,
         expr: &Expr,
