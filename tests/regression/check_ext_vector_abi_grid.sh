@@ -48,7 +48,7 @@ declare -A expected expected_class
 while read -r e_bits e_opt e_shape e_leg e_check e_class e_id _; do
     [[ -z $e_bits || $e_bits == \#* ]] && continue
     case $e_class in
-        oracle|lccc) ;;
+        oracle|lccc|flaky) ;;
         *) echo "FAIL: $expectations: unknown class '$e_class' for $e_bits $e_opt $e_shape $e_leg $e_check" >&2; exit 1 ;;
     esac
     [[ -n $e_id ]] || { echo "FAIL: $expectations: missing tracking id for $e_bits $e_opt $e_shape $e_leg $e_check" >&2; exit 1; }
@@ -57,13 +57,15 @@ while read -r e_bits e_opt e_shape e_leg e_check e_class e_id _; do
 done < "$expectations"
 xfail_oracle=0
 xfail_lccc=0
+flaky_seen=0
+flaky_total=0
 declare -A seen_expected
 
 # leg_verdict <key> <rc> <run.log>: compare the checks the probe reported as
 # failing with the expectation for this leg. Returns 0 when they agree.
 leg_verdict() {
     local key=$1 rc=$2 log=$3
-    local actual want extra missing chk
+    local actual want extra missing chk flaky judged
     actual=$(awk '/^FAIL /{print $2}' "$log" | sort -u | tr '\n' ' ')
     want=$(tr ' ' '\n' <<<"${expected[$key]:-}" | sed '/^$/d' | sort -u | tr '\n' ' ')
     seen_expected[$key]=1
@@ -71,6 +73,20 @@ leg_verdict() {
         fail "$key: probe exited $rc without a verdict: $(tr '\n' ' ' <"$log")"
         return 1
     fi
+    # A `flaky` check is neither required nor forbidden: take it out of both
+    # sets before the exact comparison, and count the occurrences.
+    flaky=
+    judged=
+    for chk in $want; do
+        if [[ ${expected_class["$key $chk"]} == flaky ]]; then flaky+="$chk "; else judged+="$chk "; fi
+    done
+    want=$judged
+    judged=
+    for chk in $actual; do
+        if [[ " $flaky " == *" $chk "* ]]; then flaky_seen=$((flaky_seen + 1)); else judged+="$chk "; fi
+    done
+    actual=$judged
+    for chk in $flaky; do flaky_total=$((flaky_total + 1)); done
     extra=
     missing=
     for chk in $actual; do [[ " $want " == *" $chk "* ]] || extra+="$chk "; done
@@ -224,5 +240,6 @@ if [[ $fails -ne 0 ]]; then
     exit 1
 fi
 echo "PASS: ext-vector ABI grid vs Clang $CLANG_ORACLE_VERSION: $checked legs, $rejected rejection checks;" \
-    "expected failures held: $xfail_oracle oracle-inconsistent checks, $xfail_lccc open lccc defects" \
+    "expected failures held: $xfail_oracle oracle-inconsistent checks, $xfail_lccc open lccc defects," \
+    "$flaky_seen of $flaky_total flaky checks failed this run" \
     "(tests/regression/ext_vector_abi/grid_expectations.txt)"

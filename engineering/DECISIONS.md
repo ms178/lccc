@@ -3693,6 +3693,8 @@ re-baselining.
   (`tests/regression/ext_vector_abi/grid_expectations.txt`) with a class and
   tracking id per check, enforced in both directions — an unlisted failure
   and a listed pass are both red — and a PASS line that prints the open
-  count. Defects are documented with reproductions in
+  count. A second run failed a different subset of the x86-64 `va_arg`
+  legs (lccc reads an unwritten slot), so those carry class `flaky`:
+  counted, never judged, retired only by the fix. Defects are documented with reproductions in
   `engineering/FOLLOWUP-2026-10-17-ext-vector-grid.md`
   (ABI-EXTVEC-VA-1, ABI-EXTVEC-LD-1, ABI-EXTVEC-I386-O2-1).

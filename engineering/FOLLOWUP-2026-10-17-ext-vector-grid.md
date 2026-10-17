@@ -5,7 +5,8 @@ contracts" job (ubuntu-24.04, lccc fastbuild, Clang 23.1.3 from
 `scripts/ci_install_clang_oracle.sh`, GCC 16 as the linker driver).
 `tests/regression/check_ext_vector_abi_grid.sh` ran 848 legs over 53 shapes
 × {-m64, -m32} × {-O0, -O2} × four provider/caller pairings; 202 legs failed
-(249 individual checks). The gate had never run with its intended oracle
+(249 individual checks); a second run failed a different subset of 27
+x86-64 `va_arg` legs, which is itself a finding (see ABI-EXTVEC-VA-1). The gate had never run with its intended oracle
 before: the runner's clang-18 was not Clang 23.1.3, so the oracle check
 skipped it.
 
@@ -14,7 +15,7 @@ The failing checks are pinned, one line each, in
 any failure not in that file and on any listed failure that stops happening.
 This note explains the classes and how to retire them.
 
-## Class `oracle` — Clang 23.1.3 disagrees with itself (154 checks)
+## Class `oracle` — Clang 23.1.3 disagrees with itself (153 checks)
 
 For these (bits, opt, shape, check) tuples the **clang provider → clang
 caller** leg fails, so there is no reference convention for lccc to meet:
@@ -35,34 +36,45 @@ they are lccc bugs, and so a future oracle bump that fixes them shows up as
 "expected failure did not occur" and gets re-measured deliberately. The
 pinned leg is in `tests/regression/lib/clang_oracle.sh`.
 
-## Class `lccc` — open lccc defects (95 checks)
+## Class `lccc` / `flaky` — open lccc defects (56 deterministic + 72 flaky checks)
 
 Clang agrees with itself on these; lccc does not meet it.
 
-### ABI-EXTVEC-VA-1 — ext vectors wider than 16 bytes through `...` (43)
+### ABI-EXTVEC-VA-1 — x86-64 `va_arg` of ext vectors wider than 16 bytes (72 flaky checks)
 
-x86-64 and i386; -O0 and -O2; both directions, and **lccc provider → lccc
-caller** too, so it is not only a Clang-compatibility gap but an internal
-mismatch between lccc's variadic caller and its `va_arg`. Shapes: every
-ext vector whose storage exceeds 16 bytes (`u8x32 u16x12 u16x16 u32x5 u32x8
-u32x16 u64x3 u64x4 u64x8 f32x5 f32x8 f32x16 f64x3 f64x4 f64x8`). Non-variadic
-by-value passing of the same shapes (`hash2`) is correct on x86-64.
+**Nondeterministic.** Two hosted runs of the same binaries failed different
+subsets of the same legs: `hashva` on -m64 for `u8x32 u16x12 u16x16 u32x5
+u32x8 u32x16 u64x3 u64x4 u64x8 f32x5 f32x8 f32x16 f64x3 f64x4 f64x8` (and
+`ldx1 ldx2 ldx3`), at -O0 and -O2, whenever **lccc compiled the callee**
+(clang→lccc and lccc→lccc). The value read varies between runs, so lccc's
+`va_arg` reads a slot the caller never wrote — stack garbage — rather than a
+consistently wrong slot. The direction matters:
 
-Reproduce (x86-64):
+- lccc caller → Clang `va_arg` (lccc:clang) never fails `hashva` for these
+  shapes: lccc's variadic **caller** places the vector where the SysV ABI
+  says (class MEMORY, natural alignment, in the overflow area).
+- lccc `va_arg` fails against both callers: the **callee** half is wrong.
 
-    clang-23 -m64 -O0 -DPROVIDER -DELEM=unsigned -DLANES=8 -c tests/regression/ext_vector_abi/abi_grid.c -o p.o
-    lccc     -m64 -O0            -DELEM=unsigned -DLANES=8 -c tests/regression/ext_vector_abi/abi_grid.c -o c.o
-    gcc -m64 -no-pie p.o c.o -o t && ./t     # prints "FAIL hashva"
+These rows are class `flaky` in `grid_expectations.txt`: the gate counts
+them but cannot judge them. The i386 rows for the same shapes are class
+`oracle` (Clang disagrees with itself there), so there is no i386 reference.
 
-Where to look: the SysV rule is that an argument of class MEMORY (every
-`__m256`/`__m512`-sized vector without the AVX register-passing exception,
-and every padded shape) is pushed on the stack with its natural alignment
-and `va_arg` reads it from the overflow area with that alignment. Compare
-`src/ir/lowering/expr_calls.rs` (variadic caller staging of a vector
-argument) with the `va_arg` lowering for `CType::ExtVector`, and check the
-16/32-byte alignment of the overflow slot on both sides.
+Reproduce (x86-64; run several times, the verdict varies):
 
-### ABI-EXTVEC-LD-1 — `long double` ext vectors by value, x86-64 (25)
+    lccc     -m64 -O0 -DPROVIDER -DELEM=unsigned -DLANES=8 -c tests/regression/ext_vector_abi/abi_grid.c -o p.o   # lccc callee (the failing half)
+    clang-23 -m64 -O0            -DELEM=unsigned -DLANES=8 -c tests/regression/ext_vector_abi/abi_grid.c -o c.o
+    gcc -m64 -no-pie p.o c.o -o t && for i in 1 2 3 4 5; do ./t; done   # "FAIL hashva" on some runs
+
+Where to look: the `va_arg` lowering for `CType::ExtVector` (and `Vector`)
+of class MEMORY. The SysV rule: round `overflow_arg_area` up to the type's
+alignment when it exceeds 8 (16 for 32-byte vectors; 32 is NOT required by
+the psABI, which caps at 16 — Clang follows the cap), read the object there,
+then advance by the size rounded up to 8. A read from the register save
+area, or an advance by the unpadded lane size instead of the storage size,
+both produce exactly this stack-dependent garbage. Compare with the GNU
+`__attribute__((vector_size(32)))` path, which the SysV gate covers.
+
+### ABI-EXTVEC-LD-1 — `long double` ext vectors by value, x86-64 (29 deterministic)
 
 `ldx2`/`ldx3` as arguments (`hash2`) disagree with Clang in both directions
 at -O0 and -O2; `ldx1` return (`ident`, `kfour`) fails **lccc → lccc** —
