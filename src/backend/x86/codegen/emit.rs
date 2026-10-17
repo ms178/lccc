@@ -6690,6 +6690,23 @@ impl X86Codegen {
         if self.machinst_disabled_kinds & MI_CALL_TYPED != 0 {
             return false;
         }
+        // AUD-VABI-3: the typed-call plan homes a 64-bit integer return in a
+        // general-purpose register (it builds `CallRetMove` from the
+        // allocator's home). An 8-byte value whose single eightbyte
+        // classifies as SSE does NOT arrive there: SysV carries it in the low
+        // half of %xmm0, which only the mature call path reads
+        // (`emit_call_store_result_impl`). Measured at -O2: `V foo(void)`
+        // returned its value in %xmm0 while the caller read %rax, which is
+        // how tests/regression/vec_incdec_elementwise.c came to abort.
+        if info.ret_eightbyte_classes.len() == 1
+            && info.ret_eightbyte_classes[0] == crate::common::types::EightbyteClass::Sse
+            && matches!(
+                info.return_type,
+                crate::common::types::IrType::I64 | crate::common::types::IrType::U64
+            )
+        {
+            return false;
+        }
         // Static-chain calls stay on the mature path. The preceding
         // SetStaticChain emission armed `state.chain_call`, and only
         // `emit_call_instruction_impl` discharges that flag by publishing

@@ -225,14 +225,13 @@ impl Lowerer {
                     self.emit_field_complex(item, base_alloca, field_offset, &field.ty);
                     item_idx += 1;
                 }
-                CType::Vector(elem_ty, total_size) => {
+                CType::Vector(..) | CType::ExtVector(..) => {
                     self.emit_field_vector(
                         item,
                         items,
                         &mut item_idx,
                         base_alloca,
-                        elem_ty,
-                        *total_size,
+                        &field.ty,
                         field_offset,
                     );
                 }
@@ -1130,32 +1129,25 @@ impl Lowerer {
         items: &[InitializerItem],
         item_idx: &mut usize,
         base_alloca: Value,
-        elem_ty: &CType,
-        total_size: usize,
+        vector_ct: &CType,
         field_offset: usize,
     ) {
-        let elem_size = elem_ty.size();
-        let num_elems = if elem_size > 0 {
-            total_size / elem_size
-        } else {
-            0
+        let Some((elem_ty, num_elems)) = vector_ct.vector_info() else {
+            return;
         };
+        let total_size = self.ctype_size(vector_ct);
         let elem_ir_ty = IrType::from_ctype(elem_ty);
         let field_addr = self.emit_gep_offset(base_alloca, field_offset, IrType::Ptr);
 
         match &item.init {
             Initializer::List(sub_items) => {
-                // List initializer: {1.0f, 2.0f, 3.0f, 4.0f}
-                // Use the existing vector init list helper
-                self.lower_vector_init_list(sub_items, field_addr, elem_ty, num_elems);
+                self.lower_vector_init_list(sub_items, field_addr, vector_ct);
                 *item_idx += 1;
             }
             Initializer::Expr(e) => {
-                // Expression initializer: could be a vector expression or a scalar
                 let expr_ct = self.expr_ctype(e);
                 if expr_ct.is_vector() {
-                    // Vector expression: memcpy
-                    let src = self.lower_expr(e);
+                    let src = self.lower_aggregate_rvalue(e);
                     let src_val = self.operand_to_value(src);
                     self.emit(Instruction::Memcpy {
                         dest: field_addr,
@@ -1164,38 +1156,63 @@ impl Lowerer {
                     });
                     *item_idx += 1;
                 } else {
-                    // Scalar: store as first element, then consume trailing flat items
-                    // for remaining elements (C11 6.7.9p17: flat init continues to next element)
-                    let val = self.lower_expr(e);
-                    let expr_ty = self.get_expr_type(e);
-                    let val = self.emit_implicit_cast(val, expr_ty, elem_ir_ty);
-                    self.emit_array_element_store(field_addr, val, 0, elem_ir_ty);
+                    // A scalar begins a flat vector initializer; remaining
+                    // non-designated items fill the logical lanes, not padding.
+                    self.zero_init_alloca(field_addr, total_size);
+                    let first = self.lower_expr(e);
+                    let first_ty = self.get_expr_type(e);
+                    let first = if matches!(elem_ty, CType::Bool) {
+                        self.emit_bool_normalize_typed(first, first_ty)
+                    } else {
+                        self.emit_implicit_cast(first, first_ty, elem_ir_ty)
+                    };
+                    let first_ty = if matches!(elem_ty, CType::Bool) {
+                        IrType::I32
+                    } else {
+                        elem_ir_ty
+                    };
+                    self.store_vector_lane(
+                        field_addr,
+                        vector_ct,
+                        0,
+                        first,
+                        first_ty,
+                        AddressSpace::Default,
+                        false,
+                    );
                     *item_idx += 1;
 
-                    // Consume subsequent non-designated items as remaining vector elements
-                    let mut ei = 1;
-                    while ei < num_elems && *item_idx < items.len() {
+                    let mut lane = 1;
+                    while lane < num_elems && *item_idx < items.len() {
                         let next_item = &items[*item_idx];
                         if !next_item.designators.is_empty() {
                             break;
                         }
-                        let expr_opt = match &next_item.init {
-                            Initializer::Expr(ne) => Some(ne),
+                        let expr = match &next_item.init {
+                            Initializer::Expr(next) => Some(next),
                             Initializer::List(sub_items) => {
                                 Self::unwrap_nested_init_expr(sub_items)
                             }
                         };
-                        if let Some(ne) = expr_opt {
-                            let nval = self.lower_expr(ne);
-                            let net = self.get_expr_type(ne);
-                            let nval = self.emit_implicit_cast(nval, net, elem_ir_ty);
-                            let offset = ei * elem_size;
-                            self.emit_array_element_store(field_addr, nval, offset, elem_ir_ty);
+                        let Some(expr) = expr else { break };
+                        let val = self.lower_expr(expr);
+                        let src_ty = self.get_expr_type(expr);
+                        let (val, val_ty) = if matches!(elem_ty, CType::Bool) {
+                            (self.emit_bool_normalize_typed(val, src_ty), IrType::I32)
                         } else {
-                            break;
-                        }
+                            (self.emit_implicit_cast(val, src_ty, elem_ir_ty), elem_ir_ty)
+                        };
+                        self.store_vector_lane(
+                            field_addr,
+                            vector_ct,
+                            lane,
+                            val,
+                            val_ty,
+                            AddressSpace::Default,
+                            false,
+                        );
                         *item_idx += 1;
-                        ei += 1;
+                        lane += 1;
                     }
                 }
             }

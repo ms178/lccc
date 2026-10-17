@@ -311,7 +311,9 @@ impl Lowerer {
                 }
             }
             // Vector type: return the element IR type (used for per-element operations)
-            TypeSpecifier::Vector(inner, _) => self.type_spec_to_ir(inner),
+            TypeSpecifier::Vector(inner, _) | TypeSpecifier::ExtVector(inner, _) => {
+                self.type_spec_to_ir(inner)
+            }
         }
     }
 
@@ -536,9 +538,14 @@ impl Lowerer {
         if let TypeSpecifier::TypeofType(inner) = ts {
             return self.sizeof_type(inner);
         }
-        // Handle vector types: total_bytes is the vector size
+        // vector_size carries its explicit byte width; ext_vector_type uses
+        // the padded CType layout and explicit logical lane count.
         if let TypeSpecifier::Vector(_, total_bytes) = ts {
             return *total_bytes;
+        }
+        if matches!(ts, TypeSpecifier::ExtVector(..)) {
+            let ctype = self.type_spec_to_ctype(ts);
+            return ctype.size_ctx(&*self.types.borrow_struct_layouts());
         }
         let ts = self.resolve_type_spec(ts);
         if let Some((size, _)) = Self::scalar_type_size_align(ts) {
@@ -582,10 +589,13 @@ impl Lowerer {
         if let TypeSpecifier::TypeofType(inner) = ts {
             return self.alignof_type(inner);
         }
-        // Handle vector types: alignment equals total vector size (power-of-2 aligned)
+        // vector_size retains its existing capped alignment; ext_vector_type
+        // uses the target-specific padded layout computed by CType.
         if let TypeSpecifier::Vector(_, total_bytes) = ts {
-            // Vector alignment is typically the total vector size, capped at 16
             return (*total_bytes).min(16);
+        }
+        if matches!(ts, TypeSpecifier::ExtVector(..)) {
+            return self.ctype_align(&self.type_spec_to_ctype(ts));
         }
         let ts = self.resolve_type_spec(ts);
         if let Some((_, align)) = Self::scalar_type_size_align(ts) {
@@ -630,6 +640,11 @@ impl Lowerer {
         }
         if let TypeSpecifier::Vector(_, total_bytes) = ts {
             return (*total_bytes).min(16);
+        }
+        if matches!(ts, TypeSpecifier::ExtVector(..)) {
+            return self
+                .type_spec_to_ctype(ts)
+                .preferred_align_ctx(&*self.types.borrow_struct_layouts());
         }
         let ts = self.resolve_type_spec(ts);
         // On i686, check if scalar type has preferred alignment different from ABI

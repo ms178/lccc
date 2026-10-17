@@ -1277,13 +1277,7 @@ impl Lowerer {
     /// the return value is packed into a register (I64), not a pointer.
     /// We detect this case and spill the packed value to an alloca first.
     fn lower_vector_assign(&mut self, lhs: &Expr, rhs: &Expr, lhs_ct: &CType) -> Operand {
-        let (_, total_size) = match lhs_ct {
-            CType::Vector(_, total_size) => ((), *total_size),
-            _ => unreachable!(
-                "lower_vector_assign called with non-vector type: {:?}",
-                lhs_ct
-            ),
-        };
+        let total_size = lhs_ct.size();
         let lhs_ptr = self.lower_expr(lhs);
         let lhs_ptr_val = self.operand_to_value(lhs_ptr);
 
@@ -1338,10 +1332,40 @@ impl Lowerer {
         Operand::Value(lhs_ptr_val)
     }
 
-    /// Check if an expression is a function call that returns a small vector in a register.
+    /// True when a call returns an i686 integer ExtVector through GP words.
+    /// Those results are reconstructed into an addressable vector object by
+    /// `lower_function_call`, not exposed as a packed scalar carrier.
+    fn is_i686_ext_vector_gp_return_call(&self, expr: &Expr) -> bool {
+        if !crate::common::types::target_is_32bit() {
+            return false;
+        }
+        let Expr::FunctionCall(func_expr, _, _) = expr else {
+            return false;
+        };
+        let mut stripped = func_expr.as_ref();
+        while let Expr::Deref(inner, _) = stripped {
+            stripped = inner;
+        }
+        let ret_ct = if let Expr::Identifier(name, _) = stripped {
+            if self.is_func_ptr_variable(name) {
+                self.fptr_variable_sig(name)
+                    .and_then(|sig| sig.return_ctype.clone())
+            } else {
+                self.func_meta
+                    .sigs
+                    .get(name.as_str())
+                    .and_then(|sig| sig.return_ctype.clone())
+            }
+        } else {
+            self.call_return_ctype(func_expr)
+        };
+        ret_ct.is_some_and(|ct| ct.i686_ext_vector_gp_word_count().is_some())
+    }
+
+    /// Check if an expression is a function call returning packed scalar vector data.
     pub(super) fn rhs_is_small_vector_call(&self, rhs: &Expr, vec_size: usize) -> bool {
-        if vec_size > 8 {
-            return false; // Large vectors use sret, returned as pointer
+        if vec_size > 8 || self.is_i686_ext_vector_gp_return_call(rhs) {
+            return false; // Large/specially reconstructed vectors are already addressable.
         }
         match rhs {
             Expr::FunctionCall(func_expr, _, _) => {
@@ -1372,6 +1396,29 @@ impl Lowerer {
         }
     }
 
+    /// Materialize a vector rvalue as an address. Small vector-returning calls
+    /// use a packed register carrier; elementwise operations need an address to
+    /// inspect its lanes, so spill those carriers using the exact object size.
+    pub(super) fn vector_operand_ptr(&mut self, expr: &Expr, vector_ct: &CType) -> Value {
+        let lowered = self.lower_aggregate_rvalue(expr);
+        if self.rhs_is_small_vector_call(expr, vector_ct.size()) {
+            let size = vector_ct.size();
+            let align = self.ctype_align(vector_ct);
+            let alloca = self.emit_entry_alloca(IrType::Ptr, size, align, false);
+            let store_ty = Self::packed_store_type(size);
+            self.emit(Instruction::Store {
+                volatile: false,
+                val: lowered,
+                ptr: alloca,
+                ty: store_ty,
+                seg_override: AddressSpace::Default,
+            });
+            alloca
+        } else {
+            self.operand_to_value(lowered)
+        }
+    }
+
     /// Lower vector compound assignment (a += b, a -= b, etc.): element-wise operation.
     /// The RHS may be a scalar, which is broadcast to all vector elements.
     fn lower_vector_compound_assign(
@@ -1386,26 +1433,24 @@ impl Lowerer {
             None => return Operand::Const(IrConst::I64(0)),
         };
         let elem_ir_ty = Self::vector_elem_ir_type(&elem_ct);
-        let elem_size = elem_ct.size();
         let is_unsigned = elem_ct.is_unsigned();
-
-        // Get the IR binary operation
         let ir_op = Self::binop_to_ir(*op, is_unsigned);
 
-        // LHS is always a vector for compound assignment. Its address is the
-        // object's storage, so its loads and stores use the object's space
-        // (a `__seg_gs` vector is read and written through %gs).
+        // LHS remains an lvalue in its own address space. Lane helpers handle
+        // both byte-strided numeric vectors and bit-packed bool ext-vectors.
         let lhs_ptr = self.lower_expr(lhs);
         let lhs_ptr_val = self.operand_to_value(lhs_ptr);
         let lhs_space = self.get_addr_space_of_struct_expr(lhs);
         let lhs_volatile = self.expr_access_is_volatile(lhs);
 
-        // RHS may be a scalar or a vector
-        let rhs_is_vector = self.expr_ctype(rhs).is_vector();
-        let rhs_lowered = self.lower_aggregate_rvalue(rhs);
-        let rhs_val = self.operand_to_value(rhs_lowered);
-
-        // For scalar RHS, cast to element type once (broadcast value)
+        let rhs_ct = self.expr_ctype(rhs);
+        let rhs_is_vector = rhs_ct.is_vector();
+        let rhs_val = if rhs_is_vector {
+            self.vector_operand_ptr(rhs, &rhs_ct)
+        } else {
+            let lowered = self.lower_expr(rhs);
+            self.operand_to_value(lowered)
+        };
         let rhs_scalar = if !rhs_is_vector {
             let src_ty = self.get_expr_type(rhs);
             Some(self.emit_implicit_cast(Operand::Value(rhs_val), src_ty, elem_ir_ty))
@@ -1413,67 +1458,25 @@ impl Lowerer {
             None
         };
 
-        // Element-wise operation
-        let ptr_int_ty = crate::common::types::target_int_ir_type();
-        for i in 0..num_elems {
-            let offset = i * elem_size;
-            // GEP to element i for LHS
-            let lhs_elem_ptr = if offset > 0 {
-                self.emit_binop_val(
-                    IrBinOp::Add,
-                    Operand::Value(lhs_ptr_val),
-                    Operand::Const(IrConst::ptr_int(offset as i64)),
-                    ptr_int_ty,
-                )
+        for lane in 0..num_elems {
+            let lhs_elem =
+                self.load_vector_lane(lhs_ptr_val, lhs_ct, lane, lhs_space, lhs_volatile);
+            let rhs_elem = if let Some(scalar) = rhs_scalar {
+                scalar
             } else {
-                lhs_ptr_val
+                self.load_vector_lane(rhs_val, &rhs_ct, lane, AddressSpace::Default, false)
             };
-            // Load LHS element
-            let lhs_elem = self.fresh_value();
-            self.emit(Instruction::Load {
-                volatile: lhs_volatile,
-                dest: lhs_elem,
-                ptr: lhs_elem_ptr,
-                ty: elem_ir_ty,
-                seg_override: lhs_space,
-            });
-            // Get RHS element: splatted scalar or loaded from vector
-            let rhs_elem_op = if let Some(ref scalar_op) = rhs_scalar {
-                *scalar_op
-            } else {
-                let rhs_elem_ptr = if offset > 0 {
-                    self.emit_binop_val(
-                        IrBinOp::Add,
-                        Operand::Value(rhs_val),
-                        Operand::Const(IrConst::ptr_int(offset as i64)),
-                        ptr_int_ty,
-                    )
-                } else {
-                    rhs_val
-                };
-                let rhs_elem = self.fresh_value();
-                self.emit(Instruction::Load {
-                    volatile: false,
-                    dest: rhs_elem,
-                    ptr: rhs_elem_ptr,
-                    ty: elem_ir_ty,
-                    seg_override: AddressSpace::Default,
-                });
-                Operand::Value(rhs_elem)
-            };
-            // Compute result
-            let result_elem =
-                self.emit_binop_val(ir_op, Operand::Value(lhs_elem), rhs_elem_op, elem_ir_ty);
-            // Store back to LHS
-            self.emit(Instruction::Store {
-                volatile: lhs_volatile,
-                val: Operand::Value(result_elem),
-                ptr: lhs_elem_ptr,
-                ty: elem_ir_ty,
-                seg_override: lhs_space,
-            });
+            let result = self.emit_binop_val(ir_op, lhs_elem, rhs_elem, elem_ir_ty);
+            self.store_vector_lane(
+                lhs_ptr_val,
+                lhs_ct,
+                lane,
+                Operand::Value(result),
+                elem_ir_ty,
+                lhs_space,
+                lhs_volatile,
+            );
         }
-
         Operand::Value(lhs_ptr_val)
     }
 
@@ -1492,31 +1495,37 @@ impl Lowerer {
             None => return Operand::Const(IrConst::I64(0)),
         };
         let elem_ir_ty = Self::vector_elem_ir_type(&elem_ct);
-        let elem_size = elem_ct.size();
-        let total_size = match vec_ct {
-            CType::Vector(_, ts) => *ts,
-            _ => unreachable!(
-                "lower_vector_binary_op called with non-vector type: {:?}",
-                vec_ct
-            ),
-        };
+        let total_size = vec_ct.size();
+        let result_align = self.ctype_align(vec_ct);
         let is_unsigned = elem_ct.is_unsigned();
         let ir_op = Self::binop_to_ir(*op, is_unsigned);
 
-        // Determine if each operand is a vector or scalar.
-        let lhs_is_vector = self.expr_ctype(lhs).is_vector();
-        let rhs_is_vector = self.expr_ctype(rhs).is_vector();
+        let lhs_ct = self.expr_ctype(lhs);
+        let rhs_ct = self.expr_ctype(rhs);
+        let lhs_is_vector = lhs_ct.is_vector();
+        let rhs_is_vector = rhs_ct.is_vector();
 
-        // Allocate result vector on stack
-        let result_alloca = self.emit_entry_alloca(IrType::Ptr, total_size, total_size, false);
+        let result_alloca = self.emit_entry_alloca(IrType::Ptr, total_size, result_align, false);
+        // Padded bytes are not logical lanes, and packed bool stores use
+        // read-modify-write. Initialize the complete object before lane writes
+        // when either can be observed; see `vector_temp_needs_zero_init`.
+        if crate::ir::lowering::lower::vector_temp_needs_zero_init(vec_ct, num_elems) {
+            self.zero_init_alloca(result_alloca, total_size);
+        }
 
-        // Lower operands. Vectors produce pointers; scalars produce values.
-        let lhs_lowered = self.lower_aggregate_rvalue(lhs);
-        let lhs_val = self.operand_to_value(lhs_lowered);
-        let rhs_lowered = self.lower_aggregate_rvalue(rhs);
-        let rhs_val = self.operand_to_value(rhs_lowered);
+        let lhs_val = if lhs_is_vector {
+            self.vector_operand_ptr(lhs, &lhs_ct)
+        } else {
+            let lowered = self.lower_expr(lhs);
+            self.operand_to_value(lowered)
+        };
+        let rhs_val = if rhs_is_vector {
+            self.vector_operand_ptr(rhs, &rhs_ct)
+        } else {
+            let lowered = self.lower_expr(rhs);
+            self.operand_to_value(lowered)
+        };
 
-        // For scalar operands, cast to the element type once (broadcast value).
         let lhs_scalar = if !lhs_is_vector {
             let src_ty = self.get_expr_type(lhs);
             Some(self.emit_implicit_cast(Operand::Value(lhs_val), src_ty, elem_ir_ty))
@@ -1529,85 +1538,38 @@ impl Lowerer {
         } else {
             None
         };
+        // `vector_operand_ptr` returns an address produced by
+        // `lower_aggregate_rvalue`, which copies a segment-resident object into
+        // a generic temporary (see `seg_copy::copy_segment_to_temp`). The
+        // materialized operand therefore lives in the DEFAULT address space:
+        // applying the expression's own segment to it would read `%gs:` at a
+        // stack address and fault (caught by
+        // tests/regression/seg_gs_runtime/seg_gs_audit.c).
+        let lhs_volatile = self.expr_access_is_volatile(lhs);
+        let rhs_volatile = self.expr_access_is_volatile(rhs);
 
-        // Element-wise operation
-        let ptr_int_ty = crate::common::types::target_int_ir_type();
-        for i in 0..num_elems {
-            let offset = i * elem_size;
-
-            // Get LHS element: load from vector, or use splatted scalar
-            let lhs_elem_op = if let Some(ref scalar_op) = lhs_scalar {
-                *scalar_op
+        for lane in 0..num_elems {
+            let lhs_elem = if let Some(scalar) = lhs_scalar {
+                scalar
             } else {
-                let lhs_elem_ptr = if offset > 0 {
-                    self.emit_binop_val(
-                        IrBinOp::Add,
-                        Operand::Value(lhs_val),
-                        Operand::Const(IrConst::ptr_int(offset as i64)),
-                        ptr_int_ty,
-                    )
-                } else {
-                    lhs_val
-                };
-                let lhs_elem = self.fresh_value();
-                self.emit(Instruction::Load {
-                    volatile: false,
-                    dest: lhs_elem,
-                    ptr: lhs_elem_ptr,
-                    ty: elem_ir_ty,
-                    seg_override: AddressSpace::Default,
-                });
-                Operand::Value(lhs_elem)
+                self.load_vector_lane(lhs_val, &lhs_ct, lane, AddressSpace::Default, lhs_volatile)
             };
-
-            // Get RHS element: load from vector, or use splatted scalar
-            let rhs_elem_op = if let Some(ref scalar_op) = rhs_scalar {
-                *scalar_op
+            let rhs_elem = if let Some(scalar) = rhs_scalar {
+                scalar
             } else {
-                let rhs_elem_ptr = if offset > 0 {
-                    self.emit_binop_val(
-                        IrBinOp::Add,
-                        Operand::Value(rhs_val),
-                        Operand::Const(IrConst::ptr_int(offset as i64)),
-                        ptr_int_ty,
-                    )
-                } else {
-                    rhs_val
-                };
-                let rhs_elem = self.fresh_value();
-                self.emit(Instruction::Load {
-                    volatile: false,
-                    dest: rhs_elem,
-                    ptr: rhs_elem_ptr,
-                    ty: elem_ir_ty,
-                    seg_override: AddressSpace::Default,
-                });
-                Operand::Value(rhs_elem)
+                self.load_vector_lane(rhs_val, &rhs_ct, lane, AddressSpace::Default, rhs_volatile)
             };
-
-            let result_elem_ptr = if offset > 0 {
-                self.emit_binop_val(
-                    IrBinOp::Add,
-                    Operand::Value(result_alloca),
-                    Operand::Const(IrConst::ptr_int(offset as i64)),
-                    ptr_int_ty,
-                )
-            } else {
-                result_alloca
-            };
-
-            // Compute result
-            let result_elem = self.emit_binop_val(ir_op, lhs_elem_op, rhs_elem_op, elem_ir_ty);
-            // Store to result
-            self.emit(Instruction::Store {
-                volatile: false,
-                val: Operand::Value(result_elem),
-                ptr: result_elem_ptr,
-                ty: elem_ir_ty,
-                seg_override: AddressSpace::Default,
-            });
+            let result = self.emit_binop_val(ir_op, lhs_elem, rhs_elem, elem_ir_ty);
+            self.store_vector_lane(
+                result_alloca,
+                vec_ct,
+                lane,
+                Operand::Value(result),
+                elem_ir_ty,
+                AddressSpace::Default,
+                false,
+            );
         }
-
         Operand::Value(result_alloca)
     }
 
@@ -1639,27 +1601,29 @@ impl Lowerer {
             None => return Operand::Const(IrConst::I64(0)),
         };
         let elem_ir_ty = Self::vector_elem_ir_type(&elem_ct);
-        let elem_size = elem_ct.size();
-        let total_size = match vec_ct {
-            CType::Vector(_, ts) => *ts,
-            _ => unreachable!("lower_vector_cmp called with non-vector type: {:?}", vec_ct),
+        let total_size = vec_ct.size();
+        let result_alloca =
+            self.emit_entry_alloca(IrType::Ptr, total_size, self.ctype_align(vec_ct), false);
+        if crate::ir::lowering::lower::vector_temp_needs_zero_init(vec_ct, num_elems) {
+            self.zero_init_alloca(result_alloca, total_size);
+        }
+
+        let lhs_ct = self.expr_ctype(lhs);
+        let rhs_ct = self.expr_ctype(rhs);
+        let lhs_is_vector = lhs_ct.is_vector();
+        let rhs_is_vector = rhs_ct.is_vector();
+        let lhs_val = if lhs_is_vector {
+            self.vector_operand_ptr(lhs, &lhs_ct)
+        } else {
+            let lowered = self.lower_expr(lhs);
+            self.operand_to_value(lowered)
         };
-        let is_unsigned = elem_ct.is_unsigned();
-        let cmp_op = Self::binop_to_cmp(op, is_unsigned);
-
-        let lhs_is_vector = self.expr_ctype(lhs).is_vector();
-        let rhs_is_vector = self.expr_ctype(rhs).is_vector();
-
-        // Allocate the result mask vector on the stack.
-        let result_alloca = self.emit_entry_alloca(IrType::Ptr, total_size, total_size, false);
-
-        let lhs_lowered = self.lower_aggregate_rvalue(lhs);
-        let lhs_val = self.operand_to_value(lhs_lowered);
-        let rhs_lowered = self.lower_aggregate_rvalue(rhs);
-        let rhs_val = self.operand_to_value(rhs_lowered);
-
-        // For a scalar operand, cast it to the element type once (the
-        // broadcast value); for a vector operand we load each lane.
+        let rhs_val = if rhs_is_vector {
+            self.vector_operand_ptr(rhs, &rhs_ct)
+        } else {
+            let lowered = self.lower_expr(rhs);
+            self.operand_to_value(lowered)
+        };
         let lhs_scalar = if !lhs_is_vector {
             let src_ty = self.get_expr_type(lhs);
             Some(self.emit_implicit_cast(Operand::Value(lhs_val), src_ty, elem_ir_ty))
@@ -1672,91 +1636,47 @@ impl Lowerer {
         } else {
             None
         };
+        // `vector_operand_ptr` returns an address produced by
+        // `lower_aggregate_rvalue`, which copies a segment-resident object into
+        // a generic temporary (see `seg_copy::copy_segment_to_temp`). The
+        // materialized operand therefore lives in the DEFAULT address space:
+        // applying the expression's own segment to it would read `%gs:` at a
+        // stack address and fault (caught by
+        // tests/regression/seg_gs_runtime/seg_gs_audit.c).
+        let lhs_volatile = self.expr_access_is_volatile(lhs);
+        let rhs_volatile = self.expr_access_is_volatile(rhs);
+        let is_unsigned = elem_ct.is_unsigned();
+        let cmp_op = Self::binop_to_cmp(op, is_unsigned);
 
-        let ptr_int_ty = crate::common::types::target_int_ir_type();
-        for i in 0..num_elems {
-            let offset = i * elem_size;
-
-            // LHS element: load the lane from the vector, or reuse the
-            // broadcast scalar.
-            let lhs_elem_op = if let Some(ref scalar_op) = lhs_scalar {
-                *scalar_op
+        for lane in 0..num_elems {
+            let lhs_elem = if let Some(scalar) = lhs_scalar {
+                scalar
             } else {
-                let lhs_elem_ptr = if offset > 0 {
-                    self.emit_binop_val(
-                        IrBinOp::Add,
-                        Operand::Value(lhs_val),
-                        Operand::Const(IrConst::ptr_int(offset as i64)),
-                        ptr_int_ty,
-                    )
-                } else {
-                    lhs_val
-                };
-                let lhs_elem = self.fresh_value();
-                self.emit(Instruction::Load {
-                    volatile: false,
-                    dest: lhs_elem,
-                    ptr: lhs_elem_ptr,
-                    ty: elem_ir_ty,
-                    seg_override: AddressSpace::Default,
-                });
-                Operand::Value(lhs_elem)
+                self.load_vector_lane(lhs_val, &lhs_ct, lane, AddressSpace::Default, lhs_volatile)
             };
-
-            // RHS element.
-            let rhs_elem_op = if let Some(ref scalar_op) = rhs_scalar {
-                *scalar_op
+            let rhs_elem = if let Some(scalar) = rhs_scalar {
+                scalar
             } else {
-                let rhs_elem_ptr = if offset > 0 {
-                    self.emit_binop_val(
-                        IrBinOp::Add,
-                        Operand::Value(rhs_val),
-                        Operand::Const(IrConst::ptr_int(offset as i64)),
-                        ptr_int_ty,
-                    )
-                } else {
-                    rhs_val
-                };
-                let rhs_elem = self.fresh_value();
-                self.emit(Instruction::Load {
-                    volatile: false,
-                    dest: rhs_elem,
-                    ptr: rhs_elem_ptr,
-                    ty: elem_ir_ty,
-                    seg_override: AddressSpace::Default,
-                });
-                Operand::Value(rhs_elem)
+                self.load_vector_lane(rhs_val, &rhs_ct, lane, AddressSpace::Default, rhs_volatile)
             };
-
-            let result_elem_ptr = if offset > 0 {
-                self.emit_binop_val(
-                    IrBinOp::Add,
-                    Operand::Value(result_alloca),
-                    Operand::Const(IrConst::ptr_int(offset as i64)),
-                    ptr_int_ty,
-                )
-            } else {
-                result_alloca
-            };
-
-            // Lane predicate -> all-ones/all-zeros mask.  `Cmp` yields an I32
-            // 0/1 boolean; widen to the element type, then `0 - x` produces
-            // the all-ones mask (two's complement) for the true lane and 0 for
-            // the false lane, at any element width.
-            let cond = self.emit_cmp_val(cmp_op, lhs_elem_op, rhs_elem_op, elem_ir_ty);
+            let cond = self.emit_cmp_val(cmp_op, lhs_elem, rhs_elem, elem_ir_ty);
             let cond_ext = self.emit_cast_val(Operand::Value(cond), IrType::I32, elem_ir_ty);
-            let zero = Operand::Const(Self::ir_zero_const(elem_ir_ty));
-            let mask =
-                self.emit_binop_val(IrBinOp::Sub, zero, Operand::Value(cond_ext), elem_ir_ty);
-            self.emit(Instruction::Store {
-                volatile: false,
-                val: Operand::Value(mask),
-                ptr: result_elem_ptr,
-                ty: elem_ir_ty,
-                seg_override: AddressSpace::Default,
-            });
+            let mask = self.emit_binop_val(
+                IrBinOp::Sub,
+                Operand::Const(Self::ir_zero_const(elem_ir_ty)),
+                Operand::Value(cond_ext),
+                elem_ir_ty,
+            );
+            self.store_vector_lane(
+                result_alloca,
+                vec_ct,
+                lane,
+                Operand::Value(mask),
+                elem_ir_ty,
+                AddressSpace::Default,
+                false,
+            );
         }
-
         Operand::Value(result_alloca)
     }
 
@@ -1777,63 +1697,58 @@ impl Lowerer {
             None => return Operand::Const(IrConst::I64(0)),
         };
         let elem_ir_ty = Self::vector_elem_ir_type(&elem_ct);
-        let elem_size = elem_ct.size();
-        let total_size = match vec_ct {
-            CType::Vector(_, ts) => *ts,
-            _ => unreachable!(
-                "lower_vector_unary called with non-vector type: {:?}",
-                vec_ct
-            ),
-        };
-        let result_alloca = self.emit_entry_alloca(IrType::Ptr, total_size, total_size, false);
-        let val = self.lower_aggregate_rvalue(inner);
-        let val = self.operand_to_value(val);
-        let ptr_int_ty = crate::common::types::target_int_ir_type();
+        let total_size = vec_ct.size();
+        let result_alloca =
+            self.emit_entry_alloca(IrType::Ptr, total_size, self.ctype_align(vec_ct), false);
+        if crate::ir::lowering::lower::vector_temp_needs_zero_init(vec_ct, num_elems) {
+            self.zero_init_alloca(result_alloca, total_size);
+        }
 
-        for i in 0..num_elems {
-            let offset = i * elem_size;
-            let elem_ptr = if offset > 0 {
-                self.emit_binop_val(
-                    IrBinOp::Add,
-                    Operand::Value(val),
-                    Operand::Const(IrConst::ptr_int(offset as i64)),
-                    ptr_int_ty,
-                )
-            } else {
-                val
-            };
-            let elem = self.fresh_value();
-            self.emit(Instruction::Load {
-                volatile: false,
-                dest: elem,
-                ptr: elem_ptr,
-                ty: elem_ir_ty,
-                seg_override: AddressSpace::Default,
-            });
-            let result_elem_ptr = if offset > 0 {
-                self.emit_binop_val(
-                    IrBinOp::Add,
-                    Operand::Value(result_alloca),
-                    Operand::Const(IrConst::ptr_int(offset as i64)),
-                    ptr_int_ty,
-                )
-            } else {
-                result_alloca
-            };
-            let result_elem = self.fresh_value();
-            self.emit(Instruction::UnaryOp {
-                dest: result_elem,
-                op: ir_unary,
-                src: Operand::Value(elem),
-                ty: elem_ir_ty,
-            });
-            self.emit(Instruction::Store {
-                volatile: false,
-                val: Operand::Value(result_elem),
-                ptr: result_elem_ptr,
-                ty: elem_ir_ty,
-                seg_override: AddressSpace::Default,
-            });
+        let src_ct = self.expr_ctype(inner);
+        let val = self.vector_operand_ptr(inner, &src_ct);
+        // `vector_operand_ptr` returns an address produced by
+        // `lower_aggregate_rvalue`, which copies a segment-resident object into
+        // a generic temporary (see `seg_copy::copy_segment_to_temp`). The
+        // materialized operand therefore lives in the DEFAULT address space:
+        // applying the expression's own segment to it would read `%gs:` at a
+        // stack address and fault (caught by
+        // tests/regression/seg_gs_runtime/seg_gs_audit.c).
+        let src_volatile = self.expr_access_is_volatile(inner);
+
+        for lane in 0..num_elems {
+            let elem =
+                self.load_vector_lane(val, &src_ct, lane, AddressSpace::Default, src_volatile);
+            // A bool vector's bitwise NOT is one-bit NOT, not an eight-bit
+            // complement followed by truth normalization (which would make
+            // both 0 and 1 true). XOR with one expresses the lane operation.
+            let result_elem =
+                if vec_ct.is_bitpacked_bool_vector() && matches!(ir_unary, IrUnaryOp::Not) {
+                    let elem = self.emit_implicit_cast(elem, elem_ir_ty, IrType::U8);
+                    Operand::Value(self.emit_binop_val(
+                        IrBinOp::Xor,
+                        elem,
+                        Operand::Const(IrConst::I64(1)),
+                        IrType::U8,
+                    ))
+                } else {
+                    let dest = self.fresh_value();
+                    self.emit(Instruction::UnaryOp {
+                        dest,
+                        op: ir_unary,
+                        src: elem,
+                        ty: elem_ir_ty,
+                    });
+                    Operand::Value(dest)
+                };
+            self.store_vector_lane(
+                result_alloca,
+                vec_ct,
+                lane,
+                result_elem,
+                elem_ir_ty,
+                AddressSpace::Default,
+                false,
+            );
         }
         Operand::Value(result_alloca)
     }

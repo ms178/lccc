@@ -246,10 +246,10 @@ pub struct IrFunction {
     /// These blocks must be kept reachable and not merged away by CFG simplify,
     /// since their labels appear in global data (.quad .LBB3) and must resolve.
     pub global_init_label_blocks: Vec<super::instruction::BlockId>,
-    /// SysV AMD64 ABI eightbyte classification for the return struct (if 9-16 bytes).
-    /// Used by the x86-64 backend to determine whether each eightbyte should be
-    /// returned in a GP register (rax/rdx) or SSE register (xmm0/xmm1).
-    /// Empty for non-struct returns, sret, or non-x86-64 targets.
+    /// Return carrier classes. SysV AMD64 uses one entry per eightbyte for
+    /// aggregate returns (rax/rdx or xmm0/xmm1). On i686, three INTEGER entries
+    /// mark the Clang integer ExtVector EAX:EDX:ECX return bundle. Empty when
+    /// neither convention applies.
     pub ret_eightbyte_classes: Vec<crate::common::types::EightbyteClass>,
     /// True if the return value is _Float128 (ONE 16-byte XMM return).
     pub ret_is_f128_sse: bool,
@@ -291,7 +291,9 @@ pub struct IrParam {
     pub param_align: Option<usize>,
     /// Per-eightbyte SysV ABI classification for struct params (x86-64 only).
     /// Empty for non-struct params or when classification is not applicable.
-    /// Each entry indicates whether that eightbyte should use SSE or GP registers.
+    /// A singleton `[NoClass]` on a scalar parameter is the internal i686
+    /// ExtVector-lane marker: the lane is stack-passed even under regparm and
+    /// does not consume the next ordinary GP register.
     pub struct_eightbyte_classes: Vec<crate::common::types::EightbyteClass>,
     /// True for _Float128 params: ONE 16-byte XMM register.
     pub is_f128_sse: bool,

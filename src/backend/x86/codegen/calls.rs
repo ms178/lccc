@@ -1761,6 +1761,19 @@ impl X86Codegen {
             self.state.invalidate_vec_peephole();
             return;
         }
+        // AUD-VABI-2: an 8-byte vector comes back in ONE SSE eightbyte (the low
+        // half of %xmm0), not in %rax. The IR type of the bit container is
+        // I64/U64, so the default path below would read the accumulator.
+        if self.call_ret_classes.len() == 1
+            && self.call_ret_classes[0] == crate::common::types::EightbyteClass::Sse
+            && matches!(return_type, IrType::I64 | IrType::U64)
+        {
+            self.store_xmm_to(dest, "xmm0", IrType::F64);
+            self.state.reg_cache.invalidate_all();
+            self.flush_pending_vec_store_impl();
+            self.state.invalidate_vec_peephole();
+            return;
+        }
         if is_i128_type(return_type) {
             use crate::common::types::EightbyteClass;
             if self.call_ret_classes.len() == 2 {

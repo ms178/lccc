@@ -57,8 +57,8 @@ enum PrecedenceLevel {
 impl Parser {
     /// Consume any pending `__attribute__((vector_size(N)))` or `__attribute__((ext_vector_type(N)))`
     /// that was parsed during a type specifier and wrap the given TypeSpecifier in a
-    /// `TypeSpecifier::Vector` node.  This is needed for casts, compound literals, sizeof,
-    /// and _Alignof where the vector_size attribute is not captured in a Declaration.
+    /// `TypeSpecifier::Vector` or `TypeSpecifier::ExtVector` node. This is needed for casts,
+    /// compound literals, sizeof, and _Alignof where the attribute is not captured in a Declaration.
     pub(super) fn apply_pending_vector_attr(&mut self, ts: TypeSpecifier) -> TypeSpecifier {
         if let Some(total_bytes) = self.attrs.parsing_vector_size.take() {
             return TypeSpecifier::Vector(Box::new(ts), total_bytes);
@@ -71,8 +71,8 @@ impl Parser {
             let total = self
                 .ext_vector_element_storage_size(&ts)
                 .and_then(|width| nelem.checked_mul(width));
-            if let Some(total) = total {
-                return TypeSpecifier::Vector(Box::new(ts), total);
+            if total.is_some() {
+                return TypeSpecifier::ExtVector(Box::new(ts), nelem);
             }
             self.emit_error(
                 "invalid or unresolvable ext_vector_type element size",
