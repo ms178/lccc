@@ -29,6 +29,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 import sys
@@ -480,10 +481,202 @@ def _compile_local(executable: str, source: Path, flags: str) -> list[str]:
             raise GodboltError(f"local compile failed: {error}") from error
 
 
+# ---------------------------------------------------------------------------
+# Local oracles: compilers that run on this host, not on Compiler Explorer.
+#
+# Local release-line channels are OPT-IN, never DEFAULT_ORACLES. A fresh
+# prefix selects the newest authenticated Intel APT build in that line;
+# manifests and measurement records retain the actual patch/build identity.
+LOCAL_ORACLES: dict[str, dict[str, Any]] = {
+    "icx2026.2": {
+        "name": "Intel oneAPI DPC++/C++ 2026.2.x (local)",
+        "release_line": "2026.2",
+        "compilerType": "local-icx",
+        "env": "LCCC_ICX_BIN",
+        "provision": "ensure_icx_2026.sh",
+        "probe_macro": "__INTEL_LLVM_COMPILER",
+    },
+}
+_LOCAL_BINARIES: dict[str, tuple[tuple[str | None, ...], Path, tuple[int, ...], str]] = {}
+_LOCAL_LOCK = threading.Lock()
+
+
+def _probe_macros(binary: str) -> dict[str, str]:
+    """Probe release and effective native data model in one compiler process."""
+    result = subprocess.run(
+        [binary, "-E", "-dM", "-x", "c", os.devnull],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode:
+        raise GodboltError(f"compiler macro probe failed: {result.stderr.strip()}")
+    macros = {}
+    for line in result.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0] == "#define":
+            macros[parts[1]] = parts[2].strip()
+    return macros
+
+
+def validate_local_oracle_flags(name: str, flags: str) -> None:
+    """Local ICX channels measure native x86-64 LP64, not arbitrary retargets.
+
+    Response/config files and forwarded driver/frontend options can hide a
+    target change; reject these opaque channels instead of guessing their
+    meaning. Ordinary ISA tuning, optimization and language flags remain valid.
+    """
+    try:
+        tokens = shlex.split(flags)
+    except ValueError as error:
+        raise GodboltError(f"{name}: invalid compiler flags: {error}") from error
+    forbidden = ('-target', '--target', '-arch', '-mabi', '--config', '-config',
+                 '-Xclang', '-Xarch', '-Xpreprocessor', '-cc1', '-ccc-host-triple',
+                 '--gcc-toolchain', '-specs', '--specs', '-wrapper')
+    for token in tokens:
+        if (token in ('-m16', '-m32', '-mx32', '--') or token.startswith('@')
+                or any(token == opt or token.startswith(opt + '=') for opt in forbidden)
+                or token.startswith(('-Xarch_', '-Wp,', '-Xclang='))):
+            raise GodboltError(f"{name}: native x86-64 LP64 oracle rejects target/opaque option {token!r}")
+
+
+def _binary_identity(path: Path) -> tuple[int, ...]:
+    stat = path.stat()
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def _local_semver(spec: dict[str, Any], probed: str | None) -> str:
+    if probed is None or not re.fullmatch(r"[0-9]{8}", probed):
+        raise GodboltError(f"missing or invalid {spec['probe_macro']} probe: {probed!r}")
+    value = int(probed)
+    major, minor, patch = value // 10000, value // 100 % 100, value % 100
+    if f"{major}.{minor}" != spec["release_line"]:
+        raise GodboltError(
+            f"compiler probes {spec['probe_macro']}={probed!r}, "
+            f"expected release line {spec['release_line']}"
+        )
+    return f"{major}.{minor}.{patch}"
+
+
+def _validated_local_oracle(name: str) -> tuple[Path, str]:
+    spec = LOCAL_ORACLES[name]
+    with _LOCAL_LOCK:
+        explicit = os.environ.get(spec["env"])
+        context = (explicit, os.environ.get("LCCC_ICX_PREFIX"), os.environ.get("LCCC_ICX_MIRROR"))
+        cached = _LOCAL_BINARIES.get(name)
+        try:
+            binary = None
+            if explicit is not None:
+                if not explicit.strip():
+                    raise GodboltError(f"{spec['env']} must not be empty")
+                binary = shutil.which(os.path.expanduser(explicit))
+                if binary is None:
+                    raise GodboltError(f"{spec['env']} is not an executable: {explicit}")
+            if cached is not None and cached[0] == context and explicit is None:
+                _, path, identity, _ = cached
+                if _binary_identity(path) == identity:
+                    binary = str(path)
+            # Always reprobe: some filesystems have coarse timestamps, so
+            # stat identity alone cannot prove an executable is unchanged.
+            if binary is None:
+                provisioner = Path(__file__).resolve().parent / spec["provision"]
+                result = subprocess.run([str(provisioner)], capture_output=True, text=True, timeout=3600)
+                if result.returncode:
+                    raise GodboltError(f"{name}: provisioning failed: {result.stderr.strip()}")
+                lines = result.stdout.strip().splitlines()
+                if len(lines) != 1:
+                    raise GodboltError(f"{name}: provisioner must print exactly one binary path")
+                binary = lines[0]
+            path = Path(binary).resolve()
+            before = _binary_identity(path)
+            macros = _probe_macros(str(path))
+            probed = macros.get(spec["probe_macro"])
+            if macros.get('__x86_64__') != '1' or macros.get('__SIZEOF_POINTER__') != '8':
+                raise GodboltError(f"{name}: compiler probe is not native x86-64 LP64")
+            _local_semver(spec, probed)
+            if _binary_identity(path) != before:
+                raise GodboltError(f"{name}: compiler changed during version probe")
+            assert probed is not None
+            _LOCAL_BINARIES[name] = (context, path, before, probed)
+            return path, probed
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise GodboltError(f"{name}: compiler resolution/probe failed: {error}") from error
+
+
+def local_oracle_binary(name: str) -> Path:
+    """Resolve and probe an opt-in local release line; invalidate changed binaries."""
+    return _validated_local_oracle(name)[0]
+
+
+def local_oracle_metadata(name: str) -> dict[str, Any]:
+    """Record the actual patch release, binary digest and available APT lock."""
+    spec = LOCAL_ORACLES[name]
+    binary, probed = _validated_local_oracle(name)
+    before = _binary_identity(binary)
+    digest = hashlib.sha256()
+    with binary.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    if _binary_identity(binary) != before:
+        raise GodboltError(f"{name}: compiler changed while hashing provenance")
+    metadata = {
+        "id": name,
+        "name": spec["name"],
+        "semver": _local_semver(spec, probed),
+        "compilerType": spec["compilerType"],
+        "binary": str(binary),
+        "binary_sha256": digest.hexdigest(),
+        "probe": f"{spec['probe_macro']}={probed}",
+        "target": "x86_64",
+        "pointer_bits": 64,
+    }
+    for parent in binary.parents:
+        manifest = parent / ".lccc-icx.json"
+        if manifest.is_file():
+            try:
+                locked = json.loads(manifest.read_text())
+                if not isinstance(locked, dict) or not all(k in locked for k in ('binary', 'binary_sha256', 'semver')):
+                    raise ValueError('missing required identity fields')
+            except (OSError, ValueError) as error:
+                raise GodboltError(f"{name}: invalid provisioning manifest: {error}") from error
+            if ((parent / locked["binary"]).resolve() != binary
+                    or locked["binary_sha256"] != metadata["binary_sha256"]
+                    or locked["semver"] != metadata["semver"]):
+                raise GodboltError(f"{name}: provisioning manifest disagrees with compiler")
+            metadata["provisioning"] = locked
+            break
+    return metadata
+
+
+def compile_local_oracle(name: str, source: Path, flags: str) -> list[str]:
+    """Assembly lines from a local oracle; never touches Compiler Explorer."""
+    validate_local_oracle_flags(name, flags)
+    return _compile_local(str(local_oracle_binary(name)), source, flags)
+
+
+def oracle_assembly(name: str, source: Path, flags: str, *,
+                    compilers: list[dict[str, Any]] | None = None,
+                    intel: bool = False) -> tuple[dict[str, Any], list[str]]:
+    """Shared dispatch for CLI users: local names never touch remote APIs."""
+    if name in LOCAL_ORACLES:
+        validate_local_oracle_flags(name, flags)
+        metadata = local_oracle_metadata(name)
+        effective_flags = flags + (' -masm=intel' if intel else '')
+        lines = compile_local_oracle(name, source, effective_flags)
+    else:
+        metadata = compiler_metadata(name, compilers=compilers)
+        result = compile_on_godbolt(name, source.read_text(), flags, intel=intel, raise_on_error=True)
+        if result is None:
+            raise GodboltError(f'{name}: missing compilation response')
+        lines = assembly_lines(result)
+    return metadata, lines
+
+
 def command_list(args: argparse.Namespace) -> int:
     pattern = re.compile(args.filter, re.IGNORECASE) if args.filter else None
     rows = []
-    for item in list_compilers(args.language, refresh=args.refresh):
+    local_items = [{"id": name, "name": spec['name'], "semver": spec['release_line'] + '.x'}
+                   for name, spec in LOCAL_ORACLES.items()]
+    remote_items = [] if args.local_only else list_compilers(args.language, refresh=args.refresh)
+    for item in [*remote_items, *local_items]:
         text = f"{item.get('id', '')} {item.get('name', '')} {item.get('semver', '')}"
         if pattern and not pattern.search(text):
             continue
@@ -494,6 +687,15 @@ def command_list(args: argparse.Namespace) -> int:
 
 
 def command_compile(args: argparse.Namespace) -> int:
+    if args.compiler in LOCAL_ORACLES:
+        if args.execute:
+            raise GodboltError('local oracle compile is assembly-only; --execute is unsupported')
+        _, assembly = oracle_assembly(args.compiler, args.source, args.flags, intel=args.intel)
+        body = _function_body(assembly, args.function)
+        if body is None:
+            raise GodboltError(f"function {args.function!r} was not emitted")
+        print('\n'.join(body))
+        return 0
     result = compile_on_godbolt(args.compiler, args.source.read_text(), args.flags,
                                 intel=args.intel, execute=args.execute)
     if result is None:
@@ -532,7 +734,7 @@ def command_compile(args: argparse.Namespace) -> int:
 def command_compare(args: argparse.Namespace) -> int:
     source_text = args.source.read_text()
     requested = [item.strip() for item in args.oracles.split(",") if item.strip()]
-    compilers = list_compilers("c")
+    compilers = list_compilers("c") if any(n not in LOCAL_ORACLES for n in requested) else []
     artifact_dir: Path | None = args.artifact_dir
     if artifact_dir:
         artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -556,13 +758,12 @@ def command_compare(args: argparse.Namespace) -> int:
         return 1
 
     for requested_name in requested:
-        cid = resolve_compiler(requested_name)
-        meta = compiler_metadata(cid, compilers=compilers)
-        result = compile_on_godbolt(cid, source_text, args.flags, intel=False)
-        if result is None:
-            records.append({"key": requested_name, **meta, "error": "compile failed"})
+        try:
+            meta, lines = oracle_assembly(requested_name, args.source, args.flags, compilers=compilers)
+        except GodboltError as error:
+            records.append({"key": requested_name, "id": resolve_compiler(requested_name), "error": str(error)})
             continue
-        body = _function_body(assembly_lines(result), args.function)
+        body = _function_body(lines, args.function)
         if body is None:
             records.append({
                 "key": requested_name, **meta, "flags": args.flags,
@@ -686,6 +887,7 @@ def build_parser() -> argparse.ArgumentParser:
     list_p.add_argument("--language", default="c")
     list_p.add_argument("--filter", default="")
     list_p.add_argument("--refresh", action="store_true")
+    list_p.add_argument("--local-only", action="store_true", help="list opt-in local channels without network/provisioning")
     list_p.set_defaults(func=command_list)
 
     compile_p = sub.add_parser("compile", help="compile one source with one CE compiler")
@@ -763,7 +965,11 @@ def main(argv: list[str] | None = None) -> int:
     if not hasattr(args, "func"):
         parser.print_help(sys.stderr)
         return 2
-    return args.func(args)
+    try:
+        return args.func(args)
+    except (GodboltError, OSError, subprocess.TimeoutExpired) as error:
+        print(f'godbolt: {error}', file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

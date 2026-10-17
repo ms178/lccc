@@ -705,4 +705,20 @@ mod tests {
             assert!(!scheduled(0, 2, false, Target::Aarch64, ""));
         }
     }
+
+    #[test]
+    fn affine_bound_checked_trip_product_boundaries() {
+        // 8-bit, step 2: the last body pass is iv = 252, the exit observes 255.
+        assert_eq!(adjusted_limit(0, 2, 1, 255, 8, false), Some(254));
+        // Step 255: a body pass at iv = 0, then the exit observes 255 + 1 = 256,
+        // outside the 8-bit domain. Refused, never wrapped.
+        assert_eq!(adjusted_limit(0, 255, 1, 255, 8, false), None);
+        // 64-bit: trips * step fills the domain and the exit overflows it.
+        assert_eq!(adjusted_limit(0, u64::MAX, 1, u64::MAX, 64, true), None);
+        // 64-bit, large step, but the exit still fits: accepted.
+        assert_eq!(
+            adjusted_limit(0, u64::MAX / 2, 1, u64::MAX, 64, false),
+            Some(u64::MAX - 1)
+        );
+    }
 }

@@ -212,6 +212,9 @@ gate "vex-flag-reads" fast \
 gate "load-cast-fold" fast \
     env CCC="$LCCC" bash tests/regression/check_load_cast_fold.sh
 
+gate "generator-map" fast \
+    env CCC="$LCCC" bash tests/regression/check_generator_map.sh
+
 gate "benchmark-codegen-registry" fast \
     python3 tests/regression/check_benchmark_codegen_registry.py
 
@@ -293,6 +296,11 @@ gate "const-volatile-objects" fast \
 # buffer, gcc-parity matrix (-O0..-O3 x {default, kill switch, -m32 SKIP}).
 gate "ivwiden-exposed-latch" fast \
     env CCC="$LCCC" bash tests/regression/check_ivwiden_exposed_latch.sh
+# Paired-counter (sibling mirror) proof: gcc-16 runtime-edge parity with and
+# without the kill switch, plus an assertion that the proof still changes the
+# constant-threshold loop (a silent refusal would otherwise pass unnoticed).
+gate "ivw-paired-counter" fast \
+    env CCC="$LCCC" bash tests/regression/check_ivw_paired_counter.sh
 gate "zlib-maketrees" fast \
     env CCC="$LCCC" bash tests/regression/check_zlib_maketrees.sh
 gate "fp-extract-homes" fast \
@@ -1889,6 +1897,15 @@ gate "godbolt-oracle-selftest" fast \
 # strands an oracle out of every future sweep. Pinned offline, no network.
 gate "godbolt-cache-selftest" fast \
     python3 scripts/test_godbolt_cache.py
+
+gate "generator-trace-selftest" fast \
+    python3 tests/regression/test_generator_map_gate.py
+
+gate "local-oracles-selftest" fast \
+    python3 scripts/test_local_oracles.py
+
+gate "icx-provision-selftest" fast \
+    python3 scripts/test_icx_provision.py
 
 # MS-11: glibc `make check` triage classifier (miscompile / unsupported /
 # environment). Fixture-driven, offline.
