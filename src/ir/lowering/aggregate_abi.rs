@@ -24,6 +24,9 @@ pub(super) struct AggregateReturn {
     pub one_xmm: bool,
     /// X87 + X87UP: the value comes back in `%st(0)` as a `long double`.
     pub x87: bool,
+    /// Two `long double` lanes come back in `%st(0)` and `%st(1)` (the
+    /// `_Complex long double` register pair); see `SysvPassing::X87Pair`.
+    pub x87_pair: bool,
 }
 
 impl Lowerer {
@@ -83,6 +86,11 @@ impl Lowerer {
                 r.two_reg_size = None;
                 r.x87 = true;
             }
+            Some(SysvPassing::X87Pair) => {
+                r.sret_size = None;
+                r.two_reg_size = None;
+                r.x87_pair = true;
+            }
             Some(passing @ SysvPassing::Regs(_)) => {
                 r.one_xmm = passing.one_xmm();
                 r.classes = passing.arg_classes();
@@ -127,6 +135,7 @@ impl Lowerer {
                     classes: s.ret_eightbyte_classes.clone(),
                     one_xmm: s.ret_is_f128_sse,
                     x87: s.ret_x87_aggregate,
+                    x87_pair: s.ret_x87_pair,
                 })
                 .unwrap_or_default(),
             _ => match self.call_return_ctype(callee) {
@@ -163,6 +172,10 @@ impl Lowerer {
             return false;
         }
         let ret = self.call_aggregate_return(callee);
-        ret.sret_size.is_none() && ret.two_reg_size.is_none() && !ret.one_xmm && !ret.x87
+        ret.sret_size.is_none()
+            && ret.two_reg_size.is_none()
+            && !ret.one_xmm
+            && !ret.x87
+            && !ret.x87_pair
     }
 }

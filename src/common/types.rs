@@ -2411,9 +2411,10 @@ impl CType {
     /// value must be rejected rather than silently disagree. Arguments:
     /// `_Bool` vectors over 64 lanes (LLVM spreads them one lane per stack
     /// byte slot). Returns over 16 bytes that LLVM still keeps in registers:
-    /// two to four %xmm pieces, three 8-byte lanes (%rax/%rdx/%rcx, or
-    /// %xmm0/%xmm1/%st(0)), and two `long double` lanes (%st(0)/%st(1)).
-    /// Every other larger return is sret, as lccc's MEMORY class does.
+    /// two to four %xmm pieces and three 8-byte lanes (%rax/%rdx/%rcx, or
+    /// %xmm0/%xmm1/%st(0)). Two `long double` lanes (%st(0)/%st(1)) are
+    /// implemented (`SysvPassing::X87Pair`). Every other larger return is
+    /// sret, as lccc's MEMORY class does.
     pub fn x86_64_ext_vector_unsupported(&self, is_return: bool) -> bool {
         let CType::ExtVector(elem, layout) = self else {
             return false;
@@ -2426,8 +2427,7 @@ impl CType {
             && (self
                 .ext_vector_xmm_pieces()
                 .is_some_and(|p| (2..=4).contains(&p))
-                || (layout.lanes == 3 && elem.size() == 8)
-                || (layout.lanes == 2 && matches!(**elem, CType::LongDouble)))
+                || (layout.lanes == 3 && elem.size() == 8))
     }
 
     /// Number of 32-bit i386 GP return words used for a Clang integer

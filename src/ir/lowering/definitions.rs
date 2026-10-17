@@ -349,6 +349,10 @@ pub(super) struct FuncSig {
     /// return value is the `long double` in %st(0); callers store it into a
     /// temporary of the aggregate type and `return` loads it from the object.
     pub ret_x87_aggregate: bool,
+    /// x86-64 two-lane `long double` ext vector return: lane 0 in %st(0)
+    /// (the IR return value) and lane 1 in %st(1) (`SetReturnF128Second` /
+    /// `GetReturnF128Second`), exactly like `_Complex long double`.
+    pub ret_x87_pair: bool,
     /// Per-param: true if the param is _Float128 (ONE 16-byte XMM param).
     pub param_is_f128_sse: Vec<bool>,
     /// Per-parameter struct sizes for by-value struct passing ABI.
@@ -378,6 +382,7 @@ impl FuncSig {
             ret_eightbyte_classes: Vec::new(),
             ret_is_f128_sse: false,
             ret_x87_aggregate: false,
+            ret_x87_pair: false,
             param_is_f128_sse: Vec::new(),
             param_struct_sizes: Vec::new(),
             param_struct_classes: Vec::new(),

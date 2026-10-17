@@ -132,12 +132,16 @@ elem_of() {
 
 in_list() { [[ " $2 " == *" $1 "* ]]; }
 
-# Clang 23.1.3 returns these in a multi-register sequence on both targets.
-ret_unsupported_both="u8x32 u16x16 u32x8 u32x16 u64x4 u64x8 f32x8 f32x16 f64x4 f64x8 ldx2"
+# Clang 23.1.3 returns these in a multi-register sequence on both targets
+# (a vector is not an aggregate for Clang's ABI code, so a MEMORY-class
+# return goes "direct" to LLVM, which splits it over %xmm0-3). `ldx2`
+# (%st(0)/%st(1), the _Complex long double pair) is implemented on x86-64
+# and still rejected on i386.
+ret_unsupported_both="u8x32 u16x16 u32x8 u32x16 u64x4 u64x8 f32x8 f32x16 f64x4 f64x8"
 ret_unsupported() {
     local bits=$1 shape=$2
     in_list "$shape" "$ret_unsupported_both" && return 0
-    if [[ $bits == 64 ]]; then in_list "$shape" "u64x3 f64x3"; else in_list "$shape" "bx128"; fi
+    if [[ $bits == 64 ]]; then in_list "$shape" "u64x3 f64x3"; else in_list "$shape" "bx128 ldx2"; fi
 }
 arg_unsupported() { [[ $2 == bx128 ]]; }
 

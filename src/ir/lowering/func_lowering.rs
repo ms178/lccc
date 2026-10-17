@@ -167,6 +167,18 @@ impl Lowerer {
                         {
                             return sig.return_type;
                         }
+                        // X87-class vector return (a one-lane `long double`
+                        // ext vector: Clang's `<1 x x86_fp80>` scalarizes to
+                        // `%st(0)`): the signature carries F128 and the
+                        // return statement loads the long double out of the
+                        // object (`ret_x87_aggregate`). Collapsing it to I64
+                        // here made the definition return a double image in
+                        // %rax while every caller — Clang and lccc's own —
+                        // popped %st(0) (ABI-EXTVEC-LD-1: `ldx1 ident/kfour`
+                        // failed even lccc -> lccc).
+                        if sig.ret_x87_aggregate || sig.ret_x87_pair {
+                            return sig.return_type;
+                        }
                         // Small legacy vector_size returns (≤8 bytes) use I64.
                         return IrType::I64;
                     }

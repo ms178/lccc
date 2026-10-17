@@ -206,6 +206,90 @@ else
     echo "note: no i386 execution capability (gcc -m32 link or qemu-i386); Part 3 not measured" >&2
 fi
 
+# ---------------------------------------------------------------- Part 4 --
+# x86-64 `long double` ext vector lanes against GCC's x87 conventions
+# (ABI-EXTVEC-LD-1). Clang hands a vector return of class MEMORY to LLVM
+# "direct" (`X86_64ABIInfo::getIndirectReturnResult`: a vector is not an
+# aggregate), which scalarizes `<N x x86_fp80>` into x87 returns: one lane
+# is `%st(0)` with a 16-byte memory argument -- exactly GCC's
+# `struct { long double }` (X87 class) -- and two lanes are `%st(0)/%st(1)`
+# -- exactly GCC's `_Complex long double` return. GCC compiles the struct /
+# complex side, lccc the ext-vector side, linked both ways; the values must
+# round-trip bit-exactly. (Arguments of the two-lane shape are not compared
+# with the complex form: Clang passes them `byval align 32`, GCC passes a
+# complex at 16; that slot alignment is covered by Part 1/2.)
+cat > "$tmp/ld_lccc.c" <<'EOF2'
+typedef long double T1 __attribute__((ext_vector_type(1)));
+typedef long double T2 __attribute__((ext_vector_type(2)));
+T1 ident1(T1 a) { return a; }
+T1 kfour1(int k, T1 a, T1 b, T1 c, T1 d, int j) { T1 r = d; r[0] = a[0] + b[0] * 2 + c[0] * 4 + d[0] * 8 + k + j; return r; }
+long double sum1(int k, T1 a, long double x, T1 b) { return a[0] * 3 + x + b[0] * 7 + k; }
+T2 ident2(T2 a) { return a; }
+T2 mk2(long double x, long double y) { T2 r; r[0] = x * 2; r[1] = y + 1; return r; }
+struct S1 { long double x; };
+struct S1 g_ident1(struct S1 a);
+struct S1 g_kfour1(int k, struct S1 a, struct S1 b, struct S1 c, struct S1 d, int j);
+long double g_sum1(int k, struct S1 a, long double x, struct S1 b);
+_Complex long double g_ident2(_Complex long double a);
+_Complex long double g_mk2(long double x, long double y);
+int lccc_calls_gcc(void) {
+    struct S1 a = {1.25L}, b = {2.5L}, c = {4.0L}, d = {8.0L};
+    int bad = 0;
+    if (g_ident1(a).x != 1.25L) bad |= 1;
+    if (g_kfour1(3, a, b, c, d, 5).x != 1.25L + 5.0L + 16.0L + 64.0L + 3 + 5) bad |= 2;
+    if (g_sum1(2, a, 0.5L, b) != 1.25L * 3 + 0.5L + 2.5L * 7 + 2) bad |= 4;
+    union { _Complex long double c; T2 v; } u;
+    u.c = g_mk2(4.0L, 0.5L);
+    if (u.v[0] != 8.0L || u.v[1] != 1.5L) bad |= 8;
+    u.c = g_ident2(u.c);
+    if (u.v[0] != 8.0L || u.v[1] != 1.5L) bad |= 16;
+    return bad;
+}
+EOF2
+cat > "$tmp/ld_gcc.c" <<'EOF2'
+#include <complex.h>
+struct S1 { long double x; };
+struct S1 g_ident1(struct S1 a) { return a; }
+struct S1 g_kfour1(int k, struct S1 a, struct S1 b, struct S1 c, struct S1 d, int j) { struct S1 r = d; r.x = a.x + b.x * 2 + c.x * 4 + d.x * 8 + k + j; return r; }
+long double g_sum1(int k, struct S1 a, long double x, struct S1 b) { return a.x * 3 + x + b.x * 7 + k; }
+_Complex long double g_ident2(_Complex long double a) { return a; }
+_Complex long double g_mk2(long double x, long double y) { return (x * 2) + (y + 1) * I; }
+struct S1 ident1(struct S1 a);
+struct S1 kfour1(int k, struct S1 a, struct S1 b, struct S1 c, struct S1 d, int j);
+long double sum1(int k, struct S1 a, long double x, struct S1 b);
+_Complex long double ident2(_Complex long double a);
+_Complex long double mk2(long double x, long double y);
+int lccc_calls_gcc(void);
+int main(void) {
+    struct S1 a = {1.25L}, b = {2.5L}, c = {4.0L}, d = {8.0L};
+    int bad = 0;
+    if (ident1(a).x != 1.25L) bad |= 32;
+    if (kfour1(3, a, b, c, d, 5).x != 1.25L + 5.0L + 16.0L + 64.0L + 3 + 5) bad |= 64;
+    if (sum1(2, a, 0.5L, b) != 1.25L * 3 + 0.5L + 2.5L * 7 + 2) bad |= 128;
+    _Complex long double r = mk2(4.0L, 0.5L);
+    if (creall(r) != 8.0L || cimagl(r) != 1.5L) bad |= 256;
+    r = ident2(r);
+    if (creall(r) != 8.0L || cimagl(r) != 1.5L) bad |= 512;
+    return bad | lccc_calls_gcc();
+}
+EOF2
+for lo in -O0 -O2; do
+    for go in -O0 -O2; do
+        rc=0
+        "$ccc" -m64 "$lo" -c "$tmp/ld_lccc.c" -o "$tmp/ldl.o" &&
+            "$gcc_bin" -m64 "$go" -w -c "$tmp/ld_gcc.c" -o "$tmp/ldg.o" &&
+            "$gcc_bin" -m64 -no-pie "$tmp/ldl.o" "$tmp/ldg.o" -o "$tmp/ldt" || rc=97
+        if [ "$rc" = 0 ]; then
+            set +e; "$tmp/ldt"; rc=$?; set -e
+        fi
+        if [ "$rc" = 0 ]; then
+            ok "x86-64 long double ext vector lanes: lccc $lo <-> gcc $go (x87 struct / complex conventions)"
+        else
+            bad "x86-64 long double ext vector lanes: lccc $lo <-> gcc $go rc=$rc (bits: 1-16 lccc caller, 32-512 gcc caller, 97 build)"
+        fi
+    done
+done
+
 echo "$gate: $pass passed, $fail failed"
 [ "$fail" = 0 ] || { echo "FAIL: $gate" >&2; exit 1; }
 echo "PASS: $gate"

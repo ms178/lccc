@@ -568,14 +568,23 @@ impl Lowerer {
             return self.unpack_i686_ext_vector_reg_return(dest, call_ret_ty, vector_ct);
         }
         // X87-class aggregate (`struct { long double }`): the call produced
-        // the long double from %st(0); give it the aggregate's storage.
-        if ret_abi.x87 {
+        // the long double from %st(0); give it the aggregate's storage. The
+        // two-lane `long double` ext vector also pops lane 1 from %st(1)
+        // (`GetReturnF128Second`, as for `_Complex long double`) into the
+        // 32-byte, 32-aligned vector object.
+        if ret_abi.x87 || ret_abi.x87_pair {
+            let lane1 = ret_abi.x87_pair.then(|| {
+                let lane1 = self.fresh_value();
+                self.emit(Instruction::GetReturnF128Second { dest: lane1 });
+                lane1
+            });
+            let (size, align) = if ret_abi.x87_pair { (32, 32) } else { (16, 16) };
             let alloca = self.fresh_value();
             self.emit(Instruction::Alloca {
                 dest: alloca,
                 ty: IrType::F128,
-                size: 16,
-                align: 16,
+                size,
+                align,
                 volatile: false,
                 semantic_volatile: false,
             });
@@ -586,6 +595,16 @@ impl Lowerer {
                 ty: IrType::F128,
                 seg_override: AddressSpace::Default,
             });
+            if let Some(lane1) = lane1 {
+                let lane1_ptr = self.emit_gep_offset(alloca, 16, IrType::F128);
+                self.emit(Instruction::Store {
+                    volatile: false,
+                    val: Operand::Value(lane1),
+                    ptr: lane1_ptr,
+                    ty: IrType::F128,
+                    seg_override: AddressSpace::Default,
+                });
+            }
             return Operand::Value(alloca);
         }
 
@@ -1664,7 +1683,7 @@ impl Lowerer {
         let mut indirect_ret_ty = self.get_func_ptr_return_ir_type(func);
         if ret_abi.two_reg_size.is_some() {
             indirect_ret_ty = IrType::I128;
-        } else if ret_abi.x87 {
+        } else if ret_abi.x87 || ret_abi.x87_pair {
             indirect_ret_ty = IrType::F128;
         }
 

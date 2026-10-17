@@ -1,6 +1,6 @@
 # Follow-up: ext_vector_type ABI grid — first measured run against Clang 23.1.3
 
-**Status: open (ABI-EXTVEC-VA-1 and ABI-EXTVEC-I386-O2-1 fixed; LD-1 and the Clang oracle class open).** Measured on 2026-10-17 by the hosted "Frontend and ABI
+**Status: open (ABI-EXTVEC-VA-1, ABI-EXTVEC-I386-O2-1 and ABI-EXTVEC-LD-1 fixed; the Clang oracle class, ABI-GNUVEC-I386-1 and ABI-EXTVEC-LD-I386-1 open).** Measured on 2026-10-17 by the hosted "Frontend and ABI
 contracts" job (ubuntu-24.04, lccc fastbuild, Clang 23.1.3 from
 `scripts/ci_install_clang_oracle.sh`, GCC 16 as the linker driver).
 `tests/regression/check_ext_vector_abi_grid.sh` ran 848 legs over 53 shapes
@@ -97,10 +97,9 @@ measured `lccc:clang`-never-fails pattern):
   `tests/regression/typedef_aligned_lowers_alignment.c` (run_regression.py,
   GCC reference output).
 - The 60 non-`long double` `flaky` rows are retired from
-  `grid_expectations.txt`. The 12 `ldx*` `hashva` rows are re-attributed to
-  ABI-EXTVEC-LD-1 (class unchanged): `ldx1` is 16 bytes and cannot have been
-  this defect, and the `ldx` shapes fail every other by-value check under
-  LD-1.
+  `grid_expectations.txt`. The 12 `ldx*` `hashva` rows were re-attributed
+  to ABI-EXTVEC-LD-1 (`ldx1` is 16 bytes and cannot have been this defect)
+  and are retired with it below.
 
 **Residual, tracked separately: ABI-GNUVEC-I386-1** — on i386 GCC passes
 16-byte GNU vectors in `%xmm0-2` for fixed arguments and keeps 32/64-byte
@@ -109,15 +108,91 @@ vectors in memory at their full alignment with a realigned `%esp` (DRAP via
 with itself; both cross legs diverge, and `check_gnu_vector_align_abi.sh`
 latches exactly that verdict so it is re-measured on every run.
 
-### ABI-EXTVEC-LD-1 — `long double` ext vectors by value, x86-64 (29 deterministic)
+### ABI-EXTVEC-LD-1 — `long double` ext vectors by value, x86-64 (29 deterministic + 12 flaky) — **FIXED**
 
-`ldx2`/`ldx3` as arguments (`hash2`) disagree with Clang in both directions
-at -O0 and -O2; `ldx1` return (`ident`, `kfour`) fails **lccc → lccc** —
-lccc's own caller and callee disagree on a one-lane `long double` vector
-return. Clang passes/returns these as consecutive x87 `long double`s
-(memory for arguments; `%st(0)` for a one-lane return, memory via hidden
-pointer for more). Reproduce with `-DELEM="long double" -DLANES=1`, any
-leg containing lccc.
+**What failed.** `ldx1` return (`ident`, `kfour`) failed **lccc → lccc**;
+`ldx2` return was a hard compile error ("by value is not supported");
+`ldx2`/`ldx3` as arguments (`hash2`) disagreed with Clang both ways; every
+`ldx*` `hashva` leg was flaky.
+
+**The conventions, from Clang's source** (`clang/lib/CodeGen/Targets/X86.cpp`,
+`X86_64ABIInfo`). The earlier wording in this note — "memory via hidden
+pointer for more [than one lane]" — was wrong:
+
+| shape | argument | return |
+|---|---|---|
+| `ldx1` (16 B) | `classify` → X87+X87UP → **MEMORY**, 16-aligned | `%st(0)` — GCC's `struct { long double }` |
+| `ldx2` (32 B) | 256 bits without AVX → MEMORY → `byval align 32` | **`%st(0)/%st(1)`** — GCC's `_Complex long double` |
+| `ldx3` (64 B) | MEMORY, `byval align 64` | hidden pointer (sret), `%rax` = pointer |
+
+The return column is not what `classify` says (MEMORY for two and three
+lanes): a vector is not an aggregate for Clang's ABI code, so
+`getIndirectReturnResult` hands a MEMORY-class vector return to LLVM
+**direct** (`ABIArgInfo::getDirect`), and LLVM scalarizes `<N x x86_fp80>`
+onto the x87 return registers — two of them exist, so `ldx2` comes back as
+the pair and `ldx3` is sret-demoted, which is the hidden pointer lccc
+already used. (`-mavx` changes the `ldx2` *argument* to the same
+scalarization, two 16-aligned `f80` slots; lccc has no AVX ABI level, see
+AUD-VABI-2.)
+
+**Root causes.**
+
+1. `ldx1`: `get_function_return_type` (func_lowering.rs) collapsed every
+   x86-64 vector return to `I64` in the function **definition**, after the
+   signature/call path had already picked `F128` for the X87 convention.
+   lccc's own caller popped `%st(0)`; the callee had converted the lane to a
+   double in `%rax` — a self-inconsistent ABI, hence lccc → lccc red.
+2. `ldx2`: there was no two-`f80` return carrier on x86-64 at all; the
+   type-level `x86_64_ext_vector_unsupported` list rejected it.
+3. `ldx2`/`ldx3` arguments were MEMORY at 8/16-byte slot granularity; the
+   32/64-byte slot rule arrived with ABI-EXTVEC-VA-1 and these shapes are
+   now on it (same caller/callee code path as `u64x4`/`f64x8`).
+
+**Fix.** `SysvPassing::X87Pair` (`sysv_classify::classify_return`, two
+`long double` lanes; `arg_classes` → `[Memory]`), carried as
+`AggregateReturn::x87_pair` / `FuncSig::ret_x87_pair`; the callee returns
+lane 0 as the IR `F128` return and lane 1 through `SetReturnF128Second`,
+the caller reads `GetReturnF128Second` and stores both lanes into a
+32-byte, 32-aligned temporary (`stmt_return.rs`, `expr_calls.rs`); the
+definition-side return type follows the signature for `ret_x87_aggregate ||
+ret_x87_pair`. `ldx2` is removed from `x86_64_ext_vector_unsupported`; the
+grid's `ret_unsupported` keeps it rejected on **i386 only** (Clang i386
+also returns it in `FP0/FP1`; lccc's i686 backend has the pair primitive
+but the ext-vector return carrier does not use it yet — tracked as part of
+ABI-EXTVEC-LD-I386-1 below).
+
+**Verification** (all on the fastbuild binary, this revision):
+
+- `abi_grid.c` `ldx1`/`ldx2`/`ldx3`, lccc ↔ lccc, {-O0,-O2}², all checks
+  including `hashva`: 12/12 legs ok; `hashva` deterministic over 40 runs
+  with shifted initial stacks per shape and opt (0 failures), so the
+  `flaky` rows are retired.
+- GCC 16.2 as the register-convention oracle (Clang 23.1.3 is not
+  installable offline; GCC implements the *same* x87 conventions for the
+  struct / complex spellings): `check_gnu_vector_align_abi.sh` Part 4 links
+  lccc's `ldx1`/`ldx2` functions against GCC's `struct { long double }` and
+  `_Complex long double` callers and callees, {-O0,-O2}², 4/4 pass
+  (previously: `ldx1` ident/kfour wrong value, `ldx2` did not compile).
+  Only returns of the two-lane shape are compared with the complex form:
+  Clang passes the argument `byval align 32`, GCC passes a complex at 16.
+- `tests/regression/ext_vector_long_double_lanes.c` (lccc-only, exit-bit
+  self-check, -O0..-O3) and the unit test
+  `sysv_classify::long_double_vector_tests` (one/two/three-lane
+  argument and return classes).
+- Hosted re-measurement: the 35 x86-64 LD-1 rows are removed from
+  `grid_expectations.txt`; the Clang legs run on CI and any residual is an
+  unlisted failure to triage, not a row to re-add blind.
+
+**Residual: ABI-EXTVEC-LD-I386-1** (6 rows, i386 `ldx3` only): `ident`/
+`kfour` cross legs at -O0 and `hash2` cross legs at -O2 disagree with Clang
+(lccc agrees with itself; the -O2 `ident`/`kfour` legs are Clang-broken,
+class `oracle`). On i386 Linux every vector argument and return is
+`getDirect()` for Clang, so `<3 x x86_fp80>` is what LLVM's i386
+legalization makes of it (scalarized `f80` slots and an sret-demoted
+return), not the 64-byte image with a 4-byte-aligned slot lccc uses after
+the hidden pointer. Not measurable here without Clang; it needs the
+hosted run's assembly to pin the slot layout before changing the i686
+carrier.
 
 ### ABI-EXTVEC-I386-O2-1 — i386 -O2 only: 32/64-byte by-value vectors (27) — **FIXED**
 
