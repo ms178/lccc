@@ -456,6 +456,18 @@ impl<'a> SemaConstEval<'a> {
                         {
                             return Some(IrConst::I32(0));
                         }
+                        // The same for a block-scope object with static
+                        // storage (a static local): GCC 16.2 answers 0 for
+                        // any object address, and the kernel's
+                        // PIN_GROUP(.mode = __builtin_choose_expr(
+                        // __builtin_constant_p((m)), (m), 0)) needs the 0
+                        // when `m` is a static-local pin array.
+                        if matches!(arg, Expr::Identifier(id, _) if
+                            self.symbols.lookup(id).is_some()
+                                && !self.symbols.is_automatic_object(id))
+                        {
+                            return Some(IrConst::I32(0));
+                        }
                         return None;
                     }
                     shared_const_eval::eval_builtin_call(name.as_str(), args, &|e| {
