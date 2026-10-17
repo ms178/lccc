@@ -223,6 +223,33 @@ jobs:
           -j 2 \
           --gcc gcc-16 \
           --json regression-dbgassert-results.json 2>&1 | tee regression-dbgassert-results.log
+    - name: Surface debug-assertion regression failures in annotations
+      if: failure()
+      run: |
+        python3 - <<'PY'
+        import json
+        from pathlib import Path
+
+        path = Path("regression-dbgassert-results.json")
+        if not path.is_file():
+            print(
+                "::error title=Debug regression harness::"
+                "the corpus gate did not run, so no regression-dbgassert-results.json exists"
+                " (an earlier step in this job failed first; that step's own"
+                " annotations name it)"
+            )
+        else:
+            report = json.loads(path.read_text(encoding="utf-8"))
+            failures = report.get("failures", [])
+            if not failures:
+                print("::error title=Debug regression harness::runner failed before reporting a test result")
+            for failure in failures:
+                name = failure.get("name", "unknown")
+                phases = ", ".join(failure.get("phases", [])) or "no phase"
+                detail = " ".join(str(failure.get("detail", "")).split())
+                detail = detail.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+                print(f"::error title=Debug regression {name} ({phases})::{detail[:1500]}")
+        PY
     - name: Upload regression results
       if: always()
       uses: actions/upload-artifact@v7
