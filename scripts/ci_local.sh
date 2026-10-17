@@ -312,6 +312,12 @@ gate "ext-vector-padded-layout" fast \
 gate "ext-vector-cross-abi" fast \
     env CCC="$LCCC" bash tests/regression/check_ext_vector_abi.sh
 
+# Vector-shaped varargs (vector_size cross-checked against GCC in all four
+# link directions; ext_vector_type as pinned LCCC round-trips). A wrong fetch
+# width or %al census poisons every later FP vararg, not just its own.
+gate "ext-vector-varargs-abi" fast \
+    env CCC="$LCCC" bash tests/regression/check_ext_vector_varargs_abi.sh
+
 gate "a9987-salvage" fast \
     env CCC="$LCCC" bash tests/regression/check_a9987_salvage.sh
 

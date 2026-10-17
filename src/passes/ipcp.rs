@@ -577,6 +577,7 @@ fn is_side_effect_free(func: &crate::ir::reexports::IrFunction) -> bool {
                 | Instruction::Intrinsic { .. }
                 | Instruction::VaArg { .. }
                 | Instruction::VaArgStruct { .. }
+                | Instruction::VaArgVector { .. }
                 | Instruction::SetReturnF64Second { .. }
                 | Instruction::SetReturnF32Second { .. }
                 | Instruction::SetReturnF128Second { .. }

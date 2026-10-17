@@ -316,6 +316,7 @@ fn analyze_function_purity(
                 | Instruction::VaCopy { .. }
                 | Instruction::VaArg { .. }
                 | Instruction::VaArgStruct { .. }
+                | Instruction::VaArgVector { .. }
                 | Instruction::PgoCounterInc { .. }
                 | Instruction::Fence { .. }
                 | Instruction::InitTrampoline { .. }

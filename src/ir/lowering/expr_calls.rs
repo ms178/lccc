@@ -1392,6 +1392,16 @@ impl Lowerer {
                             }
                         }
                         Some(CType::Vector(_, total_size)) => Some(total_size),
+                        // Clang ext_vector_type: by-value aggregate varargs on
+                        // x86-64 (SysV carrier classes; see
+                        // `infer_struct_eightbyte_classes`).  32-bit targets
+                        // keep their legacy pointer convention so the i686
+                        // consumer side is not switched under this fix.
+                        Some(ref ct @ CType::ExtVector(..))
+                            if !crate::common::types::target_is_32bit() =>
+                        {
+                            Some(ct.size())
+                        }
                         Some(CType::ComplexLongDouble) if !decomposes_cld => {
                             Some(CType::ComplexLongDouble.size())
                         }
@@ -1442,6 +1452,14 @@ impl Lowerer {
                         Some(CType::Vector(_, total_size)) => {
                             Some(total_size) // Vector types are passed by value like structs
                         }
+                        // x86-64 ext_vector_type by-value varargs (see the
+                        // signature-known branch above); 32-bit targets keep
+                        // their legacy pointer convention.
+                        Some(ref ct @ CType::ExtVector(..))
+                            if !crate::common::types::target_is_32bit() =>
+                        {
+                            Some(ct.size())
+                        }
                         Some(CType::ComplexLongDouble) if !decomposes_cld => {
                             Some(CType::ComplexLongDouble.size())
                         }
@@ -1477,6 +1495,15 @@ impl Lowerer {
                     // area (GCC i386 psABI), mirroring the struct_align Some(16)
                     // the parameter side registers (func_lowering).
                     Some(CType::Float128) | Some(CType::Decimal128) => Some(16),
+                    // Vector varargs on x86-64: the SysV carrier alignment
+                    // (16 for padded SSE shapes, storage alignment otherwise).
+                    // 32-bit targets keep the legacy pointer convention.
+                    // Vector varargs on x86-64: the SysV carrier alignment
+                    // (16 for padded SSE shapes, storage alignment otherwise).
+                    // Other targets keep their existing convention.
+                    Some(ct) if ct.is_vector() && self.target == crate::backend::Target::X86_64 => {
+                        Some(ct.align_ctx(&*self.types.borrow_struct_layouts()))
+                    }
                     _ => None,
                 }
             })
@@ -1545,6 +1572,20 @@ impl Lowerer {
         expr: &Expr,
     ) -> Vec<crate::common::types::EightbyteClass> {
         if let Some(ctype) = self.get_expr_ctype(expr) {
+            // Vector-shaped variadic arguments classify through the SysV
+            // vector carrier, not through struct layouts: an 8-byte vector is
+            // ONE SSE eightbyte (low half of an XMM), a 9..=16-byte padded
+            // vector is the full register, bit-packed bool carriers and the
+            // tracked one-lane float shapes are INTEGER.  Before this, the
+            // lookup returned an empty classification (= MEMORY) and every
+            // vector vararg degraded to the pointer convention, which no
+            // other x86-64 compiler reads (measured: GCC 16 passes
+            // vector_size(8)/(16) varargs in XMM and counts them in %al).
+            if self.target == crate::backend::Target::X86_64 {
+                if let Some((classes, _pair)) = ctype.sysv_vector_carrier() {
+                    return classes;
+                }
+            }
             if let Some(layout) = self.get_struct_layout_for_ctype(&ctype) {
                 return layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts());
             }
