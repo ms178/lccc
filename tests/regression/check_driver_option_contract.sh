@@ -224,12 +224,14 @@ CEOF
     exit 1
 }
 withdrawn_fn=$(awk '/per_name_withdrawn:/,/\.size.*per_name_withdrawn/' "$td/pername.s")
-echo "$withdrawn_fn" | grep -Eq 'call[q]?[[:space:]]+strlen(@PLT)?' || {
+# herestring, not `echo | grep -q`: under `set -o pipefail` an early-exit grep
+# can SIGPIPE the producer and turn a match into a false failure.
+grep -Eq 'call[q]?[[:space:]]+strlen(@PLT)?' <<<"$withdrawn_fn" || {
     echo "FAIL: per-name -fno-builtin-strlen did not keep the ordinary strlen call" >&2
     exit 1
 }
 explicit_fn=$(awk '/per_name_explicit_still_folds:/,/\.size.*per_name_explicit_still_folds/' "$td/pername.s")
-if echo "$explicit_fn" | grep -Eq 'call[q]?[[:space:]]+strlen(@PLT)?'; then
+if grep -Eq 'call[q]?[[:space:]]+strlen(@PLT)?' <<<"$explicit_fn"; then
     echo "FAIL: explicit __builtin_strlen must still fold under per-name withdrawal" >&2
     exit 1
 fi

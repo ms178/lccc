@@ -836,6 +836,10 @@ impl X86Codegen {
             .out
             .emit_instr_mem_reg("    movq", 0, "rsp", dest);
         self.state.emit("    movq 8(%rsp), %rax");
+        // The reload above restores the parked %rax value verbatim, but it is
+        // still a %rax write to the epoch analyzer; re-sync the park epoch so
+        // the next acc consume does not report the restored value as dead.
+        self.state.refresh_acc_park_epoch();
         self.state.emit("    addq $16, %rsp");
     }
 
@@ -1239,6 +1243,9 @@ impl X86Codegen {
                                 "    movdqu (%rsp), %{}",
                                 xmm_regs[reg_idx]
                             ));
+                            // The movabsq materialization destroyed %rax;
+                            // the cache must not claim the old value.
+                            self.state.reg_cache.invalidate_acc();
                             self.state.emit("    addq $16, %rsp");
                         }
                         Operand::Const(IrConst::LongDouble(_, f128_bytes)) => {
@@ -1263,6 +1270,8 @@ impl X86Codegen {
                                 "    movdqu (%rsp), %{}",
                                 xmm_regs[reg_idx]
                             ));
+                            // Same: the second movabsq destroyed %rax.
+                            self.state.reg_cache.invalidate_acc();
                             self.state.emit("    addq $16, %rsp");
                         }
                         _ => {
