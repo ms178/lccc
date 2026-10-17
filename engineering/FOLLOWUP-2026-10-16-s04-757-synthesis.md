@@ -138,6 +138,15 @@ run of a week still pays one download to refill the cache.
 addressing form). Added with the RA-01 port; documented here so the
 audit census counts it as a named, owned knob.
 
+## Census note: measured option contract (from closed PR #753)
+
+`LCCC_STRICT_OPTIONS` escalates every accepted-but-unimplemented
+command-line spelling in `src/driver/cli.rs` to an error, so a feature
+probe's exit status means "implemented" rather than "tolerated". It is
+the mode `scripts/lccc_capability_probe.py` runs in, follows the
+`LCCC_STRICT_` prefix precedent set by `LCCC_STRICT_MFLAGS`, and is
+documented here so the audit census counts it as a named, owned knob.
+
 ## Latent main divergence surfaced by the local suite (not by hosted CI)
 
 `fenv_constant_effects` / `fenv_constant_rounding` (in main since #843)

@@ -1673,6 +1673,19 @@ gate "peephole-trace-bisect" fast \
 gate "peephole-trace-bisect-selftest" fast \
     python3 scripts/peephole_trace_bisect.py --selftest
 
+# The capability probe is what turns the Clang-C corpus from "almost every RUN
+# filtered" (102 of 5 130 planned invocations executed) into a measured grid,
+# and it is only worth anything if a flag the compiler ignores can never be
+# reported as established.  The selftest drives the tool against a synthetic
+# compiler that reproduces the contract the probe depends on -- including one
+# that accepts a `-W`-spelled unknown option, one that ignores
+# LCCC_STRICT_OPTIONS, and one that keeps tolerating `-Wno-<unknown>` under
+# strict options; each mutation must abort the probe.  It also pins the
+# per-invocation coverage rule against a weighted-sum misreading.  Pure
+# Python, no toolchain, no corpus: fast.
+gate "capability-probe-selftest" fast \
+    python3 scripts/lccc_capability_probe.py --selftest
+
 # The one-move phi-diamond preinitialisation hoists the cheap incoming
 # above the branch. A memory-source init may fault on the path it lands
 # on: `c ? *p : *q` must never touch a NULL p when c selects q. The

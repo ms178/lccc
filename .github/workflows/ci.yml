@@ -1397,7 +1397,12 @@ jobs:
         bash tests/regression/check_peephole_trace_bisect.sh
         # The trace-bisect tool is also exercised directly, so a broken
         # operand parser fails CI even if the wrapper gate is skipped.
-        python3 scripts/peephole_trace_bisect.py --selftest
+          python3 scripts/peephole_trace_bisect.py --selftest
+          # The Clang-C corpus capability probe: an unimplemented option must
+          # never read as support, and a `-W`-spelled unknown option must not
+          # slip past a `--`-only negative control.  Synthetic compiler, no
+          # toolchain and no corpus needed.
+          python3 scripts/lccc_capability_probe.py --selftest
         bash tests/regression/check_atomic_backends.sh
         # Torture-corpus provisioning: stamp trust, integrity manifest,
         # auto-repair and invalidate-before-replace (synthetic tarball).
