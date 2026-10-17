@@ -20,6 +20,14 @@
 # rest of their ABI (arguments, varargs) is still checked with -DNO_RET.
 # The lists are the measurements recorded in the i386 and x86-64 tables of
 # the Clang 23.1.3 ext-vector ABI notes (engineering/FOLLOWUP-2026-10-15-pr833.md).
+#
+# Verdict: the set of failing checks per leg is compared EXACTLY with
+# ext_vector_abi/grid_expectations.txt, which records (a) checks on which
+# Clang 23.1.3 disagrees with itself (no reference exists) and (b) open lccc
+# defects, each with a tracking id. An unlisted failure is red; so is a
+# listed failure that stops happening (remove its line with the fix). The
+# summary line reports both classes so the open-defect count is never
+# invisible in a green run.
 set -euo pipefail
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 ccc=${CCC:-$root/target/fastbuild/lccc}
@@ -31,8 +39,57 @@ require_clang_oracle check_ext_vector_abi_grid || exit 1
 source "$root/tests/regression/i386_exec.sh"
 [ -x "$ccc" ] || { echo "FAIL: compiler not built: $ccc" >&2; exit 1; }
 src=$root/tests/regression/ext_vector_abi/abi_grid.c
+expectations=$root/tests/regression/ext_vector_abi/grid_expectations.txt
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
+
+# expected[<bits> <opt> <shape> <prov:call>] = "check check ..."; class per check.
+declare -A expected expected_class
+while read -r e_bits e_opt e_shape e_leg e_check e_class e_id _; do
+    [[ -z $e_bits || $e_bits == \#* ]] && continue
+    case $e_class in
+        oracle|lccc) ;;
+        *) echo "FAIL: $expectations: unknown class '$e_class' for $e_bits $e_opt $e_shape $e_leg $e_check" >&2; exit 1 ;;
+    esac
+    [[ -n $e_id ]] || { echo "FAIL: $expectations: missing tracking id for $e_bits $e_opt $e_shape $e_leg $e_check" >&2; exit 1; }
+    expected["$e_bits $e_opt $e_shape $e_leg"]+="$e_check "
+    expected_class["$e_bits $e_opt $e_shape $e_leg $e_check"]=$e_class
+done < "$expectations"
+xfail_oracle=0
+xfail_lccc=0
+declare -A seen_expected
+
+# leg_verdict <key> <rc> <run.log>: compare the checks the probe reported as
+# failing with the expectation for this leg. Returns 0 when they agree.
+leg_verdict() {
+    local key=$1 rc=$2 log=$3
+    local actual want extra missing chk
+    actual=$(awk '/^FAIL /{print $2}' "$log" | sort -u | tr '\n' ' ')
+    want=$(tr ' ' '\n' <<<"${expected[$key]:-}" | sed '/^$/d' | sort -u | tr '\n' ' ')
+    seen_expected[$key]=1
+    if [[ $rc -ne 0 && -z $actual ]]; then
+        fail "$key: probe exited $rc without a verdict: $(tr '\n' ' ' <"$log")"
+        return 1
+    fi
+    extra=
+    missing=
+    for chk in $actual; do [[ " $want " == *" $chk "* ]] || extra+="$chk "; done
+    for chk in $want; do [[ " $actual " == *" $chk "* ]] || missing+="$chk "; done
+    if [[ -n $extra ]]; then
+        fail "$key: unexpected failure(s): $extra"
+    fi
+    if [[ -n $missing ]]; then
+        fail "$key: expected failure(s) did not occur: $missing-- remove the line(s) from $(basename "$expectations") in the commit that fixes them"
+    fi
+    [[ -z $extra && -z $missing ]] || return 1
+    for chk in $actual; do
+        case ${expected_class["$key $chk"]} in
+            oracle) xfail_oracle=$((xfail_oracle + 1)) ;;
+            lccc) xfail_lccc=$((xfail_lccc + 1)) ;;
+        esac
+    done
+    return 0
+}
 
 shapes="u8x1 u8x2 u8x3 u8x4 u8x5 u8x7 u8x8 u8x12 u8x16 u8x32
 u16x1 u16x2 u16x3 u16x4 u16x5 u16x8 u16x12 u16x16
@@ -93,11 +150,13 @@ expect_rejected() {
 
 checked=0
 rejected=0
+ran_m32=0
 for bits in 64 32; do
     if [[ $bits == 32 ]] && ! i386_run_or_skip "$gcc_bin"; then
         if [[ ${LCCC_REQUIRE_I686:-0} == 1 ]]; then exit 1; fi
         continue
     fi
+    [[ $bits == 32 ]] && ran_m32=1
     for opt in -O0 -O2; do
         for shape in $shapes; do
             elem=$(elem_of "$shape")
@@ -145,17 +204,25 @@ for bits in 64 32; do
                 fi
                 rc=0
                 timeout 10 "$exe" >"$tmp/run.log" 2>&1 || rc=$?
-                if [[ $rc -ne 0 ]]; then
-                    fail "-m$bits $opt $shape: $prov provider -> $call caller (exit $rc): $(tr '\n' ' ' <"$tmp/run.log")"
-                fi
+                leg_verdict "$bits $opt $shape $leg" "$rc" "$tmp/run.log" || true
                 checked=$((checked + 1))
             done
         done
     done
 done
 
+# Every expectation must belong to a leg this run actually exercised:
+# a stale key (a shape or leg that no longer runs) would never be retired.
+for key in "${!expected[@]}"; do
+    [[ ${seen_expected[$key]:-0} == 1 ]] && continue
+    if [[ $key == 32\ * ]] && [[ ${ran_m32:-0} == 0 ]]; then continue; fi
+    fail "$key: listed in $(basename "$expectations") but no such leg ran"
+done
+
 if [[ $fails -ne 0 ]]; then
     echo "FAIL: ext-vector ABI grid: $fails failure(s) ($checked legs run, $rejected rejection checks)" >&2
     exit 1
 fi
-echo "PASS: ext-vector ABI grid vs Clang $CLANG_ORACLE_VERSION: $checked legs, $rejected rejection checks"
+echo "PASS: ext-vector ABI grid vs Clang $CLANG_ORACLE_VERSION: $checked legs, $rejected rejection checks;" \
+    "expected failures held: $xfail_oracle oracle-inconsistent checks, $xfail_lccc open lccc defects" \
+    "(tests/regression/ext_vector_abi/grid_expectations.txt)"

@@ -3682,3 +3682,17 @@ re-baselining.
   review sandbox; failing steps now emit `::error` annotations
   (`scripts/ci_annotate_log.py`) so the first failing line is visible from
   the check-run API alone.
+- *ABI grid: measured expectations, not silence.* The first run of the
+  ext-vector grid against its intended oracle failed 202 of 848 legs; 154
+  checks are Clang 23.1.3 disagreeing with itself (i386 `va_arg` of 32
+  vector shapes, `long double` vectors) and 95 are lccc defects that cannot
+  be fixed without a toolchain in the reviewing environment. Considered and
+  rejected: dropping those shapes from the grid (hides the defects) or
+  leaving the gate red (blocks every unrelated change and trains people to
+  ignore it). Chosen: an exact expected-failure table
+  (`tests/regression/ext_vector_abi/grid_expectations.txt`) with a class and
+  tracking id per check, enforced in both directions — an unlisted failure
+  and a listed pass are both red — and a PASS line that prints the open
+  count. Defects are documented with reproductions in
+  `engineering/FOLLOWUP-2026-10-17-ext-vector-grid.md`
+  (ABI-EXTVEC-VA-1, ABI-EXTVEC-LD-1, ABI-EXTVEC-I386-O2-1).
