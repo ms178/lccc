@@ -85,3 +85,4 @@ builtin_fold_ok	accept	-	static double d = __builtin_sqrt(4.0) + __builtin_fabs(
 builtin_nonconst_bad	reject	not constant	static int b = __builtin_isnan(n); (void)b;
 generic_null_ok	accept	-	static int *p = _Generic(n, int: (int *)0, default: (int *)0); (void)p;
 generic_auto_addr_bad	reject	not constant	int a; static int *p = _Generic(a, int: &a, default: (int *)0); (void)p;
+bcp_str_ok	accept	-	static const struct tdesc { const char *format; unsigned len; } d = { .format = (__builtin_constant_p("bm" ": register: ") ? "bm" ": register: " : "bm"), .len = 4 }; (void)d.format[0];

@@ -428,6 +428,21 @@ impl<'a> SemaConstEval<'a> {
                 if let Expr::Identifier(name, _) = func.as_ref() {
                     if name == "__builtin_constant_p" {
                         let arg = args.first()?;
+                        // A string literal argument is a constant by
+                        // definition (GCC 16.2 folds it to 1); the kernel's
+                        // dynamic-debug/print_hex descriptors build static
+                        // initializers of the form
+                        // `__builtin_constant_p(KBUILD_MODNAME ": ...")
+                        // ? "..." : ...` and the ternary only becomes a
+                        // valid string initializer once this folds.
+                        if matches!(
+                            arg,
+                            Expr::StringLiteral(..)
+                                | Expr::WideStringLiteral(..)
+                                | Expr::Char16StringLiteral(..)
+                        ) {
+                            return Some(IrConst::I32(1));
+                        }
                         if self.eval_const_expr(arg).is_some() {
                             return Some(IrConst::I32(1));
                         }

@@ -102,6 +102,23 @@ pub fn eval_builtin_call(
             // Prove positive answers early, but do not cache an early zero.
             // A local/parameter may become constant after mem2reg, inlining,
             // and propagation; the IR IsConstant node must survive until then.
+            //
+            // A string literal argument is a constant by definition (GCC 16.2
+            // folds `__builtin_constant_p("...")` to 1): the kernel's
+            // print_hex_dump/dynamic-debug descriptors initialize static
+            // structs with `__builtin_constant_p(KBUILD_MODNAME ": ...")
+            // ? "..." : ...` and the ternary only becomes a valid string
+            // initializer once the condition folds.
+            if args.first().is_some_and(|arg| {
+                matches!(
+                    arg,
+                    Expr::StringLiteral(..)
+                        | Expr::WideStringLiteral(..)
+                        | Expr::Char16StringLiteral(..)
+                )
+            }) {
+                return Some(IrConst::I32(1));
+            }
             if args.first().is_some_and(|arg| eval_fn(arg).is_some()) {
                 Some(IrConst::I32(1))
             } else {
