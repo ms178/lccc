@@ -1117,7 +1117,20 @@ fn try_simplify(
 /// add/sub-of-neg): threads the NegDef map with everything else empty.
 #[cfg(test)]
 fn try_simplify_neg(inst: &Instruction, neg_defs: &[Option<NegDef>]) -> Option<Instruction> {
-    try_simplify_with_types(inst, &[], &[], &[], &[], neg_defs, &[], &[], &[], &[], true)
+    try_simplify_with_types(
+        inst,
+        &[],
+        &[],
+        &[],
+        &[],
+        neg_defs,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        true,
+    )
 }
 
 /// Simplify a Cast instruction.
