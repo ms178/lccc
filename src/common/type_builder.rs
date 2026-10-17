@@ -355,12 +355,24 @@ pub fn param_decl_to_ctype_with(
     if let Some(ref fptr_params) = param.fptr_params {
         // `float (*func)(float, float)`: the specifier is the pointee function's
         // return type, and the parenthesised declarator's own parameter list
-        // rides on `fptr_params`.
+        // rides on `fptr_params`. The parser wraps type_spec with a Pointer
+        // per declarator star — the parenthesised group's own stars
+        // (`long (**op)(req)` has two) AND any leading stars (`long *(*op)(req)`
+        // has one, and it qualifies the RETURN pointer). fptr_inner_ptr_depth
+        // counts the parenthesised group's stars, so exactly that many levels
+        // come off before the function type; the remainder stays on the return.
+        // The old single strip turned `long (**op)(req)` into a function
+        // RETURNING long* at one level too few (crypto/ahash.c
+        // ahash_do_req_chain's `int (*const *op)(struct ahash_request *)`).
         let return_ctype = resolve(&param.type_spec);
-        let actual_return = match return_ctype {
-            CType::Pointer(inner, _) => *inner,
-            other => other,
-        };
+        let mut actual_return = return_ctype;
+        for _ in 0..param.fptr_inner_ptr_depth {
+            if let CType::Pointer(inner, _) = actual_return {
+                actual_return = *inner;
+            } else {
+                break;
+            }
+        }
         let param_types: Vec<(CType, Option<String>)> = fptr_params
             .iter()
             .map(|p| (param_decl_to_ctype_with(resolve, p), p.name.clone()))
