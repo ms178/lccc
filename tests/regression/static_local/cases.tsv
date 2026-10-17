@@ -87,3 +87,4 @@ generic_null_ok	accept	-	static int *p = _Generic(n, int: (int *)0, default: (in
 generic_auto_addr_bad	reject	not constant	int a; static int *p = _Generic(a, int: &a, default: (int *)0); (void)p;
 bcp_str_ok	accept	-	static const struct tdesc { const char *format; unsigned len; } d = { .format = (__builtin_constant_p("bm" ": register: ") ? "bm" ": register: " : "bm"), .len = 4 }; (void)d.format[0];
 funcname_static_ptr_ok	accept	-	static const char *s = __func__; (void)s;
+choose_expr_array_mode_ok	accept	-	static const int pp[2] = {1,2}; static const struct gm { int mode; const int *modes; } t = { .mode = __builtin_choose_expr(__builtin_constant_p((pp)), (pp), 0), .modes = __builtin_choose_expr(__builtin_constant_p((pp)), (const void *)0, (pp)) }; (void)t.mode;

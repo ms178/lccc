@@ -202,6 +202,22 @@ impl<'s> StaticInitChecker<'s> {
             Expr::FunctionCall(callee, args, _) if self.folds_to_constant(callee, args) => {
                 Kind::Value
             }
+            // __builtin_choose_expr(const, a, b) is ONLY the selected operand:
+            // the other one is never converted, so it may name an automatic
+            // object (GCC 16.2 accepts `__builtin_choose_expr(1, 0, (int *)&a)`).
+            // The kernel's PIN_GROUP(.mode = __builtin_choose_expr(
+            // __builtin_constant_p((m)), (m), 0)) selects `0` for array `m`
+            // and keeps the static initializer constant.
+            Expr::FunctionCall(callee, args, _)
+                if matches!(callee.as_ref(), Expr::Identifier(n, _) if n == "__builtin_choose_expr")
+                    && args.len() >= 3 =>
+            {
+                match (self.eval)(&args[0]) {
+                    Some(0) => self.value(&args[2]),
+                    Some(_) => self.value(&args[1]),
+                    None => Kind::Bad,
+                }
+            }
             // Only the selected association is part of the initializer. The
             // others are never evaluated, so they may name automatic objects
             // (GCC 16.2 accepts `_Generic(n, int: (int *)0, default: (int *)&a)`).
