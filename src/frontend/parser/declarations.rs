@@ -435,9 +435,19 @@ impl Parser {
             // truncated such return types to `int *`.
             let prefix = &derived[..fpos];
             let mut i = 0;
+            // The prefix stars' pointee spaces follow pointee_space_before
+            // (see fold_simple_derived): the wrapper for star i takes the
+            // space of the previous entry, so `struct pe * __seg_gs *reg(void)`
+            // returns a generic pointer whose pointee (the `struct pe *`) is
+            // %gs-qualified. Dropping the space (the old hardcoded Default)
+            // made the definition's return type disagree with its own
+            // prototype and with every declarator path (kernel
+            // hw_breakpoint.c register_wide_hw_breakpoint: ERR_PTR_PCPU
+            // rejected both directions).
+            let mut pending_space = AddressSpace::Default;
             while i < prefix.len() {
                 match &prefix[i] {
-                    DerivedDeclarator::Pointer(_) => {
+                    DerivedDeclarator::Pointer(space) => {
                         if let Some(DerivedDeclarator::FunctionPointer(params, variadic)) =
                             prefix.get(i + 1)
                         {
@@ -446,12 +456,15 @@ impl Parser {
                                 params.clone(),
                                 *variadic,
                             );
+                            // The function-pointer wrapper carries no space
+                            // slot (matching build_full_ctype_with_base), so
+                            // the chain restarts at Default after the core.
+                            pending_space = AddressSpace::Default;
                             i += 2;
                         } else {
-                            return_type = TypeSpecifier::Pointer(
-                                Box::new(return_type),
-                                AddressSpace::Default,
-                            );
+                            return_type =
+                                TypeSpecifier::Pointer(Box::new(return_type), pending_space);
+                            pending_space = *space;
                             i += 1;
                         }
                     }
