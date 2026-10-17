@@ -58,6 +58,9 @@ pub struct SemaConstEval<'a> {
     pub const_values: Option<&'a FxHashMap<ExprId, IrConst>>,
     /// Pre-computed expression types from bottom-up sema walk.
     pub expr_types: Option<&'a FxHashMap<ExprId, CType>>,
+    /// Which ordinary hosted-library names the CLI withdrew from builtin
+    /// status (blanket and per-name state in one object).
+    pub builtin_policy: crate::common::builtin::BuiltinPolicy,
 }
 
 impl<'a> SemaConstEval<'a> {
@@ -428,6 +431,21 @@ impl<'a> SemaConstEval<'a> {
                 if let Expr::Identifier(name, _) = func.as_ref() {
                     if name == "__builtin_constant_p" {
                         let arg = args.first()?;
+                        // A string literal argument is a constant by
+                        // definition (GCC 16.2 folds it to 1); the kernel's
+                        // dynamic-debug/print_hex descriptors build static
+                        // initializers of the form
+                        // `__builtin_constant_p(KBUILD_MODNAME ": ...")
+                        // ? "..." : ...` and the ternary only becomes a
+                        // valid string initializer once this folds.
+                        if matches!(
+                            arg,
+                            Expr::StringLiteral(..)
+                                | Expr::WideStringLiteral(..)
+                                | Expr::Char16StringLiteral(..)
+                        ) {
+                            return Some(IrConst::I32(1));
+                        }
                         if self.eval_const_expr(arg).is_some() {
                             return Some(IrConst::I32(1));
                         }
@@ -441,11 +459,26 @@ impl<'a> SemaConstEval<'a> {
                         {
                             return Some(IrConst::I32(0));
                         }
+                        // The same for a block-scope object with static
+                        // storage (a static local): GCC 16.2 answers 0 for
+                        // any object address, and the kernel's
+                        // PIN_GROUP(.mode = __builtin_choose_expr(
+                        // __builtin_constant_p((m)), (m), 0)) needs the 0
+                        // when `m` is a static-local pin array.
+                        if matches!(arg, Expr::Identifier(id, _) if
+                            self.symbols.lookup(id).is_some()
+                                && !self.symbols.is_automatic_object(id))
+                        {
+                            return Some(IrConst::I32(0));
+                        }
                         return None;
                     }
-                    shared_const_eval::eval_builtin_call(name.as_str(), args, &|e| {
-                        self.eval_const_expr(e)
-                    })
+                    shared_const_eval::eval_builtin_call_with_mode(
+                        name.as_str(),
+                        args,
+                        &|e| self.eval_const_expr(e),
+                        !self.builtin_policy.withdrawn(name.as_str()),
+                    )
                 } else {
                     None
                 }
@@ -635,6 +668,7 @@ impl<'a> SemaConstEval<'a> {
             types: self.types,
             functions: self.functions,
             expr_types: self.expr_types,
+            builtin_policy: self.builtin_policy.clone(),
         };
         checker.infer_expr_ctype(expr)
     }
@@ -1494,10 +1528,14 @@ fn ctype_from_type_spec_with_derived(
     if derived.is_empty() {
         return ty;
     }
+    // pointee_space_before mapping (see fold_simple_derived): the wrapper
+    // built at step i takes the space stored at derived[i-1].
+    let mut pending_space = AddressSpace::Default;
     for d in derived {
         match d {
-            DerivedDeclarator::Pointer(_) => {
-                ty = CType::Pointer(Box::new(ty), AddressSpace::Default);
+            DerivedDeclarator::Pointer(space) => {
+                ty = CType::Pointer(Box::new(ty), pending_space);
+                pending_space = *space;
             }
             DerivedDeclarator::Array(Some(size_expr)) => {
                 let expr: &Expr = size_expr;

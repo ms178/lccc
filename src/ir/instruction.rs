@@ -271,6 +271,31 @@ pub enum Instruction {
         eightbyte_classes: Vec<crate::common::types::EightbyteClass>,
     },
 
+    /// va_arg of a vector-shaped type on x86-64 (`va_arg(ap, T)` with T a
+    /// `vector_size` or `ext_vector_type`).
+    ///
+    /// Unlike a struct with equal eightbyte classes, a vector occupies ONE
+    /// SSE register (both its eightbytes live in the single XMM slot at
+    /// reg_save_area + fp_offset) or one 16-aligned overflow slot, and
+    /// fp_offset advances by exactly 16 — the per-eightbyte VaArgStruct
+    /// fetch would read two consecutive slots and mis-fetch every argument
+    /// that follows (measured against GCC 16). `size` is the vector's
+    /// storage size (<= 16 for the register path; larger vectors and the
+    /// tracked >16-byte shapes take the overflow path, byte-identical to
+    /// GCC's memory-class va_arg).
+    VaArgVector {
+        dest_ptr: Value,
+        va_list_ptr: Value,
+        size: usize,
+        align: usize,
+        /// SysV carrier classification from `CType::sysv_vector_carrier`:
+        /// empty = memory (overflow fetch), `[Integer]` = one GP slot,
+        /// `[Sse]` = the low half of one XMM slot, `[Sse, Sse]` = still ONE
+        /// XMM slot (a vector never spans two registers, unlike a struct
+        /// with the same classification).
+        eightbyte_classes: Vec<crate::common::types::EightbyteClass>,
+    },
+
     /// va_start: initialize a va_list. last_named_param is the pointer to the last named parameter.
     VaStart { va_list_ptr: Value },
 
@@ -584,6 +609,7 @@ impl Instruction {
             | Instruction::VaEnd { .. }
             | Instruction::VaCopy { .. }
             | Instruction::VaArgStruct { .. }
+            | Instruction::VaArgVector { .. }
             | Instruction::AtomicStore { .. }
             | Instruction::AtomicInc { .. }
             | Instruction::PgoCounterInc { .. }
@@ -674,6 +700,7 @@ impl Instruction {
             | Instruction::VaCopy { .. }
             | Instruction::VaArg { .. }
             | Instruction::VaArgStruct { .. }
+            | Instruction::VaArgVector { .. }
             // --- Profile counters are global memory. ---
             | Instruction::PgoCounterInc { .. }
             // --- Trampoline / saved-frame buffers are written. ---
@@ -911,6 +938,11 @@ impl Instruction {
                 dest_ptr,
                 va_list_ptr,
                 ..
+            }
+            | Instruction::VaArgVector {
+                dest_ptr,
+                va_list_ptr,
+                ..
             } => {
                 f(dest_ptr.0);
                 f(va_list_ptr.0);
@@ -1008,6 +1040,11 @@ impl Instruction {
                 f(src_ptr);
             }
             Instruction::VaArgStruct {
+                dest_ptr,
+                va_list_ptr,
+                ..
+            }
+            | Instruction::VaArgVector {
                 dest_ptr,
                 va_list_ptr,
                 ..
@@ -1154,6 +1191,7 @@ impl Instruction {
             | Instruction::Memcpy { .. }
             | Instruction::VaArg { .. }
             | Instruction::VaArgStruct { .. }
+            | Instruction::VaArgVector { .. }
             | Instruction::VaStart { .. }
             | Instruction::VaEnd { .. }
             | Instruction::VaCopy { .. }

@@ -186,6 +186,11 @@ pub struct Lowerer {
     /// as an inline-only definition (no external def emitted), matching the behaviour
     /// of GCC in GNU89 mode. The default (false) uses C99 inline semantics.
     pub(super) gnu89_inline: bool,
+    /// Which ordinary hosted-library names the CLI withdrew from builtin
+    /// status (blanket `-fno-builtin`/`-ffreestanding` plus per-name
+    /// `-fno-builtin-<fn>` state).  The single source of truth for every
+    /// lowering-side fold decision.
+    pub(super) builtin_policy: crate::common::builtin::BuiltinPolicy,
 }
 
 /// Largest zero-initialised aggregate region lowered as an explicit store
@@ -202,6 +207,14 @@ impl Lowerer {
         policy: crate::common::pass_policy::PassPolicy,
     ) -> Self {
         self.pass_policy = policy;
+        self
+    }
+
+    pub(crate) fn with_builtin_policy(
+        mut self,
+        policy: crate::common::builtin::BuiltinPolicy,
+    ) -> Self {
+        self.builtin_policy = policy;
         self
     }
 
@@ -278,6 +291,7 @@ impl Lowerer {
             diagnostics: RefCell::new(diagnostics),
             materialized_compound_literals: FxHashMap::default(),
             gnu89_inline,
+            builtin_policy: crate::common::builtin::BuiltinPolicy::default(),
         }
     }
 

@@ -1491,6 +1491,11 @@ fn invalidate_for_memory_effects(
             dest_ptr,
             va_list_ptr,
             ..
+        }
+        | Instruction::VaArgVector {
+            dest_ptr,
+            va_list_ptr,
+            ..
         } => {
             invalidate_for_value_write(available, *dest_ptr, roots, local_aliases);
             invalidate_for_value_write(available, *va_list_ptr, roots, local_aliases);

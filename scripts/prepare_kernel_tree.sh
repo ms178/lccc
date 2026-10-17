@@ -69,6 +69,10 @@ LCCC_PREPARED_CANARIES=(
 #   LCCC     compiler for kernel TUs (default: <repo>/target/fastbuild/lccc)
 #   LCCC_CPUSCHED / LCCC_PREVENT_AVX2   PKGBUILD option mirrors (eevdf / no)
 #   LCCC_PKGREL  override pkgrel (default: PKGBUILD pkgrel)
+#   LCCC_KERNEL_SOURCE_MODE  auto (default: verified kernel.org tarball, git
+#            mirror fallback), tarball, or git
+#   LCCC_KERNEL_GIT_URL      stable-tree mirror (default: github.com/gregkh/linux;
+#            carries the signed v$KVER release tags)
 # ============================================================================
 set -euo pipefail
 
@@ -202,14 +206,35 @@ esac
 if [[ $KDIR == / || $KDIR -ef $HOME || -L $KDIR ]]; then
   echo "prepare_kernel_tree: refusing KDIR=$KDIR (root, home or symlink)" >&2; exit 1
 fi
-if [[ -e $KDIR ]]; then
-  # Replacing KDIR deletes it. Only a directory this script stamped with
-  # .lccc-prepared, or an empty one, may be replaced. A Makefile is not
-  # ownership: a real kernel checkout has one, and it must survive.
-  if [[ ! -d $KDIR ]] || { [[ -n $(ls -A -- "$KDIR") ]] && [[ ! -f $KDIR/.lccc-prepared ]]; }; then
-    echo "prepare_kernel_tree: refusing KDIR=$KDIR (not empty and not prepared by this script;" >&2
-    echo "  remove it yourself or choose another KDIR)" >&2
-    exit 1
+# Source-acquisition mode.  Sandboxed environments (e.g. the Arena harness)
+# often cannot reach cdn.kernel.org at all; the stable tree is mirrored on
+# GitHub (github.com/gregkh/linux carries the signed v$KVER tags), so a shallow
+# checkout of the exact release tag is the fallback source.  The PKGBUILD
+# sha256 cannot verify a git checkout; instead the checkout is pinned by
+# `git describe --exact-match --tags HEAD == v$KVER` (the release tag itself)
+# and the resolved commit is recorded in the .lccc-prepared stamp.
+#   auto    (default) tarball with sha256 verification when kernel.org is
+#           reachable; shallow git checkout of tag v$KVER otherwise.
+#   tarball force the verified-tarball path (offline git trees rejected).
+#   git     force the git path (no kernel.org access attempted).
+SOURCE_MODE=${LCCC_KERNEL_SOURCE_MODE:-auto}
+git_tree_at_tag() { # KDIR is a git checkout sitting exactly on tag v$KVER
+  [[ -d $KDIR/.git ]] || return 1
+  [[ $(git -C "$KDIR" describe --exact-match --tags HEAD 2>/dev/null) == "v$KVER" ]]
+}
+if [[ -e $KDIR ]] && git_tree_at_tag; then
+  SOURCE_MODE=git
+  echo "prepare_kernel_tree: using existing git checkout at tag v$KVER"
+else
+  if [[ -e $KDIR ]]; then
+    # Replacing KDIR deletes it. Only a directory this script stamped with
+    # .lccc-prepared, or an empty one, may be replaced. A Makefile is not
+    # ownership: a real kernel checkout has one, and it must survive.
+    if [[ ! -d $KDIR ]] || { [[ -n $(ls -A -- "$KDIR") ]] && [[ ! -f $KDIR/.lccc-prepared ]]; }; then
+      echo "prepare_kernel_tree: refusing KDIR=$KDIR (not empty and not prepared by this script;" >&2
+      echo "  remove it yourself or choose another KDIR)" >&2
+      exit 1
+    fi
   fi
   # Extraction deletes KDIR. A mount point below it would make that deletion
   # reach the mounted filesystem, so refuse before anything is removed.
@@ -241,7 +266,11 @@ jobs_count() {
 preflight_host_tools() {
   local missing=() tool comp cfgname
   # kconfig lexers/parsers, plus the unconditional build-time host tools.
-  for tool in make "$HOSTCC" ld ar nm objcopy perl awk sed bc flex bison cpio \
+  # `cpio` is deliberately absent: the kernel build never invokes it (an
+  # embedded initramfs is produced by usr/gen_init_cpio from
+  # CONFIG_INITRAMFS_SOURCE, and external initramfs images are built by the
+  # caller — scripts/gen_initramfs.py covers that without a cpio binary).
+  for tool in make "$HOSTCC" ld ar nm objcopy perl awk sed bc flex bison \
               xz patch tar curl; do
     command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
   done
@@ -308,7 +337,9 @@ canaries_ok() {
 }
 if [[ -f "$KDIR/.lccc-prepared" ]] && [[ -f "$KDIR/${LCCC_PREPARED_CANARIES[0]}" ]] && canaries_ok; then
   require_lccc
-  if [[ $(cat "$KDIR/.lccc-prepared") == "$(compiler_id)" ]]; then
+  # Only the compiler line identifies the stamp; later lines record the source
+  # provenance (git tag vs tarball sha256) and must not force a re-prepare.
+  if [[ $(head -n1 "$KDIR/.lccc-prepared") == "$(compiler_id)" ]]; then
     echo "prepare_kernel_tree: $KDIR already prepared (stamp + canaries OK)"
     exit 0
   fi
@@ -322,6 +353,29 @@ fi
 mkdir -p "$WORK"
 cd "$WORK"
 
+# Shallow checkout of the exact release tag from the stable-tree git mirror.
+# Only reachable when KDIR is empty, absent, or a replaceable stamped tree
+# (guaranteed by the guard block above).  A failed clone leaves no tree behind.
+git_checkout_tree() {
+  local url=${LCCC_KERNEL_GIT_URL:-https://github.com/gregkh/linux}
+  echo "prepare_kernel_tree: shallow git checkout of v$KVER from $url"
+  rm -rf -- "$KDIR"
+  git clone --quiet --depth 1 --branch "v$KVER" "$url" "$KDIR" || return 1
+  git_tree_at_tag || {
+    echo "prepare_kernel_tree: clone did not land on tag v$KVER" >&2
+    return 1
+  }
+}
+
+if [[ $SOURCE_MODE == git ]]; then
+  [[ -d $KDIR ]] || git_checkout_tree || exit 1
+  git_tree_at_tag || {
+    echo "prepare_kernel_tree: KDIR vanished or is not at tag v$KVER" >&2
+    exit 1
+  }
+  cd "$KDIR"
+else
+
 # ---- 1. source tarball ------------------------------------------------------
 # The workspace snapshot truncates large files (~128 MB cap): a stale tarball
 # can be present but truncated. `xz -t` validates integrity cheaply (~2 s);
@@ -334,17 +388,29 @@ tarball_ok() {
 }
 if ! tarball_ok; then
   echo "prepare_kernel_tree: downloading linux-$KVER.tar.xz"
-  curl -fsSL --retry 3 -o "$TARBALL" "https://cdn.kernel.org/pub/linux/kernel/v${KVER%%.*}.x/linux-$KVER.tar.xz"
-  tarball_ok || {
-    echo "prepare_kernel_tree: download failed sha256 check against PKGBUILD ($PKG_TARBALL_SHA256)" >&2
-    exit 1
-  }
+  if ! curl -fsSL --retry 3 -o "$TARBALL" \
+        "https://cdn.kernel.org/pub/linux/kernel/v${KVER%%.*}.x/linux-$KVER.tar.xz" \
+     || ! tarball_ok; then
+    if [[ $SOURCE_MODE == tarball ]]; then
+      echo "prepare_kernel_tree: download failed sha256 check against PKGBUILD ($PKG_TARBALL_SHA256)" >&2
+      exit 1
+    fi
+    # auto mode: kernel.org unreachable (sandboxed network) — fall back to the
+    # signed-tag git mirror rather than dying after a wasted download attempt.
+    echo "prepare_kernel_tree: kernel.org tarball unavailable; falling back to git mirror" >&2
+    git_checkout_tree || exit 1
+    SOURCE_MODE=git
+    cd "$KDIR"
+  fi
 fi
 
 # ---- 2. extract -------------------------------------------------------------
 # tar always creates `linux-$KVER/`, whatever KDIR is named. Extract into a
 # private staging directory and move that top directory to KDIR, so a custom
 # KDIR works and no stray directory is ever entered or deleted by name.
+# (git mode skips all of this: the checkout already IS the tree, git verified
+# every object against the tag, and the canary checks before stamping cover
+# worktree completeness.)
 extract_tree() {
   local stage tar_err
   echo "prepare_kernel_tree: extracting"
@@ -369,6 +435,7 @@ extract_tree() {
   mv -- "$stage/linux-$KVER" "$KDIR"
   rm -rf -- "$stage"
 }
+if [[ $SOURCE_MODE == tarball ]]; then
 extract_tree
 
 # Post-extract integrity: check sentinel files spread across the tree (not just
@@ -396,6 +463,19 @@ if (( n_tree < n_tar )); then
   (( n_tree >= n_tar )) || { echo "prepare_kernel_tree: still short after re-extract ($n_tree of $n_tar)" >&2; exit 1; }
 fi
 cd "$KDIR"
+fi  # SOURCE_MODE == tarball (extract block)
+fi  # SOURCE_MODE == git else-branch (tarball download + extract)
+
+# ---- 2c. pristine base for patching -----------------------------------------
+# A previously failed run can leave a half-patched tree. In git mode we can
+# (and must) restore the pristine tag state first: re-patching a dirty tree
+# silently double-applies hunks that patch's reverse-detection misses under
+# fuzz, producing inconsistent sources that later fail in even more confusing
+# ways. (tarball mode is inherently pristine: extraction always replaces KDIR.)
+if [[ $SOURCE_MODE == git ]]; then
+  git checkout -q -- .
+  git clean -qfd
+fi
 
 # ---- 2b. localversion files, exactly like prepare() --------------------------
 # PKGBUILD: echo "-$pkgrel" > localversion.10-pkgrel;
@@ -428,13 +508,15 @@ apply_patch_series() {
       echo "prepare_kernel_tree: PKGBUILD lists $src but $PKGDIR lacks it" >&2
       return 1
     }
-    if patch -Np1 --silent --forward < "$PKGDIR/$src" >"$patch_log" 2>&1; then
-      n=$((n+1))
-    elif grep -q "previously applied" "$patch_log"; then
+    # The base is pristine (step 2c), so a plain forward apply is exact: no
+    # --forward leniency, no "previously applied" ambiguity — any mismatch
+    # fails loudly and the next run starts from the pristine tag again.
+    if patch -p1 --silent < "$PKGDIR/$src" >"$patch_log" 2>&1; then
       n=$((n+1))
     else
       echo "prepare_kernel_tree: patch FAILED: $src" >&2
       tail -5 "$patch_log" >&2
+      rm -f -- "$patch_log"
       return 1
     fi
   done < <(pkgbuild_patch_sources)
@@ -506,5 +588,14 @@ EOF
 for c in "${LCCC_PREPARED_CANARIES[@]}"; do
   [[ -f "$c" ]] || { echo "prepare_kernel_tree: post-check failed, missing: $c" >&2; exit 1; }
 done
-compiler_id > .lccc-prepared
+{
+  compiler_id
+  printf 'source=%s\n' "$SOURCE_MODE"
+  if [[ $SOURCE_MODE == git ]]; then
+    printf 'commit=%s\n' "$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+    printf 'tag-verified=%s\n' "$(git describe --exact-match --tags HEAD 2>/dev/null || echo no)"
+  else
+    printf 'tarball-sha256=%s\n' "$PKG_TARBALL_SHA256"
+  fi
+} > .lccc-prepared
 echo "prepare_kernel_tree: $KDIR ready (stamp written: $(cat .lccc-prepared))"

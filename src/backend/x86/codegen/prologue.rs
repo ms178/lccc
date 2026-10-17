@@ -528,6 +528,10 @@ impl X86Codegen {
                                 }
                             }
                         }
+                        // Vector va_arg always fetches its ONE XMM slot from
+                        // the save area when %al says one was passed; a vector
+                        // never travels in a GP register on x86-64.
+                        Instruction::VaArgVector { .. } => needs_fp = true,
                         _ => {}
                     }
                 }

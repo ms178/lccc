@@ -68,10 +68,18 @@ use crate::ir::reexports::{
     Value,
 };
 
+/// Whether a math name is eligible for builtin folding in this translation unit.
+/// Compiler-prefixed builtin spellings remain available in every mode.
+fn builtin_allowed(name: &str, builtins: &crate::common::builtin::BuiltinPolicy) -> bool {
+    !builtins.withdrawn(name)
+        || name.starts_with("__builtin_")
+        || matches!(name, "__fabstf2" | "__copysigntf3")
+}
+
 /// Run algebraic simplification on the module.
 /// Returns the number of instructions simplified.
-pub fn run(module: &mut IrModule) -> usize {
-    run_with_config(module, false)
+pub fn run(module: &mut IrModule, builtins: &crate::common::builtin::BuiltinPolicy) -> usize {
+    run_with_config(module, false, builtins)
 }
 
 /// `fill_use_counts` enables the reassociation single-use profitability
@@ -84,15 +92,26 @@ pub fn run(module: &mut IrModule) -> usize {
 /// canonicalization for downstream vectorizer pattern matching, and blocking
 /// them changes which shape reaches the vectorizer (affine_map_vectorization
 /// regressed when the guard was active at -O2).
-pub fn run_with_config(module: &mut IrModule, fill_use_counts: bool) -> usize {
-    module.for_each_function(|f| simplify_function_with_config(f, fill_use_counts))
+pub fn run_with_config(
+    module: &mut IrModule,
+    fill_use_counts: bool,
+    builtins: &crate::common::builtin::BuiltinPolicy,
+) -> usize {
+    module.for_each_function(|f| simplify_function_with_config(f, fill_use_counts, builtins))
 }
 
-pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
-    simplify_function_with_config(func, false)
+pub(crate) fn simplify_function(
+    func: &mut IrFunction,
+    builtins: &crate::common::builtin::BuiltinPolicy,
+) -> usize {
+    simplify_function_with_config(func, false, builtins)
 }
 
-fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -> usize {
+fn simplify_function_with_config(
+    func: &mut IrFunction,
+    fill_use_counts: bool,
+    builtins: &crate::common::builtin::BuiltinPolicy,
+) -> usize {
     if super::fp_environment_blocks_reordering(func) {
         return 0;
     }
@@ -295,15 +314,17 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
                     _ => {}
                 },
                 Instruction::Call { func, info } => {
-                    if matches!(
-                        func.as_str(),
-                        "fabs"
-                            | "fabsf"
-                            | "fabsl"
-                            | "__builtin_fabs"
-                            | "__builtin_fabsf"
-                            | "__builtin_fabsl"
-                    ) {
+                    if builtin_allowed(func, builtins)
+                        && matches!(
+                            func.as_str(),
+                            "fabs"
+                                | "fabsf"
+                                | "fabsl"
+                                | "__builtin_fabs"
+                                | "__builtin_fabsf"
+                                | "__builtin_fabsl"
+                        )
+                    {
                         if let Some(d) = info.dest {
                             let id = d.0 as usize;
                             if id < is_fabs.len() {
@@ -437,6 +458,7 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
                 &value_types,
                 &use_counts,
                 &cast_use_counts,
+                builtins,
             ) {
                 *inst = simplified;
                 total += 1;
@@ -897,6 +919,7 @@ fn try_simplify_with_types(
     value_types: &[Option<IrType>],
     use_counts: &[u32],
     cast_use_counts: &[u32],
+    builtins: &crate::common::builtin::BuiltinPolicy,
 ) -> Option<Instruction> {
     match inst {
         Instruction::BinOp {
@@ -1032,7 +1055,7 @@ fn try_simplify_with_types(
         }
         Instruction::Call { func, info } => {
             if let Some(d) = info.dest {
-                simplify_math_call(d, func, &info.args, info.return_type)
+                simplify_math_call(d, func, &info.args, info.return_type, builtins)
             } else {
                 None
             }
@@ -1087,6 +1110,7 @@ fn try_simplify(
         &[],
         &[],
         &[],
+        &crate::common::builtin::BuiltinPolicy::default(),
     )
 }
 
@@ -1094,7 +1118,20 @@ fn try_simplify(
 /// add/sub-of-neg): threads the NegDef map with everything else empty.
 #[cfg(test)]
 fn try_simplify_neg(inst: &Instruction, neg_defs: &[Option<NegDef>]) -> Option<Instruction> {
-    try_simplify_with_types(inst, &[], &[], &[], &[], neg_defs, &[], &[], &[], &[], &[])
+    try_simplify_with_types(
+        inst,
+        &[],
+        &[],
+        &[],
+        &[],
+        neg_defs,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &crate::common::builtin::BuiltinPolicy::default(),
+    )
 }
 
 /// Simplify a Cast instruction.
@@ -3131,7 +3168,11 @@ fn simplify_math_call(
     func: &str,
     args: &[Operand],
     return_type: IrType,
+    builtins: &crate::common::builtin::BuiltinPolicy,
 ) -> Option<Instruction> {
+    if !builtin_allowed(func, builtins) {
+        return None;
+    }
     // Check unary intrinsic table first (sqrt, sqrtf, fabs, fabsf).
     for &(name, intrinsic_op) in UNARY_INTRINSICS {
         if func == name {
@@ -3265,7 +3306,10 @@ fn simplify_math_call(
 /// external reference and fail to link (LCCC links no libgcc). Running the
 /// same folding here makes `_Float128` math builtins work at every opt level.
 /// Semantics-preserving: the fold is a rename to the backend's own intrinsic.
-pub fn fold_math_intrinsic_calls(module: &mut IrModule) {
+pub fn fold_math_intrinsic_calls(
+    module: &mut IrModule,
+    builtins: &crate::common::builtin::BuiltinPolicy,
+) {
     for func in &mut module.functions {
         if super::fp_environment_blocks_reordering(func) {
             continue;
@@ -3275,7 +3319,7 @@ pub fn fold_math_intrinsic_calls(module: &mut IrModule) {
                 if let Instruction::Call { func: callee, info } = inst {
                     if let Some(d) = info.dest {
                         if let Some(new_inst) =
-                            simplify_math_call(d, callee, &info.args, info.return_type)
+                            simplify_math_call(d, callee, &info.args, info.return_type, builtins)
                         {
                             *inst = new_inst;
                         }
@@ -3290,6 +3334,19 @@ pub fn fold_math_intrinsic_calls(module: &mut IrModule) {
 mod tests {
     use super::*;
     use crate::ir::reexports::CallInfo;
+
+    #[test]
+    fn no_builtins_allows_explicit_interfaces_not_arbitrary_double_underscore_names() {
+        let hosted = crate::common::builtin::BuiltinPolicy::default();
+        let mut withdrawn = crate::common::builtin::BuiltinPolicy::default();
+        withdrawn.withdraw_all();
+        assert!(builtin_allowed("__builtin_fabs", &withdrawn));
+        assert!(builtin_allowed("__fabstf2", &withdrawn));
+        assert!(builtin_allowed("__copysigntf3", &withdrawn));
+        assert!(builtin_allowed("sqrt", &hosted));
+        assert!(!builtin_allowed("sqrt", &withdrawn));
+        assert!(!builtin_allowed("__user_math_wrapper", &withdrawn));
+    }
 
     // === Test helpers ===
 

@@ -19,7 +19,15 @@ use crate::ir::reexports::{CallInfo, Instruction, IrFunction, IrModule, Operand,
 /// Run interprocedural purity and constness inference on the module.
 ///
 /// Returns the number of call sites updated.
+#[cfg(test)]
 pub fn run(module: &mut IrModule) -> usize {
+    run_with_builtins(module, &crate::common::builtin::BuiltinPolicy::default())
+}
+
+pub fn run_with_builtins(
+    module: &mut IrModule,
+    builtins: &crate::common::builtin::BuiltinPolicy,
+) -> usize {
     let fenv = module
         .functions
         .iter()
@@ -68,7 +76,8 @@ pub fn run(module: &mut IrModule) -> usize {
         "ceill", "floor", "floorf", "floorl", "trunc", "truncf", "truncl", "round", "roundf",
         "roundl", "log", "logf", "logl", "exp", "expf", "expl", "pow", "powf", "powl",
     ] {
-        if fp_effectful.contains(*name)
+        if builtins.withdrawn(name)
+            || fp_effectful.contains(*name)
             || (fenv && !["abs", "labs", "llabs", "imaxabs"].contains(name))
         {
             continue;
@@ -82,7 +91,7 @@ pub fn run(module: &mut IrModule) -> usize {
         "strlen", "wcslen", "strcmp", "strncmp", "wcscmp", "wcsncmp", "memcmp", "bcmp", "strchr",
         "strrchr", "strstr", "memchr",
     ] {
-        if !fp_effectful.contains(*name) {
+        if !builtins.withdrawn(name) && !fp_effectful.contains(*name) {
             pure_fns.insert(name.to_string());
         }
     }
@@ -316,6 +325,7 @@ fn analyze_function_purity(
                 | Instruction::VaCopy { .. }
                 | Instruction::VaArg { .. }
                 | Instruction::VaArgStruct { .. }
+                | Instruction::VaArgVector { .. }
                 | Instruction::PgoCounterInc { .. }
                 | Instruction::Fence { .. }
                 | Instruction::InitTrampoline { .. }

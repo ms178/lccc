@@ -650,6 +650,11 @@ fn replace_operands_in_instruction(inst: &mut Instruction, copy_map: &[Option<Op
             dest_ptr,
             va_list_ptr,
             ..
+        }
+        | Instruction::VaArgVector {
+            dest_ptr,
+            va_list_ptr,
+            ..
         } => {
             count += replace_value_in_place(dest_ptr, copy_map);
             count += replace_value_in_place(va_list_ptr, copy_map);

@@ -234,6 +234,23 @@ impl Lowerer {
             return init;
         }
 
+        // `__func__`/`__FUNCTION__`/`__PRETTY_FUNCTION__` denote a static
+        // const char[] per function (C99 6.4.2.2p4), so a static local
+        // initialized with one is an address constant (GCC 16.2 accepts
+        // `static const char *s = __func__;`; the kernel's tracepoint string
+        // helpers — lib/maple_tree.c trace_ma_op — do exactly that). Material
+        // the function name as the same interned string literal the
+        // expression path lowers it to.
+        if let Expr::Identifier(name, _) = expr {
+            if matches!(
+                name.as_str(),
+                "__func__" | "__FUNCTION__" | "__PRETTY_FUNCTION__"
+            ) {
+                let fname = self.func().name.clone();
+                return GlobalInit::GlobalAddr(self.intern_string_literal(&fname));
+            }
+        }
+
         // &(compound_literal) at file scope
         if let Expr::AddressOf(inner, _) = expr {
             if let Expr::CompoundLiteral(cl_type_spec, cl_init, _) = inner.as_ref() {

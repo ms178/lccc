@@ -17,13 +17,14 @@
 //!
 //! * `Value`: an arithmetic constant (literals, enumerators, `sizeof`,
 //!   folded integer arithmetic, the value of a const object whose initializer
-//!   was constant, `?:` on a constant condition).
+//!   was constant, `?:` on a constant condition, and a compound literal in
+//!   full-initializer position, whose own initializers are all constant).
 //! * `Address(root)`: an address constant. `root` names the static object
 //!   the address is into, so `&a.x - &a.y`-style differences can be checked
 //!   for a common object; `None` for string literals and function designators.
 //! * `Bad`: anything else, including the address of an automatic object, the
-//!   value of a non-const object, calls, assignments, comma, and compound
-//!   literals (which are automatic in block scope).
+//!   value of a non-const object, calls, assignments, comma, and a block-scope
+//!   compound literal used as an operand or address (decayed `(int[]){1,2}`).
 //!
 //! The rules were measured against GCC 16.2 (see
 //! `tests/regression/static_local/`), including the GNU folding of const
@@ -115,7 +116,7 @@ impl<'s> StaticInitChecker<'s> {
     fn collect_bad(&self, init: &Initializer, out: &mut Vec<Span>) {
         match init {
             Initializer::Expr(e) => {
-                if self.value(e) == Kind::Bad {
+                if self.leaf_kind(e) == Kind::Bad {
                     out.push(e.span());
                 }
             }
@@ -125,6 +126,38 @@ impl<'s> StaticInitChecker<'s> {
                 }
             }
         }
+    }
+
+    /// The kind of a full initializer expression of one subobject.
+    ///
+    /// A compound literal in initializer position is the braced list itself:
+    /// GCC creates no block-scope object for it (`static rs_t s =
+    /// { .lock = (inner_t){ 0, 1 } };`, `static int x = (int){5};`,
+    /// `static int *p = (int *){0};` are all accepted when the literal's own
+    /// initializers are constant — the Linux kernel's RATELIMIT_STATE_INIT
+    /// depends on this). An ARRAY-typed literal is treated conservatively as
+    /// its decayed address (the common `(int[]){1,2}` -> static-pointer shape
+    /// is exactly that, and GCC rejects it); the rarer array-literal-
+    /// initializes-array-object form is then rejected too — safe direction,
+    /// tracked as a known deviation.
+    ///
+    /// Any other use of a block-scope compound literal — an operand of
+    /// arithmetic, a cast, or `&(T){...}` — references the automatic object
+    /// and stays non-constant (GCC 16.2 rejects `(int){5} + 1` and
+    /// `&(T){...}` with "initializer element is not constant").
+    fn leaf_kind<'e>(&self, e: &'e Expr) -> Kind<'e> {
+        if let Expr::CompoundLiteral(_, init, _) = e {
+            if !matches!((self.ctype)(e), Some(CType::Array(..))) {
+                let mut inner = Vec::new();
+                self.collect_bad(init, &mut inner);
+                return if inner.is_empty() {
+                    Kind::Value
+                } else {
+                    Kind::Bad
+                };
+            }
+        }
+        self.value(e)
     }
 
     /// The kind of an expression used as a value (after array and function
@@ -202,14 +235,28 @@ impl<'s> StaticInitChecker<'s> {
                 Some(_) => Kind::Value,
                 None => Kind::Bad,
             },
-            // A call is a constant exactly when the evaluator folds it: the
-            // `value()` prologue above already asked, so a name arrives here
-            // only if it is *not* foldable and the answer is `Bad` (the `_`
-            // arm).  Deliberately no whitelist of builtin names lives here:
-            // one list would be a second opinion about what the evaluator can
-            // compute, and the two answers disagreeing is how
-            // `static double y = __builtin_sqrt(4.0);` came to be accepted by
-            // sema and then rejected during lowering.
+            // __builtin_choose_expr(const, a, b) is ONLY the selected operand:
+            // the other one is never converted, so it may name an automatic
+            // object (GCC 16.2 accepts `__builtin_choose_expr(1, 0, (int *)&a)`).
+            // The kernel's PIN_GROUP(.mode = __builtin_choose_expr(
+            // __builtin_constant_p((m)), (m), 0)) selects `0` for array `m`
+            // and keeps the static initializer constant. The arm exists for
+            // the same reason the Conditional and _Generic arms do: the
+            // evaluator folds choose_expr only when the SELECTED operand
+            // folds to a scalar, so an address-constant operand (a static
+            // array name, `.modes = choose_expr(bcp(m), NULL, (m))`) makes
+            // the whole call unevaluable there and only the operand
+            // classification below can accept it.
+            Expr::FunctionCall(callee, args, _)
+                if matches!(callee.as_ref(), Expr::Identifier(n, _) if n == "__builtin_choose_expr")
+                    && args.len() >= 3 =>
+            {
+                match (self.eval)(&args[0]) {
+                    Some(v) if is_false_condition(&v) => self.value(&args[2]),
+                    Some(_) => self.value(&args[1]),
+                    None => Kind::Bad,
+                }
+            }
             // Only the selected association is part of the initializer. The
             // others are never evaluated, so they may name automatic objects
             // (GCC 16.2 accepts `_Generic(n, int: (int *)0, default: (int *)&a)`).
@@ -310,6 +357,15 @@ impl<'s> StaticInitChecker<'s> {
     /// An identifier used as a value: an array or function decays to its
     /// address, an object contributes its value only if it is a folded const.
     fn identifier_value<'e>(&self, name: &'e str) -> Kind<'e> {
+        // `__func__`/`__FUNCTION__`/`__PRETTY_FUNCTION__` denote a static
+        // const char[] per function (C99 6.4.2.2p4), so a pointer initialized
+        // with one is an address constant (GCC 16.2 accepts
+        // `static const char *s = __func__;`; the kernel's tracepoint string
+        // helpers — lib/maple_tree.c trace_ma_op — do exactly that). The
+        // lowerer materializes them as string literals, so the value exists.
+        if matches!(name, "__func__" | "__FUNCTION__" | "__PRETTY_FUNCTION__") {
+            return Kind::Address(None);
+        }
         match self.symbols.lookup(name) {
             // Undeclared: already diagnosed; do not report a second error.
             None => Kind::Value,

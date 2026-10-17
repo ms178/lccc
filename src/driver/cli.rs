@@ -1115,6 +1115,9 @@ impl Driver {
         let strict_options = std::env::var_os("LCCC_STRICT_OPTIONS").is_some();
         let mut unknown_options: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        // Sticky profile directory: GCC applies -fprofile-dir regardless of
+        // whether it appears before or after a profile-use/generate switch.
+        let mut pgo_profile_dir: Option<String> = None;
         let mut i = 0;
         while i < args.len() {
             // x86 ISA flags are routed through the shared applicator FIRST:
@@ -1555,13 +1558,24 @@ impl Driver {
                 arg if arg == "-ffreestanding" => {
                     self.freestanding = true;
                     self.builtin_policy.withdraw_all();
+                    self.no_builtins = true;
                 }
                 arg if arg == "-fhosted" => {
                     self.freestanding = false;
                     self.builtin_policy.restore_all();
+                    self.no_builtins = false;
                 }
-                arg if arg == "-fbuiltin" => self.builtin_policy.restore_all(),
-                arg if arg == "-fno-builtin" => self.builtin_policy.withdraw_all(),
+                // The blanket fields track the policy so every consumer
+                // (sema, lowering, passes) sees one answer even though the
+                // per-name state lives in `builtin_policy`.
+                arg if arg == "-fbuiltin" => {
+                    self.builtin_policy.restore_all();
+                    self.no_builtins = false;
+                }
+                arg if arg == "-fno-builtin" => {
+                    self.builtin_policy.withdraw_all();
+                    self.no_builtins = true;
+                }
                 arg if arg.starts_with("-fno-builtin-") => {
                     self.builtin_policy
                         .withdraw_one(&arg["-fno-builtin-".len()..]);
@@ -1591,8 +1605,6 @@ impl Driver {
                 arg if arg == "-finstrument-functions" => {
                     self.instrument_functions = true;
                 }
-                arg if arg == "-finstrument-functions-exclude-file-list" => {}
-                arg if arg == "-finstrument-functions-exclude-function-list" => {}
                 // `-ffreestanding` (C11 4p6): the program may execute in a
                 // freestanding environment, so `__STDC_HOSTED__` is 0. Linux's
                 // arch/x86/boot and most firmware pass this; before this arm
@@ -2075,41 +2087,59 @@ impl Driver {
                 }
 
                 // PGO flags (instrumented profiling)
-                "-fprofile-generate" => self.pgo_generate = Some(".".to_string()),
+                "-fprofile-generate" => {
+                    self.pgo_generate =
+                        Some(pgo_profile_dir.clone().unwrap_or_else(|| ".".to_string()));
+                }
                 arg if arg.starts_with("-fprofile-generate=") => {
                     let path = arg["-fprofile-generate=".len()..].to_string();
-                    self.pgo_generate = Some(if path.is_empty() {
-                        ".".to_string()
-                    } else {
-                        path
-                    });
+                    if path.is_empty() {
+                        return Err(format!("{} requires a nonempty profile directory", arg));
+                    }
+                    self.pgo_generate = Some(path);
                 }
-                "-fprofile-use" => self.pgo_use = Some(".".to_string()),
+                "-fprofile-use" => {
+                    self.pgo_use = Some(pgo_profile_dir.clone().unwrap_or_else(|| ".".to_string()));
+                }
                 arg if arg.starts_with("-fprofile-use=") => {
                     let path = arg["-fprofile-use=".len()..].to_string();
-                    self.pgo_use = Some(if path.is_empty() {
-                        ".".to_string()
-                    } else {
-                        path
-                    });
+                    if path.is_empty() {
+                        return Err(format!("{} requires a nonempty profile directory", arg));
+                    }
+                    self.pgo_use = Some(path);
                 }
-                "-fprofile-arcs" => self.pgo_generate = Some(".".to_string()),
-                "-ftest-coverage" => self.pgo_generate = Some(".".to_string()),
+                "-fprofile-arcs" | "-ftest-coverage" => {
+                    self.pgo_generate =
+                        Some(pgo_profile_dir.clone().unwrap_or_else(|| ".".to_string()));
+                }
                 arg if arg.starts_with("-fprofile-update=") => {
                     // GCC 7+/LLVM 17+ semantics: single (default, non-atomic),
                     // atomic (lock-prefixed), prefer-atomic (atomic when the
                     // target supports it — x86-64 always does).
                     let m = arg["-fprofile-update=".len()..].to_string();
                     self.pgo_update = Some(match m.as_str() {
+                        "single" => "single".to_string(),
                         "atomic" | "prefer-atomic" => "atomic".to_string(),
-                        _ => "single".to_string(),
+                        _ => {
+                            return Err(format!(
+                                "invalid value '{}' for '{}'; expected single, atomic, or prefer-atomic",
+                                m, arg
+                            ));
+                        }
                     });
                 }
                 "-fbranch-probabilities" => {
-                    self.pgo_use = Some(self.pgo_use.clone().unwrap_or_else(|| ".".to_string()))
+                    if self.pgo_use.is_none() {
+                        self.pgo_use =
+                            Some(pgo_profile_dir.clone().unwrap_or_else(|| ".".to_string()));
+                    }
                 }
                 arg if arg.starts_with("-fprofile-dir=") => {
                     let path = arg["-fprofile-dir=".len()..].to_string();
+                    if path.is_empty() {
+                        return Err(format!("{}: profile directory must not be empty", arg));
+                    }
+                    pgo_profile_dir = Some(path.clone());
                     if self.pgo_generate.is_some() {
                         self.pgo_generate = Some(path.clone());
                     }
@@ -2117,17 +2147,16 @@ impl Driver {
                         self.pgo_use = Some(path);
                     }
                 }
-                "-fauto-profile" => self.pgo_use = Some(".".to_string()),
+                "-fauto-profile" => {
+                    self.pgo_use = Some(pgo_profile_dir.clone().unwrap_or_else(|| ".".to_string()));
+                }
                 arg if arg.starts_with("-fauto-profile=") => {
                     let path = arg["-fauto-profile=".len()..].to_string();
+                    if path.is_empty() {
+                        return Err(format!("{} requires a nonempty profile path", arg));
+                    }
                     self.pgo_use = Some(path);
                 }
-                "-fno-profile-arcs"
-                | "-fno-test-coverage"
-                | "-fno-branch-probabilities"
-                | "-fno-auto-profile" => {}
-                arg if arg.starts_with("-fno-profile") => {}
-
                 // Feature flags. Full PIC and PIE have different x86-64 data
                 // relocation rules, so preserve the last explicit mode rather
                 // than collapsing both flags into one boolean.
@@ -2160,14 +2189,25 @@ impl Driver {
                     self.cf_protection_value = None;
                 }
                 arg if arg.starts_with("-fpatchable-function-entry=") => {
-                    let val = &arg["-fpatchable-function-entry=".len()..];
-                    let parts: Vec<&str> = val.split(',').collect();
-                    let total: u32 = parts[0].parse().unwrap_or(0);
-                    let before: u32 = if parts.len() > 1 {
-                        parts[1].parse().unwrap_or(0)
-                    } else {
-                        0
+                    let value = &arg["-fpatchable-function-entry=".len()..];
+                    let parts: Vec<&str> = value.split(',').collect();
+                    let invalid = || {
+                        format!(
+                            "invalid value '{}' for '{}'; expected N[,M] with 0 <= M <= N",
+                            value, arg
+                        )
                     };
+                    if parts.is_empty() || parts.len() > 2 {
+                        return Err(invalid());
+                    }
+                    let total = parts[0].parse::<u32>().map_err(|_| invalid())?;
+                    let before = match parts.get(1) {
+                        Some(part) => part.parse::<u32>().map_err(|_| invalid())?,
+                        None => 0,
+                    };
+                    if before > total {
+                        return Err(invalid());
+                    }
                     self.patchable_function_entry = Some((total, before));
                 }
                 "-fomit-frame-pointer" => self.omit_frame_pointer = true,
@@ -2207,6 +2247,21 @@ impl Driver {
                 }
                 "-fasynchronous-unwind-tables" | "-funwind-tables" => self.no_unwind_tables = false,
                 "-fno-jump-tables" => self.no_jump_tables = true,
+                // (-ffreestanding/-fhosted/-fbuiltin/-fno-builtin are
+                // handled by the A13 arms above; per-name `-fno-builtin-<fn>`
+                // withdrawals are supported there with GCC's stickiness.)
+                "-fno-tree-vectorize" => self.disable_tree_vectorize = true,
+                "-ftree-vectorize" => self.disable_tree_vectorize = false,
+                arg if matches!(
+                    arg,
+                    "-fno-tree-loop-vectorize"
+                        | "-fno-tree-slp-vectorize"
+                        | "-ftree-loop-vectorize"
+                        | "-ftree-slp-vectorize"
+                ) =>
+                {
+                    return Err(format!("per-vectorizer control is unsupported: {}", arg));
+                }
                 "-ffunction-sections" => self.function_sections = true,
                 "-fno-function-sections" => self.function_sections = false,
                 "-fdata-sections" => self.data_sections = true,
@@ -2289,10 +2344,12 @@ impl Driver {
                 }
                 arg if arg.starts_with("-fdiagnostics-color=") => {
                     let value = &arg["-fdiagnostics-color=".len()..];
-                    if let Some(mode) = ColorMode::from_flag(value) {
-                        self.color_mode = mode;
-                    }
-                    // Unknown values silently ignored (matching GCC)
+                    self.color_mode = ColorMode::from_flag(value).ok_or_else(|| {
+                        format!(
+                            "invalid value '{}' for '{}'; expected auto, always, or never",
+                            value, arg
+                        )
+                    })?;
                 }
                 // Function-entry mcount instrumentation: `-pg` is the trigger
                 // that activates emission (see McountInstrumentation). The
@@ -2358,13 +2415,37 @@ impl Driver {
                 // NOTE: there used to be a blanket `arg if arg.starts_with("-f") => {}`
                 // here. It made every unimplemented `-f` option -- including
                 // `-ftrapv` and `-fsanitize=*`, whose explicit refusal arms
-                // sit BELOW it and were therefore unreachable dead code --
-                // disappear without a diagnostic. Anything not matched by a
-                // specific arm above now falls through to the unknown-option
-                // arm at the end of this match, which applies the documented
-                // tier policy (warning by default, `LCCC_STRICT_OPTIONS=1`
-                // fatal). Do not reintroduce it; add a specific, commented
-                // no-op arm for a flag LCCC deliberately treats as inert.
+                // sat below it and were therefore unreachable dead code --
+                // disappear without a diagnostic. Unimplemented `-f`
+                // spellings are now classified by `option_table`: a deliberate
+                // no-op carries its reason there, everything else refuses.
+                // Do not reintroduce the blanket no-op; add a specific,
+                // commented table row for a flag LCCC deliberately treats as
+                // inert. Implemented `-f` flags keep their specific arms
+                // ABOVE this fall-through.
+                arg if arg.starts_with("-f") => {
+                    use super::option_table::{Class, lookup};
+                    match lookup(arg) {
+                        // Deliberate no-op: the table row carries the reason.
+                        Some(c) if c.class == Class::BenignNoop => {}
+                        // Classified refusal: the request would change program
+                        // meaning (LTO, sanitizers, ABI, ...), so a capability
+                        // probe must read "unsupported" and fall back.
+                        Some(c) => return Err(format!("{}: {}", arg, c.rationale)),
+                        // A table miss is a spelling NEWER than this tree
+                        // knows.  Give it the generic tier treatment
+                        // (tolerated diagnostic, fatal under
+                        // LCCC_STRICT_OPTIONS=1) rather than a hard refusal:
+                        // a newer GNU's inert optimisation preference must not
+                        // break a real build, and strict mode is what turns
+                        // the tolerance into the answer a probe needs.
+                        None => {
+                            if unknown_options.insert(arg.to_string()) {
+                                unknown_option_tolerated(arg, strict_options)?;
+                            }
+                        }
+                    }
+                }
 
                 // Linker flags
                 "-static" => self.static_link = true,
@@ -3056,6 +3137,166 @@ mod cli_tests {
             d.warning_config
                 .is_enabled(crate::common::error::WarningKind::Cpp)
         );
+    }
+
+    #[test]
+    fn hosted_freestanding_and_builtin_flags_are_explicit_and_ordered() {
+        let mut d = Driver::new();
+        d.parse_cli_args(&["ccc".into(), "-ffreestanding".into(), "x.c".into()])
+            .unwrap();
+        assert!(d.freestanding);
+        assert!(d.no_builtins);
+
+        let mut d = Driver::new();
+        d.parse_cli_args(&[
+            "ccc".into(),
+            "-ffreestanding".into(),
+            "-fbuiltin".into(),
+            "x.c".into(),
+        ])
+        .unwrap();
+        assert!(d.freestanding);
+        assert!(!d.no_builtins);
+
+        let mut d = Driver::new();
+        d.parse_cli_args(&[
+            "ccc".into(),
+            "-fhosted".into(),
+            "-fno-builtin".into(),
+            "x.c".into(),
+        ])
+        .unwrap();
+        assert!(!d.freestanding);
+        assert!(d.no_builtins);
+
+        let mut d = Driver::new();
+        d.parse_cli_args(&[
+            "ccc".into(),
+            "-fno-builtin".into(),
+            "-ffreestanding".into(),
+            "-fhosted".into(),
+            "x.c".into(),
+        ])
+        .unwrap();
+        assert!(!d.freestanding);
+        assert!(!d.no_builtins);
+    }
+
+    #[test]
+    fn profile_directory_is_order_independent_and_mode_paths_override_in_order() {
+        let cases: &[(&[&str], Option<&str>, Option<&str>)] = &[
+            (
+                &["-fprofile-dir=/tmp/profile", "-fprofile-generate"],
+                Some("/tmp/profile"),
+                None,
+            ),
+            (
+                &["-fprofile-generate", "-fprofile-dir=/tmp/profile"],
+                Some("/tmp/profile"),
+                None,
+            ),
+            (
+                &["-fprofile-dir=/tmp/profile", "-fprofile-use"],
+                None,
+                Some("/tmp/profile"),
+            ),
+            (
+                &["-fprofile-use", "-fprofile-dir=/tmp/profile"],
+                None,
+                Some("/tmp/profile"),
+            ),
+            (
+                &[
+                    "-fprofile-dir=/tmp/profile",
+                    "-fprofile-generate=/tmp/generate",
+                ],
+                Some("/tmp/generate"),
+                None,
+            ),
+            (
+                &[
+                    "-fprofile-generate=/tmp/generate",
+                    "-fprofile-dir=/tmp/profile",
+                ],
+                Some("/tmp/profile"),
+                None,
+            ),
+            (
+                &["-fprofile-dir=/tmp/profile", "-fprofile-use=/tmp/use"],
+                None,
+                Some("/tmp/use"),
+            ),
+            (
+                &["-fprofile-use=/tmp/use", "-fprofile-dir=/tmp/profile"],
+                None,
+                Some("/tmp/profile"),
+            ),
+        ];
+        for &(flags, expected_generate, expected_use) in cases {
+            let mut args = vec!["ccc".to_string()];
+            args.extend(flags.iter().map(|flag| (*flag).to_string()));
+            args.push("x.c".to_string());
+            let mut driver = Driver::new();
+            driver.parse_cli_args(&args).unwrap();
+            assert_eq!(
+                driver.pgo_generate.as_deref(),
+                expected_generate,
+                "{flags:?}"
+            );
+            assert_eq!(driver.pgo_use.as_deref(), expected_use, "{flags:?}");
+        }
+        for flag in [
+            "-fprofile-dir=",
+            "-fprofile-generate=",
+            "-fprofile-use=",
+            "-fauto-profile=",
+        ] {
+            assert!(try_flag(flag).is_err(), "{flag} must reject an empty path");
+        }
+    }
+
+    #[test]
+    fn tree_vectorize_switch_is_last_one_wins_and_partial_controls_are_refused() {
+        let mut d = Driver::new();
+        d.parse_cli_args(&[
+            "ccc".into(),
+            "-fno-tree-vectorize".into(),
+            "-ftree-vectorize".into(),
+            "x.c".into(),
+        ])
+        .unwrap();
+        assert!(!d.disable_tree_vectorize);
+
+        let mut d = Driver::new();
+        d.parse_cli_args(&[
+            "ccc".into(),
+            "-ftree-vectorize".into(),
+            "-fno-tree-vectorize".into(),
+            "x.c".into(),
+        ])
+        .unwrap();
+        assert!(d.disable_tree_vectorize);
+
+        for flag in [
+            "-fno-tree-loop-vectorize",
+            "-fno-tree-slp-vectorize",
+            "-ftree-loop-vectorize",
+            "-ftree-slp-vectorize",
+        ] {
+            assert!(try_flag(flag).is_err(), "{flag} must be explicitly refused");
+        }
+        // Per-name builtin control IS implemented (GCC-compatible stickiness:
+        // a per-name withdrawal survives a later blanket `-fbuiltin`).
+        let mut d = Driver::new();
+        d.parse_cli_args(&[
+            "ccc".into(),
+            "-fno-builtin-strlen".into(),
+            "-fbuiltin".into(),
+            "x.c".into(),
+        ])
+        .unwrap();
+        assert!(d.builtin_policy.withdrawn("strlen"));
+        assert!(!d.builtin_policy.withdrawn("memcpy"));
     }
 
     /// `-mno-<feature>` must be ACCEPTED for any ISA extension LCCC never
@@ -4200,7 +4441,6 @@ mod cli_tests {
             "-fno-tree-vectorize",
             "-fno-stack-clash-protection",
             "-fuse-ld=bfd",
-            "-flto",
             "-Og",
             "-fdiagnostics-color=always",
             "-fmax-errors=5",
@@ -4333,8 +4573,6 @@ mod cli_tests {
             "-fno-tree-vectorize",
             "-fuse-ld=bfd",
             "-fuse-ld=lld",
-            "-flto",
-            "-flto=auto",
             "-march=native",
             "-mtune=generic",
             "-msse4.2",
@@ -4372,6 +4610,12 @@ mod cli_tests {
         ];
         for arg in FLAGS {
             assert!(try_flag(arg).is_ok(), "{arg} must not fail a build");
+        }
+        // LTO is a link-model request, not an inert preference: ignoring it
+        // would read as support to a probe and silently skip the requested
+        // optimisation, so it refuses and the build system falls back.
+        for arg in ["-flto", "-flto=auto"] {
+            assert!(try_flag(arg).is_err(), "{arg} must be refused, not ignored");
         }
     }
 

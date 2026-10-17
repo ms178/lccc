@@ -1255,14 +1255,19 @@ impl Lowerer {
     /// Resolve a plain identifier to a visible nested function in the
     /// current function (scope map lookup).
     ///
-    /// Outside a function there is no nested-function scope to look in, and
-    /// the answer is "none" rather than a panic.  A call expression is
-    /// *typed* at file scope whenever a constant initializer contains one
-    /// (`static int v = __builtin_clz(1);`), and the type query that asks
-    /// reaches here through `callee_signature_key`; a GNU nested function is
-    /// declared inside a function body, so no file-scope call can name one.
-    /// Panicking here was an internal error on a valid program (measured:
-    /// `ccc: internal error: not inside a function`).
+    /// At file scope there is no enclosing function and therefore no nested
+    /// functions: const-expression evaluation of file-scope constructs (array
+    /// type sizes, enum values, static initializers) legitimately reaches this
+    /// lookup for call-shaped expressions, and must observe "no nested
+    /// function" rather than assume a function context. Returning `None` there
+    /// is semantically exact, not a fallback. Outside a function there is no
+    /// nested-function scope to look in, and the answer is "none" rather than
+    /// a panic: a call expression is *typed* at file scope whenever a constant
+    /// initializer contains one (`static int v = __builtin_clz(1);`), and the
+    /// type query that asks reaches here through `callee_signature_key`; a GNU
+    /// nested function is declared inside a function body, so no file-scope
+    /// call can name one. Panicking here was an internal error on a valid
+    /// program (measured: `ccc: internal error: not inside a function`).
     pub(super) fn lookup_nested_function(&self, name: &str) -> Option<NestedFnEntry> {
         let state = self.func_state.as_ref()?;
         state.nested_functions.get(name).cloned()

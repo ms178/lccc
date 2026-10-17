@@ -71,7 +71,10 @@ pub(crate) fn narrow_string_strlen(text: &str) -> usize {
     text.chars().take_while(|&c| c != '\0').count()
 }
 
-/// Evaluate a compile-time builtin function call in a constant expression.
+/// Evaluate compiler builtins in constant expressions while honoring
+/// `-fno-builtin` for ordinary hosted-library aliases. Explicit
+/// `__builtin_*` spellings remain available in both hosted and freestanding
+/// modes.
 ///
 /// Handles all pure builtins that can be folded at compile time:
 /// - __builtin_choose_expr, __builtin_constant_p, __builtin_expect
@@ -81,11 +84,15 @@ pub(crate) fn narrow_string_strlen(text: &str) -> usize {
 /// - __builtin_parity{,l,ll}, __builtin_clrsb{,l,ll}
 ///
 /// `eval_fn` is the caller's recursive eval_const_expr function.
-pub fn eval_builtin_call(
+pub fn eval_builtin_call_with_mode(
     name: &str,
     args: &[Expr],
     eval_fn: &dyn Fn(&Expr) -> Option<IrConst>,
+    allow_nonprefixed_builtins: bool,
 ) -> Option<IrConst> {
+    if name == "strlen" && !allow_nonprefixed_builtins {
+        return None;
+    }
     match name {
         "__builtin_strlen" | "strlen" => {
             // String literal -> compile-time length (without the NUL).
@@ -112,6 +119,23 @@ pub fn eval_builtin_call(
             // Prove positive answers early, but do not cache an early zero.
             // A local/parameter may become constant after mem2reg, inlining,
             // and propagation; the IR IsConstant node must survive until then.
+            //
+            // A string literal argument is a constant by definition (GCC 16.2
+            // folds `__builtin_constant_p("...")` to 1): the kernel's
+            // print_hex_dump/dynamic-debug descriptors initialize static
+            // structs with `__builtin_constant_p(KBUILD_MODNAME ": ...")
+            // ? "..." : ...` and the ternary only becomes a valid string
+            // initializer once the condition folds.
+            if args.first().is_some_and(|arg| {
+                matches!(
+                    arg,
+                    Expr::StringLiteral(..)
+                        | Expr::WideStringLiteral(..)
+                        | Expr::Char16StringLiteral(..)
+                )
+            }) {
+                return Some(IrConst::I32(1));
+            }
             if args.first().is_some_and(|arg| eval_fn(arg).is_some()) {
                 Some(IrConst::I32(1))
             } else {

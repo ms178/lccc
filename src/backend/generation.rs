@@ -110,6 +110,7 @@ pub(crate) fn instruction_may_clobber_vector_scratch(inst: &Instruction) -> bool
         | Instruction::Memcpy { .. }
         | Instruction::VaArg { .. }
         | Instruction::VaArgStruct { .. }
+        | Instruction::VaArgVector { .. }
         | Instruction::VaStart { .. }
         | Instruction::VaEnd { .. }
         | Instruction::VaCopy { .. }
@@ -6658,6 +6659,16 @@ fn generate_instruction_body(
             eightbyte_classes,
         } => {
             cg.emit_va_arg_struct_ex(dest_ptr, va_list_ptr, *size, *align, eightbyte_classes);
+            clobber_after_call_like(cg);
+        }
+        Instruction::VaArgVector {
+            dest_ptr,
+            va_list_ptr,
+            size,
+            align,
+            eightbyte_classes,
+        } => {
+            cg.emit_va_arg_vector(dest_ptr, va_list_ptr, *size, *align, eightbyte_classes);
             clobber_after_call_like(cg);
         }
         Instruction::AtomicRmw {

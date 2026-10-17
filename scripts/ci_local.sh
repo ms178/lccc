@@ -181,6 +181,9 @@ if [ ! -x "$LCCC" ]; then
     exit 1
 fi
 
+gate "driver-option-contract" fast \
+    env CCC="$LCCC" bash tests/regression/check_driver_option_contract.sh
+
 # --------------------------------------------------------------- job:test --
 # The ratchet that keeps the 2026-10-13 audit's debt numbers from growing:
 # panic-class sites (AUD-ICE-1), unsafe sites, giant functions (AUD-MONO-1),
@@ -311,6 +314,12 @@ gate "ext-vector-padded-layout" fast \
 # provider/caller pair and clang-compiled counterparts must agree bit for bit.
 gate "ext-vector-cross-abi" fast \
     env CCC="$LCCC" bash tests/regression/check_ext_vector_abi.sh
+
+# Vector-shaped varargs (vector_size cross-checked against GCC in all four
+# link directions; ext_vector_type as pinned LCCC round-trips). A wrong fetch
+# width or %al census poisons every later FP vararg, not just its own.
+gate "ext-vector-varargs-abi" fast \
+    env CCC="$LCCC" bash tests/regression/check_ext_vector_varargs_abi.sh
 
 gate "a9987-salvage" fast \
     env CCC="$LCCC" bash tests/regression/check_a9987_salvage.sh
@@ -828,6 +837,12 @@ gate "segfs-declarator-codegen" fast \
 # generic-pointer contract are checked on the emitted assembly.
 gate "seg-named-decl-qualifier" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_seg_named_decl_qualifier.sh
+
+# A declaration nested inside another declaration's typeof() must not leak
+# its named address space onto the outer object (kernel amd/core.c per-CPU
+# read macro; oracle-compared against GCC 16).
+gate "seg-typeof-stmtexpr-leak" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_seg_typeof_stmtexpr_leak.sh
 
 # `%gs:`/`%fs:` loads whose base is a register plus a constant displacement must
 # fold into the memory operand (`movq %gs:8(%rax), %rax`) — the shape GCC and

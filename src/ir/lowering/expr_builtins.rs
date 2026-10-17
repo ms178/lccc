@@ -94,6 +94,21 @@ impl Lowerer {
 
     /// Try to lower a __builtin_* call. Returns Some(result) if handled.
     pub(super) fn try_lower_builtin_call(&mut self, name: &str, args: &[Expr]) -> Option<Operand> {
+        // -ffreestanding/-fno-builtin disables hosted-library aliases such as
+        // abs() and creal(). Explicit compiler builtins, atomics, SIMD header
+        // interfaces, and alloca remain compiler interfaces.
+        let compiler_builtin = name.starts_with("__builtin_")
+            || name.starts_with("__atomic_")
+            || name.starts_with("__sync_")
+            || name.starts_with("__lccc_")
+            || name.starts_with("_mm_")
+            || name.starts_with("_mm256_")
+            || name.starts_with("_mm512_")
+            || name == "alloca";
+        if !compiler_builtin && self.builtin_policy.withdrawn(name) {
+            return None;
+        }
+
         // GCC -fbuiltin (the default) expands abs/labs/llabs as the corresponding
         // integer absolute-value even when the user later provides a definition
         // of the same name. The user body is still emitted (so taking the

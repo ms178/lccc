@@ -1233,12 +1233,15 @@ impl Parser {
                 declarator_span,
             );
             // Attach the address-space qualifier (e.g. `__percpu`) to the
-            // outermost pointer: `unsigned int __percpu *read_count` declares a
-            // %gs-qualified POINTER, and the load through it must use %gs:.
+            // pointer the qualifier was written BEFORE. GCC binds such a
+            // qualifier to the first (innermost) star: `unsigned int __percpu
+            // *read_count` dereferences with %gs, `int __seg_gs **f` keeps
+            // the outer dereference generic and puts %gs on the second
+            // (`**f`), and `void __percpu *pptrs[]` (DECLARE_FLEX_ARRAY)
+            // makes every ELEMENT a %gs-qualified pointer, so the slot sits
+            // under the array dimensions.
             if field_addr_space != AddressSpace::Default {
-                if let TypeSpecifier::Pointer(_, addr_slot) = &mut field_type {
-                    *addr_slot = field_addr_space;
-                }
+                field_type = Self::attach_before_star_space(field_type, field_addr_space);
             }
 
             fields.push(StructFieldDecl {
@@ -1298,6 +1301,30 @@ impl Parser {
     /// into the TypeSpecifier directly to maintain backward compatibility with
     /// downstream code. For complex cases (function pointers), return the
     /// derived list for downstream to process with build_full_ctype().
+    /// Bind a BEFORE-the-star address-space qualifier to the pointer it
+    /// applies to. GCC attaches such a qualifier to the first (innermost)
+    /// star, reached through any array dimensions and outer pointer levels:
+    /// `unsigned int __percpu *read_count` dereferences with %gs, `int
+    /// __seg_gs **f` keeps the outer dereference generic and puts %gs on the
+    /// second (`**f`), and `void __percpu *pptrs[]` (DECLARE_FLEX_ARRAY)
+    /// makes every ELEMENT a %gs-qualified pointer, so the slot sits under
+    /// the array dimensions. A type without a bindable pointer is returned
+    /// unchanged (the qualifier was rejected by check_struct_field_space).
+    fn attach_before_star_space(t: TypeSpecifier, space: AddressSpace) -> TypeSpecifier {
+        match t {
+            TypeSpecifier::Array(elem, n) => {
+                TypeSpecifier::Array(Box::new(Self::attach_before_star_space(*elem, space)), n)
+            }
+            TypeSpecifier::Pointer(pointee, s)
+                if matches!(&*pointee, TypeSpecifier::Pointer(..)) =>
+            {
+                TypeSpecifier::Pointer(Box::new(Self::attach_before_star_space(*pointee, space)), s)
+            }
+            TypeSpecifier::Pointer(pointee, _) => TypeSpecifier::Pointer(pointee, space),
+            other => other,
+        }
+    }
+
     fn fold_simple_derived(
         base: &TypeSpecifier,
         derived: &[DerivedDeclarator],
@@ -1319,12 +1346,22 @@ impl Parser {
         }
 
         // Simple case: only Pointer and Array declarators. Fold into type_spec.
+        // The space mapping replicates `build_full_ctype_with_base` exactly
+        // (its `pointee_space_before`): the wrapper built at step i takes the
+        // space stored at derived[i-1] — the qualifier written after star j
+        // says the pointer values that the next-outer star points at live in
+        // that space (`struct sd * __seg_gs *sd` = the kernel's
+        // `struct sched_domain * __percpu *`: the first dereference reads %gs).
+        // The old code dropped every space, so field types lost %gs and
+        // `free_percpu(sdd->sd)` failed that GCC accepts.
         let mut result = base.clone();
+        let mut pending_space = AddressSpace::Default;
         let mut i = 0;
         while i < derived.len() {
             match &derived[i] {
-                DerivedDeclarator::Pointer(_) => {
-                    result = TypeSpecifier::Pointer(Box::new(result), AddressSpace::Default);
+                DerivedDeclarator::Pointer(space) => {
+                    result = TypeSpecifier::Pointer(Box::new(result), pending_space);
+                    pending_space = *space;
                     i += 1;
                 }
                 DerivedDeclarator::Array(_) => {

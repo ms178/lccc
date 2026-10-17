@@ -2230,6 +2230,7 @@ pub(crate) fn for_each_operand_in_instruction(inst: &Instruction, mut f: impl Fn
         Instruction::VaEnd { .. } => {}
         Instruction::VaCopy { .. } => {}
         Instruction::VaArgStruct { .. } => {}
+        Instruction::VaArgVector { .. } => {}
         Instruction::AtomicRmw { ptr, val, .. } => {
             f(ptr);
             f(val);

@@ -5408,6 +5408,22 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         let b_pos = self.label_positions.get(diff_sym).copied().or_else(|| {
                             self.resolve_numeric_label(diff_sym, reloc.offset, sec_idx)
                         });
+                        // A SECTION symbol in a difference (`fault_pt -
+                        // __ex_table`, the kernel vDSO's extable macro): the
+                        // section symbol sits at offset 0 of its section in
+                        // the relocatable object, so naming the section the
+                        // difference is placed in resolves the subtrahend.
+                        // GAS turns `X - <place-section>` into a PC-relative
+                        // reloc against X with the place offset as addend —
+                        // exactly what the b_sec == sec_idx rule below
+                        // produces.
+                        let b_pos = b_pos.or_else(|| {
+                            if *diff_sym == self.sections[sec_idx].name {
+                                Some((sec_idx, 0))
+                            } else {
+                                None
+                            }
+                        });
                         if let (Some((a_sec, a_off)), Some((b_sec, b_off))) = (a_pos, b_pos) {
                             if a_sec == b_sec {
                                 let val = a_off as i64 - b_off as i64 + reloc.addend;

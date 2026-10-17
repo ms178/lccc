@@ -177,7 +177,14 @@ pub struct TypeContext {
     pub enum_typedefs: FxHashSet<String>,
     /// Completed named enum definitions, keyed by tag name. Each scope frame
     /// records additions and shadowed values so body-less references resolve
-    /// to the definition visible at that exact lexical point.
+    /// to the definition visible at that exact lexical point. Every named
+    /// body is stored (not only packed ones) with its variant VALUES intact:
+    /// `EnumType::compatible_ctype` derives the enum's compatible integer
+    /// type (C11 6.7.2.2p4) from the presence of a negative enumerator, so a
+    /// body-less `enum tag` reference must carry the same variants as the
+    /// definition -- `enum md_submodule_id *` (first enumerator -1) is
+    /// compatible with `int *`, not `unsigned int *`, and the kernel's
+    /// `kstrtoint(buf, 10, &id)` call in drivers/md/md.c depends on it.
     pub enum_types: FxHashMap<String, crate::common::types::EnumType>,
     /// Return CType for known functions
     pub func_return_ctypes: FxHashMap<String, CType>,
@@ -213,6 +220,7 @@ impl TypeContext {
             func_ptr_typedefs: FxHashSet::default(),
             func_ptr_typedef_info: FxHashMap::default(),
             enum_typedefs: FxHashSet::default(),
+
             enum_types: FxHashMap::default(),
             func_return_ctypes: FxHashMap::default(),
             ctype_cache: RefCell::new(FxHashMap::default()),

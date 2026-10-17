@@ -140,77 +140,11 @@ impl Lowerer {
         // Use the resolved expression for emit_call_instruction too
         let effective_func = stripped_func;
 
-        // Resolve __builtin_* functions first — unless the identifier names a
-        // local binding.  A block-scope object or parameter (`llf_t abs`,
-        // `void *(*memcpy)(...)`) shadows the library function of that name
-        // (C11 6.2.1p4); expanding the builtin anyway silently replaced a
-        // call through `i64 (*abs)(i64)` with a constant-folded `int abs(int)`.
-        let callee_is_local = matches!(stripped_func, Expr::Identifier(n, _)
-            if self.func_state.as_ref().is_some_and(|fs| fs.locals.contains_key(n.as_str())));
-        if let (Expr::Identifier(name, _), false) = (stripped_func, callee_is_local) {
-            if let Some(result) = self.try_lower_builtin_call(name, args) {
-                return result;
-            }
-
-            // __attribute__((__diagnose_as(__builtin_NAME, ...))) folding
-            // (GCC semantics): a call to a diagnosed declaration that
-            // survived inlining IS a call to the builtin.  The kernel's
-            // fortify-string family (__FORTIFY_INLINE = extern __always_inline)
-            // depends on BOTH halves of GCC's ladder — inline, else fold —
-            // because the declarations are extern and resolve to nothing at
-            // link time.  A missed fold here surfaced as undefined
-            // `__fortify_strlen` / `fortify_memset_chk` at the vmlinux link.
-            // GCC folds EVERY call to a __diagnose_as declaration to the
-            // named builtin — the attribute is a declarative alias, not an
-            // inlining fallback.  For the fortify family the definitions
-            // reduce to the underlying builtin plus __builtin_constant_p-
-            // guarded COMPILE-TIME diagnostics; folding drops only those
-            // diagnostics (a missed lint), never a defined program's
-            // runtime semantics — the same license GCC's own fold runs on.
-            let alias = self.diagnose_as_builtins.get(name).cloned();
-            if std::env::var_os("CCC_DBG_DA").is_some() {
-                if name.contains("strlen") {
-                    eprintln!(
-                        "[DA-call] {} map={:?}",
-                        name,
-                        self.diagnose_as_builtins.get(name)
-                    );
-                }
-            }
-            if let Some(builtin) = alias {
-                // try_lower_builtin_call dispatches on the canonical
-                // __builtin_-prefixed spelling.
-                let builtin_name = format!("__builtin_{builtin}");
-                if let Some(result) = self.try_lower_builtin_call(&builtin_name, args) {
-                    return result;
-                }
-                // The builtin name is not one this backend expands: fall
-                // through to the ordinary call (same behavior as before the
-                // attribute existed) rather than fabricating semantics.
-            }
-
-            // Functions declared with __attribute__((error("..."))) are compile-time
-            // assertion functions (e.g., kernel's __bad_mask, __field_overflow).
-            // In GCC, these calls are eliminated by inlining + constant folding,
-            // and if they survive, GCC emits a compile error. Since CCC's inliner
-            // may not inline all call sites (due to budget/round limits), we must
-            // handle surviving calls gracefully.
-            //
-            // Instead of emitting a trap (which causes kernel BRK crashes when
-            // always_inline functions like cpucap_is_possible aren't fully inlined),
-            // we simply skip the call. This avoids referencing the undefined symbol
-            // and makes the standalone function body harmless. After inlining, the
-            // dead code containing this no-op is eliminated by constant folding and DCE.
-            //
-            // TODO: Once the inliner can fully inline all always_inline chains
-            // (eliminating all error function call sites), restore this to emit a
-            // compile error (matching GCC behavior) instead of silently dropping.
-            if self.error_functions.contains(name) {
-                // No-op: skip the call. The code path should be unreachable after
-                // inlining and constant folding. If it IS reached at runtime,
-                // execution continues harmlessly (which is better than crashing).
-                return Operand::Const(IrConst::ptr_int(0));
-            }
+        // Resolve __builtin_* functions and their attribute-driven aliases
+        // first — unless the identifier names a local binding (which shadows
+        // the library name, C11 6.2.1p4).
+        if let Some(folded) = self.try_fold_builtin_or_attr_call(stripped_func, args) {
+            return folded;
         }
 
         // Clang's i686 integer ext-vectors use the GP return words stored in
@@ -627,6 +561,89 @@ impl Lowerer {
     }
 
     /// Unpack a two-register (I128) struct return into a struct alloca.
+
+    /// The builtin fold ladder for a call whose callee is a plain
+    /// identifier that no local binding shadows: fold `__builtin_*` calls,
+    /// then `__attribute__((__diagnose_as(__builtin_NAME, ...)))` aliases,
+    /// then neutralize surviving `__attribute__((error(...)))` calls.
+    /// `Some(operand)` means the call is fully handled and must not reach
+    /// the ordinary call path.
+    fn try_fold_builtin_or_attr_call(&mut self, func: &Expr, args: &[Expr]) -> Option<Operand> {
+        // A block-scope object or parameter (`llf_t abs`,
+        // `void *(*memcpy)(...)`) shadows the library function of that name
+        // (C11 6.2.1p4); expanding the builtin anyway silently replaced a
+        // call through `i64 (*abs)(i64)` with a constant-folded `int abs(int)`.
+        let callee_is_local = matches!(func, Expr::Identifier(n, _)
+            if self.func_state.as_ref().is_some_and(|fs| fs.locals.contains_key(n.as_str())));
+        let Expr::Identifier(name, _) = func else {
+            return None;
+        };
+        if callee_is_local {
+            return None;
+        }
+        if let Some(result) = self.try_lower_builtin_call(name, args) {
+            return Some(result);
+        }
+
+        // __attribute__((__diagnose_as(__builtin_NAME, ...))) folding
+        // (GCC semantics): a call to a diagnosed declaration that
+        // survived inlining IS a call to the builtin.  The kernel's
+        // fortify-string family (__FORTIFY_INLINE = extern __always_inline)
+        // depends on BOTH halves of GCC's ladder — inline, else fold —
+        // because the declarations are extern and resolve to nothing at
+        // link time.  A missed fold here surfaced as undefined
+        // `__fortify_strlen` / `fortify_memset_chk` at the vmlinux link.
+        // GCC folds EVERY call to a __diagnose_as declaration to the
+        // named builtin — the attribute is a declarative alias, not an
+        // inlining fallback.  For the fortify family the definitions
+        // reduce to the underlying builtin plus __builtin_constant_p-
+        // guarded COMPILE-TIME diagnostics; folding drops only those
+        // diagnostics (a missed lint), never a defined program's
+        // runtime semantics — the same license GCC's own fold runs on.
+        let alias = self.diagnose_as_builtins.get(name).cloned();
+        if std::env::var_os("CCC_DBG_DA").is_some() && name.contains("strlen") {
+            eprintln!(
+                "[DA-call] {} map={:?}",
+                name,
+                self.diagnose_as_builtins.get(name)
+            );
+        }
+        if let Some(builtin) = alias {
+            // try_lower_builtin_call dispatches on the canonical
+            // __builtin_-prefixed spelling.
+            let builtin_name = format!("__builtin_{builtin}");
+            if let Some(result) = self.try_lower_builtin_call(&builtin_name, args) {
+                return Some(result);
+            }
+            // The builtin name is not one this backend expands: fall
+            // through to the ordinary call (same behavior as before the
+            // attribute existed) rather than fabricating semantics.
+        }
+
+        // Functions declared with __attribute__((error("..."))) are compile-time
+        // assertion functions (e.g., kernel's __bad_mask, __field_overflow).
+        // In GCC, these calls are eliminated by inlining + constant folding,
+        // and if they survive, GCC emits a compile error. Since CCC's inliner
+        // may not inline all call sites (due to budget/round limits), we must
+        // handle surviving calls gracefully.
+        //
+        // Instead of emitting a trap (which causes kernel BRK crashes when
+        // always_inline functions like cpucap_is_possible aren't fully inlined),
+        // we simply skip the call. This avoids referencing the undefined symbol
+        // and makes the standalone function body harmless. After inlining, the
+        // dead code containing this no-op is eliminated by constant folding and DCE.
+        //
+        // TODO: Once the inliner can fully inline all always_inline chains
+        // (eliminating all error function call sites), restore this to emit a
+        // compile error (matching GCC behavior) instead of silently dropping.
+        if self.error_functions.contains(name) {
+            // No-op: skip the call. The code path should be unreachable after
+            // inlining and constant folding. If it IS reached at runtime,
+            // execution continues harmlessly (which is better than crashing).
+            return Some(Operand::Const(IrConst::ptr_int(0)));
+        }
+        None
+    }
     fn unpack_two_reg_return(&mut self, dest: Value, size: usize) -> Operand {
         let alloca = self.fresh_value();
         self.emit(Instruction::Alloca {
@@ -1399,6 +1416,16 @@ impl Lowerer {
                             }
                         }
                         Some(CType::Vector(_, total_size)) => Some(total_size),
+                        // Clang ext_vector_type: by-value aggregate varargs on
+                        // x86-64 (SysV carrier classes; see
+                        // `infer_struct_eightbyte_classes`).  32-bit targets
+                        // keep their legacy pointer convention so the i686
+                        // consumer side is not switched under this fix.
+                        Some(ref ct @ CType::ExtVector(..))
+                            if !crate::common::types::target_is_32bit() =>
+                        {
+                            Some(ct.size())
+                        }
                         Some(CType::ComplexLongDouble) if !decomposes_cld => {
                             Some(CType::ComplexLongDouble.size())
                         }
@@ -1449,6 +1476,14 @@ impl Lowerer {
                         Some(CType::Vector(_, total_size)) => {
                             Some(total_size) // Vector types are passed by value like structs
                         }
+                        // x86-64 ext_vector_type by-value varargs (see the
+                        // signature-known branch above); 32-bit targets keep
+                        // their legacy pointer convention.
+                        Some(ref ct @ CType::ExtVector(..))
+                            if !crate::common::types::target_is_32bit() =>
+                        {
+                            Some(ct.size())
+                        }
                         Some(CType::ComplexLongDouble) if !decomposes_cld => {
                             Some(CType::ComplexLongDouble.size())
                         }
@@ -1484,6 +1519,15 @@ impl Lowerer {
                     // area (GCC i386 psABI), mirroring the struct_align Some(16)
                     // the parameter side registers (func_lowering).
                     Some(CType::Float128) | Some(CType::Decimal128) => Some(16),
+                    // Vector varargs on x86-64: the SysV carrier alignment
+                    // (16 for padded SSE shapes, storage alignment otherwise).
+                    // 32-bit targets keep the legacy pointer convention.
+                    // Vector varargs on x86-64: the SysV carrier alignment
+                    // (16 for padded SSE shapes, storage alignment otherwise).
+                    // Other targets keep their existing convention.
+                    Some(ct) if ct.is_vector() && self.target == crate::backend::Target::X86_64 => {
+                        Some(ct.align_ctx(&*self.types.borrow_struct_layouts()))
+                    }
                     _ => None,
                 }
             })
@@ -1552,6 +1596,20 @@ impl Lowerer {
         expr: &Expr,
     ) -> Vec<crate::common::types::EightbyteClass> {
         if let Some(ctype) = self.get_expr_ctype(expr) {
+            // Vector-shaped variadic arguments classify through the SysV
+            // vector carrier, not through struct layouts: an 8-byte vector is
+            // ONE SSE eightbyte (low half of an XMM), a 9..=16-byte padded
+            // vector is the full register, bit-packed bool carriers and the
+            // tracked one-lane float shapes are INTEGER.  Before this, the
+            // lookup returned an empty classification (= MEMORY) and every
+            // vector vararg degraded to the pointer convention, which no
+            // other x86-64 compiler reads (measured: GCC 16 passes
+            // vector_size(8)/(16) varargs in XMM and counts them in %al).
+            if self.target == crate::backend::Target::X86_64 {
+                if let Some((classes, _pair)) = ctype.sysv_vector_carrier() {
+                    return classes;
+                }
+            }
             if let Some(layout) = self.get_struct_layout_for_ctype(&ctype) {
                 return layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts());
             }

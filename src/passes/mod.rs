@@ -777,6 +777,7 @@ pub(crate) fn restore_phi_prefix_in_function(func: &mut IrFunction) -> usize {
 fn run_inline_phase(
     module: &mut IrModule,
     disabled: &str,
+    builtins: &crate::common::builtin::BuiltinPolicy,
     allow_inline: bool,
     size_profile: bool,
     target: crate::backend::Target,
@@ -805,7 +806,7 @@ fn run_inline_phase(
     iphase_dump!("canonicalize-fold");
     copy_prop::run(module);
     iphase_dump!("canonicalize-copyprop");
-    simplify::run(module);
+    simplify::run(module, builtins);
     iphase_dump!("canonicalize-simplify");
     // Expose byte-decoding helpers' real cost before inlining and before GVN
     // gives their byte loads multiple users. The established late run remains
@@ -962,7 +963,7 @@ fn run_inline_phase(
     }
     iphase_dump!("cleanup-cfg-simplify");
     if !std::env::var("CCC_NO_CLEANUP_SIMP").is_ok() {
-        simplify::run(module);
+        simplify::run(module, builtins);
     }
     iphase_dump!("cleanup-simplify");
     if !std::env::var("CCC_NO_CLEANUP_FOLD2").is_ok() {
@@ -998,10 +999,69 @@ pub(crate) fn pass_disabled(disabled: impl AsRef<str>, pass: &str) -> bool {
     })
 }
 
+/// Apply the driver-level `-fno-tree-vectorize` policy to every automatic
+/// vectorizer entry in the pass pipeline. Explicit vector types and intrinsics
+/// are unaffected; the disable list gates only automatic transformations.
+fn apply_tree_vectorize_policy(disabled: &mut String, disable: bool) {
+    if !disable || pass_disabled(disabled.as_str(), "all") {
+        return;
+    }
+
+    for pass in [
+        "vectorize",
+        "slp",
+        "vec_arx",
+        "arx_vectorize",
+        "vec_interleave",
+    ] {
+        if pass_disabled(disabled.as_str(), pass) {
+            continue;
+        }
+        if !disabled.is_empty() && !disabled.ends_with(',') {
+            disabled.push(',');
+        }
+        disabled.push_str(pass);
+    }
+}
+
 fn preinline_memory_enabled(requested: bool, disabled: &str) -> bool {
     requested
         && !pass_disabled(disabled, "preinline_memory")
         && !pass_disabled(disabled, "redundantloads")
+}
+
+#[cfg(test)]
+mod tree_vectorize_policy_tests {
+    use super::{apply_tree_vectorize_policy, pass_disabled};
+
+    #[test]
+    fn no_tree_vectorize_disables_every_automatic_vectorizer_only() {
+        let mut disabled = "licm,vec_arx".to_string();
+        apply_tree_vectorize_policy(&mut disabled, true);
+
+        for pass in [
+            "vectorize",
+            "slp",
+            "vec_arx",
+            "arx_vectorize",
+            "vec_interleave",
+        ] {
+            assert!(pass_disabled(&disabled, pass), "{pass} should be disabled");
+        }
+        assert!(pass_disabled(&disabled, "licm"));
+        assert!(!pass_disabled(&disabled, "inline"));
+    }
+
+    #[test]
+    fn enabled_or_globally_disabled_policy_does_not_mutate_list() {
+        let mut enabled = "licm".to_string();
+        apply_tree_vectorize_policy(&mut enabled, false);
+        assert_eq!(enabled, "licm");
+
+        let mut all = "all".to_string();
+        apply_tree_vectorize_policy(&mut all, true);
+        assert_eq!(all, "all");
+    }
 }
 
 #[cfg(test)]
@@ -1200,6 +1260,7 @@ pub(crate) fn run_passes(
     x86_fma: bool,
     x86_bmi1: bool,
     x86_avx512vl: bool,
+    disable_tree_vectorize: bool,
     ra_config: &crate::backend::regalloc::RaConfig,
 ) {
     let policy = crate::common::pass_policy::PassPolicy::new(
@@ -1326,6 +1387,7 @@ pub(crate) fn run_passes(
         _ => false,
     });
     let mut disabled = std::env::var("CCC_DISABLE_PASSES").unwrap_or_default();
+    apply_tree_vectorize_policy(&mut disabled, disable_tree_vectorize);
     vectorize::set_strict_recip_pack_enabled(!pass_disabled(&disabled, "strict_recip_pack"));
     vectorize::set_byte_count_normalize_enabled(!pass_disabled(&disabled, "byte_count_normalize"));
     // Snapshot the map policy switches once, like the other pass-pipeline
@@ -1404,7 +1466,7 @@ pub(crate) fn run_passes(
         // _Float128 math builtins lower to libgcc helper calls (__copysigntf3,
         // __fabstf2); LCCC links no libgcc, so fold them to the backend's own
         // inline intrinsics even at -O0 (semantics-preserving rename).
-        simplify::fold_math_intrinsic_calls(module);
+        simplify::fold_math_intrinsic_calls(module, builtin_policy);
         return;
     }
 
@@ -1439,7 +1501,7 @@ pub(crate) fn run_passes(
             eprintln!("[PASS] o1 mem2reg");
         }
         o1_checkpoint!("o1 mem2reg");
-        ip_purity::run(module);
+        ip_purity::run_with_builtins(module, builtin_policy);
         o1_checkpoint!("ip_purity");
         if !pass_disabled(&disabled, "fortifyfold") {
             fortify_fold::run(module, target.is_32bit(), &libcalls);
@@ -1456,7 +1518,7 @@ pub(crate) fn run_passes(
         // -O1 parity requires them here. One linear per-function sweep keeps
         // the -O1 tier cheap and predictable.
         if !pass_disabled(&disabled, "simplify") {
-            simplify::run_with_config(module, true);
+            simplify::run_with_config(module, true, builtin_policy);
         }
         o1_checkpoint!("simplify");
         // Inlining at -O1: GCC's -O1 tier inlines always_inline and
@@ -1501,7 +1563,7 @@ pub(crate) fn run_passes(
         constant_fold::run(module);
         o1_checkpoint!("copyprop2+constfold2");
         // Same f128-builtin fold as -O0 (see above).
-        simplify::fold_math_intrinsic_calls(module);
+        simplify::fold_math_intrinsic_calls(module, builtin_policy);
         module.for_each_function(dce::eliminate_dead_code);
         o1_checkpoint!("mathfold+dce");
         // Same-block dead store elimination is cheap and removes the
@@ -1582,6 +1644,7 @@ pub(crate) fn run_passes(
     run_inline_phase(
         module,
         &disabled,
+        builtin_policy,
         allow_inline,
         optimize_for_size,
         target,
@@ -1595,7 +1658,7 @@ pub(crate) fn run_passes(
     // Fold strlen("literal") after inlining so __builtin_constant_p patterns
     // (glibc _startup_fatal) resolve to 1 and the not-constant fallback
     // disappears.
-    constant_fold::fold_strlen_literals(module);
+    constant_fold::fold_strlen_literals(module, builtin_policy);
     constant_fold::resolve_remaining_is_constant(module);
 
     // Switch case outlining: extract case bodies from large switch statements
@@ -1676,7 +1739,7 @@ pub(crate) fn run_passes(
         crate::ir::mem2reg::promote_allocas_with_params(module);
         constant_fold::run(module);
         copy_prop::run(module);
-        simplify::run(module);
+        simplify::run(module, builtin_policy);
         module.for_each_function(cfg_simplify::run_function);
         module.for_each_function(dce::eliminate_dead_code);
         copy_prop::forward_memcpy_chains(module);
@@ -2325,7 +2388,9 @@ pub(crate) fn run_passes(
         if !dis.simplify && should_run!(3, 1, 2) {
             let n = timed_pass!(
                 "simplify",
-                run_on_visited(module, &dirty, &mut changed, simplify::simplify_function)
+                run_on_visited(module, &dirty, &mut changed, |func| {
+                    simplify::simplify_function(func, builtin_policy)
+                })
             );
             cur_pass_changes[3] = n;
             total_changes += n;
@@ -2778,7 +2843,7 @@ pub(crate) fn run_passes(
         let mut ipcp_changes = 0;
         if !dis.ipcp {
             ipcp_changes = timed_pass!("ipcp", ipcp::run(module));
-            let purity_changes = ip_purity::run(module);
+            let purity_changes = ip_purity::run_with_builtins(module, builtin_policy);
             if ipcp_changes > 0 || purity_changes > 0 {
                 changed.iter_mut().for_each(|c| *c = true);
             }
@@ -3800,6 +3865,7 @@ mod signed_wrap_policy_tests {
             false,
             FpContract::Off,
             X86Isa::default(),
+            false,
             false,
             false,
             false,
