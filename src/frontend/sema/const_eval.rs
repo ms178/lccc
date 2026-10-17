@@ -58,8 +58,9 @@ pub struct SemaConstEval<'a> {
     pub const_values: Option<&'a FxHashMap<ExprId, IrConst>>,
     /// Pre-computed expression types from bottom-up sema walk.
     pub expr_types: Option<&'a FxHashMap<ExprId, CType>>,
-    /// Whether ordinary hosted-library builtin folds are disabled.
-    pub no_builtins: bool,
+    /// Which ordinary hosted-library names the CLI withdrew from builtin
+    /// status (blanket and per-name state in one object).
+    pub builtin_policy: crate::common::builtin::BuiltinPolicy,
 }
 
 impl<'a> SemaConstEval<'a> {
@@ -476,7 +477,7 @@ impl<'a> SemaConstEval<'a> {
                         name.as_str(),
                         args,
                         &|e| self.eval_const_expr(e),
-                        !self.no_builtins,
+                        !self.builtin_policy.withdrawn(name.as_str()),
                     )
                 } else {
                     None
@@ -667,7 +668,7 @@ impl<'a> SemaConstEval<'a> {
             types: self.types,
             functions: self.functions,
             expr_types: self.expr_types,
-            no_builtins: self.no_builtins,
+            builtin_policy: self.builtin_policy.clone(),
         };
         checker.infer_expr_ctype(expr)
     }

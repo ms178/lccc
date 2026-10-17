@@ -70,16 +70,16 @@ use crate::ir::reexports::{
 
 /// Whether a math name is eligible for builtin folding in this translation unit.
 /// Compiler-prefixed builtin spellings remain available in every mode.
-fn builtin_allowed(name: &str, allow_hosted_builtins: bool) -> bool {
-    allow_hosted_builtins
+fn builtin_allowed(name: &str, builtins: &crate::common::builtin::BuiltinPolicy) -> bool {
+    !builtins.withdrawn(name)
         || name.starts_with("__builtin_")
         || matches!(name, "__fabstf2" | "__copysigntf3")
 }
 
 /// Run algebraic simplification on the module.
 /// Returns the number of instructions simplified.
-pub fn run(module: &mut IrModule, allow_hosted_builtins: bool) -> usize {
-    run_with_config(module, false, allow_hosted_builtins)
+pub fn run(module: &mut IrModule, builtins: &crate::common::builtin::BuiltinPolicy) -> usize {
+    run_with_config(module, false, builtins)
 }
 
 /// `fill_use_counts` enables the reassociation single-use profitability
@@ -95,21 +95,22 @@ pub fn run(module: &mut IrModule, allow_hosted_builtins: bool) -> usize {
 pub fn run_with_config(
     module: &mut IrModule,
     fill_use_counts: bool,
-    allow_hosted_builtins: bool,
+    builtins: &crate::common::builtin::BuiltinPolicy,
 ) -> usize {
-    module.for_each_function(|f| {
-        simplify_function_with_config(f, fill_use_counts, allow_hosted_builtins)
-    })
+    module.for_each_function(|f| simplify_function_with_config(f, fill_use_counts, builtins))
 }
 
-pub(crate) fn simplify_function(func: &mut IrFunction, allow_hosted_builtins: bool) -> usize {
-    simplify_function_with_config(func, false, allow_hosted_builtins)
+pub(crate) fn simplify_function(
+    func: &mut IrFunction,
+    builtins: &crate::common::builtin::BuiltinPolicy,
+) -> usize {
+    simplify_function_with_config(func, false, builtins)
 }
 
 fn simplify_function_with_config(
     func: &mut IrFunction,
     fill_use_counts: bool,
-    allow_hosted_builtins: bool,
+    builtins: &crate::common::builtin::BuiltinPolicy,
 ) -> usize {
     if super::fp_environment_blocks_reordering(func) {
         return 0;
@@ -313,7 +314,7 @@ fn simplify_function_with_config(
                     _ => {}
                 },
                 Instruction::Call { func, info } => {
-                    if builtin_allowed(func, allow_hosted_builtins)
+                    if builtin_allowed(func, builtins)
                         && matches!(
                             func.as_str(),
                             "fabs"
@@ -457,7 +458,7 @@ fn simplify_function_with_config(
                 &value_types,
                 &use_counts,
                 &cast_use_counts,
-                allow_hosted_builtins,
+                builtins,
             ) {
                 *inst = simplified;
                 total += 1;
@@ -918,7 +919,7 @@ fn try_simplify_with_types(
     value_types: &[Option<IrType>],
     use_counts: &[u32],
     cast_use_counts: &[u32],
-    allow_hosted_builtins: bool,
+    builtins: &crate::common::builtin::BuiltinPolicy,
 ) -> Option<Instruction> {
     match inst {
         Instruction::BinOp {
@@ -1054,7 +1055,7 @@ fn try_simplify_with_types(
         }
         Instruction::Call { func, info } => {
             if let Some(d) = info.dest {
-                simplify_math_call(d, func, &info.args, info.return_type, allow_hosted_builtins)
+                simplify_math_call(d, func, &info.args, info.return_type, builtins)
             } else {
                 None
             }
@@ -1109,7 +1110,7 @@ fn try_simplify(
         &[],
         &[],
         &[],
-        true,
+        &crate::common::builtin::BuiltinPolicy::default(),
     )
 }
 
@@ -1129,7 +1130,7 @@ fn try_simplify_neg(inst: &Instruction, neg_defs: &[Option<NegDef>]) -> Option<I
         &[],
         &[],
         &[],
-        true,
+        &crate::common::builtin::BuiltinPolicy::default(),
     )
 }
 
@@ -3167,9 +3168,9 @@ fn simplify_math_call(
     func: &str,
     args: &[Operand],
     return_type: IrType,
-    allow_hosted_builtins: bool,
+    builtins: &crate::common::builtin::BuiltinPolicy,
 ) -> Option<Instruction> {
-    if !builtin_allowed(func, allow_hosted_builtins) {
+    if !builtin_allowed(func, builtins) {
         return None;
     }
     // Check unary intrinsic table first (sqrt, sqrtf, fabs, fabsf).
@@ -3305,7 +3306,10 @@ fn simplify_math_call(
 /// external reference and fail to link (LCCC links no libgcc). Running the
 /// same folding here makes `_Float128` math builtins work at every opt level.
 /// Semantics-preserving: the fold is a rename to the backend's own intrinsic.
-pub fn fold_math_intrinsic_calls(module: &mut IrModule, allow_hosted_builtins: bool) {
+pub fn fold_math_intrinsic_calls(
+    module: &mut IrModule,
+    builtins: &crate::common::builtin::BuiltinPolicy,
+) {
     for func in &mut module.functions {
         if super::fp_environment_blocks_reordering(func) {
             continue;
@@ -3314,13 +3318,9 @@ pub fn fold_math_intrinsic_calls(module: &mut IrModule, allow_hosted_builtins: b
             for inst in &mut block.instructions {
                 if let Instruction::Call { func: callee, info } = inst {
                     if let Some(d) = info.dest {
-                        if let Some(new_inst) = simplify_math_call(
-                            d,
-                            callee,
-                            &info.args,
-                            info.return_type,
-                            allow_hosted_builtins,
-                        ) {
+                        if let Some(new_inst) =
+                            simplify_math_call(d, callee, &info.args, info.return_type, builtins)
+                        {
                             *inst = new_inst;
                         }
                     }
@@ -3337,12 +3337,15 @@ mod tests {
 
     #[test]
     fn no_builtins_allows_explicit_interfaces_not_arbitrary_double_underscore_names() {
-        assert!(builtin_allowed("__builtin_fabs", false));
-        assert!(builtin_allowed("__fabstf2", false));
-        assert!(builtin_allowed("__copysigntf3", false));
-        assert!(builtin_allowed("sqrt", true));
-        assert!(!builtin_allowed("sqrt", false));
-        assert!(!builtin_allowed("__user_math_wrapper", false));
+        let hosted = crate::common::builtin::BuiltinPolicy::default();
+        let mut withdrawn = crate::common::builtin::BuiltinPolicy::default();
+        withdrawn.withdraw_all();
+        assert!(builtin_allowed("__builtin_fabs", &withdrawn));
+        assert!(builtin_allowed("__fabstf2", &withdrawn));
+        assert!(builtin_allowed("__copysigntf3", &withdrawn));
+        assert!(builtin_allowed("sqrt", &hosted));
+        assert!(!builtin_allowed("sqrt", &withdrawn));
+        assert!(!builtin_allowed("__user_math_wrapper", &withdrawn));
     }
 
     // === Test helpers ===

@@ -363,7 +363,7 @@ impl Lowerer {
                         name.as_str(),
                         args,
                         &|e| self.eval_const_expr(e),
-                        !self.no_builtins,
+                        !self.builtin_policy.withdrawn(name.as_str()),
                     )
                 } else {
                     None

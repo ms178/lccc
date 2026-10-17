@@ -59,7 +59,6 @@
 //! switches `-nostartfiles`/`-nodefaultlibs` (resolved by `backend::common`
 //! from the raw command line, like `-nostdlib`).
 
-
 use super::pipeline::{CliDefine, CompileMode, Driver};
 use crate::backend::Target;
 use crate::common::error::ColorMode;
@@ -1559,13 +1558,24 @@ impl Driver {
                 arg if arg == "-ffreestanding" => {
                     self.freestanding = true;
                     self.builtin_policy.withdraw_all();
+                    self.no_builtins = true;
                 }
                 arg if arg == "-fhosted" => {
                     self.freestanding = false;
                     self.builtin_policy.restore_all();
+                    self.no_builtins = false;
                 }
-                arg if arg == "-fbuiltin" => self.builtin_policy.restore_all(),
-                arg if arg == "-fno-builtin" => self.builtin_policy.withdraw_all(),
+                // The blanket fields track the policy so every consumer
+                // (sema, lowering, passes) sees one answer even though the
+                // per-name state lives in `builtin_policy`.
+                arg if arg == "-fbuiltin" => {
+                    self.builtin_policy.restore_all();
+                    self.no_builtins = false;
+                }
+                arg if arg == "-fno-builtin" => {
+                    self.builtin_policy.withdraw_all();
+                    self.no_builtins = true;
+                }
                 arg if arg.starts_with("-fno-builtin-") => {
                     self.builtin_policy
                         .withdraw_one(&arg["-fno-builtin-".len()..]);
@@ -2237,22 +2247,9 @@ impl Driver {
                 }
                 "-fasynchronous-unwind-tables" | "-funwind-tables" => self.no_unwind_tables = false,
                 "-fno-jump-tables" => self.no_jump_tables = true,
-                "-ffreestanding" => {
-                    self.freestanding = true;
-                    self.no_builtins = true;
-                }
-                "-fhosted" => {
-                    self.freestanding = false;
-                    self.no_builtins = false;
-                }
-                "-fno-builtin" => self.no_builtins = true,
-                "-fbuiltin" => self.no_builtins = false,
-                arg if arg.starts_with("-fno-builtin-") => {
-                    return Err(format!(
-                        "per-function builtin control is unsupported: {}",
-                        arg
-                    ));
-                }
+                // (-ffreestanding/-fhosted/-fbuiltin/-fno-builtin are
+                // handled by the A13 arms above; per-name `-fno-builtin-<fn>`
+                // withdrawals are supported there with GCC's stickiness.)
                 "-fno-tree-vectorize" => self.disable_tree_vectorize = true,
                 "-ftree-vectorize" => self.disable_tree_vectorize = false,
                 arg if matches!(
@@ -2429,9 +2426,24 @@ impl Driver {
                 arg if arg.starts_with("-f") => {
                     use super::option_table::{Class, lookup};
                     match lookup(arg) {
+                        // Deliberate no-op: the table row carries the reason.
                         Some(c) if c.class == Class::BenignNoop => {}
+                        // Classified refusal: the request would change program
+                        // meaning (LTO, sanitizers, ABI, ...), so a capability
+                        // probe must read "unsupported" and fall back.
                         Some(c) => return Err(format!("{}: {}", arg, c.rationale)),
-                        None => return Err(format!("unrecognized command-line option '{}'", arg)),
+                        // A table miss is a spelling NEWER than this tree
+                        // knows.  Give it the generic tier treatment
+                        // (tolerated diagnostic, fatal under
+                        // LCCC_STRICT_OPTIONS=1) rather than a hard refusal:
+                        // a newer GNU's inert optimisation preference must not
+                        // break a real build, and strict mode is what turns
+                        // the tolerance into the answer a probe needs.
+                        None => {
+                            if unknown_options.insert(arg.to_string()) {
+                                unknown_option_tolerated(arg, strict_options)?;
+                            }
+                        }
                     }
                 }
 
@@ -3266,7 +3278,6 @@ mod cli_tests {
         assert!(d.disable_tree_vectorize);
 
         for flag in [
-            "-fno-builtin-strlen",
             "-fno-tree-loop-vectorize",
             "-fno-tree-slp-vectorize",
             "-ftree-loop-vectorize",
@@ -3274,6 +3285,18 @@ mod cli_tests {
         ] {
             assert!(try_flag(flag).is_err(), "{flag} must be explicitly refused");
         }
+        // Per-name builtin control IS implemented (GCC-compatible stickiness:
+        // a per-name withdrawal survives a later blanket `-fbuiltin`).
+        let mut d = Driver::new();
+        d.parse_cli_args(&[
+            "ccc".into(),
+            "-fno-builtin-strlen".into(),
+            "-fbuiltin".into(),
+            "x.c".into(),
+        ])
+        .unwrap();
+        assert!(d.builtin_policy.withdrawn("strlen"));
+        assert!(!d.builtin_policy.withdrawn("memcpy"));
     }
 
     /// `-mno-<feature>` must be ACCEPTED for any ISA extension LCCC never
@@ -4418,7 +4441,6 @@ mod cli_tests {
             "-fno-tree-vectorize",
             "-fno-stack-clash-protection",
             "-fuse-ld=bfd",
-            "-flto",
             "-Og",
             "-fdiagnostics-color=always",
             "-fmax-errors=5",
@@ -4551,8 +4573,6 @@ mod cli_tests {
             "-fno-tree-vectorize",
             "-fuse-ld=bfd",
             "-fuse-ld=lld",
-            "-flto",
-            "-flto=auto",
             "-march=native",
             "-mtune=generic",
             "-msse4.2",
@@ -4590,6 +4610,12 @@ mod cli_tests {
         ];
         for arg in FLAGS {
             assert!(try_flag(arg).is_ok(), "{arg} must not fail a build");
+        }
+        // LTO is a link-model request, not an inert preference: ignoring it
+        // would read as support to a probe and silently skip the requested
+        // optimisation, so it refuses and the build system falls back.
+        for arg in ["-flto", "-flto=auto"] {
+            assert!(try_flag(arg).is_err(), "{arg} must be refused, not ignored");
         }
     }
 

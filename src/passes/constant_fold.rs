@@ -104,14 +104,17 @@ fn fold_const_global_loads(module: &mut IrModule) -> usize {
 }
 
 /// Fold `strlen`/`__builtin_strlen` calls whose argument is a string-literal
-/// global into the literal's byte length. `allow_hosted_builtins` follows
+/// global into the literal's byte length. The builtin policy follows
 /// `-fno-builtin`: ordinary `strlen` folding is disabled there, while an
 /// explicit `__builtin_strlen` remains a compiler builtin. glibc's startup.h pattern
 /// `__builtin_constant_p (__builtin_strlen (message))` with a string-literal
 /// message becomes 1 after inlining; without this, the branch to
 /// `_startup_fatal_not_constant` survives into static links. Runs after
 /// inlining so parameter -> literal propagation has already happened.
-pub fn fold_strlen_literals(module: &mut IrModule, allow_hosted_builtins: bool) -> usize {
+pub fn fold_strlen_literals(
+    module: &mut IrModule,
+    builtins: &crate::common::builtin::BuiltinPolicy,
+) -> usize {
     // Narrow string literals store one C byte per Rust char, so the byte
     // length is chars().count(); String::len() over-counts bytes >= 0x80.
     let literals: crate::common::fx_hash::FxHashMap<String, usize> = module
@@ -152,7 +155,7 @@ pub fn fold_strlen_literals(module: &mut IrModule, allow_hosted_builtins: bool) 
             for inst in &mut block.instructions {
                 if let Instruction::Call { func: callee, info } = inst {
                     if callee != "__builtin_strlen"
-                        && (callee != "strlen" || !allow_hosted_builtins)
+                        && (callee != "strlen" || builtins.withdrawn(callee))
                     {
                         continue;
                     }

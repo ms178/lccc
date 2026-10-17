@@ -12,11 +12,9 @@ cat > "$td/plain.c" <<'EOF'
 int f(void) { return 42; }
 EOF
 for flag in \
-    -fdefinitely-not-a-flag \
     -flto -flto=auto \
     -fsanitize=address -fsanitize=undefined \
-    -fstack-clash-protection -ftrapv -fvisibility=hidden -fno-plt \
-    -fsemantic-interposition -fno-semantic-interposition \
+    -fstack-clash-protection -ftrapv -fvisibility=hidden \
     -fopenmp -freg-struct-return \
     -fno-profile-arcs -fno-test-coverage -fno-branch-probabilities -fno-auto-profile \
     -finstrument-functions-exclude-file-list=generated.c \
@@ -35,6 +33,19 @@ for flag in \
         grep -Fq -- "$flag" "$td/err" || { cat "$td/err" >&2; exit 1; }
     done
 done
+# A table miss (a spelling newer than this tree) is DIAGNOSED but tolerated:
+# the build continues (a probe must not be lied into "supported", but a newer
+# GNU's inert preference must not break a real build either); strict mode is
+# what turns the tolerance into the refusal a capability probe needs.
+"$CCC" -fdefinitely-not-a-flag -c "$td/plain.c" -o "$td/miss.o" 2>"$td/miss.err" && \
+    grep -Fq -- "-fdefinitely-not-a-flag" "$td/miss.err" || {
+    echo "FAIL: a table-miss -f spelling must compile with a naming diagnostic" >&2
+    exit 1
+}
+if LCCC_STRICT_OPTIONS=1 "$CCC" -fdefinitely-not-a-flag -c "$td/plain.c" -o "$td/miss2.o" 2>/dev/null; then
+    echo "FAIL: LCCC_STRICT_OPTIONS=1 must refuse a table-miss -f spelling" >&2
+    exit 1
+fi
 for flag in -fno-stack-protector -fno-stack-clash-protection -fno-lto -fsanitize=none -fno-strict-aliasing -fno-trapv; do
     "$CCC" "$flag" -c "$td/plain.c" -o "$td/noop.o"
 done
@@ -194,14 +205,43 @@ for opt in -O0 -O1; do
     }
 done
 
-if "$CCC" -fno-builtin-strlen -fsyntax-only "$td/hosted.c" >"$td/refused.out" 2>"$td/refused.err"; then
-    echo "FAIL: unsupported per-function -fno-builtin-strlen was silently accepted" >&2
+# Per-name `-fno-builtin-<fn>` IS supported, with GCC's stickiness: the
+# per-name withdrawal survives a later blanket `-fbuiltin`.  Verify the
+# withdrawal is real (ordinary strlen stays a call) and scoped (the explicit
+# __builtin_strlen spelling still folds).
+cat > "$td/pername.c" <<'CEOF'
+unsigned long per_name_withdrawn(void) {
+    char buffer[strlen("abcdefghijkl")];
+    return sizeof(buffer);
+}
+unsigned long per_name_explicit_still_folds(void) {
+    char buffer[__builtin_strlen("abcdefghijkl")];
+    return sizeof(buffer);
+}
+CEOF
+"$CCC" -O2 -fno-builtin-strlen -fbuiltin -S "$td/pername.c" -o "$td/pername.s" || {
+    echo "FAIL: -fno-builtin-strlen (per-name withdrawal) was refused; GCC keeps it sticky after -fbuiltin" >&2
+    exit 1
+}
+withdrawn_fn=$(awk '/per_name_withdrawn:/,/\.size.*per_name_withdrawn/' "$td/pername.s")
+echo "$withdrawn_fn" | grep -Eq 'call[q]?[[:space:]]+strlen(@PLT)?' || {
+    echo "FAIL: per-name -fno-builtin-strlen did not keep the ordinary strlen call" >&2
+    exit 1
+}
+explicit_fn=$(awk '/per_name_explicit_still_folds:/,/\.size.*per_name_explicit_still_folds/' "$td/pername.s")
+if echo "$explicit_fn" | grep -Eq 'call[q]?[[:space:]]+strlen(@PLT)?'; then
+    echo "FAIL: explicit __builtin_strlen must still fold under per-name withdrawal" >&2
     exit 1
 fi
-if ! grep -q 'per-function builtin control is unsupported' "$td/refused.err"; then
-    echo "FAIL: -fno-builtin-strlen failed without an explicit unsupported-option diagnostic" >&2
-    cat "$td/refused.err" >&2
-    exit 1
-fi
+
+# Ignoring these yields correct (if differently-shaped or more conservative)
+# code, so they are inert no-ops rather than refusals: a refusal would break
+# the kernel/glibc builds that pass them unconditionally.
+for flag in -fno-plt -fsemantic-interposition -fno-semantic-interposition; do
+    "$CCC" -O2 "$flag" -S "$td/plain.c" -o "$td/noop.s" 2>/dev/null || {
+        echo "FAIL: $flag must be an accepted no-op (correct default behaviour)" >&2
+        exit 1
+    }
+done
 
 echo "driver option contract: PASS (hosted/freestanding macros, builtin gating, accepted/refused vectorizer and builtin flags)"

@@ -21,10 +21,13 @@ use crate::ir::reexports::{CallInfo, Instruction, IrFunction, IrModule, Operand,
 /// Returns the number of call sites updated.
 #[cfg(test)]
 pub fn run(module: &mut IrModule) -> usize {
-    run_with_builtins(module, true)
+    run_with_builtins(module, &crate::common::builtin::BuiltinPolicy::default())
 }
 
-pub fn run_with_builtins(module: &mut IrModule, allow_hosted_builtins: bool) -> usize {
+pub fn run_with_builtins(
+    module: &mut IrModule,
+    builtins: &crate::common::builtin::BuiltinPolicy,
+) -> usize {
     let fenv = module
         .functions
         .iter()
@@ -73,7 +76,7 @@ pub fn run_with_builtins(module: &mut IrModule, allow_hosted_builtins: bool) -> 
         "ceill", "floor", "floorf", "floorl", "trunc", "truncf", "truncl", "round", "roundf",
         "roundl", "log", "logf", "logl", "exp", "expf", "expl", "pow", "powf", "powl",
     ] {
-        if !allow_hosted_builtins
+        if builtins.withdrawn(name)
             || fp_effectful.contains(*name)
             || (fenv && !["abs", "labs", "llabs", "imaxabs"].contains(name))
         {
@@ -88,7 +91,7 @@ pub fn run_with_builtins(module: &mut IrModule, allow_hosted_builtins: bool) -> 
         "strlen", "wcslen", "strcmp", "strncmp", "wcscmp", "wcsncmp", "memcmp", "bcmp", "strchr",
         "strrchr", "strstr", "memchr",
     ] {
-        if allow_hosted_builtins && !fp_effectful.contains(*name) {
+        if !builtins.withdrawn(name) && !fp_effectful.contains(*name) {
             pure_fns.insert(name.to_string());
         }
     }

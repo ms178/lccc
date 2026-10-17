@@ -777,7 +777,7 @@ pub(crate) fn restore_phi_prefix_in_function(func: &mut IrFunction) -> usize {
 fn run_inline_phase(
     module: &mut IrModule,
     disabled: &str,
-    allow_hosted_builtins: bool,
+    builtins: &crate::common::builtin::BuiltinPolicy,
     allow_inline: bool,
     size_profile: bool,
     target: crate::backend::Target,
@@ -806,7 +806,7 @@ fn run_inline_phase(
     iphase_dump!("canonicalize-fold");
     copy_prop::run(module);
     iphase_dump!("canonicalize-copyprop");
-    simplify::run(module, allow_hosted_builtins);
+    simplify::run(module, builtins);
     iphase_dump!("canonicalize-simplify");
     // Expose byte-decoding helpers' real cost before inlining and before GVN
     // gives their byte loads multiple users. The established late run remains
@@ -963,7 +963,7 @@ fn run_inline_phase(
     }
     iphase_dump!("cleanup-cfg-simplify");
     if !std::env::var("CCC_NO_CLEANUP_SIMP").is_ok() {
-        simplify::run(module, allow_hosted_builtins);
+        simplify::run(module, builtins);
     }
     iphase_dump!("cleanup-simplify");
     if !std::env::var("CCC_NO_CLEANUP_FOLD2").is_ok() {
@@ -1261,7 +1261,6 @@ pub(crate) fn run_passes(
     x86_bmi1: bool,
     x86_avx512vl: bool,
     disable_tree_vectorize: bool,
-    no_builtins: bool,
     ra_config: &crate::backend::regalloc::RaConfig,
 ) {
     let policy = crate::common::pass_policy::PassPolicy::new(
@@ -1467,7 +1466,7 @@ pub(crate) fn run_passes(
         // _Float128 math builtins lower to libgcc helper calls (__copysigntf3,
         // __fabstf2); LCCC links no libgcc, so fold them to the backend's own
         // inline intrinsics even at -O0 (semantics-preserving rename).
-        simplify::fold_math_intrinsic_calls(module, !no_builtins);
+        simplify::fold_math_intrinsic_calls(module, builtin_policy);
         return;
     }
 
@@ -1502,7 +1501,7 @@ pub(crate) fn run_passes(
             eprintln!("[PASS] o1 mem2reg");
         }
         o1_checkpoint!("o1 mem2reg");
-        ip_purity::run_with_builtins(module, !no_builtins);
+        ip_purity::run_with_builtins(module, builtin_policy);
         o1_checkpoint!("ip_purity");
         if !pass_disabled(&disabled, "fortifyfold") {
             fortify_fold::run(module, target.is_32bit(), &libcalls);
@@ -1519,7 +1518,7 @@ pub(crate) fn run_passes(
         // -O1 parity requires them here. One linear per-function sweep keeps
         // the -O1 tier cheap and predictable.
         if !pass_disabled(&disabled, "simplify") {
-            simplify::run_with_config(module, true, !no_builtins);
+            simplify::run_with_config(module, true, builtin_policy);
         }
         o1_checkpoint!("simplify");
         // Inlining at -O1: GCC's -O1 tier inlines always_inline and
@@ -1564,7 +1563,7 @@ pub(crate) fn run_passes(
         constant_fold::run(module);
         o1_checkpoint!("copyprop2+constfold2");
         // Same f128-builtin fold as -O0 (see above).
-        simplify::fold_math_intrinsic_calls(module, !no_builtins);
+        simplify::fold_math_intrinsic_calls(module, builtin_policy);
         module.for_each_function(dce::eliminate_dead_code);
         o1_checkpoint!("mathfold+dce");
         // Same-block dead store elimination is cheap and removes the
@@ -1645,7 +1644,7 @@ pub(crate) fn run_passes(
     run_inline_phase(
         module,
         &disabled,
-        !no_builtins,
+        builtin_policy,
         allow_inline,
         optimize_for_size,
         target,
@@ -1659,7 +1658,7 @@ pub(crate) fn run_passes(
     // Fold strlen("literal") after inlining so __builtin_constant_p patterns
     // (glibc _startup_fatal) resolve to 1 and the not-constant fallback
     // disappears.
-    constant_fold::fold_strlen_literals(module, !no_builtins);
+    constant_fold::fold_strlen_literals(module, builtin_policy);
     constant_fold::resolve_remaining_is_constant(module);
 
     // Switch case outlining: extract case bodies from large switch statements
@@ -1740,7 +1739,7 @@ pub(crate) fn run_passes(
         crate::ir::mem2reg::promote_allocas_with_params(module);
         constant_fold::run(module);
         copy_prop::run(module);
-        simplify::run(module, !no_builtins);
+        simplify::run(module, builtin_policy);
         module.for_each_function(cfg_simplify::run_function);
         module.for_each_function(dce::eliminate_dead_code);
         copy_prop::forward_memcpy_chains(module);
@@ -2390,7 +2389,7 @@ pub(crate) fn run_passes(
             let n = timed_pass!(
                 "simplify",
                 run_on_visited(module, &dirty, &mut changed, |func| {
-                    simplify::simplify_function(func, !no_builtins)
+                    simplify::simplify_function(func, builtin_policy)
                 })
             );
             cur_pass_changes[3] = n;
@@ -2844,7 +2843,7 @@ pub(crate) fn run_passes(
         let mut ipcp_changes = 0;
         if !dis.ipcp {
             ipcp_changes = timed_pass!("ipcp", ipcp::run(module));
-            let purity_changes = ip_purity::run_with_builtins(module, !no_builtins);
+            let purity_changes = ip_purity::run_with_builtins(module, builtin_policy);
             if ipcp_changes > 0 || purity_changes > 0 {
                 changed.iter_mut().for_each(|c| *c = true);
             }
@@ -3866,7 +3865,6 @@ mod signed_wrap_policy_tests {
             false,
             FpContract::Off,
             X86Isa::default(),
-            false,
             false,
             false,
             false,

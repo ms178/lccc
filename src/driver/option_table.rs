@@ -60,18 +60,18 @@ pub(super) const CONTRACTS: &[Contract] = &[
     },
     Contract {
         spelling: "-fno-plt",
-        class: Class::Refused,
-        rationale: "GOT-indirect external-call selection is not implemented.",
+        class: Class::BenignNoop,
+        rationale: "External calls keep the default PLT form: correct code, without the GOT-indirect selection.",
     },
     Contract {
         spelling: "-fsemantic-interposition",
-        class: Class::Refused,
-        rationale: "Semantic-interposition optimization policy is not implemented.",
+        class: Class::BenignNoop,
+        rationale: "Semantic interposition is the default assumption; nothing to change.",
     },
     Contract {
         spelling: "-fno-semantic-interposition",
-        class: Class::Refused,
-        rationale: "Semantic-interposition optimization policy is not implemented.",
+        class: Class::BenignNoop,
+        rationale: "The conservative interposition assumption is retained: correct code, missed optimisation only.",
     },
     Contract {
         spelling: "-fopenmp",
@@ -105,6 +105,15 @@ pub(super) fn lookup(arg: &str) -> Option<Contract> {
     }
     let rationale = if arg == "-flto" || arg.starts_with("-flto=") {
         "LTO IR production and link-time consumption are not implemented."
+    } else if arg.starts_with("-fsanitize-recover") || arg.starts_with("-fsanitize-undefined") {
+        // Configuration OF sanitizer behaviour, not instrumentation: with no
+        // sanitizer there is nothing to make recoverable or trap on, so the
+        // requested state is already the state.
+        return Some(Contract {
+            spelling: "option family",
+            class: Class::BenignNoop,
+            rationale: "No sanitizer instrumentation exists to configure.",
+        });
     } else if arg.starts_with("-fsanitize") {
         "The requested sanitizer instrumentation is not implemented."
     } else if arg.starts_with("-fno-profile")
@@ -144,8 +153,6 @@ mod tests {
             "-flto=auto",
             "-fsanitize=address",
             "-fvisibility=hidden",
-            "-fsemantic-interposition",
-            "-fno-semantic-interposition",
             "-fno-profile-arcs",
             "-fno-test-coverage",
             "-fno-branch-probabilities",

@@ -105,7 +105,7 @@ impl Lowerer {
             || name.starts_with("_mm256_")
             || name.starts_with("_mm512_")
             || name == "alloca";
-        if self.no_builtins && !compiler_builtin {
+        if !compiler_builtin && self.builtin_policy.withdrawn(name) {
             return None;
         }
 

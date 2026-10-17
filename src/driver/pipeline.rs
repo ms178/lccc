@@ -95,15 +95,6 @@ pub struct Driver {
     pub(super) fast_math: bool,
     /// -fwrapv makes signed Add/Sub/Mul modular; never infer no-wrap from C UB.
     pub(super) wrap_signed_overflow: bool,
-    /// `-ffreestanding` selects `__STDC_HOSTED__ == 0` and disables ordinary
-    /// hosted-library builtin recognition. `-fhosted` restores the default.
-    pub(super) freestanding: bool,
-    /// `-ffreestanding` and `-fno-builtin` suppress ordinary library-name
-    /// folds; explicit `__builtin_*` intrinsics remain available.
-    pub(super) no_builtins: bool,
-    /// `-fno-tree-vectorize` disables automatic vectorizer passes while
-    /// retaining explicit vector types and intrinsics.
-    pub(super) disable_tree_vectorize: bool,
     /// Explicitly observable FP traps; ordinary TUs retain the FENV-off policy.
     pub(super) fp_trapping_math: bool,
     /// Dynamic rounding is observable independently of exception trapping.
@@ -452,6 +443,13 @@ pub struct Driver {
     /// dropped, so `__STDC_HOSTED__` stayed 1 and such a build silently took
     /// the hosted branch — GCC flips it to 0.
     pub(super) freestanding: bool,
+    /// `-ffreestanding` and `-fno-builtin` suppress ordinary library-name
+    /// folds; explicit `__builtin_*` intrinsics remain available. The
+    /// per-name withdrawal state lives in `builtin_policy`.
+    pub(super) no_builtins: bool,
+    /// `-fno-tree-vectorize` disables automatic vectorizer passes while
+    /// retaining explicit vector types and intrinsics.
+    pub(super) disable_tree_vectorize: bool,
     /// A13: the CLI's builtin-withdrawal state, consulted by the pass-side
     /// synthesis gate (`passes::libcall`).  Populated by the `-fno-builtin`
     /// family and by `-ffreestanding`; see `src/driver/cli.rs` for the
@@ -661,7 +659,6 @@ impl Driver {
             gnu89_inline: false,
             gnu89_inline_explicit: None,
             stdc_version: None,
-            freestanding: false,
             builtin_policy: crate::common::builtin::BuiltinPolicy::default(),
             exceptions: false,
             dump_defines: false,
@@ -1089,6 +1086,7 @@ impl Driver {
             // Semantic analysis.
             let mut sema = SemanticAnalyzer::new();
             sema.set_no_builtins(self.no_builtins);
+            sema.set_builtin_policy(self.builtin_policy.clone());
             sema.set_diagnostics(diagnostics);
             if let Err(error_count) = sema.analyze(&ast) {
                 return Err(format!("{} error(s) during semantic analysis", error_count));
@@ -1931,6 +1929,7 @@ impl Driver {
         let t3 = std::time::Instant::now();
         let mut sema = SemanticAnalyzer::new();
         sema.set_no_builtins(self.no_builtins);
+        sema.set_builtin_policy(self.builtin_policy.clone());
         sema.set_diagnostics(diagnostics);
         if let Err(error_count) = sema.analyze(&ast) {
             // Errors already emitted through diagnostic engine with source spans
@@ -1974,7 +1973,7 @@ impl Driver {
             self.wrap_signed_overflow,
             fp_environment_observable,
         ))
-        .with_no_builtins(self.no_builtins);
+        .with_builtin_policy(self.builtin_policy.clone());
         let (mut module, mut diagnostics) = lowerer.lower(&ast);
         // IR lowering is a user-facing phase: it rejects ill-typed builtins,
         // target-specific intrinsics and unsupported constructs, and every one
@@ -2198,7 +2197,6 @@ impl Driver {
                 && self.enable_avx512vl
                 && !self.no_sse,
             self.disable_tree_vectorize,
-            self.no_builtins,
             ra_config.as_ref(),
         );
         if time_phases {

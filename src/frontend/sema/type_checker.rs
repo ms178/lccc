@@ -61,7 +61,7 @@ pub struct ExprTypeChecker<'a> {
     /// When set, `infer_expr_ctype` checks this map before recursing.
     pub expr_types: Option<&'a FxHashMap<ExprId, CType>>,
     /// Whether hosted-library builtin aliases are disabled for constant queries.
-    pub no_builtins: bool,
+    pub builtin_policy: crate::common::builtin::BuiltinPolicy,
 }
 
 impl<'a> ExprTypeChecker<'a> {
@@ -927,7 +927,7 @@ impl<'a> ExprTypeChecker<'a> {
             functions: self.functions,
             const_values: None,
             expr_types: self.expr_types,
-            no_builtins: self.no_builtins,
+            builtin_policy: self.builtin_policy.clone(),
         };
         evaluator.eval_const_expr(expr)?.to_i64()
     }

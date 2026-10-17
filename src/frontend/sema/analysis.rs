@@ -166,6 +166,7 @@ pub struct SemanticAnalyzer {
     function_nesting_stack: Vec<String>,
     /// Whether ordinary hosted-library builtin folds are disabled.
     no_builtins: bool,
+    builtin_policy: crate::common::builtin::BuiltinPolicy,
 }
 
 impl SemanticAnalyzer {
@@ -180,6 +181,7 @@ impl SemanticAnalyzer {
             current_return_type: None,
             function_nesting_stack: Vec::new(),
             no_builtins: false,
+            builtin_policy: crate::common::builtin::BuiltinPolicy::default(),
         };
         // Pre-populate with common implicit declarations
         analyzer.declare_implicit_functions();
@@ -227,6 +229,12 @@ impl SemanticAnalyzer {
     /// Compiler-prefixed `__builtin_*` forms remain available.
     pub fn set_no_builtins(&mut self, no_builtins: bool) {
         self.no_builtins = no_builtins;
+    }
+
+    /// Install the CLI's builtin-withdrawal policy (blanket and per-name
+    /// state).  Evaluators consult this instead of an ambient mode.
+    pub fn set_builtin_policy(&mut self, policy: crate::common::builtin::BuiltinPolicy) {
+        self.builtin_policy = policy;
     }
 
     /// Take the diagnostic engine back from the analyzer.
@@ -531,7 +539,7 @@ impl SemanticAnalyzer {
                         types: &self.result.type_context,
                         functions: &self.result.functions,
                         expr_types: Some(&self.result.expr_types),
-                        no_builtins: self.no_builtins,
+                        builtin_policy: self.builtin_policy.clone(),
                     };
                     checker.infer_expr_ctype(init_expr).unwrap_or(CType::Int)
                 } else {
@@ -1036,7 +1044,7 @@ impl SemanticAnalyzer {
                             types: &self.result.type_context,
                             functions: &self.result.functions,
                             expr_types: Some(&self.result.expr_types),
-                            no_builtins: self.no_builtins,
+                            builtin_policy: self.builtin_policy.clone(),
                         };
                         if let Some(init_ty) = checker.infer_expr_ctype(init_expr) {
                             self.check_pointer_float_conversion(
@@ -1203,7 +1211,7 @@ impl SemanticAnalyzer {
                 types: &self.result.type_context,
                 functions: &self.result.functions,
                 expr_types: Some(&self.result.expr_types),
-                no_builtins: self.no_builtins,
+                builtin_policy: self.builtin_policy.clone(),
             };
             let eval = |e: &Expr| self.eval_const_expr_value(e);
             let ctype = |e: &Expr| type_checker.infer_expr_ctype(e);
@@ -1272,7 +1280,7 @@ impl SemanticAnalyzer {
             functions: &self.result.functions,
             const_values: Some(&self.result.const_values),
             expr_types: Some(&self.result.expr_types),
-            no_builtins: self.no_builtins,
+            builtin_policy: self.builtin_policy.clone(),
         };
         let value = evaluator.eval_const_expr(expr)?;
         let is_float = matches!(value, IrConst::F32(_) | IrConst::F64(_));
@@ -1685,7 +1693,7 @@ impl SemanticAnalyzer {
                             types: &self.result.type_context,
                             functions: &self.result.functions,
                             expr_types: Some(&self.result.expr_types),
-                            no_builtins: self.no_builtins,
+                            builtin_policy: self.builtin_policy.clone(),
                         };
                         let expr_is_void =
                             matches!(checker.infer_expr_ctype(expr), Some(CType::Void) | None);
@@ -1701,7 +1709,7 @@ impl SemanticAnalyzer {
                             types: &self.result.type_context,
                             functions: &self.result.functions,
                             expr_types: Some(&self.result.expr_types),
-                            no_builtins: self.no_builtins,
+                            builtin_policy: self.builtin_policy.clone(),
                         };
                         if let Some(actual) = checker.infer_expr_ctype(expr) {
                             let actual = self.conversion_source_ctype(expr, actual);
@@ -2407,7 +2415,7 @@ impl SemanticAnalyzer {
                     types: &self.result.type_context,
                     functions: &self.result.functions,
                     expr_types: Some(&self.result.expr_types),
-                    no_builtins: self.no_builtins,
+                    builtin_policy: self.builtin_policy.clone(),
                 };
                 let signature = match checker.infer_expr_ctype(callee) {
                     Some(CType::Function(ft)) => Some(*ft),
@@ -2453,7 +2461,7 @@ impl SemanticAnalyzer {
                     types: &self.result.type_context,
                     functions: &self.result.functions,
                     expr_types: Some(&self.result.expr_types),
-                    no_builtins: self.no_builtins,
+                    builtin_policy: self.builtin_policy.clone(),
                 };
                 if let (Some(lhs_ty), Some(rhs_ty)) =
                     (checker.infer_expr_ctype(lhs), checker.infer_expr_ctype(rhs))
@@ -2592,7 +2600,7 @@ impl SemanticAnalyzer {
             types: &self.result.type_context,
             functions: &self.result.functions,
             expr_types: Some(&self.result.expr_types),
-            no_builtins: self.no_builtins,
+            builtin_policy: self.builtin_policy.clone(),
         };
         if let Some(ctype) = checker.infer_expr_ctype(expr) {
             self.result.expr_types.insert(expr.id(), ctype);
@@ -2622,7 +2630,7 @@ impl SemanticAnalyzer {
             functions: &self.result.functions,
             const_values: Some(&self.result.const_values),
             expr_types: Some(&self.result.expr_types),
-            no_builtins: self.no_builtins,
+            builtin_policy: self.builtin_policy.clone(),
         };
         if let Some(val) = evaluator.eval_const_expr(expr) {
             self.result.const_values.insert(expr.id(), val);
@@ -2644,7 +2652,7 @@ impl SemanticAnalyzer {
             types: &self.result.type_context,
             functions: &self.result.functions,
             expr_types: Some(&self.result.expr_types),
-            no_builtins: self.no_builtins,
+            builtin_policy: self.builtin_policy.clone(),
         };
 
         // Get the base type, dereferencing for pointer member access (->)
@@ -2717,7 +2725,7 @@ impl SemanticAnalyzer {
             types: &self.result.type_context,
             functions: &self.result.functions,
             expr_types: Some(&self.result.expr_types),
-            no_builtins: self.no_builtins,
+            builtin_policy: self.builtin_policy.clone(),
         };
         let lct = match checker.infer_expr_ctype(lhs) {
             Some(ct) => ct,
@@ -2785,7 +2793,7 @@ impl SemanticAnalyzer {
             types: &self.result.type_context,
             functions: &self.result.functions,
             expr_types: Some(&self.result.expr_types),
-            no_builtins: self.no_builtins,
+            builtin_policy: self.builtin_policy.clone(),
         };
         for (index, (arg, (param_ty, _))) in args.iter().zip(params).enumerate() {
             if let Some(arg_ty) = checker.infer_expr_ctype(arg) {
@@ -3090,7 +3098,7 @@ impl SemanticAnalyzer {
             types: &self.result.type_context,
             functions: &self.result.functions,
             expr_types: Some(&self.result.expr_types),
-            no_builtins: self.no_builtins,
+            builtin_policy: self.builtin_policy.clone(),
         };
         match checker.infer_expr_ctype(expr) {
             Some(CType::Struct(_) | CType::Union(_) | CType::Array(..)) | None => true,
@@ -3227,7 +3235,7 @@ impl SemanticAnalyzer {
             types: &self.result.type_context,
             functions: &self.result.functions,
             expr_types: Some(&self.result.expr_types),
-            no_builtins: self.no_builtins,
+            builtin_policy: self.builtin_policy.clone(),
         };
         let Some(from) = checker.infer_expr_ctype(expr) else {
             return;
@@ -3263,7 +3271,7 @@ impl SemanticAnalyzer {
             types: &self.result.type_context,
             functions: &self.result.functions,
             expr_types: Some(&self.result.expr_types),
-            no_builtins: self.no_builtins,
+            builtin_policy: self.builtin_policy.clone(),
         };
         let (Some(lt), Some(rt)) = (checker.infer_expr_ctype(lhs), checker.infer_expr_ctype(rhs))
         else {
@@ -3310,7 +3318,7 @@ impl SemanticAnalyzer {
             types: &self.result.type_context,
             functions: &self.result.functions,
             expr_types: Some(&self.result.expr_types),
-            no_builtins: self.no_builtins,
+            builtin_policy: self.builtin_policy.clone(),
         };
         let (Some(tt), Some(et)) = (
             checker.infer_expr_ctype(then_expr),
@@ -3379,7 +3387,7 @@ impl SemanticAnalyzer {
             types: &self.result.type_context,
             functions: &self.result.functions,
             expr_types: Some(&self.result.expr_types),
-            no_builtins: self.no_builtins,
+            builtin_policy: self.builtin_policy.clone(),
         };
         checker.infer_expr_ctype(expr)
     }
@@ -3444,7 +3452,7 @@ impl SemanticAnalyzer {
             types: &self.result.type_context,
             functions: &self.result.functions,
             expr_types: Some(&self.result.expr_types),
-            no_builtins: self.no_builtins,
+            builtin_policy: self.builtin_policy.clone(),
         };
         let (Some(CType::Pointer(_, from_space)), Some(CType::Pointer(_, to_space))) = (
             checker.infer_expr_ctype(inner),
@@ -3785,7 +3793,7 @@ impl SemanticAnalyzer {
             // The builtin policy is part of the evaluation environment, not
             // an ambient mode: a `-fno-builtin` translation unit must not
             // fold `strlen("x")` or elide a `__builtin_*` call here.
-            no_builtins: self.no_builtins,
+            builtin_policy: self.builtin_policy.clone(),
         }
     }
 
@@ -3953,7 +3961,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
             types: &self.result.type_context,
             functions: &self.result.functions,
             expr_types: Some(&self.result.expr_types),
-            no_builtins: self.no_builtins,
+            builtin_policy: self.builtin_policy.clone(),
         };
         checker.lvalue_address_space(expr)
     }
@@ -4182,7 +4190,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
             types: &self.result.type_context,
             functions: &self.result.functions,
             expr_types: Some(&self.result.expr_types),
-            no_builtins: self.no_builtins,
+            builtin_policy: self.builtin_policy.clone(),
         };
         checker.infer_expr_ctype(expr).unwrap_or(CType::Int)
     }
