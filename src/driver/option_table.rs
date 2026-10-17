@@ -64,6 +64,16 @@ pub(super) const CONTRACTS: &[Contract] = &[
         rationale: "GOT-indirect external-call selection is not implemented.",
     },
     Contract {
+        spelling: "-fsemantic-interposition",
+        class: Class::Refused,
+        rationale: "Semantic-interposition optimization policy is not implemented.",
+    },
+    Contract {
+        spelling: "-fno-semantic-interposition",
+        class: Class::Refused,
+        rationale: "Semantic-interposition optimization policy is not implemented.",
+    },
+    Contract {
         spelling: "-fopenmp",
         class: Class::Refused,
         rationale: "OpenMP lowering and runtime linkage are not implemented.",
@@ -134,6 +144,8 @@ mod tests {
             "-flto=auto",
             "-fsanitize=address",
             "-fvisibility=hidden",
+            "-fsemantic-interposition",
+            "-fno-semantic-interposition",
             "-fno-profile-arcs",
             "-fno-test-coverage",
             "-fno-branch-probabilities",
