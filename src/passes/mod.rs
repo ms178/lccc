@@ -998,10 +998,69 @@ pub(crate) fn pass_disabled(disabled: impl AsRef<str>, pass: &str) -> bool {
     })
 }
 
+/// Apply the driver-level `-fno-tree-vectorize` policy to every automatic
+/// vectorizer entry in the pass pipeline. Explicit vector types and intrinsics
+/// are unaffected; the disable list gates only automatic transformations.
+fn apply_tree_vectorize_policy(disabled: &mut String, disable: bool) {
+    if !disable || pass_disabled(disabled.as_str(), "all") {
+        return;
+    }
+
+    for pass in [
+        "vectorize",
+        "slp",
+        "vec_arx",
+        "arx_vectorize",
+        "vec_interleave",
+    ] {
+        if pass_disabled(disabled.as_str(), pass) {
+            continue;
+        }
+        if !disabled.is_empty() && !disabled.ends_with(',') {
+            disabled.push(',');
+        }
+        disabled.push_str(pass);
+    }
+}
+
 fn preinline_memory_enabled(requested: bool, disabled: &str) -> bool {
     requested
         && !pass_disabled(disabled, "preinline_memory")
         && !pass_disabled(disabled, "redundantloads")
+}
+
+#[cfg(test)]
+mod tree_vectorize_policy_tests {
+    use super::{apply_tree_vectorize_policy, pass_disabled};
+
+    #[test]
+    fn no_tree_vectorize_disables_every_automatic_vectorizer_only() {
+        let mut disabled = "licm,vec_arx".to_string();
+        apply_tree_vectorize_policy(&mut disabled, true);
+
+        for pass in [
+            "vectorize",
+            "slp",
+            "vec_arx",
+            "arx_vectorize",
+            "vec_interleave",
+        ] {
+            assert!(pass_disabled(&disabled, pass), "{pass} should be disabled");
+        }
+        assert!(pass_disabled(&disabled, "licm"));
+        assert!(!pass_disabled(&disabled, "inline"));
+    }
+
+    #[test]
+    fn enabled_or_globally_disabled_policy_does_not_mutate_list() {
+        let mut enabled = "licm".to_string();
+        apply_tree_vectorize_policy(&mut enabled, false);
+        assert_eq!(enabled, "licm");
+
+        let mut all = "all".to_string();
+        apply_tree_vectorize_policy(&mut all, true);
+        assert_eq!(all, "all");
+    }
 }
 
 #[cfg(test)]
@@ -1200,8 +1259,11 @@ pub(crate) fn run_passes(
     x86_fma: bool,
     x86_bmi1: bool,
     x86_avx512vl: bool,
+    disable_tree_vectorize: bool,
+    no_builtins: bool,
     ra_config: &crate::backend::regalloc::RaConfig,
 ) {
+    let _builtin_scope = simplify::BuiltinScope::enter(!no_builtins);
     let policy = crate::common::pass_policy::PassPolicy::new(
         wrap_signed_overflow,
         fp_environment_observable,
@@ -1326,6 +1388,7 @@ pub(crate) fn run_passes(
         _ => false,
     });
     let mut disabled = std::env::var("CCC_DISABLE_PASSES").unwrap_or_default();
+    apply_tree_vectorize_policy(&mut disabled, disable_tree_vectorize);
     vectorize::set_strict_recip_pack_enabled(!pass_disabled(&disabled, "strict_recip_pack"));
     vectorize::set_byte_count_normalize_enabled(!pass_disabled(&disabled, "byte_count_normalize"));
     // Snapshot the map policy switches once, like the other pass-pipeline
@@ -1439,7 +1502,7 @@ pub(crate) fn run_passes(
             eprintln!("[PASS] o1 mem2reg");
         }
         o1_checkpoint!("o1 mem2reg");
-        ip_purity::run(module);
+        ip_purity::run_with_builtins(module, !no_builtins);
         o1_checkpoint!("ip_purity");
         if !pass_disabled(&disabled, "fortifyfold") {
             fortify_fold::run(module, target.is_32bit(), &libcalls);
@@ -1595,7 +1658,7 @@ pub(crate) fn run_passes(
     // Fold strlen("literal") after inlining so __builtin_constant_p patterns
     // (glibc _startup_fatal) resolve to 1 and the not-constant fallback
     // disappears.
-    constant_fold::fold_strlen_literals(module);
+    constant_fold::fold_strlen_literals(module, !no_builtins);
     constant_fold::resolve_remaining_is_constant(module);
 
     // Switch case outlining: extract case bodies from large switch statements
@@ -2778,7 +2841,7 @@ pub(crate) fn run_passes(
         let mut ipcp_changes = 0;
         if !dis.ipcp {
             ipcp_changes = timed_pass!("ipcp", ipcp::run(module));
-            let purity_changes = ip_purity::run(module);
+            let purity_changes = ip_purity::run_with_builtins(module, !no_builtins);
             if ipcp_changes > 0 || purity_changes > 0 {
                 changed.iter_mut().for_each(|c| *c = true);
             }
@@ -3800,6 +3863,8 @@ mod signed_wrap_policy_tests {
             false,
             FpContract::Off,
             X86Isa::default(),
+            false,
+            false,
             false,
             false,
             false,

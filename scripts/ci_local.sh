@@ -181,6 +181,9 @@ if [ ! -x "$LCCC" ]; then
     exit 1
 fi
 
+gate "driver-option-contract" fast \
+    env CCC="$LCCC" bash tests/regression/check_driver_option_contract.sh
+
 # --------------------------------------------------------------- job:test --
 # The ratchet that keeps the 2026-10-13 audit's debt numbers from growing:
 # panic-class sites (AUD-ICE-1), unsafe sites, giant functions (AUD-MONO-1),

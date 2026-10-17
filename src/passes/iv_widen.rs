@@ -4454,12 +4454,62 @@ mod tests {
     }
 
     #[test]
+    fn runtime_signed_seed_does_not_borrow_an_unsigned_lower_bound() {
+        // With an unknown signed seed, MIN remains possible even with a small
+        // positive bound. Widening i*2 or i*-1 would erase that product's
+        // defined -fwrapv overflow before the following sign extension.
+        for (multiplier, expected) in [(1, 1), (2, 0), (-1, 0)] {
+            let mut f = counting_loop(
+                "runtime_seed_product",
+                IrType::I32,
+                IrBinOp::Add,
+                vec![
+                    Instruction::BinOp {
+                        dest: Value(9),
+                        op: IrBinOp::Mul,
+                        lhs: Operand::Value(Value(1)),
+                        rhs: Operand::Const(IrConst::I32(multiplier)),
+                        ty: IrType::I32,
+                    },
+                    Instruction::Cast {
+                        dest: Value(10),
+                        src: Operand::Value(Value(9)),
+                        from_ty: IrType::I32,
+                        to_ty: IrType::I64,
+                    },
+                    gep_inst(11, 10, IrType::I8),
+                ],
+                Some(Instruction::Cmp {
+                    dest: Value(99),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(64)),
+                    ty: IrType::I32,
+                }),
+            );
+            f.blocks[0].instructions[0] = Instruction::Load {
+                dest: Value(0),
+                ptr: Value(50),
+                ty: IrType::I32,
+                seg_override: Default::default(),
+                volatile: false,
+            };
+            f.blocks[0].instructions.swap(0, 1);
+            check_wrapv(&mut f, expected);
+        }
+    }
+
+    #[test]
     fn wrapping_signed_counted_domains_and_runtime_limits() {
         use IrBinOp::{Add, Sub};
         use IrCmpOp::{Sge, Sgt, Sle, Slt, Ult};
         for (seed, bound, cmp, latch, step, dirty_header, expected) in [
             (Some(0), None, Slt, Add, 1, false, 1),
             (None, None, Slt, Add, 1, false, 1),
+            // A constant positive bound leaves room for a non-unit step.
+            // Do not port the old strict-header matrix's blanket step-2
+            // rejection: this trajectory is defined and can be widened.
+            (Some(0), Some(63), Slt, Add, 2, false, 1),
             (Some(-64), Some(-1), Slt, Add, 1, false, 1),
             (Some(7), Some(0), Sge, Sub, 1, false, 1),
             (None, Some(0), Sge, Sub, 1, false, 1),
