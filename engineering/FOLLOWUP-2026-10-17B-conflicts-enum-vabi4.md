@@ -145,15 +145,20 @@ legs + lccc round-trip), with the NOTE printed in the gate log.
 - Gates re-run green: enum-tag-scope-compat, enum-layout-semantics (new),
   ext-vector-one-lane-fp (new), ext-vector-varargs-abi (expanded),
   strlen-embedded-nul, driver-option-contract.
-- `cargo test --profile fastbuild`: 5079 passed / 0 failed / 9 ignored
+- `cargo test --profile fastbuild`: 5081 passed / 0 failed / 9 ignored
   (lib + all binaries). Doc-tests cannot execute in this harness (the pypi
   toolchain ships no `rustdoc`; disclosed, not worked around).
-- Regression corpus: 955 passed / 9 failed / 991 total — every failure is
-  the pre-existing `-m32` environment gap (`i686_*` +
-  `segment_fill_copy_alias` need the wiped `/tmp/debroot` + `/tmp/i386inc`
-  sysroot caches; identical set before this session's changes).
-- Benchmark corpus (5 paired reps, lccc vs gcc-12, output-checked): see
-  `/tmp/bench.json` + the PR body for the receipt table.
+- Regression corpus: **957 passed / 9 failed / 993 total** in 147 s — every
+  failure is the pre-existing `-m32` environment gap (8x `i686_*` +
+  `segment_fill_copy_alias` need gcc-multilib/sysroot caches not available
+  on this host; identical set before this session's changes). Zero new
+  failures; the 4 new fixtures and the corrected `ext_vector_layout` pass.
+- Benchmark corpus (5 paired reps, lccc vs gcc-12, output-checked, n=45):
+  geomean ratio 0.714 (lccc faster), arithmetic 0.902; wins 18 / losses 15
+  / par 12; best ackermann 0.012 (83x), worst tce_sum 1.541 (pre-existing
+  perf queue). Receipt table in the PR #852 body; raw data `/tmp/bench.json`.
+- Toolchain honesty: local oracle gcc-12 only; the bit-packed bool > 32
+  lane power-of-two rule still needs a Clang/ICX receipt (hosted CI).
 
 ## Harness notes
 
