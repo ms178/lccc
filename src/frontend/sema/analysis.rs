@@ -203,6 +203,9 @@ impl SemanticAnalyzer {
                 ExternalDecl::TopLevelAsm(_) => {
                     // Top-level asm is passed through verbatim; no semantic analysis needed
                 }
+                ExternalDecl::StaticAssert(sa) => {
+                    self.check_static_assert(sa);
+                }
             }
         }
         let diag = self.diagnostics.borrow();
@@ -1654,6 +1657,33 @@ impl SemanticAnalyzer {
 
     // === Statement analysis ===
 
+    /// C11 6.7.2.3 static assertions.  The parser decides purely literal
+    /// conditions; this is the full evaluation with the sema type context:
+    /// `sizeof` of a tag resolves through the scope-tracked enum registry and
+    /// struct layouts, so `sizeof(enum Big) == 4` against an enum whose value
+    /// range needs 8 bytes fails here (GCC: `static assertion failed`).
+    /// Unevaluable expressions (exotic builtins) stay accepted — matching the
+    /// historical behavior — rather than risking false rejections.
+    fn check_static_assert(&mut self, sa: &crate::frontend::parser::ast::StaticAssert) {
+        let evaluator = SemaConstEval {
+            types: &self.result.type_context,
+            symbols: &self.symbol_table,
+            functions: &self.result.functions,
+            const_values: Some(&self.result.const_values),
+            expr_types: Some(&self.result.expr_types),
+            builtin_policy: self.builtin_policy.clone(),
+        };
+        if let Some(v) = evaluator.eval_const_expr(&sa.cond) {
+            if v.to_i64() == Some(0) {
+                let msg = match &sa.message {
+                    Some(m) => format!("static assertion failed: {m}"),
+                    None => "static assertion failed".to_string(),
+                };
+                self.diagnostics.borrow_mut().error(msg, sa.span);
+            }
+        }
+    }
+
     fn analyze_compound_stmt(&mut self, compound: &CompoundStmt) {
         self.symbol_table.push_scope();
         self.result.type_context.push_scope();
@@ -1667,6 +1697,11 @@ impl SemanticAnalyzer {
                 }
                 BlockItem::NestedFunction(nested) => {
                     self.analyze_nested_function_def(nested);
+                }
+                BlockItem::StaticAssert(sa) => {
+                    // Evaluated in declaration order, after any tag in the
+                    // same block was registered above.
+                    self.check_static_assert(sa);
                 }
             }
         }
@@ -1858,7 +1893,9 @@ impl SemanticAnalyzer {
         for item in &compound.items {
             let falls_through = match item {
                 BlockItem::Statement(stmt) => self.stmt_can_fall_through(stmt),
-                BlockItem::Declaration(_) | BlockItem::NestedFunction(_) => true,
+                BlockItem::Declaration(_)
+                | BlockItem::NestedFunction(_)
+                | BlockItem::StaticAssert(_) => true,
             };
             if !falls_through {
                 return false;
@@ -2025,7 +2062,9 @@ impl SemanticAnalyzer {
 
         for item in segment {
             let outcome = match item {
-                BlockItem::Declaration(_) | BlockItem::NestedFunction(_) => continue,
+                BlockItem::Declaration(_)
+                | BlockItem::NestedFunction(_)
+                | BlockItem::StaticAssert(_) => continue,
                 BlockItem::Statement(stmt) => {
                     let inner = self.unwrap_case_label(stmt);
                     self.stmt_switch_outcome(inner)
@@ -2053,7 +2092,9 @@ impl SemanticAnalyzer {
                 // subsequent items are dead code. This handles `return x; break;`.
                 for item in &compound.items {
                     let outcome = match item {
-                        BlockItem::Declaration(_) | BlockItem::NestedFunction(_) => continue,
+                        BlockItem::Declaration(_)
+                        | BlockItem::NestedFunction(_)
+                        | BlockItem::StaticAssert(_) => continue,
                         BlockItem::Statement(s) => self.stmt_switch_outcome(s),
                     };
                     if outcome != SwitchSegmentOutcome::FallsThrough {

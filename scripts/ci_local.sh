@@ -1102,6 +1102,10 @@ gate "record-tag-identity" fast \
     env CCC="$LCCC" bash tests/regression/check_record_tag_identity.sh
 gate "enum-tag-scope-compat" fast \
     env CCC="$LCCC" bash tests/regression/check_enum_tag_scope_compat.sh
+gate "enum-layout-semantics" fast \
+    env CCC="$LCCC" bash tests/regression/check_enum_layout_semantics.sh
+gate "ext-vector-one-lane-fp" fast \
+    env CCC="$LCCC" bash tests/regression/check_ext_vector_one_lane_fp.sh
 gate "strlen-embedded-nul" fast \
     env CCC="$LCCC" bash tests/regression/check_strlen_embedded_nul.sh
 

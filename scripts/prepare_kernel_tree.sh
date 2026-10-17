@@ -218,9 +218,42 @@ fi
 #   tarball force the verified-tarball path (offline git trees rejected).
 #   git     force the git path (no kernel.org access attempted).
 SOURCE_MODE=${LCCC_KERNEL_SOURCE_MODE:-auto}
+# Tag-signature trust policy for the git fallback (LCCC_KERNEL_GIT_TAG_VERIFY):
+#   strict  the v$KVER tag must carry a GOOD GPG signature (git verify-tag);
+#           an unsigned or unverifiable tag aborts preparation.
+#   auto    (default) verify-tag is attempted; a good signature is recorded,
+#           a missing/unverifiable one is a LOUD warning plus a
+#           gpg-verified=no line in the stamp, so downstream consumers can
+#           decide.  Tag PRESENCE alone (exact-match) pins the version, not
+#           the content.
+#   off     skip verification (recorded as off).
+LCCC_KERNEL_GIT_TAG_VERIFY=${LCCC_KERNEL_GIT_TAG_VERIFY:-auto}
+GIT_TAG_VERIFY_RESULT=unknown
 git_tree_at_tag() { # KDIR is a git checkout sitting exactly on tag v$KVER
   [[ -d $KDIR/.git ]] || return 1
-  [[ $(git -C "$KDIR" describe --exact-match --tags HEAD 2>/dev/null) == "v$KVER" ]]
+  [[ $(git -C "$KDIR" describe --exact-match --tags HEAD 2>/dev/null) == "v$KVER" ]] || return 1
+  case $LCCC_KERNEL_GIT_TAG_VERIFY in
+    off)
+      GIT_TAG_VERIFY_RESULT=off
+      ;;
+    strict)
+      if git -C "$KDIR" verify-tag "v$KVER" >/dev/null 2>&1; then
+        GIT_TAG_VERIFY_RESULT=yes
+      else
+        echo "prepare_kernel_tree: FATAL strict mode: tag v$KVER has no verifiable GPG signature" >&2
+        return 1
+      fi
+      ;;
+    *)
+      if git -C "$KDIR" verify-tag "v$KVER" >/dev/null 2>&1; then
+        GIT_TAG_VERIFY_RESULT=yes
+      else
+        GIT_TAG_VERIFY_RESULT=no
+        echo "prepare_kernel_tree: WARNING tag v$KVER signature not verified (no trusted kernel keyring?); stamp records gpg-verified=no" >&2
+      fi
+      ;;
+  esac
+  return 0
 }
 if [[ -e $KDIR ]] && git_tree_at_tag; then
   SOURCE_MODE=git
@@ -388,9 +421,22 @@ tarball_ok() {
 }
 if ! tarball_ok; then
   echo "prepare_kernel_tree: downloading linux-$KVER.tar.xz"
+  curl_ok=1
   if ! curl -fsSL --retry 3 -o "$TARBALL" \
-        "https://cdn.kernel.org/pub/linux/kernel/v${KVER%%.*}.x/linux-$KVER.tar.xz" \
-     || ! tarball_ok; then
+        "https://cdn.kernel.org/pub/linux/kernel/v${KVER%%.*}.x/linux-$KVER.tar.xz"; then
+    curl_ok=0
+  fi
+  # Trust-boundary discipline: a DOWNLOADED archive whose sha256 does not
+  # match the PKGBUILD is a corrupted or substituted artifact — auto mode
+  # must NOT quietly degrade to the git fallback (an earlier revision did,
+  # downgrading the integrity guarantee from PKGBUILD-sha256 to tag-presence).
+  # Only an unreachable/curl-failed download falls back.
+  if [[ $curl_ok == 1 ]] && [[ -f $TARBALL ]] && xz -t "$TARBALL" 2>/dev/null \
+     && [[ $(sha256_of "$TARBALL") != "$PKG_TARBALL_SHA256" ]]; then
+    echo "prepare_kernel_tree: FATAL tarball sha256 mismatch against PKGBUILD ($PKG_TARBALL_SHA256)" >&2
+    exit 1
+  fi
+  if [[ $curl_ok == 0 ]] || ! tarball_ok; then
     if [[ $SOURCE_MODE == tarball ]]; then
       echo "prepare_kernel_tree: download failed sha256 check against PKGBUILD ($PKG_TARBALL_SHA256)" >&2
       exit 1
@@ -594,6 +640,7 @@ done
   if [[ $SOURCE_MODE == git ]]; then
     printf 'commit=%s\n' "$(git rev-parse HEAD 2>/dev/null || echo unknown)"
     printf 'tag-verified=%s\n' "$(git describe --exact-match --tags HEAD 2>/dev/null || echo no)"
+    printf 'gpg-verified=%s\n' "$GIT_TAG_VERIFY_RESULT"
   else
     printf 'tarball-sha256=%s\n' "$PKG_TARBALL_SHA256"
   fi

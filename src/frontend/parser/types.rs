@@ -855,9 +855,16 @@ impl Parser {
         };
         // Record alignment for named struct/union definitions so that later
         // tag-only references (e.g., __alignof__(struct foo)) can look it up.
+        // A definition containing an enum field is NOT cached: the field's
+        // alignment follows the completed enum definition's value range
+        // (sema's registry), which the parser cannot always see — caching a
+        // 4-byte guess here made every later `_Alignof(struct WithEnum)` and
+        // `_Static_assert(_Alignof(..) == 8)` answer 4 where GCC says 8.
         match &ts {
             TypeSpecifier::Struct(Some(tag), Some(_), ..)
-            | TypeSpecifier::Union(Some(tag), Some(_), ..) => {
+            | TypeSpecifier::Union(Some(tag), Some(_), ..)
+                if !Self::type_spec_has_enum_tag(&ts) =>
+            {
                 // Pass the tag-alignment map so nested NAMED records already
                 // defined (parsed inside-out) resolve in O(1) instead of
                 // re-walking the whole chain at every level. This is what
@@ -1038,7 +1045,11 @@ impl Parser {
                 self.advance();
                 continue;
             }
-            // C11 6.7.2.1: _Static_assert is allowed as a struct-declaration
+            // C11 6.7.2.1: _Static_assert is allowed as a struct-declaration.
+            // Struct members carry no AST slot for assertions; the parse-time
+            // fast-path decides literal conditions, and tag-dependent
+            // conditions stay accepted (the enclosing struct's own layout is
+            // still being built here, so there is no sema state to defer to).
             if matches!(self.peek(), TokenKind::StaticAssert) {
                 self.parse_static_assert();
                 continue;

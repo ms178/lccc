@@ -200,15 +200,19 @@ impl Lowerer {
         let (sret_size, two_reg_size, mut call_ret_classes) =
             if let Expr::Identifier(name, _) = stripped_func {
                 if self.is_func_ptr_variable(name) {
-                    // Indirect call through function pointer variable
-                    // TODO: compute ret_eightbyte_classes from the function pointer's
-                    // return type to support mixed SSE/INTEGER struct returns via fptrs
+                    // Indirect call through function pointer variable.
+                    // AUD-VABI-4: ret_eightbyte_classes exist for non-struct
+                    // (vector) returns too, via `indirect_vector_carrier`
+                    // (computed from the callee's CType). A plain 8-byte
+                    // SSE-class return (e.g. f64x1) has `sret_size = None`
+                    // but is NOT in GPRs — the classes still flow through so
+                    // the caller reads %xmm0 instead of %rax.
                     match self.get_call_return_struct_size(effective_func) {
                         Some(size) => {
                             let (s, t) = Self::classify_struct_return(size);
                             (s, t, indirect_ret_classes.clone())
                         }
-                        None => (None, None, Vec::new()),
+                        None => (None, None, indirect_ret_classes.clone()),
                     }
                 } else {
                     // Direct function call - look up by function name
@@ -222,15 +226,16 @@ impl Lowerer {
                     )
                 }
             } else {
-                // Non-identifier function expression (e.g., array[i]())
-                // TODO: compute ret_eightbyte_classes from expression return type
-                // to support mixed SSE/INTEGER struct returns via indirect calls
+                // Non-identifier function expression (e.g., array[i]() or a
+                // cast-callee). Same AUD-VABI-4 fix: propagate
+                // `indirect_ret_classes` even without an sret struct-return so
+                // SSE-class one-lane FP vectors return to %xmm0, not %rax.
                 match self.get_call_return_struct_size(effective_func) {
                     Some(size) => {
                         let (s, t) = Self::classify_struct_return(size);
                         (s, t, indirect_ret_classes.clone())
                     }
-                    None => (None, None, Vec::new()),
+                    None => (None, None, indirect_ret_classes.clone()),
                 }
             };
         if i686_ext_vector_gp_return_words == 3 {
@@ -1273,19 +1278,42 @@ impl Lowerer {
                     }
                 }
 
-                // Spill packed struct data to a temporary alloca so that the call
-                // argument is a pointer (address) rather than raw data.  This is
-                // needed for any expression that produces packed struct data:
-                // direct function calls, statement expressions wrapping calls,
-                // ternaries, comma expressions, etc.
+                // Spill packed struct/vector data to a temporary alloca so
+                // that the call argument is a pointer (address) rather than
+                // raw data.  This is needed for any expression that produces
+                // packed aggregate data: direct function calls, statement
+                // expressions wrapping calls, ternaries, comma expressions,
+                // etc.  The vector case (a <=8-byte SSE-class vector returning
+                // in %xmm0 as a packed scalar) was previously missed, so
+                // passing `f(v)` as an argument dereferenced the bit-pattern
+                // as a pointer and segfaulted (AUD-VABI-4 chained-call
+                // witness).
                 {
-                    let is_struct_ret = matches!(
-                        self.get_expr_ctype(a),
-                        Some(CType::Struct(_)) | Some(CType::Union(_))
-                    );
-                    if is_struct_ret && self.expr_produces_packed_struct_data(a) {
-                        let struct_size = self.struct_value_size(a).unwrap_or(8);
-                        let alloc_size = if struct_size > 0 { struct_size } else { 8 };
+                    let produces_packed_aggregate = {
+                        let ct = self.get_expr_ctype(a);
+                        let is_struct =
+                            matches!(ct, Some(CType::Struct(_)) | Some(CType::Union(_)));
+                        let is_small_vec = ct.as_ref().is_some_and(|c| c.is_vector())
+                            && !crate::common::types::target_is_32bit()
+                            && ct.as_ref().map(|c| c.size()).unwrap_or(0) <= 8;
+                        (is_struct && self.expr_produces_packed_struct_data(a))
+                            || (is_small_vec
+                                && matches!(
+                                    a,
+                                    crate::frontend::parser::ast::Expr::FunctionCall(..)
+                                ))
+                    };
+                    if produces_packed_aggregate {
+                        let agg_size = if let Some(ct) = self.get_expr_ctype(a) {
+                            if ct.is_vector() {
+                                ct.size()
+                            } else {
+                                self.struct_value_size(a).unwrap_or(8)
+                            }
+                        } else {
+                            self.struct_value_size(a).unwrap_or(8)
+                        };
+                        let alloc_size = if agg_size > 0 { agg_size } else { 8 };
                         let alloca = self.fresh_value();
                         let store_ty = Self::packed_store_type(alloc_size);
                         self.emit(Instruction::Alloca {
@@ -2100,6 +2128,27 @@ impl Lowerer {
             // This case shouldn't normally be reached for sret calls, but return Ptr
             // as a safe default matching the hidden pointer convention.
             CType::Struct(_) | CType::Union(_) if is_32bit => IrType::Ptr,
+            // AUD-VABI-4: a ONE-LANE FP vector returns as the SCALAR F32/F64
+            // directly — matching the callee's IR return carrier in
+            // `register_function_sig`. Before this, a vector return kept the
+            // Ptr carrier that `from_ctype` assigns; the caller then fell
+            // through to the pointer-return path (store %rax) while the
+            // callee wrote %xmm0, and the result was read as garbage.
+            other if !is_32bit && other.is_vector() && other.elem_is_fp_scalar() => {
+                let elem = other.vector_info().unwrap().0;
+                match elem.size() {
+                    4 => IrType::F32,
+                    8 => IrType::F64,
+                    _ => IrType::I64,
+                }
+            }
+            // Small (<=8-byte) integer/fp vectors that aren't one-lane FP:
+            // I64 carrier (matches register_function_sig's <=8-byte branch).
+            other if !is_32bit && other.is_vector() && other.size() <= 8 => IrType::I64,
+            // Padded/9-16-byte vectors use I128 so the caller receives the
+            // two-eightbyte bundle and the struct-return split stores the
+            // halves correctly.
+            other if !is_32bit && other.is_vector() && other.size() <= 16 => IrType::I128,
             other => IrType::from_ctype(other),
         }
     }

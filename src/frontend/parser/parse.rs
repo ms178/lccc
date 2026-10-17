@@ -2357,9 +2357,72 @@ impl Parser {
                 Some(elem_size * count)
             }
             TypeSpecifier::Array(_, None) => Some(0),
-            // Enum, struct, union, typedef: size not reliably known at parse time.
-            // Enums can be __packed (1 byte), and struct/union sizes depend on layout.
+            // Inline enum definitions with parse-time evaluable values: the
+            // GCC compatible-type rule gives the exact size (`enum Big
+            // { B0 = 0x100000000LL }` is 8).  Body-less `enum Tag` references
+            // stay None — the tag registry lives in sema — so static asserts
+            // and other ICEs defer to sema instead of guessing 4.
+            TypeSpecifier::Enum(_, variants, is_packed) => {
+                Self::try_enum_layout(variants, *is_packed).map(|(size, _)| size)
+            }
+            // Struct, union, typedef: size not reliably known at parse time.
             _ => None,
+        }
+    }
+
+    /// Parse-time enum layout: the GCC compatible-type rule applied to an
+    /// inline variant list whose values are literal-evaluable.  Returns
+    /// `(size, align)`; `None` when any value needs sema (enum constants,
+    /// arithmetic on non-literals) — callers then fall back (sizeof: None,
+    /// alignment: int alignment).  Packed enums take the minimum width.
+    pub(super) fn try_enum_layout(
+        variants: &Option<Vec<crate::frontend::parser::ast::EnumVariant>>,
+        is_packed: bool,
+    ) -> Option<(usize, usize)> {
+        let vars = variants.as_ref()?;
+        if vars.is_empty() {
+            return None;
+        }
+        let mut min_val = i64::MAX;
+        let mut max_val = i64::MIN;
+        let mut next_val: i64 = 0;
+        for v in vars {
+            if let Some(val) = v.value.as_ref().and_then(|e| Self::eval_const_int_expr(e)) {
+                next_val = val;
+            }
+            min_val = min_val.min(next_val);
+            max_val = max_val.max(next_val);
+            next_val += 1;
+        }
+        if is_packed {
+            let (mn, mx) = (min_val, max_val);
+            let size = if mn >= 0 {
+                if mx <= 0xFF {
+                    1
+                } else if mx <= 0xFFFF {
+                    2
+                } else {
+                    4
+                }
+            } else if mn >= -128 && mx <= 127 {
+                1
+            } else if mn >= -32768 && mx <= 32767 {
+                2
+            } else {
+                4
+            };
+            return Some((size, size));
+        }
+        if min_val >= 0 {
+            if max_val <= u32::MAX as i64 {
+                Some((4, 4))
+            } else {
+                Some((8, 8))
+            }
+        } else if min_val < i32::MIN as i64 || max_val > i32::MAX as i64 {
+            Some((8, 8))
+        } else {
+            Some((4, 4))
         }
     }
 
@@ -2436,6 +2499,16 @@ impl Parser {
                     16
                 }
             }
+            TypeSpecifier::Enum(_, variants, is_packed) => {
+                // Exact for inline literal-evaluable definitions (GCC widens
+                // a value range past 32 bits to alignment 8); a body-less tag
+                // reference falls back to int alignment here — the static
+                // assert path delegates enum references to sema, which reads
+                // the completed registry definition.
+                Self::try_enum_layout(variants, *is_packed)
+                    .map(|(_, align)| align)
+                    .unwrap_or(4)
+            }
             TypeSpecifier::Array(elem, _) => Self::alignof_type_spec(elem, tag_aligns),
             TypeSpecifier::Struct(name, fields, is_packed, _, struct_aligned, _)
             | TypeSpecifier::Union(name, fields, is_packed, _, struct_aligned, _) => {
@@ -2477,7 +2550,6 @@ impl Parser {
                 // Fallback for empty struct/union or tag-only (no fields available)
                 if align == 0 { ptr_sz } else { align }
             }
-            TypeSpecifier::Enum(_, _, _) => 4,
             TypeSpecifier::TypedefName(_) => ptr_sz, // conservative default
             _ => ptr_sz,
         }

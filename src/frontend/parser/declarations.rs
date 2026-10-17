@@ -131,7 +131,9 @@ impl Parser {
 
         // Handle _Static_assert at file scope
         if matches!(self.peek(), TokenKind::StaticAssert) {
-            self.parse_static_assert();
+            if let Some(sa) = self.parse_static_assert() {
+                return Some(ExternalDecl::StaticAssert(sa));
+            }
             return Some(ExternalDecl::Declaration(Declaration::empty()));
         }
 
@@ -1382,12 +1384,22 @@ impl Parser {
                 if Self::type_spec_has_typedef(ts) {
                     return None;
                 }
+                // Enum alignment follows the completed definition's value
+                // range (GCC widens `enum Big { B0 = 0x100000000LL }` to
+                // _Alignof 8); the parser has no tag registry, so defer to
+                // sema instead of answering a constant 4.
+                if Self::type_spec_has_enum_tag(ts) {
+                    return None;
+                }
                 Some(Self::alignof_type_spec(ts, tag_aligns) as i64)
             }
             // __alignof(type) returns preferred alignment (8 for long long/double on i686)
             Expr::GnuAlignof(ts, _) => {
                 // Can't resolve typedef alignment at parse time
                 if Self::type_spec_has_typedef(ts) {
+                    return None;
+                }
+                if Self::type_spec_has_enum_tag(ts) {
                     return None;
                 }
                 Some(Self::preferred_alignof_type_spec(ts, tag_aligns) as i64)
@@ -1438,6 +1450,26 @@ impl Parser {
             TypeSpecifier::TypedefName(_) => true,
             TypeSpecifier::Pointer(inner, _) => Self::type_spec_has_typedef(inner),
             TypeSpecifier::Array(inner, _) => Self::type_spec_has_typedef(inner),
+            _ => false,
+        }
+    }
+
+    /// True when the type specifier names (or defines) an enum type.  The
+    /// parser-level evaluator has no enum tag registry, so any enum-shaped
+    /// alignof must be answered by sema (which resolves the compatible type
+    /// from the completed definition).
+    pub(super) fn type_spec_has_enum_tag(ts: &TypeSpecifier) -> bool {
+        match ts {
+            TypeSpecifier::Enum(..) => true,
+            TypeSpecifier::Pointer(inner, _) => Self::type_spec_has_enum_tag(inner),
+            TypeSpecifier::Array(inner, _) => Self::type_spec_has_enum_tag(inner),
+            TypeSpecifier::TypeofType(inner) => Self::type_spec_has_enum_tag(inner),
+            // A record with an enum field inherits the range-dependence: the
+            // field's alignment is the completed enum's alignment.
+            TypeSpecifier::Struct(_, Some(fields), ..)
+            | TypeSpecifier::Union(_, Some(fields), ..) => fields
+                .iter()
+                .any(|f| Self::type_spec_has_enum_tag(&f.type_spec)),
             _ => false,
         }
     }
@@ -1667,7 +1699,13 @@ impl Parser {
     /// with the provided message (or a default message for the single-arg form).
     /// If the expression cannot be evaluated at compile time, silently accepts
     /// it (matching GCC behavior for complex expressions).
-    pub(super) fn parse_static_assert(&mut self) {
+    /// Returns `Some(node)` when the condition could NOT be decided at parse
+    /// time: the caller stores the `StaticAssert` in the AST and sema
+    /// evaluates it with the full type context.  `None` means the parser
+    /// already handled the assertion (literal-evaluable condition, variable
+    /// reference diagnosed, or struct-member placement where the node is
+    /// dropped after the fast-path check).
+    pub(super) fn parse_static_assert(&mut self) -> Option<StaticAssert> {
         let assert_span = self.peek_span();
         self.advance(); // consume _Static_assert
         let open = self.peek_span();
@@ -1721,6 +1759,7 @@ impl Parser {
                 };
                 self.emit_error(msg, assert_span);
             }
+            return None;
         } else if Self::expr_has_non_const_identifier(&expr, enums, unevaluable) {
             // The expression references variables or non-enum identifiers, which
             // means it's definitely not a valid integer constant expression (C11 6.6).
@@ -1728,11 +1767,17 @@ impl Parser {
                 "expression in static assertion is not an integer constant expression",
                 assert_span,
             );
+            return None;
         }
         // If we can't evaluate the expression but it doesn't contain variable
-        // references (e.g. sizeof, offsetof, compiler builtins), silently accept.
-        // This matches real-world behavior where complex expressions may not be
-        // evaluable at parse time but are valid constant expressions.
+        // references (e.g. sizeof of a tag, offsetof, compiler builtins), the
+        // condition may still be decidable with the sema type context: keep
+        // the node for sema to evaluate.
+        Some(StaticAssert {
+            cond: expr,
+            message,
+            span: assert_span,
+        })
     }
 }
 

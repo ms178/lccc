@@ -14,6 +14,19 @@ pub enum ExternalDecl {
     Declaration(Declaration),
     /// Top-level asm("...") directive - emitted verbatim in assembly output.
     TopLevelAsm(String),
+    /// C11 `_Static_assert(cond[, "message"])` at file scope.  The parser
+    /// keeps the node when its literal fast-path cannot decide the condition;
+    /// sema then evaluates it with the full type context (enum tag registry,
+    /// struct layouts), which the parser does not have.
+    StaticAssert(StaticAssert),
+}
+
+/// A `_Static_assert` whose condition was not decidable at parse time.
+#[derive(Debug, Clone)]
+pub struct StaticAssert {
+    pub cond: Expr,
+    pub message: Option<String>,
+    pub span: Span,
 }
 
 /// Attributes that can be applied to function definitions via storage-class
@@ -1233,6 +1246,9 @@ pub struct CompoundStmt {
 #[derive(Debug, Clone)]
 pub enum BlockItem {
     Declaration(Declaration),
+    /// C11 `_Static_assert` at block scope: evaluated by sema (see
+    /// `StaticAssert` on `ExternalDecl` for why it survives parsing).
+    StaticAssert(StaticAssert),
     Statement(Stmt),
     /// GNU C nested function definition (GCC extension): a function defined
     /// at block scope that may reference enclosing-function locals through a

@@ -1461,7 +1461,9 @@ impl Lowerer {
                 // A nested function's labels live in ITS body, not the
                 // parent's: skip the whole definition. The nested function
                 // gets its own prescan when it is lowered independently.
-                BlockItem::Declaration(_) | BlockItem::NestedFunction(_) => {}
+                BlockItem::Declaration(_)
+                | BlockItem::NestedFunction(_)
+                | BlockItem::StaticAssert(_) => {}
             }
         }
     }

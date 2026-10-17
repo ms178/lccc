@@ -666,7 +666,7 @@ impl Lowerer {
                         self.register_struct_type(&p.type_spec);
                     }
                 }
-                ExternalDecl::TopLevelAsm(_) => {}
+                ExternalDecl::TopLevelAsm(_) | ExternalDecl::StaticAssert(_) => {}
             }
         }
 
@@ -990,6 +990,9 @@ impl Lowerer {
                 ExternalDecl::TopLevelAsm(_) => {
                     // Handled in the third pass
                 }
+                ExternalDecl::StaticAssert(_) => {
+                    // Checked by sema; produces no IR.
+                }
             }
         }
 
@@ -1059,6 +1062,9 @@ impl Lowerer {
                 }
                 ExternalDecl::TopLevelAsm(asm_str) => {
                     self.module.toplevel_asm.push(asm_str.clone());
+                }
+                ExternalDecl::StaticAssert(_) => {
+                    // Checked by sema; produces no IR.
                 }
             }
         }
@@ -1260,9 +1266,30 @@ impl Lowerer {
                     sret_size = s;
                     two_reg_ret_size = t;
                     // Small vector returns (<=8 bytes, no sret/two_reg) need
-                    // I64 so the packed value is returned in a register.
+                    // a 4/8-byte IR carrier so the packed value is returned
+                    // in a register. For a ONE-LANE FP vector the natural
+                    // carrier IS the scalar FP type (F32/F64): routing
+                    // through I64 forced a pointless `movq %xmm0,%rax ;
+                    // movq %rax,%xmm0` bounce at every leaf and — more
+                    // critically — told the downstream optimizer that the
+                    // value lived in GPR space, so argument materialization
+                    // ran `operand_to_rax` and the caller's result store
+                    // read %rax while the callee actually wrote %xmm0.
+                    // Integer one-lane vectors stay on I64/U64 as before.
                     if s.is_none() && t.is_none() {
-                        ret_ty = IrType::I64;
+                        if let Some((elem_ct, n_elems)) = full_ret_ctype.vector_info() {
+                            if n_elems == 1 && elem_ct.is_floating() {
+                                ret_ty = match elem_ct.size() {
+                                    4 => IrType::F32,
+                                    8 => IrType::F64,
+                                    _ => IrType::I64,
+                                };
+                            } else {
+                                ret_ty = IrType::I64;
+                            }
+                        } else {
+                            ret_ty = IrType::I64;
+                        }
                     }
                 }
             }

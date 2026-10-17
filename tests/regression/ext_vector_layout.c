@@ -202,7 +202,16 @@ int main(void) {
 typedef _Bool bool33 __attribute__((ext_vector_type(33)));
 typedef signed char s8x7 __attribute__((ext_vector_type(7)));
 typedef unsigned short u16x3 __attribute__((ext_vector_type(3)));
-_Static_assert(sizeof(bool33) == 5, "bool33 occupies five bytes (ceil(33/8))");
+/* The bit-packed bool layout follows ONE rule for every lane count:
+ * storage = ceil(lanes/8) rounded up to the next power of two, and the
+ * alignment is that same power of two (b4: 1/1, b9: 2/2, b17: 3->4/4).
+ * The previous text asserted sizeof == 5 alongside alignof == 8, which is
+ * not a representable C layout: sizeof must be a multiple of the alignment
+ * (arrays would stride 5 bytes with 8-byte alignment).  33 lanes therefore
+ * occupy the same 8-byte container the rule gives every other lane count;
+ * sema now evaluates these assertions, which is how the inconsistency
+ * surfaced. */
+_Static_assert(sizeof(bool33) == 8, "bool33 follows the power-of-two storage rule (ceil(33/8)=5 -> 8)");
 _Static_assert(_Alignof(bool33) == 8, "bool33 alignment follows next-power-of-two storage");
 _Static_assert(sizeof(s8x7) == 8, "s8x7 padded to next power of two (7 -> 8)");
 _Static_assert(_Alignof(s8x7) == 8, "s8x7 alignment is 8 bytes");

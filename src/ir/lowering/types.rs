@@ -371,11 +371,13 @@ impl Lowerer {
                 }
             }
             TypeSpecifier::Pointer(_, _) => Some((ptr_sz, ptr_sz)),
-            TypeSpecifier::Enum(_, _, false) => Some((4, 4)),
-            TypeSpecifier::Enum(_, _, true) => {
-                // Packed enums need type context to resolve; let caller handle via CType path
-                None
-            }
+            // Enums are NOT decided here: their size is data-dependent (the
+            // completed definition's value range — GCC widens a non-packed
+            // enum past 32 bits to 8 bytes — plus packed layouts and the
+            // scope-tracked tag registry). A static 4-byte guess silently
+            // mis-sized `enum Big { B0 = 0x100000000LL };` to sizeof 4 while
+            // every value path said 8. Return None so the caller resolves
+            // through the CType path, which consults the registry.
             TypeSpecifier::TypedefName(_) => Some((ptr_sz, ptr_sz)), // fallback for unresolved typedefs
             _ => None,
         }
@@ -515,17 +517,18 @@ impl Lowerer {
             }
             return crate::common::types::target_ptr_size(); // fallback
         }
-        // Handle packed enums (explicit or forward-reference to packed) via CType resolution
-        if let TypeSpecifier::Enum(name, _, is_packed) = ts {
-            let effective_packed = *is_packed
-                || name
-                    .as_ref()
-                    .and_then(|n| self.types.enum_types.get(n))
-                    .is_some_and(|enum_type| enum_type.is_packed);
-            if effective_packed {
-                let ctype = self.type_spec_to_ctype(ts);
-                return ctype.size_ctx(&*self.types.borrow_struct_layouts());
-            }
+        // Enums: the size follows the compatible integer type of the enum's
+        // completed definition (the scope-tracked registry) — int, widening
+        // to unsigned int / long long per the value range, or the packed
+        // minimum width.  `struct_union_layout` below matches only
+        // struct/union/array, so a non-packed enum must NOT fall through
+        // there (it would silently take the pointer-size fallback —
+        // `enum P { QA = 1, QB = 2 }` shadowing a packed outer tag reported
+        // sizeof 8 instead of 4).  Resolve through the CType path for every
+        // enum; resolve_enum consults the registry.
+        if let TypeSpecifier::Enum(..) = ts {
+            let ctype = self.type_spec_to_ctype(ts);
+            return ctype.size_ctx(&*self.types.borrow_struct_layouts());
         }
         // Handle typeof(expr) by resolving the expression's type
         if let TypeSpecifier::Typeof(expr, _) = ts {
@@ -595,6 +598,13 @@ impl Lowerer {
             return (*total_bytes).min(16);
         }
         if matches!(ts, TypeSpecifier::ExtVector(..)) {
+            return self.ctype_align(&self.type_spec_to_ctype(ts));
+        }
+        // Enums: alignment follows the compatible integer type of the
+        // completed definition (scope-tracked registry).  Same reasoning as
+        // sizeof_type: the struct_union_layout tail would fall back to
+        // pointer alignment for a non-packed enum.
+        if let TypeSpecifier::Enum(..) = ts {
             return self.ctype_align(&self.type_spec_to_ctype(ts));
         }
         let ts = self.resolve_type_spec(ts);

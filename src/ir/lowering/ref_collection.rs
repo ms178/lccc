@@ -90,6 +90,9 @@ impl Lowerer {
                 ExternalDecl::TopLevelAsm(_) => {
                     // Top-level asm doesn't reference C functions
                 }
+                ExternalDecl::StaticAssert(_) => {
+                    // No function references.
+                }
             }
         }
 
@@ -152,6 +155,7 @@ impl Lowerer {
                 BlockItem::NestedFunction(nested) => {
                     self.collect_refs_from_compound(&nested.body, refs);
                 }
+                BlockItem::StaticAssert(_) => {}
             }
         }
     }

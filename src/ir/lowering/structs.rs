@@ -341,7 +341,7 @@ impl Lowerer {
                         );
                     }
                 }
-                ExternalDecl::TopLevelAsm(_) => {}
+                ExternalDecl::TopLevelAsm(_) | ExternalDecl::StaticAssert(_) => {}
             }
         }
         for ts in type_specs_to_recompute {

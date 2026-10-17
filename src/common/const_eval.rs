@@ -84,6 +84,18 @@ pub(crate) fn narrow_string_strlen(text: &str) -> usize {
 /// - __builtin_parity{,l,ll}, __builtin_clrsb{,l,ll}
 ///
 /// `eval_fn` is the caller's recursive eval_const_expr function.
+/// Evaluate a compile-time builtin call in hosted mode (non-prefixed
+/// hosted-library names fold).  Thin wrapper over
+/// [`eval_builtin_call_with_mode`] with the default policy; kept as the
+/// natural entry point for contexts without a builtin-policy thread.
+pub fn eval_builtin_call(
+    name: &str,
+    args: &[Expr],
+    eval_fn: &dyn Fn(&Expr) -> Option<IrConst>,
+) -> Option<IrConst> {
+    eval_builtin_call_with_mode(name, args, eval_fn, true)
+}
+
 pub fn eval_builtin_call_with_mode(
     name: &str,
     args: &[Expr],
@@ -1056,7 +1068,7 @@ pub fn eval_binop_with_types(
 
 #[cfg(test)]
 mod string_length_tests {
-    use super::{eval_builtin_call, narrow_string_strlen};
+    use super::{eval_builtin_call, eval_builtin_call_with_mode, narrow_string_strlen};
     use crate::common::source::Span;
     use crate::frontend::parser::ast::Expr;
     use crate::ir::constants::IrConst;
@@ -1064,9 +1076,20 @@ mod string_length_tests {
     #[test]
     fn narrow_strlen_stops_at_first_embedded_nul() {
         assert_eq!(narrow_string_strlen("ab\0cd"), 2);
-        let literal = Expr::StringLiteral("ab\0cd".to_string(), Span::dummy());
+        let literal = || Expr::StringLiteral("ab\0cd".to_string(), Span::dummy());
         assert_eq!(
-            eval_builtin_call("strlen", &[literal], &|_| None),
+            eval_builtin_call("strlen", &[literal()], &|_| None),
+            Some(IrConst::I64(2))
+        );
+        // Policy interaction: `-fno-builtin` keeps the ordinary spelling a
+        // call (None here), while the explicit __builtin spelling still
+        // folds — GCC-compatible, at every tier.
+        assert_eq!(
+            eval_builtin_call_with_mode("strlen", &[literal()], &|_| None, false),
+            None
+        );
+        assert_eq!(
+            eval_builtin_call_with_mode("__builtin_strlen", &[literal()], &|_| None, false),
             Some(IrConst::I64(2))
         );
     }

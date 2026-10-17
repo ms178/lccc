@@ -1423,6 +1423,9 @@ impl Lowerer {
                     // function itself happens through the enclosing
                     // function-body walk, which re-visits all items.)
                 }
+                BlockItem::StaticAssert(_) => {
+                    // Checked by sema; produces no IR and no value.
+                }
             }
         }
 

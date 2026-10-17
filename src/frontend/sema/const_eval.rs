@@ -617,6 +617,14 @@ impl<'a> SemaConstEval<'a> {
             (CType::Array(a, sa), CType::Array(b, sb)) => {
                 self.ctypes_compatible(a, b) && (sa == sb || sa.is_none() || sb.is_none())
             }
+            // C11 6.7.2.2p4: an enum type is compatible with its compatible
+            // integer type (chosen from the completed definition's value
+            // range), so `typeof(again)` of a body-less `enum tag` reference
+            // answers 1 against `int`/`unsigned int` exactly like GCC —
+            // pointers to the two interchange in both directions.
+            (CType::Enum(e), other) | (other, CType::Enum(e)) if other.is_integer() => {
+                &e.compatible_ctype() == other
+            }
             _ => t1 == t2,
         }
     }
@@ -1066,13 +1074,42 @@ impl<'a> SemaConstEval<'a> {
             }
             TypeSpecifier::Enum(name, variants, is_packed) => {
                 // Check if this is a forward reference to a known packed enum
-                let effective_packed = *is_packed
-                    || name
-                        .as_ref()
-                        .and_then(|n| self.types.enum_types.get(n))
-                        .is_some_and(|enum_type| enum_type.is_packed);
+                let completed = name.as_ref().and_then(|n| self.types.enum_types.get(n));
+                let effective_packed =
+                    *is_packed || completed.is_some_and(|enum_type| enum_type.is_packed);
                 if !effective_packed {
-                    Some(4)
+                    // The width follows the VALUE RANGE, not a constant: GCC
+                    // widens a non-packed enum past 32 bits to 8 bytes
+                    // (`enum Big { B0 = 0x100000000LL }` has sizeof 8, and a
+                    // static assert comparing it to 4 must fail).  Prefer the
+                    // completed definition from the scope-tracked tag
+                    // registry; fall back to the inline variant list; only an
+                    // unresolved tag is int-sized.
+                    let resolved = completed.cloned().or_else(|| {
+                        variants.as_ref().map(|vars| {
+                            let mut next_val: i64 = 0;
+                            let values: Vec<(String, i64)> = vars
+                                .iter()
+                                .map(|v| {
+                                    if let Some(val) = v
+                                        .value
+                                        .as_ref()
+                                        .and_then(|e| self.eval_const_expr(e))
+                                        .and_then(|c| c.to_i64())
+                                    {
+                                        next_val = val;
+                                    }
+                                    (v.name.clone(), next_val)
+                                })
+                                .collect();
+                            crate::common::types::EnumType {
+                                name: name.clone(),
+                                variants: values,
+                                is_packed: false,
+                            }
+                        })
+                    });
+                    Some(resolved.map(|et| et.packed_size()).unwrap_or(4))
                 } else {
                     // Resolve the packed enum to get its correct size
                     let et = self.resolve_packed_enum_type(name, variants);
@@ -1247,13 +1284,44 @@ impl<'a> SemaConstEval<'a> {
                 struct_aligned.unwrap_or(1)
             }
             TypeSpecifier::Enum(name, variants, is_packed) => {
-                let effective_packed = *is_packed
-                    || name
-                        .as_ref()
-                        .and_then(|n| self.types.enum_types.get(n))
-                        .is_some_and(|enum_type| enum_type.is_packed);
+                let completed = name.as_ref().and_then(|n| self.types.enum_types.get(n));
+                let effective_packed = *is_packed || completed.is_some_and(|et| et.is_packed);
                 if !effective_packed {
-                    4
+                    // The alignment follows the compatible integer type of the
+                    // completed definition (int/unsigned int -> 4, long long
+                    // range -> 8).  `enum Big { B0 = 0x100000000LL }` has
+                    // _Alignof 8; a constant 4 broke static assertions that
+                    // compare it.
+                    let resolved = completed.cloned().or_else(|| {
+                        variants.as_ref().map(|vars| {
+                            let mut next_val: i64 = 0;
+                            let values: Vec<(String, i64)> = vars
+                                .iter()
+                                .map(|v| {
+                                    if let Some(val) = v
+                                        .value
+                                        .as_ref()
+                                        .and_then(|e| self.eval_const_expr(e))
+                                        .and_then(|c| c.to_i64())
+                                    {
+                                        next_val = val;
+                                    }
+                                    (v.name.clone(), next_val)
+                                })
+                                .collect();
+                            crate::common::types::EnumType {
+                                name: name.clone(),
+                                variants: values,
+                                is_packed: false,
+                            }
+                        })
+                    });
+                    resolved
+                        .map(|et| {
+                            let ct = et.compatible_ctype();
+                            ct.align_ctx(&*self.types.borrow_struct_layouts())
+                        })
+                        .unwrap_or(4)
                 } else {
                     let et = self.resolve_packed_enum_type(name, variants);
                     et.packed_size()
@@ -1472,7 +1540,19 @@ fn ctype_from_type_spec(spec: &TypeSpecifier, types: &TypeContext) -> CType {
                 CType::Int // anonymous union without context
             }
         }
-        TypeSpecifier::Enum(_, _, false) => CType::Int, // non-packed enums are int-sized
+        TypeSpecifier::Enum(name, _, false) => {
+            // The compatible type follows the completed definition's value
+            // range (a range needing 8 bytes is long long / unsigned long
+            // long); only an unresolved tag falls back to int.
+            match name
+                .as_ref()
+                .and_then(|n| types.enum_types.get(n))
+                .map(|et| et.compatible_ctype())
+            {
+                Some(ct) => ct,
+                None => CType::Int,
+            }
+        }
         TypeSpecifier::Enum(name, variants, true) => {
             // Packed enum: look up from type context or compute from variants
             if let Some(tag) = name {

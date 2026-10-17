@@ -100,7 +100,10 @@ impl Parser {
                     break 'item;
                 }
                 if matches!(self.peek(), TokenKind::StaticAssert) {
-                    self.parse_static_assert();
+                    if let Some(sa) = self.parse_static_assert() {
+                        items.push(BlockItem::StaticAssert(sa));
+                        break 'item;
+                    }
                 } else if self.is_type_specifier() && !self.is_typedef_label() {
                     // GNU C nested function definition? (`int f(int *p) { ... }`
                     // at block scope). Try to parse one; on mismatch the parser

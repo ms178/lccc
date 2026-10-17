@@ -51,6 +51,9 @@ impl Lowerer {
                     BlockItem::NestedFunction(nested) => {
                         self.lower_nested_function_def(nested);
                     }
+                    BlockItem::StaticAssert(_) => {
+                        // Checked by sema; produces no IR.
+                    }
                 }
             }
 

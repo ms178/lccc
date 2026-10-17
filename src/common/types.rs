@@ -508,18 +508,27 @@ impl EnumType {
     /// smallest integer type that can represent all variant values.
     pub fn packed_size(&self) -> usize {
         if !self.is_packed {
-            // Non-packed enum: 4 bytes if all values fit in int or unsigned int,
-            // otherwise 8 bytes (GCC extension for values exceeding 32-bit range).
-            // Values like `1U << 31` (0x80000000) fit in unsigned int (u32) even
-            // though they exceed signed int (i32) range.
-            let exceeds_32bit = self
-                .variants
-                .iter()
-                .any(|(_, v)| *v > u32::MAX as i64 || *v < i32::MIN as i64);
-            if exceeds_32bit {
-                return 8;
+            // Non-packed enum, GCC-compatible-type rule: the size follows the
+            // COMPLETE value range, not a constant.  All-nonnegative values up
+            // through UINT_MAX stay in `unsigned int` (4 bytes); any range
+            // exceeding that — including a negative minimum combined with a
+            // maximum above INT_MAX (`enum Neg { N1 = -1, N2 = 4000000000u }`
+            // is `long long`, sizeof 8, because -1 is not representable in
+            // `unsigned int`) — widens to 8 bytes.
+            let Some(min_val) = self.variants.iter().map(|(_, v)| *v).min() else {
+                return 4;
+            };
+            let Some(max_val) = self.variants.iter().map(|(_, v)| *v).max() else {
+                return 4;
+            };
+            if min_val >= 0 {
+                return if max_val > u32::MAX as i64 { 8 } else { 4 };
             }
-            return 4;
+            return if min_val < i32::MIN as i64 || max_val > i32::MAX as i64 {
+                8
+            } else {
+                4
+            };
         }
         // Find the range of variant values to determine the minimum size
         if self.variants.is_empty() {
@@ -2257,35 +2266,45 @@ impl CType {
                 _ => None,
             };
         }
-        // A ONE-element floating-point vector (`ext_vector_type(1)` of
-        // `double`, 8 bytes) keeps the legacy INTEGER carrier. Clang and GCC
-        // classify this shape as MEMORY (clang-19 compiles `id(T a){return a;}`
-        // to `movsd 8(%rsp),%xmm0` -- the argument arrives on the stack), so
-        // there is no interop to be won by moving it to SSE; and LCCC's own
-        // FP return path cannot guarantee %xmm0 for it yet: at -O1 the callee
-        // materialises the result with `vaddsd ...,%xmm2,%xmm2` and emits no
-        // move, so an SSE classification returns a stale register and breaks
-        // lccc->lccc itself (measured FAIL of f64x1 in
-        // tests/regression/check_ext_vector_abi.sh). The INTEGER carrier is
-        // self-consistent on both sides; the gap is tracked, not hidden.
-        if let CType::ExtVector(elem, layout) = self {
-            if layout.lanes == 1
-                && matches!(**elem, CType::Double | CType::Float | CType::LongDouble)
-            {
-                return match self.size() {
-                    1..=8 => Some((vec![EightbyteClass::Integer], false)),
-                    _ => None,
-                };
-            }
+        // A ONE-element floating-point vector (f32x1/f64x1) is SysV-SSE: it
+        // travels in the low half of ONE xmm register exactly like the scalar
+        // element, matching GCC 16 and Clang 19 same-compiler codegen (the
+        // gate asserts the -O1 chained-call shape end to end). The legacy
+        // INTEGER carrier here was doubly wrong: it diverged from both
+        // oracles, and the backend's missing packed-result spill made
+        // `dadd(did(x), dadd(y, y))` segfault at -O1.  32-bit targets never
+        // reach this classifier (their ext vectors use the GP-word path).
+        if self.elem_is_fp_scalar() {
+            return match self.size() {
+                4 | 8 => Some((vec![EightbyteClass::Sse], false)),
+                _ => None,
+            };
         }
         match self.size() {
             // Smaller than an eightbyte: INTEGER class, carried in the low
             // bytes of ONE general-purpose register. Measured with both
             // oracles on x86-64: clang-19 `id_u8x1`/`id_u8x2`/`id_u16x2`/
-            // `id_u32x1`/`id_f32x1` and gcc-16 `vector_size(1,2,4)` shapes all
-            // arrive in %edi and leave in %eax. The old rule classified these
-            // as SSE and LCCC passed them in %xmm0, which no oracle does.
+            // `id_u32x1` and gcc-16 `vector_size(1,2,4)` shapes all arrive
+            // in %edi and leave in %eax. The old rule classified these as
+            // SSE and LCCC passed them in %xmm0, which no oracle does.
             1..=4 => Some((vec![EightbyteClass::Integer], false)),
+            // 5..=8: A ONE-lane integer vector (u64x1/i64x1) is SysV-INTEGER
+            // — it arrives in %rdi and returns in %rax, exactly like
+            // uint64_t. GCC 12/16 and Clang agree (the psABI classes an
+            // 8-byte aggregate whose single member is INTEGER as INTEGER;
+            // "one lane" is the trivial one-member aggregate). Without this,
+            // the backend routes a 64-bit integer one-lane through %xmm0 and
+            // emits `movq %xmm0,%rdi; movq %rdi,%xmm0; ret` at every leaf:
+            // three wasted instructions plus a false XMM/GPR dependency
+            // (domain-crossing merge uop). Multi-lane integer vectors
+            // (u32x2, u16x4, ...) stay SSE — they are NOT scalar-carried.
+            5..=8
+                if self
+                    .vector_info()
+                    .is_some_and(|(e, n)| n == 1 && e.is_integer()) =>
+            {
+                Some((vec![EightbyteClass::Integer], false))
+            }
             // One SSE eightbyte: the low 64 bits of ONE xmm register.
             5..=8 => Some((vec![EightbyteClass::Sse], false)),
             // SSE + SSEUP: the full 128 bits of ONE xmm register. An
@@ -2299,6 +2318,22 @@ impl CType {
 
     pub fn is_vector(&self) -> bool {
         matches!(self, CType::Vector(_, _) | CType::ExtVector(_, _))
+    }
+
+    /// Whether this vector's sole element lane is a floating-point scalar
+    /// (float/double), used by the single-lane SSE carrier rules above. Only
+    /// meaningful when `self.is_vector()` is true; returns false for
+    /// multi-lane vectors (their classification is handled by the
+    /// per-eightbyte rules) and for integer vectors.
+    pub fn elem_is_fp_scalar(&self) -> bool {
+        match self {
+            CType::ExtVector(elem, layout) => layout.lanes == 1 && elem.is_floating(),
+            CType::Vector(elem, total_size) => {
+                let es = elem.size();
+                es > 0 && *total_size == es && elem.is_floating()
+            }
+            _ => false,
+        }
     }
 
     /// Whether this is a bit-packed bool ext-vector. `vector_size` types are
