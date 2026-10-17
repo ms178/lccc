@@ -16,6 +16,7 @@ for flag in \
     -flto -flto=auto \
     -fsanitize=address -fsanitize=undefined \
     -fstack-clash-protection -ftrapv -fvisibility=hidden -fno-plt \
+    -fsemantic-interposition -fno-semantic-interposition \
     -fopenmp -freg-struct-return \
     -fno-profile-arcs -fno-test-coverage -fno-branch-probabilities -fno-auto-profile \
     -finstrument-functions-exclude-file-list=generated.c \
