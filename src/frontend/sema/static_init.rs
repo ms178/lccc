@@ -317,6 +317,15 @@ impl<'s> StaticInitChecker<'s> {
     /// An identifier used as a value: an array or function decays to its
     /// address, an object contributes its value only if it is a folded const.
     fn identifier_value<'e>(&self, name: &'e str) -> Kind<'e> {
+        // `__func__`/`__FUNCTION__`/`__PRETTY_FUNCTION__` denote a static
+        // const char[] per function (C99 6.4.2.2p4), so a pointer initialized
+        // with one is an address constant (GCC 16.2 accepts
+        // `static const char *s = __func__;`; the kernel's tracepoint string
+        // helpers — lib/maple_tree.c trace_ma_op — do exactly that). The
+        // lowerer materializes them as string literals, so the value exists.
+        if matches!(name, "__func__" | "__FUNCTION__" | "__PRETTY_FUNCTION__") {
+            return Kind::Address(None);
+        }
         match self.symbols.lookup(name) {
             // Undeclared: already diagnosed; do not report a second error.
             None => Kind::Value,
