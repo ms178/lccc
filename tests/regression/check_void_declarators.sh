@@ -9,6 +9,10 @@
 # recorded verdict and first error (drift check); lccc must give the same
 # verdict and its recorded first error, and accepted rows must compile.
 set -euo pipefail
+# GCC quotes identifiers with U+2018/U+2019 under a UTF-8 locale and with
+# ASCII apostrophes under C; the table records the C spelling, so the
+# comparison must not depend on the host's locale.
+export LC_ALL=C
 . tests/regression/lib/gcc_oracle.sh
 require_gcc_oracle check_void_declarators || exit 1
 
