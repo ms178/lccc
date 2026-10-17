@@ -97,8 +97,21 @@ pub enum AsmItem {
     Asciz(Vec<u8>),
     /// String without NUL: `.ascii "str"`
     Ascii(Vec<u8>),
-    /// Common symbol: `.comm name, size, align`
+    /// Common symbol: `.comm name, size, align`.  `align` is the operand as
+    /// written, 0 when omitted: what it means depends on whether `.local`
+    /// flagged the symbol, which only the writer knows (a local `.bss`
+    /// allocation aligns to 1, a global common to `elf::default_comm_align`).
     Comm(String, u64, u32),
+    /// `.local a, b, ...`: GAS's sticky per-symbol local flag.  It clears
+    /// external binding (a later `.globl` restores it for a defined symbol)
+    /// and makes a later `.comm` allocate a LOCAL object in `.bss`.
+    Local(Vec<String>),
+    /// `.lcomm name, size`: a `.bss` allocation with GAS's size-derived
+    /// alignment (`lcomm_align`); binding follows `.globl` as for a label.
+    Lcomm(String, u64, u32),
+    /// `.dc.a val, ...`: address-sized values -- 8 bytes on x86-64, 4 on
+    /// i686.  The parser does not know the target; the writer does.
+    Addr(Vec<DataValue>),
     /// Symbol alias: `.set alias, target`
     Set(String, String),
     /// CFI directive. `cfi::lower_cfi` replaces these by location labels and
@@ -209,12 +222,11 @@ pub enum DataValue {
     SymbolDiff(String, String),
     /// symbol - symbol with constant addend
     SymbolDiffAddend(String, String, i64),
-    /// `(a - b) * scale + addend` — a symbol difference folded through an
-    /// arithmetic expression (e.g. `.long (end-start)*2`). Same-section label
-    /// differences are absolute, so this always resolves to a constant.
-    /// `(a - b) * scale / div + addend`. div=1 for plain scaling; header.S
-    /// PE metadata divides: `.long (section_table - .) / 8`.
-    SymbolDiffScaled(String, String, i64, i64, i64),
+    /// Any other well-formed expression over symbols (`(e - s) >> 1`,
+    /// `(section_table - .) / 8`): no relocation can express it, so it must
+    /// fold to a constant once labels are placed -- it is evaluated after
+    /// layout in GAS's section algebra and refused unless absolute.
+    Expr(String),
 }
 
 /// CFI directives (call frame information), lowered by `cfi::lower_cfi`.
@@ -570,6 +582,13 @@ fn strip_comment(line: &str) -> &str {
 /// directive followed by any single ASCII whitespace character, returning
 /// the trimmed argument. Directives are always dot-prefixed and matched
 /// case-sensitively, like GAS.
+/// The operands of `.set` or its GAS synonym `.equ`.  Every textual pass
+/// that recognises `.set` must use this: `.equ` reaching only the final
+/// parser skipped the register-alias and constant passes.
+fn set_directive_arg(line: &str) -> Option<&str> {
+    directive_arg(line, ".set").or_else(|| directive_arg(line, ".equ"))
+}
+
 fn directive_arg<'a>(line: &'a str, directive: &str) -> Option<&'a str> {
     if let Some(rest) = line.strip_prefix(directive) {
         match rest.chars().next() {
@@ -880,6 +899,16 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
             let vals = parse_data_values(args)?;
             Ok(AsmItem::Quad(vals))
         }
+        // GAS's `.dc[.size]` family (default size: word).  `.dc.x` (x87
+        // extended) is refused below: its decimal-to-64-bit-mantissa
+        // rounding is not implemented, and an f64 round trip would emit
+        // wrong low mantissa bits for literals such as 0.1.
+        ".dc.b" => Ok(AsmItem::Byte(parse_data_values(args)?)),
+        ".dc" | ".dc.w" => Ok(AsmItem::Short(parse_data_values(args)?)),
+        ".dc.l" => Ok(AsmItem::Long(parse_data_values(args)?)),
+        ".dc.a" => Ok(AsmItem::Addr(parse_data_values(args)?)),
+        ".dc.s" => Ok(AsmItem::Byte(parse_float_values(args, false)?)),
+        ".dc.d" => Ok(AsmItem::Byte(parse_float_values(args, true)?)),
         // `.octa` — 16-byte (128-bit) constants, emitted little-endian.
         // Previously this directive fell through to the "ignore unknown
         // directive" arm, silently emitting NOTHING: the kernel's
@@ -984,17 +1013,16 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
                     let Some(total_bytes) = repeat.checked_mul(size.min(8)) else {
                         return Ok(AsmItem::Zero(0));
                     };
-                    // The materialized Vec lives before the writer's fill
-                    // cap can intervene — refuse over-limit requests here
-                    // (GAS's own verdict for >256 MiB depends on free disk
-                    // and is not pinnable).
-                    if total_bytes > crate::backend::elf::MAX_DIRECTIVE_FILL as u64 {
-                        return Err(format!(
-                            ".fill: {total_bytes} bytes exceed the {}-byte directive limit",
-                            crate::backend::elf::MAX_DIRECTIVE_FILL
-                        ));
-                    }
-                    let total_bytes = total_bytes as usize;
+                    // No byte cap here: nothing is materialised at parse time (zero
+                    // runs become `Zero`, patterns a `Fill` descriptor), and the
+                    // writer decides against the live section -- the PROGBITS
+                    // ceiling and budget apply there, while a NOBITS run is a
+                    // size (GAS 2.47: `.fill 1073741824,1,0` in `.bss` is a
+                    // 1 GiB section). A parse-time cap refused exactly the
+                    // NOBITS case the writer was built to accept.
+                    let total_bytes = usize::try_from(total_bytes).map_err(|_| {
+                        format!(".fill: {total_bytes} bytes exceed the addressable size")
+                    })?;
                     if value == 0 {
                         Ok(AsmItem::Zero(total_bytes))
                     } else {
@@ -1051,7 +1079,10 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
             Ok(AsmItem::Ascii(s))
         }
         ".comm" => parse_comm_directive(args),
-        ".set" => parse_set_directive(args),
+        ".lcomm" => parse_lcomm_directive(args),
+        ".local" => Ok(AsmItem::Local(parse_symbol_list(args, ".local")?)),
+        ".base64" => Ok(AsmItem::Ascii(elf::parse_base64_args(args)?)),
+        ".set" | ".equ" => parse_set_directive(args),
         ".symver" => parse_symver_directive(args),
         // `.cfi_startproc simple` (no CIE initial instructions) keeps its
         // text so the lowering sees the operand.
@@ -1155,11 +1186,31 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
             // text; `cfi::lower_cfi` decodes and validates it.
             Ok(AsmItem::Cfi(CfiDirective::Other(line.to_string())))
         }
-        _ => {
-            // Unknown directive - just ignore it with a warning
-            // This handles .ident, .addrsig, etc. that GCC might emit
-            Ok(AsmItem::Empty)
-        }
+        // Directives accepted with no effect on the object.  Each is listed
+        // with the reason ignoring it is exact; anything else fails below.
+        //  * `.extern`: GAS documents it as accepted and ignored (undefined
+        //    symbols are external anyway).
+        //  * `.ident`: provenance text GAS puts in `.comment`; it changes no
+        //    code, data, symbol or relocation.
+        //  * `.addrsig`, `.addrsig_sym`: LLVM's address-significance table.
+        //    Without `.llvm_addrsig` lld treats every symbol as
+        //    address-significant, the conservative reading for --icf=safe.
+        //  * `.prefalign`: LLVM's preferred function alignment, a hint by
+        //    definition; the required minimum is a separate `.p2align`.
+        //  * `.att_syntax` / `.att_syntax prefix`: the syntax already in use.
+        ".extern" | ".ident" | ".addrsig" | ".addrsig_sym" | ".prefalign" => Ok(AsmItem::Empty),
+        ".att_syntax" if matches!(args.trim(), "" | "prefix") => Ok(AsmItem::Empty),
+        ".intel_syntax" | ".att_syntax" => Err(format!(
+            "unsupported pseudo-op `{line}': lccc's x86 assembler accepts AT&T syntax \
+             with %-prefixed registers only"
+        )),
+        // Fail closed.  Dropping a directive silently is how `.octa`,
+        // `.float`, `.space`, `.equ`, `.local`, `.lcomm` and `.base64` each
+        // assembled to wrong bytes or symbols with no diagnostic; GAS
+        // reports the same condition as an error.
+        _ => Err(format!(
+            "unknown pseudo-op: `{directive}' (not supported by lccc's x86 assembler)"
+        )),
     }
 }
 
@@ -1294,22 +1345,37 @@ fn parse_size_directive(args: &str) -> Result<AsmItem, String> {
     }
 }
 
-/// Parse `.comm name, size, align`.
+/// Parse `.comm name, size[, align]` (shared operand grammar).
 fn parse_comm_directive(args: &str) -> Result<AsmItem, String> {
-    let parts: Vec<&str> = args.split(',').collect();
-    if parts.len() < 2 {
-        return Err(format!("bad .comm directive: {}", args));
+    Ok(match elf::parse_comm_args(".comm", args, true)? {
+        Some((name, size, align)) => AsmItem::Comm(
+            name,
+            size,
+            u32::try_from(align).map_err(|_| format!(".comm: alignment {align} out of range"))?,
+        ),
+        None => AsmItem::Empty,
+    })
+}
+
+/// Parse `.lcomm name, size`; the alignment follows from the size.
+fn parse_lcomm_directive(args: &str) -> Result<AsmItem, String> {
+    Ok(match elf::parse_comm_args(".lcomm", args, false)? {
+        Some((name, size, _)) => AsmItem::Lcomm(name, size, elf::lcomm_align(size) as u32),
+        None => AsmItem::Empty,
+    })
+}
+
+/// Comma-separated symbol names (`.local a, b`).  An empty name is an error
+/// rather than a symbol called "" -- the old `.weak a, b` handling created
+/// one symbol literally named "a, b".
+fn parse_symbol_list(args: &str, directive: &str) -> Result<Vec<String>, String> {
+    let names: Vec<String> = args.split(',').map(|n| n.trim().to_string()).collect();
+    if names.iter().any(String::is_empty) {
+        return Err(format!(
+            "{directive}: expected a comma-separated symbol list: `{args}'"
+        ));
     }
-    let name = parts[0].trim().to_string();
-    let size: u64 = parts[1]
-        .trim()
-        .parse()
-        .map_err(|_| format!("bad .comm size: {}", args))?;
-    let align: u32 = parts
-        .get(2)
-        .map(|s| s.trim().parse().unwrap_or(1))
-        .unwrap_or(1);
-    Ok(AsmItem::Comm(name, size, align))
+    Ok(names)
 }
 
 /// Parse `.set alias, target`.
@@ -2833,6 +2899,36 @@ fn parse_u128_literal(s: &str) -> Option<u128> {
     Some(if neg { v.wrapping_neg() } else { v })
 }
 
+/// One data operand by its value in GAS's section algebra, names kept as
+/// terms: a constant, `sym + k`, `a - b + k` (the relocatable shapes), or
+/// any other well-formed expression over symbols, which has to fold to a
+/// constant after layout ([`DataValue::Expr`]). `None` for text outside the
+/// expression grammar.
+fn classify_data_expr(s: &str) -> Option<DataValue> {
+    use crate::backend::asm_expr::{SectionExpr, eval_section_expr};
+    match eval_section_expr::<String>(s, |n| Ok(SectionExpr::term(n.to_string(), 1))) {
+        Ok(v) => {
+            let c = v.constant;
+            Some(match v.terms() {
+                [] => DataValue::Integer(c),
+                [(a, 1)] if c == 0 => DataValue::Symbol(a.clone()),
+                [(a, 1)] => DataValue::SymbolOffset(a.clone(), c),
+                [(a, 1), (b, -1)] | [(b, -1), (a, 1)] if c == 0 => {
+                    DataValue::SymbolDiff(a.clone(), b.clone())
+                }
+                [(a, 1), (b, -1)] | [(b, -1), (a, 1)] => {
+                    DataValue::SymbolDiffAddend(a.clone(), b.clone(), c)
+                }
+                _ => DataValue::Expr(s.to_string()),
+            })
+        }
+        // Well-formed, but an operator needs values only layout provides.
+        Err(_) => eval_section_expr::<()>(s, |_| Ok(SectionExpr::absolute(1)))
+            .ok()
+            .map(|_| DataValue::Expr(s.to_string())),
+    }
+}
+
 fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
     let mut vals = Vec::new();
     for part in s.split(',') {
@@ -2852,6 +2948,17 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
             continue;
         }
 
+        // Every operand in the expression grammar is classified by its value
+        // in GAS's section algebra, the one model `.set` uses too: the
+        // textual splitting below tore operands apart at the wrong operator
+        // (`(e - s) >> 1` became the pair `(e` / `s) >> 1`).
+        if let Some(val) = classify_data_expr(trimmed) {
+            vals.push(val);
+            continue;
+        }
+
+        // Operands outside the expression grammar -- relocation operators
+        // (`sym@GOTOFF`, `f@PLT - .`), quoted names -- take the textual path.
         // General `symbol +/- const-expr [+/- const-expr ...]` chain, e.g. the
         // kernel's `level1_fixmap_pgt + (2 << 12) - 8 + 16`. The " - " split
         // below would break at the FIRST minus and treat everything left of
@@ -2860,20 +2967,6 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
         if let Some(val) = parse_symbol_expr_chain(trimmed) {
             vals.push(val);
             continue;
-        }
-
-        // A PARENTHESIZED symbol difference with arithmetic around it must be
-        // folded before the plain `" - "` split below, which would otherwise
-        // tear `(.Lb - .La) * 4` into the nonsense pair `(.Lb` / `.La) * 4`.
-        // `strip_sym_parens` then produced a symbol name that matches nothing,
-        // and the field was silently emitted as ZERO -- no diagnostic, wrong
-        // data. (The same probe exists further down, but only after the split
-        // has already destroyed the expression.)
-        if trimmed.starts_with('(') {
-            if let Some(val) = try_parse_sym_diff_expr(trimmed) {
-                vals.push(val);
-                continue;
-            }
         }
 
         // Check for symbol difference: .LBB3 - .Ljt_0, or with addend: tr_gdt_end - tr_gdt - 1
@@ -3040,16 +3133,6 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
             continue;
         }
 
-        // A parenthesized symbol difference with arithmetic around it must be
-        // folded BEFORE the plain symbol+offset probe, otherwise `(c-a)+7`
-        // would be misread as "symbol named `(c-a)` plus 7".
-        if trimmed.starts_with('(') {
-            if let Some(val) = try_parse_sym_diff_expr(trimmed) {
-                vals.push(val);
-                continue;
-            }
-        }
-
         // Check for symbol+offset or symbol-offset (e.g., GD_struct+128, arr+33)
         if let Some(val) = parse_symbol_offset(trimmed) {
             vals.push(val);
@@ -3060,17 +3143,6 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
         // (glibc .eh_frame emits `(.LSTART_restore_rt-1)-.`,
         //  `.LEND_restore_rt-(.LSTART_restore_rt-1)`, `.LENDCIE_-.LSTARTCIE_`).
         if let Some(val) = try_parse_sym_diff(trimmed) {
-            vals.push(val);
-            continue;
-        }
-
-        // An arithmetic expression built from a single symbol difference, e.g.
-        // `(end-start)*2` or `(end-start)+7`. GAS folds these to a constant
-        // because the difference of two same-section labels is absolute.
-        // Without this, the whole expression was treated as a SYMBOL NAME and
-        // emitted as a relocation against a nonexistent symbol — the datum
-        // silently became zero and the object gained an undefined reference.
-        if let Some(val) = try_parse_sym_diff_expr(trimmed) {
             vals.push(val);
             continue;
         }
@@ -3126,115 +3198,6 @@ fn parse_sym_addend(s: &str) -> Option<(String, i64)> {
 /// Parse GNU-as symbol-difference expressions that lack spaces around the
 /// operator or use parentheses: `(a-1)-.`, `a-(b-1)`, `(a+2)-b`, `a-b`.
 /// Returns DataValue::SymbolDiffAddend(a, b, add) meaning `a - b + add`.
-/// Fold an arithmetic expression over ONE symbol difference into a
-/// `SymbolDiffScaled` value: `(A-B)*k + c`.
-///
-/// Accepts `(A-B)`, `(A-B)*k`, `k*(A-B)`, `(A-B)+c`, `(A-B)-c` and the
-/// combination `(A-B)*k+c`. Anything else returns `None` so the caller can
-/// report it rather than silently mis-encoding it.
-fn try_parse_sym_diff_expr(s: &str) -> Option<DataValue> {
-    let t = s.trim();
-    let open = t.find('(')?;
-    let mut depth = 0usize;
-    let mut close = None;
-    for (i, c) in t[open..].char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    close = Some(open + i);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let close = close?;
-    let inner = &t[open + 1..close];
-    let (a, b) = split_simple_diff(inner)?;
-
-    let before = t[..open].trim();
-    let after = t[close + 1..].trim();
-
-    let mut scale: i64 = 1;
-    let mut addend: i64 = 0;
-
-    if !before.is_empty() {
-        let f = before.strip_suffix('*')?.trim();
-        scale = scale.checked_mul(parse_integer_expr(f).ok()?)?;
-    }
-
-    let mut div: i64 = 1;
-    let mut rest = after;
-    if let Some(r) = rest.strip_prefix('*') {
-        let (num, tail) = split_leading_int(r.trim())?;
-        scale = scale.checked_mul(num)?;
-        rest = tail.trim();
-    }
-    // Division: `(a - b) / 8` (header.S NumberOfRvaAndSizes).
-    if let Some(r) = rest.strip_prefix('/') {
-        let (num, tail) = split_leading_int(r.trim())?;
-        if num == 0 {
-            return None;
-        }
-        div = num;
-        rest = tail.trim();
-    }
-    if !rest.is_empty() {
-        let (sign, r) = if let Some(r) = rest.strip_prefix('+') {
-            (1i64, r)
-        } else if let Some(r) = rest.strip_prefix('-') {
-            (-1i64, r)
-        } else {
-            return None;
-        };
-        addend = sign.checked_mul(parse_integer_expr(r.trim()).ok()?)?;
-        rest = "";
-    }
-    if !rest.is_empty() {
-        return None;
-    }
-    Some(DataValue::SymbolDiffScaled(a, b, scale, div, addend))
-}
-
-/// Split `A-B` into its two label operands, or `None` when the text is not a
-/// plain difference of labels.
-fn split_simple_diff(s: &str) -> Option<(String, String)> {
-    let t = s.trim();
-    for (i, c) in t.char_indices().rev() {
-        if c != '-' || i == 0 {
-            continue;
-        }
-        let a = t[..i].trim();
-        let b = t[i + 1..].trim();
-        if is_label_like(a) && is_label_like(b) {
-            return Some((a.to_string(), b.to_string()));
-        }
-    }
-    None
-}
-
-/// Split a leading decimal/hex integer off the front of `s`.
-fn split_leading_int(s: &str) -> Option<(i64, &str)> {
-    let bytes = s.as_bytes();
-    let mut end = 0;
-    if s.starts_with("0x") || s.starts_with("0X") {
-        end = 2;
-        while end < bytes.len() && (bytes[end] as char).is_ascii_hexdigit() {
-            end += 1;
-        }
-    } else {
-        while end < bytes.len() && bytes[end].is_ascii_digit() {
-            end += 1;
-        }
-    }
-    if end == 0 {
-        return None;
-    }
-    Some((parse_integer_expr(&s[..end]).ok()?, &s[end..]))
-}
-
 fn try_parse_sym_diff(s: &str) -> Option<DataValue> {
     let s = s.trim();
     if s.is_empty() {
@@ -3347,10 +3310,9 @@ fn parse_integer_expr(s: &str) -> Result<i64, String> {
 /// GAS macro definition
 #[derive(Clone, Debug)]
 struct GasMacro {
-    params: Vec<(String, Option<String>)>, // (name, default_value)
-    /// Index of the `name:vararg` parameter: it swallows ALL remaining
-    /// positional arguments (comma-joined) instead of binding to one.
-    vararg_index: Option<usize>,
+    /// As written in `.macro`, for diagnostics.
+    name: String,
+    params: Vec<asm_preprocess::MacroParam>,
     body: Vec<String>,
 }
 
@@ -3468,10 +3430,7 @@ fn substitute_register_aliases(lines: Vec<String>) -> Vec<String> {
         // snapshots the target's CURRENT value, so later redefinition of
         // the target must not rewrite history — exactly what resolving
         // through the map at definition time gives us.
-        let alias_def: Option<(&str, &str)> = if let Some(rest) = trimmed
-            .strip_prefix(".set ")
-            .or_else(|| trimmed.strip_prefix(".set\t"))
-        {
+        let alias_def: Option<(&str, &str)> = if let Some(rest) = set_directive_arg(trimmed) {
             rest.find(',')
                 .map(|comma| (rest[..comma].trim(), rest[comma + 1..].trim()))
         } else if let Some(eq) = trimmed.find('=') {
@@ -3592,7 +3551,11 @@ fn expand_gas_macros_with_state(
 
         // .macro name param1:req param2:req ...
         if let Some(rest) = directive_arg(&trimmed, ".macro") {
-            let (name, params, vararg_index) = parse_macro_def(rest)?;
+            let (name, params) = asm_preprocess::parse_macro_header(rest);
+            if name.is_empty() {
+                return Err(".macro: missing name".to_string());
+            }
+            let name = name.to_string();
             let mut body = Vec::new();
             let mut depth = 1;
             i += 1;
@@ -3612,14 +3575,7 @@ fn expand_gas_macros_with_state(
             if depth != 0 {
                 return Err(".macro without matching .endm".to_string());
             }
-            macros.insert(
-                name,
-                GasMacro {
-                    params,
-                    vararg_index,
-                    body,
-                },
-            );
+            macros.insert(name.clone(), GasMacro { name, params, body });
             i += 1;
             continue;
         }
@@ -3632,7 +3588,7 @@ fn expand_gas_macros_with_state(
         }
 
         // .set symbol, expr (with symbol resolution)
-        if let Some(rest) = directive_arg(&trimmed, ".set") {
+        if let Some(rest) = set_directive_arg(&trimmed) {
             if let Some(comma_pos) = rest.find(',') {
                 let sym_name = rest[..comma_pos].trim().to_string();
                 let expr_str = rest[comma_pos + 1..].trim();
@@ -3947,7 +3903,17 @@ fn expand_gas_macros_with_state(
             } else {
                 first_part[macro_name.len()..].trim()
             };
-            let args = parse_macro_args(args_str, &mac.params, mac.vararg_index)?;
+            let fields = asm_preprocess::split_macro_arg_fields(
+                args_str,
+                asm_preprocess::MacroArgLexing::X86,
+            );
+            let values = asm_preprocess::bind_macro_args(&mac.name, &mac.params, &fields)?;
+            let args: Vec<(String, String)> = mac
+                .params
+                .iter()
+                .map(|p| p.name.clone())
+                .zip(values)
+                .collect();
             // Sort parameters by name length (longest first) to avoid partial
             // substitution: e.g., \orig must not match before \orig_len.
             let mut sorted_args: Vec<(String, String)> = args.clone();
@@ -4044,258 +4010,6 @@ fn expand_gas_macros_with_state(
     }
 
     Ok(result)
-}
-
-/// Parse a .macro definition header: "name param1:req param2:req ..."
-fn parse_macro_def(
-    rest: &str,
-) -> Result<(String, Vec<(String, Option<String>)>, Option<usize>), String> {
-    // Tokenize the parameter list at PAREN DEPTH 0 only.
-    //
-    // Splitting on raw whitespace shreds a default value that contains spaces:
-    //     .macro FILL_RETURN_BUFFER reg:req nr:req ftr:req ftr2=ALT_NOT(X86_FEATURE_ALWAYS)
-    // whose default expands to `(((1 << 0) << 16) | ((3*32+21)))`. The spaces
-    // inside it became parameter separators, inventing parameters named `<<`
-    // and `0)`, and `\ftr2` expanded to the fragment `(((1` -- which surfaced
-    // as "unsupported data expression: (((1" on the `.4byte` in
-    // altinstr_entry (arch/x86/entry/entry.S).
-    //
-    // Commas are equally valid separators in GAS, so both are honoured, but
-    // only outside parentheses and quotes.
-    fn split_params(s: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut cur = String::new();
-        let mut depth = 0i32;
-        let mut in_quote = false;
-        for c in s.chars() {
-            if in_quote {
-                cur.push(c);
-                if c == '"' {
-                    in_quote = false;
-                }
-                continue;
-            }
-            match c {
-                '"' => {
-                    in_quote = true;
-                    cur.push(c);
-                }
-                '(' => {
-                    depth += 1;
-                    cur.push(c);
-                }
-                ')' => {
-                    depth -= 1;
-                    cur.push(c);
-                }
-                _ if depth == 0 && (c.is_whitespace() || c == ',') => {
-                    if !cur.is_empty() {
-                        out.push(std::mem::take(&mut cur));
-                    }
-                }
-                _ => cur.push(c),
-            }
-        }
-        if !cur.is_empty() {
-            out.push(cur);
-        }
-        out
-    }
-
-    let parts = split_params(rest);
-    if parts.is_empty() {
-        return Err(".macro: missing name".to_string());
-    }
-    let name = parts[0].clone();
-    let mut params = Vec::new();
-    let mut vararg_index = None;
-    for part in &parts[1..] {
-        // `param=default` wins over `param:req`: a default may itself contain
-        // a colon, and the qualifier is not part of the parameter NAME.
-        if let Some(eq) = part.find('=') {
-            let pname = part[..eq].trim();
-            let pname = pname.split(':').next().unwrap_or(pname).to_string();
-            let default = part[eq + 1..].to_string();
-            params.push((pname, Some(default)));
-        } else if let Some(colon) = part.find(':') {
-            let qual = part[colon + 1..].trim();
-            if qual == "vararg" && vararg_index.is_none() {
-                vararg_index = Some(params.len());
-            }
-            params.push((part[..colon].to_string(), None));
-        } else {
-            params.push((part.clone(), None));
-        }
-    }
-    Ok((name, params, vararg_index))
-}
-
-/// Parse macro invocation arguments: "param1=val1, param2=val2" or positional
-fn parse_macro_args(
-    args_str: &str,
-    params: &[(String, Option<String>)],
-    vararg_index: Option<usize>,
-) -> Result<Vec<(String, String)>, String> {
-    let mut result = Vec::new();
-    if args_str.is_empty() {
-        // Use defaults for all params
-        for (name, default) in params {
-            result.push((name.clone(), default.clone().unwrap_or_default()));
-        }
-        return Ok(result);
-    }
-
-    // Split on commas (respecting parentheses)
-    let arg_parts = split_macro_args(args_str);
-
-    // Helper: strip surrounding quotes from GAS macro arguments
-    // In GAS, "" means empty string, "foo bar" means foo bar
-    let strip_quotes = |s: &str| -> String {
-        let t = s.trim();
-        if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
-            t[1..t.len() - 1].to_string()
-        } else {
-            t.to_string()
-        }
-    };
-
-    // GAS supports mixed positional and named arguments.
-    // Positional args fill params left-to-right, named args (key=val) override by name.
-    // Example: "0 asm_foo exc_foo has_error_code=0" with params (vector, asmsym, cfunc, has_error_code)
-    // → positional: vector=0, asmsym=asm_foo, cfunc=exc_foo; named: has_error_code=0
-    let mut positional_idx = 0;
-    let mut arg_map = crate::common::fx_hash::FxHashMap::default();
-    let mut positional_vals: Vec<(usize, String)> = Vec::new();
-
-    for part in &arg_parts {
-        let part = part.trim();
-        if let Some(eq_pos) = part.find('=') {
-            let key = part[..eq_pos].trim();
-            // Only treat as named if the key matches a known parameter name
-            if params.iter().any(|(pname, _)| pname == key) {
-                let val = strip_quotes(part[eq_pos + 1..].trim());
-                arg_map.insert(key.to_string(), val);
-                continue;
-            }
-        }
-        // Positional argument
-        positional_vals.push((positional_idx, strip_quotes(part)));
-        positional_idx += 1;
-    }
-
-    // Build result: start with positional, then override with named.
-    //
-    // A `:vararg` parameter (must be the last one) swallows ALL remaining
-    // positional arguments, comma-joined — the kernel's
-    //     .macro _xor_data vecs:vararg
-    //         .irp i, \vecs ...
-    // invoked as `_xor_data 0,1,2,3,4,5,6,7` needs `\vecs` to expand to the
-    // full seven-element list, not just `0`. An empty remainder expands to
-    // the empty string.
-    let mut pos_iter = positional_vals.into_iter();
-    for (pi, (name, default)) in params.iter().enumerate() {
-        if vararg_index == Some(pi) {
-            let joined = pos_iter
-                .by_ref()
-                .map(|(_, v)| v)
-                .collect::<Vec<String>>()
-                .join(", ");
-            let val = arg_map.get(name).cloned().unwrap_or(joined);
-            result.push((name.clone(), val));
-            continue;
-        }
-        if let Some(val) = arg_map.get(name) {
-            result.push((name.clone(), val.clone()));
-        } else if let Some((_, val)) = pos_iter.next() {
-            result.push((name.clone(), val));
-        } else {
-            result.push((name.clone(), default.clone().unwrap_or_default()));
-        }
-    }
-
-    Ok(result)
-}
-
-/// Split macro arguments on commas and spaces, respecting parentheses.
-///
-/// GAS allows both commas and spaces/tabs as macro argument separators.
-/// e.g., `base=%rsp offset=0` or `base=%rsp, offset=0` both give two args.
-/// Consecutive separators are collapsed (no empty args from double spaces).
-fn split_macro_args(s: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut depth = 0;
-    let mut in_quotes = false;
-    let mut current = String::new();
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let ch = bytes[i] as char;
-        match ch {
-            '"' => {
-                in_quotes = !in_quotes;
-                current.push(ch);
-            }
-            '\'' if !in_quotes => {
-                // GAS character literal: 'x (optionally closed 'x'). The byte
-                // after the quote is data — even a space, comma, or paren
-                // (relocate_kernel_64.S: `pr 'r', '8', ' ', ':', %r8`).
-                // Copy the literal verbatim so it never splits an argument.
-                current.push('\'');
-                if i + 1 < bytes.len() {
-                    if bytes[i + 1] == b'\\' && i + 2 < bytes.len() {
-                        current.push('\\');
-                        current.push(bytes[i + 2] as char);
-                        i += 2;
-                    } else {
-                        current.push(bytes[i + 1] as char);
-                        i += 1;
-                    }
-                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                        current.push('\'');
-                        i += 1;
-                    }
-                }
-            }
-            '(' if !in_quotes => {
-                depth += 1;
-                current.push(ch);
-            }
-            ')' if !in_quotes => {
-                depth -= 1;
-                current.push(ch);
-            }
-            ',' if depth == 0 && !in_quotes => {
-                let trimmed = current.trim().to_string();
-                if !trimmed.is_empty() {
-                    parts.push(trimmed);
-                }
-                current.clear();
-                // Skip any whitespace after comma
-                while i + 1 < bytes.len() && (bytes[i + 1] == b' ' || bytes[i + 1] == b'\t') {
-                    i += 1;
-                }
-            }
-            ' ' | '\t' if depth == 0 && !in_quotes => {
-                let trimmed = current.trim().to_string();
-                if !trimmed.is_empty() {
-                    parts.push(trimmed);
-                    current.clear();
-                }
-                // Skip remaining whitespace
-                while i + 1 < bytes.len() && (bytes[i + 1] == b' ' || bytes[i + 1] == b'\t') {
-                    i += 1;
-                }
-                // If next char is comma, let the comma handler deal with it
-            }
-            _ => current.push(ch),
-        }
-        i += 1;
-    }
-    let trimmed = current.trim().to_string();
-    if !trimmed.is_empty() {
-        parts.push(trimmed);
-    }
-    parts
 }
 
 /// Parse .irp header: "var, item1, item2, ..."
@@ -5741,10 +5455,16 @@ main:
                 other => panic!("{src}: parsed as {other:?}"),
             }
         }
-        assert!(
-            parse_directive(".fill 268435457,1,1").is_err(),
-            "256 MiB + 1 must be refused before the Vec is built"
-        );
+        // No parse-time byte cap: nothing is materialised here, and the
+        // writer decides against the live section (PROGBITS refuses past
+        // the ceiling, NOBITS holds a size -- see
+        // `sparse_nobits_holds_zero_content_as_a_size`).
+        match parse_directive(".fill 268435457,1,1").expect(".fill past the ceiling parses") {
+            AsmItem::Fill { total, elem, value } => {
+                assert_eq!((total, elem, value), (268435457, 1, 1))
+            }
+            other => panic!("parsed as {other:?}"),
+        }
         // Out-of-i64-range literals take their two's-complement pattern
         // (GAS 2.47: every count in 2^63..2^64-1 is negative -> zero bytes;
         // 2^64 is an expression error).

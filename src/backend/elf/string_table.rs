@@ -41,6 +41,14 @@ impl StringTable {
         self.offsets.get(s).copied().unwrap_or(0)
     }
 
+    /// The offset of a previously-added string, or `None` when it was never
+    /// added.  Unlike [`StringTable::offset_of`] this keeps "absent" distinct
+    /// from the empty string's offset 0, which a symbol lookup needs: offset 0
+    /// is also the NULL symbol's name.
+    pub fn get(&self, s: &str) -> Option<u32> {
+        self.offsets.get(s).copied()
+    }
+
     /// Return the raw table bytes (including the leading null byte).
     pub fn as_bytes(&self) -> &[u8] {
         &self.data

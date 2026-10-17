@@ -1,1 +1,1 @@
--fwrapv -fno-tree-vectorize
+-O2 -fwrapv -fno-tree-vectorize

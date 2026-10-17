@@ -112,6 +112,12 @@ pub struct Lowerer {
     /// Identical string literals share the same .rodata entry so that
     /// pointer equality (`"hello" == "hello"`) holds, matching GCC behavior.
     pub(super) string_dedup: FxHashMap<String, String>,
+    /// Set while a static initializer is lowered (GCC's `folding_initializer`):
+    /// `__builtin_constant_p` must then answer now, 0 unless proven, because
+    /// nothing later can prove it (GCC 16.2: `static int b =
+    /// __builtin_constant_p("ab"[1]);` is 0). In function code an unproven
+    /// answer stays deferred for inlining and propagation.
+    pub(super) folding_initializer: std::cell::Cell<bool>,
     /// Wide and UTF-16 literals have different element widths and therefore
     /// need independent intern tables from ordinary byte strings.
     pub(super) wide_string_dedup: FxHashMap<String, String>,
@@ -265,6 +271,7 @@ impl Lowerer {
             emitted_global_names: FxHashSet::default(),
             tentative_incomplete_arrays: FxHashSet::default(),
             string_dedup: FxHashMap::default(),
+            folding_initializer: std::cell::Cell::new(false),
             wide_string_dedup: FxHashMap::default(),
             char16_string_dedup: FxHashMap::default(),
             sema_functions,
@@ -475,6 +482,7 @@ impl Lowerer {
                     regparm: None,
                     is_pure: false,
                     is_const: false,
+                    assume_library: false,
                     ret_eightbyte_classes: Vec::new(),
                     ret_is_f128_sse: false,
                 },
@@ -563,8 +571,12 @@ impl Lowerer {
     }
 
     /// Insert an enum constant, tracking the change in the current scope frame.
-    pub(super) fn insert_enum_scoped(&mut self, name: String, value: i64) {
-        self.types.insert_enum_scoped(name, value);
+    pub(super) fn insert_enum_scoped(
+        &mut self,
+        name: String,
+        constant: crate::frontend::sema::type_context::EnumConstant,
+    ) {
+        self.types.insert_enum_scoped(name, constant);
     }
 
     /// Insert a static local name, tracking the change in the current scope frame.
@@ -652,7 +664,7 @@ impl Lowerer {
                         self.register_struct_type(&p.type_spec);
                     }
                 }
-                ExternalDecl::TopLevelAsm(_) => {}
+                ExternalDecl::TopLevelAsm(_) | ExternalDecl::StaticAssert(_) => {}
             }
         }
 
@@ -976,6 +988,8 @@ impl Lowerer {
                 ExternalDecl::TopLevelAsm(_) => {
                     // Handled in the third pass
                 }
+                // Decided by sema; a static assertion generates nothing.
+                ExternalDecl::StaticAssert(_) => {}
             }
         }
 
@@ -1046,6 +1060,7 @@ impl Lowerer {
                 ExternalDecl::TopLevelAsm(asm_str) => {
                     self.module.toplevel_asm.push(asm_str.clone());
                 }
+                ExternalDecl::StaticAssert(_) => {}
             }
         }
 
@@ -1107,7 +1122,22 @@ impl Lowerer {
         if is_static {
             self.static_functions.insert(name.to_string());
         }
+        let sig = self.build_function_sig(name, ret_type_spec, ptr_count, params, variadic, is_kr);
+        self.func_meta.sigs.insert(name.to_string(), sig);
+    }
 
+    /// The call-ABI signature of function `name` (return convention,
+    /// parameter types and by-value aggregate classes) -- shared by file-
+    /// scope declarations/definitions and block-scope nested declarations.
+    pub(super) fn build_function_sig(
+        &mut self,
+        name: &str,
+        ret_type_spec: &TypeSpecifier,
+        ptr_count: usize,
+        params: &[ParamDecl],
+        variadic: bool,
+        is_kr: bool,
+    ) -> FuncSig {
         // Compute the return CType once. Prefer sema's authoritative CType if available,
         // falling back to re-computing from the AST TypeSpecifier.
         // When sema provides the return type, it already includes pointer levels from
@@ -1213,43 +1243,41 @@ impl Lowerer {
         // Detect struct/complex/vector returns that need special ABI handling.
         let mut sret_size = None;
         let mut two_reg_ret_size = None;
+        let mut ret_aggregate_abi = None;
         if ptr_count == 0 {
-            if full_ret_ctype.is_struct_or_union() {
-                let size = self.sizeof_type(ret_type_spec);
-                let (s, t) = Self::classify_struct_return(size);
-                sret_size = s;
-                two_reg_ret_size = t;
-            }
-            // Vector_size retains its established by-value convention. Clang's
-            // i686 ext-vector ABI instead scalarizes integer lanes into EAX,
-            // EDX, and ECX (up to three 32-bit words); larger return values use
-            // sret. Keep this classification ExtVector-specific.
-            if full_ret_ctype.is_vector() {
+            if full_ret_ctype.is_struct_or_union() || full_ret_ctype.is_vector() {
+                // One convention for every by-value aggregate (x86-64: the
+                // psABI classifier; elsewhere by size).
                 let size = self.sizeof_type(ret_type_spec);
                 if crate::common::types::target_is_32bit()
                     && matches!(full_ret_ctype, CType::ExtVector(..))
                 {
-                    if let Some(words) = full_ret_ctype.i686_ext_vector_gp_word_count() {
-                        sret_size = None;
-                        two_reg_ret_size = None;
-                        ret_ty = match words {
-                            1 => IrType::I32,
-                            2 => IrType::I64,
-                            3 => IrType::I128,
-                            _ => unreachable!("i686 ext-vector GP return word count is bounded"),
-                        };
+                    // Clang 23.1.3's i386 ext-vector return convention, not a
+                    // SysV aggregate: lane words in EAX:EDX:ECX, one floating
+                    // lane as its scalar, one %xmm0 piece, else sret
+                    // (unsupported multi-register shapes are diagnosed where
+                    // a definition or call is lowered).
+                    if let Some((carrier, _)) = full_ret_ctype.i686_ext_vector_ret_carrier() {
+                        ret_ty = carrier;
                     } else {
                         sret_size = Some(size);
                     }
                 } else {
-                    let (s, t) = Self::classify_struct_return(size);
-                    sret_size = s;
-                    two_reg_ret_size = t;
-                    // Small vector returns (<=8 bytes, no sret/two_reg) need
-                    // I64 so the packed value is returned in a register.
-                    if s.is_none() && t.is_none() {
+                    let abi = self.aggregate_return(&full_ret_ctype, size);
+                    sret_size = abi.sret_size;
+                    two_reg_ret_size = abi.two_reg_size;
+                    if abi.x87 {
+                        // X87 class (`struct { long double }`): %st(0), carried
+                        // in the IR as the long double scalar.
+                        ret_ty = IrType::F128;
+                    } else if full_ret_ctype.is_vector()
+                        && abi.sret_size.is_none()
+                        && abi.two_reg_size.is_none()
+                    {
+                        // A small vector travels as packed I64 data, not a pointer.
                         ret_ty = IrType::I64;
                     }
+                    ret_aggregate_abi = Some(abi);
                 }
             }
             if matches!(full_ret_ctype, CType::ComplexLongDouble) {
@@ -1280,53 +1308,41 @@ impl Lowerer {
         // _Float128 returns are 16-byte SSE-class values (SysV psABI): ONE XMM
         // register (xmm0).
         let mut ret_is_f128_sse = false;
-        let ret_eightbyte_classes = if matches!(full_ret_ctype, CType::Float128)
-            || full_ret_ctype == CType::Decimal128
-        {
-            ret_is_f128_sse = true;
-            vec![
-                crate::common::types::EightbyteClass::Sse,
-                crate::common::types::EightbyteClass::Sse,
-            ]
-        } else if crate::common::types::target_is_32bit()
-            && full_ret_ctype.i686_ext_vector_gp_word_count() == Some(3)
-        {
-            // On i686 these three INTEGER markers encode the EAX:EDX:ECX
-            // return-word bundle; x86-64 continues to use actual eightbytes.
-            vec![
-                crate::common::types::EightbyteClass::Integer,
-                crate::common::types::EightbyteClass::Integer,
-                crate::common::types::EightbyteClass::Integer,
-            ]
-        } else if crate::common::types::target_elf_machine() == 62 && full_ret_ctype.is_vector() {
-            // AUD-VABI-1: a vector is not a struct.  Its first eightbyte
-            // is SSE and its second SSEUP ("upper half of the same
-            // register"), so `<4 x i32>` returns in ONE xmm0 -- while the
-            // by-value struct path below, which has no SSEUP notion, put
-            // the two halves in rdx:rax.  Measured against gcc 12.2: an
-            // lccc-compiled caller read a stack pointer and printed
-            // `16 0 65536 0` where gcc's callee had returned
-            // `11 22 33 44` in xmm0.
-            match full_ret_ctype.sysv_vector_carrier() {
-                Some((classes, one_xmm)) => {
-                    ret_is_f128_sse = one_xmm;
-                    classes
-                }
-                None => Vec::new(),
-            }
-        } else if two_reg_ret_size.is_some() && ptr_count == 0 {
-            if full_ret_ctype.is_struct_or_union() || full_ret_ctype.is_vector() {
-                if let Some(layout) = self.get_struct_layout_for_type(ret_type_spec) {
-                    layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts())
+        let ret_eightbyte_classes =
+            if matches!(full_ret_ctype, CType::Float128) || full_ret_ctype == CType::Decimal128 {
+                ret_is_f128_sse = true;
+                vec![
+                    crate::common::types::EightbyteClass::Sse,
+                    crate::common::types::EightbyteClass::Sse,
+                ]
+            } else if let Some(classes) = crate::common::types::target_is_32bit()
+                .then(|| full_ret_ctype.i686_ext_vector_ret_carrier())
+                .flatten()
+                .map(|(_, classes)| classes)
+                .filter(|classes| !classes.is_empty())
+            {
+                // i686 carrier markers (x86-64 uses real eightbytes): three
+                // INTEGER classes encode the EAX:EDX:ECX lane-word bundle,
+                // `[Sse, SseUp]` a vector returned in %xmm0.
+                classes
+            } else if let Some(abi) = ret_aggregate_abi.as_ref().filter(|a| !a.classes.is_empty()) {
+                // x86-64 register return of an aggregate, any size up to 16:
+                // the psABI classes (`[Sse, SseUp]` = ONE %xmm0).
+                ret_is_f128_sse = abi.one_xmm;
+                abi.classes.clone()
+            } else if two_reg_ret_size.is_some() && ptr_count == 0 {
+                if full_ret_ctype.is_struct_or_union() || full_ret_ctype.is_vector() {
+                    if let Some(layout) = self.get_struct_layout_for_type(ret_type_spec) {
+                        layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts())
+                    } else {
+                        Vec::new()
+                    }
                 } else {
                     Vec::new()
                 }
             } else {
                 Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
+            };
 
         // A K&R definition needs the declared body types before default
         // promotions. A prototype declaration instead needs its callable
@@ -1438,19 +1454,12 @@ impl Lowerer {
                             crate::common::types::EightbyteClass::Sse,
                             crate::common::types::EightbyteClass::Sse,
                         ]
-                    } else if crate::common::types::target_elf_machine() == 62 {
-                        // AUD-VABI-1: a vector argument is SSE (+SSEUP for the
-                        // second eightbyte), i.e. ONE xmm register; the struct
-                        // path classified it as INTEGER and the callee read
-                        // the argument from a GP pair.
-                        match self.type_spec_to_ctype(&p.type_spec).sysv_vector_carrier() {
-                            Some((classes, _)) => classes,
-                            None => match self.get_struct_layout_for_type(&p.type_spec) {
-                                Some(layout) => layout
-                                    .classify_sysv_eightbytes(&*self.types.borrow_struct_layouts()),
-                                None => Vec::new(),
-                            },
-                        }
+                    } else if let Some((classes, _)) =
+                        self.sysv_arg_abi(&self.type_spec_to_ctype(&p.type_spec))
+                    {
+                        // x86-64: the psABI classes of the struct, union or
+                        // vector (`[Memory]`, `[Sse, SseUp]`, ...).
+                        classes
                     } else if let Some(layout) = self.get_struct_layout_for_type(&p.type_spec) {
                         layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts())
                     } else {
@@ -1468,13 +1477,11 @@ impl Lowerer {
             .map(|p| {
                 matches!(self.type_spec_to_ctype(&p.type_spec), CType::Float128)
                     || self.type_spec_to_ctype(&p.type_spec) == CType::Decimal128
-                    // AUD-VABI-1: a 16-byte vector is carried in ONE 16-byte
-                    // xmm register exactly like _Float128 (SSE + SSEUP).
-                    || (crate::common::types::target_elf_machine() == 62
-                        && self
-                            .type_spec_to_ctype(&p.type_spec)
-                            .sysv_vector_carrier()
-                            .is_some_and(|(_, one_xmm)| one_xmm))
+                    // SSE + SSEUP aggregates (16-byte vectors, `struct {
+                    // _Float128 }`, ...) ride in ONE xmm exactly like _Float128.
+                    || self
+                        .sysv_arg_abi(&self.type_spec_to_ctype(&p.type_spec))
+                        .is_some_and(|(_, one_xmm)| one_xmm)
             })
             .collect();
 
@@ -1495,7 +1502,8 @@ impl Lowerer {
             })
             .collect();
 
-        let sig = if !variadic || !param_tys.is_empty() {
+        let ret_x87_aggregate = ret_aggregate_abi.as_ref().is_some_and(|a| a.x87);
+        if !variadic || !param_tys.is_empty() {
             FuncSig {
                 return_type: ret_ty,
                 return_ctype,
@@ -1507,6 +1515,7 @@ impl Lowerer {
                 two_reg_ret_size,
                 ret_eightbyte_classes: ret_eightbyte_classes.clone(),
                 ret_is_f128_sse,
+                ret_x87_aggregate,
                 param_struct_sizes,
                 param_struct_classes,
                 param_riscv_float_classes,
@@ -1523,14 +1532,14 @@ impl Lowerer {
                 sret_size,
                 two_reg_ret_size,
                 ret_eightbyte_classes,
-                ret_is_f128_sse: false,
+                ret_is_f128_sse,
+                ret_x87_aggregate,
                 param_struct_sizes: Vec::new(),
                 param_struct_classes: Vec::new(),
                 param_riscv_float_classes: Vec::new(),
                 param_is_f128_sse,
             }
-        };
-        self.func_meta.sigs.insert(name.to_string(), sig);
+        }
     }
 
     // --- IR emission helpers ---
@@ -2160,6 +2169,7 @@ impl Lowerer {
                     ret_eightbyte_classes: Vec::new(),
                     ret_is_f128_sse: false,
                     is_const: false,
+                    assume_library: false,
                     is_pure: false,
                 },
             });
@@ -2211,6 +2221,7 @@ impl Lowerer {
                 regparm: None,
                 is_pure: false,
                 is_const: false,
+                assume_library: false,
                 ret_eightbyte_classes: ret_classes,
                 ret_is_f128_sse: ret_is_f128,
             },
@@ -2553,6 +2564,8 @@ impl Lowerer {
                 regparm: None,
                 is_pure: false,
                 is_const: false,
+                // Compiler-generated aggregate copy/clear: GCC's freestanding contract requires memcpy/memset to exist with library semantics.
+                assume_library: true,
                 ret_eightbyte_classes: Vec::new(),
                 ret_is_f128_sse: false,
             },
@@ -2592,6 +2605,8 @@ impl Lowerer {
                 regparm: None,
                 is_pure: false,
                 is_const: false,
+                // Compiler-generated aggregate copy/clear: GCC's freestanding contract requires memcpy/memset to exist with library semantics.
+                assume_library: true,
                 ret_eightbyte_classes: Vec::new(),
                 ret_is_f128_sse: false,
             },
@@ -2631,8 +2646,8 @@ impl Lowerer {
     /// `None` means the value is unknown, which for a program that passed sema
     /// cannot happen.
     pub(super) fn enum_variant_value(&self, variant: &EnumVariant) -> Option<i64> {
-        if let Some(&val) = self.types.enum_constants.get(&variant.name) {
-            return Some(val);
+        if let Some(constant) = self.types.enum_constants.get(&variant.name) {
+            return Some(constant.value);
         }
         let expr = variant.value.as_ref()?;
         self.eval_const_expr(expr)
@@ -2649,29 +2664,31 @@ impl Lowerer {
                     if let Some(v) = self.enum_variant_value(variant) {
                         next_val = v;
                     }
+                    // Provisional type inside the body; retyped on completion.
+                    let constant =
+                        crate::frontend::sema::type_context::EnumConstant::provisional(next_val);
                     if scoped {
-                        self.insert_enum_scoped(variant.name.clone(), next_val);
+                        self.insert_enum_scoped(variant.name.clone(), constant);
                     } else {
                         self.types
                             .enum_constants
-                            .insert(variant.name.clone(), next_val);
+                            .insert(variant.name.clone(), constant);
                     }
                     variant_values.push((variant.name.clone(), next_val));
                     next_val += 1;
                 }
+                let enum_type = crate::common::types::EnumType {
+                    name: name.clone(),
+                    variants: variant_values,
+                    is_packed: *is_packed,
+                };
+                self.types.complete_enum_constants(&enum_type, scoped);
                 // Keep completed definitions available for later body-less
                 // references, including non-packed enums whose negative
                 // values determine signed/unsigned compatibility.  The shared
                 // type context tracks tag shadowing on its lexical scope stack.
                 if let Some(tag) = name {
-                    self.types.insert_enum_type_scoped(
-                        tag.clone(),
-                        crate::common::types::EnumType {
-                            name: Some(tag.clone()),
-                            variants: variant_values,
-                            is_packed: *is_packed,
-                        },
-                    );
+                    self.types.insert_enum_type_scoped(tag.clone(), enum_type);
                 }
             }
             TypeSpecifier::Struct(_, Some(fields), ..)
@@ -2695,16 +2712,6 @@ impl Lowerer {
     /// Collect enum constants from a type specifier, using scoped insertion.
     pub(super) fn collect_enum_constants_scoped(&mut self, ts: &TypeSpecifier) {
         self.collect_enum_constants_impl(ts, true);
-    }
-
-    /// Check if a TypeSpecifier refers to an enum type (directly or via typedef).
-    pub(super) fn is_enum_type_spec(&self, ts: &TypeSpecifier) -> bool {
-        match ts {
-            TypeSpecifier::Enum(..) => true,
-            TypeSpecifier::TypedefName(name) => self.types.enum_typedefs.contains(name),
-            TypeSpecifier::TypeofType(inner) => self.is_enum_type_spec(inner),
-            _ => false,
-        }
     }
 
     /// Check if a user-defined goto label has already been defined (i.e., the

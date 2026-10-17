@@ -531,7 +531,7 @@ impl Lowerer {
     }
 
     fn lower_identifier(&mut self, name: &str) -> Operand {
-        if name == "__func__" || name == "__FUNCTION__" || name == "__PRETTY_FUNCTION__" {
+        if crate::frontend::parser::ast::is_function_name_builtin(name) {
             let name = self.func().name.clone();
             return self.lower_string_literal(&name, false);
         }
@@ -611,8 +611,8 @@ impl Lowerer {
             return Operand::Value(dest);
         }
 
-        if let Some(&val) = self.types.enum_constants.get(name) {
-            return Operand::Const(IrConst::I64(val));
+        if let Some(constant) = self.types.enum_constants.get(name) {
+            return Operand::Const(IrConst::I64(constant.value));
         }
 
         if let Some(mangled) = self.func_mut().static_local_names.get(name).cloned() {

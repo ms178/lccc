@@ -61,6 +61,7 @@ impl Lowerer {
                             is_volatile: false,
                             is_restrict: false,
                             vla_size_exprs: Vec::new(),
+                            decayed_array: false,
                             fptr_inner_ptr_depth: 0,
                         })
                         .collect();
@@ -121,14 +122,19 @@ impl Lowerer {
                         is_volatile: false,
                         is_restrict: false,
                         vla_size_exprs: Vec::new(),
+                        decayed_array: false,
                         fptr_inner_ptr_depth: 0,
                     })
                     .collect();
                 TypeSpecifier::BareFunction(Box::new(ret_ts), param_decls, ft.variadic)
             }
-            // vector_size types historically fall back to their element type for
-            // implicit cast logic; sizing uses the original CType metadata.
-            CType::Vector(elem, _) => Self::ctype_to_type_spec(elem),
+            // Every caller resolves `typeof`, `__auto_type` or a typedef, so
+            // a vector must round-trip as a vector: collapsing it to its lane
+            // type declared `__typeof__(v) a;` / `__auto_type a = v;` as a
+            // scalar (sizeof 8 for a 16-byte vector) and miscompiled `a[i]`.
+            CType::Vector(elem, total_bytes) => {
+                TypeSpecifier::Vector(Box::new(Self::ctype_to_type_spec(elem)), *total_bytes)
+            }
             CType::ExtVector(elem, layout) => {
                 TypeSpecifier::ExtVector(Box::new(Self::ctype_to_type_spec(elem)), layout.lanes)
             }
@@ -318,16 +324,10 @@ impl Lowerer {
                         .bit_width
                         .as_ref()
                         .and_then(|bw| self.eval_const_expr(bw).and_then(|c| c.to_u32()));
-                    let mut ty = self.struct_field_ctype(f);
-                    // GCC treats enum bitfields as unsigned: values are zero-extended
-                    // on load, not sign-extended. Check both direct enum type specs
-                    // and typedef'd enum types (e.g., typedef enum EFoo EFoo).
-                    if bit_width.is_some()
-                        && self.is_enum_type_spec(&f.type_spec)
-                        && ty == CType::Int
-                    {
-                        ty = CType::UInt;
-                    }
+                    // An enum bit-field has the enum's compatible integer type
+                    // (`unsigned int` unless an enumerator is negative, GCC and
+                    // Clang alike), which `struct_field_ctype` already resolves.
+                    let ty = self.struct_field_ctype(f);
                     // C11 6.7.2.1p13: an unnamed member must be a struct/union type.
                     // An unnamed non-aggregate (no name, no bit-width) is a constraint
                     // violation that GCC ignores entirely (warning: "declaration does
@@ -340,11 +340,16 @@ impl Lowerer {
                     {
                         return None;
                     }
+                    let alignment = crate::common::types::strictest_alignment([
+                        f.alignment,
+                        self.typedef_alignment_for_type_spec(&f.type_spec).copied(),
+                        f.alignas_type.as_ref().map(|ts| self.alignof_type(ts)),
+                    ]);
                     Some(StructField {
                         name: f.name.clone().unwrap_or_default(),
                         ty,
                         bit_width,
-                        alignment: f.alignment,
+                        alignment,
                         is_packed: f.is_packed,
                         base_volatile: f.base_volatile,
                         object_volatile: f.object_volatile,

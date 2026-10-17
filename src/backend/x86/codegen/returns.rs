@@ -21,30 +21,7 @@ impl X86Codegen {
             }
             // _Float128 (IEEE binary128): the 16-byte value returns in xmm0.
             if self.func_ret_is_f128_sse {
-                match val {
-                    Operand::Value(v) => {
-                        if let Some(slot) = self.state.get_slot(v.0) {
-                            self.state
-                                .out
-                                .emit_instr_rbp_reg("    movdqu", slot.0, "xmm0");
-                        }
-                    }
-                    Operand::Const(IrConst::I128(c)) => {
-                        let bytes = (*c as u128).to_le_bytes();
-                        let lo = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-                        let hi = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-                        self.state
-                            .out
-                            .emit_instr_imm_reg("    movabsq", lo as i64, "rax");
-                        self.state.emit("    movq %rax, %xmm0");
-                        self.state
-                            .out
-                            .emit_instr_imm_reg("    movabsq", hi as i64, "rax");
-                        self.state.emit("    movq %rax, %xmm1");
-                        self.state.emit("    movlhps %xmm1, %xmm0");
-                    }
-                    _ => {}
-                }
+                self.emit_f128_sse_operand_to_xmm(val, "xmm0");
                 self.emit_epilogue_and_ret_impl(frame_size);
                 return;
             }
@@ -132,19 +109,22 @@ impl X86Codegen {
             self.emit_epilogue_and_ret_impl(frame_size);
             return;
         }
-        // AUD-VABI-2: an 8-byte vector return is ONE SSE eightbyte — the low 64
-        // bits of %xmm0 — not an accumulator return. The IR carries the bit
-        // container as I64/U64, so the generic path below would hand the value
-        // back in %rax; clang-19 and gcc-16 both keep it in %xmm0 (measured:
-        // `id_u32x2`, `id_u64x1`, `id_f32x2`, `id_f64x1` are all a bare `ret`
-        // with the argument register also being the return register). Clang's
-        // caller reads %xmm0, so an %rax return is a silent ABI mismatch.
-        if self.func_ret_classes.len() == 1
-            && self.func_ret_classes[0] == crate::common::types::EightbyteClass::Sse
-            && matches!(ret_ty, IrType::I64 | IrType::U64)
+        // One SSE eightbyte (`struct { float x, y; }`, `struct { double }`,
+        // an 8-byte vector): the aggregate's bits, carried in the IR as a
+        // packed integer, leave in the low half of %xmm0 -- not %rax. A
+        // 64-bit carrier moves straight from its register or slot; a narrower
+        // one is widened through the accumulator first.
+        if self.func_ret_classes[..] == [crate::common::types::EightbyteClass::Sse]
+            && !ret_ty.is_float()
+            && !ret_ty.is_128bit()
         {
             if let Some(val) = val {
-                self.load_bits64_to_xmm0(val);
+                if matches!(ret_ty, IrType::I64 | IrType::U64 | IrType::Ptr) {
+                    self.load_bits64_to_xmm0(val);
+                } else {
+                    self.operand_to_rax(val);
+                    self.state.emit("    movq %rax, %xmm0");
+                }
             }
             self.emit_epilogue_and_ret_impl(frame_size);
             return;

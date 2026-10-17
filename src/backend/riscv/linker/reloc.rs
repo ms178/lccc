@@ -360,58 +360,70 @@ fn relocate_address64(
     if !ctx.collect_relatives {
         return value;
     }
+    match shared_address_kind(sym, sym_idx, ctx) {
+        SharedAddressKind::Symbol => {
+            result
+                .symbol_entries
+                .push((place, sym.name.to_string(), addend));
+            return 0;
+        }
+        SharedAddressKind::Relative => result.relative_entries.push((place, value)),
+        SharedAddressKind::Absolute => {}
+    }
+    value
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SharedAddressKind {
+    Absolute,
+    Relative,
+    Symbol,
+}
+
+/// Classify after cross-object binding/visibility resolution. ABS definitions
+/// are still preemptible when default-visible; hidden undefined weak is zero.
+fn shared_address_kind(sym: &Symbol, sym_idx: usize, ctx: &RelocContext) -> SharedAddressKind {
     let global = if sym.binding() != STB_LOCAL && !sym.name.is_empty() {
         ctx.global_syms.get(sym.name.as_str())
     } else {
         None
     };
     if global.is_some_and(|g| g.visibility == STV_DEFAULT) {
-        // The loader, not this link, chooses S. RELATIVE would incorrectly
-        // bind a definition locally (or lose an import). This includes ABS
-        // definitions: default-visible globals can still be preempted.
-        result
-            .symbol_entries
-            .push((place, sym.name.to_string(), addend));
-        return 0;
+        return SharedAddressKind::Symbol;
     }
     let absolute = global.map_or(sym.shndx == SHN_ABS || sym_idx == 0, |g| {
         (g.defined && g.section_idx.is_none())
             || (!g.defined && g.binding == STB_WEAK && g.visibility != STV_DEFAULT)
     });
-    if !absolute {
-        // A section-relative address of zero still needs B+A.
-        result.relative_entries.push((place, value));
+    if absolute {
+        SharedAddressKind::Absolute
+    } else {
+        SharedAddressKind::Relative
     }
-    value
 }
 
-/// RV64 has no 32-bit RELATIVE relocation. GNU-compatible shared linking
-/// accepts only link-time ABS constants; section offsets would lose load bias.
+/// Classify a 32-bit address independently of its output storage extent.
 fn relocate_address32(
-    symbol_value: u64,
-    addend: i64,
-    sym: &Symbol,
+    s: u64,
+    a: i64,
+    sym: &super::elf_read::Symbol,
     sym_idx: usize,
-    ctx: &RelocContext,
     obj_name: &str,
+    ctx: &RelocContext,
 ) -> Result<u32, String> {
-    if ctx.collect_relatives {
-        let global = if sym.binding() != STB_LOCAL && !sym.name.is_empty() {
-            ctx.global_syms.get(sym.name.as_str())
-        } else {
-            None
-        };
-        let absolute = global.map_or(sym.shndx == SHN_ABS || sym_idx == 0, |g| {
-            g.defined && g.section_idx.is_none()
-        });
-        if !absolute {
-            return Err(format!(
-                "R_RISCV_32 against non-absolute symbol '{}' cannot be used in an RV64 shared object ('{}')",
-                sym.name, obj_name
-            ));
-        }
+    // RV64 shared addresses cannot be frozen to link-time S+A. A
+    // RELATIVE fixup would also overwrite eight bytes, not this word.
+    // Match LLD's rejection unless resolution is genuinely absolute;
+    // default-visible ABS globals are not exempt from preemption.
+    if ctx.collect_relatives
+        && shared_address_kind(sym, sym_idx, ctx) != SharedAddressKind::Absolute
+    {
+        return Err(format!(
+            "R_RISCV_32 requires a non-preemptible absolute symbol in shared output: '{}' in '{}'",
+            sym.name, obj_name
+        ));
     }
-    Ok(symbol_value.wrapping_add(addend as u64) as u32)
+    Ok(s.wrapping_add(a as u64) as u32)
 }
 
 /// Apply a single relocation to the merged section data.
@@ -444,10 +456,12 @@ fn apply_one_reloc(
             field.copy_from_slice(&value.to_le_bytes());
         }
         R_RISCV_32 => {
-            let val = relocate_address32(s, a, sym, sym_idx, ctx, obj_name)?;
-            if off + 4 <= data.len() {
-                data[off..off + 4].copy_from_slice(&val.to_le_bytes());
-            }
+            let value = relocate_address32(s, a, sym, sym_idx, obj_name, ctx)?;
+            let field = off
+                .checked_add(4)
+                .and_then(|end| data.get_mut(off..end))
+                .ok_or_else(|| format!("R_RISCV_32 field exceeds output in '{}'", obj_name))?;
+            field.copy_from_slice(&value.to_le_bytes());
         }
         R_RISCV_PCREL_HI20 => {
             let offset_val = super::displacement::checked_auipc_delta(s, a, p)?;

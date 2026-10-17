@@ -1,3 +1,4 @@
+mod aggregate_abi;
 mod array_init_plan;
 pub(crate) mod complex;
 pub(crate) mod const_eval;
@@ -18,6 +19,7 @@ pub(crate) mod expr_calls;
 pub(crate) mod expr_ops;
 mod expr_sizeof;
 pub(crate) mod expr_types;
+mod ext_vector_abi;
 mod func_lowering;
 pub(crate) mod func_state;
 mod global_decl;

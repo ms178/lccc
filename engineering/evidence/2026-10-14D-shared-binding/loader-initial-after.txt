@@ -1,0 +1,4 @@
+FAIL absolute-default command failed (91): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-_k2zs6fu/runner']: 
+FAIL absolute-local command failed (91): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-_k2zs6fu/runner']: 
+FAIL absolute-protected command failed (91): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-_k2zs6fu/runner']: 
+RV64 shared loader: 10 PASS / 3 FAIL / 0 SKIP

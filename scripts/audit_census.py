@@ -12,11 +12,18 @@ Metric definitions (this docstring is the contract):
 
 * Scanning.  Every ``src/**/*.rs`` file is read, then
   (1) comments (``//``, ``/* */`` incl. nesting), string literals (``"..."``,
-  ``b"..."``, ``r"..."``, ``r#"..."#``) and character literals are replaced by
-  whitespace, and
-  (2) everything from the first ``#[cfg(test)]`` onward is dropped, so test
-  code does not inflate or defuse the counts.
-  Both steps delete text but never bytes' worth of *lines*: line numbers (and
+  ``b"..."``, ``c"..."``, ``r"..."``, ``r#"..."#``, multi-line) and character
+  literals (``'x'``, ``'é'``, ``'\\x7f'``, ``'\\u{1F600}'``, ``b'\\''``; never
+  lifetimes or labels) are replaced by whitespace, and
+  (2) test-only *items* are blanked: an item carrying ``#[test]`` or a
+  ``#[cfg(...)]`` whose predicate requires ``test`` (``test``, or ``all(..)``
+  with a test-requiring member, or ``any(..)`` whose members all require it;
+  ``not(..)`` never does) is blanked from that attribute through the end of
+  the item (its matching ``}`` or terminating ``;``).  Production code after a
+  test module is still counted.  A test-only out-of-line module
+  (``#[cfg(test)] mod name;``, honouring ``#[path = "..."]``) makes its file,
+  and every module that file declares, test-only as a whole.
+  Both steps replace characters one for one: offsets and line numbers (and
   therefore function lengths) are preserved.
 * ``panic_sites`` -- occurrences of ``panic!``, ``unreachable!``,
   ``unimplemented!``, ``todo!``, ``.expect(`` and ``.unwrap(``.
@@ -29,12 +36,18 @@ Metric definitions (this docstring is the contract):
   impls, traits).
 * ``fns_over_300`` / ``fns_over_500`` / ``fns_over_1000`` -- functions whose
   body (from the ``fn`` keyword through its closing brace, in the *stripped*
-  text) exceeds the threshold in lines.  Approximate by construction: it is a
-  brace-matching scan, not a parser, and it counts the same way the audit did.
+  text) exceeds the threshold in lines.  A bracket-matching scan, not a
+  parser: nested generics (``<T: Into<U>>``, ``F: Fn() -> T``) and bracketed
+  ``;`` in return types are handled, and an unclosed signature or body is a
+  hard failure (exit 1) rather than a span measured to end of file.
 * ``knob_literals`` -- distinct ``CCC_*``/``LCCC_*`` identifiers appearing in
-  ``src/``; ``knobs_undocumented`` -- those not named in any tracked ``*.md``.
-* ``ignored_tests`` -- occurrences of ``#[ignore`` (AUD-ARM-GSF-1 requires each
-  one to carry a backlog id).
+  ``src/`` (a name ending in ``_`` is a prefix, not a knob); ``knobs_undocumented`` -- those not named in any ``*.md`` in git's
+  index (``git ls-files``; untracked notes never count, and a tree without git
+  metadata fails).  Rust sources are scanned by directory walk, so an untracked
+  ``.rs`` can only add sites, never hide them.
+* ``ignored_tests`` -- occurrences of ``#[ignore`` in code (comments and
+  literals excluded), *including* test code, which is where they live
+  (AUD-ARM-GSF-1 requires each one to carry a backlog id or capability gate).
 
 Usage::
 
@@ -69,8 +82,18 @@ PANIC_PAT = re.compile(
 )
 UNSAFE_PAT = re.compile(r"\bunsafe\b")
 IGNORE_PAT = re.compile(r"#\[ignore")
-KNOB_PAT = re.compile(r"\b(?:CCC|LCCC)_[A-Z0-9_]+\b")
-FN_PAT = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^>{}]*>)?\s*\(")
+# A knob name ends in a letter or digit: `CCC_NO_` (a `starts_with` prefix) or
+# `CCC_NO_INLINE_*` (prose for a family) names no variable.
+KNOB_PAT = re.compile(r"\b(?:CCC|LCCC)_[A-Z0-9_]*[A-Z0-9]\b")
+FN_PAT = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)")
+# One character literal: a plain character (any Unicode scalar), a simple
+# escape, `\x7f`, or `\u{...}`.  Anything else after a quote is a lifetime or
+# label and stays code.
+CHAR_PAT = re.compile(r"'(?:\\(?:u\{[0-9A-Fa-f_]{1,8}\}|x[0-9A-Fa-f]{2}|[^\n])|[^\\'\n])'")
+
+
+class CensusParseError(ValueError):
+    """The stripped text is not shaped like Rust; the census refuses to guess."""
 
 
 CANDIDATE = re.compile(r'//|/\*|b?"|b?r(#*)"|\'')
@@ -92,7 +115,6 @@ def strip_rust(src: str) -> str:
     """
     out: list[str] = []
     i, n = 0, len(src)
-    char_pat = re.compile(r"'(?:\\.|[^\\'\n])'")
     while True:
         m = CANDIDATE.search(src, i)
         if m is None:
@@ -138,14 +160,12 @@ def strip_rust(src: str) -> str:
                 if src[j] == '"':
                     j += 1
                     break
-                if src[j] == "\n":  # unterminated literal: stop at the line end
-                    break
-                j += 1
+                j += 1  # Rust string literals may span lines.
             out.append(_blank(src[m.start() : j]))
             i = j
             continue
         # A quote that opens a lifetime ("'a") rather than a character literal.
-        cm = char_pat.match(src, m.start())
+        cm = CHAR_PAT.match(src, m.start())
         if cm:
             out.append(_blank(src[cm.start() : cm.end()]))
             i = cm.end()
@@ -160,65 +180,331 @@ def line_index(text: str) -> list[int]:
     return [i for i, ch in enumerate(text) if ch == "\n"]
 
 
-def without_tests(stripped: str) -> str:
-    """Drop everything from the first ``#[cfg(test)]`` on (byte-preserving)."""
-    m = re.search(r"#\[cfg\(test\)\]", stripped)
+ATTR_START = re.compile(r"#\[")
+
+
+def _bracket_end(text: str, i: int) -> int:
+    """Index just past the bracket group opening at ``text[i]``; len on EOF."""
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    stack: list[str] = []
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch in pairs:
+            stack.append(pairs[ch])
+        elif stack and ch == stack[-1]:
+            stack.pop()
+            if not stack:
+                return i + 1
+        i += 1
+    return n
+
+
+def _cfg_requires_test(pred: str) -> bool:
+    """Whether a cfg predicate can only hold in a test build."""
+    pred = pred.strip()
+    if pred == "test":
+        return True
+    m = re.fullmatch(r"(all|any|not)\s*\((.*)\)", pred, re.S)
     if not m:
-        return stripped
-    return stripped[: m.start()] + "".join(
-        "\n" if ch == "\n" else " " for ch in stripped[m.start() :]
-    )
+        return False
+    args, depth, start = [], 0, 0
+    body = m.group(2)
+    for k, ch in enumerate(body):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            args.append(body[start:k])
+            start = k + 1
+    args.append(body[start:])
+    args = [arg for arg in args if arg.strip()]
+    if m.group(1) == "all":
+        return any(_cfg_requires_test(arg) for arg in args)
+    if m.group(1) == "any":
+        return bool(args) and all(_cfg_requires_test(arg) for arg in args)
+    return False
+
+
+def _attribute_is_test_only(attr_body: str) -> bool:
+    body = attr_body.strip()
+    if body == "test":
+        return True
+    m = re.fullmatch(r"cfg\s*\((.*)\)", body, re.S)
+    return bool(m) and _cfg_requires_test(m.group(1))
+
+
+def test_item_spans(stripped: str) -> list[tuple[int, int, int]]:
+    """(attribute start, item start, item end) of every test-only item.
+
+    ``stripped`` must already have comments and literals blanked.  The item
+    begins after the attribute group and ends at its first top-level ``;``
+    (``use``/``mod x;``/unit items) or at the ``}`` matching its first
+    top-level ``{``.  Nested spans inside an excluded item are not reported.
+    """
+    spans: list[tuple[int, int, int]] = []
+    n, i = len(stripped), 0
+    while True:
+        m = ATTR_START.search(stripped, i)
+        if m is None:
+            return spans
+        attr_end = _bracket_end(stripped, m.start() + 1)
+        if not _attribute_is_test_only(stripped[m.start() + 2 : attr_end - 1]):
+            i = attr_end
+            continue
+        # Skip further outer attributes and whitespace up to the item itself.
+        j = attr_end
+        while True:
+            while j < n and stripped[j].isspace():
+                j += 1
+            if stripped.startswith("#[", j):
+                j = _bracket_end(stripped, j + 1)
+                continue
+            break
+        item_start, k = j, j
+        while k < n and stripped[k] not in ";{":
+            if stripped[k] in "([":
+                k = _bracket_end(stripped, k)
+                continue
+            k += 1
+        end = n if k >= n else (k + 1 if stripped[k] == ";" else _bracket_end(stripped, k))
+        spans.append((m.start(), item_start, end))
+        i = end
+
+
+def blank_spans(text: str, spans: list[tuple[int, int, int]]) -> str:
+    """Blank each (start, _, end) range, keeping every newline."""
+    out, last = [], 0
+    for start, _item, end in spans:
+        out.append(text[last:start])
+        out.append(_blank(text[start:end]))
+        last = end
+    out.append(text[last:])
+    return "".join(out)
+
+
+def strip_tests(stripped: str) -> str:
+    """Blank test-only items of comment/literal-stripped text, item-exactly."""
+    return blank_spans(stripped, test_item_spans(stripped))
+
+
+MOD_DECL = re.compile(r"\bmod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;")
+PATH_ATTR = re.compile(r'#\[\s*path\s*=\s*"([^"]+)"\s*\]')
+
+
+def _module_dir(path: pathlib.Path) -> pathlib.Path:
+    if path.name in ("mod.rs", "lib.rs", "main.rs"):
+        return path.parent
+    return path.parent / path.stem
+
+
+def _preceding_attributes(stripped: str, pos: int) -> list[tuple[int, int]]:
+    """(start, end) of the outer attributes immediately before ``pos``."""
+    attrs: list[tuple[int, int]] = []
+    j = pos
+    while True:
+        while j > 0 and stripped[j - 1].isspace():
+            j -= 1
+        if j == 0 or stripped[j - 1] != "]":
+            return attrs
+        depth, k = 0, j - 1
+        while k >= 0:
+            if stripped[k] == "]":
+                depth += 1
+            elif stripped[k] == "[":
+                depth -= 1
+                if depth == 0:
+                    break
+            k -= 1
+        if k <= 0 or stripped[k - 1] != "#":
+            return attrs
+        attrs.append((k - 1, j))
+        j = k - 1
+
+
+def declared_module_files(path: pathlib.Path, raw: str, spans: list[tuple[int, int, int]] | None,
+                          stripped: str) -> list[pathlib.Path]:
+    """Files of out-of-line modules declared by ``path``.
+
+    With ``spans`` given, only declarations that ARE one of those (test-only)
+    items, or lie inside one, are returned; with None, every declaration is.
+    ``#[path]`` values are read from ``raw`` at the attribute offsets
+    (stripping preserves offsets, but blanks the string itself).
+    """
+    regions = [(0, len(stripped))] if spans is None else [(a, e) for a, _i, e in spans]
+    found: list[pathlib.Path] = []
+    for start, end in regions:
+        for m in MOD_DECL.finditer(stripped, start, end):
+            explicit = [value for a, e in _preceding_attributes(stripped, m.start())
+                        for value in PATH_ATTR.findall(raw[a:e])]
+            if explicit:
+                found.append((path.parent / explicit[0]).resolve())
+                continue
+            base = _module_dir(path)
+            for candidate in (base / f"{m.group(1)}.rs", base / m.group(1) / "mod.rs"):
+                if candidate.exists():
+                    found.append(candidate.resolve())
+                    break
+    return found
+
+
+def test_only_files(sources: dict[pathlib.Path, tuple[str, str]]) -> set[pathlib.Path]:
+    """Resolved paths of files reachable only through test-only modules."""
+    pending: list[pathlib.Path] = []
+    for path, (raw, stripped) in sources.items():
+        pending += declared_module_files(path, raw, test_item_spans(stripped), stripped)
+    result: set[pathlib.Path] = set()
+    while pending:
+        path = pending.pop()
+        if path in result or path not in sources:
+            continue
+        result.add(path)
+        raw, stripped = sources[path]
+        pending += declared_module_files(path, raw, None, stripped)
+    return result
+
+
+def _skip_balanced(text: str, i: int, open_ch: str, close_ch: str, what: str) -> int:
+    """Index just past the ``close_ch`` matching ``text[i] == open_ch``."""
+    depth, n = 0, len(text)
+    while i < n:
+        if text[i] == open_ch:
+            depth += 1
+        elif text[i] == close_ch:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    raise CensusParseError(f"unclosed {what}")
+
+
+def _skip_generics(text: str, i: int) -> int:
+    """Index just past the generic list opened at ``text[i] == '<'``.
+
+    ``->`` (in ``F: Fn() -> T`` bounds) is not a closing angle bracket, and a
+    const-generic ``{ ... }`` argument is skipped as a unit.  ``=>`` is skipped
+    the same way: macro inputs such as ``fn f(&self) -> T => f_impl;`` reuse
+    the ``fn`` token.
+    """
+    depth, n = 0, len(text)
+    while i < n:
+        if text.startswith(("->", "=>"), i):
+            i += 2
+            continue
+        ch = text[i]
+        if ch == "{":
+            i = _skip_balanced(text, i, "{", "}", "const-generic block")
+            continue
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        elif ch == ";":
+            break
+        i += 1
+    raise CensusParseError("unclosed generic parameter list")
+
+
+def _body_start(text: str, i: int) -> int | None:
+    """From the end of the parameter list, the index of the body's ``{``, or
+    None for a bodiless declaration.  ``;``/``{`` only count outside brackets:
+    ``-> [u8; 4]`` is a return type, ``-> Foo<{ N }>`` a const argument."""
+    depth, n = 0, len(text)
+    while i < n:
+        if text.startswith(("->", "=>"), i):
+            i += 2
+            continue
+        ch = text[i]
+        if ch in "([<":
+            depth += 1
+        elif ch in ")]>":
+            depth -= 1
+            if depth < 0:
+                raise CensusParseError("unbalanced signature")
+        elif ch == "{":
+            if depth == 0:
+                return i
+            i = _skip_balanced(text, i, "{", "}", "const-generic block")
+            continue
+        elif ch == ";" and depth == 0:
+            return None
+        i += 1
+    raise CensusParseError("signature runs to end of file")
 
 
 def scan_functions(
     text: str, newlines: list[int] | None = None
 ) -> list[tuple[str, int, int]]:
-    """Return (name, start_line, end_line) for every brace-delimited ``fn``."""
+    """Return (name, start_line, end_line) for every brace-delimited ``fn``.
+
+    Generic parameter lists may nest and contain ``->``; return types may
+    contain ``;`` inside brackets.  A signature or body that never closes
+    raises :class:`CensusParseError` instead of being silently measured to
+    end of file or dropped.
+    """
     if newlines is None:
         newlines = line_index(text)
     fns: list[tuple[str, int, int]] = []
+    n = len(text)
     for m in FN_PAT.finditer(text):
-        # The parameter list must be balanced before we look for the body.
-        i, depth, n = m.end() - 1, 0, len(text)
-        while i < n:
-            if text[i] == "(":
-                depth += 1
-            elif text[i] == ")":
-                depth -= 1
-                if depth == 0:
-                    break
-            i += 1
-        else:
-            continue
-        i += 1
-        # Skip the return type, where clause and attributes; `{` opens the body,
-        # `;` means a declaration (trait method / extern fn).
-        while i < n:
-            if text[i] == "{":
-                break
-            if text[i] == ";":
-                break
-            i += 1
-        if i >= n or text[i] == ";":
-            continue
-        depth, start_body = 0, i
-        while i < n:
-            if text[i] == "{":
-                depth += 1
-            elif text[i] == "}":
-                depth -= 1
-                if depth == 0:
-                    break
-            i += 1
-        end = i if i < n else n - 1
+        name = m.group(1)
         start_line = bisect.bisect_right(newlines, m.start()) + 1
+        try:
+            i = m.end()
+            while i < n and text[i].isspace():
+                i += 1
+            if i < n and text[i] == "<":
+                i = _skip_generics(text, i)
+                while i < n and text[i].isspace():
+                    i += 1
+            if i >= n or text[i] != "(":
+                raise CensusParseError("no parameter list")
+            i = _skip_balanced(text, i, "(", ")", "parameter list")
+            body = _body_start(text, i)
+            if body is None:
+                continue
+            end = _skip_balanced(text, body, "{", "}", "function body") - 1
+        except CensusParseError as error:
+            raise CensusParseError(f"fn {name} at line {start_line}: {error}") from None
         end_line = bisect.bisect_right(newlines, end) + 1
-        fns.append((m.group(1), start_line, end_line))
+        fns.append((name, start_line, end_line))
     return fns
 
 
 def strip_text(text: str) -> str:
-    return without_tests(strip_rust(text))
+    return strip_tests(strip_rust(text))
+
+
+def load_sources() -> dict[pathlib.Path, tuple[str, str]]:
+    """Resolved path -> (raw, comment/literal-stripped) for every scanned file."""
+    sources: dict[pathlib.Path, tuple[str, str]] = {}
+    for directory in SCAN_DIRS:
+        for path in sorted((ROOT / directory).rglob("*.rs")):
+            raw = path.read_text(errors="ignore")
+            sources[path.resolve()] = (raw, strip_rust(raw))
+    return sources
+
+
+def tracked_markdown(root: pathlib.Path) -> list[pathlib.Path]:
+    """Markdown files in git's index: only tracked documentation can discharge
+    an undocumented-knob debt (an untracked scratch note never ships).  A tree
+    without git metadata is a usage error, not an empty documentation set."""
+    import subprocess
+
+    try:
+        top = subprocess.run(["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+                             check=True, capture_output=True, text=True).stdout.strip()
+        listed = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--", "*.md"],
+                                check=True, capture_output=True).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise CensusParseError(f"documentation scope needs a git checkout: {error}") from None
+    # An enclosing repository is not this tree's documentation scope.
+    if pathlib.Path(top).resolve() != root.resolve():
+        raise CensusParseError(f"{root} is not a git work-tree root (enclosing root: {top})")
+    return [root / name for name in listed.decode().split("\0") if name and (root / name).is_file()]
 
 
 def census() -> dict[str, object]:
@@ -235,36 +521,41 @@ def census() -> dict[str, object]:
     knob_sites: dict[str, int] = {}
     files = 0
 
-    for directory in SCAN_DIRS:
-        for path in sorted((ROOT / directory).rglob("*.rs")):
-            files += 1
-            rel = path.relative_to(ROOT).as_posix()
-            raw = path.read_text(errors="ignore")
-            text = strip_text(raw)
-            panics = len(PANIC_PAT.findall(text))
-            metrics["panic_sites"] += panics
-            if rel.startswith(HOT_PREFIXES):
-                metrics["panic_sites_hot"] += panics
-            metrics["unsafe_sites"] += len(UNSAFE_PAT.findall(text))
-            metrics["ignored_tests"] += len(IGNORE_PAT.findall(text))
-            for name, start, end in scan_functions(text):
-                length = end - start + 1
-                if length > 1000:
-                    metrics["fns_over_1000"] += 1
-                if length > 500:
-                    metrics["fns_over_500"] += 1
-                if length > 300:
-                    metrics["fns_over_300"] += 1
-            # Knobs name string literals (`env::var("CCC_...")`), so they must be
-            # counted on the raw text, not the stripped one.
-            for knob in KNOB_PAT.findall(raw):
-                knobs.add(knob)
-                knob_sites[knob] = knob_sites.get(knob, 0) + 1
+    sources = load_sources()
+    test_files = test_only_files(sources)
+    for path, (raw, code) in sources.items():
+        files += 1
+        rel = path.relative_to(ROOT.resolve()).as_posix()
+        # `#[ignore]` lives in test code: count it before tests are removed.
+        metrics["ignored_tests"] += len(IGNORE_PAT.findall(code))
+        # Knobs name string literals (`env::var("CCC_...")`), so they must be
+        # counted on the raw text, not the stripped one.
+        for knob in KNOB_PAT.findall(raw):
+            knobs.add(knob)
+            knob_sites[knob] = knob_sites.get(knob, 0) + 1
+        if path in test_files:
+            continue
+        text = strip_tests(code)
+        panics = len(PANIC_PAT.findall(text))
+        metrics["panic_sites"] += panics
+        if rel.startswith(HOT_PREFIXES):
+            metrics["panic_sites_hot"] += panics
+        metrics["unsafe_sites"] += len(UNSAFE_PAT.findall(text))
+        try:
+            spans = scan_functions(text)
+        except CensusParseError as error:
+            raise CensusParseError(f"{rel}: {error}") from None
+        for _name, start, end in spans:
+            length = end - start + 1
+            if length > 1000:
+                metrics["fns_over_1000"] += 1
+            if length > 500:
+                metrics["fns_over_500"] += 1
+            if length > 300:
+                metrics["fns_over_300"] += 1
 
     documented: set[str] = set()
-    for path in ROOT.rglob("*.md"):
-        if ".git" in path.parts or "target" in path.parts:
-            continue
+    for path in tracked_markdown(ROOT):
         documented |= set(KNOB_PAT.findall(path.read_text(errors="ignore")))
 
     result: dict[str, object] = dict(metrics)
@@ -281,13 +572,19 @@ def census() -> dict[str, object]:
 
 def top_functions(limit: int) -> list[tuple[int, str, str, int, int]]:
     rows: list[tuple[int, str, str, int, int]] = []
-    for directory in SCAN_DIRS:
-        for path in sorted((ROOT / directory).rglob("*.rs")):
-            text = strip_text(path.read_text(errors="ignore"))
-            rel = path.relative_to(ROOT).as_posix()
-            newlines = line_index(text)
-            for name, start, end in scan_functions(text, newlines):
-                rows.append((end - start + 1, rel, name, start, end))
+    sources = load_sources()
+    test_files = test_only_files(sources)
+    for path, (_raw, code) in sources.items():
+        if path in test_files:
+            continue
+        text = strip_tests(code)
+        rel = path.relative_to(ROOT.resolve()).as_posix()
+        try:
+            spans = scan_functions(text, line_index(text))
+        except CensusParseError as error:
+            raise CensusParseError(f"{rel}: {error}") from None
+        for name, start, end in spans:
+            rows.append((end - start + 1, rel, name, start, end))
     rows.sort(reverse=True)
     return rows[:limit]
 
@@ -371,28 +668,176 @@ SELFTEST_SOURCE = r'''
 fn normal(x: Option<u32>) -> u32 {
     let s = "unwrap() and panic! inside a string";
     let raw = r#"expect( "#;
+    let multi = "first line
+panic!() on a continuation line";
     x.unwrap() + 1
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
+    #[ignore = "needs capability X"]
     fn t() {
         panic!("test-only panic must not count");
         None::<u32>.expect("me too");
     }
 }
+
+fn after_tests(x: Option<u8>) -> u8 { x.expect("production after tests") }
+
+#[cfg(all(test, target_arch = "x86_64"))]
+fn all_test() { todo!() }
+
+#[cfg(any(test, feature = "probe"))]
+fn any_test(x: Option<u8>) -> u8 { x.unwrap() }
+
+#[cfg(not(test))]
+fn not_test(x: Option<u8>) -> u8 { x.unwrap() }
+
+#[test]
+fn bare_test() { unreachable!() }
+
+#[cfg(test)]
+use std::cell::Cell;
+fn after_use() { unimplemented!() }
 '''
 
 
+def _selftest_module_files() -> list[tuple[str, bool]]:
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="audit-census-") as tmp:
+        root = pathlib.Path(tmp).resolve()
+        (root / "parent").mkdir()
+        files = {
+            root / "lib.rs": "#[cfg(test)]\nmod unit;\nmod parent;\n"
+            "#[cfg(test)]\n#[path = \"elsewhere/renamed.rs\"]\nmod moved;\n",
+            root / "unit.rs": "mod nested;\nfn t() { panic!() }\n",
+            root / "unit" / "nested.rs": "fn n() { panic!() }\n",
+            root / "parent.rs": "#[cfg(test)]\nmod parent_tests;\nfn p() {}\n",
+            root / "parent" / "parent_tests.rs": "fn q() { panic!() }\n",
+            root / "elsewhere" / "renamed.rs": "fn r() { panic!() }\n",
+        }
+        for path, text in files.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+        sources = {path: (text, strip_rust(text)) for path, text in files.items()}
+        excluded = test_only_files(sources)
+        expected = {root / "unit.rs", root / "unit" / "nested.rs",
+                    root / "parent" / "parent_tests.rs", root / "elsewhere" / "renamed.rs"}
+        return [
+            ("test-only module files (incl. nested, #[path], non-mod.rs parent) excluded",
+             excluded == expected),
+            ("production module files kept", not ({root / "lib.rs", root / "parent.rs"} & excluded)),
+        ]
+
+
+LEXER_SELFTEST_SOURCE = r'''
+fn lexemes<'a>(s: &'a str) -> char {
+    let smile = '\u{1F600}'; let accent = 'é'; let del = '\x7f'; let q = b'\'';
+    let brace = '{'; let c = c"panic!()"; let cr = cr#"todo!()"#; let b = br"x.unwrap()";
+    'outer: loop { break 'outer; }
+    s.chars().next().unwrap()
+}
+'''
+
+TWO_MODULE_SELFTEST_SOURCE = r'''
+fn before() { panic!() }
+#[cfg(test)]
+mod first { fn a() { panic!() } }
+fn between() { panic!() }
+#[cfg(test)]
+mod second { fn b() { panic!() } }
+fn after() { panic!() }
+'''
+
+SIGNATURE_SELFTEST_SOURCE = r'''
+fn nested<T: Into<Vec<u8>>, F: Fn(u8) -> u8>(t: T, f: F) -> u8 {
+    f(t.into()[0])
+}
+fn array_ret<const N: usize>() -> [u8; N] { [0; N] }
+fn const_arg() -> Wrap<{ 1 + 2 }> { Wrap }
+trait Decl { fn decl(&self) -> [u8; 4]; }
+'''
+
+
+def _selftest_lexer() -> list[tuple[str, bool]]:
+    code = strip_rust(LEXER_SELFTEST_SOURCE)
+    two = strip_tests(strip_rust(TWO_MODULE_SELFTEST_SOURCE))
+    two_lines = [two[: m.start()].count("\n") for m in PANIC_PAT.finditer(two)]
+    signatures = strip_tests(strip_rust(SIGNATURE_SELFTEST_SOURCE))
+    raised = []
+    for broken in ("fn open_body() { if x {\n", "fn open_params(a: u8\n", "fn open_generic<T: Into<u8>(\n"):
+        try:
+            scan_functions(broken)
+            raised.append(False)
+        except CensusParseError:
+            raised.append(True)
+    return [
+        ("unicode/escaped/byte char literals and c/cr/br strings blanked; lifetimes and labels kept",
+         PANIC_PAT.findall(code) == [".unwrap("] and "1F600" not in code and "x7f" not in code and "{" not in code.split("let brace", 1)[1].split(";", 1)[0]
+         and "'a str" in code and "'outer: loop" in code and len(code) == len(LEXER_SELFTEST_SOURCE)),
+        ("production before, between and after two test modules counts",
+         two_lines == [1, 4, 7]),
+        ("nested generics, Fn() -> T bounds, bracketed ; and const-generic braces",
+         [name for name, _s, _e in scan_functions(signatures)] == ["nested", "array_ret", "const_arg"]
+         and scan_functions(signatures)[0][1:] == (2, 4)),
+        ("unclosed body, parameter list and generics are hard failures", raised == [True, True, True]),
+        ("knob names exclude prefixes and families",
+         KNOB_PAT.findall('starts_with("CCC_NO_") CCC_NO_INLINE_* CCC_NO_X LCCC_A1 CCC_')
+         == ["CCC_NO_X", "LCCC_A1"]),
+    ]
+
+
+def _selftest_documentation_scope() -> list[tuple[str, bool]]:
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="audit-census-docs-") as tmp:
+        root = pathlib.Path(tmp)
+        (root / "tracked.md").write_text("CCC_TRACKED\n")
+        (root / "untracked.md").write_text("CCC_UNTRACKED\n")
+        missing_git = False
+        try:
+            tracked_markdown(root)
+        except CensusParseError:
+            missing_git = True
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        subprocess.run(["git", "-C", str(root), "add", "tracked.md"], check=True)
+        names = [path.name for path in tracked_markdown(root)]
+    return [
+        ("only git-tracked markdown documents a knob", names == ["tracked.md"]),
+        ("a tree without git metadata fails instead of documenting nothing", missing_git),
+    ]
+
+
 def cmd_selftest() -> int:
-    stripped = strip_text(SELFTEST_SOURCE)
+    code = strip_rust(SELFTEST_SOURCE)
+    stripped = strip_tests(code)
+    panic_lines = sorted(stripped[: m.start()].count("\n") + 1 for m in PANIC_PAT.finditer(stripped))
+    expected_lines = sorted(
+        number for number, line in enumerate(SELFTEST_SOURCE.split("\n"), 1)
+        if re.match(r"\s*x\.unwrap\(\) \+ 1|fn (after_tests|any_test|not_test|after_use)", line)
+    )
     checks = [
-        ("comment/block-comment/string panic! ignored", PANIC_PAT.findall(stripped) == [".unwrap("]),
-        ("raw string ignored", "expect(" not in stripped),
-        ("test module excluded", "test-only" not in stripped),
+        ("comments, strings and raw strings never count",
+         "inside a string" not in code and "block:" not in code and "panic! in" not in code
+         and "continuation" not in code
+         and all("expect" not in line for line in code.split("\n") if "let raw" in line)),
+        ("production after a test module, any(test, ..) and not(test) items count",
+         panic_lines == expected_lines and len(expected_lines) == 5),
+        ("test module, all(test, ..) item, bare #[test] fn and test-only use blanked",
+         "test-only" not in stripped and "todo" not in stripped
+         and "bare_test" not in stripped and "Cell" not in stripped),
+        ("#[ignore] inside test code is counted", len(IGNORE_PAT.findall(code)) == 1),
         ("line count preserved", stripped.count("\n") == SELFTEST_SOURCE.count("\n")),
-        ("long function detection", scan_functions(stripped)[0][0] == "normal"),
+        ("offsets preserved", len(stripped) == len(SELFTEST_SOURCE)),
+        ("long function detection",
+         [name for name, _s, _e in scan_functions(stripped)]
+         == ["normal", "after_tests", "any_test", "not_test", "after_use"]),
+        *_selftest_module_files(),
+        *_selftest_lexer(),
+        *_selftest_documentation_scope(),
     ]
     failed = [name for name, ok in checks if not ok]
     for name, ok in checks:
@@ -420,7 +865,11 @@ def main(argv: list[str]) -> int:
     if args.selftest:
         return cmd_selftest()
 
-    current = census()
+    try:
+        current = census()
+    except CensusParseError as error:
+        print(f"FAIL: audit_census: {error}", file=sys.stderr)
+        return 1
 
     if args.list_undocumented_knobs:
         for name in current["knob_undocumented_names"]:

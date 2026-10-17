@@ -33,7 +33,10 @@ fi
 
 toolchain_ready() {
     command -v gcc-16 >/dev/null 2>&1 && command -v g++-16 >/dev/null 2>&1 || return 1
-    local package
+    local package version
+    version=$(gcc-16 -dumpfullversion) || return 1
+    [[ ${version%%.*} == 16 ]] || return 1
+    [[ -z ${LCCC_CI_GCC_VERSION:-} || $version == "$LCCC_CI_GCC_VERSION" ]] || return 1
     for package in "${packages[@]}"; do
         [[ $(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null) == installed ]] || return 1
     done

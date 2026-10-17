@@ -1,0 +1,822 @@
+{
+  "source": "#include <stdio.h>\n#define S_(x) #x\n#define S(x) S_(x)\nint main(void) {\nputs(\"VERSION=\" __VERSION__);\n#ifdef __INTEL_COMPILER\nputs(\"INTEL_COMPILER=\" S(__INTEL_COMPILER));\n#endif\n#ifdef __INTEL_COMPILER_UPDATE\nputs(\"INTEL_COMPILER_UPDATE=\" S(__INTEL_COMPILER_UPDATE));\n#endif\n#ifdef __INTEL_COMPILER_BUILD_DATE\nputs(\"INTEL_COMPILER_BUILD_DATE=\" S(__INTEL_COMPILER_BUILD_DATE));\n#endif\n#ifdef __INTEL_LLVM_COMPILER\nputs(\"INTEL_LLVM_COMPILER=\" S(__INTEL_LLVM_COMPILER));\n#endif\nreturn 0;\n}\n",
+  "utc": "2026-10-15T16:39:40.204239+00:00",
+  "results": {
+    "icc": {
+      "compiler_id": "cicc2021100",
+      "result": {
+        "inputFilename": "example.c",
+        "code": 0,
+        "okToCache": true,
+        "timedOut": false,
+        "stdout": [],
+        "stderr": [
+          {
+            "text": "icc: remark #10441: The Intel(R) C++ Compiler Classic (ICC) is deprecated and will be removed from product release in the second half of 2023. The Intel(R) oneAPI DPC++/C++ Compiler (ICX) is the recommended compiler moving forward. Please transition to use this compiler. Use '-diag-disable=10441' to disable this message."
+          }
+        ],
+        "truncated": false,
+        "execTime": 276,
+        "processExecutionResultTime": 0.05459300009533763,
+        "instructionSet": "amd64",
+        "compilationOptions": [
+          "-g",
+          "-o",
+          "/app/output.s",
+          "-S",
+          "-gxx-name=/opt/compiler-explorer/gcc-13.2.0/bin/g++",
+          "-O2",
+          "/app/example.c"
+        ],
+        "downloads": [],
+        "tools": [],
+        "asmSize": 7822,
+        "asm": [
+          {
+            "text": "main:",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "..B1.1: # Preds ..B1.0",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  pushq %rbp #4.16",
+            "source": {
+              "file": null,
+              "line": 4
+            },
+            "labels": []
+          },
+          {
+            "text": "  movq %rsp, %rbp #4.16",
+            "source": {
+              "file": null,
+              "line": 4
+            },
+            "labels": []
+          },
+          {
+            "text": "  andq $-128, %rsp #4.16",
+            "source": {
+              "file": null,
+              "line": 4
+            },
+            "labels": []
+          },
+          {
+            "text": "  subq $128, %rsp #4.16",
+            "source": {
+              "file": null,
+              "line": 4
+            },
+            "labels": []
+          },
+          {
+            "text": "  movl $3, %edi #4.16",
+            "source": {
+              "file": null,
+              "line": 4
+            },
+            "labels": []
+          },
+          {
+            "text": "  xorl %esi, %esi #4.16",
+            "source": {
+              "file": null,
+              "line": 4
+            },
+            "labels": []
+          },
+          {
+            "text": "  call __intel_new_feature_proc_init #4.16",
+            "source": {
+              "file": null,
+              "line": 4
+            },
+            "labels": []
+          },
+          {
+            "text": "..B1.8: # Preds ..B1.1",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  stmxcsr (%rsp) #4.16",
+            "source": {
+              "file": null,
+              "line": 4
+            },
+            "labels": []
+          },
+          {
+            "text": "  movl $.L_2__STRING.0, %edi #5.1",
+            "source": {
+              "file": null,
+              "line": 5
+            },
+            "labels": [
+              {
+                "name": ".L_2__STRING.0",
+                "range": {
+                  "startCol": 9,
+                  "endCol": 23
+                }
+              }
+            ]
+          },
+          {
+            "text": "  orl $32832, (%rsp) #4.16",
+            "source": {
+              "file": null,
+              "line": 4
+            },
+            "labels": []
+          },
+          {
+            "text": "  ldmxcsr (%rsp) #4.16",
+            "source": {
+              "file": null,
+              "line": 4
+            },
+            "labels": []
+          },
+          {
+            "text": "  call puts #5.1",
+            "source": {
+              "file": null,
+              "line": 5
+            },
+            "labels": []
+          },
+          {
+            "text": "..B1.2: # Preds ..B1.8",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  movl $.L_2__STRING.1, %edi #7.1",
+            "source": {
+              "file": null,
+              "line": 7
+            },
+            "labels": [
+              {
+                "name": ".L_2__STRING.1",
+                "range": {
+                  "startCol": 9,
+                  "endCol": 23
+                }
+              }
+            ]
+          },
+          {
+            "text": "  call puts #7.1",
+            "source": {
+              "file": null,
+              "line": 7
+            },
+            "labels": []
+          },
+          {
+            "text": "..B1.3: # Preds ..B1.2",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  movl $.L_2__STRING.2, %edi #10.1",
+            "source": {
+              "file": null,
+              "line": 10
+            },
+            "labels": [
+              {
+                "name": ".L_2__STRING.2",
+                "range": {
+                  "startCol": 9,
+                  "endCol": 23
+                }
+              }
+            ]
+          },
+          {
+            "text": "  call puts #10.1",
+            "source": {
+              "file": null,
+              "line": 10
+            },
+            "labels": []
+          },
+          {
+            "text": "..B1.4: # Preds ..B1.3",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  movl $.L_2__STRING.3, %edi #13.1",
+            "source": {
+              "file": null,
+              "line": 13
+            },
+            "labels": [
+              {
+                "name": ".L_2__STRING.3",
+                "range": {
+                  "startCol": 9,
+                  "endCol": 23
+                }
+              }
+            ]
+          },
+          {
+            "text": "  call puts #13.1",
+            "source": {
+              "file": null,
+              "line": 13
+            },
+            "labels": []
+          },
+          {
+            "text": "..B1.5: # Preds ..B1.4",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  xorl %eax, %eax #18.8",
+            "source": {
+              "file": null,
+              "line": 18
+            },
+            "labels": []
+          },
+          {
+            "text": "  movq %rbp, %rsp #18.8",
+            "source": {
+              "file": null,
+              "line": 18
+            },
+            "labels": []
+          },
+          {
+            "text": "  popq %rbp #18.8",
+            "source": {
+              "file": null,
+              "line": 18
+            },
+            "labels": []
+          },
+          {
+            "text": "  ret #18.8",
+            "source": {
+              "file": null,
+              "line": 18
+            },
+            "labels": []
+          },
+          {
+            "text": ".L_2__STRING.0:",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .long 1397900630",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .long 1028542281",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .long 1702129225",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .long 693250156",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .long 724255520",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .long 1667458848",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .long 775106848",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .long 1869422642",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .word 25956",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .byte 0",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .space 1, 0x00 # pad",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": ".L_2__STRING.1:",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .long 1163152969",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .long 1329815372",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .long 1279873101",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .long 842879557",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .long 3224112",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": ".L_2__STRING.2:",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .long 1163152969",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .long 1329815372",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .long 1279873101",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .long 1432310341",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .long 1413563472",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .long 808533317",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .byte 0",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .space 3, 0x00 # pad",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": ".L_2__STRING.3:",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .long 1163152969",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .long 1329815372",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .long 1279873101",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .long 1113543237",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .long 1145850197",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .long 1413563487",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .long 808598853",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .long 909128498",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .word 14640",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .byte 0",
+            "source": null,
+            "labels": []
+          }
+        ],
+        "optOutput": [],
+        "labelDefinitions": {
+          "main": 1,
+          "..B1.1": 2,
+          "..B1.8": 10,
+          "..B1.2": 16,
+          "..B1.3": 19,
+          "..B1.4": 22,
+          "..B1.5": 25,
+          ".L_2__STRING.0": 30,
+          ".L_2__STRING.1": 42,
+          ".L_2__STRING.2": 48,
+          ".L_2__STRING.3": 57
+        },
+        "parsingTime": 3,
+        "filteredCount": 271,
+        "popularArguments": {},
+        "execResult": {
+          "code": 0,
+          "okToCache": true,
+          "timedOut": false,
+          "stdout": [
+            {
+              "text": "VERSION=Intel(R) C++ gcc 13.2 mode"
+            },
+            {
+              "text": "INTEL_COMPILER=2021"
+            },
+            {
+              "text": "INTEL_COMPILER_UPDATE=10"
+            },
+            {
+              "text": "INTEL_COMPILER_BUILD_DATE=20230609"
+            }
+          ],
+          "stderr": [],
+          "truncated": false,
+          "execTime": 18,
+          "processExecutionResultTime": 0.016232000198215246,
+          "didExecute": true,
+          "buildResult": {
+            "inputFilename": "example.c",
+            "code": 0,
+            "okToCache": true,
+            "timedOut": false,
+            "stdout": [],
+            "stderr": [
+              {
+                "text": "icc: remark #10441: The Intel(R) C++ Compiler Classic (ICC) is deprecated and will be removed from product release in the second half of 2023. The Intel(R) oneAPI DPC++/C++ Compiler (ICX) is the recommended compiler moving forward. Please transition to use this compiler. Use '-diag-disable=10441' to disable this message."
+              }
+            ],
+            "truncated": false,
+            "execTime": 155,
+            "processExecutionResultTime": 0.027261000126600266,
+            "instructionSet": "amd64",
+            "downloads": [],
+            "executableFilename": "/nosym/tmp/compiler-explorer-compileruGtq7f/output.s",
+            "compilationOptions": [
+              "-g",
+              "-o",
+              "/app/output.s",
+              "-gxx-name=/opt/compiler-explorer/gcc-13.2.0/bin/g++",
+              "-O2",
+              "/app/example.c",
+              "-L./lib",
+              "-Wl,-rpath,./lib",
+              "-Wl,-rpath,/opt/compiler-explorer/intel-cpp-2023.2.1.8/compiler/latest/linux/compiler/lib/intel64_lin",
+              "-Wl,-rpath,/opt/compiler-explorer/intel-cpp-2023.2.1.8/compiler/latest/linux/compiler/lib/ia32_lin"
+            ],
+            "preparedLdPaths": [
+              "/opt/compiler-explorer/intel-cpp-2023.2.1.8/compiler/latest/linux/compiler/lib/intel64_lin",
+              "/opt/compiler-explorer/intel-cpp-2023.2.1.8/compiler/latest/linux/compiler/lib/ia32_lin"
+            ],
+            "defaultExecOptions": {
+              "timeoutMs": 20000,
+              "maxErrorOutput": 5000,
+              "env": {
+                "LD_LIBRARY_PATH": "",
+                "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin",
+                "HOME": "/home/ce"
+              }
+            },
+            "packageStoreTime": 59
+          }
+        },
+        "queueTime": 5,
+        "lcccOracleOptions": {
+          "requested": "-O2",
+          "effective": "-O2"
+        }
+      }
+    },
+    "icx": {
+      "compiler_id": "cicxlatest",
+      "result": {
+        "inputFilename": "example.c",
+        "code": 0,
+        "okToCache": true,
+        "timedOut": false,
+        "stdout": [],
+        "stderr": [],
+        "truncated": false,
+        "execTime": 269,
+        "processExecutionResultTime": 0.0012519992887973785,
+        "instructionSet": "amd64",
+        "compilationOptions": [
+          "-g",
+          "-o",
+          "/app/output.s",
+          "-fno-verbose-asm",
+          "-S",
+          "--gcc-toolchain=/opt/compiler-explorer/gcc-13.2.0",
+          "-fcolor-diagnostics",
+          "-fno-crash-diagnostics",
+          "-O2",
+          "/app/example.c"
+        ],
+        "downloads": [],
+        "tools": [],
+        "asmSize": 4221,
+        "asm": [
+          {
+            "text": "main:",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  pushq %rax",
+            "source": {
+              "file": null,
+              "line": 4
+            },
+            "labels": []
+          },
+          {
+            "text": "  stmxcsr 4(%rsp)",
+            "source": {
+              "file": null,
+              "line": 4
+            },
+            "labels": []
+          },
+          {
+            "text": "  orl $32832, 4(%rsp)",
+            "source": {
+              "file": null,
+              "line": 4
+            },
+            "labels": []
+          },
+          {
+            "text": "  ldmxcsr 4(%rsp)",
+            "source": {
+              "file": null,
+              "line": 4
+            },
+            "labels": []
+          },
+          {
+            "text": "  movl $.L.str, %edi",
+            "source": {
+              "file": null,
+              "line": 5,
+              "column": 1
+            },
+            "labels": [
+              {
+                "name": ".L.str",
+                "range": {
+                  "startCol": 9,
+                  "endCol": 15
+                }
+              }
+            ]
+          },
+          {
+            "text": "  callq puts",
+            "source": {
+              "file": null,
+              "line": 5,
+              "column": 1
+            },
+            "labels": []
+          },
+          {
+            "text": "  movl $.L.str.1, %edi",
+            "source": {
+              "file": null,
+              "line": 16,
+              "column": 1
+            },
+            "labels": [
+              {
+                "name": ".L.str.1",
+                "range": {
+                  "startCol": 9,
+                  "endCol": 17
+                }
+              }
+            ]
+          },
+          {
+            "text": "  callq puts",
+            "source": {
+              "file": null,
+              "line": 16,
+              "column": 1
+            },
+            "labels": []
+          },
+          {
+            "text": "  xorl %eax, %eax",
+            "source": {
+              "file": null,
+              "line": 18,
+              "column": 1
+            },
+            "labels": []
+          },
+          {
+            "text": "  popq %rcx",
+            "source": {
+              "file": null,
+              "line": 18,
+              "column": 1
+            },
+            "labels": []
+          },
+          {
+            "text": "  retq",
+            "source": {
+              "file": null,
+              "line": 18,
+              "column": 1
+            },
+            "labels": []
+          },
+          {
+            "text": "",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": ".L.str:",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .asciz \"VERSION=Intel(R) oneAPI DPC++/C++ Compiler 2024.0.0 (2024.0.0.20231017)\"",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": ".L.str.1:",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "  .asciz \"INTEL_LLVM_COMPILER=20240000\"",
+            "source": null,
+            "labels": []
+          },
+          {
+            "text": "",
+            "source": null,
+            "labels": []
+          }
+        ],
+        "optOutput": [],
+        "labelDefinitions": {
+          "main": 1,
+          ".L.str": 14,
+          ".L.str.1": 17
+        },
+        "parsingTime": 1,
+        "filteredCount": 289,
+        "popularArguments": {},
+        "execResult": {
+          "code": 0,
+          "okToCache": true,
+          "timedOut": false,
+          "stdout": [
+            {
+              "text": "VERSION=Intel(R) oneAPI DPC++/C++ Compiler 2024.0.0 (2024.0.0.20231017)"
+            },
+            {
+              "text": "INTEL_LLVM_COMPILER=20240000"
+            }
+          ],
+          "stderr": [],
+          "truncated": false,
+          "execTime": 25,
+          "processExecutionResultTime": 0.01992199942469597,
+          "didExecute": true,
+          "buildResult": {
+            "inputFilename": "example.c",
+            "code": 0,
+            "okToCache": true,
+            "timedOut": false,
+            "stdout": [],
+            "stderr": [],
+            "truncated": false,
+            "execTime": 101,
+            "processExecutionResultTime": 0.0012379996478557587,
+            "instructionSet": "amd64",
+            "downloads": [],
+            "executableFilename": "/nosym/tmp/compiler-explorer-compilerG8BhY8/output.s",
+            "compilationOptions": [
+              "-g",
+              "-o",
+              "/app/output.s",
+              "-fno-verbose-asm",
+              "--gcc-toolchain=/opt/compiler-explorer/gcc-13.2.0",
+              "-fcolor-diagnostics",
+              "-fno-crash-diagnostics",
+              "-O2",
+              "/app/example.c",
+              "-L./lib",
+              "-Wl,-rpath,./lib",
+              "-Wl,-rpath,/opt/compiler-explorer/intel-cpp-2024.0.0.49524/compiler/latest/lib",
+              "-Wl,-rpath,/opt/compiler-explorer/intel-cpp-2024.0.0.49524/tbb/latest/lib",
+              "-Wl,-rpath,/opt/compiler-explorer/gcc-13.2.0/lib64",
+              "-Wl,-rpath,/opt/compiler-explorer/gcc-13.2.0/lib32"
+            ],
+            "preparedLdPaths": [
+              "/opt/compiler-explorer/intel-cpp-2024.0.0.49524/compiler/latest/lib",
+              "/opt/compiler-explorer/intel-cpp-2024.0.0.49524/tbb/latest/lib"
+            ],
+            "defaultExecOptions": {
+              "timeoutMs": 20000,
+              "maxErrorOutput": 5000,
+              "env": {
+                "LD_LIBRARY_PATH": "",
+                "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:/opt/compiler-explorer/intel-cpp-2024.0.0.49524/compiler/latest/bin",
+                "HOME": "/home/ce"
+              }
+            },
+            "packageStoreTime": 56
+          }
+        },
+        "queueTime": 6,
+        "lcccOracleOptions": {
+          "requested": "-O2",
+          "effective": "-O2"
+        }
+      }
+    }
+  }
+}

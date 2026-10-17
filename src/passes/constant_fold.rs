@@ -152,6 +152,11 @@ pub fn fold_strlen_literals(module: &mut IrModule) -> usize {
                     if callee != "strlen" && callee != "__builtin_strlen" {
                         continue;
                     }
+                    // Only the library `strlen` has a known result
+                    // (`-fno-builtin[-strlen]` keeps the call, as GCC does).
+                    if !info.assume_library {
+                        continue;
+                    }
                     let Some(dest) = info.dest else { continue };
                     if let Some(Operand::Value(v)) = info.args.first() {
                         if let Some(&len) = addr_lens.get(&v.0) {
@@ -1089,6 +1094,15 @@ fn fold_binop(op: IrBinOp, lhs: i64, rhs: i64, ty: IrType) -> Option<i64> {
             );
             return Some(ty.truncate_i64(rotated as i64));
         }
+        // Width-typed like the rotates: the identity threshold is the
+        // operation width (`k >= W` returns x), and the zero-extended value
+        // keeps a signed operand's sign extension from surviving the mask.
+        IrBinOp::Bzhi => {
+            let bits = (ty.size() * 8) as u32;
+            let kept =
+                crate::ir::ops::zero_high_bits_from(lhs as u64 as u128, rhs as u64 as u128, bits);
+            return Some(ty.truncate_i64(kept as i64));
+        }
     })
 }
 
@@ -1179,6 +1193,73 @@ fn fold_cast(
 mod tests {
     use super::*;
     use crate::common::types::IrType;
+
+    /// `Bzhi` folds to the instruction's result (Intel SDM BZHI: index bits
+    /// 7:0, the source unchanged from the width on) at every legal width, and
+    /// the container-width evaluators other passes use agree once truncated.
+    #[test]
+    fn bzhi_folds_like_the_instruction() {
+        fn oracle(x: u64, n: u64, width: u32) -> u64 {
+            let x = if width == 32 { x & 0xFFFF_FFFF } else { x };
+            let k = n & 0xFF;
+            if k >= u64::from(width) {
+                x
+            } else {
+                x & ((1u64 << k) - 1)
+            }
+        }
+        let sources = [
+            0u64,
+            1,
+            0x8000_0000,
+            0x8000_0001,
+            0xFFFF_FFFF,
+            1 << 63,
+            u64::MAX,
+            0xFEDC_BA98_7654_3210,
+        ];
+        let indices = [
+            0u64,
+            1,
+            8,
+            31,
+            32,
+            33,
+            63,
+            64,
+            65,
+            127,
+            128,
+            255,
+            256,
+            257,
+            0x1FF,
+            0x8000_0000,
+            0x1_0000_0020,
+            u64::MAX,
+            0xFFFF_FFFF_FFFF_FF1F,
+        ];
+        for ty in [IrType::I32, IrType::U32, IrType::I64, IrType::U64] {
+            let width = (ty.size() * 8) as u32;
+            for x in sources {
+                for n in indices {
+                    let (lhs, rhs) = (ty.truncate_i64(x as i64), ty.truncate_i64(n as i64));
+                    let want = ty.truncate_i64(oracle(x, n, width) as i64);
+                    assert_eq!(
+                        fold_binop(IrBinOp::Bzhi, lhs, rhs, ty),
+                        Some(want),
+                        "fold Bzhi({x:#x}, {n:#x}) at {ty:?}"
+                    );
+                    let container = IrBinOp::Bzhi.eval_i64(lhs, rhs).unwrap();
+                    assert_eq!(ty.truncate_i64(container), want, "eval_i64 at {ty:?}");
+                    let wide = IrBinOp::Bzhi
+                        .eval_i128(i128::from(lhs), i128::from(rhs))
+                        .unwrap();
+                    assert_eq!(ty.truncate_i64(wide as i64), want, "eval_i128 at {ty:?}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_fold_binop_add() {

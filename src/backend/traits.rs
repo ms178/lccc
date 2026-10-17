@@ -70,8 +70,8 @@ use super::regalloc::PhysReg;
 use super::state::{CodegenState, SlotAddr, StackSlot};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::reexports::{
-    AtomicOrdering, AtomicRmwOp, BlockId, Instruction, IntrinsicOp, IrBinOp, IrCmpOp, IrConst,
-    IrFunction, IrUnaryOp, Operand, Value,
+    AtomicOrdering, AtomicRmwOp, BlockId, CallInfo, Instruction, IntrinsicOp, IrBinOp, IrCmpOp,
+    IrConst, IrFunction, IrUnaryOp, Operand, Value,
 };
 
 /// Minimum number of switch cases required to consider a jump table.
@@ -2170,12 +2170,7 @@ pub trait ArchCodegen {
     /// contract (`X86Tune::memset_strategy`: straight-line stores, counted
     /// vector loop, `rep stosb`, or `LibCall` above the L3-derived bound).
     /// Default: never (non-x86 backends keep the libc call).
-    fn inline_memset_len(
-        &self,
-        _func: &str,
-        _args: &[Operand],
-        _is_variadic: bool,
-    ) -> Option<usize> {
+    fn inline_memset_len(&self, _func: &str, _info: &CallInfo) -> Option<usize> {
         None
     }
 

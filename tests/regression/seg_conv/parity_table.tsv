@@ -93,3 +93,17 @@ desig_arr_member_seg_accept	accept	stmt	struct seg_arr s2 = { .v[1].p = gp }; (v
 desig_arr_top_generic_reject	reject	stmt	int __seg_gs *ap[2] = { [1] = q }; (void)ap;
 desig_union_generic_reject	reject	stmt	union seg_un u = { .p = q }; (void)u;
 desig_union_seg_accept	accept	stmt	union seg_un u = { .p = gp }; (void)u;
+# Declarator-fold shapes (kernel percpu members): `T * __seg_gs *` must keep
+# the %gs on the POINTEE level — the member type is a generic pointer whose
+# pointee values live in %gs, so consuming it as a gs-void* is fine (the
+# first dereference is the segment access) but leaking it to a generic
+# pointer is not. Measured against GCC 16.2 (sched/topology.c shapes).
+member_init_gs_gs	accept	stmt	struct s * __seg_gs *q0 = g_sdd.sd;
+member_init_gs_gen	reject	stmt	struct s **q1 = g_sdd.sd;
+member_arg_gs_void	accept	stmt	take_gs_generic(g_sdd.sd);
+member_arg_gs_int	reject	stmt	take_q(g_sdd.sd);
+member_assign_gen_gs	reject	stmt	g_sdd.sd = q;
+member_assign_cast	accept	stmt	g_sdd.sd = (struct s * __seg_gs *)q;
+decl_local_gs_chain	accept	stmt	struct s * __seg_gs *l0 = 0;
+addr_of_gs_obj	reject	stmt	struct s * __seg_gs *l1 = &sgp;
+typedef_ptr_to_gs	reject	stmt	ulp_gs_t *t0 = 0; take_gs_generic(t0);

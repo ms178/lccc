@@ -10,6 +10,7 @@ an explicitly incomplete index. No raw counter data is thrown away.
 """
 import argparse
 import json
+import shlex
 from pathlib import Path
 import contextlib
 import callgrind_ab as cg
@@ -22,6 +23,19 @@ sys.path.insert(0, str(ROOT))
 from tools.corpus import publication
 
 
+def workload_flags(item, sizing):
+    """Keep registry identity; only explicit sizing macros override defaults.
+
+    Drop the superseded definition instead of passing conflicting -D options.
+    Registry flags and the sizing file use joined -DNAME[=VALUE] spellings.
+    """
+    size_flags = shlex.split(sizing)
+    overridden = {flag[2:].split('=', 1)[0] for flag in size_flags if flag.startswith('-D')}
+    result = [flag for flag in item.extra_flags
+              if not (flag.startswith('-D') and flag[2:].split('=', 1)[0] in overridden)]
+    return [*result, *size_flags]
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--mine", required=True)
@@ -31,6 +45,7 @@ def main(argv=None):
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--target-flags", default="-march=x86-64-v3",
                         help="common target flags; use an empty string for compiler defaults")
+    parser.add_argument("--cflag", action="append", default=[], help="extra common compiler option; repeatable")
     parser.add_argument("--only", help="comma-separated corpus ids")
     args = parser.parse_args(argv)
     sizes = json.loads((ROOT / "tests/benchmark/callgrind_sizes.json").read_text())
@@ -52,7 +67,9 @@ def main(argv=None):
                 continue
             directory = args.out / item.name
             directory.mkdir(exist_ok=True)
-            flags = "-std=gnu17 -O2 " + args.target_flags + " -fwrapv -Wl,--no-as-needed -lm " + sizes[item.name]
+            flags = shlex.join(["-std=gnu17", "-O2", *shlex.split(args.target_flags), "-fwrapv",
+                                "-Wl,--no-as-needed", "-lm", *args.cflag,
+                                *workload_flags(item, sizes[item.name])])
             command = [args.mine, args.ref, "--opt=" + flags, bench.source_for(item).stem,
                        "--out-root", str(directory), "--instrument-timeout", "60",
                        "--gcc-include-command", args.gcc_include_command]

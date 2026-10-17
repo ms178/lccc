@@ -60,6 +60,12 @@ pub fn run(module: &mut IrModule) -> usize {
     }
     let mut pure_fns: FxHashSet<String> = FxHashSet::default();
     let mut const_fns: FxHashSet<String> = FxHashSet::default();
+    // What the C library guarantees about its own functions.  Kept apart
+    // from the inferred/annotated sets: it describes the LIBRARY function,
+    // so it applies only to calls known to reach it
+    // (`CallInfo::assume_library` -- false under `-fno-builtin[-<fn>]` /
+    // `-ffreestanding`), never to a name.
+    let mut lib = LibraryFacts::default();
 
     // Standard math builtins known to be const
     for name in &[
@@ -73,8 +79,7 @@ pub fn run(module: &mut IrModule) -> usize {
         {
             continue;
         }
-        const_fns.insert(name.to_string());
-        pure_fns.insert(name.to_string());
+        lib.const_fns.insert(*name);
     }
 
     // Standard string/mem builtins known to be pure
@@ -83,7 +88,7 @@ pub fn run(module: &mut IrModule) -> usize {
         "strrchr", "strstr", "memchr",
     ] {
         if !fp_effectful.contains(*name) {
-            pure_fns.insert(name.to_string());
+            lib.pure_fns.insert(*name);
         }
     }
 
@@ -125,7 +130,8 @@ pub fn run(module: &mut IrModule) -> usize {
                 continue;
             }
 
-            let (can_be_pure, can_be_const) = analyze_function_purity(func, &pure_fns, &const_fns);
+            let (can_be_pure, can_be_const) =
+                analyze_function_purity(func, &pure_fns, &const_fns, &lib);
 
             if can_be_const && !is_already_const {
                 const_fns.insert(func.name.clone());
@@ -151,13 +157,13 @@ pub fn run(module: &mut IrModule) -> usize {
                     ref mut info,
                 } = inst
                 {
-                    if const_fns.contains(callee.as_str()) {
+                    if const_fns.contains(callee.as_str()) || lib.is_const(callee, info) {
                         if !info.is_const {
                             info.is_const = true;
                             info.is_pure = true;
                             total_updates += 1;
                         }
-                    } else if pure_fns.contains(callee.as_str()) {
+                    } else if pure_fns.contains(callee.as_str()) || lib.is_pure(callee, info) {
                         if !info.is_pure {
                             info.is_pure = true;
                             total_updates += 1;
@@ -171,11 +177,30 @@ pub fn run(module: &mut IrModule) -> usize {
     total_updates
 }
 
+/// Purity the C library guarantees for its own functions (a const function
+/// is also pure).
+#[derive(Default)]
+struct LibraryFacts {
+    const_fns: FxHashSet<&'static str>,
+    pure_fns: FxHashSet<&'static str>,
+}
+
+impl LibraryFacts {
+    fn is_const(&self, callee: &str, info: &CallInfo) -> bool {
+        info.assume_library && self.const_fns.contains(callee)
+    }
+
+    fn is_pure(&self, callee: &str, info: &CallInfo) -> bool {
+        info.assume_library && (self.pure_fns.contains(callee) || self.const_fns.contains(callee))
+    }
+}
+
 /// Analyze a function body to determine if it meets the criteria for `pure` and/or `const`.
 fn analyze_function_purity(
     func: &IrFunction,
     pure_fns: &FxHashSet<String>,
     const_fns: &FxHashSet<String>,
+    lib: &LibraryFacts,
 ) -> (bool, bool) {
     if super::fp_environment_blocks_reordering(func) {
         return (false, false);
@@ -278,8 +303,12 @@ fn analyze_function_purity(
                     }
                 }
                 Instruction::Call { func: callee, info } => {
-                    let callee_const = const_fns.contains(callee.as_str()) || info.is_const;
-                    let callee_pure = pure_fns.contains(callee.as_str()) || info.is_pure;
+                    let callee_const = const_fns.contains(callee.as_str())
+                        || info.is_const
+                        || lib.is_const(callee, info);
+                    let callee_pure = pure_fns.contains(callee.as_str())
+                        || info.is_pure
+                        || lib.is_pure(callee, info);
 
                     if !callee_const {
                         is_const = false;
@@ -430,7 +459,12 @@ mod memory_read_tests {
                     source_spans: vec![],
                 });
                 assert_eq!(
-                    analyze_function_purity(&f, &FxHashSet::default(), &FxHashSet::default()),
+                    analyze_function_purity(
+                        &f,
+                        &FxHashSet::default(),
+                        &FxHashSet::default(),
+                        &LibraryFacts::default(),
+                    ),
                     (false, false),
                     "{op:?}, {pointer:?}"
                 );
@@ -482,7 +516,12 @@ mod memory_read_tests {
                 });
                 f.next_value_id = 2;
                 assert_eq!(
-                    analyze_function_purity(&f, &FxHashSet::default(), &FxHashSet::default()),
+                    analyze_function_purity(
+                        &f,
+                        &FxHashSet::default(),
+                        &FxHashSet::default(),
+                        &LibraryFacts::default(),
+                    ),
                     (false, false),
                     "{op:?}, source={source:?}"
                 );
@@ -550,7 +589,12 @@ mod memory_read_tests {
             // Analyze the pre-DCE IR; an unused nonvolatile reader may later
             // disappear, but it must not be classified as read-none while present.
             assert_eq!(
-                analyze_function_purity(&f, &FxHashSet::default(), &FxHashSet::default()),
+                analyze_function_purity(
+                    &f,
+                    &FxHashSet::default(),
+                    &FxHashSet::default(),
+                    &LibraryFacts::default(),
+                ),
                 (true, !op.may_read_memory()),
                 "{op:?}"
             );

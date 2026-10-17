@@ -1513,6 +1513,13 @@ fn peephole_optimize_inner(
         if !sk("store_fwd") {
             global_changed |= store_forwarding::global_store_forwarding(&mut store, &mut infos);
         }
+        // Store forwarding replaces same-register scalar reloads with an
+        // exact zeroing `movq %xmmN, %xmmN`; drop the ones whose upper-half
+        // zeroing nothing observes.
+        if !sk("zeroing_self_move") {
+            global_changed |=
+                vector_copy::eliminate_unobserved_zeroing_self_moves(&store, &mut infos);
+        }
         if !sk("spill_deref") {
             global_changed |= spill_deref::fold_spill_deref_roundtrip(&mut store, &mut infos);
         }
@@ -1548,7 +1555,7 @@ fn peephole_optimize_inner(
         if !sk("dead_regs") {
             global_changed |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
             global_changed |= dead_code::eliminate_dead_fp_moves(&store, &mut infos);
-            self_zext::eliminate_redundant_self_zext(&store, &mut infos);
+            global_changed |= self_zext::eliminate_redundant_self_zext(&store, &mut infos);
         }
         if !sk("dead_stores") {
             global_changed |= dead_code::eliminate_dead_stores(&store, &mut infos);
@@ -1670,7 +1677,14 @@ fn peephole_optimize_inner(
             if !sk("dead_regs") {
                 changed2 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
                 changed2 |= dead_code::eliminate_dead_fp_moves(&store, &mut infos);
-                self_zext::eliminate_redundant_self_zext(&store, &mut infos);
+                changed2 |= self_zext::eliminate_redundant_self_zext(&store, &mut infos);
+            }
+            // A redundant self-zext deleted above can be the only line
+            // separating a `mov MEM,%d; <inc %d>; mov %d,MEM` trio (the
+            // emitter re-zero-extends a 32-bit index before each access),
+            // and Phase 1's `mem_rmw` never runs again: re-try the fold here.
+            if !sk("mem_rmw") {
+                changed2 |= memory_fold::fold_memory_rmw(&mut store, &mut infos);
             }
             if !sk("dead_stores") {
                 changed2 |= dead_code::eliminate_dead_stores(&store, &mut infos);
@@ -1763,7 +1777,14 @@ fn peephole_optimize_inner(
             if !sk("dead_regs") {
                 changed3 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
                 changed3 |= dead_code::eliminate_dead_fp_moves(&store, &mut infos);
-                self_zext::eliminate_redundant_self_zext(&store, &mut infos);
+                changed3 |= self_zext::eliminate_redundant_self_zext(&store, &mut infos);
+            }
+            // A redundant self-zext deleted above can be the only line
+            // separating a `mov MEM,%d; <inc %d>; mov %d,MEM` trio (the
+            // emitter re-zero-extends a 32-bit index before each access),
+            // and Phase 1's `mem_rmw` never runs again: re-try the fold here.
+            if !sk("mem_rmw") {
+                changed3 |= memory_fold::fold_memory_rmw(&mut store, &mut infos);
             }
             if !sk("dead_stores") {
                 changed3 |= dead_code::eliminate_dead_stores(&store, &mut infos);
@@ -5365,3 +5386,6 @@ mod regression_tests {
 
 #[cfg(test)]
 mod debug_adjacency_tests;
+
+#[cfg(test)]
+mod scalar_transfer_tests;

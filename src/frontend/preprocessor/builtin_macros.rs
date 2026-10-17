@@ -40,8 +40,15 @@ fn define_limits_macros(macros: &mut MacroTable) {
     def(macros, "SCHAR_MIN", "(-128)");
     def(macros, "SCHAR_MAX", "127");
     def(macros, "UCHAR_MAX", "255");
-    def(macros, "CHAR_MIN", "(-128)");
-    def(macros, "CHAR_MAX", "127");
+    // Plain `char` follows the one signedness answer (target default,
+    // -f[no-]signed-char / -f[no-]unsigned-char), like `__CHAR_UNSIGNED__`.
+    if crate::common::types::char_is_unsigned() {
+        def(macros, "CHAR_MIN", "0");
+        def(macros, "CHAR_MAX", "255");
+    } else {
+        def(macros, "CHAR_MIN", "(-128)");
+        def(macros, "CHAR_MAX", "127");
+    }
 
     // short
     def(macros, "SHRT_MIN", "(-32768)");
@@ -407,14 +414,12 @@ fn define_type_traits_macros(macros: &mut MacroTable) {
     def(macros, "__ORDER_BIG_ENDIAN__", "4321");
     def(macros, "__ORDER_PDP_ENDIAN__", "3412");
 
-    // __CHAR_UNSIGNED__: defined iff the target's plain `char` is unsigned.
-    // Derived from the same process-global `char_is_unsigned()` the type
-    // system consults, so the type, this macro and glibc's `<limits.h>`
-    // (which computes CHAR_MIN/CHAR_MAX from it) cannot disagree — the three
-    // used to drift, and `-funsigned-char` on x86-64 flipped only the type,
-    // leaving CHAR_MIN at -128.  The driver records the per-target default
-    // (unsigned on AArch64/RISC-V SysV, signed on x86) before parsing and the
-    // -funsigned-char / -fsigned-char overrides after it.
+    // __CHAR_UNSIGNED__: defined iff plain `char` is unsigned, read from the
+    // same `char_is_unsigned()` the type system consults, so the type, this
+    // macro and glibc's <limits.h> (which derives CHAR_MIN/CHAR_MAX from it)
+    // give one answer.  The driver records the target default (unsigned on
+    // AArch64 and RISC-V SysV, signed on x86) and then the flag overrides,
+    // all before preprocessing starts.
     if crate::common::types::char_is_unsigned() {
         def(macros, "__CHAR_UNSIGNED__", "1");
     }

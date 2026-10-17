@@ -31,6 +31,8 @@
 #                         interim autosave (ledger: *-PARTIAL-NOT-DELIVERABLE).
 #         LCCC_SNAPSHOT_UNGATED=1 — emergency pre-wipe save without that proof
 #                         (ledger ci_gate=UNGATED; never a delivery candidate).
+#         LCCC_SOURCE_ARCHIVE_XZ=1 — bounded-memory xz source fallback; gzip
+#                         remains the compatibility default. Recovery accepts both.
 #         LCCC_BASE_REF — explicit upstream base for a rebase/new session.
 #                         When set, it atomically supersedes artifacts/.base_ref
 #                         after ancestry validation.
@@ -355,30 +357,38 @@ rm -rf "$series_tmp"
 # mktemp IN THE DESTINATION DIRECTORY: the rename below must stay within one
 # filesystem to be atomic (audit F8 — a cross-fs mv is copy+unlink, and a kill
 # mid-copy would publish a truncated tarball, breaking the header invariant).
-tar_tmp=$(mktemp "$BULK/.lccc-src.tar.gz.tmp.XXXXXX")
+source_name=lccc-src.tar.gz
+source_compressor=(gzip -n)
+source_verify=(gzip -t)
+if [[ ${LCCC_SOURCE_ARCHIVE_XZ:-0} == 1 ]]; then
+  source_name=lccc-src.tar.xz
+  source_compressor=(xz -T1 -3 -c)
+  source_verify=(xz -t)
+fi
+tar_tmp=$(mktemp "$BULK/.$source_name.tmp.XXXXXX")
 # Archive the validated COMMIT, not a worktree containing logs/build caches.
-if ! git archive --format=tar --prefix=lccc/ "$HEAD_SHA" | gzip -n > "$tar_tmp"; then
+if ! git archive --format=tar --prefix=lccc/ "$HEAD_SHA" | "${source_compressor[@]}" > "$tar_tmp"; then
   rm -f "$tar_tmp"
   echo "source archive creation failed; preserving prior archive" >&2
   exit 1
 fi
-gzip -t "$tar_tmp"
+"${source_verify[@]}" "$tar_tmp"
 [[ -s "$tar_tmp" ]] || { rm -f "$tar_tmp"; echo "source tarball is empty" >&2; exit 1; }
 sync -f "$tar_tmp" 2>/dev/null || true
 chmod 644 "$tar_tmp"
-mv -f "$tar_tmp" "$BULK/lccc-src.tar.gz"
-tar_sha=$(sha256sum "$BULK/lccc-src.tar.gz" | awk '{print $1}')
+mv -f "$tar_tmp" "$BULK/$source_name"
+tar_sha=$(sha256sum "$BULK/$source_name" | awk '{print $1}')
 # A small authenticated offline recipe makes the compact history recoverable
 # even without network/BASE objects: reverse the exact cumulative patch from
 # the HEAD source, verify BASE's tree, then write its original commit bytes.
 # This is independently atomic metadata, not a multi-file transaction claim.
-python3 - "$REPO" "$BASE" "$HEAD_SHA" "$tar_sha" "$patch_sha" "$DELIVERABLE" <<'PYSOURCE' | atomic_write "$ART/SOURCE_ARCHIVE.json"
+python3 - "$REPO" "$BASE" "$HEAD_SHA" "$tar_sha" "$patch_sha" "$DELIVERABLE" "$source_name" <<'PYSOURCE' | atomic_write "$ART/SOURCE_ARCHIVE.json"
 import base64,json,subprocess,sys
-repo,base,head,archive_sha,patch_sha,patch=sys.argv[1:]
+repo,base,head,archive_sha,patch_sha,patch,source_name=sys.argv[1:]
 def git(*args):return subprocess.check_output(['git','-C',repo,*args])
 raw=git('cat-file','commit',base)
 if len(raw)>65536:raise ValueError('BASE commit exceeds offline recipe budget')
-print(json.dumps(dict(format='lccc-source-archive-v2',archive='lccc-src.tar.gz',archive_sha256=archive_sha,
+print(json.dumps(dict(format='lccc-source-archive-v2',archive=source_name,archive_sha256=archive_sha,
     patch=__import__('pathlib').Path(patch).name,patch_sha256=patch_sha,prefix='lccc/',head=head,
     tree=git('rev-parse',head+'^{tree}').decode().strip(),branch=git('branch','--show-current').decode().strip(),
     base=base,base_commit_base64=base64.b64encode(raw).decode(),
@@ -495,7 +505,7 @@ echo "SNAPSHOT $tag"
 echo "  base       : $BASE"
 echo "  head       : $HEAD_SHA"
 echo "  deliverable: $DELIVERABLE ($bytes bytes, sha256 $patch_sha) [$verdict, $ci_gate]"
-echo "  source tar : $BULK/lccc-src.tar.gz (sha256 $tar_sha)"
+echo "  source tar : $BULK/$source_name (sha256 $tar_sha)"
 echo "  bundle     : $ART/lccc-session.bundle (requires upstream base) (sha256 $bundle_sha)"
 echo "  artifacts  : $ART"
 echo "  bulk       : $BULK"

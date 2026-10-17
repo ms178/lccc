@@ -294,7 +294,7 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
                     }
                     _ => {}
                 },
-                Instruction::Call { func, info } => {
+                Instruction::Call { func, info } if info.assume_library => {
                     if matches!(
                         func.as_str(),
                         "fabs"
@@ -1030,7 +1030,9 @@ fn try_simplify_with_types(
             }
             None
         }
-        Instruction::Call { func, info } => {
+        // Only a call that reaches the C library function has its semantics
+        // (`CallInfo::assume_library`; false under `-fno-builtin[-<fn>]`).
+        Instruction::Call { func, info } if info.assume_library => {
             if let Some(d) = info.dest {
                 simplify_math_call(d, func, &info.args, info.return_type)
             } else {
@@ -1981,6 +1983,83 @@ fn unbiased_even_product_half(
     None
 }
 
+/// Exact reciprocal for a normal binary power of two, with a normal reciprocal.
+/// Multiplication and division then have the same exact real result and the
+/// same single rounding. Excluding subnormal constants on BOTH sides also
+/// preserves DAZ behavior: flushing a newly subnormal reciprocal to zero would
+/// not be equivalent to division by a large normal constant. Construct bits;
+/// never approximate a reciprocal using host floating arithmetic.
+fn normal_power_of_two_reciprocal(rhs: &Operand, ty: IrType) -> Option<IrConst> {
+    match (ty, rhs) {
+        (IrType::F64, Operand::Const(IrConst::F64(value))) => {
+            let bits = value.to_bits();
+            let exponent = (bits >> 52) & 0x7ff;
+            if bits & 0x000f_ffff_ffff_ffff != 0 || !(1..=2045).contains(&exponent) {
+                return None;
+            }
+            Some(IrConst::F64(f64::from_bits(
+                (bits & (1 << 63)) | ((2046 - exponent) << 52),
+            )))
+        }
+        (IrType::F32, Operand::Const(IrConst::F32(value))) => {
+            let bits = value.to_bits();
+            let exponent = (bits >> 23) & 0xff;
+            if bits & 0x007f_ffff != 0 || !(1..=253).contains(&exponent) {
+                return None;
+            }
+            Some(IrConst::F32(f32::from_bits(
+                (bits & (1 << 31)) | ((254 - exponent) << 23),
+            )))
+        }
+        _ => None,
+    }
+}
+
+/// `Bzhi(0, n)` keeps bits of zero.  A constant index is a fixed mask: only
+/// its low eight bits count, `k >= W` is the identity and `k == 0` keeps
+/// nothing; anything else is the plain `and` every later pass (known bits,
+/// demanded bits, immediates) already understands.  `None` keeps the
+/// operation (opaque index on a nonzero source).
+fn simplify_bzhi(
+    dest: Value,
+    lhs: &Operand,
+    rhs: &Operand,
+    ty: IrType,
+    lhs_zero: bool,
+) -> Option<Instruction> {
+    if lhs_zero {
+        return Some(Instruction::Copy {
+            dest,
+            src: Operand::Const(IrConst::zero(ty)),
+        });
+    }
+    let Operand::Const(c) = rhs else {
+        return None;
+    };
+    let index = c.to_i128()?;
+    let k = (index & 0xFF) as u32;
+    let bits = (ty.size() * 8) as u32;
+    if bits == 0 || bits > 64 {
+        return None;
+    }
+    if k >= bits {
+        return Some(Instruction::Copy { dest, src: *lhs });
+    }
+    if k == 0 {
+        return Some(Instruction::Copy {
+            dest,
+            src: Operand::Const(IrConst::zero(ty)),
+        });
+    }
+    Some(Instruction::BinOp {
+        dest,
+        op: IrBinOp::And,
+        lhs: *lhs,
+        rhs: Operand::Const(IrConst::from_i64(((1u64 << k) - 1) as i64, ty)),
+        ty,
+    })
+}
+
 fn simplify_binop(
     dest: Value,
     op: IrBinOp,
@@ -2153,6 +2232,17 @@ fn simplify_binop(
             }
         }
         IrBinOp::SDiv | IrBinOp::UDiv => {
+            if op == IrBinOp::SDiv
+                && let Some(reciprocal) = normal_power_of_two_reciprocal(rhs, ty)
+            {
+                return Some(Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Mul,
+                    lhs: *lhs,
+                    rhs: Operand::Const(reciprocal),
+                    ty,
+                });
+            }
             if rhs_one {
                 // x / 1 => x (valid for both int and float)
                 return Some(Instruction::Copy { dest, src: *lhs });
@@ -2430,6 +2520,11 @@ fn simplify_binop(
                 if bits > 0 && amount.rem_euclid(bits) == 0 {
                     return Some(Instruction::Copy { dest, src: *lhs });
                 }
+            }
+        }
+        IrBinOp::Bzhi => {
+            if let Some(rewritten) = simplify_bzhi(dest, lhs, rhs, ty, lhs_zero) {
+                return Some(rewritten);
             }
         }
     }
@@ -3122,7 +3217,6 @@ fn float_const(return_type: IrType, val: f64) -> IrConst {
 /// Optimizations:
 /// - pow(x, 2.0) / powf(x, 2.0f) => x * x  (avoids expensive libm call)
 /// - pow(x, 0.0) => 1.0, pow(x, 1.0) => x
-/// - pow(x, 0.5) => sqrt(x), powf(x, 0.5f) => sqrtf(x)
 /// - pow(x, -1.0) => 1.0 / x
 /// - sqrt(x) / sqrtf(x) => SqrtF64/SqrtF32 intrinsic (inline instruction)
 /// - fabs(x) / fabsf(x) => FabsF64/FabsF32 intrinsic (inline instruction)
@@ -3237,20 +3331,10 @@ fn simplify_math_call(
                 ty: return_type,
             });
         }
-        if exp == 0.5 {
-            // pow(x, 0.5) => sqrt(x)
-            let sqrt_op = if return_type == IrType::F32 {
-                IntrinsicOp::SqrtF32
-            } else {
-                IntrinsicOp::SqrtF64
-            };
-            return Some(Instruction::Intrinsic {
-                dest: Some(dest),
-                op: sqrt_op,
-                dest_ptr: None,
-                args: vec![base],
-            });
-        }
+        // pow(x, 0.5) is NOT sqrt(x): pow(-0, 0.5) = +0 and
+        // pow(-inf, 0.5) = +inf (C17 F.10.4.4), where sqrt gives -0 and NaN.
+        // GCC 16.2 and Clang 23.1 keep the call at -O2, even with
+        // -fno-math-errno; only unsafe-math licenses the rewrite.
     }
 
     None
@@ -3273,6 +3357,9 @@ pub fn fold_math_intrinsic_calls(module: &mut IrModule) {
         for block in &mut func.blocks {
             for inst in &mut block.instructions {
                 if let Instruction::Call { func: callee, info } = inst {
+                    if !info.assume_library {
+                        continue;
+                    }
                     if let Some(d) = info.dest {
                         if let Some(new_inst) =
                             simplify_math_call(d, callee, &info.args, info.return_type)
@@ -3378,6 +3465,9 @@ mod tests {
                 regparm: None,
                 is_pure: false,
                 is_const: false,
+                // A call to the C library function (what lowering produces for a
+                // hosted TU without -fno-builtin).
+                assume_library: true,
                 ret_eightbyte_classes: Vec::new(),
                 ret_is_f128_sse: false,
             },
@@ -3956,10 +4046,91 @@ mod tests {
     }
 
     #[test]
-    fn test_float_div_one_not_simplified() {
-        // x / F64(1.0) is not simplified because is_one() only matches integer 1.
+    fn test_float_div_one_keeps_an_fp_operation() {
+        // A copy would lose signaling-NaN quieting/invalid. Multiplication by
+        // exact normal 1 retains that operation; this is not an x/1 -> x fold.
         let inst = binop_val_const(IrBinOp::SDiv, IrConst::F64(1.0), IrType::F64);
-        assert!(simplify_default(&inst).is_none());
+        assert!(matches!(simplify_default(&inst), Some(Instruction::BinOp {
+            op: IrBinOp::Mul, rhs: Operand::Const(IrConst::F64(v)), ..
+        }) if v == 1.0));
+    }
+
+    #[test]
+    fn exact_reciprocals_cover_both_signs_and_every_normal_exponent() {
+        for sign in [0u64, 1 << 63] {
+            for exponent in 1u64..=2045 {
+                let divisor = f64::from_bits(sign | (exponent << 52));
+                let result = normal_power_of_two_reciprocal(
+                    &Operand::Const(IrConst::F64(divisor)),
+                    IrType::F64,
+                );
+                let Some(IrConst::F64(inverse)) = result else {
+                    panic!("normal reciprocal missing")
+                };
+                assert!(inverse.is_normal());
+                assert_eq!(divisor * inverse, 1.0);
+                assert_eq!(inverse.is_sign_negative(), divisor.is_sign_negative());
+            }
+        }
+        for sign in [0u32, 1 << 31] {
+            for exponent in 1u32..=253 {
+                let divisor = f32::from_bits(sign | (exponent << 23));
+                let result = normal_power_of_two_reciprocal(
+                    &Operand::Const(IrConst::F32(divisor)),
+                    IrType::F32,
+                );
+                let Some(IrConst::F32(inverse)) = result else {
+                    panic!("normal reciprocal missing")
+                };
+                assert!(inverse.is_normal());
+                assert_eq!(divisor * inverse, 1.0);
+                assert_eq!(inverse.is_sign_negative(), divisor.is_sign_negative());
+            }
+        }
+    }
+
+    #[test]
+    fn reciprocal_strength_reduction_rejects_approximation_and_daz_traps() {
+        for value in [
+            0.0,
+            -0.0,
+            3.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            f64::from_bits(1),
+            f64::from_bits(2046 << 52),
+            f64::from_bits(0x3ff0000000000001),
+        ] {
+            assert!(
+                normal_power_of_two_reciprocal(&Operand::Const(IrConst::F64(value)), IrType::F64)
+                    .is_none()
+            );
+        }
+        for value in [
+            0.0,
+            -0.0,
+            3.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::from_bits(1),
+            f32::from_bits(254 << 23),
+            f32::from_bits(0x3f800001),
+        ] {
+            assert!(
+                normal_power_of_two_reciprocal(&Operand::Const(IrConst::F32(value)), IrType::F32)
+                    .is_none()
+            );
+        }
+        assert!(
+            normal_power_of_two_reciprocal(&Operand::Const(IrConst::F32(2.0)), IrType::F64)
+                .is_none()
+        );
+        assert!(
+            normal_power_of_two_reciprocal(&Operand::Const(IrConst::I64(2)), IrType::F64).is_none()
+        );
+        assert!(normal_power_of_two_reciprocal(&Operand::Value(Value(1)), IrType::F32).is_none());
     }
 
     // === Math call simplification tests ===
@@ -4143,20 +4314,36 @@ mod tests {
         }
     }
 
+    /// pow(-0, 0.5) = +0 and pow(-inf, 0.5) = +inf, but sqrt gives -0 and
+    /// NaN: the call must stay (GCC 16.2 / Clang 23.1 agree at -O2).
     #[test]
-    fn test_pow_x_half() {
+    fn test_pow_x_half_is_not_sqrt() {
         let inst = make_call(
             "pow",
             vec![Operand::Value(Value(1)), Operand::Const(IrConst::F64(0.5))],
             IrType::F64,
         );
-        let result = simplify_default(&inst).unwrap();
-        match result {
-            Instruction::Intrinsic {
-                op: IntrinsicOp::SqrtF64,
-                ..
-            } => {}
-            _ => panic!("Expected SqrtF64 intrinsic, got {:?}", result),
+        assert!(simplify_default(&inst).is_none());
+    }
+
+    /// `-fno-builtin[-sqrt]`: a call that does not reach the library
+    /// function has no known semantics and is never rewritten.
+    #[test]
+    fn withdrawn_math_calls_are_not_folded() {
+        for (name, args) in [
+            ("sqrt", vec![Operand::Value(Value(1))]),
+            ("fabs", vec![Operand::Value(Value(1))]),
+            (
+                "pow",
+                vec![Operand::Value(Value(1)), Operand::Const(IrConst::F64(2.0))],
+            ),
+        ] {
+            let mut inst = make_call(name, args, IrType::F64);
+            assert!(simplify_default(&inst).is_some(), "{name}");
+            if let Instruction::Call { info, .. } = &mut inst {
+                info.assume_library = false;
+            }
+            assert!(simplify_default(&inst).is_none(), "{name}");
         }
     }
 
@@ -5703,6 +5890,117 @@ mod tests {
                 assert_eq!(ty, IrType::I32);
             }
             other => panic!("expected BitTest through cast, got {other:?}"),
+        }
+    }
+
+    /// A constant `Bzhi` index becomes a copy, a zero or an `and`; evaluating
+    /// the rewrite must give the instruction's result (Intel SDM BZHI: index
+    /// bits 7:0, the source unchanged from the width on) for every source.
+    #[test]
+    fn bzhi_constant_index_rewrites_are_exact() {
+        fn oracle(x: u64, n: u64, width: u32) -> u64 {
+            let k = n & 0xFF;
+            if k >= u64::from(width) {
+                x
+            } else {
+                x & ((1u64 << k) - 1)
+            }
+        }
+        let sources = [
+            0u64,
+            1,
+            0x8000_0000,
+            0xFFFF_FFFF,
+            1 << 63,
+            u64::MAX,
+            0x0123_4567_89AB_CDEF,
+        ];
+        let indices = [
+            0u64,
+            1,
+            31,
+            32,
+            33,
+            63,
+            64,
+            255,
+            256,
+            257,
+            0x1_0000_0020,
+            u64::MAX,
+            0xFFFF_FFFF_FFFF_FF1F,
+        ];
+        for ty in [IrType::I32, IrType::U32, IrType::I64, IrType::U64] {
+            let width = (ty.size() * 8) as u32;
+            for n in indices {
+                let index = IrConst::from_i64(n as i64, ty);
+                let got = simplify_binop(
+                    Value(4),
+                    IrBinOp::Bzhi,
+                    &Operand::Value(Value(1)),
+                    &Operand::Const(index),
+                    ty,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                )
+                .unwrap_or_else(|| panic!("constant-index Bzhi({n:#x}) at {ty:?} not rewritten"));
+                for x in sources {
+                    let x = ty.truncate_i64(x as i64);
+                    let value = match &got {
+                        Instruction::Copy {
+                            src: Operand::Value(Value(1)),
+                            ..
+                        } => x,
+                        Instruction::Copy {
+                            src: Operand::Const(c),
+                            ..
+                        } => c.to_i64().unwrap(),
+                        Instruction::BinOp {
+                            op: IrBinOp::And,
+                            lhs: Operand::Value(Value(1)),
+                            rhs: Operand::Const(mask),
+                            ty: and_ty,
+                            ..
+                        } if *and_ty == ty => x & mask.to_i64().unwrap(),
+                        other => panic!("unexpected Bzhi rewrite {other:?}"),
+                    };
+                    let want = ty.truncate_i64(oracle(x as u64, n, width) as i64);
+                    assert_eq!(
+                        ty.truncate_i64(value),
+                        want,
+                        "Bzhi({x:#x}, {n:#x}) at {ty:?} via {got:?}"
+                    );
+                }
+            }
+            let zero = simplify_binop(
+                Value(4),
+                IrBinOp::Bzhi,
+                &Operand::Const(IrConst::zero(ty)),
+                &Operand::Value(Value(2)),
+                ty,
+                &[],
+                &[],
+                &[],
+                &[],
+            );
+            assert!(
+                matches!(zero, Some(Instruction::Copy { src: Operand::Const(c), .. }) if c.to_i64() == Some(0)),
+                "Bzhi(0, n) at {ty:?} must fold to zero, got {zero:?}"
+            );
+            let opaque = simplify_binop(
+                Value(4),
+                IrBinOp::Bzhi,
+                &Operand::Value(Value(1)),
+                &Operand::Value(Value(2)),
+                ty,
+                &[],
+                &[],
+                &[],
+                &[],
+            );
+            assert!(opaque.is_none(), "opaque Bzhi must stay, got {opaque:?}");
         }
     }
 

@@ -2036,6 +2036,67 @@ mod tests {
     }
 
     #[test]
+    fn fp_pre_refuses_environment_barriers_but_integer_pre_remains_enabled() {
+        use crate::ir::reexports::CallInfo;
+        let fp_fixture = || {
+            let mut f = int_recurrence();
+            for block in &mut f.blocks {
+                for inst in &mut block.instructions {
+                    let convert =
+                        matches!(inst.dest(), Some(Value(1 | 2 | 3 | 4 | 5 | 6 | 7 | 9 | 13)));
+                    if convert {
+                        match inst {
+                            Instruction::Phi { ty, .. } => *ty = IrType::F64,
+                            Instruction::BinOp { ty, op, .. } => {
+                                *ty = IrType::F64;
+                                if !matches!(op, IrBinOp::Mul) {
+                                    *op = IrBinOp::Add;
+                                }
+                            }
+                            _ => {}
+                        }
+                        inst.for_each_operand_mut(|o| {
+                            if let Operand::Const(IrConst::I64(n)) = o {
+                                *o = Operand::Const(IrConst::F64(*n as f64));
+                            }
+                        });
+                    }
+                }
+            }
+            let mut result = IrFunction::new("fp".into(), IrType::F64, Vec::new(), false);
+            result.blocks = f.blocks;
+            result
+        };
+        let env = EnvConfig {
+            fp_broad: true,
+            ..ENV_CONFIG_DEFAULT
+        };
+        let tm = TargetModel {
+            fp_fma: false,
+            ..TargetModel::detect()
+        };
+        assert!(run_round(&mut fp_fixture(), &env, &tm) > 0);
+        for at in [3, 5, 10] {
+            let call = Instruction::Call {
+                func: "fesetround".into(),
+                info: CallInfo::default(),
+            };
+            let mut f = fp_fixture();
+            f.blocks[1].instructions.insert(at, call.clone());
+            assert_eq!(run_round(&mut f, &env, &tm), 0);
+            let mut integer = int_recurrence();
+            integer.blocks[1].instructions.insert(at, call);
+            assert!(run_round(&mut integer, &env, &tm) > 0);
+        }
+        let mut observable = fp_fixture();
+        observable.pass_policy.fp_environment_observable = true;
+        assert_eq!(run_round(&mut observable, &env, &tm), 0);
+        let mut integer = int_recurrence();
+        integer.pass_policy.fp_environment_observable = true;
+        assert!(run_round(&mut integer, &env, &tm) > 0);
+    }
+
+    #[test]
     fn singly_used_fp_square_is_left_alone_by_default() {
         let mut f = int_recurrence();
         for b in &mut f.blocks {

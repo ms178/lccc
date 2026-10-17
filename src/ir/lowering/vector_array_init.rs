@@ -18,13 +18,6 @@ pub(super) struct VectorArrayInitPlan {
     pub(super) elements: Vec<Option<Initializer>>,
 }
 
-/// Return true when `ty` is an array (possibly multidimensional) whose leaf is
-/// an ext-vector object. Incomplete dimensions are deliberately not considered
-/// an ext-vector-array shape until the declaration's bound has been completed.
-pub(super) fn is_ext_vector_array_type(ty: &CType) -> bool {
-    vector_array_leaf_count(ty).is_some_and(|(is_array, _)| is_array)
-}
-
 fn vector_array_leaf_count(ty: &CType) -> Option<(bool, usize)> {
     match ty {
         CType::ExtVector(..) => Some((false, 1)),

@@ -125,6 +125,8 @@ jobs:
         export RUSTFLAGS="$(cat target/lccc-rustflags)"
         python3 scripts/ci_test_report.py --self-test
         python3 scripts/ci_test_report.py -- cargo test --profile fastbuild --all-targets --locked -j 2
+        python3 tests/regression/check_avx512_scalar_witness.py --self-test
+        python3 tests/regression/check_avx512_scalar_witness.py
     - name: Package immutable compiler executables
       run: |
         set -euo pipefail
@@ -489,6 +491,10 @@ jobs:
       run: |
         python3 scripts/test_local_oracles.py
         python3 scripts/test_icx_provision.py
+    - name: Verify binary-equivalence attribution contracts
+      run: python3 tests/corpus/test_binary_equivalence.py
+    - name: Verify benchmark harness oracle and timing contracts
+      run: python3 tests/benchmark/test_benchmark_harness.py
     - name: Verify GCC provisioning contracts (mock only)
       run: python3 tests/regression/check_ci_gcc16_provisioning.py
     - name: Verify swap provisioning contracts (mock only)
@@ -543,6 +549,10 @@ jobs:
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_aggregate_call_abi.sh
     - name: Vector arguments and returns at the compiler boundary
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_vector_abi_boundary.sh
+    - name: SysV by-value aggregate and vector ABI against GCC 16
+      run: python3 tests/regression/check_sysv_aggregate_abi.py --lccc target/fastbuild/lccc --cc gcc-16
+    - name: Vector argument operand forms against GCC 16
+      run: python3 tests/regression/check_vector_arg_forms.py --lccc target/fastbuild/lccc --cc gcc-16
     - name: Wide-vector ABI debt (latched)
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_vector_abi_wide.sh
     - name: LCCC vs GCC compatibility suite
@@ -558,6 +568,8 @@ jobs:
         env CCC=target/fastbuild/lccc python3 scripts/check_repro_replay.py
     - name: Shuffle builtin diagnostics
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_shuffle_diagnostics.sh
+    - name: Subscript constraint diagnostics
+      run: env CCC=target/fastbuild/lccc python3 tests/regression/check_subscript_diagnostics.py
     - name: Cross-target intrinsic trap
       run: |
         env CCC=target/fastbuild/lccc \
@@ -593,6 +605,10 @@ jobs:
       run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_static_local_init.sh
     - name: Designated initializer validity
       run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_designator_init.sh
+    - name: Vector initializers inside aggregates
+      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_vector_static_init.sh
+    - name: Void declarators and initializers
+      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_void_declarators.sh
     - name: File-scope constant initializers
       run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_file_scope_init.sh
     - name: Const-object read folding
@@ -697,6 +713,7 @@ jobs:
         python3 scripts/check_byte_count_normalize.py --lccc target/fastbuild/lccc --gcc gcc-16 --output target/pr835-byte-count --json target/pr835-byte-count.json
         bash tests/regression/check_byte_accessor_inline.sh
         bash tests/regression/check_unsigned_affine_loop.sh
+        python3 tests/regression/check_affine_wrapv_differential.py --lccc target/fastbuild/lccc --cc gcc-16
     - name: Benchmark output gate (workload kernels vs GCC oracle)
       env:
         GCC_BIN: gcc-16
@@ -743,6 +760,14 @@ jobs:
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_enum_tag_scope_compat.sh
     - name: Embedded-NUL strlen contract
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_strlen_embedded_nul.sh
+    # Enum/enumerator types and `_Alignas(type)` member layout, on x86-64 and
+    # i686 (the corpus covers x86-64 only; these layouts differ on i686).
+    - name: Enum type and alignas layout fixtures
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_fixture_modes.sh enum_type_semantics.c alignas_type_layout.c
+    # Type-dependent `_Static_assert` conditions are decided by sema; false
+    # ones must be rejected, not silently accepted.
+    - name: Static assertion semantics
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_static_assert_sema.sh
     - name: Volatile destructuring ratchet
       run: |
         python3 scripts/check_volatile_destructuring.py --self-test
@@ -1223,6 +1248,9 @@ jobs:
         # layout agree across the probe set; a 16 GB object compiles under
         # a hard RSS ceiling. Mirrored in scripts/ci_local.sh.
         python3 tests/regression/check_sparse_bss_equivalence.py --lccc target/fastbuild/lccc
+        # NOBITS / `.org` parity on all four targets against pinned GAS
+        # verdicts.  Mirrored in scripts/ci_local.sh (parity-checked).
+        python3 tests/regression/check_nobits_org_parity.py --lccc target/fastbuild/lccc
         # UB-exploitation invariant (E22): `-fno-strict-aliasing`,
         # `-fwrapv` and `-fno-strict-overflow` are tolerated only because
         # this optimizer exploits no undefined behaviour (no TBAA, no
@@ -1245,8 +1273,10 @@ jobs:
         # contract, the ungated __*_chk rows and three runtime programs.
         bash tests/regression/check_libcall_synthesis_no_selfcall.sh
         # Plain-`char` signedness must be one answer, not three: the type
-        # system, `__CHAR_UNSIGNED__` and glibc's `CHAR_MIN`/`CHAR_MAX` (which
-        # derives from that macro) all follow `char_is_unsigned()`.
+        # system, `__CHAR_UNSIGNED__`, lccc's predefined CHAR_MIN/CHAR_MAX and
+        # glibc's `<limits.h>` (which derives from that macro) all follow
+        # `char_is_unsigned()`, including the -fno-signed-char /
+        # -fno-unsigned-char spellings.
         # `-funsigned-char` used to flip only the type, leaving CHAR_MIN at
         # -128 on x86-64.  Behavioural rows against GCC, plus the AArch64 /
         # RISC-V defaults via the binary-name target selector (preprocessing
@@ -1356,6 +1386,7 @@ jobs:
         # at every opt level times every kill switch, plus the asm pins that
         # say the fold actually fired (and stayed off when refused).
         bash tests/regression/check_rmw_sib_folds.sh
+        bash tests/regression/check_rmw_index_zext_codegen.sh
         bash tests/regression/check_select_from_compare.sh
         bash tests/regression/check_affine_loop_fold.sh
         bash tests/regression/check_phi_acyclic_order.sh
@@ -1366,8 +1397,19 @@ jobs:
         # in ci_local.sh -- scripts/check_ci_gate_parity.py fails if the two
         # lists drift, which is how this line came to exist.
         bash tests/regression/check_fma_gating.sh
+        bash tests/regression/check_fma_dest_coalesce_codegen.sh
+        bash tests/regression/check_vector_remainder_codegen.sh
         bash tests/regression/check_fma_matcher_guards.sh
         bash tests/regression/check_redundant_test_elimination.sh
+        # Escaped-local frame addresses stay direct operands, direct -c
+        # objects equal -S + GNU as, devirtualized hot leaves inline, and C
+        # masks that only feed hardware-masked x86-64 shift counts are dropped.
+        python3 tests/regression/check_frame_gep_direct.py
+        python3 tests/regression/check_direct_assembly_parity.py
+        python3 tests/regression/check_inline_devirt_hot_leaf.py
+        python3 tests/regression/check_shift_count_demand.py
+        # BMI2 _bzhi_u32/_u64 lower to one bzhi and match GCC's results.
+        python3 tests/regression/check_bmi2_bzhi.py
         python3 tests/regression/verify_pr713_audit.py --quiet
         python3 scripts/check_doc_links.py
         # AUD-RATCHET-1: the audit census (scripts/audit_census.py) is the
@@ -1573,6 +1615,8 @@ jobs:
         if-no-files-found: error
   test:
     name: Test Suite
+    # A one-step result aggregator: bound it like every other job.
+    timeout-minutes: 5
     runs-on: ubuntu-24.04
     needs:
     - build

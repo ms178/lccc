@@ -240,20 +240,17 @@ impl Lowerer {
                     }
                     item_idx = advanced.new_item_idx;
                 }
-                // Vector fields use their logical lane count and target storage
-                // stride; ext-vector bool lanes are bit-packed.
-                CType::Vector(_, _) | CType::ExtVector(_, _) => {
+                // Vector field (`vector_size` or `ext_vector_type`): a braced
+                // list of lanes or a vector value, at the vector's own lane
+                // stride (ext-vector `_Bool` lanes are bit-packed). The span
+                // is cleared first: a later union member replaces it whole.
+                CType::Vector(..) | CType::ExtVector(..) => {
                     let field_size = self.resolve_ctype_size(&field_layout.ty);
                     let end = field_offset.saturating_add(field_size).min(bytes.len());
                     if let Some(span) = bytes.get_mut(field_offset..end) {
                         span.fill(0);
                     }
-                    self.write_vector_init_to_bytes(
-                        bytes,
-                        field_offset,
-                        &field_layout.ty,
-                        &item.init,
-                    );
+                    self.write_vector_init_bytes(&item.init, &field_layout.ty, bytes, field_offset);
                     item_idx += 1;
                 }
                 // Complex field: write {real, imag} pair to bytes
@@ -409,80 +406,17 @@ impl Lowerer {
         }
     }
 
-    /// Write one vector initializer into a global byte image. Ordinary vectors
-    /// contain contiguous scalar lanes; ext vectors use their padded lane stride,
-    /// object tail padding, and (for bool lanes) packed bit representation.
-    pub(super) fn write_vector_init_to_bytes(
-        &self,
-        bytes: &mut [u8],
-        offset: usize,
-        vector_ty: &CType,
-        init: &Initializer,
-    ) {
-        let Some((elem_ty, lanes)) = vector_ty.vector_info() else {
-            return;
-        };
-        let nested_init = match init {
-            Initializer::List(items) => Some(items.as_slice()),
-            Initializer::Expr(expr) => match Self::strip_casts(expr) {
-                Expr::CompoundLiteral(_, nested, _) => match &**nested {
-                    Initializer::List(items) => Some(items.as_slice()),
-                    _ => None,
-                },
-                _ => None,
-            },
-        };
-        let Some(items) = nested_init else {
-            return;
-        };
-        let CType::ExtVector(_, layout) = vector_ty else {
-            let lane_size = elem_ty.size();
-            let elem_ir_ty = IrType::from_ctype(elem_ty);
-            for (lane, item) in items.iter().enumerate().take(lanes) {
-                let raw = self.eval_init_scalar(&item.init);
-                let val = if matches!(elem_ty, CType::Bool) {
-                    raw.bool_normalize()
-                } else {
-                    raw
-                };
-                self.write_const_to_bytes(bytes, offset + lane * lane_size, &val, elem_ir_ty);
-            }
-            return;
-        };
-        if layout.bitpacked_bool {
-            for (lane, item) in items.iter().enumerate().take(lanes) {
-                let raw = self.eval_init_scalar(&item.init);
-                if raw.is_nonzero() {
-                    let byte_offset = offset + lane / 8;
-                    if let Some(byte) = bytes.get_mut(byte_offset) {
-                        *byte |= 1 << (lane % 8);
-                    }
-                }
-            }
-            return;
-        }
-        let elem_ir_ty = IrType::from_ctype(elem_ty);
-        for (lane, item) in items.iter().enumerate().take(lanes) {
-            let raw = self.eval_init_scalar(&item.init);
-            let val = if matches!(elem_ty, CType::Bool) {
-                raw.bool_normalize()
-            } else {
-                raw
-            };
-            self.write_const_to_bytes(
-                bytes,
-                offset + lane * layout.element_storage_size,
-                &val,
-                elem_ir_ty,
-            );
-        }
-    }
-
     /// Evaluate an initializer to a scalar constant (handles both Expr and arbitrarily
     /// nested brace-wrapped Lists like `{{{42}}}`).
     pub(super) fn eval_init_scalar(&self, init: &Initializer) -> IrConst {
         match init {
-            Initializer::Expr(expr) => self.eval_const_expr(expr).unwrap_or(IrConst::I64(0)),
+            // A byte buffer holds no relocation: an element that is not an
+            // arithmetic constant is an error here, never a silent 0 (the
+            // classifiers route address constants to the compound path).
+            Initializer::Expr(expr) => self.eval_const_expr(expr).unwrap_or_else(|| {
+                self.diagnose_non_constant(expr);
+                IrConst::I64(0)
+            }),
             Initializer::List(sub_items) => {
                 if let Some(first) = sub_items.first() {
                     self.eval_init_scalar(&first.init)
@@ -819,6 +753,8 @@ impl Lowerer {
                         bytes,
                         field_offset,
                     );
+                } else if elem_ty.is_vector() {
+                    self.fill_array_of_vectors(sub_items, elem_ty, arr_size, bytes, field_offset);
                 } else if elem_ty.is_complex() {
                     // Array of complex elements: each sub-item initializes one complex value
                     self.fill_array_of_complex(

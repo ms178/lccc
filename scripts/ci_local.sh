@@ -254,9 +254,18 @@ gate "sparse-bss-nobits" fast \
 gate "sparse-bss-equivalence" fast \
     python3 tests/regression/check_sparse_bss_equivalence.py --lccc "$LCCC"
 
-# A13/A14: a pass may synthesise a libcall only when this TU does not
-# define that symbol (per symbol: an asm label, an alias or a static
-# definition counts), and a constant-size memcpy/memset call may be
+# NOBITS and `.org` parity on all four targets against pinned GAS verdicts
+# (sizes and bytes; re-measure with --oracle): zero runs, pads with any fill,
+# gigabyte runs, subsections and deferred skips are a size everywhere, and
+# `.org` -- dropped on RISC-V, refusing the kernel ALTERNATIVE check on
+# AArch64 -- follows GAS.  Deliberate divergences are listed in the script.
+gate "nobits-org-parity" fast \
+    python3 tests/regression/check_nobits_org_parity.py --lccc "$LCCC"
+
+# A13/A14: a pass may synthesise a libcall only when this TU neither defines
+# nor redirects that symbol (a body, an asm label, an alias or a top-level
+# asm mention) nor one its libc implementation calls (memmove -> memcpy,
+# puts -> fputs/fwrite/strlen), and a constant-size memcpy/memset call may be
 # expanded only while the callee still is the builtin. Refusals, positive
 # controls, the -fno-builtin/-ffreestanding contract, the ungated __*_chk
 # rows and three runtime programs.
@@ -264,11 +273,13 @@ gate "libcall-synthesis-no-selfcall" fast \
     env CCC="$LCCC" bash tests/regression/check_libcall_synthesis_no_selfcall.sh
 
 # Plain-`char` signedness must be one answer, not three: the type system,
-# `__CHAR_UNSIGNED__` and glibc's `CHAR_MIN`/`CHAR_MAX` (derived from that
-# macro) all follow `char_is_unsigned()`. `-funsigned-char` used to flip only
-# the type, leaving `CHAR_MIN` at -128 on x86-64.  Behavioural rows against
-# GCC, plus the AArch64/RISC-V defaults via the binary-name target selector
-# (preprocessing only).  Fast: five tiny compiles.
+# `__CHAR_UNSIGNED__`, lccc's predefined CHAR_MIN/CHAR_MAX and glibc's
+# `<limits.h>` (derived from that macro) all follow `char_is_unsigned()`,
+# including GCC's -fno-signed-char / -fno-unsigned-char spellings.
+# `-funsigned-char` used to flip only the type, leaving `CHAR_MIN` at -128 on
+# x86-64.  Behavioural rows against GCC (gcc-16 when present), plus the
+# AArch64/RISC-V defaults via the binary-name target selector (preprocessing
+# only).  Fast: a few tiny compiles.
 gate "char-signedness" fast \
     env CCC="$LCCC" bash tests/regression/check_char_signedness.sh
 
@@ -283,6 +294,12 @@ gate "va-arg-pack-len-folds" fast \
 
 gate "benchmark-codegen-registry" fast \
     python3 tests/regression/check_benchmark_codegen_registry.py
+
+gate "binary-equivalence-contracts" fast \
+    python3 tests/corpus/test_binary_equivalence.py
+
+gate "benchmark-harness-contracts" fast \
+    python3 tests/benchmark/test_benchmark_harness.py
 
 gate "gcc-provisioning-mocks" fast \
     python3 tests/regression/check_ci_gcc16_provisioning.py
@@ -334,6 +351,17 @@ gate "static-local-init" fast \
 
 gate "designator-init" fast \
     env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_designator_init.sh
+
+# Vector initializers inside aggregates (static, static-local, automatic;
+# arrays of vectors; brace elision; same-type and integer casts), byte for
+# byte against GCC 16.2 at -O0 and -O2.
+gate "vector-static-init" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_vector_static_init.sh
+
+# `void` objects, members, parameters and initializers (C11 6.7.6.3p10,
+# 6.7.9p3): every row's verdict and message against GCC 16.2.
+gate "void-declarators" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_void_declarators.sh
 
 # File-scope initializers (C11 6.7.9p4) against GCC 16.2, plus runtime values of
 # folded forms: a constant that is accepted but emitted as zero fails the values check.
@@ -403,6 +431,20 @@ gate "aggregate-call-abi" fast \
 gate "vector-abi-boundary" fast \
     env CCC="$LCCC" bash tests/regression/check_vector_abi_boundary.sh
 
+# x86-64 SysV by-value aggregates and vectors against GCC 16.2 in both call
+# directions (plus lccc<->lccc): 186 curated and seeded shapes (unions,
+# bit-fields, packed, nested, x87, _Float128, vectors) through scalar-only and
+# aggregate-argument signatures, initializers, assignments, conditionals,
+# register exhaustion and va_arg.
+gate "sysv-aggregate-abi" fast \
+    python3 tests/regression/check_sysv_aggregate_abi.py --lccc "$LCCC" --cc "${GCC:-gcc-16}"
+
+# Every operand form of a vector argument (lvalues, call results, conditionals,
+# comma, statement expressions, compound literals, ...) through direct,
+# variadic, K&R and struct-wrapped calls at -O0 and -O2, against GCC 16.2.
+gate "vector-arg-forms" fast \
+    python3 tests/regression/check_vector_arg_forms.py --lccc "$LCCC" --cc "${GCC:-gcc-16}"
+
 # AUD-VABI-2: the 32-byte case of the same rule (WHOLE %ymm with AVX on).  Not
 # fixable like the 16-byte one -- it needs a %ymm carrier through return and
 # argument classification, the prologue, location allocation and the call
@@ -427,7 +469,7 @@ gate "o-stdout" fast \
 
 # AUD-HYGIENE-1: the loose `tests/*.c`/`*.sh` scratch (compat_test.sh and the
 # IVSR/univsr probes) are gates now instead of unreferenced files.  The compat
-# suite is a 20-program run-and-compare differential against GCC; the probe
+# suite is a run-and-compare differential against GCC; the probe
 # gate is metamorphic -- the same programs must produce the same numbers with
 # the strength-reduction pass on, off, and at -O3.
 gate "compat-suite" fast \
@@ -442,6 +484,12 @@ gate "ivsr-reproducers" fast \
 # GCC does.
 gate "shuffle-diagnostics" fast \
     env CCC="$LCCC" bash tests/regression/check_shuffle_diagnostics.sh
+
+# C11 6.5.2.1p1: a subscript whose operands are not pointer + integer must be
+# diagnosed (LCCC lowered it as a pointer access, crashing struct-based
+# `__m256` code at run time); oracle-checked against gcc.
+gate "subscript-diagnostics" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" python3 tests/regression/check_subscript_diagnostics.py
 
 # AUD-SILENT-ZERO-1: a target that cannot execute an x86-only intrinsic must
 # trap at the first execution, not silently compute zeros (and must not trap
@@ -584,6 +632,14 @@ cargo_test_repeated() (
 )
 
 gate "cargo-test" fast cargo_test_repeated
+
+# The native AVX-512 masked scalar-forwarding witness is #[ignore]d because
+# hosts without AVX512F cannot execute it. Run it explicitly wherever the CPU
+# can; elsewhere the gate prints an explicit SKIP rather than a vacuous pass.
+gate "avx512-scalar-witness-selftest" fast \
+    python3 tests/regression/check_avx512_scalar_witness.py --self-test
+gate "avx512-scalar-witness" fast \
+    python3 tests/regression/check_avx512_scalar_witness.py
 
 # CI's second test run: the fastbuild profile inherits `release`, which
 # compiles every debug_assert! out -- the %rax shadow-epoch validator, the
@@ -1089,6 +1145,15 @@ gate "enum-tag-scope-compat" fast \
     env CCC="$LCCC" bash tests/regression/check_enum_tag_scope_compat.sh
 gate "strlen-embedded-nul" fast \
     env CCC="$LCCC" bash tests/regression/check_strlen_embedded_nul.sh
+# Enum/enumerator types and `_Alignas(type)` member layout on x86-64 and i686:
+# the corpus compares x86-64 output only, and both layouts differ on i686.
+gate "type-layout-fixtures" fast \
+    env CCC="$LCCC" bash tests/regression/check_fixture_modes.sh \
+    enum_type_semantics.c alignas_type_layout.c
+# False type-dependent `_Static_assert`s (sizeof, _Generic, enumerator types)
+# used to compile: the parser accepted whatever it could not evaluate.
+gate "static-assert-sema" fast \
+    env CCC="$LCCC" bash tests/regression/check_static_assert_sema.sh
 
 gate "copy-alias-sizes" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_copy_alias_sizes.sh
@@ -1105,6 +1170,9 @@ gate "tls-pie-preemptible" fast \
 gate "rmw-sib-folds" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_rmw_sib_folds.sh
 
+gate "rmw-index-zext" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_rmw_index_zext_codegen.sh
+
 gate "select-from-compare" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_select_from_compare.sh
 
@@ -1114,6 +1182,11 @@ gate "affine-loop-fold" fast \
 gate "unsigned-affine-loop" fast \
     env CCC="$LCCC" bash tests/regression/check_unsigned_affine_loop.sh
 
+# Differential -fwrapv witness for the exit-compare bound folds (signed
+# affold + unsigned loop_bound) against a -O0 -fwrapv GCC reference.
+gate "affine-wrapv-differential" fast \
+    python3 tests/regression/check_affine_wrapv_differential.py --lccc target/fastbuild/lccc
+
 # The FMA contract gate.  It is registered here because a regression test that
 # nothing runs is the defect it was written to fix: the audit found the packed
 # matmul arm contracting unconditionally, the fix shipped, and nothing pinned
@@ -1121,6 +1194,42 @@ gate "unsigned-affine-loop" fast \
 # still have gone green.
 gate "fma-contract-gating" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_fma_gating.sh
+
+# Destructive-FMA destination coalescing and stack FP parameters: the alias
+# bodies and the stack-multiplicand body are executed symbolically and must
+# return exactly the source expression (one FMA, no relay, no GPR bounce).
+gate "fma-dest-coalesce" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_fma_dest_coalesce_codegen.sh
+
+# Division-free vector remainder transitions: the vectorizer's signed trip
+# bound `limit /s VF` must reach the backend strength-reduced (div_by_const
+# reruns after the loop transforms), never as `idiv`.
+gate "vector-remainder-codegen" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_vector_remainder_codegen.sh
+
+# Escaped locals under register pressure: constant-offset frame addresses are
+# direct operands, never reloaded spilled pointers (zstd sequence-decoder shape).
+gate "frame-gep-direct" fast \
+    env CCC=target/fastbuild/lccc python3 tests/regression/check_frame_gep_direct.py
+
+# Direct -c objects carry the same instructions as -S + GNU as (the private
+# tight-loop marker must not disable peephole analyses in production builds).
+gate "direct-assembly-parity" fast \
+    env CCC=target/fastbuild/lccc python3 tests/regression/check_direct_assembly_parity.py
+
+# Inliner: devirtualized per-iteration template predicates are inlined.
+gate "inline-devirt-hot-leaf" fast \
+    env CCC=target/fastbuild/lccc python3 tests/regression/check_inline_devirt_hot_leaf.py
+
+# x86-64 shift counts: C masks that only feed hardware-masked counts are
+# dropped, observable masks kept (zstd BIT_lookBits shape, kill-switch control).
+gate "shift-count-demand" fast \
+    env CCC=target/fastbuild/lccc python3 tests/regression/check_shift_count_demand.py
+
+# BMI2 `_bzhi_u32/_u64`: one `bzhi` per opaque helper at x86-64-v3, none at
+# x86-64, the builtin rejected without BMI2, results equal to GCC's.
+gate "bmi2-bzhi" fast \
+    env CCC=target/fastbuild/lccc GCC="${GCC:-gcc-16}" python3 tests/regression/check_bmi2_bzhi.py
 
 # The matcher's legality proof: the two shapes it used to miscompile (an
 # inverted-polarity break loop, an unmodeled per-iteration effect) are RUNTIME

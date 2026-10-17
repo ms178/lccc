@@ -1,0 +1,844 @@
+{
+  "complete": true,
+  "compilers": {
+    "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone\n",
+    "gcc": "gcc-16 (Debian 16.2.0-3) 16.2.0\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+    "clang": "Debian clang version 23.1.3 (1)\nTarget: x86_64-pc-linux-gnu\nThread model: posix\nInstalledDir: /usr/lib/llvm-23/bin\n"
+  },
+  "cases": [
+    {
+      "compiler": "lccc",
+      "abi": "x64",
+      "witness": "wrapv_domains",
+      "case": "0",
+      "build": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "/home/user/.cache/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/lccc-x64-wrapv_domains"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/lccc-x64-wrapv_domains-0.log",
+        "/home/user/.cache/pr833-research/wrapv/lccc-x64-wrapv_domains",
+        "0"
+      ],
+      "status": 0,
+      "stdout": "28",
+      "stderr": "",
+      "memcheck": "==550704== Memcheck, a memory error detector\n==550704== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550704== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550704== Command: /home/user/.cache/pr833-research/wrapv/lccc-x64-wrapv_domains 0\n==550704== Parent PID: 550699\n==550704== \n==550704== \n==550704== HEAP SUMMARY:\n==550704==     in use at exit: 0 bytes in 0 blocks\n==550704==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550704== \n==550704== All heap blocks were freed -- no leaks are possible\n==550704== \n==550704== For lists of detected and suppressed errors, rerun with: -s\n==550704== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "lccc",
+      "abi": "x64",
+      "witness": "wrapv_domains",
+      "case": "1",
+      "build": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "/home/user/.cache/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/lccc-x64-wrapv_domains"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/lccc-x64-wrapv_domains-1.log",
+        "/home/user/.cache/pr833-research/wrapv/lccc-x64-wrapv_domains",
+        "1"
+      ],
+      "status": 0,
+      "stdout": "-1073665362",
+      "stderr": "",
+      "memcheck": "==550705== Memcheck, a memory error detector\n==550705== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550705== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550705== Command: /home/user/.cache/pr833-research/wrapv/lccc-x64-wrapv_domains 1\n==550705== Parent PID: 550699\n==550705== \n==550705== \n==550705== HEAP SUMMARY:\n==550705==     in use at exit: 0 bytes in 0 blocks\n==550705==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550705== \n==550705== All heap blocks were freed -- no leaks are possible\n==550705== \n==550705== For lists of detected and suppressed errors, rerun with: -s\n==550705== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "lccc",
+      "abi": "x64",
+      "witness": "wrapv_domains",
+      "case": "2",
+      "build": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "/home/user/.cache/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/lccc-x64-wrapv_domains"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/lccc-x64-wrapv_domains-2.log",
+        "/home/user/.cache/pr833-research/wrapv/lccc-x64-wrapv_domains",
+        "2"
+      ],
+      "status": 0,
+      "stdout": "1",
+      "stderr": "",
+      "memcheck": "==550706== Memcheck, a memory error detector\n==550706== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550706== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550706== Command: /home/user/.cache/pr833-research/wrapv/lccc-x64-wrapv_domains 2\n==550706== Parent PID: 550699\n==550706== \n==550706== \n==550706== HEAP SUMMARY:\n==550706==     in use at exit: 0 bytes in 0 blocks\n==550706==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550706== \n==550706== All heap blocks were freed -- no leaks are possible\n==550706== \n==550706== For lists of detected and suppressed errors, rerun with: -s\n==550706== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "lccc",
+      "abi": "x64",
+      "witness": "wrapv_domains",
+      "case": "3",
+      "build": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "/home/user/.cache/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/lccc-x64-wrapv_domains"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/lccc-x64-wrapv_domains-3.log",
+        "/home/user/.cache/pr833-research/wrapv/lccc-x64-wrapv_domains",
+        "3"
+      ],
+      "status": 0,
+      "stdout": "10",
+      "stderr": "",
+      "memcheck": "==550707== Memcheck, a memory error detector\n==550707== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550707== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550707== Command: /home/user/.cache/pr833-research/wrapv/lccc-x64-wrapv_domains 3\n==550707== Parent PID: 550699\n==550707== \n==550707== \n==550707== HEAP SUMMARY:\n==550707==     in use at exit: 0 bytes in 0 blocks\n==550707==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550707== \n==550707== All heap blocks were freed -- no leaks are possible\n==550707== \n==550707== For lists of detected and suppressed errors, rerun with: -s\n==550707== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "lccc",
+      "abi": "x64",
+      "witness": "wrapv_reverse_sub",
+      "case": "",
+      "build": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "/home/user/.cache/lccc/tests/regression/wrapv_reverse_sub.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/lccc-x64-wrapv_reverse_sub"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/lccc-x64-wrapv_reverse_sub-default.log",
+        "/home/user/.cache/pr833-research/wrapv/lccc-x64-wrapv_reverse_sub"
+      ],
+      "status": 0,
+      "stdout": "682afb0d",
+      "stderr": "",
+      "memcheck": "==550710== Memcheck, a memory error detector\n==550710== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550710== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550710== Command: /home/user/.cache/pr833-research/wrapv/lccc-x64-wrapv_reverse_sub\n==550710== Parent PID: 550699\n==550710== \n==550710== \n==550710== HEAP SUMMARY:\n==550710==     in use at exit: 0 bytes in 0 blocks\n==550710==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550710== \n==550710== All heap blocks were freed -- no leaks are possible\n==550710== \n==550710== For lists of detected and suppressed errors, rerun with: -s\n==550710== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "lccc",
+      "abi": "x86",
+      "witness": "wrapv_domains",
+      "case": "0",
+      "build": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-m32",
+        "-msse2",
+        "/home/user/.cache/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/lccc-x86-wrapv_domains"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/lccc-x86-wrapv_domains-0.log",
+        "/home/user/.cache/pr833-research/wrapv/lccc-x86-wrapv_domains",
+        "0"
+      ],
+      "status": 0,
+      "stdout": "28",
+      "stderr": "",
+      "memcheck": "==550713== Memcheck, a memory error detector\n==550713== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550713== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550713== Command: /home/user/.cache/pr833-research/wrapv/lccc-x86-wrapv_domains 0\n==550713== Parent PID: 550699\n==550713== \n==550713== \n==550713== HEAP SUMMARY:\n==550713==     in use at exit: 0 bytes in 0 blocks\n==550713==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550713== \n==550713== All heap blocks were freed -- no leaks are possible\n==550713== \n==550713== For lists of detected and suppressed errors, rerun with: -s\n==550713== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "lccc",
+      "abi": "x86",
+      "witness": "wrapv_domains",
+      "case": "1",
+      "build": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-m32",
+        "-msse2",
+        "/home/user/.cache/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/lccc-x86-wrapv_domains"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/lccc-x86-wrapv_domains-1.log",
+        "/home/user/.cache/pr833-research/wrapv/lccc-x86-wrapv_domains",
+        "1"
+      ],
+      "status": 0,
+      "stdout": "-1073665362",
+      "stderr": "",
+      "memcheck": "==550720== Memcheck, a memory error detector\n==550720== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550720== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550720== Command: /home/user/.cache/pr833-research/wrapv/lccc-x86-wrapv_domains 1\n==550720== Parent PID: 550699\n==550720== \n==550720== \n==550720== HEAP SUMMARY:\n==550720==     in use at exit: 0 bytes in 0 blocks\n==550720==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550720== \n==550720== All heap blocks were freed -- no leaks are possible\n==550720== \n==550720== For lists of detected and suppressed errors, rerun with: -s\n==550720== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "lccc",
+      "abi": "x86",
+      "witness": "wrapv_domains",
+      "case": "2",
+      "build": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-m32",
+        "-msse2",
+        "/home/user/.cache/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/lccc-x86-wrapv_domains"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/lccc-x86-wrapv_domains-2.log",
+        "/home/user/.cache/pr833-research/wrapv/lccc-x86-wrapv_domains",
+        "2"
+      ],
+      "status": 0,
+      "stdout": "1",
+      "stderr": "",
+      "memcheck": "==550741== Memcheck, a memory error detector\n==550741== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550741== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550741== Command: /home/user/.cache/pr833-research/wrapv/lccc-x86-wrapv_domains 2\n==550741== Parent PID: 550699\n==550741== \n==550741== \n==550741== HEAP SUMMARY:\n==550741==     in use at exit: 0 bytes in 0 blocks\n==550741==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550741== \n==550741== All heap blocks were freed -- no leaks are possible\n==550741== \n==550741== For lists of detected and suppressed errors, rerun with: -s\n==550741== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "lccc",
+      "abi": "x86",
+      "witness": "wrapv_domains",
+      "case": "3",
+      "build": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-m32",
+        "-msse2",
+        "/home/user/.cache/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/lccc-x86-wrapv_domains"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/lccc-x86-wrapv_domains-3.log",
+        "/home/user/.cache/pr833-research/wrapv/lccc-x86-wrapv_domains",
+        "3"
+      ],
+      "status": 0,
+      "stdout": "10",
+      "stderr": "",
+      "memcheck": "==550748== Memcheck, a memory error detector\n==550748== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550748== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550748== Command: /home/user/.cache/pr833-research/wrapv/lccc-x86-wrapv_domains 3\n==550748== Parent PID: 550699\n==550748== \n==550748== \n==550748== HEAP SUMMARY:\n==550748==     in use at exit: 0 bytes in 0 blocks\n==550748==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550748== \n==550748== All heap blocks were freed -- no leaks are possible\n==550748== \n==550748== For lists of detected and suppressed errors, rerun with: -s\n==550748== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "lccc",
+      "abi": "x86",
+      "witness": "wrapv_reverse_sub",
+      "case": "",
+      "build": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-m32",
+        "-msse2",
+        "/home/user/.cache/lccc/tests/regression/wrapv_reverse_sub.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/lccc-x86-wrapv_reverse_sub"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/lccc-x86-wrapv_reverse_sub-default.log",
+        "/home/user/.cache/pr833-research/wrapv/lccc-x86-wrapv_reverse_sub"
+      ],
+      "status": 0,
+      "stdout": "682afb0d",
+      "stderr": "",
+      "memcheck": "==550753== Memcheck, a memory error detector\n==550753== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550753== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550753== Command: /home/user/.cache/pr833-research/wrapv/lccc-x86-wrapv_reverse_sub\n==550753== Parent PID: 550699\n==550753== \n==550753== \n==550753== HEAP SUMMARY:\n==550753==     in use at exit: 0 bytes in 0 blocks\n==550753==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550753== \n==550753== All heap blocks were freed -- no leaks are possible\n==550753== \n==550753== For lists of detected and suppressed errors, rerun with: -s\n==550753== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "gcc",
+      "abi": "x64",
+      "witness": "wrapv_domains",
+      "case": "0",
+      "build": [
+        "/usr/bin/gcc-16",
+        "-O2",
+        "-fwrapv",
+        "/home/user/.cache/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/gcc-x64-wrapv_domains"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/gcc-x64-wrapv_domains-0.log",
+        "/home/user/.cache/pr833-research/wrapv/gcc-x64-wrapv_domains",
+        "0"
+      ],
+      "status": 0,
+      "stdout": "28",
+      "stderr": "",
+      "memcheck": "==550769== Memcheck, a memory error detector\n==550769== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550769== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550769== Command: /home/user/.cache/pr833-research/wrapv/gcc-x64-wrapv_domains 0\n==550769== Parent PID: 550699\n==550769== \n==550769== \n==550769== HEAP SUMMARY:\n==550769==     in use at exit: 0 bytes in 0 blocks\n==550769==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550769== \n==550769== All heap blocks were freed -- no leaks are possible\n==550769== \n==550769== For lists of detected and suppressed errors, rerun with: -s\n==550769== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "gcc",
+      "abi": "x64",
+      "witness": "wrapv_domains",
+      "case": "1",
+      "build": [
+        "/usr/bin/gcc-16",
+        "-O2",
+        "-fwrapv",
+        "/home/user/.cache/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/gcc-x64-wrapv_domains"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/gcc-x64-wrapv_domains-1.log",
+        "/home/user/.cache/pr833-research/wrapv/gcc-x64-wrapv_domains",
+        "1"
+      ],
+      "status": 0,
+      "stdout": "-1073665362",
+      "stderr": "",
+      "memcheck": "==550773== Memcheck, a memory error detector\n==550773== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550773== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550773== Command: /home/user/.cache/pr833-research/wrapv/gcc-x64-wrapv_domains 1\n==550773== Parent PID: 550699\n==550773== \n==550773== \n==550773== HEAP SUMMARY:\n==550773==     in use at exit: 0 bytes in 0 blocks\n==550773==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550773== \n==550773== All heap blocks were freed -- no leaks are possible\n==550773== \n==550773== For lists of detected and suppressed errors, rerun with: -s\n==550773== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "gcc",
+      "abi": "x64",
+      "witness": "wrapv_domains",
+      "case": "2",
+      "build": [
+        "/usr/bin/gcc-16",
+        "-O2",
+        "-fwrapv",
+        "/home/user/.cache/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/gcc-x64-wrapv_domains"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/gcc-x64-wrapv_domains-2.log",
+        "/home/user/.cache/pr833-research/wrapv/gcc-x64-wrapv_domains",
+        "2"
+      ],
+      "status": 0,
+      "stdout": "1",
+      "stderr": "",
+      "memcheck": "==550775== Memcheck, a memory error detector\n==550775== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550775== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550775== Command: /home/user/.cache/pr833-research/wrapv/gcc-x64-wrapv_domains 2\n==550775== Parent PID: 550699\n==550775== \n==550775== \n==550775== HEAP SUMMARY:\n==550775==     in use at exit: 0 bytes in 0 blocks\n==550775==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550775== \n==550775== All heap blocks were freed -- no leaks are possible\n==550775== \n==550775== For lists of detected and suppressed errors, rerun with: -s\n==550775== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "gcc",
+      "abi": "x64",
+      "witness": "wrapv_domains",
+      "case": "3",
+      "build": [
+        "/usr/bin/gcc-16",
+        "-O2",
+        "-fwrapv",
+        "/home/user/.cache/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/gcc-x64-wrapv_domains"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/gcc-x64-wrapv_domains-3.log",
+        "/home/user/.cache/pr833-research/wrapv/gcc-x64-wrapv_domains",
+        "3"
+      ],
+      "status": 0,
+      "stdout": "10",
+      "stderr": "",
+      "memcheck": "==550777== Memcheck, a memory error detector\n==550777== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550777== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550777== Command: /home/user/.cache/pr833-research/wrapv/gcc-x64-wrapv_domains 3\n==550777== Parent PID: 550699\n==550777== \n==550777== \n==550777== HEAP SUMMARY:\n==550777==     in use at exit: 0 bytes in 0 blocks\n==550777==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550777== \n==550777== All heap blocks were freed -- no leaks are possible\n==550777== \n==550777== For lists of detected and suppressed errors, rerun with: -s\n==550777== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "gcc",
+      "abi": "x64",
+      "witness": "wrapv_reverse_sub",
+      "case": "",
+      "build": [
+        "/usr/bin/gcc-16",
+        "-O2",
+        "-fwrapv",
+        "/home/user/.cache/lccc/tests/regression/wrapv_reverse_sub.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/gcc-x64-wrapv_reverse_sub"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/gcc-x64-wrapv_reverse_sub-default.log",
+        "/home/user/.cache/pr833-research/wrapv/gcc-x64-wrapv_reverse_sub"
+      ],
+      "status": 0,
+      "stdout": "682afb0d",
+      "stderr": "",
+      "memcheck": "==550784== Memcheck, a memory error detector\n==550784== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550784== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550784== Command: /home/user/.cache/pr833-research/wrapv/gcc-x64-wrapv_reverse_sub\n==550784== Parent PID: 550699\n==550784== \n==550784== \n==550784== HEAP SUMMARY:\n==550784==     in use at exit: 0 bytes in 0 blocks\n==550784==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550784== \n==550784== All heap blocks were freed -- no leaks are possible\n==550784== \n==550784== For lists of detected and suppressed errors, rerun with: -s\n==550784== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "gcc",
+      "abi": "x86",
+      "witness": "wrapv_domains",
+      "case": "0",
+      "build": [
+        "/usr/bin/gcc-16",
+        "-O2",
+        "-fwrapv",
+        "-m32",
+        "-msse2",
+        "/home/user/.cache/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/gcc-x86-wrapv_domains"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/gcc-x86-wrapv_domains-0.log",
+        "/home/user/.cache/pr833-research/wrapv/gcc-x86-wrapv_domains",
+        "0"
+      ],
+      "status": 0,
+      "stdout": "28",
+      "stderr": "",
+      "memcheck": "==550793== Memcheck, a memory error detector\n==550793== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550793== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550793== Command: /home/user/.cache/pr833-research/wrapv/gcc-x86-wrapv_domains 0\n==550793== Parent PID: 550699\n==550793== \n==550793== \n==550793== HEAP SUMMARY:\n==550793==     in use at exit: 0 bytes in 0 blocks\n==550793==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550793== \n==550793== All heap blocks were freed -- no leaks are possible\n==550793== \n==550793== For lists of detected and suppressed errors, rerun with: -s\n==550793== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "gcc",
+      "abi": "x86",
+      "witness": "wrapv_domains",
+      "case": "1",
+      "build": [
+        "/usr/bin/gcc-16",
+        "-O2",
+        "-fwrapv",
+        "-m32",
+        "-msse2",
+        "/home/user/.cache/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/gcc-x86-wrapv_domains"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/gcc-x86-wrapv_domains-1.log",
+        "/home/user/.cache/pr833-research/wrapv/gcc-x86-wrapv_domains",
+        "1"
+      ],
+      "status": 0,
+      "stdout": "-1073665362",
+      "stderr": "",
+      "memcheck": "==550799== Memcheck, a memory error detector\n==550799== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550799== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550799== Command: /home/user/.cache/pr833-research/wrapv/gcc-x86-wrapv_domains 1\n==550799== Parent PID: 550699\n==550799== \n==550799== \n==550799== HEAP SUMMARY:\n==550799==     in use at exit: 0 bytes in 0 blocks\n==550799==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550799== \n==550799== All heap blocks were freed -- no leaks are possible\n==550799== \n==550799== For lists of detected and suppressed errors, rerun with: -s\n==550799== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "gcc",
+      "abi": "x86",
+      "witness": "wrapv_domains",
+      "case": "2",
+      "build": [
+        "/usr/bin/gcc-16",
+        "-O2",
+        "-fwrapv",
+        "-m32",
+        "-msse2",
+        "/home/user/.cache/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/gcc-x86-wrapv_domains"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/gcc-x86-wrapv_domains-2.log",
+        "/home/user/.cache/pr833-research/wrapv/gcc-x86-wrapv_domains",
+        "2"
+      ],
+      "status": 0,
+      "stdout": "1",
+      "stderr": "",
+      "memcheck": "==550803== Memcheck, a memory error detector\n==550803== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550803== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550803== Command: /home/user/.cache/pr833-research/wrapv/gcc-x86-wrapv_domains 2\n==550803== Parent PID: 550699\n==550803== \n==550803== \n==550803== HEAP SUMMARY:\n==550803==     in use at exit: 0 bytes in 0 blocks\n==550803==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550803== \n==550803== All heap blocks were freed -- no leaks are possible\n==550803== \n==550803== For lists of detected and suppressed errors, rerun with: -s\n==550803== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "gcc",
+      "abi": "x86",
+      "witness": "wrapv_domains",
+      "case": "3",
+      "build": [
+        "/usr/bin/gcc-16",
+        "-O2",
+        "-fwrapv",
+        "-m32",
+        "-msse2",
+        "/home/user/.cache/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/gcc-x86-wrapv_domains"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/gcc-x86-wrapv_domains-3.log",
+        "/home/user/.cache/pr833-research/wrapv/gcc-x86-wrapv_domains",
+        "3"
+      ],
+      "status": 0,
+      "stdout": "10",
+      "stderr": "",
+      "memcheck": "==550807== Memcheck, a memory error detector\n==550807== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550807== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550807== Command: /home/user/.cache/pr833-research/wrapv/gcc-x86-wrapv_domains 3\n==550807== Parent PID: 550699\n==550807== \n==550807== \n==550807== HEAP SUMMARY:\n==550807==     in use at exit: 0 bytes in 0 blocks\n==550807==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550807== \n==550807== All heap blocks were freed -- no leaks are possible\n==550807== \n==550807== For lists of detected and suppressed errors, rerun with: -s\n==550807== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "gcc",
+      "abi": "x86",
+      "witness": "wrapv_reverse_sub",
+      "case": "",
+      "build": [
+        "/usr/bin/gcc-16",
+        "-O2",
+        "-fwrapv",
+        "-m32",
+        "-msse2",
+        "/home/user/.cache/lccc/tests/regression/wrapv_reverse_sub.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/gcc-x86-wrapv_reverse_sub"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/gcc-x86-wrapv_reverse_sub-default.log",
+        "/home/user/.cache/pr833-research/wrapv/gcc-x86-wrapv_reverse_sub"
+      ],
+      "status": 0,
+      "stdout": "682afb0d",
+      "stderr": "",
+      "memcheck": "==550816== Memcheck, a memory error detector\n==550816== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550816== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550816== Command: /home/user/.cache/pr833-research/wrapv/gcc-x86-wrapv_reverse_sub\n==550816== Parent PID: 550699\n==550816== \n==550816== \n==550816== HEAP SUMMARY:\n==550816==     in use at exit: 0 bytes in 0 blocks\n==550816==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550816== \n==550816== All heap blocks were freed -- no leaks are possible\n==550816== \n==550816== For lists of detected and suppressed errors, rerun with: -s\n==550816== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "clang",
+      "abi": "x64",
+      "witness": "wrapv_domains",
+      "case": "0",
+      "build": [
+        "/usr/bin/clang-23",
+        "-O2",
+        "-fwrapv",
+        "/home/user/.cache/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/clang-x64-wrapv_domains"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/clang-x64-wrapv_domains-0.log",
+        "/home/user/.cache/pr833-research/wrapv/clang-x64-wrapv_domains",
+        "0"
+      ],
+      "status": 0,
+      "stdout": "28",
+      "stderr": "",
+      "memcheck": "==550826== Memcheck, a memory error detector\n==550826== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550826== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550826== Command: /home/user/.cache/pr833-research/wrapv/clang-x64-wrapv_domains 0\n==550826== Parent PID: 550699\n==550826== \n==550826== \n==550826== HEAP SUMMARY:\n==550826==     in use at exit: 0 bytes in 0 blocks\n==550826==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550826== \n==550826== All heap blocks were freed -- no leaks are possible\n==550826== \n==550826== For lists of detected and suppressed errors, rerun with: -s\n==550826== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "clang",
+      "abi": "x64",
+      "witness": "wrapv_domains",
+      "case": "1",
+      "build": [
+        "/usr/bin/clang-23",
+        "-O2",
+        "-fwrapv",
+        "/home/user/.cache/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/clang-x64-wrapv_domains"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/clang-x64-wrapv_domains-1.log",
+        "/home/user/.cache/pr833-research/wrapv/clang-x64-wrapv_domains",
+        "1"
+      ],
+      "status": 0,
+      "stdout": "-1073665362",
+      "stderr": "",
+      "memcheck": "==550830== Memcheck, a memory error detector\n==550830== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550830== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550830== Command: /home/user/.cache/pr833-research/wrapv/clang-x64-wrapv_domains 1\n==550830== Parent PID: 550699\n==550830== \n==550830== \n==550830== HEAP SUMMARY:\n==550830==     in use at exit: 0 bytes in 0 blocks\n==550830==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550830== \n==550830== All heap blocks were freed -- no leaks are possible\n==550830== \n==550830== For lists of detected and suppressed errors, rerun with: -s\n==550830== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "clang",
+      "abi": "x64",
+      "witness": "wrapv_domains",
+      "case": "2",
+      "build": [
+        "/usr/bin/clang-23",
+        "-O2",
+        "-fwrapv",
+        "/home/user/.cache/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/clang-x64-wrapv_domains"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/clang-x64-wrapv_domains-2.log",
+        "/home/user/.cache/pr833-research/wrapv/clang-x64-wrapv_domains",
+        "2"
+      ],
+      "status": 0,
+      "stdout": "1",
+      "stderr": "",
+      "memcheck": "==550832== Memcheck, a memory error detector\n==550832== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550832== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550832== Command: /home/user/.cache/pr833-research/wrapv/clang-x64-wrapv_domains 2\n==550832== Parent PID: 550699\n==550832== \n==550832== \n==550832== HEAP SUMMARY:\n==550832==     in use at exit: 0 bytes in 0 blocks\n==550832==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550832== \n==550832== All heap blocks were freed -- no leaks are possible\n==550832== \n==550832== For lists of detected and suppressed errors, rerun with: -s\n==550832== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "clang",
+      "abi": "x64",
+      "witness": "wrapv_domains",
+      "case": "3",
+      "build": [
+        "/usr/bin/clang-23",
+        "-O2",
+        "-fwrapv",
+        "/home/user/.cache/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/clang-x64-wrapv_domains"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/clang-x64-wrapv_domains-3.log",
+        "/home/user/.cache/pr833-research/wrapv/clang-x64-wrapv_domains",
+        "3"
+      ],
+      "status": 0,
+      "stdout": "10",
+      "stderr": "",
+      "memcheck": "==550834== Memcheck, a memory error detector\n==550834== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550834== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550834== Command: /home/user/.cache/pr833-research/wrapv/clang-x64-wrapv_domains 3\n==550834== Parent PID: 550699\n==550834== \n==550834== \n==550834== HEAP SUMMARY:\n==550834==     in use at exit: 0 bytes in 0 blocks\n==550834==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550834== \n==550834== All heap blocks were freed -- no leaks are possible\n==550834== \n==550834== For lists of detected and suppressed errors, rerun with: -s\n==550834== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "clang",
+      "abi": "x64",
+      "witness": "wrapv_reverse_sub",
+      "case": "",
+      "build": [
+        "/usr/bin/clang-23",
+        "-O2",
+        "-fwrapv",
+        "/home/user/.cache/lccc/tests/regression/wrapv_reverse_sub.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/clang-x64-wrapv_reverse_sub"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/clang-x64-wrapv_reverse_sub-default.log",
+        "/home/user/.cache/pr833-research/wrapv/clang-x64-wrapv_reverse_sub"
+      ],
+      "status": 0,
+      "stdout": "682afb0d",
+      "stderr": "",
+      "memcheck": "==550839== Memcheck, a memory error detector\n==550839== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550839== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550839== Command: /home/user/.cache/pr833-research/wrapv/clang-x64-wrapv_reverse_sub\n==550839== Parent PID: 550699\n==550839== \n==550839== \n==550839== HEAP SUMMARY:\n==550839==     in use at exit: 0 bytes in 0 blocks\n==550839==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550839== \n==550839== All heap blocks were freed -- no leaks are possible\n==550839== \n==550839== For lists of detected and suppressed errors, rerun with: -s\n==550839== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "clang",
+      "abi": "x86",
+      "witness": "wrapv_domains",
+      "case": "0",
+      "build": [
+        "/usr/bin/clang-23",
+        "-O2",
+        "-fwrapv",
+        "-m32",
+        "-msse2",
+        "/home/user/.cache/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/clang-x86-wrapv_domains"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/clang-x86-wrapv_domains-0.log",
+        "/home/user/.cache/pr833-research/wrapv/clang-x86-wrapv_domains",
+        "0"
+      ],
+      "status": 0,
+      "stdout": "28",
+      "stderr": "",
+      "memcheck": "==550846== Memcheck, a memory error detector\n==550846== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550846== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550846== Command: /home/user/.cache/pr833-research/wrapv/clang-x86-wrapv_domains 0\n==550846== Parent PID: 550699\n==550846== \n==550846== \n==550846== HEAP SUMMARY:\n==550846==     in use at exit: 0 bytes in 0 blocks\n==550846==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550846== \n==550846== All heap blocks were freed -- no leaks are possible\n==550846== \n==550846== For lists of detected and suppressed errors, rerun with: -s\n==550846== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "clang",
+      "abi": "x86",
+      "witness": "wrapv_domains",
+      "case": "1",
+      "build": [
+        "/usr/bin/clang-23",
+        "-O2",
+        "-fwrapv",
+        "-m32",
+        "-msse2",
+        "/home/user/.cache/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/clang-x86-wrapv_domains"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/clang-x86-wrapv_domains-1.log",
+        "/home/user/.cache/pr833-research/wrapv/clang-x86-wrapv_domains",
+        "1"
+      ],
+      "status": 0,
+      "stdout": "-1073665362",
+      "stderr": "",
+      "memcheck": "==550852== Memcheck, a memory error detector\n==550852== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550852== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550852== Command: /home/user/.cache/pr833-research/wrapv/clang-x86-wrapv_domains 1\n==550852== Parent PID: 550699\n==550852== \n==550852== \n==550852== HEAP SUMMARY:\n==550852==     in use at exit: 0 bytes in 0 blocks\n==550852==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550852== \n==550852== All heap blocks were freed -- no leaks are possible\n==550852== \n==550852== For lists of detected and suppressed errors, rerun with: -s\n==550852== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "clang",
+      "abi": "x86",
+      "witness": "wrapv_domains",
+      "case": "2",
+      "build": [
+        "/usr/bin/clang-23",
+        "-O2",
+        "-fwrapv",
+        "-m32",
+        "-msse2",
+        "/home/user/.cache/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/clang-x86-wrapv_domains"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/clang-x86-wrapv_domains-2.log",
+        "/home/user/.cache/pr833-research/wrapv/clang-x86-wrapv_domains",
+        "2"
+      ],
+      "status": 0,
+      "stdout": "1",
+      "stderr": "",
+      "memcheck": "==550856== Memcheck, a memory error detector\n==550856== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550856== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550856== Command: /home/user/.cache/pr833-research/wrapv/clang-x86-wrapv_domains 2\n==550856== Parent PID: 550699\n==550856== \n==550856== \n==550856== HEAP SUMMARY:\n==550856==     in use at exit: 0 bytes in 0 blocks\n==550856==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550856== \n==550856== All heap blocks were freed -- no leaks are possible\n==550856== \n==550856== For lists of detected and suppressed errors, rerun with: -s\n==550856== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "clang",
+      "abi": "x86",
+      "witness": "wrapv_domains",
+      "case": "3",
+      "build": [
+        "/usr/bin/clang-23",
+        "-O2",
+        "-fwrapv",
+        "-m32",
+        "-msse2",
+        "/home/user/.cache/lccc/tests/regression/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/clang-x86-wrapv_domains"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/clang-x86-wrapv_domains-3.log",
+        "/home/user/.cache/pr833-research/wrapv/clang-x86-wrapv_domains",
+        "3"
+      ],
+      "status": 0,
+      "stdout": "10",
+      "stderr": "",
+      "memcheck": "==550860== Memcheck, a memory error detector\n==550860== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550860== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550860== Command: /home/user/.cache/pr833-research/wrapv/clang-x86-wrapv_domains 3\n==550860== Parent PID: 550699\n==550860== \n==550860== \n==550860== HEAP SUMMARY:\n==550860==     in use at exit: 0 bytes in 0 blocks\n==550860==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550860== \n==550860== All heap blocks were freed -- no leaks are possible\n==550860== \n==550860== For lists of detected and suppressed errors, rerun with: -s\n==550860== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    },
+    {
+      "compiler": "clang",
+      "abi": "x86",
+      "witness": "wrapv_reverse_sub",
+      "case": "",
+      "build": [
+        "/usr/bin/clang-23",
+        "-O2",
+        "-fwrapv",
+        "-m32",
+        "-msse2",
+        "/home/user/.cache/lccc/tests/regression/wrapv_reverse_sub.c",
+        "-o",
+        "/home/user/.cache/pr833-research/wrapv/clang-x86-wrapv_reverse_sub"
+      ],
+      "command": [
+        "valgrind",
+        "--error-exitcode=97",
+        "--leak-check=full",
+        "--log-file=/home/user/.cache/pr833-research/wrapv/clang-x86-wrapv_reverse_sub-default.log",
+        "/home/user/.cache/pr833-research/wrapv/clang-x86-wrapv_reverse_sub"
+      ],
+      "status": 0,
+      "stdout": "682afb0d",
+      "stderr": "",
+      "memcheck": "==550867== Memcheck, a memory error detector\n==550867== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==550867== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==550867== Command: /home/user/.cache/pr833-research/wrapv/clang-x86-wrapv_reverse_sub\n==550867== Parent PID: 550699\n==550867== \n==550867== \n==550867== HEAP SUMMARY:\n==550867==     in use at exit: 0 bytes in 0 blocks\n==550867==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==550867== \n==550867== All heap blocks were freed -- no leaks are possible\n==550867== \n==550867== For lists of detected and suppressed errors, rerun with: -s\n==550867== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+      "pass": true
+    }
+  ]
+}

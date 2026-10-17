@@ -1047,17 +1047,10 @@ fn try_pair_fuse_gp_to_xmm_relay(
 /// XMM-load-side handler: forward a scalar-FP store to a subsequent
 /// scalar-FP load of the same slot.
 ///
-/// Semantics matrix (all forms copy exactly `size.byte_size()` bits out of
-/// the backing register, which is what the store put in the slot):
-/// * same register, MERGE load (movsd/movss: preserve dest's upper bits) →
-///   the load writes the value its destination already holds → pure no-op;
-/// * same register, FULL load (movq/movd: zero the upper bits) → NOT a
-///   no-op (the zeroing is observable) — keep the load;
-/// * different register → plain forward to a reg-reg move with identical
-///   merge/zero semantics (`movsd/movss` merge like the load; `movq/movd`
-///   zero-extend like the load), or pair-fuse a following store relay;
-/// * GP-backed mapping → pair-fuse the store relay to a GP store only (a
-///   plain `movq %rS, %xmmD` is NOT equivalent to a merge load).
+/// Memory MOVSD/MOVSS zero the unused low-XMM lanes; their register forms
+/// merge instead. Forward with an exact zeroing bit move, preserving the
+/// original legacy/VEX upper-vector behavior. This also avoids an artificial
+/// dependency on the old destination. No scalar floating arithmetic is used.
 fn gsf_handle_load_xmm(
     store: &mut LineStore,
     infos: &mut [LineInfo],
@@ -1083,70 +1076,40 @@ fn gsf_handle_load_xmm(
         let bytes_match = mapping.size.byte_size() == load_size.byte_size();
         if bytes_match && is_xmm_family(mapping.reg_id) {
             let src = mapping.reg_id;
-            if src == dst && matches!(load_size, MoveSize::SD | MoveSize::SS) {
-                // MERGE self-reload: identity. See the semantics matrix.
+            if src != dst && try_pair_fuse_xmm_relay(store, infos, i, src, dst, load_size, fp) {
                 mark_nop(&mut infos[i]);
                 changed = true;
                 load_still_writes_xmm = false;
-            } else if src != dst {
-                if try_pair_fuse_xmm_relay(store, infos, i, src, dst, load_size, fp) {
-                    mark_nop(&mut infos[i]);
+            } else {
+                let vex = infos[i].trimmed(store.get(i)).starts_with('v');
+                let replacement = match (load_size, vex) {
+                    (MoveSize::SD | MoveSize::Q, _) => Some(format!(
+                        "    {}movq %xmm{}, %xmm{}",
+                        if vex { "v" } else { "" },
+                        src - 24,
+                        dst - 24
+                    )),
+                    (MoveSize::SS | MoveSize::L, true) => Some(format!(
+                        // VINSERTPS requires AVX, already required by the
+                        // replaced VEX load. Select lane 0, zero lanes 1..3;
+                        // VEX also clears bits above 127. There is no old-dst
+                        // dependency and no nonexistent XMM-to-XMM MOVD.
+                        "    vinsertps $14, %xmm{}, %xmm{}, %xmm{}",
+                        src - 24,
+                        src - 24,
+                        dst - 24
+                    )),
+                    // SSE2 has no one-instruction XMM-to-XMM move that copies
+                    // 32 bits and zeros the other 96. Keep the legal load;
+                    // don't silently introduce SSE4.1 or clobber a scratch GP.
+                    _ => None,
+                };
+                if let Some(text) = replacement {
+                    replace_line(store, &mut infos[i], i, text);
                     changed = true;
-                    load_still_writes_xmm = false;
-                } else {
-                    let Some(mnemonic) = xmm_mnemonic(load_size) else {
-                        return changed;
-                    };
-                    // Preserve the line's own encoding family: a VEX-encoded
-                    // load (vmovsd/vmovss) is rewritten with the 3-operand
-                    // VEX form (merge semantics identical to the load);
-                    // legacy loads get the legacy 2-operand form. The Q/L
-                    // XMM forms have no merge distinction (both zero the
-                    // upper bits), so the plain form serves both families.
-                    let v_encoded = infos[i].trimmed(store.get(i)).starts_with('v');
-                    let (new_text, ok) = match (load_size, v_encoded) {
-                        (MoveSize::SD, true) => (
-                            format!(
-                                "    vmovsd %xmm{}, %xmm{}, %xmm{}",
-                                dst - 24,
-                                src - 24,
-                                dst - 24
-                            ),
-                            true,
-                        ),
-                        (MoveSize::SS, true) => (
-                            format!(
-                                "    vmovss %xmm{}, %xmm{}, %xmm{}",
-                                dst - 24,
-                                src - 24,
-                                dst - 24
-                            ),
-                            true,
-                        ),
-                        (MoveSize::L, true) => {
-                            // No VEX reg-reg vmovd exists; keep the load.
-                            (String::new(), false)
-                        }
-                        (MoveSize::Q, true) => (
-                            // VMOVQ xmm, xmm exists as a 2-operand VEX form;
-                            // emitting legacy SSE in a VEX context risks the
-                            // AVX-SSE transition penalty.
-                            format!("    vmovq %xmm{}, %xmm{}", src - 24, dst - 24),
-                            true,
-                        ),
-                        _ => (
-                            format!("    {} %xmm{}, %xmm{}", mnemonic, src - 24, dst - 24),
-                            true,
-                        ),
-                    };
-                    if ok {
-                        replace_line(store, &mut infos[i], i, new_text);
-                        changed = true;
-                    }
                 }
             }
         } else if bytes_match && is_valid_gp_reg(mapping.reg_id) {
-            // GP-backed mapping read by an XMM load: relay fusion only.
             if try_pair_fuse_gp_to_xmm_relay(
                 store,
                 infos,
@@ -1160,11 +1123,33 @@ fn gsf_handle_load_xmm(
                 mark_nop(&mut infos[i]);
                 changed = true;
                 load_still_writes_xmm = false;
+            } else {
+                let (mnemonic, gp_size) = match load_size {
+                    MoveSize::SD | MoveSize::Q => ("movq", MoveSize::Q),
+                    MoveSize::SS | MoveSize::L => ("movd", MoveSize::L),
+                    _ => return changed,
+                };
+                let vex = infos[i].trimmed(store.get(i)).starts_with('v');
+                let text = format!(
+                    "    {}{} {}, %xmm{}",
+                    if vex { "v" } else { "" },
+                    mnemonic,
+                    reg_id_to_name(mapping.reg_id, gp_size),
+                    dst - 24
+                );
+                replace_line(store, &mut infos[i], i, text);
+                changed = true;
             }
         }
     }
     if load_still_writes_xmm {
         invalidate_reg_flat(slot_entries, reg_offsets, dst);
+    }
+    if changed {
+        // Forwarding adds a backing-register read. Later relay proofs must
+        // see it; stale liveness could delete that register's producer.
+        lv.refresh_at(store, infos, i);
+        fp.refresh_at(store, infos, i);
     }
     changed
 }
@@ -1955,9 +1940,9 @@ mod tests {
     // ── Fix E: XMM store→load forwarding ───────────────────────────────────
 
     #[test]
-    fn fp_store_fp_load_same_register_merges_to_nop() {
-        // movsd merge semantics: the reload writes the value its
-        // destination already holds → identity → nop.
+    fn fp_store_fp_load_same_register_keeps_zeroing() {
+        // A memory reload zeros bits 127:64 even when the low lane already
+        // matches. The replacement must keep that architectural write.
         let asm = concat!(
             "f:\n",
             ".cfi_startproc\n",
@@ -1970,9 +1955,9 @@ mod tests {
         let (mut store, mut infos) = build_pinned(asm);
         assert!(global_store_forwarding(&mut store, &mut infos));
         let reload = (0..store.len())
-            .find(|&i| store.get(i).contains("movsd 72(%rsp), %xmm6"))
-            .expect("reload line index");
-        assert!(infos[reload].is_nop(), "the self-reload must be nop'd");
+            .find(|&i| store.get(i).contains("movq %xmm6, %xmm6"))
+            .expect("zeroing self-transfer");
+        assert!(!infos[reload].is_nop(), "upper-lane zeroing is observable");
     }
 
     #[test]
@@ -1989,7 +1974,7 @@ mod tests {
         let (mut store, mut infos) = build_pinned(asm);
         assert!(global_store_forwarding(&mut store, &mut infos));
         assert!(
-            (0..store.len()).any(|i| store.get(i).contains("movsd %xmm6, %xmm0")),
+            (0..store.len()).any(|i| store.get(i).contains("movq %xmm6, %xmm0")),
             "the load must forward to a reg-reg move"
         );
         assert!(
@@ -2018,7 +2003,7 @@ mod tests {
         let (mut store, mut infos) = build_pinned(asm);
         assert!(global_store_forwarding(&mut store, &mut infos));
         assert!(
-            (0..store.len()).any(|i| store.get(i).contains("movsd %xmm15, %xmm6")),
+            (0..store.len()).any(|i| store.get(i).contains("movq %xmm15, %xmm6")),
             "the reload must forward to a reg-reg move across read-only loads"
         );
         assert!(
@@ -2273,7 +2258,7 @@ mod tests {
         assert!(global_store_forwarding(&mut store, &mut infos));
         assert!(
             (0..store.len())
-                .any(|i| { !infos[i].is_nop() && store.get(i).trim() == "movsd %xmm0, %xmm6" })
+                .any(|i| { !infos[i].is_nop() && store.get(i).trim() == "movq %xmm0, %xmm6" })
         );
     }
 
@@ -2302,7 +2287,8 @@ mod tests {
     fn movd_self_reload_is_not_a_nop() {
         // `movd slot, %xmm5` ZEROES bits 127:32 of its destination; even
         // when the low 32 bits already match, the zeroing is observable —
-        // unlike movsd/movss (merge forms). The load must survive.
+        // like memory movsd/movss. Without a legal SSE2 register replacement,
+        // this 32-bit load must survive.
         let asm = concat!(
             "f:\n",
             ".cfi_startproc\n",
@@ -2420,7 +2406,7 @@ mod tests {
         let (mut store, mut infos) = build_pinned(asm);
         assert!(global_store_forwarding(&mut store, &mut infos));
         assert!(
-            (0..store.len()).any(|i| store.get(i).contains("movsd %xmm6, %xmm0")),
+            (0..store.len()).any(|i| store.get(i).contains("movq %xmm6, %xmm0")),
             "the forward must fire across vzeroupper (low 128 preserved)"
         );
     }

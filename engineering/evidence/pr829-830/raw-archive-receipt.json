@@ -1,0 +1,21 @@
+{
+  "archive": "/home/user/artifacts/pr829-830-raw.tar.xz",
+  "sha256": "81eda017acbb3fbae1e0d0bb05235a41d92e1ebe446960ccc865906473777192",
+  "bytes": 10708636,
+  "verified_members": 6303,
+  "raw_bytes": 252938232,
+  "excluded_compilers": {
+    "cache/synthesis-v1": {
+      "bytes": 27655368,
+      "sha256": "5857a7ac7032eb90bda68a47733e5106463f466c78b6746af8115affcc07d93c"
+    },
+    "cache/synthesis-v2": {
+      "bytes": 27664296,
+      "sha256": "624ed62a4e95a77d58fdfba22423ee63ee750af2f35253323164682bbc1c7027"
+    },
+    "cache/synthesis-v3": {
+      "bytes": 27655560,
+      "sha256": "11978c98e4a921110345a18a3e7b3b33a7cb6c2b1a4fff36d0b258f062296fd1"
+    }
+  }
+}

@@ -1,0 +1,224 @@
+{
+  "id": "cicxlatest",
+  "metadata": {
+    "id": "cicxlatest",
+    "name": "x86-64 icx (latest)",
+    "semver": "(latest)",
+    "compilerType": "clang-intel"
+  },
+  "result": {
+    "inputFilename": "example.c",
+    "code": 0,
+    "okToCache": true,
+    "timedOut": false,
+    "stdout": [],
+    "stderr": [],
+    "truncated": false,
+    "execTime": 53,
+    "processExecutionResultTime": 0.004481000127270818,
+    "instructionSet": "amd64",
+    "compilationOptions": [
+      "-g",
+      "-o",
+      "/app/output.s",
+      "-fno-verbose-asm",
+      "-S",
+      "--gcc-toolchain=/opt/compiler-explorer/gcc-13.2.0",
+      "-fcolor-diagnostics",
+      "-fno-crash-diagnostics",
+      "-O2",
+      "-march=x86-64-v3",
+      "/app/example.c"
+    ],
+    "downloads": [],
+    "tools": [],
+    "asmSize": 2414,
+    "asm": [
+      {
+        "text": "identity:",
+        "source": null,
+        "labels": []
+      },
+      {
+        "text": "  leal 1(%rdi), %eax",
+        "source": {
+          "file": null,
+          "line": 2,
+          "column": 29
+        },
+        "labels": []
+      },
+      {
+        "text": "  retq",
+        "source": {
+          "file": null,
+          "line": 2,
+          "column": 21
+        },
+        "labels": []
+      },
+      {
+        "text": "",
+        "source": null,
+        "labels": []
+      }
+    ],
+    "optOutput": [],
+    "labelDefinitions": {
+      "identity": 1
+    },
+    "parsingTime": 2,
+    "filteredCount": 149,
+    "popularArguments": {},
+    "queueTime": 4,
+    "lcccOracleOptions": {
+      "requested": "-O2 -march=x86-64-v3",
+      "effective": "-O2 -march=x86-64-v3"
+    }
+  },
+  "claim": "latest CE ICX channel; actual identity retained, not latest Intel release",
+  "version_probe": {
+    "inputFilename": "example.c",
+    "code": 0,
+    "okToCache": true,
+    "timedOut": false,
+    "stdout": [],
+    "stderr": [
+      {
+        "text": "Intel(R) oneAPI DPC++/C++ Compiler 2024.0.0 (2024.0.0.20231017)"
+      },
+      {
+        "text": "Target: x86_64-unknown-linux-gnu"
+      },
+      {
+        "text": "Thread model: posix"
+      },
+      {
+        "text": "InstalledDir: /cefs/33/33ffeb1993568d15542a3061_consolidated/compilers_c++_intel-cpp_2024.0.0.49524/compiler/2024.0/bin/compiler"
+      },
+      {
+        "text": "Configuration file: /cefs/33/33ffeb1993568d15542a3061_consolidated/compilers_c++_intel-cpp_2024.0.0.49524/compiler/2024.0/bin/compiler/../icx.cfg"
+      },
+      {
+        "text": "Found candidate GCC installation: /opt/compiler-explorer/gcc-13.2.0/lib/gcc/x86_64-linux-gnu/13.2.0"
+      },
+      {
+        "text": "Selected GCC installation: /opt/compiler-explorer/gcc-13.2.0/lib/gcc/x86_64-linux-gnu/13.2.0"
+      },
+      {
+        "text": "Candidate multilib: .;@m64"
+      },
+      {
+        "text": "Candidate multilib: 32;@m32"
+      },
+      {
+        "text": "Candidate multilib: x32;@mx32"
+      },
+      {
+        "text": "Selected multilib: .;@m64"
+      },
+      {
+        "text": " (in-process)"
+      },
+      {
+        "text": " \"/cefs/33/33ffeb1993568d15542a3061_consolidated/compilers_c++_intel-cpp_2024.0.0.49524/compiler/2024.0/bin/compiler/clang\" -cc1 -triple x86_64-unknown-linux-gnu -S -disable-free -clear-ast-before-backend -disable-llvm-verifier -discard-value-names -main-file-name example.c -mrelocation-model static -fveclib=SVML -mframe-pointer=none -menable-no-infs -menable-no-nans -fapprox-func -funsafe-math-optimizations -fno-signed-zeros -mreassociate -freciprocal-math -fdenormal-fp-math=preserve-sign,preserve-sign -ffp-contract=fast -fno-rounding-math -ffast-math -ffinite-math-only -fno-verbose-asm -mconstructor-aliases -funwind-tables=2 -target-cpu x86-64-v3 -mllvm -x86-enable-unaligned-vector-move=true -debug-info-kind=limited -dwarf-version=4 -debugger-tuning=gdb -v -fcoverage-compilation-dir=/app -resource-dir /cefs/33/33ffeb1993568d15542a3061_consolidated/compilers_c++_intel-cpp_2024.0.0.49524/compiler/2024.0/lib/clang/17 -internal-isystem /cefs/33/33ffeb1993568d15542a3061_consolidated/compilers_c++_intel-cpp_2024.0.0.49524/compiler/2024.0/bin/compiler/../../opt/compiler/include -internal-isystem /cefs/33/33ffeb1993568d15542a3061_consolidated/compilers_c++_intel-cpp_2024.0.0.49524/compiler/2024.0/lib/clang/17/include -internal-isystem /usr/local/include -internal-isystem /opt/compiler-explorer/gcc-13.2.0/lib/gcc/x86_64-linux-gnu/13.2.0/../../../../x86_64-linux-gnu/include -internal-externc-isystem /usr/include/x86_64-linux-gnu -internal-externc-isystem /include -internal-externc-isystem /usr/include -O2 -fdebug-compilation-dir=/app -ferror-limit 19 -fheinous-gnu-extensions -fgnuc-version=4.2.1 -fcolor-diagnostics -vectorize-loops -vectorize-slp -dwarf-debug-flags \" --intel -g -o /app/output.s -fno-verbose-asm -S --gcc-toolchain=/opt/compiler-explorer/gcc-13.2.0 -fcolor-diagnostics -gen-reproducer=off -O2 -march=x86-64-v3 -v <source> -fveclib=SVML -fheinous-gnu-extensions\" -D__GCC_HAVE_DWARF2_CFI_ASM=1 -fintel-compatibility -fintel-libirc-allowed -mllvm -disable-hir-generate-mkl-call -mllvm -loopopt=1 -floopopt-pipeline=light -mllvm -intel-abi-compatible=true -o /app/output.s -x c <source>"
+      },
+      {
+        "text": "clang -cc1 version 17.0.0 based upon LLVM 17.0.0git default target x86_64-unknown-linux-gnu"
+      },
+      {
+        "text": "ignoring nonexistent directory \"/opt/compiler-explorer/gcc-13.2.0/lib/gcc/x86_64-linux-gnu/13.2.0/../../../../x86_64-linux-gnu/include\""
+      },
+      {
+        "text": "ignoring nonexistent directory \"/include\""
+      },
+      {
+        "text": "#include \"...\" search starts here:"
+      },
+      {
+        "text": "#include <...> search starts here:"
+      },
+      {
+        "text": " /cefs/33/33ffeb1993568d15542a3061_consolidated/compilers_c++_intel-cpp_2024.0.0.49524/compiler/2024.0/bin/compiler/../../opt/compiler/include"
+      },
+      {
+        "text": " /cefs/33/33ffeb1993568d15542a3061_consolidated/compilers_c++_intel-cpp_2024.0.0.49524/compiler/2024.0/lib/clang/17/include"
+      },
+      {
+        "text": " /usr/local/include"
+      },
+      {
+        "text": " /usr/include/x86_64-linux-gnu"
+      },
+      {
+        "text": " /usr/include"
+      },
+      {
+        "text": "End of search list."
+      }
+    ],
+    "truncated": false,
+    "execTime": 1547,
+    "processExecutionResultTime": 0.0711270000319928,
+    "instructionSet": "amd64",
+    "compilationOptions": [
+      "-g",
+      "-o",
+      "/app/output.s",
+      "-fno-verbose-asm",
+      "-S",
+      "--gcc-toolchain=/opt/compiler-explorer/gcc-13.2.0",
+      "-fcolor-diagnostics",
+      "-fno-crash-diagnostics",
+      "-O2",
+      "-march=x86-64-v3",
+      "-v",
+      "/app/example.c"
+    ],
+    "downloads": [],
+    "tools": [],
+    "asmSize": 2375,
+    "asm": [
+      {
+        "text": "f:",
+        "source": null,
+        "labels": []
+      },
+      {
+        "text": "  leal 1(%rdi), %eax",
+        "source": {
+          "file": null,
+          "line": 1,
+          "column": 22
+        },
+        "labels": []
+      },
+      {
+        "text": "  retq",
+        "source": {
+          "file": null,
+          "line": 1,
+          "column": 14
+        },
+        "labels": []
+      },
+      {
+        "text": "",
+        "source": null,
+        "labels": []
+      }
+    ],
+    "optOutput": [],
+    "labelDefinitions": {
+      "f": 1
+    },
+    "parsingTime": 0,
+    "filteredCount": 149,
+    "popularArguments": {},
+    "queueTime": 5,
+    "lcccOracleOptions": {
+      "requested": "-O2 -march=x86-64-v3 -v",
+      "effective": "-O2 -march=x86-64-v3 -v"
+    }
+  }
+}

@@ -338,6 +338,10 @@ pub(super) struct FuncSig {
     pub ret_eightbyte_classes: Vec<crate::common::types::EightbyteClass>,
     /// True if the return value is _Float128 (ONE 16-byte XMM return).
     pub ret_is_f128_sse: bool,
+    /// x86-64 X87-class aggregate return (`struct { long double }`): the IR
+    /// return value is the `long double` in %st(0); callers store it into a
+    /// temporary of the aggregate type and `return` loads it from the object.
+    pub ret_x87_aggregate: bool,
     /// Per-param: true if the param is _Float128 (ONE 16-byte XMM param).
     pub param_is_f128_sse: Vec<bool>,
     /// Per-parameter struct sizes for by-value struct passing ABI.
@@ -366,6 +370,7 @@ impl FuncSig {
             two_reg_ret_size: None,
             ret_eightbyte_classes: Vec::new(),
             ret_is_f128_sse: false,
+            ret_x87_aggregate: false,
             param_is_f128_sse: Vec::new(),
             param_struct_sizes: Vec::new(),
             param_struct_classes: Vec::new(),
@@ -467,6 +472,8 @@ pub(super) enum ParamKind {
     ComplexFloatPacked(usize),
     /// i686 Clang ExtVector parameter scalarized into one IR scalar per lane.
     ExtVectorDecomposed(Vec<usize>),
+    /// i686 Clang ExtVector parameter passed as 16-byte XMM pieces.
+    ExtVectorXmm(Vec<usize>),
 }
 
 /// Result of building the IR parameter list for a function.

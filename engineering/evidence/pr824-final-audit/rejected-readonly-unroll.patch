@@ -1,0 +1,235 @@
+diff --git a/src/passes/loop_unroll.rs b/src/passes/loop_unroll.rs
+index 1ee9af57..b9371f6e 100644
+--- a/src/passes/loop_unroll.rs
++++ b/src/passes/loop_unroll.rs
+@@ -60,6 +60,9 @@ thread_local! {
+     /// Defaults to enabled, which is exactly the environment-unset default, so
+     /// an entry point that never went through `run_passes` (unit tests) behaves
+     /// as it did before the switch existed.
++    // Target-specific profitability, reset per TU. Cloning remains scalar
++    // and source-ordered; this does not widen any load or reassociate a sum.
++    static READONLY_REDUCTION_UNROLL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+     static TWO_BLOCK_UNROLL_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+ }
+ 
+@@ -69,6 +72,10 @@ pub(crate) fn set_two_block_unroll_enabled(enabled: bool) {
+     TWO_BLOCK_UNROLL_ENABLED.with(|cell| cell.set(enabled));
+ }
+ 
++pub(crate) fn set_readonly_reduction_unroll(enabled: bool) {
++    READONLY_REDUCTION_UNROLL.with(|cell| cell.set(enabled));
++}
++
+ #[inline]
+ fn two_block_unroll_enabled() -> bool {
+     TWO_BLOCK_UNROLL_ENABLED.with(|cell| cell.get())
+@@ -3000,6 +3007,78 @@ fn try_complete_unroll_two_block(
+ ///   territory), `k ≤ 4`, and `work × k ≤ 512` expanded instructions.
+ ///
+ /// Returns `true` when the loop was rewritten.
++/// A deliberately small read-only exception to the store-seeded SLP policy.
++/// One independent integer load feeds one 32-bit Add accumulator. Table
++/// walks indexed by the accumulator (CRC), FP, calls, volatile accesses and
++/// large/live-state bodies are excluded. Existing finite-trip/CFG/clone
++/// proofs still apply; only profitability admission changes.
++fn tiny_readonly_reduction(work: &[Instruction], phis: &[HeaderPhi], iv: Value, trip: i64) -> bool {
++    if trip < 32 || work.len() > 10 || phis.len() != 2 {
++        return false;
++    }
++    let Some(acc) = phis.iter().find(|p| p.id != iv.0) else {
++        return false;
++    };
++    if !acc.ty.is_integer() || acc.ty.size() != 4 {
++        return false;
++    }
++    let Operand::Value(back) = acc.back else {
++        return false;
++    };
++    let mut loads = 0;
++    let mut sum = false;
++    for inst in work {
++        if let Instruction::BinOp {
++            dest,
++            op: IrBinOp::Add,
++            lhs,
++            rhs,
++            ty,
++        } = inst
++            && *dest == back
++            && *ty == acc.ty
++            && (matches!(lhs, Operand::Value(v) if v.0 == acc.id)
++                != matches!(rhs, Operand::Value(v) if v.0 == acc.id))
++        {
++            sum = true;
++            continue;
++        }
++        let mut consumes_acc = false;
++        inst.for_each_used_value(|v| consumes_acc |= v == acc.id);
++        if consumes_acc {
++            return false;
++        }
++        match inst {
++            Instruction::Load {
++                ty,
++                volatile: false,
++                ..
++            } if ty.is_integer() && ty.size() == 4 => loads += 1,
++            Instruction::GlobalAddr { .. }
++            | Instruction::GetElementPtr { .. }
++            | Instruction::Copy { .. } => {}
++            Instruction::Cast { from_ty, to_ty, .. }
++                if from_ty.is_integer() && to_ty.is_integer() => {}
++            Instruction::BinOp { op, ty, .. }
++                if ty.is_integer()
++                    && matches!(
++                        op,
++                        IrBinOp::Add
++                            | IrBinOp::Sub
++                            | IrBinOp::Mul
++                            | IrBinOp::And
++                            | IrBinOp::Or
++                            | IrBinOp::Xor
++                            | IrBinOp::Shl
++                            | IrBinOp::LShr
++                            | IrBinOp::AShr
++                    ) => {}
++            _ => return false,
++        }
++    }
++    sum && loads == 1
++}
++
+ fn try_partial_unroll_two_block(
+     func: &mut IrFunction,
+     lp: &loop_analysis::NaturalLoop,
+@@ -3116,7 +3195,9 @@ fn try_partial_unroll_two_block(
+     // PROFITABILITY: the pass exists to make the k concatenated bodies
+     // BB-SLP feedstock — `run_bb_slp` is STORE-SEEDED and its lane inputs
+     // are LOAD packs, so a latch lacking either can never pack anything
+-    // and the unroll is pure code-size bloat with zero runtime gain.
++    // and broad admission has historically bloated code at neutral runtime.
++    // The bounded independent-load reduction below is a separate measured
++    // scalar branch-overhead exception, not a claim of SLP profitability.
+     // Measured (2026-09-18, the codegen-quality gate's tolerance breach):
+     // gzip_crc32's table walk (loads + the crc rotation only, no store)
+     // +30% insns at neutral runtime; glibc_memcmp's compare loops +20.7%
+@@ -3145,7 +3226,12 @@ fn try_partial_unroll_two_block(
+                 }
+             )
+         });
+-        if !has_store || !has_load {
++        let tiny_readonly = !has_store
++            && has_load
++            && READONLY_REDUCTION_UNROLL.with(|cell| cell.get())
++            && collect_header_phis(func, header, latch_label)
++                .is_some_and(|phis| tiny_readonly_reduction(work, &phis, iv_phi, trip));
++        if (!has_store || !has_load) && !tiny_readonly {
+             return false;
+         }
+     }
+@@ -5412,6 +5498,64 @@ mod tests {
+         ));
+     }
+ 
++    #[test]
++    fn tiny_readonly_reduction_unroll_preserves_ssa_and_load_width() {
++        let mut func = make_two_block_feed_loop(64, LatchFeed::LoadOnly);
++        set_readonly_reduction_unroll(true);
++        let count = unroll_loops(&mut func, UnrollPhase::PostVec);
++        set_readonly_reduction_unroll(false);
++        assert_eq!(count, 1);
++        let body = merged_body_of(&func);
++        assert_eq!(
++            body.instructions
++                .iter()
++                .filter(|inst| matches!(
++                    inst,
++                    Instruction::Load {
++                        ty: IrType::I32,
++                        volatile: false,
++                        ..
++                    }
++                ))
++                .count(),
++            4
++        );
++        let mut violations = Vec::new();
++        crate::passes::verify::verify_function(&func, "readonly reduction", &mut violations);
++        assert!(violations.is_empty(), "{violations:?}");
++    }
++
++    #[test]
++    fn tiny_readonly_reduction_profitability_refusals() {
++        let func = make_two_block_feed_loop(64, LatchFeed::LoadOnly);
++        let phis = collect_header_phis(&func, 1, BlockId(2)).unwrap();
++        let work = &func.blocks[2].instructions[..4];
++        assert!(tiny_readonly_reduction(work, &phis, Value(1), 64));
++        assert!(!tiny_readonly_reduction(work, &phis, Value(1), 31));
++        let mut changed = work.to_vec();
++        if let Instruction::Load { ptr, .. } = &mut changed[2] {
++            *ptr = Value(2);
++        }
++        assert!(!tiny_readonly_reduction(&changed, &phis, Value(1), 64));
++        changed = work.to_vec();
++        if let Instruction::Load { volatile, .. } = &mut changed[2] {
++            *volatile = true;
++        }
++        assert!(!tiny_readonly_reduction(&changed, &phis, Value(1), 64));
++        changed = work.to_vec();
++        changed.push(changed[2].clone());
++        assert!(!tiny_readonly_reduction(&changed, &phis, Value(1), 64));
++        changed = work.to_vec();
++        if let Instruction::BinOp { op, .. } = &mut changed[3] {
++            *op = IrBinOp::Xor;
++        }
++        assert!(!tiny_readonly_reduction(&changed, &phis, Value(1), 64));
++        while changed.len() <= 10 {
++            changed.push(work[0].clone());
++        }
++        assert!(!tiny_readonly_reduction(&changed, &phis, Value(1), 64));
++    }
++
+     #[test]
+     fn two_block_unroll_declines_load_only_latch() {
+         // A load-only latch (table walk / compare loop) has no store seeds
+diff --git a/src/passes/mod.rs b/src/passes/mod.rs
+index 6cf9c162..198508e3 100644
+--- a/src/passes/mod.rs
++++ b/src/passes/mod.rs
+@@ -1332,6 +1332,10 @@ pub(crate) fn run_passes(
+         _ => false,
+     });
+     let mut disabled = std::env::var("CCC_DISABLE_PASSES").unwrap_or_default();
++    loop_unroll::set_readonly_reduction_unroll(
++        target == crate::backend::Target::X86_64
++            && !pass_disabled(&disabled, "readonly_reduction_unroll"),
++    );
+     vectorize::set_strict_recip_pack_enabled(!pass_disabled(&disabled, "strict_recip_pack"));
+     // Snapshot the map policy switches once, like the other pass-pipeline
+     // knobs.  Both the pre-unroll constant-trip entry and the main vectorizer
+@@ -1858,6 +1862,25 @@ pub(crate) fn run_passes(
+             total_changes_excl_dce += n;
+         }
+ 
++        // Inlining exposes byte-assembly DAGs whose redundant casts have now
++        // been simplified. Fold them before trip/body profitability checks,
++        // rather than waiting until after the sole unroll opportunity.
++        if iter == 0
++            && target == crate::backend::Target::X86_64
++            && !optimize_for_size
++            && !pass_disabled(&disabled, "byte_load")
++            && !pass_disabled(&disabled, "byte_load_pre_unroll")
++        {
++            let n = timed_pass!(
++                "byte_load_pre_unroll",
++                run_on_visited(module, &dirty, &mut changed, |f| byte_load::run_function(
++                    f, target
++                ))
++            );
++            total_changes += n;
++            total_changes_excl_dce += n;
++        }
++
+         // Phase 2b-pre: pre-unroll CONST-TRIP map vectorization. The complete
+         // unroller below runs BEFORE the Phase 2b-vec vectorizer and steals
+         // every constant-trip elementwise loop (limit <= 16), leaving 16

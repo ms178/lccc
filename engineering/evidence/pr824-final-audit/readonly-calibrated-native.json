@@ -1,0 +1,97 @@
+{
+  "label": "CALIBRATED 100x rounds: production four-way unroll candidate / S31",
+  "arm_a": {
+    "binary": "/home/user/.cache/pr824-measurements/readonly-native/long-before",
+    "sha256": "2d26bc93fec0aa07f87e216fef03fc2808cba9a9d6cd7a06ca9bc06082c6228c",
+    "env": "",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "4775ffc27eb3624b1f3b3bdde74b19d30721fdddf25d640024b6aa1fe5be8a31"
+    }
+  },
+  "arm_b": {
+    "binary": "/home/user/.cache/pr824-measurements/readonly-native/long-after",
+    "sha256": "122c10920caef0d2b5cb0c57d8fa1f83be76472758f74a5d5af8ab0532fc9cdd",
+    "env": "",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "4775ffc27eb3624b1f3b3bdde74b19d30721fdddf25d640024b6aa1fe5be8a31"
+    }
+  },
+  "identical_binaries": false,
+  "rounds": 15,
+  "warmup": 1,
+  "arm_a_timings": {
+    "arm": "S31",
+    "n": 15,
+    "min_ms": 353.11,
+    "median_ms": 375.955,
+    "mean_ms": 391.674,
+    "stdev_ms": 32.844,
+    "samples_ms": [
+      395.273,
+      440.734,
+      434.349,
+      460.651,
+      375.955,
+      374.042,
+      376.773,
+      380.919,
+      353.11,
+      360.882,
+      437.748,
+      371.892,
+      373.185,
+      374.147,
+      365.451
+    ]
+  },
+  "arm_b_timings": {
+    "arm": "unroll4",
+    "n": 15,
+    "min_ms": 386.769,
+    "median_ms": 401.682,
+    "mean_ms": 419.96,
+    "stdev_ms": 43.133,
+    "samples_ms": [
+      410.442,
+      489.979,
+      393.241,
+      543.444,
+      439.697,
+      404.523,
+      409.666,
+      392.369,
+      390.514,
+      398.19,
+      398.594,
+      401.682,
+      453.489,
+      386.769,
+      386.806
+    ]
+  },
+  "paired_diffs_ms": [
+    -15.169,
+    -49.246,
+    41.108,
+    -82.793,
+    -63.743,
+    -30.481,
+    -32.893,
+    -11.45,
+    -37.404,
+    -37.308,
+    39.155,
+    -29.789,
+    -80.304,
+    -12.622,
+    -21.355
+  ],
+  "median_ratio_b_over_a": 1.06843,
+  "min_ratio_b_over_a": 1.09532,
+  "sign_test_p": 0.00982,
+  "median_and_min_agree": true,
+  "significant": true,
+  "verdict": "S31 FASTER by 6.84% (median)"
+}

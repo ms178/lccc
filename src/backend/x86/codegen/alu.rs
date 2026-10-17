@@ -478,6 +478,91 @@ impl X86Codegen {
         }
     }
 
+    /// Register-direct BMI2 `bzhi`: `bzhi %index, %src, %dest`.  Staging is
+    /// `emit_shift_reg_direct`'s VEX discipline -- the index from its own
+    /// register home or staged in %rcx (staged first when the source must be
+    /// loaded into the index's home), the source from its home or loaded into
+    /// the destination -- because `bzhi`, like `shlx`, reads both sources
+    /// before writing the destination and takes its index in a register.
+    /// The 32-bit form zero-extends into the full register, as the
+    /// accumulator path's `store_eax_to` discipline expects.
+    fn emit_bzhi_reg_direct(
+        &mut self,
+        src: &Operand,
+        index: &Operand,
+        dest_phys: PhysReg,
+        use_32bit: bool,
+        dest_value_id: u32,
+    ) {
+        let gpr_home = |r: Option<PhysReg>| r.filter(|r| !super::emit::is_xmm_reg(*r));
+        let index_home = gpr_home(self.operand_reg(index));
+        let src_home = gpr_home(self.operand_reg(src));
+        let name = |r: PhysReg| {
+            if use_32bit {
+                super::emit::phys_reg_name_32(r).to_string()
+            } else {
+                super::emit::phys_reg_name(r).to_string()
+            }
+        };
+        let index_name = match index_home {
+            Some(r) if src_home.is_some() || r.0 != dest_phys.0 => name(r),
+            _ => {
+                self.operand_to_rcx(index);
+                if use_32bit { "ecx" } else { "rcx" }.to_string()
+            }
+        };
+        let src_name = match src_home {
+            Some(r) => name(r),
+            None => {
+                self.operand_to_callee_reg(src, dest_phys);
+                name(dest_phys)
+            }
+        };
+        let mnem = if use_32bit { "bzhil" } else { "bzhiq" };
+        let dest_name = name(dest_phys);
+        self.state.emit_fmt(format_args!(
+            "    {mnem} %{index_name}, %{src_name}, %{dest_name}"
+        ));
+        self.state.reg_cache.invalidate_acc();
+        // In-place compute accounting (see note_inplace_compute): the result
+        // was written into dest_phys.
+        self.note_inplace_compute(dest_phys, dest_value_id);
+    }
+
+    /// Accumulator `Bzhi`: source in %rax/%eax, index in %rcx.  With BMI2
+    /// this is the instruction itself.  Without it (the frontend rejects the
+    /// builtins then, so only hand-built IR gets here) the portable form uses
+    /// no register beyond the two operands: `k = index & 0xFF`; `k >= W`
+    /// keeps the source; otherwise shifting left by `W - k` and back clears
+    /// the high bits, spelled as `(W - 1 - k)` plus `1` so that `k == 0`
+    /// clears all W bits instead of hitting the count mask.  For
+    /// `k <= W - 1`, `(W - 1) ^ k == W - 1 - k`.
+    fn emit_bzhi_acc(&mut self, use_32bit: bool) {
+        if self.bmi2_enabled {
+            self.state.emit(if use_32bit {
+                "    bzhil %ecx, %eax, %eax"
+            } else {
+                "    bzhiq %rcx, %rax, %rax"
+            });
+            return;
+        }
+        let (width, sfx) = if use_32bit { (32, 'l') } else { (64, 'q') };
+        let acc = if use_32bit { "eax" } else { "rax" };
+        let done = self.state.fresh_label("bzhi_keep");
+        self.state.emit("    movzbl %cl, %ecx");
+        self.state.emit_fmt(format_args!("    cmpl ${width}, %ecx"));
+        self.state.out.emit_jcc_label("    jae", &done);
+        self.state
+            .emit_fmt(format_args!("    xorl ${}, %ecx", width - 1));
+        self.state
+            .emit_fmt(format_args!("    shl{sfx} %cl, %{acc}"));
+        self.state.emit_fmt(format_args!("    shl{sfx} $1, %{acc}"));
+        self.state.emit_fmt(format_args!("    shr{sfx} $1, %{acc}"));
+        self.state
+            .emit_fmt(format_args!("    shr{sfx} %cl, %{acc}"));
+        self.state.out.emit_named_label(&done);
+    }
+
     /// Emit `dest = BT(base, index) & 1` directly to a physical register.
     /// Returns false only when the result register is BT's fixed count
     /// register (%rcx) or is not an ordinary GPR; the accumulator fallback
@@ -957,6 +1042,10 @@ impl X86Codegen {
                     self.emit_rotate_reg_direct(op, lhs, rhs, dest_phys, ty, dest.0);
                     return;
                 }
+            }
+            if op == IrBinOp::Bzhi && self.bmi2_enabled && is_bzhi_type(ty) {
+                self.emit_bzhi_reg_direct(lhs, rhs, dest_phys, use_32bit, dest.0);
+                return;
             }
             if op == IrBinOp::BitTest {
                 if self.emit_bit_test_reg_direct(lhs, rhs, dest_phys, use_32bit) {
@@ -1836,6 +1925,7 @@ impl X86Codegen {
                 }
             }
             IrBinOp::BitTest => unreachable!("BitTest handled by native BT fallback"),
+            IrBinOp::Bzhi => self.emit_bzhi_acc(use_32bit),
             // Rotates of every integer width are emitted above
             // (register-direct or accumulator, both width-aware); this arm
             // is structurally dead for well-typed IR.
@@ -2239,4 +2329,9 @@ impl X86Codegen {
         self.operand_to_rax_rdx(src);
         self.store_rax_rdx_to(dest);
     }
+}
+
+/// The IR types `Bzhi` is defined on (see `IrBinOp::Bzhi`).
+fn is_bzhi_type(ty: IrType) -> bool {
+    matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64)
 }

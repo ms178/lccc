@@ -50,6 +50,8 @@ HERE = Path(__file__).resolve().parent
 PROGRAMS = HERE / "programs"
 REPO_ROOT = HERE.parents[1]
 DEFAULT_LCCC = REPO_ROOT / "target" / "fastbuild" / "lccc"
+sys.path.insert(0, str(REPO_ROOT))
+from tools.corpus import process
 
 
 @dataclass(frozen=True)
@@ -225,47 +227,24 @@ def child_cpu_seconds() -> float:
 
 def invoke(command: list[str], *, timeout_s: int, cwd: Path | None = None,
            env: dict[str, str] | None = None) -> dict[str, Any]:
-    """Run one child and return both wall and aggregate child CPU time.
-
-    Wall time is the primary metric.  Child CPU time is retained as a useful
-    diagnosis for scheduler steal/noise; it is not a substitute for PMU data.
-    """
+    """Bounded byte-preserving execution; wall time and child CPU stay distinct."""
     cpu_before = child_cpu_seconds()
     start_ns = time.perf_counter_ns()
     try:
-        completed = subprocess.run(
-            command, capture_output=True, text=True, timeout=timeout_s,
-            cwd=str(cwd) if cwd else None, env=env, check=False,
-        )
-        error = ""
-    except subprocess.TimeoutExpired as exc:
-        completed = None
-        error = f"timeout after {timeout_s}s"
-        stdout = exc.stdout or ""
-        stderr = exc.stderr or ""
+        result = process.run(command, timeout_s, cwd=cwd, env=env)
     except OSError as exc:
-        completed = None
-        error = f"execution error: {exc}"
-        stdout = ""
-        stderr = ""
+        result = dict(returncode=None, stdout=b'', stderr=b'', failure=str(exc))
     end_ns = time.perf_counter_ns()
     cpu_after = child_cpu_seconds()
-
-    if completed is not None:
-        stdout = completed.stdout
-        stderr = completed.stderr
-        returncode = completed.returncode
-    else:
-        returncode = -1
-
     return {
-        "ok": completed is not None and returncode == 0,
-        "returncode": returncode,
-        "error": error,
+        "ok": result['failure'] is None and result['returncode'] == 0,
+        "returncode": result['returncode'],
+        "error": result['failure'] or '',
         "wall_s": (end_ns - start_ns) / 1_000_000_000.0,
         "child_cpu_s": max(0.0, cpu_after - cpu_before),
-        "stdout": stdout.strip(),
-        "stderr": stderr.strip(),
+        "stdout": result['stdout'].decode('utf-8', errors='backslashreplace'),
+        "stdout_sha256": hashlib.sha256(result['stdout']).hexdigest(),
+        "stderr": result['stderr'].decode('utf-8', errors='backslashreplace'),
         "command": command,
     }
 
@@ -684,6 +663,9 @@ def output_path(work: Path, artifacts: Path | None, benchmark: Benchmark,
     return work / f"{benchmark.name}_{compiler.key}"
 
 
+REFERENCE_COMPILERS = ("gcc", "clang", "icx")
+
+
 def evaluate_correctness(entry: dict[str, Any], compiler_keys: list[str]) -> None:
     """Mark output stability and cross-compiler equivalence without hiding errors."""
     successful: dict[str, list[str]] = {}
@@ -691,19 +673,24 @@ def evaluate_correctness(entry: dict[str, Any], compiler_keys: list[str]) -> Non
         timed = entry["runs"].get(key, [])
         # Warm-ups are excluded from timing, never from correctness. A wrong
         # first execution or unstable control cannot certify later samples.
-        runs = [*entry.get("warmups", {}).get(key, []), *timed]
-        outputs = [run["stdout"] for run in runs if run.get("ok")]
-        if outputs:
+        observed = [*entry.get("warmups", {}).get(key, []), *timed]
+        # Exact stdout bytes (hash), never lossy decoded/stripped text.
+        outputs = [run.get("stdout_sha256", run["stdout"]) for run in observed if run.get("ok")]
+        complete = bool(timed) and len(outputs) == len(observed)
+        stable = len(set(outputs)) == 1 if outputs else None
+        if complete and stable:
             successful[key] = outputs
         entry["correctness"][key] = {
-            "stable_within_compiler": len(set(outputs)) == 1 if outputs else None,
-            "output": outputs[0] if outputs else None,
-            "all_runs_successful": bool(timed) and len(outputs) == len(runs),
-            "matches_baseline": None,
+            "stable_within_compiler": stable,
+            "all_runs_successful": complete,
+            "output": next((run["stdout"] for run in observed if run.get("ok")), None),
+            "matches_baseline": False if observed and not (complete and stable) else None,
         }
-    # When requested, GCC remains the oracle even if it failed. Falling back
-    # to LCCC would let the candidate certify its own wrong or missing result.
-    baseline = "gcc" if "gcc" in compiler_keys else next(iter(successful), None)
+    # The oracle is an independent reference compiler: GCC when requested,
+    # else the first requested of Clang/ICX. A failed oracle is never replaced
+    # by a later one, and an LCCC build (lccc/lev/ccc/--candidate) never
+    # becomes the oracle: a candidate would certify its own wrong output.
+    baseline = next((key for key in REFERENCE_COMPILERS if key in compiler_keys), None)
     entry["baseline_compiler"] = baseline
     if baseline is None or baseline not in successful:
         return
@@ -855,6 +842,9 @@ def run_benchmark(benchmark: Benchmark, compilers: list[CompilerSpec], args: arg
         for compiler in compilers:
             if compiler.key == "gcc":
                 continue
+            if not all(entry["correctness"][key]["matches_baseline"] is True
+                       for key in (compiler.key, "gcc")):
+                continue
             ratio = pair_ratios(entry["rounds"], compiler.key, "gcc",
                                 seed + stable_seed(benchmark.name, compiler.key, "gcc") % 1_000_000)
             entry["ratios_to_gcc"][compiler.key] = ratio
@@ -865,6 +855,9 @@ def run_benchmark(benchmark: Benchmark, compilers: list[CompilerSpec], args: arg
     if "lccc" in compiler_keys:
         for compiler in compilers:
             if compiler.key == "lccc":
+                continue
+            if not all(entry["correctness"][key]["matches_baseline"] is True
+                       for key in ("lccc", compiler.key)):
                 continue
             entry["ratios_from_lccc"][compiler.key] = pair_ratios(
                 entry["rounds"], "lccc", compiler.key,

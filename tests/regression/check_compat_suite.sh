@@ -330,6 +330,47 @@ int main() {
 }
 '
 
+# A GNU vector comparison is a mask of signed integer lanes as wide as the
+# operand lanes (int lanes for float, 64-bit lanes for double); __typeof__,
+# __auto_type and sizeof must see that vector type.  LCCC used to lower float
+# lane comparisons as a compare of the vector's address (segfault), type the
+# comparison as int (sizeof 4, m[1] crashed) and collapse typeof/auto_type
+# vectors to their lane type.
+test_program "GNU vector comparison masks" '
+#include <stdio.h>
+#include <math.h>
+typedef float v4f __attribute__((vector_size(16)));
+typedef double v2d __attribute__((vector_size(16)));
+typedef int v4i __attribute__((vector_size(16)));
+typedef unsigned char v16u __attribute__((vector_size(16)));
+typedef short v8s __attribute__((vector_size(16)));
+typedef float v8f __attribute__((vector_size(32)));
+static void pf(const char *n, v4i m) { printf("%s %d %d %d %d\n", n, m[0], m[1], m[2], m[3]); }
+int main(void) {
+  volatile float nanv = NAN;
+  v4f f = {1, 2, nanv, -3}, g = {1, 1, 1, nanv};
+  pf("eq", f == g); pf("ne", f != g); pf("lt", f < g); pf("le", f <= g);
+  pf("gt", f > g); pf("ge", f >= g); pf("lt1", f < 1); pf("1lt", 1 < f);
+  pf("ltd", f < 1.5);
+  v2d d = {0.5, nanv}, e = {0.5, 0.5};
+  __typeof__(d == e) dm = d == e; __typeof__(d != e) dn = d != e;
+  printf("d %lld %lld %lld %lld %zu %zu\n", (long long)dm[0], (long long)dm[1], (long long)dn[0], (long long)dn[1], sizeof dm, sizeof(d < 0));
+  v8f h = {1,2,3,4,5,6,7,8}; __typeof__(h > 4) hm = h > 4;
+  printf("h %zu %d %d %d\n", sizeof hm, hm[0], hm[4], hm[7]);
+  v16u a = {1, 200, 3}, b = {1, 2, 255};
+  __typeof__(a < b) am = a < b;
+  printf("u %zu %d %d %d %d\n", sizeof am, am[0], am[1], am[2], am[3]);
+  v8s s = {-1, 5, 7}, t = {0, 5, -7};
+  __auto_type sm = s >= t;
+  printf("s %zu %d %d %d\n", sizeof sm, sm[0], sm[1], sm[2]);
+  v4i i = {1, -2, 3, 4};
+  pf("ilt", i < 2); pf("not", ~(i == i)); pf("neg", -(f < g));
+  v4f sel = (v4f)((v4i)f & (f > 0));
+  printf("sel %g %g %g\n", sel[0], sel[1], sel[3]);
+  return 0;
+}
+'
+
 # --- Summary ---
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed, $SKIP skipped (of $TOTAL) ==="

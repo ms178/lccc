@@ -115,6 +115,15 @@ pub struct CallInfo {
     /// aggregate returns; on i686, three INTEGER entries mark a Clang integer
     /// ExtVector result carried in EAX:EDX:ECX.
     pub ret_eightbyte_classes: Vec<EightbyteClass>,
+    /// The callee may be treated as the standard library function of that
+    /// name: folded (`printf` -> `puts`) or expanded inline (constant-size
+    /// `memcpy`/`memset`).  Set by lowering for `__builtin_*` spellings and
+    /// for the compiler's own struct-copy / zero-init calls, by
+    /// `passes::builtin_policy::apply` for plain calls the function's
+    /// [`crate::common::pass_policy::BuiltinPolicy`] permits, and by the
+    /// passes that synthesize library calls.  `false` (the default) means
+    /// "call it as written": never folded, never expanded.
+    pub assume_library: bool,
 }
 
 /// An IR instruction.

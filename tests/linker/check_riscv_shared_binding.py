@@ -17,6 +17,7 @@ import tempfile
 from check_riscv_relocation_contract import fixture, sections, run
 
 MASK = (1 << 64) - 1
+WORD_SENTINEL = 0xD15EA5ED
 
 
 def dynamic_symbols(sec):
@@ -60,13 +61,6 @@ def verify(out, options, *, merged_visibility=None, definition_offset=0, places=
             assert symbol["shndx"] == 0 and symbol["value"] == 0, symbol
     relas = sec.get(".rela.dyn", (None, b""))[1]
     entries = [struct.unpack_from("<QQq", relas, i) for i in range(0, len(relas), 24)]
-    if kind == 1:
-        assert options["absolute"] and defined, options
-        assert not entries, entries
-        data = sec[".data"][1]
-        assert struct.unpack_from("<I", data)[0] == (value + addend) & 0xffffffff, data
-        assert data[4:16] == b"\xa5" * 12, data
-        return
     if kind == 20:
         assert places == 1 and addend == 0
         # The canonical GOT_HI20 form has zero addend. Its HI20 must address
@@ -92,6 +86,12 @@ def verify(out, options, *, merged_visibility=None, definition_offset=0, places=
         locations = [(sh[3] + i * 16, struct.unpack_from("<Q", data, i * 16)[0])
                      for i in range(places)]
     for place, initial in locations:
+        if kind == 1:
+            assert absolute and not preemptible
+            assert not entries, (entries, options)
+            assert initial & 0xffffffff == (value + addend) & 0xffffffff
+            assert initial >> 32 == WORD_SENTINEL, ("four-byte relocation corrupted next word", initial)
+            continue
         at = [(info, a) for p, info, a in entries if p == place]
         if preemptible:
             assert at == [((symbols["target"]["index"] << 32) | 2, addend)], (at, options)
@@ -130,16 +130,13 @@ def cases():
             (b, v, d) for b in (1, 2) for v in range(4) for d in (True, False)]:
         for absolute, target_value in [(False, 0)] + ([(True, 0), (True, 256)] if defined else []):
             for kind in (1, 2, 20):
-                addends = (-7, 0, 11, -(1 << 63), (1 << 63) - 1) if kind != 20 else (0,)
-                for addend in addends:
+                for addend in ((-7, 0, 11, -(1 << 63), (1 << 63) - 1) if kind in (1, 2) else (0,)):
                     options = dict(binding=binding, visibility=visibility, defined=defined,
                                    absolute=absolute, target_value=target_value, kind=kind, addend=addend)
                     accept = not (binding == 1 and visibility != 0 and not defined)
                     if kind == 1:
-                        options["payload"] = bytes(4) + b"\xa5" * 12
-                        # R_RISCV_32 writes the low 32 bits of S+A, including
-                        # extreme RELA addends; GNU ld does not range-reject ABS.
-                        accept = defined and absolute
+                        accept &= (binding == 0 or visibility != 0) and (
+                            absolute or (binding == 2 and not defined))
                     yield f"b{binding}-v{visibility}-d{defined}-abs{absolute}-{target_value}-k{kind}-a{addend}", options, accept
 
 
@@ -184,7 +181,9 @@ def measure(args, records, versions):
             if args.only_riscv32 and options["kind"] != 1:
                 continue
             src = root / (name + ".o")
-            src.write_bytes(fixture(**options))
+            # A nonzero neighbor makes an accidental eight-byte write visible.
+            payload = struct.pack("<IIQ", 0, WORD_SENTINEL, 0) if options["kind"] == 1 else None
+            src.write_bytes(fixture(**options, payload=payload))
             for tool, command in tools.items():
                 out = root / f"{name}-{tool}.so"
                 try:
@@ -193,8 +192,37 @@ def measure(args, records, versions):
                     if accept:
                         verify(out, options)
                     elif tool == "lccc":
-                        assert ("R_RISCV_32" in diagnostic or "undefined non-default-visible" in diagnostic
-                                if options["kind"] == 1 else "undefined non-default-visible" in diagnostic), diagnostic
+                        expected = ("undefined non-default-visible" if options["binding"] == 1
+                                    and options["visibility"] != 0 and not options["defined"]
+                                    else "R_RISCV_32 requires")
+                        assert expected in diagnostic, diagnostic
+                    records.append(dict(case=name, tool=tool, passed=True))
+                except (AssertionError, OSError, subprocess.TimeoutExpired, ValueError,
+                        struct.error, KeyError, IndexError) as error:
+                    records.append(dict(case=name, tool=tool, passed=False, error=str(error)))
+        # CALL_PLT is a function-import contract, not just a data address.
+        # Hidden/internal/protected missing weak functions must not become
+        # null-symbol JUMP_SLOT entries. Default weak imports need real dynsym.
+        for visibility in range(4):
+            src = root / f"weak-function-v{visibility}.o"
+            src.write_bytes(fixture(kind=19, binding=2, visibility=visibility, defined=False,
+                                   payload=struct.pack("<IIQ", 0x97, 0x80e7, 0)))
+            for tool, command in tools.items():
+                name = f"weak-function-plt-v{visibility}"
+                out = root / (name + tool + ".so")
+                try:
+                    rc, diagnostic = run(command + [str(src), "-o", str(out)])
+                    assert rc == 0, diagnostic
+                    sec = sections(out)
+                    relas = sec.get(".rela.plt", (None, b""))[1]
+                    entries = [struct.unpack_from("<QQq", relas, i) for i in range(0, len(relas), 24)]
+                    if visibility == 0:
+                        symbol = dynamic_symbols(sec)["target"]
+                        assert symbol["shndx"] == 0 and symbol["binding"] == 2
+                        assert len(entries) == 1
+                        assert entries[0][1] == (symbol["index"] << 32) | 5
+                    else:
+                        assert not entries, ("non-preemptible weak function has PLT fixup", entries)
                     records.append(dict(case=name, tool=tool, passed=True))
                 except (AssertionError, OSError, subprocess.TimeoutExpired, ValueError,
                         struct.error, KeyError, IndexError) as error:

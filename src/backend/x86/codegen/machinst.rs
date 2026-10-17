@@ -483,6 +483,12 @@ pub enum MachInst {
         target: CallTarget,
         /// Return-value home: rax is copied here after the call.
         ret: Option<CallRetMove>,
+        /// Leading SysV GP argument registers the callee reads, published
+        /// as `# LCCC_CALL_ARGS` (with `# LCCC_CALL_FP 0`) right after the
+        /// call text. `None` publishes nothing, and the text liveness
+        /// oracles then assume all six GP and eight SSE argument registers
+        /// are read (fail-closed).
+        gp_arg_count: Option<u8>,
     },
 
     /// Return: `ret`.

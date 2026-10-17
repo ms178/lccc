@@ -2430,6 +2430,7 @@ mod tests {
             regparm: None,
             is_pure: false,
             is_const: false,
+            assume_library: false,
             ret_eightbyte_classes: Vec::new(),
         }
     }

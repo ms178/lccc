@@ -48,6 +48,8 @@ impl Lowerer {
                         self.lower_local_decl(decl);
                     }
                     BlockItem::Statement(stmt) => self.lower_stmt(stmt),
+                    // Decided by sema; a static assertion generates nothing.
+                    BlockItem::StaticAssert(_) => {}
                     BlockItem::NestedFunction(nested) => {
                         self.lower_nested_function_def(nested);
                     }
@@ -280,7 +282,10 @@ impl Lowerer {
                     let real_sizeof = self.sizeof_type(sizeof_ts);
                     align = Some(align.map_or(real_sizeof, |a| a.max(real_sizeof)));
                 }
-                align.or_else(|| decl.alignas_type.as_ref().map(|ts| self.alignof_type(ts)))
+                crate::common::types::strictest_alignment([
+                    align,
+                    decl.alignas_type.as_ref().map(|ts| self.alignof_type(ts)),
+                ])
             };
             if let Some(align) = effective_alignment {
                 self.types
@@ -329,11 +334,11 @@ impl Lowerer {
     }
 
     fn compute_explicit_alignment(&self, decl: &Declaration, type_spec: &TypeSpecifier) -> usize {
-        let mut ea = if let Some(ref alignas_ts) = decl.alignas_type {
-            self.alignof_type(alignas_ts)
-        } else {
-            decl.alignment.unwrap_or(0)
-        };
+        let mut ea = crate::common::types::strictest_alignment([
+            decl.alignment,
+            decl.alignas_type.as_ref().map(|ts| self.alignof_type(ts)),
+        ])
+        .unwrap_or(0);
         if let Some(ref sizeof_ts) = decl.alignment_sizeof_type {
             ea = ea.max(self.sizeof_type(sizeof_ts));
         }
@@ -601,11 +606,10 @@ impl Lowerer {
 
         // Respect explicit __attribute__((aligned(N))) / _Alignas(N) on static locals.
         // Resolve _Alignas(type) via the lowerer for accurate typedef resolution.
-        let mut explicit_align = if let Some(ref alignas_ts) = decl.alignas_type {
-            Some(self.alignof_type(alignas_ts))
-        } else {
-            decl.alignment
-        };
+        let mut explicit_align = crate::common::types::strictest_alignment([
+            decl.alignment,
+            decl.alignas_type.as_ref().map(|ts| self.alignof_type(ts)),
+        ]);
         // Recompute sizeof for aligned(sizeof(type)) with full layout info
         if let Some(ref sizeof_ts) = decl.alignment_sizeof_type {
             let real_sizeof = self.sizeof_type(sizeof_ts);

@@ -68,15 +68,14 @@ fn expand_literal_pools(statements: &[AsmStatement]) -> Vec<AsmStatement> {
         out.push(AsmStatement::Directive(AsmDirective::Balign(8)));
         for entry in pool.drain(..) {
             out.push(AsmStatement::Label(entry.label));
-            if entry.addend != 0 {
-                out.push(AsmStatement::Directive(AsmDirective::Quad(vec![
-                    DataValue::SymbolOffset(entry.symbol, entry.addend),
-                ])));
+            let value = if entry.addend != 0 {
+                format!("{} + ({})", entry.symbol, entry.addend)
             } else {
-                out.push(AsmStatement::Directive(AsmDirective::Quad(vec![
-                    DataValue::Symbol(entry.symbol),
-                ])));
-            }
+                entry.symbol
+            };
+            out.push(AsmStatement::Directive(AsmDirective::Quad(vec![
+                DataValue::Expr(value),
+            ])));
         }
     };
 
@@ -290,116 +289,45 @@ fn resolve_numeric_operand(
     }
 }
 
-/// Resolve numeric label references (e.g., `1b`, `2f`) within an expression string.
-/// Replaces each occurrence with the resolved unique label name (e.g., `.Lnum_1_3`).
+/// Resolve numeric label references (e.g., `1b`, `2f`) within an expression
+/// string ([`crate::backend::asm_expr::rewrite_numeric_label_refs`]).
 fn resolve_numeric_refs_in_expr(
     expr: &str,
     current_idx: usize,
     defs: &FxHashMap<String, Vec<(usize, String)>>,
 ) -> String {
-    let bytes = expr.as_bytes();
-    let mut result = String::with_capacity(expr.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_digit() {
-            let start = i;
-            // Skip hex literals (0x..., 0X...) and binary literals (0b..., 0B...)
-            // to avoid misinterpreting hex digits as label refs (e.g., 0x1b)
-            if bytes[i] == b'0'
-                && i + 1 < bytes.len()
-                && (bytes[i + 1] == b'x'
-                    || bytes[i + 1] == b'X'
-                    || bytes[i + 1] == b'b'
-                    || bytes[i + 1] == b'B')
-            {
-                // Consume the entire hex/binary literal
-                i += 2; // skip 0x or 0b
-                while i < bytes.len() && bytes[i].is_ascii_alphanumeric() {
-                    i += 1;
-                }
-                result.push_str(&expr[start..i]);
-                continue;
-            }
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            // Check if followed by 'b' or 'f' (not part of a longer identifier)
-            if i < bytes.len()
-                && (bytes[i] == b'b' || bytes[i] == b'f' || bytes[i] == b'B' || bytes[i] == b'F')
-                && (i + 1 >= bytes.len() || !bytes[i + 1].is_ascii_alphanumeric())
-            {
-                let label_ref = &expr[start..=i];
-                i += 1;
-                if let Some(resolved) = resolve_numeric_name(label_ref, current_idx, defs) {
-                    result.push_str(&resolved);
-                } else {
-                    result.push_str(label_ref);
-                }
-            } else {
-                // Regular number
-                result.push_str(&expr[start..i]);
-            }
-        } else {
-            result.push(bytes[i] as char);
-            i += 1;
-        }
-    }
-    result
+    crate::backend::asm_expr::rewrite_numeric_label_refs(expr, |r| {
+        resolve_numeric_name(r, current_idx, defs)
+    })
 }
 
-/// Resolve numeric label references in data directives.
+/// Resolve numeric label references in the directives that carry
+/// expressions: data values, `.org` (the kernel's ALTERNATIVE length checks,
+/// `.org . - (664b-663b) + (662b-661b)`) and `.set`.
 fn resolve_numeric_directive(
     dir: &AsmDirective,
     current_idx: usize,
     defs: &FxHashMap<String, Vec<(usize, String)>>,
 ) -> AsmDirective {
+    let expr = |e: &str| resolve_numeric_refs_in_expr(e, current_idx, defs);
+    let vals = |vals: &[DataValue]| -> Vec<DataValue> {
+        vals.iter()
+            .map(|v| match v {
+                DataValue::Expr(e) => DataValue::Expr(expr(e)),
+                DataValue::Integer(_) => v.clone(),
+            })
+            .collect()
+    };
     match dir {
-        AsmDirective::Byte(vals) => {
-            AsmDirective::Byte(resolve_numeric_data_values(vals, current_idx, defs))
-        }
-        AsmDirective::Long(vals) => {
-            AsmDirective::Long(resolve_numeric_data_values(vals, current_idx, defs))
-        }
-        AsmDirective::Quad(vals) => {
-            AsmDirective::Quad(resolve_numeric_data_values(vals, current_idx, defs))
-        }
+        AsmDirective::Byte(v) => AsmDirective::Byte(vals(v)),
+        AsmDirective::Short(v) => AsmDirective::Short(vals(v)),
+        AsmDirective::Long(v) => AsmDirective::Long(vals(v)),
+        AsmDirective::Quad(v) => AsmDirective::Quad(vals(v)),
+        AsmDirective::Org { expr: e, fill } => AsmDirective::Org {
+            expr: expr(e),
+            fill: *fill,
+        },
+        AsmDirective::Set(name, e) => AsmDirective::Set(name.clone(), expr(e)),
         _ => dir.clone(),
     }
-}
-
-/// Resolve numeric label references in data values.
-fn resolve_numeric_data_values(
-    vals: &[DataValue],
-    current_idx: usize,
-    defs: &FxHashMap<String, Vec<(usize, String)>>,
-) -> Vec<DataValue> {
-    vals.iter()
-        .map(|v| match v {
-            DataValue::Symbol(name) => {
-                if let Some(resolved) = resolve_numeric_name(name, current_idx, defs) {
-                    DataValue::Symbol(resolved)
-                } else {
-                    v.clone()
-                }
-            }
-            DataValue::SymbolOffset(name, off) => {
-                if let Some(resolved) = resolve_numeric_name(name, current_idx, defs) {
-                    DataValue::SymbolOffset(resolved, *off)
-                } else {
-                    v.clone()
-                }
-            }
-            DataValue::SymbolDiff(a, b) => {
-                let new_a = resolve_numeric_name(a, current_idx, defs).unwrap_or_else(|| a.clone());
-                let new_b = resolve_numeric_name(b, current_idx, defs).unwrap_or_else(|| b.clone());
-                DataValue::SymbolDiff(new_a, new_b)
-            }
-            DataValue::SymbolDiffAddend(a, b, add) => {
-                let new_a = resolve_numeric_name(a, current_idx, defs).unwrap_or_else(|| a.clone());
-                let new_b = resolve_numeric_name(b, current_idx, defs).unwrap_or_else(|| b.clone());
-                DataValue::SymbolDiffAddend(new_a, new_b, *add)
-            }
-            _ => v.clone(),
-        })
-        .collect()
 }

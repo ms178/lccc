@@ -153,6 +153,7 @@ fn hook_call(vfn: Value, vsite: Value) -> CallInfo {
         // defaults an extern call gets anyway.)
         is_pure: false,
         is_const: false,
+        assume_library: false,
         ret_eightbyte_classes: vec![],
     }
 }

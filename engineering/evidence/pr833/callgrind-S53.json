@@ -1,0 +1,1406 @@
+{
+  "complete": true,
+  "metric": "bounded whole-program simulated Ir; not runtime",
+  "selected": [
+    "aarch64_select_patterns",
+    "ackermann",
+    "arith_loop",
+    "ascii_case_fold",
+    "binary_search",
+    "binary_trees",
+    "bitops",
+    "byte_load_reassembly",
+    "chacha20_block",
+    "constant_recursion",
+    "double_reduction",
+    "expat_siphash24",
+    "expat_xml_scan",
+    "fannkuch",
+    "fib",
+    "glibc_memcmp",
+    "glibc_strstr",
+    "gzip_crc32",
+    "hash_table",
+    "histogram",
+    "libm_round_family",
+    "linux_find_bit",
+    "linux_find_bit_scaled",
+    "linux_rbtree",
+    "loop_patterns",
+    "lz4_compress",
+    "lz4_match_extend",
+    "mandelbrot",
+    "matmul",
+    "nbody",
+    "percpu_ptr_walk",
+    "qsort",
+    "ring_fifo",
+    "sha256_transform",
+    "sieve",
+    "spectral_norm",
+    "sqlite_varint",
+    "strlen_bench",
+    "struct_copy",
+    "switch_dispatch",
+    "tce_sum",
+    "tls_seg_access",
+    "zlib_ng_adler32",
+    "zlib_ng_adler32_combine",
+    "zstd_count"
+  ],
+  "results": {
+    "arith_loop": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DARITH_ITERS=20000",
+      "metrics": {
+        "conditional_mispredicts": [
+          3380,
+          3472
+        ],
+        "d1_misses": [
+          1900,
+          1926
+        ],
+        "i1_misses": [
+          1410,
+          1409
+        ],
+        "indirect_mispredicts": [
+          258,
+          276
+        ],
+        "ir_mine": 2188299,
+        "ir_ratio": 0.8240396147726952,
+        "ir_ref": 2655575,
+        "ll_misses": [
+          2950,
+          2968
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/arith_loop/manifest.json"
+    },
+    "fib": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DFIB_N=25",
+      "metrics": {
+        "conditional_mispredicts": [
+          3402,
+          22060
+        ],
+        "d1_misses": [
+          1898,
+          1926
+        ],
+        "i1_misses": [
+          1388,
+          1404
+        ],
+        "indirect_mispredicts": [
+          259,
+          277
+        ],
+        "ir_mine": 148689,
+        "ir_ratio": 0.07364450894250152,
+        "ir_ref": 2019010,
+        "ll_misses": [
+          2928,
+          2965
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/fib/manifest.json"
+    },
+    "matmul": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DN=48",
+      "metrics": {
+        "conditional_mispredicts": [
+          3594,
+          5947
+        ],
+        "d1_misses": [
+          3251,
+          3281
+        ],
+        "i1_misses": [
+          1489,
+          1488
+        ],
+        "indirect_mispredicts": [
+          260,
+          278
+        ],
+        "ir_mine": 340138,
+        "ir_ratio": 0.9828475990684074,
+        "ir_ref": 346074,
+        "ll_misses": [
+          3902,
+          3924
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/matmul/manifest.json"
+    },
+    "qsort": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DN=10000",
+      "metrics": {
+        "conditional_mispredicts": [
+          78847,
+          78942
+        ],
+        "d1_misses": [
+          7681,
+          7724
+        ],
+        "i1_misses": [
+          1441,
+          1443
+        ],
+        "indirect_mispredicts": [
+          266,
+          291
+        ],
+        "ir_mine": 3504606,
+        "ir_ratio": 1.0333794007966615,
+        "ir_ref": 3391403,
+        "ll_misses": [
+          4227,
+          4249
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/qsort/manifest.json"
+    },
+    "sieve": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DN=100000",
+      "metrics": {
+        "conditional_mispredicts": [
+          3610,
+          3688
+        ],
+        "d1_misses": [
+          51869,
+          51908
+        ],
+        "i1_misses": [
+          1397,
+          1400
+        ],
+        "indirect_mispredicts": [
+          266,
+          291
+        ],
+        "ir_mine": 1817931,
+        "ir_ratio": 1.053949416624393,
+        "ir_ref": 1724875,
+        "ll_misses": [
+          4500,
+          4522
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/sieve/manifest.json"
+    },
+    "tce_sum": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off",
+      "metrics": {
+        "conditional_mispredicts": [
+          3394,
+          3486
+        ],
+        "d1_misses": [
+          1897,
+          1926
+        ],
+        "i1_misses": [
+          1388,
+          1392
+        ],
+        "indirect_mispredicts": [
+          260,
+          278
+        ],
+        "ir_mine": 148650,
+        "ir_ratio": 0.9533307252752891,
+        "ir_ref": 155927,
+        "ll_misses": [
+          2929,
+          2953
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/tce_sum/manifest.json"
+    },
+    "nbody": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -lm -DSTEPS=1000",
+      "metrics": {
+        "conditional_mispredicts": [
+          3538,
+          3616
+        ],
+        "d1_misses": [
+          1931,
+          1956
+        ],
+        "i1_misses": [
+          1483,
+          1479
+        ],
+        "indirect_mispredicts": [
+          260,
+          278
+        ],
+        "ir_mine": 743886,
+        "ir_ratio": 1.2156767895984875,
+        "ir_ref": 611911,
+        "ll_misses": [
+          3037,
+          3052
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/nbody/manifest.json"
+    },
+    "binary_trees": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DTREE_DEPTH=10",
+      "metrics": {
+        "conditional_mispredicts": [
+          301063,
+          191641
+        ],
+        "d1_misses": [
+          61135,
+          61122
+        ],
+        "i1_misses": [
+          1461,
+          1543
+        ],
+        "indirect_mispredicts": [
+          268,
+          285
+        ],
+        "ir_mine": 48461007,
+        "ir_ratio": 1.0790732018162077,
+        "ir_ref": 44909842,
+        "ll_misses": [
+          5065,
+          5165
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/binary_trees/manifest.json"
+    },
+    "spectral_norm": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -lm -DN=128",
+      "metrics": {
+        "conditional_mispredicts": [
+          8656,
+          8754
+        ],
+        "d1_misses": [
+          1957,
+          2006
+        ],
+        "i1_misses": [
+          1465,
+          1464
+        ],
+        "indirect_mispredicts": [
+          259,
+          290
+        ],
+        "ir_mine": 5655745,
+        "ir_ratio": 2.0803696721688354,
+        "ir_ref": 2718625,
+        "ll_misses": [
+          3010,
+          3032
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/spectral_norm/manifest.json"
+    },
+    "mandelbrot": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DWIDTH=128 -DHEIGHT=128",
+      "metrics": {
+        "conditional_mispredicts": [
+          15570,
+          15651
+        ],
+        "d1_misses": [
+          1897,
+          1927
+        ],
+        "i1_misses": [
+          1394,
+          1396
+        ],
+        "indirect_mispredicts": [
+          258,
+          276
+        ],
+        "ir_mine": 6742308,
+        "ir_ratio": 1.1326063168391145,
+        "ir_ref": 5952914,
+        "ll_misses": [
+          2934,
+          2957
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/mandelbrot/manifest.json"
+    },
+    "hash_table": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DNUM_OPS=20000",
+      "metrics": {
+        "conditional_mispredicts": [
+          19539,
+          19660
+        ],
+        "d1_misses": [
+          98390,
+          98304
+        ],
+        "i1_misses": [
+          1403,
+          1405
+        ],
+        "indirect_mispredicts": [
+          267,
+          293
+        ],
+        "ir_mine": 7716653,
+        "ir_ratio": 1.0464122393293223,
+        "ir_ref": 7374391,
+        "ll_misses": [
+          26078,
+          26099
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/hash_table/manifest.json"
+    },
+    "strlen_bench": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DNSTRINGS=1000",
+      "metrics": {
+        "conditional_mispredicts": [
+          132152,
+          130505
+        ],
+        "d1_misses": [
+          220147,
+          221618
+        ],
+        "i1_misses": [
+          1434,
+          1429
+        ],
+        "indirect_mispredicts": [
+          276,
+          304
+        ],
+        "ir_mine": 9139038,
+        "ir_ratio": 1.128081876259351,
+        "ir_ref": 8101396,
+        "ll_misses": [
+          5401,
+          5431
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/strlen_bench/manifest.json"
+    },
+    "switch_dispatch": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DN=20000",
+      "metrics": {
+        "conditional_mispredicts": [
+          3374,
+          3468
+        ],
+        "d1_misses": [
+          1900,
+          1928
+        ],
+        "i1_misses": [
+          1391,
+          1396
+        ],
+        "indirect_mispredicts": [
+          19020,
+          18888
+        ],
+        "ir_mine": 555744,
+        "ir_ratio": 1.080810280984535,
+        "ir_ref": 514192,
+        "ll_misses": [
+          2932,
+          2958
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/switch_dispatch/manifest.json"
+    },
+    "struct_copy": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DN=2000",
+      "metrics": {
+        "conditional_mispredicts": [
+          3471,
+          3561
+        ],
+        "d1_misses": [
+          1936,
+          1965
+        ],
+        "i1_misses": [
+          1497,
+          1495
+        ],
+        "indirect_mispredicts": [
+          260,
+          278
+        ],
+        "ir_mine": 379791,
+        "ir_ratio": 0.8934850270663213,
+        "ir_ref": 425067,
+        "ll_misses": [
+          3049,
+          3067
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/struct_copy/manifest.json"
+    },
+    "loop_patterns": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DSIZE=16384",
+      "metrics": {
+        "conditional_mispredicts": [
+          3525,
+          3617
+        ],
+        "d1_misses": [
+          10556,
+          10579
+        ],
+        "i1_misses": [
+          1415,
+          1418
+        ],
+        "indirect_mispredicts": [
+          262,
+          280
+        ],
+        "ir_mine": 709980,
+        "ir_ratio": 1.245937427610751,
+        "ir_ref": 569836,
+        "ll_misses": [
+          5004,
+          5027
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/loop_patterns/manifest.json"
+    },
+    "fannkuch": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DFANNKUCH_N=7",
+      "metrics": {
+        "conditional_mispredicts": [
+          23095,
+          23751
+        ],
+        "d1_misses": [
+          1904,
+          1928
+        ],
+        "i1_misses": [
+          1395,
+          1399
+        ],
+        "indirect_mispredicts": [
+          258,
+          276
+        ],
+        "ir_mine": 1293298,
+        "ir_ratio": 1.1757479006417395,
+        "ir_ref": 1099979,
+        "ll_misses": [
+          2939,
+          2961
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/fannkuch/manifest.json"
+    },
+    "ackermann": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DACK_N=6",
+      "metrics": {
+        "conditional_mispredicts": [
+          3385,
+          4618
+        ],
+        "d1_misses": [
+          1900,
+          1972
+        ],
+        "i1_misses": [
+          1387,
+          1396
+        ],
+        "indirect_mispredicts": [
+          258,
+          276
+        ],
+        "ir_mine": 148411,
+        "ir_ratio": 0.12783285112452702,
+        "ir_ref": 1160977,
+        "ll_misses": [
+          2929,
+          2955
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/ackermann/manifest.json"
+    },
+    "constant_recursion": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DACK_N=6",
+      "metrics": {
+        "conditional_mispredicts": [
+          3366,
+          4597
+        ],
+        "d1_misses": [
+          1901,
+          1975
+        ],
+        "i1_misses": [
+          1389,
+          1397
+        ],
+        "indirect_mispredicts": [
+          258,
+          276
+        ],
+        "ir_mine": 148125,
+        "ir_ratio": 0.12761794482769315,
+        "ir_ref": 1160691,
+        "ll_misses": [
+          2929,
+          2957
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/constant_recursion/manifest.json"
+    },
+    "bitops": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DN=20000",
+      "metrics": {
+        "conditional_mispredicts": [
+          3407,
+          3494
+        ],
+        "d1_misses": [
+          1895,
+          1926
+        ],
+        "i1_misses": [
+          1391,
+          1396
+        ],
+        "indirect_mispredicts": [
+          259,
+          277
+        ],
+        "ir_mine": 1269316,
+        "ir_ratio": 0.7309349203744173,
+        "ir_ref": 1736565,
+        "ll_misses": [
+          2930,
+          2957
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/bitops/manifest.json"
+    },
+    "double_reduction": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DREDUCTION_PASSES=1",
+      "metrics": {
+        "conditional_mispredicts": [
+          3401,
+          3494
+        ],
+        "d1_misses": [
+          526315,
+          526340
+        ],
+        "i1_misses": [
+          1395,
+          1397
+        ],
+        "indirect_mispredicts": [
+          259,
+          277
+        ],
+        "ir_mine": 30425889,
+        "ir_ratio": 1.1258311665956466,
+        "ir_ref": 27025268,
+        "ll_misses": [
+          199545,
+          199567
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/double_reduction/manifest.json"
+    },
+    "ascii_case_fold": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off",
+      "metrics": {
+        "conditional_mispredicts": [
+          3265,
+          3374
+        ],
+        "d1_misses": [
+          5006,
+          5037
+        ],
+        "i1_misses": [
+          1214,
+          1220
+        ],
+        "indirect_mispredicts": [
+          238,
+          270
+        ],
+        "ir_mine": 2242977,
+        "ir_ratio": 1.6202290159048454,
+        "ir_ref": 1384358,
+        "ll_misses": [
+          4787,
+          4814
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/ascii_case_fold/manifest.json"
+    },
+    "binary_search": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off",
+      "metrics": {
+        "conditional_mispredicts": [
+          5325,
+          12298
+        ],
+        "d1_misses": [
+          2128,
+          2159
+        ],
+        "i1_misses": [
+          1217,
+          1217
+        ],
+        "indirect_mispredicts": [
+          238,
+          270
+        ],
+        "ir_mine": 607798,
+        "ir_ratio": 1.3987062270017006,
+        "ir_ref": 434543,
+        "ll_misses": [
+          2998,
+          3018
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/binary_search/manifest.json"
+    },
+    "ring_fifo": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off",
+      "metrics": {
+        "conditional_mispredicts": [
+          3260,
+          3362
+        ],
+        "d1_misses": [
+          1931,
+          1893
+        ],
+        "i1_misses": [
+          1210,
+          1209
+        ],
+        "indirect_mispredicts": [
+          238,
+          270
+        ],
+        "ir_mine": 625815,
+        "ir_ratio": 2.4690196356922205,
+        "ir_ref": 253467,
+        "ll_misses": [
+          2802,
+          2755
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/ring_fifo/manifest.json"
+    },
+    "aarch64_select_patterns": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DSELECT_ITERS=20000",
+      "metrics": {
+        "conditional_mispredicts": [
+          3409,
+          3498
+        ],
+        "d1_misses": [
+          1902,
+          1927
+        ],
+        "i1_misses": [
+          1393,
+          1395
+        ],
+        "indirect_mispredicts": [
+          257,
+          275
+        ],
+        "ir_mine": 868615,
+        "ir_ratio": 1.2133477118467682,
+        "ir_ref": 715883,
+        "ll_misses": [
+          2933,
+          2956
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/aarch64_select_patterns/manifest.json"
+    },
+    "histogram": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off",
+      "metrics": {
+        "conditional_mispredicts": [
+          3275,
+          3384
+        ],
+        "d1_misses": [
+          10158,
+          10186
+        ],
+        "i1_misses": [
+          1211,
+          1216
+        ],
+        "indirect_mispredicts": [
+          238,
+          270
+        ],
+        "ir_mine": 3227805,
+        "ir_ratio": 1.9038727985140873,
+        "ir_ref": 1695389,
+        "ll_misses": [
+          6866,
+          6890
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/histogram/manifest.json"
+    },
+    "gzip_crc32": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DDATA_SIZE=16384 -DPASSES=4",
+      "metrics": {
+        "conditional_mispredicts": [
+          3422,
+          3504
+        ],
+        "d1_misses": [
+          2212,
+          2251
+        ],
+        "i1_misses": [
+          1402,
+          1403
+        ],
+        "indirect_mispredicts": [
+          259,
+          277
+        ],
+        "ir_mine": 803773,
+        "ir_ratio": 0.9911327753143173,
+        "ir_ref": 810964,
+        "ll_misses": [
+          3217,
+          3236
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/gzip_crc32/manifest.json"
+    },
+    "libm_round_family": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DN=256 -DPASSES=4",
+      "metrics": {
+        "conditional_mispredicts": [
+          3507,
+          3555
+        ],
+        "d1_misses": [
+          1977,
+          2002
+        ],
+        "i1_misses": [
+          1486,
+          1487
+        ],
+        "indirect_mispredicts": [
+          259,
+          279
+        ],
+        "ir_mine": 174433,
+        "ir_ratio": 0.9762257878565712,
+        "ir_ref": 178681,
+        "ll_misses": [
+          3072,
+          3095
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/libm_round_family/manifest.json"
+    },
+    "tls_seg_access": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DPASSES=100",
+      "metrics": {
+        "conditional_mispredicts": [
+          3487,
+          3567
+        ],
+        "d1_misses": [
+          1912,
+          1940
+        ],
+        "i1_misses": [
+          1391,
+          1398
+        ],
+        "indirect_mispredicts": [
+          258,
+          264
+        ],
+        "ir_mine": 214056,
+        "ir_ratio": 0.9721908083877209,
+        "ir_ref": 220179,
+        "ll_misses": [
+          2943,
+          2965
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/tls_seg_access/manifest.json"
+    },
+    "percpu_ptr_walk": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DPASSES=1000",
+      "metrics": {
+        "conditional_mispredicts": [
+          4402,
+          4500
+        ],
+        "d1_misses": [
+          1910,
+          1938
+        ],
+        "i1_misses": [
+          1404,
+          1396
+        ],
+        "indirect_mispredicts": [
+          264,
+          288
+        ],
+        "ir_mine": 287640,
+        "ir_ratio": 0.9850617461524236,
+        "ir_ref": 292002,
+        "ll_misses": [
+          2952,
+          2967
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/percpu_ptr_walk/manifest.json"
+    },
+    "byte_load_reassembly": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off",
+      "metrics": {
+        "conditional_mispredicts": [
+          23425,
+          6029
+        ],
+        "d1_misses": [
+          1975,
+          2008
+        ],
+        "i1_misses": [
+          1415,
+          1417
+        ],
+        "indirect_mispredicts": [
+          263,
+          281
+        ],
+        "ir_mine": 72113323,
+        "ir_ratio": 4.2866770261046065,
+        "ir_ref": 16822663,
+        "ll_misses": [
+          3023,
+          3048
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/byte_load_reassembly/manifest.json"
+    },
+    "zlib_ng_adler32": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DDATA_SIZE=16384 -DPASSES=4",
+      "metrics": {
+        "conditional_mispredicts": [
+          3458,
+          3522
+        ],
+        "d1_misses": [
+          2200,
+          2232
+        ],
+        "i1_misses": [
+          1411,
+          1404
+        ],
+        "indirect_mispredicts": [
+          259,
+          277
+        ],
+        "ir_mine": 466596,
+        "ir_ratio": 0.9183586707500453,
+        "ir_ref": 508076,
+        "ll_misses": [
+          3209,
+          3222
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/zlib_ng_adler32/manifest.json"
+    },
+    "zlib_ng_adler32_combine": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DPASSES=10000",
+      "metrics": {
+        "conditional_mispredicts": [
+          5596,
+          5680
+        ],
+        "d1_misses": [
+          1928,
+          1953
+        ],
+        "i1_misses": [
+          1416,
+          1422
+        ],
+        "indirect_mispredicts": [
+          260,
+          278
+        ],
+        "ir_mine": 21857224,
+        "ir_ratio": 1.0224490690438648,
+        "ir_ref": 21377323,
+        "ll_misses": [
+          2979,
+          3005
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/zlib_ng_adler32_combine/manifest.json"
+    },
+    "expat_xml_scan": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DXML_SIZE=16384 -DPASSES=4",
+      "metrics": {
+        "conditional_mispredicts": [
+          25578,
+          31908
+        ],
+        "d1_misses": [
+          2196,
+          2230
+        ],
+        "i1_misses": [
+          1395,
+          1395
+        ],
+        "indirect_mispredicts": [
+          258,
+          276
+        ],
+        "ir_mine": 1652791,
+        "ir_ratio": 1.1500284586278349,
+        "ir_ref": 1437174,
+        "ll_misses": [
+          3194,
+          3212
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/expat_xml_scan/manifest.json"
+    },
+    "expat_siphash24": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DPASSES=1000",
+      "metrics": {
+        "conditional_mispredicts": [
+          116346,
+          116579
+        ],
+        "d1_misses": [
+          1919,
+          1946
+        ],
+        "i1_misses": [
+          1452,
+          1422
+        ],
+        "indirect_mispredicts": [
+          1455,
+          1344
+        ],
+        "ir_mine": 15211721,
+        "ir_ratio": 0.9901482606931399,
+        "ir_ref": 15363074,
+        "ll_misses": [
+          3002,
+          2994
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/expat_siphash24/manifest.json"
+    },
+    "sqlite_varint": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DVALUE_COUNT=2048 -DPASSES=4",
+      "metrics": {
+        "conditional_mispredicts": [
+          11502,
+          10437
+        ],
+        "d1_misses": [
+          2253,
+          2283
+        ],
+        "i1_misses": [
+          1418,
+          1417
+        ],
+        "indirect_mispredicts": [
+          2080,
+          2098
+        ],
+        "ir_mine": 832950,
+        "ir_ratio": 1.09014024782875,
+        "ir_ref": 764076,
+        "ll_misses": [
+          3249,
+          3269
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/sqlite_varint/manifest.json"
+    },
+    "linux_find_bit": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DPASSES=32",
+      "metrics": {
+        "conditional_mispredicts": [
+          11944,
+          11962
+        ],
+        "d1_misses": [
+          137251,
+          137246
+        ],
+        "i1_misses": [
+          1391,
+          1396
+        ],
+        "indirect_mispredicts": [
+          258,
+          276
+        ],
+        "ir_mine": 5960744,
+        "ir_ratio": 1.1733602516346746,
+        "ir_ref": 5080063,
+        "ll_misses": [
+          7029,
+          7052
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/linux_find_bit/manifest.json"
+    },
+    "linux_find_bit_scaled": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DPASSES=128",
+      "metrics": {
+        "conditional_mispredicts": [
+          36652,
+          36575
+        ],
+        "d1_misses": [
+          530633,
+          530535
+        ],
+        "i1_misses": [
+          1400,
+          1404
+        ],
+        "indirect_mispredicts": [
+          258,
+          276
+        ],
+        "ir_mine": 22944635,
+        "ir_ratio": 1.1823837224731975,
+        "ir_ref": 19405405,
+        "ll_misses": [
+          7037,
+          7061
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/linux_find_bit_scaled/manifest.json"
+    },
+    "glibc_memcmp": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DPASSES=16",
+      "metrics": {
+        "conditional_mispredicts": [
+          3468,
+          3530
+        ],
+        "d1_misses": [
+          25369,
+          25342
+        ],
+        "i1_misses": [
+          1402,
+          1404
+        ],
+        "indirect_mispredicts": [
+          258,
+          276
+        ],
+        "ir_mine": 725659,
+        "ir_ratio": 1.0445179501130653,
+        "ir_ref": 694731,
+        "ll_misses": [
+          4992,
+          5013
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/glibc_memcmp/manifest.json"
+    },
+    "chacha20_block": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DBLOCK_COUNT=256 -DPASSES=2",
+      "metrics": {
+        "conditional_mispredicts": [
+          3928,
+          4545
+        ],
+        "d1_misses": [
+          1911,
+          1935
+        ],
+        "i1_misses": [
+          1410,
+          1417
+        ],
+        "indirect_mispredicts": [
+          261,
+          279
+        ],
+        "ir_mine": 421777,
+        "ir_ratio": 0.5102540279360563,
+        "ir_ref": 826602,
+        "ll_misses": [
+          2952,
+          2981
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/chacha20_block/manifest.json"
+    },
+    "sha256_transform": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DBLOCK_COUNT=256 -DPASSES=2",
+      "metrics": {
+        "conditional_mispredicts": [
+          4456,
+          5068
+        ],
+        "d1_misses": [
+          1920,
+          1938
+        ],
+        "i1_misses": [
+          1419,
+          1411
+        ],
+        "indirect_mispredicts": [
+          261,
+          279
+        ],
+        "ir_mine": 1838180,
+        "ir_ratio": 0.9491784833323953,
+        "ir_ref": 1936601,
+        "ll_misses": [
+          2966,
+          2979
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/sha256_transform/manifest.json"
+    },
+    "linux_rbtree": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DNODE_COUNT=1024 -DLOOKUP_ROUNDS=2",
+      "metrics": {
+        "conditional_mispredicts": [
+          18060,
+          22144
+        ],
+        "d1_misses": [
+          2556,
+          2570
+        ],
+        "i1_misses": [
+          1419,
+          1420
+        ],
+        "indirect_mispredicts": [
+          262,
+          280
+        ],
+        "ir_mine": 517814,
+        "ir_ratio": 1.2529677934522225,
+        "ir_ref": 413270,
+        "ll_misses": [
+          3476,
+          3496
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/linux_rbtree/manifest.json"
+    },
+    "zstd_count": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DBUFFER_SIZE=16384 -DQUERY_COUNT=1024 -DPASSES=2",
+      "metrics": {
+        "conditional_mispredicts": [
+          5486,
+          5546
+        ],
+        "d1_misses": [
+          2202,
+          2234
+        ],
+        "i1_misses": [
+          1415,
+          1415
+        ],
+        "indirect_mispredicts": [
+          262,
+          280
+        ],
+        "ir_mine": 459715,
+        "ir_ratio": 1.105663544838401,
+        "ir_ref": 415782,
+        "ll_misses": [
+          3215,
+          3233
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/zstd_count/manifest.json"
+    },
+    "lz4_compress": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DSRC_SIZE=16384 -DPASSES=2",
+      "metrics": {
+        "conditional_mispredicts": [
+          10671,
+          10740
+        ],
+        "d1_misses": [
+          5945,
+          6004
+        ],
+        "i1_misses": [
+          1433,
+          1427
+        ],
+        "indirect_mispredicts": [
+          273,
+          294
+        ],
+        "ir_mine": 637244,
+        "ir_ratio": 1.1201020888848265,
+        "ir_ref": 568916,
+        "ll_misses": [
+          4521,
+          4536
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/lz4_compress/manifest.json"
+    },
+    "lz4_match_extend": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DSRC_SIZE=16384 -DPASSES=2 -DMATCH_RICH=1",
+      "metrics": {
+        "conditional_mispredicts": [
+          8308,
+          8619
+        ],
+        "d1_misses": [
+          14233,
+          14188
+        ],
+        "i1_misses": [
+          1444,
+          1434
+        ],
+        "indirect_mispredicts": [
+          273,
+          294
+        ],
+        "ir_mine": 1153595,
+        "ir_ratio": 1.2419484550400006,
+        "ir_ref": 928859,
+        "ll_misses": [
+          4440,
+          4454
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/lz4_match_extend/manifest.json"
+    },
+    "glibc_strstr": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DHAYSTACK_LEN=16384 -DQUERY_COUNT=32 -DPASSES=2",
+      "metrics": {
+        "conditional_mispredicts": [
+          9504,
+          9539
+        ],
+        "d1_misses": [
+          2204,
+          2237
+        ],
+        "i1_misses": [
+          1421,
+          1423
+        ],
+        "indirect_mispredicts": [
+          262,
+          280
+        ],
+        "ir_mine": 3778701,
+        "ir_ratio": 1.8352723645074243,
+        "ir_ref": 2058932,
+        "ll_misses": [
+          3222,
+          3244
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S53/glibc_strstr/manifest.json"
+    }
+  },
+  "failures": [],
+  "worst_first": [
+    "byte_load_reassembly",
+    "ring_fifo",
+    "spectral_norm",
+    "histogram",
+    "glibc_strstr",
+    "ascii_case_fold",
+    "binary_search",
+    "linux_rbtree",
+    "loop_patterns",
+    "lz4_match_extend",
+    "nbody",
+    "aarch64_select_patterns",
+    "linux_find_bit_scaled",
+    "fannkuch",
+    "linux_find_bit",
+    "expat_xml_scan",
+    "mandelbrot",
+    "strlen_bench",
+    "double_reduction",
+    "lz4_compress",
+    "zstd_count",
+    "sqlite_varint",
+    "switch_dispatch",
+    "binary_trees",
+    "sieve",
+    "hash_table",
+    "glibc_memcmp",
+    "qsort",
+    "zlib_ng_adler32_combine",
+    "gzip_crc32",
+    "expat_siphash24",
+    "percpu_ptr_walk",
+    "matmul",
+    "libm_round_family",
+    "tls_seg_access",
+    "tce_sum",
+    "sha256_transform",
+    "zlib_ng_adler32",
+    "struct_copy",
+    "arith_loop",
+    "bitops",
+    "chacha20_block",
+    "ackermann",
+    "constant_recursion",
+    "fib"
+  ]
+}

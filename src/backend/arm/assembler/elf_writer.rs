@@ -13,9 +13,10 @@
 
 use super::encoder::{EncodeResult, RelocType, encode_instruction};
 use super::parser::{AsmDirective, AsmStatement, DataValue, Operand, SizeExpr, SymbolKind};
+use crate::backend::elf::SetValue;
 use crate::backend::elf::{
-    self, ELFCLASS64, EM_AARCH64, ElfWriterBase, ObjReloc, STT_FUNC, STT_NOTYPE, STT_OBJECT,
-    STT_TLS, STV_HIDDEN, STV_INTERNAL, STV_PROTECTED,
+    self, DataFixup, ELFCLASS64, EM_AARCH64, ElfWriterBase, ObjReloc, STT_FUNC, STT_NOTYPE,
+    STT_OBJECT, STT_TLS, STV_HIDDEN, STV_INTERNAL, STV_PROTECTED,
 };
 
 /// AArch64 NOP instruction: `d503201f` in little-endian
@@ -34,9 +35,7 @@ pub struct ElfWriter {
     /// resolved at assembly time without emitting unnecessary relocations.
     pending_branch_relocs: Vec<PendingReloc>,
     /// Pending symbol differences to resolve after all labels are known
-    pending_sym_diffs: Vec<PendingSymDiff>,
     /// Pending raw expressions to resolve after all labels are known
-    pending_exprs: Vec<PendingExpr>,
     /// Pending instructions with symbolic offset expressions (resolved after labels are known)
     pending_instructions: Vec<PendingInstruction>,
 }
@@ -61,30 +60,6 @@ fn is_branch_reloc_type(elf_type: u32) -> bool {
     )
 }
 
-/// A pending raw expression to be resolved after all labels are known.
-struct PendingExpr {
-    section: String,
-    offset: u64,
-    expr: String,
-    size: usize,
-}
-
-/// A pending symbol difference to be resolved after all labels are known.
-struct PendingSymDiff {
-    /// Section containing the data directive
-    section: String,
-    /// Offset within that section where the value should be written
-    offset: u64,
-    /// The positive symbol (A in A - B)
-    sym_a: String,
-    /// The negative symbol (B in A - B)
-    sym_b: String,
-    /// Extra addend
-    extra_addend: i64,
-    /// Size in bytes (1, 4, or 8)
-    size: usize,
-}
-
 /// A pending instruction whose operands contain symbolic expressions.
 /// A NOP placeholder is emitted at the instruction offset; after all labels
 /// are known, the expression is evaluated, operands are updated, and the
@@ -102,144 +77,8 @@ impl ElfWriter {
         Self {
             base: ElfWriterBase::new(AARCH64_NOP, 4),
             pending_branch_relocs: Vec::new(),
-            pending_sym_diffs: Vec::new(),
-            pending_exprs: Vec::new(),
             pending_instructions: Vec::new(),
         }
-    }
-
-    /// Resolve pending symbol differences after all labels are known.
-    fn resolve_sym_diffs(&mut self) -> Result<(), String> {
-        let pending = std::mem::take(&mut self.pending_sym_diffs);
-        for diff in &pending {
-            let sym_a_info = self.base.labels.get(&diff.sym_a).cloned();
-            let sym_b_info = self.base.labels.get(&diff.sym_b).cloned();
-
-            match (sym_a_info, sym_b_info) {
-                (Some((sec_a, off_a)), Some((sec_b, off_b))) => {
-                    if sec_a == sec_b {
-                        // Same section: resolve at assembly time by patching the data
-                        let value = (off_a as i64) - (off_b as i64) + diff.extra_addend;
-                        if let Some(section) = self.base.sections.get_mut(&diff.section) {
-                            let off = diff.offset as usize;
-                            if diff.size == 1 && off < section.data.len() {
-                                section.data[off] = value as u8;
-                            } else if diff.size == 4 && off + 4 <= section.data.len() {
-                                section.data[off..off + 4]
-                                    .copy_from_slice(&(value as i32).to_le_bytes());
-                            } else if diff.size == 8 && off + 8 <= section.data.len() {
-                                section.data[off..off + 8].copy_from_slice(&value.to_le_bytes());
-                            }
-                        }
-                    } else {
-                        // Cross-section: emit R_AARCH64_PREL32 or PREL64 based on size
-                        let addend =
-                            off_a as i64 + diff.offset as i64 - off_b as i64 + diff.extra_addend;
-                        let reloc_type = if diff.size == 8 {
-                            RelocType::Prel64.elf_type()
-                        } else {
-                            RelocType::Prel32.elf_type()
-                        };
-                        if let Some(section) = self.base.sections.get_mut(&diff.section) {
-                            section.relocs.push(ObjReloc {
-                                offset: diff.offset,
-                                reloc_type,
-                                symbol_name: sec_a.clone(),
-                                addend,
-                            });
-                        }
-                    }
-                }
-                _ => {
-                    // Forward-referenced or external symbols: emit PREL32 or PREL64 based on size
-                    let reloc_type = if diff.size == 8 {
-                        RelocType::Prel64.elf_type()
-                    } else {
-                        RelocType::Prel32.elf_type()
-                    };
-                    if let Some(section) = self.base.sections.get_mut(&diff.section) {
-                        section.relocs.push(ObjReloc {
-                            offset: diff.offset,
-                            reloc_type,
-                            symbol_name: diff.sym_a.clone(),
-                            addend: diff.extra_addend,
-                        });
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Resolve pending raw expressions by substituting label offsets and evaluating.
-    fn resolve_pending_exprs(&mut self) -> Result<(), String> {
-        let pending = std::mem::take(&mut self.pending_exprs);
-        for pexpr in &pending {
-            // Substitute label names with their offset values
-            let mut expr = pexpr.expr.clone();
-
-            // Collect all label names, sorted longest first to avoid partial replacements
-            let mut label_names: Vec<&String> = self.base.labels.keys().collect();
-            label_names.sort_by_key(|name| std::cmp::Reverse(name.len()));
-
-            let mut all_resolved = true;
-            for label_name in &label_names {
-                if expr.contains(label_name.as_str()) {
-                    if let Some((_section, offset)) = self.base.labels.get(*label_name) {
-                        expr = expr.replace(label_name.as_str(), &offset.to_string());
-                    } else {
-                        all_resolved = false;
-                    }
-                }
-            }
-
-            if all_resolved {
-                // Try to evaluate the expression
-                if let Ok(val) = crate::backend::asm_expr::parse_integer_expr(&expr) {
-                    if let Some(section) = self.base.sections.get_mut(&pexpr.section) {
-                        let off = pexpr.offset as usize;
-                        match pexpr.size {
-                            1 if off < section.data.len() => {
-                                section.data[off] = val as u8;
-                            }
-                            2 if off + 2 <= section.data.len() => {
-                                section.data[off..off + 2]
-                                    .copy_from_slice(&(val as i16).to_le_bytes());
-                            }
-                            4 if off + 4 <= section.data.len() => {
-                                section.data[off..off + 4]
-                                    .copy_from_slice(&(val as i32).to_le_bytes());
-                            }
-                            8 if off + 8 <= section.data.len() => {
-                                section.data[off..off + 8].copy_from_slice(&val.to_le_bytes());
-                            }
-                            _ => {}
-                        }
-                    }
-                } else {
-                    // Couldn't evaluate - emit as symbol reference
-                    if let Some(section) = self.base.sections.get_mut(&pexpr.section) {
-                        section.relocs.push(ObjReloc {
-                            offset: pexpr.offset,
-                            reloc_type: RelocType::Abs32.elf_type(),
-                            symbol_name: pexpr.expr.clone(),
-                            addend: 0,
-                        });
-                    }
-                }
-            } else {
-                // Unresolved symbols - emit as relocation
-                if let Some(section) = self.base.sections.get_mut(&pexpr.section) {
-                    section.relocs.push(ObjReloc {
-                        offset: pexpr.offset,
-                        reloc_type: RelocType::Abs32.elf_type(),
-                        symbol_name: pexpr.expr.clone(),
-                        addend: 0,
-                    });
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Resolve pending instructions that contain symbolic offset expressions.
@@ -379,25 +218,14 @@ impl ElfWriter {
             self.process_statement(stmt)?;
         }
         // Merge subsections (e.g., .text.__subsection.1 → .text) before resolving
-        let remap = self.base.merge_subsections();
+        let remap = self.base.merge_subsections()?;
+        self.base.allocate_local_commons()?;
         // Fix up pending references that pointed to now-merged subsection names
         if !remap.is_empty() {
             for reloc in &mut self.pending_branch_relocs {
                 if let Some((parent, offset_adj)) = remap.get(&reloc.section) {
                     reloc.offset += offset_adj;
                     reloc.section = parent.clone();
-                }
-            }
-            for diff in &mut self.pending_sym_diffs {
-                if let Some((parent, offset_adj)) = remap.get(&diff.section) {
-                    diff.offset += offset_adj;
-                    diff.section = parent.clone();
-                }
-            }
-            for expr in &mut self.pending_exprs {
-                if let Some((parent, offset_adj)) = remap.get(&expr.section) {
-                    expr.offset += offset_adj;
-                    expr.section = parent.clone();
                 }
             }
             for instr in &mut self.pending_instructions {
@@ -407,9 +235,10 @@ impl ElfWriter {
                 }
             }
         }
-        // Resolve symbol differences first (needs all labels to be known)
-        self.resolve_sym_diffs()?;
-        self.resolve_pending_exprs()?;
+        // Data values that name symbols (needs every label, after the merge).
+        for (section, offset, size, fixup) in self.base.resolve_pending_data(&remap)? {
+            self.emit_data_fixup(&section, offset, size, &fixup)?;
+        }
         self.resolve_pending_instructions()?;
         self.resolve_local_branches()?;
         Ok(())
@@ -420,10 +249,7 @@ impl ElfWriter {
             AsmStatement::Empty => Ok(()),
 
             AsmStatement::Label(name) => {
-                self.base.ensure_text_section();
-                let section = self.base.current_section.clone();
-                let offset = self.base.current_offset();
-                self.base.labels.insert(name.clone(), (section, offset));
+                self.base.define_label(name)?;
                 Ok(())
             }
 
@@ -480,12 +306,7 @@ impl ElfWriter {
             }
 
             AsmDirective::Global(sym) => {
-                for s in sym.split(',') {
-                    let s = s.trim();
-                    if !s.is_empty() {
-                        self.base.set_global(s);
-                    }
-                }
+                self.base.set_global(sym);
                 Ok(())
             }
             AsmDirective::Weak(sym) => {
@@ -543,15 +364,9 @@ impl ElfWriter {
 
             AsmDirective::Byte(vals) => self.emit_data_values(vals, 1),
 
-            AsmDirective::Short(vals) => {
-                for val in vals {
-                    // RAW-value NOBITS rule: `.short 256` stores two zero
-                    // bytes but GAS still rejects the non-zero value.
-                    self.base.nobits_guard(*val != 0)?;
-                    self.base.emit_bytes(&(*val as u16).to_le_bytes())?;
-                }
-                Ok(())
-            }
+            // `emit_data_integer` applies the RAW-value NOBITS rule
+            // (`.short 65536` stores zeros but GAS still rejects it in .bss).
+            AsmDirective::Short(vals) => self.emit_data_values(vals, 2),
 
             AsmDirective::Long(vals) => self.emit_data_values(vals, 4),
             AsmDirective::Quad(vals) => self.emit_data_values(vals, 8),
@@ -575,17 +390,14 @@ impl ElfWriter {
                 Ok(())
             }
 
-            AsmDirective::Comm(sym, size, align) => {
-                self.base.emit_comm(sym, *size, *align);
+            AsmDirective::Comm(sym, size, align) => self.base.declare_comm(sym, *size, *align),
+            AsmDirective::Lcomm(sym, size) => self.base.declare_lcomm(sym, *size),
+            AsmDirective::Local(syms) => {
+                self.base.set_local(syms);
                 Ok(())
             }
 
-            AsmDirective::Local(_) => Ok(()),
-
-            AsmDirective::Set(alias, target) => {
-                self.base.set_alias(alias, target);
-                Ok(())
-            }
+            AsmDirective::Set(alias, target) => self.base.define_set(alias, target),
 
             AsmDirective::Incbin { path, skip, count } => {
                 let data = std::fs::read(path)
@@ -612,187 +424,70 @@ impl ElfWriter {
                 Ok(())
             }
 
-            AsmDirective::Org { expr, fill } => self.process_org(expr, *fill),
+            AsmDirective::Org { expr, fill } => self.base.emit_org(expr, *fill),
 
             AsmDirective::Cfi | AsmDirective::Ignored | AsmDirective::Ltorg => Ok(()),
         }
     }
 
-    /// `.org new-lc, fill` — pad the current section with `fill` up to byte
-    /// offset `new-lc` from the section start (GAS semantics).
-    ///
-    /// Evaluated immediately: unlike `.word` expressions, padding changes
-    /// every offset that follows it, so deferral is impossible. The
-    /// expression may reference `.` (the current location counter) and
-    /// labels that are already defined in the current section; forward
-    /// references and cross-section symbols are errors, matching GAS.
-    /// Backward targets error too ("attempt to move .org backwards") — a
-    /// silent no-op would corrupt vector-table layouts.
-    fn process_org(&mut self, expr: &str, fill: u8) -> Result<(), String> {
-        let section = self.base.current_section.clone();
-        let current = self
-            .base
-            .sections
-            .get(&section)
-            .ok_or_else(|| ".org: no active section".to_string())?
-            .data
-            .len() as i64;
-        let target = self.eval_org_expr(expr, &section, current)?;
-        if target < current {
-            return Err(format!(
-                ".org: attempt to move .org backwards (to byte {} from byte {})",
-                target, current
-            ));
-        }
-        let padding = (target - current) as usize;
-        // `.org` is the same constant-source / unbounded-output amplifier
-        // as `.zero`: refuse the materialization before touching memory
-        // (GAS dies writing it too — nonzero exit either way).
-        if padding > crate::backend::elf::MAX_DIRECTIVE_FILL {
-            return Err(format!(
-                ".org: {padding} bytes of fill exceed the {}-byte limit",
-                crate::backend::elf::MAX_DIRECTIVE_FILL
-            ));
-        }
-        self.base.ensure_default_section();
-        self.base.charge_fill(padding)?;
-        if padding > 0 {
-            // `.org` pads with its fill byte (default ZERO), even in an
-            // executable section — it is a positioning directive, not an
-            // alignment one (GAS emits plain fill bytes too).
-            let data = &mut self
-                .base
-                .sections
-                .get_mut(&section)
-                .ok_or_else(|| ".org: no active section".to_string())?
-                .data;
-            data.resize(data.len() + padding, fill);
-        }
-        Ok(())
-    }
-
-    /// Substitute the location counter and same-section labels in a `.org`
-    /// expression, then evaluate the result as a constant expression.
-    ///
-    /// Scanning is token-boundary aware: an identifier is a maximal run of
-    /// `[A-Za-z0-9_.$]`, so the `.` inside `.Lventry_start` is part of the
-    /// label and only a *standalone* `.` token becomes the location counter.
-    fn eval_org_expr(&self, expr: &str, section: &str, current: i64) -> Result<i64, String> {
-        let bytes = expr.as_bytes();
-        let mut rebuilt = String::with_capacity(expr.len() + 16);
-        let mut i = 0usize;
-        while i < bytes.len() {
-            let c = bytes[i];
-            if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'$' {
-                let start = i;
-                i += 1;
-                while i < bytes.len()
-                    && (bytes[i].is_ascii_alphanumeric()
-                        || bytes[i] == b'_'
-                        || bytes[i] == b'.'
-                        || bytes[i] == b'$')
-                {
-                    i += 1;
-                }
-                let token = &expr[start..i];
-                if token == "." {
-                    rebuilt.push_str(&current.to_string());
-                } else if let Some((sym_sec, off)) = self.base.labels.get(token) {
-                    if sym_sec != section {
-                        return Err(format!(
-                            ".org: symbol '{}' is in section '{}', not the current section",
-                            token, sym_sec
-                        ));
-                    }
-                    rebuilt.push_str(&off.to_string());
-                } else if crate::backend::asm_expr::parse_integer_expr(token).is_ok() {
-                    // Numeric literal (decimal, hex 0x, binary 0b, ...).
-                    // Checked after labels so that a label can never be
-                    // shadowed, and before the error arm so hex/binary
-                    // constants survive the scan. Numeric *label*
-                    // references (`662b`) parse as neither and are
-                    // rejected below — they are not supported in `.org`.
-                    rebuilt.push_str(token);
-                } else {
-                    return Err(format!(
-                        ".org: unknown or forward-referenced symbol '{}' (padding cannot be deferred, so forward references are unsupported)",
-                        token
-                    ));
-                }
-                continue;
-            }
-            rebuilt.push(c as char);
-            i += 1;
-        }
-        crate::backend::asm_expr::parse_integer_expr(&rebuilt)
-    }
-
-    /// Emit typed data values (Long or Quad) with proper relocations.
+    /// Emit `size`-byte data values (`.byte`, `.long`, `.quad`): constants
+    /// now, everything that names a symbol through the shared value model
+    /// (see `ElfWriterBase::classify`), turned into relocations by
+    /// [`Self::emit_data_fixup`].
     fn emit_data_values(&mut self, vals: &[DataValue], size: usize) -> Result<(), String> {
         for val in vals {
-            match val {
+            let value = match val {
                 DataValue::Integer(v) => {
                     self.base.emit_data_integer(*v, size)?;
+                    continue;
                 }
-                DataValue::Symbol(sym) => {
-                    let reloc_type = if size == 4 {
-                        RelocType::Abs32.elf_type()
-                    } else {
-                        RelocType::Abs64.elf_type()
-                    };
-                    self.base.emit_data_symbol_ref(sym, 0, size, reloc_type)?;
-                }
-                DataValue::SymbolOffset(sym, addend) => {
-                    let reloc_type = if size == 4 {
-                        RelocType::Abs32.elf_type()
-                    } else {
-                        RelocType::Abs64.elf_type()
-                    };
-                    self.base
-                        .emit_data_symbol_ref(sym, *addend, size, reloc_type)?;
-                }
-                DataValue::SymbolDiff(sym_a, sym_b) => {
-                    self.record_sym_diff(sym_a, sym_b, 0, size)?;
-                }
-                DataValue::SymbolDiffAddend(sym_a, sym_b, addend) => {
-                    self.record_sym_diff(sym_a, sym_b, *addend, size)?;
-                }
-                DataValue::Expr(expr) => {
-                    let section = self.base.current_section.clone();
-                    let offset = self.base.current_offset();
-                    self.pending_exprs.push(PendingExpr {
-                        section,
-                        offset,
-                        expr: expr.clone(),
-                        size,
-                    });
-                    self.base.emit_placeholder(size)?;
-                }
-            }
+                DataValue::Expr(expr) => self.base.capture_data_symbol(expr)?,
+            };
+            self.base.emit_data_value(value, size)?;
         }
         Ok(())
     }
 
-    /// Record a pending symbol difference for deferred resolution.
-    fn record_sym_diff(
+    /// The relocation for one deferred data value.  GAS 2.47 (aarch64):
+    /// `.byte` has no data relocation at all; `.2byte`/`.4byte`/`.8byte`
+    /// take ABS16/32/64 for `sym + k` and PREL16/32/64 for `sym - S + k`
+    /// with S the section holding the value; any other difference is
+    /// refused ("can't resolve").
+    fn emit_data_fixup(
         &mut self,
-        sym_a: &str,
-        sym_b: &str,
-        extra_addend: i64,
+        section: &str,
+        offset: u64,
         size: usize,
+        fixup: &DataFixup,
     ) -> Result<(), String> {
-        let section = self.base.current_section.clone();
-        let offset = self.base.current_offset();
-        self.pending_sym_diffs.push(PendingSymDiff {
-            section,
-            offset,
-            sym_a: sym_a.to_string(),
-            sym_b: sym_b.to_string(),
-            extra_addend,
-            size,
-        });
-        self.base.emit_placeholder(size)?;
-        Ok(())
+        let (abs, prel) = match size {
+            8 => (RelocType::Abs64, RelocType::Prel64),
+            4 => (RelocType::Abs32, RelocType::Prel32),
+            2 => (RelocType::Abs16, RelocType::Prel16),
+            _ => {
+                return Err(format!(
+                    "{section}+{offset:#x}: a {size}-byte data value cannot name a symbol on AArch64 (no such relocation)"
+                ));
+            }
+        };
+        match fixup {
+            DataFixup::Constant(_) => Ok(()),
+            DataFixup::Abs { sym, addend } => {
+                self.base
+                    .add_reloc_at(section, offset, abs.elf_type(), sym, *addend);
+                Ok(())
+            }
+            DataFixup::Diff { add, sub, .. } => match fixup.pc_relative(section, offset) {
+                Some((sym, addend)) => {
+                    self.base
+                        .add_reloc_at(section, offset, prel.elf_type(), &sym, addend);
+                    Ok(())
+                }
+                None => Err(format!(
+                    "{section}+{offset:#x}: can't resolve `{add}' - `{sub}' (not a link-time value)"
+                )),
+            },
+        }
     }
 
     /// Check if any operand contains a deferred symbolic expression.
@@ -2928,5 +2623,57 @@ mod aarch64_encoder_tests {
             assemble(".data\n.byte 1\n.org 0\n").is_err(),
             "backwards .org must fail"
         );
+    }
+    fn alternative(orig: usize, repl: usize) -> String {
+        let words = |n: usize, w: &str| vec![format!("\t.word {w}\n"); n].concat();
+        format!(
+            ".text\n661:\n{}662:\n.pushsection .altinstr_replacement,\"a\"\n663:\n{}664:\n.popsection\n\
+             .org . - (664b-663b) + (662b-661b)\n.org . - (662b-661b) + (664b-663b)\n.word 0x33333333\n",
+            words(orig, "0x11111111"),
+            words(repl, "0x22222222")
+        )
+    }
+
+    /// The kernel's ALTERNATIVE length check (arm64 `alternative-macros.h`)
+    /// against GAS 2.47: equal lengths assemble with no padding, and a
+    /// replacement of either other length fails one of the two `.org`s.
+    /// Numeric labels and the cross-section label difference are what the
+    /// old resolver refused.
+    #[test]
+    fn org_kernel_alternative_length_check() {
+        // Through the driver's numeric-label pass, as `lccc-arm -c` runs it.
+        let full = |asm: &str| -> Result<ElfWriter, String> {
+            let statements = super::super::resolve_numeric_labels(&parse_asm(asm)?);
+            let mut writer = ElfWriter::new();
+            writer.process_statements(&statements)?;
+            Ok(writer)
+        };
+        let w = full(&alternative(2, 2)).expect("equal lengths assemble");
+        assert_eq!(w.base.sections[".text"].data.len(), 12);
+        assert!(full(&alternative(3, 1)).is_err(), "shorter replacement");
+        assert!(full(&alternative(1, 3)).is_err(), "longer replacement");
+    }
+
+    /// `.org` positions (GAS 2.47 bytes), including before any section
+    /// directive, and gigabyte NOBITS targets held as a size.
+    #[test]
+    fn org_positions_and_sparse_nobits() {
+        let w = assemble(".data\n.byte 1\n.org 8, 0xaa\n.byte 2\n").unwrap();
+        assert_eq!(
+            w.base.sections[".data"].data,
+            [1, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 2]
+        );
+        let w = assemble(".set N, 4\n.data\nL:\n.byte 1\n.org L + N\n.byte 2\n").unwrap();
+        assert_eq!(w.base.sections[".data"].data, [1, 0, 0, 0, 2]);
+        let w = assemble(".org 4\n.word 0x12345678\n").unwrap();
+        assert_eq!(
+            w.base.sections[".text"].data,
+            [0, 0, 0, 0, 0x78, 0x56, 0x34, 0x12]
+        );
+        assert!(assemble(".text\nT:\n.word 1\n.data\n.org T + 4\n").is_err());
+        let w = assemble(".bss\n.byte 0\n.org 0x40000000\n.long 0\n.zero 0x40000000\n").unwrap();
+        let bss = &w.base.sections[".bss"];
+        assert!(bss.data.is_empty(), "NOBITS holds no bytes");
+        assert_eq!(bss.size(), 0x8000_0004);
     }
 }

@@ -585,13 +585,13 @@ impl Lowerer {
                 rhs,
                 _,
             ) => {
-                let lt = self.expr_ctype(lhs);
-                let rt = self.expr_ctype(rhs);
-                if lt.is_vector() {
-                    return lt;
-                }
-                if rt.is_vector() {
-                    return rt;
+                // The mask has signed integer lanes of the operand's width
+                // (`int` lanes for `float`), not the operand type: `-(f < g)`
+                // and `(f < g)[i]` must see an integer vector.
+                for side in [lhs, rhs] {
+                    if let Some(mask) = self.expr_ctype(side).vector_comparison_result() {
+                        return mask;
+                    }
                 }
                 // Scalar/complex comparisons: fall through to get_expr_ctype.
             }

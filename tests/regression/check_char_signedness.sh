@@ -19,7 +19,7 @@
 #
 # The rows below are behavioural: a tiny program is compiled and RUN, and for
 # the x86-64 rows GCC is compiled from the same source and its output must
-# match byte for byte (GCC 14.2 here; the ABI facts it pins — signed char on
+# match byte for byte (gcc-16 when present, else gcc; the ABI facts it pins — signed char on
 # x86-64, and the flag being order-sensitive within one command line — are
 # stable across GCC versions).  The AArch64/RISC-V rows only need the
 # preprocessor: the target selector reads the *binary name*, so the gate
@@ -35,7 +35,7 @@ if [ ! -x "$CCC" ]; then
   exit 0
 fi
 CCC=$(cd "$(dirname "$CCC")" && pwd)/$(basename "$CCC")
-GCC=$(command -v gcc || true)
+GCC=${GCC:-$(command -v gcc-16 || command -v gcc || true)}
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -107,6 +107,8 @@ behaviour_row "-fsigned-char names the default"         "macro=0 min=-128 max=12
 behaviour_row "-funsigned-char"                         "macro=1 min=0 max=255 neg=0"    -funsigned-char
 behaviour_row "-funsigned-char beats an earlier -fsigned-char" "macro=1 min=0 max=255 neg=0" -fsigned-char -funsigned-char
 behaviour_row "-fsigned-char beats an earlier -funsigned-char" "macro=0 min=-128 max=127 neg=1" -funsigned-char -fsigned-char
+behaviour_row "-fno-signed-char == -funsigned-char"     "macro=1 min=0 max=255 neg=0"    -fno-signed-char
+behaviour_row "-fno-unsigned-char == -fsigned-char"     "macro=0 min=-128 max=127 neg=1" -funsigned-char -fno-unsigned-char
 
 # --- preprocessor rows (target defaults, selected by binary name) -----------
 # The driver has no `-target` flag: the target comes from the binary name
@@ -141,6 +143,8 @@ macro_row "aarch64 -fsigned-char"                 signed_char   aarch64-linux-gn
 macro_row "riscv64 -fsigned-char"                 signed_char   riscv64-linux-gnu-lccc -fsigned-char
 macro_row "x86-64 default"                        signed_char   lccc
 macro_row "x86-64 -funsigned-char"                unsigned_char lccc -funsigned-char
+macro_row "aarch64 -fno-unsigned-char"            signed_char   aarch64-linux-gnu-lccc -fno-unsigned-char
+macro_row "riscv64 -fno-signed-char"              unsigned_char riscv64-linux-gnu-lccc -fno-signed-char
 
 echo
 if [ "$FAIL" -eq 0 ]; then

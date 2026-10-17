@@ -820,6 +820,7 @@ impl ArmCodegen {
                         }
                     }
                 }
+                IrBinOp::Bzhi => crate::ir::ops::bzhi_outside_x86_64(),
                 IrBinOp::BitTest => {
                     // AArch64 has no BT. UBFX extracts a 1-bit field when the
                     // index is an in-range immediate; variable and 64-bit cases
@@ -885,6 +886,7 @@ impl ArmCodegen {
                         }
                     }
                 }
+                IrBinOp::Bzhi => crate::ir::ops::bzhi_outside_x86_64(),
                 IrBinOp::BitTest => {
                     if let Some(imm) = Self::const_as_imm12(rhs) {
                         if (0..63).contains(&imm) {

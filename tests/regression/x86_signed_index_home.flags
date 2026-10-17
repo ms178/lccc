@@ -1,1 +1,1 @@
--fwrapv
+-O2 -fwrapv

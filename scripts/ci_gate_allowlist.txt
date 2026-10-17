@@ -29,7 +29,6 @@ tests/regression/check_custom_section_progbits.sh  # passes locally; not yet wir
 tests/regression/check_empty_leaf_frame.sh  # passes locally; not yet wired into ci_local.sh / a workflow
 tests/regression/check_f128_copy_fusion.sh  # passes locally; not yet wired into ci_local.sh / a workflow
 tests/regression/check_fixed_slp_distances_codegen.sh  # passes locally; not yet wired into ci_local.sh / a workflow
-tests/regression/check_fma_dest_coalesce_codegen.sh  # codegen contract (FMA dest coalesce) — needs triage
 tests/regression/check_gas_isa_scan.sh  # GAS rejects vextracti128 operand size on this binutils — env
 tests/regression/check_global_addr_cse.sh  # passes locally; not yet wired into ci_local.sh / a workflow
 tests/regression/check_global_addr_remat.sh  # weak PIE extern GOT indirection — needs triage
@@ -80,7 +79,6 @@ tests/regression/check_vararg_overalign_interop.sh  # passes locally; not yet wi
 tests/regression/check_vec_interleave_codegen.sh  # passes locally; not yet wired into ci_local.sh / a workflow
 tests/regression/check_vecreg_new_ops_codegen.sh  # codegen contract (XMM home) — needs triage
 tests/regression/check_vector_dot_fma_codegen.sh  # passes locally; not yet wired into ci_local.sh / a workflow
-tests/regression/check_vector_remainder_codegen.sh  # passes locally; not yet wired into ci_local.sh / a workflow
 tests/regression/check_wide_cond_zero_test.sh  # passes locally; not yet wired into ci_local.sh / a workflow
 tests/regression/check_wide_const_imm_stores.sh  # passes locally; not yet wired into ci_local.sh / a workflow
 tests/regression/check_widened_byte_chain.sh  # passes locally; not yet wired into ci_local.sh / a workflow

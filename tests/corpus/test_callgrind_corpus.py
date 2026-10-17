@@ -88,6 +88,17 @@ int main(void) {
                 self.assertEqual(args[1], driver)
                 self.assertEqual(args[args.index("--gcc-include-command") + 1], driver)
 
+    def test_common_semantic_flags_reach_both_measurement_arms(self):
+        import shlex
+        with tempfile.TemporaryDirectory() as td, patch.object(screen.cg, "main", return_value=1) as measure:
+            self.assertEqual(screen.main(["--mine", "candidate", "--ref", "reference",
+                "--only", "ring_fifo", "--out", td, "--cflag=-ffp-contract=off"]), 1)
+            command = measure.call_args.args[0]
+            self.assertEqual(command[:2], ["candidate", "reference"])
+            options = next(a.removeprefix("--opt=") for a in command if a.startswith("--opt="))
+            self.assertIn("-ffp-contract=off", shlex.split(options))
+            self.assertIn("-fwrapv", shlex.split(options))
+
     def test_interruption_keeps_incomplete_checkpoint(self):
         with tempfile.TemporaryDirectory() as td, patch.object(screen.cg, "main", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):

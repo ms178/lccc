@@ -701,6 +701,7 @@ fn instruction_corpus() -> Vec<MachInst> {
                     dst: reg(PhysReg((2 + (i % 4)) as u8)),
                     size: if i % 2 == 0 { OpSize::S32 } else { OpSize::S64 },
                 }),
+                gp_arg_count: None,
             });
         }
         // Void call, no saves, no ret.
@@ -713,6 +714,7 @@ fn instruction_corpus() -> Vec<MachInst> {
             }],
             target: CallTarget::Direct("machinst_probe_void".into()),
             ret: None,
+            gp_arg_count: None,
         });
         // Indirect target: the staging move and the `call *%reg` form —
         // r10 and r11, with and without an accompanying caller-save pair.
@@ -736,6 +738,7 @@ fn instruction_corpus() -> Vec<MachInst> {
                     dst: reg(PhysReg(2)),
                     size: OpSize::S64,
                 }),
+                gp_arg_count: None,
             });
             v.push(MachInst::CallTyped {
                 caller_saves: vec![],
@@ -746,6 +749,7 @@ fn instruction_corpus() -> Vec<MachInst> {
                 }],
                 target: CallTarget::Indirect(target_reg),
                 ret: None,
+                gp_arg_count: None,
             });
         }
         // Wide-immediate arguments: outside the sign-extended imm32 window
@@ -774,6 +778,7 @@ fn instruction_corpus() -> Vec<MachInst> {
                 ],
                 target: CallTarget::Direct("machinst_probe_wide".into()),
                 ret: None,
+                gp_arg_count: None,
             });
         }
         // The xmm0/xmm1 pre-colored scratch pair participates in FMov shapes.
@@ -3557,6 +3562,7 @@ fn calltyped_emits_saves_args_call_ret_restores_in_order() {
             dst: reg(PhysReg(2)),
             size: OpSize::S64,
         }),
+        gp_arg_count: None,
     };
     let lines = emit(&inst);
     assert_eq!(
@@ -3576,6 +3582,38 @@ fn calltyped_emits_saves_args_call_ret_restores_in_order() {
     );
 }
 
+/// The typed call publishes the same call-site markers as the mature path,
+/// inside the GP oracle's window: directly after the call text and before
+/// the return move (which is a real instruction and would end the window).
+#[test]
+fn calltyped_publishes_call_site_markers_before_the_return_move() {
+    let inst = MachInst::CallTyped {
+        caller_saves: vec![],
+        args: vec![CallArgMove {
+            src: MachOperand::Imm(1),
+            dst_reg: RDI,
+            size: OpSize::S64,
+        }],
+        target: CallTarget::Direct("f".into()),
+        ret: Some(CallRetMove {
+            dst: MachOperand::StackSlot(-8),
+            size: OpSize::S64,
+        }),
+        gp_arg_count: Some(3),
+    };
+    let lines = emit(&inst);
+    let call = lines.iter().position(|l| l == "call f").expect("call");
+    assert_eq!(
+        lines[call + 1..],
+        [
+            "# LCCC_CALL_ARGS 3",
+            "# LCCC_CALL_FP 0",
+            "movq %rax, -8(%rbp)"
+        ],
+        "{lines:?}"
+    );
+}
+
 /// A 32-bit return home must name %eax (the sub-register), not %rax with
 /// a 32-bit mnemonic — the mismatch the very first smoke test caught.
 #[test]
@@ -3588,6 +3626,7 @@ fn calltyped_return_home_names_the_sized_rax() {
             dst: MachOperand::StackSlot(-8),
             size: OpSize::S32,
         }),
+        gp_arg_count: None,
     };
     let lines = emit(&inst);
     assert_eq!(lines, vec!["call f", "movl %eax, -8(%rbp)"], "{lines:?}");
@@ -4488,6 +4527,7 @@ mod typed_indirect_calls {
                 dst: MachOperand::StackSlot(-16),
                 size: OpSize::S64,
             }),
+            gp_arg_count: None,
         };
         let lines = emit(&inst);
         assert_eq!(
@@ -4538,6 +4578,7 @@ mod typed_indirect_calls {
                 regparm: None,
                 is_pure: false,
                 is_const: false,
+                assume_library: false,
                 ret_eightbyte_classes: vec![],
             },
         };

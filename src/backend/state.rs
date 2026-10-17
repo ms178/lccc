@@ -578,6 +578,12 @@ pub struct CodegenState {
     /// would re-load the dest slot and re-write the alloca — two memory ops
     /// per over-aligned parameter. `emit_store_impl` elides them.
     pub param_homing_stores: FxHashSet<(u32, u32)>,
+    /// x86-64 only: rematerialize constant-offset addresses of ordinary
+    /// allocas as direct frame operands instead of reloading a spilled copy.
+    pub frame_gep_direct: bool,
+    /// Single-definition `GEP(alloca, const)` values -> (alloca, byte offset),
+    /// valid for the current function (see `stack_layout`).
+    pub frame_offset_aliases: FxHashMap<u32, (u32, i64)>,
     /// ParamRef dests whose ONLY use was the elided homing store: dead after
     /// the elision. `emit_param_ref_impl` skips them entirely.
     pub dead_param_ref_dests: FxHashSet<u32>,
@@ -776,6 +782,8 @@ impl CodegenState {
             func_is_variadic: false,
             param_alloca_slots: Vec::new(),
             param_homing_stores: FxHashSet::default(),
+            frame_gep_direct: false,
+            frame_offset_aliases: FxHashMap::default(),
             dead_param_ref_dests: FxHashSet::default(),
             param_pre_stored: FxHashSet::default(),
             uses_sret: false,
@@ -1488,6 +1496,21 @@ impl CodegenState {
     /// Classify how to access a value's effective address.
     /// Returns `None` if the value has no assigned stack slot (and isn't register-assigned).
     pub fn resolve_slot_addr(&self, val_id: u32) -> Option<SlotAddr> {
+        // A constant-offset address of an ordinary alloca is itself a frame
+        // operand. Using it directly avoids reloading a spilled pointer copy
+        // (`mov OFF(%rsp),%rcx; mov (%rcx),...`). The producer still executes
+        // for non-memory uses; this only changes how memory operands address.
+        if let Some(&(base, offset)) = self.frame_offset_aliases.get(&val_id) {
+            if let Some(slot) = self.get_slot(base) {
+                if self.is_alloca(base) && self.alloca_over_align(base).is_none() {
+                    if let Some(addr) = slot.0.checked_add(offset) {
+                        if i32::try_from(addr).is_ok() {
+                            return Some(SlotAddr::Direct(StackSlot(addr)));
+                        }
+                    }
+                }
+            }
+        }
         if let Some(slot) = self.get_slot(val_id) {
             if self.is_alloca(val_id) {
                 if self.alloca_over_align(val_id).is_some() {

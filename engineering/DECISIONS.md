@@ -2986,3 +2986,655 @@ fold it verified.
   hand-maintained diagnostic replay reports `fail flag=0`).  Detail and the
   exact failing test names: `docs/FOLLOWUP-2026-10-13-audit-sweep.md`,
   section CI-DIAG-1.
+
+## 2026-10-15 — census: item-exact test exclusion; native AVX-512 witness gate
+
+- **Defect (A14-01):** `audit_census.py` blanked everything after the first
+  `#[cfg(test)]` in a file, so production code below a mid-file test module
+  was never counted; it scanned test-only module files
+  (`#[cfg(test)] mod x;`) as production; it hid every `#[ignore]` (they live
+  in test code, which was dropped first); and a normal string literal ended
+  at a newline, so multi-line strings leaked their contents into the scan.
+- **Decision:** exclude test-only *items* exactly (`#[test]`, or a `cfg`
+  predicate that requires `test`: `test`, `all(..)` with a test member,
+  `any(..)` whose members all require it; never `not(..)`), from the
+  attribute to the item's matching `}` or terminating `;`. A test-only
+  out-of-line module (honouring `#[path]`) makes its file and its submodules
+  test-only. `#[ignore]` is counted in all code. Strings may span lines.
+  Every rule has a self-test case, including a temporary module tree.
+- **Re-baseline (measurement change, not new debt):** panic sites 889→855,
+  unsafe 29→25 (test-only files no longer counted), ignored tests 1→10
+  (previously invisible), functions over 300/500/1000 lines 194/76/23 →
+  229/92/27 (production code after test modules now visible), undocumented
+  knobs 295→293. Knob literals 501→505 are not a measurement change: they are
+  this series' documented kill switches (`CCC_NO_FRAME_GEP_DIRECT`,
+  `CCC_NO_INLINE_{DEVIRT,HOT_LEAF,JOINT_FIXPOINT,SNAPSHOT_REFRESH}`: the five
+  names `src/` gains over main). The ratchet holds from these honest numbers.
+- **Remaining A14-01 acceptance items, closed in the same series:** character
+  literals with `\u{..}`/`\x..` escapes no longer leak (they used to fall to
+  the lifetime path); `scan_functions` no longer drops functions whose
+  generics nest (`<T: Into<U>>`) or contain `Fn() -> T` (the old one-level
+  `<[^>]*>` regex silently skipped them), treats `;` inside `[u8; N]` as
+  part of the return type, skips `=>` in `fn` macro inputs, and raises on an
+  unclosed signature/body instead of measuring to EOF. Documentation is
+  `git ls-files '*.md'` only, run from the work-tree root. On this tree the
+  ratcheted numbers are unchanged by these fixes (no newly visible function
+  exceeds 300 lines).
+- **AVX-512:** the native masked scalar-forwarding witness is `#[ignore]`d
+  (a non-AVX512F host cannot execute it, and an early `return` would be a
+  pass that never ran). `tests/regression/check_avx512_scalar_witness.py`
+  runs it with `--ignored --exact` in both CI mirrors and requires exactly
+  `1 passed; 0 failed`; a host whose kernel flags lack `avx512f` prints an
+  explicit `SKIP` (no emulator is assumed); `--require` makes that a failure.
+
+## 2026-10-16 — one owner for exit-compare bound folds; candidates never certify
+
+- **Defect (rebase onto 2f477ce0):** upstream's new `loop_bound` pass
+  rewrites `(iv + k) <= limit` to `iv <= limit - k` for unsigned counted
+  loops, the same rewrite `CCC_NO_AFFINE_EXIT_FOLD` is documented to switch
+  off. With the switch set, `hot_guard_64` still compared against `$248`, so
+  the PR824 boundary gate's kill-switch contract failed (264/265). This is the
+  coverage-hole class of PR713 audit item 8 (kill switch missing a clone).
+- **Superseded by upstream #841 (rebase onto 629cc7d6):** main now gates
+  `loop_bound` on `loop_rotate::affine_fold_enabled()`, so the switch owns
+  every producer, and its signed fold carries a whole-trajectory no-wrap
+  certificate that keeps it sound under `-fwrapv`. This series therefore
+  drops its own `!wrap_signed_overflow` disable and its separate gate: the
+  same contract, one implementation. `CCC_DISABLE_PASSES=loop_bound` remains
+  the per-pass switch.
+- **Defect (benchmark oracle):** `evaluate_correctness` used GCC as oracle
+  when requested but otherwise fell back to the first successful compiler in
+  request order, so `--compilers lccc,clang` made LCCC the oracle and a
+  wrong LCCC output "matched" while Clang "failed".
+- **Decision:** only reference compilers (`gcc`, then `clang`, then `icx`, the
+  first one requested) can be the oracle; a failed oracle is never replaced,
+  and with no reference requested nothing is certified (`matches_baseline`
+  stays `None`, which keeps the workload out of aggregates and best-reference
+  selection). The S55 test that expected certification against a fallback was
+  wrong and now asserts the fail-closed result; a new test covers every
+  request order including candidate-only runs
+  (`tests/benchmark/test_benchmark_harness.py`).
+- **Defect (env-read ratchet, 155 > 151):** the S55 inliner read its four
+  `CCC_NO_INLINE_*` switches per invocation inside `src/passes/inline.rs`,
+  against `check_env_test_hygiene.sh`'s rule that a new switch is resolved
+  once in `run_passes`. **Decision:** `run_passes` resolves them and installs
+  an `InlineFeatures` value per translation unit (`inline::set_features`, a
+  `thread_local` like the affine-fold knobs); unit tests call
+  `inline_run_with` with explicit features. The count is back at the budget
+  (151) without raising it.
+- **Census knob names:** `KNOB_PAT` matched prefixes (`CCC_NO_` in a
+  `starts_with`, `LCCC_RET_`/`LCCC_VOLATILE_` marker prefixes) and a family
+  written as `CCC_NO_INLINE_*` in prose as knobs. A knob name now ends in a
+  letter or digit (self-test case added): knob literals 507→503,
+  undocumented 293→292, a measurement change. The series' real knob growth
+  over main stays the six documented switches (the five above plus
+  `CCC_NO_SHIFT_COUNT_DEMAND`).
+
+## 2026-10-16 — x86-64 shift-count demanded bits (`backend::x86::shift_count`)
+
+- **Decision:** a late, x86-64-only IR pass computes, per value, how many low
+  bits any user can observe when every user is a variable shift count (or an
+  `and`-by-constant / `C - x` / integer cast feeding one), then forwards
+  `x & m` to `x` when `m` covers those bits and rewrites `C - x` to `-x`
+  (`C ≡ 0`) or `~x` (`C ≡ -1`) modulo `2^bits`.  It runs after the last
+  semantic IR pass (`CCC_NO_SHIFT_COUNT_DEMAND=1` disables it; the regression
+  check uses that switch as its negative control).
+- **Why:** portable bit readers spell the hardware masking out in C (zstd's
+  `BIT_lookBits`: `(c << (n & 63)) >> 1 >> ((63 - nb) & 63)`); LCCC emitted
+  `andl $63` twice plus `movl $63; subl; andl`, GCC 16.2 emits `notl` and
+  two `shrx`/`shlx`.  The rewrite is a backend-contract fact (each IR shift is
+  one hardware shift whose count the CPU masks), not a C-UB argument, which is
+  why it is target-specific and late instead of a generic IR fold.
+- **Edge cases fixed during red-team:** the demand is the maximum over every
+  lowering of a shift: `I32/U32` shifts are always 32-bit forms (5 bits), but
+  `I8/I16` shifts are 8/16-bit forms on the MachInst path and 64-bit forms on
+  the accumulator path, so they demand 6 bits (the first draft used 5 and
+  would have dropped a needed `& 31` there).  The unit oracle evaluates every
+  case under both lowerings.  Phi, store, call, compare, terminator and
+  shifted-operand uses demand all bits; nested masks resolve to the root;
+  rewired operands keep their exact type; dead `and`s are deleted by the pass
+  itself with source spans kept parallel (generic DCE declines FP-env
+  functions); rotates are untouched.
+- **Measurement (instruction counts, Callgrind, one API call, 1 MiB Silesia
+  prefixes, `engineering/evidence/pr833/zstd-shift-count-callgrind.json`):**
+  decompression −3.3 % to −3.7 % Ir (xml/dickens, levels 1/3), compression
+  −0.2 % to −0.5 %.  No timing claim; lccc remains at 1.40–1.45× GCC's Ir for
+  decompression and 1.86–1.94× for compression on these inputs.
+- **Census:** one knob (`CCC_NO_SHIFT_COUNT_DEMAND`, documented here); no
+  production panic site.
+
+## 2026-10-16 — inliner snapshots sized after scalar cleanup (`CCC_NO_INLINE_SNAPSHOT_CLEANUP`)
+
+- **Decision:** when the inliner refreshes a processed caller's snapshot
+  (the body later callers clone), it sizes, judges and clones a copy cleaned
+  by a function-local scalar chain: `promote_function(.., false)` (the homes
+  inlining introduced; the function's own parameter homes stay, so sizes
+  remain in the home form of the raw snapshots they are compared with),
+  then up to three rounds of constant folding, copy propagation, SCCP, CFG
+  simplification, the simplifier and DCE.  The refresh rule itself is
+  unchanged (a grown multi-site body is still not refreshed); the cleanup
+  only changes what "grown" measures.  Bodies with inline asm, label
+  addresses, indirect branches or static locals holding label addresses are
+  not cleaned (their value and block identities are resolved later).
+- **Why:** processing leaves pasted clones unsimplified (parameter homes,
+  copies, folded-away branches, dead values), so zstd's `BIT_flushBits`
+  measured 126 instructions for 43 raw ones and was never refreshed; every
+  caller re-expanded the raw body's calls.
+- **Rejected:** promoting the function's own parameter homes too
+  (`promote_params = true`): +13..+21 % zstd Ir, with calls to
+  `ERR_isError`, `MEM_readLEST` and `BIT_readBitsFast` left in
+  `zstd_decompress_block.c`.  Cleaning every raw snapshot (not just
+  refreshed ones) would retune every inline decision program-wide; not done.
+- **Evidence:** unit test
+  `snapshot_cleanup_refreshes_a_body_that_only_grew_by_dead_work` (switch
+  off as the negative control).  Callgrind Ir (zstd 1.5.7, 1 MiB Silesia
+  prefixes, `-O3 -march=x86-64-v3`): compression level 3 −1.4 % (xml,
+  dickens), level 1 within +0.15 %; decompression within ±0.05 %.  The
+  promotion step (added with the caller cleanup below) changes no zstd Ir by
+  itself; it makes the cleaned `FSE_encodeSymbol` 59 instead of 83
+  instructions.
+- **Census:** one knob, `CCC_NO_INLINE_SNAPSHOT_CLEANUP` (documented here).
+
+## 2026-10-16 — BMI2 `bzhi` as an exact IR operation (`IrBinOp::Bzhi`)
+
+- **Decision:** `__builtin_ia32_bzhi_si` / `__builtin_ia32_bzhi_di` (GCC's
+  names) lower on x86-64 to a new `IrBinOp::Bzhi`, and the bundled
+  `bmi2intrin.h` uses them under `__BMI2__` (the portable C stays the
+  fallback).  Semantics are the instruction's (Intel SDM BZHI): `k = n & 0xFF`,
+  `k >= W` returns the source, otherwise `x & ((1 << k) - 1)`; I32/U32/I64/U64
+  only.  The x86 backend emits one `bzhil`/`bzhiq` (register-direct with the
+  `shlx` staging discipline, or on the accumulator); constant folding,
+  `eval_i64`/`eval_i128` and the simplifier (constant index → copy, zero or
+  `and`; zero source → zero) are exact.
+- **Why:** zstd's `BIT_getLowerBits` calls `_bzhi_u64` on every bit-stream
+  write.  The emulation was 18 IR instructions in 4 blocks per call
+  (`and $255; mov $1; shlx; sub; and; cmp $64; cmov` after optimization) and
+  inflated every caller's inline size: `ZSTD_encodeSequences_body` grew from
+  313 to 1119 instructions and hit the 500-instruction hard cap.  GCC emits
+  one `bzhi`.
+- **Relation to PR840's `bmi2_mask` peephole:** that pass rewrites the
+  emulation's emitted 8-instruction window into `bzhi` but must keep the
+  `cmp` (flags may be live) and only fires on that exact adjacent shape, after
+  the inliner has already paid for the 18-instruction body.  With the IR
+  operation the intrinsic never reaches that shape, so the inline cost, the
+  compare and the window fragility disappear together; the peephole stays
+  for hand-written C of the same idiom (its own tests are unchanged, and
+  `tests/regression/bmi2_saturating_mask.c` still passes through the new
+  path).
+- **Not the rejected idiom rewrite:** this is not `x & ((1 << n) - 1)` →
+  `bzhi` (that C shift is undefined from `n >= W`, and the earlier decision
+  not to exploit it stands); the intrinsic's own total semantics are the
+  instruction's, so the mapping is exact for every index.
+- **Permission and targets:** the builtins carry an AUD-CPU-3 requirement
+  (`bmi2`, `-mbmi2`): without BMI2 the call is a compile error naming the
+  extension, as in GCC.  `_di` is x86-64-only; i686 `_si` lowers to the
+  equivalent select with every shift count in range (`k & 31`).  No pass
+  synthesizes `Bzhi`, so the AArch64/RISC-V/i686 backends' arms call one
+  shared `#[cold]` `ir::ops::bzhi_outside_x86_64()` stating that invariant
+  (one census panic site).  The x86 accumulator path still has a no-BMI2
+  sequence for hand-built IR (two registers only: `movzbl; cmp $W; jae;
+  xor $(W-1); shl %cl; shl $1; shr $1; shr %cl`), checked against hardware
+  `bzhi` on 12 288 index/source pairs.  `isel` declines `Bzhi` (no MachInst
+  opcode).
+- **Evidence:** `tests/regression/check_bmi2_bzhi.py` (CI fast gate
+  `bmi2-bzhi`): one `bzhi` and no compare/branch/cmov per opaque helper at
+  `-march=x86-64-v3`, no `bzhi` at `-march=x86-64`; 505 printed results
+  (opaque, constant-index and fully constant paths; indices 0..257, 0x1ff,
+  high index bits set) equal GCC 16.2 at both ISA levels; the direct builtin
+  without BMI2 is rejected.  Unit tests: `bzhi_folds_like_the_instruction`
+  (fold and both container evaluators, 4 types × 8 sources × 19 indices) and
+  `bzhi_constant_index_rewrites_are_exact` (simplifier rewrites evaluated
+  against the SDM oracle).
+- **Measurement (Callgrind Ir, one API call, 1 MiB Silesia prefixes,
+  `-O3 -march=x86-64-v3`, against the preceding snapshot-cleanup commit so
+  only `Bzhi` differs):** compression −6.2 % to −8.5 % (xml l1
+  29.75M → 27.72M, xml l3 35.28M → 32.49M, dickens l1 69.07M → 64.80M,
+  dickens l3 79.55M → 72.80M); decompression identical (it does not call
+  `_bzhi_u64`).  No timing claim.
+
+## 2026-10-16 — clean a size-capped caller before giving up on it (`CCC_NO_INLINE_CALLER_CLEANUP`)
+
+- **Decision:** when site selection finds nothing for a caller that is past
+  its size cap, the inliner runs the same function-local scalar cleanup as
+  the snapshot refresh (`scalar_cleanup`: own-home promotion off, three
+  bounded rounds) on the caller in place and selects again against the
+  cleaned size.  It reruns only once the caller has grown past its last
+  cleaned size, so each cleanup is paid for by newly inlined work and the
+  shared round counter still bounds the loop.  Callers with inline asm,
+  label addresses, indirect branches or label-holding static locals are not
+  cleaned (`scalar_cleanup_blocked`).
+- **Why (root cause, from `CCC_INLINE_DEBUG`):** the size caps measured the
+  caller as pasted.  zstd's `ZSTD_encodeSequences_body` reached 885
+  instructions after its first-pass `BIT_addBits` clones (450 after
+  cleanup), crossed the 500-instruction hard cap and kept nine outlined
+  `BIT_flushBits` calls and an outlined `FSE_encodeSymbol` per sequence.
+- **Rejected:** raising the caps or the per-caller budget (the screened
+  "si"/"lp" arms).  Both loosen growth limits for every caller to work
+  around a measurement error in one; the root cause is that 12 first-pass
+  `BIT_addBits` clones exhausted the budget as pasted, then the hard cap
+  refused the rest, so the fix measures the real size instead.
+- **Evidence:** unit test
+  `caller_cleanup_measures_a_capped_caller_after_folding_its_dead_work`
+  (switch off as the negative control).  Callgrind Ir against the same
+  binary with the switch set (zstd 1.5.7, 1 MiB prefixes, `-O3
+  -march=x86-64-v3`): compression xml l1 −4.7 %, xml l3 −1.2 %, dickens l1
+  −6.1 %, dickens l3 −0.9 %, bin l1 −3.3 %, bin l3 −2.6 %; decompression
+  −0.003 %.
+
+## 2026-10-16 — hot-leaf admission for declared-inline direct callees (`CCC_NO_INLINE_HOT_DIRECT`)
+
+- **Decision:** the per-iteration hot-leaf rule (call block dominates every
+  latch, callee within the hot-leaf size, charged to the hot-leaf budget)
+  now also admits a DIRECT call when the callee is declared `static inline`
+  and the caller is below the absolute caller cap (1000 instructions).
+  Plain-static direct callees keep the historical caps.
+- **Why:** after the caller cleanup, zstd's `FSE_encodeSymbol` (59 cleaned
+  instructions, `MEM_STATIC` = `static inline`) is still called on every
+  sequence from a capped `ZSTD_encodeSequences_body`.  The earlier,
+  unconditional extension to all direct calls cloned two small plain-static
+  hash helpers into the 2.5k-instruction doubleFast loop and slowed
+  binary-input level-3 compression by 21-28 % on the screening host with
+  identical Callgrind counts (a layout effect).  The programmer's `inline`
+  declaration and the absolute cap together exclude that caller and admit
+  the encoder.
+- **Evidence:** `tests/regression/check_inline_devirt_hot_leaf.py`
+  (`sum_i` inlined, `sum_s` kept, `CCC_NO_INLINE_HOT_DIRECT=1` as the
+  negative control; output equals GCC under every inliner switch).
+  Callgrind Ir against the caller-cleanup arm: compression xml l1 −5.9 %,
+  xml l3 −6.7 %, dickens l1 −5.4 %, dickens l3 −7.1 %, bin l1 −7.8 %,
+  bin l3 −7.0 %; decompression identical.  No timing claim: the screening
+  host has no PMU and no Intel/AMD hardware was available.
+
+## 2026-10-16 — REJECTED: static-inline parity with the plain-static size tiers
+
+- **Finding (kept as a known inversion):** a `static inline` body without
+  vector intrinsics is ordinary-eligible only up to 32 instructions, while
+  the same body declared plain `static` gets the medium (160/16), loop,
+  constant-trip and single-call-site tiers; between 33 and 160 instructions
+  the `inline` keyword makes a body LESS likely to be inlined (GCC does the
+  opposite: declared-inline bodies get `max-inline-insns-single`).
+- **Experiment:** one switch extending all static tiers (and the multi-site
+  loop-clone guards) to `static inline` bodies, with a fixture and negative
+  control.
+- **Measured and rejected:** byte-identical assembly for all 45 benchmark
+  programs at `-O2`, `-O2 -march=x86-64-v3`, `-O3 -march=x86-64-v3` and
+  `-Os`; zstd 1.5.7 changes in five files with −101 to −124 Ir per one-call
+  compression run at levels 1, 3, 6 and 9 (|Δ| < 0.001 %) for +2232 bytes
+  of `libzstd.a` text.  A program-wide retune with no measured benefit and
+  unmeasured blast radius (kernel stack frames: see the `ror32`/blake2s
+  note at the static-inline admission) is not justified.  zstd's real
+  missed inline, `ZSTD_count` (19 blocks, loops, 5 sites), stays outside
+  the parity tiers anyway (16-block medium limit, two-site loop limit).
+
+## 2026-10-16 — subscript constraint diagnostics with trusted operand types
+
+- **Change:** sema rejects `E1[E2]` unless one operand is a pointer/array
+  (or GNU vector) and the other an integer (C11 6.5.2.1p1), as GCC does.
+- **Why:** LCCC lowered any subscript as a pointer access.  LCCC's
+  `<immintrin.h>` defines `__m256` as a struct (GCC's is a vector), so
+  `__m256 v = ...; v[0] = s;` compiled silently and segfaulted at run time.
+  It is now a compile-time error -- a documented gap (GCC accepts it), but
+  an error instead of a miscompile.
+- **Trust rule:** sema's expression typing is not exact everywhere (unhandled
+  type specifiers fall back to `int`), so the check acts only on operand
+  types it can trust: declared names, member accesses, literals, and any
+  operand inferred as a struct/union.  The first version trusted every
+  inferred type and rejected the replayed reproducer
+  `artifacts/repros/crash_gen_slot_stress_seed20260930_-O2.c` (a cast to an
+  attribute-spelled vector type that sema typed as its lane type).  That
+  mistyping is fixed (next entry), but the rule stays narrow: broadening it
+  would buy diagnostics for exotic float/scalar subscripts, while any
+  remaining `int` fallback would turn into a false rejection of valid code.
+- **Evidence:** `tests/regression/check_subscript_diagnostics.py` (gate
+  `subscript-diagnostics`): eight invalid forms diagnosed (GCC agrees on all
+  but the struct-based `__m256`, where the gate asserts the documented
+  divergence), the valid forms (including vector-valued operands of every shape
+  above) print GCC's output at -O0 and -O2; no subscript diagnostic on any
+  `artifacts/repros/*.c`.
+
+## 2026-10-16 — GNU vector comparisons are integer-lane vectors everywhere
+
+- **Bugs (pre-existing, all reproduced against GCC 16.2):**
+  1. A comparison with a vector operand was typed `int` by sema, by
+     lowering's `get_binop_ctype` and by `sizeof`: `sizeof(v == w)` was 4
+     and `__typeof__(v == w) m = v == v; m[1]` segfaulted (16-byte store
+     into a 4-byte object).
+  2. `ctype_to_type_spec` collapsed a vector to its lane type, so
+     `__typeof__(v) t` and `__auto_type u = v - w` declared scalars
+     (sizeof 8 for a 16-byte vector).
+  3. Sema's `resolve_type_spec` had no arm for `TypeSpecifier::Vector`
+     (attribute-spelled casts and type names) and fell back to `int`.
+  4. Float- and double-lane comparisons skipped the element-wise lowering
+     and compared the vector's stack address: `(f < g)[i]` segfaulted.
+     `expr_ctype` typed a float comparison as the float vector, so
+     `-(f < g)` negated an address.
+- **Fix:** one rule, `CType::vector_comparison_result`: signed integer
+  lanes of the operand's lane width and the same total size (`int` lanes
+  for `float`, 64-bit for `double`), used by sema, `get_binop_ctype`,
+  `expr_ctype` and `sizeof`.  `lower_vector_cmp` handles `float`/`double`
+  lanes with the scalar ordered `Cmp` (NaN lanes false except `!=`, as in
+  GCC) and stores the mask in the same-width integer type.  Vectors
+  round-trip through typeof/`__auto_type`/typedef resolution.
+- **Evidence:** compat-suite program "GNU vector comparison masks" (NaN
+  lanes, scalar broadcast on either side, `float`/`double`/32-byte/`u8`/
+  `short` lanes, typeof, `__auto_type`, `~`, `-`, mask-select); identical
+  to GCC at -O0, -O1, -O2, -O3, `-march=x86-64-v3` and `-m32 -msse2`; the
+  previous compiler segfaults on it.  `check_subscript_diagnostics.py`
+  covers the typeof/sizeof/`__auto_type` forms.
+
+## 2026-10-16 — NOTED, not changed: 32-byte vector argument ABI under `-mavx`
+
+- **Finding:** with `-mavx`, GCC passes and returns 32-byte vectors in
+  `%ymm` registers; LCCC (`sysv_vector_carrier` returns `None` above
+  16 bytes) uses memory.  Mixed LCCC/GCC objects exchanging `__m256`
+  by value disagree (garbage or a segfault in `.cache/rt/abi_{f,m}.c`).
+- **Why not here:** an ABI change touches argument classification, varargs,
+  returns and every backend that shares the classifier; it needs its own
+  change with interop gates in both directions.  Recorded in the follow-up.
+
+## 2026-10-16 — hot loop helpers: declared-inline callees with a loop at in-loop sites
+
+- **Change:** under the existing `CCC_NO_INLINE_HOT_DIRECT` switch and
+  hot-leaf budget, a `static inline` (not always_inline) callee that has a
+  loop, is not recursive or constant-trip, and has at most 160 instructions
+  in 24 blocks is inlined at any call site inside a caller loop, past the
+  static-inline instruction limit and the soft/hard caller caps.  The
+  absolute caller cap (1000 instructions, checked before each inline) and
+  the relative hot-leaf budget (the caller's entry size) still bound it.
+  Plain-static callees are not candidates.
+- **Why:** zstd's `ZSTD_count` (142 instructions, 19 blocks after its own
+  helpers) is the match-length scan every block compressor runs once per
+  match.  LCCC left 163 calls to it in `libzstd.a`; GCC leaves 5.  A source
+  experiment forcing it inline measured −2.2…−3.8 % Ir at level 1, which
+  justified a rule; the rule had to exclude the 2.5k-instruction doubleFast
+  loop (an earlier direct-call extension slowed binary level 3 by 21-28 %
+  on the screening host with identical Ir, a layout effect), which the
+  absolute cap does.
+- **Evidence (Callgrind Ir, one compression call on 1 MiB prefixes,
+  `-O3 -march=x86-64-v3`, previous tree → this rule; GCC 16.2 for scale):**
+
+  | input | level | before | after | Δ | GCC |
+  |---|---|---|---|---|---|
+  | xml | 1 | 24847932 | 24258680 | −2.4 % | 15958310 |
+  | dickens | 1 | 57573894 | 55624396 | −3.4 % | 35949226 |
+  | bin | 1 | 35502707 | 34159406 | −3.8 % | 22340755 |
+  | xml/dickens/bin | 3 | — | identical | 0 | — |
+  | xml | 5 | 84804813 | 83340535 | −1.7 % | 58264214 |
+  | dickens | 5 | 173277442 | 163285601 | −5.8 % | 115172453 |
+  | xml | 6 | 112751683 | 106878645 | −5.2 % | 77615891 |
+  | dickens | 6 | 243947797 | 221343424 | −9.3 % | 162369533 |
+  | xml | 9 | 153107458 | 140383863 | −8.3 % | 103940845 |
+  | dickens | 9 | 364437200 | 320203948 | −12.1 % | 239727213 |
+  | xml | 16 | 1260672672 | 1164028352 | −7.7 % | 720640553 |
+  | dickens | 16 | 1815216241 | 1729178952 | −4.7 % | 837217774 |
+
+  Decompression +13/+14 Ir (of 9.3M/18.5M).  `libzstd.a` text 796474 →
+  894010 bytes (+12 %; GCC: 1268515), mostly the dictMatchState/extDict
+  and row-matcher template instances that call `ZSTD_count` in loops.
+  Benchmark corpus: `scripts/codegen_sweep_compare.py` over all 58
+  `tests/benchmark/programs` files is byte-identical at `-O2`, `-Os` and
+  `-O3 -march=x86-64-v3`.  Fixture: contract 5 of
+  `tests/regression/inline_devirt_hot_leaf.c` (declared-inline scan inlined
+  into a capped caller, plain-static twin kept, switch as negative
+  control; the previous compiler fails the check).  No timing claim: no PMU
+  and no Intel/AMD hardware on the screening host.
+
+## 2026-10-16 — S57: restore pointer-domain map synthesis; exact scalar reloads without the latency
+
+- **#841 silently dropped `map_pointer_domain_fits` (restored).** The
+  synthesized session patch (2eeff669) reverted the S5x rule with no
+  conflict and no note. Main's own `backlog.md` (PR831, "pointer-domain
+  synthesis") and `PR831-COMPILER-AUDIT.md:200` still record it as done.
+  Without it, a signed-`long`-IV dynamic map loop over elements wider than
+  one byte (`f16`/`f32` in the vectorizer probe) is not vectorized at all.
+  The rule is sound: address arithmetic is exact modulo 2^ptr, so an index
+  type at least pointer-wide, or a range proven non-negative within its
+  type, cannot change the addresses. When the byte limit for I64/U64 with
+  element size > 1 is unsupported, the element-IV compare is kept, unless
+  `map_dynamic_u64_byte_limit` proves the byte form. The unit test
+  `pointer_width` (4 cases) failed on the rebase and passes again.
+- **Zeroing self-move elimination (new, x86 peephole phase 2).** Store
+  forwarding (this series) replaces a `movsd slot, %xmmN` reload of a value
+  `%xmmN` still holds with `movq %xmmN, %xmmN`. That is the exact
+  replacement: memory MOVSD zeroes bits 127:64, while the register forms
+  merge. Main's version (older than #841) deletes such a reload as an
+  "identity", which is only correct when the upper half is never observed.
+  - The exact form is one more µop, and one cycle on the scalar chain:
+    `movq` is not move-eliminated. That pushed `struct_copy` to 139
+    instructions against a ratchet of 136.
+  - `eliminate_unobserved_zeroing_self_moves` deletes the move only when a
+    forward scan within the basic block proves the zeroed half is
+    overwritten before anything can read or copy it. Lines that may
+    observe it, including any barrier or unmodelled line, keep the move.
+  - We keep exactness and recover the cost: struct_copy has 132
+    instructions (main: 132), and its Callgrind Ir is 0.956x main's.
+- **Typed calls publish the call-site markers.** The MachInst `CallTyped`
+  path never emitted `# LCCC_CALL_ARGS`, so the GP liveness oracle assumed
+  all six argument registers live at every such call (fail-closed, but it
+  pinned scratch copies). The typed subset is non-variadic, has no sret, no
+  static chain, and at most six scalar integer/pointer arguments, each in
+  one GP register. The exact data is therefore `args.len()` GP registers
+  and 0 SSE registers, emitted before the return move as the window
+  contract requires.
+  - `expat_siphash24`'s driver loop loses a dead `movq %rdx, %rcx`. Its
+    S56 +0.079% Ir regression against main becomes 1.00000.
+  - Ten corpus programs shrink by 1–7 static instructions; none grow.
+- **#841's byte-accessor gate, negative control isolated.** The control
+  asserts that with byte scheduling disabled, `body_le64` stays outlined.
+  Our capped-caller cleanup shrinks `main()`, so the unscheduled accessor
+  fits the budget for an unrelated reason. With that one feature pinned off
+  (`CCC_NO_INLINE_CALLER_CLEANUP=1`), our compiler matches main in all eight
+  switch/mode cases. The positive O2/O3 assertions still run with every
+  inliner feature enabled, so nothing is relaxed.
+
+## 2026-10-16 — S57 rebase onto 629cc7d6 (PR #841): one RV64 address classifier
+
+- **R_RISCV_32 in RV64 shared output (conflict with #841):** #841's
+  `relocate_address32` accepted exactly `defined && absolute` and re-derived
+  absoluteness locally. That contradicts two rules already on main: its own
+  `relocate_address64` treats default-visible ABS definitions as preemptible
+  (symbolic `R_RISCV_64`, "default-visible globals can still be preempted"),
+  and treats an unresolved non-default-visible weak as absolute zero; and
+  `FOLLOWUP-2026-10-15-pr831-pr832.md` records the LLD 23-validated contract
+  (830/830). This series keeps ONE classifier (`shared_address_kind`) for
+  both widths: RV64 has no 32-bit dynamic relocation, so anything not
+  genuinely absolute is rejected (the LLD behaviour) and hidden/internal/
+  protected unresolved weak resolves to zero. #841's two checker unit tests
+  that encoded the other model are removed; the series' own tests
+  (`test_word_relocation_matrix_rejects_runtime_addresses`,
+  `test_word_relocation_checks_width_and_no_dynamic_fixup`) cover the same
+  surface, including the neighbour-word sentinel against eight-byte writes.
+- **GNU ld divergence (measured, binutils 2.44 riscv64 cross):** 35 of the
+  175 R_RISCV_32 oracle cases differ, all in two classes: bfd freezes a
+  default-visible ABS global/weak definition to S+A (it is still preemptible),
+  and rejects an unresolved hidden/internal/protected weak (whose value is
+  zero by gABI). LCCC passes all 419 of its own cases. The `--oracle` mode is a
+  semantic comparison, not a gate. Its other 28 failures are bfd 2.44's: 24
+  `R_RISCV_RELATIVE` fixups (load-biasing) for ABS `R_RISCV_64`/GOT targets,
+  2 linker crashes on a `GOT_HI20` against an unresolved hidden/internal weak,
+  and 2 symbolic `R_RISCV_64` fixups for a merged-protected definition.
+- **Kill switch:** main's owner-switch topology (`affine_fold_enabled()`
+  gating `loop_bound`, the signed fold sound under `-fwrapv` through its
+  whole-trajectory certificate) replaces this series' version; see the
+  2026-10-16 owner entry above.
+- **Census re-baseline (no new debt from this series):** `fns_over_500`
+  92→93 and `fns_over_1000` 27→28 are upstream growth measured by this
+  series' stricter scanner: `iv_strength_reduce::find_derived_exprs` (503
+  lines, untouched here) and `x86::codegen::alu::emit_int_binop_impl` (1015
+  lines on main; this series adds 4). `panic_sites` 856→855.
+- **Harness hygiene:** compressed evidence (`*.gz *.xz *.zst *.zip *.tar
+  *.bundle`) is declared `binary` so `text=auto` can never EOL-normalize a
+  stream without an early NUL; the one-step `test` aggregator job gets a
+  5-minute timeout like every other job.
+
+## 2026-10-16 — S60: builtin policy as a per-call fact (A13/A14), not ambient state
+
+**Problem (reproduced on main e8ae10ab and S59):** lccc assumed every call
+named `memset`/`printf`/`strlen`/`sqrt`/... IS the C library function, always.
+(a) A TU implementing the mem* family had its own zero loop rewritten into
+`call memset` inside `memset` (rc=139 at -O2/-O3; GCC 16.2 hangs on the same
+TU, Clang refuses by name). (b) `-fno-builtin`, `-fno-builtin-<fn>`,
+`-ffreestanding`, `-fhosted`, `-fno-hosted`, `-fno-freestanding` were
+silently ignored, and `__STDC_HOSTED__` stayed 1 under `-ffreestanding`.
+(c) Under `-fno-builtin`, a TU's own `strlen`/`sqrt`/`pow`/`fabs`/`memcpy`
+were folded, mapped to instructions or expanded from the library contract
+(S59 prints `3 2.0 16.0 4.0 0` for `nobuiltin_tu_library_names.c`; GCC and
+this series print `103 5.0 6.0 3.0 1`).
+
+**Design.** Two facts, both carried WITH the IR (pass_policy.rs's rule):
+
+1. `CallInfo::assume_library` — "this call reaches the library function".
+   Lowering sets it for `__builtin_X` spellings (which `-fno-builtin` never
+   withdraws) and for the compiler's own aggregate copies;
+   `passes::builtin_policy::apply`, run once after lowering and the pragma
+   aliases, sets it for every plain call the command line and the TU's
+   definitions permit. EVERY site that interprets a call by name reads it:
+   constant-size memcpy/memset expansion (all three backend predicates now
+   take `&CallInfo`, so no caller can forget), `fortify_fold`'s source,
+   `constant_fold`'s strlen, `simplify`'s math tables, `ip_purity`'s library
+   purity tables (split from the inferred sets, so they describe calls that
+   reach the library, never a name). Inlining/outlining propagate it.
+2. `PassPolicy::builtins` (Copy, per function) — what a pass may CREATE a
+   call to, for the 18 `Libcall` names lccc synthesizes (loop_idiom,
+   loop_memset, fortify_fold's targets). `run_passes` re-stamps only the two
+   CLI semantics it owns and keeps this TU-derived fact.
+
+**What withdraws.** Measured on the oracles, 12 flag rows (cli test
+`builtin_flags_match_gcc`): blanket flags last-wins, `-fno-builtin-<fn>`
+sticky (also for names outside `Libcall`, via `BuiltinFlags`), hosted flags
+also set the blanket state, `-fbuiltin` leaves hosted-ness alone. Reserved
+`__` names (libgcc runtime such as `__copysigntf3`, which must still fold at
+-O0 because lccc links no libgcc) are never withdrawn, except the fortified
+`Libcall` entry points (`__printf_chk` stays a call under `-fno-builtin`, as
+on GCC).
+
+**What the TU does to a name (revised in S64 on main a88fb736b, which had
+merged #844's A13/A14 as 9a96de807).** A name is *defined* by a function
+body whose C name it is (not a `gnu_inline` extern-inline body: glibc's
+`<stdio.h>` defines `putchar`/`vprintf` that way under `__OPTIMIZE__`, and
+counting them would withdraw printf→puts from every -O2 TU), and *opaque*
+when an `__asm__` label re-spells it (on a definition or a declaration; a
+label equal to the name is an identity), an alias or `#pragma weak a = b`
+names it, or top-level assembly mentions it. Then:
+
+* an existing call to that exact name is not assumed to be the library
+  function (per name: a TU-defined `memset` leaves `memcpy(d, s, 8)`
+  expandable, as GCC 16.2, Clang 23.1 and #844 do);
+* a pass may not synthesize `f` anywhere in the TU when any name in
+  `reach(f)` is defined or opaque. `reach` is `f` plus what a libc
+  implementation of `f` calls through public symbols, from source:
+  memmove→memcpy (musl `memmove.c`), puts→fputs, fwrite, strlen and
+  fputs→fwrite, strlen (musl `puts.c`, `fputs.c`).
+
+Three S60 choices were reversed. (1) The family withdrawal (a `memset`
+body withdrew memcpy/memmove too) had no evidence behind it; the per-name
+rule plus `reach` is what the libc sources and both oracles support.
+(2) Top-level asm is read as a *mention*, not by enumerating defining
+directives: S60's enumerator missed `memset = impl`, `.equiv`, `.eqv` and
+`.weakref`, and a missed form is a self-recursion, while a blob that merely
+calls the function costs one optimization in a rare TU (main's
+`common::asm_scan`, shared with `dead_statics`). (3) A per-function
+reachability rule (withdraw `f` only in functions the TU's definition can
+reach, with an escape set for unknown calls) was built and unit-tested in
+S64, then dropped: it still routes synthesized calls into the program's own
+`memcpy` (main's `check_libcall_synthesis_no_selfcall.sh` runtime row
+counts them), and none of the 61 corpus programs nor zstd defines any of
+the nine names, so its precision is worth nothing measured.
+
+**Oracle comparison** (`tests/regression` + asm probes, -O2, 6 shapes × 5
+flag sets): 29/30 cells equal GCC 16.2. The deviation is deliberate:
+`-fno-builtin-puts` keeps `printf("hi\n")` as printf, where GCC and Clang 23.1
+both create the `puts` call. On `-fno-builtin-memset` the oracles split (GCC
+still forms `memset` from a loop, Clang does not); lccc follows the one rule
+for both: a name the user withdrew is never synthesized, since the usual
+reason for withdrawing it is an own definition with other semantics. Cost:
+one fold under a rare flag.
+
+**vs main's 9a96de807 (#844/#757), same findings, different mechanism.**
+Main publishes the policy as process-global state (`common::builtin`'s
+`RwLock`, a test-serialisation mutex, fail-closed "half published" states)
+and threads a `LibcallAllowance` plus a per-rewrite gate through each pass.
+Replaced, not merged: ambient state races concurrent TUs and unit tests
+(pass_policy.rs forbids it), a name gate pessimizes `__builtin_memset` under
+`-ffreestanding` (the spelling is lost; this series keeps it inline, as GCC
+does), main's `cli.rs` arms ignored `-fno-hosted`/`-fno-freestanding` (and
+its second `-ffreestanding` arm was dead, shadowed by the first), and
+main's `constant_fold` strlen, `simplify` math tables and `ip_purity` tables
+do not consult the policy, so `-fno-builtin` TUs keep the wrong values
+shown above. Adopted from main: the regression fixtures and
+`check_libcall_synthesis_no_selfcall.sh` (unchanged, all rows pass), the
+`reach` edges, the mention-based asm scan, alias-defines-both, the
+asm-label rules, its unit tests (ported to `builtin_policy.rs` /
+`fortify_fold.rs`), and checking the stdio fold's ORIGINAL callee
+(`printf("")` creates nothing, yet a TU-defined `printf` keeps its call).
+
+**Also fixed (found by this audit):** `pow(x, 0.5)` was rewritten to
+`sqrt(x)` unconditionally; that is wrong for -0 (+0 vs -0) and -inf (+inf vs
+NaN), and GCC 16.2 / Clang 23.1 keep the call at -O2 even with
+`-fno-math-errno`. Removed.
+
+**Noted, not changed (math-errno policy):** `pow(x, 2.0)` → `x*x` and
+`sqrt` → `sqrtsd` drop the `errno` (ERANGE/EDOM) a hosted glibc sets
+(`math_errhandling & MATH_ERRNO`). GCC 16.2 and Clang 23.1 keep `pow(x,2)` a
+call by default and fold it under `-fno-math-errno`; GCC guards `sqrtsd` with
+a NaN check that calls `sqrt` for the errno. Fixing it needs a
+`math_errno` PassPolicy bit plus a guarded sqrt in every backend: a
+performance-sensitive change that deserves its own measured series.
+
+## 2026-10-16 — S60: plain-char signedness is one answer (adopted from PR #844, extended)
+
+**Reproduced on this branch against GCC 16.2:** `-funsigned-char` flipped the
+type but not `__CHAR_UNSIGNED__` (`(char)-1, CHAR_MIN, macro` printed
+`255 -128 0`; GCC `255 0 1`); `-fno-signed-char` and `-fno-unsigned-char`
+were ignored outright; AArch64 kept `__CHAR_UNSIGNED__` under `-fsigned-char`;
+RISC-V (unsigned char by psABI) never defined it; the predefined
+`CHAR_MIN`/`CHAR_MAX` were hardcoded signed.
+
+**Agree with main's 21154ab63 (from #757/#844)** that the macro must be
+derived from the same `char_is_unsigned()` the type system reads (main's
+existing process-global; replacing that plumbing is out of scope) and that
+the hardcoded AArch64 define must go; this commit is rebased onto it.
+**What main still lacks (from its source at a88fb736b):** no arm for
+`-fno-signed-char` / `-fno-unsigned-char` (GCC treats them as the opposite
+flag), and `builtin_macros.rs` still predefines `CHAR_MIN` as `(-128)`
+unconditionally, so under `-funsigned-char` lccc's own `CHAR_MIN`
+contradicts its `__CHAR_UNSIGNED__` until glibc's `<limits.h>` redefines it.
+Both are fixed here. The gate (main's, same file) gains four `-fno-` rows
+and the gcc-16 oracle; its `va_arg_pack_len` gate is adopted as protection for the inliner fix main already has (passes).
+
+## 2026-10-17 — S67: one rule per type fact (enums, `_Static_assert`, `_Alignas`)
+
+**Problem.** The same fact was computed by independent rules that disagreed:
+enumerator types by four, enum size/alignment by five (parser, sema type
+checker, sema constant evaluator, lowering, `CType`), member alignment by
+five converters. Two silent fallbacks hid it: `sizeof` of an unknown
+identifier returned 4, and the parser accepted any `_Static_assert` it could
+not fold — so fixtures written to pin these facts passed vacuously.
+
+**Decisions.**
+- *Enum facts derive from `EnumType` only.* An enumerator's type is a
+  function of its whole enum and is stored with the constant
+  (`EnumConstant`). Every integer property of `CType::Enum` delegates to
+  `compatible_ctype()`, so no consumer can re-derive width or signedness.
+  Sema keeps `CType::Enum` identity (tag-compatibility diagnostics need it);
+  lowering keeps lowering non-packed enums to the compatible type (upstream's
+  choice, agreed). With delegation the two are interchangeable for every
+  arithmetic purpose.
+- *The parser answers only what it knows exactly.* `alignof_type_spec`
+  returns `Option`; typedefs, enums, `#pragma pack` records and anything
+  built on them are `None`, never a guess. Consumers defer: `_Static_assert`
+  to sema (new AST nodes), `_Alignas(type)` to the layout builders
+  (`StructFieldDecl::alignas_type`, mirroring declarations).
+- *Sema decides deferred assertions and accepts evaluator gaps.* Rejecting
+  an assertion sema cannot fold would turn every evaluator gap into a false
+  reject of a valid program; accepting it keeps the pre-existing behaviour
+  for that residual only. Every gap found while enforcing (`?:` decay,
+  `_Generic`) was fixed in the evaluator rather than special-cased.
+- *Strictest alignment wins, everywhere* (`strictest_alignment`,
+  C11 6.7.5p6). Considered and rejected: keeping the first-source `or()`
+  chains and patching the observed cases — it is the shape that produced
+  the bugs.
+- *Gate shape.* Self-checking fixtures (static and runtime checks of each
+  fact) run with the oracle and lccc on x86-64 and i686: the oracle leg
+  proves the expectation, and the runtime half still catches a compiler that
+  wrongly accepts the static half.

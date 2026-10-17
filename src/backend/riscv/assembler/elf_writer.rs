@@ -17,9 +17,9 @@ use super::parser::{
     AsmStatement, DataValue, Directive, Operand, SizeExpr, SymbolType, Visibility,
 };
 use crate::backend::elf::{
-    self, ELFCLASS64, EM_RISCV, ElfWriterBase, ObjReloc, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE,
-    SHT_NOBITS, SHT_PROGBITS, STT_FUNC, STT_NOTYPE, STT_OBJECT, STT_TLS, STV_HIDDEN, STV_INTERNAL,
-    STV_PROTECTED,
+    self, DataFixup, ELFCLASS64, EM_RISCV, ElfWriterBase, ObjReloc, SHF_ALLOC, SHF_EXECINSTR,
+    SHF_WRITE, SHT_NOBITS, SHT_PROGBITS, STT_FUNC, STT_NOTYPE, STT_OBJECT, STT_TLS, STV_HIDDEN,
+    STV_INTERNAL, STV_PROTECTED,
 };
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
@@ -55,7 +55,6 @@ pub struct ElfWriter {
     /// GNU numeric labels: e.g., "1" -> [(section, offset), ...] in definition order.
     numeric_labels: FxHashMap<String, Vec<(String, u64)>>,
     /// Deferred data expressions that reference forward labels (resolved after all statements).
-    deferred_exprs: Vec<DeferredExpr>,
     /// ELF e_flags to use (default: RVC + double-float ABI)
     elf_flags: u32,
     /// ELF class: ELFCLASS64 (default) or ELFCLASS32 for RV32 targets.
@@ -64,15 +63,6 @@ pub struct ElfWriter {
     no_relax: bool,
     /// Stack for `.option push`/`.option pop` to save/restore the `no_relax` state.
     option_stack: Vec<bool>,
-}
-
-/// A data expression that couldn't be evaluated immediately (e.g., forward label reference)
-/// and must be resolved after all statements are processed.
-struct DeferredExpr {
-    section: String,
-    offset: u64,
-    size: usize,
-    expr: String,
 }
 
 struct PendingReloc {
@@ -137,7 +127,6 @@ fn resolve_numeric_label_refs(statements: &[AsmStatement]) -> Vec<AsmStatement> 
 
     // Second pass: rewrite labels and references
     let mut result = Vec::with_capacity(statements.len());
-    let mut dot_counter: usize = 0;
 
     for (i, stmt) in statements.iter().enumerate() {
         match stmt {
@@ -170,13 +159,11 @@ fn resolve_numeric_label_refs(statements: &[AsmStatement]) -> Vec<AsmStatement> 
                 });
             }
             AsmStatement::Directive(dir) => {
-                let new_dir =
-                    rewrite_numeric_refs_in_directive(dir, i, &label_defs, &mut dot_counter);
-                // If the directive references '.', a synthetic label was inserted
-                // before the directive. Check and handle.
-                for d in new_dir {
-                    result.push(d);
-                }
+                result.push(AsmStatement::Directive(rewrite_numeric_refs_in_directive(
+                    dir,
+                    i,
+                    &label_defs,
+                )));
             }
             _ => result.push(stmt.clone()),
         }
@@ -244,255 +231,40 @@ fn resolve_numeric_ref_name(
     }
 }
 
-/// Rewrite a symbol name that may be a numeric label ref or `.` (current position).
-/// If it's `.`, a synthetic label is generated and `needs_dot_label` is set.
-fn rewrite_symbol_name(
-    name: &str,
-    stmt_idx: usize,
-    label_defs: &FxHashMap<String, Vec<(usize, usize)>>,
-    dot_counter: &mut usize,
-    needs_dot_label: &mut Option<String>,
-) -> String {
-    if name == "." {
-        let label = format!(".Ldot_{}", *dot_counter);
-        *dot_counter += 1;
-        *needs_dot_label = Some(label.clone());
-        label
-    } else if let Some(resolved) = resolve_numeric_ref_name(name, stmt_idx, label_defs) {
-        resolved
-    } else {
-        name.to_string()
-    }
-}
-
-/// Decompose a symbol name that may contain an embedded addend.
-///
-/// For example, `"cgroup_bpf_enabled_key+144"` -> `("cgroup_bpf_enabled_key", 144)`.
-/// If there is no embedded addend, returns `(name, 0)`.
-///
-/// This is needed because inline asm operand substitution can produce symbol
-/// references like `sym+offset` as a single string, but ELF relocations must
-/// reference the base symbol with a numeric addend in the RELA entry.
-fn decompose_symbol_addend(name: &str) -> (String, i64) {
-    // Split on the last `+` or `-` if the suffix is a plain integer.
-    // Names without arithmetic (e.g. `.Ldot_2`, `my_func`) pass through as-is.
-    if let Some(plus_pos) = name.rfind('+') {
-        let base = &name[..plus_pos];
-        let offset_str = name[plus_pos + 1..].trim();
-        if !base.is_empty() && !offset_str.is_empty() {
-            if let Ok(offset) = offset_str.parse::<i64>() {
-                return (base.to_string(), offset);
-            }
-        }
-    } else if let Some(minus_pos) = name.rfind('-') {
-        // Only if it's not the first character (not a negative number)
-        if minus_pos > 0 {
-            let base = &name[..minus_pos];
-            let offset_str = &name[minus_pos..]; // includes the '-'
-            if !base.is_empty() {
-                if let Ok(offset) = offset_str.parse::<i64>() {
-                    return (base.to_string(), offset);
-                }
-            }
-        }
-    }
-    (name.to_string(), 0)
-}
-
-/// Rewrite numeric label refs and `.` in a DataValue.
-fn rewrite_data_value(
-    dv: &DataValue,
-    stmt_idx: usize,
-    label_defs: &FxHashMap<String, Vec<(usize, usize)>>,
-    dot_counter: &mut usize,
-    dot_labels: &mut Vec<String>,
-) -> DataValue {
-    match dv {
-        DataValue::SymbolDiff {
-            sym_a,
-            sym_b,
-            addend,
-        } => {
-            let mut needs_dot = None;
-            let new_a =
-                rewrite_symbol_name(sym_a, stmt_idx, label_defs, dot_counter, &mut needs_dot);
-            if let Some(l) = needs_dot.take() {
-                dot_labels.push(l);
-            }
-            let new_b =
-                rewrite_symbol_name(sym_b, stmt_idx, label_defs, dot_counter, &mut needs_dot);
-            if let Some(l) = needs_dot.take() {
-                dot_labels.push(l);
-            }
-            DataValue::SymbolDiff {
-                sym_a: new_a,
-                sym_b: new_b,
-                addend: *addend,
-            }
-        }
-        DataValue::Symbol { name, addend } => {
-            let mut needs_dot = None;
-            let new_name =
-                rewrite_symbol_name(name, stmt_idx, label_defs, dot_counter, &mut needs_dot);
-            if let Some(l) = needs_dot.take() {
-                dot_labels.push(l);
-            }
-            DataValue::Symbol {
-                name: new_name,
-                addend: *addend,
-            }
-        }
-        DataValue::Expression(expr) => {
-            // Rewrite numeric refs and '.' in expression strings
-            let resolved =
-                rewrite_expr_numeric_refs(expr, stmt_idx, label_defs, dot_counter, dot_labels);
-            DataValue::Expression(resolved)
-        }
-        other => other.clone(),
-    }
-}
-
-/// Rewrite numeric label refs and '.' inside a raw expression string.
-fn rewrite_expr_numeric_refs(
-    expr: &str,
-    stmt_idx: usize,
-    label_defs: &FxHashMap<String, Vec<(usize, usize)>>,
-    dot_counter: &mut usize,
-    dot_labels: &mut Vec<String>,
-) -> String {
-    // Replace standalone '.' that represents current position
-    // We need to be careful: '.' could appear in symbol names like '.Lfoo'
-    // The pattern we're looking for is '.' surrounded by operators or parens
-    let mut result = String::with_capacity(expr.len());
-    let bytes = expr.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-    while i < len {
-        if bytes[i] == b'.' {
-            // Check if this is a standalone '.' (current position)
-            let prev_is_sep = i == 0
-                || matches!(
-                    bytes[i - 1],
-                    b' ' | b'('
-                        | b')'
-                        | b'+'
-                        | b'-'
-                        | b'*'
-                        | b'/'
-                        | b'|'
-                        | b'&'
-                        | b'^'
-                        | b','
-                        | b'~'
-                );
-            let next_is_sep = i + 1 >= len
-                || matches!(
-                    bytes[i + 1],
-                    b' ' | b'('
-                        | b')'
-                        | b'+'
-                        | b'-'
-                        | b'*'
-                        | b'/'
-                        | b'|'
-                        | b'&'
-                        | b'^'
-                        | b','
-                        | b'~'
-                );
-            if prev_is_sep && next_is_sep {
-                let label = format!(".Ldot_{}", *dot_counter);
-                *dot_counter += 1;
-                dot_labels.push(label.clone());
-                result.push_str(&label);
-                i += 1;
-                continue;
-            }
-        }
-        // Try to match a numeric label reference (digits followed by 'f' or 'b')
-        if bytes[i].is_ascii_digit() {
-            let start = i;
-            while i < len && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            if i < len
-                && (bytes[i] == b'f' || bytes[i] == b'F' || bytes[i] == b'b' || bytes[i] == b'B')
-            {
-                let next_after = if i + 1 < len { bytes[i + 1] } else { b' ' };
-                // Must not be followed by an alphanumeric (to avoid matching hex or identifiers)
-                if !next_after.is_ascii_alphanumeric() && next_after != b'_' {
-                    let ref_str = &expr[start..=i];
-                    if let Some(resolved) = resolve_numeric_ref_name(ref_str, stmt_idx, label_defs)
-                    {
-                        result.push_str(&resolved);
-                        i += 1;
-                        continue;
-                    }
-                }
-            }
-            // Not a numeric ref, push digits as-is
-            result.push_str(&expr[start..i]);
-            continue;
-        }
-        result.push(bytes[i] as char);
-        i += 1;
-    }
-    result
-}
-
-/// Rewrite a list of DataValues, collecting any dot labels needed.
-fn rewrite_data_values(
-    values: &[DataValue],
-    stmt_idx: usize,
-    label_defs: &FxHashMap<String, Vec<(usize, usize)>>,
-    dot_counter: &mut usize,
-    dot_labels: &mut Vec<String>,
-) -> Vec<DataValue> {
-    values
-        .iter()
-        .map(|dv| rewrite_data_value(dv, stmt_idx, label_defs, dot_counter, dot_labels))
-        .collect()
-}
-
-/// Rewrite numeric label references and '.' in a directive.
-/// Returns a list of statements: possibly a synthetic label before the directive.
+/// Rewrite numeric label references in the directives that carry
+/// expressions: data values, `.org` and `.set`. `.` is left alone: the
+/// writer binds it to each field's own position (a synthetic label placed
+/// before the directive gave every field of `.long 0, .` the first one's).
 fn rewrite_numeric_refs_in_directive(
     dir: &Directive,
     stmt_idx: usize,
     label_defs: &FxHashMap<String, Vec<(usize, usize)>>,
-    dot_counter: &mut usize,
-) -> Vec<AsmStatement> {
-    let mut dot_labels: Vec<String> = Vec::new();
-    let new_dir = match dir {
-        Directive::Byte(vals) => {
-            let new_vals =
-                rewrite_data_values(vals, stmt_idx, label_defs, dot_counter, &mut dot_labels);
-            Directive::Byte(new_vals)
-        }
-        Directive::Short(vals) => {
-            let new_vals =
-                rewrite_data_values(vals, stmt_idx, label_defs, dot_counter, &mut dot_labels);
-            Directive::Short(new_vals)
-        }
-        Directive::Long(vals) => {
-            let new_vals =
-                rewrite_data_values(vals, stmt_idx, label_defs, dot_counter, &mut dot_labels);
-            Directive::Long(new_vals)
-        }
-        Directive::Quad(vals) => {
-            let new_vals =
-                rewrite_data_values(vals, stmt_idx, label_defs, dot_counter, &mut dot_labels);
-            Directive::Quad(new_vals)
-        }
-        _ => dir.clone(),
+) -> Directive {
+    let expr = |e: &str| {
+        crate::backend::asm_expr::rewrite_numeric_label_refs(e, |r| {
+            resolve_numeric_ref_name(r, stmt_idx, label_defs)
+        })
     };
-    let mut stmts = Vec::new();
-    // Insert synthetic dot labels before the directive
-    for label in dot_labels {
-        stmts.push(AsmStatement::Label(label));
+    let vals = |vals: &[DataValue]| -> Vec<DataValue> {
+        vals.iter()
+            .map(|v| match v {
+                DataValue::Expression(e) => DataValue::Expression(expr(e)),
+                DataValue::Integer(_) => v.clone(),
+            })
+            .collect()
+    };
+    match dir {
+        Directive::Byte(v) => Directive::Byte(vals(v)),
+        Directive::Short(v) => Directive::Short(vals(v)),
+        Directive::Long(v) => Directive::Long(vals(v)),
+        Directive::Quad(v) => Directive::Quad(vals(v)),
+        Directive::Org { expr: e, fill } => Directive::Org {
+            expr: expr(e),
+            fill: *fill,
+        },
+        Directive::Set(name, e) => Directive::Set(name.clone(), expr(e)),
+        _ => dir.clone(),
     }
-    stmts.push(AsmStatement::Directive(new_dir));
-    stmts
 }
 
 impl ElfWriter {
@@ -510,7 +282,6 @@ impl ElfWriter {
             pending_branch_relocs: Vec::new(),
             pcrel_hi_counter: 0,
             numeric_labels: FxHashMap::default(),
-            deferred_exprs: Vec::new(),
             elf_flags: EF_RISCV_FLOAT_ABI_DOUBLE | EF_RISCV_RVC,
             elf_class: ELFCLASS64,
             no_relax: false,
@@ -645,7 +416,8 @@ impl ElfWriter {
         // Merge subsections (e.g., .text.__subsection.1 → .text) before resolving
         // relocations. This is critical for kernel ALTERNATIVE macros which use
         // .subsection 1 to place alternative code within the same section.
-        let remap = self.base.merge_subsections();
+        let remap = self.base.merge_subsections()?;
+        self.base.allocate_local_commons()?;
         // Fix up pending references that pointed to now-merged subsection names.
         // Deferred expressions and branch relocs created inside a subsection store the
         // subsection name as their section; after merging, that section no longer exists.
@@ -657,14 +429,10 @@ impl ElfWriter {
                     reloc.section = parent.clone();
                 }
             }
-            for expr in &mut self.deferred_exprs {
-                if let Some((parent, offset_adj)) = remap.get(&expr.section) {
-                    expr.offset += offset_adj;
-                    expr.section = parent.clone();
-                }
-            }
         }
-        self.resolve_deferred_exprs()?;
+        for (section, offset, size, fixup) in self.base.resolve_pending_data(&remap)? {
+            self.emit_data_fixup(&section, offset, size, &fixup)?;
+        }
         // Compression is disabled: the linker handles relaxation via
         // R_RISCV_RELAX. Running our own compression would change code
         // layout in ways the linker's relaxation pass doesn't expect.
@@ -678,12 +446,7 @@ impl ElfWriter {
             AsmStatement::Empty => Ok(()),
 
             AsmStatement::Label(name) => {
-                self.base.ensure_text_section();
-                let section = self.base.current_section.clone();
-                let offset = self.base.current_offset();
-                self.base
-                    .labels
-                    .insert(name.clone(), (section.clone(), offset));
+                let (section, offset) = self.base.define_label(name)?;
                 if is_numeric_label(name) {
                     self.numeric_labels
                         .entry(name.clone())
@@ -757,21 +520,11 @@ impl ElfWriter {
             }
 
             Directive::Globl(sym) => {
-                for s in sym.split(',') {
-                    let s = s.trim();
-                    if !s.is_empty() {
-                        self.base.set_global(s);
-                    }
-                }
+                self.base.set_global(sym);
                 Ok(())
             }
             Directive::Weak(sym) => {
-                for s in sym.split(',') {
-                    let s = s.trim();
-                    if !s.is_empty() {
-                        self.base.set_weak(s);
-                    }
-                }
+                self.base.set_weak(sym);
                 Ok(())
             }
 
@@ -824,161 +577,14 @@ impl ElfWriter {
 
             Directive::Byte(values) => {
                 for dv in values {
-                    match dv {
-                        DataValue::Integer(v) => {
-                            // RAW-value NOBITS rule: `.byte 1` in .bss is a
-                            // GAS error even though one byte could be stored.
-                            self.base.nobits_guard(*v != 0)?;
-                            self.base.emit_bytes(&[*v as u8])?;
-                        }
-                        DataValue::Symbol { name, addend } => {
-                            // Try resolving as alias (.set/.equ) — may be a forward ref
-                            let resolved = self.base.resolve_expr_aliases(name);
-                            let deferred_expr = if *addend != 0 {
-                                format!("({}) + ({})", name, addend)
-                            } else {
-                                name.clone()
-                            };
-                            let eval_expr = if *addend != 0 {
-                                format!("({}) + ({})", resolved, addend)
-                            } else {
-                                resolved.clone()
-                            };
-                            if let Ok(v) = crate::backend::asm_expr::parse_integer_expr(&eval_expr)
-                            {
-                                self.base.nobits_guard(v != 0)?;
-                                self.base.emit_bytes(&[v as u8])?;
-                            } else {
-                                // Defer: alias not yet defined (forward reference)
-                                let section = self.base.current_section.clone();
-                                let offset = self.base.current_offset();
-                                self.deferred_exprs.push(DeferredExpr {
-                                    section,
-                                    offset,
-                                    size: 1,
-                                    expr: deferred_expr,
-                                });
-                                self.base.emit_placeholder(1)?;
-                            }
-                        }
-                        DataValue::Expression(expr) => {
-                            let resolved = self.base.resolve_expr_aliases(expr);
-                            let resolved = self.base.resolve_expr_labels(&resolved);
-                            match crate::backend::asm_expr::parse_integer_expr(&resolved) {
-                                Ok(v) => {
-                                    self.base.nobits_guard(v != 0)?;
-                                    self.base.emit_bytes(&[v as u8])?;
-                                }
-                                Err(_) => {
-                                    let section = self.base.current_section.clone();
-                                    let offset = self.base.current_offset();
-                                    self.deferred_exprs.push(DeferredExpr {
-                                        section,
-                                        offset,
-                                        size: 1,
-                                        expr: expr.clone(),
-                                    });
-                                    self.base.emit_placeholder(1)?;
-                                }
-                            }
-                        }
-                        DataValue::SymbolDiff {
-                            sym_a,
-                            sym_b,
-                            addend,
-                        } => {
-                            let (base_a, extra_a) = decompose_symbol_addend(sym_a);
-                            let (base_b, extra_b) = decompose_symbol_addend(sym_b);
-                            self.base.add_reloc(
-                                RelocType::Add8.elf_type(),
-                                base_a,
-                                *addend + extra_a,
-                            );
-                            self.base
-                                .add_reloc(RelocType::Sub8.elf_type(), base_b, extra_b);
-                            self.base.emit_placeholder(1)?;
-                        }
-                    }
+                    self.emit_data_value(dv, 1)?;
                 }
                 Ok(())
             }
 
             Directive::Short(values) => {
                 for dv in values {
-                    match dv {
-                        DataValue::Integer(v) => {
-                            self.base.nobits_guard(*v != 0)?;
-                            self.base.emit_bytes(&(*v as u16).to_le_bytes())?;
-                        }
-                        DataValue::Expression(expr) => {
-                            let resolved = self.base.resolve_expr_aliases(expr);
-                            let resolved = self.base.resolve_expr_labels(&resolved);
-                            match crate::backend::asm_expr::parse_integer_expr(&resolved) {
-                                Ok(v) => {
-                                    // Raw value, pre-truncation: `.short 256`
-                                    // stores zeros but GAS still rejects it
-                                    // in a NOBITS section.
-                                    self.base.nobits_guard(v != 0)?;
-                                    self.base.emit_bytes(&(v as u16).to_le_bytes())?;
-                                }
-                                Err(_) => {
-                                    // Defer: expression contains forward references
-                                    let section = self.base.current_section.clone();
-                                    let offset = self.base.current_offset();
-                                    self.deferred_exprs.push(DeferredExpr {
-                                        section,
-                                        offset,
-                                        size: 2,
-                                        expr: expr.clone(),
-                                    });
-                                    self.base.emit_placeholder(2)?;
-                                }
-                            }
-                        }
-                        DataValue::Symbol { name, addend } => {
-                            // Try resolving as alias (.set/.equ) — may be a forward ref
-                            let resolved = self.base.resolve_expr_aliases(name);
-                            let deferred_expr = if *addend != 0 {
-                                format!("({}) + ({})", name, addend)
-                            } else {
-                                name.clone()
-                            };
-                            let eval_expr = if *addend != 0 {
-                                format!("({}) + ({})", resolved, addend)
-                            } else {
-                                resolved.clone()
-                            };
-                            if let Ok(v) = crate::backend::asm_expr::parse_integer_expr(&eval_expr)
-                            {
-                                self.base.nobits_guard(v != 0)?;
-                                self.base.emit_bytes(&(v as u16).to_le_bytes())?;
-                            } else {
-                                // Defer: alias not yet defined (forward reference)
-                                let section = self.base.current_section.clone();
-                                let offset = self.base.current_offset();
-                                self.deferred_exprs.push(DeferredExpr {
-                                    section,
-                                    offset,
-                                    size: 2,
-                                    expr: deferred_expr,
-                                });
-                                self.base.emit_placeholder(2)?;
-                            }
-                        }
-                        DataValue::SymbolDiff {
-                            sym_a,
-                            sym_b,
-                            addend,
-                        } => {
-                            let add_type = RelocType::Add16.elf_type();
-                            let sub_type = RelocType::Sub16.elf_type();
-                            let (base_a, extra_a) = decompose_symbol_addend(sym_a);
-                            let (base_b, extra_b) = decompose_symbol_addend(sym_b);
-                            self.base.add_reloc(add_type, base_a, *addend + extra_a);
-                            self.base.add_reloc(sub_type, base_b, extra_b);
-                            self.base.emit_placeholder(2)?;
-                        }
-                    }
+                    self.emit_data_value(dv, 2)?;
                 }
                 Ok(())
             }
@@ -1024,28 +630,14 @@ impl ElfWriter {
                 Ok(())
             }
 
-            Directive::Comm { sym, size, align } => {
-                self.base.emit_comm(sym, *size, *align);
+            Directive::Comm { sym, size, align } => self.base.declare_comm(sym, *size, *align),
+            Directive::Lcomm { sym, size } => self.base.declare_lcomm(sym, *size),
+            Directive::Local(syms) => {
+                self.base.set_local(syms);
                 Ok(())
             }
 
-            Directive::Local(_) => Ok(()),
-
-            Directive::Set(alias, target) => {
-                // If the target expression contains '.', resolve it as
-                // current offset, then try to evaluate to a constant.
-                let mut resolved = self.base.resolve_expr_aliases(target);
-                if resolved.contains('.') {
-                    resolved = self.base.resolve_expr_labels(&resolved);
-                }
-                // Try to evaluate to a constant; if so, store the constant
-                if let Ok(v) = crate::backend::asm_expr::parse_integer_expr(&resolved) {
-                    self.base.set_alias(alias, &v.to_string());
-                } else {
-                    self.base.set_alias(alias, &resolved);
-                }
-                Ok(())
-            }
+            Directive::Set(alias, target) => self.base.define_set(alias, target),
 
             Directive::ArchOption(opt) => {
                 let opt = opt.trim();
@@ -1066,6 +658,7 @@ impl ElfWriter {
 
             Directive::Attribute(_) => Ok(()),
 
+            Directive::Org { expr, fill } => self.base.emit_org(expr, *fill),
             Directive::Cfi | Directive::Ignored => Ok(()),
 
             Directive::Insn(args) => {
@@ -1119,117 +712,58 @@ impl ElfWriter {
         }
     }
 
-    /// Emit a typed data value for .long (size=4) or .quad (size=8).
-    ///
-    /// Note: `SymbolDiff` sym_a/sym_b may contain embedded addends (e.g.
-    /// `"cgroup_bpf_enabled_key+144"`) from inline asm operand substitution.
-    /// These are decomposed via [`decompose_symbol_addend`] so the ELF
-    /// relocation references the base symbol with a proper addend.
+    /// Emit a `size`-byte data value (`.byte`/`.2byte`/`.4byte`/`.8byte`):
+    /// constants now, everything that names a symbol through the shared
+    /// value model (`ElfWriterBase::classify`), turned into relocations by
+    /// [`Self::emit_data_fixup`].  Symbol names may carry an addend spelled
+    /// in (`key+144`, from inline-asm operand substitution); the evaluator
+    /// reads that as the expression it is.
     fn emit_data_value(&mut self, dv: &DataValue, size: usize) -> Result<(), String> {
-        match dv {
-            DataValue::SymbolDiff {
-                sym_a,
-                sym_b,
-                addend,
-            } => {
-                let (add_type, sub_type) = if size == 4 {
-                    (RelocType::Add32.elf_type(), RelocType::Sub32.elf_type())
-                } else {
-                    (RelocType::Add64.elf_type(), RelocType::Sub64.elf_type())
-                };
-                // Decompose sym_a if it contains an embedded addend (e.g.
-                // "cgroup_bpf_enabled_key+144") so the relocation references
-                // the base symbol with a numeric addend rather than creating a
-                // bogus symbol named "symbol+offset".
-                let (base_a, extra_a) = decompose_symbol_addend(sym_a);
-                let (base_b, extra_b) = decompose_symbol_addend(sym_b);
-                self.base.add_reloc(add_type, base_a, *addend + extra_a);
-                self.base.add_reloc(sub_type, base_b, extra_b);
-                self.base.emit_placeholder(size)?;
-            }
-            DataValue::Symbol { name, addend } => {
-                // Try resolving as alias (.set/.equ) first — the "symbol"
-                // may actually be a compile-time constant defined via .set.
-                let resolved = self.base.resolve_expr_aliases(name);
-                if let Ok(v) = crate::backend::asm_expr::parse_integer_expr(&resolved) {
-                    self.base.emit_data_integer(v + addend, size)?;
-                } else {
-                    let reloc_type = if size == 4 {
-                        RelocType::Abs32.elf_type()
-                    } else {
-                        RelocType::Abs64.elf_type()
-                    };
-                    self.base
-                        .emit_data_symbol_ref(name, *addend, size, reloc_type)?;
-                }
-            }
-            DataValue::Integer(v) => {
-                self.base.emit_data_integer(*v, size)?;
-            }
-            DataValue::Expression(expr) => {
-                let mut resolved = self.base.resolve_expr_aliases(expr);
-                // Resolve .Ldot_N synthetic labels to current offset
-                resolved = self.base.resolve_expr_labels(&resolved);
-                match crate::backend::asm_expr::parse_integer_expr(&resolved) {
-                    Ok(v) => self.base.emit_data_integer(v, size)?,
-                    Err(_) => {
-                        // Expression contains unresolved symbols (e.g., forward references).
-                        // Defer resolution until all labels are known.
-                        let section = self.base.current_section.clone();
-                        let offset = self.base.current_offset();
-                        self.deferred_exprs.push(DeferredExpr {
-                            section,
-                            offset,
-                            size,
-                            expr: expr.clone(),
-                        });
-                        // Emit placeholder bytes that will be patched later
-                        self.base.emit_placeholder(size)?;
-                    }
-                }
-            }
-        }
-        Ok(())
+        let value = match dv {
+            DataValue::Integer(v) => return self.base.emit_data_integer(*v, size),
+            DataValue::Expression(expr) => self.base.capture_data_symbol(expr)?,
+        };
+        self.base.emit_data_value(value, size)
     }
 
-    /// Resolve deferred data expressions now that all labels are known.
-    fn resolve_deferred_exprs(&mut self) -> Result<(), String> {
-        let deferred = std::mem::take(&mut self.deferred_exprs);
-        for def in &deferred {
-            // Re-resolve with all labels now available (using stored label offsets)
-            let resolved = self.base.resolve_expr_aliases(&def.expr);
-            let resolved = self.base.resolve_expr_all_labels(&resolved, &def.section);
-            let value = match crate::backend::asm_expr::parse_integer_expr(&resolved) {
-                Ok(v) => v,
-                Err(_) => {
-                    // Cross-section label reference: try resolving labels from
-                    // ANY section. This handles kernel ALTERNATIVE macros where
-                    // .2byte expressions in .alternative reference labels placed
-                    // in .text (or a subsection merged into .text).
-                    let cross_resolved = self.base.resolve_expr_cross_section(&def.expr);
-                    // An unresolved expression is not a numeric zero. The
-                    // placeholder may only be patched with a proven constant;
-                    // otherwise the assembler must reject rather than emit an
-                    // apparently successful but incorrect object.
-                    crate::backend::asm_expr::parse_integer_expr(&cross_resolved).map_err(|e| {
-                        format!(
-                            "unresolved RISC-V data expression '{}' in section '{}' at offset {} ({}): {}",
-                            def.expr, def.section, def.offset, cross_resolved, e
-                        )
-                    })?
-                }
-            };
-            if let Some(section) = self.base.sections.get_mut(&def.section) {
-                let off = def.offset as usize;
-                if def.size == 4 && off + 4 <= section.data.len() {
-                    section.data[off..off + 4].copy_from_slice(&(value as u32).to_le_bytes());
-                } else if def.size == 8 && off + 8 <= section.data.len() {
-                    section.data[off..off + 8].copy_from_slice(&value.to_le_bytes());
-                } else if def.size == 2 && off + 2 <= section.data.len() {
-                    section.data[off..off + 2].copy_from_slice(&(value as u16).to_le_bytes());
-                } else if def.size == 1 && off < section.data.len() {
-                    section.data[off] = value as u8;
-                }
+    /// The relocation(s) for one deferred data value.  GAS 2.44 (riscv64,
+    /// -mno-relax): `sym + k` is R_RISCV_32/64 (there is none for 1 or 2
+    /// bytes: refused), and EVERY difference not folded to a constant --
+    /// `.`-relative ones included -- is an ADD/SUB pair of the value's
+    /// width, so the linker computes it after relaxation.
+    fn emit_data_fixup(
+        &mut self,
+        section: &str,
+        offset: u64,
+        size: usize,
+        fixup: &DataFixup,
+    ) -> Result<(), String> {
+        let (add_t, sub_t) = match size {
+            1 => (RelocType::Add8, RelocType::Sub8),
+            2 => (RelocType::Add16, RelocType::Sub16),
+            4 => (RelocType::Add32, RelocType::Sub32),
+            _ => (RelocType::Add64, RelocType::Sub64),
+        };
+        match fixup {
+            DataFixup::Constant(_) => {}
+            DataFixup::Abs { sym, addend } => {
+                let t = match size {
+                    4 => RelocType::Abs32,
+                    8 => RelocType::Abs64,
+                    _ => {
+                        return Err(format!(
+                            "{section}+{offset:#x}: a {size}-byte data value cannot name a symbol on RISC-V (no such relocation)"
+                        ));
+                    }
+                };
+                self.base
+                    .add_reloc_at(section, offset, t.elf_type(), sym, *addend);
+            }
+            DataFixup::Diff { add, sub, addend } => {
+                self.base
+                    .add_reloc_at(section, offset, add_t.elf_type(), add, *addend);
+                self.base
+                    .add_reloc_at(section, offset, sub_t.elf_type(), sub, 0);
             }
         }
         Ok(())
@@ -2093,15 +1627,21 @@ mod branch_range_tests {
     }
 
     #[test]
-    fn symbol_difference_trailing_minus_is_an_add_relocation_addend() {
+    fn symbol_difference_trailing_minus_applies_to_the_difference() {
+        // Both labels are in `.data`, so the difference is a constant (GAS
+        // folds it too); `A-B-4` is (A-B)-4 = -8, never A-(B-4) = 0.
         let w = assemble(".data\nA:\n.byte 0,0,0,0\nB:\n.byte 0,0,0,0\n.long A-B-4\n")
             .expect("symbol difference must assemble");
-        let relocs = &w.base.sections[".data"].relocs;
-        assert_eq!(relocs.len(), 2, "ADD32 and SUB32 are both required");
-        assert_eq!(relocs[0].symbol_name, "A");
-        assert_eq!(relocs[0].addend, -4, "the trailing -4 applies to A-B");
-        assert_eq!(relocs[1].symbol_name, "B");
-        assert_eq!(relocs[1].addend, 0, "B must not absorb and invert -4");
+        let data = &w.base.sections[".data"];
+        assert!(
+            data.relocs.is_empty(),
+            "a same-section difference is a constant"
+        );
+        assert_eq!(
+            data.data[8..12],
+            (-8i32).to_le_bytes(),
+            "the trailing -4 applies to A-B"
+        );
     }
 
     /// A surplus operand used to be discarded silently, so a malformed branch
@@ -2474,6 +2014,64 @@ mod padding_law_tests {
         assert_eq!(
             section(".data", ".data\n.byte 1\n.p2align 0,,1\n.byte 2\n").len(),
             2
+        );
+    }
+    fn alternative(orig: usize, repl: usize) -> String {
+        let words = |n: usize, w: &str| vec![format!("\t.word {w}\n"); n].concat();
+        format!(
+            ".text\n661:\n{}662:\n.pushsection .altinstr_replacement,\"a\"\n663:\n{}664:\n.popsection\n\
+             .org . - (664b-663b) + (662b-661b)\n.org . - (662b-661b) + (664b-663b)\n.word 0x33333333\n",
+            words(orig, "0x11111111"),
+            words(repl, "0x22222222")
+        )
+    }
+
+    fn assemble(asm: &str) -> Result<ElfWriter, String> {
+        let statements = parse_asm(asm)?;
+        let mut w = ElfWriter::new();
+        w.process_statements(&statements)?;
+        Ok(w)
+    }
+
+    /// `.org` used to be dropped on this target: `.byte 1; .org 8; .byte 2`
+    /// assembled to `01 02` instead of GAS's `01 00*7 02`, and the kernel's
+    /// ALTERNATIVE length check (`alternative-macros.h`) could never fail.
+    #[test]
+    fn org_is_honoured_not_dropped() {
+        assert_eq!(
+            section(".data", ".data\n.byte 1\n.org 8\n.byte 2\n"),
+            [1, 0, 0, 0, 0, 0, 0, 0, 2]
+        );
+        assert_eq!(
+            section(".data", ".data\n.byte 1\n.org . + 2, 9\n.byte 2\n"),
+            [1, 9, 9, 2]
+        );
+        let w = assemble(&alternative(2, 2)).expect("equal lengths assemble");
+        assert_eq!(w.base.sections[".text"].data.len(), 12);
+        assert!(assemble(&alternative(3, 1)).is_err(), "shorter replacement");
+        assert!(assemble(&alternative(1, 3)).is_err(), "longer replacement");
+        assert!(assemble(".data\n.quad 1\n.org 4\n").is_err(), "backwards");
+    }
+
+    /// Gigabyte NOBITS runs (`.zero`, `.skip` with a non-zero fill, `.fill`,
+    /// alignment, `.org`) are a size: no bytes, no ceiling, no budget.
+    #[test]
+    fn sparse_nobits_is_a_size() {
+        let w = assemble(
+            ".bss\n.byte 0\n.zero 0x40000000\n.skip 0x40000000, 1\n.fill 0x40000000, 4, 0\n\
+             .p2align 30\n.org 0x1c0000000 + 0x40000000\n.long 0\n",
+        )
+        .expect("sparse NOBITS assembles");
+        let bss = &w.base.sections[".bss"];
+        assert!(bss.data.is_empty(), "NOBITS holds no bytes");
+        assert_eq!(bss.size(), 0x2_0000_0004);
+        assert!(
+            assemble(".bss\n.fill 0x40000000, 1, 1\n").is_err(),
+            "non-zero fill"
+        );
+        assert!(
+            assemble(".data\n.zero 0x10000001\n").is_err(),
+            "PROGBITS ceiling"
         );
     }
 }

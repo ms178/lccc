@@ -1,0 +1,35 @@
+{
+  "compiler_sha256": "0e92765b3c81dcd06cabc1c2dffa853127fb0bcea0777085b928103032750939",
+  "records": [
+    {
+      "source": "tests/benchmark/programs/gzip_crc32.c",
+      "flags": "-O2 -march=x86-64-v3",
+      "assembly_identical": true
+    },
+    {
+      "source": "tests/benchmark/programs/zlib_ng_adler32.c",
+      "flags": "-O2 -march=x86-64-v3",
+      "assembly_identical": true
+    },
+    {
+      "source": "tests/benchmark/programs/expat_xml_scan.c",
+      "flags": "-O2 -march=x86-64-v3",
+      "assembly_identical": true
+    },
+    {
+      "source": "tests/benchmark/programs/sqlite_varint.c",
+      "flags": "-O2 -march=x86-64-v3",
+      "assembly_identical": true
+    },
+    {
+      "source": "tests/benchmark/programs/linux_find_bit.c",
+      "flags": "-O2 -march=x86-64-v3",
+      "assembly_identical": true
+    },
+    {
+      "source": "tests/benchmark/programs/glibc_memcmp.c",
+      "flags": "-O2 -march=x86-64-v3",
+      "assembly_identical": true
+    }
+  ]
+}

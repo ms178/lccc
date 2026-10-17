@@ -1,0 +1,173 @@
+{
+  "complete": true,
+  "source": {
+    "sha256": "927478b18ee0aa0d118eea4d2a9d6bb1251fdf3c64c2619ab578463beba99560",
+    "flags": []
+  },
+  "flags": [
+    "-O2",
+    "-march=x86-64-v3",
+    "-fwrapv",
+    "-ffp-contract=off"
+  ],
+  "pinning": {
+    "requested": "0",
+    "allowed_cpus": [
+      0,
+      1
+    ],
+    "applied": true,
+    "cpu": 0,
+    "reason": "taskset pinning"
+  },
+  "warnings": [],
+  "build_sha256": {
+    "s48": "e1d7020154f97dbe8e8d7779e49ac664e63ae412ff21cf22e3a9d4944e6126eb",
+    "s49": "7c5dd66ec8be8969e55b4527892e9834d01142448c0b56e2b921be3b38190424"
+  },
+  "program_sha256": {
+    "s48": "acc23f78deb408aa9b01eef3e4dd757ae3173413cef1b8ac99c08ed6b5eed888",
+    "s49": "f3dfe2bdc0f6d8b45c8f683b37ae1bfb3ebb5294bab04c305f776f8e18280edd"
+  },
+  "driver_sha256": "51065a204ba2fd3da870a117cc96fc8efdff000e39c23aedb868f2897a869d37",
+  "samples": [
+    {
+      "order": [
+        "s48",
+        "s49"
+      ],
+      "values": {
+        "s48": {
+          "ns": 195442142,
+          "iterations": 42
+        },
+        "s49": {
+          "ns": 185120870,
+          "iterations": 42
+        }
+      }
+    },
+    {
+      "order": [
+        "s49",
+        "s48"
+      ],
+      "values": {
+        "s49": {
+          "ns": 187704792,
+          "iterations": 42
+        },
+        "s48": {
+          "ns": 207081776,
+          "iterations": 42
+        }
+      }
+    },
+    {
+      "order": [
+        "s48",
+        "s49"
+      ],
+      "values": {
+        "s48": {
+          "ns": 209052255,
+          "iterations": 42
+        },
+        "s49": {
+          "ns": 196518296,
+          "iterations": 42
+        }
+      }
+    },
+    {
+      "order": [
+        "s49",
+        "s48"
+      ],
+      "values": {
+        "s49": {
+          "ns": 193037378,
+          "iterations": 42
+        },
+        "s48": {
+          "ns": 196737352,
+          "iterations": 42
+        }
+      }
+    },
+    {
+      "order": [
+        "s49",
+        "s48"
+      ],
+      "values": {
+        "s49": {
+          "ns": 195888379,
+          "iterations": 42
+        },
+        "s48": {
+          "ns": 207665664,
+          "iterations": 42
+        }
+      }
+    },
+    {
+      "order": [
+        "s49",
+        "s48"
+      ],
+      "values": {
+        "s49": {
+          "ns": 189690166,
+          "iterations": 42
+        },
+        "s48": {
+          "ns": 206310142,
+          "iterations": 42
+        }
+      }
+    },
+    {
+      "order": [
+        "s49",
+        "s48"
+      ],
+      "values": {
+        "s49": {
+          "ns": 214556428,
+          "iterations": 42
+        },
+        "s48": {
+          "ns": 215975862,
+          "iterations": 42
+        }
+      }
+    }
+  ],
+  "metric": "fresh-child entry time, lower s49/s48 is better",
+  "calibration": {
+    "s48": {
+      "ns": 26282863,
+      "iterations": 5
+    },
+    "s49": {
+      "ns": 24197403,
+      "iterations": 5
+    }
+  },
+  "iterations": 42,
+  "ratios": [
+    0.9471901408039214,
+    0.9064283474176887,
+    0.940043894766885,
+    0.9811933323164784,
+    0.9432872783437131,
+    0.9194417887609229,
+    0.993427811854271
+  ],
+  "median": 0.9432872783437131,
+  "exploratory_ci95": [
+    0.9194417887609229,
+    0.9811933323164784
+  ]
+}

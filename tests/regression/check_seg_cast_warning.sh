@@ -2,9 +2,13 @@
 # Explicit-cast diagnostics between named address spaces, and the abstract
 # declarator paths (sizeof, unnamed parameters, casts) that carry them.
 #
-# GCC 14.2 accepts every cast below and warns with "cast to ... address space
-# pointer from disjoint ...". The rule is applied to the outermost pointer
-# only, so `long *__seg_gs *` -> `long *__seg_gs *` is silent.
+# GCC 14.2 accepts every cast below. "cast to ... address space pointer from
+# disjoint ..." warns when the cast removes or switches a named space, with
+# exactly one silent case: a NULL POINTER CONSTANT converted into a named
+# space — the kernel's per-cpu sentinel `(typeof(&var))(void *)0` inside
+# -Werror builds (verified against GCC 12 and 14.2). The rule is applied to
+# the outermost pointer only, so `long *__seg_gs *` -> `long *__seg_gs *` is
+# silent.
 #
 #   line 1  generic -> __seg_gs          warns
 #   line 2  __seg_gs -> generic          warns
@@ -13,6 +17,9 @@
 #   line 5  generic -> `long *__seg_gs *` warns
 #   line 6  void * -> void *             silent
 #   line 8  `q = (int *)gp` (__seg_gs)   warns (the cast-RHS shape of cast_rev.c)
+#   line 9  (void *)0 -> __seg_gs        silent (null pointer constant)
+#   line 10 0 -> __seg_gs               silent (integer null constant)
+#   line 11 __seg_gs null -> generic     warns (named space removed)
 #
 # The runtime half checks sizeof and the unnamed-parameter and cast reads
 # against the values GCC produces.
@@ -31,14 +38,17 @@ void e(long *p) { long *__seg_gs *w = (long *__seg_gs *)p; (void)w; }
 void f(void *p) { void *q = (void *)p; (void)q; }
 int __seg_gs *gp; int *q;
 void g(void) { q = (int *)gp; }
+void h(void) { long __seg_gs *n = (long __seg_gs *)(void *)0; (void)n; }
+void i(void) { long __seg_gs *m = (long __seg_gs *)0; (void)m; }
+void j(void) { long *k = (long *)(long __seg_gs *)0; (void)k; }
 C
 
 fail=0
 "$CCC" -O0 -c -o "$tmp/casts.o" "$src" 2> "$tmp/casts.err" || { echo "FAIL: casts.c rejected"; cat "$tmp/casts.err"; exit 1; }
 warned=$(grep -c "warning: cast to" "$tmp/casts.err" || true)
 lines=$( (grep "warning: cast to" "$tmp/casts.err" || true) | sed -E 's/^[^:]*:([0-9]+):.*/\1/' | tr '\n' ' ')
-if [ "$warned" -ne 5 ] || [ "$lines" != "1 2 3 5 8 " ]; then
-    echo "FAIL: expected 5 cast warnings on lines 1 2 3 5 8, got $warned on: $lines"
+if [ "$warned" -ne 6 ] || [ "$lines" != "1 2 3 5 8 11 " ]; then
+    echo "FAIL: expected 6 cast warnings on lines 1 2 3 5 8 11, got $warned on: $lines"
     cat "$tmp/casts.err"
     fail=1
 fi
@@ -74,4 +84,4 @@ fi
 if [ "$fail" -ne 0 ]; then
     exit 1
 fi
-echo "check_seg_cast_warning: PASSED (5 cast warnings on lines 1 2 3 5 8; 0 on 4 6; sizeof 8 8)"
+echo "check_seg_cast_warning: PASSED (6 cast warnings on lines 1 2 3 5 8 11; 0 on 4 6 9 10; sizeof 8 8)"

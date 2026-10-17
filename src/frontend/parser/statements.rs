@@ -100,7 +100,9 @@ impl Parser {
                     break 'item;
                 }
                 if matches!(self.peek(), TokenKind::StaticAssert) {
-                    self.parse_static_assert();
+                    if let Some(deferred) = self.parse_static_assert() {
+                        items.push(BlockItem::StaticAssert(deferred));
+                    }
                 } else if self.is_type_specifier() && !self.is_typedef_label() {
                     // GNU C nested function definition? (`int f(int *p) { ... }`
                     // at block scope). Try to parse one; on mismatch the parser
@@ -129,6 +131,12 @@ impl Parser {
                     items.push(BlockItem::Statement(stmt));
                 }
             }
+            // `_Static_assert`s from struct member lists in this item.
+            items.extend(
+                self.deferred_static_asserts
+                    .drain(..)
+                    .map(BlockItem::StaticAssert),
+            );
             // Universal progress guarantee, ENFORCED: no statement parse
             // may return having consumed nothing, or this loop would retry
             // the same token forever (defense in depth on top of the

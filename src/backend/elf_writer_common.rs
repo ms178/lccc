@@ -31,6 +31,14 @@ use crate::common::fx_hash::FxHashMap;
 ///
 /// Implemented by x86-64 and i686 to provide relocation types,
 /// ELF constants, and instruction encoding.
+/// The names of a comma-separated symbol-list directive (`.weak a, b`).
+fn symbol_names(list: &str) -> impl Iterator<Item = String> + '_ {
+    list.split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+}
+
 pub trait X86Arch {
     /// Encode an instruction, returning (bytes, relocations, optional jump info).
     /// The `section_data_len` parameter is the current offset in the section.
@@ -158,23 +166,9 @@ pub trait X86Arch {
         4
     }
 
-    /// Optional: absolute 32-bit relocation for local symbol references.
-    /// Only x86-64 uses R_X86_64_32 this way; i686 returns None since
-    /// its R_386_32 is handled by the general abs path.
-    fn reloc_abs32_for_internal() -> Option<u32> {
-        None
-    }
-
     /// Whether `.skip` expressions with label arithmetic are supported.
     /// Both x86-64 and i686 enable this for the Linux kernel's ALTERNATIVES macros.
     fn supports_deferred_skips() -> bool {
-        false
-    }
-
-    /// Whether `.set` alias resolution for label-difference expressions
-    /// should be done during data value emission. Both x86-64 and i686
-    /// enable this for DWARF debug info `.set .Lset0, .LECIE-.LSCIE` patterns.
-    fn resolve_set_aliases_in_data() -> bool {
         false
     }
 
@@ -341,6 +335,14 @@ thread_local! {
     static PAD_QUEUE_FORCE_FALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// A base of a finalised `.set` value: a section (by index) or a name that
+/// stays a symbol (an undefined external, or a global/weak label).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SetBase {
+    Sec(usize),
+    Sym(String),
+}
+
 /// One relaxation-pass transition of a jump (see `relax_jumps`).
 enum JumpAction {
     /// Long form -> 2-byte short form (first, optimistic pass only).
@@ -463,17 +465,16 @@ enum AlignMarkerKind {
     TightLoop { header: String },
 }
 
-/// A pending `(a - b) * scale + addend` datum, folded once both labels are
-/// placed.
-struct ScaledDiff {
+/// A data field whose expression must fold to a constant once labels are
+/// placed (`.long (e - s) >> 1`), see [`DataValue::Expr`].
+struct DataExpr {
     sec_idx: usize,
     offset: usize,
-    a: String,
-    b: String,
-    scale: i64,
-    /// Divisor applied after scaling (div >= 1).
-    div: i64,
-    addend: i64,
+    /// The expression, `.` already bound to the field's position.
+    expr: String,
+    /// The local `.set` symbols it names, with their values at this use
+    /// (a later redefinition does not change them).
+    captured: Vec<(String, crate::backend::asm_expr::SectionExpr<String>)>,
     size: usize,
 }
 
@@ -493,11 +494,19 @@ struct Section {
     /// (`data`) separate, and nothing but the ELF header's `sh_size` and the
     /// offsets derived from `cursor` ever needs the former.
     ///
-    /// Invariant: `zero_tail == 0` for every non-NOBITS section. It is
-    /// established by `pad_fill` (which only withholds zeros for NOBITS) and
-    /// restored by `materialize_tail`, so `data` alone is the section's
-    /// content for PROGBITS/EXEC sections at all times -- every unchanged
-    /// `data` reader in this file keeps its exact old meaning there.
+    /// Invariant: `zero_tail == 0` for every non-NOBITS section, so `data`
+    /// alone is the section's content for PROGBITS/EXEC sections at all
+    /// times -- every `data` reader in this file keeps its exact meaning
+    /// there.
+    ///
+    /// What a NOBITS section holds is decided by what GAS 2.47 accepts in one
+    /// (measured): zero stores (`.long 0`, `.uleb128 0`, `.fill N,4,0`),
+    /// position padding with ANY fill byte (`.skip 3,1`, `.org 64,7`,
+    /// `.p2align 4,0x90` -- none of it is stored), and instructions, whose
+    /// bytes are accepted and discarded. Every zero run and every pad goes to
+    /// the tail ([`Self::hold_zeros`]); only non-zero instruction bytes are
+    /// materialised (jump relaxation patches them), so a gigabyte gap
+    /// followed by `.long 0` costs a counter, not a gigabyte.
     zero_tail: u64,
     alignment: u64,
     relocations: Vec<ElfRelocation>,
@@ -546,17 +555,25 @@ impl Section {
         Ok(())
     }
 
-    /// Append `n` bytes of `fill`, holding them back when both the section and
-    /// the fill allow it (NOBITS, zero fill).
+    /// Grow a NOBITS section by `n` bytes that never reach the object file.
+    fn hold_zeros(&mut self, n: u64) -> Result<(), String> {
+        debug_assert_eq!(self.section_type, SHT_NOBITS, "only NOBITS holds a tail");
+        self.zero_tail = self
+            .zero_tail
+            .checked_add(n)
+            .ok_or_else(|| format!("section '{}' exceeds the addressable size", self.name))?;
+        Ok(())
+    }
+
+    /// Append `n` bytes of position padding filled with `fill`.
+    ///
+    /// In a NOBITS section the run is a size whatever `fill` is: GAS 2.47
+    /// accepts a non-zero pad byte there (`.skip 3,1`, `.org 64,7`) and
+    /// stores nothing, so the byte is unobservable.
     fn pad_fill(&mut self, n: u64, fill: u8) -> Result<(), String> {
-        if self.section_type == SHT_NOBITS && fill == 0 {
-            self.zero_tail = self
-                .zero_tail
-                .checked_add(n)
-                .ok_or_else(|| format!("section '{}' exceeds the addressable size", self.name))?;
-            return Ok(());
+        if self.section_type == SHT_NOBITS {
+            return self.hold_zeros(n);
         }
-        self.materialize_tail()?;
         let n = usize::try_from(n)
             .map_err(|_| format!("fill of {} bytes does not fit this target", n))?;
         extend_fill(self, n, fill)
@@ -565,14 +582,16 @@ impl Section {
     /// Patch `bytes` into the section at `offset`.
     ///
     /// A patch needs real bytes where it writes, so a held-back NOBITS tail is
-    /// materialised first; for every other section (and for any NOBITS section
-    /// that never held a tail) this is exactly `data[offset..].copy_from_slice`.
+    /// materialised first if (and only if) the patch reaches into it; for
+    /// every other section this is exactly `data[offset..].copy_from_slice`.
     /// The bounds check turns a logic error into a diagnostic instead of a
     /// panic, because the callers derive offsets from label positions and from
     /// jump-relaxation state.
     fn write_bytes_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), String> {
-        self.materialize_tail()?;
         let end = offset + bytes.len();
+        if end > self.data.len() {
+            self.materialize_tail()?;
+        }
         if end > self.data.len() {
             return Err(format!(
                 "patch of {} bytes at offset {} exceeds section '{}' ({} bytes)",
@@ -586,9 +605,13 @@ impl Section {
         Ok(())
     }
 
-    /// Append bytes; materialises any tail first so `data` stays a prefix of
-    /// the section's true content.
+    /// Append bytes. Zero bytes in a NOBITS section join the tail; anything
+    /// else materialises the tail first so `data` stays a prefix of the
+    /// section's true content.
     fn push_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
+        if self.section_type == SHT_NOBITS && bytes.iter().all(|&b| b == 0) {
+            return self.hold_zeros(bytes.len() as u64);
+        }
         self.materialize_tail()?;
         self.data
             .try_reserve(bytes.len())
@@ -1265,6 +1288,14 @@ pub struct ElfWriterCore<A: X86Arch> {
     numeric_label_positions: FxHashMap<String, Vec<(usize, u64)>>,
     pending_globals: Vec<String>,
     pending_weaks: Vec<String>,
+    /// Symbols named by `.local` (GAS's sticky `local` flag): a later
+    /// `.comm` allocates them in `.bss` as LOCAL objects.
+    local_flagged: crate::common::fx_hash::FxHashSet<String>,
+    /// `.bss` allocations from `.lcomm` and `.local`+`.comm`, as
+    /// (name, size, alignment) in source order.  GAS places them in `.bss`
+    /// subsection 1, i.e. after every ordinary `.bss` byte of the file;
+    /// `build` appends them once all items are processed.
+    local_commons: Vec<(String, u64, u32)>,
     pending_types: FxHashMap<String, SymbolKind>,
     pending_sizes: FxHashMap<String, SizeExpr>,
     pending_hidden: Vec<String>,
@@ -1281,6 +1312,13 @@ pub struct ElfWriterCore<A: X86Arch> {
     /// (alias, expr with `.` already substituted, sec_idx). Re-evaluated
     /// after all labels are placed.
     pending_set_exprs: Vec<(String, String, usize)>,
+    /// `.set NAME, expr` with a symbolic linear value, captured where the
+    /// directive stands: `.` is a relaxation-tracked `.Ldotpos_` label,
+    /// constant and symbolic `.set` operands are substituted by the value
+    /// they had THEN, and every other name stays a named term resolved after
+    /// layout (`resolve_set_constants`).  GAS semantics: `.set baz, foo+4` is
+    /// foo's section plus 4, never the ABS section offset 5.
+    set_exprs: FxHashMap<String, crate::backend::asm_expr::SectionExpr<String>>,
     /// `.symver real, name@VER` where `real` is NOT defined in this object:
     /// GNU-as semantics — every reference to `real` becomes a versioned
     /// reference `name@VER` (glibc compat_symbol_reference; needed because
@@ -1314,7 +1352,7 @@ pub struct ElfWriterCore<A: X86Arch> {
     /// plain-NOP rule for executable alignment padding.
     last_item_was_insn: bool,
     /// Scaled symbol differences awaiting label resolution.
-    deferred_scaled_diffs: Vec<ScaledDiff>,
+    deferred_data_exprs: Vec<DataExpr>,
     /// CFA location advances awaiting the final code layout.
     deferred_cfa_advances: Vec<CfaAdvance>,
     /// Source position of the item being processed. Zero-width records
@@ -1342,6 +1380,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
             numeric_label_positions: FxHashMap::default(),
             pending_globals: Vec::new(),
             pending_weaks: Vec::new(),
+            local_flagged: Default::default(),
+            local_commons: Vec::new(),
             pending_types: FxHashMap::default(),
             pending_sizes: FxHashMap::default(),
             pending_hidden: Vec::new(),
@@ -1350,6 +1390,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             aliases: FxHashMap::default(),
             set_values: FxHashMap::default(),
             pending_set_exprs: Vec::new(),
+            set_exprs: FxHashMap::default(),
             symver_refs: FxHashMap::default(),
             symver_flags: FxHashMap::default(),
             section_stack: Vec::new(),
@@ -1359,7 +1400,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             deferred_leb_diffs: Vec::new(),
             code_mode: A::default_code_mode(),
             last_item_was_insn: false,
-            deferred_scaled_diffs: Vec::new(),
+            deferred_data_exprs: Vec::new(),
             deferred_cfa_advances: Vec::new(),
             seq: 0,
             label_seq: FxHashMap::default(),
@@ -1375,6 +1416,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             self.seq += 1;
             self.process_item(item)?;
         }
+        self.allocate_local_commons()?;
         // GNU-as .symver references: if `real` was never DEFINED in this
         // object, rewrite relocations against it to the versioned name
         // (foo@VER). `@@` in a reference selects the default version ->
@@ -1618,17 +1660,20 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     }
                 }
             }
-            AsmItem::Weak(name) => {
-                self.pending_weaks.push(name.clone());
-            }
-            AsmItem::Hidden(name) => {
-                self.pending_hidden.push(name.clone());
-            }
-            AsmItem::Protected(name) => {
-                self.pending_protected.push(name.clone());
-            }
-            AsmItem::Internal(name) => {
-                self.pending_internal.push(name.clone());
+            // Like `.globl`, each of these takes a comma-separated list in
+            // GAS; `.weak a, b` used to create one symbol named "a, b".
+            AsmItem::Weak(name) => self.pending_weaks.extend(symbol_names(name)),
+            AsmItem::Hidden(name) => self.pending_hidden.extend(symbol_names(name)),
+            AsmItem::Protected(name) => self.pending_protected.extend(symbol_names(name)),
+            AsmItem::Internal(name) => self.pending_internal.extend(symbol_names(name)),
+            AsmItem::Local(names) => {
+                // GAS clears external binding; a later `.globl` restores it
+                // for a defined symbol (last one wins), but not for a
+                // `.local`-flagged `.comm` (see the Comm arm).
+                for name in names {
+                    self.pending_globals.retain(|g| g != name);
+                    self.local_flagged.insert(name.clone());
+                }
             }
             AsmItem::SymbolType(name, kind) => {
                 self.pending_types.insert(name.clone(), *kind);
@@ -1650,6 +1695,13 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 self.pending_sizes.insert(name.clone(), resolved);
             }
             AsmItem::Label(name) => {
+                // GAS refuses to define a symbol twice (numeric labels are
+                // the exception by design); silently moving it re-bound
+                // every earlier reference.  A `.lcomm`/`.local`+`.comm`
+                // allocation is a definition too.
+                if !name.bytes().all(|c| c.is_ascii_digit()) && self.is_allocated_here(name) {
+                    return Err(format!("symbol `{name}' is already defined"));
+                }
                 self.ensure_section()?;
                 let sec_idx = self.current_section.unwrap();
                 let offset = self.sections[sec_idx].cursor();
@@ -1858,6 +1910,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
             AsmItem::Quad(vals) => {
                 self.emit_data_values(vals, 8)?;
             }
+            AsmItem::Addr(vals) => {
+                let size = if A::elf_class() == ELFCLASS32 { 4 } else { 8 };
+                self.emit_data_values(vals, size)?;
+            }
             AsmItem::Uleb128(vals) => {
                 self.emit_leb_values(vals, false)?;
             }
@@ -1878,27 +1934,29 @@ impl<A: X86Arch> ElfWriterCore<A> {
             }
             AsmItem::Fill { total, elem, value } => {
                 // Mirrors `ElfWriterBase::emit_fill_pattern` (the x86 core
-                // does not share that struct): per-directive ceiling, the
-                // NOBITS raw-value law with GAS's fill wording, the
-                // assembly-wide budget, one allocation, tight copies.
+                // does not share that struct). NOBITS first: GAS's raw-value
+                // law (a non-zero pattern is an error whatever its width),
+                // and a zero run is a size -- no cap, no budget, no bytes.
+                // PROGBITS: per-directive ceiling, assembly-wide budget, one
+                // allocation, tight copies.
                 debug_assert!((1..=8).contains(elem), "parser clamps elem to 1..=8");
+                self.ensure_section()?;
+                let section = self.current_section_mut()?;
+                if section.section_type == SHT_NOBITS {
+                    if *value != 0 {
+                        return Err(format!(
+                            "attempt to fill section `{}` with non-zero value",
+                            section.name
+                        ));
+                    }
+                    section.hold_zeros(*total as u64)?;
+                    return Ok(());
+                }
                 if *total > crate::backend::elf::MAX_DIRECTIVE_FILL {
                     return Err(format!(
                         "fill directive of {total} bytes exceeds the {}-byte directive limit",
                         crate::backend::elf::MAX_DIRECTIVE_FILL
                     ));
-                }
-                self.ensure_section()?;
-                if *value != 0 {
-                    if let Some(sec_idx) = self.current_section {
-                        let section = &self.sections[sec_idx];
-                        if section.section_type == SHT_NOBITS {
-                            return Err(format!(
-                                "attempt to fill section `{}` with non-zero value",
-                                section.name
-                            ));
-                        }
-                    }
                 }
                 self.charge_fill(*total)?;
                 if *total > 0 {
@@ -1952,12 +2010,11 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     // need to wait for label resolution.
                     if let Some(n) = parse_const_skip(expr) {
                         let fill_byte = *fill;
-                        let nobits_zero = fill_byte == 0
-                            && self.current_section_mut()?.section_type == SHT_NOBITS;
-                        // Held-back NOBITS zeros bypass the cap and budget
-                        // (size, not bytes); everything else keeps the
-                        // GAS-parity limits.
-                        if !nobits_zero {
+                        // A NOBITS run is a size whatever its fill byte
+                        // (`pad_fill`), so it bypasses the cap and budget;
+                        // everything else keeps the GAS-parity limits.
+                        let nobits = self.current_section_mut()?.section_type == SHT_NOBITS;
+                        if !nobits {
                             if n > crate::backend::elf::MAX_DIRECTIVE_FILL {
                                 return Err(format!(
                                     ".skip: {n} bytes exceed the {}-byte directive limit",
@@ -1993,9 +2050,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     // runaway positives are refused before materialization.
                     let val = val.max(0) as u64;
                     let fill_byte = *fill;
-                    let nobits_zero =
-                        fill_byte == 0 && self.current_section_mut()?.section_type == SHT_NOBITS;
-                    if !nobits_zero {
+                    let nobits = self.current_section_mut()?.section_type == SHT_NOBITS;
+                    if !nobits {
                         if val > crate::backend::elf::MAX_DIRECTIVE_FILL as u64 {
                             return Err(format!(
                                 ".skip: {val} bytes exceed the {}-byte directive limit",
@@ -2015,68 +2071,76 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 section.push_bytes(bytes)?;
             }
             AsmItem::Comm(name, size, align) => {
-                let sym_idx = self.symbols.len();
-                self.symbols.push(SymbolInfo {
-                    name: name.clone(),
-                    binding: STB_GLOBAL,
-                    sym_type: STT_OBJECT,
-                    visibility: STV_DEFAULT,
-                    section: None,
-                    value: *align as u64,
-                    size: *size,
-                    is_common: true,
-                    common_align: *align,
-                });
-                self.symbol_map.insert(name.clone(), sym_idx);
-            }
-            AsmItem::Set(alias, target) => {
-                // ONLY expressions with actual arithmetic are folded to
-                // constants; a bare symbol target (`.set foo_alias, bar_fn`,
-                // the alias-attribute lowering) must stay a symbolic alias —
-                // folding it to a section offset redirects calls to an
-                // absolute address (asm_label_alias regression, SIGSEGV).
-                let is_arithmetic = target.contains(|c: char| {
-                    matches!(
-                        c,
-                        '+' | '-' | '*' | '/' | '&' | '|' | '^' | '~' | '(' | '<' | '>'
-                    )
-                });
-                if is_arithmetic {
-                    if let Some((sec_idx, substituted)) = self.substitute_dot(target) {
-                        if substituted.contains(".Ldotpos_") {
-                            // `.`-relative: MUST defer to post-layout eval;
-                            // jump relaxation moves everything after this
-                            // point (SYM_FUNC_END sizes were 66 bytes too
-                            // large when evaluated eagerly).
-                            self.pending_set_exprs
-                                .push((alias.clone(), substituted, sec_idx));
-                            self.aliases.insert(alias.clone(), target.clone());
-                        } else {
-                            match self.eval_label_expr(&substituted, sec_idx) {
-                                Some(val) => {
-                                    self.set_values.insert(alias.clone(), val);
-                                }
-                                None => {
-                                    // Forward label refs: retry after layout.
-                                    self.pending_set_exprs.push((
-                                        alias.clone(),
-                                        substituted,
-                                        sec_idx,
-                                    ));
-                                    self.aliases.insert(alias.clone(), target.clone());
-                                }
-                            }
-                        }
-                    } else {
-                        self.aliases.insert(alias.clone(), target.clone());
+                if self.is_allocated_here(name) {
+                    return Err(format!("symbol `{name}' is already defined"));
+                }
+                if self.local_flagged.contains(name) {
+                    // `.local x` then `.comm x`: a LOCAL object in `.bss`,
+                    // even if a `.globl x` came in between (GAS 2.47).
+                    let align = (*align).max(1);
+                    if !align.is_power_of_two() {
+                        return Err(format!(".comm {name}: alignment {align} not a power of 2"));
                     }
-                } else if let Ok(val) = crate::backend::asm_expr::parse_integer_expr(target) {
-                    // Pure integer constant (`.set salign, 0x1000`).
-                    self.set_values.insert(alias.clone(), val);
+                    self.pending_globals.retain(|g| g != name);
+                    self.local_commons.push((name.clone(), *size, align));
+                } else if let Some(&i) = self
+                    .symbol_map
+                    .get(name)
+                    .filter(|&&i| self.symbols[i].is_common)
+                {
+                    // A repeated `.comm` keeps the first size (GAS warns if
+                    // they differ) and takes the new alignment, an omitted
+                    // one by the size law of the KEPT size (GAS 2.47:
+                    // `.comm x,4,8` then `.comm x,100` -> 4).  Pushing a
+                    // second symbol emitted two COMMON entries of one name.
+                    let sym = &mut self.symbols[i];
+                    let align = if *align == 0 {
+                        elf_mod::default_comm_align(sym.size)
+                    } else {
+                        *align
+                    };
+                    sym.common_align = align;
+                    sym.value = u64::from(align);
                 } else {
-                    self.aliases.insert(alias.clone(), target.clone());
+                    let align = if *align == 0 {
+                        elf_mod::default_comm_align(*size)
+                    } else {
+                        *align
+                    };
+                    // A common is an external OBJECT; a definition that
+                    // later replaces it stays GLOBAL and, unless `.type`
+                    // says otherwise, an OBJECT (GAS).
+                    self.pending_globals.push(name.clone());
+                    self.pending_types
+                        .entry(name.clone())
+                        .or_insert(SymbolKind::Object);
+                    let sym_idx = self.symbols.len();
+                    self.symbols.push(SymbolInfo {
+                        name: name.clone(),
+                        binding: STB_GLOBAL,
+                        sym_type: STT_OBJECT,
+                        visibility: STV_DEFAULT,
+                        section: None,
+                        value: align as u64,
+                        size: *size,
+                        is_common: true,
+                        common_align: align,
+                    });
+                    self.symbol_map.insert(name.clone(), sym_idx);
                 }
             }
+            AsmItem::Lcomm(name, size, align) => {
+                if self.is_allocated_here(name)
+                    || self
+                        .symbol_map
+                        .get(name)
+                        .is_some_and(|&i| self.symbols[i].is_common)
+                {
+                    return Err(format!("symbol `{name}' is already defined"));
+                }
+                self.local_commons.push((name.clone(), *size, *align));
+            }
+            AsmItem::Set(alias, target) => self.define_set(alias, target)?,
             AsmItem::Symver(name, ver_string, flag) => {
                 // GNU as semantics (verified against binutils 2.47):
                 //   .symver real, name@@V  -> symbols `real` AND `name@@V`
@@ -2140,10 +2204,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
     fn process_org(&mut self, sym: &str, offset: i64, fill: u8) -> Result<(), String> {
         let after_insn = self.last_item_was_insn;
-        let sec_idx = match self.current_section {
-            Some(idx) => idx,
-            None => return Ok(()),
-        };
+        // GAS: `.org` before any section directive positions within `.text`;
+        // returning early here dropped it and shifted everything after it.
+        self.ensure_section()?;
+        let sec_idx = self.current_section.ok_or("no active section for .org")?;
         let current = self.sections[sec_idx].cursor();
         let target = if sym.is_empty() {
             offset as u64
@@ -2177,14 +2241,17 @@ impl<A: X86Arch> ElfWriterCore<A> {
         };
         // `.org` pads with a constant fill from a possibly tiny source —
         // the same unbounded-output amplifier as `.zero`; refuse before
-        // materializing (GAS dies writing runaway pads too).
-        if padding > crate::backend::elf::MAX_DIRECTIVE_FILL {
-            return Err(format!(
-                ".org: {padding} bytes of fill exceed the {}-byte directive limit",
-                crate::backend::elf::MAX_DIRECTIVE_FILL
-            ));
+        // materializing (GAS dies writing runaway pads too). A NOBITS pad
+        // is a size (`pad_fill`), so it needs neither ceiling nor budget.
+        if self.sections[sec_idx].section_type != SHT_NOBITS {
+            if padding > crate::backend::elf::MAX_DIRECTIVE_FILL {
+                return Err(format!(
+                    ".org: {padding} bytes of fill exceed the {}-byte directive limit",
+                    crate::backend::elf::MAX_DIRECTIVE_FILL
+                ));
+            }
+            self.charge_fill(padding)?;
         }
-        self.charge_fill(padding)?;
         // Record .org marker for post-relaxation fixup (even when padding == 0,
         // because code before it may shrink during jump relaxation)
         if !sym.is_empty() {
@@ -2359,56 +2426,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         _ => section.push_bytes(&v.to_le_bytes())?,
                     }
                 }
-                DataValue::Symbol(sym) => {
-                    // Resolve .set aliases for label-difference expressions (DWARF debug info)
-                    if A::resolve_set_aliases_in_data() {
-                        if let Some(target) = self.aliases.get(sym).cloned() {
-                            if let Some(pos) = target.find('-') {
-                                let a = target[..pos].trim().to_string();
-                                let b = target[pos + 1..].trim().to_string();
-                                let offset = self.sections[sec_idx].cursor();
-                                self.sections[sec_idx].relocations.push(ElfRelocation {
-                                    offset,
-                                    symbol: a,
-                                    reloc_type: if size <= 4 {
-                                        A::reloc_pc32()
-                                    } else {
-                                        A::reloc_abs64()
-                                    },
-                                    addend: 0,
-                                    diff_symbol: Some(b),
-                                    patch_size: size as u8,
-                                });
-                                let section = &mut self.sections[sec_idx];
-                                section.pad_fill(size as u64, 0)?;
-                                continue;
-                            }
-                        }
-                    }
-                    let offset = self.sections[sec_idx].cursor();
-                    self.sections[sec_idx].relocations.push(ElfRelocation {
-                        offset,
-                        symbol: sym.clone(),
-                        reloc_type: A::reloc_abs(size),
-                        addend: 0,
-                        diff_symbol: None,
-                        patch_size: size as u8,
-                    });
-                    let section = &mut self.sections[sec_idx];
-                    section.pad_fill(size as u64, 0)?;
-                }
+                DataValue::Symbol(sym) => self.emit_symbol_ref(sec_idx, sym, 0, size)?,
                 DataValue::SymbolOffset(sym, addend) => {
-                    let offset = self.sections[sec_idx].cursor();
-                    self.sections[sec_idx].relocations.push(ElfRelocation {
-                        offset,
-                        symbol: sym.clone(),
-                        reloc_type: A::reloc_abs(size),
-                        addend: *addend,
-                        diff_symbol: None,
-                        patch_size: size as u8,
-                    });
-                    let section = &mut self.sections[sec_idx];
-                    section.pad_fill(size as u64, 0)?;
+                    self.emit_symbol_ref(sec_idx, sym, *addend, size)?;
                 }
                 DataValue::SymbolDiff(a, b) => {
                     self.emit_symbol_diff(sec_idx, a, b, size, 0)?;
@@ -2416,44 +2436,127 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 DataValue::SymbolDiffAddend(a, b, addend) => {
                     self.emit_symbol_diff(sec_idx, a, b, size, *addend)?;
                 }
-                DataValue::SymbolDiffScaled(a, b, scale, div, addend) => {
-                    // `(a-b)*scale + addend`. A scaled difference cannot be
-                    // expressed by any ELF relocation, so it must be folded to
-                    // a constant here; that is sound precisely because a
-                    // same-section label difference is link-time invariant.
-                    // `.` as either operand is THIS directive's position: register a
-                    // synthetic label at the current offset so the post-layout
-                    // fold resolves it (header.S: `.long (section_table - .) / 8`).
-                    let here = self.sections[sec_idx].cursor();
-                    let dot_name = format!(".Ldot_{}_{}", sec_idx, here);
-                    let a_res = if a == "." {
-                        self.place_label(&dot_name, sec_idx, here);
-                        dot_name.clone()
-                    } else {
-                        self.aliases.get(a).cloned().unwrap_or_else(|| a.clone())
-                    };
-                    let b_res = if b == "." {
-                        self.place_label(&dot_name, sec_idx, here);
-                        dot_name.clone()
-                    } else {
-                        self.aliases.get(b).cloned().unwrap_or_else(|| b.clone())
-                    };
-                    self.deferred_scaled_diffs.push(ScaledDiff {
-                        sec_idx,
-                        offset: self.sections[sec_idx].cursor_usize(),
-                        a: a_res,
-                        b: b_res,
-                        scale: *scale,
-                        div: *div,
-                        addend: *addend,
-                        size,
-                    });
-                    let section = &mut self.sections[sec_idx];
-                    section.pad_fill(size as u64, 0)?;
+                DataValue::Expr(expr) => {
+                    self.defer_data_expr(sec_idx, expr, size)?;
                 }
             }
         }
         Ok(())
+    }
+
+    /// A label at the current position of `sec_idx`: the value of `.` in a
+    /// data field, kept current by relaxation like any label.
+    fn dot_label(&mut self, sec_idx: usize) -> String {
+        let offset = self.sections[sec_idx].cursor();
+        let name = format!(".Ldot_{sec_idx}_{offset}");
+        self.place_label(&name, sec_idx, offset);
+        name
+    }
+
+    /// `sym + addend` in a `size`-byte data field: an absolute relocation
+    /// (`.` is this field's position), unless `sym` is a `.set` symbol
+    /// whose value is known here ([`Self::emit_set_operand`]).
+    fn emit_symbol_ref(
+        &mut self,
+        sec_idx: usize,
+        sym: &str,
+        addend: i64,
+        size: usize,
+    ) -> Result<(), String> {
+        if self.emit_set_operand(sec_idx, sym, addend, size)? {
+            return Ok(());
+        }
+        let symbol = if sym == "." {
+            self.dot_label(sec_idx)
+        } else {
+            sym.to_string()
+        };
+        let offset = self.sections[sec_idx].cursor();
+        self.sections[sec_idx].relocations.push(ElfRelocation {
+            offset,
+            symbol,
+            reloc_type: A::reloc_abs(size),
+            addend,
+            diff_symbol: None,
+            patch_size: size as u8,
+        });
+        self.sections[sec_idx].pad_fill(size as u64, 0)
+    }
+
+    /// Reserve a `size`-byte field for `expr`, folded by
+    /// [`Self::resolve_data_exprs`] after layout. `.` is this field's
+    /// position, a synthetic label that moves with relaxation.
+    fn defer_data_expr(&mut self, sec_idx: usize, expr: &str, size: usize) -> Result<(), String> {
+        let (_, text) = self.substitute_dot(expr).ok_or("no active section")?;
+        let mut captured = Vec::new();
+        for name in crate::backend::asm_expr::expr_symbols(&text)? {
+            let is_set = self.set_values.contains_key(&name)
+                || self.set_exprs.contains_key(&name)
+                || self.aliases.contains_key(&name);
+            if is_set && !captured.iter().any(|(n, _)| *n == name) {
+                let v = self.capture_set_operand(&name, 0);
+                captured.push((name, v));
+            }
+        }
+        let offset = self.sections[sec_idx].cursor_usize();
+        self.deferred_data_exprs.push(DataExpr {
+            sec_idx,
+            offset,
+            expr: text,
+            captured,
+            size,
+        });
+        self.sections[sec_idx].pad_fill(size as u64, 0)
+    }
+
+    /// `sym + addend` in a `size`-byte data field when `sym` is a `.set`
+    /// symbol with a value at this point: a constant is stored, a local
+    /// symbolic value substituted ([`Self::set_operand_at_use`]). `false`
+    /// leaves `sym` to the ordinary relocation path.
+    fn emit_set_operand(
+        &mut self,
+        sec_idx: usize,
+        sym: &str,
+        addend: i64,
+        size: usize,
+    ) -> Result<bool, String> {
+        if let Some(&v) = self.set_values.get(sym) {
+            let v = v.wrapping_add(addend);
+            self.sections[sec_idx].push_bytes(&v.to_le_bytes()[..size])?;
+            return Ok(true);
+        }
+        let Some((a, b, k)) = self.set_operand_at_use(sym) else {
+            return Ok(false);
+        };
+        let k = k.wrapping_add(addend);
+        match b {
+            Some(b) => self.emit_symbol_diff(sec_idx, &a, &b, size, k)?,
+            None => {
+                let offset = self.sections[sec_idx].cursor();
+                self.sections[sec_idx].relocations.push(ElfRelocation {
+                    offset,
+                    symbol: a,
+                    reloc_type: A::reloc_abs(size),
+                    addend: k,
+                    diff_symbol: None,
+                    patch_size: size as u8,
+                });
+                self.sections[sec_idx].pad_fill(size as u64, 0)?;
+            }
+        }
+        Ok(true)
+    }
+
+    /// GAS's PC-relative data relocation for a `size`-byte field, if the
+    /// target has one (ELF32 has no PC64).
+    fn data_pc_reloc(size: usize) -> Option<u32> {
+        match size {
+            8 => (A::reloc_pc64() != A::reloc_pc32()).then(A::reloc_pc64),
+            4 => Some(A::reloc_pc32()),
+            2 => A::reloc_pc16(),
+            1 => A::reloc_pc8(),
+            _ => None,
+        }
     }
 
     fn emit_symbol_diff(
@@ -2489,21 +2592,38 @@ impl<A: X86Arch> ElfWriterCore<A> {
             .cloned()
             .unwrap_or_else(|| b.to_string());
 
+        // A literal minuend (`5 - .`) is a PC-relative value with no symbol:
+        // GAS writes a symbol-less R_*_PC32. Refused rather than emitted as
+        // a relocation against a "symbol" named `5`.
+        if crate::backend::asm_expr::parse_integer_expr(&a_resolved).is_ok() {
+            return Err(format!(
+                "`{a} - {b}`: a PC-relative value without a symbol is not supported"
+            ));
+        }
+        // `.` as the minuend is THIS directive's position: a synthetic label
+        // here, which relaxation keeps current (`. - .data` is the offset).
+        let a_resolved = if a_resolved == "." {
+            self.dot_label(sec_idx)
+        } else {
+            a_resolved
+        };
         if b_resolved == "." {
             // `sym - .` means PC-relative. The relocation WIDTH must match
-            // the data directive width: `.quad sym - .` is an 8-byte slot,
-            // and patching it with a 4-byte PC32 leaves the upper half zero
-            // AND overflows silently once the delta exceeds ±2 GiB. GAS
-            // emits R_X86_64_PC64 here; the kernel's __jump_table
-            // (`.quad key - .`) and static_call sites depend on it.
+            // the data directive width (GAS: PC8/PC16/PC32/PC64): `.quad
+            // sym - .` patched with a 4-byte PC32 leaves the upper half zero
+            // and overflows silently past ±2 GiB (the kernel's __jump_table
+            // `.quad key - .`), and a PC32 on a `.byte`/`.2byte` field
+            // overwrites the bytes after it.
+            let reloc_type = Self::data_pc_reloc(size).ok_or_else(|| {
+                format!(
+                    "cannot represent relocation type BFD_RELOC_{}_PCREL",
+                    size * 8
+                )
+            })?;
             self.sections[sec_idx].relocations.push(ElfRelocation {
                 offset,
                 symbol: a_resolved,
-                reloc_type: if size == 8 {
-                    A::reloc_pc64()
-                } else {
-                    A::reloc_pc32()
-                },
+                reloc_type,
                 addend,
                 diff_symbol: None,
                 patch_size: size as u8,
@@ -2583,12 +2703,15 @@ impl<A: X86Arch> ElfWriterCore<A> {
         for val in vals {
             match val {
                 DataValue::Integer(v) => {
-                    let section = &mut self.sections[sec_idx];
+                    // Through `push_bytes`, never straight into `data`: in a
+                    // NOBITS section the (guard-proven zero) byte is a size.
+                    let mut enc = Vec::with_capacity(10);
                     if signed {
-                        encode_sleb128(&mut section.data, *v);
+                        encode_sleb128(&mut enc, *v);
                     } else {
-                        encode_uleb128(&mut section.data, *v as u64);
+                        encode_uleb128(&mut enc, *v as u64);
                     }
+                    self.sections[sec_idx].push_bytes(&enc)?;
                 }
                 DataValue::SymbolDiff(a, b) => {
                     self.defer_leb_diff(sec_idx, a, b, 0, signed)?;
@@ -2596,10 +2719,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 DataValue::SymbolDiffAddend(a, b, addend) => {
                     self.defer_leb_diff(sec_idx, a, b, *addend, signed)?;
                 }
-                DataValue::SymbolDiffScaled(..) => {
-                    return Err(
-                        "scaled symbol difference in .uleb128/.sleb128 is unsupported".to_string(),
-                    );
+                DataValue::Expr(expr) => {
+                    return Err(format!(
+                        "unsupported expression {expr} in .uleb128/.sleb128"
+                    ));
                 }
                 DataValue::Symbol(sym) | DataValue::SymbolOffset(sym, _) => {
                     return Err(format!(
@@ -2886,6 +3009,58 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
     /// Define (or redefine) label `name` at `offset` in `sec_idx`, stamped
     /// with the current source position for `shift_after`.
+    /// `name` is already defined by a label or reserved by a pending
+    /// `.lcomm` / `.local`+`.comm` allocation.
+    fn is_allocated_here(&self, name: &str) -> bool {
+        self.label_positions.contains_key(name)
+            || self.local_commons.iter().any(|(n, _, _)| n == name)
+    }
+
+    /// Lay out the `.lcomm` / `.local`+`.comm` allocations at the end of
+    /// `.bss` (GAS's subsection 1), through the ordinary item path so the
+    /// alignment, NOBITS size-only growth and symbol creation are the ones
+    /// every other `.bss` object gets.  Each becomes an OBJECT of its size
+    /// unless the source said otherwise with `.type`/`.size`.
+    fn allocate_local_commons(&mut self) -> Result<(), String> {
+        let commons = std::mem::take(&mut self.local_commons);
+        if commons.is_empty() {
+            return Ok(());
+        }
+        let (saved_current, saved_previous) = (self.current_section, self.previous_section);
+        self.process_item(&AsmItem::Section(SectionDirective {
+            name: ".bss".to_string(),
+            flags: None,
+            section_type: None,
+            extra: None,
+            comdat_group: None,
+        }))?;
+        for (name, size, align) in commons {
+            let zeros = usize::try_from(size)
+                .map_err(|_| format!("{name}: size {size} exceeds the host address space"))?;
+            for item in [
+                AsmItem::Align {
+                    align: u64::from(align),
+                    fill: None,
+                    max_skip: None,
+                },
+                AsmItem::Label(name.clone()),
+                AsmItem::Zero(zeros),
+            ] {
+                self.seq += 1;
+                self.process_item(&item)?;
+            }
+            self.pending_types
+                .entry(name.clone())
+                .or_insert(SymbolKind::Object);
+            self.pending_sizes
+                .entry(name)
+                .or_insert(SizeExpr::Constant(size));
+        }
+        self.current_section = saved_current;
+        self.previous_section = saved_previous;
+        Ok(())
+    }
+
     fn place_label(&mut self, name: &str, sec_idx: usize, offset: u64) {
         self.label_positions
             .insert(name.to_string(), (sec_idx, offset));
@@ -2949,7 +3124,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 *loff = map(*loff, None);
             }
         }
-        for d in self.deferred_scaled_diffs.iter_mut() {
+        for d in self.deferred_data_exprs.iter_mut() {
             if d.sec_idx == sec_idx {
                 d.offset = map(d.offset, None);
             }
@@ -3033,20 +3208,35 @@ impl<A: X86Arch> ElfWriterCore<A> {
             if count == 0 {
                 continue;
             }
-            // Deferred skips resolve after labels are known — the expression
-            // can compute a huge runtime size (`.skip 1<<40`); refuse before
-            // the vec allocation (GAS dies on runaway pads as well).
-            if count > crate::backend::elf::MAX_DIRECTIVE_FILL {
-                return Err(format!(
-                    ".skip: {count} bytes exceed the {}-byte directive limit",
-                    crate::backend::elf::MAX_DIRECTIVE_FILL
-                ));
+            let section = &mut self.sections[*sec_idx];
+            if section.section_type == SHT_NOBITS && *offset >= section.data.len() {
+                // The gap opens inside the held zero tail (everything past
+                // `data` is tail), so it is more tail: a size, with no
+                // ceiling. Splicing into `data` here indexed past its end --
+                // `.bss; .zero 16; .skip 2f-1f` was an internal error.
+                section.hold_zeros(count as u64)?;
+            } else {
+                // Deferred skips resolve after labels are known — the
+                // expression can compute a huge runtime size (`.skip
+                // 1<<40`); refuse before the allocation (GAS dies on runaway
+                // pads as well).
+                if count > crate::backend::elf::MAX_DIRECTIVE_FILL {
+                    return Err(format!(
+                        ".skip: {count} bytes exceed the {}-byte directive limit",
+                        crate::backend::elf::MAX_DIRECTIVE_FILL
+                    ));
+                }
+                // A NOBITS gap between instruction bytes stores nothing, so
+                // its fill byte is unobservable; zeros keep `data` honest.
+                let fill = if section.section_type == SHT_NOBITS {
+                    0
+                } else {
+                    *fill
+                };
+                section
+                    .data
+                    .splice(*offset..*offset, std::iter::repeat_n(fill, count));
             }
-
-            let fill_bytes: Vec<u8> = vec![*fill; count];
-            self.sections[*sec_idx]
-                .data
-                .splice(*offset..*offset, fill_bytes);
 
             // Everything after the gap moves; a label at the gap start
             // moves only if it was defined after the `.skip`.
@@ -3240,20 +3430,21 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 // PC8 relocation: S + A - P with P = the byte's own offset,
                 // so A = addend + byte_off - b_off computes a - b when the
                 // subtrahend is in the byte's OWN section (its distance to
-                // the byte is a link-time constant).
-                if *size == 1 && pos_b.0 == *sec_idx {
-                    if let Some(pc8) = A::reloc_pc8() {
-                        let addend = *addend + (*offset as i64) - (pos_b.1 as i64);
-                        self.sections[*sec_idx].relocations.push(ElfRelocation {
-                            offset: *offset as u64,
-                            symbol: sym_a.clone(),
-                            reloc_type: pc8,
-                            addend,
-                            diff_symbol: None,
-                            patch_size: 1,
-                        });
-                        continue;
-                    }
+                // the byte is a link-time constant). The same holds for a
+                // `.2byte`: PC16.
+                if pos_b.0 == *sec_idx
+                    && let Some(pc) = Self::data_pc_reloc(*size)
+                {
+                    let addend = *addend + (*offset as i64) - (pos_b.1 as i64);
+                    self.sections[*sec_idx].relocations.push(ElfRelocation {
+                        offset: *offset as u64,
+                        symbol: sym_a.clone(),
+                        reloc_type: pc,
+                        addend,
+                        diff_symbol: None,
+                        patch_size: *size as u8,
+                    });
+                    continue;
                 }
                 return Err(format!("cross-section .byte diff: {} - {}", sym_a, sym_b));
             }
@@ -3496,35 +3687,33 @@ impl<A: X86Arch> ElfWriterCore<A> {
         }
     }
 
-    /// Fold every pending `(a - b) * scale + addend` datum into its constant.
-    fn resolve_scaled_diffs(&mut self) -> Result<(), String> {
-        let pending = std::mem::take(&mut self.deferred_scaled_diffs);
+    /// Fold every deferred data expression to its constant. Its value is
+    /// computed in section algebra -- every label, global or not, is its
+    /// section plus offset -- so a difference of labels in one section
+    /// cancels to a number and anything else is refused, as GAS does.
+    fn resolve_data_exprs(&mut self) -> Result<(), String> {
+        use crate::backend::asm_expr::eval_section_expr;
+        let pending = std::mem::take(&mut self.deferred_data_exprs);
         for d in &pending {
-            let pa = self
-                .label_positions
-                .get(&d.a)
-                .ok_or_else(|| format!("undefined label in expression: {}", d.a))?;
-            let pb = self
-                .label_positions
-                .get(&d.b)
-                .ok_or_else(|| format!("undefined label in expression: {}", d.b))?;
-            if pa.0 != pb.0 {
+            let v = eval_section_expr(&d.expr, |n| {
+                let v = match d.captured.iter().find(|(c, _)| c == n) {
+                    Some((_, v)) => self.final_set_value(v, 0)?,
+                    None => self.final_set_name(n, 0)?,
+                };
+                Ok(self.fold_label_terms(v))
+            })
+            .map_err(|e| format!("can't resolve `{}': {e}", d.expr))?;
+            if !v.is_absolute() {
                 return Err(format!(
-                    "difference of labels in different sections is not constant: {} - {}",
-                    d.a, d.b
+                    "can't resolve `{}': not an assembly-time constant",
+                    d.expr
                 ));
             }
-            let value = (pa.1 as i64 - pb.1 as i64)
-                .checked_mul(d.scale)
-                .map(|v| v / d.div)
-                .and_then(|v| v.checked_add(d.addend))
-                .ok_or_else(|| format!("overflow folding ({} - {})", d.a, d.b))?;
-            let bytes = value.to_le_bytes();
             let sec = &mut self.sections[d.sec_idx];
             if d.offset + d.size > sec.cursor_usize() {
-                return Err("internal: scaled diff placeholder overflow".to_string());
+                return Err("internal: data expression placeholder overflow".to_string());
             }
-            sec.write_bytes_at(d.offset, &bytes[..d.size])?;
+            sec.write_bytes_at(d.offset, &v.constant.to_le_bytes()[..d.size])?;
         }
         Ok(())
     }
@@ -3628,8 +3817,6 @@ impl<A: X86Arch> ElfWriterCore<A> {
         }
 
         // Scaled symbol differences: same reasoning.
-        self.resolve_scaled_diffs()?;
-
         // CFA advances measure code, so they are sized only after the LAST
         // step that can resize a code section: `resolve_deferred_byte_diffs`
         // shrinks every `.uleb128`/`.sleb128` placeholder, including one in
@@ -3641,10 +3828,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // deferred difference measures the `.eh_frame` this step shrinks.
         self.resolve_cfa_advances()?;
 
+        self.resolve_data_exprs()?;
+
         // Absolute .set constants (incl. forward `.`-position expressions)
         // fold before internal relocation resolution: relocs against them
         // patch constants and never reach the symbol table.
-        self.resolve_set_constants();
+        self.resolve_set_constants()?;
 
         // Resolve internal relocations (unresolvable differences and
         // out-of-range short branches are hard assembler errors, as in GAS).
@@ -3988,7 +4177,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
         // Add COMMON symbols
         for sym in &self.symbols {
-            if sym.is_common {
+            // `.comm x` followed by a definition of `x`: the definition
+            // replaces the common (GAS), it must not be emitted twice.
+            if sym.is_common && !self.label_positions.contains_key(&sym.name) {
                 shared_symbols.retain(|s| !(s.name == sym.name && s.section_name == "*UND*"));
                 shared_symbols.push(ObjSymbol {
                     name: sym.name.clone(),
@@ -4627,7 +4818,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
     /// later removes bytes from a code section (a shrinking `.uleb128`),
     /// which moves targets without touching the jumps.
     fn patch_short_jumps(&mut self, sec_idx: usize) -> Result<(), String> {
-        self.sections[sec_idx].materialize_tail()?;
+        // No tail materialisation: a jump is an instruction, and instruction
+        // bytes are always materialised when pushed (see `push_bytes`), so
+        // every patch below lands inside `data`.
         let mut local_labels: FxHashMap<String, usize> = FxHashMap::default();
         for (name, &(s_idx, offset)) in &self.label_positions {
             if s_idx == sec_idx {
@@ -5182,51 +5375,158 @@ impl<A: X86Arch> ElfWriterCore<A> {
         Some((sec_idx, out))
     }
 
-    /// Evaluate an integer expression that may reference SAME-SECTION labels
-    /// (label -> section offset) and previously-evaluated .set constants.
-    /// None if any symbol is unknown or cross-section.
-    fn eval_label_expr(&self, expr: &str, sec_idx: usize) -> Option<i64> {
-        let bytes = expr.as_bytes();
-        let mut out = String::with_capacity(expr.len() + 16);
-        let mut i = 0;
-        while i < bytes.len() {
-            let b = bytes[i];
-            // NUMBER tokens first: `0x100` must not become `0` + ident `x100`.
-            if b.is_ascii_digit() {
-                let start = i;
-                while i < bytes.len() && bytes[i].is_ascii_alphanumeric() {
-                    i += 1;
-                }
-                out.push_str(&expr[start..i]);
-                continue;
+    /// `.set NAME, expr` / `.equ NAME, expr` (GAS `pseudo_set`).
+    ///
+    /// A constant is an ABS symbol; a bare symbol stays a textual alias
+    /// (GAS copies the target's attributes, and folding `.set foo_alias,
+    /// bar_fn` to an offset redirected calls to an absolute address -- the
+    /// asm_label_alias regression); any other linear expression is captured
+    /// here with [`Self::capture_set_operand`] (`set_exprs`) and finalised
+    /// after layout. An expression whose operators need values that are
+    /// still unknown (`(e - s) >> 1` with forward labels) is evaluated after
+    /// layout in GAS's section algebra (`pending_set_exprs`).
+    fn define_set(&mut self, alias: &str, target: &str) -> Result<(), String> {
+        use crate::backend::asm_expr::{SectionExpr, eval_section_expr, is_bare_symbol};
+        let target = target.trim();
+        self.set_values.remove(alias);
+        self.set_exprs.remove(alias);
+        self.pending_set_exprs.retain(|(a, _, _)| a != alias);
+        self.aliases.remove(alias);
+        if let Ok(val) = crate::backend::asm_expr::parse_integer_expr(target) {
+            // A constant, with or without operators (`.set salign, 0x1000`,
+            // `.equ N, 3*4+1`): an absolute symbol, whether or not a section
+            // has been selected yet.
+            self.set_values.insert(alias.to_string(), val);
+            return Ok(());
+        }
+        if is_bare_symbol(target) {
+            self.aliases.insert(alias.to_string(), target.to_string());
+            return Ok(());
+        }
+        // `.` is this position: GAS defines `.set` before any section in
+        // `.text`, and the synthetic label moves with relaxation.
+        self.ensure_section()?;
+        let (sec_idx, substituted) = self.substitute_dot(target).ok_or("no active section")?;
+        match eval_section_expr(&substituted, |n| Ok(self.capture_set_operand(n, 0))) {
+            Ok(v) if v.is_absolute() => {
+                self.set_values.insert(alias.to_string(), v.constant);
             }
-            if b.is_ascii_alphabetic() || b == b'_' || b == b'.' {
-                let start = i;
-                while i < bytes.len()
-                    && (bytes[i].is_ascii_alphanumeric()
-                        || bytes[i] == b'_'
-                        || bytes[i] == b'.'
-                        || bytes[i] == b'$')
-                {
-                    i += 1;
-                }
-                let ident = &expr[start..i];
-                if let Some(&(lsec, loff)) = self.label_positions.get(ident) {
-                    if lsec != sec_idx {
-                        return None;
-                    }
-                    out.push_str(&loff.to_string());
-                } else if let Some(&v) = self.set_values.get(ident) {
-                    out.push_str(&v.to_string());
-                } else {
-                    return None;
-                }
-            } else {
-                out.push(b as char);
-                i += 1;
+            Ok(v) => {
+                self.set_exprs.insert(alias.to_string(), v);
+            }
+            Err(e) => {
+                // Well-formed once every symbol is a number: only the values
+                // are unknown yet, so evaluate after layout.
+                eval_section_expr::<()>(&substituted, |_| Ok(SectionExpr::absolute(0)))
+                    .map_err(|_| format!(".set {alias}, {target}: {e}"))?;
+                self.pending_set_exprs
+                    .push((alias.to_string(), substituted, sec_idx));
             }
         }
-        crate::backend::asm_expr::parse_integer_expr(&out).ok()
+        Ok(())
+    }
+
+    /// The value a `.set` operand has at this point: a constant or symbolic
+    /// `.set` contributes its value as of now (a later redefinition does not
+    /// change what was captured), a local textual alias its target, and
+    /// every other name -- a label, which relaxation may still move, a
+    /// global/weak symbol, or an external -- stays a named term.
+    fn capture_set_operand(
+        &self,
+        name: &str,
+        depth: u32,
+    ) -> crate::backend::asm_expr::SectionExpr<String> {
+        use crate::backend::asm_expr::SectionExpr;
+        if let Some(&v) = self.set_values.get(name) {
+            return SectionExpr::absolute(v);
+        }
+        if !self.is_global_or_weak(name) {
+            if let Some(v) = self.set_exprs.get(name) {
+                return v.clone();
+            }
+            if let Some(target) = self.aliases.get(name)
+                && depth < 64
+            {
+                return self.capture_set_operand(target, depth + 1);
+            }
+        }
+        SectionExpr::term(name.to_string(), 1)
+    }
+
+    fn is_global_or_weak(&self, name: &str) -> bool {
+        self.pending_globals.iter().any(|g| g == name)
+            || self.pending_weaks.iter().any(|w| w == name)
+    }
+
+    /// The final value of a captured `.set` value after layout, in terms of
+    /// section indices (`Ok`) and the names that stay symbols: undefined
+    /// externals and global/weak labels (GAS relocates against those by
+    /// name). `Err` on a definition cycle.
+    fn final_set_value(
+        &self,
+        v: &crate::backend::asm_expr::SectionExpr<String>,
+        depth: u32,
+    ) -> Result<crate::backend::asm_expr::SectionExpr<SetBase>, String> {
+        use crate::backend::asm_expr::SectionExpr;
+        let mut out = SectionExpr::absolute(v.constant);
+        for (name, coeff) in v.terms() {
+            let t = self.final_set_name(name, depth)?;
+            out = out.add_scaled(t, *coeff);
+        }
+        Ok(out)
+    }
+
+    fn final_set_name(
+        &self,
+        name: &str,
+        depth: u32,
+    ) -> Result<crate::backend::asm_expr::SectionExpr<SetBase>, String> {
+        use crate::backend::asm_expr::SectionExpr;
+        if depth > 64 {
+            return Err(format!("symbol `{name}' is defined in terms of itself"));
+        }
+        if let Some(&v) = self.set_values.get(name) {
+            return Ok(SectionExpr::absolute(v));
+        }
+        if let Some(v) = self.set_exprs.get(name) {
+            return self.final_set_value(v, depth + 1);
+        }
+        if let Some(target) = self.aliases.get(name) {
+            return self.final_set_name(target, depth + 1);
+        }
+        if let Some(&(sec, off)) = self.label_positions.get(name) {
+            return Ok(if self.is_global_or_weak(name) {
+                SectionExpr::term(SetBase::Sym(name.to_string()), 1)
+            } else {
+                SectionExpr::at(SetBase::Sec(sec), off as i64)
+            });
+        }
+        if let Some(&sec) = self.section_map.get(name) {
+            return Ok(SectionExpr::at(SetBase::Sec(sec), 0));
+        }
+        Ok(SectionExpr::term(SetBase::Sym(name.to_string()), 1))
+    }
+
+    /// A data directive naming a LOCAL symbolic `.set` assembles the value
+    /// the symbol has at this point (GAS: `.set v, v0; .long v; .set v, 7`
+    /// relocates the first `.long` against v0), so substitute it here:
+    /// `Some((symbol, minus-symbol, addend))`, or `None` for anything else.
+    fn set_operand_at_use(&self, sym: &str) -> Option<(String, Option<String>, i64)> {
+        if self.is_global_or_weak(sym) {
+            return None;
+        }
+        let v = match (self.set_exprs.get(sym), self.aliases.get(sym)) {
+            (Some(v), _) => v.clone(),
+            (None, Some(t)) if crate::backend::asm_expr::is_bare_symbol(t) => {
+                self.capture_set_operand(sym, 0)
+            }
+            _ => return None,
+        };
+        match v.terms() {
+            [(a, 1)] => Some((a.clone(), None, v.constant)),
+            [(a, 1), (b, -1)] | [(b, -1), (a, 1)] => Some((a.clone(), Some(b.clone()), v.constant)),
+            _ => None,
+        }
     }
 
     /// Late resolution: pending `.`-position .set expressions, then convert
@@ -5238,16 +5538,25 @@ impl<A: X86Arch> ElfWriterCore<A> {
     /// which broke when the constant fold swallowed the symbol entirely
     /// ("undefined reference to ZO_z_input_len" in header.S).
     /// The writer consumes abs_symbols in build_symbol_table.
-    fn resolve_set_constants(&mut self) {
+    fn resolve_set_constants(&mut self) -> Result<(), String> {
         let pending = std::mem::take(&mut self.pending_set_exprs);
-        for (alias, expr, sec_idx) in pending {
-            if let Some(val) = self.eval_label_expr(&expr, sec_idx) {
-                self.set_values.insert(alias.clone(), val);
-                self.aliases.remove(&alias);
-            }
+        for (alias, expr, _sec_idx) in pending {
+            let v =
+                crate::backend::asm_expr::eval_section_expr(&expr, |n| self.final_set_name(n, 0))
+                    .map_err(|e| format!(".set {alias}: {e}"))?;
+            self.publish_final_set(&alias, v)?;
+        }
+        let mut names: Vec<String> = self.set_exprs.keys().cloned().collect();
+        names.sort_unstable();
+        for alias in names {
+            let captured = self.set_exprs[&alias].clone();
+            let v = self
+                .final_set_value(&captured, 0)
+                .map_err(|e| format!(".set {alias}: {e}"))?;
+            self.publish_final_set(&alias, v)?;
         }
         if self.set_values.is_empty() {
-            return;
+            return Ok(());
         }
         for sec_idx in 0..self.sections.len() {
             let mut remaining = Vec::new();
@@ -5290,6 +5599,77 @@ impl<A: X86Arch> ElfWriterCore<A> {
         for (name, val) in self.set_values.clone() {
             self.aliases.entry(name).or_insert_with(|| val.to_string());
         }
+        Ok(())
+    }
+
+    /// `v` with every defined label among its symbol terms (the global and
+    /// weak ones [`Self::final_set_name`] keeps by name) replaced by its
+    /// section plus offset: the value's position, independent of binding.
+    fn fold_label_terms(
+        &self,
+        v: crate::backend::asm_expr::SectionExpr<SetBase>,
+    ) -> crate::backend::asm_expr::SectionExpr<SetBase> {
+        use crate::backend::asm_expr::SectionExpr;
+        let mut folded = SectionExpr::absolute(v.constant);
+        for (base, coeff) in v.terms() {
+            let t = match base {
+                SetBase::Sym(n) => match self.label_positions.get(n) {
+                    Some(&(sec, off)) => SectionExpr::at(SetBase::Sec(sec), off as i64),
+                    None => SectionExpr::term(base.clone(), 1),
+                },
+                SetBase::Sec(_) => SectionExpr::term(base.clone(), 1),
+            };
+            folded = folded.add_scaled(t, *coeff);
+        }
+        folded
+    }
+
+    /// Give a `.set` symbol its final value: a constant is an ABS symbol
+    /// (relocations against it are patched by the caller), `section +
+    /// offset` a symbol defined there like a label (LOCAL unless `.globl`),
+    /// and `external + k` for a local symbol rewrites every relocation
+    /// against it to the external (GAS emits no symbol for it).
+    fn publish_final_set(
+        &mut self,
+        alias: &str,
+        v: crate::backend::asm_expr::SectionExpr<SetBase>,
+    ) -> Result<(), String> {
+        let folded = self.fold_label_terms(v);
+        self.set_exprs.remove(alias);
+        let c = folded.constant;
+        match folded.terms() {
+            [] => {
+                self.set_values.insert(alias.to_string(), c);
+            }
+            [(SetBase::Sec(sec), 1)] if c >= 0 => {
+                let sec = *sec;
+                self.place_label(alias, sec, c as u64);
+            }
+            [(SetBase::Sym(ext), 1)] if !self.is_global_or_weak(alias) => {
+                let ext = ext.clone();
+                for sec in &mut self.sections {
+                    for r in &mut sec.relocations {
+                        if r.symbol == alias {
+                            r.symbol = ext.clone();
+                            r.addend = r.addend.wrapping_add(c);
+                        }
+                    }
+                }
+            }
+            _ => {
+                let used = self.sections.iter().any(|s| {
+                    s.relocations
+                        .iter()
+                        .any(|r| r.symbol == alias || r.diff_symbol.as_deref() == Some(alias))
+                });
+                if used {
+                    return Err(format!(
+                        "can't resolve `{alias}': its value is not a link-time address"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Format a PC8 range failure exactly like GAS: positive values
@@ -5408,6 +5788,18 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         let b_pos = self.label_positions.get(diff_sym).copied().or_else(|| {
                             self.resolve_numeric_label(diff_sym, reloc.offset, sec_idx)
                         });
+                        // A SECTION symbol in a difference: in GAS a section
+                        // name used as a symbol is offset 0 of THAT section,
+                        // wherever the expression is placed.  So `X - S`
+                        // with X in S is a constant (the a_sec == b_sec rule
+                        // below), and with S the place section -- the kernel
+                        // vDSO extable's `.long (from) - __ex_table` -- a
+                        // PC-relative reloc against X (the b_sec == sec_idx
+                        // rule).  (From PR #845, which resolved only the
+                        // place section, so `.long lbl - .text` placed in
+                        // `.data` still failed where GAS gives lbl's offset.)
+                        let b_pos = b_pos
+                            .or_else(|| self.section_map.get(diff_sym.as_str()).map(|&i| (i, 0)));
                         if let (Some((a_sec, a_off)), Some((b_sec, b_off))) = (a_pos, b_pos) {
                             if a_sec == b_sec {
                                 let val = a_off as i64 - b_off as i64 + reloc.addend;
@@ -5428,35 +5820,28 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         // `identity_mapped - 0b` where identity_mapped lives
                         // in a different section of the same object.
                         if a_pos.is_none() || a_pos.map(|(s, _)| s) != Some(sec_idx) {
-                            if let Some((b_sec, b_off)) = b_pos {
-                                if b_sec == sec_idx && reloc.patch_size == 4 {
-                                    let mut conv = reloc.clone();
-                                    conv.reloc_type = A::reloc_pc32();
-                                    conv.addend += reloc.offset as i64 - b_off as i64;
-                                    conv.diff_symbol = None;
-                                    unresolved.push(conv);
-                                    continue;
-                                }
-                                // 8-byte sibling (`.quad xtrn - local`,
-                                // GAS 2.47: R_X86_64_PC64). The old path let
-                                // the ABS64 diff-reloc survive to emission,
-                                // which evaluates S+A instead of S+A-P. An
-                                // architecture without a PC64 type (ELF32)
-                                // cannot represent it at all -- GAS errors.
-                                if b_sec == sec_idx && reloc.patch_size == 8 {
-                                    if A::reloc_pc64() != A::reloc_pc32() {
-                                        let mut conv = reloc.clone();
-                                        conv.reloc_type = A::reloc_pc64();
-                                        conv.addend += reloc.offset as i64 - b_off as i64;
-                                        conv.diff_symbol = None;
-                                        unresolved.push(conv);
-                                        continue;
-                                    }
+                            // Every width (GAS 2.47: PC8/PC16/PC32/PC64 --
+                            // `.2byte t - d` with t in another section is a
+                            // PC16). The old 8-byte path let the ABS64
+                            // diff-reloc survive to emission (S+A instead of
+                            // S+A-P); an ELF32 target has no PC64 at all and
+                            // GAS errors.
+                            if let Some((b_sec, b_off)) = b_pos
+                                && b_sec == sec_idx
+                            {
+                                let Some(pc) = Self::data_pc_reloc(reloc.patch_size as usize)
+                                else {
                                     return Err(
                                         "cannot represent relocation type BFD_RELOC_64_PCREL"
                                             .to_string(),
                                     );
-                                }
+                                };
+                                let mut conv = reloc.clone();
+                                conv.reloc_type = pc;
+                                conv.addend += reloc.offset as i64 - b_off as i64;
+                                conv.diff_symbol = None;
+                                unresolved.push(conv);
+                                continue;
                             }
                         }
                     }
@@ -5518,6 +5903,18 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         }
                     }
 
+                    // `.byte f - .` with f a local label of this section:
+                    // a constant (GAS), range-checked like a short branch.
+                    if A::reloc_pc8() == Some(reloc.reloc_type) && target_sec == sec_idx && is_local
+                    {
+                        let rel = (target_off as i64) + reloc.addend - (reloc.offset as i64);
+                        if !(-128..=127).contains(&rel) {
+                            return Err(Self::pc8_range_error(rel, reloc.offset));
+                        }
+                        pc8_patches.push((reloc.offset as usize, rel as u8));
+                        continue;
+                    }
+
                     if target_sec == sec_idx
                         && is_local
                         && (reloc.reloc_type == A::reloc_pc32()
@@ -5526,17 +5923,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     {
                         let rel = (target_off as i64) + reloc.addend - (reloc.offset as i64);
                         resolved.push((reloc.offset as usize, rel, reloc.patch_size as usize));
-                    } else if let Some(abs32_type) = A::reloc_abs32_for_internal() {
-                        if target_sec == sec_idx && is_local && reloc.reloc_type == abs32_type {
-                            let val = (target_off as i64) + reloc.addend;
-                            resolved.push((reloc.offset as usize, val, reloc.patch_size as usize));
-                        } else {
-                            if let Some(msg) = Self::unrepresentable_quad_error(reloc) {
-                                return Err(msg);
-                            }
-                            unresolved.push(Self::externalize_pc8_reloc(reloc));
-                        }
                     } else {
+                        // An absolute reference stays a relocation even to a
+                        // label of its own section: its value is the link-time
+                        // address, not the section offset (GAS).
                         if let Some(msg) = Self::unrepresentable_quad_error(reloc) {
                             return Err(msg);
                         }
@@ -6992,6 +7382,58 @@ ret
 
         // PROGBITS content is untouched by the rule.
         assemble_object(".data\n.byte 1\n.short 256\n.fill 4,1,7\n");
+    }
+
+    /// Sparse NOBITS at scale (GAS 2.47 measured with `.byte 0; FORM;
+    /// after: .long 0` in `.bss`): zero content and position padding with
+    /// ANY fill byte are a size, so a gigabyte gap followed by more zeros
+    /// costs a counter -- the old writer refused or materialised it. Only
+    /// non-zero instruction bytes are materialised, and only from where they
+    /// start. PROGBITS keeps the per-directive ceiling.
+    #[test]
+    fn sparse_nobits_holds_zero_content_as_a_size() {
+        const G: u64 = 1 << 30;
+        for (src, size) in [
+            (format!(".bss\n.byte 0\n.zero {G}\n.long 0\n"), G + 5),
+            (format!(".bss\n.byte 0\n.fill {G},1,0\n.long 0\n"), G + 5),
+            (
+                format!(".bss\n.byte 0\n.fill {G},4,0\n.long 0\n"),
+                4 * G + 5,
+            ),
+            (format!(".bss\n.byte 0\n.skip {G},7\n.long 0\n"), G + 5),
+            (format!(".bss\n.byte 0\n.org {G},7\n.long 0\n"), G + 4),
+            (
+                format!(".bss\n.byte 0\n.zero {G}\n.uleb128 0\n.sleb128 0\n"),
+                G + 3,
+            ),
+            (
+                format!(".bss\n.byte 0\n.zero {G}\n.p2align 4,0x90\n"),
+                G + 16,
+            ),
+            (format!(".bss\nnop\n.zero {G}\n.long 0\n"), G + 5),
+        ] {
+            let obj = assemble_object(&src);
+            assert_eq!(section_size(&obj, ".bss"), Some(size), "{src:?}");
+            assert!(obj.len() < 1 << 16, "{src:?}: {} object bytes", obj.len());
+        }
+        // A symbolic `.skip` resolved after a held tail (GAS: 0x1c); the
+        // #844 tail made this an out-of-range splice (internal error).
+        let obj = assemble_object(".bss\n.zero 16\n.skip 2f-1f\n1:\n.zero 4\n2:\n.long 0\n");
+        assert_eq!(section_size(&obj, ".bss"), Some(0x1c));
+        // An instruction after a held tail sits at the right offset.
+        let obj = assemble_object(".bss\n.zero 16\nnop\nafter:\n.long 0\n");
+        assert_eq!(section_size(&obj, ".bss"), Some(21));
+        // PROGBITS: the ceiling still refuses a runaway fill, zero or not.
+        for src in [
+            ".data\n.fill 268435457,1,1\n",
+            ".data\n.fill 268435457,1,0\n",
+        ] {
+            let err = assemble_err(src, false);
+            assert!(err.contains("directive limit"), "{src:?}: {err}");
+        }
+        // NOBITS raw-value law survives the size path.
+        let err = assemble_err(&format!(".bss\n.fill {G},1,1\n"), false);
+        assert!(err.contains("fill section"), "{err}");
     }
 
     /// P1 bare-input law (GAS 2.47 measured, both targets): content

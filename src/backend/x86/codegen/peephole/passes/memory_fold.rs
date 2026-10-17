@@ -4548,9 +4548,9 @@ pub(super) fn fold_memory_rmw(store: &mut LineStore, infos: &mut [LineInfo]) -> 
         // Owned copies of the increment's register and immediate: the
         // copy parse borrows `lj`, which the copy arm then replaces with
         // the increment's own line text.
-        let (value_reg, imm_text): (String, String) =
+        let (value_reg, imm_text, op): (String, String, IncOp) =
             match parse_const_increment(&lj, reg_width, loaded_reg) {
-                Some((reg, imm)) => (reg.to_string(), imm.to_string()),
+                Some((reg, imm, op)) => (reg.to_string(), imm.to_string(), op),
                 None => {
                     let Some(copy_dest) = parse_same_width_copy(&lj, reg_width, loaded_reg) else {
                         i += 1;
@@ -4564,11 +4564,12 @@ pub(super) fn fold_memory_rmw(store: &mut LineStore, infos: &mut [LineInfo]) -> 
                         continue;
                     }
                     lj = infos[j].trimmed(store.get(j)).to_string();
-                    let Some((reg, imm)) = parse_const_increment(&lj, reg_width, &copy_dest) else {
+                    let Some((reg, imm, op)) = parse_const_increment(&lj, reg_width, &copy_dest)
+                    else {
                         i += 1;
                         continue;
                     };
-                    (reg.to_string(), imm.to_string())
+                    (reg.to_string(), imm.to_string(), op)
                 }
             };
         let value_fam = register_family_fast(&value_reg);
@@ -4710,7 +4711,8 @@ pub(super) fn fold_memory_rmw(store: &mut LineStore, infos: &mut [LineInfo]) -> 
             continue;
         }
         let suffix = mem_width.mnemonic_suffix();
-        let new_line = format!("    add{} ${}, {}", suffix, imm_text, mem);
+        let imm_text = narrow_imm_text(&imm_text, mem_width);
+        let new_line = format!("    {}{} ${}, {}", op.mnemonic(), suffix, imm_text, mem);
         // A volatile store fuses into a volatile RMW: the fused line must
         // stay pinned, or a later pass could reuse or delete the access
         // the fold just preserved. `replace_line` re-classifies, so the
@@ -4816,34 +4818,56 @@ fn parse_store_reg_to_mem(t: &str) -> Option<(RmwWidth, &str, &str)> {
     Some((width, src, dst))
 }
 
-/// A constant increment of `reg` on a line, in one of the two forms the
-/// backend emits:
+/// The ALU operation a fused read-modify-write re-emits.  Both are exact
+/// modulo 2^width, so a narrow store of the low bits of a wider `add`/`sub`
+/// equals the narrow memory-destination form of the same operation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IncOp {
+    Add,
+    Sub,
+}
+
+impl IncOp {
+    fn mnemonic(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Sub => "sub",
+        }
+    }
+}
+
+/// A constant increment of `reg` on a line, in one of the forms the backend
+/// emits:
 ///
-/// * `add{width} $IMM, %reg` -- in place, and
+/// * `add{width} $IMM, %reg` / `sub{width} $IMM, %reg` -- in place, and
 /// * `lea{l,q} IMM(%reg), %dst` -- the register-width LEA form (there is no
-///   8/16-bit LEA).
+///   8/16-bit LEA), always an add.
 ///
-/// Returns `(value_reg, immediate_text)`; the text is the source's own
-/// spelling (`1`, `0x1`, `-4`), re-emitted with a `$`.
+/// Returns `(value_reg, immediate_text, op)`; the text is the source's own
+/// spelling (`1`, `0x1`, `-4`), re-emitted with a `$` after the same
+/// operation, so no immediate is ever negated (`sub $-2147483648` has no
+/// `add` spelling).
 fn parse_const_increment<'a>(
     t: &'a str,
     width: RmwWidth,
     reg: &'a str,
-) -> Option<(&'a str, &'a str)> {
+) -> Option<(&'a str, &'a str, IncOp)> {
     let sp = t.find(' ')?;
     let (mnemonic, rest) = t.split_at(sp);
     let rest = rest.trim_start();
-    let want = format!("add{}", width.mnemonic_suffix());
-    if mnemonic == want {
+    let op = match mnemonic.strip_suffix(width.mnemonic_suffix()) {
+        Some("add") => Some(IncOp::Add),
+        Some("sub") => Some(IncOp::Sub),
+        _ => None,
+    };
+    if let Some(op) = op {
         let (imm, dst) = split_two_operands(rest)?;
         let imm = imm.strip_prefix('$')?;
         if dst != reg {
             return None;
         }
-        if parse_plain_imm(imm).is_none() {
-            return None;
-        }
-        return Some((reg, imm));
+        parse_plain_imm(imm)?;
+        return Some((reg, imm, op));
     }
     let lea_want = match width {
         RmwWidth::L => "leal",
@@ -4856,8 +4880,17 @@ fn parse_const_increment<'a>(
         let imm = &src[..open];
         let inner = src.get(open + 1..src.len().checked_sub(1)?)?;
         // Base-register-only addressing: an index term would mean the
-        // "increment" is not a constant add of this register.
-        if inner != reg {
+        // "increment" is not a constant add of this register.  The base is
+        // spelled in ADDRESS width, which on x86-64 is the 64-bit name of the
+        // family: the backend's own spelling of `x + K` for a 32-bit `x` in
+        // `%r9d` is `leal K(%r9), %dst`.  That is exactly the 32-bit add --
+        // `leal` keeps the low 32 bits of `%r9 + K`, which are `%r9d + K`
+        // modulo 2^32 whatever the upper half holds -- so the base is
+        // compared by family, accepting the loaded register's own spelling or
+        // its 64-bit address spelling and nothing else (no 16/8-bit names, no
+        // other family).
+        let fam = register_family_fast(reg);
+        if fam > 15 || (inner != reg && inner != reg_id_to_name(fam, MoveSize::Q)) {
             return None;
         }
         if imm.is_empty() || parse_plain_imm(imm).is_none() {
@@ -4866,9 +4899,34 @@ fn parse_const_increment<'a>(
         if !dst.starts_with('%') || dst.contains('(') {
             return None;
         }
-        return Some((dst, imm));
+        return Some((dst, imm, IncOp::Add));
     }
     None
+}
+
+/// The immediate of a fused narrow RMW.  The increment ran at register width
+/// (`leal 300(%r9), %eax` feeding a byte store), but the fused instruction
+/// carries a `width`-bit immediate: a byte/word operation only ever sees the
+/// value modulo 2^width, so an out-of-range literal is re-spelled as its
+/// wrapped signed value (`300` -> `44` for a byte), which encodes the same
+/// bytes the assembler would have truncated to -- without the "shortened"
+/// warning or the misleading text.  In-range literals (signed or unsigned
+/// reading) keep the source's spelling.
+fn narrow_imm_text(imm: &str, width: RmwWidth) -> String {
+    let bits = match width {
+        RmwWidth::B => 8,
+        RmwWidth::W => 16,
+        RmwWidth::L | RmwWidth::Q => return imm.to_string(),
+    };
+    let Some(v) = parse_plain_imm(imm) else {
+        return imm.to_string();
+    };
+    if (-(1i64 << (bits - 1))..(1i64 << bits)).contains(&v) {
+        return imm.to_string();
+    }
+    // Two's-complement wrap into `bits`: keep the low bits, then re-sign.
+    let sign = 1i64 << (bits - 1);
+    (((v & ((1i64 << bits) - 1)) ^ sign) - sign).to_string()
 }
 
 /// Decimal or `0x` integer literal with an optional sign, in `i32` range --
@@ -4951,4 +5009,125 @@ fn parse_narrow_copy(t: &str, mem_width: RmwWidth) -> Option<RegId> {
         return None;
     }
     Some(fam)
+}
+
+#[cfg(test)]
+mod rmw_increment_form_tests {
+    use super::super::super::types::classify_line;
+    use super::{RmwWidth, fold_memory_rmw, narrow_imm_text};
+    use crate::backend::peephole_common::LineStore;
+
+    fn run(asm: &str) -> (bool, Vec<String>) {
+        let mut store = LineStore::new(asm.to_string());
+        let n = store.len();
+        let mut infos: Vec<_> = (0..n).map(|i| classify_line(store.get(i))).collect();
+        let changed = fold_memory_rmw(&mut store, &mut infos);
+        let out: Vec<String> = (0..store.len())
+            .filter(|i| !infos[*i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect();
+        (changed, out)
+    }
+
+    /// Every temporary the fold deletes is redefined before `ret`, and the
+    /// redefinitions also kill the flags, so deadness is never the reason a
+    /// case below folds or refuses.
+    const TAIL: &str = "    xorl %eax, %eax\n    xorl %r9d, %r9d\n    xorl %r10d, %r10d\n    ret\n";
+
+    /// The backend's spelling of a 32-bit `x + K`: the LEA base is the
+    /// family's 64-bit (address-width) name.  This is `C[idx]++` on an `int`
+    /// table, and it used to be refused because `%r9` != `%r9d` textually.
+    #[test]
+    fn folds_lea_with_address_width_base() {
+        let (changed, out) = run(&format!(
+            "    movl (%rdi, %rsi, 4), %r9d\n    leal 1(%r9), %eax\n    movl %eax, (%rdi, %rsi, 4)\n{TAIL}"
+        ));
+        assert!(changed, "{out:?}");
+        assert_eq!(out[0], "addl $1, (%rdi, %rsi, 4)", "{out:?}");
+    }
+
+    /// The loaded register's own spelling stays accepted.
+    #[test]
+    fn folds_lea_with_exact_base() {
+        let (changed, out) = run(&format!(
+            "    movl (%rdi), %r9d\n    leal 7(%r9d), %eax\n    movl %eax, (%rdi)\n{TAIL}"
+        ));
+        assert!(changed, "{out:?}");
+        assert_eq!(out[0], "addl $7, (%rdi)", "{out:?}");
+    }
+
+    /// A base of ANOTHER family is not an increment of the loaded value.
+    #[test]
+    fn refuses_lea_with_other_family_base() {
+        let (changed, out) = run(&format!(
+            "    movl (%rdi), %r9d\n    leal 1(%r10), %eax\n    movl %eax, (%rdi)\n{TAIL}"
+        ));
+        assert!(!changed, "{out:?}");
+    }
+
+    /// An index term makes it `x + y + K`, not a constant increment.
+    #[test]
+    fn refuses_lea_with_index_term() {
+        let (changed, out) = run(&format!(
+            "    movl (%rdi), %r9d\n    leal 1(%r9, %r9), %eax\n    movl %eax, (%rdi)\n{TAIL}"
+        ));
+        assert!(!changed, "{out:?}");
+    }
+
+    /// `C[i] -= K` fuses to the same operation, never to a negated `add`.
+    #[test]
+    fn folds_sub_with_same_operation() {
+        let (changed, out) = run(&format!(
+            "    movl (%rdi, %rsi, 4), %eax\n    subl $3, %eax\n    movl %eax, (%rdi, %rsi, 4)\n{TAIL}"
+        ));
+        assert!(changed, "{out:?}");
+        assert_eq!(out[0], "subl $3, (%rdi, %rsi, 4)", "{out:?}");
+        let (changed, out) = run(&format!(
+            "    movl (%rdi), %eax\n    subl $-2147483648, %eax\n    movl %eax, (%rdi)\n{TAIL}"
+        ));
+        assert!(changed, "{out:?}");
+        assert_eq!(out[0], "subl $-2147483648, (%rdi)", "{out:?}");
+    }
+
+    /// A `sub` of a register other than the loaded one is not an increment.
+    #[test]
+    fn refuses_sub_of_other_register() {
+        let (changed, out) = run(&format!(
+            "    movl (%rdi), %eax\n    subl $3, %r10d\n    movl %eax, (%rdi)\n{TAIL}"
+        ));
+        assert!(!changed, "{out:?}");
+    }
+
+    /// A byte counter incremented at register width: the fused `addb` gets the
+    /// immediate wrapped into 8 bits instead of a literal GAS must truncate.
+    #[test]
+    fn narrow_fold_wraps_out_of_range_immediate() {
+        let (changed, out) = run(&format!(
+            "    movzbl (%rdi), %r9d\n    leal 300(%r9), %eax\n    movb %al, (%rdi)\n{TAIL}"
+        ));
+        assert!(changed, "{out:?}");
+        assert_eq!(out[0], "addb $44, (%rdi)", "{out:?}");
+    }
+
+    #[test]
+    fn narrow_imm_text_is_exact_modulo_width() {
+        let cases = [
+            ("1", RmwWidth::B, "1"),
+            ("-3", RmwWidth::B, "-3"),
+            ("255", RmwWidth::B, "255"),
+            ("-128", RmwWidth::B, "-128"),
+            ("200", RmwWidth::B, "200"),
+            ("300", RmwWidth::B, "44"),
+            ("-129", RmwWidth::B, "127"),
+            ("0x1ff", RmwWidth::B, "-1"),
+            ("70000", RmwWidth::W, "4464"),
+            ("65535", RmwWidth::W, "65535"),
+            ("-32769", RmwWidth::W, "32767"),
+            ("70000", RmwWidth::L, "70000"),
+            ("-2147483648", RmwWidth::Q, "-2147483648"),
+        ];
+        for (imm, width, want) in cases {
+            assert_eq!(narrow_imm_text(imm, width), want, "{imm} at {width:?}");
+        }
+    }
 }

@@ -7,6 +7,7 @@
 //! - `classify_struct_return`: shared sret/two-reg classification logic
 //! - Helpers: maybe_narrow_call_result, is_function_variadic, get_func_ptr_return_ir_type
 
+use super::aggregate_abi::AggregateReturn;
 use super::lower::Lowerer;
 use crate::common::types::{AddressSpace, CType, IrType, target_int_ir_type};
 use crate::frontend::parser::ast::Expr;
@@ -232,15 +233,15 @@ impl Lowerer {
         if call_return_ct.is_none() {
             call_return_ct = self.call_return_ctype(effective_func);
         }
-        let i686_ext_vector_gp_return_ctype = if crate::common::types::target_is_32bit() {
-            call_return_ct.filter(|ct| ct.i686_ext_vector_gp_word_count().is_some())
+        // i686 ext vectors returned in registers (lane words, one floating
+        // lane, or one XMM piece); the call result is rebuilt into an object.
+        let i686_ext_vector_reg_return_ctype = if crate::common::types::target_is_32bit() {
+            call_return_ct
+                .clone()
+                .filter(|ct| ct.i686_ext_vector_ret_carrier().is_some())
         } else {
             None
         };
-        let i686_ext_vector_gp_return_words = i686_ext_vector_gp_return_ctype
-            .as_ref()
-            .and_then(CType::i686_ext_vector_gp_word_count)
-            .unwrap_or(0);
 
         // Determine sret/two-reg return convention
         // `f128_sret_ret`: the callee returns a _Float128/_Decimal128 through
@@ -248,64 +249,31 @@ impl Lowerer {
         // buffer ADDRESS, and the 16-byte carrier value must be loaded out of
         // it (see the sret result handling below).
         let mut f128_sret_ret = false;
-        // AUD-VABI-1: the indirect-call paths below have no FuncSig to read, so
-        // the "ONE 16-byte %xmm" carrier for a vector-returning indirect call
-        // has to come from the callee expression's own function type.  Without
-        // it `pick_impl(0)(a, b, c)` read the result from %rdx:%rax while the
-        // callee (whatever compiled it) had written %xmm0.
-        let indirect_vector_carrier = if crate::common::types::target_elf_machine() == 62 {
-            self.call_return_ctype(effective_func)
-                .and_then(|ct| ct.sysv_vector_carrier())
-        } else {
-            None
-        };
-        let (indirect_ret_classes, indirect_ret_is_one_xmm) = match &indirect_vector_carrier {
-            Some((classes, one_xmm)) => (classes.clone(), *one_xmm),
-            None => (Vec::new(), false),
-        };
-        let (sret_size, two_reg_size, mut call_ret_classes) =
-            if let Expr::Identifier(name, _) = stripped_func {
-                if self.is_func_ptr_variable(name) {
-                    // Indirect call through function pointer variable
-                    // TODO: compute ret_eightbyte_classes from the function pointer's
-                    // return type to support mixed SSE/INTEGER struct returns via fptrs
-                    match self.get_call_return_struct_size(effective_func) {
-                        Some(size) => {
-                            let (s, t) = Self::classify_struct_return(size);
-                            (s, t, indirect_ret_classes.clone())
-                        }
-                        None => (None, None, Vec::new()),
-                    }
-                } else {
-                    // Direct function call - look up by function name
-                    let sig = self.func_meta.sigs.get(name.as_str());
-                    f128_sret_ret = sig.is_some_and(|s| s.ret_is_f128_sse && s.sret_size.is_some());
-                    (
-                        sig.and_then(|s| s.sret_size),
-                        sig.and_then(|s| s.two_reg_ret_size),
-                        sig.map(|s| s.ret_eightbyte_classes.clone())
-                            .unwrap_or_default(),
-                    )
-                }
-            } else {
-                // Non-identifier function expression (e.g., array[i]())
-                // TODO: compute ret_eightbyte_classes from expression return type
-                // to support mixed SSE/INTEGER struct returns via indirect calls
-                match self.get_call_return_struct_size(effective_func) {
-                    Some(size) => {
-                        let (s, t) = Self::classify_struct_return(size);
-                        (s, t, indirect_ret_classes.clone())
-                    }
-                    None => (None, None, Vec::new()),
-                }
-            };
-        if i686_ext_vector_gp_return_words == 3 {
-            call_ret_classes = vec![
-                crate::common::types::EightbyteClass::Integer,
-                crate::common::types::EightbyteClass::Integer,
-                crate::common::types::EightbyteClass::Integer,
-            ];
+        // The return convention of this call: the callee's signature for a
+        // direct call; for an indirect call (no FuncSig) the callee
+        // expression's own function type, classified like a definition.
+        let mut ret_abi = self.call_aggregate_return(stripped_func);
+        if let Expr::Identifier(name, _) = stripped_func {
+            if !self.is_func_ptr_variable(name) {
+                f128_sret_ret = self
+                    .func_meta
+                    .sigs
+                    .get(name.as_str())
+                    .is_some_and(|s| s.ret_is_f128_sse && s.sret_size.is_some());
+            }
         }
+        if let Some((_, classes)) = i686_ext_vector_reg_return_ctype
+            .as_ref()
+            .and_then(CType::i686_ext_vector_ret_carrier)
+        {
+            // Carrier markers for the backend: three INTEGER classes for the
+            // EAX:EDX:ECX lane-word bundle, `[Sse, SseUp]` for `%xmm0`.
+            if !classes.is_empty() {
+                ret_abi.classes = classes;
+            }
+        }
+        let sret_size = ret_abi.sret_size;
+        let two_reg_size = ret_abi.two_reg_size;
 
         // Lower arguments with implicit casts
         let (
@@ -357,6 +325,12 @@ impl Lowerer {
                 .map(|(_, param_ctypes, _, _)| param_ctypes)
                 .filter(|v| !v.is_empty())
         });
+        self.diagnose_call_ext_vector_abi(
+            stripped_func,
+            call_return_ct.as_ref(),
+            &param_ctypes_for_decompose,
+            args,
+        );
         self.decompose_complex_call_args(
             &mut arg_vals,
             &mut arg_types,
@@ -376,7 +350,6 @@ impl Lowerer {
             &mut struct_arg_riscv_float_classes,
             &param_ctypes_for_decompose,
             args,
-            call_is_variadic,
         );
 
         let dest = self.fresh_value();
@@ -439,32 +412,29 @@ impl Lowerer {
         // Unknown/unprototyped/variadic-tail/complex-callee positions keep
         // the argument expression's own type (covers indirect calls and
         // variadic positions, as before).
-        // AUD-VABI-1: a 16-byte VECTOR argument is carried in ONE 16-byte xmm
-        // register just like _Float128 (its eightbytes are SSE + SSEUP, the
-        // upper half of the same register).  Without this the [Sse, Sse]
-        // classes below send it through the two-register struct path, so a
-        // gcc-compiled callee read the vector from xmm0 while lccc's caller
-        // had put its halves in a GP pair.
-        let one_xmm_carrier = |ct: &CType| -> bool {
-            ct.sysv_vector_carrier().is_some_and(|(_, one_xmm)| one_xmm)
-                && crate::common::types::target_elf_machine() == 62
-        };
+        // `_Float128`/`_Decimal128` scalars: the operand is the 16-byte value
+        // itself (backend class F128SseReg). A 16-byte `[SSE, SSEUP]`
+        // aggregate or vector also travels in one XMM register, but its
+        // operand is an address: the backend recognises it from the
+        // eightbyte classes (StructXmmReg), so it must NOT be flagged here.
         let original_f128_flags: Vec<bool> = args
             .iter()
             .enumerate()
             .map(|(i, a)| {
                 if let Some(p) = param_ctypes_for_decompose.as_ref().and_then(|v| v.get(i)) {
-                    return matches!(p, CType::Float128 | CType::Decimal128) || one_xmm_carrier(p);
+                    return matches!(p, CType::Float128 | CType::Decimal128);
                 }
-                self.get_expr_ctype(a).is_some_and(|ct| {
-                    matches!(ct, CType::Float128 | CType::Decimal128) || one_xmm_carrier(&ct)
-                })
+                self.get_expr_ctype(a)
+                    .is_some_and(|ct| matches!(ct, CType::Float128 | CType::Decimal128))
             })
             .collect();
         let mut struct_arg_is_f128_sse = Vec::with_capacity(arg_vals.len());
         for (arg_idx, flag) in original_f128_flags.into_iter().enumerate() {
-            if let Some(lanes) = ext_vector_arg_lanes.get(arg_idx).copied().flatten() {
-                struct_arg_is_f128_sse.extend(std::iter::repeat_n(false, lanes));
+            if let Some((count, xmm_pieces)) = ext_vector_arg_lanes.get(arg_idx).copied().flatten()
+            {
+                // XMM pieces reuse the 16-byte stack alignment of the i686
+                // `__float128` carrier; scalarized lanes are plain slots.
+                struct_arg_is_f128_sse.extend(std::iter::repeat_n(xmm_pieces, count));
             } else {
                 struct_arg_is_f128_sse.push(flag);
             }
@@ -505,10 +475,10 @@ impl Lowerer {
                                         2
                                     }
                                     CType::ComplexLongDouble if decomposes_cld => 2,
-                                    CType::ExtVector(_, layout)
+                                    CType::ExtVector(..)
                                         if crate::common::types::target_is_32bit() =>
                                     {
-                                        layout.lanes
+                                        ct.i386_ext_vector_ir_args()
                                     }
                                     _ => 1,
                                 }
@@ -543,13 +513,7 @@ impl Lowerer {
             struct_arg_is_f128_sse,
             call_variadic,
             num_fixed_args,
-            two_reg_size,
-            sret_size,
-            call_ret_classes,
-            // AUD-VABI-1: "the indirect callee returns a 16-byte vector in ONE
-            // %xmm" -- derived from the callee expression's function type,
-            // since these paths have no FuncSig to consult.
-            indirect_ret_is_one_xmm,
+            &ret_abi,
         );
 
         // After call to noreturn function, emit unreachable and start dead block.
@@ -600,8 +564,29 @@ impl Lowerer {
             return self.unpack_two_reg_return(dest, size);
         }
 
-        if let Some(vector_ct) = i686_ext_vector_gp_return_ctype.as_ref() {
-            return self.unpack_i686_ext_vector_gp_return(dest, call_ret_ty, vector_ct);
+        if let Some(vector_ct) = i686_ext_vector_reg_return_ctype.as_ref() {
+            return self.unpack_i686_ext_vector_reg_return(dest, call_ret_ty, vector_ct);
+        }
+        // X87-class aggregate (`struct { long double }`): the call produced
+        // the long double from %st(0); give it the aggregate's storage.
+        if ret_abi.x87 {
+            let alloca = self.fresh_value();
+            self.emit(Instruction::Alloca {
+                dest: alloca,
+                ty: IrType::F128,
+                size: 16,
+                align: 16,
+                volatile: false,
+                semantic_volatile: false,
+            });
+            self.emit(Instruction::Store {
+                volatile: false,
+                val: Operand::Value(dest),
+                ptr: alloca,
+                ty: IrType::F128,
+                seg_override: AddressSpace::Default,
+            });
+            return Operand::Value(alloca);
         }
 
         // For complex returns (non-sret), store into complex alloca
@@ -690,7 +675,7 @@ impl Lowerer {
     /// padded object representation. Materialize the carrier in memory before
     /// loading lanes: i686 I128 arithmetic intentionally models the low 64-bit
     /// pair, so shifting an I128 by 64 would lose the ECX word.
-    fn unpack_i686_ext_vector_gp_return(
+    pub(super) fn unpack_i686_ext_vector_gp_return(
         &mut self,
         dest: Value,
         return_type: IrType,
@@ -740,11 +725,13 @@ impl Lowerer {
                     ty: IrType::I32,
                     seg_override: AddressSpace::Default,
                 });
+                let lane_value =
+                    self.i386_bool_lane_bit(vector_ct, Operand::Value(lane_value), IrType::I32);
                 self.store_vector_lane(
                     result,
                     vector_ct,
                     lane,
-                    Operand::Value(lane_value),
+                    lane_value,
                     IrType::I32,
                     AddressSpace::Default,
                     false,
@@ -947,10 +934,27 @@ impl Lowerer {
         }
     }
 
-    /// Scalarize fixed i686 ExtVector call arguments to match Clang's lane-wise
-    /// stack ABI. `vector_size` and long-double ext-vectors keep their existing
-    /// by-value aggregate path. Returns each original argument's lane count so
-    /// call metadata (fixed-argument count and carrier flags) can be expanded.
+    /// The C type an argument is passed as: its prototype parameter's type,
+    /// else (variadic or unprototyped calls) the argument expression's own.
+    pub(super) fn call_arg_ctype(
+        &self,
+        param_ctypes: &Option<Vec<CType>>,
+        arg_idx: usize,
+        arg: &Expr,
+    ) -> Option<CType> {
+        match param_ctypes.as_ref().and_then(|p| p.get(arg_idx)) {
+            Some(ct) => Some(ct.clone()),
+            None => self.get_expr_ctype(arg),
+        }
+    }
+
+    /// Lower i686 ExtVector call arguments to Clang 23.1.3's i386 carriers
+    /// (`CType::i386_ext_vector_arg`): scalarized lanes, each its own stack
+    /// slot; widened vectors as 16-byte `[Sse, SseUp]` pieces (`%xmm0-2`,
+    /// then 16-byte-aligned stack); 8-byte integer images as a by-value
+    /// 8-byte aggregate. Returns, per original argument, how many IR arguments it
+    /// became and whether those are 16-byte-aligned XMM pieces, so the call
+    /// metadata (fixed-argument count, carrier flags) can be expanded.
     fn decompose_i686_ext_vector_call_args(
         &mut self,
         arg_vals: &mut Vec<Operand>,
@@ -961,23 +965,22 @@ impl Lowerer {
         struct_arg_riscv_float_classes: &mut Vec<Option<crate::common::types::RiscvFloatClass>>,
         param_ctypes: &Option<Vec<CType>>,
         args: &[Expr],
-        _is_variadic_call: bool,
-    ) -> Vec<Option<usize>> {
-        let mut lane_counts = vec![None; args.len()];
+    ) -> Vec<Option<(usize, bool)>> {
+        use crate::common::types::{EightbyteClass, I386ExtVectorCarrier};
+        let mut expansions = vec![None; args.len()];
         if !crate::common::types::target_is_32bit() {
-            return lane_counts;
+            return expansions;
         }
-        let Some(param_ctypes) = param_ctypes.as_ref() else {
-            return lane_counts;
-        };
 
+        // No earlier i686 pass splits an argument (complex values travel as
+        // structs), so operand i is still argument i.
+        debug_assert_eq!(arg_vals.len(), args.len());
         let old_vals = std::mem::take(arg_vals);
         let old_types = std::mem::take(arg_types);
         let old_sizes = std::mem::take(struct_arg_sizes);
         let old_aligns = std::mem::take(struct_arg_aligns);
         let old_classes = std::mem::take(struct_arg_classes);
         let old_riscv_classes = std::mem::take(struct_arg_riscv_float_classes);
-        let mut cursor = 0usize;
         let mut new_vals = Vec::with_capacity(old_vals.len());
         let mut new_types = Vec::with_capacity(old_types.len());
         let mut new_sizes = Vec::with_capacity(old_sizes.len());
@@ -985,61 +988,89 @@ impl Lowerer {
         let mut new_classes = Vec::with_capacity(old_classes.len());
         let mut new_riscv_classes = Vec::with_capacity(old_riscv_classes.len());
 
-        for (arg_idx, arg) in args.iter().enumerate() {
-            let ext_vector = param_ctypes.get(arg_idx).and_then(|ct| match ct {
-                CType::ExtVector(elem, layout) => Some((ct, elem.as_ref(), layout.lanes)),
-                _ => None,
-            });
-            if let Some((vector_ct, elem_ct, lanes)) = ext_vector {
-                let Some(value) = old_vals.get(cursor).copied() else {
-                    break;
-                };
-                let base = self.operand_to_value(value);
-                let address_space = self.aggregate_lvalue_space(arg);
-                let volatile = self.expr_access_is_volatile(arg);
-                let lane_ty = if matches!(elem_ct, CType::Bool) {
-                    IrType::I32
-                } else {
-                    IrType::from_ctype(elem_ct)
-                };
-                for lane in 0..lanes {
-                    let lane_value =
-                        self.load_vector_lane(base, vector_ct, lane, address_space, volatile);
-                    new_vals.push(lane_value);
-                    new_types.push(lane_ty);
-                    new_sizes.push(None);
-                    new_aligns.push(None);
-                    // `[NoClass]` tags this scalar as an i686 ExtVector lane;
-                    // regparm/fastcall keep it on the stack without consuming
-                    // their next ordinary GP argument register.
-                    new_classes.push(vec![crate::common::types::EightbyteClass::NoClass]);
-                    new_riscv_classes.push(None);
-                }
-                lane_counts[arg_idx] = Some(lanes);
-                cursor += 1;
-            } else {
-                let Some(value) = old_vals.get(cursor).copied() else {
-                    break;
-                };
+        for (cursor, &value) in old_vals.iter().enumerate() {
+            let arg = args.get(cursor);
+            let vector_ct = arg
+                .and_then(|arg| self.call_arg_ctype(param_ctypes, cursor, arg))
+                .filter(|ct| matches!(ct, CType::ExtVector(..)));
+            let carrier = vector_ct.as_ref().and_then(CType::i386_ext_vector_arg);
+            let (Some(arg), Some(vector_ct), Some(carrier)) = (arg, vector_ct, carrier) else {
                 new_vals.push(value);
                 new_types.push(old_types.get(cursor).copied().unwrap_or(IrType::Ptr));
                 new_sizes.push(old_sizes.get(cursor).copied().flatten());
                 new_aligns.push(old_aligns.get(cursor).copied().flatten());
                 new_classes.push(old_classes.get(cursor).cloned().unwrap_or_default());
                 new_riscv_classes.push(old_riscv_classes.get(cursor).copied().flatten());
-                cursor += 1;
+                continue;
+            };
+            let base = self.operand_to_value(value);
+            let address_space = self.aggregate_lvalue_space(arg);
+            let volatile = self.expr_access_is_volatile(arg);
+            match carrier {
+                I386ExtVectorCarrier::Lanes => {
+                    let (elem_ct, lanes) = vector_ct
+                        .vector_info()
+                        .expect("ExtVector must carry its logical lane count");
+                    let lane_ty = if matches!(elem_ct, CType::Bool) {
+                        IrType::I32
+                    } else {
+                        IrType::from_ctype(elem_ct)
+                    };
+                    for lane in 0..lanes {
+                        let lane_value =
+                            self.load_vector_lane(base, &vector_ct, lane, address_space, volatile);
+                        new_vals.push(lane_value);
+                        new_types.push(lane_ty);
+                        new_sizes.push(None);
+                        new_aligns.push(None);
+                        // `[NoClass]` tags this scalar as an i686 ExtVector
+                        // lane; regparm/fastcall keep it on the stack without
+                        // consuming their next ordinary GP argument register.
+                        new_classes.push(vec![EightbyteClass::NoClass]);
+                        new_riscv_classes.push(None);
+                    }
+                    expansions[cursor] = Some((lanes, false));
+                }
+                I386ExtVectorCarrier::Xmm { pieces } => {
+                    let image = self.i386_ext_vector_xmm_image(
+                        base,
+                        &vector_ct,
+                        pieces,
+                        address_space,
+                        volatile,
+                    );
+                    for piece in 0..pieces {
+                        let ptr = if piece == 0 {
+                            image
+                        } else {
+                            self.emit_gep_offset(image, 16 * piece, IrType::Ptr)
+                        };
+                        new_vals.push(Operand::Value(ptr));
+                        new_types.push(IrType::Ptr);
+                        new_sizes.push(Some(16));
+                        new_aligns.push(Some(16));
+                        new_classes.push(vec![EightbyteClass::Sse, EightbyteClass::SseUp]);
+                        new_riscv_classes.push(None);
+                    }
+                    expansions[cursor] = Some((pieces, true));
+                }
+                I386ExtVectorCarrier::Image64
+                | I386ExtVectorCarrier::Unsupported
+                | I386ExtVectorCarrier::Scalar
+                | I386ExtVectorCarrier::GpLanes
+                | I386ExtVectorCarrier::Sret => {
+                    // (`Unsupported` shapes are diagnosed for calls that can
+                    // reach foreign code; see diagnose_call_ext_vector_abi.)
+                    // The object bytes as one by-value stack aggregate (an
+                    // i64 image occupies two 4-byte-aligned slots).
+                    new_vals.push(Operand::Value(base));
+                    new_types.push(IrType::Ptr);
+                    new_sizes.push(Some(vector_ct.size()));
+                    new_aligns.push(Some(4));
+                    new_classes.push(Vec::new());
+                    new_riscv_classes.push(None);
+                }
             }
-        }
-        // Keep any remaining operands intact if a prior ABI decomposition
-        // produced extra entries; this is a defensive preservation path.
-        while cursor < old_vals.len() {
-            new_vals.push(old_vals[cursor]);
-            new_types.push(old_types.get(cursor).copied().unwrap_or(IrType::Ptr));
-            new_sizes.push(old_sizes.get(cursor).copied().flatten());
-            new_aligns.push(old_aligns.get(cursor).copied().flatten());
-            new_classes.push(old_classes.get(cursor).cloned().unwrap_or_default());
-            new_riscv_classes.push(old_riscv_classes.get(cursor).copied().flatten());
-            cursor += 1;
         }
         *arg_vals = new_vals;
         *arg_types = new_types;
@@ -1047,7 +1078,7 @@ impl Lowerer {
         *struct_arg_aligns = new_aligns;
         *struct_arg_classes = new_classes;
         *struct_arg_riscv_float_classes = new_riscv_classes;
-        lane_counts
+        expansions
     }
 
     /// Lower function call arguments, applying implicit casts for parameter types
@@ -1262,10 +1293,9 @@ impl Lowerer {
                 // direct function calls, statement expressions wrapping calls,
                 // ternaries, comma expressions, etc.
                 {
-                    let is_struct_ret = matches!(
-                        self.get_expr_ctype(a),
-                        Some(CType::Struct(_)) | Some(CType::Union(_))
-                    );
+                    let is_struct_ret = self
+                        .get_expr_ctype(a)
+                        .is_some_and(|ct| ct.is_struct_or_union() || ct.is_vector());
                     if is_struct_ret && self.expr_produces_packed_struct_data(a) {
                         let struct_size = self.struct_value_size(a).unwrap_or(8);
                         let alloc_size = if struct_size > 0 { struct_size } else { 8 };
@@ -1287,6 +1317,16 @@ impl Lowerer {
                             seg_override: AddressSpace::Default,
                         });
                         val = Operand::Value(alloca);
+                    }
+                    // A by-value vector argument is now the ADDRESS of its
+                    // object (packed carriers were spilled just above), whatever
+                    // carrier type `get_expr_type` reports for a call result
+                    // (i686 ext vectors: I32/I64/I128 words, an x87 lane, or an
+                    // XMM image). Casting that carrier type to the parameter's
+                    // Ptr would reinterpret the address (an I128 cast is an
+                    // ICE on i686).
+                    if self.get_expr_ctype(a).is_some_and(|ct| ct.is_vector()) {
+                        arg_ty = IrType::Ptr;
                     }
                 }
 
@@ -1398,7 +1438,9 @@ impl Lowerer {
                                 self.struct_value_size(a)
                             }
                         }
-                        Some(CType::Vector(_, total_size)) => Some(total_size),
+                        // GNU and ext vectors alike are passed by value
+                        // (an ext vector's object includes its padding).
+                        Some(ref ct) if ct.is_vector() => Some(ct.size()),
                         Some(CType::ComplexLongDouble) if !decomposes_cld => {
                             Some(CType::ComplexLongDouble.size())
                         }
@@ -1446,9 +1488,9 @@ impl Lowerer {
                                 self.struct_value_size(a)
                             }
                         }
-                        Some(CType::Vector(_, total_size)) => {
-                            Some(total_size) // Vector types are passed by value like structs
-                        }
+                        // GNU and ext vectors alike are passed by value
+                        // (an ext vector's object includes its padding).
+                        Some(ref ct) if ct.is_vector() => Some(ct.size()),
                         Some(CType::ComplexLongDouble) if !decomposes_cld => {
                             Some(CType::ComplexLongDouble.size())
                         }
@@ -1552,6 +1594,10 @@ impl Lowerer {
         expr: &Expr,
     ) -> Vec<crate::common::types::EightbyteClass> {
         if let Some(ctype) = self.get_expr_ctype(expr) {
+            // x86-64 structs, unions AND vectors (a vector has no layout).
+            if let Some((classes, _)) = self.sysv_arg_abi(&ctype) {
+                return classes;
+            }
             if let Some(layout) = self.get_struct_layout_for_ctype(&ctype) {
                 return layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts());
             }
@@ -1574,14 +1620,13 @@ impl Lowerer {
         struct_arg_is_f128_sse: Vec<bool>,
         is_variadic: bool,
         num_fixed_args: usize,
-        two_reg_size: Option<usize>,
-        sret_size: Option<usize>,
-        call_ret_classes: Vec<crate::common::types::EightbyteClass>,
-        indirect_ret_is_one_xmm: bool,
+        ret_abi: &AggregateReturn,
     ) -> IrType {
         let mut indirect_ret_ty = self.get_func_ptr_return_ir_type(func);
-        if two_reg_size.is_some() {
+        if ret_abi.two_reg_size.is_some() {
             indirect_ret_ty = IrType::I128;
+        } else if ret_abi.x87 {
+            indirect_ret_ty = IrType::F128;
         }
 
         match func {
@@ -1605,13 +1650,14 @@ impl Lowerer {
                             struct_arg_classes,
                             struct_arg_riscv_float_classes,
                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
-                            is_sret: sret_size.is_some(),
+                            is_sret: ret_abi.sret_size.is_some(),
                             is_fastcall: false,
                             regparm: None,
                             is_pure: false,
                             is_const: false,
-                            ret_eightbyte_classes: call_ret_classes,
-                            ret_is_f128_sse: indirect_ret_is_one_xmm,
+                            assume_library: false,
+                            ret_eightbyte_classes: ret_abi.classes.clone(),
+                            ret_is_f128_sse: ret_abi.one_xmm,
                         },
                     });
                     indirect_ret_ty
@@ -1660,12 +1706,13 @@ impl Lowerer {
                             struct_arg_classes,
                             struct_arg_riscv_float_classes,
                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
-                            is_sret: sret_size.is_some(),
+                            is_sret: ret_abi.sret_size.is_some(),
                             is_fastcall: callee_is_fastcall,
                             regparm: callee_regparm,
                             is_pure,
                             is_const,
-                            ret_eightbyte_classes: call_ret_classes,
+                            assume_library: false,
+                            ret_eightbyte_classes: ret_abi.classes.clone(),
                             ret_is_f128_sse: call_ret_is_f128_sse,
                         },
                     });
@@ -1715,15 +1762,15 @@ impl Lowerer {
                         struct_arg_classes: sac,
                         struct_arg_riscv_float_classes: sarfc,
                         struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
-                        is_sret: sret_size.is_some(),
+                        is_sret: ret_abi.sret_size.is_some(),
                         is_fastcall: false,
                         regparm: None,
                         is_pure: false,
                         is_const: false,
-                        ret_eightbyte_classes: call_ret_classes,
-                        // AUD-VABI-1: the same carrier rule as the other
-                        // indirect arms -- see `indirect_vector_carrier`.
-                        ret_is_f128_sse: indirect_ret_is_one_xmm,
+                        assume_library: false,
+                        ret_eightbyte_classes: ret_abi.classes.clone(),
+                        // From the callee's type: `indirect_aggregate_return`.
+                        ret_is_f128_sse: ret_abi.one_xmm,
                     },
                 });
                 indirect_ret_ty
@@ -1801,12 +1848,13 @@ impl Lowerer {
                             struct_arg_classes: sac,
                             struct_arg_riscv_float_classes: sarfc,
                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
-                            is_sret: sret_size.is_some(),
+                            is_sret: ret_abi.sret_size.is_some(),
                             is_fastcall: callee_is_fastcall,
                             regparm: callee_regparm,
                             is_pure,
                             is_const,
-                            ret_eightbyte_classes: call_ret_classes,
+                            assume_library: false,
+                            ret_eightbyte_classes: ret_abi.classes.clone(),
                             ret_is_f128_sse: call_ret_is_f128_sse,
                         },
                     });
@@ -1826,15 +1874,15 @@ impl Lowerer {
                             struct_arg_classes: sac,
                             struct_arg_riscv_float_classes: sarfc,
                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
-                            is_sret: sret_size.is_some(),
+                            is_sret: ret_abi.sret_size.is_some(),
                             is_fastcall: false,
                             regparm: None,
                             is_pure: false,
                             is_const: false,
-                            ret_eightbyte_classes: call_ret_classes,
-                            // AUD-VABI-1: the same carrier rule as the other
-                            // indirect arms -- see `indirect_vector_carrier`.
-                            ret_is_f128_sse: indirect_ret_is_one_xmm,
+                            assume_library: false,
+                            ret_eightbyte_classes: ret_abi.classes.clone(),
+                            // From the callee's type: `indirect_aggregate_return`.
+                            ret_is_f128_sse: ret_abi.one_xmm,
                         },
                     });
                     indirect_ret_ty
@@ -1995,13 +2043,8 @@ impl Lowerer {
     fn func_return_ir_type(ret_ctype: &CType, _returns_cld_in_regs: bool) -> IrType {
         let is_32bit = crate::common::types::target_is_32bit();
         if is_32bit {
-            if let Some(words) = ret_ctype.i686_ext_vector_gp_word_count() {
-                return match words {
-                    1 => IrType::I32,
-                    2 => IrType::I64,
-                    3 => IrType::I128,
-                    _ => unreachable!("i686 ext-vector GP return word count is bounded"),
-                };
+            if let Some((carrier, _)) = ret_ctype.i686_ext_vector_ret_carrier() {
+                return carrier;
             }
         }
         match ret_ctype {

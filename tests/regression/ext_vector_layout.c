@@ -202,7 +202,10 @@ int main(void) {
 typedef _Bool bool33 __attribute__((ext_vector_type(33)));
 typedef signed char s8x7 __attribute__((ext_vector_type(7)));
 typedef unsigned short u16x3 __attribute__((ext_vector_type(3)));
-_Static_assert(sizeof(bool33) == 5, "bool33 occupies five bytes (ceil(33/8))");
+/* The ceil(33/8) = 5-byte payload is padded to power-of-two storage, as for
+ * every other shape (Clang 23.1.3: 8 on x86-64 and i686). This assertion
+ * read 5 while the parser still accepted every sizeof it could not fold. */
+_Static_assert(sizeof(bool33) == 8, "bool33 payload padded to eight-byte storage");
 _Static_assert(_Alignof(bool33) == 8, "bool33 alignment follows next-power-of-two storage");
 _Static_assert(sizeof(s8x7) == 8, "s8x7 padded to next power of two (7 -> 8)");
 _Static_assert(_Alignof(s8x7) == 8, "s8x7 alignment is 8 bytes");

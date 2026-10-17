@@ -105,6 +105,7 @@ impl X86Arch for I686Arch {
         // (`.word (to), real_mode_seg` in realmode.h LJMPW_RM) while rejecting
         // R_386_32 against them as "Invalid absolute relocation".
         match size {
+            1 => R_386_8,
             2 => R_386_16,
             _ => R_386_32,
         }
@@ -193,9 +194,6 @@ impl X86Arch for I686Arch {
         )
     }
     fn supports_deferred_skips() -> bool {
-        true
-    }
-    fn resolve_set_aliases_in_data() -> bool {
         true
     }
 

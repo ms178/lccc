@@ -138,7 +138,6 @@ impl Lowerer {
     }
 
     fn lower_typedef(&mut self, decl: &Declaration) {
-        let is_enum_type = self.is_enum_type_spec(&decl.type_spec);
         for declarator in &decl.declarators {
             if declarator.name.is_empty() {
                 continue;
@@ -188,16 +187,16 @@ impl Lowerer {
             self.types
                 .typedefs
                 .insert(declarator.name.clone(), resolved_ctype);
-            if is_enum_type && declarator.derived.is_empty() {
-                self.types.enum_typedefs.insert(declarator.name.clone());
-            }
             let effective_alignment = {
                 let mut align = decl.alignment;
                 if let Some(ref sizeof_ts) = decl.alignment_sizeof_type {
                     let real_sizeof = self.sizeof_type(sizeof_ts);
                     align = Some(align.map_or(real_sizeof, |a| a.max(real_sizeof)));
                 }
-                align.or_else(|| decl.alignas_type.as_ref().map(|ts| self.alignof_type(ts)))
+                crate::common::types::strictest_alignment([
+                    align,
+                    decl.alignas_type.as_ref().map(|ts| self.alignof_type(ts)),
+                ])
             };
             if let Some(align) = effective_alignment {
                 self.types
@@ -537,11 +536,12 @@ impl Lowerer {
         } else {
             da.var_ty.align()
         };
-        let mut explicit = if let Some(ref alignas_ts) = decl.alignas_type {
-            Some(self.alignof_type(alignas_ts))
-        } else {
-            decl.alignment
-        };
+        // The strictest explicit source wins (C11 6.7.5p6): `_Alignas(type)`
+        // does not discard an `aligned(N)` written next to it.
+        let mut explicit = crate::common::types::strictest_alignment([
+            decl.alignment,
+            decl.alignas_type.as_ref().map(|ts| self.alignof_type(ts)),
+        ]);
         if let Some(ref sizeof_ts) = decl.alignment_sizeof_type {
             let real_sizeof = self.sizeof_type(sizeof_ts);
             explicit = Some(explicit.map_or(real_sizeof, |a| a.max(real_sizeof)));

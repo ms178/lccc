@@ -16,7 +16,7 @@ This harness refuses to do that. It:
 1. Builds (or takes) both arms and **hashes them**. If they are identical the
    comparison is declared UNINFORMATIVE and no verdict is emitted (exit 3),
    unless `--allow-identical` is passed.
-2. Checks both arms produce **identical stdout and exit status** on a warm-up
+2. Checks both arms produce **byte-identical stdout and successful exit status** on a warm-up
    run. An A/B across a miscompile is meaningless, so it is reported as a
    CORRECTNESS failure (exit 4) rather than a timing result.
 3. Times the two arms **interleaved within each round, with the order
@@ -57,6 +57,10 @@ import statistics
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tools.corpus import process
 import time
 
 
@@ -108,32 +112,47 @@ def build(src: str, ccc: str, cflags: list[str], env_extra: str, out: str) -> No
         )
 
 
+#: Per-execution limit.  A hung arm is an infrastructure failure, never a
+#: timing sample (an unbounded subprocess.run would hang the whole A/B).
+RUN_TIMEOUT_S = 300
+
+
+def _execute(binary: str) -> dict:
+    """Run `binary` under the shared bounded runner; raise when the runner
+    reports a failure (timeout, launch error, output overflow)."""
+    result = process.run([binary], RUN_TIMEOUT_S)
+    if result["failure"]:
+        raise ValueError(f"{binary}: execution failed: {result['failure']}")
+    return result
+
+
+def _text(stdout: bytes) -> str:
+    # surrogateescape keeps arbitrary bytes distinct: equal text means
+    # byte-identical output.
+    return stdout.decode("utf-8", "surrogateescape")
+
+
 def run_once(binary: str) -> tuple[int, str]:
-    r = subprocess.run([binary], capture_output=True, text=True)
-    return r.returncode, r.stdout
+    r = _execute(binary)
+    return r["returncode"], _text(r["stdout"])
 
 
 def time_run(binary: str) -> tuple[float, int, str]:
-    t0 = time.perf_counter()
-    r = subprocess.run([binary], capture_output=True, text=True)
-    return (time.perf_counter() - t0) * 1000.0, r.returncode, r.stdout
+    r = _execute(binary)
+    return r["elapsed"] * 1000.0, r["returncode"], _text(r["stdout"])
 
 
 def sign_test_p(diffs: list[float]) -> float:
-    """Two-sided exact-ish sign test p-value over per-round paired differences."""
+    """Two-sided exact binomial sign test; zero differences are ties."""
+    import math
+
     nz = [d for d in diffs if d != 0.0]
     n = len(nz)
     if n == 0:
         return 1.0
-    k = sum(1 for d in nz if d > 0)
-    # normal approximation with continuity correction; adequate for n >= 12
-    z = (abs(k - n / 2.0) - 0.5) / (0.5 * n**0.5)
-    if z <= 0:
-        return 1.0
-    # erfc via math
-    import math
-
-    return math.erfc(z / math.sqrt(2.0))
+    positive = sum(d > 0 for d in nz)
+    k = min(positive, n - positive)
+    return min(1.0, 2 * sum(math.comb(n, i) for i in range(k + 1)) / (1 << n))
 
 
 def summarise(name: str, t: list[float]) -> dict:
@@ -144,7 +163,7 @@ def summarise(name: str, t: list[float]) -> dict:
         "median_ms": round(statistics.median(t), 3),
         "mean_ms": round(statistics.mean(t), 3),
         "stdev_ms": round(statistics.pstdev(t), 3) if len(t) > 1 else 0.0,
-        "samples_ms": [round(x, 3) for x in t],
+        "samples_ms": list(t),
     }
 
 
@@ -216,8 +235,14 @@ def run_comparison(args, ap, tmp):
     }
 
     # ---- correctness screen: an A/B across a miscompile is not a perf result --
-    rc_a, out_a = run_once(bin_a)
-    rc_b, out_b = run_once(bin_b)
+    try:
+        rc_a, out_a = run_once(bin_a)
+        rc_b, out_b = run_once(bin_b)
+    except (OSError, ValueError) as error:
+        result.update(verdict="infrastructure-failure", error=str(error))
+        emit(args.json, result)
+        print(error, file=sys.stderr)
+        return 4
     result["arm_a"]["warmup"] = {"rc": rc_a, "stdout_sha256": sha256_of_str(out_a)}
     result["arm_b"]["warmup"] = {"rc": rc_b, "stdout_sha256": sha256_of_str(out_b)}
     if rc_a != 0 or rc_b != 0 or out_a != out_b:
@@ -262,7 +287,7 @@ def run_comparison(args, ap, tmp):
         for position, (arm,binary) in enumerate(order):
             try:
                 elapsed, rc, out = time_run(binary)
-            except (OSError, subprocess.SubprocessError) as exc:
+            except (OSError, ValueError) as exc:
                 records.append({'round':r,'arm':arm,'order':position,
                                 'phase':'warmup' if r < args.warmup else 'timed',
                                 'error':str(exc)})
@@ -293,11 +318,11 @@ def run_comparison(args, ap, tmp):
     print(f"  {args.name_b}: min={sb['min_ms']:8.2f} med={sb['median_ms']:8.2f} "
           f"mean={sb['mean_ms']:8.2f} sd={sb['stdev_ms']:6.2f} n={sb['n']}")
     print(f"  median ratio {args.name_b}/{args.name_a} = {med_ratio:.4f}   "
-          f"min ratio = {min_ratio:.4f}   sign-test p = {p:.4f}")
+          f"min ratio = {min_ratio:.4f}   sign-test p = {p:.6g}")
 
     agrees = (med_ratio < 1.0) == (min_ratio < 1.0)
-    delta = abs(1.0 - med_ratio) * 100.0
-    verdict = f"{args.name_a} {'FASTER' if a_faster else 'SLOWER'} by {delta:.2f}% (median)"
+    delta = abs(1.0 - 1.0 / med_ratio) * 100.0
+    verdict = f"{args.name_a}: {delta:.2f}% {'less' if a_faster else 'more'} median elapsed time"
     if p > 0.05:
         verdict += " — NOT significant (sign test p > 0.05); treat as noise"
     elif not agrees:
@@ -308,10 +333,10 @@ def run_comparison(args, ap, tmp):
         {
             "arm_a_timings": sa,
             "arm_b_timings": sb,
-            "paired_diffs_ms": [round(d, 3) for d in diffs],
+            "paired_diffs_ms": diffs,
             "median_ratio_b_over_a": round(med_ratio, 5),
             "min_ratio_b_over_a": round(min_ratio, 5),
-            "sign_test_p": round(p, 5),
+            "sign_test_p": p,
             "median_and_min_agree": agrees,
             "significant": p <= 0.05,
             "verdict": verdict,
@@ -322,7 +347,7 @@ def run_comparison(args, ap, tmp):
 
 
 def sha256_of_str(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8", "replace")).hexdigest()
+    return hashlib.sha256(s.encode("utf-8", "surrogateescape")).hexdigest()
 
 
 def emit(path: str | None, result: dict) -> None:

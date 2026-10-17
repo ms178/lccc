@@ -814,6 +814,7 @@ pub fn x86_inst_fixed_scratch(inst: &Instruction) -> X86FixedScratch {
             | IntrinsicOp::FmaF64x4Hoisted
             | IntrinsicOp::FmaF64x4SIB
             | IntrinsicOp::FmaF64x4HoistedSIB
+            | IntrinsicOp::MulAddF64x4HoistedSIB
             | IntrinsicOp::LoadF64x4
             | IntrinsicOp::LoadF64x2
             | IntrinsicOp::LoadI32x8
@@ -1054,8 +1055,8 @@ pub(crate) fn x86_param_caller_homes_safe_with_config(
     let inline_libc = |inst: &Instruction| -> bool {
         is_64
             && matches!(inst, Instruction::Call { func: name, info }
-                if crate::backend::generation::inline_memcpy_len(name, &info.args, info.is_variadic).is_some()
-                    || crate::backend::generation::x86_inline_memset_len(name, &info.args, info.is_variadic).is_some())
+                if crate::backend::generation::inline_memcpy_len(name, info).is_some()
+                    || crate::backend::generation::x86_inline_memset_len(name, info).is_some())
     };
     if func.blocks.iter().any(|b| {
         b.instructions.iter().any(|inst| {
@@ -6140,6 +6141,7 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                 | O::FmaF64x4Hoisted
                 | O::FmaF64x4SIB
                 | O::FmaF64x4HoistedSIB
+                | O::MulAddF64x4HoistedSIB
                 | O::BroadcastLoadF64
                 | O::LoadF64x2
                 | O::LoadF64x4
@@ -7094,18 +7096,10 @@ fn collect_call_arg_values(func: &IrFunction) -> (FxHashSet<u32>, FxHashSet<u32>
                 Instruction::Call { func: name, info }
                     if crate::common::types::target_elf_machine()
                         == crate::backend::elf::EM_X86_64
-                        && (crate::backend::generation::inline_memcpy_len(
-                            name,
-                            &info.args,
-                            info.is_variadic,
-                        )
-                        .is_some()
-                            || crate::backend::generation::x86_inline_memset_len(
-                                name,
-                                &info.args,
-                                info.is_variadic,
-                            )
-                            .is_some()) =>
+                        && (crate::backend::generation::inline_memcpy_len(name, info)
+                            .is_some()
+                            || crate::backend::generation::x86_inline_memset_len(name, info)
+                                .is_some()) =>
                 {
                     continue;
                 }

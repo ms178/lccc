@@ -131,6 +131,7 @@ impl X86Codegen {
             // stack arguments (SysV AMD64); the >16 case is completed by the
             // caller's dynamic %rsp realignment (emit_call_stack_args_impl).
             stack_arg_align_cap: usize::MAX,
+            vector_xmm_regs: 0,
         }
     }
 
@@ -920,6 +921,7 @@ impl X86Codegen {
                     | CallArgClass::IntReg { .. }
                     | CallArgClass::StructSseReg { .. }
                     | CallArgClass::F128SseReg { .. }
+                    | CallArgClass::StructXmmReg { .. }
                     | CallArgClass::StructMixedIntSseReg { .. }
                     | CallArgClass::StructMixedSseIntReg { .. }
                     | CallArgClass::I128RegPair { .. }
@@ -987,7 +989,7 @@ impl X86Codegen {
                         }
                     }
                 }
-                CallArgClass::F128SseReg { reg_idx } => {
+                CallArgClass::F128SseReg { reg_idx } | CallArgClass::StructXmmReg { reg_idx } => {
                     if *reg_idx < 8 {
                         written_xmm[*reg_idx] = true;
                     }
@@ -1198,81 +1200,18 @@ impl X86Codegen {
                         float_count += 1;
                     }
                 }
+                CallArgClass::StructXmmReg { reg_idx } => {
+                    // A `[SSE, SSEUP]` aggregate is exactly 16 bytes: load
+                    // them through its address into one XMM register.
+                    self.operand_to_rax(arg);
+                    self.state
+                        .out
+                        .emit_instr_mem_reg("    movdqu", 0, "rax", xmm_regs[reg_idx]);
+                    float_count += 1;
+                }
                 CallArgClass::F128SseReg { reg_idx } => {
-                    // _Float128: the full 16 bytes go in ONE XMM register (SysV psABI).
-                    // The IR value is the 16-byte DATA (in a slot), not a pointer:
-                    // load the slot directly. Constants are materialized bit-exact.
-                    match arg {
-                        Operand::Value(v) => {
-                            if let Some(slot) = self.state.get_slot(v.0) {
-                                self.state.out.emit_instr_rbp_reg(
-                                    "    movdqu",
-                                    slot.0,
-                                    xmm_regs[reg_idx],
-                                );
-                            } else {
-                                self.state.emit_fmt(format_args!(
-                                    "    pxor %{}, %{}",
-                                    xmm_regs[reg_idx], xmm_regs[reg_idx]
-                                ));
-                            }
-                        }
-                        Operand::Const(IrConst::I128(c)) => {
-                            let bytes = (*c as u128).to_le_bytes();
-                            let lo = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-                            let hi = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-                            // Register-agnostic materialization via a 16-byte
-                            // stack scratch: the old xmm0/xmm1 construction
-                            // clobbered earlier arguments when reg_idx != 0
-                            // (the second _Float128 constant argument
-                            // overwrote the first).
-                            self.state.emit("    subq $16, %rsp");
-                            self.state
-                                .out
-                                .emit_instr_imm_reg("    movabsq", lo as i64, "rax");
-                            self.state.emit("    movq %rax, (%rsp)");
-                            self.state
-                                .out
-                                .emit_instr_imm_reg("    movabsq", hi as i64, "rax");
-                            self.state.emit("    movq %rax, 8(%rsp)");
-                            self.state.emit_fmt(format_args!(
-                                "    movdqu (%rsp), %{}",
-                                xmm_regs[reg_idx]
-                            ));
-                            self.state.emit("    addq $16, %rsp");
-                        }
-                        Operand::Const(IrConst::LongDouble(_, f128_bytes)) => {
-                            // long double (x87 80-bit): the constant's payload
-                            // is binary128; narrow to x87 bytes first, then
-                            // materialize the 16-byte slot (10 significant
-                            // bytes) into the XMM argument register.
-                            let x87 =
-                                crate::common::long_double::f128_bytes_to_x87_bytes(f128_bytes);
-                            let lo = u64::from_le_bytes(x87[0..8].try_into().unwrap());
-                            let hi = u64::from_le_bytes([x87[8], x87[9], 0, 0, 0, 0, 0, 0]);
-                            self.state.emit("    subq $16, %rsp");
-                            self.state
-                                .out
-                                .emit_instr_imm_reg("    movabsq", lo as i64, "rax");
-                            self.state.emit("    movq %rax, (%rsp)");
-                            self.state
-                                .out
-                                .emit_instr_imm_reg("    movabsq", hi as i64, "rax");
-                            self.state.emit("    movq %rax, 8(%rsp)");
-                            self.state.emit_fmt(format_args!(
-                                "    movdqu (%rsp), %{}",
-                                xmm_regs[reg_idx]
-                            ));
-                            self.state.emit("    addq $16, %rsp");
-                        }
-                        _ => {
-                            self.operand_to_rax(arg);
-                            self.state.emit_fmt(format_args!(
-                                "    movdqu 0(%rax), %{}",
-                                xmm_regs[reg_idx]
-                            ));
-                        }
-                    }
+                    // _Float128 / _Decimal128: the 16 bytes go in ONE XMM register.
+                    self.emit_f128_sse_operand_to_xmm(arg, xmm_regs[reg_idx]);
                     float_count += 1;
                 }
                 CallArgClass::StructMixedIntSseReg {
@@ -1726,6 +1665,50 @@ impl X86Codegen {
         }
     }
 
+    /// Load a 16-byte SSE + SSEUP value (it travels in ONE XMM register) into
+    /// `xmm`: a scalar `_Float128` / `_Decimal128` argument or return, or the
+    /// returned bytes of a one-XMM aggregate. Such a value is always homed in
+    /// a 16-byte slot; a constant is materialized bit-exact through a stack
+    /// scratch, so no other XMM or argument register is disturbed. Aggregate
+    /// ARGUMENTS use `StructXmmReg` (operand = address) instead, and
+    /// `long double` (X87 class) never travels in XMM.
+    pub(super) fn emit_f128_sse_operand_to_xmm(&mut self, op: &Operand, xmm: &str) {
+        let bits: u128 = match op {
+            Operand::Value(v) => {
+                let Some(slot) = self.state.get_slot(v.0) else {
+                    panic!(
+                        "internal error: 16-byte SSE scalar v{} has no stack slot",
+                        v.0
+                    );
+                };
+                self.state.out.emit_instr_rbp_reg("    movdqu", slot.0, xmm);
+                return;
+            }
+            Operand::Const(IrConst::Zero) => {
+                self.state.emit_fmt(format_args!("    pxor %{xmm}, %{xmm}"));
+                return;
+            }
+            Operand::Const(IrConst::I128(c)) => *c as u128,
+            Operand::Const(c) => {
+                panic!("internal error: {c:?} is not a 16-byte SSE scalar constant")
+            }
+        };
+        let lo = bits as u64;
+        let hi = (bits >> 64) as u64;
+        self.state.emit("    subq $16, %rsp");
+        self.state
+            .out
+            .emit_instr_imm_reg("    movabsq", lo as i64, "rax");
+        self.state.emit("    movq %rax, (%rsp)");
+        self.state
+            .out
+            .emit_instr_imm_reg("    movabsq", hi as i64, "rax");
+        self.state.emit("    movq %rax, 8(%rsp)");
+        self.state
+            .emit_fmt(format_args!("    movdqu (%rsp), %{xmm}"));
+        self.state.emit("    addq $16, %rsp");
+    }
+
     pub(super) fn set_call_ret_eightbyte_classes_impl(
         &mut self,
         classes: &[crate::common::types::EightbyteClass],
@@ -1761,12 +1744,12 @@ impl X86Codegen {
             self.state.invalidate_vec_peephole();
             return;
         }
-        // AUD-VABI-2: an 8-byte vector comes back in ONE SSE eightbyte (the low
-        // half of %xmm0), not in %rax. The IR type of the bit container is
-        // I64/U64, so the default path below would read the accumulator.
-        if self.call_ret_classes.len() == 1
-            && self.call_ret_classes[0] == crate::common::types::EightbyteClass::Sse
-            && matches!(return_type, IrType::I64 | IrType::U64)
+        // One SSE eightbyte (`struct { float x, y; }`, `struct { double }`,
+        // an 8-byte vector): the aggregate's bits come back in the low half
+        // of %xmm0, while the IR carries them as a packed integer.
+        if self.call_ret_classes[..] == [crate::common::types::EightbyteClass::Sse]
+            && !return_type.is_float()
+            && !is_i128_type(return_type)
         {
             self.store_xmm_to(dest, "xmm0", IrType::F64);
             self.state.reg_cache.invalidate_all();

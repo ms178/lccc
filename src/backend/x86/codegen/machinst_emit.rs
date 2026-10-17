@@ -1184,6 +1184,7 @@ pub fn emit_machinst_with_tune(
             args,
             target,
             ret,
+            gp_arg_count,
         } => {
             // Phase 1: caller-save spills (Phase 2b of the mature path,
             // typed). Same slot addressing as every other MachOperand —
@@ -1232,6 +1233,15 @@ pub fn emit_machinst_with_tune(
                 CallTarget::Indirect(reg) => {
                     out.emit_fmt(format_args!("    call *%{}", reg_name(*reg)))
                 }
+            }
+            // Same markers, same order, as emit_call_instruction_impl: the
+            // GP oracle scans a tight window after the call text, so they
+            // precede the return move. The typed subset is non-variadic (no
+            // `# LCCC_VA_CALL`), never a static-chain call, and passes no
+            // floating-point argument.
+            if let Some(n) = gp_arg_count {
+                out.emit_fmt(format_args!("    # LCCC_CALL_ARGS {}", (*n).min(6)));
+                out.emit("    # LCCC_CALL_FP 0");
             }
             // Phase 4: return home.
             if let Some(r) = ret {

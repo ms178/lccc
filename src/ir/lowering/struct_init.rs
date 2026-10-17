@@ -737,6 +737,31 @@ impl Lowerer {
                     elem_size,
                 );
             }
+        } else if elem_ty.is_vector() {
+            // Array of vectors: element `i` is initialized like a vector
+            // member at its offset (positional or `[i]`-designated).
+            let mut ai = 0usize;
+            let mut si = 0usize;
+            while si < sub_items.len() {
+                if let [Designator::Index(e)] = sub_items[si].designators.as_slice() {
+                    if let Some(i) = self.eval_const_expr_for_designator(e) {
+                        ai = i;
+                    }
+                }
+                if ai >= arr_size {
+                    break;
+                }
+                let item = &sub_items[si];
+                self.emit_field_vector(
+                    item,
+                    sub_items,
+                    &mut si,
+                    base_alloca,
+                    elem_ty,
+                    field_offset + ai * elem_size,
+                );
+                ai += 1;
+            }
         } else if elem_ty.is_complex() {
             self.emit_array_of_complex_list_init(
                 sub_items,
@@ -1147,8 +1172,10 @@ impl Lowerer {
             Initializer::Expr(e) => {
                 let expr_ct = self.expr_ctype(e);
                 if expr_ct.is_vector() {
-                    let src = self.lower_aggregate_rvalue(e);
-                    let src_val = self.operand_to_value(src);
+                    // Vector expression: memcpy from the address of its bytes
+                    // (a <= 8-byte vector call result is packed register data
+                    // and is spilled first).
+                    let src_val = self.get_struct_base_addr(e);
                     self.emit(Instruction::Memcpy {
                         dest: field_addr,
                         src: src_val,

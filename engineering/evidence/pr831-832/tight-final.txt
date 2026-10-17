@@ -1,0 +1,11 @@
+program                          gcc16.2                   clang                     icx        lccc-tight
+spectral_norm          2^3:6 2^5:1 cas:1                  2^4:11                  2^4:11  2^3:3 2^4:4 2^5:1 2^6:3
+nbody                        2^3:1 cas:7                   2^4:9                   2^4:4       2^3:4 2^4:3
+gzip_crc32             2^3:1 2^5:1 2^6:2                   2^4:3                   2^4:3  2^3:2 2^5:1 2^6:1
+sha256_transform       2^3:3 2^5:1 cas:2                   2^4:4                   2^4:3       2^3:3 2^4:4
+
+=== corpus totals (loop-header strongest unconditional alignment) ===
+  gcc16.2  : 2^3:11 2^5:3 2^6:2 cascade:10
+  clang    : 2^4:27
+  icx      : 2^4:21
+  lccc     : 2^3:12 2^4:11 2^5:2 2^6:4   rejects: span>64:3

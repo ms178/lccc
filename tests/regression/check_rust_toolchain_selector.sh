@@ -50,3 +50,30 @@ rm "$tmp/rust-toolchain.toml"
 expect_eq "$(lccc_rust_toolchain_from_manifest "$tmp")" stable "missing-manifest fallback"
 
 printf 'PASS rust_toolchain selector: manifest=%s, overrides honored\n' "$manifest_channel"
+
+# Execute the real bootstrap function with a tiny rustup stub, never the
+# bootstrap's swap/apt/repository side effects.
+python3 - "$repo_root" <<'PYTEST'
+from pathlib import Path
+import os, subprocess, sys, tempfile
+root = Path(sys.argv[1])
+text = (root / 'scripts/lccc-bootstrap.sh').read_text()
+a = text.index('setup_rust() {'); b = text.index('\n}\n', a) + 3
+for version, should_install, component_fail in [('stable', True, False), ('beta', True, False),
+        ('nightly', True, False), ('1.99.0', False, False), ('1.98.0', True, False), ('stable', True, True)]:
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp); binary = home / '.cargo/bin'; binary.mkdir(parents=True)
+        stub = binary / 'rustup'
+        stub.write_text('#!/bin/bash\necho "$*" >> "$LOG"\n'
+            'if [[ "$*" == "toolchain list" ]]; then printf "stable-x86_64-unknown-linux-gnu\\n1.99.0-x86_64-unknown-linux-gnu\\n"; fi\n'
+            'if [[ "$1" == component && "$COMPONENT_FAIL" == 1 ]]; then exit 7; fi\nexit 0\n')
+        stub.chmod(0o755)
+        script = 'set -euo pipefail\nlog() { :; }\nRUST_PROXIES=(cargo rustc)\n' + text[a:b] + '\nsetup_rust\n'
+        result = subprocess.run(['bash', '-c', script], text=True, capture_output=True,
+            env=dict(os.environ, HOME=tmp, RUST_VERSION=version, LOG=str(home / 'log'), COMPONENT_FAIL=str(int(component_fail))))
+        commands = (home / 'log').read_text().splitlines()
+        installed = any(c.startswith('toolchain install ' + version + ' ') for c in commands)
+        assert installed == should_install, (version, commands)
+        assert (result.returncode != 0) == component_fail, (version, result.stderr)
+print('PASS bootstrap Rust freshness/component contracts: 6 scenarios')
+PYTEST

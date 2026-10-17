@@ -49,7 +49,8 @@ pub(super) fn has_array_field_designators(items: &[InitializerItem]) -> bool {
 }
 
 /// Check if an expression contains a string literal anywhere,
-/// including through binary operations and casts (e.g., `"str" + N`).
+/// including through binary operations, casts and either operand of `?:`
+/// (e.g., `"str" + N`, `c ? "a" : "b"`).
 pub(super) fn expr_contains_string_literal(expr: &Expr) -> bool {
     match expr {
         Expr::StringLiteral(_, _)
@@ -59,6 +60,12 @@ pub(super) fn expr_contains_string_literal(expr: &Expr) -> bool {
             expr_contains_string_literal(lhs) || expr_contains_string_literal(rhs)
         }
         Expr::Cast(_, inner, _, _) => expr_contains_string_literal(inner),
+        Expr::Conditional(_, then, els, _) => {
+            expr_contains_string_literal(then) || expr_contains_string_literal(els)
+        }
+        Expr::GnuConditional(cond, els, _) => {
+            expr_contains_string_literal(cond) || expr_contains_string_literal(els)
+        }
         _ => false,
     }
 }
@@ -80,7 +87,7 @@ pub(super) fn init_contains_string_literal(item: &InitializerItem) -> bool {
 pub(super) fn init_contains_addr_expr(
     item: &InitializerItem,
     is_multidim_char_array: bool,
-    enum_constants: &FxHashMap<String, i64>,
+    enum_constants: &FxHashMap<String, crate::frontend::sema::type_context::EnumConstant>,
 ) -> bool {
     match &item.init {
         Initializer::Expr(expr) => {
@@ -101,7 +108,10 @@ pub(super) fn init_contains_addr_expr(
 /// Conservative: false positives are safe (just use the slower Compound path).
 /// `enum_constants` is used to exclude known enum constant identifiers, which are
 /// compile-time integer values and not addresses.
-fn expr_might_be_addr(expr: &Expr, enum_constants: &FxHashMap<String, i64>) -> bool {
+fn expr_might_be_addr(
+    expr: &Expr,
+    enum_constants: &FxHashMap<String, crate::frontend::sema::type_context::EnumConstant>,
+) -> bool {
     match expr {
         Expr::AddressOf(_, _) => true,
         Expr::LabelAddr(_, _) => true,
@@ -123,6 +133,13 @@ fn expr_might_be_addr(expr: &Expr, enum_constants: &FxHashMap<String, i64>) -> b
         }
         // Compound literals may contain addresses
         Expr::CompoundLiteral(_, _, _) => true,
+        // Either operand of `?:` may be the selected address.
+        Expr::Conditional(_, then, els, _) => {
+            expr_might_be_addr(then, enum_constants) || expr_might_be_addr(els, enum_constants)
+        }
+        Expr::GnuConditional(cond, els, _) => {
+            expr_might_be_addr(cond, enum_constants) || expr_might_be_addr(els, enum_constants)
+        }
         _ => false,
     }
 }

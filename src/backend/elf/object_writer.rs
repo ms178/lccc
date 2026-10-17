@@ -35,19 +35,46 @@ pub struct ObjSection {
     pub sh_type: u32,
     pub sh_flags: u64,
     pub data: Vec<u8>,
-    /// Section size when it differs from `data.len()`.
+    /// Section size when it differs from `data.len()`; read it through
+    /// [`ObjSection::size`].
     ///
-    /// Only a NOBITS section can differ (its contents are never emitted, so an
-    /// assembler may hold a zero fill as a size instead of as bytes -- see
-    /// `elf_writer_common::Section::pad_fill`). `None` means `data.len()`, and
-    /// that is what every PROGBITS/EXEC section uses, so behaviour there is
-    /// byte-for-byte unchanged.
+    /// Only a NOBITS section can differ: its contents are never emitted, so an
+    /// assembler holds its zero runs as a size instead of as bytes (the x86
+    /// core's `Section::hold_zeros` tail, and `ElfWriterBase`, which keeps
+    /// every NOBITS section as a pure size -- see [`ObjSection::grow_nobits`]).
+    /// `None` means `data.len()`, and that is what every PROGBITS/EXEC section
+    /// uses, so behaviour there is byte-for-byte unchanged.
     pub sh_size: Option<u64>,
     pub sh_addralign: u64,
     /// Relocations targeting this section.
     pub relocs: Vec<ObjReloc>,
     /// If this section is part of a COMDAT group, the group signature symbol name.
     pub comdat_group: Option<String>,
+}
+
+impl ObjSection {
+    /// The section's size in bytes (`sh_size`).
+    pub fn size(&self) -> u64 {
+        self.sh_size.unwrap_or(self.data.len() as u64)
+    }
+
+    /// Grow a size-only NOBITS section by `n` zero bytes.
+    ///
+    /// A NOBITS section carries no file bytes, so holding it as a number
+    /// makes `int a[1 << 30];` (or `.zero 16G`) cost a counter instead of the
+    /// allocation it used to be refused for; only the address space bounds it.
+    pub fn grow_nobits(&mut self, n: u64) -> Result<(), String> {
+        debug_assert!(
+            self.sh_type == SHT_NOBITS && self.data.is_empty(),
+            "only a size-only NOBITS section grows by count"
+        );
+        let size = self
+            .size()
+            .checked_add(n)
+            .ok_or_else(|| format!("section '{}' exceeds the addressable size", self.name))?;
+        self.sh_size = Some(size);
+        Ok(())
+    }
 }
 
 /// A relocation entry in a relocatable object file.
@@ -458,7 +485,7 @@ pub fn write_relocatable_object(
                         &sym_entries,
                         &strtab,
                         content_sections,
-                    );
+                    )?;
                     if use_rela && !is_32bit {
                         write_rela64(
                             &mut elf,
@@ -546,7 +573,7 @@ pub fn write_relocatable_object(
             let sh_name = shstrtab.offset_of(".group");
             // sh_link = symtab index, sh_info = symbol index of group signature
             let sig_sym_idx =
-                find_symbol_index_shared(group_name, &sym_entries, &strtab, content_sections);
+                find_symbol_index_shared(group_name, &sym_entries, &strtab, content_sections)?;
             write_shdr32(
                 &mut elf,
                 sh_name,
@@ -570,6 +597,15 @@ pub fn write_relocatable_object(
             // 8/4) cap); NOBITS used to force 0 here, which no
             // toolchain emits (GNU as stamps the capped cursor).
             let sh_offset = section_offsets[i] as u32;
+            // ELF32 cannot describe a section of 4 GiB or more; truncating
+            // the size would make the linker allocate a wrapped, tiny one.
+            let sh_size = u32::try_from(section.size()).map_err(|_| {
+                format!(
+                    "section '{}' of {} bytes exceeds the ELF32 size limit",
+                    section.name,
+                    section.size()
+                )
+            })?;
             write_shdr32(
                 &mut elf,
                 sh_name,
@@ -577,7 +613,7 @@ pub fn write_relocatable_object(
                 section.sh_flags as u32,
                 0,
                 sh_offset,
-                section.sh_size.unwrap_or(section.data.len() as u64) as u32,
+                sh_size,
                 0,
                 0,
                 section.sh_addralign as u32,
@@ -659,7 +695,7 @@ pub fn write_relocatable_object(
         for (gi, (group_name, _members)) in comdat_groups.iter().enumerate() {
             let sh_name = shstrtab.offset_of(".group");
             let sig_sym_idx =
-                find_symbol_index_shared(group_name, &sym_entries, &strtab, content_sections);
+                find_symbol_index_shared(group_name, &sym_entries, &strtab, content_sections)?;
             write_shdr64(
                 &mut elf,
                 sh_name,
@@ -686,7 +722,7 @@ pub fn write_relocatable_object(
                 section.sh_flags,
                 0,
                 sh_offset,
-                section.sh_size.unwrap_or(section.data.len() as u64),
+                section.size(),
                 0,
                 0,
                 section.sh_addralign,
@@ -770,24 +806,40 @@ pub fn write_relocatable_object(
 ///
 /// Checks section names first (returns section symbol index), then searches
 /// by string table offset for named symbols (excluding section symbols).
+///
+/// The empty name is the NULL symbol (`STN_UNDEF`, index 0) -- what a reloc
+/// with no symbol legitimately names.  Any OTHER name that is not in the
+/// table is an assembler bookkeeping defect, and it is an error: answering 0
+/// would silently bind the relocation to absolute address 0.  That is how a
+/// misclassified `R_X86_64_32S` (a `-fno-pie` jump table's `.Ljt` that was
+/// neither folded into its section nor emitted as a symbol) became a SIGSEGV
+/// at run time instead of a diagnostic at assembly time.  GAS has no such
+/// state: every referenced name is defined, folded, or an undefined global.
 fn find_symbol_index_shared(
     name: &str,
     sym_entries: &[SymEntry],
     strtab: &StringTable,
     content_sections: &[String],
-) -> u32 {
+) -> Result<u32, String> {
+    if name.is_empty() {
+        return Ok(0);
+    }
     // Check if it's a section symbol
     for (i, sec_name) in content_sections.iter().enumerate() {
         if sec_name == name {
-            return (i + 1) as u32; // +1 for NULL entry
+            return Ok((i + 1) as u32); // +1 for NULL entry
         }
     }
-    // Search named symbols
-    let name_offset = strtab.offset_of(name);
-    for (i, entry) in sym_entries.iter().enumerate() {
-        if entry.st_name == name_offset && entry.st_info & 0xF != STT_SECTION {
-            return i as u32;
+    // Search named symbols (index 0 is the NULL symbol, never a match).
+    if let Some(name_offset) = strtab.get(name) {
+        for (i, entry) in sym_entries.iter().enumerate().skip(1) {
+            if entry.st_name == name_offset && entry.st_info & 0xF != STT_SECTION {
+                return Ok(i as u32);
+            }
         }
     }
-    0 // undefined
+    Err(format!(
+        "internal assembler error: `{name}` is referenced (relocation or group \
+         signature) but has no symbol-table entry and is not a section"
+    ))
 }

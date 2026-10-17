@@ -1601,6 +1601,9 @@ pub struct TypedCallPlan {
     pub args: Vec<CallArgMove>,
     /// Return-value move, or None for void calls / rax-homed returns.
     pub ret: Option<CallRetMove>,
+    /// Leading SysV GP argument registers the call reads: argument `i`
+    /// is assigned register `i` above, one register per argument.
+    pub gp_arg_count: u8,
 }
 
 /// Build the argument/return move plan for a typed call.
@@ -1806,6 +1809,8 @@ pub fn build_typed_call_ex(
     Ok(TypedCallPlan {
         args: ordered,
         ret: ret_move,
+        // `SYSCALL_ARG_REGS[i]` above already bounded `args.len()` by 6.
+        gp_arg_count: args.len() as u8,
     })
 }
 
@@ -2014,6 +2019,11 @@ fn lower_instruction_typed_inner(
             // register/stack-aware SETCC materialization and keeps the i32
             // result zero-extended. MachInst currently has no BT opcode.
             if *op == IrBinOp::BitTest {
+                return false;
+            }
+            // Bzhi likewise: MachInst has no BZHI opcode; the text path
+            // emits the register-direct VEX form.
+            if *op == IrBinOp::Bzhi {
                 return false;
             }
             // Only handle I32/U32/I64/U64/Ptr — sub-32-bit types have complex

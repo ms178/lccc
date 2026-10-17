@@ -3683,7 +3683,7 @@ impl X86Codegen {
 
                 self.state.reg_cache.invalidate_all();
             }
-            IntrinsicOp::FmaF64x4HoistedSIB => {
+            IntrinsicOp::FmaF64x4HoistedSIB | IntrinsicOp::MulAddF64x4HoistedSIB => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
                 // Optimal quad-FMA: SIB + hoisted broadcast.
@@ -3783,33 +3783,31 @@ impl X86Codegen {
                     disp = 0;
                 }
 
-                if disp == 0 {
-                    self.state.emit_fmt(format_args!(
-                        "    vmovupd (%{},%{}), %ymm0",
-                        c_name, off_name
-                    ));
-                    self.state.emit_fmt(format_args!(
-                        "    vfmadd231pd (%{},%{}), %ymm1, %ymm0",
-                        b_name, off_name
-                    ));
-                    self.state.emit_fmt(format_args!(
-                        "    vmovupd %ymm0, (%{},%{})",
-                        c_name, off_name
-                    ));
+                // The unfused sibling preserves C + (A * B), including the
+                // two rounding steps. xmm2 is quarantined by regalloc_helpers;
+                // ymm1 remains the loop-invariant broadcast in both modes.
+                let c_mem = if disp == 0 {
+                    format!("(%{},%{})", c_name, off_name)
                 } else {
-                    self.state.emit_fmt(format_args!(
-                        "    vmovupd {}(%{},%{}), %ymm0",
-                        disp, c_name, off_name
-                    ));
-                    self.state.emit_fmt(format_args!(
-                        "    vfmadd231pd {}(%{},%{}), %ymm1, %ymm0",
-                        disp, b_name, off_name
-                    ));
-                    self.state.emit_fmt(format_args!(
-                        "    vmovupd %ymm0, {}(%{},%{})",
-                        disp, c_name, off_name
-                    ));
+                    format!("{}(%{},%{})", disp, c_name, off_name)
+                };
+                let b_mem = if disp == 0 {
+                    format!("(%{},%{})", b_name, off_name)
+                } else {
+                    format!("{}(%{},%{})", disp, b_name, off_name)
+                };
+                self.state
+                    .emit_fmt(format_args!("    vmovupd {}, %ymm0", c_mem));
+                if *op == IntrinsicOp::FmaF64x4HoistedSIB {
+                    self.state
+                        .emit_fmt(format_args!("    vfmadd231pd {}, %ymm1, %ymm0", b_mem));
+                } else {
+                    self.state
+                        .emit_fmt(format_args!("    vmulpd {}, %ymm1, %ymm2", b_mem));
+                    self.state.emit("    vaddpd %ymm2, %ymm0, %ymm0");
                 }
+                self.state
+                    .emit_fmt(format_args!("    vmovupd %ymm0, {}", c_mem));
 
                 self.state.reg_cache.invalidate_all();
             }
@@ -5577,8 +5575,13 @@ impl X86Codegen {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
                 self.avx_load_arg(&args[0]);
-                self.state.emit("    vextracti128 $1, %ymm0, %ymm1");
-                self.state.emit("    vpaddq %ymm1, %ymm0, %ymm0");
+                // VEXTRACTI128's destination is an XMM register: the former
+                // `%ymm1` spelling was accepted only by the integrated
+                // assembler and made `-S` output unassemblable by GNU as.
+                // Only the low 128 bits feed the rest of the fold, so the
+                // add is 128-bit as well.
+                self.state.emit("    vextracti128 $1, %ymm0, %xmm1");
+                self.state.emit("    vpaddq %xmm1, %xmm0, %xmm0");
                 self.state.emit("    vpshufd $0xEE, %xmm0, %xmm1");
                 self.state.emit("    vpaddq %xmm1, %xmm0, %xmm0");
                 self.state.emit("    movq %xmm0, %rax");
@@ -10505,6 +10508,44 @@ mod fma_form_reencode_tests {
 #[cfg(test)]
 mod vector_address_contract_tests {
     use super::*;
+
+    #[test]
+    fn unfused_packed_update_keeps_two_roundings_and_hoisted_factor() {
+        for disp in [0, 32, 96, i64::from(i32::MAX) + 1, i64::MIN] {
+            let mut cg = X86Codegen::new();
+            for (id, reg) in [
+                (0, super::super::machinst::R12),
+                (1, super::super::machinst::R13),
+                (2, super::super::machinst::R14),
+            ] {
+                cg.reg_assignments.insert(id, reg);
+            }
+            cg.emit_intrinsic_impl(
+                &None,
+                &IntrinsicOp::MulAddF64x4HoistedSIB,
+                &None,
+                &[
+                    Operand::Value(Value(0)),
+                    Operand::Value(Value(1)),
+                    Operand::Value(Value(2)),
+                    Operand::Const(IrConst::I64(disp)),
+                ],
+            );
+            let out = &cg.state.out.buf;
+            assert_eq!(out.matches("vmulpd").count(), 1, "{out}");
+            assert_eq!(out.matches("vaddpd").count(), 1, "{out}");
+            assert!(!out.contains("vfmadd"), "{out}");
+            assert!(out.contains("vaddpd %ymm2, %ymm0, %ymm0"), "{out}");
+            assert!(
+                !out.lines().any(|line| line.trim_end().ends_with(", %ymm1")),
+                "broadcast must survive: {out}"
+            );
+            assert!(
+                !out.contains(", %r12") && !out.contains(", %r13") && !out.contains(", %r14"),
+                "{out}"
+            );
+        }
+    }
 
     #[test]
     fn constant_index_sum_must_fit_the_encoding_without_truncation() {

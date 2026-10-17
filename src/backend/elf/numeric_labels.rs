@@ -107,6 +107,9 @@ pub fn resolve_numeric_labels(items: &[AsmItem]) -> Vec<AsmItem> {
             AsmItem::Quad(vals) => {
                 result.push(AsmItem::Quad(resolve_numeric_data_values(vals, i, &defs)));
             }
+            AsmItem::Addr(vals) => {
+                result.push(AsmItem::Addr(resolve_numeric_data_values(vals, i, &defs)));
+            }
             AsmItem::Byte(vals) => {
                 result.push(AsmItem::Byte(resolve_numeric_data_values(vals, i, &defs)));
             }
@@ -123,6 +126,10 @@ pub fn resolve_numeric_labels(items: &[AsmItem]) -> Vec<AsmItem> {
             AsmItem::SkipExpr(expr, fill) => {
                 let new_expr = resolve_numeric_refs_in_expr(expr, i, &defs);
                 result.push(AsmItem::SkipExpr(new_expr, *fill));
+            }
+            AsmItem::Set(name, expr) => {
+                let new_expr = resolve_numeric_refs_in_expr(expr, i, &defs);
+                result.push(AsmItem::Set(name.clone(), new_expr));
             }
             AsmItem::Org(sym, offset, fill) => {
                 if let Some(resolved) = resolve_numeric_name(sym, i, &defs) {
@@ -223,10 +230,10 @@ fn resolve_numeric_data_values(
                     }
                 }
                 // A numeric label reference is equally valid in the ADDEND and
-                // SCALED forms. Leaving them in the catch-all below meant a
+                // expression forms. Leaving them in the catch-all below meant a
                 // difference such as
                 //     .long 770b + 1 - 760b        (SymbolDiffAddend)
-                //     .long (770b - 760b) * 4      (SymbolDiffScaled)
+                //     .long (770b - 760b) * 4      (Expr)
                 // kept the raw names `770b`/`760b`, while the DEFINITIONS had
                 // already been renamed to `.Lnum_770_0`/`.Lnum_760_0`. Nothing
                 // downstream could ever match them, so the assembler aborted with
@@ -240,12 +247,8 @@ fn resolve_numeric_data_values(
                         resolve_numeric_name(rhs, current_idx, defs).unwrap_or_else(|| rhs.clone());
                     DataValue::SymbolDiffAddend(new_lhs, new_rhs, *addend)
                 }
-                DataValue::SymbolDiffScaled(lhs, rhs, scale, div, addend) => {
-                    let new_lhs =
-                        resolve_numeric_name(lhs, current_idx, defs).unwrap_or_else(|| lhs.clone());
-                    let new_rhs =
-                        resolve_numeric_name(rhs, current_idx, defs).unwrap_or_else(|| rhs.clone());
-                    DataValue::SymbolDiffScaled(new_lhs, new_rhs, *scale, *div, *addend)
+                DataValue::Expr(expr) => {
+                    DataValue::Expr(resolve_numeric_refs_in_expr(expr, current_idx, defs))
                 }
                 // Exhaustive on purpose: every future DataValue variant that can
                 // carry a symbol name must be considered here explicitly.
@@ -353,40 +356,16 @@ fn resolve_numeric_displacement(
     }
 }
 
-/// Resolve numeric label references (e.g., "6651f", "661b") within an expression string.
-/// Scans for patterns like digits followed by 'f' or 'b' and replaces them with unique names.
+/// Resolve numeric label references (`6651f`, `661b`) within an expression
+/// string ([`crate::backend::asm_expr::rewrite_numeric_label_refs`]).
 pub fn resolve_numeric_refs_in_expr(
     expr: &str,
     current_idx: usize,
     defs: &FxHashMap<String, Vec<(usize, String)>>,
 ) -> String {
-    let mut result = String::with_capacity(expr.len());
-    let bytes = expr.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_digit() {
-            let start = i;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            if i < bytes.len() && (bytes[i] == b'f' || bytes[i] == b'b') {
-                let next = i + 1;
-                if next >= bytes.len() || !bytes[next].is_ascii_alphanumeric() {
-                    let ref_name = &expr[start..=i];
-                    if let Some(resolved) = resolve_numeric_name(ref_name, current_idx, defs) {
-                        result.push_str(&resolved);
-                        i += 1;
-                        continue;
-                    }
-                }
-            }
-            result.push_str(&expr[start..i]);
-        } else {
-            result.push(bytes[i] as char);
-            i += 1;
-        }
-    }
-    result
+    crate::backend::asm_expr::rewrite_numeric_label_refs(expr, |r| {
+        resolve_numeric_name(r, current_idx, defs)
+    })
 }
 
 #[cfg(test)]

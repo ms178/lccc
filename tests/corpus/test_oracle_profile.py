@@ -45,6 +45,12 @@ class ProfileTests(unittest.TestCase):
                 result = profile.verify(['icc'], '-O2 -march=haswell -ffp-contract=off')
             self.assertEqual(result['complete'], expected)
             self.assertEqual(result['compilers']['icc']['contraction_off']['ok'], expected)
+    def test_classic_icc_value_safe_dialect_is_explicit(self):
+        flags = '-O2 -march=haswell -fno-fast-math -ffp-contract=off -DN=17'
+        self.assertEqual(godbolt.compiler_flags('icc', flags),
+            '-O2 -xCORE-AVX2 -fp-model precise -no-fma -DN=17')
+        self.assertEqual(godbolt.compiler_flags('icx', flags), flags)
+        self.assertEqual(godbolt.compiler_flags('gcc16.2', flags), flags)
 
     def test_each_missing_feature_fails_admission(self):
         for n in range(len(ASSEMBLY)):

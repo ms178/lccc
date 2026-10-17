@@ -218,10 +218,7 @@ impl Lowerer {
                 // Try normal scalar constant evaluation of the condition first.
                 // If that fails (e.g., condition involves a function pointer
                 // comparison like `fn == NULL`), try address-aware evaluation.
-                let cond_val = self
-                    .eval_const_expr(cond)
-                    .or_else(|| self.eval_addr_comparison_cond(cond));
-                let cond_val = cond_val?;
+                let cond_val = self.eval_init_condition(cond)?;
                 let selected = if cond_val.is_nonzero() {
                     then_e
                 } else {
@@ -978,6 +975,14 @@ impl Lowerer {
     /// This is used by the Linux kernel's _OF_DECLARE macro:
     ///   .data = (fn == (fn_type)NULL) ? fn : fn
     /// where the condition must be evaluated at compile time for a static initializer.
+    /// The value of a `?:` condition in a static initializer: an integer
+    /// constant, or an address comparison such as the kernel's
+    /// `_OF_DECLARE` `fn == (fn_type)NULL`.
+    pub(super) fn eval_init_condition(&self, cond: &Expr) -> Option<IrConst> {
+        self.eval_const_expr(cond)
+            .or_else(|| self.eval_addr_comparison_cond(cond))
+    }
+
     fn eval_addr_comparison_cond(&self, expr: &Expr) -> Option<IrConst> {
         // Unwrap casts (e.g., (fn_type)NULL is Cast(fn_type, 0))
         let expr = match expr {

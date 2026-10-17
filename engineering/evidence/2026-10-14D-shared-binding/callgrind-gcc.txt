@@ -1,0 +1,6 @@
+gzip_crc32
+zlib_ng_adler32
+expat_xml_scan
+sqlite_varint
+linux_find_bit
+glibc_memcmp

@@ -91,6 +91,15 @@ fn cmp_version(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
+/// The path of a `-fprofile-*=PATH` option; GCC 16.2 rejects an empty one
+/// with this wording instead of falling back to the current directory.
+fn profile_path_arg(arg: &str, prefix: &str) -> Result<String, String> {
+    match &arg[prefix.len()..] {
+        "" => Err(format!("missing argument to '{prefix}'")),
+        path => Ok(path.to_string()),
+    }
+}
+
 impl Driver {
     /// Parse the value of `-falign-*=N[:M]`: a power-of-two byte alignment
     /// with an optional max-skip (`.p2align` third operand). Returns `None`
@@ -1115,6 +1124,9 @@ impl Driver {
         let strict_options = std::env::var_os("LCCC_STRICT_OPTIONS").is_some();
         let mut unknown_options: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        // The last `-fprofile-dir=`, which a bare profile mode switch uses
+        // wherever it appears relative to the switch.
+        let mut profile_dir: Option<String> = None;
         let mut i = 0;
         while i < args.len() {
             // x86 ISA flags are routed through the shared applicator FIRST:
@@ -1530,49 +1542,15 @@ impl Driver {
                 arg if arg == "-fno-exceptions" => {
                     self.exceptions = false;
                 }
-                // ---- A13: which library calls an optimisation may create ----
-                // A pass may replace user code with a call to a standard
-                // library function (`loop_idiom` -> memcpy/memmove,
-                // `loop_memset` -> memset, `fortify_fold` -> puts/fwrite/...).
-                // That is only sound while the callee really is the library
-                // function: a translation unit that defines `memcpy` (glibc's
-                // own string routines do) makes the synthesised call resolve
-                // into a definition the compiled code is part of — unbounded
-                // self-recursion, or a silently ignored user definition.
-                // These arms record the CLI half of the policy; the passes
-                // consult it together with the TU's own definitions
-                // (`passes::libcall::LibcallAllowance`).
-                //
-                // Semantics follow GCC: `-ffreestanding` implies
-                // `-fno-builtin`; `-fbuiltin`/`-fhosted` clear the *blanket*
-                // withdrawal (last one wins); a per-name `-fno-builtin-<fn>`
-                // is sticky (GCC keeps it even after a later `-fbuiltin`) and
-                // is never cleared by the blanket arms.
-                //
-                // `-ffreestanding` additionally flips `__STDC_HOSTED__` to 0
-                // (C11 4p6) — Linux's arch/x86/boot and most firmware pass
-                // this flag, and headers branch on the macro.
-                arg if arg == "-ffreestanding" => {
-                    self.freestanding = true;
-                    self.builtin_policy.withdraw_all();
-                }
-                arg if arg == "-fhosted" => {
-                    self.freestanding = false;
-                    self.builtin_policy.restore_all();
-                }
-                arg if arg == "-fbuiltin" => self.builtin_policy.restore_all(),
-                arg if arg == "-fno-builtin" => self.builtin_policy.withdraw_all(),
-                arg if arg.starts_with("-fno-builtin-") => {
-                    self.builtin_policy
-                        .withdraw_one(&arg["-fno-builtin-".len()..]);
-                }
                 // Plain-char signedness overrides (GCC-compatible): these
                 // re-record the process-global AFTER the target default was
                 // installed, so they win regardless of order relative to it.
-                arg if arg == "-funsigned-char" => {
+                // GCC treats the negative spellings as the opposite flag
+                // (measured on GCC 16.2: `-fno-signed-char` == `-funsigned-char`).
+                "-funsigned-char" | "-fno-signed-char" => {
                     crate::common::types::set_char_unsigned(true);
                 }
-                arg if arg == "-fsigned-char" => {
+                "-fsigned-char" | "-fno-unsigned-char" => {
                     crate::common::types::set_char_unsigned(false);
                 }
                 // `-fshort-wchar`: 16-bit unsigned `wchar_t` (GCC's
@@ -1593,47 +1571,6 @@ impl Driver {
                 }
                 arg if arg == "-finstrument-functions-exclude-file-list" => {}
                 arg if arg == "-finstrument-functions-exclude-function-list" => {}
-                // `-ffreestanding` (C11 4p6): the program may execute in a
-                // freestanding environment, so `__STDC_HOSTED__` is 0. Linux's
-                // arch/x86/boot and most firmware pass this; before this arm
-                // existed the flag was dropped by the blanket `-f` swallow and
-                // the macro stayed 1, silently selecting hosted header paths.
-                //
-                // `-fhosted` is the documented negation and must restore 1
-                // (GCC accepts both, last one wins).
-
-                // ---- A13/A14: which library calls an optimisation may create --------------
-                // A pass may replace user code with a call to a standard library function
-                // (`loop_idiom` -> memcpy/memmove, `loop_memset` -> memset, `fortify_fold` ->
-                // puts/fwrite/...) and the backend may expand a constant-size memcpy/memset
-                // call inline.  Both are only sound while the callee really is the library
-                // function: a translation unit that defines `memcpy` (glibc's own string
-                // routines do) makes the synthesised call resolve into a definition the
-                // compiled code is part of -- unbounded self-recursion, or a silently ignored
-                // user definition.  These four arms record the CLI half of the policy; the
-                // passes consult it together with the TU's own definitions
-                // (`passes::libcall::LibcallAllowance`) and the backend consults the same
-                // object (`backend::libcall_policy`).
-                //
-                // Semantics follow GCC 16.2 (verified on the pinned oracles, both Godbolt and
-                // local): `-ffreestanding` implies `-fno-builtin`; `-fbuiltin`/`-fhosted`
-                // clear the *blanket* withdrawal (last one wins); a per-name
-                // `-fno-builtin-<fn>` is sticky (GCC keeps it even after a later `-fbuiltin`)
-                // and is never cleared by the blanket arms.
-                "-ffreestanding" => {
-                    self.freestanding = true;
-                    self.builtin_policy.withdraw_all();
-                }
-                "-fhosted" => {
-                    self.freestanding = false;
-                    self.builtin_policy.restore_all();
-                }
-                "-fbuiltin" => self.builtin_policy.restore_all(),
-                arg if arg == "-fno-builtin" => self.builtin_policy.withdraw_all(),
-                arg if arg.starts_with("-fno-builtin-") => {
-                    self.builtin_policy
-                        .withdraw_one(&arg["-fno-builtin-".len()..]);
-                }
                 // `-ansi` is `-std=c90` in GCC's driver (measured: `gcc
                 // -ansi -dM -E` reports `__STDC_VERSION__` absent, exactly
                 // like `-std=c90`, and defines `__STRICT_ANSI__`).  Ignoring
@@ -2074,53 +2011,58 @@ impl Driver {
                     ));
                 }
 
-                // PGO flags (instrumented profiling)
-                "-fprofile-generate" => self.pgo_generate = Some(".".to_string()),
+                // PGO flags (instrumented profiling), with GCC 16.2's measured
+                // path rules: the later of `-fprofile-dir=D` and an explicit
+                // `-fprofile-generate=P`/`-fprofile-use=P` decides the
+                // directory, a bare mode switch uses the `-fprofile-dir` given
+                // before OR after it, and an empty path is an error.
+                "-fprofile-generate" | "-fprofile-arcs" | "-ftest-coverage" => {
+                    self.pgo_generate =
+                        Some(profile_dir.clone().unwrap_or_else(|| ".".to_string()));
+                }
                 arg if arg.starts_with("-fprofile-generate=") => {
-                    let path = arg["-fprofile-generate=".len()..].to_string();
-                    self.pgo_generate = Some(if path.is_empty() {
-                        ".".to_string()
-                    } else {
-                        path
-                    });
+                    self.pgo_generate = Some(profile_path_arg(arg, "-fprofile-generate=")?);
                 }
-                "-fprofile-use" => self.pgo_use = Some(".".to_string()),
+                "-fprofile-use" => {
+                    self.pgo_use = Some(profile_dir.clone().unwrap_or_else(|| ".".to_string()));
+                }
                 arg if arg.starts_with("-fprofile-use=") => {
-                    let path = arg["-fprofile-use=".len()..].to_string();
-                    self.pgo_use = Some(if path.is_empty() {
-                        ".".to_string()
-                    } else {
-                        path
-                    });
+                    self.pgo_use = Some(profile_path_arg(arg, "-fprofile-use=")?);
                 }
-                "-fprofile-arcs" => self.pgo_generate = Some(".".to_string()),
-                "-ftest-coverage" => self.pgo_generate = Some(".".to_string()),
                 arg if arg.starts_with("-fprofile-update=") => {
                     // GCC 7+/LLVM 17+ semantics: single (default, non-atomic),
                     // atomic (lock-prefixed), prefer-atomic (atomic when the
                     // target supports it — x86-64 always does).
-                    let m = arg["-fprofile-update=".len()..].to_string();
-                    self.pgo_update = Some(match m.as_str() {
-                        "atomic" | "prefer-atomic" => "atomic".to_string(),
-                        _ => "single".to_string(),
+                    self.pgo_update = Some(match profile_path_arg(arg, "-fprofile-update=")? {
+                        m if m == "atomic" || m == "prefer-atomic" => "atomic".to_string(),
+                        m if m == "single" => m,
+                        m => {
+                            return Err(format!(
+                                "unknown profile update method '{m}' (valid arguments to \
+                                 '-fprofile-update=' are: atomic prefer-atomic single)"
+                            ));
+                        }
                     });
                 }
                 "-fbranch-probabilities" => {
-                    self.pgo_use = Some(self.pgo_use.clone().unwrap_or_else(|| ".".to_string()))
+                    self.pgo_use =
+                        Some(self.pgo_use.clone().unwrap_or_else(|| {
+                            profile_dir.clone().unwrap_or_else(|| ".".to_string())
+                        }))
                 }
                 arg if arg.starts_with("-fprofile-dir=") => {
-                    let path = arg["-fprofile-dir=".len()..].to_string();
+                    let path = profile_path_arg(arg, "-fprofile-dir=")?;
                     if self.pgo_generate.is_some() {
                         self.pgo_generate = Some(path.clone());
                     }
                     if self.pgo_use.is_some() {
-                        self.pgo_use = Some(path);
+                        self.pgo_use = Some(path.clone());
                     }
+                    profile_dir = Some(path);
                 }
                 "-fauto-profile" => self.pgo_use = Some(".".to_string()),
                 arg if arg.starts_with("-fauto-profile=") => {
-                    let path = arg["-fauto-profile=".len()..].to_string();
-                    self.pgo_use = Some(path);
+                    self.pgo_use = Some(profile_path_arg(arg, "-fauto-profile=")?);
                 }
                 "-fno-profile-arcs"
                 | "-fno-test-coverage"
@@ -2236,6 +2178,26 @@ impl Driver {
                 "-fno-trapping-math" => self.fp_trapping_math = false,
                 "-fwrapv" => self.wrap_signed_overflow = true,
                 "-fno-wrapv" => self.wrap_signed_overflow = false,
+                // Builtin status and hosted-ness, with GCC 16.2's exact
+                // semantics (measured on the oracle; pinned by
+                // `builtin_flags_match_gcc`): the blanket flags are
+                // last-wins, `-fno-builtin-<fn>` is sticky, and the hosted
+                // flags also set the blanket builtin state while
+                // `-fbuiltin` leaves hosted-ness alone.
+                "-ffreestanding" | "-fno-hosted" => {
+                    self.freestanding = true;
+                    self.builtin_policy.withdraw_all();
+                }
+                "-fhosted" | "-fno-freestanding" => {
+                    self.freestanding = false;
+                    self.builtin_policy.restore_all();
+                }
+                "-fbuiltin" => self.builtin_policy.restore_all(),
+                "-fno-builtin" => self.builtin_policy.withdraw_all(),
+                arg if arg.starts_with("-fno-builtin-") => {
+                    self.builtin_policy
+                        .withdraw_name(&arg["-fno-builtin-".len()..]);
+                }
                 "-ffast-math" => {
                     self.fp_trapping_math = false;
                     self.fp_rounding_math = false;
@@ -3058,6 +3020,77 @@ mod cli_tests {
         );
     }
 
+    fn parse_flags(flags: &[&str]) -> Result<Driver, String> {
+        let mut d = Driver::new();
+        let mut args = vec!["ccc".to_string()];
+        args.extend(flags.iter().map(|f| f.to_string()));
+        args.push("x.c".to_string());
+        d.parse_cli_args(&args).map(|_| d)
+    }
+
+    /// Profile paths, as GCC 16.2 places the `.gcda` files (measured): the
+    /// later of `-fprofile-dir` and an explicit mode path wins, and a bare
+    /// mode switch takes `-fprofile-dir` from either side.
+    #[test]
+    fn profile_dir_applies_in_either_order() {
+        let generate_dir = |flags: &[&str]| parse_flags(flags).unwrap().pgo_generate;
+        let dir = |s: &str| Some(s.to_string());
+        assert_eq!(
+            generate_dir(&["-fprofile-dir=D", "-fprofile-generate"]),
+            dir("D")
+        );
+        assert_eq!(
+            generate_dir(&["-fprofile-generate", "-fprofile-dir=D"]),
+            dir("D")
+        );
+        assert_eq!(
+            generate_dir(&["-fprofile-generate=P", "-fprofile-dir=D"]),
+            dir("D")
+        );
+        assert_eq!(
+            generate_dir(&["-fprofile-dir=D", "-fprofile-generate=P"]),
+            dir("P")
+        );
+        assert_eq!(
+            generate_dir(&["-fprofile-dir=D", "-fprofile-arcs"]),
+            dir("D")
+        );
+        assert_eq!(generate_dir(&["-fprofile-generate"]), dir("."));
+        let used = parse_flags(&["-fprofile-dir=U", "-fprofile-use"])
+            .unwrap()
+            .pgo_use;
+        assert_eq!(used, dir("U"));
+    }
+
+    #[test]
+    fn empty_profile_paths_and_unknown_update_methods_are_errors() {
+        for prefix in [
+            "-fprofile-generate=",
+            "-fprofile-use=",
+            "-fprofile-dir=",
+            "-fauto-profile=",
+            "-fprofile-update=",
+        ] {
+            assert_eq!(
+                try_flag(prefix),
+                Err(format!("missing argument to '{prefix}'"))
+            );
+        }
+        let err = try_flag("-fprofile-update=unknown").unwrap_err();
+        assert!(
+            err.starts_with("unknown profile update method 'unknown'"),
+            "{err}"
+        );
+        for (flag, method) in [
+            ("-fprofile-update=single", "single"),
+            ("-fprofile-update=atomic", "atomic"),
+            ("-fprofile-update=prefer-atomic", "atomic"),
+        ] {
+            let d = parse_flags(&[flag]).unwrap();
+            assert_eq!(d.pgo_update.as_deref(), Some(method), "{flag}");
+        }
+    }
+
     /// `-mno-<feature>` must be ACCEPTED for any ISA extension LCCC never
     /// emits. A compiler that cannot generate a feature already complies with
     /// a request not to use it, and the Linux kernel probes the compiler with
@@ -3443,6 +3476,40 @@ mod cli_tests {
                     }
                 }
             }
+        }
+    }
+
+    /// The GCC 16.2 table, measured on the oracle with
+    /// `memset(b, 7, 8)` (call vs inline) and `__STDC_HOSTED__`.
+    #[test]
+    fn builtin_flags_match_gcc() {
+        for (flags, memset_builtin, hosted) in [
+            (vec![], true, true),
+            (vec!["-fno-builtin"], false, true),
+            (vec!["-fno-builtin", "-fbuiltin"], true, true),
+            (vec!["-fno-builtin-memset"], false, true),
+            (vec!["-fno-builtin-memset", "-fbuiltin"], false, true),
+            (vec!["-ffreestanding"], false, false),
+            (vec!["-ffreestanding", "-fhosted"], true, true),
+            (vec!["-ffreestanding", "-fbuiltin"], true, false),
+            (vec!["-fno-builtin", "-fhosted"], true, true),
+            (vec!["-fno-hosted"], false, false),
+            (vec!["-fno-freestanding"], true, true),
+            (vec!["-fno-builtin-printf"], true, true),
+        ] {
+            let mut driver = Driver::new();
+            let args = std::iter::once("lccc")
+                .chain(flags)
+                .chain(["x.c"])
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            driver.parse_cli_args(&args).unwrap();
+            assert_eq!(
+                driver.builtin_policy.may_assume("memset"),
+                memset_builtin,
+                "{args:?}"
+            );
+            assert_eq!(!driver.freestanding, hosted, "{args:?}");
         }
     }
 

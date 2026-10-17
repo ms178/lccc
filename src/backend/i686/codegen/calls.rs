@@ -40,6 +40,7 @@ impl I686Codegen {
             // The caller packs 4-granular and va_arg walks 4-granular, so the
             // callee layout must agree — see CallAbiConfig::stack_arg_align_cap.
             stack_arg_align_cap: 4,
+            vector_xmm_regs: 3,
         }
     }
 
@@ -62,7 +63,10 @@ impl I686Codegen {
         struct_arg_aligns: &[Option<usize>],
         struct_arg_is_f128_sse: &[bool],
     ) -> usize {
-        let _ = ac;
+        // A vector piece in an XMM register occupies no outgoing stack.
+        if matches!(ac, call_abi::CallArgClass::StructXmmReg { .. }) {
+            return 4;
+        }
         let align = struct_arg_aligns.get(i).copied().flatten().unwrap_or(4);
         if struct_arg_is_f128_sse.get(i).copied().unwrap_or(false) && align >= 16 {
             16
@@ -102,6 +106,7 @@ impl I686Codegen {
                 call_abi::CallArgClass::IntReg { .. } => {} // regparm: in register, no stack space
                 call_abi::CallArgClass::I64RegPair { .. } => {} // regparm: register pair
                 call_abi::CallArgClass::StructByValReg { .. } => {} // regparm: struct in registers
+                call_abi::CallArgClass::StructXmmReg { .. } => {} // i386 vector piece in %xmmN
                 _ => total += 4,
             }
         }
@@ -147,6 +152,7 @@ impl I686Codegen {
                 | call_abi::CallArgClass::StructByValStack { .. }
                 | call_abi::CallArgClass::LargeStructStack { .. }
                 | call_abi::CallArgClass::StructSplitRegStack { .. }
+                | call_abi::CallArgClass::StructXmmReg { .. }
         )
     }
 
@@ -198,7 +204,8 @@ impl I686Codegen {
                         call_abi::CallArgClass::ZeroSizeSkip
                         | call_abi::CallArgClass::IntReg { .. }
                         | call_abi::CallArgClass::I64RegPair { .. }
-                        | call_abi::CallArgClass::StructByValReg { .. } => 0,
+                        | call_abi::CallArgClass::StructByValReg { .. }
+                        | call_abi::CallArgClass::StructXmmReg { .. } => 0,
                         _ => 4,
                     };
                 }
@@ -279,6 +286,7 @@ impl I686Codegen {
                 call_abi::CallArgClass::IntReg { .. } => {} // regparm: handled in emit_call_reg_args
                 call_abi::CallArgClass::I64RegPair { .. } => {} // regparm: register pair
                 call_abi::CallArgClass::StructByValReg { .. } => {} // regparm: struct in registers
+                call_abi::CallArgClass::StructXmmReg { .. } => {} // loaded in emit_call_reg_args
                 _ => {
                     if !self.store_const_to_stack_arg(&args[i], stack_offset) {
                         self.operand_to_eax(&args[i]);
@@ -302,6 +310,17 @@ impl I686Codegen {
         _stack_arg_space: usize,
         _struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>],
     ) {
+        // i386 vector pieces: the operand is the address of the piece's 16
+        // bytes. They load first, through %eax, because the regparm moves
+        // below also stage through %eax and must be the last writers of the
+        // GP argument registers; nothing after this point touches an XMM
+        // register before the call.
+        for (i, ac) in arg_classes.iter().enumerate() {
+            if let call_abi::CallArgClass::StructXmmReg { reg_idx } = ac {
+                self.operand_to_eax(&args[i]);
+                emit!(self.state, "    movups (%eax), %xmm{}", reg_idx);
+            }
+        }
         if self.current_call_regparm == 0 {
             return; // cdecl: no register args
         }
@@ -592,6 +611,15 @@ impl I686Codegen {
             let sr12 = self.slot_ref_offset(slot, 12);
             emit!(self.state, "    movl %ecx, {}", sr8);
             emit!(self.state, "    movl $0, {}", sr12);
+        }
+    }
+
+    /// Store a 16-byte i386 vector piece returned in %xmm0 over the I128
+    /// result slot (the regular I128 store above wrote EAX:EDX there).
+    pub(super) fn emit_call_store_i686_xmm_result_impl(&mut self, dest: &Value) {
+        if let Some(slot) = self.state.get_slot(dest.0) {
+            let sr = self.slot_ref(slot);
+            emit!(self.state, "    movups %xmm0, {}", sr);
         }
     }
 

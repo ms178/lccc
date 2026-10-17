@@ -126,7 +126,10 @@ setup_rust() {
                  --no-modify-path >/dev/null
   fi
 
-  if ! "$bin/rustup" toolchain list 2>/dev/null | grep -q "^$RUST_VERSION"; then
+  # A cached moving channel can be months old. Resolve it again; explicit
+  # version/date overrides retain their reproducibility and offline behavior.
+  if [[ $RUST_VERSION == stable || $RUST_VERSION == beta || $RUST_VERSION == nightly ]] ||
+      ! "$bin/rustup" toolchain list 2>/dev/null | grep -q "^$RUST_VERSION"; then
     log "installing Rust $RUST_VERSION"
     "$bin/rustup" toolchain install "$RUST_VERSION" \
       --profile minimal --no-self-update >/dev/null

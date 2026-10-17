@@ -182,30 +182,24 @@ impl StructLayoutProvider for FxHashMap<String, RcLayout> {
     }
 }
 
-/// System V AMD64 ABI classification for a single 8-byte "eightbyte" of a struct.
-/// Used to determine whether a struct field group should be passed in GP or SSE registers.
+/// System V AMD64 ABI class of one 8-byte "eightbyte" of a by-value
+/// aggregate, as handed from lowering to the backend. Produced only by
+/// `crate::common::sysv_classify`, which models the full psABI algorithm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EightbyteClass {
-    /// No fields occupy this eightbyte yet (initial state during classification).
+    /// Padding only: occupies no register.
     NoClass,
-    /// All fields in this eightbyte are float/double -> pass in xmm register.
+    /// Passed in the next free SSE register (low 64 bits).
     Sse,
-    /// At least one non-float field in this eightbyte -> pass in GP register.
+    /// The upper half of the preceding SSE eightbyte's register:
+    /// `[Sse, SseUp]` is one 16-byte value in ONE `%xmm` register.
+    SseUp,
+    /// Passed in the next free general-purpose register.
     Integer,
-}
-
-impl EightbyteClass {
-    /// Merge two eightbyte classifications per SysV ABI rules:
-    /// - NoClass + X = X
-    /// - Integer + anything = Integer
-    /// - SSE + SSE = SSE
-    pub fn merge(self, other: EightbyteClass) -> EightbyteClass {
-        match (self, other) {
-            (EightbyteClass::NoClass, x) | (x, EightbyteClass::NoClass) => x,
-            (EightbyteClass::Integer, _) | (_, EightbyteClass::Integer) => EightbyteClass::Integer,
-            (EightbyteClass::Sse, EightbyteClass::Sse) => EightbyteClass::Sse,
-        }
-    }
+    /// The aggregate is passed in memory (only ever the sole class:
+    /// `[Memory]`). Covers misaligned fields, X87 members and BLKmode
+    /// vectors; objects over 16 bytes keep an empty class list instead.
+    Memory,
 }
 
 /// Classification of a struct for RISC-V LP64D hardware floating-point calling convention.
@@ -325,11 +319,39 @@ pub enum CType {
     ExtVector(Box<CType>, ExtVectorLayout),
 }
 
+/// Clang 23.1.3's i386 carrier for a by-value `ext_vector_type` value,
+/// derived with the executable probes in
+/// `tests/regression/ext_vector_abi/i386_probe` (LLVM's i386 calling
+/// convention applied to Clang's IR vector type).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum I386ExtVectorCarrier {
+    /// Argument: each lane is its own scalar argument in its own stack slot.
+    Lanes,
+    /// Argument: the 8-byte memory image in one stack slot (Clang coerces a
+    /// 64-bit integer-lane vector to `i64`).
+    Image64,
+    /// 16-byte pieces in XMM registers, lanes widened in place (`_Bool`
+    /// lanes become 16/N-byte integers whose bit 0 is the lane).
+    /// Arguments: %xmm0-%xmm2 then 16-byte-aligned stack slots; returns: %xmm0.
+    Xmm { pieces: usize },
+    /// Return: the lone lane as a scalar (%eax, %eax:%edx or %st(0)).
+    Scalar,
+    /// Return: lane i in the i-th of %eax, %edx, %ecx (at most three integer
+    /// lanes of at most 4 bytes).
+    GpLanes,
+    /// Return: through a hidden pointer to the memory image.
+    Sret,
+    /// Clang's convention has no lccc carrier (several XMM or x87 return
+    /// registers, or one-lane-per-slot `_Bool` vectors over 64 lanes).
+    Unsupported,
+}
+
 /// Target-specific object layout for a Clang `ext_vector_type`.
 ///
 /// `vector_size` retains its legacy byte-width semantics in `CType::Vector`.
 /// This descriptor is only used for `ext_vector_type`, whose object may be
 /// padded beyond its logical lanes and whose `_Bool` lanes are bit-packed.
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ExtVectorLayout {
     pub lanes: usize,
@@ -424,6 +446,15 @@ pub struct FunctionType {
 /// StructField describes a single field in a struct or union declaration.
 /// Used during construction of StructLayout.
 
+/// The alignment a member or object gets from all of its explicit sources
+/// (`_Alignas(N)`, `_Alignas(type)`, `aligned(N)`, an aligned typedef): the
+/// strictest one (C11 6.7.5p6), or `None` when there is none. Every
+/// `StructFieldDecl` -> `StructField` conversion merges through this, so the
+/// sema and lowering layouts of one record cannot differ.
+pub fn strictest_alignment(sources: impl IntoIterator<Item = Option<usize>>) -> Option<usize> {
+    sources.into_iter().flatten().max()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StructField {
     pub name: String,
@@ -486,13 +517,14 @@ impl EnumType {
                     CType::UShort
                 }
             }
-            8 => {
-                if any_negative {
-                    CType::LongLong
-                } else {
-                    CType::ULongLong
-                }
-            }
+            // GCC and Clang pick `long` on LP64 targets and `long long` on
+            // ILP32 (measured: `_Generic` on `enum { E = 1LL << 32 }`).
+            8 => match (any_negative, target_ptr_size() == 8) {
+                (true, true) => CType::Long,
+                (false, true) => CType::ULong,
+                (true, false) => CType::LongLong,
+                (false, false) => CType::ULongLong,
+            },
             _ => {
                 if any_negative {
                     CType::Int
@@ -503,23 +535,37 @@ impl EnumType {
         }
     }
 
+    /// Type of every enumerator once the enum is complete: `int` when all
+    /// enumerators fit in `int`, otherwise the enum's compatible type for all
+    /// of them (`enum { A = 0, B = 1LL << 32 }` makes `A` an `unsigned long`
+    /// on LP64). GCC 16.2 and Clang 23.1.3 agree in every `-std` mode
+    /// (measured with `_Generic` and `sizeof` under gnu17, gnu23 and c11).
+    pub fn constant_ctype(&self) -> CType {
+        if self.variants.iter().all(|(_, v)| i32::try_from(*v).is_ok()) {
+            CType::Int
+        } else {
+            self.compatible_ctype()
+        }
+    }
+
     /// Returns the size (and alignment) in bytes for this enum.
     /// Non-packed enums are always 4 bytes (int). Packed enums use the
     /// smallest integer type that can represent all variant values.
     pub fn packed_size(&self) -> usize {
         if !self.is_packed {
-            // Non-packed enum: 4 bytes if all values fit in int or unsigned int,
-            // otherwise 8 bytes (GCC extension for values exceeding 32-bit range).
-            // Values like `1U << 31` (0x80000000) fit in unsigned int (u32) even
-            // though they exceed signed int (i32) range.
-            let exceeds_32bit = self
-                .variants
-                .iter()
-                .any(|(_, v)| *v > u32::MAX as i64 || *v < i32::MIN as i64);
-            if exceeds_32bit {
-                return 8;
-            }
-            return 4;
+            // Non-packed enum: 4 bytes when ONE 32-bit type holds every value
+            // (`unsigned int` without negatives, else `int`), otherwise 8 (GCC
+            // extension). `{ -1, 0x80000000 }` fits neither 32-bit type and is
+            // `long` (GCC 16.2 and Clang 23.1.3, measured).
+            let any_negative = self.variants.iter().any(|(_, v)| *v < 0);
+            let fits_32 = self.variants.iter().all(|(_, v)| {
+                if any_negative {
+                    i32::try_from(*v).is_ok()
+                } else {
+                    u32::try_from(*v).is_ok()
+                }
+            });
+            return if fits_32 { 4 } else { 8 };
         }
         // Find the range of variant values to determine the minimum size
         if self.variants.is_empty() {
@@ -1144,189 +1190,14 @@ impl StructLayout {
         }
     }
 
-    /// Classify each 8-byte "eightbyte" of this struct/union per the System V AMD64 ABI.
-    ///
-    /// Returns a vector with one entry per eightbyte (so 1 entry for size <= 8, 2 for size <= 16).
-    /// Each entry is `EightbyteClass::Sse` if all fields in that eightbyte are float/double,
-    /// or `EightbyteClass::Integer` otherwise.
-    ///
-    /// Structs > 16 bytes get MEMORY class (empty vec, meaning pass on stack).
-    /// Structs containing unaligned fields or bitfields spanning eightbyte boundaries
-    /// are conservatively classified as INTEGER.
+    /// SysV AMD64 argument classes of this record (see `sysv_classify`):
+    /// register classes, `[Memory]` for a record passed in memory, or an
+    /// empty list for records over 16 bytes (MEMORY by size) and empty ones.
     pub fn classify_sysv_eightbytes(&self, ctx: &dyn StructLayoutProvider) -> Vec<EightbyteClass> {
-        // Structs > 16 bytes -> MEMORY class
         if self.size > 16 || self.size == 0 {
             return Vec::new();
         }
-
-        let n_eightbytes = if self.size <= 8 { 1 } else { 2 };
-        // Start with NO_CLASS (uninitialized), then merge field classifications
-        let mut classes = vec![EightbyteClass::NoClass; n_eightbytes];
-
-        for field in &self.fields {
-            // Skip zero-width bitfields (padding only)
-            if field.bit_width == Some(0) {
-                continue;
-            }
-            // Bitfields complicate classification -- conservatively treat as INTEGER
-            if field.bit_width.is_some() {
-                let eb_idx = field.offset / 8;
-                if eb_idx < n_eightbytes {
-                    classes[eb_idx] = classes[eb_idx].merge(EightbyteClass::Integer);
-                }
-                continue;
-            }
-
-            Self::classify_field_type(&field.ty, field.offset, &mut classes, n_eightbytes, ctx);
-        }
-
-        // Replace any remaining NoClass with Integer (e.g., padding-only eightbytes)
-        for c in &mut classes {
-            if *c == EightbyteClass::NoClass {
-                *c = EightbyteClass::Integer;
-            }
-        }
-
-        classes
-    }
-
-    /// Recursively classify a field's type into the eightbyte slots it occupies.
-    fn classify_field_type(
-        ty: &CType,
-        base_offset: usize,
-        classes: &mut [EightbyteClass],
-        n_eightbytes: usize,
-        ctx: &dyn StructLayoutProvider,
-    ) {
-        match ty {
-            CType::Float => {
-                let eb_idx = base_offset / 8;
-                if eb_idx < n_eightbytes {
-                    classes[eb_idx] = classes[eb_idx].merge(EightbyteClass::Sse);
-                }
-            }
-            CType::Double => {
-                let eb_idx = base_offset / 8;
-                if eb_idx < n_eightbytes {
-                    classes[eb_idx] = classes[eb_idx].merge(EightbyteClass::Sse);
-                }
-            }
-            // Decimal FP members classify like the binary floats of equal
-            // width (GCC SysV: _Decimal32/_Decimal64 are SSE, _Decimal128
-            // occupies two SSE eightbytes).
-            CType::Decimal32 | CType::Decimal64 => {
-                let eb_idx = base_offset / 8;
-                if eb_idx < n_eightbytes {
-                    classes[eb_idx] = classes[eb_idx].merge(EightbyteClass::Sse);
-                }
-            }
-            CType::Decimal128 => {
-                let eb_idx = base_offset / 8;
-                if eb_idx + 1 < n_eightbytes {
-                    classes[eb_idx] = classes[eb_idx].merge(EightbyteClass::Sse);
-                    classes[eb_idx + 1] = classes[eb_idx + 1].merge(EightbyteClass::Sse);
-                } else if eb_idx < n_eightbytes {
-                    classes[eb_idx] = classes[eb_idx].merge(EightbyteClass::Sse);
-                }
-            }
-            // Array: classify each element
-            CType::Array(elem_ty, Some(count)) => {
-                let elem_size = elem_ty.size();
-                if elem_size > 0 {
-                    for i in 0..*count {
-                        Self::classify_field_type(
-                            elem_ty,
-                            base_offset + i * elem_size,
-                            classes,
-                            n_eightbytes,
-                            ctx,
-                        );
-                    }
-                }
-            }
-            // Nested struct/union: classify each of its fields
-            CType::Struct(key) | CType::Union(key) => {
-                if let Some(layout) = ctx.get_struct_layout(key) {
-                    for inner_field in &layout.fields {
-                        if inner_field.bit_width == Some(0) {
-                            continue;
-                        }
-                        if inner_field.bit_width.is_some() {
-                            let eb_idx = (base_offset + inner_field.offset) / 8;
-                            if eb_idx < n_eightbytes {
-                                classes[eb_idx] = classes[eb_idx].merge(EightbyteClass::Integer);
-                            }
-                            continue;
-                        }
-                        Self::classify_field_type(
-                            &inner_field.ty,
-                            base_offset + inner_field.offset,
-                            classes,
-                            n_eightbytes,
-                            ctx,
-                        );
-                    }
-                } else {
-                    // Unknown layout: treat conservatively as INTEGER
-                    let eb_idx = base_offset / 8;
-                    if eb_idx < n_eightbytes {
-                        classes[eb_idx] = classes[eb_idx].merge(EightbyteClass::Integer);
-                    }
-                }
-            }
-            // Byte-sized GCC vectors keep their historical classification.
-            CType::Vector(elem_ty, total_size) => {
-                let elem_size = elem_ty.size();
-                if elem_size > 0 {
-                    let num_elems = total_size / elem_size;
-                    for i in 0..num_elems {
-                        Self::classify_field_type(
-                            elem_ty,
-                            base_offset + i * elem_size,
-                            classes,
-                            n_eightbytes,
-                            ctx,
-                        );
-                    }
-                } else {
-                    let eb_idx = base_offset / 8;
-                    if eb_idx < n_eightbytes {
-                        classes[eb_idx] = classes[eb_idx].merge(EightbyteClass::Integer);
-                    }
-                }
-            }
-            // ext_vector_type has an explicit lane count and may have padded
-            // storage. Classify only its logical lanes; padding contributes no
-            // additional fields. Packed bool vectors occupy integer bytes.
-            CType::ExtVector(elem_ty, layout) => {
-                if layout.bitpacked_bool {
-                    let first = base_offset / 8;
-                    let last = (base_offset + layout.storage_size.saturating_sub(1)) / 8;
-                    for eb_idx in first..=last {
-                        if eb_idx < n_eightbytes {
-                            classes[eb_idx] = classes[eb_idx].merge(EightbyteClass::Integer);
-                        }
-                    }
-                } else if layout.element_storage_size > 0 {
-                    for i in 0..layout.lanes {
-                        Self::classify_field_type(
-                            elem_ty,
-                            base_offset + i * layout.element_storage_size,
-                            classes,
-                            n_eightbytes,
-                            ctx,
-                        );
-                    }
-                }
-            }
-            // All other types (integers, pointers, enums, etc.) -> INTEGER
-            _ => {
-                let eb_idx = base_offset / 8;
-                if eb_idx < n_eightbytes {
-                    classes[eb_idx] = classes[eb_idx].merge(EightbyteClass::Integer);
-                }
-            }
-        }
+        super::sysv_classify::classify_layout(self, ctx).arg_classes()
     }
 
     /// Classify this struct for the RISC-V LP64D hardware floating-point calling convention.
@@ -2122,7 +1993,9 @@ impl CType {
             CType::Struct(key) | CType::Union(key) => {
                 ctx.get_struct_layout(key).map(|l| l.align).unwrap_or(1)
             }
-            CType::Enum(e) => e.packed_size(),
+            // Aligned as its compatible type: an 8-byte enum is 4-aligned on
+            // i386 like `long long` (GCC 16.2 `_Alignof`, -m32).
+            CType::Enum(e) => e.compatible_ctype().align_ctx(ctx),
             // GCC vector_size alignment retains its target-specific cap.
             CType::Vector(_, total_size) => (*total_size).min(16),
             // Clang ext_vector_type alignment follows its padded storage size.
@@ -2141,6 +2014,7 @@ impl CType {
         }
         // On i686: long long and double have preferred alignment of 8
         match self {
+            CType::Enum(e) => e.compatible_ctype().preferred_align_ctx(ctx),
             CType::LongLong | CType::ULongLong => 8,
             CType::Double => 8,
             CType::ComplexDouble => 8,
@@ -2182,6 +2056,9 @@ impl CType {
     }
 
     pub fn is_signed(&self) -> bool {
+        if let CType::Enum(e) = self {
+            return e.compatible_ctype().is_signed();
+        }
         matches!(
             self,
             CType::Char | CType::Short | CType::Int | CType::Long | CType::LongLong | CType::Int128
@@ -2227,76 +2104,24 @@ impl CType {
         self.is_integer() || self.is_floating() || self.is_complex()
     }
 
-    /// Whether this is a GCC vector extension type.
-    /// SysV AMD64 classification of a VECTOR type, as the pair
-    /// `(eightbyte classes, occupies ONE xmm register)`.
-    ///
-    /// The psABI classifies the FIRST eightbyte of a vector as SSE and every
-    /// further eightbyte as SSEUP -- "the upper half of the same vector
-    /// register" -- which is why `<4 x i32>` occupies exactly ONE `%xmm`
-    /// register while a `{double, double}` struct, whose two eightbytes are
-    /// both plain SSE, takes two.  LCCC already models "one 16-byte XMM" with
-    /// the carrier `_Float128` uses (`is_f128_sse` in the call ABI), so a
-    /// 16-byte vector is described by the same flag.
-    ///
-    /// Returns `None` for anything that is not a vector, and for 32-byte
-    /// vectors, whose SysV treatment (two SSEUP eightbytes in ONE `%ymm`) is a
-    /// per-invocation ABI decision the caller has to make with `-mavx` in
-    /// hand -- returning `None` keeps the existing by-value behaviour there
-    /// instead of promising a convention the backend may not emit.
-    pub fn sysv_vector_carrier(&self) -> Option<(Vec<EightbyteClass>, bool)> {
-        if !self.is_vector() {
-            return None;
-        }
-        // Clang lowers packed `_Bool` ext vectors through an integer carrier
-        // on x86-64 (e.g. ext_vector_type(4) is an i8 argument/return), not an
-        // SSE register. This classification is separate from vector_size.
-        if self.is_bitpacked_bool_vector() {
-            return match self.size() {
-                1..=8 => Some((vec![EightbyteClass::Integer], false)),
-                _ => None,
-            };
-        }
-        // A ONE-element floating-point vector (`ext_vector_type(1)` of
-        // `double`, 8 bytes) keeps the legacy INTEGER carrier. Clang and GCC
-        // classify this shape as MEMORY (clang-19 compiles `id(T a){return a;}`
-        // to `movsd 8(%rsp),%xmm0` -- the argument arrives on the stack), so
-        // there is no interop to be won by moving it to SSE; and LCCC's own
-        // FP return path cannot guarantee %xmm0 for it yet: at -O1 the callee
-        // materialises the result with `vaddsd ...,%xmm2,%xmm2` and emits no
-        // move, so an SSE classification returns a stale register and breaks
-        // lccc->lccc itself (measured FAIL of f64x1 in
-        // tests/regression/check_ext_vector_abi.sh). The INTEGER carrier is
-        // self-consistent on both sides; the gap is tracked, not hidden.
-        if let CType::ExtVector(elem, layout) = self {
-            if layout.lanes == 1
-                && matches!(**elem, CType::Double | CType::Float | CType::LongDouble)
-            {
-                return match self.size() {
-                    1..=8 => Some((vec![EightbyteClass::Integer], false)),
-                    _ => None,
-                };
-            }
-        }
-        match self.size() {
-            // Smaller than an eightbyte: INTEGER class, carried in the low
-            // bytes of ONE general-purpose register. Measured with both
-            // oracles on x86-64: clang-19 `id_u8x1`/`id_u8x2`/`id_u16x2`/
-            // `id_u32x1`/`id_f32x1` and gcc-16 `vector_size(1,2,4)` shapes all
-            // arrive in %edi and leave in %eax. The old rule classified these
-            // as SSE and LCCC passed them in %xmm0, which no oracle does.
-            1..=4 => Some((vec![EightbyteClass::Integer], false)),
-            // One SSE eightbyte: the low 64 bits of ONE xmm register.
-            5..=8 => Some((vec![EightbyteClass::Sse], false)),
-            // SSE + SSEUP: the full 128 bits of ONE xmm register. An
-            // ext_vector_type(3) object is padded to 16 bytes and still uses a
-            // single %xmm0 (clang-19 `id_u32x3`/`id_f32x3`), so 9..=16 is one
-            // register, not the two-register struct form.
-            9..=16 => Some((vec![EightbyteClass::Sse, EightbyteClass::Sse], true)),
-            _ => None,
-        }
+    /// SysV AMD64 by-value argument convention of a struct, union or vector
+    /// (`None` for other types and incomplete records). See `sysv_classify`.
+    pub fn sysv_passing(
+        &self,
+        ctx: &dyn StructLayoutProvider,
+    ) -> Option<super::sysv_classify::SysvPassing> {
+        super::sysv_classify::classify(self, ctx)
     }
 
+    /// The return-position counterpart of `sysv_passing`.
+    pub fn sysv_return_passing(
+        &self,
+        ctx: &dyn StructLayoutProvider,
+    ) -> Option<super::sysv_classify::SysvPassing> {
+        super::sysv_classify::classify_return(self, ctx)
+    }
+
+    /// Whether this is a GCC vector extension type.
     pub fn is_vector(&self) -> bool {
         matches!(self, CType::Vector(_, _) | CType::ExtVector(_, _))
     }
@@ -2307,14 +2132,158 @@ impl CType {
         matches!(self, CType::ExtVector(_, layout) if layout.bitpacked_bool)
     }
 
+    /// The 16-byte pieces LLVM widens or splits this ext vector into on
+    /// x86 (its calling-convention register type), or `None` when the vector
+    /// is a single scalar lane or is scalarized instead. Measured against
+    /// Clang 23.1.3: `_Bool` lanes widen at 2, 4, 8 and 16 lanes; other lanes
+    /// when the lane count is a power of two, or when rounding it up to one
+    /// fills exactly 16 bytes (u8x12, u16x5..7, u32x3, f32x3).
+    pub fn ext_vector_xmm_pieces(&self) -> Option<usize> {
+        let CType::ExtVector(elem, layout) = self else {
+            return None;
+        };
+        let n = layout.lanes;
+        if layout.bitpacked_bool {
+            return matches!(n, 2 | 4 | 8 | 16).then_some(1);
+        }
+        let e = elem.size();
+        if n < 2 || matches!(**elem, CType::LongDouble) || !matches!(e, 1 | 2 | 4 | 8) {
+            return None;
+        }
+        if n.is_power_of_two() {
+            Some((n * e).div_ceil(16))
+        } else {
+            (n.next_power_of_two() * e == 16).then_some(1)
+        }
+    }
+
+    /// Clang 23.1.3's i386 convention for this ext vector as an argument
+    /// (`None` for other types). See `I386ExtVectorCarrier`.
+    pub fn i386_ext_vector_arg(&self) -> Option<I386ExtVectorCarrier> {
+        let CType::ExtVector(elem, layout) = self else {
+            return None;
+        };
+        let n = layout.lanes;
+        Some(if n == 1 {
+            I386ExtVectorCarrier::Lanes
+        } else if layout.bitpacked_bool && n > 64 {
+            I386ExtVectorCarrier::Unsupported
+        } else if (layout.bitpacked_bool && n == 64)
+            || (!layout.bitpacked_bool && elem.is_integer() && n * elem.size() == 8)
+        {
+            I386ExtVectorCarrier::Image64
+        } else if let Some(pieces) = self.ext_vector_xmm_pieces() {
+            I386ExtVectorCarrier::Xmm { pieces }
+        } else {
+            I386ExtVectorCarrier::Lanes
+        })
+    }
+
+    /// Number of IR arguments an i386 by-value ext vector expands to: one
+    /// per lane when scalarized, one per 16-byte piece when widened, and one
+    /// otherwise (including every non-ext-vector type).
+    pub fn i386_ext_vector_ir_args(&self) -> usize {
+        match self.i386_ext_vector_arg() {
+            Some(I386ExtVectorCarrier::Lanes) => self.vector_info().map_or(1, |(_, lanes)| lanes),
+            Some(I386ExtVectorCarrier::Xmm { pieces }) => pieces,
+            _ => 1,
+        }
+    }
+
+    /// Clang 23.1.3's i386 convention for this ext vector as a return value
+    /// (`None` for other types). See `I386ExtVectorCarrier`.
+    pub fn i386_ext_vector_ret(&self) -> Option<I386ExtVectorCarrier> {
+        let CType::ExtVector(elem, layout) = self else {
+            return None;
+        };
+        let n = layout.lanes;
+        let int_lanes = layout.bitpacked_bool || elem.is_integer();
+        Some(if n == 1 {
+            I386ExtVectorCarrier::Scalar
+        } else if layout.bitpacked_bool && n > 64 {
+            I386ExtVectorCarrier::Unsupported
+        } else if let Some(pieces) = self.ext_vector_xmm_pieces() {
+            match pieces {
+                1 => I386ExtVectorCarrier::Xmm { pieces },
+                // %xmm0..%xmm3: no lccc carrier for a multi-register return.
+                2..=4 => I386ExtVectorCarrier::Unsupported,
+                _ => I386ExtVectorCarrier::Sret,
+            }
+        } else if int_lanes && n <= 3 && elem.size() <= 4 {
+            I386ExtVectorCarrier::GpLanes
+        } else if matches!(**elem, CType::LongDouble) && n == 2 {
+            // %st(0) and %st(1).
+            I386ExtVectorCarrier::Unsupported
+        } else {
+            I386ExtVectorCarrier::Sret
+        })
+    }
+
+    /// The IR carrier of an i386 ext-vector register return: up to three
+    /// lane words in EAX/EDX/ECX (I32, I64, or the I128 bundle tagged with
+    /// three INTEGER classes), a one-lane floating vector as its x87 scalar,
+    /// or one XMM piece (I128 tagged `[Sse, SseUp]`). `None` for sret and
+    /// unsupported returns and for anything but an ext vector.
+    pub fn i686_ext_vector_ret_carrier(&self) -> Option<(IrType, Vec<EightbyteClass>)> {
+        match self.i386_ext_vector_ret()? {
+            I386ExtVectorCarrier::Xmm { .. } => Some((
+                IrType::I128,
+                vec![EightbyteClass::Sse, EightbyteClass::SseUp],
+            )),
+            I386ExtVectorCarrier::Scalar | I386ExtVectorCarrier::GpLanes => {
+                if let Some(words) = self.i686_ext_vector_gp_word_count() {
+                    return Some(match words {
+                        1 => (IrType::I32, Vec::new()),
+                        2 => (IrType::I64, Vec::new()),
+                        _ => (IrType::I128, vec![EightbyteClass::Integer; 3]),
+                    });
+                }
+                let (elem, _) = self.vector_info()?;
+                matches!(elem, CType::Float | CType::Double | CType::LongDouble)
+                    .then(|| (IrType::from_ctype(elem), Vec::new()))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether Clang 23.1.3's x86-64 convention for this ext vector has no
+    /// lccc carrier in the given position, so passing or returning it by
+    /// value must be rejected rather than silently disagree. Arguments:
+    /// `_Bool` vectors over 64 lanes (LLVM spreads them one lane per stack
+    /// byte slot). Returns over 16 bytes that LLVM still keeps in registers:
+    /// two to four %xmm pieces, three 8-byte lanes (%rax/%rdx/%rcx, or
+    /// %xmm0/%xmm1/%st(0)), and two `long double` lanes (%st(0)/%st(1)).
+    /// Every other larger return is sret, as lccc's MEMORY class does.
+    pub fn x86_64_ext_vector_unsupported(&self, is_return: bool) -> bool {
+        let CType::ExtVector(elem, layout) = self else {
+            return false;
+        };
+        if layout.bitpacked_bool && layout.lanes > 64 {
+            return !is_return;
+        }
+        is_return
+            && self.size() > 16
+            && (self
+                .ext_vector_xmm_pieces()
+                .is_some_and(|p| (2..=4).contains(&p))
+                || (layout.lanes == 3 && elem.size() == 8)
+                || (layout.lanes == 2 && matches!(**elem, CType::LongDouble)))
+    }
+
     /// Number of 32-bit i386 GP return words used for a Clang integer
-    /// ext-vector. The i386 Clang ABI scalarizes each logical lane and returns
-    /// up to three words in EAX, EDX, and ECX; larger vectors use sret. This
-    /// is deliberately limited to ExtVector and does not change vector_size.
+    /// ext-vector returned lane by lane (`GpLanes`, or a lone integer lane):
+    /// lane i in the i-th of EAX, EDX and ECX, a 64-bit lane in EAX:EDX.
+    /// Deliberately limited to ExtVector; `vector_size` is unchanged.
     pub fn i686_ext_vector_gp_word_count(&self) -> Option<usize> {
         let CType::ExtVector(elem, layout) = self else {
             return None;
         };
+        if !matches!(
+            self.i386_ext_vector_ret(),
+            Some(I386ExtVectorCarrier::GpLanes | I386ExtVectorCarrier::Scalar)
+        ) {
+            return None;
+        }
         if !elem.is_integer() {
             return None;
         }
@@ -2336,6 +2305,33 @@ impl CType {
                 Some(layout.element_storage_size)
             }
             CType::ExtVector(_, _) => None,
+            _ => None,
+        }
+    }
+
+    /// The type of a vector comparison whose operand has this vector type:
+    /// signed integer lanes of the same width and count (GCC and Clang:
+    /// `int` lanes for `float`, 64-bit lanes for `double`). An ext-vector
+    /// keeps its layout, which depends only on the lane count and width; a
+    /// bit-packed `_Bool` ext-vector compares to its own type. `None` for
+    /// non-vectors and lane widths without a signed integer type.
+    pub fn vector_comparison_result(&self) -> Option<CType> {
+        let signed_lane = |elem: &CType| -> Option<CType> {
+            Some(match elem.size() {
+                1 => CType::Char,
+                2 => CType::Short,
+                4 => CType::Int,
+                8 => CType::LongLong,
+                16 => CType::Int128,
+                _ => return None,
+            })
+        };
+        match self {
+            CType::Vector(elem, total) => Some(CType::Vector(Box::new(signed_lane(elem)?), *total)),
+            CType::ExtVector(_, layout) if layout.bitpacked_bool => Some(self.clone()),
+            CType::ExtVector(elem, layout) => {
+                Some(CType::ExtVector(Box::new(signed_lane(elem)?), *layout))
+            }
             _ => None,
         }
     }
@@ -2365,6 +2361,9 @@ impl CType {
     pub fn integer_promoted(&self) -> CType {
         match self {
             CType::Bool | CType::Char | CType::UChar | CType::Short | CType::UShort => CType::Int,
+            // An enum promotes as its compatible type does (C11 6.3.1.1p2): a
+            // packed one to `int`, an `unsigned int` one stays unsigned.
+            CType::Enum(e) => e.compatible_ctype().integer_promoted(),
             other => other.clone(),
         }
     }
@@ -2382,6 +2381,9 @@ impl CType {
     /// Whether this is an unsigned integer type.
     /// Used by usual arithmetic conversions (C11 6.3.1.8).
     pub fn is_unsigned(&self) -> bool {
+        if let CType::Enum(e) = self {
+            return e.compatible_ctype().is_unsigned();
+        }
         matches!(
             self,
             CType::Bool
@@ -2402,15 +2404,8 @@ impl CType {
             CType::Char | CType::UChar => 1,
             CType::Short | CType::UShort => 2,
             CType::Int | CType::UInt => 3,
-            CType::Enum(e) => {
-                // Enum rank follows its underlying type size
-                match e.packed_size() {
-                    1 => 1,
-                    2 => 2,
-                    8 => 5, // same rank as long long
-                    _ => 3, // int
-                }
-            }
+            // An enum ranks as its compatible type (C11 6.3.1.1p1).
+            CType::Enum(e) => e.compatible_ctype().integer_rank(),
             CType::Long | CType::ULong => 4,
             CType::LongLong | CType::ULongLong => 5,
             CType::Int128 | CType::UInt128 => 6,
@@ -2559,12 +2554,19 @@ impl CType {
     /// `__is_constexpr` macro which relies on `sizeof` of a conditional where
     /// one branch is `(void*)runtime_zero` (NOT an NPC → type is void*, sizeof 1)
     /// vs `(void*)constant_zero` (IS an NPC → type is int*, sizeof 4).
+    ///
+    /// The rules operate on the arms' VALUES, so both arms undergo lvalue
+    /// conversion first (C11 6.3.2.1p3-p4): `1 ? arr : arr` is an `int *`.
+    /// Decaying here, not in each caller, keeps sema and lowering agreeing
+    /// (sema once sized that conditional as the array, 16 bytes, not 8).
     pub fn conditional_composite_type(
         then_ct: Option<CType>,
         else_ct: Option<CType>,
         then_is_npc: bool,
         else_is_npc: bool,
     ) -> Option<CType> {
+        let then_ct = then_ct.map(|ct| ct.decayed_value_ctype());
+        let else_ct = else_ct.map(|ct| ct.decayed_value_ctype());
         match (then_ct, else_ct) {
             (Some(t), Some(e)) => {
                 // Both void
@@ -2997,31 +2999,8 @@ impl IrType {
             CType::Short => IrType::I16,
             CType::UShort => IrType::U16,
             CType::Int => IrType::I32,
-            CType::Enum(e) => {
-                // Map enum to IR type based on its computed size.
-                // For non-packed enums with 64-bit values, packed_size() returns 8.
-                match e.packed_size() {
-                    1 => IrType::I8,
-                    2 => IrType::I16,
-                    8 => {
-                        // 64-bit enums: check signedness
-                        if e.variants.iter().any(|(_, v)| *v < 0) {
-                            IrType::I64
-                        } else {
-                            IrType::U64
-                        }
-                    }
-                    _ => {
-                        // 4-byte enum: unsigned if any value exceeds i32 range
-                        // (e.g., 1U << 31 = 0x80000000 fits in u32 but not i32)
-                        if e.variants.iter().any(|(_, v)| *v > i32::MAX as i64) {
-                            IrType::U32
-                        } else {
-                            IrType::I32
-                        }
-                    }
-                }
-            }
+            // An enum is represented as its compatible integer type.
+            CType::Enum(e) => IrType::from_ctype(&e.compatible_ctype()),
             CType::UInt => IrType::U32,
             // ILP32: long = 32-bit; LP64: long = 64-bit
             CType::Long => {

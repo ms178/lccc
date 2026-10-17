@@ -13,6 +13,35 @@ impl I686Codegen {
         self.flush_x87_pending_copy();
         if let Some(val) = val {
             let ret_ty = self.current_return_type;
+            if ret_ty == IrType::I128 && self.current_return_i686_xmm {
+                match val {
+                    Operand::Value(value) => {
+                        let slot = self
+                            .state
+                            .get_slot(value.0)
+                            .expect("i686 XMM vector return must be stack-backed");
+                        let sr = self.slot_ref(slot);
+                        emit!(self.state, "    movups {}, %xmm0", sr);
+                    }
+                    Operand::Const(IrConst::Zero) => self.state.emit("    xorps %xmm0, %xmm0"),
+                    Operand::Const(IrConst::I128(value)) => {
+                        self.state.emit("    subl $16, %esp");
+                        for word in 0..4 {
+                            emit!(
+                                self.state,
+                                "    movl ${}, {}(%esp)",
+                                (*value >> (32 * word)) as u32 as i32,
+                                4 * word
+                            );
+                        }
+                        self.state.emit("    movups (%esp), %xmm0");
+                        self.state.emit("    addl $16, %esp");
+                    }
+                    _ => panic!("unsupported i686 XMM vector return operand: {val:?}"),
+                }
+                self.emit_epilogue_and_ret(frame_size);
+                return;
+            }
             if ret_ty == IrType::I128 && self.current_return_i686_ext_vector_gp3 {
                 match val {
                     Operand::Value(value) => {

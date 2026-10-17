@@ -26,14 +26,14 @@
 //!
 //! Most initializers are canonical as written: [`Lowerer::is_canonical_list`]
 //! checks that in one pass without allocating, and such lists are lowered as
-//! they are.  Shapes outside this model - flexible array members, vector
-//! members met by brace elision, a member overridden inside a struct-typed
-//! expression that initialized it - are also lowered as written.
+//! they are.  A vector is initialized like an array of its lanes, except
+//! that an expression of vector type initializes it whole.  Shapes outside
+//! this model - flexible array members, a member overridden inside a
+//! struct-typed expression that initialized it - are lowered as written.
 
 use super::array_init_plan::ArrayGeometry;
 use super::lower::Lowerer;
 use super::string_init::StringInit;
-use super::vector_array_init::is_ext_vector_array_type;
 use crate::common::source::Span;
 use crate::common::types::{CType, InitFieldResolution, RcLayout, StructLayout};
 use crate::frontend::parser::ast::{Designator, Expr, Initializer, InitializerItem};
@@ -48,7 +48,7 @@ enum Node {
     Array(Vec<Option<Node>>),
     /// An array of scalars: its initializers relative to the array.
     Scalars(Vec<InitializerItem>),
-    /// Kept as written: a braced scalar, or a vector's initializer.
+    /// Kept as written: a braced scalar.
     Raw(Initializer),
 }
 
@@ -123,14 +123,6 @@ impl Lowerer {
             CType::Array(elem, Some(len)) => {
                 if let Some(geo) = self.scalar_array_geometry(ty) {
                     Kind::Scalars(geo)
-                } else if is_ext_vector_array_type(ty) {
-                    // A vector object is opaque at its own initializer level,
-                    // but arrays of vectors are aggregates whose dimensions
-                    // and designators can be canonicalized here.
-                    Kind::Array {
-                        elem: (**elem).clone(),
-                        len: *len,
-                    }
                 } else if matches!(self.init_kind(elem), Kind::Opaque) {
                     Kind::Opaque
                 } else {
@@ -140,9 +132,23 @@ impl Lowerer {
                     }
                 }
             }
-            CType::Array(_, None) | CType::Vector(..) | CType::ExtVector(..) => Kind::Opaque,
+            // A vector takes initializers exactly like an array of its
+            // lanes: braced, brace-elided (p20) or `[i]`-designated.
+            // Lanes are positions here; the byte writers apply the lane
+            // stride (padded or bit-packed for an ext-vector).
+            CType::Vector(elem, _) | CType::ExtVector(elem, _) => {
+                let lanes = CType::Array(elem.clone(), ty.vector_info().map(|(_, n)| n));
+                self.scalar_array_geometry(&lanes)
+                    .map_or(Kind::Opaque, Kind::Scalars)
+            }
+            CType::Array(_, None) => Kind::Opaque,
             _ => Kind::Leaf,
         }
+    }
+
+    /// Whether `e` is a whole vector value initializing the vector `ty`.
+    fn expr_initializes_vector(&self, e: &Expr, ty: &CType) -> bool {
+        ty.is_vector() && self.get_expr_ctype(e).is_some_and(|ct| ct.is_vector())
     }
 
     /// Whether `e` initializes a whole struct/union of type `ty` (p13).
@@ -252,15 +258,15 @@ impl Lowerer {
                 CType::Array(elem, _) => {
                     geo.strides.len() == 1 && StringInit::for_elem_ctype(e, elem).is_some()
                 }
-                _ => false,
+                _ => self.expr_initializes_vector(e, ty),
             },
             (kind @ (Kind::Record(_) | Kind::Array { .. }), Initializer::List(sub)) => {
                 self.is_canonical_list(sub, &kind)
             }
             (Kind::Record(_), Initializer::Expr(e)) => self.expr_initializes_record(e, ty),
             (Kind::Array { .. }, Initializer::Expr(_)) => false,
-            // Flexible array members and vectors keep the lowerings' own
-            // handling, whatever their form.
+            // Flexible array members keep the lowerings' own handling,
+            // whatever their form.
             (Kind::Opaque, _) => true,
         }
     }
@@ -563,6 +569,11 @@ impl Lowerer {
                 (Initializer::Expr(e), Kind::Leaf) => {
                     Self::store(root, frames, Some(Node::Expr(e.clone())));
                 }
+                (Initializer::Expr(e), Kind::Scalars(_))
+                    if self.expr_initializes_vector(e, &sub_ty) =>
+                {
+                    Self::store(root, frames, Some(Node::Expr(e.clone())));
+                }
                 (Initializer::Expr(e), Kind::Scalars(geo)) => {
                     let whole_string = match &sub_ty {
                         CType::Array(elem, _) => {
@@ -590,23 +601,8 @@ impl Lowerer {
                     self.enter(root, frames)?;
                     continue;
                 }
-                (init, Kind::Opaque) => {
-                    // A vector member takes a braced list or a vector value as
-                    // written; flexible array members are not modelled.
-                    let whole = match init {
-                        Initializer::List(_) => true,
-                        Initializer::Expr(e) => {
-                            matches!(
-                                self.get_expr_ctype(e),
-                                Some(CType::Vector(..) | CType::ExtVector(..))
-                            )
-                        }
-                    };
-                    if !matches!(sub_ty, CType::Vector(..) | CType::ExtVector(..)) || !whole {
-                        return Err(Unsupported);
-                    }
-                    Self::store(root, frames, Some(Node::Raw(item.init.clone())));
-                }
+                // Flexible array members are not modelled.
+                (_, Kind::Opaque) => return Err(Unsupported),
             }
             Self::advance(frames.last_mut().expect("frame"));
             return Ok(1);

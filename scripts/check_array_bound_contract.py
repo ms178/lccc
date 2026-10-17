@@ -189,12 +189,18 @@ CASES: list[tuple[str, str, tuple[str, object]]] = [
 
 
 def read_bss_size(obj: Path) -> int | None:
-    """`sh_size` of `.bss` in an ELF object, or None if the file does not parse.
+    """`sh_size` of `.bss` in an ELF object, or None if there is no object or
+    it does not parse.
 
     Reading the field directly is deliberate: a `.bss` size is the one number
     this gate is about, and `readelf` is not guaranteed to exist next to the
-    compiler under test. Supports ELF32/ELF64, both endiannesses.
+    compiler under test. Supports ELF32/ELF64, both endiannesses. A compiler
+    that refused the program leaves no object; that must surface as a FAIL row
+    naming the case (`.bss=None`), not as a traceback that hides which
+    contract broke.
     """
+    if not obj.is_file():
+        return None
     data = obj.read_bytes()
     if len(data) < 52 or data[:4] != b"\x7fELF":
         return None

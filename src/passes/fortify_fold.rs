@@ -230,6 +230,8 @@ fn mk_call(name: &str, args: Vec<Operand>, arg_types: Vec<IrType>) -> Instructio
             regparm: None,
             is_pure: false,
             is_const: false,
+            // Created only when every target passes `BuiltinPolicy::may_synthesize`.
+            assume_library: true,
             ret_eightbyte_classes: Vec::new(),
         },
     }
@@ -611,11 +613,7 @@ fn classify(
 
 /// Entry point: fold every eligible hardened or plain stdio call in the
 /// module.  `size_t_is_u32` selects fwrite's size_t width (ILP32 targets).
-pub fn run(
-    module: &mut IrModule,
-    size_t_is_u32: bool,
-    libcalls: &crate::passes::libcall::LibcallAllowance,
-) {
+pub fn run(module: &mut IrModule, size_t_is_u32: bool) {
     let strings: FxHashMap<String, String> = module
         .string_literals
         .iter()
@@ -660,6 +658,13 @@ pub fn run(
                 let Instruction::Call { func: callee, info } = inst else {
                     continue;
                 };
+                // The source must BE the library function: a call spelled
+                // `__builtin_printf`, or a plain call the builtin policy
+                // permits (GCC 16.2: `-fno-builtin` keeps `__printf_chk`
+                // a call; a TU-defined `puts` keeps its own `printf`).
+                if !info.assume_library {
+                    continue;
+                }
                 // Result must be unused (absent or dead).
                 if let Some(dest) = info.dest {
                     if !value_unused(func, dest) {
@@ -689,16 +694,15 @@ pub fn run(
                     next_val,
                     &fresh,
                 ) {
-                    // A13: neither replace the original call (the TU may
-                    // define or withdraw the callee the fold assumes) nor
-                    // synthesise a call to a stdio function this TU defines
-                    // (or a withdrawn one).  The decision is dropped whole,
-                    // so the original printf call stays.
-                    if !crate::passes::libcall::stdio_fold_permitted(
-                        callee,
-                        &decision.insts,
-                        libcalls,
-                    ) {
+                    // Every call the fold creates must be synthesizable here.
+                    let targets_ok = decision.insts.iter().all(|i| match i {
+                        Instruction::Call { func: target, .. } => {
+                            crate::common::pass_policy::Libcall::from_name(target)
+                                .is_none_or(|l| func.pass_policy.builtins.may_synthesize(l))
+                        }
+                        _ => true,
+                    });
+                    if !targets_ok {
                         continue;
                     }
                     if decision.new_literal.is_some() {
@@ -776,6 +780,8 @@ mod tests {
                 regparm: None,
                 is_pure: false,
                 is_const: false,
+                // A call to the library function (what lowering + policy produce).
+                assume_library: true,
                 ret_eightbyte_classes: Vec::new(),
             },
         }
@@ -816,11 +822,7 @@ mod tests {
         let mut module = IrModule::default();
         module.string_literals = strings;
         module.functions = vec![func];
-        run(
-            &mut module,
-            false,
-            &crate::passes::libcall::LibcallAllowance::unrestricted(),
-        );
+        run(&mut module, false);
         module.functions.pop().unwrap()
     }
 
@@ -1629,6 +1631,52 @@ mod tests {
             vec!["printf"],
             "placeholder form has no constant fmt at index 0 -> stays"
         );
+    }
+
+    /// From #844: a call that is not the library function is never folded,
+    /// even when the fold would create nothing (`printf("")` is deleted only
+    /// when it IS the library's `printf`; a TU-defined one keeps its call).
+    #[test]
+    fn a_call_that_is_not_the_library_function_stays() {
+        let mut insts = Vec::new();
+        staging(&mut insts);
+        for fmt in [4u32, 1, 3] {
+            let mut call = hardened_call(
+                "printf",
+                None,
+                vec![Operand::Value(Value(fmt))],
+                vec![IrType::Ptr],
+            );
+            if let Instruction::Call { info, .. } = &mut call {
+                info.assume_library = false;
+            }
+            insts.push(call);
+        }
+        let func = run_module(simple_func(insts), std_strings());
+        assert_eq!(flat_calls(&func), vec!["printf", "printf", "printf"]);
+    }
+
+    /// Only the calls the fold would create need to be synthesizable here:
+    /// with `puts` withdrawn, `printf("hello\n")` stays while `printf("a")`
+    /// still becomes `putchar('a')`.
+    #[test]
+    fn the_fold_needs_only_its_own_targets() {
+        let mut insts = Vec::new();
+        staging(&mut insts);
+        for fmt in [1u32, 3] {
+            insts.push(hardened_call(
+                "printf",
+                None,
+                vec![Operand::Value(Value(fmt))],
+                vec![IrType::Ptr],
+            ));
+        }
+        let mut func = simple_func(insts);
+        func.pass_policy
+            .builtins
+            .withdraw_libcall(crate::common::pass_policy::Libcall::Puts);
+        let func = run_module(func, std_strings());
+        assert_eq!(flat_calls(&func), vec!["printf", "putchar"]);
     }
 
     #[test]
