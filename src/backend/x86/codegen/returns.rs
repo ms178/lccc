@@ -132,6 +132,23 @@ impl X86Codegen {
             self.emit_epilogue_and_ret_impl(frame_size);
             return;
         }
+        // AUD-VABI-2: an 8-byte vector is ONE SSE eightbyte (the low 64 bits
+        // of %xmm0), not an accumulator return. The IR carries the bit
+        // container as I64/U64, so the default path below would hand it back
+        // in %rax while every caller (and `calls.rs`) reads %xmm0. Both
+        // oracles return `id(T a){return a;}` as a bare `ret` for an 8-byte
+        // `vector_size`/`ext_vector_type` shape, so the argument register is
+        // also the return register.
+        if self.func_ret_classes.len() == 1
+            && self.func_ret_classes[0] == crate::common::types::EightbyteClass::Sse
+            && matches!(ret_ty, IrType::I64 | IrType::U64)
+        {
+            if let Some(val) = val {
+                self.load_bits64_to_xmm0(val);
+            }
+            self.emit_epilogue_and_ret_impl(frame_size);
+            return;
+        }
         crate::backend::traits::emit_return_default(self, val, frame_size);
     }
 
