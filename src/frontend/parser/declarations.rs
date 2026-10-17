@@ -1012,6 +1012,15 @@ impl Parser {
             }
         }
 
+        // The declarators consumed the declaration's named address space (the
+        // star loop keeps the base qualifier in `parsing_address_space` as the
+        // object's storage space across `a, b` declarators). Nothing after the
+        // loop reads it, so clear it: a declaration nested inside this one's
+        // own type specifier (`typeof(({ T __seg_gs *q = 0; 0; })) x;`) would
+        // otherwise leave the qualifier in the slot, and this declaration's
+        // own snapshot below would inherit the nested declaration's space.
+        self.attrs.parsing_address_space = AddressSpace::Default;
+
         // Apply __attribute__((mode(...))): transform type to specified bit-width
         let type_spec = if let Some(mk) = mode_kind {
             mk.apply(type_spec)

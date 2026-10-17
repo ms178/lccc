@@ -740,6 +740,12 @@ gate "segfs-declarator-codegen" fast \
 gate "seg-named-decl-qualifier" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_seg_named_decl_qualifier.sh
 
+# A declaration nested inside another declaration's typeof() must not leak
+# its named address space onto the outer object (kernel amd/core.c per-CPU
+# read macro; oracle-compared against GCC 16).
+gate "seg-typeof-stmtexpr-leak" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_seg_typeof_stmtexpr_leak.sh
+
 # `%gs:`/`%fs:` loads whose base is a register plus a constant displacement must
 # fold into the memory operand (`movq %gs:8(%rax), %rax`) — the shape GCC and
 # Clang emit for every per-CPU `base->field` access — including when the base
