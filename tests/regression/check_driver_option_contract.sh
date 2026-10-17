@@ -21,7 +21,8 @@ for flag in \
     -fno-profile-arcs -fno-test-coverage -fno-branch-probabilities -fno-auto-profile \
     -finstrument-functions-exclude-file-list=generated.c \
     -finstrument-functions-exclude-function-list=helper \
-    -fprofile-update=unknown -fdiagnostics-color=unknown -fprofile-dir= \
+    -fprofile-update=unknown -fdiagnostics-color=unknown \
+    -fprofile-dir= -fprofile-generate= -fprofile-use= -fauto-profile= \
     -fpatchable-function-entry=bogus -fpatchable-function-entry=2,0,1 \
     -fpatchable-function-entry=1,2; do
     for order in before after; do

@@ -1855,22 +1855,20 @@ impl Driver {
                 }
                 arg if arg.starts_with("-fprofile-generate=") => {
                     let path = arg["-fprofile-generate=".len()..].to_string();
-                    self.pgo_generate = Some(if path.is_empty() {
-                        ".".to_string()
-                    } else {
-                        path
-                    });
+                    if path.is_empty() {
+                        return Err(format!("{} requires a nonempty profile directory", arg));
+                    }
+                    self.pgo_generate = Some(path);
                 }
                 "-fprofile-use" => {
                     self.pgo_use = Some(pgo_profile_dir.clone().unwrap_or_else(|| ".".to_string()));
                 }
                 arg if arg.starts_with("-fprofile-use=") => {
                     let path = arg["-fprofile-use=".len()..].to_string();
-                    self.pgo_use = Some(if path.is_empty() {
-                        ".".to_string()
-                    } else {
-                        path
-                    });
+                    if path.is_empty() {
+                        return Err(format!("{} requires a nonempty profile directory", arg));
+                    }
+                    self.pgo_use = Some(path);
                 }
                 "-fprofile-arcs" | "-ftest-coverage" => {
                     self.pgo_generate =
@@ -1916,6 +1914,9 @@ impl Driver {
                 }
                 arg if arg.starts_with("-fauto-profile=") => {
                     let path = arg["-fauto-profile=".len()..].to_string();
+                    if path.is_empty() {
+                        return Err(format!("{} requires a nonempty profile path", arg));
+                    }
                     self.pgo_use = Some(path);
                 }
                 // Feature flags. Full PIC and PIE have different x86-64 data
@@ -2504,7 +2505,14 @@ mod cli_tests {
             );
             assert_eq!(driver.pgo_use.as_deref(), expected_use, "{flags:?}");
         }
-        assert!(try_flag("-fprofile-dir=").is_err());
+        for flag in [
+            "-fprofile-dir=",
+            "-fprofile-generate=",
+            "-fprofile-use=",
+            "-fauto-profile=",
+        ] {
+            assert!(try_flag(flag).is_err(), "{flag} must reject an empty path");
+        }
     }
 
     #[test]
