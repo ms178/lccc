@@ -141,13 +141,17 @@ audit census counts it as a named, owned knob.
 ## Latent main divergence surfaced by the local suite (not by hosted CI)
 
 `fenv_constant_effects` / `fenv_constant_rounding` (in main since #843)
-fail the GCC runtime comparison under `run_regression_suite.sh`: lccc
-constant-folds `1.0 + DBL_MIN`-class expressions at compile time ignoring
-a dynamic `fesetround` change, GCC-16 honors it (gcc
-`3ff0000000000000`/downward vs lccc `3ff0000000000001`). Hosted CI never
-sees this because `run_regression.py` records SKIP-COMPARE when its gcc
-invocation fails to link `-lm` for the effects test. Independent of this
-session's passes (identical with `CCC_DISABLE_PASSES=byte_load` and with
-`CCC_NO_AFFINE_EXIT_FOLD=1`). Proper fix is rounding-mode-aware constant
-folding (FENV_ACCESS semantics) — queued, do not paper over with test
-deletion.
+fail the GCC runtime comparison under `run_regression_suite.sh` — and
+assembly-level analysis shows the mismatch is GCC's, not ours: LCCC keeps
+the runtime `vaddsd` for `0x1p0 + 0x1p-53` under `FENV_ACCESS ON`
+(conformant; its self-check exits 0 in every mode), while GCC 16
+constant-folds to the round-to-nearest value and its own self-check exits
+1 under FE_UPWARD; under `-frounding-math` GCC also DCEs the discarded
+`1.0/0.0` (exit 52) where LCCC preserves the FE_DIVBYZERO raise. The
+differential is therefore wrong-by-design for these two programs:
+both now carry `LCCC_NO_COMPARE=1` sidecars, and the exit-code-enforcing
+conformance coverage (every -O level, pragma and flag routes, both ABIs)
+lives in `tests/regression/check_fp_environment.sh` in both CI mirrors.
+Hosted `run_regression.py` had always recorded SKIP-COMPARE here (its gcc
+invocation fails to link `-lm`), which is why the divergence only
+surfaced through the local suite.
