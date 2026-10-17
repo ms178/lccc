@@ -8,7 +8,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 CONSUMERS = {'corpus', 'frontend', 'codegen', 'backend'}
-LANES = CONSUMERS | {'build', 'debug', 'clippy', 'msrv', 'benchmark'}
+LANES = CONSUMERS | {'build', 'debug', 'clippy', 'msrv', 'benchmark', 'icx-oracle'}
 
 
 def validate(workflow, benchmark):
@@ -54,6 +54,11 @@ def validate(workflow, benchmark):
     assert debug.count('profile.fastbuild.debug-assertions=true') == 2
     assert '--gcc gcc-16' in debug
     assert not jobs['debug'].get('needs')
+    icx = jobs['icx-oracle']
+    assert icx['needs'] == ['build']
+    icx_steps = '\n'.join(s.get('run', '') for s in icx['steps'])
+    assert 'ensure_icx_2026.sh' in icx_steps and 'LCCC_TEST_REAL_ICX' in icx_steps
+    assert any(s.get('uses', '').startswith('actions/upload-artifact@') and s.get('if') == 'always()' for s in icx['steps'])
 
 
 class ReusableReachability(unittest.TestCase):

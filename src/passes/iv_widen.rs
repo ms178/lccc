@@ -566,6 +566,7 @@ struct WidenPlan {
     /// members whose consumers expect the narrow value appear here.
     escapes: Vec<(usize, Value)>,
     has_addressing: bool,
+    sibling_mirror: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1238,61 +1239,66 @@ fn analyze_iv(
     // domain. Strict unit-step guards also admit runtime seeds/bounds; wider
     // strides require a constant threshold with room for the final step.
     let signed_wrapping = ext == ExtKind::Se && func.pass_policy.wrap_signed_overflow;
-    let (seed_range, intercept): (Option<Range>, bool) = if ext == ExtKind::Ze || signed_wrapping {
-        let proof = prove_counted_bound(
-            func,
-            lp,
-            preds,
-            succs,
-            uses,
-            dom,
-            phi_dest,
-            phi_ty,
-            latch,
-            init,
-            latch_is_sub,
-            step,
-            latch_dest,
-        )?;
-        // The exposed-latch intercept activates when the first body pass runs
-        // at a seed the proof could not confine AND the proof's range cannot
-        // close the exiting latch step: the narrow recurrence then wraps at
-        // the ring top where the wide one does not, member values diverge
-        // from `zext(narrow)`, and only value-exact uses are admissible. A
-        // phi-guarded strict range, or a seed-inclusive range with
-        // `hi + mag <= max` (incrementing; `lo - mag >= 0` decrementing),
-        // proves no-wrap over the WHOLE trajectory — the intercept stays off
-        // and the ordinary closure rules apply.
-        let step_val = match step {
-            Operand::Const(c) => c.to_i64().unwrap_or(0),
-            _ => 0,
-        };
-        let delta: i128 = if latch_is_sub {
-            -(step_val as i128)
+    let (seed_range, intercept, sibling_mirror): (Option<Range>, bool, bool) =
+        if ext == ExtKind::Ze || signed_wrapping {
+            let proof = prove_counted_bound(
+                func,
+                lp,
+                preds,
+                succs,
+                uses,
+                dom,
+                phi_dest,
+                phi_ty,
+                latch,
+                init,
+                latch_is_sub,
+                step,
+                latch_dest,
+            )?;
+            // The exposed-latch intercept activates when the first body pass runs
+            // at a seed the proof could not confine AND the proof's range cannot
+            // close the exiting latch step: the narrow recurrence then wraps at
+            // the ring top where the wide one does not, member values diverge
+            // from `zext(narrow)`, and only value-exact uses are admissible. A
+            // phi-guarded strict range, or a seed-inclusive range with
+            // `hi + mag <= max` (incrementing; `lo - mag >= 0` decrementing),
+            // proves no-wrap over the WHOLE trajectory — the intercept stays off
+            // and the ordinary closure rules apply.
+            let step_val = match step {
+                Operand::Const(c) => c.to_i64().unwrap_or(0),
+                _ => 0,
+            };
+            let delta: i128 = if latch_is_sub {
+                -(step_val as i128)
+            } else {
+                step_val as i128
+            };
+            let max = type_max_i128(phi_ty);
+            let wrap_closed = if delta > 0 {
+                proof.range.hi + delta <= max
+            } else if delta < 0 {
+                let min = if signed_wrapping { -max - 1 } else { 0 };
+                proof.range.lo + delta >= min
+            } else {
+                true
+            };
+            // The mirror theorem permits only the final exiting latch result to
+            // cross the narrow boundary, and only after proving it unobservable.
+            // Upstream's own `min` above is kept: it is never below the type
+            // minimum, so it is at least as conservative as the rejected change.
+            let latch_closed = wrap_closed || proof.exit_latch_dead;
+            if signed_wrapping && !latch_closed {
+                return None;
+            }
+            (
+                Some(proof.range),
+                proof.latch_exposed && !latch_closed,
+                proof.exit_latch_dead,
+            )
         } else {
-            step_val as i128
+            (None, false, false)
         };
-        let max = type_max_i128(phi_ty);
-        let wrap_closed = if delta > 0 {
-            proof.range.hi + delta <= max
-        } else if delta < 0 {
-            let min = if signed_wrapping { -max - 1 } else { 0 };
-            proof.range.lo + delta >= min
-        } else {
-            true
-        };
-        // The mirror theorem permits only the final exiting latch result to
-        // cross the narrow boundary, and only after proving it unobservable.
-        // Upstream's own `min` above is kept: it is never below the type
-        // minimum, so it is at least as conservative as the rejected change.
-        let latch_closed = wrap_closed || proof.exit_latch_dead;
-        if signed_wrapping && !latch_closed {
-            return None;
-        }
-        (Some(proof.range), proof.latch_exposed && !latch_closed)
-    } else {
-        (None, false)
-    };
 
     let mut members: Vec<Member> = Vec::new();
     members.push(Member::of(
@@ -2100,6 +2106,7 @@ fn analyze_iv(
         cmps,
         escapes,
         has_addressing,
+        sibling_mirror,
     })
 }
 
@@ -3557,6 +3564,9 @@ fn apply_widen(func: &mut IrFunction, plan: &WidenPlan, preheader_idx: usize, de
 
     func.next_value_id = next_id;
     if debug {
+        if plan.sibling_mirror {
+            eprintln!("[IV-WIDEN-MIRROR] fn={} phi={}", func.name, phi_dest.0);
+        }
         eprintln!(
             "[IV-WIDEN] widened phi {:?} (ty {:?} → {:?})",
             phi_dest, phi_ty, wide_ty
@@ -4228,6 +4238,30 @@ mod tests {
                 )),
                 "paired phi %{value} was not widened"
             );
+        }
+    }
+
+    #[test]
+    fn paired_counter_is_independent_of_header_candidate_order() {
+        let mut func = paired_counting_loop("paired_reverse_order", false);
+        func.blocks[1].instructions.swap(0, 1);
+        check_wrapv(&mut func, 2);
+    }
+
+    #[test]
+    fn paired_counter_mirror_pins_nonnegative_domain_and_signed_boundary() {
+        for (lower, expected) in [(-1, 1), (0, 2), (i32::MAX, 2)] {
+            let mut func = paired_counting_loop("paired_domain", false);
+            if let Instruction::Cmp { rhs, .. } = &mut func.blocks[1].instructions[2] {
+                *rhs = Operand::Const(IrConst::I32(lower));
+            } else {
+                panic!("fixture header no longer contains the sibling guard");
+            }
+            check_wrapv(&mut func, expected);
+            assert!(func.blocks[1].instructions.iter().any(|inst| matches!(inst,
+                Instruction::Phi { dest: Value(1), ty, .. }
+                if *ty == if expected == 2 { IrType::I64 } else { IrType::I32 }
+            )));
         }
     }
 

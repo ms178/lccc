@@ -39,8 +39,15 @@
 //! preheader instructions from the unmodified function, and only a fully
 //! successful lowering is committed, so an unexpected shape leaves the loop
 //! scalar with no partial edit.
+//!
+//! Effect contract: every body instruction is accounted for. Exactly one
+//! nonvolatile, default-address-space byte store and its unique GEP are
+//! admitted by instruction identity; no other stores, loads, calls or asm
+//! survive matching. The CFG has one body entry, and all iteration-local
+//! results remain local. Rejection leaves IR and allocation cursors unchanged.
 use super::*;
 use crate::common::source::Span;
+use crate::ir::analysis::{FlatAdj, build_cfg, build_label_map};
 
 /// Elements per packed iteration: four ymm vectors of eight dword lanes.
 const VEC_ELEMS: u64 = 32;
@@ -91,48 +98,58 @@ fn iv_const(ty: IrType, v: u64) -> Operand {
     }
 }
 
-/// Count every definition of each value id in the function.
-fn def_counts(func: &IrFunction) -> FxHashMap<u32, u32> {
-    let mut counts: FxHashMap<u32, u32> = FxHashMap::default();
-    for block in &func.blocks {
-        for inst in &block.instructions {
-            if let Some(d) = inst.dest() {
-                *counts.entry(d.0).or_insert(0) += 1;
-            }
-        }
-    }
-    counts
+/// One linear scan indexes definitions and use ownership. A value owned by
+/// `usize::MAX` is used in multiple blocks. Escape queries are O(1), rather
+/// than rescanning the entire function for every expression node. Shared CFG
+/// construction includes switch, computed-goto and asm-goto edges.
+struct FunctionFacts {
+    defs: FxHashMap<u32, u32>,
+    use_owner: FxHashMap<u32, usize>,
+    labels: FxHashMap<BlockId, usize>,
+    preds: FlatAdj,
 }
 
-/// Count uses of `value` outside block `skip` (instructions and terminators).
-fn uses_outside(func: &IrFunction, skip: usize, value: u32) -> usize {
-    let mut n = 0usize;
-    for (bi, block) in func.blocks.iter().enumerate() {
-        if bi == skip {
-            continue;
-        }
-        for inst in &block.instructions {
-            inst.for_each_used_value(|v| n += usize::from(v == value));
-        }
-        block
-            .terminator
-            .for_each_used_value(|v| n += usize::from(v == value));
-    }
-    n
-}
-
-fn max_value_id(func: &IrFunction) -> u32 {
-    let mut max = 0u32;
-    for block in &func.blocks {
-        for inst in &block.instructions {
-            if let Some(d) = inst.dest() {
-                max = max.max(d.0);
+impl FunctionFacts {
+    fn build(func: &IrFunction) -> Self {
+        let labels = build_label_map(func);
+        let (preds, _) = build_cfg(func, &labels);
+        let mut facts = Self {
+            defs: FxHashMap::default(),
+            use_owner: FxHashMap::default(),
+            labels,
+            preds,
+        };
+        for (bi, block) in func.blocks.iter().enumerate() {
+            let mut record_use = |id| {
+                facts
+                    .use_owner
+                    .entry(id)
+                    .and_modify(|owner| {
+                        if *owner != bi {
+                            *owner = usize::MAX;
+                        }
+                    })
+                    .or_insert(bi);
+            };
+            for inst in &block.instructions {
+                if let Some(d) = inst.dest() {
+                    *facts.defs.entry(d.0).or_insert(0) += 1;
+                }
+                if let Instruction::InlineAsm { outputs, .. } = inst {
+                    for (_, dest, _) in outputs {
+                        *facts.defs.entry(dest.0).or_insert(0) += 1;
+                    }
+                }
+                inst.for_each_used_value(&mut record_use);
             }
-            inst.for_each_used_value(|v| max = max.max(v));
+            block.terminator.for_each_used_value(&mut record_use);
         }
-        block.terminator.for_each_used_value(|v| max = max.max(v));
+        facts
     }
-    max
+
+    fn escapes(&self, id: u32, body: usize) -> bool {
+        self.use_owner.get(&id).is_some_and(|owner| *owner != body)
+    }
 }
 
 /// Everything the lowering needs. Built only by a fully successful match.
@@ -152,7 +169,7 @@ struct Plan {
     root_cast: Value,
     /// Source of the byte-truncating cast: the vector value to narrow.
     root_src: Value,
-    /// Destination of the address cast, consumed only by the GEP.
+    /// Address cast, also usable as a low-bit arithmetic alias of the IV.
     addr_cast: Value,
 }
 
@@ -168,7 +185,8 @@ struct Induction {
     limit: u64,
 }
 
-fn match_induction(func: &IrFunction, b: usize, defs: &FxHashMap<u32, u32>) -> Option<Induction> {
+fn match_induction(func: &IrFunction, b: usize, facts: &FunctionFacts) -> Option<Induction> {
+    let defs = &facts.defs;
     let blk = &func.blocks[b];
     let Terminator::Branch(hdr_label) = blk.terminator else {
         return None;
@@ -194,7 +212,7 @@ fn match_induction(func: &IrFunction, b: usize, defs: &FxHashMap<u32, u32>) -> O
     if defs.get(&inc.0).copied() != Some(1) || defs.get(&iv.0).copied() != Some(1) {
         return None;
     }
-    let header = func.blocks.iter().position(|bl| bl.label == hdr_label)?;
+    let header = *facts.labels.get(&hdr_label)?;
     if header == b {
         return None;
     }
@@ -261,31 +279,14 @@ fn match_induction(func: &IrFunction, b: usize, defs: &FxHashMap<u32, u32>) -> O
     }
     // The header's only predecessors are the preheader and this body, and the
     // preheader enters it by an unconditional branch.
-    let mut edges = 0usize;
-    let mut preheader = None;
-    for (bi, block) in func.blocks.iter().enumerate() {
-        let targets: &[BlockId] = match &block.terminator {
-            Terminator::Branch(t) => std::slice::from_ref(t),
-            Terminator::CondBranch {
-                true_label,
-                false_label,
-                ..
-            } => &[*true_label, *false_label][..],
-            _ => &[],
-        };
-        let n = targets.iter().filter(|t| **t == hdr.label).count();
-        edges += n;
-        if n > 0 && bi != b {
-            if bi == header || block.label != pred || n != 1 {
-                return None;
-            }
-            preheader = Some(bi);
-        }
-    }
-    if edges != 2 {
+    let predecessors = facts.preds.row(header);
+    if predecessors.len() != 2 || facts.preds.row(b) != [header as u32] {
         return None;
     }
-    let preheader = preheader?;
+    let preheader = predecessors.iter().copied().find(|&bi| bi as usize != b)? as usize;
+    if preheader == header || func.blocks[preheader].label != pred {
+        return None;
+    }
     if !matches!(func.blocks[preheader].terminator, Terminator::Branch(t) if t == hdr.label) {
         return None;
     }
@@ -312,8 +313,9 @@ fn match_body(
     func: &IrFunction,
     b: usize,
     ind: &Induction,
-    defs: &FxHashMap<u32, u32>,
+    facts: &FunctionFacts,
 ) -> Option<BodyMatch> {
+    let defs = &facts.defs;
     let blk = &func.blocks[b];
     let iv = ind.iv;
     let iv_ty = ind.iv_ty;
@@ -321,21 +323,21 @@ fn match_body(
     // vector op, the single address computation, the single byte store, or a
     // global address feeding the store base.
     let (_latch, body) = blk.instructions.split_last()?;
-    let mut store: Option<(Value, Value, IrType)> = None; // (val, ptr, ty)
-    let mut gep: Option<(Value, Value, Value)> = None; // (dest, base, offset)
-    for inst in body {
+    let mut store: Option<(usize, Value, Value, IrType)> = None;
+    let mut gep: Option<(usize, Value, Value, Value)> = None;
+    for (ii, inst) in body.iter().enumerate() {
         match inst {
             Instruction::Store {
                 val: Operand::Value(v),
                 ptr,
                 ty,
                 volatile: false,
-                ..
+                seg_override: AddressSpace::Default,
             } => {
                 if store.is_some() {
                     return None;
                 }
-                store = Some((*v, *ptr, *ty));
+                store = Some((ii, *v, *ptr, *ty));
             }
             Instruction::GetElementPtr {
                 dest,
@@ -346,14 +348,22 @@ fn match_body(
                 if gep.is_some() {
                     return None;
                 }
-                gep = Some((*dest, *base, *off));
+                gep = Some((ii, *dest, *base, *off));
             }
+            // Every memory operation must be precisely the supported one.
+            // In particular a constant-valued/volatile/FS/GS store must not
+            // disappear behind the computation walk's opcode whitelist.
+            Instruction::Store { .. } | Instruction::GetElementPtr { .. } => return None,
             _ => {}
         }
     }
-    let (store_val, store_ptr, store_ty) = store?;
-    let (gep_dest, base_v, addr_cast) = gep?;
-    if gep_dest != store_ptr || !matches!(store_ty, IrType::U8 | IrType::I8) {
+    let (store_index, store_val, store_ptr, store_ty) = store?;
+    let (gep_index, gep_dest, base_v, addr_cast) = gep?;
+    if gep_dest != store_ptr
+        || !matches!(store_ty, IrType::U8 | IrType::I8)
+        || defs.get(&gep_dest.0).copied() != Some(1)
+        || defs.get(&addr_cast.0).copied() != Some(1)
+    {
         return None;
     }
 
@@ -362,9 +372,9 @@ fn match_body(
     let mut root_cast: Option<(Value, Value)> = None; // (dest, src)
     let mut base_global: Option<String> = None;
     let mut addr_seen = false;
-    for inst in body {
+    for (ii, inst) in body.iter().enumerate() {
         match inst {
-            Instruction::Store { .. } | Instruction::GetElementPtr { .. } => {}
+            _ if ii == store_index || ii == gep_index => {}
             Instruction::GlobalAddr { dest, name } => {
                 // Only a global feeding the store base is admitted.
                 if *dest != base_v || defs.get(&dest.0).copied() != Some(1) {
@@ -390,6 +400,7 @@ fn match_body(
                         return None;
                     }
                     addr_seen = true;
+                    known.insert(dest.0);
                     continue;
                 }
                 if *dest == store_val {
@@ -466,13 +477,13 @@ fn match_body(
 
     // Iteration-local values must not escape the body.
     for &d in &known {
-        if d != iv.0 && uses_outside(func, b, d) != 0 {
+        if d != iv.0 && facts.escapes(d, b) {
             return None;
         }
     }
-    if uses_outside(func, b, root_cast_dest.0) != 0
-        || uses_outside(func, b, addr_cast.0) != 0
-        || uses_outside(func, b, store_ptr.0) != 0
+    if facts.escapes(root_cast_dest.0, b)
+        || facts.escapes(addr_cast.0, b)
+        || facts.escapes(store_ptr.0, b)
     {
         return None;
     }
@@ -492,9 +503,9 @@ fn match_body(
     })
 }
 
-fn match_loop(func: &IrFunction, b: usize, defs: &FxHashMap<u32, u32>) -> Option<Plan> {
-    let ind = match_induction(func, b, defs)?;
-    let body = match_body(func, b, &ind, defs)?;
+fn match_loop(func: &IrFunction, b: usize, facts: &FunctionFacts) -> Option<Plan> {
+    let ind = match_induction(func, b, facts)?;
+    let body = match_body(func, b, &ind, facts)?;
     Some(Plan {
         body: b,
         header: ind.header,
@@ -530,8 +541,6 @@ struct Hoisted {
     const_vecs: FxHashMap<u32, Value>,
     /// Broadcast of 0xFF for the byte narrowing.
     mask255: Value,
-    /// Two 32-byte scratch slots for the intermediate packs.
-    scratch: [Value; 2],
 }
 
 /// The fully built replacement, ready to commit.
@@ -554,7 +563,7 @@ fn broadcast(dest: Value, arg: Operand) -> Instruction {
 }
 
 /// Preheader instructions: the store base rematerialization, lane offsets,
-/// scratch slots, the byte mask and the arithmetic constants.
+/// the byte mask and the arithmetic constants.
 fn hoist(
     func: &IrFunction,
     plan: &Plan,
@@ -587,20 +596,6 @@ fn hoist(
             args: bytes,
         });
     }
-    // The x86 backend implements the 256-bit pack family only in its
-    // memory-destination form, so the first pack level writes to these slots
-    // and is reloaded as a register.
-    let scratch = [fresh.value(), fresh.value()];
-    for slot in scratch {
-        pre.push(Instruction::Alloca {
-            dest: slot,
-            ty: IrType::I64,
-            size: 32,
-            align: 32,
-            volatile: false,
-            semantic_volatile: false,
-        });
-    }
     let mask255 = fresh.value();
     pre.push(broadcast(mask255, Operand::Const(IrConst::I32(255))));
     let mut const_vecs: FxHashMap<u32, Value> = FxHashMap::default();
@@ -627,7 +622,6 @@ fn hoist(
         iota,
         const_vecs,
         mask255,
-        scratch,
     })
 }
 
@@ -685,6 +679,7 @@ fn lower_body(
     // Evaluate the admitted operations per vector, keyed by IR value id.
     let mut vec_of: FxHashMap<u32, [Value; GROUPS]> = FxHashMap::default();
     vec_of.insert(plan.iv.0, lanes);
+    vec_of.insert(plan.addr_cast.0, lanes);
     for inst in body {
         match inst {
             Instruction::Cast { dest, src, .. } => {
@@ -758,26 +753,16 @@ fn lower_body(
     let t23 = fresh.value();
     let off = fresh.value();
     let gep = fresh.value();
-    // Level one: 32-bit lanes to 16-bit words, into scratch memory.
-    for (pair, slot) in [(0usize, 0usize), (2, 1)] {
+    // Pure SSA narrowing exposes register allocation and load folding to
+    // the backend: no scratch allocas, stores or reloads are required by IR.
+    for (dest, pair) in [(t01, 0usize), (t23, 2)] {
         vb.push(Instruction::Intrinsic {
-            dest: None,
-            op: IntrinsicOp::Packssdw256,
-            dest_ptr: Some(hoisted.scratch[slot]),
+            dest: Some(dest),
+            op: IntrinsicOp::VecPackssdwI16x16,
+            dest_ptr: None,
             args: vec![
                 Operand::Value(masked[pair]),
                 Operand::Value(masked[pair + 1]),
-            ],
-        });
-    }
-    for (dest, slot) in [(t01, 0usize), (t23, 1)] {
-        vb.push(Instruction::Intrinsic {
-            dest: Some(dest),
-            op: IntrinsicOp::VecLoadI32x8,
-            dest_ptr: None,
-            args: vec![
-                Operand::Value(hoisted.scratch[slot]),
-                Operand::Const(IrConst::I64(0)),
             ],
         });
     }
@@ -911,9 +896,9 @@ fn commit(func: &mut IrFunction, plan: &Plan, low: Lowered) {
             }
         }
     }
+    func.next_label = low.vb.label.0 + 1;
     func.blocks.push(low.vh);
     func.blocks.push(low.vb);
-    func.next_label += 2;
     func.next_value_id = next_value;
 }
 
@@ -922,12 +907,35 @@ fn commit(func: &mut IrFunction, plan: &Plan, low: Lowered) {
 /// `trace` enables the `[VEC-GEN] fn=` line that `check_generator_map.sh`
 /// counts. Returns the number of transformed loops (0 or 1).
 pub(super) fn transform_function(func: &mut IrFunction, trace: bool) -> usize {
-    let defs = def_counts(func);
-    let Some(plan) = (0..func.blocks.len()).find_map(|b| match_loop(func, b, &defs)) else {
+    let facts = FunctionFacts::build(func);
+    if facts.labels.len() != func.blocks.len() {
+        return 0;
+    }
+    let Some(plan) = (0..func.blocks.len()).find_map(|b| match_loop(func, b, &facts)) else {
         return 0;
     };
-    let next = max_value_id(func).saturating_add(1).max(func.next_value_id);
-    let (vh_label, vb_label) = (BlockId(func.next_label), BlockId(func.next_label + 1));
+    let next = func.sound_next_value_id();
+    // Bound all lowering allocations before constructing temporary blocks.
+    // Eight fresh IDs per scalar instruction plus 128 fixed IDs is a strict
+    // overestimate (at most two broadcasts + four lane results per binop).
+    let Some(budget) = u32::try_from(func.blocks[plan.body].instructions.len())
+        .ok()
+        .and_then(|n| n.checked_mul(8))
+        .and_then(|n| n.checked_add(128))
+    else {
+        return 0;
+    };
+    if next.checked_add(budget).is_none() {
+        return 0;
+    }
+    let max_label = func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0);
+    let Some(first_label) = max_label.checked_add(1).map(|n| n.max(func.next_label)) else {
+        return 0;
+    };
+    if first_label.checked_add(2).is_none() {
+        return 0;
+    }
+    let (vh_label, vb_label) = (BlockId(first_label), BlockId(first_label + 1));
     let Some(low) = lower(func, &plan, next, vh_label, vb_label) else {
         return 0;
     };
@@ -940,3 +948,7 @@ pub(super) fn transform_function(func: &mut IrFunction, trace: bool) -> usize {
     commit(func, &plan, low);
     1
 }
+
+#[cfg(test)]
+#[path = "vectorize_generator_map_tests.rs"]
+mod tests;

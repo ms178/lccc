@@ -432,7 +432,9 @@ jobs:
     - name: Verify W2 load->cast fold structure and runtime
       run: bash tests/regression/check_load_cast_fold.sh
     - name: Verify generator-map vectorizer (fires, matches gcc-16, kill switch)
-      run: bash tests/regression/check_generator_map.sh
+      run: |
+        python3 tests/regression/test_generator_map_gate.py
+        bash tests/regression/check_generator_map.sh
     - name: Verify benchmark codegen registry and evidence (mock only)
       run: python3 tests/regression/check_benchmark_codegen_registry.py
     - name: Verify local oracle identity and ICX provisioning (offline, mock only)
@@ -1395,6 +1397,47 @@ jobs:
     name: Complete benchmark corpus
     needs: [build]
     uses: ./.github/workflows/bench.yml
+  icx-oracle:
+    name: Authenticated Intel ICX 2026.2 integration
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+    - uses: actions/checkout@v7
+    - uses: actions/download-artifact@v8
+      with:
+        name: lccc-fast-${{ github.sha }}
+    - name: Verify immutable compiler artifact
+      run: |
+        set -euo pipefail
+        tar -xzf lccc-fast.tar.gz
+        test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
+        sha256sum -c target/ci-build.sha256
+    - name: Provision authenticated vendor compiler snapshot
+      run: |
+        set -euo pipefail
+        mkdir -p intel-evidence
+        binary=$(bash scripts/ensure_icx_2026.sh "$RUNNER_TEMP/intel-icx-2026.2")
+        test -x "$binary"
+        echo "LCCC_ICX_BIN=$binary" >> "$GITHUB_ENV"
+        cp "$RUNNER_TEMP/intel-icx-2026.2/.lccc-icx.json" intel-evidence/install.json
+        # Reusing a frozen snapshot must not resolve/download a moving latest.
+        test "$(bash scripts/ensure_icx_2026.sh "$RUNNER_TEMP/intel-icx-2026.2")" = "$binary"
+        "$binary" --version | tee intel-evidence/version.txt
+        "$binary" -E -dM -x c /dev/null > intel-evidence/macros.txt
+        sha256sum "$binary" > intel-evidence/binary.sha256
+    - name: Verify real native compilation and all local dispatch modes
+      env:
+        LCCC_TEST_REAL_ICX: '1'
+        CCC: target/fastbuild/lccc
+      run: python3 scripts/test_local_oracles.py
+    - name: Retain authenticated package, probe and binary identities
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: intel-icx-provenance-${{ github.sha }}
+        path: intel-evidence/
+        if-no-files-found: error
   test:
     name: Test Suite
     runs-on: ubuntu-24.04
@@ -1408,6 +1451,7 @@ jobs:
     - clippy
     - msrv
     - benchmark
+    - icx-oracle
     if: always()
     steps:
     - name: Require every independent lane to pass

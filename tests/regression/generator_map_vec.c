@@ -33,7 +33,7 @@ static unsigned char g_gen[20];
 static unsigned char g_ref[20];
 
 /* A: histogram-init shape, u32 induction, full 2^18, multiplicative hash. */
-static void gen_a(void) {
+__attribute__((noinline)) static void gen_a(void) {
     for (unsigned i = 0; i < (1u << 18); ++i) {
         unsigned x = (i * 2654435761u) >> 24;
         a_hist[i] = (unsigned char)x;
@@ -47,7 +47,7 @@ static void gen_a(void) {
 }
 
 /* B: size_t induction, trip 4103 (not a multiple of 32), i*37+11 narrowed. */
-static void gen_b(void) {
+__attribute__((noinline)) static void gen_b(void) {
     for (size_t i = 0; i < sizeof b_gen; i++)
         b_gen[i] = (unsigned char)(i * 37 + 11);
     for (size_t i = 0; i < sizeof b_ref; i++) {
@@ -58,7 +58,7 @@ static void gen_b(void) {
 }
 
 /* C: nonzero start (C0 = 5), trip 995, mixed xor/shift/or/sub chain. */
-static void gen_c(void) {
+__attribute__((noinline)) static void gen_c(void) {
     for (unsigned i = 5; i < 1000; ++i)
         c_gen[i] = (unsigned char)((((i ^ 0x5au) * 3u) + (i >> 2) - 7u) | 1u);
     for (unsigned i = 5; i < 1000; ++i) {
@@ -69,7 +69,7 @@ static void gen_c(void) {
 }
 
 /* D: exactly two packed groups, shifts and masks (no tail). */
-static void gen_d(void) {
+__attribute__((noinline)) static void gen_d(void) {
     for (unsigned i = 0; i < 64; ++i)
         d_gen[i] = (unsigned char)(((i << 3) & 0xF0u) ^ i);
     for (unsigned i = 0; i < 64; ++i) {
@@ -80,7 +80,7 @@ static void gen_d(void) {
 }
 
 /* E: exactly one packed group, start zero (no scalar tail at all). */
-static void gen_e(void) {
+__attribute__((noinline)) static void gen_e(void) {
     for (unsigned i = 0; i < 32; ++i)
         e_gen[i] = (unsigned char)(i * 7u + 3u);
     for (unsigned i = 0; i < 32; ++i) {
@@ -91,7 +91,7 @@ static void gen_e(void) {
 }
 
 /* F: signed byte store from a size_t induction (I8 store, U64 chain). */
-static void gen_f(void) {
+__attribute__((noinline)) static void gen_f(void) {
     for (size_t i = 0; i < sizeof f_gen; i++)
         f_gen[i] = (signed char)((long)i * -5 + 100);
     for (size_t i = 0; i < sizeof f_ref; i++) {
@@ -102,7 +102,7 @@ static void gen_f(void) {
 }
 
 /* G: trip shorter than one packed group, which the transform must decline. */
-static void gen_g(void) {
+__attribute__((noinline)) static void gen_g(void) {
     for (unsigned i = 0; i < 20; ++i)
         g_gen[i] = (unsigned char)(i * 11u);
     for (unsigned i = 0; i < 20; ++i) {
@@ -110,6 +110,42 @@ static void gen_g(void) {
         BARRIER(j);
         g_ref[j] = (unsigned char)(j * 11u);
     }
+}
+
+/* H/I: additional effects must not disappear from a packed prefix.
+ * Pointers are parameters, so volatile-alloca ancestry is not a safety net. */
+__attribute__((noinline)) static void gen_volatile(unsigned char *dst, volatile unsigned *tick) {
+    for (unsigned i = 0; i < 32; ++i) {
+        dst[i] = (unsigned char)(i * 3u);
+        *tick = i;
+    }
+}
+
+__attribute__((noinline)) static void gen_constant(unsigned char *dst, unsigned char *side) {
+    for (unsigned i = 0; i < 32; ++i) {
+        dst[i] = (unsigned char)(i * 3u);
+        *side = 0xa5u;
+    }
+}
+
+static int effects_check(void) {
+    unsigned char bytes[34];
+    memset(bytes, 0xc7, sizeof bytes);
+    volatile unsigned tick = 0x12345678u;
+    gen_volatile(bytes + 1, &tick);
+    if (tick != 31 || bytes[0] != 0xc7 || bytes[33] != 0xc7) return 1;
+    for (unsigned i = 0; i < 32; ++i)
+        if (bytes[i + 1] != (unsigned char)(i * 3u)) return 1;
+    memset(bytes, 0xc7, sizeof bytes);
+    unsigned char side = 0x7b;
+    gen_constant(bytes + 1, &side);
+    if (side != 0xa5 || bytes[0] != 0xc7 || bytes[33] != 0xc7) return 1;
+    for (unsigned i = 0; i < 32; ++i)
+        if (bytes[i + 1] != (unsigned char)(i * 3u)) return 1;
+    /* Deliberate alias: a store-effect omission also breaks ordinary memory. */
+    gen_constant(bytes + 1, bytes + 1);
+    if (bytes[1] != 0xa5 || bytes[33] != 0xc7) return 1;
+    return 0;
 }
 
 static int check(const char *name, const void *got, const void *want, size_t n) {
@@ -131,7 +167,7 @@ int main(void) {
     gen_e();
     gen_f();
     gen_g();
-    int bad = 0;
+    int bad = effects_check();
     bad += check("a", a_hist, a_ref, sizeof a_hist);
     bad += check("b", b_gen, b_ref, sizeof b_gen);
     bad += check("c", c_gen + 5, c_ref + 5, sizeof c_gen - 5);

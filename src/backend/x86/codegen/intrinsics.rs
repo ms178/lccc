@@ -6249,6 +6249,11 @@ impl X86Codegen {
                     self.emit_vec_fma_128(d, args, mn, ps);
                 }
             }
+            IntrinsicOp::VecPackssdwI16x16 => {
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vpackssdw", false);
+                }
+            }
             IntrinsicOp::VecAddI32x8 | IntrinsicOp::VecAddI32x4 => {
                 // defer-aware emitters (vpaddd is 3-op VEX, paddd is 2-op).
                 if let Some(d) = dest {

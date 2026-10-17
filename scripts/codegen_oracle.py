@@ -496,6 +496,7 @@ def _record_local_oracle(name: str, req: Request) -> dict[str, Any]:
         raise godbolt.GodboltError(
             f"{name} is a local x86-64 oracle; --arch {req.arch} was requested"
         )
+    godbolt.validate_local_oracle_flags(name, req.flags)
     metadata = godbolt.local_oracle_metadata(name)
     started = time.perf_counter()
     lines = godbolt.compile_local_oracle(name, req.source, req.flags)

@@ -9,6 +9,8 @@
 #     proof must FIRE here, so default and kill-switch assembly must differ.
 #     A silent refusal would otherwise pass every semantic check unnoticed.
 set -euo pipefail
+# Do not inherit policy/debug state that invalidates the positive arm.
+unset CCC_NO_IV_WIDEN CCC_IV_WIDEN_DEBUG
 cd "$(dirname "$0")/../.."
 ccc=${CCC:-target/fastbuild/lccc}
 ref_cc=gcc-16
@@ -49,8 +51,18 @@ done
 echo "IVW-PAIRED: proof fires on constant-threshold shape"
 # Compare only the paired_const body: the kill switch disables every iv_widen
 # proof, so unrelated loops elsewhere in the file would also differ.
-"$ccc" -O2 -fwrapv -w -S "$const" -o "$td/const-on.s"
-CCC_NO_IV_WIDEN=1 "$ccc" -O2 -fwrapv -w -S "$const" -o "$td/const-off.s"
+CCC_IV_WIDEN_DEBUG=1 "$ccc" -O2 -fwrapv -w -S "$const" -o "$td/const-on.s" 2>"$td/const-on.trace"
+CCC_NO_IV_WIDEN=1 CCC_IV_WIDEN_DEBUG=1 "$ccc" -O2 -fwrapv -w -S "$const" -o "$td/const-off.s" 2>"$td/const-off.trace"
+# These are successful producers (set -e); only now inspect their diagnostics.
+if ! grep -Eq "^\[IV-WIDEN-MIRROR\] fn=paired_const phi=[0-9]+$" "$td/const-on.trace"; then
+    echo "FAIL: constant-threshold kernel did not use the sibling-mirror theorem" >&2
+    cat "$td/const-on.trace" >&2
+    exit 1
+fi
+if grep -q "^\[IV-WIDEN-MIRROR\]" "$td/const-off.trace"; then
+    echo "FAIL: kill switch did not suppress the sibling-mirror theorem" >&2
+    exit 1
+fi
 body() { awk '/^paired_const:/{on=1} on{print} /\.size[ \t]+paired_const,/{exit}' "$1"; }
 body "$td/const-on.s" > "$td/const-on.fn"
 body "$td/const-off.s" > "$td/const-off.fn"

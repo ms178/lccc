@@ -1,6 +1,6 @@
 # PR #846 — critical audit and implementation handoff
 
-**Recommendation: do not merge yet.** Two high-confidence correctness blockers remain in the generator-map vectorizer. Existing green checks are useful regression evidence, not a proof that the matcher preserves every admitted loop's effects.
+**Current recommendation: do not merge yet.** The original audit findings below are preserved as the review record. Follow-up work has since addressed F1–F4 locally and added an ICX CI lane, but the final worktree is not yet pushed or hosted-CI validated; live ICX provisioning remains unverified. The current performance measurement is still slower than GCC. See the dated follow-up status at the end for exact evidence and open risks.
 
 Review date: 2026-10-17. Scope: the complete PR delta, surrounding pass-entry guards and flag analysis, regression scripts, oracle dispatch/identity, provisioning, and CI/local wiring. This is a source-level audit plus compiler-free tests, **not** an executed miscompilation reproduction or an exhaustive compiler proof. The initial exact-application sanity check established patch integrity; this deeper audit found issues that check missed.
 
@@ -134,7 +134,7 @@ These are targeted to the requested ICX upgrade; they do not fix or hide F1/F2.
 
 ## Implementation handoff: acceptance criteria for a 10/10 review
 
-**Work on the existing Arena branch and PR. Do not change the branch, silently disable the transform, weaken gates, or regenerate guessed vendor pins. Do not run local compile tests in this harness. Let GitHub CI run compilation/runtime regressions.**
+**Work on the existing Arena branch and PR. Do not change the branch, silently disable the transform, weaken gates, or regenerate guessed vendor pins. Local compilation and runtime validation are authorized; report hosted checks separately and do not treat local results as hosted CI evidence.**
 
 ### Work package A — close memory-effect legality first
 
@@ -182,3 +182,14 @@ These are targeted to the requested ICX upgrade; they do not fix or hide F1/F2.
 4. Update this report and the PR body with resolved findings and evidence links. Prefer small, separately reviewable commits for legality, gate hardening, dispatch and evidence.
 
 **Merge decision:** fix F1/F2 and their negative tests first; close F3/F4 and verify the real ICX upgrade before treating the PR as ready. F5/F6 need a deliberate supported-surface/target decision. Performance claims must remain qualified until F7 is evidenced. Do not merge the current branch merely because its existing corpus checks are green.
+
+## Follow-up status — 2026-10-17 (local worktree, not pushed)
+
+The following updates supersede the original open/required-fix descriptions where stated; the sections above remain the historical audit record.
+
+- **F1/F2 addressed locally:** the matcher now scans/account for body effects, matches the selected store and GEP by instruction identity, requires a nonvolatile default-address-space store, checks CFG edges through shared CFG construction, and rejects unsupported side effects/shapes. Direct Rust tests cover additional value/constant/volatile stores, FS and GS, unmatched GEPs, escaping/duplicate definitions, unsupported effects, malformed control flow, tails, and failure-atomic rejection. Focused generator-map Rust tests passed **21/21**; the compiler-built runtime/trace gate passed six named positives, the kill-switch arm, GCC output parity, and refusal checks for `gen_g`, `gen_volatile`, and `gen_constant`.
+- **F3/F4 addressed locally:** trace capture checks compiler exit status before counting; six mutation tests passed. Per-kernel firing/refusal assertions and a theorem-specific paired-counter trace are wired into regression gates. The paired-counter gate passed all optimization-level and kill-switch cases, including proof firing on the constant-threshold shape.
+- **Pack-register follow-up:** made the 256-bit signed-word pack a pure vector SSA value and admitted the final `Packuswb256` sink as a legal homed consumer. On the exact same local benchmark harness, 3-round/1,000-repetition medians changed from 0.04576s to 0.04269s for LCCC, with generator instructions 92→89, memory loads 10→8, stores 8→6 and stack references 12→8. GCC measured 0.03058s in the after run. This short local sample is not a robust performance win claim; LCCC remains slower. Full baseline/optimized measurements and variance review remain required.
+- **Oracle tests:** the local oracle/provisioning unittest suite passed **24 tests, 2 skipped**. It does not prove real Intel package availability or a successful live install. The hosted ICX job is added but has not run on the final head.
+- **Local CI result:** `scripts/ci_local.sh --fast` ended **241 passed, 31 failed, 13 skipped** before the latest small edits. Multiple failures are confirmed environment limitations (missing i386 libc/libgcc, unavailable qemu/binutils downloads under sandbox network restrictions). Some targeted 32-bit checks have a valid test prerequisite failure rather than a demonstrated source regression. The artifact-DAG layout test did fail because the new `icx-oracle` job was not included in its expected lane set; the test has since been updated and passed in isolation. The whole local suite has not yet been rerun after that correction.
+- **Still open:** final full suite/remaining target-specific checks, final benchmark with adequate samples, live ICX provisioning/effective target probe, final diff review, PR body update, commit/push, and green hosted checks on the pushed SHA. No merge recommendation upgrade is made.

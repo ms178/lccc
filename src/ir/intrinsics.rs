@@ -612,6 +612,10 @@ pub enum IntrinsicOp {
     VecSubI32x8,
     VecSubI64x2,
     VecAndI32x4,
+    /// AVX2 signed-saturating pack of two I32x8 values into I16x16.
+    /// Independent 128-bit halves, matching vpackssdw lane order.
+    /// args = [first I32x8, second I32x8]; dest = pure 256-bit SSA value.
+    VecPackssdwI16x16,
     VecAndI32x8,
     VecOrI32x4,
     VecOrI32x8,
@@ -1738,7 +1742,7 @@ impl IntrinsicOp {
             | FmaF64x4 | FmaF64x4Hoisted | BroadcastLoadF64 | FmaF64x4SIB | FmaF64x4HoistedSIB
             | LoadF64x4 | LoadI32x8 | AddF64x4 | MulF64x4 | AddI32x8
             | VecLoadF64x4 | VecLoadI32x8 | VecAddF64x4 | VecMulF64x4 | VecFmaF64x4 | VecMaddF64x4 | VecMaddF64x4Signed(..) | VecBroadcastF64x4 | VecAddI32x8 | VecMulI32x8 | VecBroadcastI32x8 | VecMaxI32x8
-            | VecSubI32x8 | VecAndI32x8 | VecOrI32x8 | VecXorI32x8
+            | VecPackssdwI16x16 | VecSubI32x8 | VecAndI32x8 | VecOrI32x8 | VecXorI32x8
             | VecSubF64x4 | VecDivF64x4 | VecSqrtF64x4 | VecXorF64x4
             | VecSubF32x8 | VecDivF32x8 | VecSqrtF32x8 | VecXorF32x8
             | VecZeroF64x4 | VecZeroI32x8 | VecLoadF32x8 | VecAddF32x8
@@ -2112,6 +2116,7 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecLoadF64x2
                 | IntrinsicOp::VecLoadI32x8
                 | IntrinsicOp::VecLoadI32x4
+                | IntrinsicOp::VecPackssdwI16x16
                 | IntrinsicOp::VecLoadF32x8
                 | IntrinsicOp::VecLoadF32x4
                 | IntrinsicOp::VecAddF64x4
@@ -2358,6 +2363,16 @@ mod vector_width_tests {
     /// - `VecSadalpI32x4` / `VecSmlal{Hi,Lo}I32x4` are unlowered NEON-shaped
     ///   variants with no registered result; exempt until a lowering lands.
     #[test]
+    fn generator_pack_has_full_width_pure_value_metadata() {
+        let op = IntrinsicOp::VecPackssdwI16x16;
+        assert_eq!(op.vector_home_width(), Some(32));
+        assert_eq!(op.vector_result_width(), Some(32));
+        assert!(op.produces_vector_value());
+        assert!(op.is_pure());
+        assert!(!op.writes_memory_via_args());
+    }
+
+    #[test]
     fn declared_width_agrees_with_the_lane_count_in_the_name() {
         const SRC: &str = include_str!("intrinsics.rs");
         let enum_start = SRC
@@ -2460,6 +2475,7 @@ mod vector_width_tests {
             "VecShufdI32x4" => IntrinsicOp::VecShufdI32x4,
             "VecShufbI32x4" => IntrinsicOp::VecShufbI32x4,
             "VecPackI32x4" => IntrinsicOp::VecPackI32x4,
+            "VecPackssdwI16x16" => IntrinsicOp::VecPackssdwI16x16,
             "VecExtractLaneI32x4" => IntrinsicOp::VecExtractLaneI32x4,
             "VecAddI32x8" => IntrinsicOp::VecAddI32x8,
             "VecAddI64x2" => IntrinsicOp::VecAddI64x2,
@@ -2837,6 +2853,7 @@ mod memory_classification_tests {
             O::VecPackI64x2,
             O::VecPackI32x4Pair,
             O::VecExtractLaneI64x2,
+            O::VecPackssdwI16x16,
             O::VecAndI16x16,
             O::VecOrI16x16,
             O::VecXorI16x16,

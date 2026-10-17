@@ -49,6 +49,7 @@ def verify(oracles, flags):
         report['compilers'][name] = row
         try:
             if local:
+                godbolt.validate_local_oracle_flags(name, flags)
                 row['metadata'] = godbolt.local_oracle_metadata(name)
                 row['effective_flags'] = flags
 

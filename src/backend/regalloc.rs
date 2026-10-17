@@ -8246,6 +8246,7 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
             | O::VecLShrI16x16
             | O::VecAShrI16x16
             | O::VecShlI32x8
+            | O::VecPackssdwI16x16
             | O::VecLShrI32x8
             | O::VecAShrI32x8
             | O::VecShlI64x4
@@ -8448,6 +8449,11 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecLShrI16x16
                     | O::VecAShrI16x16
                     | O::VecShlI32x8
+                    | O::VecPackssdwI16x16
+                    // The final byte-pack is a home-aware 256-bit AVX
+                    // binary store; permit it to consume the register-homed
+                    // word packs rather than round-tripping through slots.
+                    | O::Packuswb256
                     | O::VecLShrI32x8
                     | O::VecAShrI32x8
                     | O::VecShlI64x4

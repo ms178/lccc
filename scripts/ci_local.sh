@@ -1898,6 +1898,9 @@ gate "godbolt-oracle-selftest" fast \
 gate "godbolt-cache-selftest" fast \
     python3 scripts/test_godbolt_cache.py
 
+gate "generator-trace-selftest" fast \
+    python3 tests/regression/test_generator_map_gate.py
+
 gate "local-oracles-selftest" fast \
     python3 scripts/test_local_oracles.py
 
