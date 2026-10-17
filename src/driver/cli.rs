@@ -1395,6 +1395,15 @@ impl Driver {
                 // tolerating a name is a missing diagnostic, never different
                 // code -- which is why this namespace, unlike `-f`/`--`/`-g`,
                 // is not fail-closed by default.
+                // `-w`: inhibit all warning messages.  Measured against
+                // GCC 16.2 (2026-10-17): dominant regardless of position
+                // (`-w -Wall` and `-Wall -w` are both silent, `#warning`
+                // included), hence a sticky latch in `WarningConfig`.  The
+                // driver's own option-contract diagnostics (tolerated
+                // unknown options, LCCC_STRICT_OPTIONS) are NOT user-code
+                // warnings and stay audible.
+                "-w" => self.warning_config.set_inhibit_all(),
+
                 arg if arg.starts_with("-W") => {
                     let flag = &arg[2..];
                     // A `-Wno-<name>` request is honoured by construction
@@ -3008,6 +3017,45 @@ mod cli_tests {
         // args[0] is argv[0] (used for target detection from the binary name).
         let args = vec!["ccc".to_string(), flag.to_string(), "x.c".to_string()];
         d.parse_cli_args(&args).map(|_| ())
+    }
+
+    /// `-w` inhibits every warning and is dominant regardless of position —
+    /// measured against GCC 16.2 (2026-10-17): `-w -Wall` and `-Wall -w` are
+    /// both completely silent on a file with a `#warning` directive and an
+    /// unused variable, while plain `-Wall` warns. A sticky latch, not an
+    /// order-dependent toggle.
+    #[test]
+    fn dash_w_inhibits_all_warnings_in_both_orders() {
+        use crate::common::error::WarningKind;
+        for args in [
+            vec!["ccc", "-w", "x.c"],
+            vec!["ccc", "-w", "-Wall", "x.c"],
+            vec!["ccc", "-Wall", "-w", "x.c"],
+        ] {
+            let mut d = Driver::new();
+            let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            d.parse_cli_args(&owned)
+                .unwrap_or_else(|e| panic!("{:?} must parse: {e}", args));
+            for kind in [WarningKind::Cpp, WarningKind::ReturnType] {
+                assert!(
+                    !d.warning_config.is_enabled(kind),
+                    "{:?}: {:?} must be inhibited by -w",
+                    args,
+                    kind
+                );
+            }
+        }
+        // Control: without -w the same warnings stay enabled.
+        let mut d = Driver::new();
+        let owned: Vec<String> = ["ccc", "-Wall", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        d.parse_cli_args(&owned).expect("-Wall must parse");
+        assert!(
+            d.warning_config
+                .is_enabled(crate::common::error::WarningKind::Cpp)
+        );
     }
 
     /// `-mno-<feature>` must be ACCEPTED for any ISA extension LCCC never
