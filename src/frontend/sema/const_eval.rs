@@ -191,9 +191,9 @@ impl<'a> SemaConstEval<'a> {
                     // Sema never produces D32/D64 constants.
                     let wide_side = |ct: &Option<CType>| matches!(ct, Some(CType::Float128));
                     if wide_side(&lhs_ctype) || wide_side(&rhs_ctype) {
-                        let l128 = Self::f128_bytes_of(lv, lhs_ctype.as_ref())?;
-                        let r128 = Self::f128_bytes_of(rv, rhs_ctype.as_ref())?;
-                        return Self::fold_f128_binop(op, &l128, &r128);
+                        let l128 = shared_const_eval::f128_bytes_of(lv, lhs_ctype.as_ref())?;
+                        let r128 = shared_const_eval::f128_bytes_of(rv, rhs_ctype.as_ref())?;
+                        return shared_const_eval::fold_f128_binop(op, &l128, &r128);
                     }
                     let result = shared_const_eval::eval_binop_with_types(
                         op,
@@ -261,25 +261,33 @@ impl<'a> SemaConstEval<'a> {
                 // `(_Float128)3` is binary128 3.0, not the bit pattern 3).
                 let src_ctype = self.const_ctype(inner);
                 if target_ctype == CType::Float128 {
-                    let bytes = Self::f128_bytes_of(&src_val, src_ctype.as_ref())?;
+                    let bytes = shared_const_eval::f128_bytes_of(&src_val, src_ctype.as_ref())?;
                     return Some(IrConst::I128(u128::from_le_bytes(bytes) as i128));
                 }
                 if matches!(src_ctype, Some(CType::Float128)) {
                     let IrConst::I128(bits) = src_val else {
                         return None;
                     };
-                    return self.cast_f128_to_ctype(&(bits as u128).to_le_bytes(), &target_ctype);
+                    return shared_const_eval::f128_to_ctype(
+                        &(bits as u128).to_le_bytes(),
+                        &target_ctype,
+                    );
                 }
 
-                // Handle float source types: use value-based conversion
-                // For LongDouble, use full x87 precision for integer conversions
-                if let IrConst::LongDouble(fv, bytes) = &src_val {
-                    return self.cast_long_double_to_ctype(*fv, bytes, &target_ctype);
+                // Handle float source types: use value-based conversion.
+                // A long double converts from its value in the target format
+                // (x87: 64-bit significand), never from its f64 shadow.
+                if let IrConst::LongDouble(_, bytes) = &src_val {
+                    let value = crate::common::long_double::long_double_value_bytes(bytes);
+                    return shared_const_eval::f128_to_ctype(&value, &target_ctype);
                 }
-                if let Some(fv) = src_val.to_f64() {
-                    if matches!(&src_val, IrConst::F32(_) | IrConst::F64(_)) {
-                        return self.cast_float_to_ctype(fv, &target_ctype);
-                    }
+                // float/double are exact in binary128, so one converter
+                // serves every binary floating source (target-width `long`,
+                // target-signedness `char`, single rounding to `float`).
+                if let IrConst::F32(_) | IrConst::F64(_) = src_val {
+                    let fv = src_val.to_f64()?;
+                    let value = crate::common::long_double::f64_to_f128_bytes_lossless(fv);
+                    return shared_const_eval::f128_to_ctype(&value, &target_ctype);
                 }
 
                 // Handle I128 source: use full 128-bit value to avoid truncation
@@ -774,159 +782,10 @@ impl<'a> SemaConstEval<'a> {
             .or_else(|| self.infer_expr_ctype(expr))
     }
 
-    /// The truth value of a folded constant (C11 6.3.1.2: `!= 0`). A
-    /// _Float128 constant is an I128 carrier whose bits do not encode zero
-    /// uniquely: -0.0Q is false, any NaN true.
+    /// The truth value of a folded constant (C11 6.3.1.2: `!= 0`), decided by
+    /// its C type: the I128 carrier of -0.0Q or -0.0DL is false, a NaN true.
     fn const_truth(&self, val: &IrConst, expr: &Expr) -> bool {
-        match (val, self.const_ctype(expr)) {
-            (IrConst::I128(bits), Some(CType::Float128)) => {
-                Self::f128_is_nonzero(&(*bits as u128).to_le_bytes())
-            }
-            _ => val.is_nonzero(),
-        }
-    }
-
-    /// Whether a binary128 value is nonzero (NaN included).
-    fn f128_is_nonzero(bytes: &[u8; 16]) -> bool {
-        u128::from_le_bytes(*bytes) & !(1u128 << 127) != 0
-    }
-
-    /// The exact binary128 value of a constant of real type `ct`: every
-    /// lccc integer and standard floating constant is exactly representable
-    /// (64-bit integers in 113 bits; long double constants carry binary128
-    /// bytes), and 128-bit integers round once. Declines pointers, decimal
-    /// and complex values.
-    fn f128_bytes_of(val: &IrConst, ct: Option<&CType>) -> Option<[u8; 16]> {
-        use crate::common::long_double as ld;
-        let ct = ct?;
-        if *ct == CType::Float128 {
-            let IrConst::I128(bits) = val else {
-                return None;
-            };
-            return Some((*bits as u128).to_le_bytes());
-        }
-        if !(ct.is_integer() || ct.is_floating()) {
-            return None;
-        }
-        Some(match val {
-            // An x87 long double constant's bytes may hold the full binary128
-            // parse of its literal; its value is that rounded to 64 bits.
-            IrConst::LongDouble(_, bytes)
-                if !crate::common::types::target_long_double_is_f128() =>
-            {
-                ld::x87_bytes_to_f128_bytes(&ld::f128_bytes_to_x87_bytes(bytes))
-            }
-            IrConst::LongDouble(_, bytes) => *bytes,
-            IrConst::F64(f) => ld::f64_to_f128_bytes_lossless(*f),
-            IrConst::F32(f) => ld::f64_to_f128_bytes_lossless(f64::from(*f)),
-            IrConst::I128(v) if ct.is_unsigned() => ld::u128_to_f128_bytes(*v as u128),
-            IrConst::I128(v) => ld::i128_to_f128_bytes(*v),
-            other => {
-                let v = other.to_i64()?;
-                if ct.is_unsigned() {
-                    ld::u64_to_f128_bytes(v as u64)
-                } else {
-                    ld::i64_to_f128_bytes(v)
-                }
-            }
-        })
-    }
-
-    /// Fold `l op r` in binary128 (IEEE semantics: comparisons with a NaN
-    /// are false except `!=`; +0 == -0).
-    fn fold_f128_binop(op: &BinOp, l: &[u8; 16], r: &[u8; 16]) -> Option<IrConst> {
-        use crate::common::long_double as ld;
-        let carrier = |b: [u8; 16]| IrConst::I128(u128::from_le_bytes(b) as i128);
-        let truth = |b: bool| IrConst::I64(i64::from(b));
-        let ord = ld::f128_cmp(l, r);
-        let ordered = ord != i32::MIN;
-        Some(match op {
-            BinOp::Add => carrier(ld::f128_add(l, r)),
-            BinOp::Sub => carrier(ld::f128_sub(l, r)),
-            BinOp::Mul => carrier(ld::f128_mul(l, r)),
-            BinOp::Div => carrier(ld::f128_div(l, r)),
-            BinOp::Lt => truth(ordered && ord < 0),
-            BinOp::Le => truth(ordered && ord <= 0),
-            BinOp::Gt => truth(ordered && ord > 0),
-            BinOp::Ge => truth(ordered && ord >= 0),
-            BinOp::Eq => truth(ord == 0),
-            BinOp::Ne => truth(ord != 0),
-            BinOp::LogicalAnd => truth(Self::f128_is_nonzero(l) && Self::f128_is_nonzero(r)),
-            BinOp::LogicalOr => truth(Self::f128_is_nonzero(l) || Self::f128_is_nonzero(r)),
-            _ => return None,
-        })
-    }
-
-    /// Convert a binary128 constant to `target` by value. Out-of-range
-    /// floating-to-integer conversions are undefined (C11 6.3.1.4) and stay
-    /// unfolded.
-    fn cast_f128_to_ctype(&self, bytes: &[u8; 16], target: &CType) -> Option<IrConst> {
-        use crate::common::long_double as ld;
-        match target {
-            CType::Float128 => Some(IrConst::I128(u128::from_le_bytes(*bytes) as i128)),
-            CType::Enum(e) => self.cast_f128_to_ctype(bytes, &e.compatible_ctype()),
-            // x87 long double: round to its 64-bit significand once, here,
-            // so the constant equals what the runtime conversion yields.
-            CType::LongDouble if !crate::common::types::target_long_double_is_f128() => {
-                let rounded = ld::x87_bytes_to_f128_bytes(&ld::f128_bytes_to_x87_bytes(bytes));
-                Some(IrConst::long_double_with_bytes(
-                    ld::f128_bytes_to_f64(&rounded),
-                    rounded,
-                ))
-            }
-            _ => self.cast_long_double_to_ctype(ld::f128_bytes_to_f64(bytes), bytes, target),
-        }
-    }
-
-    /// Cast a long double value (with f128 bytes) to a target CType.
-    /// Uses full precision for integer conversions.
-    fn cast_long_double_to_ctype(
-        &self,
-        fv: f64,
-        bytes: &[u8; 16],
-        target: &CType,
-    ) -> Option<IrConst> {
-        use crate::common::long_double::{
-            f128_bytes_to_i64, f128_bytes_to_i128, f128_bytes_to_u64, f128_bytes_to_u128,
-        };
-        Some(match target {
-            CType::Float => IrConst::F32(fv as f32),
-            CType::Double => IrConst::F64(fv),
-            CType::LongDouble => IrConst::long_double_with_bytes(fv, *bytes),
-            CType::Char => IrConst::I8(f128_bytes_to_i64(bytes)? as i8),
-            CType::UChar => IrConst::I32(f128_bytes_to_u64(bytes)? as u8 as i32),
-            CType::Short => IrConst::I16(f128_bytes_to_i64(bytes)? as i16),
-            CType::UShort => IrConst::I32(f128_bytes_to_u64(bytes)? as u16 as i32),
-            CType::Int => IrConst::I32(f128_bytes_to_i64(bytes)? as i32),
-            CType::UInt => IrConst::I32(f128_bytes_to_u64(bytes)? as u32 as i32),
-            CType::Long | CType::LongLong => IrConst::I64(f128_bytes_to_i64(bytes)?),
-            CType::ULong | CType::ULongLong => IrConst::I64(f128_bytes_to_u64(bytes)? as i64),
-            // The binary128 value decides, not its f64 image: 1e-400L is a
-            // nonzero x87 value that rounds to 0.0 in double.
-            CType::Bool => IrConst::I8(i8::from(Self::f128_is_nonzero(bytes))),
-            CType::Int128 => IrConst::I128(f128_bytes_to_i128(bytes)?),
-            CType::UInt128 => IrConst::I128(f128_bytes_to_u128(bytes)? as i128),
-            _ => return None,
-        })
-    }
-
-    /// Cast a float value to a target CType.
-    fn cast_float_to_ctype(&self, fv: f64, target: &CType) -> Option<IrConst> {
-        Some(match target {
-            CType::Float => IrConst::F32(fv as f32),
-            CType::Double => IrConst::F64(fv),
-            CType::LongDouble => IrConst::long_double(fv),
-            CType::Char => IrConst::I8(fv as i8),
-            CType::UChar => IrConst::I32(fv as u8 as i32),
-            CType::Short => IrConst::I16(fv as i16),
-            CType::UShort => IrConst::I32(fv as u16 as i32),
-            CType::Int => IrConst::I32(fv as i32),
-            CType::UInt => IrConst::I32(fv as u32 as i32),
-            CType::Long | CType::LongLong => IrConst::I64(fv as i64),
-            CType::ULong | CType::ULongLong => IrConst::I64(fv as u64 as i64),
-            CType::Bool => IrConst::I8(if fv != 0.0 { 1 } else { 0 }),
-            _ => return None,
-        })
+        shared_const_eval::const_truth(val, self.const_ctype(expr).as_ref())
     }
 
     /// Convert raw bits to an IrConst based on target CType.

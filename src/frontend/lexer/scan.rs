@@ -611,14 +611,25 @@ impl Lexer {
         is_imaginary: bool,
         start: usize,
     ) -> Token {
-        let value: f64 = text.parse().unwrap_or(0.0);
+        // A `float` literal rounds once, decimal -> binary32 (C11 6.4.4.2);
+        // parsing as f64 and narrowing later double-rounds. Every f32 is an
+        // exact f64, so the later narrowing is exact.
+        let value: f64 = if float_kind == 1 {
+            text.parse::<f32>().map_or(0.0, f64::from)
+        } else {
+            text.parse().unwrap_or(0.0)
+        };
         let span = Span::new(start as u32, self.pos as u32, self.file_id);
         if is_imaginary {
             match float_kind {
                 1 => Token::new(TokenKind::ImaginaryLiteralF32(value), span),
                 2 => {
+                    // The literal's value is its single rounding to the
+                    // target long double format; the f64 shadow derives from
+                    // that value (C: `(double)0.1L` rounds the long double).
                     let f128_bytes =
-                        crate::common::long_double::parse_long_double_to_f128_bytes(text);
+                        crate::common::long_double::parse_long_double_value_bytes(text);
+                    let value = crate::common::long_double::f128_bytes_to_f64(&f128_bytes);
                     Token::new(
                         TokenKind::ImaginaryLiteralLongDouble(value, f128_bytes),
                         span,
@@ -631,7 +642,8 @@ impl Lexer {
                 1 => Token::new(TokenKind::FloatLiteralF32(value), span),
                 2 => {
                     let f128_bytes =
-                        crate::common::long_double::parse_long_double_to_f128_bytes(text);
+                        crate::common::long_double::parse_long_double_value_bytes(text);
+                    let value = crate::common::long_double::f128_bytes_to_f64(&f128_bytes);
                     Token::new(TokenKind::FloatLiteralLongDouble(value, f128_bytes), span)
                 }
                 3 => {

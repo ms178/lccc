@@ -147,94 +147,15 @@ impl BigUint {
         (self.limbs.len() as u32 - 1) * 32 + top_bits
     }
 
-    /// Check if bit at position `pos` (0-indexed from LSB) is set.
-    fn bit_at(&self, pos: u32) -> bool {
-        let word_idx = (pos / 32) as usize;
-        let bit_idx = pos % 32;
-        if word_idx < self.limbs.len() {
-            (self.limbs[word_idx] >> bit_idx) & 1 != 0
-        } else {
-            false
-        }
-    }
-
-    /// Check if any bit in the range [0, pos) is set (i.e., any of the bottom `pos` bits).
-    fn any_bits_below(&self, pos: u32) -> bool {
-        let full_words = (pos / 32) as usize;
-        let remainder = pos % 32;
-        for i in 0..full_words {
-            if i < self.limbs.len() && self.limbs[i] != 0 {
-                return true;
-            }
-        }
-        if remainder > 0 && full_words < self.limbs.len() {
-            let mask = (1u32 << remainder) - 1;
-            if self.limbs[full_words] & mask != 0 {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Extract the top N bits (up to 128), with the MSB at bit (N-1).
-    /// Returns (top_val, bits_shifted) where the value is approximately top_val * 2^bits_shifted.
-    fn top_n_bits(&self, n: u32) -> (u128, i32) {
-        assert!(n > 0 && n <= 128);
-        let bl = self.bit_length();
-        if bl == 0 {
-            return (0, 0);
-        }
-        if bl <= n {
-            // Value fits in n bits
-            let mut val: u128 = 0;
-            for (i, &limb) in self.limbs.iter().enumerate() {
-                val |= (limb as u128) << (i * 32);
-            }
-            return (val, 0);
-        }
-
-        // We need bits [bl-1 .. bl-n] of the big integer
-        let shift = bl - n;
-        let word_shift = (shift / 32) as usize;
-        let bit_shift = shift % 32;
-
-        let mut val: u128 = 0;
-        // We need up to (n/32 + 2) limbs due to bit_shift straddling
-        let limbs_needed = (n / 32 + 2) as usize;
-        for j in 0..limbs_needed {
-            let idx = word_shift + j;
-            if idx < self.limbs.len() {
-                let limb = self.limbs[idx] as u128;
-                if j == 0 {
-                    val |= limb >> bit_shift;
-                } else {
-                    let bit_pos = j as u32 * 32 - bit_shift;
-                    if bit_pos < 128 {
-                        val |= limb << bit_pos;
-                    }
-                }
-            }
-        }
-        // Mask to n bits
-        if n < 128 {
-            val &= (1u128 << n) - 1;
-        }
-
-        (val, shift as i32)
-    }
-
-    /// Divide dividend by divisor, returning the quotient (floor division).
-    /// The remainder is discarded. Used for dividing by large powers of 10.
-    fn div_big(dividend: &BigUint, divisor: &BigUint) -> BigUint {
-        if divisor.is_zero() {
-            return BigUint { limbs: vec![0] };
-        }
-
+    /// Floor division plus an "inexact" flag (remainder != 0), the sticky
+    /// bit a correctly rounded conversion needs. `divisor` must be nonzero.
+    fn div_rem_big(dividend: &BigUint, divisor: &BigUint) -> (BigUint, bool) {
+        debug_assert!(!divisor.is_zero());
         let d_bits = dividend.bit_length();
         let v_bits = divisor.bit_length();
 
         if d_bits < v_bits {
-            return BigUint { limbs: vec![0] };
+            return (BigUint { limbs: vec![0] }, !dividend.is_zero());
         }
 
         // Simple long division: shift divisor up, subtract repeatedly
@@ -263,9 +184,23 @@ impl BigUint {
             quotient_limbs.pop();
         }
 
-        BigUint {
-            limbs: quotient_limbs,
-        }
+        let inexact = remainder.iter().any(|&l| l != 0);
+        (
+            BigUint {
+                limbs: quotient_limbs,
+            },
+            inexact,
+        )
+    }
+
+    /// The value as a u128; the caller guarantees it fits.
+    fn to_u128(&self) -> u128 {
+        debug_assert!(self.bit_length() <= 128);
+        self.limbs
+            .iter()
+            .take(4)
+            .enumerate()
+            .fold(0u128, |acc, (i, &l)| acc | (u128::from(l) << (32 * i)))
     }
 }
 
@@ -417,7 +352,7 @@ fn parse_decimal_digits(text: &str, capacity: usize) -> Option<ParsedDecimal> {
     } else {
         0
     };
-    let decimal_exp = exp10 - frac_digits;
+    let decimal_exp = exp10.saturating_sub(frac_digits);
 
     // Strip leading zeros
     while digits.len() > 1 && digits[0] == 0 {
@@ -434,85 +369,135 @@ fn parse_decimal_digits(text: &str, capacity: usize) -> Option<ParsedDecimal> {
     })
 }
 
-/// Apply IEEE 754 round-to-nearest-even to a BigUint value, extracting a 113-bit mantissa.
-/// Returns (mantissa113, binary_exp) after rounding, or None if zero.
-fn round_to_nearest_even_113(big_val: &BigUint) -> Option<(u128, i32)> {
-    let (top113, shift) = big_val.top_n_bits(113);
-    if top113 == 0 {
-        return None;
+/// Decimal digits x 10^decimal_exp rounded once to binary128.
+fn decimal_to_float_bigint_f128(negative: bool, digits: &[u8], decimal_exp: i32) -> [u8; 16] {
+    match decimal_to_binary_rne(digits, decimal_exp, 113, F128_EMIN, F128_EMAX) {
+        Some((m, q)) => encode_f128_rounded(negative, m, q),
+        None => make_f128_infinity(negative),
     }
-
-    let lz = top113.leading_zeros() - (128 - 113);
-    let mut mantissa113 = top113 << lz;
-    let effective_shift = shift - lz as i32;
-    let binary_exp = shift + 112 - lz as i32;
-
-    // IEEE 754 round-to-nearest-even:
-    // guard bit = bit at position (effective_shift - 1)
-    // sticky bits = any bits below the guard bit
-    if effective_shift > 0 {
-        let guard_pos = (effective_shift - 1) as u32;
-        let guard = big_val.bit_at(guard_pos);
-        let sticky = if guard_pos > 0 {
-            big_val.any_bits_below(guard_pos)
-        } else {
-            false
-        };
-
-        if guard && (sticky || (mantissa113 & 1 != 0)) {
-            // Round up
-            mantissa113 = mantissa113.wrapping_add(1);
-            // If mantissa overflowed past 113 bits, we need to adjust
-            if mantissa113 >> 113 != 0 {
-                // This means we went from 0x1FFF...FFF to 0x2000...000 (114 bits)
-                // Shift right and increment exponent
-                return Some((mantissa113 >> 1, binary_exp + 1));
-            }
-        }
-    }
-
-    Some((mantissa113, binary_exp))
 }
 
-/// Shared decimal-to-float bigint conversion for f128 (113-bit mantissa).
-fn decimal_to_float_bigint_f128(negative: bool, digits: &[u8], decimal_exp: i32) -> [u8; 16] {
-    if decimal_exp >= 0 {
-        let mut big_val = BigUint::from_decimal_digits(digits);
-        let p10 = pow10_big(decimal_exp as u32);
-        big_val = mul_big(&big_val, &p10);
+/// Decimal digits x 10^decimal_exp rounded once to x87 extended precision
+/// (64-bit significand, explicit integer bit, gradual underflow).
+fn decimal_to_float_bigint_x87(negative: bool, digits: &[u8], decimal_exp: i32) -> [u8; 16] {
+    match decimal_to_binary_rne(digits, decimal_exp, 64, F128_EMIN, F128_EMAX) {
+        Some((m, q)) => encode_x87_rounded(negative, m, q),
+        None => make_x87_infinity(negative),
+    }
+}
 
-        if big_val.is_zero() {
-            return make_f128_zero(negative);
-        }
+/// Minimum normal / maximum unbiased exponent shared by binary128 and x87
+/// extended (both use a 15-bit exponent with bias 16383).
+const F128_EMIN: i32 = -16382;
+const F128_EMAX: i32 = 16383;
 
-        match round_to_nearest_even_113(&big_val) {
-            Some((mantissa113, binary_exp)) => encode_f128(negative, binary_exp, mantissa113),
-            None => make_f128_zero(negative),
-        }
+/// Round `digits x 10^decimal_exp` (most-significant digit first, at least
+/// one nonzero digit) ONCE, half-even, to a binary format with `prec <= 113`
+/// significand bits, minimum normal exponent `emin` and gradual underflow.
+///
+/// Returns `Some((m, q))` with the rounded value `m * 2^q` (`m < 2^prec`;
+/// `m == 0` is an underflow to zero) or `None` on overflow past `emax`.
+///
+/// Method: scale the exact rational N/D by 2^s so the integer quotient has
+/// prec+3 or prec+4 bits, keep `remainder != 0` as the sticky bit, and drop
+/// the bits below the quantum 2^q, where q = max(floor(log2 v), emin) -
+/// (prec - 1). One rounding covers normal, subnormal and tie cases; the old
+/// path rounded to 113 bits first and then truncated subnormals and dropped
+/// the division remainder.
+fn decimal_to_binary_rne(
+    digits: &[u8],
+    decimal_exp: i32,
+    prec: u32,
+    emin: i32,
+    emax: i32,
+) -> Option<(u128, i32)> {
+    debug_assert!((2..=113).contains(&prec));
+    let n = digits.len() as i64;
+    let e10 = i64::from(decimal_exp);
+    // 10^(n-1+e10) <= v < 10^(n+e10). 10^4933 > 2^16384 exceeds every
+    // 15-bit-exponent format; 10^-4966 is below half the smallest binary128
+    // subnormal (2^-16495 ~ 1.5e-4966 > 1e-4966).
+    if n - 1 + e10 > 4933 {
+        return None;
+    }
+    if n + e10 < -4966 {
+        return Some((0, 0));
+    }
+    let mut num = BigUint::from_decimal_digits(digits);
+    if num.is_zero() {
+        return Some((0, 0));
+    }
+    let mut den = BigUint { limbs: vec![1] };
+    if e10 >= 0 {
+        num = mul_big(&num, &pow10_big(e10 as u32));
     } else {
-        let neg_exp = (-decimal_exp) as u32;
-        let big_d = BigUint::from_decimal_digits(digits);
-        if big_d.is_zero() {
-            return make_f128_zero(negative);
-        }
-
-        let extra_bits = (128 + neg_exp * 4).min(200000);
-        let mut shifted_d = big_d;
-        shifted_d.shl(extra_bits);
-
-        let p10 = pow10_big(neg_exp);
-        let quotient = BigUint::div_big(&shifted_d, &p10);
-        if quotient.is_zero() {
-            return make_f128_zero(negative);
-        }
-
-        match round_to_nearest_even_113(&quotient) {
-            Some((mantissa113, binary_exp)) => {
-                encode_f128(negative, binary_exp - extra_bits as i32, mantissa113)
-            }
-            None => make_f128_zero(negative),
+        den = pow10_big((-e10) as u32);
+    }
+    // floor(log2(N/D)) is nb-db-1 or nb-db, so s gives the quotient
+    // prec+3 or prec+4 bits (<= 117: fits a u128).
+    let s = i64::from(prec) + 3 - (i64::from(num.bit_length()) - i64::from(den.bit_length()));
+    if s >= 0 {
+        num.shl(s as u32);
+    } else {
+        den.shl((-s) as u32);
+    }
+    let (q_big, inexact) = BigUint::div_rem_big(&num, &den);
+    let q = q_big.to_u128();
+    let msb = 127 - i64::from(q.leading_zeros()) - s;
+    let mut qexp = msb.max(i64::from(emin)) - (i64::from(prec) - 1);
+    // Bits of `q` below the quantum: >= 3 by construction, more when the
+    // result is subnormal.
+    let k = (qexp + s) as u64;
+    debug_assert!(k >= 3);
+    let mut m = if k < 128 { q >> k } else { 0 };
+    let guard = k - 1 < 128 && (q >> (k - 1)) & 1 != 0;
+    let below = if k - 1 >= 128 {
+        q != 0
+    } else {
+        q & ((1u128 << (k - 1)) - 1) != 0
+    };
+    if guard && (below || inexact || m & 1 != 0) {
+        m += 1;
+        if m == 1u128 << prec {
+            m >>= 1;
+            qexp += 1;
         }
     }
+    if m != 0 && qexp + i64::from(127 - m.leading_zeros()) > i64::from(emax) {
+        return None;
+    }
+    Some((m, qexp as i32))
+}
+
+/// Encode a value `m * 2^q` already rounded to binary128 (`m < 2^113`;
+/// a normal result has bit 112 set, a subnormal one has q = -16494).
+fn encode_f128_rounded(negative: bool, m: u128, q: i32) -> [u8; 16] {
+    let sign_bit = if negative { 1u128 << 127 } else { 0 };
+    if m >> 112 == 0 {
+        debug_assert!(m == 0 || q == F128_EMIN - 112);
+        return (sign_bit | m).to_le_bytes();
+    }
+    let biased = (q + 112 + 16383) as u128;
+    (sign_bit | (biased << 112) | (m & ((1u128 << 112) - 1))).to_le_bytes()
+}
+
+/// Encode a value `m * 2^q` already rounded to x87 extended (`m < 2^64`
+/// with the explicit integer bit; a denormal has q = -16445).
+fn encode_x87_rounded(negative: bool, m: u128, q: i32) -> [u8; 16] {
+    if m == 0 {
+        return make_x87_zero(negative);
+    }
+    let biased: u16 = if m >> 63 == 0 {
+        debug_assert!(q == F128_EMIN - 63);
+        0
+    } else {
+        (q + 63 + 16383) as u16
+    };
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&(m as u64).to_le_bytes());
+    let se = biased | if negative { 0x8000 } else { 0 };
+    bytes[8..10].copy_from_slice(&se.to_le_bytes());
+    bytes
 }
 
 /// Multiply two big integers.
@@ -918,6 +903,87 @@ pub fn parse_long_double_to_f128_bytes(text: &str) -> [u8; 16] {
     }
 }
 
+/// The value of a `long double` literal: `text` rounded ONCE to the target's
+/// long double format (x87 extended or binary128), returned as the binary128
+/// bytes of that value (lossless for both formats). Rounding the binary128
+/// parse to 64 bits afterwards double-rounds; this does not.
+pub fn parse_long_double_value_bytes(text: &str) -> [u8; 16] {
+    if super::types::target_long_double_is_f128() {
+        return parse_long_double_to_f128_bytes(text);
+    }
+    let x87 = match preparse_long_double(text) {
+        PreparsedFloat::Decimal(neg, digits) => match parse_decimal_digits(digits, 40) {
+            Some(p) => decimal_to_float_bigint_x87(neg, &p.digits, p.decimal_exp),
+            None => make_x87_zero(neg),
+        },
+        // The hex parser rounds to the requested format itself.
+        PreparsedFloat::Hex(neg, hex) => {
+            let mut b = super::hex_float::parse_long_double(hex, false);
+            b[15] |= u8::from(neg) << 7;
+            return b;
+        }
+        PreparsedFloat::Infinity(_) | PreparsedFloat::NaN(_) => {
+            return parse_long_double_to_f128_bytes(text);
+        }
+    };
+    x87_bytes_to_f128_bytes(&x87)
+}
+
+/// Canonical value bytes of a long double constant: on x87 targets the
+/// binary128 image rounded to the 64-bit significand (constant bytes may hold
+/// a wider intermediate), on binary128 targets the bytes unchanged.
+pub fn long_double_value_bytes(bytes: &[u8; 16]) -> [u8; 16] {
+    if super::types::target_long_double_is_f128() {
+        *bytes
+    } else {
+        x87_bytes_to_f128_bytes(&f128_bytes_to_x87_bytes(bytes))
+    }
+}
+
+/// Round binary128 to binary32 (nearest-even) with a single rounding.
+/// Narrowing through f64 double-rounds; rounding to odd at 53 bits first
+/// does not, because 53 >= 24 + 2 (Boldo and Melquiond, "Emulation of FMA
+/// and correctly rounded sums: proved algorithms using rounding to odd").
+pub fn f128_bytes_to_f32(bytes: &[u8; 16]) -> f32 {
+    let (sign, biased_exp, mantissa) = f128_decompose(bytes);
+    let signed = |v: f32| if sign { -v } else { v };
+    if biased_exp == 0x7FFF {
+        return if mantissa == 0 {
+            signed(f32::INFINITY)
+        } else {
+            f32::NAN
+        };
+    }
+    let (m, e) = if biased_exp == 0 {
+        (mantissa, F128_EMIN - 112)
+    } else {
+        (mantissa | (1u128 << 112), biased_exp - 16383 - 112)
+    };
+    if m == 0 {
+        return signed(0.0);
+    }
+    let width = 128 - m.leading_zeros() as i32;
+    let top = e + width - 1;
+    // Far outside binary32: overflow to infinity, or below half the
+    // smallest subnormal (2^-150).
+    if top > 200 {
+        return signed(f32::INFINITY);
+    }
+    if top < -200 {
+        return signed(0.0);
+    }
+    let (m53, e53) = if width > 53 {
+        let sh = (width - 53) as u32;
+        let sticky = m & ((1u128 << sh) - 1) != 0;
+        ((m >> sh) | u128::from(sticky), e + sh as i32)
+    } else {
+        (m, e)
+    };
+    // m53 < 2^53 and |e53| <= 253: the product is an exact f64.
+    let scale = f64::from_bits(((e53 + 1023) as u64) << 52);
+    signed(((m53 as f64) * scale) as f32)
+}
+
 /// Parse a decimal float string to IEEE 754 binary128 format.
 fn parse_decimal_float_to_f128(negative: bool, text: &str) -> [u8; 16] {
     match parse_decimal_digits(text, 40) {
@@ -942,18 +1008,7 @@ fn encode_f128(negative: bool, binary_exp: i32, mantissa113: u128) -> [u8; 16] {
     }
 
     if biased_exp <= 0 {
-        // Subnormal or underflow
-        // TODO: the right-shift here truncates without rounding
-        let shift = 1 - biased_exp;
-        if shift >= 113 {
-            return make_f128_zero(negative);
-        }
-        let mantissa_denorm = mantissa113 >> shift as u32;
-        // f128: implicit bit is NOT stored, mantissa is bits [111:0]
-        let mantissa_stored = mantissa_denorm & ((1u128 << 112) - 1);
-        let sign_bit = if negative { 1u128 << 127 } else { 0 };
-        let val = sign_bit | mantissa_stored;
-        return val.to_le_bytes();
+        return f128_encode_subnormal(negative, (1 - biased_exp) as u32, mantissa113, false, false);
     }
 
     let exp15 = biased_exp as u128;
@@ -967,6 +1022,34 @@ fn encode_f128(negative: bool, binary_exp: i32, mantissa113: u128) -> [u8; 16] {
 /// Parse a hex float string (0x..p..) to f128 format.
 fn parse_hex_float_to_f128(negative: bool, text: &str) -> [u8; 16] {
     super::hex_float::parse_f128(text, negative)
+}
+
+/// Gradual underflow (IEEE 754-2008 7.5): the value
+/// `(mantissa + guard/2 + sticky/4) * 2^(-16382 - 112 - shift)` rounded ONCE,
+/// half-even, to the subnormal quantum 2^-16494. A carry into bit 112 is the
+/// smallest normal number, which the raw-bits union encodes correctly.
+fn f128_encode_subnormal(
+    negative: bool,
+    shift: u32,
+    mantissa: u128,
+    guard: bool,
+    sticky: bool,
+) -> [u8; 16] {
+    debug_assert!(mantissa >> 114 == 0);
+    let ext = (mantissa << 1) | u128::from(guard);
+    let drop = shift + 1;
+    let (kept, g, s) = if drop >= 128 {
+        (0, false, ext != 0 || sticky)
+    } else {
+        (
+            ext >> drop,
+            (ext >> (drop - 1)) & 1 != 0,
+            ext & ((1u128 << (drop - 1)) - 1) != 0 || sticky,
+        )
+    };
+    let k = kept + u128::from(g && (s || kept & 1 != 0));
+    let sign_bit = if negative { 1u128 << 127 } else { 0 };
+    (sign_bit | k).to_le_bytes()
 }
 
 /// Construct raw f128 bytes from sign, biased exponent, and stored mantissa (no implicit bit).
@@ -1281,7 +1364,8 @@ pub fn f128_bytes_to_i64(bytes: &[u8; 16]) -> Option<i64> {
         if abs_val > i64::MAX as u128 + 1 {
             return None;
         }
-        Some(-(abs_val as i64))
+        // -2^63: the negation must not overflow.
+        Some((abs_val as i64).wrapping_neg())
     } else {
         if abs_val > i64::MAX as u128 {
             return None;
@@ -1307,7 +1391,8 @@ pub fn f128_bytes_to_i128(bytes: &[u8; 16]) -> Option<i128> {
         if abs_val > i128::MAX as u128 + 1 {
             return None;
         }
-        Some(-(abs_val as i128))
+        // -2^127: the negation must not overflow.
+        Some((abs_val as i128).wrapping_neg())
     } else {
         if abs_val > i128::MAX as u128 {
             return None;
@@ -2255,6 +2340,17 @@ fn f128_round_and_encode(
     round: bool,
     sticky: bool,
 ) -> [u8; 16] {
+    // A subnormal result must round at the subnormal quantum, not at bit 0
+    // of the 113-bit significand (that double-rounded and then truncated).
+    if binary_exp + 16383 <= 0 && mantissa != 0 {
+        return f128_encode_subnormal(
+            sign,
+            (1 - (binary_exp + 16383)) as u32,
+            mantissa,
+            guard,
+            round || sticky,
+        );
+    }
     let mut m = mantissa;
     let mut exp = binary_exp;
 

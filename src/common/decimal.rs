@@ -490,7 +490,9 @@ pub fn decode_bid32(v: u32) -> Option<(bool, u32, i32)> {
         // Large-coefficient form: implicit high bit 2^23.
         let c = (1u32 << 23) | (v & 0x1F_FFFF);
         let e = (((v >> 21) & 0xFF) as i32) - 101;
-        Some((neg, c, e))
+        // A coefficient above 10^7 - 1 is non-canonical and denotes zero
+        // (IEEE 754-2008 3.5.2); only the large form can encode one.
+        Some((neg, if c > 9_999_999 { 0 } else { c }, e))
     } else {
         let c = v & 0x7F_FFFF;
         let e = (((v >> 23) & 0xFF) as i32) - 101;
@@ -513,7 +515,8 @@ pub fn decode_bid64(v: u64) -> Option<(bool, u64, i32)> {
         // Large-coefficient form: implicit high bit 2^53.
         let c = (1u64 << 53) | (v & 0x7_FFFF_FFFF_FFFF);
         let e = (((v >> 51) & 0x3FF) as i32) - 398;
-        Some((neg, c, e))
+        // Non-canonical (> 10^16 - 1) denotes zero; see `decode_bid32`.
+        Some((neg, if c > 9_999_999_999_999_999 { 0 } else { c }, e))
     } else {
         // Small form: full 53-bit coefficient (2^53 - 1 is FOURTEEN hex
         // digits; a 13-digit mask silently drops bits 52..49).
@@ -523,21 +526,29 @@ pub fn decode_bid64(v: u64) -> Option<(bool, u64, i32)> {
     }
 }
 
-/// Decode finite BID128 bits (small form only: every decimal coefficient
-/// up to 10^34 - 1 fits the 113-bit field). See [`decode_bid32`].
+/// Decode finite BID128 bits. Every canonical coefficient (<= 10^34 - 1)
+/// fits the small form's 113-bit field; the large form (steering bits 11)
+/// implies a coefficient of at least 2^113, and a small-form coefficient
+/// above 10^34 - 1 is likewise non-canonical: both denote zero (IEEE
+/// 754-2008 3.5.2). See [`decode_bid32`].
 pub fn decode_bid128(hi: u64, lo: u64) -> Option<(bool, u128, i32)> {
     if (hi & 0x7800_0000_0000_0000) == 0x7800_0000_0000_0000 {
         return None;
     }
     let neg = (hi & 0x8000_0000_0000_0000) != 0;
+    if (hi & 0x6000_0000_0000_0000) == 0x6000_0000_0000_0000 {
+        let e = (((hi >> 47) & 0x3FFF) as i32) - 6176;
+        return Some((neg, 0, e));
+    }
     let c = (((hi & 0x1_FFFF_FFFF_FFFF) as u128) << 64) | lo as u128;
     let e = (((hi >> 49) & 0x3FFF) as i32) - 6176;
-    Some((neg, c, e))
+    Some((neg, if c >= 10u128.pow(34) { 0 } else { c }, e))
 }
 
 /// C-truthiness zero test on a BID32 carrier: +0 and -0 in any quantum
-/// compare equal to zero; infinities and NaNs are nonzero. Powers the
-/// constant evaluator's `is_zero` for `D32` (branch/logical folding).
+/// compare equal to zero (non-canonical encodings decode as zero); infinities
+/// and NaNs are nonzero. Powers the constant evaluator's `is_zero` for `D32`
+/// (branch/logical folding).
 pub fn bid32_is_zero(v: u32) -> bool {
     match decode_bid32(v) {
         Some((_, c, _)) => c == 0,
@@ -548,6 +559,15 @@ pub fn bid32_is_zero(v: u32) -> bool {
 /// C-truthiness zero test on a BID64 carrier. See [`bid32_is_zero`].
 pub fn bid64_is_zero(v: u64) -> bool {
     match decode_bid64(v) {
+        Some((_, c, _)) => c == 0 || c > 9_999_999_999_999_999,
+        None => false,
+    }
+}
+
+/// C-truthiness zero test on a BID128 carrier (`hi`:`lo` words). See
+/// [`bid32_is_zero`].
+pub fn bid128_is_zero(hi: u64, lo: u64) -> bool {
+    match decode_bid128(hi, lo) {
         Some((_, c, _)) => c == 0,
         None => false,
     }
