@@ -3638,3 +3638,47 @@ not fold — so fixtures written to pin these facts passed vacuously.
   fact) run with the oracle and lccc on x86-64 and i686: the oracle leg
   proves the expectation, and the runtime half still catches a compiler that
   wrongly accepts the static half.
+
+## 2026-10-17 — Integration hardening: pinned ABI oracle, gated ABI markers, census re-baseline
+
+**Problem.** The S57–S67 integration went red on hosted CI for reasons the
+series itself could not see: `check_ext_vector_abi.sh` measured lccc against
+whatever `clang` the runner shipped (clang-18, whose i386 8-byte-vector
+return convention differs from the one the series was derived from);
+`check_void_declarators.sh` tripped `pipefail` on the producer's SIGPIPE;
+the ext-vector grid gate ran only locally; a VLA-struct variadic argument
+(by-value size `None`) picked up the i686 ext-vector `[NoClass]` lane
+marker on x86-64; `check_nobits_org_parity.py` parsed a `nargs="*"` option
+with plain `parse_args` (the corpus ratchet forbids the shape); the
+integration commit named three deleted files as if present; and the audit
+census grew — mostly because the series rewrote the census scanner (the old
+one blanked every function after a file's first `#[cfg(test)]`), without
+re-baselining.
+
+**Decisions.**
+- *One pinned oracle, installed, never discovered.* The ext-vector ABI gates
+  require Clang 23.1.3 from `scripts/ci_install_clang_oracle.sh` (sha256
+  pinned, cached by version). An ABI gate whose oracle floats with the
+  runner image measures the image, not the compiler. The old per-shape
+  `ABI_SKIP` list is retired: every exclusion was a clang-18 artefact.
+- *ABI markers are target-gated at the consumer.* The in-band `[NoClass]`
+  lane marker is honoured only when `CallAbiConfig::i386_ext_vector_lanes`
+  is set, and the lowering builder never attaches eightbyte classes to an
+  argument without a by-value size. Considered and deferred: an out-of-band
+  `ArgKind` carrying the lane count — the right end state, but a cross-
+  backend signature change this integration should not also carry.
+- *Census: same scanner, same tree, then compare.* With the new scanner on
+  both trees, main measures 859/112/25/9/233/95/28/500/291 and this branch
+  855/107/25/10/231/94/28/509/290 (panic, hot panic, unsafe, ignored, >300,
+  >500, >1000, knobs, undocumented). Every metric is at or below main except
+  nine new, documented `CCC_NO_*` knobs and one capability-gated `#[ignore]`.
+  The baseline is rewritten to the branch's numbers; the apparent +34 in
+  `fns_over_300` is visibility, not code. Two functions the series pushed
+  past 500 lines (`lower_call_arguments`, x86 `parse_directive`) were split
+  by pure moves; four hot-path `.expect` on an ext-vector invariant were
+  consolidated into `CType::vector_lanes`; the six bare `#[ignore]` the old
+  scanner never saw now carry their backlog id (`AUD-ARM-GSF-1`).
+- *Observability over log access.* Hosted logs may be unreachable from a
+  review sandbox; failing steps now emit `::error` annotations
+  (`scripts/ci_annotate_log.py`) so the first failing line is visible from
+  the check-run API alone.

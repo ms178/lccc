@@ -60,9 +60,7 @@ impl Lowerer {
     ) -> Value {
         let image_size = 16 * pieces;
         let image = self.emit_entry_alloca(IrType::Ptr, image_size, 16, false);
-        let (elem_ct, lanes) = vector_ct
-            .vector_info()
-            .expect("ExtVector must carry its logical lane count");
+        let (elem_ct, lanes) = vector_ct.vector_lanes();
         let size = vector_ct.size();
         if vector_ct.is_bitpacked_bool_vector() || space != AddressSpace::Default || volatile {
             self.zero_init_alloca(image, image_size);
@@ -115,9 +113,7 @@ impl Lowerer {
         let align = self.ctype_align(vector_ct);
         let vector = self.emit_entry_alloca(IrType::Ptr, size, align, false);
         if vector_ct.is_bitpacked_bool_vector() {
-            let (_, lanes) = vector_ct
-                .vector_info()
-                .expect("ExtVector must carry its logical lane count");
+            let (_, lanes) = vector_ct.vector_lanes();
             let lane_ty = xmm_bool_lane_ty(lanes);
             self.zero_init_alloca(vector, size);
             for lane in 0..lanes {
@@ -317,9 +313,7 @@ impl Lowerer {
         ap_expr: &Expr,
         vector_ct: &CType,
     ) -> Operand {
-        let (elem_ct, lanes) = vector_ct
-            .vector_info()
-            .expect("ExtVector must carry its logical lane count");
+        let (elem_ct, lanes) = vector_ct.vector_lanes();
         // Sub-int lanes occupy (and are read from) a full 4-byte slot.
         let lane_ty =
             if matches!(elem_ct, CType::Bool) || (elem_ct.is_integer() && elem_ct.size() < 4) {

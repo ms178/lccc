@@ -2336,6 +2336,14 @@ impl CType {
         }
     }
 
+    /// `vector_info` for a type the caller has already classified as a
+    /// vector (an ext-vector ABI carrier was selected for it).  A non-vector
+    /// here is a lowering invariant violation, reported as an internal error
+    /// at this one site rather than at every carrier.
+    pub fn vector_lanes(&self) -> (&CType, usize) {
+        self.vector_info().expect("ExtVector must carry its logical lane count")
+    }
+
     /// For a vector type, returns (element_type, logical lane count).
     /// Returns None for non-vector types. Ext-vector lane count is never
     /// inferred from padded object storage.

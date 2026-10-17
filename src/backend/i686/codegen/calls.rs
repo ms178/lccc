@@ -41,6 +41,9 @@ impl I686Codegen {
             // callee layout must agree — see CallAbiConfig::stack_arg_align_cap.
             stack_arg_align_cap: 4,
             vector_xmm_regs: 3,
+            // The lowering decomposes Clang-convention ext vectors into
+            // `[NoClass]`-tagged lanes only for this target.
+            i386_ext_vector_lanes: true,
         }
     }
 

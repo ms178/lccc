@@ -392,6 +392,17 @@ pub struct CallAbiConfig {
     /// a variadic call, go to 16-byte-aligned stack slots. 0 elsewhere:
     /// x86-64 carries `[SSE, SSEUP]` values in its ordinary FP registers.
     pub vector_xmm_regs: usize,
+    /// Whether a scalar argument tagged `[NoClass]` (no `struct_size`) is a
+    /// Clang-i386 ExtVector lane: stack-passed without consuming or killing
+    /// the regparm/fastcall GP sequence. The tag is an in-band marker the
+    /// i686 lowering attaches to decomposed lanes, so it is only meaningful
+    /// where that lowering runs. Every other target must ignore it: on
+    /// x86-64 a by-reference aggregate (a VLA struct in a variadic call
+    /// carries `struct_size: None` and whatever classes the zero-byte static
+    /// layout produced) is an ordinary pointer in the next GP register, and
+    /// honoring the tag there pushed the pointer to the stack while the
+    /// callee's `va_arg` read `%rsi` (gcc.c-torture 20020412-1.c aborts).
+    pub i386_ext_vector_lanes: bool,
 }
 
 /// Result of SysV per-eightbyte struct classification.
@@ -490,7 +501,8 @@ pub(crate) struct ArgInfo<'a> {
     /// SysV per-eightbyte classification (x86-64 only). Empty if not applicable.
     /// The exact `[NoClass]` value with no `struct_size` is also an internal
     /// i686 marker for an ExtVector lane that is stack-passed without consuming
-    /// regparm GP registers.
+    /// regparm GP registers; it is honored only under
+    /// `CallAbiConfig::i386_ext_vector_lanes`.
     pub(crate) eightbyte_classes: &'a [crate::common::types::EightbyteClass],
     /// RISC-V LP64D float struct classification. None if not applicable.
     pub(crate) riscv_float_class: Option<crate::common::types::RiscvFloatClass>,
@@ -605,10 +617,12 @@ fn classify_args_core(
         // Clang's i386 ExtVector ABI passes each logical lane in a stack slot
         // even when the surrounding function uses regparm. Unlike ordinary
         // aggregates, these lanes do not consume/kill the register sequence,
-        // so a following scalar can still use EAX/EDX/ECX.
-        if info.struct_size.is_none()
-            && info.eightbyte_classes.len() == 1
-            && info.eightbyte_classes[0] == crate::common::types::EightbyteClass::NoClass
+        // so a following scalar can still use EAX/EDX/ECX. The marker is
+        // target-gated (see `CallAbiConfig::i386_ext_vector_lanes`): a
+        // by-reference aggregate on x86-64 can carry the same bytes.
+        if config.i386_ext_vector_lanes
+            && info.struct_size.is_none()
+            && info.eightbyte_classes == [crate::common::types::EightbyteClass::NoClass]
         {
             result.push(if info.is_long_double {
                 CoreArgClass::F128Stack
@@ -1624,4 +1638,105 @@ pub fn compute_stack_push_bytes(
         total += padding[i] + cls.stack_bytes();
     }
     total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::types::EightbyteClass;
+
+    /// The x86-64 SysV configuration (`X86Codegen::call_abi_config_impl`).
+    fn sysv_x86_64() -> CallAbiConfig {
+        CallAbiConfig {
+            max_int_regs: 6,
+            max_float_regs: 8,
+            align_i128_pairs: false,
+            f128_in_fp_regs: false,
+            f128_in_gp_pairs: false,
+            variadic_floats_in_gp: false,
+            large_struct_by_ref: false,
+            use_sysv_struct_classification: true,
+            use_riscv_float_struct_classification: false,
+            allow_struct_split_reg_stack: false,
+            align_struct_pairs: false,
+            sret_uses_dedicated_reg: false,
+            gcc_regparm_mode: false,
+            stack_arg_align_cap: usize::MAX,
+            vector_xmm_regs: 0,
+            i386_ext_vector_lanes: false,
+        }
+    }
+
+    /// The i686 `-mregparm=3` configuration (`I686Codegen::call_abi_config_impl`).
+    fn i686_regparm3() -> CallAbiConfig {
+        CallAbiConfig {
+            max_int_regs: 3,
+            max_float_regs: 0,
+            align_i128_pairs: false,
+            f128_in_fp_regs: false,
+            f128_in_gp_pairs: false,
+            variadic_floats_in_gp: false,
+            large_struct_by_ref: false,
+            use_sysv_struct_classification: false,
+            use_riscv_float_struct_classification: false,
+            allow_struct_split_reg_stack: false,
+            align_struct_pairs: false,
+            sret_uses_dedicated_reg: false,
+            gcc_regparm_mode: true,
+            stack_arg_align_cap: 4,
+            vector_xmm_regs: 3,
+            i386_ext_vector_lanes: true,
+        }
+    }
+
+    fn scalar(classes: &[EightbyteClass]) -> ArgInfo<'_> {
+        ArgInfo {
+            is_float: false,
+            is_i128: false,
+            is_long_double: false,
+            is_f128_sse: false,
+            is_i64_pair: false,
+            struct_size: None,
+            struct_align: None,
+            eightbyte_classes: classes,
+            riscv_float_class: None,
+        }
+    }
+
+    /// gcc.c-torture/execute/20020412-1.c: `foo(int size, ...)` receives two
+    /// VLA-containing structs. GCC passes them by reference, so each is a
+    /// pointer in the next GP register (%rsi, %rdx) and the callee's
+    /// `va_arg` reads them from the register save area. The lowering hands
+    /// such an argument over with `struct_size: None`; whatever classes the
+    /// zero-byte static layout yielded must not demote it to the stack.
+    #[test]
+    fn x86_64_by_reference_aggregate_takes_the_next_gp_register() {
+        let config = sysv_x86_64();
+        let no_class = [EightbyteClass::NoClass];
+        let args = [scalar(&[]), scalar(&no_class), scalar(&no_class)];
+        let core = classify_args_core(&args, true, true, &config);
+        let regs: Vec<usize> = core
+            .classes
+            .iter()
+            .map(|c| match c {
+                CoreArgClass::IntReg { reg_idx } => *reg_idx,
+                other => panic!("by-reference aggregate left the GP sequence: {other:?}"),
+            })
+            .collect();
+        assert_eq!(regs, [0, 1, 2]);
+        assert_eq!(core.int_reg_idx, 3);
+    }
+
+    /// The marker keeps its i686 meaning: a decomposed ExtVector lane is
+    /// stack-passed and leaves the regparm registers to the next scalar.
+    #[test]
+    fn i686_ext_vector_lane_marker_skips_the_regparm_sequence() {
+        let config = i686_regparm3();
+        let no_class = [EightbyteClass::NoClass];
+        let args = [scalar(&no_class), scalar(&no_class), scalar(&[])];
+        let core = classify_args_core(&args, false, false, &config);
+        assert!(matches!(core.classes[0], CoreArgClass::Stack));
+        assert!(matches!(core.classes[1], CoreArgClass::Stack));
+        assert!(matches!(core.classes[2], CoreArgClass::IntReg { reg_idx: 0 }));
+    }
 }

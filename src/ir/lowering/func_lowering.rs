@@ -310,9 +310,7 @@ impl Lowerer {
                 continue;
             }
             if i386_carrier == Some(crate::common::types::I386ExtVectorCarrier::Lanes) {
-                let (elem, lanes) = param_ctype
-                    .vector_info()
-                    .expect("ExtVector must carry its logical lane count");
+                let (elem, lanes) = param_ctype.vector_lanes();
                 let lane_ty = if matches!(elem, CType::Bool) {
                     IrType::I32
                 } else {

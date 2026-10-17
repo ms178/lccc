@@ -132,6 +132,7 @@ impl X86Codegen {
             // caller's dynamic %rsp realignment (emit_call_stack_args_impl).
             stack_arg_align_cap: usize::MAX,
             vector_xmm_regs: 0,
+            i386_ext_vector_lanes: false,
         }
     }
 

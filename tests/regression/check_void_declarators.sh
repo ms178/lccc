@@ -26,7 +26,10 @@ gcc_oracle_positive_control "$GCC_ORACLE_BIN" "$tmp" || exit 1
 first_error() {
     local out
     if out=$("$@" 2>&1); then return 0; fi
-    printf '%s\n' "$out" | grep -m1 'error: ' | sed 's/.*error: //'
+    # One sed pass: print the first `error: ` line (its message only) and
+    # quit. No early-exiting pipeline consumer, so `set -o pipefail` can
+    # never see a SIGPIPE from the producer.
+    sed -n '/error: /{s/.*error: //p;q;}' <<<"$out"
     return 1
 }
 

@@ -46,10 +46,17 @@ impl Lowerer {
 
     /// Eightbyte classes and the one-`%xmm` flag of a by-value aggregate
     /// argument on x86-64 (`None` elsewhere, or for non-aggregates). Records
-    /// over 16 bytes keep an empty class list (MEMORY by size).
+    /// over 16 bytes keep an empty class list (MEMORY by size), and so do
+    /// records of zero static size: they have no eightbyte to classify
+    /// (`StructLayout::classify_sysv_eightbytes` answers the same), and a
+    /// VLA-containing struct -- static size zero, passed by reference in a
+    /// variadic call -- must reach the backend as a plain pointer. The
+    /// classifier's `[NoClass]` for an empty record is its merge identity,
+    /// not an argument carrier.
     pub(super) fn sysv_arg_abi(&self, ct: &CType) -> Option<(Vec<EightbyteClass>, bool)> {
         let passing = self.sysv_passing(ct)?;
-        if ct.size_ctx(&*self.types.borrow_struct_layouts()) > 16 {
+        let size = ct.size_ctx(&*self.types.borrow_struct_layouts());
+        if size == 0 || size > 16 {
             return Some((Vec::new(), false));
         }
         let one_xmm = passing.one_xmm();

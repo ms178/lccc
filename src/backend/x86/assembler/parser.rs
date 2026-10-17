@@ -899,16 +899,9 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
             let vals = parse_data_values(args)?;
             Ok(AsmItem::Quad(vals))
         }
-        // GAS's `.dc[.size]` family (default size: word).  `.dc.x` (x87
-        // extended) is refused below: its decimal-to-64-bit-mantissa
-        // rounding is not implemented, and an f64 round trip would emit
-        // wrong low mantissa bits for literals such as 0.1.
-        ".dc.b" => Ok(AsmItem::Byte(parse_data_values(args)?)),
-        ".dc" | ".dc.w" => Ok(AsmItem::Short(parse_data_values(args)?)),
-        ".dc.l" => Ok(AsmItem::Long(parse_data_values(args)?)),
-        ".dc.a" => Ok(AsmItem::Addr(parse_data_values(args)?)),
-        ".dc.s" => Ok(AsmItem::Byte(parse_float_values(args, false)?)),
-        ".dc.d" => Ok(AsmItem::Byte(parse_float_values(args, true)?)),
+        ".dc" | ".dc.b" | ".dc.w" | ".dc.l" | ".dc.a" | ".dc.s" | ".dc.d" => {
+            parse_dc_directive(directive, args)
+        }
         // `.octa` — 16-byte (128-bit) constants, emitted little-endian.
         // Previously this directive fell through to the "ignore unknown
         // directive" arm, silently emitting NOTHING: the kernel's
@@ -1186,28 +1179,38 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
             // text; `cfi::lower_cfi` decodes and validates it.
             Ok(AsmItem::Cfi(CfiDirective::Other(line.to_string())))
         }
-        // Directives accepted with no effect on the object.  Each is listed
-        // with the reason ignoring it is exact; anything else fails below.
-        //  * `.extern`: GAS documents it as accepted and ignored (undefined
-        //    symbols are external anyway).
-        //  * `.ident`: provenance text GAS puts in `.comment`; it changes no
-        //    code, data, symbol or relocation.
-        //  * `.addrsig`, `.addrsig_sym`: LLVM's address-significance table.
-        //    Without `.llvm_addrsig` lld treats every symbol as
-        //    address-significant, the conservative reading for --icf=safe.
-        //  * `.prefalign`: LLVM's preferred function alignment, a hint by
-        //    definition; the required minimum is a separate `.p2align`.
-        //  * `.att_syntax` / `.att_syntax prefix`: the syntax already in use.
+        _ => parse_unlisted_directive(line, directive, args),
+    }
+}
+
+/// Every directive `parse_directive` has no arm for: a short list accepted
+/// with no effect on the object, and an error for everything else.
+///
+/// Directives accepted with no effect, each with the reason ignoring it is
+/// exact:
+///  * `.extern`: GAS documents it as accepted and ignored (undefined
+///    symbols are external anyway).
+///  * `.ident`: provenance text GAS puts in `.comment`; it changes no
+///    code, data, symbol or relocation.
+///  * `.addrsig`, `.addrsig_sym`: LLVM's address-significance table.
+///    Without `.llvm_addrsig` lld treats every symbol as
+///    address-significant, the conservative reading for --icf=safe.
+///  * `.prefalign`: LLVM's preferred function alignment, a hint by
+///    definition; the required minimum is a separate `.p2align`.
+///  * `.att_syntax` / `.att_syntax prefix`: the syntax already in use.
+///
+/// Anything else fails closed.  Dropping a directive silently is how
+/// `.octa`, `.float`, `.space`, `.equ`, `.local`, `.lcomm` and `.base64`
+/// each assembled to wrong bytes or symbols with no diagnostic; GAS reports
+/// the same condition as an error.
+fn parse_unlisted_directive(line: &str, directive: &str, args: &str) -> Result<AsmItem, String> {
+    match directive {
         ".extern" | ".ident" | ".addrsig" | ".addrsig_sym" | ".prefalign" => Ok(AsmItem::Empty),
         ".att_syntax" if matches!(args.trim(), "" | "prefix") => Ok(AsmItem::Empty),
         ".intel_syntax" | ".att_syntax" => Err(format!(
             "unsupported pseudo-op `{line}': lccc's x86 assembler accepts AT&T syntax \
              with %-prefixed registers only"
         )),
-        // Fail closed.  Dropping a directive silently is how `.octa`,
-        // `.float`, `.space`, `.equ`, `.local`, `.lcomm` and `.base64` each
-        // assembled to wrong bytes or symbols with no diagnostic; GAS
-        // reports the same condition as an error.
         _ => Err(format!(
             "unknown pseudo-op: `{directive}' (not supported by lccc's x86 assembler)"
         )),
@@ -1310,6 +1313,22 @@ fn parse_type_directive(args: &str) -> Result<AsmItem, String> {
         _ => return Err(format!("unknown symbol type: {}", kind_str)),
     };
     Ok(AsmItem::SymbolType(name, kind))
+}
+
+/// GAS's `.dc[.size]` family (default size: word).  `.dc.x` (x87 extended)
+/// is not listed and so is refused by `parse_unlisted_directive`: its
+/// decimal-to-64-bit-mantissa rounding is not implemented, and an f64 round
+/// trip would emit wrong low mantissa bits for literals such as 0.1.
+fn parse_dc_directive(directive: &str, args: &str) -> Result<AsmItem, String> {
+    Ok(match directive {
+        ".dc.b" => AsmItem::Byte(parse_data_values(args)?),
+        ".dc" | ".dc.w" => AsmItem::Short(parse_data_values(args)?),
+        ".dc.l" => AsmItem::Long(parse_data_values(args)?),
+        ".dc.a" => AsmItem::Addr(parse_data_values(args)?),
+        ".dc.s" => AsmItem::Byte(parse_float_values(args, false)?),
+        ".dc.d" => AsmItem::Byte(parse_float_values(args, true)?),
+        other => return Err(format!("internal error: `{other}' is not a .dc directive")),
+    })
 }
 
 /// Parse `.size name, expr`.

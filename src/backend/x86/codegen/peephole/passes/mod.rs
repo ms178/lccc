@@ -4052,7 +4052,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: trampoline coalescing not triggering for this test pattern yet
+    #[ignore = "AUD-ARM-GSF-1: trampoline coalescing does not trigger on this pattern yet"]
     fn test_loop_trampoline_simple_coalesce() {
         let asm = [
             ".LBB1:",
@@ -4092,7 +4092,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: trampoline coalescing not triggering for this test pattern yet
+    #[ignore = "AUD-ARM-GSF-1: trampoline coalescing does not trigger on this pattern yet"]
     fn test_loop_trampoline_two_copies() {
         let asm = [
             ".LBB10:",

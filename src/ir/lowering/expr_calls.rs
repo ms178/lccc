@@ -684,9 +684,7 @@ impl Lowerer {
         let words = vector_ct
             .i686_ext_vector_gp_word_count()
             .expect("caller only selects the i686 integer ExtVector GP ABI");
-        let (elem_ct, lanes) = vector_ct
-            .vector_info()
-            .expect("ExtVector must carry its logical lane count");
+        let (elem_ct, lanes) = vector_ct.vector_lanes();
         let elem_size = elem_ct.size();
         // See try_i686_ext_vector_gp_return: bundle is bounded at three 32-bit
         // words or one 64-bit word. Callee and caller must agree, otherwise
@@ -1008,9 +1006,7 @@ impl Lowerer {
             let volatile = self.expr_access_is_volatile(arg);
             match carrier {
                 I386ExtVectorCarrier::Lanes => {
-                    let (elem_ct, lanes) = vector_ct
-                        .vector_info()
-                        .expect("ExtVector must carry its logical lane count");
+                    let (elem_ct, lanes) = vector_ct.vector_lanes();
                     let lane_ty = if matches!(elem_ct, CType::Bool) {
                         IrType::I32
                     } else {
@@ -1531,32 +1527,66 @@ impl Lowerer {
             })
             .collect();
 
+        let (struct_arg_classes, struct_arg_riscv_float_classes) =
+            self.call_arg_abi_classes(func_name, args, &struct_arg_sizes);
+
+        (
+            arg_vals,
+            arg_types,
+            struct_arg_sizes,
+            struct_arg_aligns,
+            struct_arg_classes,
+            struct_arg_riscv_float_classes,
+        )
+    }
+
+    /// Per-argument ABI class tables for a call: the SysV eightbyte classes
+    /// and the RISC-V float classes, taken from the callee's registered
+    /// signature where it covers the argument and derived from the argument
+    /// expression otherwise.  `struct_arg_sizes` is the by-value size table
+    /// the caller built for the same `args`.
+    fn call_arg_abi_classes(
+        &self,
+        func_name: Option<&str>,
+        args: &[Expr],
+        struct_arg_sizes: &[Option<usize>],
+    ) -> (
+        Vec<Vec<crate::common::types::EightbyteClass>>,
+        Vec<Option<crate::common::types::RiscvFloatClass>>,
+    ) {
         // Build struct_arg_classes: propagate per-eightbyte SysV ABI classification from FuncSig.
         // For variadic args beyond fixed params, infer classification from expression CType
         // so that struct fields are correctly split between GP and SSE registers.
-        let struct_arg_classes: Vec<Vec<crate::common::types::EightbyteClass>> =
-            if let Some(ref classes) = func_name.and_then(|n| {
-                self.func_meta
-                    .sigs
-                    .get(n)
-                    .map(|s| s.param_struct_classes.clone())
-            }) {
-                args.iter()
-                    .enumerate()
-                    .map(|(i, a)| {
-                        if i < classes.len() && !classes[i].is_empty() {
-                            classes[i].clone()
-                        } else {
-                            // Infer eightbyte classification from expression CType for variadic struct args
-                            self.infer_struct_eightbyte_classes(a)
-                        }
-                    })
-                    .collect()
-            } else {
-                args.iter()
-                    .map(|a| self.infer_struct_eightbyte_classes(a))
-                    .collect()
-            };
+        //
+        // Invariant: an argument without a by-value size carries no classes.
+        // Such an argument is a scalar or a pointer (a variable-size aggregate
+        // passed by reference, see `struct_arg_sizes` above), and the backend
+        // reads eightbyte classes only alongside a size -- except for the
+        // i686 ExtVector lane marker, which the i686 decomposition attaches
+        // AFTER this point and which `CallAbiConfig::i386_ext_vector_lanes`
+        // gates to that target. Deriving the classes from an argument the
+        // size pass declined would hand that marker's bytes to x86-64.
+        let registered_classes = func_name.and_then(|n| {
+            self.func_meta
+                .sigs
+                .get(n)
+                .map(|s| s.param_struct_classes.clone())
+        });
+        let struct_arg_classes: Vec<Vec<crate::common::types::EightbyteClass>> = args
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                if struct_arg_sizes.get(i).copied().flatten().is_none() {
+                    return Vec::new();
+                }
+                match registered_classes.as_ref().and_then(|c| c.get(i)) {
+                    Some(classes) if !classes.is_empty() => classes.clone(),
+                    // Infer eightbyte classification from the expression CType
+                    // for variadic struct args beyond the declared parameters.
+                    _ => self.infer_struct_eightbyte_classes(a),
+                }
+            })
+            .collect();
 
         // Build struct_arg_riscv_float_classes: propagate RISC-V float classification from FuncSig.
         // Variadic args beyond fixed params get None — on RISC-V LP64D, variadic
@@ -1576,14 +1606,7 @@ impl Lowerer {
                 args.iter().map(|_a| None).collect()
             };
 
-        (
-            arg_vals,
-            arg_types,
-            struct_arg_sizes,
-            struct_arg_aligns,
-            struct_arg_classes,
-            struct_arg_riscv_float_classes,
-        )
+        (struct_arg_classes, struct_arg_riscv_float_classes)
     }
 
     /// Infer SysV ABI eightbyte classification for a struct argument expression.

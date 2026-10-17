@@ -6981,7 +6981,7 @@ mod tests {
     // ── Global store forwarding tests ─────────────────────────────────
 
     #[test]
-    #[ignore] // GSF is disabled due to correctness bug in complex float-array code
+    #[ignore = "AUD-ARM-GSF-1: GSF is parked on a complex float-array miscompile"]
     fn test_gsf_same_reg_elimination() {
         // Store x0 then load x0 from same slot (non-adjacent) — load is dead
         let input = "\
@@ -6995,7 +6995,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // GSF is disabled due to correctness bug in complex float-array code
+    #[ignore = "AUD-ARM-GSF-1: GSF is parked on a complex float-array miscompile"]
     fn test_gsf_different_reg_forwarding() {
         // Store x5 then load x10 from same slot — replace load with mov
         let input = "\
@@ -7057,7 +7057,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // GSF is disabled due to correctness bug in complex float-array code
+    #[ignore = "AUD-ARM-GSF-1: GSF is parked on a complex float-array miscompile"]
     fn test_gsf_word_forwarding() {
         // Word store forwarded to word load
         let input = "\
@@ -7071,7 +7071,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // GSF is disabled due to correctness bug in complex float-array code
+    #[ignore = "AUD-ARM-GSF-1: GSF is parked on a complex float-array miscompile"]
     fn test_gsf_ldrsw_forwarding() {
         // Word store forwarded to sign-extending load
         let input = "\

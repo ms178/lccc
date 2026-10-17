@@ -329,6 +329,15 @@ gate "ext-vector-padded-layout" fast \
 gate "ext-vector-cross-abi" fast \
     env CCC="$LCCC" bash tests/regression/check_ext_vector_abi.sh
 
+# The by-value ext-vector ABI grid: every shape (lane type x lane count) on
+# -m64 and -m32 at -O0/-O2, built as provider and caller by lccc and by the
+# pinned Clang 23.1.3 oracle and linked in all four combinations; shapes
+# Clang returns in register sequences lccc has no carrier for must be
+# rejected with the by-value diagnostic. Needs the exact oracle:
+# scripts/ci_install_clang_oracle.sh installs it (CLANG=... selects it).
+gate "ext-vector-abi-grid" fast \
+    env CCC="$LCCC" bash tests/regression/check_ext_vector_abi_grid.sh
+
 gate "a9987-salvage" fast \
     env CCC="$LCCC" bash tests/regression/check_a9987_salvage.sh
 

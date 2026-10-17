@@ -26,6 +26,7 @@ impl RiscvCodegen {
             // the va_arg / prologue readers cap identically.
             stack_arg_align_cap: 16,
             vector_xmm_regs: 0,
+            i386_ext_vector_lanes: false,
         }
     }
 

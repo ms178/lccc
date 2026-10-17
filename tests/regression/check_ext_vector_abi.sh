@@ -19,8 +19,17 @@
 set -euo pipefail
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 ccc=${CCC:-$root/target/fastbuild/lccc}
-clang_bin=${CLANG:-clang-19}
 gcc_bin=${GCC:-gcc}
+# The oracle is the pinned Clang release, the same one the ABI grid
+# (check_ext_vector_abi_grid.sh) and lccc's own i386 ext-vector convention
+# follow. "Whatever clang is on PATH" is not a reference: Clang's i386
+# return convention for 8-byte vectors (u32x2, u64x1 below) changed between
+# releases, so an older oracle reports lccc's correct Clang-23 convention as
+# a mismatch. A missing oracle FAILS (never a silent skip of the cross legs).
+# shellcheck source=tests/regression/lib/clang_oracle.sh
+. "$root/tests/regression/lib/clang_oracle.sh"
+require_clang_oracle check_ext_vector_abi || exit 1
+clang_bin=$CLANG_ORACLE_BIN
 source "$root/tests/regression/i386_exec.sh"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -30,20 +39,6 @@ caller=$dir/ext_vector_abi_caller.c
 
 [ -x "$ccc" ] || { echo "FAIL: compiler not built: $ccc" >&2; exit 1; }
 
-clang_available=1
-if ! command -v "$clang_bin" >/dev/null 2>&1; then
-    if command -v clang >/dev/null 2>&1; then
-        echo "NOTE: $clang_bin not found; using $(clang --version | sed -n 1p)"
-        clang_bin=clang
-    else
-        clang_available=0
-        if [[ ${LCCC_REQUIRE_CLANG:-0} == 1 ]]; then
-            echo "FAIL: required Clang cross-ABI oracle not found: $clang_bin" >&2
-            exit 1
-        fi
-        echo "SKIP: Clang cross-ABI oracle not found"
-    fi
-fi
 
 compile_with() {
     # compile_with <compiler-id> <out> <src> <extra flags...>
@@ -56,62 +51,24 @@ compile_with() {
     esac
 }
 
-# Shapes excluded per (bits, opt). Every entry is a measured oracle or psABI
-# limitation, not a convenience:
-#   m32 F64X2: Clang 19 returns a two-lane double vector as two x87 values but
-#              emits a half-size ELF object for the same type (see the layout
-#              gate's documented Clang-19 x87 defect), so provider and caller
-#              disagree on the object even when both are Clang.
-#   m32 BOOL4: Clang 19 i386 packs/returns the bit-packed bool vector with a
-#              carrier its own caller does not undo at -O2 (self-inconsistent);
-#              excluded only where the clang->clang leg fails.
-skips_for() {
-    local bits=$1 opt=$2 prov=$3 call=$4
-    local out=()
-    if [[ $bits == 32 ]]; then
-        out+=(-DABI_SKIP_F64X2)
-        if [[ $opt == -O2 ]]; then out+=(-DABI_SKIP_BOOL4); fi
-    fi
-    # `ext_vector_type(1)` of double: clang-19 passes AND returns it in MEMORY
-    # (measured at -O0 and -O1: the callee reads its argument from the incoming
-    # stack area, 16(%rbp) / 8(%rsp)), while lccc carries it in %xmm0. GCC's
-    # `vector_size(8)` double of one lane does the same (sret: the value is
-    # passed on the stack and returned through the hidden pointer). Both
-    # compilers are self-consistent, so the same-compiler legs still cover the
-    # shape; only the mixed legs would be testing an oracle-vs-oracle
-    # divergence of the two extensions, not an lccc defect.
-    if [[ $prov != "$call" ]]; then
-        out+=(-DABI_SKIP_F64X1)
-        if [[ $bits == 32 ]]; then
-            # i386 two-lane floating-point ext vectors: clang-19 returns them
-            # as an x87 PAIR (two lanes in %st(0)/%st(1) -- measured in
-            # `ext_vector_abi_provider.c` `abi_f32x2`: two `flds` before the
-            # epilogue), while lccc uses the hidden-pointer/sret form
-            # (`rep movsb` into the caller's buffer, `ret $4`). Both are
-            # internally consistent -- the same-compiler i386 legs cover the
-            # shape -- so a mixed leg would only compare two different
-            # extension conventions, neither of which the i386 psABI defines.
-            out+=(-DABI_SKIP_F32X2)
-        fi
-    fi
-    if [[ ${#out[@]} -eq 0 ]]; then return 0; fi
-    printf '%s\n' "${out[@]}"
-}
+# No shape is excluded. The caller supports -DABI_SKIP_<SHAPE> for a
+# MEASURED oracle defect; the exclusions this gate carried were measurements
+# of Clang 19 (x87-pair returns, a self-inconsistent i386 bool4 at -O2) and
+# of lccc's former i386 sret convention, all superseded by the Clang 23.1.3
+# convention lccc now implements (tests/regression/check_ext_vector_abi_grid.sh
+# records the i386 and x86-64 measurements shape by shape). Re-adding one
+# requires its evidence here, as before.
 
 run_leg() {
     local bits=$1 opt=$2 prov=$3 call=$4 tag=$5
     local -a flags=(-m"$bits" "$opt" -no-pie)
-    local -a skip
-    mapfile -t skip < <(skips_for "$bits" "$opt" "$prov" "$call")
     local obj_p=$tmp/prov-$tag-$bits$opt.o obj_c=$tmp/call-$tag-$bits$opt.o exe=$tmp/exe-$tag-$bits$opt
     if ! compile_with "$prov" "$obj_p" "$provider" "${flags[@]}" -c >"$tmp/$tag-p.log" 2>&1; then
         echo "FAIL: ext-vector ABI provider ($prov) compile -m$bits $opt" >&2
         cat "$tmp/$tag-p.log" >&2
         exit 1
     fi
-    local -a cflags=("${flags[@]}")
-    if [[ ${#skip[@]} -gt 0 ]]; then cflags+=("${skip[@]}"); fi
-    if ! compile_with "$call" "$obj_c" "$caller" "${cflags[@]}" -c >"$tmp/$tag-c.log" 2>&1; then
+    if ! compile_with "$call" "$obj_c" "$caller" "${flags[@]}" -c >"$tmp/$tag-c.log" 2>&1; then
         echo "FAIL: ext-vector ABI caller ($call) compile -m$bits $opt" >&2
         cat "$tmp/$tag-c.log" >&2
         exit 1
@@ -128,9 +85,7 @@ run_leg() {
         cat "$tmp/$tag-run.out" >&2
         exit 1
     fi
-    local skipped=""
-    if [[ ${#skip[@]} -gt 0 ]]; then skipped=", skipped ${skip[*]}"; fi
-    echo "PASS: ext-vector cross-ABI -m$bits ($prov provider, $call caller, $opt)$skipped"
+    echo "PASS: ext-vector cross-ABI -m$bits ($prov provider, $call caller, $opt)"
 }
 
 for bits in 64 32; do
@@ -140,10 +95,8 @@ for bits in 64 32; do
     fi
     for opt in -O0 -O1 -O2; do
         run_leg "$bits" "$opt" lccc lccc lccc-lccc
-        if [[ $clang_available == 1 ]]; then
-            run_leg "$bits" "$opt" clang clang clang-clang
-            run_leg "$bits" "$opt" clang lccc clang-lccc
-            run_leg "$bits" "$opt" lccc clang lccc-clang
-        fi
+        run_leg "$bits" "$opt" clang clang clang-clang
+        run_leg "$bits" "$opt" clang lccc clang-lccc
+        run_leg "$bits" "$opt" lccc clang lccc-clang
     done
 done

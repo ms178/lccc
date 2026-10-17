@@ -22,7 +22,8 @@ DIVERGENCES are deliberate, each with its reason; every other row must match.
 Usage:
   check_nobits_org_parity.py --lccc target/fastbuild/lccc
       (lccc-i686, lccc-arm and lccc-riscv are taken from the same directory)
-  check_nobits_org_parity.py --lccc ... --oracle x86_64=AS aarch64=AS riscv64=AS
+  check_nobits_org_parity.py --lccc ... --oracle x86_64=AS --oracle aarch64=AS \
+      --oracle riscv64=AS
       re-measure the pinned table against real assemblers and report drift.
 """
 
@@ -165,8 +166,13 @@ def org_outcome(cmd, src, workdir, tag):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--lccc", required=True)
-    ap.add_argument("--oracle", nargs="*", default=None,
-                    help="TARGET=ASSEMBLER pairs; re-measure the pinned table")
+    # One pair per occurrence: a greedy `nargs="*"` option would swallow any
+    # token that follows it (and trips the corpus ratchet against star
+    # arguments parsed with plain parse_args).
+    ap.add_argument("--oracle", action="append", default=None,
+                    metavar="TARGET=ASSEMBLER",
+                    help="re-measure the pinned table against this assembler "
+                         "(repeat per target: x86_64, aarch64, riscv64)")
     args = ap.parse_args()
     bindir = os.path.dirname(os.path.abspath(args.lccc))
     lccc = {"x86_64": [args.lccc, "-c"], "i686": [os.path.join(bindir, "lccc-i686"), "-c"],
