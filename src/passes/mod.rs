@@ -22,6 +22,7 @@ pub(crate) mod backedge_pre;
 pub(crate) mod bit_idioms;
 pub(crate) mod block_layout;
 pub(crate) mod bool_thread;
+pub(crate) mod builtin_policy;
 pub(crate) mod byte_load;
 pub(crate) mod cfg_simplify;
 pub(crate) mod const_array_promote;
@@ -48,7 +49,6 @@ pub(crate) mod ip_purity;
 pub(crate) mod ipcp;
 pub(crate) mod iv_strength_reduce;
 pub(crate) mod iv_widen;
-pub(crate) mod libcall;
 pub(crate) mod licm;
 pub(crate) mod load_forward;
 pub(crate) mod loop_align;
@@ -1185,7 +1185,6 @@ fn late_vectorize_entry(
 
 pub(crate) fn run_passes(
     module: &mut IrModule,
-    builtin_policy: &crate::common::builtin::BuiltinPolicy,
     opt_level: u32,
     target: crate::backend::Target,
     code16gcc: bool,
@@ -1207,7 +1206,12 @@ pub(crate) fn run_passes(
         fp_environment_observable,
     );
     for func in &mut module.functions {
-        func.pass_policy = policy;
+        // Re-stamp the two command-line semantics this entry owns; the
+        // builtin policy is a per-TU fact `builtin_policy::apply` already
+        // derived from the definitions after lowering, and resetting it here
+        // would let loop_memset turn the TU's own `memset` loop into a
+        // `call memset` (infinite recursion).
+        func.pass_policy = policy.with_builtins(func.pass_policy.builtins);
     }
     let fp_reassoc = fp_reassoc && !fp_environment_observable;
     let fp_contract = if fp_environment_observable {
@@ -1215,12 +1219,6 @@ pub(crate) fn run_passes(
     } else {
         fp_contract
     };
-    // A13/A14: snapshot the CLI withdrawals and this TU's own definition
-    // set once.  Every synthesis decision below is answered from this
-    // object; nothing re-collects mid-pipeline, because inlining merges
-    // bodies but never introduces a new defined *symbol*.
-    let libcalls =
-        crate::passes::libcall::LibcallAllowance::from_module(module, builtin_policy.clone());
     // Checkpoint the lowering output BEFORE any optimizer runs: the SSA
     // validators in this function attribute a violation to the phase that
     // created it, and at -O0 the optimizer phase loop is the empty set —
@@ -1244,10 +1242,10 @@ pub(crate) fn run_passes(
     // vectorize.rs). AVX2 is tracked separately so `-mno-avx` downgrades to
     // 128-bit SSE2 instead of disabling vectorization outright.
     vectorize::set_x86_simd_isa(x86_isa.simd, x86_isa.ymm, x86_isa.sse41, x86_avx512vl);
-    // Vec*I64x2 map intrinsics are implemented only by the x86-64 backend.
+    // I64 maps and unfused packed multiply/add are x86-64-only lowerings.
     // Refresh the per-thread gate for every TU: a worker may compile i686
     // immediately after x86-64 in the same process.
-    vectorize::set_x86_map_i64_available(target == crate::backend::Target::X86_64);
+    vectorize::set_x86_64_vector_intrinsics_available(target == crate::backend::Target::X86_64);
     // Pass B (two-block guard-free unroll) kill switch, resolved once here for
     // the same reason as the ISA gates above: the unroller is a hot path and
     // must not read the process environment per call, and per-thread state
@@ -1357,6 +1355,17 @@ pub(crate) fn run_passes(
             && std::env::var_os("LCCC_FORCE_SSE2").is_none(),
         std::env::var_os("LCCC_DEBUG_VECTORIZE").is_some(),
     );
+    // The inliner's extension kill switches (A/B and triage), same rule.
+    let inline_enabled = |name: &str| std::env::var_os(name).is_none();
+    inline::set_features(inline::InlineFeatures {
+        devirt: inline_enabled("CCC_NO_INLINE_DEVIRT"),
+        snapshot_refresh: inline_enabled("CCC_NO_INLINE_SNAPSHOT_REFRESH"),
+        joint_fixpoint: inline_enabled("CCC_NO_INLINE_JOINT_FIXPOINT"),
+        hot_leaf: inline_enabled("CCC_NO_INLINE_HOT_LEAF"),
+        snapshot_cleanup: inline_enabled("CCC_NO_INLINE_SNAPSHOT_CLEANUP"),
+        caller_cleanup: inline_enabled("CCC_NO_INLINE_CALLER_CLEANUP"),
+        hot_direct: inline_enabled("CCC_NO_INLINE_HOT_DIRECT"),
+    });
     // The affine exit-compare fold's knobs, same rule as the byte-compare arm:
     // resolved here (the ratchet in check_env_test_hygiene.sh excludes this
     // file) and handed to the pass, never read per loop.
@@ -1442,7 +1451,7 @@ pub(crate) fn run_passes(
         ip_purity::run(module);
         o1_checkpoint!("ip_purity");
         if !pass_disabled(&disabled, "fortifyfold") {
-            fortify_fold::run(module, target.is_32bit(), &libcalls);
+            fortify_fold::run(module, target.is_32bit());
         }
         o1_checkpoint!("fortifyfold");
         constant_fold::run(module);
@@ -1589,7 +1598,7 @@ pub(crate) fn run_passes(
     );
     preloop_dump!("inline_phase");
     if !pass_disabled(&disabled, "fortifyfold") {
-        fortify_fold::run(module, target.is_32bit(), &libcalls);
+        fortify_fold::run(module, target.is_32bit());
         preloop_dump!("fortify_fold");
     }
     // Fold strlen("literal") after inlining so __builtin_constant_p patterns
@@ -1818,10 +1827,18 @@ pub(crate) fn run_passes(
             total_changes_excl_dce += n;
         }
 
-        // Phase 2a: Division-by-constant strength reduction (first iteration only).
+        // Phase 2a: Division-by-constant strength reduction.
         // Replaces slow div/idiv instructions with fast multiply-and-shift sequences.
         // Run early so subsequent passes (narrowing, simplify, constant folding, DCE)
-        // can optimize the expanded instruction sequences.
+        // can optimize the expanded instruction sequences. It runs on EVERY
+        // iteration (dirty functions only): the loop transforms later in this
+        // iteration create constant divisions of their own -- the vectorizer's
+        // signed trip bound `limit /s 8` reached the backend as
+        // `movl $8, %ecx; idivl %ecx` in every vectorized `int n` reduction
+        // (p15..p18 in simd_fp_oracle.c, 20-90 cycles at each loop entry).
+        // The rewrite only touches Div/Rem by a constant, so a rerun is a
+        // no-op scan once none is left; the next iteration's simplify, cvp
+        // and constfold still clean up the expansion.
         //
         // Disabled on i686: the pass generates I64 multiply + shift-right-32 sequences
         // to extract the high 32 bits of a widened multiplication. The i686 backend
@@ -1829,7 +1846,7 @@ pub(crate) fn run_passes(
         // sequences produce wrong results. Fall back to hardware idiv/div instead.
         // TODO: Re-enable once i686 has proper 64-bit arithmetic support, or implement
         // a 32-bit-aware variant that uses single-operand imull for mulhi.
-        if iter == 0 && !pass_disabled(&disabled, "divconst") && !target.is_32bit() {
+        if !pass_disabled(&disabled, "divconst") && !target.is_32bit() {
             let n = timed_pass!(
                 "div_by_const",
                 run_on_visited(
@@ -1991,7 +2008,7 @@ pub(crate) fn run_passes(
             let n = timed_pass!(
                 "loop_idiom",
                 run_on_visited(module, &dirty, &mut changed, |func| {
-                    loop_idiom::run_function(func, &aliased_names, &local_globals, &libcalls)
+                    loop_idiom::run_function(func, &aliased_names, &local_globals)
                 })
             );
             total_changes += n;
@@ -3104,7 +3121,7 @@ pub(crate) fn run_passes(
     if !pass_disabled(&disabled, "loop_memset") && std::env::var_os("CCC_NO_MEMSET_LOOP").is_none()
     {
         for function in &mut module.functions {
-            let changed = loop_memset::run(function, &libcalls);
+            let changed = loop_memset::run(function);
             if changed > 0 {
                 verify::verify_after_func_pass(function, "loop_memset");
             }
@@ -3791,7 +3808,6 @@ mod signed_wrap_policy_tests {
     fn apply(module: &mut IrModule, level: u32, wrap: bool, fenv: bool) {
         run_passes(
             module,
-            &crate::common::builtin::BuiltinPolicy::default(),
             level,
             crate::backend::Target::X86_64,
             false,
@@ -3821,11 +3837,16 @@ mod signed_wrap_policy_tests {
         ));
         let mut second = IrModule::new();
         second.functions.push(first.functions[0].clone());
+        // A TU-derived builtin policy (here: the TU defines `memset`) is not
+        // the entry's to reset.
+        let mut defined = crate::common::pass_policy::BuiltinPolicy::HOSTED;
+        defined.withdraw_libcall(crate::common::pass_policy::Libcall::Memset);
+        first.functions[0].pass_policy.builtins = defined;
         for level in 0..=3 {
             for wrap in [false, true] {
                 for fenv in [false, true] {
                     apply(&mut first, level, wrap, fenv);
-                    let expected = PassPolicy::new(wrap, fenv);
+                    let expected = PassPolicy::new(wrap, fenv).with_builtins(defined);
                     assert_eq!(first.functions[0].pass_policy, expected);
                     // A second TU on the SAME thread must neither inherit nor
                     // overwrite the first TU's independent contract.

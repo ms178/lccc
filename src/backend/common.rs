@@ -838,6 +838,9 @@ mod gcc_directory_tests {
         std::fs::create_dir_all(format!("{base}/14/32")).unwrap();
         std::fs::write(format!("{base}/14/32/crtbegin.o"), b"old probe marker").unwrap();
         let preferred = probe_gcc_bases(&[base], &["32"], false);
+        // A newer version directory without the runtime must not shadow it.
+        std::fs::create_dir_all(format!("{base}/17/32")).unwrap();
+        let not_shadowed = probe_gcc_bases(&[base], &["32"], false);
         let short = probe_gcc_bases(&[base], &[], true);
         std::fs::remove_dir_all(base).unwrap();
         assert_eq!(
@@ -845,7 +848,8 @@ mod gcc_directory_tests {
             "native crt must not satisfy a multilib probe"
         );
         assert_eq!(selected, Some(multilib.clone()));
-        assert_eq!(preferred, Some(multilib));
+        assert_eq!(preferred, Some(multilib.clone()));
+        assert_eq!(not_shadowed, Some(multilib));
         assert_eq!(short, Some(native));
         Ok(())
     }
@@ -4036,6 +4040,7 @@ mod value_type_map_tests {
                 regparm: None,
                 is_pure: false,
                 is_const: false,
+                assume_library: false,
                 ret_eightbyte_classes: vec![],
             },
         }

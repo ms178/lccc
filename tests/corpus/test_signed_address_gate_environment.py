@@ -49,7 +49,7 @@ note() { :; }
         spec = importlib.util.spec_from_file_location("wrapv_gate", ROOT / "scripts/check_wrapv_oracles.py")
         gate = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(gate)
-        for fixture, expected_runs in [("domains", 24), ("signed-scale", 30),
+        for fixture, expected_runs in [("domains", 30), ("signed-scale", 30),
                                        ("canonical", 60), ("pointer", 90),
                                        ("pointer-i128", 30)]:
             with self.subTest(fixture=fixture), tempfile.TemporaryDirectory() as directory:
@@ -77,6 +77,7 @@ note() { :; }
                                          (fixture == "pointer" and "pointer-i128" in command[-1]))
                     output = ("pointer-to-int128 implementation-defined extension: PASS"
                               if pointer_i128_case else
+                              "682afb0d" if "reverse-sub" in command[-1] else
                               "integer pointer widths: PASS" if fixture == "pointer" else
                               "i32 address canonical: PASS 82" if fixture == "canonical" else
                               "signed scale ring: PASS 16" if fixture == "signed-scale" else

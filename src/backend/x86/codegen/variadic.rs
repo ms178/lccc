@@ -271,20 +271,27 @@ impl X86Codegen {
         align: usize,
         eightbyte_classes: &[EightbyteClass],
     ) {
-        // Empty classification = MEMORY class (size > 16, unaligned, X87, …).
-        if eightbyte_classes.is_empty() {
+        // MEMORY: over 16 bytes (empty classes) or classified `[Memory]`
+        // (misaligned fields, X87 members, BLKmode vectors).
+        if eightbyte_classes.is_empty() || eightbyte_classes == [EightbyteClass::Memory] {
             self.emit_va_arg_struct_overflow(dest_ptr, va_list_ptr, size, align);
             return;
         }
+        // SSE + SSEUP: the whole value is ONE 16-byte register-save slot.
+        let one_xmm = eightbyte_classes == [EightbyteClass::Sse, EightbyteClass::SseUp];
 
         let gp_count = eightbyte_classes
             .iter()
             .filter(|c| matches!(c, EightbyteClass::Integer | EightbyteClass::NoClass))
             .count() as i64;
-        let fp_count = eightbyte_classes
-            .iter()
-            .filter(|c| matches!(c, EightbyteClass::Sse))
-            .count() as i64;
+        let fp_count = if one_xmm {
+            1
+        } else {
+            eightbyte_classes
+                .iter()
+                .filter(|c| matches!(c, EightbyteClass::Sse))
+                .count() as i64
+        };
 
         // Register demand that can never be satisfied (defensive: the classifier
         // cannot emit more than 2 GP / 2 SSE eightbytes for a <=16-byte struct).
@@ -316,7 +323,20 @@ impl X86Codegen {
         }
 
         // ==== Register path (fall-through). %eax = gp_offset, %edx = fp_offset. ====
-        self.emit_va_arg_struct_register_path(eightbyte_classes, gp_count, fp_count, &label_end);
+        if one_xmm {
+            self.state.emit("    movq 16(%rcx), %rsi"); // reg_save_area
+            self.state.emit("    movups (%rsi,%rdx), %xmm0");
+            self.state.emit("    movups %xmm0, (%rdi)");
+            self.state.emit("    addl $16, 4(%rcx)");
+            self.state.out.emit_jmp_label(&label_end);
+        } else {
+            self.emit_va_arg_struct_register_path(
+                eightbyte_classes,
+                gp_count,
+                fp_count,
+                &label_end,
+            );
+        }
 
         // ==== Memory (overflow) path. %rcx = &va_list, %rdi = dest still live. ====
         self.state.out.emit_named_label(&label_mem);

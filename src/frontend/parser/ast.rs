@@ -14,6 +14,18 @@ pub enum ExternalDecl {
     Declaration(Declaration),
     /// Top-level asm("...") directive - emitted verbatim in assembly output.
     TopLevelAsm(String),
+    /// A `_Static_assert` the parser could not decide; sema evaluates it.
+    StaticAssert(StaticAssert),
+}
+
+/// A `_Static_assert` whose condition needs type information (`sizeof`,
+/// `_Generic`, enumerator types, ...). The parser decides what it can; the
+/// rest reach sema, which evaluates them in lexical order.
+#[derive(Debug, Clone)]
+pub struct StaticAssert {
+    pub cond: Expr,
+    pub message: Option<String>,
+    pub span: Span,
 }
 
 /// Attributes that can be applied to function definitions via storage-class
@@ -383,6 +395,11 @@ pub struct ParamDecl {
     /// E.g., for `void foo(int a, int b[a++])`, the expression `a++` is stored here
     /// so its side effects can be evaluated at function entry during IR lowering.
     pub vla_size_exprs: Vec<Expr>,
+    /// Declared with an array declarator whose outermost dimension was
+    /// adjusted to a pointer (C11 6.7.6.3p7): `T a[2]` arrives as `T *`.
+    /// The constraints on the unadjusted type still apply -- `void a[2]` is
+    /// an array of `void` -- so sema needs to know the adjustment happened.
+    pub decayed_array: bool,
     /// The number of `*` inside the parenthesized declarator for function pointer params.
     /// `(*fp)` has depth 1, `(**fpp)` has depth 2. A depth >= 2 means pointer-to-function-
     /// pointer. This distinguishes `int (**fpp)(int)` from `void *(*fp)(size_t)` which
@@ -971,6 +988,7 @@ mod declarator_law_tests {
             is_volatile: false,
             is_restrict: false,
             vla_size_exprs: Vec::new(),
+            decayed_array: false,
             fptr_inner_ptr_depth: 0,
         }
     }
@@ -1202,6 +1220,10 @@ pub struct StructFieldDecl {
     pub derived: Vec<DerivedDeclarator>,
     /// Per-field alignment from _Alignas(N) or __attribute__((aligned(N))).
     pub alignment: Option<usize>,
+    /// `_Alignas(type-name)` whose alignment the parser cannot know exactly
+    /// (typedef, enum, ...). The layout builders resolve it and take the
+    /// strictest of it and `alignment` (C11 6.7.5p6).
+    pub alignas_type: Option<TypeSpecifier>,
     /// Per-field __attribute__((packed)) - forces this field's alignment to 1.
     pub is_packed: bool,
     /// `volatile` on the field's base type (`volatile u32 ctrl`, `volatile int a[4]`):
@@ -1239,6 +1261,8 @@ pub enum BlockItem {
     /// static chain. Reuses `FunctionDef`; the item is lowered to a separate
     /// IR function with a mangled `parent.name` symbol.
     NestedFunction(FunctionDef),
+    /// A `_Static_assert` the parser could not decide; sema evaluates it.
+    StaticAssert(StaticAssert),
 }
 
 /// Statements.
@@ -1598,4 +1622,11 @@ impl Expr {
             | Expr::BuiltinTypesCompatibleP(_, _, _, _, s) => *s,
         }
     }
+}
+
+/// Whether `name` is a predefined identifier naming the enclosing function's
+/// name string: C's `__func__` and GCC's `__FUNCTION__` and (in C, the same
+/// string) `__PRETTY_FUNCTION__`.
+pub fn is_function_name_builtin(name: &str) -> bool {
+    matches!(name, "__func__" | "__FUNCTION__" | "__PRETTY_FUNCTION__")
 }

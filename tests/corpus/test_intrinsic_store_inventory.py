@@ -15,9 +15,10 @@ SOURCE = Path(__file__).resolve().parents[2] / "src/ir/intrinsics.rs"
 IDENT = r"[A-Za-z_][A-Za-z_0-9]*"
 ENUM = r"^pub enum IntrinsicOp\s*\{(.*?)^\}"
 MATRIX = r"^pub\(crate\) const VECTOR_STORES: \[IntrinsicOp; (\d+)\] = \[(.*?)^\];"
-# Non-VecStore writers have scalar results and private scratch arguments.
+# Non-VecStore argument writers: private scratch and packed read/modify/write.
 # Keep this exact: an arbitrary new opcode must not silently join the set.
-SCRATCH_WRITERS = {"StrictRecipMulAddF64x4", "StrictRecipMulAddPackedF64x4"}
+OTHER_ARG_WRITERS = {"StrictRecipMulAddF64x4", "StrictRecipMulAddPackedF64x4",
+                     "FmaF64x4SIB", "FmaF64x4HoistedSIB", "MulAddF64x4HoistedSIB"}
 WRITES = r"^    pub fn writes_memory_via_args\(&self\) -> bool \{(.*?)^    \}"
 
 
@@ -114,9 +115,9 @@ def inventory(source):
                          without_comments(extract(WRITES, source)[1]), re.S)
     require(match is not None, "write classification no longer a literal matches! list")
     writes = names(match[1], "|", qualified=True)
-    require(SCRATCH_WRITERS <= set(declared), "scratch writer missing from enum")
+    require(OTHER_ARG_WRITERS <= set(declared), "argument writer missing from enum")
     for label, entries, expected in (("matrix", matrix, stores),
-                                     ("writes", writes, stores | SCRATCH_WRITERS)):
+                                     ("writes", writes, stores | OTHER_ARG_WRITERS)):
         require(set(entries) == expected,
                 f"{label}: missing={sorted(expected - set(entries))}, "
                 f"extra={sorted(set(entries) - expected)}")
@@ -137,15 +138,15 @@ class IntrinsicStoreInventoryTests(unittest.TestCase):
                 body + "\n];" + source[match.end():])
 
     def writes(self, source, entries, include_scratch=True):
-        entries = list(entries) + (sorted(SCRATCH_WRITERS) if include_scratch else [])
+        entries = list(entries) + (sorted(OTHER_ARG_WRITERS) if include_scratch else [])
         match = extract(WRITES, source)
         body = " | ".join(f"IntrinsicOp::{name}" for name in entries)
         return (source[:match.start(1)] + f"\n        matches!(self, {body})\n" +
                 source[match.end(1):])
 
     def test_scratch_writers_are_required_without_admitting_arbitrary_ops(self):
-        for omitted in SCRATCH_WRITERS:
-            entries = self.stores + sorted(SCRATCH_WRITERS - {omitted})
+        for omitted in OTHER_ARG_WRITERS:
+            entries = self.stores + sorted(OTHER_ARG_WRITERS - {omitted})
             with self.subTest(omitted=omitted), self.assertRaisesRegex(AssertionError, "writes: missing"):
                 inventory(self.writes(self.source, entries, include_scratch=False))
         with self.assertRaisesRegex(AssertionError, "extra=.*SqrtF64"):

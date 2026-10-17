@@ -78,26 +78,6 @@ class SharedBindingTests(unittest.TestCase):
         image[".data"] = (image[".data"][0], struct.pack("<QQ", 249, 0))
         self.verify(image, binding=0, absolute=True, target_value=256)
 
-    def test_rv64_shared_32_requires_absolute(self):
-        rows = [(o, accept) for _, o, accept in gate.cases() if o["kind"] == 1]
-        self.assertTrue(rows)
-        self.assertTrue(any(accept for _, accept in rows))
-        self.assertTrue(any(not accept for _, accept in rows))
-        for options, accept in rows:
-            self.assertEqual(accept, options["defined"] and options["absolute"])
-
-    def test_absolute_32_checks_four_bytes_and_neighbor(self):
-        image = self.image(absolute=True)
-        image[".dynsym"] = (image[".dynsym"][0], bytes(24))
-        image[".rela.dyn"] = (image[".rela.dyn"][0], b"")
-        correct = struct.pack("<I", 249) + b"\xa5" * 12
-        image[".data"] = (image[".data"][0], correct)
-        self.verify(image, binding=0, absolute=True, target_value=256, kind=1)
-        for corrupt in (struct.pack("<I", 248) + correct[4:], correct[:4] + bytes(4) + correct[8:]):
-            image[".data"] = (image[".data"][0], corrupt)
-            with self.assertRaises(AssertionError):
-                self.verify(image, binding=0, absolute=True, target_value=256, kind=1)
-
     def test_reserved_got_header_is_not_the_requested_slot(self):
         image = self.image(addend=0)
         header = list(image[".data"][0]); header[3] = 0x3000
@@ -118,6 +98,36 @@ class SharedBindingTests(unittest.TestCase):
                 path.write_bytes(fixture(**kwargs))
                 sym = struct.unpack_from("<IBBHQQ", sections(path)[".symtab"][1], 24)
                 self.assertEqual((sym[3], sym[4]), (section, value))
+
+    def test_word_relocation_matrix_rejects_runtime_addresses(self):
+        rows = [(o, accept) for _, o, accept in gate.cases() if o["kind"] == 1]
+        self.assertTrue(rows)
+        for o, accept in rows:
+            if accept:
+                self.assertTrue(o["binding"] == 0 or o["visibility"] != 0)
+                self.assertTrue(o["absolute"] or (o["binding"] == 2 and not o["defined"]))
+            if o["defined"] and not o["absolute"]:
+                self.assertFalse(accept)
+            if o["binding"] != 0 and o["visibility"] == 0:
+                self.assertFalse(accept)
+        self.assertTrue(any(accept for _, accept in rows))
+        self.assertTrue(any(not accept for _, accept in rows))
+
+    def test_word_relocation_checks_width_and_no_dynamic_fixup(self):
+        image = self.image(info=3)
+        image[".dynsym"] = (image[".dynsym"][0], bytes(24))
+        image[".rela.dyn"] = (image[".rela.dyn"][0], b"")
+        image[".data"] = (image[".data"][0], struct.pack("<IIQ", 249, gate.WORD_SENTINEL, 0))
+        options = dict(kind=1, binding=0, absolute=True, target_value=256)
+        self.verify(image, **options)
+        for value in ((gate.WORD_SENTINEL << 32) | 248, 249):
+            image[".data"] = (image[".data"][0], struct.pack("<QQ", value, 0))
+            with self.assertRaises(AssertionError):
+                self.verify(image, **options)
+        image[".data"] = (image[".data"][0], struct.pack("<IIQ", 249, gate.WORD_SENTINEL, 0))
+        image[".rela.dyn"] = (image[".rela.dyn"][0], struct.pack("<QQq", 0x2000, 3, 249))
+        with self.assertRaises(AssertionError):
+            self.verify(image, **options)
 
     def test_missing_tool_is_structured_failure(self):
         with tempfile.TemporaryDirectory() as tmp:

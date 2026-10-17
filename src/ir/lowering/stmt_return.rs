@@ -28,12 +28,37 @@ impl Lowerer {
         if let Some(op) = self.try_i686_ext_vector_gp_return(e) {
             return op;
         }
+        if let Some(op) = self.try_i686_ext_vector_xmm_or_fp_return(e) {
+            return op;
+        }
 
         // Try sret return first (large structs and complex types via hidden pointer)
         if let Some(sret_alloca) = self.func().sret_ptr {
             if let Some(op) = self.try_sret_return(e, sret_alloca) {
                 return op;
             }
+        }
+
+        // X87-class aggregate (`struct { long double }`): the value leaves in
+        // %st(0), so the IR returns the long double read out of the object.
+        let fname = self.func().name.clone();
+        if self
+            .func_meta
+            .sigs
+            .get(fname.as_str())
+            .is_some_and(|s| s.ret_x87_aggregate)
+        {
+            let seg = self.aggregate_lvalue_space(e);
+            let addr = self.get_struct_base_addr(e);
+            let val = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest: val,
+                ptr: addr,
+                ty: IrType::F128,
+                seg_override: seg,
+            });
+            return Operand::Value(val);
         }
 
         // Two-register struct return (9-16 bytes packed into I128)
@@ -255,13 +280,21 @@ impl Lowerer {
             }
         }
         // On i686, the i386 SysV ABI uses sret for ALL struct sizes (threshold 0).
-        // On 64-bit targets, structs > 16 bytes use sret.
+        // On 64-bit targets, structs > 16 bytes use sret -- and so does an
+        // x86-64 MEMORY-class aggregate of any size (misaligned fields,
+        // BLKmode vectors): the function's own signature is authoritative.
         let sret_threshold = if crate::common::types::target_is_32bit() {
             0
         } else {
             16
         };
-        if struct_size > sret_threshold {
+        let fname = self.func().name.clone();
+        let fn_returns_aggregate_in_memory = self
+            .func_meta
+            .sigs
+            .get(fname.as_str())
+            .is_some_and(|s| s.sret_size.is_some());
+        if struct_size > sret_threshold || (struct_size > 0 && fn_returns_aggregate_in_memory) {
             let src_addr = self.get_struct_base_addr(e);
             let sret_ptr = self.fresh_value();
             self.emit(Instruction::Load {

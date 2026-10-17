@@ -38,33 +38,77 @@ if len(re.findall(r"^\s*movsd\s+%xmm\d+,\s*%xmm\d+\s*$", distance, re.M)) != 1:
     raise SystemExit("distance3 contains unexpected register-to-register movsd relays")
 
 # When an accumulator shares a home with a multiplicand, the destructive FMA
-# must not clobber a multiplicand before both are read. Two correct shapes
-# exist: (a) the guarded xmm0 fallback, or (b) the copy-then-accumulate form
-# (copy both ABI sources to scratch registers, then vfmadd into a third).
-# The check accepts either but rejects a bare FMA whose destination is an
-# un-copied ABI source register.
-for name in ("accumulator_alias_lhs", "accumulator_alias_rhs"):
-    fn_body = body(name)  # NOTE: do NOT rebind `text` — body() reads it
-    if not re.search(r"^\s*vfmadd\w*", fn_body, re.M):
-        raise SystemExit(f"{name} no longer emits an FMA")
-    fma = re.search(r"^\s*vfmadd\w*\s+%xmm(\d+),\s*%xmm(\d+),\s*%xmm(\d+)\s*$", fn_body, re.M)
-    if fma:
-        dest = int(fma.group(3))
-        for src in (int(fma.group(1)), int(fma.group(2))):
-            if src == dest and src in (0, 1):
-                # FMA writes an ABI source register that was NOT copied out
-                # first — the aliasing bug this fixture guards against.
-                copies = re.findall(
-                    r"^\s*movsd\s+%xmm[01],\s*%xmm\d+\s*$", fn_body, re.M
-                )
-                if not copies:
-                    raise SystemExit(f"{name} destructive FMA clobbers an un-copied multiplicand")
+# must not clobber a multiplicand before every read of it. A single VEX FMA
+# reads all three operands before it writes, so `vfmadd231sd %xmm1, %xmm0,
+# %xmm0` (xmm0 = xmm0*xmm1 + xmm0 = x*y + x) is the optimal one-instruction
+# body, not a hazard; the hazard is an EARLIER write of a register a later
+# instruction still reads as the original parameter. So the body is executed
+# symbolically (register moves and the three VEX FMA operand orders; any other
+# instruction touching an XMM register fails closed) and the returned %xmm0
+# must be exactly the source expression. One FMA and no relay is required.
+MOVES = ("movsd", "movapd", "vmovsd", "vmovapd", "movaps", "vmovaps")
+def returned_value(name, fn_body, regs, memory=None):
+    """Symbolically execute a straight-line scalar-double body.
 
-# The ten-argument case puts two source parameters on the incoming stack while
-# still requiring direct accumulation into the allocated (non-xmm0) result.
+    `regs` seeds the incoming XMM parameters, `memory` the incoming stack
+    slots (`N(%rsp)` -> symbol). Register moves, stack loads, and the three
+    VEX FMA operand orders (register or stack third operand) are modelled;
+    any other instruction mentioning an XMM register or an unmodelled memory
+    operand fails closed rather than being guessed at.
+    """
+    regs = dict(regs)
+    memory = memory or {}
+    fmas = 0
+    def read(operand):
+        if operand.startswith("%xmm"):
+            return regs.get(operand[1:])
+        if operand in memory:
+            return memory[operand]
+        raise SystemExit(f"{name}: unmodelled operand {operand!r}")
+    for raw in fn_body.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or line.startswith(".") or line == "ret":
+            continue
+        op, _, rest = line.partition(" ")
+        args = [a.strip() for a in rest.split(",")] if rest else []
+        if op in MOVES and len(args) == 2 and args[1].startswith("%xmm"):
+            regs[args[1][1:]] = read(args[0])
+        elif op.startswith("vfmadd") and op.endswith("sd") and len(args) == 3:
+            a, b, c = (read(r) for r in args)  # AT&T: op3, op2, op1(dest)
+            form = op[len("vfmadd"):-2]
+            prod, add = {"132": ((c, a), b), "213": ((b, c), a), "231": ((b, a), c)}[form]
+            regs[args[2][1:]] = ("fma", frozenset(prod) if prod[0] != prod[1] else prod, add)
+            fmas += 1
+        elif "xmm" in line or "(%rsp)" in line:
+            raise SystemExit(f"{name}: unmodelled instruction {line!r}; extend the model")
+    if fmas != 1:
+        raise SystemExit(f"{name}: expected exactly one FMA, found {fmas}")
+    return regs.get("xmm0")
+RELAY = r"^\s*v?mov(?:sd|apd|aps)\s+%xmm\d+,\s*%xmm\d+\s*$"
+for name, addend in (("accumulator_alias_lhs", "x"), ("accumulator_alias_rhs", "y")):
+    got = returned_value(name, body(name), {"xmm0": "x", "xmm1": "y"})
+    want = ("fma", frozenset(("x", "y")), addend)
+    if got != want:
+        raise SystemExit(f"{name}: returned {got!r}, want x*y + {addend} (multiplicand clobbered)")
+    relays = re.findall(RELAY, body(name), re.M)
+    if relays:
+        raise SystemExit(f"{name}: {len(relays)} XMM relay(s) around a single destructive FMA")
+
+# The ten-argument case passes the two multiplicands on the incoming stack
+# (8(%rsp), 16(%rsp)) and the accumulator in %xmm0, the return register.
+# GCC 16.2 and Clang 23 emit `vmovsd 8(%rsp), %xmm1; vfmadd231sd 16(%rsp),
+# %xmm1, %xmm0; ret`. Required: the result is exactly acc + x*y, both stack
+# reads stay in the SSE domain (no GPR bounce such as `movq 16(%rsp), %rax;
+# movq %rax, %xmm4`, the former last-stack-FP-parameter path), and no relay.
 stack = body("stack_multiplicands")
-if len(re.findall(r"^\s*movsd\s+\d+\(%rsp\),\s*%xmm\d+", stack, re.M)) < 2:
-    raise SystemExit("stack_multiplicands no longer exercises stack FP parameters")
-if not re.search(r"^\s*vfmadd\w*.*,\s*%xmm([2-9]|1[0-5])\s*$", stack, re.M):
-    raise SystemExit("stack_multiplicands did not FMA directly into its allocated result")
+if re.search(r"^\s*mov[lq]\s+\d+\(%rsp\),\s*%[re]?[a-z0-9]+\s*$", stack, re.M):
+    raise SystemExit("stack_multiplicands bounces a stack FP parameter through a GPR")
+got = returned_value("stack_multiplicands", stack, {"xmm0": "acc"},
+                     {"8(%rsp)": "x", "16(%rsp)": "y"})
+if got != ("fma", frozenset(("x", "y")), "acc"):
+    raise SystemExit(f"stack_multiplicands returned {got!r}, want acc + x*y")
+if re.findall(RELAY, stack, re.M):
+    raise SystemExit("stack_multiplicands contains an XMM relay")
 PY
+
+echo "fma dest coalesce codegen: PASS (alias bodies and stack multiplicands proven symbolically; no GPR bounce, no relay)"

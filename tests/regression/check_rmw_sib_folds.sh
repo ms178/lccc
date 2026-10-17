@@ -62,10 +62,13 @@ expected=$(timeout 300 "$work/ref") || bad "gcc oracle exited non-zero"
 for opt in -O1 -O2 -O3; do
     for envs in "" "CCC_PEEPHOLE_SKIP=mem_rmw" "CCC_PEEPHOLE_SKIP=shl_sib" "CCC_PEEPHOLE_SKIP=mem_rmw,shl_sib"; do
         name=$(echo "opt${opt} $(echo "$envs" | tr -d '=,')" | tr -d ' -')
-        if ! "$CCC" "$opt" "$corpus" -o "$work/$name" > "$work/$name.build" 2>&1; then
+        # The skip set is read by the COMPILER: it must be in the compile
+        # command's environment.  (Exporting it to the compiled program, as
+        # this loop once did, ran the default build four times.)
+        if ! env $envs "$CCC" "$opt" "$corpus" -o "$work/$name" > "$work/$name.build" 2>&1; then
             bad "$opt [$envs]: lccc failed to build"; continue
         fi
-        got=$(timeout 300 env $envs "$work/$name") || { bad "$opt [$envs]: non-zero exit"; continue; }
+        got=$(timeout 300 "$work/$name") || { bad "$opt [$envs]: non-zero exit"; continue; }
         [[ $got == "$expected" ]] || bad "$opt [$envs]: stdout differs from the oracle"
     done
 done

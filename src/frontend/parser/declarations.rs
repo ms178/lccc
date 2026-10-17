@@ -131,8 +131,10 @@ impl Parser {
 
         // Handle _Static_assert at file scope
         if matches!(self.peek(), TokenKind::StaticAssert) {
-            self.parse_static_assert();
-            return Some(ExternalDecl::Declaration(Declaration::empty()));
+            return Some(match self.parse_static_assert() {
+                Some(deferred) => ExternalDecl::StaticAssert(deferred),
+                None => ExternalDecl::Declaration(Declaration::empty()),
+            });
         }
 
         let start = self.peek_span();
@@ -405,16 +407,20 @@ impl Parser {
             .position(|d| matches!(d, DerivedDeclarator::Function(_, _)));
 
         if let Some(fpos) = func_pos {
-            // Apply post-Function derivations (Array/Pointer)
+            // Apply post-Function derivations (Array/Pointer). Space mapping
+            // follows pointee_space_before: each wrapper takes the previous
+            // entry's space (a Function entry has none, so the first wrapper
+            // after it takes Default).
+            let mut pending_space = AddressSpace::Default;
             for d in &derived[fpos + 1..] {
                 match d {
                     DerivedDeclarator::Array(size_expr) => {
                         return_type =
                             TypeSpecifier::Array(Box::new(return_type), size_expr.clone());
                     }
-                    DerivedDeclarator::Pointer(_) => {
-                        return_type =
-                            TypeSpecifier::Pointer(Box::new(return_type), AddressSpace::Default);
+                    DerivedDeclarator::Pointer(space) => {
+                        return_type = TypeSpecifier::Pointer(Box::new(return_type), pending_space);
+                        pending_space = *space;
                     }
                     _ => {}
                 }
@@ -470,12 +476,14 @@ impl Parser {
                 }
             }
         } else {
-            // No Function in derived - just apply pointer derivations
+            // No Function in derived - just apply pointer derivations, with
+            // the same pointee_space_before mapping as build_full_ctype.
+            let mut pending_space = AddressSpace::Default;
             for d in derived {
                 match d {
-                    DerivedDeclarator::Pointer(_) => {
-                        return_type =
-                            TypeSpecifier::Pointer(Box::new(return_type), AddressSpace::Default);
+                    DerivedDeclarator::Pointer(space) => {
+                        return_type = TypeSpecifier::Pointer(Box::new(return_type), pending_space);
+                        pending_space = *space;
                     }
                     _ => break,
                 }
@@ -492,7 +500,7 @@ impl Parser {
                 loop {
                     let (pname, pderived) = self.parse_declarator();
                     if let Some(ref name) = pname {
-                        let (full_type, fptr_params, fptr_variadic) =
+                        let (full_type, fptr_params, fptr_variadic, decayed_array) =
                             self.apply_kr_derivations(&type_spec, &pderived);
                         // Compute fptr_inner_ptr_depth for K&R function pointer params.
                         // Count Pointer entries AFTER FunctionPointer in derived list;
@@ -523,6 +531,7 @@ impl Parser {
                                 param.fptr_params = fptr_params.clone();
                                 param.fptr_variadic = fptr_variadic;
                                 param.fptr_inner_ptr_depth = inner_depth;
+                                param.decayed_array = decayed_array;
                                 break;
                             }
                         }
@@ -547,7 +556,7 @@ impl Parser {
         &self,
         type_spec: &TypeSpecifier,
         pderived: &[DerivedDeclarator],
-    ) -> (TypeSpecifier, Option<Vec<ParamDecl>>, bool) {
+    ) -> (TypeSpecifier, Option<Vec<ParamDecl>>, bool, bool) {
         let mut full_type = type_spec.clone();
 
         // Check if this is a function pointer parameter.
@@ -572,24 +581,39 @@ impl Parser {
             // For `int *(*fp)()`:
             //   pderived = [Pointer, Pointer, FunctionPointer([], false)]
             //   First Pointer is return-type pointer, second is syntax marker.
-            let ptr_count = pderived
+            // The syntax-marker star is the last Pointer in pderived; any
+            // further Pointers are return-type levels. Drop the marker, then
+            // apply the remaining stars with the pointee_space_before chain
+            // (see fold_simple_derived): the wrapper built at step k takes
+            // the space stored at the PREVIOUS star (the first takes
+            // Default).
+            let mut star_spaces = pderived
                 .iter()
-                .filter(|d| matches!(d, DerivedDeclarator::Pointer(_)))
-                .count();
-            // Apply all pointers except the syntax marker (last one)
-            for _ in 0..ptr_count.saturating_sub(1) {
-                full_type = TypeSpecifier::Pointer(Box::new(full_type), AddressSpace::Default);
+                .filter_map(|d| match d {
+                    DerivedDeclarator::Pointer(space) => Some(*space),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            star_spaces.pop();
+            let mut pending = AddressSpace::Default;
+            for space in star_spaces {
+                full_type = TypeSpecifier::Pointer(Box::new(full_type), pending);
+                pending = space;
             }
-            // Apply one Pointer wrapping for the function-pointer-to-pointer decay
-            full_type = TypeSpecifier::Pointer(Box::new(full_type), AddressSpace::Default);
-            return (full_type, Some(fptr_params), variadic);
+            // The final application is the function-pointer-to-pointer decay
+            // wrapper: the syntax-marker star's own level, whose space is the
+            // previous star's (see pointee_space_before).
+            full_type = TypeSpecifier::Pointer(Box::new(full_type), pending);
+            return (full_type, Some(fptr_params), variadic, false);
         }
 
         // Not a function pointer - apply all derivations normally.
-        // Apply pointers
+        // Apply pointers, keeping each star's own address space
+        // (`struct sd * __seg_gs *` declares a pointer whose pointee values
+        // live in %gs — the kernel's percpu `T * __percpu *` members).
         for d in pderived {
-            if let DerivedDeclarator::Pointer(_) = d {
-                full_type = TypeSpecifier::Pointer(Box::new(full_type), AddressSpace::Default);
+            if let DerivedDeclarator::Pointer(space) = d {
+                full_type = TypeSpecifier::Pointer(Box::new(full_type), *space);
             }
         }
         // Collect array dimensions
@@ -604,7 +628,8 @@ impl Parser {
             })
             .collect();
         // Array params: outermost dimension decays to pointer
-        if !array_dims.is_empty() {
+        let decayed_array = !array_dims.is_empty();
+        if decayed_array {
             for dim in array_dims.iter().skip(1).rev() {
                 full_type = TypeSpecifier::Array(Box::new(full_type), dim.clone());
             }
@@ -616,7 +641,7 @@ impl Parser {
                 full_type = TypeSpecifier::Pointer(Box::new(full_type), AddressSpace::Default);
             }
         }
-        (full_type, None, false)
+        (full_type, None, false, decayed_array)
     }
 
     /// Parse the rest of a declaration (not a function definition).
@@ -1334,20 +1359,11 @@ impl Parser {
                 SizeofArg::Type(ts) => Self::try_sizeof_type_spec(ts).map(|s| s as i64),
                 SizeofArg::Expr(_) => None,
             },
-            Expr::Alignof(ts, _) => {
-                // Can't resolve typedef alignment at parse time
-                if Self::type_spec_has_typedef(ts) {
-                    return None;
-                }
-                Some(Self::alignof_type_spec(ts, tag_aligns) as i64)
-            }
+            // `None` when the parser cannot know the alignment exactly.
+            Expr::Alignof(ts, _) => Self::alignof_type_spec(ts, tag_aligns).map(|a| a as i64),
             // __alignof(type) returns preferred alignment (8 for long long/double on i686)
             Expr::GnuAlignof(ts, _) => {
-                // Can't resolve typedef alignment at parse time
-                if Self::type_spec_has_typedef(ts) {
-                    return None;
-                }
-                Some(Self::preferred_alignof_type_spec(ts, tag_aligns) as i64)
+                Self::preferred_alignof_type_spec(ts, tag_aligns).map(|a| a as i64)
             }
             // __alignof__(expr): parser-level can't always determine type alignment
             // from an expression, so return None (let sema/lowerer handle it)
@@ -1383,18 +1399,6 @@ impl Parser {
             | Expr::GnuAlignof(..)
             | Expr::AlignofExpr(..)
             | Expr::GnuAlignofExpr(..) => true,
-            _ => false,
-        }
-    }
-
-    /// Check if a type specifier contains an unresolvable typedef name.
-    /// Used to bail out of parser-level alignof/sizeof evaluation when the
-    /// actual type can't be determined without typedef resolution.
-    fn type_spec_has_typedef(ts: &TypeSpecifier) -> bool {
-        match ts {
-            TypeSpecifier::TypedefName(_) => true,
-            TypeSpecifier::Pointer(inner, _) => Self::type_spec_has_typedef(inner),
-            TypeSpecifier::Array(inner, _) => Self::type_spec_has_typedef(inner),
             _ => false,
         }
     }
@@ -1542,10 +1546,12 @@ impl Parser {
         mut spec: TypeSpecifier,
         derived: &[DerivedDeclarator],
     ) -> TypeSpecifier {
+        let mut pending_space = AddressSpace::Default;
         for d in derived {
             match d {
-                DerivedDeclarator::Pointer(_) => {
-                    spec = TypeSpecifier::Pointer(Box::new(spec), AddressSpace::Default);
+                DerivedDeclarator::Pointer(space) => {
+                    spec = TypeSpecifier::Pointer(Box::new(spec), pending_space);
+                    pending_space = *space;
                 }
                 DerivedDeclarator::Array(n) => {
                     spec = TypeSpecifier::Array(Box::new(spec), n.clone());
@@ -1620,9 +1626,11 @@ impl Parser {
     ///
     /// If the constant expression evaluates to zero, emits a compile error
     /// with the provided message (or a default message for the single-arg form).
-    /// If the expression cannot be evaluated at compile time, silently accepts
-    /// it (matching GCC behavior for complex expressions).
-    pub(super) fn parse_static_assert(&mut self) {
+    /// A condition the parser cannot evaluate without types (`sizeof`,
+    /// `_Generic`, enumerator types, builtins) is returned for sema to decide;
+    /// GCC diagnoses those too, so accepting them here would let a false
+    /// assertion compile.
+    pub(super) fn parse_static_assert(&mut self) -> Option<StaticAssert> {
         let assert_span = self.peek_span();
         self.advance(); // consume _Static_assert
         let open = self.peek_span();
@@ -1676,6 +1684,7 @@ impl Parser {
                 };
                 self.emit_error(msg, assert_span);
             }
+            None
         } else if Self::expr_has_non_const_identifier(&expr, enums, unevaluable) {
             // The expression references variables or non-enum identifiers, which
             // means it's definitely not a valid integer constant expression (C11 6.6).
@@ -1683,11 +1692,14 @@ impl Parser {
                 "expression in static assertion is not an integer constant expression",
                 assert_span,
             );
+            None
+        } else {
+            Some(StaticAssert {
+                cond: expr,
+                message,
+                span: assert_span,
+            })
         }
-        // If we can't evaluate the expression but it doesn't contain variable
-        // references (e.g. sizeof, offsetof, compiler builtins), silently accept.
-        // This matches real-world behavior where complex expressions may not be
-        // evaluable at parse time but are valid constant expressions.
     }
 }
 

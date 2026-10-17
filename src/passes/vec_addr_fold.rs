@@ -68,7 +68,10 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                 // A narrow Add wraps BEFORE address extension and cannot be
                 // replaced with a 64-bit address sum. Mutable webs cannot be
                 // substituted position-independently either.
-                if *op == IntrinsicOp::FmaF64x4HoistedSIB {
+                if matches!(
+                    op,
+                    IntrinsicOp::FmaF64x4HoistedSIB | IntrinsicOp::MulAddF64x4HoistedSIB
+                ) {
                     if args.len() == 3
                         && let Operand::Value(offset) = args[2]
                         && !multi.contains(&offset.0)

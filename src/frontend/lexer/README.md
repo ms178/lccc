@@ -45,7 +45,7 @@ Three widths of float, each mirrored by an imaginary counterpart (GCC `_Complex`
 |---------|---------|
 | `FloatLiteral(f64)` | `double` (no suffix) |
 | `FloatLiteralF32(f64)` | `float` (`f`/`F` suffix); stored as f64, narrowed later |
-| `FloatLiteralLongDouble(f64, [u8; 16])` | `long double` (`l`/`L` suffix); carries both an f64 approximation and the full IEEE 754 binary128 bytes |
+| `FloatLiteralLongDouble(f64, [u8; 16])` | `long double` (`l`/`L` suffix); carries an f64 approximation and an IEEE 754 binary128 carrier; hexadecimal literals are rounded to the target long-double precision before exact widening into that carrier |
 | `ImaginaryLiteral(f64)` | `_Complex double` imaginary part (`i`/`j` suffix) |
 | `ImaginaryLiteralF32(f64)` | `_Complex float` imaginary part (`fi`/`if` suffix) |
 | `ImaginaryLiteralLongDouble(f64, [u8; 16])` | `_Complex long double` imaginary part (`li`/`il` suffix) |

@@ -87,8 +87,8 @@ impl Lowerer {
                         }
                     }
                 }
-                ExternalDecl::TopLevelAsm(_) => {
-                    // Top-level asm doesn't reference C functions
+                ExternalDecl::TopLevelAsm(_) | ExternalDecl::StaticAssert(_) => {
+                    // Neither references C functions
                 }
             }
         }
@@ -149,6 +149,8 @@ impl Lowerer {
                 // references keep the callees alive exactly like parent-body
                 // references do (the nested function is only reachable from
                 // the parent).
+                // Decided by sema; a static assertion generates nothing.
+                BlockItem::StaticAssert(_) => {}
                 BlockItem::NestedFunction(nested) => {
                     self.collect_refs_from_compound(&nested.body, refs);
                 }

@@ -341,7 +341,7 @@ impl Lowerer {
                         );
                     }
                 }
-                ExternalDecl::TopLevelAsm(_) => {}
+                ExternalDecl::TopLevelAsm(_) | ExternalDecl::StaticAssert(_) => {}
             }
         }
         for ts in type_specs_to_recompute {
@@ -814,58 +814,12 @@ impl Lowerer {
                 // the return value to a temporary alloca so we have an address.
                 let struct_size = self.struct_value_size(expr).unwrap_or(8);
 
-                // Check if this is an sret call (struct > 16 bytes with hidden pointer)
-                // or a two-register return (9-16 bytes) - both return an alloca address.
-                // On i686 (32-bit), ALL struct returns use sret regardless of size.
-                let is_32bit = crate::common::types::target_is_32bit();
-                let returns_address = if is_32bit {
-                    // i686: all struct returns use hidden pointer (sret)
-                    true
-                } else if let Expr::Identifier(name, _) = func_expr.as_ref() {
-                    // Detect function pointer variables: identifiers that are
-                    // local/global variables rather than known function names
-                    let is_fptr_var = (self.func_mut().locals.contains_key(name)
-                        && !self.known_functions.contains(name))
-                        || (!self.func_mut().locals.contains_key(name)
-                            && self.globals.contains_key(name)
-                            && !self.known_functions.contains(name));
-                    if is_fptr_var {
-                        // Indirect call through variable: use struct size to determine ABI
-                        struct_size > 8
-                    } else {
-                        match self.func_meta.sigs.get(name.as_str()) {
-                            Some(s) => s.sret_size.is_some() || s.two_reg_ret_size.is_some(),
-                            None => {
-                                // No seeded signature (e.g. an SSE/AVX builtin
-                                // whose system-header declaration is ISA-gated
-                                // out of the build). Classify by the return
-                                // type: a struct/vector return > 8 bytes comes
-                                // back by address (sret or an intrinsic result
-                                // alloca); <= 8 bytes is packed register data.
-                                // Without this, _mm256_clmulepi64_epi128 was
-                                // misclassified as a small packed return: its
-                                // result ADDRESS was spilled as 8 bytes and
-                                // the 32-byte init memcpy read through it
-                                // (clmul256 regression).
-                                let ret_size = self
-                                    .types
-                                    .func_return_ctypes
-                                    .get(name.as_str())
-                                    .filter(|c| c.is_struct_or_union() || c.is_vector())
-                                    .map(|c| self.ctype_size(c))
-                                    .unwrap_or(struct_size);
-                                ret_size > 8
-                            }
-                        }
-                    }
-                } else {
-                    // Indirect call through expression: determine from return type
-                    struct_size > 8
-                };
+                // Every non-packed by-value result (sret, two-register,
+                // one-XMM, x87) is already in memory: the call yields its address.
+                let returns_address = !self.call_result_is_packed(func_expr, struct_size);
 
                 if returns_address {
-                    // For sret and two-register calls, lower_expr returns the alloca
-                    // address directly (the struct data is already there)
+                    // lower_expr returns the result buffer's address directly.
                     let val = self.lower_expr(expr);
                     match val {
                         Operand::Value(v) => v,
@@ -1018,24 +972,8 @@ impl Lowerer {
     pub(super) fn expr_produces_packed_struct_data(&self, expr: &Expr) -> bool {
         match expr {
             Expr::FunctionCall(func_expr, _, _) => {
-                // On i686 (32-bit), ALL struct returns use sret, never packed data
-                if crate::common::types::target_is_32bit() {
-                    return false;
-                }
-                let struct_size = self.struct_value_size(expr).unwrap_or(8);
-                if struct_size > 8 {
-                    // 9+ byte structs: sret or two-reg return, both produce addresses
-                    return false;
-                }
-                // Small struct (<= 8 bytes): produces packed data unless somehow sret
-                if let Expr::Identifier(name, _) = func_expr.as_ref() {
-                    self.func_meta
-                        .sigs
-                        .get(name.as_str())
-                        .is_none_or(|s| s.sret_size.is_none() && s.two_reg_ret_size.is_none())
-                } else {
-                    true
-                }
+                let size = self.struct_value_size(expr).unwrap_or(8);
+                self.call_result_is_packed(func_expr, size)
             }
             Expr::Conditional(_, then_expr, else_expr, _) => {
                 // If either branch produces packed struct data, the ternary does too

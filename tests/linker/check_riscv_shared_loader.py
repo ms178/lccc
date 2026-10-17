@@ -15,9 +15,12 @@ import struct
 import subprocess
 import tempfile
 
-from check_riscv_relocation_contract import run
+from check_riscv_relocation_contract import run, sections
 
 CASES = [
+    ("weak-function-hidden", 'extern __attribute__((weak,visibility("hidden"))) int target(void);', "zero"),
+    ("weak-function-protected", 'extern __attribute__((weak,visibility("protected"))) int target(void);', "zero"),
+    ("function-import", 'extern int target(void);', "function-address"),
     ("default", "int target=42;", "address"),
     ("weak-definition", "__attribute__((weak)) int target=42;", "address"),
     ("import", "extern int target;", "address"),
@@ -44,13 +47,17 @@ def checked(command, commands):
 
 
 def runner(expect):
-    if expect == "address":
+    if expect in ("address", "function-address"):
         check = "la s1,target\n bne s0,s1,.fail"
     elif expect == "value":
         check = "lw t1,0(s0)\n li t2,42\n bne t1,t2,.fail"
     else:
         check = f"li t1,{256 if expect == 'absolute' else 0}\n bne s0,t1,.fail"
     provider = "" if expect == "missing" else ".data\n.globl target\ntarget: .word 99\n"
+    call_check = ""
+    if expect == "function-address":
+        provider = ".text\n.globl target\n.type target,@function\ntarget: li a0,73\n ret\n"
+        call_check = "la t0,call_target\n jalr ra,t0,0\n li t1,73\n bne a0,t1,.fail"
     return f""".option pic
 .text
 .globl _start
@@ -61,6 +68,7 @@ _start:
  la t0,get_ptr
  jalr ra,t0,0
  bne a0,s0,.fail
+ {call_check}
  li a0,0
  j .exit
 .fail:
@@ -92,7 +100,13 @@ def measure(args, report):
             report["records"].append(row)
             try:
                 source = root / "shared.c"
-                source.write_text(declaration + "\nint *observed=&target;\nint *get_ptr(void){return &target;}\n")
+                if name.startswith("weak-function"):
+                    body = "int (*observed)(void)=target; int *get_ptr(void){if(target) return (int*)(long)target();return 0;}"
+                elif name == "function-import":
+                    body = "int (*observed)(void)=target; int (*get_ptr(void))(void){return target;} int call_target(void){return target();}"
+                else:
+                    body = "int *observed=&target; int *get_ptr(void){return &target;}"
+                source.write_text(declaration + "\n" + body + "\n")
                 asm = root / "runner.s"
                 asm.write_text(runner(expect))
                 row["source"] = source.read_text()
@@ -118,12 +132,17 @@ def measure(args, report):
                     checked(cc + ["-c", str(definition), "-o", str(absolute_obj)], commands)
                     objects.append(str(absolute_obj))
                 checked([args.lccc, "-shared", "-nostdlib", *objects, "-o", str(so)], commands)
+                # A zero symbol index is not a valid imported PLT target.
+                relas = sections(so).get(".rela.plt", (None, b""))[1]
+                for offset in range(0, len(relas), 24):
+                    _, info, _ = struct.unpack_from("<QQq", relas, offset)
+                    assert info >> 32 != 0, "null-symbol JUMP_SLOT"
                 checked(cc + ["-c", str(asm), "-o", str(runner_obj)], commands)
                 checked([args.linker, "-m", "elf64lriscv", "-pie", "-E", "--dynamic-linker",
                          "/lib/ld-linux-riscv64-lp64d.so.1", str(runner_obj), str(so), "-o", str(exe)], commands)
                 row["file_sha256"] = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
                                       for p in (obj, so, runner_obj, exe)}
-                checked([args.qemu, "-L", str(args.sysroot), str(exe)], commands)
+                checked(["env", "LD_BIND_NOW=1", args.qemu, "-L", str(args.sysroot), str(exe)], commands)
                 row["passed"] = True
             except (AssertionError, OSError, ValueError, subprocess.TimeoutExpired, struct.error) as error:
                 row["error"] = str(error)

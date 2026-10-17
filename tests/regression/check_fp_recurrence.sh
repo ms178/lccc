@@ -20,7 +20,7 @@ for arch in x86-64 x86-64-v3; do
     for opt in 0 1 2 3; do
         CCC_VALIDATE_SSA=1 CCC_VERIFY_IR=abort "$CCC" -O"$opt" -march="$arch" \
             -ffp-contract=off "$src" -lm -o "$work/run"
-        "$work/run" > "$work/actual"
+        "$work/run" > "$work/actual" || { cat "$work/actual" >&2; exit 1; }
         cmp "$work/expected" "$work/actual"
         CCC_VALIDATE_SSA=1 CCC_VERIFY_IR=abort "$CCC" -O"$opt" -march="$arch" \
             -ffp-contract=off "$oracle" -o "$work/oracle"

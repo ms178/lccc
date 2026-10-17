@@ -1371,6 +1371,13 @@ fn dump_helper(
         // Indirect-call value-profile lines. Four slots per site; empty
         // slots carry count 0 (parser skips them; lookup(0) -> "?").
         if let Some(sites) = func_sites.get(fkey) {
+            // One signature string per DISTINCT signature of this function.
+            // The name used to be `sig_{fkey}_{functions.len()}` for every
+            // site -- constant inside this loop -- so a function with two
+            // value-profile sites defined one label twice: invalid assembly
+            // (GAS: "symbol already defined"), and with differing signatures
+            // every site referenced the last string.
+            let mut sig_syms: Vec<(&str, String)> = Vec::new();
             for sr in sites {
                 let sp = Value(next);
                 next += 1;
@@ -1395,8 +1402,20 @@ fn dump_helper(
                     ty: IrType::I64,
                     seg_override: crate::common::types::AddressSpace::Default,
                 });
-                let sig_sym = format!("__lccc_pgo_sig_{}_{}", sanitize(fkey), m.functions.len());
-                m.string_literals.push((sig_sym.clone(), sr.sig.clone()));
+                let sig_sym = match sig_syms.iter().find(|(sig, _)| *sig == sr.sig) {
+                    Some((_, sym)) => sym.clone(),
+                    None => {
+                        let sym = format!(
+                            "__lccc_pgo_sig_{}_{}_{}",
+                            sanitize(fkey),
+                            m.functions.len(),
+                            sig_syms.len()
+                        );
+                        m.string_literals.push((sym.clone(), sr.sig.clone()));
+                        sig_syms.push((sr.sig.as_str(), sym.clone()));
+                        sym
+                    }
+                };
                 for slot in 0..4usize {
                     let ap = Value(next);
                     next += 1;
@@ -1690,6 +1709,7 @@ fn ci(d: Option<Value>, a: Vec<Operand>, t: Vec<IrType>, r: IrType, var: bool) -
         regparm: None,
         is_pure: false,
         is_const: false,
+        assume_library: false,
         ret_eightbyte_classes: vec![],
         ret_is_f128_sse: false,
     }
@@ -2760,6 +2780,85 @@ mod tests {
             "__unit_pgo_lookup",
         );
         crate::passes::validate_unique_defs(&module, "backend:pre-codegen");
+    }
+
+    #[test]
+    fn value_profile_signature_strings_are_per_signature() {
+        // Three indirect-call sites in one function, signatures A, B, A.
+        // Each site must reference the string of ITS signature, and no
+        // label may be defined twice (one name for every site used to give
+        // invalid assembly and, for differing signatures, the last string).
+        let mut module = IrModule::new();
+        let rec: Vec<Rec> = vec![(
+            "unit-f".to_string(),
+            "__unit_counter".to_string(),
+            vec![(1, 2, 0)],
+            0,
+            1,
+            2,
+            0,
+            3,
+        )];
+        let sigs = ["I32:0", "I64:1:I64", "I32:0"];
+        let mut sites: FxHashMap<String, Vec<SiteRec>> = FxHashMap::default();
+        sites.insert(
+            "unit-f".to_string(),
+            sigs.iter()
+                .enumerate()
+                .map(|(ordinal, sig)| SiteRec {
+                    ordinal,
+                    site: format!("__unit_site_{ordinal}"),
+                    sig: sig.to_string(),
+                })
+                .collect(),
+        );
+        dump_helper(
+            &mut module,
+            std::path::Path::new("unit.profraw"),
+            &rec,
+            "__unit_pgo_dump",
+            &sites,
+            "__unit_pgo_lookup",
+        );
+        let sig_strings: Vec<&(String, String)> = module
+            .string_literals
+            .iter()
+            .filter(|(name, _)| name.starts_with("__lccc_pgo_sig_"))
+            .collect();
+        let names: FxHashSet<&String> = sig_strings.iter().map(|(n, _)| n).collect();
+        assert_eq!(
+            names.len(),
+            sig_strings.len(),
+            "a signature label is defined twice"
+        );
+        assert_eq!(sig_strings.len(), 2, "one string per distinct signature");
+        let text_of = |name: &str| {
+            sig_strings
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, t)| t.as_str())
+                .unwrap()
+        };
+        let dump = module
+            .functions
+            .iter()
+            .find(|f| f.name == "__unit_pgo_dump")
+            .unwrap();
+        let mut referenced: Vec<&str> = Vec::new();
+        for inst in dump.blocks.iter().flat_map(|b| &b.instructions) {
+            if let Instruction::GlobalAddr { name, .. } = inst {
+                if name.starts_with("__lccc_pgo_sig_") {
+                    let text = text_of(name);
+                    if referenced.last() != Some(&text) {
+                        referenced.push(text);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            referenced, sigs,
+            "each site must reference its own signature string"
+        );
     }
 
     #[test]

@@ -72,3 +72,31 @@ for opt in -O0 -O1 -O2 -O3 -Os -Oz; do
         done
     done
 done
+
+# A nonnegative signed mask carries a real [0, mask] range under -fwrapv.
+# Keep the TLS store-forwarding opportunity without reinstating signed UB.
+for lanes in 2 8 64 257; do
+    flags=(-O2 -fwrapv -ffp-contract=off -DPASSES=129 -DLANES="$lanes")
+    source=tests/benchmark/programs/tls_seg_access.c
+    gcc "${flags[@]}" "$source" -o "$td/tls-ref"
+    "$ccc" "${flags[@]}" "$source" -o "$td/tls"
+    CCC_NO_IV_WIDEN=1 "$ccc" "${flags[@]}" "$source" -o "$td/tls-off"
+    "$td/tls-ref" > "$td/tls-ref.out"
+    for arm in tls tls-off; do
+        "$td/$arm" > "$td/$arm.out"
+        cmp "$td/tls-ref.out" "$td/$arm.out"
+        if [[ ${LCCC_VERIFY_MEMCHECK:-0} == 1 ]]; then
+            valgrind --quiet --error-exitcode=97 "$td/$arm" > "$td/$arm.vg"
+            cmp "$td/tls-ref.out" "$td/$arm.vg"
+        fi
+    done
+    if [[ $lanes == 64 ]]; then
+        "$ccc" "${flags[@]}" -S "$source" -o "$td/tls.s"
+        awk '/^tls_pass:/{on=1} on{print} /^[[:space:]]*\.size[[:space:]]+tls_pass/{exit}' "$td/tls.s" > "$td/tls-pass.s"
+        [[ -s "$td/tls-pass.s" ]] || { echo 'FAIL: missing tls_pass assembly'; exit 1; }
+        if grep -q 'movslq' "$td/tls-pass.s"; then
+            echo 'FAIL: bounded masked IV still requires repeated sign extension'; exit 1
+        fi
+    fi
+    echo "wrapping signed masked TLS: lanes=$lanes PASS"
+done

@@ -115,7 +115,7 @@ RegListIndexed { regs, index }     -- {v0.s, v1.s}[0] (NEON single-element)
 ```
 parse_asm(text)
   0. Strip C-style /* ... */ block comments
-  1. expand_macros() -- collect .macro/.endm definitions, expand invocations
+  1. asm_preprocess::expand_macros() -- the shared GAS .macro expander (also RISC-V)
      - Supports default parameters, varargs (\()), .purgem
      - Nested macro definitions tracked with depth counter
      - Recursive expansion with 64-level depth limit

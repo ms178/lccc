@@ -44,6 +44,7 @@ and provides enough context to understand the system without reading code.
 | `type_builder.rs`   | Shared AST-to-CType conversion trait                 | Sema, lowering                                 |
 | `const_arith.rs`    | Low-level integer/float constant arithmetic          | Sema const_eval, lowering const_eval           |
 | `const_eval.rs`     | Shared constant expression evaluation logic          | Sema const_eval, lowering const_eval           |
+| `hex_float.rs` | Bounded guard/sticky hexadecimal parsing; direct binary32/64/128 and x87 rounding | lexer, long-double hexadecimal parser |
 | `long_double.rs`    | x87 80-bit and IEEE binary128 arithmetic/conversion  | const_arith, constant_fold pass, IR constants  |
 | `encoding.rs`       | PUA encoding for non-UTF-8 source bytes              | Lexer                                          |
 | `asm_constraints.rs`| Inline asm constraint classification                 | Inline pass, cfg_simplify, backend             |

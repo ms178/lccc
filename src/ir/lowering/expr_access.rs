@@ -1416,6 +1416,8 @@ impl Lowerer {
                     self.collect_enum_constants_scoped(&decl.type_spec);
                     self.lower_local_decl(decl);
                 }
+                // Decided by sema; a static assertion generates nothing.
+                BlockItem::StaticAssert(_) => {}
                 BlockItem::NestedFunction(_) => {
                     // Nested function definitions inside statement
                     // expressions are not lowered here: a definition is not
@@ -1546,6 +1548,9 @@ impl Lowerer {
         if ctype.is_struct_or_union() {
             return self.lower_va_arg_struct(ap_expr, type_spec, &ctype);
         }
+        if ctype.is_vector() {
+            return self.lower_va_arg_vector(ap_expr, type_spec, &ctype);
+        }
 
         use crate::backend::Target;
         let ap_val = if self.target == Target::Riscv64 || self.target == Target::I686 {
@@ -1565,6 +1570,54 @@ impl Lowerer {
             result_ty,
         });
         Operand::Value(dest)
+    }
+
+    /// Lower `va_arg` of a by-value vector. A vector is an aggregate on the
+    /// va_list, never a pointer to one: x86-64 reads it as the SysV class
+    /// its callers pass it with (one 16-byte `%xmm` save slot, GP slots, or
+    /// the overflow area); i686 ext vectors read the carriers their callers
+    /// pass (`CType::i386_ext_vector_arg`); anything else is read like a
+    /// struct of the same size.
+    fn lower_va_arg_vector(
+        &mut self,
+        ap_expr: &Expr,
+        type_spec: &TypeSpecifier,
+        ctype: &CType,
+    ) -> Operand {
+        use crate::backend::Target;
+        use crate::common::types::I386ExtVectorCarrier;
+        match self.target {
+            Target::X86_64 => {
+                let size = ctype.size();
+                let align = self.ctype_align(ctype);
+                let eightbyte_classes = self
+                    .sysv_arg_abi(ctype)
+                    .map(|(classes, _)| classes)
+                    .unwrap_or_default();
+                let ap_val = self.lower_va_list_pointer(ap_expr);
+                let va_list_ptr = self.operand_to_value(ap_val);
+                let dest_ptr =
+                    self.emit_entry_alloca(IrType::Ptr, size.div_ceil(8).max(1) * 8, align, false);
+                self.emit(Instruction::VaArgStruct {
+                    dest_ptr,
+                    va_list_ptr,
+                    size,
+                    align,
+                    eightbyte_classes,
+                });
+                Operand::Value(dest_ptr)
+            }
+            Target::I686 => match ctype.i386_ext_vector_arg() {
+                Some(I386ExtVectorCarrier::Xmm { pieces }) => {
+                    self.lower_i386_va_arg_ext_vector_xmm(ap_expr, ctype, pieces)
+                }
+                Some(I386ExtVectorCarrier::Lanes) => {
+                    self.lower_i386_va_arg_ext_vector_lanes(ap_expr, ctype)
+                }
+                _ => self.lower_va_arg_struct(ap_expr, type_spec, ctype),
+            },
+            _ => self.lower_va_arg_struct(ap_expr, type_spec, ctype),
+        }
     }
 
     /// Lower va_arg for struct/union types.

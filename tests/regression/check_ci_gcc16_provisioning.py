@@ -25,12 +25,17 @@ elif name == 'dpkg-query':
     print('installed' if os.environ.get('READY') == '1' else 'not-installed')
 elif name == 'apt-cache': print('  Candidate: ' + os.environ.get('CANDIDATE', '16.2.0-1'))
 elif name in ('gcc-16', 'g++-16'):
-    if args == ['-dumpfullversion']: print(os.environ.get('GXX_VERSION' if name == 'g++-16' else 'VERSION', '16.2.0'))
+    if args == ['-dumpfullversion']:
+        upgraded = pathlib.Path(os.environ['MOCK_LOG'] + '.installed').exists()
+        version = os.environ.get('UPGRADED_VERSION' if upgraded else 'VERSION', os.environ.get('VERSION', '16.2.0'))
+        print(os.environ.get('GXX_VERSION', version) if name == 'g++-16' else version)
     elif os.environ.get('BANNER_FAIL') == '1': sys.exit(7)
     else: print(name + ' (mock Debian) 16.2.0\nCopyright')
-elif name == 'apt-get' and os.environ.get('APT_FAIL') == '1': sys.exit(9)
-elif name == 'apt-get' and os.environ.get('APT_INSTALL_FAIL') == '1' \
-        and args[:1] == ['install'] and '--dry-run' not in args: sys.exit(9)
+elif name == 'apt-get':
+    if os.environ.get('APT_FAIL') == '1': sys.exit(9)
+    real_install = args[:1] == ['install'] and '--dry-run' not in args
+    if real_install and os.environ.get('APT_INSTALL_FAIL') == '1': sys.exit(9)
+    if real_install: pathlib.Path(os.environ['MOCK_LOG'] + '.installed').touch()
 '''
 
 
@@ -109,6 +114,11 @@ class ProvisioningTests(unittest.TestCase):
         result, commands = self.invoke(READY="1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(any(c[0] in ("apt-get", "apt-cache", "dpkg") for c in commands))
+
+    def test_installed_wrong_minor_is_upgraded_not_mistaken_for_ready(self):
+        result, commands = self.invoke(READY="1", VERSION="16.1.0", UPGRADED_VERSION="16.2.0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any(c[:2] == ["apt-get", "install"] for c in commands))
 
     def test_errors_propagate(self):
         for overrides in ({"VERSION": "15.3.0"}, {"VERSION": "16.1.0"},

@@ -46,6 +46,9 @@ pub struct I686Codegen {
     /// Whether this function returns an i686 integer ExtVector through EAX:EDX:ECX.
     /// The three INTEGER return markers are carried in ret_eightbyte_classes.
     pub(super) current_return_i686_ext_vector_gp3: bool,
+    /// Whether this function returns a 16-byte i386 vector piece in %xmm0
+    /// (IR: I128 with `[Sse, SseUp]` return classes).
+    pub(super) current_return_i686_xmm: bool,
     /// Whether the current function is variadic
     pub(super) is_variadic: bool,
     /// Register allocation results (callee-saved registers: ebx, esi, edi)
@@ -466,6 +469,7 @@ impl I686Codegen {
             state,
             current_return_type: IrType::I32,
             current_return_i686_ext_vector_gp3: false,
+            current_return_i686_xmm: false,
             is_variadic: false,
             reg_assignments: FxHashMap::default(),
             divrem_tail_dests: FxHashSet::default(),
@@ -2722,8 +2726,15 @@ impl ArchCodegen for I686Codegen {
             && ret_eightbyte_classes
                 .iter()
                 .all(|class| *class == crate::common::types::EightbyteClass::Integer);
+        let returns_i686_xmm = return_type == IrType::I128
+            && ret_eightbyte_classes
+                == [
+                    crate::common::types::EightbyteClass::Sse,
+                    crate::common::types::EightbyteClass::SseUp,
+                ];
         if is_fastcall {
             let gp3_dest = returns_i686_ext_vector_gp3.then(|| dest.clone()).flatten();
+            let xmm_dest = returns_i686_xmm.then(|| dest.clone()).flatten();
             self.emit_fastcall(
                 args,
                 arg_types,
@@ -2737,6 +2748,9 @@ impl ArchCodegen for I686Codegen {
             );
             if let Some(dest) = gp3_dest {
                 self.emit_call_store_i686_ext_vector_gp3_result_impl(&dest);
+            }
+            if let Some(dest) = xmm_dest {
+                self.emit_call_store_i686_xmm_result_impl(&dest);
             }
             return;
         }
@@ -2816,6 +2830,9 @@ impl ArchCodegen for I686Codegen {
             self.emit_call_store_result(&dest, return_type);
             if returns_i686_ext_vector_gp3 {
                 self.emit_call_store_i686_ext_vector_gp3_result_impl(&dest);
+            }
+            if returns_i686_xmm {
+                self.emit_call_store_i686_xmm_result_impl(&dest);
             }
         }
     }

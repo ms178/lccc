@@ -21,7 +21,7 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::{SourceManager, Span};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::reexports::{
-    BasicBlock, GlobalInit, Instruction, IrBinOp, IrConst, IrFunction, IrModule, Operand,
+    BasicBlock, CallInfo, GlobalInit, Instruction, IrBinOp, IrConst, IrFunction, IrModule, Operand,
     Terminator, Value,
 };
 use std::collections::hash_map::Entry;
@@ -2435,10 +2435,8 @@ pub fn build_rematerializable_global_addr_set_for(
                         // arm proves the root is used as an argument value.
                         !info.is_sret
                             && !info.is_fastcall
-                            && inline_memcpy_len(func.as_str(), &info.args, info.is_variadic)
-                                .is_none()
-                            && x86_inline_memset_len(func.as_str(), &info.args, info.is_variadic)
-                                .is_none()
+                            && inline_memcpy_len(func.as_str(), info).is_none()
+                            && x86_inline_memset_len(func.as_str(), info).is_none()
                     }
                     // A Copy of the root forwards the ADDRESS VALUE into a
                     // new SSA value (IVSR's recurrence initialization is
@@ -3210,6 +3208,25 @@ struct MulAddFusion {
     negate_addend: bool,
 }
 
+/// A float `Add` whose destination feeds the loop-carried accumulator web
+/// AND whose non-product operand is itself a member of that web: the
+/// reduction step `acc' = acc + product` (either operand order). Splitting
+/// it keeps the multiply off the serial chain. See `detect_mul_add_fusions`.
+fn reduction_step(
+    accumulator_dests: &FxHashSet<u32>,
+    add_dest: u32,
+    product: u32,
+    lhs: &Operand,
+    rhs: &Operand,
+) -> bool {
+    let addend = match (lhs, rhs) {
+        (Operand::Value(v), other) | (other, Operand::Value(v)) if v.0 == product => other,
+        _ => return false,
+    };
+    accumulator_dests.contains(&add_dest)
+        && matches!(addend, Operand::Value(a) if accumulator_dests.contains(&a.0))
+}
+
 fn detect_mul_add_fusions(
     block: &BasicBlock,
     use_counts: &[u32],
@@ -3219,15 +3236,24 @@ fn detect_mul_add_fusions(
     // Integer `acc - a*b` -> msub (AArch64; see supports_fused_int_mul_sub).
     fuse_int_sub: bool,
     // Float Mul;Sub -> fmsub/fnmsub (levkropp e3b21b8f, audited port).
-    // None disables Sub fusion entirely (backend lacks the instruction or
-    // CCC_NO_FMSUB is set); Some(accs) enables it except for destinations
-    // in `accs`: fusing `acc -= a*b` puts the multiply on the loop-carried
-    // serial dependency chain (fmsub latency > fsub latency), a measured
-    // 13% regression on nbody. Such Subs stay split so the multiply issues
-    // independently of the chain.  Every NEGATED family is gated the same
-    // way: `acc += -(a*b)` lowers to Add(Neg(mul), acc) and is the same
-    // program as `acc -= a*b`, so it must not slip past the calibration.
-    fuse_float_sub: Option<&FxHashSet<u32>>,
+    // False when the backend lacks the instruction or CCC_NO_FMSUB is set.
+    fuse_float_sub: bool,
+    // Loop-carried accumulator web (see `accumulator_dests` in
+    // generate_function). Fusing a reduction step `acc' = acc + a*b` puts
+    // the multiply on the accumulator's serial dependency chain: each
+    // iteration pays the FMA latency instead of the add latency, while the
+    // multiply could have issued off-chain. llvm-mca (LLVM 23.1) on the
+    // dot-product body: split 3.0 cycles/iteration on alderlake,
+    // sapphirerapids, znver4 and znver5 vs fused 5.0 (Intel) / 4.0 (AMD).
+    // The plain-Add family is refused only for a true reduction step (see
+    // `reduction_step`), GCC's avoid_fma_chains criterion: when the addend
+    // is loop-invariant and the product itself depends on the recurrence
+    // (mandelbrot's `zi' = 2*zr*zi + ci`) the multiply is ON the chain
+    // anyway and fusion shortens it. The Sub and negated families keep their
+    // measured destination-only calibration (fmsub into an accumulator was a
+    // 13% nbody regression). Integer fusion is unaffected: integer madd/msub
+    // latency equals the multiply's, so no chain grows.
+    accumulator_dests: &FxHashSet<u32>,
 ) -> FxHashMap<usize, MulAddFusion> {
     let mut fusion_map: FxHashMap<usize, MulAddFusion> = FxHashMap::default();
     // `a*b + c*d` must not fuse the first mul with an add whose other
@@ -3294,12 +3320,14 @@ fn detect_mul_add_fusions(
                     product_val = dest.0;
                 }
                 Instruction::BinOp {
+                    dest: add_dest,
                     op: IrBinOp::Add,
                     lhs,
                     rhs,
                     ty,
-                    ..
-                } => {
+                } if !(mul_ty.is_float()
+                    && reduction_step(accumulator_dests, add_dest.0, product_val, lhs, rhs)) =>
+                {
                     add_idx = Some(scan);
                     add_lhs_r = Some(lhs);
                     add_rhs_r = Some(rhs);
@@ -3309,7 +3337,7 @@ fn detect_mul_add_fusions(
                 // Float Sub fusion: `a - b*c` -> fmsub, `b*c - a` -> fnmsub
                 // (both single-rounding, matching GCC -ffp-contract=fast).
                 // Subs whose dest is a loop-carried accumulator stay split
-                // (see fuse_float_sub above).
+                // (see accumulator_dests above).
                 Instruction::BinOp {
                     dest: sub_dest,
                     op: IrBinOp::Sub,
@@ -3318,7 +3346,8 @@ fn detect_mul_add_fusions(
                     ty,
                     ..
                 } if mul_ty.is_float()
-                    && fuse_float_sub.is_some_and(|accs| !accs.contains(&sub_dest.0)) =>
+                    && fuse_float_sub
+                    && !accumulator_dests.contains(&sub_dest.0) =>
                 {
                     add_idx = Some(scan);
                     add_lhs_r = Some(lhs);
@@ -3439,17 +3468,16 @@ fn detect_mul_add_fusions(
         // is `acc -= a*b` in source terms; the nbody calibration rules it).
         let negated = neg_product_idx.is_some() || neg_result_idx.is_some();
         if negated {
-            let Some(accs) = fuse_float_sub else {
+            if !fuse_float_sub {
                 continue;
-            };
-            let partner_dest = block.instructions[next_idx].dest().map(|d| d.0);
+            }
+            // The partner's own dest was gated at the scan; a folded Neg
+            // writes the final value, which must not feed the chain either.
             let final_dest = match neg_result_idx {
                 Some(n) => block.instructions[n].dest().map(|d| d.0),
                 None => None,
             };
-            if partner_dest.is_some_and(|d| accs.contains(&d))
-                || final_dest.is_some_and(|d| accs.contains(&d))
-            {
+            if final_dest.is_some_and(|d| accumulator_dests.contains(&d)) {
                 continue;
             }
         }
@@ -3578,13 +3606,19 @@ fn detect_gap_fma_fusions(
                     // (`p[i].vx -= t * mag` with the accumulator loaded
                     // between the multiply and the subtract).
                     let sub_ok = *partner_op == IrBinOp::Add || fuse_float_sub;
-                    // Accumulator gate mirrors the fmsub/fmadd policy: fusing
-                    // into a loop-carried accumulator lengthens the serial
-                    // dependency chain.
+                    // Accumulator gate mirrors the adjacent detector: a
+                    // plain-Add reduction step (`reduction_step`) and any
+                    // Sub into the accumulator web stay split, since fusing
+                    // them lengthens the serial dependency chain.
+                    let chain_step = if *partner_op == IrBinOp::Add {
+                        reduction_step(accumulator_dests, add_dest.0, mul_dest.0, lhs, rhs)
+                    } else {
+                        accumulator_dests.contains(&add_dest.0)
+                    };
                     if mul_used
                         && add_ty == mul_ty
                         && sub_ok
-                        && !accumulator_dests.contains(&add_dest.0)
+                        && !chain_step
                         && (fp_int.like(mul_ty)
                             || fp_contract.fuse_pair(
                                 fp_tags.get(&mul_dest.0).copied(),
@@ -3914,12 +3948,6 @@ fn pre_size_output_buffer(cg: &mut dyn ArchCodegen, module: &IrModule) {
 }
 
 fn collect_symbol_sets(cg: &mut dyn ArchCodegen, module: &IrModule) {
-    // A14b: publish this module's defined symbols for the const-size
-    // expansion gate.  Same collector as the pass-side rule, so the two
-    // halves of A14 cannot disagree about what this TU defines.
-    crate::backend::libcall_policy::set_module_state(crate::common::builtin::symbol_inventory(
-        module,
-    ));
     let state = cg.state();
     state
         .extern_function_symbols
@@ -4358,8 +4386,15 @@ pub(crate) fn destlen_covers_n(destlen: &IrConst, n: i64) -> bool {
 }
 
 /// `Some(n)` if this call is a fixed-size memcpy we may expand inline.
-pub(crate) fn inline_memcpy_len(func: &str, args: &[Operand], is_variadic: bool) -> Option<usize> {
-    if is_variadic || args.len() < 3 {
+///
+/// Expansion replaces the call with the library function's semantics, so
+/// it requires `CallInfo::assume_library`: the call is spelled
+/// `__builtin_memcpy`, was created by the compiler, or the builtin policy
+/// (`-fno-builtin`, `-ffreestanding`, a TU definition or redirect of
+/// `memcpy`) permits treating the plain name as the library function.
+pub(crate) fn inline_memcpy_len(func: &str, info: &CallInfo) -> Option<usize> {
+    let (args, is_variadic) = (&info.args, info.is_variadic);
+    if !info.assume_library || is_variadic || args.len() < 3 {
         return None;
     }
     let n = match args.get(2) {
@@ -4367,10 +4402,7 @@ pub(crate) fn inline_memcpy_len(func: &str, args: &[Operand], is_variadic: bool)
         _ => return None,
     };
     match func {
-        // A14a/b: expand only while the callee still is the builtin.
-        "memcpy" if crate::backend::libcall_policy::may_assume_builtin("memcpy") => {
-            Some(n as usize)
-        }
+        "memcpy" => Some(n as usize),
         "__memcpy_chk" => {
             if args.len() < 4 {
                 return None;
@@ -4390,13 +4422,11 @@ pub(crate) fn inline_memcpy_len(func: &str, args: &[Operand], is_variadic: bool)
 /// consults the CPU tuning row); this helper only answers the shape
 /// question so the x86 emitter and the MachInst typed-call gate agree on
 /// exactly the same set of calls.  `__memset_chk` is admitted only when the
-/// fortify `destlen` covers `n` (same rule as `inline_memcpy_len`).
-pub(crate) fn inline_memset_const_len(
-    func: &str,
-    args: &[Operand],
-    is_variadic: bool,
-) -> Option<usize> {
-    if is_variadic || args.len() < 3 {
+/// fortify `destlen` covers `n` (same rule as `inline_memcpy_len`), and
+/// only for an `assume_library` call (also the same rule).
+pub(crate) fn inline_memset_const_len(func: &str, info: &CallInfo) -> Option<usize> {
+    let (args, is_variadic) = (&info.args, info.is_variadic);
+    if !info.assume_library || is_variadic || args.len() < 3 {
         return None;
     }
     let n = match args.get(2) {
@@ -4404,10 +4434,7 @@ pub(crate) fn inline_memset_const_len(
         _ => return None,
     };
     match func {
-        // A14a/b: expand only while the callee still is the builtin.
-        "memset" if crate::backend::libcall_policy::may_assume_builtin("memset") => {
-            Some(n as usize)
-        }
+        "memset" => Some(n as usize),
         "__memset_chk" => {
             if args.len() < 4 {
                 return None;
@@ -4443,13 +4470,9 @@ fn call_result_is_used(cg: &dyn ArchCodegen, v: &Value) -> bool {
 /// consulted by the x86 emitter *and* by the register allocator's
 /// parameter-home policy (`regalloc::x86_param_caller_homes_safe`), so the
 /// two can never disagree about whether a call instruction is a real call.
-pub(crate) fn x86_inline_memset_len(
-    func: &str,
-    args: &[Operand],
-    is_variadic: bool,
-) -> Option<usize> {
+pub(crate) fn x86_inline_memset_len(func: &str, info: &CallInfo) -> Option<usize> {
     use crate::backend::x86::cpu_model::{CopyStrategy, active};
-    let n = inline_memset_const_len(func, args, is_variadic)?;
+    let n = inline_memset_const_len(func, info)?;
     match active().memset_strategy(n, 16) {
         CopyStrategy::LibCall => None,
         _ => Some(n),
@@ -4738,7 +4761,7 @@ fn generate_function(
                 crate::ir::intrinsics::IntrinsicOp::FmaF64x4
                 | crate::ir::intrinsics::IntrinsicOp::FmaF64x4Hoisted
                 | crate::ir::intrinsics::IntrinsicOp::FmaF64x4SIB
-                | crate::ir::intrinsics::IntrinsicOp::FmaF64x4HoistedSIB
+                | crate::ir::intrinsics::IntrinsicOp::FmaF64x4HoistedSIB | crate::ir::intrinsics::IntrinsicOp::MulAddF64x4HoistedSIB
                 | crate::ir::intrinsics::IntrinsicOp::FmaF64x2
                 | crate::ir::intrinsics::IntrinsicOp::FmaF64x2Hoisted
                 | crate::ir::intrinsics::IntrinsicOp::VecZeroF64x4
@@ -4801,10 +4824,11 @@ fn generate_function(
 
     let entry_label = func.blocks.first().map(|b| b.label);
 
-    // Loop-carried accumulator destinations for the fmsub gate (levkropp
-    // e3b21b8f, audited). Fusing `acc -= a*b` into fmsub puts the multiply
-    // on the accumulator's serial dependency chain (fmsub latency > fsub),
-    // measured 13% regression on nbody. Recognized accumulators: memory-
+    // Loop-carried accumulator destinations for the float-fusion gate
+    // (levkropp e3b21b8f, audited; extended to every float family). Fusing
+    // `acc ±= a*b` puts the multiply on the accumulator's serial dependency
+    // chain (FMA latency > add latency; fmsub measured a 13% nbody
+    // regression). Recognized accumulators: memory-
     // promoted loop F64 phis, surviving Phi dests, multi-Copy dests (the
     // phi-web shape after phi elimination), and — transitively — values
     // COPIED INTO any accumulator (the backedge source sits on the same
@@ -5262,11 +5286,8 @@ fn generate_function(
             cg.fp_contract(),
             &func.fp_expr_tags,
             cg.supports_fused_int_mul_sub(),
-            if cg.supports_fused_float_mul_sub() && !env_flag_set("CCC_NO_FMSUB") {
-                Some(&accumulator_dests)
-            } else {
-                None
-            },
+            cg.supports_fused_float_mul_sub() && !env_flag_set("CCC_NO_FMSUB"),
+            &accumulator_dests,
         );
         // Gap-fused fmadd (levkropp 2e57bcf2, audited port): Mul, [Load/GEP
         // x1-2], Add. The fmadd is emitted at the Add, so the multiply
@@ -6545,7 +6566,7 @@ fn generate_instruction_body(
             // emit_inline_memcpy_call is an EMPTY body.
             // __memcpy_chk is inlined only when destlen covers n.
             let inline_len = if cg.supports_inline_memcpy_call() {
-                inline_memcpy_len(func.as_str(), &info.args, info.is_variadic)
+                inline_memcpy_len(func.as_str(), info)
             } else {
                 None
             };
@@ -6565,7 +6586,7 @@ fn generate_instruction_body(
             // tuning row (X86Tune::memset_strategy) whether straight-line
             // stores, a vector loop or `rep stosb` beat the libc call; it
             // answers None for sizes above the L3-derived libcall bound.
-            if let Some(size) = cg.inline_memset_len(func.as_str(), &info.args, info.is_variadic) {
+            if let Some(size) = cg.inline_memset_len(func.as_str(), info) {
                 let result = info.dest.filter(|d| call_result_is_used(cg, d));
                 cg.emit_inline_memset_call(&info.args[0], &info.args[1], size, result.as_ref());
                 clobber_after_call_like(cg);
@@ -7812,8 +7833,6 @@ mod reg_offset_sym_map_tests {
 #[cfg(test)]
 mod remat_call_arg_tests {
     use super::*;
-    use crate::common::builtin::BuiltinPolicy;
-    use crate::ir::reexports::CallInfo;
 
     fn function_with_global_addr_call(
         args: Vec<Operand>,
@@ -7840,6 +7859,9 @@ mod remat_call_arg_tests {
                         num_fixed_args: 1,
                         is_sret,
                         is_fastcall,
+                        // A call to the library function (`memset` here
+                        // must be eligible for inline expansion).
+                        assume_library: true,
                         ..Default::default()
                     },
                 },
@@ -7855,28 +7877,6 @@ mod remat_call_arg_tests {
         let mut map = FxHashMap::default();
         map.insert(0, "g".to_string());
         map
-    }
-
-    /// Run `f` in the world a real compilation is in: the driver published
-    /// the builtin policy and the module published exactly these `defined`
-    /// symbols (`libcall_policy::published_policy_for_test`).
-    ///
-    /// The remat set is built from the same predicate that decides the
-    /// const-size inline expansion, and that predicate fails closed before
-    /// publication — without the window a test would observe "no module has
-    /// been compiled yet" rather than the engine's behaviour, and the
-    /// no-definition window is the shape of a translation unit that only
-    /// *uses* the builtin.
-    fn with_module_definitions<T>(defined: &[&str], f: impl FnOnce() -> T) -> T {
-        let inventory = crate::common::builtin::SymbolInventory {
-            defined: defined.iter().map(|name| name.to_string()).collect(),
-            ..crate::common::builtin::SymbolInventory::default()
-        };
-        let _window = crate::backend::libcall_policy::published_policy_for_test(
-            crate::common::builtin::BuiltinPolicy::default(),
-            inventory,
-        );
-        f()
     }
 
     #[test]
@@ -7904,9 +7904,7 @@ mod remat_call_arg_tests {
             false,
             false,
         );
-        let set = with_module_definitions(&[], || {
-            build_rematerializable_global_addr_set_for(&func, &global_addr_map())
-        });
+        let set = build_rematerializable_global_addr_set_for(&func, &global_addr_map());
         assert!(!set.contains(&0));
     }
 
@@ -7917,7 +7915,9 @@ mod remat_call_arg_tests {
         // callee is no longer the library's), so it travels the
         // remat-capable call emitter and the root must stay in the set —
         // the exclusion tracks the expansion decision, not the call shape.
-        let func = function_with_global_addr_call(
+        // `passes::builtin_policy::apply` leaves `assume_library` unset on
+        // a call to a TU-defined name.
+        let mut func = function_with_global_addr_call(
             vec![
                 Operand::Value(Value(0)),
                 Operand::Value(Value(1)),
@@ -7927,9 +7927,11 @@ mod remat_call_arg_tests {
             false,
             false,
         );
-        let set = with_module_definitions(&["memcpy"], || {
-            build_rematerializable_global_addr_set_for(&func, &global_addr_map())
-        });
+        let Instruction::Call { info, .. } = &mut func.blocks[0].instructions[1] else {
+            unreachable!()
+        };
+        info.assume_library = false;
+        let set = build_rematerializable_global_addr_set_for(&func, &global_addr_map());
         assert!(
             set.contains(&0),
             "a TU-defined memcpy is not inline-expanded: the root must be rematerializable"
@@ -7949,27 +7951,19 @@ mod remat_call_arg_tests {
             Operand::Const(IrConst::I32(0)),
             Operand::Const(IrConst::I64(16)),
         ];
-        let func = function_with_global_addr_call(args.clone(), "memset", false, false);
-        for defined in [&[][..], &["memset"][..]] {
-            let (set, inlined) = with_module_definitions(defined, || {
-                (
-                    build_rematerializable_global_addr_set_for(&func, &global_addr_map()),
-                    x86_inline_memset_len("memset", &args, false).is_some(),
-                )
-            });
-            assert_eq!(set.contains(&0), !inlined, "defined={defined:?}");
-        }
-
-        let mut withdrawn = crate::common::builtin::BuiltinPolicy::default();
-        withdrawn.withdraw_one("memset");
-        let _window = crate::backend::libcall_policy::published_policy_for_test(
-            withdrawn,
-            crate::common::builtin::SymbolInventory::default(),
-        );
+        let mut func = function_with_global_addr_call(args.clone(), "memset", false, false);
         let set = build_rematerializable_global_addr_set_for(&func, &global_addr_map());
-        let inlined = x86_inline_memset_len("memset", &args, false).is_some();
-        assert!(!inlined, "a withdrawn memset must not be expanded");
+        let Instruction::Call { info, .. } = &mut func.blocks[0].instructions[1] else {
+            unreachable!()
+        };
+        let inlined = x86_inline_memset_len("memset", info).is_some();
         assert_eq!(set.contains(&0), !inlined);
+        // A plain `memset` the builtin policy withdrew is a real call: never
+        // expanded, so its GlobalAddr argument stays rematerializable.
+        info.assume_library = false;
+        assert!(x86_inline_memset_len("memset", info).is_none());
+        let set = build_rematerializable_global_addr_set_for(&func, &global_addr_map());
+        assert!(set.contains(&0));
     }
 
     #[test]

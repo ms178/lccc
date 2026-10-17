@@ -68,7 +68,10 @@ class SnapshotPolicyTests(unittest.TestCase):
             self.assertEqual(p.returncode, 2, p.stderr)
             self.assertIn('LCCC_SNAPSHOT_ALLOW_PRUNE=1', p.stderr)
 
-    def snapshot_roundtrip(self, keep):
+    def test_xz_source_snapshot(self):
+        self.snapshot_roundtrip(keep=None, xz=True)
+
+    def snapshot_roundtrip(self, keep, xz=False):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td); repo = root / 'repo'; repo.mkdir()
             def git(*args):
@@ -82,6 +85,7 @@ class SnapshotPolicyTests(unittest.TestCase):
             env = dict(os.environ, LCCC_REPO=str(repo), LCCC_ARTIFACTS=str(root/'art'),
                        LCCC_DELIVERABLE=str(root/'ms178-1.patch'), LCCC_SNAPSHOT_UNGATED='1',
                        LCCC_BASE_REF=base)
+            env['LCCC_SOURCE_ARCHIVE_XZ'] = '1' if xz else '0'
             env.pop('LCCC_BULK_ARTIFACTS', None)
             env.pop('LCCC_SNAPSHOT_KEEP', None)
             env.pop('LCCC_SNAPSHOT_ALLOW_PRUNE', None)
@@ -93,12 +97,18 @@ class SnapshotPolicyTests(unittest.TestCase):
                                    env=env, capture_output=True, text=True, timeout=45)
                 self.assertEqual(p.returncode, 0, p.stderr)
             art = root / 'art'
+            import hashlib, json, tarfile
+            metadata = json.loads((art / 'SOURCE_ARCHIVE.json').read_text())
+            archive = art / metadata['archive']
+            self.assertEqual(archive.suffix, '.xz' if xz else '.gz')
+            self.assertEqual(hashlib.sha256(archive.read_bytes()).hexdigest(), metadata['archive_sha256'])
+            with tarfile.open(archive, 'r:*') as source:
+                self.assertEqual(source.extractfile('lccc/a.txt').read(), b'change 2\n')
             self.assertFalse((art / 'ms178-1.patch').exists())
             self.assertFalse((art / 'series').exists())
             snapshots = sorted(art.glob('ms178-1.S*.patch.gz'))
             self.assertEqual(len(snapshots), 3 if keep is None else keep)
             self.assertEqual(gzip.decompress(snapshots[-1].read_bytes()), (root/'ms178-1.patch').read_bytes())
-            self.assertIn(b'change 2', gzip.decompress((art/'lccc-src.tar.gz').read_bytes()))
             recovered = root/'recovered'
             subprocess.run(['git', 'init', '-q', str(recovered)], check=True)
             subprocess.run(['git','-C',str(recovered),'fetch','-q','--depth=1',str(repo),base],check=True)

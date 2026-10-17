@@ -124,8 +124,26 @@ t=$(total "$work/nofma.s")
 p=$(packed "$work/fast.s")
 [[ $p -eq 4 ]] || bad "-ffp-contract=fast: $p packed FMAs, want 4 (is contract=off frozen?)"
 
+note "contract 3b: unfused AVX2 keeps packed work without contracting"
+for mode in off nofma; do
+    for insn in vmulpd vaddpd; do
+        n=$(awk -v op="$insn" '$1 == op && /%ymm/ { n++ } END { print n+0 }' "$work/$mode.s")
+        [[ $n -eq 4 ]] || bad "$mode: $n packed $insn, want four separately-rounded chunks"
+    done
+done
+"$GCC" -O0 -ffp-contract=off "$here/vectorize_unfused_matmul.c" -o "$work/unfused-ref"
+ref_unfused=$("$work/unfused-ref")
+for mode in -ffp-contract=off -mno-fma; do
+    "$CCC" $flags "$mode" "$here/vectorize_unfused_matmul.c" -o "$work/unfused-got"
+    got_unfused=$("$work/unfused-got")
+    [[ "$ref_unfused" == "$got_unfused" ]] || bad "$mode: two-rounding/tail/canary mismatch: $got_unfused != $ref_unfused"
+done
+
 note "contract 4: unproven shapes do not reach the packed arm"
 for src in call side_exit; do
+    "$CCC" $flags -ffp-contract=off -S -o "$work/$src-off.s" "$work/$src.c"
+    n=$(awk '$1 == "vmulpd" && /%ymm/ { n++ } END { print n+0 }' "$work/$src-off.s")
+    [[ $n -eq 0 ]] || bad "$src: unfused packed rewrite bypassed legality proof"
     p=$(packed "$work/$src.s")
     [[ $p -eq 0 ]] || bad "$src: $p packed FMAs despite the unproven shape"
     s=$(grep -c 'vfmadd' "$work/$src.s" || true)
@@ -164,6 +182,11 @@ EOF
 ref=$(timeout 120 "$work/ref") || bad "gcc oracle exited non-zero"
 got=$(timeout 120 "$work/got") || bad "lccc probe exited non-zero"
 [[ "$ref" == "$got" ]] || bad "inclusive bound: lccc=$got oracle=$ref"
+
+# Constant-power division must retain exact rounding/exception behavior; this
+# also keeps the matrix initialization's strength reduction non-vacuous.
+python3 "$root/scripts/check_fp_pow2_div.py" --lccc "$CCC" --gcc "$GCC" || bad "power-of-two division contract"
+python3 "$root/scripts/check_hex_float_oracles.py" --lccc "$CCC" --gcc "$GCC" --clang "${CLANG:-clang}" || bad "hexadecimal literal oracle"
 
 if [[ $fail -ne 0 ]]; then
     echo "check_fma_gating: FAILED" >&2

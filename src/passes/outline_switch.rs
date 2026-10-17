@@ -1323,6 +1323,9 @@ fn remap_call_info(info: &CallInfo, remap_op: &dyn Fn(&Operand) -> Operand) -> C
         regparm: None,
         is_pure: info.is_pure,
         is_const: info.is_const,
+        // A remapped call is the same call: it still reaches (or not) the
+        // library function.
+        assume_library: info.assume_library,
         ret_eightbyte_classes: info.ret_eightbyte_classes.clone(),
         ret_is_f128_sse: info.ret_is_f128_sse,
     }
@@ -1467,6 +1470,7 @@ fn replace_case_with_call(
                 regparm: None,
                 is_pure: false,
                 is_const: false,
+                assume_library: false,
                 ret_eightbyte_classes: Vec::new(),
                 ret_is_f128_sse: false,
             },
@@ -1511,6 +1515,7 @@ fn replace_case_with_call(
                 regparm: None,
                 is_pure: false,
                 is_const: false,
+                assume_library: false,
                 ret_eightbyte_classes: Vec::new(),
                 ret_is_f128_sse: false,
             },

@@ -23,15 +23,10 @@ pub enum CommentStyle {
     Hash,
     /// `#` and `//` (RISC-V GAS)
     HashAndSlashSlash,
-    /// `//` and `@` (ARM GAS — but `@` is not a comment before type specifiers
-    /// like `@function`, `@object`, `@progbits`, `@nobits`, `@tls_object`, `@note`)
-    /// Currently the ARM assembler uses its own strip_comment; this variant will
-    /// be used when ARM migrates to the shared preprocessor.
-    // Dead in production builds (nothing constructs it yet); kept live by the
-    // `strip_comment` test matrix. `expect` therefore applies only outside
-    // `cfg(test)` so the deadness assertion stays compiler-enforced in every
-    // shipped configuration while test builds see a genuinely used variant.
-    #[cfg_attr(all(not(test), not(feature = "gcc_assembler")), expect(dead_code))]
+    /// `//` and `@` (the ARM assembler's macro expansion) -- but `@` is not a
+    /// comment before type specifiers like `@function`, `@object`,
+    /// `@progbits`, `@nobits`, `@tls_object`, `@note`, nor in the macro
+    /// counter `\@`.
     SlashSlashAndAt,
 }
 
@@ -135,7 +130,8 @@ pub fn strip_comment<'a>(line: &'a str, style: &CommentStyle) -> &'a str {
                 if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
                     return &line[..i];
                 }
-                if bytes[i] == b'@' {
+                if bytes[i] == b'@' && !(i > 0 && bytes[i - 1] == b'\\') {
+                    // `\@` is GAS's macro invocation counter, not a comment.
                     // `@` is NOT a comment before type specifiers used in GAS directives
                     let after = &line[i + 1..];
                     if !after.starts_with("object")
@@ -651,42 +647,140 @@ pub(crate) fn expand_rept_blocks_with_insn_size(
 
 // ── .macro / .endm expansion ───────────────────────────────────────────
 
-/// Macro definition: name, parameter list (with optional defaults), and body lines.
+/// One `.macro` parameter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MacroParam {
+    pub(crate) name: String,
+    /// `name=default`, used when the invocation omits the argument.
+    pub(crate) default: Option<String>,
+    /// `name:req`: omitting the argument is an error.
+    pub(crate) required: bool,
+    /// `name:vararg`: takes every remaining positional argument.
+    pub(crate) vararg: bool,
+}
+
+/// A `.macro` definition.
 pub(crate) struct MacroDef {
-    params: Vec<String>,
-    defaults: Vec<Option<String>>,
-    /// Index of the `name:vararg` parameter, if any: it swallows all
-    /// remaining invocation arguments (comma-joined) rather than binding
-    /// to a single one. GAS requires it to be the last parameter.
-    vararg_index: Option<usize>,
+    /// As written in `.macro`, for diagnostics.
+    name: String,
+    params: Vec<MacroParam>,
     body: Vec<String>,
 }
 
 impl MacroDef {
-    /// The replacement text for parameter `pi` given invocation args.
+    /// Bind an invocation's arguments (as comma fields of whitespace-separated
+    /// tokens, see [`split_macro_arg_fields`]) to the parameters, the way GAS
+    /// 2.47 does -- every rule below was measured on the pinned oracle:
     ///
-    /// GAS `:vararg` semantics: the vararg parameter expands to ALL
-    /// remaining arguments joined with ", " (an empty list expands to the
-    /// empty string). Without this, `.macro _xor_data vecs:vararg` invoked
-    /// as `_xor_data 0,1,2,3,4,5,6,7` bound `\vecs` to just `0`, so the
-    /// `.irp i, \vecs` round loop silently emitted one iteration instead of
-    /// eight — the assembled AES-CTR code was missing 7/8 of its rounds.
-    /// Every other parameter binds positionally, falling back to its
-    /// declared default and then to "0" when the caller omits it.
-    fn replacement_for(&self, args: &[String], pi: usize) -> String {
-        if self.vararg_index == Some(pi) {
-            return if pi < args.len() {
-                args[pi..].join(", ")
-            } else {
-                String::new()
-            };
+    /// * positional arguments fill parameters left to right, and one past the
+    ///   last parameter is "too many positional arguments";
+    /// * `param=value` binds by name (whitespace around `=` is closed by
+    ///   [`split_macro_arg_fields`]); a keyword naming no parameter is an error, a
+    ///   repeated keyword takes the last value, and a positional argument
+    ///   after a keyword is "can't mix positional and keyword arguments";
+    /// * quotes around a keyword value are stripped, as for positional ones;
+    /// * a `:vararg` parameter takes the remaining positional arguments as
+    ///   GAS writes them: tokens of one comma field joined by a space, fields
+    ///   by a comma (`V 1, 2 3,4` gives `2 3,4`). `.macro _xor_data
+    ///   vecs:vararg` invoked as `_xor_data 0,1,2,3,4,5,6,7` must hand all
+    ///   eight rounds to `.irp i, \vecs` (binding just `0` once dropped 7/8 of
+    ///   the AES-CTR rounds);
+    /// * an omitted argument takes its default, else is an error for
+    ///   `:req`, else the EMPTY string -- the earlier `"0"` turned
+    ///   `.byte \a\b` with `b` omitted into `70`.
+    fn bind(&self, fields: &[Vec<String>]) -> Result<Vec<String>, String> {
+        bind_macro_args(&self.name, &self.params, fields)
+    }
+}
+
+/// See [`MacroDef::bind`]; shared with the x86 expander.
+pub(crate) fn bind_macro_args(
+    macro_name: &str,
+    params: &[MacroParam],
+    fields: &[Vec<String>],
+) -> Result<Vec<String>, String> {
+    let mut named: Vec<Option<String>> = vec![None; params.len()];
+    let mut positional: Vec<(usize, String)> = Vec::new();
+    for (field, args) in fields.iter().enumerate() {
+        for arg in args {
+            if let Some(eq) = find_toplevel_eq(arg) {
+                let key = arg[..eq].trim();
+                if is_macro_param_name(key) {
+                    let Some(pi) = params.iter().position(|p| p.name == key) else {
+                        return Err(format!(
+                            "Parameter named `{key}' does not exist for macro `{macro_name}'"
+                        ));
+                    };
+                    named[pi] = Some(strip_arg_quotes(arg[eq + 1..].trim()).to_string());
+                    continue;
+                }
+            }
+            if named.iter().any(Option::is_some) {
+                return Err("can't mix positional and keyword arguments".to_string());
+            }
+            positional.push((field, arg.clone()));
         }
-        args.get(pi).cloned().unwrap_or_else(|| {
-            self.defaults
-                .get(pi)
-                .and_then(|d| d.clone())
-                .unwrap_or_else(|| "0".to_string())
-        })
+    }
+    let mut positional = positional.into_iter();
+    let mut values = Vec::with_capacity(params.len());
+    for (param, named) in params.iter().zip(named) {
+        let given = if param.vararg {
+            let rest = join_vararg(positional.by_ref());
+            named.or((!rest.is_empty()).then_some(rest))
+        } else {
+            named.or_else(|| {
+                positional
+                    .next()
+                    .map(|(_, arg)| strip_arg_quotes(&arg).to_string())
+            })
+        };
+        let value = match (given, &param.default) {
+            (Some(v), _) => v,
+            (None, Some(d)) => d.clone(),
+            (None, None) if param.required => {
+                return Err(format!(
+                    "Missing value for required parameter `{}' of macro `{macro_name}'",
+                    param.name
+                ));
+            }
+            (None, None) => String::new(),
+        };
+        values.push(value);
+    }
+    if positional.next().is_some() {
+        return Err("too many positional arguments".to_string());
+    }
+    Ok(values)
+}
+
+/// The text a `:vararg` parameter receives, see [`bind_macro_args`].
+fn join_vararg(args: impl Iterator<Item = (usize, String)>) -> String {
+    let mut out = String::new();
+    let mut last_field = None;
+    for (field, arg) in args {
+        if let Some(prev) = last_field {
+            out.push(if prev == field { ' ' } else { ',' });
+        }
+        out.push_str(&arg);
+        last_field = Some(field);
+    }
+    out
+}
+
+/// Whether `s` can name a macro parameter (a GAS symbol-name token).
+fn is_macro_param_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, '_' | '.' | '$'))
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$'))
+}
+
+fn strip_arg_quotes(s: &str) -> &str {
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        &s[1..s.len() - 1]
+    } else {
+        s
     }
 }
 
@@ -726,37 +820,38 @@ fn find_toplevel_eq(s: &str) -> Option<usize> {
 /// `.macro FILL_RETURN_BUFFER reg:req nr:req ftr:req ftr2=...` left every
 /// `\ftr` unexpanded in the macro body.
 ///
-/// Returns the bare name and whether the token declared `:vararg`.
-fn split_param_qualifier(tok: &str) -> (String, bool) {
-    match tok.split_once(':') {
-        Some((base, qual)) if matches!(qual, "req" | "vararg") && !base.is_empty() => {
-            (base.to_string(), qual == "vararg")
-        }
-        _ => (tok.to_string(), false),
+/// Returns the parameter with its qualifier applied and no default.
+fn split_param_qualifier(tok: &str) -> MacroParam {
+    let (name, qual) = match tok.split_once(':') {
+        Some((base, qual)) if matches!(qual, "req" | "vararg") && !base.is_empty() => (base, qual),
+        _ => (tok, ""),
+    };
+    MacroParam {
+        name: name.to_string(),
+        default: None,
+        required: qual == "req",
+        vararg: qual == "vararg",
     }
 }
 
-/// Parse macro parameter list, handling `param = default_value` syntax.
+/// Split the operands of `.macro` into the macro name and its parameters.
+pub(crate) fn parse_macro_header(rest: &str) -> (&str, Vec<MacroParam>) {
+    match rest.find([' ', '\t', ',']) {
+        Some(pos) => (
+            &rest[..pos],
+            parse_macro_params(rest[pos..].trim().trim_start_matches(',')),
+        ),
+        None => (rest, Vec::new()),
+    }
+}
+
+/// Parse a macro parameter list, handling `param = default_value` syntax.
 ///
 /// GAS allows parameters like `enable = 1` where `1` is the default value
 /// used when the caller omits that argument. Parameters are separated by
-/// commas or whitespace. Returns the names, their defaults, and the index
-/// of the `:vararg` parameter (if any).
-fn parse_macro_params(params_str: &str) -> (Vec<String>, Vec<Option<String>>, Option<usize>) {
-    if params_str.is_empty() {
-        return (Vec::new(), Vec::new(), None);
-    }
+/// commas or whitespace.
+fn parse_macro_params(params_str: &str) -> Vec<MacroParam> {
     let mut params = Vec::new();
-    let mut defaults = Vec::new();
-    let mut vararg_index = None;
-    let mut push_param = |name: String, is_vararg: bool, default: Option<String>| {
-        if is_vararg && vararg_index.is_none() {
-            vararg_index = Some(params.len());
-        }
-        params.push(name);
-        defaults.push(default);
-    };
-
     // Split on TOP-LEVEL commas only: a parameter default may itself contain
     // commas inside parentheses. The kernel's
     //     .macro FILL_RETURN_BUFFER reg:req nr:req ftr:req ftr2=ALT_NOT(X86_FEATURE_ALWAYS)
@@ -768,88 +863,174 @@ fn parse_macro_params(params_str: &str) -> (Vec<String>, Vec<Option<String>>, Op
         if part.is_empty() {
             continue;
         }
-        // Check for `param = default_value` syntax.
-        //
         // Only the FIRST `=` at paren depth 0 separates the name from the
-        // default; everything after it belongs to the default, spaces included.
-        // The tokens before it are additional parameters (GAS allows
+        // default; everything after it belongs to the default, spaces
+        // included. The tokens before it are further parameters (GAS allows
         // whitespace as a separator), but the default itself must never be
-        // whitespace-split: the kernel writes
-        //     .macro FILL_RETURN_BUFFER ... ftr2=ALT_NOT(X86_FEATURE_ALWAYS)
-        // whose default expands to `(((1 << 0) << 16) | ((3*32+21)))`. Treating
-        // the spaces inside it as parameter separators invented parameters
-        // named `<<` and `0)` and left `\ftr2` expanding to the fragment
-        // `(((1`, which then reached `.4byte` as an unparsable expression.
-        if let Some(eq_pos) = find_toplevel_eq(part) {
-            let param_name = part[..eq_pos].trim();
-            let default_val = part[eq_pos + 1..].trim();
-            // The param name might contain spaces (e.g., "enable = 1")
-            // Take the last whitespace-delimited token as the param name
-            // in case there are multiple tokens before the =
-            let tokens: Vec<&str> = param_name.split_whitespace().collect();
-            if tokens.len() > 1 {
-                // Everything before the last token are separate params with no default
-                for t in &tokens[..tokens.len() - 1] {
-                    let (name, is_vararg) = split_param_qualifier(t);
-                    push_param(name, is_vararg, None);
-                }
+        // whitespace-split: treating the spaces inside
+        // `(((1 << 0) << 16) | ((3*32+21)))` as separators invented
+        // parameters named `<<` and `0)` and left `\ftr2` expanding to `(((1`.
+        let (names, default) = match find_toplevel_eq(part) {
+            Some(eq) => (part[..eq].trim(), Some(part[eq + 1..].trim())),
+            None => (part, None),
+        };
+        let tokens: Vec<&str> = names.split_whitespace().collect();
+        for (i, tok) in tokens.iter().enumerate() {
+            let mut param = split_param_qualifier(tok);
+            if i + 1 == tokens.len() {
+                param.default = default.map(str::to_string);
             }
-            if let Some(last) = tokens.last() {
-                if !last.is_empty() {
-                    let (name, is_vararg) = split_param_qualifier(last);
-                    push_param(name, is_vararg, Some(default_val.to_string()));
-                }
-            }
-        } else {
-            // No default value - may contain space-separated params
-            for token in part.split_whitespace() {
-                if !token.is_empty() {
-                    let (name, is_vararg) = split_param_qualifier(token);
-                    push_param(name, is_vararg, None);
-                }
-            }
+            params.push(param);
         }
     }
-    (params, defaults, vararg_index)
+    params
 }
 
-/// Split macro invocation arguments, matching GNU as behavior.
-///
-/// GAS treats both commas and whitespace as argument separators. Specifically:
-/// 1. Split on commas first (respecting parentheses and quotes)
-/// 2. Within each comma-separated field, further split on whitespace
-/// 3. However, tokens connected by arithmetic/bitwise operators (`+`, `-`, `*`,
-///    `/`, `%`, `|`, `&`, `^`, `<<`, `>>`, `~`) are kept as a single expression
-///    argument with internal spaces stripped.
-///
-/// Examples:
-/// - `lb a5, 0(a1), 10f` → [`lb`, `a5`, `0(a1)`, `10f`]
-/// - `886b, 888f, 0x1234, 0, 889f - 888f` → [`886b`, `888f`, `0x1234`, `0`, `889f-888f`]
-/// - `a b c` → [`a`, `b`, `c`]
-///
-/// Quoted strings are kept as a single argument with outer quotes stripped.
-/// Parenthesized groups like `0(a1)` are kept together.
-pub fn split_macro_args(s: &str) -> Vec<String> {
-    if s.is_empty() {
-        return Vec::new();
+/// How GAS's input scrubber separates whitespace-delimited macro arguments
+/// on a target (see [`split_macro_arg_fields`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MacroArgLexing {
+    /// x86: `-`, `*`, `(`, `[`, `%` and `$` begin an operand
+    /// (`-8(%rbp)`, `*%rax`, `$1`), so whitespace before them separates.
+    X86,
+    /// AArch64 and RISC-V: only symbol characters do.
+    Generic,
+}
+
+impl MacroArgLexing {
+    fn word_start(self, c: char) -> bool {
+        is_macro_word_char(c) || (self == Self::X86 && matches!(c, '-' | '*' | '(' | '[' | '%'))
     }
 
-    // Step 1: Split on commas (respecting parens and quotes) to get comma fields.
-    let comma_fields = split_on_commas_raw(s);
+    fn word_end(self, c: char) -> bool {
+        is_macro_word_char(c) || (self == Self::X86 && matches!(c, '-' | '*'))
+    }
+}
 
-    // Step 2: Within each comma field, split on whitespace (respecting parens),
-    // then merge expression tokens connected by operators.
-    let mut args = Vec::new();
-    for field in &comma_fields {
-        let trimmed = field.trim();
-        if trimmed.is_empty() {
+fn is_macro_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$' | '@' | '"' | '\'' | '\\')
+}
+
+/// Split macro invocation arguments the way the AArch64/RISC-V GAS does;
+/// see [`split_macro_arg_fields`].
+pub fn split_macro_args(s: &str) -> Vec<String> {
+    split_macro_arg_fields(s, MacroArgLexing::Generic).concat()
+}
+
+/// Split macro invocation arguments into comma fields of arguments, as GAS
+/// 2.47 does (every rule measured on x86-64, AArch64 and RISC-V):
+///
+/// * a top-level comma ends a field (commas inside parentheses, strings and
+///   character literals do not);
+/// * whitespace separates two arguments only between a character that can
+///   end a word and one that can begin a word ([`MacroArgLexing`]); next to
+///   anything else it disappears: `1 + 2`, `(1) (2)` and `%hi(x) %lo(y)` are
+///   one argument everywhere, `1 -1` and `x0 [x1]` are one on AArch64/RISC-V
+///   but two on x86, and `a b`, `1 $2`, `1 "x"` are two everywhere;
+/// * a character literal `'x` (optionally closed `'x'`) is data, even a
+///   space or comma (`pr 'r', '8', ' ', ':', %r8` in relocate_kernel_64.S),
+///   and becomes its decimal value, as GAS's scrubber writes it: `' '` is
+///   `32`, `'\n'` is `10`; only `\b \f \n \r \t` are escapes, any other
+///   escaped character is itself (`'\v` is `118`, `'\101` is `49` then `01`).
+///
+/// Quotes are kept; [`MacroDef::bind`] strips them from argument values.
+pub(crate) fn split_macro_arg_fields(s: &str, lexing: MacroArgLexing) -> Vec<Vec<String>> {
+    let mut fields: Vec<Vec<String>> = Vec::new();
+    let mut field: Vec<String> = Vec::new();
+    let mut arg = String::new();
+    let (mut depth, mut in_str) = (0i32, false);
+    let mut chars = s.chars().peekable();
+    // GAS's scrubber has already replaced a character literal by its decimal
+    // value, and drops the whitespace after one (`',' 2` is `442`).
+    let mut after_char_literal = false;
+    fn end_arg(arg: &mut String, field: &mut Vec<String>) {
+        let a = arg.trim();
+        if !a.is_empty() {
+            field.push(a.to_string());
+        }
+        arg.clear();
+    }
+    while let Some(c) = chars.next() {
+        if in_str {
+            arg.push(c);
+            match c {
+                '\\' => arg.extend(chars.next()),
+                '"' => in_str = false,
+                _ => {}
+            }
             continue;
         }
-        let sub_tokens = split_field_on_whitespace(trimmed);
-        let merged = merge_expression_tokens(&sub_tokens);
-        args.extend(merged);
+        if !c.is_whitespace() {
+            after_char_literal = false;
+        }
+        match c {
+            '"' => {
+                in_str = true;
+                arg.push(c);
+            }
+            '\'' => {
+                let value = match chars.next() {
+                    Some('\\') => chars.next().map(|e| match e {
+                        'b' => '\u{8}',
+                        'f' => '\u{c}',
+                        'n' => '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        other => other,
+                    }),
+                    other => other,
+                };
+                chars.next_if_eq(&'\'');
+                match value {
+                    Some(v) if v.is_ascii() => {
+                        arg.push_str(&u32::from(v).to_string());
+                        after_char_literal = true;
+                        continue;
+                    }
+                    // GAS writes the first UTF-8 byte of a non-ASCII literal,
+                    // which a `String` cannot hold; keep the literal as written.
+                    Some(v) => {
+                        arg.push('\'');
+                        arg.push(v);
+                    }
+                    None => arg.push('\''),
+                }
+            }
+            '(' => {
+                depth += 1;
+                arg.push(c);
+            }
+            ')' => {
+                depth -= 1;
+                arg.push(c);
+            }
+            ',' if depth <= 0 => {
+                end_arg(&mut arg, &mut field);
+                if !field.is_empty() {
+                    fields.push(std::mem::take(&mut field));
+                }
+            }
+            c if c.is_whitespace() => {
+                while chars.next_if(|c| c.is_whitespace()).is_some() {}
+                let (Some(prev), Some(&next)) = (arg.chars().last(), chars.peek()) else {
+                    continue;
+                };
+                if !after_char_literal && lexing.word_end(prev) && lexing.word_start(next) {
+                    if depth > 0 {
+                        arg.push(' ');
+                    } else {
+                        end_arg(&mut arg, &mut field);
+                    }
+                }
+            }
+            _ => arg.push(c),
+        }
     }
-    args
+    end_arg(&mut arg, &mut field);
+    if !field.is_empty() {
+        fields.push(field);
+    }
+    fields
 }
 
 /// Split a string on top-level commas (outside parens and quotes).
@@ -924,320 +1105,199 @@ fn split_on_commas_raw(s: &str) -> Vec<String> {
     fields
 }
 
-/// Split a single comma field on whitespace, respecting parenthesized groups
-/// and quoted strings.
-fn split_field_on_whitespace(s: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    let mut paren_depth = 0i32;
-
-    while i < bytes.len() {
-        match bytes[i] {
-            b'(' => {
-                paren_depth += 1;
-                current.push('(');
-            }
-            b')' => {
-                paren_depth -= 1;
-                current.push(')');
-            }
-            b'"' => {
-                // Consume quoted string, stripping outer quotes
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'"' {
-                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                        current.push(bytes[i + 1] as char);
-                        i += 2;
-                        continue;
-                    }
-                    current.push(bytes[i] as char);
-                    i += 1;
-                }
-                // Skip closing quote
-            }
-            b'\'' => {
-                // GAS character literal: 'x (optionally closed: 'x'). The
-                // byte after the quote is data, even a space or comma
-                // (`movb $' ', %bl` in relocate_kernel_64.S). Copy the whole
-                // literal through verbatim so it never splits the token.
-                current.push('\'');
-                if i + 1 < bytes.len() {
-                    if bytes[i + 1] == b'\\' && i + 2 < bytes.len() {
-                        current.push('\\');
-                        current.push(bytes[i + 2] as char);
-                        i += 2;
-                    } else {
-                        current.push(bytes[i + 1] as char);
-                        i += 1;
-                    }
-                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                        current.push('\'');
-                        i += 1;
-                    }
-                }
-            }
-            b' ' | b'\t' if paren_depth == 0 => {
-                let trimmed = current.trim().to_string();
-                if !trimmed.is_empty() {
-                    tokens.push(trimmed);
-                    current.clear();
-                }
-                // Skip remaining whitespace
-                while i + 1 < bytes.len() && (bytes[i + 1] == b' ' || bytes[i + 1] == b'\t') {
-                    i += 1;
-                }
-            }
-            _ => {
-                current.push(bytes[i] as char);
-            }
-        }
-        i += 1;
-    }
-    let trimmed = current.trim().to_string();
-    if !trimmed.is_empty() {
-        tokens.push(trimmed);
-    }
-    tokens
-}
-
-/// Check if a token looks like an arithmetic/bitwise operator that connects
-/// expression parts in GAS macro arguments.
-fn is_expression_operator(token: &str) -> bool {
-    matches!(
-        token,
-        "+" | "-" | "*" | "/" | "%" | "|" | "&" | "^" | "~" | "<<" | ">>" | "!" | "||" | "&&"
-    )
-}
-
-/// Check if a token ends with an operand character (digit, letter, `_`, `.`, `)`),
-/// indicating it could be the left-hand side of a binary operator expression.
-fn ends_with_operand(token: &str) -> bool {
-    let bytes = token.as_bytes();
-    if bytes.is_empty() {
-        return false;
-    }
-    let last = bytes[bytes.len() - 1];
-    last.is_ascii_alphanumeric() || last == b'_' || last == b'.' || last == b')'
-}
-
-/// Check if a token ends with an operator character, indicating the expression
-/// continues into the next token.
-fn ends_with_operator(token: &str) -> bool {
-    let bytes = token.as_bytes();
-    if bytes.is_empty() {
-        return false;
-    }
-    let last = bytes[bytes.len() - 1];
-    matches!(
-        last,
-        b'+' | b'-' | b'*' | b'/' | b'%' | b'|' | b'&' | b'^' | b'~'
-    )
-}
-
-/// Check if a token starts with an operator character that could be a binary
-/// operator connecting it to the preceding token (e.g., `-888f` after `889f`).
-/// Only treats leading `-`/`+` as binary operators when preceded by an operand.
-fn starts_with_binary_operator(token: &str) -> bool {
-    let bytes = token.as_bytes();
-    if bytes.is_empty() {
-        return false;
-    }
-    let first = bytes[0];
-    matches!(
-        first,
-        b'+' | b'-' | b'*' | b'/' | b'%' | b'|' | b'&' | b'^' | b'~'
-    )
-}
-
-/// Merge tokens that form arithmetic/bitwise expressions.
-///
-/// When tokens are: `[889f, -, 888f]`, merge to `[889f-888f]`.
-/// When tokens are: `[889f, +, 888f]`, merge to `[889f+888f]`.
-/// When tokens are: `[lb, a5]`, keep as `[lb, a5]` (no operator).
-/// When tokens are: `[a, -4, b]`, keep as `[a, -4, b]` (unary minus, not binary).
-///
-/// Context-awareness: a leading `-`/`+` on the next token is only treated as
-/// a binary operator if the current merged token ends with an operand character
-/// (digit, letter, `_`, `.`, `)`). This prevents false merges like `a-4`.
-fn merge_expression_tokens(tokens: &[String]) -> Vec<String> {
-    if tokens.is_empty() {
-        return Vec::new();
-    }
-    if tokens.len() == 1 {
-        return tokens.to_vec();
-    }
-
-    let mut result = Vec::new();
-    let mut i = 0;
-
-    while i < tokens.len() {
-        let mut merged = tokens[i].clone();
-        // Look ahead: if next token is an operator or starts with one, merge
-        while i + 1 < tokens.len() {
-            let next = &tokens[i + 1];
-            if is_expression_operator(next) && ends_with_operand(&merged) {
-                // Standalone operator token (e.g., `-`, `+`): merge it and the
-                // following operand, but only if current token looks like an operand
-                merged.push_str(next);
-                i += 1;
-                if i + 1 < tokens.len() {
-                    merged.push_str(&tokens[i + 1]);
-                    i += 1;
-                }
-            } else if starts_with_binary_operator(next) && ends_with_operand(&merged) {
-                // Next token starts with operator (e.g., `-888f`) and current
-                // ends with operand — treat as binary expression continuation
-                merged.push_str(next);
-                i += 1;
-            } else if ends_with_operator(&merged) {
-                // Current ends with operator (e.g., `889f+`), merge with next
-                merged.push_str(next);
-                i += 1;
-            } else {
-                break;
-            }
-        }
-        result.push(merged);
-        i += 1;
-    }
-    result
-}
-
 /// Expand `.macro`/`.endm` definitions and macro invocations.
 ///
-/// Two-pass approach:
-/// 1. Collect macro definitions (`.macro name [params]` ... `.endm`)
-/// 2. Expand macro invocations: lines where the first word matches a defined macro
-///
-/// Handles nested macro definitions and recursive expansion.
+/// Definitions take effect in order, including ones made by an expanded
+/// macro body (a macro may define macros); `.purgem` removes one. An
+/// invocation may follow any number of labels (`a: b: M 7`), as in GAS.
 pub fn expand_macros(lines: &[&str], comment_style: &CommentStyle) -> Result<Vec<String>, String> {
-    expand_macros_at(lines, comment_style, 0, &mut ExpansionTotals::default())
+    expand_macros_counted(lines, comment_style, &mut ExpansionTotals::default())
 }
 
-/// Test-only view of the depth-carrying core below, with the caller's own
-/// accumulator.  [`expand_macros`] owns its [`ExpansionTotals`] internally, and
-/// the nested-billing law is a statement about that accumulator, not about the
-/// returned lines -- without this seam the only way to observe it is to expand
-/// several megabytes of text and watch which side of the ceiling refuses.
-#[cfg(test)]
+/// [`expand_macros`] charging the caller's own accumulator. The nested-billing
+/// law is a statement about that accumulator, not about the returned lines --
+/// without this seam the only way to observe it is to expand several
+/// megabytes of text and watch which side of the ceiling refuses.
 pub(crate) fn expand_macros_counted(
     lines: &[&str],
     comment_style: &CommentStyle,
     totals: &mut ExpansionTotals,
 ) -> Result<Vec<String>, String> {
-    expand_macros_at(lines, comment_style, 0, totals)
+    let mut run = MacroRun {
+        macros: crate::common::fx_hash::FxHashMap::default(),
+        comment_style,
+        totals,
+        invocations: 0,
+    };
+    run.expand(lines, 0)
 }
 
-/// Depth-carrying core of [`expand_macros`].  `depth` counts live macro
-/// frames; GAS 2.47 fatals the 102nd with `macros nested too deeply`
-/// (101-frame chains assemble — measured on the pinned oracle), and
-/// without the counter a self-referential macro recurses until the
-/// native stack overflows, which is a crash, never a verdict.
-fn expand_macros_at(
-    lines: &[&str],
-    comment_style: &CommentStyle,
-    depth: u32,
-    totals: &mut ExpansionTotals,
-) -> Result<Vec<String>, String> {
-    use crate::common::fx_hash::FxHashMap;
-    let mut macros: FxHashMap<String, MacroDef> = FxHashMap::default();
-    let mut result = Vec::new();
-    let mut i = 0;
+/// The state of one [`expand_macros`] run.
+struct MacroRun<'a> {
+    macros: crate::common::fx_hash::FxHashMap<String, MacroDef>,
+    comment_style: &'a CommentStyle,
+    totals: &'a mut ExpansionTotals,
+    /// GAS `\@`: macro invocations so far in this run.
+    invocations: u64,
+}
 
-    while i < lines.len() {
-        let trimmed = strip_comment(lines[i], comment_style).trim().to_string();
-        if trimmed.starts_with(".macro ") || trimmed.starts_with(".macro\t") {
-            // Parse: .macro name [param1[, param2, ...]]
-            let rest = trimmed[".macro".len()..].trim();
-            let (name, params_str) = match rest.find([' ', '\t', ',']) {
-                Some(pos) => (
-                    rest[..pos].trim(),
-                    rest[pos..].trim().trim_start_matches(','),
-                ),
-                None => (rest, ""),
-            };
-            let (params, defaults, vararg_index) = parse_macro_params(params_str);
-            let mut body = Vec::new();
-            let mut depth = 1;
-            i += 1;
-            while i < lines.len() {
-                let inner = strip_comment(lines[i], comment_style).trim().to_string();
-                if inner.starts_with(".macro ") || inner.starts_with(".macro\t") {
-                    depth += 1;
-                } else if inner == ".endm"
-                    || inner.starts_with(".endm ")
-                    || inner.starts_with(".endm\t")
-                {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                }
-                body.push(lines[i].to_string());
-                i += 1;
-            }
-            macros.insert(
-                name.to_string(),
-                MacroDef {
-                    params,
-                    defaults,
-                    vararg_index,
-                    body,
-                },
-            );
-        } else if trimmed == ".endm"
-            || trimmed.starts_with(".endm ")
-            || trimmed.starts_with(".endm\t")
-        {
-            // stray .endm — skip
-        } else if trimmed.starts_with(".purgem ") || trimmed.starts_with(".purgem\t") {
-            // Remove a macro definition (GAS .purgem directive)
-            let name = trimmed[".purgem".len()..].trim();
-            macros.remove(name);
-        } else if !trimmed.is_empty() && !trimmed.starts_with('.') && !trimmed.starts_with('#') {
-            let first_word = trimmed.split([' ', '\t']).next().unwrap_or("");
-            let potential_name = first_word.trim_end_matches(':');
-            if potential_name != first_word {
-                // It's a label, not a macro invocation
-                result.push(lines[i].to_string());
-            } else if let Some(mac) = macros.get(potential_name) {
-                let args_str = trimmed[first_word.len()..].trim();
-                let args = split_macro_args(args_str);
-                // Sort parameter indices by name length (longest first) to avoid
-                // partial substitution: e.g., \orig must not match before \orig_len.
-                let mut sorted_indices: Vec<usize> = (0..mac.params.len()).collect();
-                sorted_indices.sort_by(|&a, &b| mac.params[b].len().cmp(&mac.params[a].len()));
-                let mut expanded_lines = Vec::new();
-                for body_line in &mac.body {
-                    let mut expanded = body_line.clone();
-                    for &pi in &sorted_indices {
-                        let param = &mac.params[pi];
-                        let pattern = format!("\\{}", param);
-                        let replacement = mac.replacement_for(&args, pi);
-                        expanded = replace_macro_param(&expanded, &pattern, &replacement);
-                    }
-                    // Strip GAS macro argument delimiters: \() resolves to empty string.
-                    // Used to separate parameter names from adjacent text,
-                    // e.g., \op\()_safe_regs -> rdmsr_safe_regs
-                    expanded = expanded.replace("\\()", "");
-                    expanded_lines.push(expanded);
-                }
-                let refs: Vec<&str> = expanded_lines.iter().map(|s| s.as_str()).collect();
-                let re_expanded =
-                    expand_macros_with(&refs, &macros, comment_style, depth + 1, totals)?;
-                totals.charge(".macro", &re_expanded)?;
-                result.extend(re_expanded);
-            } else {
-                result.push(lines[i].to_string());
-            }
-        } else {
-            result.push(lines[i].to_string());
+impl MacroRun<'_> {
+    /// Expand `lines` in macro frame `depth`. GAS 2.47 fatals the 102nd
+    /// live frame with `macros nested too deeply` (101-frame chains assemble
+    /// -- measured on the pinned oracle); without the bound a
+    /// self-referential macro recurses until the native stack overflows,
+    /// which is a crash, never a verdict.
+    fn expand(&mut self, lines: &[&str], depth: u32) -> Result<Vec<String>, String> {
+        if depth > 101 {
+            return Err("macros nested too deeply".to_string());
         }
-        i += 1;
+        // GAS expands statements, not lines: `EMIT val=7 ; EMIT val=9` in a
+        // macro body is two invocations, and the second must neither be
+        // swallowed as arguments of the first nor be left unexpanded.
+        let statements = split_statements(lines, self.comment_style);
+        let lines: Vec<&str> = statements.iter().map(|s| s.as_ref()).collect();
+        let mut result = Vec::new();
+        let mut i = 0;
+        while i < lines.len() {
+            let stmt = strip_comment(lines[i], self.comment_style).trim();
+            if let Some(rest) = directive_operands(stmt, ".macro") {
+                let (name, params) = parse_macro_header(rest);
+                let mut body = Vec::new();
+                let mut nesting = 1;
+                i += 1;
+                while i < lines.len() {
+                    let inner = strip_comment(lines[i], self.comment_style).trim();
+                    if directive_operands(inner, ".macro").is_some() {
+                        nesting += 1;
+                    } else if directive_operands(inner, ".endm").is_some() {
+                        nesting -= 1;
+                        if nesting == 0 {
+                            break;
+                        }
+                    }
+                    body.push(lines[i].to_string());
+                    i += 1;
+                }
+                let def = MacroDef {
+                    name: name.to_string(),
+                    params,
+                    body,
+                };
+                self.macros.insert(name.to_string(), def);
+            } else if directive_operands(stmt, ".endm").is_some() {
+                // A stray `.endm` closes nothing.
+            } else if let Some(name) = directive_operands(stmt, ".purgem") {
+                self.macros.remove(name);
+            } else {
+                let (labels, invocation) = split_leading_labels(stmt);
+                let name = invocation.split([' ', '\t']).next().unwrap_or("");
+                match self.macros.get(name) {
+                    Some(mac) if !name.starts_with('.') => {
+                        let body = self.instantiate(mac, invocation[name.len()..].trim())?;
+                        self.invocations += 1;
+                        result.extend(labels.iter().map(|l| l.to_string()));
+                        let refs: Vec<&str> = body.iter().map(String::as_str).collect();
+                        let expanded = self.expand(&refs, depth + 1)?;
+                        self.totals.charge(".macro", &expanded)?;
+                        result.extend(expanded);
+                    }
+                    _ => result.push(lines[i].to_string()),
+                }
+            }
+            i += 1;
+        }
+        Ok(result)
     }
-    Ok(result)
+
+    /// The body of `mac` for one invocation with `args`: parameters bound
+    /// ([`MacroDef::bind`]) and substituted, `\()` removed and `\@`
+    /// replaced. `\@` is numbered BEFORE the body's own invocations
+    /// (pre-order: `M` = 0, its inner `I` = 1, the next `M` = 2), so every
+    /// expansion gets unique local labels such as `.L\@`.
+    fn instantiate(&self, mac: &MacroDef, args: &str) -> Result<Vec<String>, String> {
+        let values = mac.bind(&split_macro_arg_fields(args, MacroArgLexing::Generic))?;
+        let counter = self.invocations.to_string();
+        // Longest name first, so `\orig` never matches inside `\orig_len`.
+        let mut order: Vec<usize> = (0..mac.params.len()).collect();
+        order.sort_by_key(|&pi| std::cmp::Reverse(mac.params[pi].name.len()));
+        Ok(mac
+            .body
+            .iter()
+            .map(|line| {
+                let mut line = line.clone();
+                for &pi in &order {
+                    let pattern = format!("\\{}", mac.params[pi].name);
+                    line = replace_macro_param(&line, &pattern, &values[pi]);
+                }
+                // `\()` separates a parameter from adjacent text
+                // (`\op\()_safe_regs` -> `rdmsr_safe_regs`) and is empty.
+                line.replace("\\()", "").replace("\\@", &counter)
+            })
+            .collect())
+    }
+}
+
+/// `lines` with every multi-statement line (`a ; b`, outside strings and
+/// after `style`'s comment) split into its statements. A single-statement
+/// line is kept verbatim, comment included, so it reaches the parser as
+/// written.
+fn split_statements<'l>(lines: &[&'l str], style: &CommentStyle) -> Vec<std::borrow::Cow<'l, str>> {
+    let mut out = Vec::with_capacity(lines.len());
+    for &line in lines {
+        let code = strip_comment(line, style);
+        let mut parts = Vec::new();
+        let (mut start, mut in_str, mut escaped) = (0, false, false);
+        for (i, c) in code.char_indices() {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' if in_str => escaped = true,
+                '"' => in_str = !in_str,
+                ';' if !in_str => {
+                    parts.push(&code[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        if parts.is_empty() {
+            out.push(std::borrow::Cow::Borrowed(line));
+            continue;
+        }
+        parts.push(&code[start..]);
+        out.extend(
+            parts
+                .into_iter()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| std::borrow::Cow::Owned(s.to_string())),
+        );
+    }
+    out
+}
+
+/// The operands of `stmt` when it is the directive `name` (`name` alone or
+/// followed by whitespace), else `None`.
+fn directive_operands<'s>(stmt: &'s str, name: &str) -> Option<&'s str> {
+    let rest = stmt.strip_prefix(name)?;
+    (rest.is_empty() || rest.starts_with([' ', '\t'])).then(|| rest.trim())
+}
+
+/// Split the `label:` definitions off the front of a statement. GAS accepts
+/// any number before a macro invocation (`a: b: M 7`, `1: M 8`).
+fn split_leading_labels(stmt: &str) -> (Vec<&str>, &str) {
+    let mut labels = Vec::new();
+    let mut rest = stmt;
+    loop {
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$')))
+            .unwrap_or(rest.len());
+        let after = &rest[end..];
+        if end == 0 || !after.starts_with(':') || after.starts_with("::") {
+            return (labels, rest);
+        }
+        labels.push(&rest[..=end]);
+        rest = after[1..].trim_start();
+    }
 }
 
 /// Replace `\param` in a macro body line with the argument value, but only
@@ -1275,60 +1335,6 @@ pub fn replace_macro_param(text: &str, pattern: &str, replacement: &str) -> Stri
         }
     }
     result
-}
-
-/// Re-expand macro invocations using already-collected macro definitions.
-fn expand_macros_with(
-    lines: &[&str],
-    macros: &crate::common::fx_hash::FxHashMap<String, MacroDef>,
-    comment_style: &CommentStyle,
-    depth: u32,
-    totals: &mut ExpansionTotals,
-) -> Result<Vec<String>, String> {
-    // Frame entry: the GAS 2.47 nesting wall (see `expand_macros_at`).
-    if depth > 101 {
-        return Err("macros nested too deeply".to_string());
-    }
-    let mut result = Vec::new();
-    for line in lines {
-        let trimmed = strip_comment(line, comment_style).trim().to_string();
-        if trimmed.is_empty() || trimmed.starts_with('.') || trimmed.starts_with('#') {
-            result.push(line.to_string());
-            continue;
-        }
-        let first_word = trimmed.split([' ', '\t']).next().unwrap_or("");
-        let potential_name = first_word.trim_end_matches(':');
-        if potential_name != first_word {
-            result.push(line.to_string());
-        } else if let Some(mac) = macros.get(potential_name) {
-            let args_str = trimmed[first_word.len()..].trim();
-            let args = split_macro_args(args_str);
-            // Sort parameter indices by name length (longest first) to avoid
-            // partial substitution: e.g., \orig must not match before \orig_len.
-            let mut sorted_indices: Vec<usize> = (0..mac.params.len()).collect();
-            sorted_indices.sort_by(|&a, &b| mac.params[b].len().cmp(&mac.params[a].len()));
-            let mut expanded_lines = Vec::new();
-            for body_line in &mac.body {
-                let mut expanded = body_line.clone();
-                for &pi in &sorted_indices {
-                    let param = &mac.params[pi];
-                    let pattern = format!("\\{}", param);
-                    let replacement = mac.replacement_for(&args, pi);
-                    expanded = replace_macro_param(&expanded, &pattern, &replacement);
-                }
-                // Strip GAS macro argument delimiters: \() resolves to empty string
-                expanded = expanded.replace("\\()", "");
-                expanded_lines.push(expanded);
-            }
-            let refs: Vec<&str> = expanded_lines.iter().map(|s| s.as_str()).collect();
-            let re_expanded = expand_macros_with(&refs, macros, comment_style, depth + 1, totals)?;
-            totals.charge(".macro", &re_expanded)?;
-            result.extend(re_expanded);
-        } else {
-            result.push(line.to_string());
-        }
-    }
-    Ok(result)
 }
 
 // ── .if / .else / .endif conditional assembly ──────────────────────────
@@ -1678,52 +1684,6 @@ fn find_top_level_op(s: &str, op: &str) -> Option<usize> {
 
 // ── Shared data-value helpers ──────────────────────────────────────────
 
-/// Check if a string looks like a GNU numeric label reference (e.g. "2f", "1b", "42f").
-pub fn is_numeric_label_ref(s: &str) -> bool {
-    if s.len() < 2 {
-        return false;
-    }
-    let last = s.as_bytes()[s.len() - 1];
-    if last != b'f' && last != b'F' && last != b'b' && last != b'B' {
-        return false;
-    }
-    s[..s.len() - 1].bytes().all(|b| b.is_ascii_digit())
-}
-
-/// Find the position of the `-` operator in a symbol difference expression
-/// like `sym_a - sym_b`. Skips position 0 to avoid matching a leading negation.
-///
-/// Returns `None` if no valid symbol difference operator is found.
-pub fn find_symbol_diff_minus(expr: &str) -> Option<usize> {
-    let bytes = expr.as_bytes();
-    let len = bytes.len();
-    let mut i = 1;
-    while i < len {
-        if bytes[i] == b'-' {
-            let left_char = bytes[i - 1];
-            let left_ok = left_char.is_ascii_alphanumeric()
-                || left_char == b'_'
-                || left_char == b'.'
-                || left_char == b' '
-                || left_char == b')';
-            let right_start = expr[i + 1..].trim_start();
-            if !right_start.is_empty() {
-                let right_char = right_start.as_bytes()[0];
-                let right_ok = right_char.is_ascii_alphabetic()
-                    || right_char == b'_'
-                    || right_char == b'.'
-                    || right_char.is_ascii_digit()
-                    || right_char == b'(';
-                if left_ok && right_ok {
-                    return Some(i);
-                }
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1962,10 +1922,11 @@ mod tests {
     /// A macro that calls itself twice per frame is the exponential shape.  It
     /// must answer with the depth diagnostic in bounded time -- the error
     /// propagates out of the first over-deep frame, so nothing is materialized
-    /// along the way.
+    /// along the way.  (Two statements: `d d` is ONE call of `d` with a
+    /// surplus argument, which GAS 2.47 rejects before recursing.)
     #[test]
     fn self_doubling_macro_is_refused_not_materialized() {
-        let src = ".macro d\n d d\n.endm\nd\n";
+        let src = ".macro d\n d\n d\n.endm\nd\n";
         let err = expand_macros(&src.lines().collect::<Vec<_>>(), &CommentStyle::Hash)
             .expect_err("must not expand");
         assert!(err.contains("macros nested too deeply"), "got: {err}");
@@ -2249,21 +2210,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_numeric_label_ref() {
-        assert!(is_numeric_label_ref("1f"));
-        assert!(is_numeric_label_ref("42b"));
-        assert!(!is_numeric_label_ref("f"));
-        assert!(!is_numeric_label_ref("abc"));
-    }
-
-    #[test]
-    fn test_find_symbol_diff_minus() {
-        assert_eq!(find_symbol_diff_minus("a - b"), Some(2));
-        assert_eq!(find_symbol_diff_minus("-5"), None);
-        assert_eq!(find_symbol_diff_minus(".Lfoo-.Lbar"), Some(5));
-    }
-
-    #[test]
     fn test_split_macro_args() {
         assert_eq!(split_macro_args("a, b, c"), vec!["a", "b", "c"]);
         assert_eq!(split_macro_args("0(a1), x, y"), vec!["0(a1)", "x", "y"]);
@@ -2289,58 +2235,65 @@ mod tests {
         assert_eq!(split_macro_args("889f -888f"), vec!["889f-888f"]);
     }
 
+    /// `(name, default, required, vararg)` of each parameter.
+    fn param_shapes(params: &str) -> Vec<(String, Option<String>, bool, bool)> {
+        parse_macro_params(params)
+            .into_iter()
+            .map(|p| (p.name, p.default, p.required, p.vararg))
+            .collect()
+    }
+
+    fn plain(name: &str) -> (String, Option<String>, bool, bool) {
+        (name.to_string(), None, false, false)
+    }
+
     #[test]
     fn test_parse_macro_params_simple() {
-        let (params, defaults, _va) = parse_macro_params("a, b, c");
-        assert_eq!(params, vec!["a", "b", "c"]);
-        assert_eq!(defaults, vec![None, None, None]);
+        assert_eq!(
+            param_shapes("a, b, c"),
+            [plain("a"), plain("b"), plain("c")]
+        );
+        assert_eq!(param_shapes("a b c"), [plain("a"), plain("b"), plain("c")]);
+        assert!(param_shapes("").is_empty());
     }
 
     #[test]
     fn test_parse_macro_params_with_defaults() {
-        let (params, defaults, _va) = parse_macro_params("a, b = 5, c");
-        assert_eq!(params, vec!["a", "b", "c"]);
-        assert_eq!(defaults, vec![None, Some("5".to_string()), None]);
-    }
-
-    #[test]
-    fn test_parse_macro_params_space_separated() {
-        let (params, defaults, _va) = parse_macro_params("a b c");
-        assert_eq!(params, vec!["a", "b", "c"]);
-        assert_eq!(defaults, vec![None, None, None]);
-    }
-
-    #[test]
-    fn test_parse_macro_params_mixed() {
+        let five = ("b".to_string(), Some("5".to_string()), false, false);
+        assert_eq!(param_shapes("a, b = 5, c"), [plain("a"), five, plain("c")]);
         // GAS-style: `.macro ALT_NEW_CONTENT vendor_id, patch_id, enable = 1, new_c`
-        let (params, defaults, _va) = parse_macro_params("vendor_id, patch_id, enable = 1, new_c");
-        assert_eq!(params, vec!["vendor_id", "patch_id", "enable", "new_c"]);
-        assert_eq!(defaults, vec![None, None, Some("1".to_string()), None]);
+        let enable = ("enable".to_string(), Some("1".to_string()), false, false);
+        assert_eq!(
+            param_shapes("vendor_id, patch_id, enable = 1, new_c"),
+            [
+                plain("vendor_id"),
+                plain("patch_id"),
+                enable,
+                plain("new_c")
+            ]
+        );
+        // A default keeps its spaces and parentheses, and the names before it
+        // are separate parameters (the kernel's FILL_RETURN_BUFFER).
+        let flags = (
+            "flags".to_string(),
+            Some("(((1 << 4) | ( 3*32+21)))".to_string()),
+            false,
+            false,
+        );
+        assert_eq!(
+            param_shapes("reg nr flags=(((1 << 4) | ( 3*32+21)))"),
+            [plain("reg"), plain("nr"), flags]
+        );
     }
 
     #[test]
-    fn test_parse_macro_params_empty() {
-        let (params, defaults, _va) = parse_macro_params("");
-        assert!(params.is_empty());
-        assert!(defaults.is_empty());
-    }
-
-    #[test]
-    fn test_parse_macro_params_vararg() {
-        let (params, defaults, va) = parse_macro_params("vecs:vararg");
-        assert_eq!(params, vec!["vecs"]);
-        assert_eq!(defaults, vec![None]);
-        assert_eq!(va, Some(0));
-
-        let (params, defaults, va) = parse_macro_params("a, rest:vararg");
-        assert_eq!(params, vec!["a", "rest"]);
-        assert_eq!(defaults, vec![None, None]);
-        assert_eq!(va, Some(1));
-
-        // :req stays a plain mandatory parameter (no vararg semantics)
-        let (params, _defaults, va) = parse_macro_params("reg:req, nr:req");
-        assert_eq!(params, vec!["reg", "nr"]);
-        assert_eq!(va, None);
+    fn test_parse_macro_params_qualifiers() {
+        let vecs = ("vecs".to_string(), None, false, true);
+        assert_eq!(param_shapes("vecs:vararg"), [vecs]);
+        let rest = ("rest".to_string(), None, false, true);
+        assert_eq!(param_shapes("a, rest:vararg"), [plain("a"), rest]);
+        let req = |n: &str| (n.to_string(), None, true, false);
+        assert_eq!(param_shapes("reg:req, nr:req"), [req("reg"), req("nr")]);
     }
 
     #[test]
@@ -2361,7 +2314,7 @@ mod tests {
         assert!(
             result
                 .iter()
-                .any(|l| l.replace('\t', " ").contains(".irp i, 10, 20, 30")),
+                .any(|l| l.replace('\t', " ").contains(".irp i, 10,20,30")),
             "vararg substitution incomplete: {result:?}"
         );
     }
@@ -2489,6 +2442,102 @@ mod tests {
         assert_eq!(
             replace_macro_param("\\op\\()_safe_regs", "\\op", "rdmsr"),
             "rdmsr\\()_safe_regs"
+        );
+    }
+
+    fn fields(s: &str, lexing: MacroArgLexing) -> Vec<Vec<String>> {
+        split_macro_arg_fields(s, lexing)
+    }
+
+    fn flat(s: &str, lexing: MacroArgLexing) -> Vec<String> {
+        fields(s, lexing).concat()
+    }
+
+    /// Every expectation below is GAS 2.47 output (`.ascii "[\a|\b|\c]"`).
+    #[test]
+    fn macro_arg_whitespace_follows_the_target_scrubber() {
+        use MacroArgLexing::{Generic, X86};
+        for (src, x86, generic) in [
+            ("1 -1", &["1", "-1"][..], &["1-1"][..]),
+            ("1 - 1", &["1", "-", "1"], &["1-1"]),
+            ("4 *2", &["4", "*2"], &["4*2"]),
+            ("1 (2)", &["1", "(2)"], &["1(2)"]),
+            ("x0 [x1]", &["x0", "[x1]"], &["x0[x1]"]),
+            ("1 + 2", &["1+2"], &["1+2"]),
+            ("(1) (2)", &["(1)(2)"], &["(1)(2)"]),
+            ("(1) -2", &["(1)-2"], &["(1)-2"]),
+            ("%hi(x) %lo(y)", &["%hi(x)%lo(y)"], &["%hi(x)%lo(y)"]),
+            ("1 ) 2", &["1)2"], &["1)2"]),
+            ("a b", &["a", "b"], &["a", "b"]),
+            ("a. b", &["a.", "b"], &["a.", "b"]),
+            ("1 $2", &["1", "$2"], &["1", "$2"]),
+            ("1 \"x\"", &["1", "\"x\""], &["1", "\"x\""]),
+            ("a = 3", &["a=3"], &["a=3"]),
+        ] {
+            assert_eq!(flat(src, X86), x86, "x86: {src}");
+            assert_eq!(flat(src, Generic), generic, "generic: {src}");
+        }
+        assert_eq!(
+            fields("886b, 888f, 0x1234, 0, 889f - 888f", Generic),
+            [["886b"], ["888f"], ["0x1234"], ["0"], ["889f-888f"]]
+        );
+        // Inside parentheses whitespace never separates; GAS scrubs it.
+        assert_eq!(flat("(2, 3),4", Generic), ["(2,3)", "4"]);
+    }
+
+    #[test]
+    fn macro_arg_char_literals_become_decimal() {
+        use MacroArgLexing::{Generic, X86};
+        for lexing in [X86, Generic] {
+            assert_eq!(
+                fields("'r', '8', ' ', ':', %r8", lexing),
+                [["114"], ["56"], ["32"], ["58"], ["%r8"]]
+            );
+            assert_eq!(flat("',' 2", lexing), ["442"]);
+            assert_eq!(flat("'a' 'b'", lexing), ["9798"]);
+            assert_eq!(flat("1 'a", lexing), ["1", "97"]);
+            assert_eq!(flat("x'a", lexing), ["x97"]);
+            assert_eq!(flat("'a+1", lexing), ["97+1"]);
+            assert_eq!(flat(r"'\n '\v '\\", lexing), ["1011892"]);
+            assert_eq!(flat(r"'\'' '\101", lexing), ["394901"]);
+        }
+    }
+
+    fn bind(header: &str, args: &str) -> Result<Vec<String>, String> {
+        let (name, params) = parse_macro_header(header);
+        bind_macro_args(name, &params, &fields(args, MacroArgLexing::X86))
+    }
+
+    /// GAS 2.47 binding rules, shared by every target's expander.
+    #[test]
+    fn macro_binding_matches_gas() {
+        let ok = |v: &[&str]| Ok(v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(bind("o a b c", "1 c=3"), ok(&["1", "", "3"]));
+        assert_eq!(bind("o a b", "b = 5 a=1"), ok(&["1", "5"]));
+        assert_eq!(bind("o a", "a=1 a=2"), ok(&["2"]), "last keyword wins");
+        assert_eq!(bind("o s", "s=\"a b\""), ok(&["a b"]));
+        assert_eq!(bind("o s t", "\"x\" 1"), ok(&["x", "1"]));
+        assert_eq!(bind("o a=(1 << 2)", ""), ok(&["(1 << 2)"]));
+        assert_eq!(bind("o a, b", "x0, =sym"), ok(&["x0", "=sym"]));
+        assert_eq!(bind("v a, r:vararg", "1, 2 3,4"), ok(&["1", "2 3,4"]));
+        assert_eq!(bind("v a, r:vararg", "1, (2,3),4"), ok(&["1", "(2,3),4"]));
+        assert_eq!(bind("v a, r:vararg", "1"), ok(&["1", ""]));
+        assert_eq!(bind("v a, r:vararg", "1 r=9"), ok(&["1", "9"]));
+        assert_eq!(
+            bind("o a b", "a=1 2").unwrap_err(),
+            "can't mix positional and keyword arguments"
+        );
+        assert_eq!(
+            bind("o a", "1 2").unwrap_err(),
+            "too many positional arguments"
+        );
+        assert_eq!(
+            bind("o a:req", "").unwrap_err(),
+            "Missing value for required parameter `a' of macro `o'"
+        );
+        assert_eq!(
+            bind("o a", "z=1").unwrap_err(),
+            "Parameter named `z' does not exist for macro `o'"
         );
     }
 }

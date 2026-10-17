@@ -65,7 +65,13 @@ pub fn emit_shared_library(
                         let sym = &obj.symbols[reloc.sym_idx as usize];
                         if !sym.name.is_empty() && sym.binding() != STB_LOCAL {
                             if let Some(gsym) = global_syms.get(sym.name.as_str()) {
-                                if !gsym.defined && !plt_set.contains(sym.name.as_str()) {
+                                // A non-default-visible unresolved weak is
+                                // local zero, not an import. It has no dynsym
+                                // entry and must never produce JUMP_SLOT(0).
+                                if !gsym.defined
+                                    && gsym.visibility == STV_DEFAULT
+                                    && !plt_set.contains(sym.name.as_str())
+                                {
                                     plt_set.insert(sym.name.to_string());
                                     plt_symbols.push(sym.name.to_string());
                                 }
@@ -974,7 +980,8 @@ pub fn emit_shared_library(
                 .iter()
                 .position(|n| n == name)
                 .map(|j| j + 1)
-                .unwrap_or(0) as u64;
+                .ok_or_else(|| format!("missing dynamic RISC-V PLT symbol '{}'", name))?
+                as u64;
             let r_info = (si << 32) | R_RISCV_JUMP_SLOT;
             if rp + 24 <= elf.len() {
                 elf[rp..rp + 8].copy_from_slice(&got_entry_addr.to_le_bytes());

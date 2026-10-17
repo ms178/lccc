@@ -1,0 +1,30 @@
+{
+  "distribution": "Compiler Explorer Linux x86-64 binary archives; not source-built linker timing oracles",
+  "archives": {
+    "gcc-16.2.0": {
+      "url": "https://compiler-explorer.s3.amazonaws.com/opt/gcc-16.2.0.tar.xz",
+      "sha256": "7bffbfc6b2eb997a7a6e3cbd013372b41de5746850ded8b6453f9820e5678828"
+    },
+    "clang-23.1.0": {
+      "url": "https://compiler-explorer.s3.amazonaws.com/opt/clang-23.1.0.tar.xz",
+      "sha256": "6b081e9729cd19268638157cdee9c2843b8d437e03b5af5c24d12d8a9315073f"
+    }
+  },
+  "tools": {
+    "gcc16": {
+      "path": "/home/user/.cache/oracles/gcc-16.2.0/bin/gcc",
+      "sha256": "c9956b02c551225a721b994bda8eca1813770ed6d9eada4a1f16a765d1bc782e",
+      "version": "gcc (Compiler-Explorer-Build-gcc--binutils-2.44) 16.2.0\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n"
+    },
+    "clang23": {
+      "path": "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+      "sha256": "d9d167ada281dfaeb1fe996ecb26fe69d70684e4b2a3278759f7152123774793",
+      "version": "clang version 23.1.0 (https://github.com/llvm/llvm-project.git ea7d852a70e8bdfaf601d6626a760f9771b2c4b4)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /home/user/.cache/oracles/clang-23.1.0/bin\n"
+    },
+    "lld23": {
+      "path": "/home/user/.cache/oracles/clang-23.1.0/bin/ld.lld",
+      "sha256": "2942deff1745d49972959fefc3caeab3e70a6f1ded78239f673edc5c749d7326",
+      "version": "LLD 23.1.0 (https://github.com/llvm/llvm-project.git ea7d852a70e8bdfaf601d6626a760f9771b2c4b4) (compatible with GNU linkers)\n"
+    }
+  }
+}

@@ -52,9 +52,8 @@ pub(crate) fn run_function(
     func: &mut IrFunction,
     aliased_names: &FxHashSet<String>,
     local_globals: &FxHashSet<String>,
-    libcalls: &crate::passes::libcall::LibcallAllowance,
 ) -> usize {
-    recognize_idioms(func, aliased_names, local_globals, libcalls)
+    recognize_idioms(func, aliased_names, local_globals)
 }
 
 /// Maximum loops rewritten per function per fixpoint run. Each rewrite
@@ -342,6 +341,20 @@ struct CopyLoop {
     needs_zero_guard: bool,
 }
 
+impl CopyLoop {
+    /// The library function the rewrite calls: `memmove` when the source
+    /// and destination may overlap (the guarded rewrite), `memcpy` when
+    /// they are proven disjoint.  The one answer both the synthesis gate and
+    /// the emitted call use, so the gate always checks the symbol emitted.
+    fn callee(&self) -> crate::common::pass_policy::Libcall {
+        if self.needs_overlap_guard {
+            crate::common::pass_policy::Libcall::Memmove
+        } else {
+            crate::common::pass_policy::Libcall::Memcpy
+        }
+    }
+}
+
 fn debug_enabled() -> bool {
     static FLAG: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("CCC_DEBUG_LOOP_IDIOM").is_some());
@@ -360,7 +373,6 @@ pub(crate) fn recognize_idioms(
     func: &mut IrFunction,
     aliased_names: &FxHashSet<String>,
     local_globals: &FxHashSet<String>,
-    libcalls: &crate::passes::libcall::LibcallAllowance,
 ) -> usize {
     if std::env::var("CCC_NO_LOOP_IDIOM").is_ok() {
         return 0;
@@ -410,15 +422,25 @@ pub(crate) fn recognize_idioms(
                     matched.needs_overlap_guard,
                     matched.needs_zero_guard,
                 );
-                // A13: the rewrite functions gate themselves, each next to
-                // the only place it decides its callee (`memcpy` for the
-                // bare path; `memmove`/`memcpy` for the guarded one,
-                // depending on which guard it needs).  A refused rewrite
-                // leaves the loop scalar.
+                // The rewrite creates a library call: only while the callee is
+                // the library function (no -fno-builtin, and this TU does not
+                // implement the mem* family -- a copy loop inside a TU-defined
+                // `memmove` must not become `call memmove`).  Checked before
+                // either rewrite touches the IR.
+                let callee = matched.callee();
+                if !func.pass_policy.builtins.may_synthesize(callee) {
+                    dlog!(
+                        "{} loop@{}: keep scalar ({} is not the library function here)",
+                        func.name,
+                        lp.header,
+                        callee.name()
+                    );
+                    continue;
+                }
                 let rewritten = if matched.needs_overlap_guard || matched.needs_zero_guard {
-                    rewrite_guarded_copy_loop(func, &matched, &lp.body, &cfg, libcalls)
+                    rewrite_guarded_copy_loop(func, &matched, &lp.body, &cfg)
                 } else {
-                    rewrite_copy_loop(func, &matched, &lp.body, libcalls)
+                    rewrite_copy_loop(func, &matched, &lp.body)
                 };
                 if rewritten {
                     if matched.needs_overlap_guard || matched.needs_zero_guard {
@@ -1390,6 +1412,8 @@ fn make_copy_call(
             regparm: None,
             is_pure: false,
             is_const: false,
+            // Created only under `BuiltinPolicy::may_synthesize`.
+            assume_library: true,
             ret_eightbyte_classes: Vec::new(),
             ret_is_f128_sse: false,
         },
@@ -1409,25 +1433,9 @@ fn make_copy_call(
 /// - const bound with an IV use in a `Value`-typed slot (consts only
 ///   fit `Operand` slots; the matcher already bails the reachable
 ///   cases, this closes the proof against future IR growth).
-fn rewrite_copy_loop(
-    func: &mut IrFunction,
-    m: &CopyLoop,
-    body: &FxHashSet<usize>,
-    libcalls: &crate::passes::libcall::LibcallAllowance,
-) -> bool {
+fn rewrite_copy_loop(func: &mut IrFunction, m: &CopyLoop, body: &FxHashSet<usize>) -> bool {
     let fname = func.name.clone();
     let size_ty = crate::common::types::target_int_ir_type();
-    // A13: the synthesised call is a `memcpy`; refuse while the TU defines
-    // that symbol (or a CLI knob withdrew it).  Checked next to the only
-    // place this function decides its callee, so the gate cannot drift from
-    // what the rewrite actually emits.
-    if !libcalls.may_use("memcpy") {
-        dlog!(
-            "{fname} loop@{}: rewrite abort (memcpy not synthesizable)",
-            m.header
-        );
-        return false;
-    }
     if m.ult_ty.size() > size_ty.size() {
         dlog!(
             "{fname} loop@{}: rewrite abort (bound wider than size_t)",
@@ -1737,9 +1745,10 @@ fn rewrite_copy_loop(
         }
     };
 
-    // Only proven-disjoint roots reach this rewrite. A forward-overlap
-    // scalar loop cannot be replaced by either memcpy or memmove.
-    let call_name = "memcpy";
+    // Only proven-disjoint roots reach this rewrite (`m.callee()` is
+    // `memcpy`). A forward-overlap scalar loop cannot be replaced by either
+    // memcpy or memmove.
+    let call_name = m.callee().name();
     let call = make_copy_call(func, call_name, dst, src, len, size_ty);
     func.blocks[m.preheader].instructions.push(call);
 
@@ -1893,25 +1902,9 @@ fn rewrite_guarded_copy_loop(
     m: &CopyLoop,
     body: &FxHashSet<usize>,
     cfg: &CfgAnalysis,
-    libcalls: &crate::passes::libcall::LibcallAllowance,
 ) -> bool {
-    // A13: the fast path calls `memmove` when an overlap guard is needed and
-    // `memcpy` otherwise (the zero-guard-only shape, taken by provably
-    // disjoint pointers).  Gate the exact symbol this rewrite will emit,
-    // before any mutation.
-    let call_name = if m.needs_overlap_guard {
-        "memmove"
-    } else {
-        "memcpy"
-    };
-    if !libcalls.may_use(call_name) {
-        dlog!(
-            "{} loop@{}: guard declines ({call_name} not synthesizable)",
-            func.name,
-            m.header
-        );
-        return false;
-    }
+    // The callee the top-level gate in `recognize_idioms` admitted.
+    let call_name = m.callee().name();
     let size_ty = crate::common::types::target_int_ir_type();
     let guard_ty = match size_ty {
         IrType::I32 => IrType::U32,
@@ -2303,12 +2296,7 @@ mod tests {
         // Synthetic D/S GlobalAddr instructions represent private, strong
         // definitions in these tests; G is intentionally unproven.
         let local_globals = ["D".to_string(), "S".to_string()].into_iter().collect();
-        super::run_function(
-            func,
-            &FxHashSet::default(),
-            &local_globals,
-            &crate::passes::libcall::LibcallAllowance::unrestricted(),
-        )
+        super::run_function(func, &FxHashSet::default(), &local_globals)
     }
 
     fn val(id: u32) -> Operand {
@@ -2466,15 +2454,7 @@ mod tests {
         let mut f = self_loop_copy_func(IrType::U8);
         let aliases: FxHashSet<String> = ["D".to_string(), "S".to_string()].into_iter().collect();
         let local_globals = aliases.clone();
-        assert_eq!(
-            super::run_function(
-                &mut f,
-                &aliases,
-                &local_globals,
-                &crate::passes::libcall::LibcallAllowance::unrestricted()
-            ),
-            1
-        );
+        assert_eq!(super::run_function(&mut f, &aliases, &local_globals,), 1);
         assert!(has_call(&f, "memmove"));
         assert!(!has_call(&f, "memcpy"));
         assert_guarded_scalar_fallback(&f);
@@ -2484,12 +2464,7 @@ mod tests {
     fn extern_global_names_cannot_prove_disjoint() {
         let mut f = self_loop_copy_func(IrType::U8);
         assert_eq!(
-            super::run_function(
-                &mut f,
-                &FxHashSet::default(),
-                &FxHashSet::default(),
-                &crate::passes::libcall::LibcallAllowance::unrestricted(),
-            ),
+            super::run_function(&mut f, &FxHashSet::default(), &FxHashSet::default(),),
             1
         );
         assert!(has_call(&f, "memmove"));

@@ -8,6 +8,7 @@
 
 use super::ast::*;
 use super::parse::{ModeKind, Parser};
+use crate::common::source::Span;
 use crate::common::types::AddressSpace;
 use crate::frontend::lexer::token::TokenKind;
 
@@ -152,12 +153,33 @@ impl Parser {
             (None, Vec::new())
         };
 
-        // Parse outer suffixes: array dimensions and function params
+        // Parse outer suffixes: array dimensions and function params.  A
+        // parenthesised inner declarator without `*` (`(g(void))`) ends in the
+        // suffix the outer ones wrap directly.
         let mut outer_suffixes = Vec::with_capacity(4);
+        let mut innermost_suffix_is_function = if inner_derived
+            .iter()
+            .any(|d| matches!(d, DerivedDeclarator::Pointer(_)))
+        {
+            None
+        } else {
+            inner_derived.last().and_then(|d| match d {
+                DerivedDeclarator::Function(..) => Some(true),
+                DerivedDeclarator::Array(_) => Some(false),
+                _ => None,
+            })
+        };
         loop {
             match self.peek() {
                 TokenKind::LBracket => {
                     let open_bracket = self.peek_span();
+                    self.check_suffix_composition(
+                        innermost_suffix_is_function,
+                        false,
+                        name.as_deref(),
+                        open_bracket,
+                    );
+                    innermost_suffix_is_function = Some(false);
                     self.advance();
                     // C99 array parameter declarators can have qualifiers and 'static':
                     // [static restrict const 10], [restrict n], [const], etc.
@@ -179,6 +201,14 @@ impl Parser {
                     outer_suffixes.push(DerivedDeclarator::Array(size));
                 }
                 TokenKind::LParen => {
+                    let open_paren = self.peek_span();
+                    self.check_suffix_composition(
+                        innermost_suffix_is_function,
+                        true,
+                        name.as_deref(),
+                        open_paren,
+                    );
+                    innermost_suffix_is_function = Some(true);
                     let (params, variadic) = self.parse_param_list();
                     outer_suffixes.push(DerivedDeclarator::Function(params, variadic));
                 }
@@ -292,6 +322,31 @@ impl Parser {
     ///   inner_derived: [Pointer]
     ///   outer_suffixes: [Function([int])]
     ///   Result: [Pointer, FunctionPointer([int])]
+    /// C11 6.7.6.3p1 and 6.7.6.2p1: a function cannot return an array or a
+    /// function, and an array element cannot be a function.  Within one
+    /// direct declarator each suffix derives the type of the one before it
+    /// (`g(void)[2]`: `g` is a function returning an array), so the pair of
+    /// adjacent suffixes decides it; `(*f(void))[3]` is valid because the
+    /// `*` separates them.  `prev_is_function` describes the suffix the new
+    /// one follows (`None`: there is none, or a `*` intervenes).  Wording is
+    /// GCC 16.2's.
+    fn check_suffix_composition(
+        &mut self,
+        prev_is_function: Option<bool>,
+        next_is_function: bool,
+        name: Option<&str>,
+        span: Span,
+    ) {
+        let subject = name.map_or_else(|| "type name".to_string(), |n| format!("'{n}'"));
+        let message = match (prev_is_function, next_is_function) {
+            (Some(true), false) => format!("{subject} declared as function returning an array"),
+            (Some(true), true) => format!("{subject} declared as function returning a function"),
+            (Some(false), true) => format!("declaration of {subject} as array of functions"),
+            (Some(false), false) | (None, _) => return,
+        };
+        self.emit_error(message, span);
+    }
+
     fn combine_declarator_parts(
         &self,
         mut outer_pointers: Vec<DerivedDeclarator>,
@@ -786,6 +841,7 @@ impl Parser {
                     is_volatile: param_is_volatile,
                     is_restrict: param_is_restrict,
                     vla_size_exprs,
+                    decayed_array: !array_dims.is_empty(),
                     fptr_inner_ptr_depth: inner_ptr_depth,
                 });
             } else {
@@ -820,6 +876,7 @@ impl Parser {
                 is_volatile: false,
                 is_restrict: false,
                 vla_size_exprs: Vec::new(),
+                decayed_array: false,
                 fptr_inner_ptr_depth: 0,
             });
             if !self.consume_if(&TokenKind::Comma) {

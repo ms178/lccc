@@ -24,21 +24,6 @@ use crate::frontend::parser::ast::{
     StructFieldDecl, TypeSpecifier, UnaryOp,
 };
 
-/// Determine the C type of an enum constant value, following GCC's promotion rules.
-/// GCC uses the progression: int -> unsigned int -> long long -> unsigned long long.
-/// (On LP64 targets, long == long long, so we skip long/unsigned long.)
-pub fn enum_constant_type(val: i64) -> CType {
-    if val >= i32::MIN as i64 && val <= i32::MAX as i64 {
-        CType::Int
-    } else if val >= 0 && val <= u32::MAX as i64 {
-        CType::UInt
-    } else if val >= 0 {
-        CType::ULongLong
-    } else {
-        CType::LongLong
-    }
-}
-
 /// Expression type checker that infers CTypes using only sema-available state.
 ///
 /// This struct borrows the sema state needed for type inference and provides
@@ -152,11 +137,11 @@ impl<'a> ExprTypeChecker<'a> {
 
             // Identifiers: look up in symbol table or enum constants
             Expr::Identifier(name, _) => {
-                if name == "__func__" || name == "__FUNCTION__" || name == "__PRETTY_FUNCTION__" {
+                if crate::frontend::parser::ast::is_function_name_builtin(name) {
                     return Some(CType::Pointer(Box::new(CType::Char), AddressSpace::Default));
                 }
-                if let Some(&val) = self.types.enum_constants.get(name) {
-                    return Some(enum_constant_type(val));
+                if let Some(constant) = self.types.enum_constants.get(name) {
+                    return Some(constant.ty.clone());
                 }
                 if let Some(sym) = self.symbols.lookup(name) {
                     return Some(sym.ty.clone());
@@ -424,18 +409,22 @@ impl<'a> ExprTypeChecker<'a> {
     /// on deeply nested expression chains like `+1+1+1+...+1` (which appear in
     /// preprocessor-generated enum initializers).
     fn infer_binop_ctype(&self, op: &BinOp, lhs: &Expr, rhs: &Expr) -> Option<CType> {
-        // Comparison and logical operators always produce int
         match op {
-            BinOp::Eq
-            | BinOp::Ne
-            | BinOp::Lt
-            | BinOp::Le
-            | BinOp::Gt
-            | BinOp::Ge
-            | BinOp::LogicalAnd
-            | BinOp::LogicalOr => {
-                return Some(CType::Int);
+            // A GNU vector comparison yields a vector of signed integers with
+            // the operand's lane width and count (GCC: `int` lanes for
+            // `float`, 64-bit lanes for `double`); a scalar comparison and
+            // the logical operators produce `int`.
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                let vector = [lhs, rhs]
+                    .into_iter()
+                    .filter_map(|e| self.infer_expr_ctype(e))
+                    .find(CType::is_vector);
+                return match vector {
+                    Some(v) => v.vector_comparison_result(),
+                    None => Some(CType::Int),
+                };
             }
+            BinOp::LogicalAnd | BinOp::LogicalOr => return Some(CType::Int),
             _ => {}
         }
 
@@ -688,14 +677,17 @@ impl<'a> ExprTypeChecker<'a> {
                 return self.ctype_matches_generic(elem, pointee);
             }
         }
-        // Enum matches int
-        if matches!(controlling, CType::Enum(_)) && matches!(assoc, CType::Int) {
-            return true;
+        // An enum type is compatible with its compatible integer type
+        // (C11 6.7.2.2p4) and with nothing else; two enums compare by
+        // identity above.
+        match (controlling, assoc) {
+            (CType::Enum(e), other) | (other, CType::Enum(e))
+                if !matches!(other, CType::Enum(_)) =>
+            {
+                e.compatible_ctype() == *other
+            }
+            _ => false,
         }
-        if matches!(controlling, CType::Int) && matches!(assoc, CType::Enum(_)) {
-            return true;
-        }
-        false
     }
 
     /// Resolve a TypeSpecifier to a CType using sema's type context.
@@ -772,48 +764,35 @@ impl<'a> ExprTypeChecker<'a> {
                     CType::Int // fallback for unknown typedef
                 }
             }
-            TypeSpecifier::Enum(name, variants, _is_packed) => {
-                // GCC extension: determine underlying enum type based on value range.
-                // Uses progression: int -> unsigned int -> long long -> unsigned long long.
-                let values = if let Some(vars) = variants {
-                    let mut vals = Vec::with_capacity(8);
-                    let mut next_val: i64 = 0;
-                    for v in vars {
-                        if let Some(ref val_expr) = v.value {
-                            if let Some(val) = self.eval_const_expr(val_expr) {
+            TypeSpecifier::Enum(name, variants, is_packed) => {
+                // The same enum the analyzer resolves (`resolve_enum`): the
+                // completed definition visible here, or this body's values.
+                // Every integer property of the result (size, signedness,
+                // rank, promotion, `_Generic` match) is that of its
+                // compatible type, so no width rule lives here.
+                let completed = name.as_ref().and_then(|n| self.types.enum_types.get(n));
+                let variants = match variants {
+                    Some(vars) => {
+                        let mut values = Vec::with_capacity(vars.len());
+                        let mut next_val: i64 = 0;
+                        for v in vars {
+                            if let Some(val) =
+                                v.value.as_ref().and_then(|e| self.eval_const_expr(e))
+                            {
                                 next_val = val;
                             }
+                            values.push((v.name.clone(), next_val));
+                            next_val = next_val.wrapping_add(1);
                         }
-                        vals.push(next_val);
-                        next_val += 1;
+                        values
                     }
-                    vals
-                } else if let Some(n) = name {
-                    if let Some(et) = self.types.enum_types.get(n) {
-                        et.variants.iter().map(|(_, v)| *v).collect()
-                    } else {
-                        Vec::new()
-                    }
-                } else {
-                    Vec::new()
+                    None => completed.map(|et| et.variants.clone()).unwrap_or_default(),
                 };
-                // Determine smallest type that fits all values
-                let fits_int = values
-                    .iter()
-                    .all(|v| *v >= i32::MIN as i64 && *v <= i32::MAX as i64);
-                if fits_int {
-                    return CType::Int;
-                }
-                let fits_uint = values.iter().all(|v| *v >= 0 && *v <= u32::MAX as i64);
-                if fits_uint {
-                    return CType::UInt;
-                }
-                let has_negative = values.iter().any(|v| *v < 0);
-                if has_negative {
-                    CType::LongLong
-                } else {
-                    CType::ULongLong
-                }
+                CType::Enum(crate::common::types::EnumType {
+                    name: name.clone(),
+                    variants,
+                    is_packed: *is_packed || completed.is_some_and(|et| et.is_packed),
+                })
             }
             TypeSpecifier::Struct(
                 tag,
@@ -877,6 +856,11 @@ impl<'a> ExprTypeChecker<'a> {
                 }
             }
             TypeSpecifier::TypeofType(inner) => self.resolve_type_spec(inner),
+            // A cast or type name spelled with `__attribute__((vector_size))`
+            // (the parser wraps it, see `apply_pending_vector_attr`).
+            TypeSpecifier::Vector(elem, total_bytes) => {
+                CType::Vector(Box::new(self.resolve_type_spec(elem)), *total_bytes)
+            }
             TypeSpecifier::Typeof(expr, _) => {
                 // typeof(expr): try to infer the expression's type
                 self.infer_expr_ctype(expr).unwrap_or(CType::Int)
@@ -911,6 +895,7 @@ impl<'a> ExprTypeChecker<'a> {
             functions: self.functions,
             const_values: None,
             expr_types: self.expr_types,
+            folding_initializer: false,
         };
         evaluator.eval_const_expr(expr)?.to_i64()
     }
@@ -932,14 +917,9 @@ impl<'a> ExprTypeChecker<'a> {
         let struct_fields: Vec<StructField> = fields
             .iter()
             .filter_map(|f| {
-                let mut ty = self.resolve_field_ctype(f);
-                // GCC treats enum bitfields as unsigned
-                if f.bit_width.is_some()
-                    && matches!(&f.type_spec, TypeSpecifier::Enum(..))
-                    && ty == CType::Int
-                {
-                    ty = CType::UInt;
-                }
+                // An enum bit-field keeps the enum type; its signedness is the
+                // enum's compatible integer type.
+                let ty = self.resolve_field_ctype(f);
                 // C11 6.7.2.1p13: unnamed non-aggregate members are constraint
                 // violations GCC ignores entirely; drop from layout + init.
                 if f.name.is_none()
@@ -948,6 +928,23 @@ impl<'a> ExprTypeChecker<'a> {
                 {
                     return None;
                 }
+                let typedef_alignment = |ts: &TypeSpecifier| match ts {
+                    TypeSpecifier::TypedefName(name) => {
+                        self.types.typedef_alignments.get(name).copied()
+                    }
+                    _ => None,
+                };
+                let alignas_type = f.alignas_type.as_ref().map(|ts| {
+                    let natural = self
+                        .resolve_type_spec(ts)
+                        .align_ctx(&*self.types.borrow_struct_layouts());
+                    natural.max(typedef_alignment(ts).unwrap_or(0))
+                });
+                let alignment = crate::common::types::strictest_alignment([
+                    f.alignment,
+                    typedef_alignment(&f.type_spec),
+                    alignas_type,
+                ]);
                 Some(StructField {
                     name: f.name.clone().unwrap_or_default(),
                     ty,
@@ -955,7 +952,7 @@ impl<'a> ExprTypeChecker<'a> {
                         .bit_width
                         .as_ref()
                         .and_then(|bw| self.eval_const_expr(bw).map(|v| v as u32)),
-                    alignment: f.alignment,
+                    alignment,
                     is_packed: f.is_packed,
                     base_volatile: f.base_volatile,
                     object_volatile: f.object_volatile,
@@ -1003,10 +1000,14 @@ impl<'a> ExprTypeChecker<'a> {
     /// Get the CType for a struct field declaration, accounting for derived declarators.
     fn resolve_field_ctype(&self, f: &StructFieldDecl) -> CType {
         let mut ctype = self.resolve_type_spec(&f.type_spec);
+        // Space mapping follows pointee_space_before (see fold_simple_derived):
+        // the wrapper built at step i takes the space stored at derived[i-1].
+        let mut pending_space = AddressSpace::Default;
         for derived in &f.derived {
             match derived {
-                DerivedDeclarator::Pointer(_) => {
-                    ctype = CType::Pointer(Box::new(ctype), AddressSpace::Default);
+                DerivedDeclarator::Pointer(space) => {
+                    ctype = CType::Pointer(Box::new(ctype), pending_space);
+                    pending_space = *space;
                 }
                 DerivedDeclarator::Array(Some(size_expr)) => {
                     let size = self.eval_const_expr(size_expr).unwrap_or(0) as usize;
@@ -1026,6 +1027,9 @@ impl<'a> ExprTypeChecker<'a> {
     /// TODO: consolidate with sema/builtins.rs BuiltinInfo to avoid duplication.
     fn builtin_return_ctype(name: &str) -> Option<CType> {
         match name {
+            // BMI2 BZHI returns its operand type.
+            "__builtin_ia32_bzhi_si" => Some(CType::UInt),
+            "__builtin_ia32_bzhi_di" => Some(CType::ULongLong),
             // Float-returning builtins
             "__builtin_inf"
             | "__builtin_huge_val"
@@ -1210,10 +1214,13 @@ impl<'a> ExprTypeChecker<'a> {
                     // for typeof expressions referencing earlier declarations.
                     let mut ctype =
                         self.resolve_type_spec_with_scope(&decl.type_spec, &local_scope);
+                    // pointee_space_before mapping (see fold_simple_derived).
+                    let mut pending_space = AddressSpace::Default;
                     for derived in &declarator.derived {
                         match derived {
-                            DerivedDeclarator::Pointer(_) => {
-                                ctype = CType::Pointer(Box::new(ctype), AddressSpace::Default);
+                            DerivedDeclarator::Pointer(space) => {
+                                ctype = CType::Pointer(Box::new(ctype), pending_space);
+                                pending_space = *space;
                             }
                             DerivedDeclarator::Array(Some(size_expr)) => {
                                 let size = self.eval_const_expr(size_expr).unwrap_or(0) as usize;
@@ -1259,10 +1266,13 @@ impl<'a> ExprTypeChecker<'a> {
                     }
                     let mut ctype =
                         self.resolve_type_spec_with_scope(&decl.type_spec, &local_scope);
+                    // pointee_space_before mapping (see fold_simple_derived).
+                    let mut pending_space = AddressSpace::Default;
                     for derived in &declarator.derived {
                         match derived {
-                            DerivedDeclarator::Pointer(_) => {
-                                ctype = CType::Pointer(Box::new(ctype), AddressSpace::Default);
+                            DerivedDeclarator::Pointer(space) => {
+                                ctype = CType::Pointer(Box::new(ctype), pending_space);
+                                pending_space = *space;
                             }
                             DerivedDeclarator::Array(Some(size_expr)) => {
                                 let size = self.eval_const_expr(size_expr).unwrap_or(0) as usize;

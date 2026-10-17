@@ -1,0 +1,323 @@
+[
+  {
+    "options": {
+      "kind": 1,
+      "binding": 0,
+      "visibility": 0,
+      "defined": true,
+      "absolute": false,
+      "target_value": 0,
+      "addend": 11
+    },
+    "status": 1,
+    "stderr": "ld.lld-23: error: relocation R_RISCV_32 cannot be used against symbol 'target'; recompile with -fPIC\n>>> defined in /tmp/tmp7ofz3s2r/a.o\n>>> referenced by /tmp/tmp7ofz3s2r/a.o:(.data+0x0)\n"
+  },
+  {
+    "options": {
+      "kind": 1,
+      "binding": 0,
+      "visibility": 0,
+      "defined": true,
+      "absolute": true,
+      "target_value": 256,
+      "addend": 11
+    },
+    "status": 0,
+    "stderr": "",
+    "readelf": "\nThere are no relocations in this file.\n"
+  },
+  {
+    "options": {
+      "kind": 1,
+      "binding": 0,
+      "visibility": 2,
+      "defined": true,
+      "absolute": false,
+      "target_value": 0,
+      "addend": 11
+    },
+    "status": 1,
+    "stderr": "ld.lld-23: error: relocation R_RISCV_32 cannot be used against symbol 'target'; recompile with -fPIC\n>>> defined in /tmp/tmp7ofz3s2r/a.o\n>>> referenced by /tmp/tmp7ofz3s2r/a.o:(.data+0x0)\n"
+  },
+  {
+    "options": {
+      "kind": 1,
+      "binding": 0,
+      "visibility": 2,
+      "defined": true,
+      "absolute": true,
+      "target_value": 256,
+      "addend": 11
+    },
+    "status": 0,
+    "stderr": "",
+    "readelf": "\nThere are no relocations in this file.\n"
+  },
+  {
+    "options": {
+      "kind": 1,
+      "binding": 0,
+      "visibility": 3,
+      "defined": true,
+      "absolute": false,
+      "target_value": 0,
+      "addend": 11
+    },
+    "status": 1,
+    "stderr": "ld.lld-23: error: relocation R_RISCV_32 cannot be used against symbol 'target'; recompile with -fPIC\n>>> defined in /tmp/tmp7ofz3s2r/a.o\n>>> referenced by /tmp/tmp7ofz3s2r/a.o:(.data+0x0)\n"
+  },
+  {
+    "options": {
+      "kind": 1,
+      "binding": 0,
+      "visibility": 3,
+      "defined": true,
+      "absolute": true,
+      "target_value": 256,
+      "addend": 11
+    },
+    "status": 0,
+    "stderr": "",
+    "readelf": "\nThere are no relocations in this file.\n"
+  },
+  {
+    "options": {
+      "kind": 1,
+      "binding": 1,
+      "visibility": 0,
+      "defined": true,
+      "absolute": false,
+      "target_value": 0,
+      "addend": 11
+    },
+    "status": 1,
+    "stderr": "ld.lld-23: error: relocation R_RISCV_32 cannot be used against symbol 'target'; recompile with -fPIC\n>>> defined in /tmp/tmp7ofz3s2r/a.o\n>>> referenced by /tmp/tmp7ofz3s2r/a.o:(.data+0x0)\n"
+  },
+  {
+    "options": {
+      "kind": 1,
+      "binding": 1,
+      "visibility": 0,
+      "defined": true,
+      "absolute": true,
+      "target_value": 256,
+      "addend": 11
+    },
+    "status": 1,
+    "stderr": "ld.lld-23: error: relocation R_RISCV_32 cannot be used against symbol 'target'; recompile with -fPIC\n>>> defined in /tmp/tmp7ofz3s2r/a.o\n>>> referenced by /tmp/tmp7ofz3s2r/a.o:(.data+0x0)\n"
+  },
+  {
+    "options": {
+      "kind": 1,
+      "binding": 1,
+      "visibility": 0,
+      "defined": false,
+      "absolute": false,
+      "target_value": 0,
+      "addend": 11
+    },
+    "status": 1,
+    "stderr": "ld.lld-23: error: relocation R_RISCV_32 cannot be used against symbol 'target'; recompile with -fPIC\n>>> defined in /tmp/tmp7ofz3s2r/a.o\n>>> referenced by /tmp/tmp7ofz3s2r/a.o:(.data+0x0)\n"
+  },
+  {
+    "options": {
+      "kind": 1,
+      "binding": 1,
+      "visibility": 2,
+      "defined": true,
+      "absolute": false,
+      "target_value": 0,
+      "addend": 11
+    },
+    "status": 1,
+    "stderr": "ld.lld-23: error: relocation R_RISCV_32 cannot be used against symbol 'target'; recompile with -fPIC\n>>> defined in /tmp/tmp7ofz3s2r/a.o\n>>> referenced by /tmp/tmp7ofz3s2r/a.o:(.data+0x0)\n"
+  },
+  {
+    "options": {
+      "kind": 1,
+      "binding": 1,
+      "visibility": 2,
+      "defined": true,
+      "absolute": true,
+      "target_value": 256,
+      "addend": 11
+    },
+    "status": 0,
+    "stderr": "",
+    "readelf": "\nThere are no relocations in this file.\n"
+  },
+  {
+    "options": {
+      "kind": 1,
+      "binding": 1,
+      "visibility": 2,
+      "defined": false,
+      "absolute": false,
+      "target_value": 0,
+      "addend": 11
+    },
+    "status": 1,
+    "stderr": "ld.lld-23: error: undefined hidden symbol: target\n>>> referenced by /tmp/tmp7ofz3s2r/a.o:(.data+0x0)\n"
+  },
+  {
+    "options": {
+      "kind": 1,
+      "binding": 1,
+      "visibility": 3,
+      "defined": true,
+      "absolute": false,
+      "target_value": 0,
+      "addend": 11
+    },
+    "status": 1,
+    "stderr": "ld.lld-23: error: relocation R_RISCV_32 cannot be used against symbol 'target'; recompile with -fPIC\n>>> defined in /tmp/tmp7ofz3s2r/a.o\n>>> referenced by /tmp/tmp7ofz3s2r/a.o:(.data+0x0)\n"
+  },
+  {
+    "options": {
+      "kind": 1,
+      "binding": 1,
+      "visibility": 3,
+      "defined": true,
+      "absolute": true,
+      "target_value": 256,
+      "addend": 11
+    },
+    "status": 0,
+    "stderr": "",
+    "readelf": "\nThere are no relocations in this file.\n"
+  },
+  {
+    "options": {
+      "kind": 1,
+      "binding": 1,
+      "visibility": 3,
+      "defined": false,
+      "absolute": false,
+      "target_value": 0,
+      "addend": 11
+    },
+    "status": 1,
+    "stderr": "ld.lld-23: error: undefined protected symbol: target\n>>> referenced by /tmp/tmp7ofz3s2r/a.o:(.data+0x0)\n"
+  },
+  {
+    "options": {
+      "kind": 1,
+      "binding": 2,
+      "visibility": 0,
+      "defined": true,
+      "absolute": false,
+      "target_value": 0,
+      "addend": 11
+    },
+    "status": 1,
+    "stderr": "ld.lld-23: error: relocation R_RISCV_32 cannot be used against symbol 'target'; recompile with -fPIC\n>>> defined in /tmp/tmp7ofz3s2r/a.o\n>>> referenced by /tmp/tmp7ofz3s2r/a.o:(.data+0x0)\n"
+  },
+  {
+    "options": {
+      "kind": 1,
+      "binding": 2,
+      "visibility": 0,
+      "defined": true,
+      "absolute": true,
+      "target_value": 256,
+      "addend": 11
+    },
+    "status": 1,
+    "stderr": "ld.lld-23: error: relocation R_RISCV_32 cannot be used against symbol 'target'; recompile with -fPIC\n>>> defined in /tmp/tmp7ofz3s2r/a.o\n>>> referenced by /tmp/tmp7ofz3s2r/a.o:(.data+0x0)\n"
+  },
+  {
+    "options": {
+      "kind": 1,
+      "binding": 2,
+      "visibility": 0,
+      "defined": false,
+      "absolute": false,
+      "target_value": 0,
+      "addend": 11
+    },
+    "status": 1,
+    "stderr": "ld.lld-23: error: relocation R_RISCV_32 cannot be used against symbol 'target'; recompile with -fPIC\n>>> defined in /tmp/tmp7ofz3s2r/a.o\n>>> referenced by /tmp/tmp7ofz3s2r/a.o:(.data+0x0)\n"
+  },
+  {
+    "options": {
+      "kind": 1,
+      "binding": 2,
+      "visibility": 2,
+      "defined": true,
+      "absolute": false,
+      "target_value": 0,
+      "addend": 11
+    },
+    "status": 1,
+    "stderr": "ld.lld-23: error: relocation R_RISCV_32 cannot be used against symbol 'target'; recompile with -fPIC\n>>> defined in /tmp/tmp7ofz3s2r/a.o\n>>> referenced by /tmp/tmp7ofz3s2r/a.o:(.data+0x0)\n"
+  },
+  {
+    "options": {
+      "kind": 1,
+      "binding": 2,
+      "visibility": 2,
+      "defined": true,
+      "absolute": true,
+      "target_value": 256,
+      "addend": 11
+    },
+    "status": 0,
+    "stderr": "",
+    "readelf": "\nThere are no relocations in this file.\n"
+  },
+  {
+    "options": {
+      "kind": 1,
+      "binding": 2,
+      "visibility": 2,
+      "defined": false,
+      "absolute": false,
+      "target_value": 0,
+      "addend": 11
+    },
+    "status": 0,
+    "stderr": "",
+    "readelf": "\nThere are no relocations in this file.\n"
+  },
+  {
+    "options": {
+      "kind": 1,
+      "binding": 2,
+      "visibility": 3,
+      "defined": true,
+      "absolute": false,
+      "target_value": 0,
+      "addend": 11
+    },
+    "status": 1,
+    "stderr": "ld.lld-23: error: relocation R_RISCV_32 cannot be used against symbol 'target'; recompile with -fPIC\n>>> defined in /tmp/tmp7ofz3s2r/a.o\n>>> referenced by /tmp/tmp7ofz3s2r/a.o:(.data+0x0)\n"
+  },
+  {
+    "options": {
+      "kind": 1,
+      "binding": 2,
+      "visibility": 3,
+      "defined": true,
+      "absolute": true,
+      "target_value": 256,
+      "addend": 11
+    },
+    "status": 0,
+    "stderr": "",
+    "readelf": "\nThere are no relocations in this file.\n"
+  },
+  {
+    "options": {
+      "kind": 1,
+      "binding": 2,
+      "visibility": 3,
+      "defined": false,
+      "absolute": false,
+      "target_value": 0,
+      "addend": 11
+    },
+    "status": 0,
+    "stderr": "",
+    "readelf": "\nThere are no relocations in this file.\n"
+  }
+]

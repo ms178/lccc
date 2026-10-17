@@ -324,6 +324,7 @@ pub fn run_regalloc_and_merge_clobbers_ex(
                             // matmul group needs a third scratch (product,
                             // hoisted factor, unaligned C addend).
                             | O::FmaF64x2Hoisted
+                            | O::MulAddF64x4HoistedSIB
                     )
                 } else {
                     false

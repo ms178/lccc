@@ -52,27 +52,21 @@ impl Lowerer {
         // Vector comparisons (==, !=, <, <=, >, >=).  These must be lowered
         // element-wise here; the scalar/pointer fall-through below would
         // otherwise compare a vector's stack address against the scalar
-        // operand (miscompiling PR 110817 and friends).  Only integer element
-        // types take this path — float element vectors have no integer IrCmpOp
-        // and are intentionally left to their existing lowering.
+        // operand (miscompiling PR 110817 and friends).  Float lanes take it
+        // too: `Cmp` on F32/F64 is the same ordered compare scalar `<` uses,
+        // and the fall-through compared the vector's stack address against
+        // the other operand, so `(f < g)[i]` dereferenced a 0/1 boolean.
         if matches!(
             op,
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
         ) {
-            let lhs_ct = self.expr_ctype(lhs);
-            if lhs_ct.is_vector() {
-                if let Some((elem_ct, _)) = lhs_ct.vector_info() {
-                    if !elem_ct.is_floating() {
-                        return self.lower_vector_cmp(*op, lhs, rhs, &lhs_ct);
-                    }
-                }
-            }
-            let rhs_ct = self.expr_ctype(rhs);
-            if rhs_ct.is_vector() {
-                if let Some((elem_ct, _)) = rhs_ct.vector_info() {
-                    if !elem_ct.is_floating() {
-                        return self.lower_vector_cmp(*op, lhs, rhs, &rhs_ct);
-                    }
+            for side in [lhs, rhs] {
+                let ct = self.expr_ctype(side);
+                if ct
+                    .vector_info()
+                    .is_some_and(|(elem, _)| Self::vector_cmp_lane_supported(elem))
+                {
+                    return self.lower_vector_cmp(*op, lhs, rhs, &ct);
                 }
             }
         }
@@ -560,6 +554,12 @@ impl Lowerer {
     }
 
     /// Convert a comparison BinOp to the corresponding IrCmpOp.
+    /// Lanes `lower_vector_cmp` handles: integers and `float`/`double`
+    /// (`long double` and `__float128` are not valid vector lanes).
+    fn vector_cmp_lane_supported(elem: &CType) -> bool {
+        !elem.is_floating() || matches!(elem, CType::Float | CType::Double)
+    }
+
     pub(super) fn binop_to_cmp(op: BinOp, is_unsigned: bool) -> IrCmpOp {
         match (op, is_unsigned) {
             (BinOp::Eq, _) => IrCmpOp::Eq,
@@ -1091,20 +1091,34 @@ impl Lowerer {
         // data from address-producing branches so both branches produce data
         // values.
         //
-        // Only check for struct-typed expressions (both branches struct/union).
-        // expr_produces_packed_struct_data() is not valid for non-struct types
-        // (it can return true for non-struct function calls).
-        let result_is_struct = then_ct.is_struct_or_union() || else_ct.is_struct_or_union();
-        let (needs_struct_load, then_produces_packed) = if result_is_struct {
+        // Only for aggregate-typed conditionals (struct, union or GNU vector):
+        // expr_produces_packed_struct_data() answers from the return ABI and
+        // the size alone, so it is true for scalar-returning calls as well.
+        let is_aggregate = |ct: &CType| ct.is_struct_or_union() || ct.is_vector();
+        let result_is_aggregate = is_aggregate(&then_ct) || is_aggregate(&else_ct);
+        let (needs_struct_load, then_produces_packed) = if result_is_aggregate {
             let tp = self.expr_produces_packed_struct_data(then_expr);
             let ep = self.expr_produces_packed_struct_data(else_expr);
             (tp != ep, tp)
         } else {
             (false, false)
         };
-        // Use target int type for loading packed small-struct data (≤8 bytes)
+        // Both arms yield the address of the aggregate's bytes: the merge is a
+        // pointer whatever the arms' IR value types say (an x87-class call
+        // result is typed F128 but lowered to its result buffer's address).
+        let both_addresses = result_is_aggregate && !needs_struct_load && !then_produces_packed;
+        // The merged packed value has the object's own width: the address
+        // arm is loaded at it (a 4-byte vector must not be read as 8 bytes)
+        // and the call arm's integer-register value is narrowed to it.
         let effective_ty = if needs_struct_load {
-            crate::common::types::target_int_ir_type()
+            self.struct_value_size(then_expr)
+                .or_else(|| self.struct_value_size(else_expr))
+                .map_or_else(
+                    crate::common::types::target_int_ir_type,
+                    Self::packed_store_type,
+                )
+        } else if both_addresses {
+            IrType::Ptr
         } else {
             common_ty
         };
@@ -1130,6 +1144,8 @@ impl Lowerer {
                     } else {
                         then_val
                     }
+                } else if both_addresses {
+                    then_val
                 } else {
                     s.emit_implicit_cast(then_val, then_ty, effective_ty)
                 }
@@ -1152,6 +1168,8 @@ impl Lowerer {
                     } else {
                         else_val
                     }
+                } else if both_addresses {
+                    else_val
                 } else {
                     s.emit_implicit_cast(else_val, else_ty, effective_ty)
                 }

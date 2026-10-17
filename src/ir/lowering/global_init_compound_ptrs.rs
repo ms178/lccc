@@ -891,6 +891,8 @@ impl Lowerer {
             } else if let Some(val) = self.eval_const_expr(expr) {
                 let ir_ty = IrType::from_ctype(ty);
                 self.write_const_to_bytes(bytes, offset, &val, ir_ty);
+            } else {
+                self.diagnose_non_constant(expr);
             }
         } else if let (Some(bo), Some(bw)) = (bit_offset, bit_width) {
             let ir_ty = IrType::from_ctype(ty);

@@ -6,10 +6,15 @@
 static __inline__ unsigned int __attribute__((__always_inline__))
 _bzhi_u32(unsigned int __src, unsigned int __index)
 {
+#if defined(__x86_64__) && defined(__BMI2__)
+    /* One `bzhi`; the IR operation folds and simplifies exactly. */
+    return __builtin_ia32_bzhi_si(__src, __index);
+#else
     __index &= 0xFF;
     if (__index >= 32)
         return __src;
     return __src & ((1U << __index) - 1U);
+#endif
 }
 
 #ifdef __x86_64__
@@ -17,10 +22,14 @@ _bzhi_u32(unsigned int __src, unsigned int __index)
 static __inline__ unsigned long long __attribute__((__always_inline__))
 _bzhi_u64(unsigned long long __src, unsigned long long __index)
 {
+#ifdef __BMI2__
+    return __builtin_ia32_bzhi_di(__src, __index);
+#else
     __index &= 0xFF;
     if (__index >= 64)
         return __src;
     return __src & ((1ULL << __index) - 1ULL);
+#endif
 }
 #endif
 

@@ -649,15 +649,13 @@ impl Lowerer {
         field_size: usize,
         field_is_pointer: bool,
     ) {
-        // Vector fields need their logical lane count, padded ext-vector stride,
-        // and packed-bool representation rather than scalar-sized fallback.
-        if matches!(field_ty, CType::Vector(_, _) | CType::ExtVector(_, _)) {
+        // Vector fields hold no relocation: emit their byte image.
+        if field_ty.is_vector() {
             let mut bytes = vec![0u8; field_size];
-            self.write_vector_init_to_bytes(&mut bytes, 0, field_ty, init);
+            self.write_vector_init_bytes(init, field_ty, &mut bytes, 0);
             push_bytes_as_elements(elements, &bytes);
             return;
         }
-
         // Complex fields: emit {real, imag} as byte pairs
         if field_ty.is_complex() {
             let mut bytes = vec![0u8; field_size];
@@ -688,6 +686,7 @@ impl Lowerer {
                     } else if let Some(addr_init) = self.eval_global_addr_expr(expr) {
                         elements.push(addr_init);
                     } else {
+                        self.diagnose_non_constant(expr);
                         push_zero_bytes(elements, field_size);
                     }
                 } else if let Expr::CompoundLiteral(cl_type_spec, cl_init, _) = expr {
@@ -774,7 +773,9 @@ impl Lowerer {
                 // Non-struct field: serialize to bytes (arrays, scalars)
                 let mut bytes = vec![0u8; field_size];
                 if let CType::Array(ref inner_ty, Some(arr_size)) = field_ty_clone {
-                    if inner_ty.is_complex() {
+                    if inner_ty.is_vector() {
+                        self.fill_array_of_vectors(nested_items, inner_ty, arr_size, &mut bytes, 0);
+                    } else if inner_ty.is_complex() {
                         let elem_size = self.resolve_ctype_size(inner_ty);
                         self.fill_array_of_complex(
                             nested_items,

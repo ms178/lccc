@@ -95,6 +95,14 @@ pub struct Driver {
     pub(super) fast_math: bool,
     /// -fwrapv makes signed Add/Sub/Mul modular; never infer no-wrap from C UB.
     pub(super) wrap_signed_overflow: bool,
+    /// `-ffreestanding` / `-fno-hosted`: a freestanding implementation, so
+    /// `__STDC_HOSTED__` is 0 (C17 6.10.8.1).  Independent of the builtin
+    /// policy: `-ffreestanding -fbuiltin` stays freestanding (GCC 16.2).
+    pub(super) freestanding: bool,
+    /// The command line's builtin withdrawals (`-fno-builtin[-<fn>]`,
+    /// `-ffreestanding`, ...); combined with the TU's own definitions by
+    /// `passes::builtin_policy::apply` right after lowering.
+    pub(super) builtin_policy: crate::common::pass_policy::BuiltinFlags,
     /// Explicitly observable FP traps; ordinary TUs retain the FENV-off policy.
     pub(super) fp_trapping_math: bool,
     /// Dynamic rounding is observable independently of exception trapping.
@@ -434,20 +442,6 @@ pub struct Driver {
     /// `None` = keep the built-in default; `Some(None)` = the dialect defines
     /// no `__STDC_VERSION__` (C89/C90); `Some(Some(v))` = define it as `v`.
     pub(super) stdc_version: Option<Option<&'static str>>,
-    /// `-ffreestanding`: the translation unit does not assume a hosted
-    /// implementation, so `__STDC_HOSTED__` must report 0 (C11 4p6).
-    ///
-    /// Linux's `arch/x86/boot` and most firmware build with this flag, and
-    /// headers branch on `__STDC_HOSTED__` to choose freestanding paths.
-    /// Before this field existed the flag had no arm at all and was silently
-    /// dropped, so `__STDC_HOSTED__` stayed 1 and such a build silently took
-    /// the hosted branch — GCC flips it to 0.
-    pub(super) freestanding: bool,
-    /// A13: the CLI's builtin-withdrawal state, consulted by the pass-side
-    /// synthesis gate (`passes::libcall`).  Populated by the `-fno-builtin`
-    /// family and by `-ffreestanding`; see `src/driver/cli.rs` for the
-    /// exact GCC-compatible semantics.
-    pub(super) builtin_policy: crate::common::builtin::BuiltinPolicy,
     /// Whether -fexceptions is in effect (defines __EXCEPTIONS like GCC).
     pub(super) exceptions: bool,
     /// Whether to dump preprocessor defines instead of preprocessed output (-dM).
@@ -522,6 +516,8 @@ impl Driver {
             fp_contract_explicit: false,
             fast_math: false,
             wrap_signed_overflow: false,
+            freestanding: false,
+            builtin_policy: crate::common::pass_policy::BuiltinFlags::default(),
             fp_trapping_math: false,
             fp_rounding_math: false,
             verbose: false,
@@ -649,8 +645,6 @@ impl Driver {
             gnu89_inline: false,
             gnu89_inline_explicit: None,
             stdc_version: None,
-            freestanding: false,
-            builtin_policy: crate::common::builtin::BuiltinPolicy::default(),
             exceptions: false,
             dump_defines: false,
             color_mode: ColorMode::Auto,
@@ -1670,10 +1664,8 @@ impl Driver {
                 None => preprocessor.undefine_macro("__STDC_VERSION__"),
             }
         }
-        // `-ffreestanding` contract (C11 4p6): a freestanding implementation
-        // defines `__STDC_HOSTED__` as 0. Applied here, next to the other
-        // dialect-selected standards macro and BEFORE the user's `-D`s, so
-        // `-ffreestanding -D__STDC_HOSTED__=1` still lets the user win.
+        // C17 6.10.8.1: a freestanding implementation defines
+        // `__STDC_HOSTED__` as 0.  Before the user's `-D`s, which still win.
         if self.freestanding {
             preprocessor.define_macro("__STDC_HOSTED__", "0");
         }
@@ -1776,13 +1768,6 @@ impl Driver {
             self.x86_tune.as_deref(),
         );
         crate::backend::x86::cpu_model::set_active(tune);
-        // A14a: publish the CLI's builtin-withdrawal state for the backend's
-        // const-size expansion gate — process-global for the same reason
-        // and at the same point as the tuning row.  The TU's own definitions
-        // cannot be published here (the module does not exist yet); the pass
-        // runner snapshots them (`passes::run_passes`) and the backend
-        // publishes its module's set at codegen entry.
-        crate::backend::libcall_policy::set(self.builtin_policy.clone());
         if let Ok(v) = std::env::var("LCCC_DUMP_TUNE") {
             if v == "all" {
                 for cpu in crate::backend::x86::cpu_model::X86Cpu::ALL {
@@ -1990,6 +1975,11 @@ impl Driver {
                 .aliases
                 .push((old_name.clone(), new_name.clone(), false));
         }
+        // The builtin policy needs the whole TU -- a definition can follow its
+        // first call, and the pragma aliases above define symbols too -- so
+        // it is published onto the IR here, after the last symbol is known
+        // and before any pass runs.
+        crate::passes::builtin_policy::apply(&mut module, &self.builtin_policy);
 
         // Apply -fcommon: mark tentative definitions as COMMON symbols.
         // A tentative definition is a global variable at file scope with no initializer
@@ -2135,7 +2125,6 @@ impl Driver {
         // If PGO use is active, run PGO layout before passes? Actually after, but we prepare
         run_passes(
             &mut module,
-            &self.builtin_policy,
             self.opt_level,
             self.target,
             self.code16gcc,
@@ -2212,6 +2201,18 @@ impl Driver {
             let nprom = crate::pgo::promote::promote_indirect_calls(&mut module, &pgo_unit);
             if nprom > 0 {
                 let _ = crate::passes::inline::run(&mut module);
+            }
+        }
+
+        // x86-64 hardware shifts mask their counts; drop the C-level masks
+        // that only feed such counts. This must follow every semantic IR
+        // pass (see backend::x86::shift_count for the contract).
+        if self.target == Target::X86_64
+            && self.opt_level >= 1
+            && std::env::var_os("CCC_NO_SHIFT_COUNT_DEMAND").is_none()
+        {
+            for func in &mut module.functions {
+                crate::backend::x86::shift_count::run(func);
             }
         }
 

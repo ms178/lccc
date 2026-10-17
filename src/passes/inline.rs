@@ -146,6 +146,22 @@ const MAX_INLINE_BUDGET_PER_CALLER: usize = 350;
 /// overflow the 16KB kernel stack if individual frames are too large).
 const MAX_CALLER_INSTRUCTIONS_AFTER_INLINE: usize = 200;
 
+/// Raw-snapshot size limit for an internal-linkage, loop-free callee whose call
+/// site is inside a loop and which may bypass the caller-size caps. It is
+/// twice the ordinary inline limit: hot bit-writer/hash helpers (43-47 IR
+/// instructions in zstd's encoder) fall just above that limit, while every
+/// such clone is still charged to MAX_INLINE_BUDGET_PER_CALLER.
+const MAX_HOT_LOOP_INLINE_LEAF_INSTRUCTIONS: usize = 2 * MAX_INLINE_INSTRUCTIONS;
+
+/// Size limits for a declared-`inline` internal callee WITH a loop whose call
+/// site is inside a caller loop (see `is_hot_loop_helper_candidate`): zstd's
+/// `ZSTD_count` is 142 instructions in 19 blocks after its own helpers are
+/// inlined. The limits are the single-call-site/medium-static instruction
+/// limit and the vector-intrinsic block limit -- tiers the inliner already
+/// accepts for other hot bodies -- not a fit to one function.
+const MAX_HOT_LOOP_HELPER_INSTRUCTIONS: usize = 160;
+const MAX_HOT_LOOP_HELPER_BLOCKS: usize = 24;
+
 /// Maximum instructions for __attribute__((always_inline)) functions.
 /// GCC always inlines __attribute__((always_inline)) regardless of size, and
 /// failing to do so can cause section mismatch errors in the kernel (e.g., when
@@ -378,6 +394,70 @@ fn aggregate_frame_should_stay_outlined(
 ///    budget and caller size constraints.
 ///
 /// Returns `(site, callee_inst_count, use_relaxed)` or `None` if no eligible site.
+/// Size/shape test for an internal-linkage loop-free leaf that may be inlined
+/// at an in-loop site despite caller-size caps (and, for declared-inline
+/// bodies, despite exceeding the ordinary static-inline limit). The in-loop
+/// and budget conditions are decided per site in `select_inline_site`.
+/// Plain statics qualify too: GCC auto-inlines small static leaves in hot
+/// loops, and devirtualized template predicates (zstd's match finders) are
+/// plain statics.
+fn is_hot_leaf_candidate(data: &CalleeData) -> bool {
+    let instructions: usize = data.blocks.iter().map(|b| b.instructions.len()).sum();
+    (data.is_static_inline || data.is_plain_static)
+        && !data.is_always_inline
+        && !data.has_loops
+        && !data.is_recursive
+        && !data.const_trip_only
+        && instructions <= MAX_HOT_LOOP_INLINE_LEAF_INSTRUCTIONS
+        && data.blocks.len() <= MAX_INLINE_BLOCKS_NO_LOOPS
+}
+
+/// Size/shape test for a declared-`inline` internal-linkage callee that
+/// contains a loop and may be inlined at an in-loop site despite the
+/// static-inline limit and the caller-size caps (`select_inline_site`).
+/// GCC gives declared-inline bodies `max-inline-insns-single`; LCCC's
+/// static-inline tier stops at MAX_INLINE_INSTRUCTIONS, so a short scanning
+/// loop such as zstd's `ZSTD_count` (run once per match in every block
+/// compressor) stayed a call: 163 call sites in libzstd versus 5 for GCC.
+fn is_hot_loop_helper_candidate(data: &CalleeData) -> bool {
+    let instructions: usize = data.blocks.iter().map(|b| b.instructions.len()).sum();
+    data.is_static_inline
+        && !data.is_always_inline
+        && data.has_loops
+        && !data.is_recursive
+        && !data.const_trip_only
+        && instructions <= MAX_HOT_LOOP_HELPER_INSTRUCTIONS
+        && data.blocks.len() <= MAX_HOT_LOOP_HELPER_BLOCKS
+}
+
+/// Blocks of `lp` executed on every iteration that reaches a back edge: each
+/// dominates every latch (in-loop predecessor of the header). A static, profile-
+/// free "must execute per iteration" proof used for hot-site decisions.
+fn every_iteration_blocks_of(
+    cfg: &crate::ir::analysis::CfgAnalysis,
+    lp: &loop_analysis::NaturalLoop,
+) -> Vec<usize> {
+    let latches: Vec<usize> = cfg
+        .preds
+        .row(lp.header)
+        .iter()
+        .map(|&p| p as usize)
+        .filter(|p| lp.body.contains(p))
+        .collect();
+    if latches.is_empty() {
+        return Vec::new();
+    }
+    lp.body
+        .iter()
+        .copied()
+        .filter(|&b| {
+            latches
+                .iter()
+                .all(|&latch| crate::ir::analysis::dominates_idom(&cfg.idom, b, latch))
+        })
+        .collect()
+}
+
 fn select_inline_site(
     call_sites: &[InlineCallSite],
     callee_map: &FxHashMap<String, CalleeData>,
@@ -389,10 +469,14 @@ fn select_inline_site(
     budget_remaining: usize,
     always_inline_budget_remaining: usize,
     pgo_force_budget_remaining: usize,
+    hot_leaf_budget_remaining: Option<usize>,
     size_optimized: bool,
     loop_blocks: &FxHashSet<usize>,
+    every_iteration_blocks: &FxHashSet<usize>,
+    devirtualized_callees: &FxHashSet<String>,
     caller_has_loops: bool,
-) -> Option<(InlineCallSite, usize, bool)> {
+    hot_direct: bool,
+) -> Option<(InlineCallSite, usize, bool, bool)> {
     // First pass: look for tiny/small callees anywhere in the function.
     // These are always inlined regardless of caller size because:
     // 1. They have negligible impact on code/stack size
@@ -448,6 +532,13 @@ fn select_inline_site(
         // Attribute/section/PGO cases keep their stronger correctness or
         // profile-driven policy.
         if aggregate_frame_should_stay_outlined(callee_data, site.pgo_force, size_optimized)
+            || template_wrapper_should_wait_for_specialization(
+                callee_data,
+                callee_inst_count,
+                caller_has_section,
+                site.pgo_force,
+                size_optimized,
+            )
             || multisite_loop_wrapper_should_stay_outlined(
                 callee_data,
                 callee_inst_count,
@@ -520,7 +611,7 @@ fn select_inline_site(
             || is_gnu_inline_eligible
         {
             let use_relaxed = callee_data.is_always_inline || callee_data.exceeds_normal_limits;
-            return Some((site.clone(), callee_inst_count, use_relaxed));
+            return Some((site.clone(), callee_inst_count, use_relaxed, false));
         }
     }
 
@@ -558,6 +649,13 @@ fn select_inline_site(
             .map(|b| b.instructions.len())
             .sum();
         if aggregate_frame_should_stay_outlined(callee_data, site.pgo_force, size_optimized)
+            || template_wrapper_should_wait_for_specialization(
+                callee_data,
+                callee_inst_count,
+                caller_has_section,
+                site.pgo_force,
+                size_optimized,
+            )
             || multisite_loop_wrapper_should_stay_outlined(
                 callee_data,
                 callee_inst_count,
@@ -625,6 +723,53 @@ fn select_inline_site(
         if caller_is_recursive && !callee_data.is_always_inline {
             continue;
         }
+        // Devirtualized hot leaf. A function-pointer template parameter
+        // (zstd's `matchFound`) is specialized to one small static target;
+        // when that call executes on EVERY loop iteration (its block
+        // dominates every latch), leaving it outlined defeats the intended
+        // specialization and costs call/return plus argument traffic per
+        // iteration. Such a site bypasses the caller-size caps, charged to
+        // the ordinary budget and then to a relative budget equal to the
+        // caller's entry size (GCC's large-function-growth = 100%), which
+        // also bounds kernel stack frames.
+        //
+        // Direct calls (`hot_direct`) qualify only for a callee the
+        // programmer declared `inline` (GCC's max-inline-insns-single
+        // versus -auto distinction), and only below the absolute caller cap:
+        // an earlier, unconditional extension cloned two small direct hash
+        // helpers into zstd's 2.5k-instruction doubleFast loop, which slowed
+        // binary-input level-3 compression by 21-28 % on the screening host
+        // with identical Callgrind counts. That caller stays excluded; the
+        // admitted case is a declared-inline leaf such as zstd's
+        // FSE_encodeSymbol, called on every iteration of a mid-sized
+        // sequence-encoding loop.
+        //
+        // A declared-inline callee with its own loop (a scan such as zstd's
+        // `ZSTD_count`) qualifies at any in-loop site, not only an
+        // every-iteration one: it runs once per match, and its call
+        // overhead (argument setup, a callee-saved frame, the return) is
+        // paid on each. Same knob, budget and absolute caller cap, so the
+        // 2.5k-instruction doubleFast loop above stays excluded.
+        let hot_inline_leaf = hot_leaf_budget_remaining.is_some()
+            && !size_optimized
+            && ((every_iteration_blocks.contains(&site.block_idx)
+                && is_hot_leaf_candidate(callee_data)
+                && (devirtualized_callees.contains(&site.callee_name)
+                    || (hot_direct && callee_data.is_static_inline && !caller_at_absolute_cap)))
+                || (hot_direct
+                    && !caller_at_absolute_cap
+                    && loop_blocks.contains(&site.block_idx)
+                    && is_hot_loop_helper_candidate(callee_data)));
+        // A hot-leaf candidate above the ordinary limit is offered by
+        // `find_inline_call_sites` only for this decision; every other site
+        // keeps the historical exceeds-normal-limits exclusion.
+        if callee_data.exceeds_normal_limits
+            && !caller_has_section
+            && !callee_data.is_single_call_site_static
+            && !hot_inline_leaf
+        {
+            continue;
+        }
         // A profile-guided FORCE-INLINE site is hot (in a hot loop /
         // high frequency); it should be inlined even when the caller is large
         // or the normal budget is tight — the PGO advantage. We bypass the
@@ -660,6 +805,7 @@ fn select_inline_site(
             let in_loop = loop_blocks.contains(&site.block_idx);
             let size_cap_exempt = callee_data.is_single_call_site_static
                 && callee_data.size_inline_cost <= MAX_SINGLE_SITE_LOOP_NEST_EXEMPTION_COST;
+
             // A constant-trip clone (see MAX_CONST_TRIP_COUNT) is bounded by
             // the per-caller budget and the hard/absolute caps below. The soft
             // cap would otherwise veto the second clone in a caller, as in
@@ -669,6 +815,7 @@ fn select_inline_site(
                 && !callee_data.is_always_inline
                 && !size_cap_exempt
                 && !const_trip_admitted
+                && !hot_inline_leaf
                 && !(in_loop
                     && !callee_data.has_loops
                     && callee_inst_count <= MAX_INLINE_INSTRUCTIONS)
@@ -678,13 +825,13 @@ fn select_inline_site(
             }
             // Absolute cap: stop normal inlining for extremely large callers.
             // always_inline callees MUST still be inlined (C semantic requirement).
-            if caller_at_absolute_cap && !callee_data.is_always_inline {
+            if caller_at_absolute_cap && !callee_data.is_always_inline && !hot_inline_leaf {
                 continue;
             }
             // Hard cap: stop normal inlining to prevent kernel stack overflow.
             // always_inline callees are still inlined (C semantic requirement),
             // but are limited by the always_inline budget.
-            if caller_at_hard_cap && !callee_data.is_always_inline {
+            if caller_at_hard_cap && !callee_data.is_always_inline && !hot_inline_leaf {
                 continue;
             }
         }
@@ -711,9 +858,12 @@ fn select_inline_site(
             // Single-call-site statics don't consume the normal budget: each
             // is inlined at most once module-wide, so they cannot cause the
             // exponential blowup the budget guards against.
+            if hot_inline_leaf && callee_inst_count <= hot_leaf_budget_remaining.unwrap_or(0) {
+                return Some((site.clone(), callee_inst_count, use_relaxed, true));
+            }
             continue;
         }
-        return Some((site.clone(), callee_inst_count, use_relaxed));
+        return Some((site.clone(), callee_inst_count, use_relaxed, false));
     }
 
     None
@@ -747,7 +897,73 @@ pub fn run_always_inline_only(module: &mut IrModule) -> usize {
     inline_run_impl(module, false, true)
 }
 
+/// Switches for the inliner's later extensions. Each defaults on and is
+/// reversible from the environment for A/B measurement and miscompile triage
+/// (project convention). `run_passes` resolves the `CCC_NO_INLINE_*` switches
+/// once per translation unit and hands them over through [`set_features`]
+/// (the pass pipeline does not read the environment per call; see
+/// `check_env_test_hygiene.sh`); tests pass explicit values instead of
+/// mutating the process environment, which parallel tests share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct InlineFeatures {
+    /// Resolve constant-folded indirect calls to direct calls first.
+    pub(crate) devirt: bool,
+    /// Replace a processed caller's snapshot with its processed body.
+    pub(crate) snapshot_refresh: bool,
+    /// Iterate ordinary and second-pass always_inline expansion jointly.
+    pub(crate) joint_fixpoint: bool,
+    /// Devirtualized per-iteration hot-leaf budget bypass.
+    pub(crate) hot_leaf: bool,
+    /// Size and clone a refreshed snapshot after scalar cleanup.
+    pub(crate) snapshot_cleanup: bool,
+    /// Clean a size-capped caller in place before giving up on it.
+    pub(crate) caller_cleanup: bool,
+    /// Extend the hot-leaf admission to direct calls of declared-inline
+    /// leaves, and admit declared-inline loop helpers at in-loop sites
+    /// (both below the absolute caller cap).
+    pub(crate) hot_direct: bool,
+}
+
+impl InlineFeatures {
+    pub(crate) const ALL: Self = Self {
+        devirt: true,
+        snapshot_refresh: true,
+        joint_fixpoint: true,
+        hot_leaf: true,
+        snapshot_cleanup: true,
+        caller_cleanup: true,
+        hot_direct: true,
+    };
+}
+
+// A `thread_local` (not a `LazyLock`): worker threads compile several
+// translation units in one process and `run_passes` re-resolves per unit,
+// the same shape as the affine-fold and byte-compare knobs.
+thread_local! {
+    static FEATURES: std::cell::Cell<InlineFeatures> =
+        const { std::cell::Cell::new(InlineFeatures::ALL) };
+}
+
+/// Install this translation unit's inliner feature switches.
+pub(crate) fn set_features(features: InlineFeatures) {
+    FEATURES.with(|f| f.set(features));
+}
+
 fn inline_run_impl(module: &mut IrModule, size_optimized: bool, always_inline_only: bool) -> usize {
+    inline_run_with(
+        module,
+        size_optimized,
+        always_inline_only,
+        FEATURES.with(|f| f.get()),
+    )
+}
+
+fn inline_run_with(
+    module: &mut IrModule,
+    size_optimized: bool,
+    always_inline_only: bool,
+    features: InlineFeatures,
+) -> usize {
     let mut total_inlined = 0;
     let debug_inline = std::env::var("CCC_INLINE_DEBUG").is_ok();
     let skip_list: Vec<String> = std::env::var("CCC_INLINE_SKIP")
@@ -759,7 +975,28 @@ fn inline_run_impl(module: &mut IrModule, size_optimized: bool, always_inline_on
 
     // Build a snapshot of eligible callees (we can't borrow module mutably while reading callees).
     // We clone the callee function bodies since we need them while mutating callers.
-    let mut callee_map = build_callee_map(module);
+    let InlineFeatures {
+        devirt: devirt_enabled,
+        snapshot_refresh: refresh_enabled,
+        joint_fixpoint: joint_fixpoint_enabled,
+        hot_leaf: hot_leaf_enabled,
+        snapshot_cleanup: cleanup_enabled,
+        caller_cleanup: caller_cleanup_enabled,
+        hot_direct: hot_direct_enabled,
+    } = features;
+    let devirtualized = if devirt_enabled {
+        devirtualize_constant_indirect_calls(module)
+    } else {
+        FxHashSet::default()
+    };
+    if debug_inline && !devirtualized.is_empty() {
+        eprintln!(
+            "[INLINE] Devirtualized constant indirect calls (caller, callee): {:?}",
+            devirtualized
+        );
+    }
+    let callee_ctx = callee_context(module);
+    let mut callee_map = build_callee_map_with(module, &callee_ctx);
     if always_inline_only {
         callee_map.retain(|_, data| data.is_always_inline);
     }
@@ -808,6 +1045,12 @@ fn inline_run_impl(module: &mut IrModule, size_optimized: bool, always_inline_on
 
     // Process each function as a potential caller
     for func_idx in 0..module.functions.len() {
+        let inlined_before = total_inlined;
+        let devirtualized_callees: FxHashSet<String> = devirtualized
+            .iter()
+            .filter(|(caller, _)| *caller == module.functions[func_idx].name)
+            .map(|(_, callee)| callee.clone())
+            .collect();
         if module.functions[func_idx].is_declaration {
             continue;
         }
@@ -833,6 +1076,17 @@ fn inline_run_impl(module: &mut IrModule, size_optimized: bool, always_inline_on
             })
         };
         let mut budget_remaining = MAX_INLINE_BUDGET_PER_CALLER;
+        // Relative growth allowance for hot in-loop declared-inline leaves
+        // only (see `select_inline_site`): at most the caller's entry size.
+        let mut hot_leaf_budget_remaining = hot_leaf_enabled.then(|| {
+            MAX_INLINE_BUDGET_PER_CALLER.max(
+                module.functions[func_idx]
+                    .blocks
+                    .iter()
+                    .map(|b| b.instructions.len())
+                    .sum(),
+            )
+        });
         let mut always_inline_budget_remaining = MAX_ALWAYS_INLINE_BUDGET_PER_CALLER;
         let mut pgo_force_budget_remaining = MAX_PGO_FORCE_INLINE_BUDGET_PER_CALLER;
         // During one -Os inliner invocation, clone a large ordinary callee at
@@ -937,449 +1191,273 @@ fn inline_run_impl(module: &mut IrModule, size_optimized: bool, always_inline_on
 
         // Iterate to handle chains of inlined calls (A calls B calls C, all small inline).
         // Limit iterations to prevent infinite loops from recursive inline functions.
-        let max_rounds = 200;
-        for _round in 0..max_rounds {
-            // Check if the caller has grown too large for further normal inlining.
-            // Each SSA value in CCC gets an 8-byte stack slot, so functions with
-            // too many instructions will have massive stack frames. Stop normal
-            // inlining once the caller exceeds the threshold; always_inline
-            // callees are still inlined (required by C semantics).
-            let caller_inst_count: usize = module.functions[func_idx]
-                .blocks
-                .iter()
-                .map(|b| b.instructions.len())
-                .sum();
-            let caller_too_large = caller_inst_count > MAX_CALLER_INSTRUCTIONS_AFTER_INLINE;
-            let caller_at_hard_cap = caller_inst_count > MAX_CALLER_INSTRUCTIONS_HARD_CAP;
-            let caller_at_absolute_cap = caller_inst_count > MAX_CALLER_INSTRUCTIONS_ABSOLUTE_CAP;
-
-            // Find call sites to inline in the current function.
-            // When the caller has a custom section attribute, also consider callees
-            // that exceed normal limits, to avoid dangerous cross-section calls.
-            let mut call_sites = find_inline_call_sites(
-                &module.functions[func_idx],
-                &callee_map,
-                &skip_list,
-                caller_has_section,
-            );
-            // PGO: filter/adjust call sites based on profile. On a FLAT
-            // profile (no hot/cold spread) PGO inlining has no informative
-            // signal; skip reading the profile entirely so inlining is
-            // byte-identical to plain -O2 (prevents pass perturbation that can
-            // regress hot paths — see inline_pgo::inline_decisions_active).
-            if let Some(profile) = crate::pgo::get_pgo_profile() {
-                if crate::pgo::inline_pgo::inline_decisions_active() {
-                    let caller_name = module.functions[func_idx].name.clone();
-                    // Per-call-site hotness. Derive block counts for the
-                    // CURRENT caller CFG from the h0-keyed profile (the CFG may
-                    // have changed since training; derive handles drift
-                    // gracefully) so the decision sees the count of the block
-                    // containing each call (LLVM isHotCallSite/BFI).
-                    let caller_fn = &module.functions[func_idx];
-                    let mut caller_fp = crate::pgo::prepass_profile(&caller_name);
-                    if let Some(fp) = caller_fp.as_mut() {
-                        crate::pgo::profile::derive_block_counts(caller_fn, fp);
-                    }
-                    // For each call site, check if PGO says to force inline or deny
-                    let mut filtered = Vec::with_capacity(16);
-                    for site in call_sites {
-                        if let Some(callee) = callee_map.get(&site.callee_name) {
-                            // Get callee name
-                            let callee_name = &site.callee_name;
-                            let site_cnt = caller_fp
-                                .as_ref()
-                                .map(|fp| {
-                                    let lbl =
-                                        module.functions[func_idx].blocks[site.block_idx].label;
-                                    fp.block_count(lbl)
-                                })
-                                .unwrap_or(0);
-                            // Check PGO inline decision
-                            if let Some(force) = crate::pgo::inline_pgo::should_inline_site(
-                                &module.functions[func_idx],
-                                &{
-                                    // Reconstruct IrFunction for callee from callee_map data
-                                    // callee_map stores blocks, we need to create a dummy IrFunction
-                                    let dummy = crate::ir::reexports::IrFunction {
-                                        pass_policy: Default::default(),
-                                        name: callee_name.clone(),
-                                        return_type: crate::common::types::IrType::I32,
-                                        params: vec![],
-                                        blocks: callee.blocks.clone(),
-                                        is_variadic: false,
-                                        is_declaration: false,
-                                        is_static: false,
-                                        is_inline: false,
-                                        is_always_inline: false,
-                                        is_noinline: false,
-                                        next_value_id: 0,
-                                        fp_expr_tags: Default::default(),
-                                        next_label: 0,
-                                        section: None,
-                                        visibility: None,
-                                        is_weak: false,
-                                        is_used: false,
-                                        has_inlined_calls: false,
-                                        param_alloca_values: vec![],
-                                        uses_sret: false,
-                                        is_fastcall: false,
-                                        regparm: None,
-                                        is_naked: false,
-                                        no_instrument: false,
-                                        global_init_label_blocks: vec![],
-                                        ret_eightbyte_classes: vec![],
-                                        ret_is_f128_sse: false,
-                                        is_gnu_inline_def: false,
-                                        loop_promoted_f64_values: Vec::new(),
-                                    };
-                                    dummy
-                                },
-                                site_cnt,
-                                Some(profile),
-                            ) {
-                                if force {
-                                    let mut s2 = site;
-                                    s2.pgo_force = true;
-                                    filtered.push(s2);
-                                    continue;
-                                } else {
-                                    continue;
-                                } // deny
-                            }
-                            // Also check threshold multiplier
-                            let mult = crate::pgo::inline_pgo::inline_threshold_multiplier(
-                                &caller_name,
-                                callee_name,
-                                profile,
-                            );
-                            if mult < 0.4 {
-                                // Cold: skip unless tiny
-                                let inst_count: usize =
-                                    callee.blocks.iter().map(|b| b.instructions.len()).sum();
-                                if inst_count > 5 {
-                                    continue;
-                                }
-                            }
-                        }
-                        filtered.push(site);
-                    }
-                    call_sites = filtered;
-                } // end inline_decisions_active
-            }
-            if size_optimized && !size_inlined_large_callees.is_empty() {
-                call_sites.retain(|site| !size_inlined_large_callees.contains(&site.callee_name));
-            }
-            if call_sites.is_empty() {
-                break;
-            }
-
-            // Select best call site (prioritizes tiny/small, respects budgets).
-            // Compute which blocks are inside loops: call sites there are
-            // high-value (per-iteration call overhead) and exempt from the
-            // caller-size caps. Also used to avoid inlining loop-containing
-            // callees into a caller that already has loops.
-            let needs_loop_info = size_optimized
-                || caller_too_large
-                || call_sites
-                    .iter()
-                    .any(|s| callee_map[&s.callee_name].has_loops);
-            let loop_blocks: FxHashSet<usize> = if needs_loop_info {
-                let cfg = crate::ir::analysis::CfgAnalysis::build(&module.functions[func_idx]);
-                let loops = loop_analysis::find_natural_loops(
-                    cfg.num_blocks,
-                    &cfg.preds,
-                    &cfg.succs,
-                    &cfg.idom,
-                );
-                let mut s = FxHashSet::default();
-                for lp in &loops {
-                    s.extend(lp.body.iter().copied());
-                }
-                s
-            } else {
-                FxHashSet::default()
-            };
-            let caller_has_loops = !loop_blocks.is_empty();
-            let found_site = select_inline_site(
-                &call_sites,
-                &callee_map,
-                caller_too_large,
-                caller_at_hard_cap,
-                caller_at_absolute_cap,
-                caller_has_section,
-                caller_is_recursive,
-                budget_remaining,
-                always_inline_budget_remaining,
-                pgo_force_budget_remaining,
-                size_optimized,
-                &loop_blocks,
-                caller_has_loops,
-            );
-            let (site, callee_inst_count, _use_relaxed) = match found_site {
-                Some(s) => s,
-                None => {
-                    if debug_inline && caller_too_large {
-                        eprintln!(
-                            "[INLINE] No more always_inline callees to inline into '{}' (caller has {} instructions)",
-                            module.functions[func_idx].name, caller_inst_count
-                        );
-                    }
-                    break;
-                }
-            };
-            let callee_data = &callee_map[&site.callee_name];
-
-            let success = inline_call_site(
-                &mut module.functions[func_idx],
-                &site,
-                callee_data,
-                &mut global_max_block_id,
-            );
-
-            if success {
-                if size_optimized
-                    && !callee_data.is_always_inline
-                    && !callee_data.is_single_call_site_static
-                    && callee_inst_count > MAX_SMALL_STATIC_LOOP_INLINE_INSTRUCTIONS
-                {
-                    size_inlined_large_callees.insert(site.callee_name.clone());
-                }
-                if debug_inline {
-                    eprintln!(
-                        "[INLINE] Inlined '{}' into '{}'",
-                        site.callee_name, module.functions[func_idx].name
-                    );
-                }
-                if std::env::var("CCC_INLINE_VALIDATE").is_ok() {
-                    validate_function_values(&module.functions[func_idx], &site.callee_name);
-                }
-                if std::env::var("CCC_INLINE_DUMP_IR").is_ok() {
-                    dump_function_ir(
-                        &module.functions[func_idx],
-                        &format!(
-                            "after inlining '{}' into '{}'",
-                            site.callee_name, module.functions[func_idx].name
-                        ),
-                    );
-                }
-                // Deduct from the always_inline budget only when the callee
-                // is actually always_inline. Non-always_inline callees that
-                // use the relaxed path (exceeds_normal_limits) should not
-                // consume the always_inline budget — otherwise a large
-                // exceeds_normal_limits callee (e.g., find_next_bit with 77
-                // instructions) can exhaust the budget and prevent true
-                // always_inline callees (e.g., idle_init) from being inlined,
-                // causing section mismatch errors.
-                let callee_is_always_inline = callee_map
-                    .get(&site.callee_name)
-                    .map(|d| d.is_always_inline)
-                    .unwrap_or(false);
-                if callee_is_always_inline {
-                    // Don't deduct small callees from the always_inline budget.
-                    // Small callees (≤20 instructions) have negligible individual
-                    // impact and are always inlined regardless of budget (handled
-                    // in the first pass). Not counting them preserves budget for
-                    // larger always_inline callees that actually matter (e.g.,
-                    // intel_pmu_init_glc at 211 instructions needs to be inlined
-                    // into intel_pmu_init to avoid section mismatches).
-                    let callee_blocks = callee_map
-                        .get(&site.callee_name)
-                        .map(|d| d.blocks.len())
-                        .unwrap_or(0);
-                    let is_small = callee_inst_count <= MAX_SMALL_INLINE_INSTRUCTIONS
-                        && callee_blocks <= MAX_SMALL_INLINE_BLOCKS;
-                    if !is_small {
-                        always_inline_budget_remaining =
-                            always_inline_budget_remaining.saturating_sub(callee_inst_count);
-                    }
-                } else if site.pgo_force {
-                    // PGO-forced sites consume the dedicated PGO budget.
-                    pgo_force_budget_remaining =
-                        pgo_force_budget_remaining.saturating_sub(callee_inst_count);
-                } else {
-                    budget_remaining = budget_remaining.saturating_sub(callee_inst_count);
-                }
-                total_inlined += 1;
-                module.functions[func_idx].has_inlined_calls = true;
-            } else {
-                break;
-            }
-        }
-
-        // Second pass: ensure all remaining __always_inline call sites are inlined.
-        // The main loop above may exhaust max_rounds before processing all call sites
-        // in functions with 200+ inline sites (e.g., kernel's ___slab_alloc in mm/slub.c).
-        // When always_inline functions like cpucap_is_possible() are left un-inlined,
-        // their standalone bodies contain BRK traps from unresolved compiletime_assert,
-        // causing kernel crashes. This pass also handles cases where the main loop's
-        // budget was exhausted, leaving correctness-critical always_inline chains
-        // (e.g., KVM nVHE functions referencing section-specific symbols) un-inlined.
-        //
-        // This pass uses its own independent budget (not shared with the main loop)
-        // to allow small always_inline chains needed for correctness while preventing
-        // large chains from causing stack overflow. Combined with the main loop, the
-        // worst case is 200 + 400 = 600 always_inline instructions per caller.
-        //
-        // Note: this pass intentionally does NOT check caller_too_large /
-        // caller_at_hard_cap / caller_at_absolute_cap. These are correctness-
-        // critical inlines (avoiding linker errors and BRK crashes), so they
-        // must proceed regardless of caller size. The budget limit (400 inst)
-        // provides the growth bound instead.
+        // Ordinary and second-pass always_inline expansion form one bounded
+        // fixpoint. A mandatory raw template can expose calls the ordinary
+        // policy always accepts (tiny/static-inline). Previously those calls
+        // survived because ordinary rounds had already finished. The rounds
+        // and second-pass budget are shared, so no new growth bound appears.
+        let mut ordinary_rounds_left: usize = 200;
         let mut second_pass_budget = MAX_ALWAYS_INLINE_SECOND_PASS_BUDGET;
-        for _round in 0..MAX_ALWAYS_INLINE_SECOND_PASS_ROUNDS {
-            let mut call_sites = find_inline_call_sites(
-                &module.functions[func_idx],
-                &callee_map,
-                &skip_list,
-                caller_has_section,
-            );
-            // PGO: filter/adjust call sites based on profile. On a FLAT
-            // profile (no hot/cold spread) PGO inlining has no informative
-            // signal; skip reading the profile entirely so inlining is
-            // byte-identical to plain -O2 (prevents pass perturbation that can
-            // regress hot paths — see inline_pgo::inline_decisions_active).
-            if let Some(profile) = crate::pgo::get_pgo_profile() {
-                if crate::pgo::inline_pgo::inline_decisions_active() {
-                    let caller_name = module.functions[func_idx].name.clone();
-                    // Per-call-site hotness. Derive block counts for the
-                    // CURRENT caller CFG from the h0-keyed profile (the CFG may
-                    // have changed since training; derive handles drift
-                    // gracefully) so the decision sees the count of the block
-                    // containing each call (LLVM isHotCallSite/BFI).
-                    let caller_fn = &module.functions[func_idx];
-                    let mut caller_fp = crate::pgo::prepass_profile(&caller_name);
-                    if let Some(fp) = caller_fp.as_mut() {
-                        crate::pgo::profile::derive_block_counts(caller_fn, fp);
-                    }
-                    // For each call site, check if PGO says to force inline or deny
-                    let mut filtered = Vec::with_capacity(16);
-                    for site in call_sites {
-                        if let Some(callee) = callee_map.get(&site.callee_name) {
-                            // Get callee name
-                            let callee_name = &site.callee_name;
-                            let site_cnt = caller_fp
-                                .as_ref()
-                                .map(|fp| {
-                                    let lbl =
-                                        module.functions[func_idx].blocks[site.block_idx].label;
-                                    fp.block_count(lbl)
-                                })
-                                .unwrap_or(0);
-                            // Check PGO inline decision
-                            if let Some(force) = crate::pgo::inline_pgo::should_inline_site(
-                                &module.functions[func_idx],
-                                &{
-                                    // Reconstruct IrFunction for callee from callee_map data
-                                    // callee_map stores blocks, we need to create a dummy IrFunction
-                                    let dummy = crate::ir::reexports::IrFunction {
-                                        pass_policy: Default::default(),
-                                        name: callee_name.clone(),
-                                        return_type: crate::common::types::IrType::I32,
-                                        params: vec![],
-                                        blocks: callee.blocks.clone(),
-                                        is_variadic: false,
-                                        is_declaration: false,
-                                        is_static: false,
-                                        is_inline: false,
-                                        is_always_inline: false,
-                                        is_noinline: false,
-                                        next_value_id: 0,
-                                        fp_expr_tags: Default::default(),
-                                        next_label: 0,
-                                        section: None,
-                                        visibility: None,
-                                        is_weak: false,
-                                        is_used: false,
-                                        has_inlined_calls: false,
-                                        param_alloca_values: vec![],
-                                        uses_sret: false,
-                                        is_fastcall: false,
-                                        regparm: None,
-                                        is_naked: false,
-                                        no_instrument: false,
-                                        global_init_label_blocks: vec![],
-                                        ret_eightbyte_classes: vec![],
-                                        ret_is_f128_sse: false,
-                                        is_gnu_inline_def: false,
-                                        loop_promoted_f64_values: Vec::new(),
-                                    };
-                                    dummy
-                                },
-                                site_cnt,
-                                Some(profile),
-                            ) {
-                                if force {
-                                    let mut s2 = site;
-                                    s2.pgo_force = true;
-                                    filtered.push(s2);
-                                    continue;
-                                } else {
-                                    continue;
-                                } // deny
-                            }
-                            // Also check threshold multiplier
-                            let mult = crate::pgo::inline_pgo::inline_threshold_multiplier(
-                                &caller_name,
-                                callee_name,
-                                profile,
-                            );
-                            if mult < 0.4 {
-                                // Cold: skip unless tiny
-                                let inst_count: usize =
-                                    callee.blocks.iter().map(|b| b.instructions.len()).sum();
-                                if inst_count > 5 {
-                                    continue;
-                                }
-                            }
-                        }
-                        filtered.push(site);
-                    }
-                    call_sites = filtered;
-                } // end inline_decisions_active
-            }
-            if call_sites.is_empty() {
-                break;
-            }
-
-            // Only look for always_inline callees
-            let mut found = false;
-            for site in &call_sites {
-                let callee_data = &callee_map[&site.callee_name];
-                if !callee_data.is_always_inline {
-                    continue;
-                }
-                let callee_inst_count: usize = callee_data
+        let mut second_pass_rounds_left = MAX_ALWAYS_INLINE_SECOND_PASS_ROUNDS;
+        // Size of this caller right after its last in-place cleanup; see the
+        // capped-caller re-measurement below.
+        let mut size_after_cleanup: Option<usize> = None;
+        loop {
+            let mut second_pass_inlined = false;
+            while ordinary_rounds_left > 0 {
+                ordinary_rounds_left -= 1;
+                // Check if the caller has grown too large for further normal inlining.
+                // Each SSA value in CCC gets an 8-byte stack slot, so functions with
+                // too many instructions will have massive stack frames. Stop normal
+                // inlining once the caller exceeds the threshold; always_inline
+                // callees are still inlined (required by C semantics).
+                let caller_inst_count: usize = module.functions[func_idx]
                     .blocks
                     .iter()
                     .map(|b| b.instructions.len())
                     .sum();
-                let is_tiny = callee_inst_count <= MAX_TINY_INLINE_INSTRUCTIONS
-                    && callee_data.blocks.len() <= 1;
-                let is_small = callee_inst_count <= MAX_SMALL_INLINE_INSTRUCTIONS
-                    && callee_data.blocks.len() <= MAX_SMALL_INLINE_BLOCKS;
-                // Tiny and small always_inline callees always pass; others must fit
-                // in the second pass budget. Small always_inline callees bypass the
-                // budget because they have correctness requirements (e.g., inline asm
-                // "i" constraints in arch_static_branch). Callers with section
-                // attributes bypass budget (section-specific symbols like __kvm_nvhe_*
-                // MUST be resolved through inlining).
-                if !is_tiny
-                    && !is_small
-                    && !caller_has_section
-                    && callee_inst_count > second_pass_budget
-                {
-                    continue;
+                let caller_too_large = caller_inst_count > MAX_CALLER_INSTRUCTIONS_AFTER_INLINE;
+                let caller_at_hard_cap = caller_inst_count > MAX_CALLER_INSTRUCTIONS_HARD_CAP;
+                let caller_at_absolute_cap =
+                    caller_inst_count > MAX_CALLER_INSTRUCTIONS_ABSOLUTE_CAP;
+
+                // Find call sites to inline in the current function.
+                // When the caller has a custom section attribute, also consider callees
+                // that exceed normal limits, to avoid dangerous cross-section calls.
+                let mut call_sites = find_inline_call_sites(
+                    &module.functions[func_idx],
+                    &callee_map,
+                    &skip_list,
+                    caller_has_section,
+                );
+                // PGO: filter/adjust call sites based on profile. On a FLAT
+                // profile (no hot/cold spread) PGO inlining has no informative
+                // signal; skip reading the profile entirely so inlining is
+                // byte-identical to plain -O2 (prevents pass perturbation that can
+                // regress hot paths — see inline_pgo::inline_decisions_active).
+                if let Some(profile) = crate::pgo::get_pgo_profile() {
+                    if crate::pgo::inline_pgo::inline_decisions_active() {
+                        let caller_name = module.functions[func_idx].name.clone();
+                        // Per-call-site hotness. Derive block counts for the
+                        // CURRENT caller CFG from the h0-keyed profile (the CFG may
+                        // have changed since training; derive handles drift
+                        // gracefully) so the decision sees the count of the block
+                        // containing each call (LLVM isHotCallSite/BFI).
+                        let caller_fn = &module.functions[func_idx];
+                        let mut caller_fp = crate::pgo::prepass_profile(&caller_name);
+                        if let Some(fp) = caller_fp.as_mut() {
+                            crate::pgo::profile::derive_block_counts(caller_fn, fp);
+                        }
+                        // For each call site, check if PGO says to force inline or deny
+                        let mut filtered = Vec::with_capacity(16);
+                        for site in call_sites {
+                            if let Some(callee) = callee_map.get(&site.callee_name) {
+                                // Get callee name
+                                let callee_name = &site.callee_name;
+                                let site_cnt = caller_fp
+                                    .as_ref()
+                                    .map(|fp| {
+                                        let lbl =
+                                            module.functions[func_idx].blocks[site.block_idx].label;
+                                        fp.block_count(lbl)
+                                    })
+                                    .unwrap_or(0);
+                                // Check PGO inline decision
+                                if let Some(force) = crate::pgo::inline_pgo::should_inline_site(
+                                    &module.functions[func_idx],
+                                    &{
+                                        // Reconstruct IrFunction for callee from callee_map data
+                                        // callee_map stores blocks, we need to create a dummy IrFunction
+                                        let dummy = crate::ir::reexports::IrFunction {
+                                            pass_policy: Default::default(),
+                                            name: callee_name.clone(),
+                                            return_type: crate::common::types::IrType::I32,
+                                            params: vec![],
+                                            blocks: callee.blocks.clone(),
+                                            is_variadic: false,
+                                            is_declaration: false,
+                                            is_static: false,
+                                            is_inline: false,
+                                            is_always_inline: false,
+                                            is_noinline: false,
+                                            next_value_id: 0,
+                                            fp_expr_tags: Default::default(),
+                                            next_label: 0,
+                                            section: None,
+                                            visibility: None,
+                                            is_weak: false,
+                                            is_used: false,
+                                            has_inlined_calls: false,
+                                            param_alloca_values: vec![],
+                                            uses_sret: false,
+                                            is_fastcall: false,
+                                            regparm: None,
+                                            is_naked: false,
+                                            no_instrument: false,
+                                            global_init_label_blocks: vec![],
+                                            ret_eightbyte_classes: vec![],
+                                            ret_is_f128_sse: false,
+                                            is_gnu_inline_def: false,
+                                            loop_promoted_f64_values: Vec::new(),
+                                        };
+                                        dummy
+                                    },
+                                    site_cnt,
+                                    Some(profile),
+                                ) {
+                                    if force {
+                                        let mut s2 = site;
+                                        s2.pgo_force = true;
+                                        filtered.push(s2);
+                                        continue;
+                                    } else {
+                                        continue;
+                                    } // deny
+                                }
+                                // Also check threshold multiplier
+                                let mult = crate::pgo::inline_pgo::inline_threshold_multiplier(
+                                    &caller_name,
+                                    callee_name,
+                                    profile,
+                                );
+                                if mult < 0.4 {
+                                    // Cold: skip unless tiny
+                                    let inst_count: usize =
+                                        callee.blocks.iter().map(|b| b.instructions.len()).sum();
+                                    if inst_count > 5 {
+                                        continue;
+                                    }
+                                }
+                            }
+                            filtered.push(site);
+                        }
+                        call_sites = filtered;
+                    } // end inline_decisions_active
                 }
+                if size_optimized && !size_inlined_large_callees.is_empty() {
+                    call_sites
+                        .retain(|site| !size_inlined_large_callees.contains(&site.callee_name));
+                }
+                if call_sites.is_empty() {
+                    break;
+                }
+
+                // Select best call site (prioritizes tiny/small, respects budgets).
+                // Compute which blocks are inside loops: call sites there are
+                // high-value (per-iteration call overhead) and exempt from the
+                // caller-size caps. Also used to avoid inlining loop-containing
+                // callees into a caller that already has loops.
+                let needs_loop_info = size_optimized
+                    || caller_too_large
+                    || call_sites
+                        .iter()
+                        .any(|s| callee_map[&s.callee_name].has_loops);
+                let (loop_blocks, every_iteration_blocks): (FxHashSet<usize>, FxHashSet<usize>) =
+                    if needs_loop_info {
+                        let cfg =
+                            crate::ir::analysis::CfgAnalysis::build(&module.functions[func_idx]);
+                        let loops = loop_analysis::find_natural_loops(
+                            cfg.num_blocks,
+                            &cfg.preds,
+                            &cfg.succs,
+                            &cfg.idom,
+                        );
+                        let mut s = FxHashSet::default();
+                        let mut every = FxHashSet::default();
+                        for lp in &loops {
+                            s.extend(lp.body.iter().copied());
+                            every.extend(every_iteration_blocks_of(&cfg, lp));
+                        }
+                        (s, every)
+                    } else {
+                        (FxHashSet::default(), FxHashSet::default())
+                    };
+                let caller_has_loops = !loop_blocks.is_empty();
+                let found_site = select_inline_site(
+                    &call_sites,
+                    &callee_map,
+                    caller_too_large,
+                    caller_at_hard_cap,
+                    caller_at_absolute_cap,
+                    caller_has_section,
+                    caller_is_recursive,
+                    budget_remaining,
+                    always_inline_budget_remaining,
+                    pgo_force_budget_remaining,
+                    hot_leaf_budget_remaining,
+                    size_optimized,
+                    &loop_blocks,
+                    &every_iteration_blocks,
+                    &devirtualized_callees,
+                    caller_has_loops,
+                    hot_direct_enabled,
+                );
+                let (site, callee_inst_count, _use_relaxed, hot_leaf_charge) = match found_site {
+                    Some(s) => s,
+                    None => {
+                        // The size caps measure the caller as pasted: every
+                        // inlined clone still carries its parameter homes,
+                        // copies and dead residue until the post-inline
+                        // cleanup (zstd's ZSTD_encodeSequences_body: 885
+                        // here, 450 after this cleanup), so a capped caller
+                        // refuses calls its real size admits. Before giving
+                        // up, run the function-local cleanup in place and
+                        // select again against the size the caller really
+                        // has. It reruns only after the caller grew past its
+                        // last cleaned size, so every cleanup is paid for by
+                        // newly inlined work, and the shared round counter
+                        // still bounds the loop.
+                        if caller_cleanup_enabled
+                            && caller_too_large
+                            && size_after_cleanup.is_none_or(|n| caller_inst_count > n)
+                            && !scalar_cleanup_blocked(&module.functions[func_idx], module)
+                        {
+                            scalar_cleanup(&mut module.functions[func_idx]);
+                            let cleaned: usize = module.functions[func_idx]
+                                .blocks
+                                .iter()
+                                .map(|b| b.instructions.len())
+                                .sum();
+                            size_after_cleanup = Some(cleaned);
+                            if debug_inline {
+                                eprintln!(
+                                    "[INLINE] Cleaned capped caller '{}': {} -> {} instructions",
+                                    module.functions[func_idx].name, caller_inst_count, cleaned
+                                );
+                            }
+                            if cleaned < caller_inst_count {
+                                continue;
+                            }
+                        }
+                        if debug_inline && caller_too_large {
+                            eprintln!(
+                                "[INLINE] No more always_inline callees to inline into '{}' (caller has {} instructions)",
+                                module.functions[func_idx].name, caller_inst_count
+                            );
+                        }
+                        break;
+                    }
+                };
+                let callee_data = &callee_map[&site.callee_name];
+
                 let success = inline_call_site(
                     &mut module.functions[func_idx],
-                    site,
+                    &site,
                     callee_data,
                     &mut global_max_block_id,
                 );
+
                 if success {
+                    if size_optimized
+                        && !callee_data.is_always_inline
+                        && !callee_data.is_single_call_site_static
+                        && callee_inst_count > MAX_SMALL_STATIC_LOOP_INLINE_INSTRUCTIONS
+                    {
+                        size_inlined_large_callees.insert(site.callee_name.clone());
+                    }
                     if debug_inline {
                         eprintln!(
-                            "[INLINE] Inlined always_inline '{}' into '{}' (second pass)",
+                            "[INLINE] Inlined '{}' into '{}'",
                             site.callee_name, module.functions[func_idx].name
                         );
                     }
@@ -1390,23 +1468,288 @@ fn inline_run_impl(module: &mut IrModule, size_optimized: bool, always_inline_on
                         dump_function_ir(
                             &module.functions[func_idx],
                             &format!(
-                                "after inlining '{}' into '{}' (second pass)",
+                                "after inlining '{}' into '{}'",
                                 site.callee_name, module.functions[func_idx].name
                             ),
                         );
                     }
+                    // Deduct from the always_inline budget only when the callee
+                    // is actually always_inline. Non-always_inline callees that
+                    // use the relaxed path (exceeds_normal_limits) should not
+                    // consume the always_inline budget — otherwise a large
+                    // exceeds_normal_limits callee (e.g., find_next_bit with 77
+                    // instructions) can exhaust the budget and prevent true
+                    // always_inline callees (e.g., idle_init) from being inlined,
+                    // causing section mismatch errors.
+                    let callee_is_always_inline = callee_map
+                        .get(&site.callee_name)
+                        .map(|d| d.is_always_inline)
+                        .unwrap_or(false);
+                    if callee_is_always_inline {
+                        // Don't deduct small callees from the always_inline budget.
+                        // Small callees (≤20 instructions) have negligible individual
+                        // impact and are always inlined regardless of budget (handled
+                        // in the first pass). Not counting them preserves budget for
+                        // larger always_inline callees that actually matter (e.g.,
+                        // intel_pmu_init_glc at 211 instructions needs to be inlined
+                        // into intel_pmu_init to avoid section mismatches).
+                        let callee_blocks = callee_map
+                            .get(&site.callee_name)
+                            .map(|d| d.blocks.len())
+                            .unwrap_or(0);
+                        let is_small = callee_inst_count <= MAX_SMALL_INLINE_INSTRUCTIONS
+                            && callee_blocks <= MAX_SMALL_INLINE_BLOCKS;
+                        if !is_small {
+                            always_inline_budget_remaining =
+                                always_inline_budget_remaining.saturating_sub(callee_inst_count);
+                        }
+                    } else if site.pgo_force {
+                        // PGO-forced sites consume the dedicated PGO budget.
+                        pgo_force_budget_remaining =
+                            pgo_force_budget_remaining.saturating_sub(callee_inst_count);
+                    } else if hot_leaf_charge {
+                        hot_leaf_budget_remaining =
+                            hot_leaf_budget_remaining.map(|b| b.saturating_sub(callee_inst_count));
+                    } else {
+                        budget_remaining = budget_remaining.saturating_sub(callee_inst_count);
+                    }
                     total_inlined += 1;
                     module.functions[func_idx].has_inlined_calls = true;
-                    if !is_tiny && !is_small && !caller_has_section {
-                        second_pass_budget = second_pass_budget.saturating_sub(callee_inst_count);
-                    }
-                    found = true;
-                    break; // Re-scan after each inline
+                } else {
+                    break;
                 }
             }
-            if !found {
+
+            // Second pass: ensure all remaining __always_inline call sites are inlined.
+            // The main loop above may exhaust max_rounds before processing all call sites
+            // in functions with 200+ inline sites (e.g., kernel's ___slab_alloc in mm/slub.c).
+            // When always_inline functions like cpucap_is_possible() are left un-inlined,
+            // their standalone bodies contain BRK traps from unresolved compiletime_assert,
+            // causing kernel crashes. This pass also handles cases where the main loop's
+            // budget was exhausted, leaving correctness-critical always_inline chains
+            // (e.g., KVM nVHE functions referencing section-specific symbols) un-inlined.
+            //
+            // This pass uses its own independent budget (not shared with the main loop)
+            // to allow small always_inline chains needed for correctness while preventing
+            // large chains from causing stack overflow. Combined with the main loop, the
+            // worst case is 200 + 400 = 600 always_inline instructions per caller.
+            //
+            // Note: this pass intentionally does NOT check caller_too_large /
+            // caller_at_hard_cap / caller_at_absolute_cap. These are correctness-
+            // critical inlines (avoiding linker errors and BRK crashes), so they
+            // must proceed regardless of caller size. The budget limit (400 inst)
+            // provides the growth bound instead.
+            while second_pass_rounds_left > 0 {
+                second_pass_rounds_left -= 1;
+                let mut call_sites = find_inline_call_sites(
+                    &module.functions[func_idx],
+                    &callee_map,
+                    &skip_list,
+                    caller_has_section,
+                );
+                // PGO: filter/adjust call sites based on profile. On a FLAT
+                // profile (no hot/cold spread) PGO inlining has no informative
+                // signal; skip reading the profile entirely so inlining is
+                // byte-identical to plain -O2 (prevents pass perturbation that can
+                // regress hot paths — see inline_pgo::inline_decisions_active).
+                if let Some(profile) = crate::pgo::get_pgo_profile() {
+                    if crate::pgo::inline_pgo::inline_decisions_active() {
+                        let caller_name = module.functions[func_idx].name.clone();
+                        // Per-call-site hotness. Derive block counts for the
+                        // CURRENT caller CFG from the h0-keyed profile (the CFG may
+                        // have changed since training; derive handles drift
+                        // gracefully) so the decision sees the count of the block
+                        // containing each call (LLVM isHotCallSite/BFI).
+                        let caller_fn = &module.functions[func_idx];
+                        let mut caller_fp = crate::pgo::prepass_profile(&caller_name);
+                        if let Some(fp) = caller_fp.as_mut() {
+                            crate::pgo::profile::derive_block_counts(caller_fn, fp);
+                        }
+                        // For each call site, check if PGO says to force inline or deny
+                        let mut filtered = Vec::with_capacity(16);
+                        for site in call_sites {
+                            if let Some(callee) = callee_map.get(&site.callee_name) {
+                                // Get callee name
+                                let callee_name = &site.callee_name;
+                                let site_cnt = caller_fp
+                                    .as_ref()
+                                    .map(|fp| {
+                                        let lbl =
+                                            module.functions[func_idx].blocks[site.block_idx].label;
+                                        fp.block_count(lbl)
+                                    })
+                                    .unwrap_or(0);
+                                // Check PGO inline decision
+                                if let Some(force) = crate::pgo::inline_pgo::should_inline_site(
+                                    &module.functions[func_idx],
+                                    &{
+                                        // Reconstruct IrFunction for callee from callee_map data
+                                        // callee_map stores blocks, we need to create a dummy IrFunction
+                                        let dummy = crate::ir::reexports::IrFunction {
+                                            pass_policy: Default::default(),
+                                            name: callee_name.clone(),
+                                            return_type: crate::common::types::IrType::I32,
+                                            params: vec![],
+                                            blocks: callee.blocks.clone(),
+                                            is_variadic: false,
+                                            is_declaration: false,
+                                            is_static: false,
+                                            is_inline: false,
+                                            is_always_inline: false,
+                                            is_noinline: false,
+                                            next_value_id: 0,
+                                            fp_expr_tags: Default::default(),
+                                            next_label: 0,
+                                            section: None,
+                                            visibility: None,
+                                            is_weak: false,
+                                            is_used: false,
+                                            has_inlined_calls: false,
+                                            param_alloca_values: vec![],
+                                            uses_sret: false,
+                                            is_fastcall: false,
+                                            regparm: None,
+                                            is_naked: false,
+                                            no_instrument: false,
+                                            global_init_label_blocks: vec![],
+                                            ret_eightbyte_classes: vec![],
+                                            ret_is_f128_sse: false,
+                                            is_gnu_inline_def: false,
+                                            loop_promoted_f64_values: Vec::new(),
+                                        };
+                                        dummy
+                                    },
+                                    site_cnt,
+                                    Some(profile),
+                                ) {
+                                    if force {
+                                        let mut s2 = site;
+                                        s2.pgo_force = true;
+                                        filtered.push(s2);
+                                        continue;
+                                    } else {
+                                        continue;
+                                    } // deny
+                                }
+                                // Also check threshold multiplier
+                                let mult = crate::pgo::inline_pgo::inline_threshold_multiplier(
+                                    &caller_name,
+                                    callee_name,
+                                    profile,
+                                );
+                                if mult < 0.4 {
+                                    // Cold: skip unless tiny
+                                    let inst_count: usize =
+                                        callee.blocks.iter().map(|b| b.instructions.len()).sum();
+                                    if inst_count > 5 {
+                                        continue;
+                                    }
+                                }
+                            }
+                            filtered.push(site);
+                        }
+                        call_sites = filtered;
+                    } // end inline_decisions_active
+                }
+                if call_sites.is_empty() {
+                    break;
+                }
+
+                // Only look for always_inline callees
+                let mut found = false;
+                for site in &call_sites {
+                    let callee_data = &callee_map[&site.callee_name];
+                    if !callee_data.is_always_inline {
+                        continue;
+                    }
+                    let callee_inst_count: usize = callee_data
+                        .blocks
+                        .iter()
+                        .map(|b| b.instructions.len())
+                        .sum();
+                    let is_tiny = callee_inst_count <= MAX_TINY_INLINE_INSTRUCTIONS
+                        && callee_data.blocks.len() <= 1;
+                    let is_small = callee_inst_count <= MAX_SMALL_INLINE_INSTRUCTIONS
+                        && callee_data.blocks.len() <= MAX_SMALL_INLINE_BLOCKS;
+                    // Tiny and small always_inline callees always pass; others must fit
+                    // in the second pass budget. Small always_inline callees bypass the
+                    // budget because they have correctness requirements (e.g., inline asm
+                    // "i" constraints in arch_static_branch). Callers with section
+                    // attributes bypass budget (section-specific symbols like __kvm_nvhe_*
+                    // MUST be resolved through inlining).
+                    if !is_tiny
+                        && !is_small
+                        && !caller_has_section
+                        && callee_inst_count > second_pass_budget
+                    {
+                        continue;
+                    }
+                    let success = inline_call_site(
+                        &mut module.functions[func_idx],
+                        site,
+                        callee_data,
+                        &mut global_max_block_id,
+                    );
+                    if success {
+                        if debug_inline {
+                            eprintln!(
+                                "[INLINE] Inlined always_inline '{}' into '{}' (second pass)",
+                                site.callee_name, module.functions[func_idx].name
+                            );
+                        }
+                        if std::env::var("CCC_INLINE_VALIDATE").is_ok() {
+                            validate_function_values(
+                                &module.functions[func_idx],
+                                &site.callee_name,
+                            );
+                        }
+                        if std::env::var("CCC_INLINE_DUMP_IR").is_ok() {
+                            dump_function_ir(
+                                &module.functions[func_idx],
+                                &format!(
+                                    "after inlining '{}' into '{}' (second pass)",
+                                    site.callee_name, module.functions[func_idx].name
+                                ),
+                            );
+                        }
+                        total_inlined += 1;
+                        second_pass_inlined = true;
+                        module.functions[func_idx].has_inlined_calls = true;
+                        if !is_tiny && !is_small && !caller_has_section {
+                            second_pass_budget =
+                                second_pass_budget.saturating_sub(callee_inst_count);
+                        }
+                        found = true;
+                        break; // Re-scan after each inline
+                    }
+                }
+                if !found {
+                    break;
+                }
+            }
+            if !joint_fixpoint_enabled || !second_pass_inlined || ordinary_rounds_left == 0 {
                 break;
             }
+        }
+
+        // Bottom-up snapshot refresh. A later caller should clone this
+        // function's processed body, not the raw pre-inlining snapshot: the
+        // raw body re-exposes calls already expanded here, after that later
+        // caller may have exhausted its size budget (zstd's encode loop kept
+        // ten outlined bit-writer calls this way). Refresh only when the
+        // processed body passes the identical eligibility rules, judged
+        // against the same invocation-entry call graph, and cloning it cannot
+        // duplicate grown work (see `refresh_callee_snapshot`). Otherwise
+        // retain the old snapshot, preserving gnu_inline, always_inline and
+        // section-sensitive wrapper behavior exactly.
+        if refresh_enabled && total_inlined != inlined_before {
+            refresh_callee_snapshot(
+                module,
+                func_idx,
+                &callee_ctx,
+                &mut callee_map,
+                cleanup_enabled,
+            );
         }
     }
 
@@ -2288,6 +2631,138 @@ fn const_trip_site_arg(
     })
 }
 
+/// Rewrite an indirect call whose target is provably one local function into
+/// the equivalent direct call, so ordinary inlining can see it.
+///
+/// Template specialization often reaches the inliner as `call *%f` where `%f`
+/// is a constant-folded `GlobalAddr`; the backend already emits that as a
+/// direct `call f`, but the IR call graph still hides the callee. Rules:
+/// * the pointer must resolve through uniquely-defined `Copy` values to one
+///   `GlobalAddr`; reassigned or phi-joined values are not constants;
+/// * the target must be a non-weak, non-variadic definition without an asm
+///   label, so the direct name binds exactly where the address bound;
+/// * the call-site ABI must be exactly the definition's scalar ABI. Struct,
+///   sret, binary128-in-SSE and fastcall/regparm mismatches stay indirect.
+///
+/// A call through a mismatched prototype is undefined in C, but rewriting it
+/// would turn that into inliner parameter-type confusion. Refusing is cheap.
+fn devirtualize_constant_indirect_calls(module: &mut IrModule) -> FxHashSet<(String, String)> {
+    struct Target {
+        params: Vec<IrType>,
+        return_type: IrType,
+        is_fastcall: bool,
+        regparm: Option<u8>,
+    }
+    let targets: FxHashMap<String, Target> = module
+        .functions
+        .iter()
+        .filter(|f| {
+            !f.is_declaration
+                && !f.is_weak
+                && !f.is_variadic
+                && !f.uses_sret
+                && !f.ret_is_f128_sse
+                && f.ret_eightbyte_classes.is_empty()
+                && f.params
+                    .iter()
+                    .all(|p| p.struct_size.is_none() && !p.is_f128_sse)
+                && !module.asm_labels.contains_key(&f.name)
+        })
+        .map(|f| {
+            (
+                f.name.clone(),
+                Target {
+                    params: f.params.iter().map(|p| p.ty).collect(),
+                    return_type: f.return_type,
+                    is_fastcall: f.is_fastcall,
+                    regparm: f.regparm,
+                },
+            )
+        })
+        .collect();
+    let mut rewritten: FxHashSet<(String, String)> = FxHashSet::default();
+    if targets.is_empty() {
+        return rewritten;
+    }
+    for func in &mut module.functions {
+        if func.is_declaration {
+            continue;
+        }
+        // Count definitions, retaining the single defining instruction.
+        let mut defs: FxHashMap<Value, (u32, Option<(usize, usize)>)> = FxHashMap::default();
+        for (bi, block) in func.blocks.iter().enumerate() {
+            for (ii, inst) in block.instructions.iter().enumerate() {
+                if let Some(dest) = inst.dest() {
+                    let entry = defs.entry(dest).or_insert((0, None));
+                    entry.0 += 1;
+                    entry.1 = Some((bi, ii));
+                }
+            }
+        }
+        let resolve = |mut value: Value| -> Option<String> {
+            for _ in 0..8 {
+                let &(count, Some((bi, ii))) = defs.get(&value)? else {
+                    return None;
+                };
+                if count != 1 {
+                    return None;
+                }
+                match &func.blocks[bi].instructions[ii] {
+                    Instruction::GlobalAddr { name, .. } => return Some(name.clone()),
+                    Instruction::Copy {
+                        src: Operand::Value(src),
+                        ..
+                    } => value = *src,
+                    _ => return None,
+                }
+            }
+            None
+        };
+        let mut rewrites: Vec<(usize, usize, String)> = Vec::new();
+        for (bi, block) in func.blocks.iter().enumerate() {
+            for (ii, inst) in block.instructions.iter().enumerate() {
+                let Instruction::CallIndirect {
+                    func_ptr: Operand::Value(ptr),
+                    info,
+                } = inst
+                else {
+                    continue;
+                };
+                let Some(name) = resolve(*ptr) else {
+                    continue;
+                };
+                let Some(target) = targets.get(&name) else {
+                    continue;
+                };
+                let scalar_abi = !info.is_variadic
+                    && !info.is_sret
+                    && !info.ret_is_f128_sse
+                    && info.ret_eightbyte_classes.is_empty()
+                    && info.struct_arg_sizes.iter().all(Option::is_none)
+                    && info.struct_arg_is_f128_sse.iter().all(|f| !f)
+                    && info.args.len() == target.params.len()
+                    && info.arg_types == target.params
+                    && info.num_fixed_args == target.params.len()
+                    && info.return_type == target.return_type
+                    && info.is_fastcall == target.is_fastcall
+                    && info.regparm == target.regparm;
+                if scalar_abi {
+                    rewrites.push((bi, ii, name));
+                }
+            }
+        }
+        for (bi, ii, name) in rewrites {
+            let inst = &mut func.blocks[bi].instructions[ii];
+            if let Instruction::CallIndirect { info, .. } = inst {
+                let info = info.clone();
+                rewritten.insert((func.name.clone(), name.clone()));
+                *inst = Instruction::Call { func: name, info };
+            }
+        }
+    }
+    rewritten
+}
+
 fn direct_call_counts(module: &IrModule) -> FxHashMap<String, usize> {
     let mut counts = FxHashMap::default();
     for function in &module.functions {
@@ -2374,19 +2849,24 @@ fn function_referenced_as_value(
     asm_templates.iter().any(|t| t.contains(name))
 }
 
-fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
+/// Module-wide facts shared by every callee snapshot in one inliner invocation.
+/// A refreshed snapshot deliberately reuses the invocation-entry call graph:
+/// eligibility is then judged exactly as it was for the raw snapshot.
+struct CalleeContext {
+    call_counts: FxHashMap<String, usize>,
+    value_referenced: FxHashSet<String>,
+    asm_templates: Vec<String>,
+    call_site_counts: FxHashMap<String, usize>,
+    /// For callees with exactly one entry call site: the function holding it.
+    sole_caller: FxHashMap<String, String>,
+    debug_callee: bool,
+}
+
+fn callee_context(module: &IrModule) -> CalleeContext {
     let call_counts = direct_call_counts(module);
-    let mut map = FxHashMap::default();
-
-    // One linear scan: which functions are referenced as values anywhere?
-    // Needed before the per-function loop below (see the soundness note on
-    // `is_single_call_site_static`).
     let (value_referenced, asm_templates) = collect_value_referenced_functions(module);
-
-    // Count direct call sites per callee across the whole module. A static
-    // function with exactly one call site is dead after inlining (net code
-    // shrink), so it gets more generous size limits below.
     let mut call_site_counts: FxHashMap<String, usize> = FxHashMap::default();
+    let mut sole_caller: FxHashMap<String, String> = FxHashMap::default();
     for f in &module.functions {
         for block in &f.blocks {
             for inst in &block.instructions {
@@ -2395,19 +2875,39 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
                 } = inst
                 {
                     *call_site_counts.entry(callee_name.clone()).or_insert(0) += 1;
+                    sole_caller.insert(callee_name.clone(), f.name.clone());
                 }
             }
         }
     }
+    sole_caller.retain(|callee, _| call_site_counts.get(callee) == Some(&1));
+    CalleeContext {
+        call_counts,
+        value_referenced,
+        asm_templates,
+        call_site_counts,
+        sole_caller,
+        debug_callee: std::env::var("CCC_INLINE_DEBUG").is_ok(),
+    }
+}
 
-    let debug_callee = std::env::var("CCC_INLINE_DEBUG").is_ok();
-    for func in &module.functions {
+fn callee_data_for(
+    func: &IrFunction,
+    module: &IrModule,
+    ctx: &CalleeContext,
+) -> Option<CalleeData> {
+    let call_counts = &ctx.call_counts;
+    let value_referenced = &ctx.value_referenced;
+    let asm_templates = &ctx.asm_templates;
+    let call_site_counts = &ctx.call_site_counts;
+    let debug_callee = ctx.debug_callee;
+    {
         if func.is_declaration {
-            continue;
+            return None;
         }
         // __attribute__((noinline)) takes precedence: never inline these functions
         if func.is_noinline {
-            continue;
+            return None;
         }
         // __weak definitions are NOT necessarily the linked definition: a
         // strong override in another TU replaces the symbol at link time,
@@ -2419,7 +2919,7 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
         // __init_single_page page-faulted on pfn 1). Weak callees are
         // therefore never inlinable, no matter how tiny their body.
         if func.is_weak {
-            continue;
+            return None;
         }
 
         // va_arg_pack forwarding plan (S17) — computed before the variadic
@@ -2613,7 +3113,7 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
                     func.is_declaration,
                 );
             }
-            continue;
+            return None;
         }
         if debug_callee {
             let ic: usize = func.blocks.iter().map(|b| b.instructions.len()).sum();
@@ -2645,7 +3145,7 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
                     va_arg_pack_plan = Some(p);
                 }
                 None => {
-                    continue;
+                    return None;
                 }
             }
         }
@@ -2707,13 +3207,13 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
         let exceeds_normal = !is_always_inline && !fits_normal && !fits_single_call_site_static;
         if is_always_inline {
             if !fits_relaxed {
-                continue;
+                return None;
             }
         } else {
             // For static inline: admit if within normal limits OR within relaxed limits
             // (the latter only used for section-attributed callers).
             if !fits_normal && !fits_single_call_site_static && !fits_relaxed {
-                continue;
+                return None;
             }
         }
 
@@ -2752,7 +3252,7 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
             }
         }
         if has_problematic {
-            continue;
+            return None;
         }
 
         // Don't inline functions whose static local variables contain label
@@ -2761,7 +3261,7 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
         // when block IDs are remapped during inlining. This causes dangling
         // references to non-existent labels, resulting in linker errors.
         if func_has_static_locals_with_label_refs(module, &func.name) {
-            continue;
+            return None;
         }
 
         // Clone the function's blocks for use during inlining
@@ -2782,60 +3282,218 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
             })
             .sum();
 
-        map.insert(
-            func.name.clone(),
-            CalleeData {
-                blocks: func.blocks.clone(),
-                param_struct_sizes,
-                return_type: func.return_type,
-                num_params: func.params.len(),
-                // Post-structural inlining can clone values into a function
-                // whose cached next_value_id predates the clone. Preserve the
-                // stronger of the cached cursor and the real IR maximum so a
-                // later inline cannot collide with an existing definition.
-                next_value_id: std::cmp::max(
-                    func.next_value_id,
-                    func.max_value_id().saturating_add(1),
-                ),
-                max_block_id,
-                is_always_inline,
-                exceeds_normal_limits: exceeds_normal,
-                is_static_inline: func.is_static && func.is_inline,
-                is_gnu_inline_def: func.is_gnu_inline_def,
-                is_plain_static: func.is_static
-                    && !func.is_inline
-                    && !is_always_inline
-                    && !func.is_gnu_inline_def,
-                direct_call_count: total_calls,
-                loop_bound_params,
-                const_trip_only,
-                has_inlineable_loop_descendant: false,
-                has_inlined_calls: func.has_inlined_calls,
-                // Any static callee with a single call site is dead after
-                // inlining (internal linkage + address never taken), so it is
-                // exempt from the soft caller-size cap and the per-caller
-                // budget in select_inline_site (regardless of which size
-                // bucket above admitted it). This deliberately INCLUDES
-                // `static inline`: inlining the only call is always a net
-                // code shrink (the outlined body, prologue/epilogue and call
-                // sequence all disappear). Excluding `inline` here left
-                // loop-containing `static inline` helpers over the 6-block
-                // normal limit permanently outlined (zstd_count: 10 blocks,
-                // 63 instructions, one hot call site — GCC inlines it).
-                is_single_call_site_static: func.is_static
-                    && has_single_call_site
-                    && !survives_via_reference,
-                single_call_site: has_single_call_site,
-                agg_frame_bytes,
-                has_loops,
-                is_recursive,
-                has_vector_intrinsics: func_has_vector_intrinsics(func),
-                // Filled from the complete map below, after every eligible
-                // descendant is known.
-                size_inline_cost: inst_count,
-                va_arg_pack: va_arg_pack_plan.take(),
-            },
-        );
+        Some(CalleeData {
+            blocks: func.blocks.clone(),
+            param_struct_sizes,
+            return_type: func.return_type,
+            num_params: func.params.len(),
+            // Post-structural inlining can clone values into a function
+            // whose cached next_value_id predates the clone. Preserve the
+            // stronger of the cached cursor and the real IR maximum so a
+            // later inline cannot collide with an existing definition.
+            next_value_id: std::cmp::max(func.next_value_id, func.max_value_id().saturating_add(1)),
+            max_block_id,
+            is_always_inline,
+            exceeds_normal_limits: exceeds_normal,
+            is_static_inline: func.is_static && func.is_inline,
+            is_gnu_inline_def: func.is_gnu_inline_def,
+            is_plain_static: func.is_static
+                && !func.is_inline
+                && !is_always_inline
+                && !func.is_gnu_inline_def,
+            direct_call_count: total_calls,
+            loop_bound_params,
+            const_trip_only,
+            has_inlineable_loop_descendant: false,
+            has_inlined_calls: func.has_inlined_calls,
+            // Any static callee with a single call site is dead after
+            // inlining (internal linkage + address never taken), so it is
+            // exempt from the soft caller-size cap and the per-caller
+            // budget in select_inline_site (regardless of which size
+            // bucket above admitted it). This deliberately INCLUDES
+            // `static inline`: inlining the only call is always a net
+            // code shrink (the outlined body, prologue/epilogue and call
+            // sequence all disappear). Excluding `inline` here left
+            // loop-containing `static inline` helpers over the 6-block
+            // normal limit permanently outlined (zstd_count: 10 blocks,
+            // 63 instructions, one hot call site — GCC inlines it).
+            is_single_call_site_static: func.is_static
+                && has_single_call_site
+                && !survives_via_reference,
+            single_call_site: has_single_call_site,
+            agg_frame_bytes,
+            has_loops,
+            is_recursive,
+            has_vector_intrinsics: func_has_vector_intrinsics(func),
+            // Filled from the complete map below, after every eligible
+            // descendant is known.
+            size_inline_cost: inst_count,
+            va_arg_pack: va_arg_pack_plan.take(),
+        })
+    }
+}
+
+/// Scalar cleanup rounds for a refreshed snapshot (each round runs the six
+/// passes below; it stops at the first round that changes nothing).
+const SNAPSHOT_CLEANUP_ROUNDS: usize = 3;
+
+/// The processed body as every later caller sees it once its own post-inline
+/// scalar cleanup has run: constant folding, copy propagation, SCCP, CFG
+/// simplification, algebraic simplification and DCE, on a clone (the module
+/// function itself is untouched). `None` when cleanup could change something
+/// the inliner must preserve verbatim: inline asm (its operand symbols are
+/// resolved after inlining by tracing the original value chains, see
+/// `resolve_inline_asm_symbols`), label addresses or indirect branches (block
+/// identities are observable), and static locals holding label addresses.
+/// Whether the scalar cleanup below must leave `func` alone: inline asm
+/// operands, label addresses and indirect branches pin the exact value and
+/// block identities later passes (`resolve_inline_asm_symbols`, computed
+/// goto) resolve, and a static local holding a label address ties the
+/// function to its block labels.
+fn scalar_cleanup_blocked(func: &IrFunction, module: &IrModule) -> bool {
+    let pinned_blocks_or_asm = func.blocks.iter().any(|block| {
+        matches!(block.terminator, Terminator::IndirectBranch { .. })
+            || block.instructions.iter().any(|inst| {
+                matches!(
+                    inst,
+                    Instruction::InlineAsm { .. } | Instruction::LabelAddr { .. }
+                )
+            })
+    });
+    pinned_blocks_or_asm || func_has_static_locals_with_label_refs(module, &func.name)
+}
+
+/// The function-local part of the post-inline cleanup chain, shared by
+/// snapshot sizing and capped-caller re-measurement. It first promotes the
+/// homes inlining introduced (each inlined callee's parameter homes and
+/// locals): the passes below cannot see through a home, so without it a
+/// cleaned body kept every clone's store/load traffic (zstd's
+/// FSE_encodeSymbol: 47 raw, 83 "cleaned", 59 with the promotion). The
+/// function's OWN parameter homes -- the first `params.len()` entry
+/// allocas, the positional contract the inliner's argument binding and the
+/// backend's `find_param_alloca` rely on -- stay, so sizes remain in the
+/// home form of the raw snapshots they are compared with. Promoting them
+/// too (`promote_params = true`) measured +13..+21 % zstd Ir, with calls to
+/// ERR_isError, MEM_readLEST and BIT_readBitsFast left behind in
+/// zstd_decompress_block.c.
+fn scalar_cleanup(body: &mut IrFunction) {
+    crate::ir::mem2reg::promote::promote_function(body, false);
+    for _ in 0..SNAPSHOT_CLEANUP_ROUNDS {
+        let changed = super::constant_fold::fold_function(body)
+            + super::copy_prop::propagate_copies(body)
+            + super::sccp::run_function(body)
+            + super::cfg_simplify::run_function(body)
+            + super::simplify::simplify_function(body)
+            + super::dce::eliminate_dead_code(body);
+        if changed == 0 {
+            break;
+        }
+    }
+}
+
+fn cleaned_snapshot_body(func: &IrFunction, module: &IrModule) -> Option<IrFunction> {
+    if scalar_cleanup_blocked(func, module) {
+        return None;
+    }
+    let mut body = func.clone();
+    scalar_cleanup(&mut body);
+    Some(body)
+}
+
+fn refresh_callee_snapshot(
+    module: &IrModule,
+    func_idx: usize,
+    ctx: &CalleeContext,
+    callee_map: &mut FxHashMap<String, CalleeData>,
+    cleanup: bool,
+) {
+    let func = &module.functions[func_idx];
+    let instructions =
+        |blocks: &[BasicBlock]| -> usize { blocks.iter().map(|b| b.instructions.len()).sum() };
+    let Some(previous) = callee_map
+        .get(&func.name)
+        .map(|old| instructions(&old.blocks))
+    else {
+        return;
+    };
+    // A `__builtin_va_arg_pack()` wrapper means something only per call site:
+    // its pack sentinels are spliced with each site's extra arguments. Its
+    // processed body inlined the pack's consumer with the unresolved sentinel
+    // counted as ONE argument (`__builtin_va_arg_pack_len()` folded to a
+    // constant), so it is not the function's meaning and must never replace
+    // the raw snapshot. Cleanup made this reachable by shrinking such a body
+    // below its raw size (tests/regression/va_arg_pack_len_inline.c,
+    // nested_count: 421 expected, wrong count returned).
+    if callee_map
+        .get(&func.name)
+        .is_some_and(|old| old.va_arg_pack.is_some())
+    {
+        return;
+    }
+    // Processing leaves the body unsimplified: the inlined clones keep their
+    // parameter homes, copies, folded-away branches and dead values until the
+    // later scalar passes, so BIT_flushBits measured 126 instructions for 43
+    // raw ones. Size, judge and clone the body after that cleanup instead
+    // (the identical eligibility rules then see what callers really pay).
+    let cleaned = if cleanup {
+        cleaned_snapshot_body(func, module)
+    } else {
+        None
+    };
+    let Some(data) = callee_data_for(cleaned.as_ref().unwrap_or(func), module, ctx) else {
+        return;
+    };
+    // A grown multi-site body would be cloned, grown, at every site, and
+    // could push hot static-inline helpers out of their size class. Refresh
+    // only when cloning cannot duplicate work (a single-call-site static,
+    // held by a function that is never cloned itself, dies at that one site)
+    // or when the (cleaned) processed body is no larger than the raw
+    // snapshot: every clone is then no larger than the raw clone it replaces,
+    // which would still have to expand the calls processing removed.
+    // A single entry call site still duplicates when the function holding it
+    // is itself an inline candidate (the site is cloned with its holder).
+    let moved_once = data.is_single_call_site_static
+        && !module.asm_labels.contains_key(&func.name)
+        && ctx
+            .sole_caller
+            .get(&func.name)
+            .is_some_and(|holder| !callee_map.contains_key(holder));
+    if !moved_once && instructions(&data.blocks) > previous {
+        return;
+    }
+    let alias = module
+        .asm_labels
+        .get(&func.name)
+        .filter(|a| a.as_str() != func.name.as_str() && callee_map.contains_key(a.as_str()))
+        .cloned();
+    callee_map.insert(func.name.clone(), data);
+    let mut visiting = FxHashSet::default();
+    let cost = estimate_size_inline_cost(&func.name, callee_map, &mut visiting, 0);
+    let mut visiting = FxHashSet::default();
+    let has_loop = inlineable_loop_descendant(&func.name, callee_map, &mut visiting, 0);
+    // The entry was inserted above and nothing in between removes entries.
+    let Some(entry) = callee_map.get_mut(&func.name) else {
+        return;
+    };
+    entry.size_inline_cost = cost;
+    entry.has_inlineable_loop_descendant = has_loop;
+    if let Some(alias) = alias {
+        let aliased = entry.clone();
+        callee_map.insert(alias, aliased);
+    }
+}
+
+fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
+    build_callee_map_with(module, &callee_context(module))
+}
+
+fn build_callee_map_with(module: &IrModule, ctx: &CalleeContext) -> FxHashMap<String, CalleeData> {
+    let mut map = FxHashMap::default();
+    for func in &module.functions {
+        let Some(data) = callee_data_for(func, module, ctx) else {
+            continue;
+        };
+        map.insert(func.name.clone(), data);
         // Register the same body under its __asm__ label so call sites that
         // carry the redirected name find the inline definition. Without this,
         // glibc's hidden_proto pattern (body `__argz_next`, calls
@@ -2937,6 +3595,35 @@ fn inlineable_loop_descendant(
     }
     visiting.remove(name);
     found
+}
+
+/// Defer a small ordinary wrapper which hides more mandatory expansion than
+/// the normal caller budget. The callee map is a pre-expansion snapshot: cloning
+/// this raw wrapper AFTER the caller's phase-0 drain introduces a large forced
+/// template behind the economics budgets. Those budgets may leave its runtime
+/// branches/indirect calls intact. Keeping the wrapper lets its own phase-0
+/// expansion and constant propagation specialize the template first.
+///
+/// This is a scheduling deferral, not a permanent single-call-site veto. A later
+/// invocation sees the expanded loop body and uses the existing normal policy.
+/// Never override explicit inline contracts, section requirements or PGO, and
+/// do not change the separately measured size-optimization policy.
+fn template_wrapper_should_wait_for_specialization(
+    data: &CalleeData,
+    raw_inst_count: usize,
+    caller_has_section: bool,
+    pgo_force: bool,
+    size_optimized: bool,
+) -> bool {
+    !size_optimized
+        && data.is_plain_static
+        && !data.has_loops
+        && data.has_inlineable_loop_descendant
+        && raw_inst_count <= MAX_SMALL_STATIC_LOOP_INLINE_INSTRUCTIONS
+        && data.blocks.len() <= MAX_SMALL_STATIC_LOOP_INLINE_BLOCKS
+        && data.size_inline_cost > MAX_INLINE_BUDGET_PER_CALLER
+        && !caller_has_section
+        && !pgo_force
 }
 
 /// Preserve an ordinary tiny/small static wrapper when inlining it would
@@ -3160,6 +3847,8 @@ fn find_inline_call_sites(
                         if callee_data.exceeds_normal_limits
                             && !caller_has_section
                             && !callee_data.is_single_call_site_static
+                            && !is_hot_leaf_candidate(callee_data)
+                            && !is_hot_loop_helper_candidate(callee_data)
                         {
                             continue;
                         }
@@ -4085,6 +4774,9 @@ fn remap_call_info(info: &CallInfo, vo: u32) -> CallInfo {
         regparm: None,
         is_pure: info.is_pure,
         is_const: info.is_const,
+        // A remapped call is the same call: it still reaches (or not) the
+        // library function.
+        assume_library: info.assume_library,
         ret_eightbyte_classes: info.ret_eightbyte_classes.clone(),
         ret_is_f128_sse: info.ret_is_f128_sse,
     }
@@ -4835,6 +5527,94 @@ mod inline_limit_tests {
             size_inline_cost: 0,
             va_arg_pack: None,
         }
+    }
+
+    /// A declared-inline looping callee of `blocks` blocks and
+    /// `instructions` instructions in total (spread over the blocks).
+    fn loop_helper_data(blocks: usize, instructions: usize) -> CalleeData {
+        let mut data = wrapper_policy_data(blocks);
+        let copy = Instruction::Copy {
+            dest: Value(0),
+            src: Operand::Const(IrConst::I32(0)),
+        };
+        for i in 0..instructions {
+            data.blocks[i % blocks].instructions.push(copy.clone());
+        }
+        data.is_plain_static = false;
+        data.is_static_inline = true;
+        data.has_loops = true;
+        data
+    }
+
+    #[test]
+    fn hot_loop_helper_is_a_bounded_declared_inline_loop() {
+        // zstd's ZSTD_count after its own helpers: 142 instructions, 19 blocks.
+        assert!(is_hot_loop_helper_candidate(&loop_helper_data(19, 142)));
+        let limit = loop_helper_data(MAX_HOT_LOOP_HELPER_BLOCKS, MAX_HOT_LOOP_HELPER_INSTRUCTIONS);
+        assert!(is_hot_loop_helper_candidate(&limit));
+        let wide = MAX_HOT_LOOP_HELPER_INSTRUCTIONS + 1;
+        assert!(!is_hot_loop_helper_candidate(&loop_helper_data(19, wide)));
+        let branchy = MAX_HOT_LOOP_HELPER_BLOCKS + 1;
+        assert!(!is_hot_loop_helper_candidate(&loop_helper_data(
+            branchy, 142
+        )));
+        let reject = |edit: fn(&mut CalleeData)| {
+            let mut data = loop_helper_data(19, 142);
+            edit(&mut data);
+            !is_hot_loop_helper_candidate(&data)
+        };
+        // Loop-free bodies are the hot-leaf rule's; plain statics keep the
+        // historical caps; always_inline, recursion and constant-trip clones
+        // have their own policies.
+        assert!(reject(|d| d.has_loops = false));
+        assert!(reject(|d| {
+            d.is_static_inline = false;
+            d.is_plain_static = true;
+        }));
+        assert!(reject(|d| d.is_always_inline = true));
+        assert!(reject(|d| d.is_recursive = true));
+        assert!(reject(|d| d.const_trip_only = true));
+    }
+
+    #[test]
+    fn large_mandatory_template_wrapper_is_deferred_not_permanently_banned() {
+        let mut data = wrapper_policy_data(1);
+        data.single_call_site = true;
+        data.is_single_call_site_static = true;
+        data.direct_call_count = 1;
+        data.has_inlineable_loop_descendant = true;
+        data.size_inline_cost = MAX_INLINE_BUDGET_PER_CALLER + 1;
+        let refused = |d: &CalleeData, raw, section, pgo, size| {
+            template_wrapper_should_wait_for_specialization(d, raw, section, pgo, size)
+        };
+        assert!(refused(&data, 21, false, false, false));
+        assert!(!refused(&data, 21, true, false, false));
+        assert!(!refused(&data, 21, false, true, false));
+        assert!(!refused(&data, 21, false, false, true));
+        assert!(!refused(
+            &data,
+            MAX_SMALL_STATIC_LOOP_INLINE_INSTRUCTIONS + 1,
+            false,
+            false,
+            false
+        ));
+        data.size_inline_cost = MAX_INLINE_BUDGET_PER_CALLER;
+        assert!(!refused(&data, 21, false, false, false));
+        data.size_inline_cost += 1;
+        data.is_plain_static = false;
+        assert!(!refused(&data, 21, false, false, false));
+        data.is_plain_static = true;
+        data.has_inlineable_loop_descendant = false;
+        assert!(!refused(&data, 21, false, false, false));
+        data.has_inlineable_loop_descendant = true;
+        // Once expansion/specialization exposes the real loop, normal inline
+        // policy can consider it; do not blacklist the function forever.
+        data.has_loops = true;
+        data.has_inlined_calls = true;
+        assert!(!refused(&data, 21, false, false, false));
+        data.has_loops = false;
+        data.blocks = wrapper_policy_data(MAX_SMALL_STATIC_LOOP_INLINE_BLOCKS + 1).blocks;
+        assert!(!refused(&data, 21, false, false, false));
     }
 
     #[test]
@@ -5642,5 +6422,523 @@ mod const_trip_tests {
             &sizes,
             &[Operand::Value(Value(1)), arg]
         ));
+    }
+}
+
+#[cfg(test)]
+mod devirtualization_tests {
+    use super::*;
+    use crate::common::types::IrType;
+    use crate::ir::module::{IrModule, IrParam};
+    use crate::ir::reexports::{BasicBlock, CallInfo, Instruction, Terminator};
+
+    fn scalar(ty: IrType) -> IrParam {
+        IrParam {
+            ty,
+            noalias: false,
+            struct_size: None,
+            struct_align: None,
+            param_align: None,
+            struct_eightbyte_classes: Vec::new(),
+            is_f128_sse: false,
+            riscv_float_class: None,
+        }
+    }
+
+    /// static int leaf(int x) { return x + 1; }
+    fn leaf() -> IrFunction {
+        let mut f = IrFunction::new("leaf".into(), IrType::I32, vec![scalar(IrType::I32)], false);
+        f.is_static = true;
+        f.next_value_id = 3;
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                // Frontend shape: a parameter home precedes its ParamRef.
+                Instruction::Alloca {
+                    dest: Value(2),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 0,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::I32,
+                },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Value(Value(0)),
+                    ptr: Value(2),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::BinOp {
+                    dest: Value(1),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
+            source_spans: Vec::new(),
+        });
+        f
+    }
+
+    fn indirect(ptr: Value, arg_type: IrType) -> Instruction {
+        Instruction::CallIndirect {
+            func_ptr: Operand::Value(ptr),
+            info: CallInfo {
+                dest: Some(Value(4)),
+                args: vec![Operand::Const(IrConst::I32(41))],
+                arg_types: vec![arg_type],
+                return_type: IrType::I32,
+                num_fixed_args: 1,
+                struct_arg_sizes: vec![None],
+                struct_arg_aligns: vec![None],
+                struct_arg_classes: vec![Vec::new()],
+                struct_arg_riscv_float_classes: vec![None],
+                struct_arg_is_f128_sse: vec![false],
+                ..CallInfo::default()
+            },
+        }
+    }
+
+    fn module(target: &str, extra: Vec<Instruction>, arg_type: IrType) -> IrModule {
+        let mut caller = IrFunction::new("caller".into(), IrType::I32, vec![], false);
+        caller.next_value_id = 6;
+        let mut instructions = vec![Instruction::GlobalAddr {
+            dest: Value(2),
+            name: target.into(),
+        }];
+        instructions.extend(extra);
+        instructions.push(Instruction::Copy {
+            dest: Value(3),
+            src: Operand::Value(Value(2)),
+        });
+        instructions.push(indirect(Value(3), arg_type));
+        caller.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions,
+            terminator: Terminator::Return(Some(Operand::Value(Value(4)))),
+            source_spans: Vec::new(),
+        });
+        let mut module = IrModule::default();
+        module.functions = vec![leaf(), caller];
+        module
+    }
+
+    fn calls(module: &IrModule) -> (usize, usize) {
+        let mut direct = 0;
+        let mut indirect = 0;
+        for inst in module.functions[1]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+        {
+            match inst {
+                Instruction::Call { func, .. } if func == "leaf" => direct += 1,
+                Instruction::CallIndirect { .. } => indirect += 1,
+                _ => {}
+            }
+        }
+        (direct, indirect)
+    }
+
+    #[test]
+    fn unique_constant_target_becomes_direct_and_inlines() {
+        let mut m = module("leaf", Vec::new(), IrType::I32);
+        assert_eq!(
+            devirtualize_constant_indirect_calls(&mut m),
+            [("caller".to_string(), "leaf".to_string())]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(calls(&m), (1, 0));
+        let mut m = module("leaf", Vec::new(), IrType::I32);
+        assert!(run(&mut m) >= 1);
+        assert_eq!(calls(&m), (0, 0), "devirtualized tiny leaf must be inlined");
+    }
+
+    #[test]
+    fn reassigned_pointer_is_not_a_constant() {
+        let reassigned = vec![Instruction::Copy {
+            dest: Value(2),
+            src: Operand::Const(IrConst::I64(0)),
+        }];
+        let mut m = module("leaf", reassigned, IrType::I32);
+        assert!(devirtualize_constant_indirect_calls(&mut m).is_empty());
+        assert_eq!(calls(&m), (0, 1));
+    }
+
+    #[test]
+    fn abi_mismatch_and_ineligible_targets_stay_indirect() {
+        let mut m = module("leaf", Vec::new(), IrType::I64);
+        assert!(
+            devirtualize_constant_indirect_calls(&mut m).is_empty(),
+            "argument type mismatch"
+        );
+        for edit in 0..4 {
+            let mut m = module("leaf", Vec::new(), IrType::I32);
+            match edit {
+                0 => m.functions[0].is_weak = true,
+                1 => m.functions[0].is_variadic = true,
+                2 => {
+                    m.asm_labels.insert("leaf".into(), "leaf_impl".into());
+                }
+                _ => {
+                    m.functions[0].is_declaration = true;
+                    m.functions[0].blocks.clear();
+                }
+            }
+            assert!(
+                devirtualize_constant_indirect_calls(&mut m).is_empty(),
+                "edit {edit}"
+            );
+            assert_eq!(calls(&m), (0, 1), "edit {edit}");
+        }
+        let mut m = module("object", Vec::new(), IrType::I32);
+        assert!(
+            devirtualize_constant_indirect_calls(&mut m).is_empty(),
+            "data address"
+        );
+    }
+
+    #[test]
+    fn every_iteration_blocks_exclude_conditional_loop_paths() {
+        // 0 -> 1(header) -> {2, 6(exit)}; 2 -> {3, 4}; 3 -> 5; 4 -> 5; 5 -> 1.
+        let cond = |t: u32, f: u32| Terminator::CondBranch {
+            cond: Operand::Const(IrConst::I32(1)),
+            true_label: BlockId(t),
+            false_label: BlockId(f),
+        };
+        let mut f = IrFunction::new("loop".into(), IrType::Void, vec![], false);
+        for (label, term) in [
+            (0, Terminator::Branch(BlockId(1))),
+            (1, cond(2, 6)),
+            (2, cond(3, 4)),
+            (3, Terminator::Branch(BlockId(5))),
+            (4, Terminator::Branch(BlockId(5))),
+            (5, Terminator::Branch(BlockId(1))),
+            (6, Terminator::Return(None)),
+        ] {
+            f.blocks.push(BasicBlock {
+                label: BlockId(label),
+                instructions: Vec::new(),
+                terminator: term,
+                source_spans: Vec::new(),
+            });
+        }
+        let cfg = crate::ir::analysis::CfgAnalysis::build(&f);
+        let loops =
+            loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
+        assert_eq!(loops.len(), 1);
+        let mut every = every_iteration_blocks_of(&cfg, &loops[0]);
+        every.sort_unstable();
+        assert_eq!(
+            every,
+            vec![1, 2, 5],
+            "conditional arms 3/4 are not per-iteration"
+        );
+    }
+}
+
+#[cfg(test)]
+mod feature_switch_tests {
+    //! Each inliner extension switch must change the result on the shape it
+    //! exists for; otherwise the switch (and the extension) is untested.
+    use super::*;
+    use crate::ir::reexports::{
+        BasicBlock, BlockId, CallInfo, Instruction, IrBinOp, IrConst, IrFunction, IrModule,
+        Operand, Terminator, Value,
+    };
+
+    fn call(callee: &str) -> Instruction {
+        Instruction::Call {
+            func: callee.to_string(),
+            info: CallInfo {
+                args: vec![Operand::Const(IrConst::I32(0))],
+                arg_types: vec![IrType::I32],
+                return_type: IrType::Void,
+                num_fixed_args: 1,
+                ..CallInfo::default()
+            },
+        }
+    }
+
+    /// A one-block void function of `work` instructions (0, or >= 3), then
+    /// `calls`. The work is live and irreducible -- load a global, square it
+    /// `work - 3` times, store it back -- so the snapshot cleanup cannot fold
+    /// it away (a `+1` chain would reassociate into one add, silently
+    /// changing every size class these policy tests are built on).
+    fn function(name: &str, work: u32, calls: &[&str]) -> IrFunction {
+        assert!(
+            work == 0 || work >= 3,
+            "global address, load and store are the minimum work"
+        );
+        let mut f = IrFunction::new(name.to_string(), IrType::Void, vec![], false);
+        let mut instructions = Vec::new();
+        let mut next_value = 1;
+        if work >= 3 {
+            let last = work - 1;
+            instructions.push(Instruction::GlobalAddr {
+                dest: Value(1),
+                name: "sink".to_string(),
+            });
+            instructions.push(Instruction::Load {
+                dest: Value(2),
+                ptr: Value(1),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            });
+            instructions.extend((3..=last).map(|i| Instruction::BinOp {
+                dest: Value(i),
+                op: IrBinOp::Mul,
+                lhs: Operand::Value(Value(i - 1)),
+                rhs: Operand::Value(Value(i - 1)),
+                ty: IrType::I32,
+            }));
+            instructions.push(Instruction::Store {
+                val: Operand::Value(Value(last)),
+                ptr: Value(1),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            });
+            next_value = last + 1;
+        }
+        instructions.extend(calls.iter().map(|c| call(c)));
+        f.next_value_id = next_value;
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        f
+    }
+
+    fn calls_to(module: &IrModule, caller: &str, callee: &str) -> usize {
+        module
+            .functions
+            .iter()
+            .filter(|f| f.name == caller)
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.instructions.iter())
+            .filter(|i| matches!(i, Instruction::Call { func, .. } if func == callee))
+            .count()
+    }
+
+    fn run(mut module: IrModule, features: InlineFeatures) -> IrModule {
+        inline_run_with(&mut module, false, false, features);
+        module
+    }
+
+    /// Second-pass always_inline templates expose ordinary calls. `gen`
+    /// holds more mandatory `ai` sites than Phase 0's work counter and the
+    /// first pass's always_inline budget admit, so the last `ai` clones are
+    /// inserted by the second pass, after the ordinary rounds ended; each
+    /// carries a call to the tiny `leaf`, which the ordinary policy accepts
+    /// at any caller size.
+    fn joint_fixpoint_module() -> IrModule {
+        let mut leaf = function("leaf", 3, &[]);
+        leaf.is_static = true;
+        leaf.is_inline = true;
+        let mut ai = function("ai", 24, &["leaf"]);
+        ai.is_static = true;
+        ai.is_always_inline = true;
+        let mut generator = function("gen", 0, &["ai"; 40]);
+        generator.is_static = true;
+        generator.is_always_inline = true;
+        let caller = function("f", 0, &["gen"]);
+        let mut module = IrModule::new();
+        module.functions = vec![leaf, ai, generator, caller];
+        module
+    }
+
+    #[test]
+    fn joint_fixpoint_inlines_calls_exposed_by_second_pass_templates() {
+        let on = run(joint_fixpoint_module(), InlineFeatures::ALL);
+        assert_eq!(calls_to(&on, "f", "gen"), 0);
+        assert_eq!(calls_to(&on, "f", "ai"), 0, "always_inline contract");
+        assert_eq!(calls_to(&on, "f", "leaf"), 0, "exposed tiny calls inline");
+        let off = run(
+            joint_fixpoint_module(),
+            InlineFeatures {
+                joint_fixpoint: false,
+                ..InlineFeatures::ALL
+            },
+        );
+        assert_eq!(calls_to(&off, "f", "ai"), 0, "always_inline contract");
+        assert!(
+            calls_to(&off, "f", "leaf") > 0,
+            "negative control: without the joint fixpoint the exposed calls survive"
+        );
+    }
+
+    /// A processed single-call-site static must be cloned as processed.
+    /// `h` inlines all six calls to the ordinary (budgeted) static `helper`
+    /// itself. Its only caller `g` first grows past the soft caller cap and
+    /// the per-caller budget on `static inline` `other` sites (admitted
+    /// regardless of both) while staying under the hard cap, which binds
+    /// every non-always_inline callee. `h` still inlines (a single-call-site
+    /// static within the loop-nest exemption cost skips the soft cap), but
+    /// cloning the raw `h` would re-expose six `helper` calls that `g` can no
+    /// longer afford, while the refreshed snapshot has none left.
+    fn snapshot_refresh_module() -> IrModule {
+        let mut helper = function("helper", 22, &[]);
+        helper.is_static = true;
+        let mut other = function("other", 22, &[]);
+        other.is_static = true;
+        other.is_inline = true;
+        let mut h = function("h", 0, &["helper"; 6]);
+        h.is_static = true;
+        let mut calls = vec!["other"; 16];
+        calls.push("h");
+        let mut g = function("g", 0, &calls);
+        g.is_noinline = true;
+        let mut module = IrModule::new();
+        module.functions = vec![helper, other, h, g];
+        module
+    }
+
+    /// `helper` computes nothing observable: once inlined, all its work is
+    /// dead. Processing `h` (called twice, so a grown body is never
+    /// refreshed) therefore grows the unsimplified body by six dead copies of
+    /// that work, while the cleaned body is smaller than the raw snapshot.
+    /// Only the cleaned refresh spares `g` -- past its soft cap and budget --
+    /// from re-exposed `helper` calls it can no longer afford.
+    fn snapshot_cleanup_module() -> IrModule {
+        let mut helper = IrFunction::new("helper".to_string(), IrType::Void, vec![], false);
+        let instructions: Vec<Instruction> = (1..=22u32)
+            .map(|i| Instruction::BinOp {
+                dest: Value(i),
+                op: IrBinOp::Add,
+                lhs: if i == 1 {
+                    Operand::Const(IrConst::I32(7))
+                } else {
+                    Operand::Value(Value(i - 1))
+                },
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::I32,
+            })
+            .collect();
+        helper.next_value_id = 23;
+        helper.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        helper.is_static = true;
+        let mut other = function("other", 22, &[]);
+        other.is_static = true;
+        other.is_inline = true;
+        let mut h = function("h", 3, &["helper"; 6]);
+        h.is_static = true;
+        let mut calls = vec!["other"; 16];
+        calls.extend(["h", "h"]);
+        let mut g = function("g", 3, &calls);
+        g.is_noinline = true;
+        let mut module = IrModule::new();
+        module.functions = vec![helper, other, h, g];
+        module
+    }
+
+    #[test]
+    fn snapshot_cleanup_refreshes_a_body_that_only_grew_by_dead_work() {
+        let on = run(snapshot_cleanup_module(), InlineFeatures::ALL);
+        assert_eq!(calls_to(&on, "h", "helper"), 0, "h processes its helpers");
+        assert_eq!(calls_to(&on, "g", "h"), 0, "both h sites inline");
+        assert_eq!(calls_to(&on, "g", "helper"), 0, "cleaned body cloned");
+        let off = run(
+            snapshot_cleanup_module(),
+            InlineFeatures {
+                snapshot_cleanup: false,
+                ..InlineFeatures::ALL
+            },
+        );
+        assert_eq!(calls_to(&off, "g", "h"), 0, "both h sites inline");
+        assert!(
+            calls_to(&off, "g", "helper") > 0,
+            "negative control: the grown unsimplified body is not refreshed"
+        );
+    }
+
+    /// `waste` is 22 instructions of dead work, `static inline`, so the
+    /// first selection pass admits all ten sites regardless of caller size.
+    /// Pasted, they take `g` past the soft caller cap although all of it
+    /// folds away. `helper` (plain static, 40 live instructions, two sites,
+    /// not in a loop) is admitted only below the soft cap, so it inlines
+    /// only when `g` is measured after an in-place cleanup.
+    fn caller_cleanup_module() -> IrModule {
+        let mut waste = snapshot_cleanup_module().functions.remove(0);
+        waste.name = "waste".to_string();
+        waste.is_inline = true;
+        let mut helper = function("helper", 40, &[]);
+        helper.is_static = true;
+        let mut calls = vec!["waste"; 10];
+        calls.extend(["helper", "helper"]);
+        let mut g = function("g", 3, &calls);
+        g.is_noinline = true;
+        let mut module = IrModule::new();
+        module.functions = vec![waste, helper, g];
+        module
+    }
+
+    #[test]
+    fn caller_cleanup_measures_a_capped_caller_after_folding_its_dead_work() {
+        let on = run(caller_cleanup_module(), InlineFeatures::ALL);
+        assert_eq!(calls_to(&on, "g", "waste"), 0, "first-pass sites inline");
+        assert_eq!(
+            calls_to(&on, "g", "helper"),
+            0,
+            "cleaned caller admits helper"
+        );
+        let g = on.functions.iter().find(|f| f.name == "g").unwrap();
+        let stores = g
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter(|i| matches!(i, Instruction::Store { .. }))
+            .count();
+        assert_eq!(stores, 3, "g's own store and both helper clones survive");
+        let off = run(
+            caller_cleanup_module(),
+            InlineFeatures {
+                caller_cleanup: false,
+                ..InlineFeatures::ALL
+            },
+        );
+        assert_eq!(calls_to(&off, "g", "waste"), 0, "first-pass sites inline");
+        assert_eq!(
+            calls_to(&off, "g", "helper"),
+            2,
+            "negative control: the pasted size keeps g past the soft cap"
+        );
+    }
+
+    #[test]
+    fn snapshot_refresh_clones_the_processed_single_site_body() {
+        let on = run(snapshot_refresh_module(), InlineFeatures::ALL);
+        assert_eq!(calls_to(&on, "h", "helper"), 0, "h processes its helpers");
+        assert_eq!(calls_to(&on, "g", "h"), 0, "single call site inlines");
+        assert_eq!(calls_to(&on, "g", "helper"), 0, "processed body cloned");
+        let off = run(
+            snapshot_refresh_module(),
+            InlineFeatures {
+                snapshot_refresh: false,
+                ..InlineFeatures::ALL
+            },
+        );
+        assert_eq!(calls_to(&off, "g", "h"), 0, "single call site inlines");
+        assert!(
+            calls_to(&off, "g", "helper") > 0,
+            "negative control: the raw snapshot re-exposes expanded calls"
+        );
     }
 }

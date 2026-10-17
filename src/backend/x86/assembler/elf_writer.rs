@@ -211,6 +211,7 @@ impl X86Arch for X86_64Arch {
 
     fn reloc_abs(size: usize) -> u32 {
         match size {
+            1 => R_X86_64_8,
             2 => R_X86_64_16,
             4 => R_X86_64_32,
             _ => R_X86_64_64,
@@ -293,6 +294,7 @@ impl X86Arch for X86_64Arch {
                 | 26 // GOTPC32
                 | 27 // GOT64
                 | 28 // GOTPCREL64
+                | 30 // GOTPLT64: "like GOT64, says PLT entry needed"
         )
     }
 
@@ -354,13 +356,7 @@ impl X86Arch for X86_64Arch {
             _ => 4,
         }
     }
-    fn reloc_abs32_for_internal() -> Option<u32> {
-        Some(R_X86_64_32)
-    }
     fn supports_deferred_skips() -> bool {
-        true
-    }
-    fn resolve_set_aliases_in_data() -> bool {
         true
     }
 }
@@ -430,9 +426,9 @@ mod tests {
     #[test]
     fn got_slot_classification_pins_binutils_numbering() {
         // The true GOT-slot classes: GOT32 = 3, GOTPCREL = 9,
-        // GOTPC32 = 26, GOT64 = 27, GOTPCREL64 = 28, and the relaxable
-        // GOTPCRELX family (41, 42, 43, 46, 49).
-        for t in [3, 9, 26, 27, 28, 41, 42, 43, 46, 49] {
+        // GOTPC32 = 26, GOT64 = 27, GOTPCREL64 = 28, GOTPLT64 = 30, and the
+        // relaxable GOTPCRELX family (41, 42, 43, 46, 49).
+        for t in [3, 9, 26, 27, 28, 30, 41, 42, 43, 46, 49] {
             assert!(
                 X86_64Arch::is_got_slot_reloc(t),
                 "reloc {t} is a GOT-slot class but classified foldable"
@@ -441,7 +437,9 @@ mod tests {
         // The absolute field classes MUST fold: 1 (64), 10 (32),
         // 11 (32S — the jump-table displacement), 12 (16), 13 (PC16),
         // and the PC-relative pair 2 (PC32) / 24 (PC64).
-        for t in [1, 2, 10, 11, 12, 13, 24] {
+        // GOTOFF64 (25) and PLTOFF64 (31) are offsets FROM the GOT base, not
+        // slots: the symbol itself is resolved, so folding stays sound.
+        for t in [1, 2, 10, 11, 12, 13, 24, 25, 31] {
             assert!(
                 !X86_64Arch::is_got_slot_reloc(t),
                 "absolute/pcrel reloc {t} misclassified as GOT slot — \

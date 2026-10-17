@@ -1,0 +1,42 @@
+{
+  "complete": true,
+  "metric": "bounded whole-program simulated Ir; not runtime",
+  "selected": [
+    "matmul"
+  ],
+  "results": {
+    "matmul": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -O2 -march=x86-64-v3 -fwrapv -ffp-contract=off -DN=48",
+      "metrics": {
+        "conditional_mispredicts": [
+          3571,
+          5923
+        ],
+        "d1_misses": [
+          3253,
+          3272
+        ],
+        "i1_misses": [
+          1489,
+          1488
+        ],
+        "indirect_mispredicts": [
+          260,
+          278
+        ],
+        "ir_mine": 338565,
+        "ir_ratio": 0.9827692807858323,
+        "ir_ref": 344501,
+        "ll_misses": [
+          3894,
+          3916
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/callgrind-S51-recovered/matmul/manifest.json"
+    }
+  },
+  "failures": [],
+  "worst_first": [
+    "matmul"
+  ]
+}

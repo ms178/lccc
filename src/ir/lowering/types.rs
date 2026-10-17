@@ -371,11 +371,7 @@ impl Lowerer {
                 }
             }
             TypeSpecifier::Pointer(_, _) => Some((ptr_sz, ptr_sz)),
-            TypeSpecifier::Enum(_, _, false) => Some((4, 4)),
-            TypeSpecifier::Enum(_, _, true) => {
-                // Packed enums need type context to resolve; let caller handle via CType path
-                None
-            }
+            // Enums resolve through their CType (callers' enum branch).
             TypeSpecifier::TypedefName(_) => Some((ptr_sz, ptr_sz)), // fallback for unresolved typedefs
             _ => None,
         }
@@ -454,22 +450,19 @@ impl Lowerer {
                     .bit_width
                     .as_ref()
                     .and_then(|bw| self.eval_const_expr(bw).and_then(|c| c.to_u32()));
-                let mut ty = self.struct_field_ctype(f);
-                // GCC treats enum bitfields as unsigned (see struct_or_union_to_ctype).
-                // Check both direct enum type specs and typedef'd enum types.
-                if bit_width.is_some() && self.is_enum_type_spec(&f.type_spec) && ty == CType::Int {
-                    ty = CType::UInt;
-                }
+                // An enum bit-field has the enum's compatible integer type
+                // (`unsigned int` unless an enumerator is negative), which
+                // `struct_field_ctype` already resolves.
+                let ty = self.struct_field_ctype(f);
                 // Merge per-field alignment with typedef alignment.
                 // If the field's type is a typedef with __aligned__, that alignment
                 // must be applied even when the field itself has no explicit alignment.
-                let field_alignment = {
-                    let mut align = f.alignment;
-                    if let Some(&ta) = self.typedef_alignment_for_type_spec(&f.type_spec) {
-                        align = Some(align.map_or(ta, |a| a.max(ta)));
-                    }
-                    align
-                };
+                // `alignof_type` already includes an aligned typedef's override.
+                let field_alignment = crate::common::types::strictest_alignment([
+                    f.alignment,
+                    self.typedef_alignment_for_type_spec(&f.type_spec).copied(),
+                    f.alignas_type.as_ref().map(|ts| self.alignof_type(ts)),
+                ]);
                 // C11 6.7.2.1p13: unnamed members must be struct/union. An unnamed
                 // non-aggregate (no name, no bit-width) is a constraint violation GCC
                 // ignores entirely; drop it from layout + initializers.
@@ -515,17 +508,11 @@ impl Lowerer {
             }
             return crate::common::types::target_ptr_size(); // fallback
         }
-        // Handle packed enums (explicit or forward-reference to packed) via CType resolution
-        if let TypeSpecifier::Enum(name, _, is_packed) = ts {
-            let effective_packed = *is_packed
-                || name
-                    .as_ref()
-                    .and_then(|n| self.types.enum_types.get(n))
-                    .is_some_and(|enum_type| enum_type.is_packed);
-            if effective_packed {
-                let ctype = self.type_spec_to_ctype(ts);
-                return ctype.size_ctx(&*self.types.borrow_struct_layouts());
-            }
+        // An enum's size depends on its values (1/2 bytes packed; 4 or 8
+        // otherwise), so it resolves through its CType like every other use.
+        if matches!(ts, TypeSpecifier::Enum(..)) {
+            let ctype = self.type_spec_to_ctype(ts);
+            return ctype.size_ctx(&*self.types.borrow_struct_layouts());
         }
         // Handle typeof(expr) by resolving the expression's type
         if let TypeSpecifier::Typeof(expr, _) = ts {
@@ -594,7 +581,7 @@ impl Lowerer {
         if let TypeSpecifier::Vector(_, total_bytes) = ts {
             return (*total_bytes).min(16);
         }
-        if matches!(ts, TypeSpecifier::ExtVector(..)) {
+        if matches!(ts, TypeSpecifier::ExtVector(..) | TypeSpecifier::Enum(..)) {
             return self.ctype_align(&self.type_spec_to_ctype(ts));
         }
         let ts = self.resolve_type_spec(ts);
@@ -641,7 +628,7 @@ impl Lowerer {
         if let TypeSpecifier::Vector(_, total_bytes) = ts {
             return (*total_bytes).min(16);
         }
-        if matches!(ts, TypeSpecifier::ExtVector(..)) {
+        if matches!(ts, TypeSpecifier::ExtVector(..) | TypeSpecifier::Enum(..)) {
             return self
                 .type_spec_to_ctype(ts)
                 .preferred_align_ctx(&*self.types.borrow_struct_layouts());

@@ -1,0 +1,19 @@
+{
+  "checked_at": "2026-10-15T11:50:35.645043+00:00",
+  "pulls": {
+    "831": {
+      "state": "closed",
+      "merged": false,
+      "merged_at": null,
+      "merge_commit_sha": "f86523193d4a22bc27c35de9f96310112c160569",
+      "updated_at": "2026-10-15T10:09:32Z"
+    },
+    "832": {
+      "state": "closed",
+      "merged": true,
+      "merged_at": "2026-10-15T10:35:20Z",
+      "merge_commit_sha": "63e783b15586eca86f306bd75a52b82c57304bbb",
+      "updated_at": "2026-10-15T10:35:20Z"
+    }
+  }
+}

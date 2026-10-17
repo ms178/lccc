@@ -78,7 +78,11 @@ impl Lowerer {
             base_return_type,
             return_is_bool,
         ));
-        self.func_mut().return_ctype = Some(self.type_spec_to_ctype(&func.return_type));
+        let return_ctype = self.type_spec_to_ctype(&func.return_type);
+        if !func.attrs.is_static() && !self.is_internal_function(&func.name) {
+            self.diagnose_unsupported_ext_vector_abi(&return_ctype, true, func.span);
+        }
+        self.func_mut().return_ctype = Some(return_ctype);
         // Clear get_expr_ctype memoization cache: results depend on
         // per-function state (local variables), so cannot span functions.
         self.expr_ctype_cache.borrow_mut().clear();
@@ -267,16 +271,46 @@ impl Lowerer {
                 }
             }
 
-            // Clang's i686 ExtVector parameter ABI scalarizes each logical lane
-            // into ordinary scalar argument slots (including floating and x87
-            // lanes). Keep ABI carriers separate from the padded local vector
-            // object representation; the lane CType drives scalar slot width.
-            if crate::common::types::target_is_32bit()
-                && matches!(&param_ctype, CType::ExtVector(..))
-            {
-                let (elem, lanes) = param_ctype
-                    .vector_info()
-                    .expect("ExtVector must carry its logical lane count");
+            // Clang 23.1.3's i386 ext-vector parameter carriers
+            // (`CType::i386_ext_vector_arg`). Scalarized vectors take one
+            // ordinary scalar slot per logical lane (including floating and
+            // x87 lanes); the lane CType drives the slot width. Widened
+            // vectors arrive as 16-byte `[Sse, SseUp]` pieces (%xmm0-2, then
+            // 16-byte-aligned stack). 8-byte integer images and diagnosed
+            // shapes fall through to the by-value aggregate path below.
+            if !func.attrs.is_static() && !self.is_internal_function(&func.name) {
+                self.diagnose_unsupported_ext_vector_abi(&param_ctype, false, func.span);
+            }
+            let i386_carrier = if crate::common::types::target_is_32bit() {
+                param_ctype.i386_ext_vector_arg()
+            } else {
+                None
+            };
+            if let Some(crate::common::types::I386ExtVectorCarrier::Xmm { pieces }) = i386_carrier {
+                let mut piece_indices = Vec::with_capacity(pieces);
+                for _ in 0..pieces {
+                    piece_indices.push(params.len());
+                    params.push(IrParam {
+                        ty: IrType::Ptr,
+                        noalias: false,
+                        struct_size: Some(16),
+                        struct_align: Some(16),
+                        param_align: None,
+                        struct_eightbyte_classes: vec![
+                            crate::common::types::EightbyteClass::Sse,
+                            crate::common::types::EightbyteClass::SseUp,
+                        ],
+                        riscv_float_class: None,
+                        // On i686 this only selects the 16-byte stack slot
+                        // alignment shared with the `__float128` carrier.
+                        is_f128_sse: true,
+                    });
+                }
+                param_kinds.push(ParamKind::ExtVectorXmm(piece_indices));
+                continue;
+            }
+            if i386_carrier == Some(crate::common::types::I386ExtVectorCarrier::Lanes) {
+                let (elem, lanes) = param_ctype.vector_lanes();
                 let lane_ty = if matches!(elem, CType::Bool) {
                     IrType::I32
                 } else {
@@ -329,34 +363,28 @@ impl Lowerer {
                 };
                 // Compute struct alignment, per-eightbyte SysV ABI classification,
                 // and RISC-V LP64D float field classification
-                // AUD-VABI-1: a VECTOR is not a struct.  Its eightbytes are
-                // SSE + SSEUP (the upper half of the SAME register), so a
-                // 16-byte vector arrives in ONE %xmm -- not in the GP pair the
-                // layout classifier would pick (it has no notion of a "vector
-                // element", so it falls back to INTEGER).  Measured: an
-                // lccc-compiled callee read %rdi/%rsi/%rdx/%rcx and returned
-                // garbage where gcc had passed the two vectors in %xmm0/%xmm1.
-                let vector_carrier = if crate::common::types::target_elf_machine() == 62 {
-                    param_ctype.sysv_vector_carrier()
-                } else {
-                    None
-                };
-                let (struct_align, struct_eightbyte_classes, riscv_float_class) = if struct_size
-                    .is_some()
-                {
-                    if let Some((classes, _)) = vector_carrier.clone() {
-                        (Some(self.ctype_align(&param_ctype)), classes, None)
-                    } else if let Some(layout) = self.get_struct_layout_for_type(&param.type_spec) {
-                        let ctx = &*self.types.borrow_struct_layouts();
-                        let classes = layout.classify_sysv_eightbytes(ctx);
-                        let rv_class = layout.classify_riscv_float_fields(ctx);
-                        (Some(layout.align), classes, rv_class)
+                // x86-64: the psABI classes of the struct, union or vector
+                // (`[Memory]`, `[Sse, SseUp]` = ONE %xmm, ...).
+                let sysv_abi = self.sysv_arg_abi(&param_ctype);
+                let (struct_align, struct_eightbyte_classes, riscv_float_class) =
+                    if struct_size.is_some() {
+                        if let Some(layout) = self.get_struct_layout_for_type(&param.type_spec) {
+                            let ctx = &*self.types.borrow_struct_layouts();
+                            let classes = match &sysv_abi {
+                                Some((classes, _)) => classes.clone(),
+                                None => layout.classify_sysv_eightbytes(ctx),
+                            };
+                            let rv_class = layout.classify_riscv_float_fields(ctx);
+                            (Some(layout.align), classes, rv_class)
+                        } else if let Some((classes, _)) = sysv_abi.clone() {
+                            // A vector: no record layout.
+                            (Some(self.ctype_align(&param_ctype)), classes, None)
+                        } else {
+                            (None, Vec::new(), None)
+                        }
                     } else {
                         (None, Vec::new(), None)
-                    }
-                } else {
-                    (None, Vec::new(), None)
-                };
+                    };
                 // Struct params carry alignment through `struct_align`.
                 // The struct LAYOUT's natural alignment (layout.align) is not
                 // enough: a typedef override (`typedef S7 AS32
@@ -368,9 +396,7 @@ impl Lowerer {
                 // alignment in so the alloca is padded and the capture
                 // targets the effective aligned address.
                 let declared_align = self.alignof_type(&param.type_spec);
-                let direct_align = param
-                    .alignment
-                    .or_else(|| param.alignas_type.as_ref().map(|ts| self.alignof_type(ts)));
+                let direct_align = self.param_explicit_alignment(param);
                 let extra = declared_align.max(direct_align.unwrap_or(0));
                 let struct_align = match struct_align {
                     Some(a) => Some(a.max(extra)),
@@ -386,7 +412,9 @@ impl Lowerer {
                     struct_eightbyte_classes,
                     riscv_float_class,
                     // "ONE 16-byte %xmm" -- the same carrier _Float128 uses.
-                    is_f128_sse: vector_carrier.is_some_and(|(_, one_xmm)| one_xmm),
+                    // A one-XMM aggregate is identified by its `[Sse, SseUp]`
+                    // classes; the flag is reserved for `_Float128` values.
+                    is_f128_sse: false,
                 });
                 param_kinds.push(ParamKind::Struct(ir_idx));
                 continue;
@@ -404,9 +432,7 @@ impl Lowerer {
                 // Fold it in exactly like the scalar arm.
                 let natural_align = self.ctype_align(&param_ctype);
                 let declared_align = self.alignof_type(&param.type_spec);
-                let direct_align = param
-                    .alignment
-                    .or_else(|| param.alignas_type.as_ref().map(|ts| self.alignof_type(ts)));
+                let direct_align = self.param_explicit_alignment(param);
                 let declared = declared_align.max(direct_align.unwrap_or(0));
                 let param_align = (declared > natural_align).then_some(declared);
                 params.push(IrParam {
@@ -453,9 +479,7 @@ impl Lowerer {
             // (GCC/Clang reject), so they MUST be honored — otherwise the
             // parameter is homed at natural alignment while the user asked
             // for more (silent misalignment of `&x`).
-            let direct_align = param
-                .alignment
-                .or_else(|| param.alignas_type.as_ref().map(|ts| self.alignof_type(ts)));
+            let direct_align = self.param_explicit_alignment(param);
             let declared_align = declared_align.max(direct_align.unwrap_or(0));
             let param_align = (declared_align > natural_align).then_some(declared_align);
             params.push(IrParam {
@@ -594,6 +618,12 @@ impl Lowerer {
                         &info.params,
                     );
                 }
+                ParamKind::ExtVectorXmm(piece_ir_idxs) => {
+                    let ctype = self.type_spec_to_ctype(&orig_param.type_spec);
+                    let slots: Vec<Value> = piece_ir_idxs.iter().map(|&i| ir_allocas[i]).collect();
+                    let vector = self.i386_ext_vector_param_from_pieces(&ctype, &slots);
+                    self.register_struct_or_complex_param(orig_param, vector);
+                }
             }
         }
 
@@ -601,6 +631,15 @@ impl Lowerer {
     }
 
     /// Register a normal (non-struct, non-complex) parameter as a local variable.
+    /// A parameter's explicit alignment: the strictest of its `aligned(N)` /
+    /// `_Alignas(N)` and `_Alignas(type)` (C11 6.7.5p6).
+    fn param_explicit_alignment(&self, param: &ParamDecl) -> Option<usize> {
+        crate::common::types::strictest_alignment([
+            param.alignment,
+            param.alignas_type.as_ref().map(|ts| self.alignof_type(ts)),
+        ])
+    }
+
     fn register_normal_param(&mut self, orig_param: &ParamDecl, ir_param: &IrParam, alloca: Value) {
         let ty = ir_param.ty;
         let param_size = self.sizeof_type(&orig_param.type_spec).max(ty.size());
@@ -789,11 +828,12 @@ impl Lowerer {
                 ty: lane_ty,
                 seg_override: AddressSpace::Default,
             });
+            let lane_val = self.i386_bool_lane_bit(&ctype, Operand::Value(lane_val), lane_ty);
             self.store_vector_lane(
                 vector_alloca,
                 &ctype,
                 lane,
-                Operand::Value(lane_val),
+                lane_val,
                 lane_ty,
                 AddressSpace::Default,
                 false,
@@ -1443,7 +1483,9 @@ impl Lowerer {
                 // A nested function's labels live in ITS body, not the
                 // parent's: skip the whole definition. The nested function
                 // gets its own prescan when it is lowered independently.
-                BlockItem::Declaration(_) | BlockItem::NestedFunction(_) => {}
+                BlockItem::Declaration(_)
+                | BlockItem::NestedFunction(_)
+                | BlockItem::StaticAssert(_) => {}
             }
         }
     }

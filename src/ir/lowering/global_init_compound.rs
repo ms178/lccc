@@ -352,14 +352,15 @@ impl Lowerer {
             elements.push(addr_init);
         } else if let Some(addr_init) = self.eval_global_addr_expr(expr) {
             elements.push(addr_init);
-        } else if coerce_ty.is_none() {
-            // Untyped path: try raw const eval as last resort
-            if let Some(val) = self.eval_const_expr(expr) {
-                self.push_const_as_bytes(elements, &val, element_size);
-            } else {
-                push_zero_bytes(elements, element_size);
-            }
+        } else if let Some(val) = coerce_ty
+            .is_none()
+            .then(|| self.eval_const_expr(expr))
+            .flatten()
+        {
+            // Untyped path: raw const eval as the last resort.
+            self.push_const_as_bytes(elements, &val, element_size);
         } else {
+            self.diagnose_non_constant(expr);
             push_zero_bytes(elements, element_size);
         }
     }

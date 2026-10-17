@@ -359,9 +359,16 @@ impl Lowerer {
             // Handle compile-time builtin function calls in constant expressions.
             Expr::FunctionCall(func, args, _) => {
                 if let Expr::Identifier(name, _) = func.as_ref() {
-                    shared_const_eval::eval_builtin_call(name.as_str(), args, &|e| {
+                    let folded = shared_const_eval::eval_builtin_call(name.as_str(), args, &|e| {
                         self.eval_const_expr(e)
-                    })
+                    });
+                    if folded.is_none()
+                        && name == "__builtin_constant_p"
+                        && self.folding_initializer.get()
+                    {
+                        return Some(IrConst::I32(0));
+                    }
+                    folded
                 } else {
                     None
                 }
@@ -689,8 +696,8 @@ impl Lowerer {
             .as_ref()
             .is_some_and(|fs| fs.locals.contains_key(name));
         if !is_local {
-            if let Some(&val) = self.types.enum_constants.get(name) {
-                return Some(IrConst::I64(val));
+            if let Some(constant) = self.types.enum_constants.get(name) {
+                return Some(IrConst::I64(constant.value));
             }
         }
         if let Some(ref fs) = self.func_state {

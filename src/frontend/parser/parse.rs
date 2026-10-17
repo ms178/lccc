@@ -592,6 +592,10 @@ pub struct Parser {
     /// (e.g., `MY_SIZE = sizeof(some_typedef)`). These are still valid constants,
     /// just not evaluable by our constant-expression evaluator.
     pub(super) unevaluable_enum_constants: FxHashSet<String>,
+    /// `_Static_assert`s from struct member lists awaiting sema, emitted after
+    /// the enclosing file-scope or block item (the members are not in scope
+    /// as identifiers, so the assertion means the same there).
+    pub(super) deferred_static_asserts: Vec<super::ast::StaticAssert>,
     /// Map of struct/union tag names to their computed alignments.
     /// Populated when a struct/union with fields is parsed, so that later
     /// __alignof__(struct tag) references can look up the correct alignment
@@ -623,6 +627,7 @@ impl Parser {
             diagnostics: DiagnosticEngine::new(),
             enum_constants: FxHashMap::default(),
             unevaluable_enum_constants: FxHashSet::default(),
+            deferred_static_asserts: Vec::new(),
             struct_tag_alignments: FxHashMap::default(),
         }
     }
@@ -993,6 +998,11 @@ impl Parser {
             }
             if let Some(decl) = self.parse_external_decl() {
                 decls.push(decl);
+                decls.extend(
+                    self.deferred_static_asserts
+                        .drain(..)
+                        .map(ExternalDecl::StaticAssert),
+                );
             } else {
                 // Report error for unrecognized token at top level
                 if !matches!(self.peek(), TokenKind::Semicolon | TokenKind::Eof) {
@@ -2298,7 +2308,9 @@ impl Parser {
                     } else {
                         Some(&self.struct_tag_alignments)
                     };
-                    return Some(Self::alignof_type_spec(&result_type, tag_aligns));
+                    // `None` (typedef, enum, ...): the layout code resolves
+                    // the saved type; no guessed number may stand in for it.
+                    return Self::alignof_type_spec(&result_type, tag_aligns);
                 }
             }
         }
@@ -2380,18 +2392,22 @@ impl Parser {
         )
     }
 
-    /// Compute alignment (in bytes) for a type specifier.
-    /// Used by _Alignas(type) to determine the alignment value.
+    /// Alignment (in bytes) of a type specifier when the parser knows it
+    /// EXACTLY, else `None`. Typedef targets, enums (whose size depends on
+    /// their values), `#pragma pack` records and other types needing sema are
+    /// `None`: callers defer those (`_Alignas(type)` carries the type to the
+    /// layout builder, `_Static_assert` goes to sema). A guess here once laid
+    /// out `struct { char a; _Alignas(uint16_t) char b; }` as 16 bytes.
     /// The optional `tag_aligns` map provides previously-computed alignments for
     /// struct/union tags, enabling correct alignment for tag-only references
     /// (e.g., `__alignof__(struct packed_tag)` where the definition is elsewhere).
     pub(super) fn alignof_type_spec(
         ts: &TypeSpecifier,
         tag_aligns: Option<&FxHashMap<String, usize>>,
-    ) -> usize {
+    ) -> Option<usize> {
         use crate::common::types::target_ptr_size;
         let ptr_sz = target_ptr_size();
-        match ts {
+        let align = match ts {
             TypeSpecifier::Void
             | TypeSpecifier::Bool
             | TypeSpecifier::Char
@@ -2436,9 +2452,9 @@ impl Parser {
                     16
                 }
             }
-            TypeSpecifier::Array(elem, _) => Self::alignof_type_spec(elem, tag_aligns),
-            TypeSpecifier::Struct(name, fields, is_packed, _, struct_aligned, _)
-            | TypeSpecifier::Union(name, fields, is_packed, _, struct_aligned, _) => {
+            TypeSpecifier::Array(elem, _) => return Self::alignof_type_spec(elem, tag_aligns),
+            TypeSpecifier::Struct(name, fields, is_packed, pragma_pack, struct_aligned, _)
+            | TypeSpecifier::Union(name, fields, is_packed, pragma_pack, struct_aligned, _) => {
                 // Cache hit for previously DEFINED named records: definitions
                 // insert their final alignment into struct_tag_alignments the
                 // moment their fields are parsed, so lookups bottom-up during
@@ -2448,39 +2464,47 @@ impl Parser {
                 // from 11.6 s to milliseconds).
                 if let Some(tag) = name {
                     if let Some(a) = tag_aligns.and_then(|m| m.get(tag)) {
-                        return *a;
+                        return Some(*a);
                     }
                 }
+                if pragma_pack.is_some() {
+                    return None;
+                }
                 if *is_packed {
-                    return 1;
+                    return Some(1);
                 }
                 // Explicit struct/union-level __attribute__((aligned(N))) overrides
                 let mut align = struct_aligned.unwrap_or(0);
                 // Compute max alignment from fields if available
-                if let Some(field_list) = fields {
-                    for field in field_list {
-                        let field_align = if let Some(fa) = field.alignment {
-                            fa
-                        } else {
-                            Self::alignof_type_spec(&field.type_spec, tag_aligns)
-                        };
-                        align = align.max(field_align);
+                // A tag-only reference was answered by the cache above.
+                let field_list = fields.as_ref()?;
+                for field in field_list {
+                    // A member's own alignment raises its type's (C11 6.7.5);
+                    // a type-form `_Alignas` the parser could not size makes
+                    // the record's alignment unknown here.
+                    if field.alignas_type.is_some() && field.alignment.is_none() {
+                        return None;
                     }
-                } else if let Some(tag_name) = name {
-                    // Tag-only reference: look up previously stored alignment
-                    if let Some(ta) = tag_aligns {
-                        if let Some(&stored) = ta.get(tag_name.as_str()) {
-                            return stored;
-                        }
+                    // Packed members and unnamed bit-fields (which do not
+                    // align the record on SysV) are left to the layout code.
+                    if field.is_packed || (field.name.is_none() && field.bit_width.is_some()) {
+                        return None;
                     }
+                    let natural = if field.derived.is_empty() {
+                        Self::alignof_type_spec(&field.type_spec, tag_aligns)?
+                    } else {
+                        return None;
+                    };
+                    align = align.max(natural).max(field.alignment.unwrap_or(0));
                 }
-                // Fallback for empty struct/union or tag-only (no fields available)
-                if align == 0 { ptr_sz } else { align }
+                // An empty record aligns to 1 (GNU C).
+                align.max(1)
             }
-            TypeSpecifier::Enum(_, _, _) => 4,
-            TypeSpecifier::TypedefName(_) => ptr_sz, // conservative default
-            _ => ptr_sz,
-        }
+            // Enum width depends on the values, typedefs on their target and
+            // everything else here (vectors, typeof, ...) on sema.
+            _ => return None,
+        };
+        Some(align)
     }
 
     /// Compute preferred (natural) alignment for a type specifier.
@@ -2490,7 +2514,7 @@ impl Parser {
     pub(super) fn preferred_alignof_type_spec(
         ts: &TypeSpecifier,
         tag_aligns: Option<&FxHashMap<String, usize>>,
-    ) -> usize {
+    ) -> Option<usize> {
         use crate::common::types::target_ptr_size;
         let ptr_sz = target_ptr_size();
         if ptr_sz != 4 {
@@ -2499,8 +2523,10 @@ impl Parser {
         }
         // On i686: long long and double have preferred alignment of 8
         match ts {
-            TypeSpecifier::LongLong | TypeSpecifier::UnsignedLongLong | TypeSpecifier::Double => 8,
-            TypeSpecifier::ComplexDouble => 8,
+            TypeSpecifier::LongLong | TypeSpecifier::UnsignedLongLong | TypeSpecifier::Double => {
+                Some(8)
+            }
+            TypeSpecifier::ComplexDouble => Some(8),
             TypeSpecifier::Array(elem, _) => Self::preferred_alignof_type_spec(elem, tag_aligns),
             _ => Self::alignof_type_spec(ts, tag_aligns),
         }

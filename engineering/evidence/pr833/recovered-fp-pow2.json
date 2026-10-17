@@ -1,0 +1,378 @@
+{
+  "complete": true,
+  "commands": [
+    {
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "--version"
+      ],
+      "returncode": 0,
+      "stdout": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone\n",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "/usr/bin/gcc-16",
+        "--version"
+      ],
+      "returncode": 0,
+      "stdout": "gcc-16 (Debian 16.2.0-3) 16.2.0\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-march=x86-64-v3",
+        "-ffp-contract=off",
+        "-S",
+        "/home/user/.cache/lccc/tests/fixtures/fp_pow2/kernels.c",
+        "-o",
+        "/home/user/.cache/fp-pow2-S51-recovered/kernel.s"
+      ],
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-c",
+        "/home/user/.cache/fp-pow2-S51-recovered/kernel.s",
+        "-o",
+        "/home/user/.cache/fp-pow2-S51-recovered/kernel.o"
+      ],
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "/usr/bin/gcc-16",
+        "-O0",
+        "-frounding-math",
+        "-fsignaling-nans",
+        "-c",
+        "/home/user/.cache/lccc/tests/fixtures/fp_pow2/driver.c",
+        "-o",
+        "/home/user/.cache/fp-pow2-S51-recovered/driver.o"
+      ],
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "/usr/bin/gcc-16",
+        "/home/user/.cache/fp-pow2-S51-recovered/kernel.o",
+        "/home/user/.cache/fp-pow2-S51-recovered/driver.o",
+        "-lm",
+        "-o",
+        "/home/user/.cache/fp-pow2-S51-recovered/probe"
+      ],
+      "returncode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "/home/user/.cache/fp-pow2-S51-recovered/probe"
+      ],
+      "returncode": 0,
+      "stdout": "POW2_PASS 4928\n",
+      "stderr": ""
+    }
+  ],
+  "checks": {
+    "div64_p256": {
+      "div": 0,
+      "mul": 1,
+      "add": 0,
+      "expected": [
+        [
+          0,
+          1,
+          0
+        ]
+      ]
+    },
+    "div64_n256": {
+      "div": 0,
+      "mul": 1,
+      "add": 0,
+      "expected": [
+        [
+          0,
+          1,
+          0
+        ]
+      ]
+    },
+    "div64_half": {
+      "div": 0,
+      "mul": 0,
+      "add": 1,
+      "expected": [
+        [
+          0,
+          0,
+          1
+        ],
+        [
+          0,
+          1,
+          0
+        ]
+      ]
+    },
+    "div64_nhalf": {
+      "div": 0,
+      "mul": 1,
+      "add": 0,
+      "expected": [
+        [
+          0,
+          1,
+          0
+        ]
+      ]
+    },
+    "div64_one": {
+      "div": 0,
+      "mul": 1,
+      "add": 0,
+      "expected": [
+        [
+          0,
+          1,
+          0
+        ]
+      ]
+    },
+    "div64_none": {
+      "div": 0,
+      "mul": 1,
+      "add": 0,
+      "expected": [
+        [
+          0,
+          1,
+          0
+        ]
+      ]
+    },
+    "div64_large": {
+      "div": 0,
+      "mul": 1,
+      "add": 0,
+      "expected": [
+        [
+          0,
+          1,
+          0
+        ]
+      ]
+    },
+    "div64_small": {
+      "div": 0,
+      "mul": 1,
+      "add": 0,
+      "expected": [
+        [
+          0,
+          1,
+          0
+        ]
+      ]
+    },
+    "reject64_huge": {
+      "div": 1,
+      "mul": 0,
+      "add": 0,
+      "expected": [
+        [
+          1,
+          0,
+          0
+        ]
+      ]
+    },
+    "reject64_tiny": {
+      "div": 1,
+      "mul": 0,
+      "add": 0,
+      "expected": [
+        [
+          1,
+          0,
+          0
+        ]
+      ]
+    },
+    "reject64_three": {
+      "div": 1,
+      "mul": 0,
+      "add": 0,
+      "expected": [
+        [
+          1,
+          0,
+          0
+        ]
+      ]
+    },
+    "div32_p256": {
+      "div": 0,
+      "mul": 1,
+      "add": 0,
+      "expected": [
+        [
+          0,
+          1,
+          0
+        ]
+      ]
+    },
+    "div32_n256": {
+      "div": 0,
+      "mul": 1,
+      "add": 0,
+      "expected": [
+        [
+          0,
+          1,
+          0
+        ]
+      ]
+    },
+    "div32_half": {
+      "div": 0,
+      "mul": 0,
+      "add": 1,
+      "expected": [
+        [
+          0,
+          0,
+          1
+        ],
+        [
+          0,
+          1,
+          0
+        ]
+      ]
+    },
+    "div32_nhalf": {
+      "div": 0,
+      "mul": 1,
+      "add": 0,
+      "expected": [
+        [
+          0,
+          1,
+          0
+        ]
+      ]
+    },
+    "div32_one": {
+      "div": 0,
+      "mul": 1,
+      "add": 0,
+      "expected": [
+        [
+          0,
+          1,
+          0
+        ]
+      ]
+    },
+    "div32_none": {
+      "div": 0,
+      "mul": 1,
+      "add": 0,
+      "expected": [
+        [
+          0,
+          1,
+          0
+        ]
+      ]
+    },
+    "div32_large": {
+      "div": 0,
+      "mul": 1,
+      "add": 0,
+      "expected": [
+        [
+          0,
+          1,
+          0
+        ]
+      ]
+    },
+    "div32_small": {
+      "div": 0,
+      "mul": 1,
+      "add": 0,
+      "expected": [
+        [
+          0,
+          1,
+          0
+        ]
+      ]
+    },
+    "reject32_huge": {
+      "div": 1,
+      "mul": 0,
+      "add": 0,
+      "expected": [
+        [
+          1,
+          0,
+          0
+        ]
+      ]
+    },
+    "reject32_tiny": {
+      "div": 1,
+      "mul": 0,
+      "add": 0,
+      "expected": [
+        [
+          1,
+          0,
+          0
+        ]
+      ]
+    },
+    "reject32_three": {
+      "div": 1,
+      "mul": 0,
+      "add": 0,
+      "expected": [
+        [
+          1,
+          0,
+          0
+        ]
+      ]
+    }
+  },
+  "sources": {
+    "tests/fixtures/fp_pow2/kernels.c": "67bf3480a143b0c73081f3452f46651a0c87d8f16d095f1f29e28bfcc6c3d7a8",
+    "tests/fixtures/fp_pow2/driver.c": "b7f51bb69792c3645cf17721ee38d777f2ff66cab38561101ac3ce5b07d0f218"
+  },
+  "compilers": {
+    "lccc": {
+      "path": "/home/user/.cache/lccc/target/fastbuild/lccc",
+      "sha256": "3226e1d72d28f2c01ebe7c74f80276661f4f1d580fa27c24df2b82c254ecdc51",
+      "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone\n"
+    },
+    "gcc": {
+      "path": "/usr/bin/gcc-16",
+      "sha256": "d85726de39dccd87c573ee63d467caee8e69f56cc2edea710f02d1ba5e0ae477",
+      "version": "gcc-16 (Debian 16.2.0-3) 16.2.0\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n"
+    }
+  }
+}

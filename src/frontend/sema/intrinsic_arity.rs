@@ -34,6 +34,8 @@ const ARITY_TABLE: &[(&str, u8)] = &[
     ("__builtin_ia32_aesenclast256", 2),
     ("__builtin_ia32_aesimc128", 1),
     ("__builtin_ia32_aeskeygenassist128", 2),
+    ("__builtin_ia32_bzhi_di", 2),
+    ("__builtin_ia32_bzhi_si", 2),
     ("__builtin_ia32_clflush", 1),
     ("__builtin_ia32_crc32di", 2),
     ("__builtin_ia32_crc32hi", 2),

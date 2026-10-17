@@ -174,6 +174,12 @@ class SurveyContracts(unittest.TestCase):
     def test_tune_remote_failure_is_not_success(self):
         self.assertEqual(self.tune_run(remote=RuntimeError("offline")), 1)
 
+    def test_tune_remote_failure_still_reports_the_local_table(self):
+        # Failing closed must not discard the measurement that did succeed.
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(self.tune_run(remote=RuntimeError("offline")), 1)
+        self.assertIn("`probe`", out.getvalue())
+
     def test_tune_missing_requested_function_is_not_success(self):
         self.assertEqual(self.tune_run(function="missing"), 1)
 

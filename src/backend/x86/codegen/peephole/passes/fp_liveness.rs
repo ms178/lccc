@@ -473,6 +473,10 @@ pub(super) fn has_implicit_vector_effects_line(t: &str) -> bool {
     let (mn, operands) = split_mnemonic(t);
     let base = mn.strip_prefix('v').unwrap_or(mn);
     state_image_register_reads(mn).is_some()
+        // Decorated destinations are deliberately not plain register defs.
+        // Equality/copy caches must still retire their old values: a masked
+        // write MAY change the scalar even though it is not a full overwrite.
+        || operands.contains('{')
         // AVX2 gather masks are explicit but nontrailing read/write outputs.
         // Treat them as local barriers until consumers model both outputs;
         // merely keeping the mask read live in DCE does not protect equality
@@ -896,6 +900,14 @@ pub(super) fn known_explicit_vector_inputs(mn: &str, operands: &str) -> bool {
 
 /// Reads of vector registers by architectural state-image instructions.
 /// Even restores with no register inputs have non-textual vector writes.
+// Do not infer definite XMM kills for FXRSTOR here. Intel's instruction
+// contract makes XMM/MXCSR restoration implementation-dependent when
+// CR4.OSFXSR is clear, and AMD's fast FXSAVE/FXRSTOR (EFER.FFXSR) skips the
+// XMM registers entirely at CPL 0 in 64-bit mode -- exactly the kernel code
+// this compiler also builds. This textual pass proves neither bit nor mode.
+// XRSTOR additionally has runtime component masks. Hosted user-space may
+// permit a stronger model, but no such target contract reaches this analysis.
+// https://www.felixcloutier.com/x86/fxrstor
 fn state_image_register_reads(mn: &str) -> Option<u128> {
     match mn {
         "fxsave" | "fxsave64" | "fxsaveq" => Some(XMM_ALL),
@@ -904,19 +916,6 @@ fn state_image_register_reads(mn: &str) -> Option<u128> {
         "fxrstor" | "fxrstor64" | "fxrstorq" | "xrstor" | "xrstor64" | "xrstorq" | "xrstors"
         | "xrstors64" => Some(0),
         _ => None,
-    }
-}
-
-/// Definite vector-register writes by architectural state-image restores.
-/// FXSAVE-format state restores the full low 128 bits of XMM registers but
-/// does not restore YMM/ZMM upper components. XRSTOR/XRSTORS writes depend on
-/// XCR0, XSTATE_BV, and the runtime EDX:EAX request mask; without proving that
-/// mask at the instruction, treating any component as unconditionally killed
-/// would be unsound.
-fn state_image_register_writes(mn: &str) -> u128 {
-    match mn {
-        "fxrstor" | "fxrstor64" | "fxrstorq" => XMM_ALL,
-        _ => 0,
     }
 }
 
@@ -1911,7 +1910,7 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
                 (
                     Effect {
                         reads: reads | upper.reads | implicit_fp_reads(mn, operands, mentioned),
-                        writes: writes | upper.writes | state_image_register_writes(mn),
+                        writes: writes | upper.writes,
                     },
                     fall,
                 )
@@ -2294,11 +2293,13 @@ mod tests {
     }
 
     #[test]
-    fn fxrstor_kills_all_low_xmm_state_but_preserves_upper_vector_state() {
+    fn fxrstor_is_not_a_definite_xmm_kill_in_any_vector_region() {
+        // Fail closed: FXRSTOR's XMM/MXCSR restore is implementation-dependent
+        // when CR4.OSFXSR is clear and this textual pass proves neither that
+        // bit nor the execution mode. A prior XMM definition therefore stays
+        // live for a later read, and the production DCE must keep the move.
         for mn in ["fxrstor", "fxrstor64", "fxrstorq"] {
-            // Cover the low endpoint, the legacy XMM7 boundary, and XMM15
-            // (which only exists in 64-bit mode). The later read must observe
-            // the restored value, not the value copied into the register here.
+            // Low endpoint, legacy XMM7 boundary and the 64-bit-only XMM15.
             for reg in [0u32, 7, 15] {
                 let def_text = format!("movaps %xmm6, %xmm{reg}");
                 let (store, mut infos, lv) = build(&format!(
@@ -2307,26 +2308,23 @@ mod tests {
                 let def = line_of(&store, &def_text);
                 assert_eq!(
                     lv.xmm_live_after(def, reg),
-                    Some(false),
-                    "{mn} restores and overwrites low XMM{reg}"
+                    Some(true),
+                    "{mn} must not be modelled as killing low XMM{reg}"
                 );
                 assert!(
-                    lv.reg_move_dead_after(&store, &infos, def, reg),
-                    "the legacy low-XMM move is dead before {mn} for XMM{reg}"
+                    !lv.reg_move_dead_after(&store, &infos, def, reg),
+                    "the move feeding XMM{reg} across {mn} is not dead"
                 );
+                super::super::dead_code::eliminate_dead_fp_moves(&store, &mut infos);
                 assert!(
-                    super::super::dead_code::eliminate_dead_fp_moves(&store, &mut infos),
-                    "the dead legacy move is removed by the production pass for {mn}/XMM{reg}"
-                );
-                assert!(
-                    infos[def].is_nop(),
-                    "the move is eliminated for {mn}/XMM{reg}"
+                    !infos[def].is_nop(),
+                    "the production pass keeps the move across {mn} for XMM{reg}"
                 );
             }
 
-            // Use an XMM-width VEX producer: eliminate_dead_fp_moves parses
-            // XMM moves, not YMM/ZMM moves. The later wider read makes the
-            // producer's upper-zeroing write observable across FXRSTOR.
+            // An XMM-width VEX producer also zeroes the YMM/ZMM upper state;
+            // a later wide read observes it whether or not FXRSTOR rewrites
+            // the low lane, so both regions stay live and the move survives.
             for reg in [7u32, 15] {
                 for (width, region_shift) in [("ymm", YMM_HIGH_SHIFT), ("zmm", ZMM_HIGH_SHIFT)] {
                     let def_text = format!("vmovaps %xmm6, %xmm{reg}");
@@ -2337,8 +2335,8 @@ mod tests {
                     let def = line_of(&store, &def_text);
                     assert_eq!(
                         lv.xmm_live_after(def, reg),
-                        Some(false),
-                        "{mn} kills low XMM{reg} before the {width} read"
+                        Some(true),
+                        "{mn} must not be modelled as killing low XMM{reg} before the {width} read"
                     );
                     let facts = lv.func_of(def).expect("function facts");
                     assert_ne!(
@@ -2348,12 +2346,12 @@ mod tests {
                     );
                     assert!(
                         !lv.reg_move_dead_after(&store, &infos, def, reg),
-                        "deleting the XMM-width VEX move would erase live {width}-high state"
+                        "deleting the XMM-width VEX move would erase live {width} state"
                     );
                     super::super::dead_code::eliminate_dead_fp_moves(&store, &mut infos);
                     assert!(
                         !infos[def].is_nop(),
-                        "the production pass preserves the XMM VEX move carrying live {width}-high state"
+                        "the production pass preserves the XMM VEX move live across {mn}"
                     );
                 }
             }
@@ -2400,6 +2398,17 @@ mod tests {
         );
         let def = line_of(&store, "movaps %xmm6, %xmm0");
         assert_eq!(lv.xmm_live_after(def, 0), Some(false));
+    }
+
+    #[test]
+    fn state_restore_is_not_an_unconditional_xmm_kill() {
+        for mnemonic in ["fxrstor", "fxrstor64", "fxrstorq", "xrstor", "xrstors"] {
+            let (store, _, lv) = build(&format!(
+                "    movaps %xmm6, %xmm7\n    {mnemonic} (%rdi)\n    addps %xmm7, %xmm0\n    ret\n"
+            ));
+            let def = line_of(&store, "movaps %xmm6, %xmm7");
+            assert_eq!(lv.xmm_live_after(def, 7), Some(true), "{mnemonic}");
+        }
     }
 
     #[test]

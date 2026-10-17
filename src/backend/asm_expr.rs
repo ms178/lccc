@@ -37,10 +37,88 @@ enum ExprToken {
     Num(i64),
     Op(char),
     Op2(&'static str),
+    /// A symbol or the location counter `.`; produced only in symbol mode
+    /// ([`eval_section_expr`]) -- the numeric evaluator keeps rejecting
+    /// identifiers at the lexer, exactly as before.
+    Sym(String),
 }
 
 /// Tokenize an expression string into ExprTokens.
 fn tokenize_expr(s: &str) -> Result<Vec<ExprToken>, String> {
+    tokenize_expr_mode(s, false)
+}
+
+/// `[A-Za-z_.$]` starts a GAS symbol; digits and those continue one.
+fn is_sym_start(c: u8) -> bool {
+    c.is_ascii_alphabetic() || c == b'_' || c == b'.' || c == b'$'
+}
+
+/// The end of a numeric local-label reference (`1b`, `42f`) starting at
+/// `i`: digits, then `b` or `f`, not followed by a symbol character (`0b1`
+/// is binary 1, `1fx` no reference).
+pub fn numeric_label_ref_end(bytes: &[u8], i: usize) -> Option<usize> {
+    let mut j = i;
+    while j < bytes.len() && bytes[j].is_ascii_digit() {
+        j += 1;
+    }
+    let suffix = *bytes.get(j)?;
+    if j == i || (suffix != b'b' && suffix != b'f') {
+        return None;
+    }
+    match bytes.get(j + 1) {
+        Some(&n) if is_sym_start(n) || n.is_ascii_digit() => None,
+        _ => Some(j + 1),
+    }
+}
+
+/// `expr` with every numeric local-label reference (`1b`, `42f`) replaced
+/// by `resolve`'s name for it (unchanged when `resolve` returns `None`).
+/// Only whole tokens are references: digits inside a symbol name (`x1b`)
+/// and numbers of any radix (`0x1f`, `0b1`) are copied as they are, while
+/// `0b` alone is label 0 backward.
+pub fn rewrite_numeric_label_refs(
+    expr: &str,
+    mut resolve: impl FnMut(&str) -> Option<String>,
+) -> String {
+    let bytes = expr.as_bytes();
+    let is_sym = |b: u8| is_sym_start(b) || b.is_ascii_digit();
+    let mut out = String::with_capacity(expr.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let start = i;
+        if bytes[i].is_ascii_digit() {
+            if let Some(end) = numeric_label_ref_end(bytes, i)
+                && let Some(name) = resolve(&expr[i..end])
+            {
+                out.push_str(&name);
+                i = end;
+                continue;
+            }
+            while i < bytes.len() && is_sym(bytes[i]) {
+                i += 1;
+            }
+        } else if is_sym_start(bytes[i]) {
+            while i < bytes.len() && is_sym(bytes[i]) {
+                i += 1;
+            }
+        } else {
+            i += expr[i..].chars().next().map_or(1, char::len_utf8);
+        }
+        out.push_str(&expr[start..i]);
+    }
+    out
+}
+
+/// `s` is one GAS symbol name and nothing else (`.` alone is the location
+/// counter, not a symbol).
+pub fn is_bare_symbol(s: &str) -> bool {
+    let b = s.as_bytes();
+    s != "."
+        && b.first().is_some_and(|&c| is_sym_start(c))
+        && b.iter().all(|&c| is_sym_start(c) || c.is_ascii_digit())
+}
+
+fn tokenize_expr_mode(s: &str, symbols: bool) -> Result<Vec<ExprToken>, String> {
     let mut tokens = Vec::new();
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -84,6 +162,18 @@ fn tokenize_expr(s: &str) -> Result<Vec<ExprToken>, String> {
             // (`mov $1 <> 0, %ecx` — byte-probed on 2.47: b9 ff ff ff ff).
             tokens.push(ExprToken::Op2("!="));
             i += 2;
+        } else if symbols && is_sym_start(c) {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && (is_sym_start(bytes[i]) || bytes[i].is_ascii_digit()) {
+                i += 1;
+            }
+            tokens.push(ExprToken::Sym(s[start..i].to_string()));
+        } else if symbols && let Some(end) = numeric_label_ref_end(bytes, i) {
+            // `1b` / `1f`: a reference to the nearest numeric label `1:`
+            // backward / forward, a symbol (GAS), not the integer 1.
+            tokens.push(ExprToken::Sym(s[i..end].to_string()));
+            i = end;
         } else if c == b'('
             || c == b')'
             || c == b'+'
@@ -168,276 +258,354 @@ fn tokenize_expr(s: &str) -> Result<Vec<ExprToken>, String> {
     Ok(tokens)
 }
 
-fn eval_tokens(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
-    // GAS operator precedence, loosest to tightest (binutils manual,
-    // "Operator Precedence"): || < && < | < ^ < & < == != <>
-    // < < > <= >= < << >> < + - < * / % < unary. Every comparison and
-    // logical operator yields -1 (all ones) for TRUE and 0 for false —
-    // the shell convention, NOT C's 1. `mov $0 < 1, %esp` is therefore
-    // bc ff ff ff ff (GAS 2.47 byte-probed).
-    eval_lor(tokens, pos)
+/// GAS operator precedence, loosest to tightest (binutils manual,
+/// "Operator Precedence"): || < && < | < ^ < & < == != <> < < > <= >= <
+/// << >> < + - < * / % < unary. Every comparison and logical operator yields
+/// -1 (all ones) for TRUE and 0 for false -- the shell convention, NOT C's 1.
+/// `mov $0 < 1, %esp` is therefore bc ff ff ff ff (GAS 2.47 byte-probed).
+const PRECEDENCE: [&[&str]; 10] = [
+    &["||"],
+    &["&&"],
+    &["|"],
+    &["^"],
+    &["&"],
+    &["==", "!="],
+    &["<", ">", "<=", ">="],
+    &["<<", ">>"],
+    &["+", "-"],
+    &["*", "/", "%"],
+];
+
+/// The value domain the one grammar evaluates in: plain integers for
+/// [`parse_integer_expr`], section-relative terms for [`eval_section_expr`].
+trait ExprDomain: Sized {
+    fn num(v: i64) -> Self;
+    fn binary(self, op: &'static str, rhs: Self) -> Result<Self, String>;
+    fn unary(self, op: char) -> Result<Self, String>;
 }
 
-fn eval_lor(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
-    let mut val = eval_land(tokens, pos)?;
-    while *pos < tokens.len() {
-        if matches!(&tokens[*pos], ExprToken::Op2("||")) {
-            *pos += 1;
-            let rhs = eval_land(tokens, pos)?;
-            val = -i64::from(val != 0 || rhs != 0);
-        } else {
-            break;
-        }
-    }
-    Ok(val)
-}
-
-fn eval_land(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
-    let mut val = eval_or(tokens, pos)?;
-    while *pos < tokens.len() {
-        if matches!(&tokens[*pos], ExprToken::Op2("&&")) {
-            *pos += 1;
-            let rhs = eval_or(tokens, pos)?;
-            val = -i64::from(val != 0 && rhs != 0);
-        } else {
-            break;
-        }
-    }
-    Ok(val)
-}
-
-fn eval_or(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
-    let mut val = eval_xor(tokens, pos)?;
-    while *pos < tokens.len() {
-        if matches!(&tokens[*pos], ExprToken::Op('|')) {
-            *pos += 1;
-            val |= eval_xor(tokens, pos)?;
-        } else {
-            break;
-        }
-    }
-    Ok(val)
-}
-
-fn eval_xor(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
-    let mut val = eval_and(tokens, pos)?;
-    while *pos < tokens.len() {
-        if matches!(&tokens[*pos], ExprToken::Op('^')) {
-            *pos += 1;
-            val ^= eval_and(tokens, pos)?;
-        } else {
-            break;
-        }
-    }
-    Ok(val)
-}
-
-fn eval_and(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
-    let mut val = eval_eq(tokens, pos)?;
-    while *pos < tokens.len() {
-        if matches!(&tokens[*pos], ExprToken::Op('&')) {
-            *pos += 1;
-            val &= eval_eq(tokens, pos)?;
-        } else {
-            break;
-        }
-    }
-    Ok(val)
-}
-
-/// `==` / `!=` (and GAS's `<>` spelling, unified to `!=` by the tokenizer).
-fn eval_eq(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
-    let mut val = eval_cmp(tokens, pos)?;
-    while *pos < tokens.len() {
-        match &tokens[*pos] {
-            ExprToken::Op2("==") => {
-                *pos += 1;
-                let rhs = eval_cmp(tokens, pos)?;
-                val = -i64::from(val == rhs);
-            }
-            ExprToken::Op2("!=") => {
-                *pos += 1;
-                let rhs = eval_cmp(tokens, pos)?;
-                val = -i64::from(val != rhs);
-            }
-            _ => break,
-        }
-    }
-    Ok(val)
-}
-
-/// `<` `>` `<=` `>=` — GAS comparison operators, TRUE = -1.
-fn eval_cmp(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
-    let mut val = eval_shift(tokens, pos)?;
-    while *pos < tokens.len() {
-        match &tokens[*pos] {
-            ExprToken::Op('<') => {
-                *pos += 1;
-                let rhs = eval_shift(tokens, pos)?;
-                val = -i64::from(val < rhs);
-            }
-            ExprToken::Op('>') => {
-                *pos += 1;
-                let rhs = eval_shift(tokens, pos)?;
-                val = -i64::from(val > rhs);
-            }
-            ExprToken::Op2("<=") => {
-                *pos += 1;
-                let rhs = eval_shift(tokens, pos)?;
-                val = -i64::from(val <= rhs);
-            }
-            ExprToken::Op2(">=") => {
-                *pos += 1;
-                let rhs = eval_shift(tokens, pos)?;
-                val = -i64::from(val >= rhs);
-            }
-            _ => break,
-        }
-    }
-    Ok(val)
-}
-
-fn eval_shift(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
-    let mut val = eval_add(tokens, pos)?;
-    while *pos < tokens.len() {
-        match &tokens[*pos] {
-            ExprToken::Op2("<<") => {
-                *pos += 1;
-                let rhs = eval_add(tokens, pos)?;
-                // GNU as 2.47 (measured): a shift count outside 0..64
-                // warns ("shift count out of range (64 is not between 0
-                // and 63)") and yields 0.  Letting Rust mask the count
-                // (1 << 64 -> 1 << 0 -> 1) made `.rept 1<<64` expand
-                // once instead of zero times, and a negative count
-                // panicked the assembler instead of erroring.
-                val = if (0..64).contains(&rhs) {
-                    val << rhs
-                } else {
-                    0
-                };
-            }
-            ExprToken::Op2(">>") => {
-                *pos += 1;
-                let rhs = eval_add(tokens, pos)?;
-                // Same out-of-range law as `<<` (GAS warns and yields 0).
-                val = if (0..64).contains(&rhs) {
-                    ((val as u64) >> rhs) as i64
-                } else {
-                    0
-                };
-            }
-            _ => break,
-        }
-    }
-    Ok(val)
-}
-
-fn eval_add(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
-    let mut val = eval_mul(tokens, pos)?;
-    while *pos < tokens.len() {
-        match &tokens[*pos] {
-            ExprToken::Op('+') => {
-                *pos += 1;
-                // GAS evaluates in bignum and keeps the low bits; wrapping
-                // arithmetic reproduces them identically in every profile
-                // (plain +,- would panic in debug on overflow).
-                val = val.wrapping_add(eval_mul(tokens, pos)?);
-            }
-            ExprToken::Op('-') => {
-                *pos += 1;
-                val = val.wrapping_sub(eval_mul(tokens, pos)?);
-            }
-            _ => break,
-        }
-    }
-    Ok(val)
-}
-
-fn eval_mul(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
-    let mut val = eval_unary(tokens, pos)?;
-    while *pos < tokens.len() {
-        match &tokens[*pos] {
-            ExprToken::Op('*') => {
-                *pos += 1;
-                val = val.wrapping_mul(eval_unary(tokens, pos)?);
-            }
-            ExprToken::Op('/') => {
-                *pos += 1;
-                let rhs = eval_unary(tokens, pos)?;
-                // GNU as 2.47 (measured): `/0` WARNS ("division by
-                // zero") and yields the left-hand side (`7/0` = 7,
-                // `0/0` = 0); `.rept 7/0` therefore expands 7 times
-                // with rc 0.  Hard-erroring here rejected input GAS
-                // accepts.  `MIN/-1` would panic Rust in every profile;
-                // GAS's bignum result -2^63 has the i64::MIN pattern.
-                val = if rhs == 0 {
-                    val
-                } else if rhs == -1 {
-                    val.wrapping_neg()
-                } else {
-                    val / rhs
-                };
-            }
-            ExprToken::Op('%') => {
-                *pos += 1;
-                let rhs = eval_unary(tokens, pos)?;
-                // Same law: `%0` warns and yields 0 (`7%0` = 0);
-                // `x % -1` is 0 for every x, and Rust would panic on
-                // `MIN % -1`.
-                val = if rhs == 0 {
-                    0
-                } else if rhs == -1 {
-                    0
-                } else {
-                    val % rhs
-                };
-            }
-            _ => break,
-        }
-    }
-    Ok(val)
-}
-
-fn eval_unary(tokens: &[ExprToken], pos: &mut usize) -> Result<i64, String> {
-    if *pos >= tokens.len() {
-        return Err("unexpected end of expression".to_string());
-    }
-    match &tokens[*pos] {
-        ExprToken::Op('-') => {
-            *pos += 1;
-            // wrapping: `-(1<<63)` must be i64::MIN (GAS keeps the
-            // two's-complement pattern) instead of a debug-profile panic.
-            Ok(eval_unary(tokens, pos)?.wrapping_neg())
-        }
-        ExprToken::Op('+') => {
-            *pos += 1;
-            eval_unary(tokens, pos)
-        }
-        ExprToken::Op('~') => {
-            *pos += 1;
-            Ok(!eval_unary(tokens, pos)?)
-        }
-        ExprToken::Op('!') => {
-            *pos += 1;
-            Ok(if eval_unary(tokens, pos)? == 0 { 1 } else { 0 })
-        }
-        ExprToken::Op('(') => {
-            *pos += 1;
-            let val = eval_tokens(tokens, pos)?;
-            if *pos < tokens.len() && matches!(&tokens[*pos], ExprToken::Op(')')) {
-                *pos += 1;
+/// The integer law of every binary operator (GAS 2.47, measured).
+fn int_binary(op: &str, l: i64, r: i64) -> i64 {
+    match op {
+        "||" => -i64::from(l != 0 || r != 0),
+        "&&" => -i64::from(l != 0 && r != 0),
+        "|" => l | r,
+        "^" => l ^ r,
+        "&" => l & r,
+        "==" => -i64::from(l == r),
+        "!=" => -i64::from(l != r),
+        "<" => -i64::from(l < r),
+        ">" => -i64::from(l > r),
+        "<=" => -i64::from(l <= r),
+        ">=" => -i64::from(l >= r),
+        // A shift count outside 0..64 warns ("shift count out of range (64 is
+        // not between 0 and 63)") and yields 0. Letting Rust mask the count
+        // (1 << 64 -> 1 << 0 -> 1) made `.rept 1<<64` expand once instead of
+        // zero times, and a negative count panicked the assembler.
+        "<<" => {
+            if (0..64).contains(&r) {
+                l << r
             } else {
-                return Err("missing closing parenthesis".to_string());
+                0
             }
-            Ok(val)
         }
-        ExprToken::Num(v) => {
-            let v = *v;
-            *pos += 1;
-            Ok(v)
+        ">>" => {
+            if (0..64).contains(&r) {
+                ((l as u64) >> r) as i64
+            } else {
+                0
+            }
         }
-        other => Err(format!("unexpected token in expression: {:?}", other)),
+        // GAS evaluates in bignum and keeps the low bits; wrapping arithmetic
+        // reproduces them identically in every profile (plain +,- would panic
+        // in debug on overflow).
+        "+" => l.wrapping_add(r),
+        "-" => l.wrapping_sub(r),
+        "*" => l.wrapping_mul(r),
+        // `/0` WARNS ("division by zero") and yields the left-hand side (`7/0`
+        // = 7, `0/0` = 0); `.rept 7/0` therefore expands 7 times with rc 0.
+        // `MIN/-1` would panic Rust in every profile; GAS's bignum result
+        // -2^63 has the i64::MIN pattern.
+        "/" => {
+            if r == 0 {
+                l
+            } else if r == -1 {
+                l.wrapping_neg()
+            } else {
+                l / r
+            }
+        }
+        // Same law: `%0` warns and yields 0 (`7%0` = 0); `x % -1` is 0 for
+        // every x, and Rust would panic on `MIN % -1`.
+        "%" => {
+            if r == 0 || r == -1 {
+                0
+            } else {
+                l % r
+            }
+        }
+        _ => unreachable!("operator {op} is not in PRECEDENCE"),
     }
+}
+
+/// The integer law of every unary operator.
+fn int_unary(op: char, v: i64) -> i64 {
+    match op {
+        // wrapping: `-(1<<63)` must be i64::MIN (GAS keeps the two's-
+        // complement pattern) instead of a debug-profile panic.
+        '-' => v.wrapping_neg(),
+        '+' => v,
+        '~' => !v,
+        '!' => i64::from(v == 0),
+        _ => unreachable!("unary operator {op}"),
+    }
+}
+
+impl ExprDomain for i64 {
+    fn num(v: i64) -> Self {
+        v
+    }
+    fn binary(self, op: &'static str, rhs: Self) -> Result<Self, String> {
+        Ok(int_binary(op, self, rhs))
+    }
+    fn unary(self, op: char) -> Result<Self, String> {
+        Ok(int_unary(op, self))
+    }
+}
+
+/// Recursive-descent evaluation of a token stream in domain `V`; `sym`
+/// resolves [`ExprToken::Sym`] (never produced for the numeric domain).
+struct ExprParser<'a, V, F: FnMut(&str) -> Result<V, String>> {
+    tokens: &'a [ExprToken],
+    pos: usize,
+    sym: F,
+}
+
+impl<V: ExprDomain, F: FnMut(&str) -> Result<V, String>> ExprParser<'_, V, F> {
+    fn expr(&mut self) -> Result<V, String> {
+        self.level(0)
+    }
+
+    fn peek_op(&self, ops: &[&'static str]) -> Option<&'static str> {
+        let spelled: &str = match self.tokens.get(self.pos)? {
+            ExprToken::Op(c) => match c {
+                '|' => "|",
+                '^' => "^",
+                '&' => "&",
+                '<' => "<",
+                '>' => ">",
+                '+' => "+",
+                '-' => "-",
+                '*' => "*",
+                '/' => "/",
+                '%' => "%",
+                _ => return None,
+            },
+            ExprToken::Op2(op) => op,
+            _ => return None,
+        };
+        ops.iter().copied().find(|&op| op == spelled)
+    }
+
+    fn level(&mut self, level: usize) -> Result<V, String> {
+        let Some(ops) = PRECEDENCE.get(level) else {
+            return self.unary();
+        };
+        let mut val = self.level(level + 1)?;
+        while let Some(op) = self.peek_op(ops) {
+            self.pos += 1;
+            let rhs = self.level(level + 1)?;
+            val = val.binary(op, rhs)?;
+        }
+        Ok(val)
+    }
+
+    fn unary(&mut self) -> Result<V, String> {
+        let Some(token) = self.tokens.get(self.pos) else {
+            return Err("unexpected end of expression".to_string());
+        };
+        match token {
+            ExprToken::Op(op @ ('-' | '+' | '~' | '!')) => {
+                let op = *op;
+                self.pos += 1;
+                self.unary()?.unary(op)
+            }
+            ExprToken::Op('(') => {
+                self.pos += 1;
+                let val = self.expr()?;
+                if matches!(self.tokens.get(self.pos), Some(ExprToken::Op(')'))) {
+                    self.pos += 1;
+                } else {
+                    return Err("missing closing parenthesis".to_string());
+                }
+                Ok(val)
+            }
+            ExprToken::Num(v) => {
+                let v = *v;
+                self.pos += 1;
+                Ok(V::num(v))
+            }
+            ExprToken::Sym(name) => {
+                let name = name.clone();
+                self.pos += 1;
+                (self.sym)(&name)
+            }
+            other => Err(format!("unexpected token in expression: {:?}", other)),
+        }
+    }
+}
+
+/// Evaluate a whole token stream; trailing tokens are an error.
+fn eval_all<V: ExprDomain>(
+    tokens: &[ExprToken],
+    sym: impl FnMut(&str) -> Result<V, String>,
+) -> Result<V, String> {
+    if tokens.is_empty() {
+        return Err("empty expression".to_string());
+    }
+    let mut parser = ExprParser {
+        tokens,
+        pos: 0,
+        sym,
+    };
+    let val = parser.expr()?;
+    if parser.pos < tokens.len() {
+        return Err(format!(
+            "unexpected trailing token in expression: {:?}",
+            tokens[parser.pos]
+        ));
+    }
+    Ok(val)
+}
+
+// ── section-relative expressions ───────────────────────────────────────────
+
+/// A GAS expression value: `constant + sum(coeff * base(section))`.
+///
+/// This is the assembler's operand-section algebra (GAS `expr.c`): a label
+/// is its section's base plus an offset, `+`/`-` combine terms, so the
+/// difference of two labels in one section is absolute, `*` scales terms by
+/// an absolute factor, and every other operator needs absolute operands.
+/// Sections are opaque keys chosen by the caller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SectionExpr<K> {
+    pub constant: i64,
+    terms: Vec<(K, i64)>,
+}
+
+impl<K: Clone + PartialEq> SectionExpr<K> {
+    pub fn absolute(v: i64) -> Self {
+        Self {
+            constant: v,
+            terms: Vec::new(),
+        }
+    }
+
+    /// `offset` bytes into `section`.
+    pub fn at(section: K, offset: i64) -> Self {
+        Self {
+            constant: offset,
+            terms: vec![(section, 1)],
+        }
+    }
+
+    /// `coeff * base(key)`: one symbolic term with no constant.
+    pub fn term(key: K, coeff: i64) -> Self {
+        Self::absolute(0).add_scaled(
+            Self {
+                constant: 0,
+                terms: vec![(key, 1)],
+            },
+            coeff,
+        )
+    }
+
+    pub fn is_absolute(&self) -> bool {
+        self.terms.is_empty()
+    }
+
+    /// The non-zero `(base, coefficient)` terms, in first-seen order.
+    pub fn terms(&self) -> &[(K, i64)] {
+        &self.terms
+    }
+
+    /// `self + sign * rhs`, cancelling terms whose coefficients sum to 0.
+    pub fn add_scaled(mut self, rhs: Self, sign: i64) -> Self {
+        self.constant = self.constant.wrapping_add(rhs.constant.wrapping_mul(sign));
+        for (k, c) in rhs.terms {
+            match self.terms.iter_mut().find(|(sk, _)| *sk == k) {
+                Some((_, sc)) => *sc = sc.wrapping_add(c.wrapping_mul(sign)),
+                None => self.terms.push((k, c.wrapping_mul(sign))),
+            }
+        }
+        self.terms.retain(|&(_, c)| c != 0);
+        self
+    }
+
+    pub fn scale(mut self, factor: i64) -> Self {
+        self.constant = self.constant.wrapping_mul(factor);
+        for (_, c) in &mut self.terms {
+            *c = c.wrapping_mul(factor);
+        }
+        self.terms.retain(|&(_, c)| c != 0);
+        self
+    }
+}
+
+impl<K: Clone + PartialEq> ExprDomain for SectionExpr<K> {
+    fn num(v: i64) -> Self {
+        Self::absolute(v)
+    }
+    fn binary(self, op: &'static str, rhs: Self) -> Result<Self, String> {
+        match op {
+            "+" => Ok(self.add_scaled(rhs, 1)),
+            "-" => Ok(self.add_scaled(rhs, -1)),
+            "*" if rhs.is_absolute() => Ok(self.scale(rhs.constant)),
+            "*" if self.is_absolute() => Ok(rhs.scale(self.constant)),
+            _ if self.is_absolute() && rhs.is_absolute() => {
+                Ok(Self::absolute(int_binary(op, self.constant, rhs.constant)))
+            }
+            _ => Err(format!(
+                "operator `{op}` needs absolute operands (a symbol's address is not known until link time)"
+            )),
+        }
+    }
+    fn unary(self, op: char) -> Result<Self, String> {
+        match op {
+            '+' => Ok(self),
+            '-' => Ok(self.scale(-1)),
+            _ if self.is_absolute() => Ok(Self::absolute(int_unary(op, self.constant))),
+            _ => Err(format!("operator `{op}` needs an absolute operand")),
+        }
+    }
+}
+
+/// Evaluate `s` with symbols: `resolve` maps each symbol (and `.`, the
+/// location counter) to its section-relative value, or errors. Integer
+/// literals, precedence and every operator law are exactly those of
+/// [`parse_integer_expr`]; only the value domain differs.
+pub fn eval_section_expr<K: Clone + PartialEq>(
+    s: &str,
+    resolve: impl FnMut(&str) -> Result<SectionExpr<K>, String>,
+) -> Result<SectionExpr<K>, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty expression".to_string());
+    }
+    let tokens = tokenize_expr_mode(s, true)?;
+    eval_all(&tokens, resolve)
+}
+
+/// The symbol names `s` mentions, in order (`.` included), or the
+/// tokenizer's error.
+pub fn expr_symbols(s: &str) -> Result<Vec<String>, String> {
+    Ok(tokenize_expr_mode(s, true)?
+        .into_iter()
+        .filter_map(|t| match t {
+            ExprToken::Sym(n) => Some(n),
+            _ => None,
+        })
+        .collect())
 }
 
 /// The radix a bare integer literal is spelled in.
@@ -693,18 +861,9 @@ pub fn parse_integer_expr(s: &str) -> Result<i64, String> {
         return Ok(val);
     }
     let tokens = tokenize_expr(s)?;
-    if tokens.is_empty() {
-        return Err("empty expression".to_string());
-    }
-    let mut pos = 0;
-    let val = eval_tokens(&tokens, &mut pos)?;
-    if pos < tokens.len() {
-        return Err(format!(
-            "unexpected trailing token in expression: {:?}",
-            tokens[pos]
-        ));
-    }
-    Ok(val)
+    eval_all(&tokens, |name| {
+        Err::<i64, _>(format!("unexpected symbol '{name}' in integer expression"))
+    })
 }
 
 // ── alignment directive tail ───────────────────────────────────────────────
@@ -839,6 +998,119 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Numeric local-label references are whole tokens only: the three
+    /// per-target copies this replaced each read some of these wrong
+    /// (`0x1f` as `0x` + `1f`, `x1b` as `x` + `1b`, `0b` as a binary prefix,
+    /// `1B`/`1F` as references although GAS knows only lowercase).
+    #[test]
+    fn numeric_label_refs_are_whole_tokens() {
+        let rename = |e: &str| rewrite_numeric_label_refs(e, |r| Some(format!("<{r}>")));
+        assert_eq!(rename("2b + 1 - 1b"), "<2b> + 1 - <1b>");
+        assert_eq!(rename("(3f-2b)>>2"), "(<3f>-<2b>)>>2");
+        assert_eq!(rename("0b"), "<0b>");
+        assert_eq!(rename("0b1 + 0x1f + 0x1b"), "0b1 + 0x1f + 0x1b");
+        assert_eq!(rename("x1b - 1b"), "x1b - <1b>");
+        assert_eq!(rename(".L1f + 1fx + 1B + 1F"), ".L1f + 1fx + 1B + 1F");
+        assert_eq!(rename("10f"), "<10f>");
+        // An unresolvable reference is left as written.
+        assert_eq!(rewrite_numeric_label_refs("1b", |_| None), "1b");
+    }
+
+    #[test]
+    fn numeric_label_refs_are_symbols_in_expressions() {
+        assert_eq!(
+            expr_symbols("(2b - 1b) * 4 + x1 - .").unwrap(),
+            ["2b", "1b", "x1", "."]
+        );
+        assert_eq!(expr_symbols("0b1 + 0x1f").unwrap(), Vec::<String>::new());
+        let v =
+            eval_section_expr::<String>("2f - 1b + 3", |n| Ok(SectionExpr::term(n.to_string(), 1)))
+                .unwrap();
+        assert_eq!(v.terms(), [("2f".to_string(), 1), ("1b".to_string(), -1)]);
+        assert_eq!(v.constant, 3);
+        // Without symbols allowed, `1b` is not a number.
+        assert!(parse_integer_expr("1b").is_err());
+        assert_eq!(parse_integer_expr("0b11"), Ok(3));
+    }
+
+    /// One grammar, two domains: on constant input the section evaluator
+    /// must agree with `parse_integer_expr` bit for bit -- precedence, GAS's
+    /// -1-is-true comparisons, `/0`, `%-1`, shift ranges, wrapping.
+    #[test]
+    fn section_domain_matches_integer_domain_on_constants() {
+        for e in [
+            "1+2*3",
+            "(1+2)*3",
+            "1<<3+1",
+            "7/0",
+            "0/0",
+            "7%0",
+            "5%-1",
+            "1<<64",
+            "1>>-1",
+            "-9223372036854775807-1",
+            "(-9223372036854775807-1)/-1",
+            "0<1",
+            "2==2",
+            "1<>0",
+            "3&&0",
+            "3||0",
+            "!5",
+            "!0",
+            "~0",
+            "6&3|8^1",
+            "0x10-0b11",
+            "'a'+1",
+            "1 < 2 + 3",
+            "10-3-2",
+            "2*3%4",
+            "-(1<<63)",
+        ] {
+            let int = parse_integer_expr(e).unwrap_or_else(|err| panic!("{e}: {err}"));
+            let sec = eval_section_expr::<u8>(e, |n| Err(format!("no symbol {n}")))
+                .unwrap_or_else(|err| panic!("{e}: {err}"));
+            assert!(sec.is_absolute(), "{e}");
+            assert_eq!(sec.constant, int, "{e}");
+        }
+    }
+
+    /// GAS operand-section algebra: labels of one section cancel in a
+    /// difference, scale by absolute factors, and any other operator on a
+    /// relocatable operand is refused rather than folded.
+    #[test]
+    fn section_algebra_cancels_scales_and_refuses() {
+        let resolve = |n: &str| -> Result<SectionExpr<u8>, String> {
+            match n {
+                "a" => Ok(SectionExpr::at(1, 4)),
+                "b" => Ok(SectionExpr::at(1, 20)),
+                "c" => Ok(SectionExpr::at(2, 8)),
+                _ => Err(format!("unknown {n}")),
+            }
+        };
+        let v = eval_section_expr("b - a", resolve).unwrap();
+        assert!(v.is_absolute() && v.constant == 16);
+        let v = eval_section_expr("(b - a) * 2 + (c - c)", resolve).unwrap();
+        assert!(v.is_absolute() && v.constant == 32);
+        let v = eval_section_expr("2 * (b - a) - (b - a)", resolve).unwrap();
+        assert!(v.is_absolute() && v.constant == 16);
+        assert!(!eval_section_expr("a + 4", resolve).unwrap().is_absolute());
+        assert!(!eval_section_expr("c - a", resolve).unwrap().is_absolute());
+        assert!(
+            !eval_section_expr("a * 2 - a", resolve)
+                .unwrap()
+                .is_absolute()
+        );
+        for e in ["a & 1", "a / 2", "~a", "a << 1", "a == b", "a * c"] {
+            assert!(
+                eval_section_expr(e, resolve).is_err(),
+                "{e} must be refused"
+            );
+        }
+        assert!(eval_section_expr("d", resolve).is_err());
+        // The integer evaluator still rejects identifiers at the lexer.
+        assert!(parse_integer_expr("a + 1").is_err());
+    }
 
     /// GNU as 2.47 (measured): a decimal literal in 2^63..2^64-1 is the
     /// two's-complement pattern (negative as i64); anything ABOVE u64::MAX

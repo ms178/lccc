@@ -5,3 +5,4 @@
 # shrink.  Only a measurement with no local meaning belongs here; a
 # contract (anything that can fail) must be mirrored.
 .github/scripts/ci-bench.py  # timed benchmark run on the runner's hardware; its pass/fail is output-only, which ci_local's benchmark-output-oracle checks
+scripts/ci_annotate_log.py  # attaches a failed gate's output to the check run as annotations; a terminal shows that output directly

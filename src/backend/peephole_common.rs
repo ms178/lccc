@@ -542,6 +542,10 @@ pub(crate) fn directive_emits_data(text: &str) -> bool {
     ) {
         return alignment_fill_is_explicit(args);
     }
+    // Integrated-assembler alignment marker: default NOP padding only.
+    if name == "lccc_tight_loop" {
+        return false;
+    }
     if matches!(
         name,
         // Positional/debug/symbol bookkeeping: no bytes here, no re-reading of
@@ -734,6 +738,15 @@ pub(crate) fn inert_directive(text: &str) -> bool {
     ) {
         return !alignment_fill_is_explicit(&t[name.len()..]);
     }
+    // The private tight-loop marker is an alignment request resolved by the
+    // integrated assembler: at most default NOP padding at this position,
+    // never data, registers, flags or memory. Treating it as opaque made every
+    // peephole analysis (FP liveness, slot forwarding, memory folding) give up
+    // on each function containing a tight loop, but only in direct `-c`
+    // compiles, where the marker exists. `-S` output never carries it.
+    if name == ".lccc_tight_loop" {
+        return true;
+    }
     false
 }
 
@@ -823,9 +836,22 @@ mod inert_directive_tests {
             ".p2align 4",
             ".balign 16",
             ".align 16",
+            ".lccc_tight_loop .LBB7",
         ] {
             assert!(inert_directive(t), "{t} must be steppable");
         }
+    }
+
+    #[test]
+    fn tight_loop_marker_is_alignment_not_data() {
+        // Like a default-fill `.p2align`: steppable and byte-free for the
+        // data classifier. An opaque marker disabled peephole analyses in
+        // every direct `-c` function containing a tight loop.
+        for t in [".lccc_tight_loop .LBB7", "\t.lccc_tight_loop .L1"] {
+            assert!(inert_directive(t), "{t}");
+            assert!(!directive_emits_data(t), "{t}");
+        }
+        assert!(directive_emits_data(".p2align 4, 0xcc"));
     }
 
     #[test]

@@ -30,9 +30,15 @@ for opt in -O2 -O3; do
     fi
 done
 # Both diagnostic switches must suppress the extra scheduling opportunity.
+# These are controls for ONE variable: whether byte scheduling is what makes
+# body_le64 compact enough to inline. The inliner's capped-caller cleanup
+# shrinks main() for unrelated reasons and can then admit the unscheduled
+# accessor on its own budget, so the controls pin that path off; the positive
+# O2/O3 assertions above run with every inliner feature enabled.
+control=(env CCC_NO_INLINE_CALLER_CLEANUP=1)
 for mode in -m64 -m32; do
     for disabled in byte_load postinline; do
-        CCC_DISABLE_PASSES="$disabled" "$CCC" "$mode" -O2 -S "$root/tests/benchmark/programs/byte_load_reassembly.c" -o "$tmp/disabled.s"
+        "${control[@]}" CCC_DISABLE_PASSES="$disabled" "$CCC" "$mode" -O2 -S "$root/tests/benchmark/programs/byte_load_reassembly.c" -o "$tmp/disabled.s"
         if ! grep -Eq '^[[:space:]]*call[q]?[[:space:]]+body_le64' "$tmp/disabled.s"; then
             echo "FAIL: byte scheduling ignored disabled pass $disabled on $mode" >&2
             exit 1
@@ -40,12 +46,12 @@ for mode in -m64 -m32; do
     done
 done
 # The new early-only switch is separate from the preserved i686 placement.
-CCC_DISABLE_PASSES=byte_load_early "$CCC" -m64 -O2 -S "$root/tests/benchmark/programs/byte_load_reassembly.c" -o "$tmp/early64.s"
+"${control[@]}" CCC_DISABLE_PASSES=byte_load_early "$CCC" -m64 -O2 -S "$root/tests/benchmark/programs/byte_load_reassembly.c" -o "$tmp/early64.s"
 if ! grep -Eq '^[[:space:]]*call[q]?[[:space:]]+body_le64' "$tmp/early64.s"; then
     echo 'FAIL: x86-64 early byte scheduling ignored its own switch' >&2
     exit 1
 fi
-CCC_DISABLE_PASSES=byte_load_early "$CCC" -m32 -O2 -S "$root/tests/benchmark/programs/byte_load_reassembly.c" -o "$tmp/early32.s"
+"${control[@]}" CCC_DISABLE_PASSES=byte_load_early "$CCC" -m32 -O2 -S "$root/tests/benchmark/programs/byte_load_reassembly.c" -o "$tmp/early32.s"
 if grep -Eq '^[[:space:]]*call[q]?[[:space:]]+body_le64' "$tmp/early32.s"; then
     echo 'FAIL: early-only switch suppressed the separate i686 placement' >&2
     exit 1

@@ -809,6 +809,27 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
         return 0;
     }
 
+    // CHAINED CANDIDATES: every check above inspects the IR as it was before
+    // this round, but all surviving candidates are rewritten together. In a
+    // chain `store tmp1; memcpy tmp2 <- tmp1; memcpy obj <- tmp2` both
+    // `tmp1 -> tmp2` and `tmp2 -> obj` pass in isolation. Applying them
+    // together redirects tmp1's stores into tmp2 and deletes BOTH copies, so
+    // the value is stranded in tmp2 (now dead) and `obj` is read
+    // uninitialized (an inlined `static T make()` returning an i386 ext-vector
+    // carrier: `T b = make(2)` left `b` unwritten at -O2). Defer any candidate
+    // whose root is the destination object of another candidate; the
+    // driver's fixed point collapses the chain one link per round.
+    {
+        let dest_roots: FxHashSet<u32> = copies
+            .values()
+            .map(|&(_, _, dest)| paths.get(&dest.0).map_or(dest.0, |p| p.0))
+            .collect();
+        copies.retain(|root, _| !dest_roots.contains(root));
+    }
+    if copies.is_empty() {
+        return 0;
+    }
+
     if std::env::var("CCC_DEBUG_AGGFWD").is_ok() {
         for (&root, &(bi, copy_i, dest)) in &copies {
             eprintln!(
@@ -1354,6 +1375,103 @@ mod tests {
             func.blocks[0].instructions[2],
             Instruction::GetElementPtr { dest: Value(2), .. }
         ));
+    }
+
+    /// `store tmp1; memcpy tmp2 <- tmp1; memcpy obj <- tmp2; load obj`:
+    /// the two store-only forwards must not be applied in the same round.
+    /// Whether applying both strands the value depends on candidate map
+    /// iteration order, so both value numberings of the temporaries run.
+    fn chained_store_only_copies_result(tmp1: u32, tmp2: u32) -> Option<i32> {
+        let alloca = |dest| Instruction::Alloca {
+            dest: Value(dest),
+            ty: IrType::Ptr,
+            size: 16,
+            align: 16,
+            volatile: false,
+            semantic_volatile: false,
+        };
+        let mut func = IrFunction::new("chain".into(), IrType::I32, vec![], false);
+        func.next_value_id = 4;
+        // Allocas live in the entry block and the chain in a successor, as
+        // after inlining (the dest-window scan then starts at the store).
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![alloca(0), alloca(1), alloca(2)],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: vec![],
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Const(IrConst::I32(42)),
+                    ptr: Value(tmp1),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::Memcpy {
+                    dest: Value(tmp2),
+                    src: Value(tmp1),
+                    size: 16,
+                },
+                Instruction::Memcpy {
+                    dest: Value(0),
+                    src: Value(tmp2),
+                    size: 16,
+                },
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(3),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: vec![],
+        });
+
+        for _ in 0..8 {
+            if run(&mut func) == 0 {
+                break;
+            }
+        }
+        // Evaluate the straight-line result: each alloca holds one word.
+        let mut mem: FxHashMap<u32, i32> = FxHashMap::default();
+        let mut returned = None;
+        for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+            match inst {
+                Instruction::Store {
+                    val: Operand::Const(IrConst::I32(c)),
+                    ptr,
+                    ..
+                } => {
+                    mem.insert(ptr.0, *c);
+                }
+                Instruction::Memcpy { dest, src, .. } => match mem.get(&src.0).copied() {
+                    Some(v) => {
+                        mem.insert(dest.0, v);
+                    }
+                    None => {
+                        mem.remove(&dest.0);
+                    }
+                },
+                Instruction::Load {
+                    dest: Value(3),
+                    ptr,
+                    ..
+                } => returned = mem.get(&ptr.0).copied(),
+                _ => {}
+            }
+        }
+        returned
+    }
+
+    #[test]
+    fn chained_store_only_copies_keep_final_object_initialized() {
+        assert_eq!(chained_store_only_copies_result(1, 2), Some(42));
+        assert_eq!(chained_store_only_copies_result(2, 1), Some(42));
     }
 
     #[test]

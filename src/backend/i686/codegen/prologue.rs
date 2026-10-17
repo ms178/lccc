@@ -92,6 +92,12 @@ impl I686Codegen {
         self.is_variadic = func.is_variadic;
         self.is_fastcall = func.is_fastcall;
         self.current_return_type = func.return_type;
+        self.current_return_i686_xmm = func.return_type == IrType::I128
+            && func.ret_eightbyte_classes
+                == [
+                    crate::common::types::EightbyteClass::Sse,
+                    crate::common::types::EightbyteClass::SseUp,
+                ];
         self.current_return_i686_ext_vector_gp3 = func.return_type == IrType::I128
             && func.ret_eightbyte_classes.len() == 3
             && func
@@ -1194,6 +1200,20 @@ impl I686Codegen {
             // there is nothing to capture into it. In particular do not fall
             // through to the stack-copy arm (or shift the following argument).
             if matches!(class, ParamClass::ZeroSizeSkip) {
+                continue;
+            }
+
+            // An i386 vector piece arrives in %xmm{reg_idx} (shared mapping:
+            // CoreArgClass::StructXmmReg -> ParamClass::F128SseReg). Nothing
+            // in the prologue uses an XMM register, so the store can sit in
+            // parameter order; the parameter object is its 16-byte alloca.
+            if let ParamClass::F128SseReg { reg_idx } = class {
+                if let Some(slot) =
+                    find_param_alloca(func, i).and_then(|(dest, _)| self.state.get_slot(dest.0))
+                {
+                    let dst = self.slot_ref(slot);
+                    emit!(self.state, "    movups %xmm{}, {}", reg_idx, dst);
+                }
                 continue;
             }
 

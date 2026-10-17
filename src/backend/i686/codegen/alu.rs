@@ -1079,6 +1079,7 @@ impl I686Codegen {
                     None => self.state.emit(&format!("    {mnem} %cl, %{acc}")),
                 }
             }
+            IrBinOp::Bzhi => crate::ir::ops::bzhi_outside_x86_64(),
             IrBinOp::BitTest => {
                 // i686 BT stores the selected bit directly in CF and masks the
                 // index modulo 32, exactly matching `(base >> index) & 1` on

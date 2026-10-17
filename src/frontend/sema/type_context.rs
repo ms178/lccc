@@ -79,13 +79,38 @@ pub fn extract_fptr_typedef_info(
 /// Pushed on scope entry, popped on scope exit. Tracks both newly-added keys
 /// (removed on undo) and shadowed keys (restored to previous value on undo)
 /// across enum_constants, struct_layouts, ctype_cache, and typedefs.
+/// An enumeration constant: its value and its C type.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumConstant {
+    pub value: i64,
+    pub ty: CType,
+}
+
+impl EnumConstant {
+    /// The constant as seen inside its own enum body, before the enum is
+    /// complete: `int` when the value fits, else the smallest of `unsigned
+    /// int`, `long long` or `unsigned long long` holding it.
+    pub fn provisional(value: i64) -> Self {
+        let ty = if i32::try_from(value).is_ok() {
+            CType::Int
+        } else if u32::try_from(value).is_ok() {
+            CType::UInt
+        } else if value >= 0 {
+            CType::ULongLong
+        } else {
+            CType::LongLong
+        };
+        Self { value, ty }
+    }
+}
+
 #[derive(Debug)]
 pub struct TypeScopeFrame {
     /// Every write to `enum_constants` in this scope, with the value it
     /// replaced (`None` when the name did not exist before the scope).  Undone
     /// last-write-first, so a name written twice inside one scope is restored
     /// correctly without scanning the log.
-    pub enums_changed: Vec<(String, Option<i64>)>,
+    pub enums_changed: Vec<(String, Option<EnumConstant>)>,
     /// Enum tag definitions introduced or shadowed in this scope.  Tag
     /// identity is lexical: an inner `enum E` must not overwrite the completed
     /// outer `enum E` after this frame is popped.
@@ -156,8 +181,8 @@ pub struct TypeContext {
     /// (C 6.7.2.3): `struct.S` then denotes `struct.S#1` until the scope pops.
     /// Scoped like `struct_layouts` so shadowing unwinds with the scope.
     pub record_alias: RefCell<FxHashMap<String, String>>,
-    /// Enum constant values
-    pub enum_constants: FxHashMap<String, i64>,
+    /// Enum constants: value and C type, keyed by enumerator name.
+    pub enum_constants: FxHashMap<String, EnumConstant>,
     /// Typedef mappings (name -> resolved CType)
     pub typedefs: FxHashMap<String, CType>,
     /// Per-typedef alignment overrides from `__attribute__((aligned(N)))` on typedef
@@ -172,9 +197,6 @@ pub struct TypeContext {
     pub func_ptr_typedefs: FxHashSet<String>,
     /// Function pointer typedef info (return type, params, variadic)
     pub func_ptr_typedef_info: FxHashMap<String, FunctionTypedefInfo>,
-    /// Set of typedef names that alias enum types.
-    /// Used to treat enum-typedef bitfields as unsigned (GCC compat).
-    pub enum_typedefs: FxHashSet<String>,
     /// Completed named enum definitions, keyed by tag name. Each scope frame
     /// records additions and shadowed values so body-less references resolve
     /// to the definition visible at that exact lexical point.
@@ -212,7 +234,6 @@ impl TypeContext {
             function_typedefs: FxHashMap::default(),
             func_ptr_typedefs: FxHashSet::default(),
             func_ptr_typedef_info: FxHashMap::default(),
-            enum_typedefs: FxHashSet::default(),
             enum_types: FxHashMap::default(),
             func_return_ctypes: FxHashMap::default(),
             ctype_cache: RefCell::new(FxHashMap::default()),
@@ -616,12 +637,37 @@ impl TypeContext {
     /// every later use of the outer `A` -- in sema and in the lowerer, which
     /// share this map -- silently became 2.  GCC 16.2 prints `1 1` for the
     /// program above; lccc printed `2 2`.
-    pub fn insert_enum_scoped(&mut self, name: String, value: i64) {
-        let previous = self.enum_constants.get(&name).copied();
+    pub fn insert_enum_scoped(&mut self, name: String, constant: EnumConstant) {
+        let previous = self.enum_constants.get(&name).cloned();
         if let Some(frame) = self.scope_stack.get_mut().last_mut() {
             frame.enums_changed.push((name.clone(), previous));
         }
-        self.enum_constants.insert(name, value);
+        self.enum_constants.insert(name, constant);
+    }
+
+    /// Give every enumerator of a just-completed enum its final type
+    /// ([`EnumType::constant_ctype`]); inside the enum body they carried
+    /// [`EnumConstant::provisional`] types. Returns that type.
+    ///
+    /// [`EnumType::constant_ctype`]: crate::common::types::EnumType::constant_ctype
+    pub fn complete_enum_constants(
+        &mut self,
+        enum_type: &crate::common::types::EnumType,
+        scoped: bool,
+    ) -> CType {
+        let ty = enum_type.constant_ctype();
+        for (name, value) in &enum_type.variants {
+            let constant = EnumConstant {
+                value: *value,
+                ty: ty.clone(),
+            };
+            if scoped {
+                self.insert_enum_scoped(name.clone(), constant);
+            } else {
+                self.enum_constants.insert(name.clone(), constant);
+            }
+        }
+        ty
     }
 
     /// Insert a completed enum tag definition, tracking lexical shadowing so

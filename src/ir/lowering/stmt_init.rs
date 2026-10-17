@@ -270,277 +270,7 @@ impl Lowerer {
             return;
         };
         let name = entity_key;
-        let mut ret_ty = self.type_spec_to_ir(ret_type_spec);
-        if ptr_count > 0 {
-            ret_ty = IrType::Ptr;
-        }
-
-        // Complex return types need special IR type overrides (same as register_function_meta)
-        if ptr_count == 0 {
-            let ret_ctype = self.type_spec_to_ctype(ret_type_spec);
-            if matches!(ret_ctype, CType::ComplexDouble) && self.decomposes_complex_double() {
-                ret_ty = IrType::F64;
-            } else if matches!(ret_ctype, CType::ComplexFloat) {
-                if self.uses_packed_complex_float() {
-                    ret_ty = IrType::F64;
-                } else if !self.decomposes_complex_float() {
-                    // i686: _Complex float (8 bytes) packed in eax:edx as I64
-                    ret_ty = IrType::I64;
-                } else {
-                    ret_ty = IrType::F32;
-                }
-            }
-            // i686: _Float128/_Decimal128 (TFmode/TDmode) is class MEMORY —
-            // hidden-pointer return (sret); the IR return type becomes Ptr.
-            // x86-64 keeps the U128/xmm0:xmm1 return.
-            else if (matches!(ret_ctype, CType::Float128) || ret_ctype == CType::Decimal128)
-                && crate::common::types::target_is_32bit()
-            {
-                ret_ty = IrType::Ptr;
-            }
-        }
-
-        // Track CType for pointer/aggregate returns and i686 ext-vector GP
-        // returns. Without the vector CType, callers cannot unpack EAX:EDX:ECX
-        // lane words back into the object representation.
-        let mut return_ctype = None;
-        if ret_ty == IrType::Ptr
-            || (ptr_count == 0
-                && matches!(self.type_spec_to_ctype(ret_type_spec), CType::ExtVector(..)))
-        {
-            let base_ctype = self.type_spec_to_ctype(ret_type_spec);
-            let ret_ctype = if ptr_count > 0 {
-                let mut ct = base_ctype;
-                for _ in 0..ptr_count {
-                    ct = CType::Pointer(Box::new(ct), AddressSpace::Default);
-                }
-                ct
-            } else {
-                base_ctype
-            };
-            return_ctype = Some(ret_ctype);
-        }
-
-        // Record complex return types for expr_ctype resolution
-        if ptr_count == 0 {
-            let ret_ct = self.type_spec_to_ctype(ret_type_spec);
-            if ret_ct.is_complex() {
-                self.types
-                    .func_return_ctypes
-                    .insert(name.to_string(), ret_ct);
-            }
-        }
-
-        // Detect struct/complex/vector returns that need special ABI handling
-        let mut sret_size = None;
-        let mut two_reg_ret_size = None;
-        if ptr_count == 0 {
-            let ret_ct = self.type_spec_to_ctype(ret_type_spec);
-            if ret_ct.is_struct_or_union() {
-                let size = self.sizeof_type(ret_type_spec);
-                let (s, t) = Self::classify_struct_return(size);
-                sret_size = s;
-                two_reg_ret_size = t;
-            }
-            // i686 Clang ext-vectors with up to three integer GP words return
-            // in EAX/EDX/ECX. All other ext-vector and vector_size return
-            // classification remains unchanged here.
-            if ret_ct.is_vector() {
-                let size = self.sizeof_type(ret_type_spec);
-                if crate::common::types::target_is_32bit() && matches!(ret_ct, CType::ExtVector(..))
-                {
-                    if let Some(words) = ret_ct.i686_ext_vector_gp_word_count() {
-                        sret_size = None;
-                        two_reg_ret_size = None;
-                        ret_ty = match words {
-                            1 => IrType::I32,
-                            2 => IrType::I64,
-                            3 => IrType::I128,
-                            _ => unreachable!("i686 ext-vector GP return word count is bounded"),
-                        };
-                    } else {
-                        sret_size = Some(size);
-                    }
-                } else {
-                    let (s, t) = Self::classify_struct_return(size);
-                    sret_size = s;
-                    two_reg_ret_size = t;
-                    // Small vector returns (<=8 bytes, no sret/two_reg) need I64.
-                    if s.is_none() && t.is_none() {
-                        ret_ty = IrType::I64;
-                    }
-                }
-            }
-            if matches!(ret_ct, CType::ComplexLongDouble) {
-                // On x86-64, _Complex long double returns via st(0)/st(1), no sret needed.
-                // On all other targets (including i686), use sret.
-                if !self.returns_complex_long_double_in_regs() {
-                    let size = self.sizeof_type(ret_type_spec);
-                    sret_size = Some(size);
-                }
-            }
-            // On i686, _Complex double (16 bytes) exceeds 8-byte reg pair, needs sret.
-            if matches!(ret_ct, CType::ComplexDouble) && !self.decomposes_complex_double() {
-                sret_size = Some(ret_ct.size());
-            }
-            // On i686, _Float128/_Decimal128 (TFmode/TDmode) is class MEMORY —
-            // hidden-pointer return, matching GCC's i386 convention.
-            if (matches!(ret_ct, CType::Float128) || ret_ct == CType::Decimal128)
-                && crate::common::types::target_is_32bit()
-            {
-                sret_size = Some(16);
-            }
-        }
-
-        // Return carrier classes are normally SysV eightbytes. On i686 an
-        // ExtVector with three GP words uses three INTEGER markers for its
-        // EAX:EDX:ECX return bundle.
-        let ret_eightbyte_classes = if ptr_count == 0
-            && crate::common::types::target_is_32bit()
-            && self
-                .type_spec_to_ctype(ret_type_spec)
-                .i686_ext_vector_gp_word_count()
-                == Some(3)
-        {
-            vec![
-                crate::common::types::EightbyteClass::Integer,
-                crate::common::types::EightbyteClass::Integer,
-                crate::common::types::EightbyteClass::Integer,
-            ]
-        } else if two_reg_ret_size.is_some() && ptr_count == 0 {
-            let ret_ct = self.type_spec_to_ctype(ret_type_spec);
-            if ret_ct.is_struct_or_union() || ret_ct.is_vector() {
-                if let Some(layout) = self.get_struct_layout_for_type(ret_type_spec) {
-                    layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts())
-                } else {
-                    Vec::new()
-                }
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-
-        let param_tys: Vec<IrType> = params
-            .iter()
-            .map(|p| self.type_spec_to_ir(&p.type_spec))
-            .collect();
-        let param_bool_flags: Vec<bool> = params
-            .iter()
-            .map(|p| self.is_type_bool(&p.type_spec))
-            .collect();
-        let param_ctypes: Vec<CType> = params
-            .iter()
-            .map(|p| self.type_spec_to_ctype(&p.type_spec))
-            .collect();
-        let decomposes_cld = self.decomposes_complex_long_double();
-        let decomposes_cd = self.decomposes_complex_double();
-        let decomposes_cf = self.decomposes_complex_float();
-        let param_struct_sizes: Vec<Option<usize>> = params
-            .iter()
-            .map(|p| {
-                let ctype = self.type_spec_to_ctype(&p.type_spec);
-                if self.is_type_struct_or_union(&p.type_spec) {
-                    Some(self.sizeof_type(&p.type_spec))
-                } else if ctype.is_vector() {
-                    // Vector types are passed by value like structs
-                    Some(self.sizeof_type(&p.type_spec))
-                } else if !decomposes_cld && matches!(ctype, CType::ComplexLongDouble) {
-                    Some(self.sizeof_type(&p.type_spec))
-                } else if !decomposes_cd && matches!(ctype, CType::ComplexDouble) {
-                    Some(CType::ComplexDouble.size())
-                } else if !decomposes_cf && matches!(ctype, CType::ComplexFloat) {
-                    Some(CType::ComplexFloat.size())
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Compute per-eightbyte SysV ABI classification for struct params
-        let param_struct_classes: Vec<Vec<crate::common::types::EightbyteClass>> = params
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                if param_struct_sizes.get(i).copied().flatten().is_some() {
-                    if crate::common::types::target_elf_machine() == 62 {
-                        // AUD-VABI-1: same rule as the definition path -- a
-                        // vector argument is ONE xmm register (SSE + SSEUP),
-                        // not a two-GP by-value struct.  Declarations matter
-                        // because the call site reads its classification from
-                        // this signature.
-                        match self.type_spec_to_ctype(&p.type_spec).sysv_vector_carrier() {
-                            Some((classes, _)) => classes,
-                            None => match self.get_struct_layout_for_type(&p.type_spec) {
-                                Some(layout) => layout
-                                    .classify_sysv_eightbytes(&*self.types.borrow_struct_layouts()),
-                                None => Vec::new(),
-                            },
-                        }
-                    } else if let Some(layout) = self.get_struct_layout_for_type(&p.type_spec) {
-                        layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts())
-                    } else {
-                        Vec::new()
-                    }
-                } else {
-                    Vec::new()
-                }
-            })
-            .collect();
-
-        // Compute RISC-V LP64D float field classification for struct params
-        let param_riscv_float_classes: Vec<Option<crate::common::types::RiscvFloatClass>> = params
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                if param_struct_sizes.get(i).copied().flatten().is_some() {
-                    if let Some(layout) = self.get_struct_layout_for_type(&p.type_spec) {
-                        layout.classify_riscv_float_fields(&*self.types.borrow_struct_layouts())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let sig = if !variadic || !param_tys.is_empty() {
-            FuncSig {
-                return_type: ret_ty,
-                return_ctype,
-                param_types: param_tys,
-                param_ctypes,
-                param_bool_flags,
-                is_variadic: variadic,
-                sret_size,
-                two_reg_ret_size,
-                ret_eightbyte_classes: ret_eightbyte_classes.clone(),
-                ret_is_f128_sse: false,
-                param_struct_sizes,
-                param_struct_classes,
-                param_riscv_float_classes,
-                param_is_f128_sse: Vec::new(),
-            }
-        } else {
-            FuncSig {
-                return_type: ret_ty,
-                return_ctype,
-                param_types: Vec::new(),
-                param_ctypes: Vec::new(),
-                param_bool_flags: Vec::new(),
-                is_variadic: variadic,
-                sret_size,
-                two_reg_ret_size,
-                ret_eightbyte_classes,
-                ret_is_f128_sse: false,
-                param_struct_sizes: Vec::new(),
-                param_struct_classes: Vec::new(),
-                param_riscv_float_classes: Vec::new(),
-                param_is_f128_sse: Vec::new(),
-            }
-        };
+        let sig = self.build_function_sig(name, ret_type_spec, ptr_count, params, variadic, false);
         // Don't overwrite an existing, more complete sig from the first pass
         // (e.g., a K&R definition) with a less complete block-scope declaration
         // that has empty/unspecified parameters like `int *f();`.
@@ -1569,9 +1299,11 @@ impl Lowerer {
         }
     }
 
-    /// Initialize a vector object, preserving padded storage and packed bool
-    /// lane representation. The CType supplies logical lane count independently
-    /// of total storage bytes.
+    /// Vector init list: `v4hi a = {1, 2, 3, 4};`, lanes positional or
+    /// `[i]`-designated (the canonical form of an elided or designated
+    /// vector initializer). Lanes not mentioned are zero. The CType supplies
+    /// the logical lane count, the padded ext-vector storage and the packed
+    /// `_Bool` lane representation (`store_vector_lane`).
     pub(super) fn lower_vector_init_list(
         &mut self,
         items: &[InitializerItem],
@@ -1583,23 +1315,30 @@ impl Lowerer {
         };
         let elem_ir_ty = IrType::from_ctype(elem_ct);
         let total_size = self.ctype_size(vector_ct);
-        // Packed bool lane stores are read-modify-write, padding is not written
-        // by any lane, and a short initializer list leaves C-mandated zero
-        // lanes; clear the object in exactly those cases, sized by the object.
-        // (main sized this as `elem_size * num_elems`: that under-clears the
-        // padding byte of `u8x3` and over-clears past a bit-packed `bool4`,
-        // whose object is smaller than lanes * elem_size.)
-        if items.len() < num_elems
+        // Clear the object, sized by the object, exactly when some byte is
+        // not defined by a plain lane store: a short or designated list
+        // leaves C-mandated zero lanes, packed `_Bool` lane stores are
+        // read-modify-write, and ext-vector padding is written by no lane.
+        let designated = items.iter().any(|it| !it.designators.is_empty());
+        if designated
+            || items.len() < num_elems
             || crate::ir::lowering::lower::vector_temp_needs_zero_init(vector_ct, num_elems)
         {
             self.zero_init_alloca(alloca, total_size);
         }
-        for (idx, item) in items.iter().enumerate().take(num_elems) {
+        let mut idx = 0usize;
+        for item in items {
+            if let Some(Designator::Index(d)) = item.designators.first() {
+                match self.eval_const_expr(d).and_then(|c| c.to_usize()) {
+                    Some(i) => idx = i,
+                    None => continue,
+                }
+            }
             let init_expr = match &item.init {
                 Initializer::Expr(e) => Some(e),
                 Initializer::List(sub_items) => Self::unwrap_nested_init_expr(sub_items),
             };
-            if let Some(e) = init_expr {
+            if let (true, Some(e)) = (idx < num_elems, init_expr) {
                 let val = self.lower_expr(e);
                 let expr_ty = self.get_expr_type(e);
                 let val = if matches!(elem_ct, CType::Bool) {
@@ -1621,6 +1360,7 @@ impl Lowerer {
                     false,
                 );
             }
+            idx += 1;
         }
     }
 

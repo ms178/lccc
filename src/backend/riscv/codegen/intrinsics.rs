@@ -452,6 +452,7 @@ impl RiscvCodegen {
             | IntrinsicOp::BroadcastLoadF64
             | IntrinsicOp::FmaF64x4SIB
             | IntrinsicOp::FmaF64x4HoistedSIB
+            | IntrinsicOp::MulAddF64x4HoistedSIB
             | IntrinsicOp::LoadF64x4
             | IntrinsicOp::LoadF64x2
             | IntrinsicOp::LoadI32x8

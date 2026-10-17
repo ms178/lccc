@@ -2613,7 +2613,10 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
                         if !dst_xmm.is_empty()
                             && gp_dead.dead_after(store, infos, j, gpr_family, &[i, j])
                         {
-                            let replacement = format!("    movsd {}, {}", src, dst_xmm);
+                            // GP-to-XMM MOVQ zeroes bits 127:64. A register
+                            // MOVSD would merge stale bits and add a false
+                            // dependency; XMM-to-XMM MOVQ is bit-exact.
+                            let replacement = format!("    movq {}, {}", src, dst_xmm);
                             replace_line(store, &mut infos[i], i, replacement);
                             mark_nop(&mut infos[j]);
                             gp_dead.invalidate(store, infos, i);
@@ -11945,7 +11948,7 @@ pub(super) fn fold_shift_into_sib(store: &mut LineStore, infos: &mut [LineInfo])
         let mut j = next_non_debug(store, infos, i + 1, len);
         let mut steps = 0usize;
         let mut add_rest: Option<String> = None;
-        while j < len && steps <= WINDOW && !infos[j].is_barrier() {
+        while j < len && steps <= WINDOW && !infos[j].is_barrier() && !infos[j].pinned {
             let t = infos[j].trimmed(store.get(j));
             if let Some(rest) = t.strip_prefix("addq ") {
                 if rest.contains(&shifted_reg) {
@@ -12143,6 +12146,30 @@ mod shift_into_sib_tests {
         ]);
         assert!(flat(&out).contains("leaq (%r9,%rax,8),%r9"), "{out}");
         assert!(!out.contains("shlq"), "{out}");
+    }
+
+    #[test]
+    fn competitive_audit_pinned_sib_interior_and_consumer_are_barriers() {
+        for pinned in [4, 5] {
+            let text = f(&[
+                "shlq $3, %rcx",
+                "leaq bins(%rip), %r9",
+                "addq %rcx, %r9",
+                "movq %r9, %rax",
+                "ret",
+            ]);
+            let mut store = LineStore::new(text.clone());
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            infos[pinned].pinned = true;
+            assert!(
+                !fold_shift_into_sib(&mut store, &mut infos),
+                "crossed pinned line {pinned}"
+            );
+            assert!(!infos[3].is_nop());
+            assert_eq!(store.get(pinned), text.lines().nth(pinned).unwrap());
+        }
     }
 
     #[test]

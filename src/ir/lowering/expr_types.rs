@@ -347,7 +347,7 @@ impl Lowerer {
         }
         if ret_ct.is_vector() {
             if crate::common::types::target_is_32bit()
-                && ret_ct.i686_ext_vector_gp_word_count().is_some()
+                && ret_ct.i686_ext_vector_ret_carrier().is_some()
             {
                 return None;
             }
@@ -424,6 +424,9 @@ impl Lowerer {
             | "_mm_cvtsi128_si64x"
             | "__builtin_ia32_pextrq128"
             | "__builtin_ia32_cvtsi128si64" => Some(IrType::I64),
+            // BMI2 BZHI returns its operand type (unsigned int / unsigned long long).
+            "__builtin_ia32_bzhi_si" => Some(IrType::U32),
+            "__builtin_ia32_bzhi_di" => Some(IrType::U64),
             // Float-returning builtins
             "__builtin_inf" | "__builtin_huge_val" => Some(IrType::F64),
             "__builtin_inff" | "__builtin_huge_valf" => Some(IrType::F32),
@@ -1218,20 +1221,11 @@ impl Lowerer {
             // expression convention).
             Expr::ConvertVector(_, _, _) => IrType::Ptr,
             Expr::Identifier(name, _) => {
-                if name == "__func__" || name == "__FUNCTION__" || name == "__PRETTY_FUNCTION__" {
+                if crate::frontend::parser::ast::is_function_name_builtin(name) {
                     return IrType::Ptr;
                 }
-                if let Some(&val) = self.types.enum_constants.get(name) {
-                    // Enum constants follow GCC promotion: int -> unsigned int -> long long
-                    if val >= i32::MIN as i64 && val <= i32::MAX as i64 {
-                        return IrType::I32;
-                    } else if val >= 0 && val <= u32::MAX as i64 {
-                        return IrType::U32;
-                    } else if val >= 0 {
-                        return IrType::U64;
-                    } else {
-                        return IrType::I64;
-                    }
+                if let Some(constant) = self.types.enum_constants.get(name) {
+                    return IrType::from_ctype(&constant.ty);
                 }
                 if let Some(vi) = self.lookup_var_info(name) {
                     if vi.is_array {
@@ -1284,18 +1278,21 @@ impl Lowerer {
 
     /// Get the CType of a binary operation expression.
     fn get_binop_ctype(&self, op: &BinOp, lhs: &Expr, rhs: &Expr) -> Option<CType> {
-        // Comparison and logical operators always produce int
         match op {
-            BinOp::Eq
-            | BinOp::Ne
-            | BinOp::Lt
-            | BinOp::Le
-            | BinOp::Gt
-            | BinOp::Ge
-            | BinOp::LogicalAnd
-            | BinOp::LogicalOr => {
-                return Some(CType::Int);
+            // A GNU vector comparison is a vector of signed lanes (so
+            // `__typeof__(a == b)` declares a vector, as in GCC); a scalar
+            // comparison and the logical operators produce `int`.
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                let vector = [lhs, rhs]
+                    .into_iter()
+                    .filter_map(|e| self.get_expr_ctype(e))
+                    .find(CType::is_vector);
+                return match vector {
+                    Some(v) => v.vector_comparison_result(),
+                    None => Some(CType::Int),
+                };
             }
+            BinOp::LogicalAnd | BinOp::LogicalOr => return Some(CType::Int),
             _ => {}
         }
 
@@ -1577,9 +1574,8 @@ impl Lowerer {
                         },
                     )));
                 }
-                // Enum constants have type int in C
-                if self.types.enum_constants.contains_key(name) {
-                    return Some(CType::Int);
+                if let Some(constant) = self.types.enum_constants.get(name) {
+                    return Some(constant.ty.clone());
                 }
                 None
             }
@@ -1656,33 +1652,20 @@ impl Lowerer {
             }
             Expr::Conditional(_, then_expr, else_expr, _) => {
                 use crate::common::const_arith::is_null_pointer_constant;
-                // C11 6.5.15p3-p6 operate on the *values* of the arms, so both
-                // arms undergo lvalue conversion first (C11 6.3.2.1p2-p3):
-                // `1 ? arr : (int *)0` is an `int *`, not an array.  Decaying
-                // here keeps the composite rules (pointer/pointer, pointer/NPC)
-                // reachable for array and function-designator arms.
-                let then_ct = self
-                    .get_expr_ctype(then_expr)
-                    .map(|ct| ct.decayed_value_ctype());
-                let else_ct = self
-                    .get_expr_ctype(else_expr)
-                    .map(|ct| ct.decayed_value_ctype());
+                // The arms' lvalue conversion (`1 ? arr : (int *)0` is an
+                // `int *`) happens inside the shared composite rule.
                 CType::conditional_composite_type(
-                    then_ct,
-                    else_ct,
+                    self.get_expr_ctype(then_expr),
+                    self.get_expr_ctype(else_expr),
                     is_null_pointer_constant(then_expr),
                     is_null_pointer_constant(else_expr),
                 )
             }
             Expr::GnuConditional(cond, else_expr, _) => {
                 use crate::common::const_arith::is_null_pointer_constant;
-                let cond_ct = self.get_expr_ctype(cond).map(|ct| ct.decayed_value_ctype());
-                let else_ct = self
-                    .get_expr_ctype(else_expr)
-                    .map(|ct| ct.decayed_value_ctype());
                 CType::conditional_composite_type(
-                    cond_ct,
-                    else_ct,
+                    self.get_expr_ctype(cond),
+                    self.get_expr_ctype(else_expr),
                     is_null_pointer_constant(cond),
                     is_null_pointer_constant(else_expr),
                 )

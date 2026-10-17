@@ -149,10 +149,10 @@ thread_local! {
     // backend emit vprold for every rotate amount.  Default FALSE: the
     // driver opts in per TU, failing closed exactly like the other gates.
     static X86_AVX512VL_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    // The I64 map lowering uses register-based Vec*I64x2 operations.  i686's
-    // stack-based vector backend does not implement those operations.  This
+    // I64 maps and unfused packed multiply/add have x86-64-only lowerings.
+    // The i686 stack-vector backend does not implement those operations. This
     // target bit is set by the driver per translation unit, not by host cfg.
-    static X86_MAP_I64_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static X86_64_VECTOR_INTRINSICS_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     // The map kill switch is resolved once by the pass runner and refreshed
     // for every translation unit, so early and main map entries agree without
     // reading the process environment for every function.
@@ -173,12 +173,12 @@ thread_local! {
     static NO_MAP_ZERO_REM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-pub(crate) fn set_x86_map_i64_available(available: bool) {
-    X86_MAP_I64_AVAILABLE.with(|cell| cell.set(available));
+pub(crate) fn set_x86_64_vector_intrinsics_available(available: bool) {
+    X86_64_VECTOR_INTRINSICS_AVAILABLE.with(|cell| cell.set(available));
 }
 
-fn x86_map_i64_available() -> bool {
-    X86_MAP_I64_AVAILABLE.with(|cell| cell.get())
+fn x86_64_vector_intrinsics_available() -> bool {
+    X86_64_VECTOR_INTRINSICS_AVAILABLE.with(|cell| cell.get())
 }
 
 pub(crate) fn set_no_map_vec(disabled: bool) {
@@ -644,8 +644,8 @@ fn vectorize_with_analysis_mode(
             //     machine.  `x86_fma_enabled()` is the resolved target answer.
             //
             // Both are checked here, before any IR is touched, so an unasked-for
-            // contraction stays scalar (and therefore bit-exact) instead of
-            // becoming a silent rounding difference.  NEON's `fmla` is baseline
+            // contraction uses a separately rounded AVX2 multiply/add where
+            // that lowering exists; other targets stay scalar. NEON's `fmla` is baseline
             // on AArch64, so only the contract half applies there.
             if skip_small {
                 if debug {
@@ -654,7 +654,9 @@ fn vectorize_with_analysis_mode(
                         machine_step_width
                     );
                 }
-            } else if !fma_transform_allowed(neon, fp_contract) {
+            } else if !fma_transform_allowed(neon, fp_contract)
+                && (neon || use_sse2 || !x86_64_vector_intrinsics_available())
+            {
                 if debug {
                     eprintln!(
                         "[VEC] Skip matmul arm: fused arithmetic not requested/available \
@@ -673,10 +675,15 @@ fn vectorize_with_analysis_mode(
                 // Use AVX2 by default (or if LCCC_FORCE_AVX2 is set)
                 if debug {
                     eprintln!(
-                        "[VEC] Matmul pattern matched! Transforming to FmaF64x4 (AVX2, 4-wide)"
+                        "[VEC] Matmul pattern matched! Transforming to packed AVX2 multiply/add (fused={})",
+                        fma_transform_allowed(neon, fp_contract)
                     );
                 }
-                total_changes += transform_to_fma_f64x4(func, &mut pattern);
+                total_changes += transform_to_fma_f64x4(
+                    func,
+                    &mut pattern,
+                    fma_transform_allowed(neon, fp_contract),
+                );
             }
         } else if !neon
             && !force_two_wide
@@ -2572,6 +2579,20 @@ fn reduction_copy_root(definitions: &ReductionDefinitions<'_>, mut value: Value)
     None
 }
 
+/// Copy-bearing shapes belong to the late min/max rerun. Admitting them
+/// before IV widening strands the generated vector counter in I32 (one
+/// movslq per iteration). Direct-load early shapes retain their old policy.
+fn minmax_element_root_for_phase(
+    definitions: &ReductionDefinitions<'_>,
+    value: Value,
+) -> Option<Value> {
+    if late_minmax_only() {
+        reduction_copy_root(definitions, value)
+    } else {
+        Some(value)
+    }
+}
+
 /// Min/max reductions take an early return from `analyze_reduction_pattern`
 /// because their accumulator update is a Select rather than an Add. Apply the
 /// same fail-closed side-effect/control-flow discipline as the sum/dot path:
@@ -3065,6 +3086,21 @@ mod minmax_reduction_legality_tests {
         assert_eq!(
             reduction_copy_root(&reduction_definitions(&func).unwrap(), Value(10)),
             Some(Value(4))
+        );
+        assert_eq!(
+            minmax_element_root_for_phase(&reduction_definitions(&func).unwrap(), Value(10)),
+            Some(Value(10))
+        );
+        {
+            let _scope = LateMinMaxOnlyScope::enter();
+            assert_eq!(
+                minmax_element_root_for_phase(&reduction_definitions(&func).unwrap(), Value(10)),
+                Some(Value(4))
+            );
+        }
+        assert_eq!(
+            minmax_element_root_for_phase(&reduction_definitions(&func).unwrap(), Value(10)),
+            Some(Value(10))
         );
         assert!(sound(&func));
         func.blocks[2].instructions[3] = Instruction::Cast {
@@ -3845,12 +3881,12 @@ fn analyze_reduction_pattern(
                     };
                     use crate::ir::reexports::IrCmpOp as C;
                     let definitions = get_definitions()?;
-                    let Some(x_val) = reduction_copy_root(definitions, x_val) else {
+                    let Some(x_val) = minmax_element_root_for_phase(definitions, x_val) else {
                         continue;
                     };
                     let x_on = |o: &Operand| {
                         matches!(o, Operand::Value(v)
-                        if reduction_copy_root(definitions, *v) == Some(x_val))
+                        if minmax_element_root_for_phase(definitions, *v) == Some(x_val))
                     };
                     let phi_on = |o: &Operand| matches!(o, Operand::Value(v) if v.0 == dest.0);
                     // `is_max_form` and `is_min_form` are exact duals: the
@@ -4169,7 +4205,7 @@ fn analyze_reduction_pattern(
             }
             _ => return None,
         };
-        let x_val = reduction_copy_root(get_definitions()?, x_val)?;
+        let x_val = minmax_element_root_for_phase(get_definitions()?, x_val)?;
         let Some(x_inst) = body
             .instructions
             .iter()
@@ -8509,7 +8545,7 @@ fn analyze_map_pattern(
     // loop scalar; FP division is IEEE-defined elementwise (no trap) and is
     // parsed into the map expression tree.
     const MAP_MAX_STREAMS: usize = 4;
-    let i64_map = !neon && x86_map_i64_available() && x86_simd_available();
+    let i64_map = !neon && x86_64_vector_intrinsics_available() && x86_simd_available();
     let mut load_infos: Vec<(usize, Value, Value, IrType)> = Vec::new();
     let mut store_info = None; // (block, ptr value, stored val, element type)
     for &block_idx in &loop_info.body {
@@ -17831,11 +17867,16 @@ fn map_max_executed_iv(limit: &Operand, iv_ty: IrType, exit_cmp_op: IrCmpOp) -> 
     }
 }
 
-/// Trace an offset operand's Copy/Cast chain back to the map IV, requiring
-/// every cast to preserve all values in [0, max_iv]. The structural matcher
-/// admits some same-width signedness casts; those are only safe here when the
-/// accepted trip range proves the values nonnegative and representable in both
-/// types.
+/// Preserve address bits modulo pointer width; narrower arithmetic needs a range proof.
+fn map_pointer_domain_fits(max: i128, ty: IrType) -> bool {
+    ty.is_integer()
+        && (ty.size() as usize >= crate::common::types::target_ptr_size()
+            || nonnegative_range_fits_integer_type(max, ty))
+}
+
+/// Follow Copy/Cast glue that preserves the eventual address bits. Pointer-width
+/// arithmetic is a ring; narrower intermediates need a full range proof. This
+/// does not establish a recoverable byte counter or scalar-remainder bound.
 fn map_iv_cast_chain_preserves_range(
     func: &IrFunction,
     mut value: Value,
@@ -17868,8 +17909,8 @@ fn map_iv_cast_chain_preserves_range(
                 from_ty,
                 to_ty,
                 ..
-            } if nonnegative_range_fits_integer_type(max_iv, *from_ty)
-                && nonnegative_range_fits_integer_type(max_iv, *to_ty) =>
+            } if map_pointer_domain_fits(max_iv, *from_ty)
+                && map_pointer_domain_fits(max_iv, *to_ty) =>
             {
                 value = *src;
             }
@@ -17880,8 +17921,8 @@ fn map_iv_cast_chain_preserves_range(
 }
 
 /// Prove that the exact canonical byte-offset expression accepted by
-/// `offset_is_canonical_unit_stride` computes `iv * elem_size` without
-/// intermediate wrap/truncation for every source iteration. This matters
+/// `offset_is_canonical_unit_stride` computes `iv * elem_size` modulo pointer
+/// width, without narrower intermediate wrap/truncation on source iterations. This matters
 /// especially for map loops: their packed transform uses a separate I64 byte
 /// IV, while a U32 `i+i`, `i*2`, or `i<<1` in the original GEP wraps before
 /// being widened on LP64. The scalar remainder keeps the original expression,
@@ -17942,8 +17983,8 @@ fn map_gep_offset_arithmetic_is_safe(
                 from_ty,
                 to_ty,
                 ..
-            } if nonnegative_range_fits_integer_type(max_offset, *from_ty)
-                && nonnegative_range_fits_integer_type(max_offset, *to_ty) =>
+            } if map_pointer_domain_fits(max_offset, *from_ty)
+                && map_pointer_domain_fits(max_offset, *to_ty) =>
             {
                 value = *src;
             }
@@ -17966,7 +18007,7 @@ fn map_gep_offset_arithmetic_is_safe(
                 let Some(scaled_iv) = scaled_iv else {
                     return false;
                 };
-                return nonnegative_range_fits_integer_type(max_offset, *ty)
+                return map_pointer_domain_fits(max_offset, *ty)
                     && map_iv_cast_chain_preserves_range(func, scaled_iv, iv, iv_ty, max_iv);
             }
             Instruction::BinOp {
@@ -17976,7 +18017,7 @@ fn map_gep_offset_arithmetic_is_safe(
                 ty,
                 ..
             } if shift.to_i64() == Some(i64::from(elem_size.trailing_zeros())) => {
-                return nonnegative_range_fits_integer_type(max_offset, *ty)
+                return map_pointer_domain_fits(max_offset, *ty)
                     && map_iv_cast_chain_preserves_range(func, *scaled_iv, iv, iv_ty, max_iv);
             }
             Instruction::BinOp {
@@ -17986,7 +18027,7 @@ fn map_gep_offset_arithmetic_is_safe(
                 ty,
                 ..
             } if elem_size == 2 && lhs == rhs => {
-                return nonnegative_range_fits_integer_type(max_offset, *ty)
+                return map_pointer_domain_fits(max_offset, *ty)
                     && map_iv_cast_chain_preserves_range(func, *lhs, iv, iv_ty, max_iv);
             }
             _ => return false,
@@ -18000,11 +18041,14 @@ mod map_offset_wrap_tests {
     use super::*;
 
     #[test]
-    fn dynamic_u64_versioning_proves_only_the_guarded_offset_range() {
+    fn dynamic_u64_versioning_separates_address_bits_from_byte_bounds() {
         let dynamic = Operand::Value(Value(77));
         let bound = map_offset_proof_limit(IrType::U64, &dynamic, IrCmpOp::Ult, 2);
         let (wide, iv, gep) = offset_function(IrType::U64, IrType::U64, None, true);
-        assert!(!safe(&wide, iv, gep, IrType::U64, &dynamic, IrCmpOp::Ult));
+        // Address bits may wrap in the pointer ring. The byte counter cannot:
+        // its quotient still needs the separately tested runtime range guard.
+        assert!(safe(&wide, iv, gep, IrType::U64, &dynamic, IrCmpOp::Ult));
+        assert!(!dynamic_map_byte_limit_supported(IrType::U64, 2));
         assert!(safe(&wide, iv, gep, IrType::U64, &bound, IrCmpOp::Ult));
         // Runtime versioning must not excuse a narrower intermediate cast.
         let (narrow, iv, gep) = offset_function(IrType::U64, IrType::U32, Some(IrType::U32), true);
@@ -18152,6 +18196,32 @@ mod map_offset_wrap_tests {
         op: IrCmpOp,
     ) -> bool {
         map_gep_offset_arithmetic_is_safe(func, gep, iv, iv_ty, limit, op, 2)
+    }
+
+    #[test]
+    fn pointer_width_wrap_is_safe_for_addresses_not_remainder_recovery() {
+        let dynamic = Operand::Value(Value(99));
+        for ty in [IrType::I64, IrType::U64] {
+            let cmp = if ty == IrType::I64 {
+                IrCmpOp::Slt
+            } else {
+                IrCmpOp::Ult
+            };
+            for multiply in [false, true] {
+                let (func, iv, gep) = offset_function(ty, IrType::I64, Some(IrType::I64), multiply);
+                assert!(safe(&func, iv, gep, ty, &dynamic, cmp));
+            }
+            // An address recurrence may wrap but a byte bound/resume may not.
+            assert!(!dynamic_map_byte_limit_supported(ty, 2));
+        }
+        let (narrow, iv, gep) = offset_function(IrType::U64, IrType::U32, Some(IrType::U32), true);
+        assert!(!safe(&narrow, iv, gep, IrType::U64, &dynamic, IrCmpOp::Ult));
+        // Concrete high-bit counterexample: address bits remain exact, but
+        // shifting them back loses the high element bits. Keep the element IV.
+        let elements = (1u64 << 63) + 8;
+        let bytes = elements.wrapping_mul(2);
+        assert_eq!(bytes, 16);
+        assert_ne!(bytes >> 1, elements);
     }
 
     #[test]
@@ -22201,7 +22271,11 @@ fn fma_body_instruction_is_legal(inst: &Instruction) -> bool {
 
 /// Transform loop to use AVX2 FmaF64x4 intrinsic (4-wide, 256-bit).
 /// Same pattern as SSE2 but processes 4 elements per iteration instead of 2.
-fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &mut VectorizablePattern) -> usize {
+fn transform_to_fma_f64x4(
+    func: &mut IrFunction,
+    pattern: &mut VectorizablePattern,
+    fused: bool,
+) -> usize {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let mut changes = 0;
 
@@ -22837,7 +22911,11 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &mut VectorizablePatte
             if disp == 0 {
                 prelude.push(Instruction::Intrinsic {
                     dest: None,
-                    op: IntrinsicOp::FmaF64x4HoistedSIB,
+                    op: if fused {
+                        IntrinsicOp::FmaF64x4HoistedSIB
+                    } else {
+                        IntrinsicOp::MulAddF64x4HoistedSIB
+                    },
                     dest_ptr: None,
                     args: vec![
                         Operand::Value(c_base),
@@ -22848,7 +22926,11 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &mut VectorizablePatte
             } else {
                 prelude.push(Instruction::Intrinsic {
                     dest: None,
-                    op: IntrinsicOp::FmaF64x4HoistedSIB,
+                    op: if fused {
+                        IntrinsicOp::FmaF64x4HoistedSIB
+                    } else {
+                        IntrinsicOp::MulAddF64x4HoistedSIB
+                    },
                     dest_ptr: None,
                     args: vec![
                         Operand::Value(c_base),

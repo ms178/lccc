@@ -1,0 +1,2105 @@
+{
+  "icx": {
+    "metadata": {
+      "id": "cicxlatest",
+      "name": "x86-64 icx (latest)",
+      "semver": "(latest)",
+      "compilerType": "clang-intel"
+    },
+    "response": {
+      "inputFilename": "example.c",
+      "code": 0,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [],
+      "stderr": [],
+      "truncated": false,
+      "execTime": 1248,
+      "processExecutionResultTime": 0.0033740000799298286,
+      "instructionSet": "amd64",
+      "compilationOptions": [
+        "-g",
+        "-o",
+        "/app/output.s",
+        "-fno-verbose-asm",
+        "-S",
+        "--gcc-toolchain=/opt/compiler-explorer/gcc-13.2.0",
+        "-fcolor-diagnostics",
+        "-fno-crash-diagnostics",
+        "-O2",
+        "-march=haswell",
+        "-fno-fast-math",
+        "-ffp-contract=off",
+        "/app/example.c"
+      ],
+      "downloads": [],
+      "tools": [],
+      "asmSize": 2761,
+      "asm": [
+        {
+          "text": "  .text",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .file \"example.c\"",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .file 1 \"/app\"\"example.c\"",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .type .L.str,@object",
+          "source": null,
+          "labels": [
+            {
+              "name": ".L.str",
+              "range": {
+                "startCol": 9,
+                "endCol": 15
+              }
+            }
+          ]
+        },
+        {
+          "text": "  .section .rodata.str1.1,\"aMS\",@progbits,1",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": ".L.str:",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .asciz \"Intel(R) oneAPI DPC++/C++ Compiler 2024.0.0 (2024.0.0.20231017)\"",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .size .L.str, 64",
+          "source": null,
+          "labels": [
+            {
+              "name": ".L.str",
+              "range": {
+                "startCol": 9,
+                "endCol": 15
+              }
+            }
+          ]
+        },
+        {
+          "text": "",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .type version,@object",
+          "source": null,
+          "labels": [
+            {
+              "name": "version",
+              "range": {
+                "startCol": 9,
+                "endCol": 16
+              }
+            }
+          ]
+        },
+        {
+          "text": "  .data",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .globl version",
+          "source": null,
+          "labels": [
+            {
+              "name": "version",
+              "range": {
+                "startCol": 10,
+                "endCol": 17
+              }
+            }
+          ]
+        },
+        {
+          "text": "  .p2align 3, 0x0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "version:",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .quad .L.str",
+          "source": null,
+          "labels": [
+            {
+              "name": ".L.str",
+              "range": {
+                "startCol": 9,
+                "endCol": 15
+              }
+            }
+          ]
+        },
+        {
+          "text": "  .size version, 8",
+          "source": null,
+          "labels": [
+            {
+              "name": "version",
+              "range": {
+                "startCol": 9,
+                "endCol": 16
+              }
+            }
+          ]
+        },
+        {
+          "text": "",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .section .debug_abbrev,\"\",@progbits",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 1",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 17",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 1",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 37",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 14",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .ascii \"\\201v\"",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 14",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 19",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 5",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 3",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 14",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 16",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 23",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 27",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 14",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 2",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 52",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 73",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 19",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 58",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 11",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 59",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 11",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 2",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 24",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 3",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 1",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 1",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 73",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 19",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 4",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 33",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 73",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 19",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 55",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 11",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 5",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 36",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 3",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 14",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 62",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 11",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 11",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 11",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 6",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 36",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 3",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 14",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 11",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 11",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 62",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 11",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 7",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 52",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 3",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 14",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 73",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 19",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 63",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 25",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 58",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 11",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 59",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 11",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 2",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 24",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 8",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 15",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 73",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 19",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 9",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 38",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 73",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 19",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .section .debug_info,\"\",@progbits",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .long .Ldebug_info_end0-.Ldebug_info_start0",
+          "source": null,
+          "labels": [
+            {
+              "name": ".Ldebug_info_end0",
+              "range": {
+                "startCol": 9,
+                "endCol": 26
+              }
+            },
+            {
+              "name": ".Ldebug_info_start0",
+              "range": {
+                "startCol": 27,
+                "endCol": 46
+              }
+            }
+          ]
+        },
+        {
+          "text": ".Ldebug_info_start0:",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .short 4",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .long .debug_abbrev",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 8",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 1",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .long .Linfo_string0",
+          "source": null,
+          "labels": [
+            {
+              "name": ".Linfo_string0",
+              "range": {
+                "startCol": 9,
+                "endCol": 23
+              }
+            }
+          ]
+        },
+        {
+          "text": "  .long .Linfo_string1",
+          "source": null,
+          "labels": [
+            {
+              "name": ".Linfo_string1",
+              "range": {
+                "startCol": 9,
+                "endCol": 23
+              }
+            }
+          ]
+        },
+        {
+          "text": "  .short 29",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .long .Linfo_string2",
+          "source": null,
+          "labels": [
+            {
+              "name": ".Linfo_string2",
+              "range": {
+                "startCol": 9,
+                "endCol": 23
+              }
+            }
+          ]
+        },
+        {
+          "text": "  .long .Lline_table_start0",
+          "source": null,
+          "labels": [
+            {
+              "name": ".Lline_table_start0",
+              "range": {
+                "startCol": 9,
+                "endCol": 28
+              }
+            }
+          ]
+        },
+        {
+          "text": "  .long .Linfo_string3",
+          "source": null,
+          "labels": [
+            {
+              "name": ".Linfo_string3",
+              "range": {
+                "startCol": 9,
+                "endCol": 23
+              }
+            }
+          ]
+        },
+        {
+          "text": "  .byte 2",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .long 51",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 1",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 1",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 9",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 3",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .quad .L.str",
+          "source": null,
+          "labels": [
+            {
+              "name": ".L.str",
+              "range": {
+                "startCol": 9,
+                "endCol": 15
+              }
+            }
+          ]
+        },
+        {
+          "text": "  .byte 3",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .long 63",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 4",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .long 70",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 64",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 5",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .long .Linfo_string4",
+          "source": null,
+          "labels": [
+            {
+              "name": ".Linfo_string4",
+              "range": {
+                "startCol": 9,
+                "endCol": 23
+              }
+            }
+          ]
+        },
+        {
+          "text": "  .byte 6",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 1",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 6",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .long .Linfo_string5",
+          "source": null,
+          "labels": [
+            {
+              "name": ".Linfo_string5",
+              "range": {
+                "startCol": 9,
+                "endCol": 23
+              }
+            }
+          ]
+        },
+        {
+          "text": "  .byte 8",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 7",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 7",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .long .Linfo_string6",
+          "source": null,
+          "labels": [
+            {
+              "name": ".Linfo_string6",
+              "range": {
+                "startCol": 9,
+                "endCol": 23
+              }
+            }
+          ]
+        },
+        {
+          "text": "  .long 98",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 1",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 1",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 9",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 3",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .quad version",
+          "source": null,
+          "labels": [
+            {
+              "name": "version",
+              "range": {
+                "startCol": 9,
+                "endCol": 16
+              }
+            }
+          ]
+        },
+        {
+          "text": "  .byte 8",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .long 103",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 9",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .long 63",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": ".Ldebug_info_end0:",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .section .debug_str,\"MS\",@progbits,1",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": ".Linfo_string0:",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .asciz \"clang based Intel(R) oneAPI DPC++/C++ Compiler 2024.0.0 (2024.0.0.20231017)\"",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": ".Linfo_string1:",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .asciz \" --intel -g -o /app/output.s -fno-verbose-asm -S --gcc-toolchain=/opt/compiler-explorer/gcc-13.2.0 -fcolor-diagnostics -gen-reproducer=off -O2 -march=haswell -fno-fast-math -ffp-contract=off /app/example.c -fveclib=SVML -fheinous-gnu-extensions\"",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": ".Linfo_string2:",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .asciz \"/app/example.c\"",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": ".Linfo_string3:",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .asciz \"/app\"",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": ".Linfo_string4:",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .asciz \"char\"",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": ".Linfo_string5:",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .asciz \"__ARRAY_SIZE_TYPE__\"",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": ".Linfo_string6:",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .asciz \"version\"",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .ident \"Intel(R) oneAPI DPC++/C++ Compiler 2024.0.0 (2024.0.0.20231017)\"",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .section \".note.GNU-stack\",\"\",@progbits",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .section .debug_line,\"\",@progbits",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": ".Lline_table_start0:",
+          "source": null,
+          "labels": []
+        }
+      ],
+      "optOutput": [],
+      "labelDefinitions": {
+        ".L.str": 6,
+        "version": 14,
+        ".Ldebug_info_start0": 121,
+        ".Ldebug_info_end0": 167,
+        ".Linfo_string0": 169,
+        ".Linfo_string1": 171,
+        ".Linfo_string2": 173,
+        ".Linfo_string3": 175,
+        ".Linfo_string4": 177,
+        ".Linfo_string5": 179,
+        ".Linfo_string6": 181,
+        ".Lline_table_start0": 186
+      },
+      "parsingTime": 3,
+      "filteredCount": 1,
+      "popularArguments": {},
+      "queueTime": 5,
+      "lcccOracleOptions": {
+        "requested": "-O2 -march=haswell -fno-fast-math -ffp-contract=off",
+        "effective": "-O2 -march=haswell -fno-fast-math -ffp-contract=off"
+      }
+    }
+  },
+  "icc": {
+    "metadata": {
+      "id": "cicc2021100",
+      "name": "x86-64 icc 2021.10.0",
+      "semver": "2021.10.0",
+      "compilerType": ""
+    },
+    "response": {
+      "inputFilename": "example.c",
+      "code": 0,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [],
+      "stderr": [
+        {
+          "text": "icc: remark #10441: The Intel(R) C++ Compiler Classic (ICC) is deprecated and will be removed from product release in the second half of 2023. The Intel(R) oneAPI DPC++/C++ Compiler (ICX) is the recommended compiler moving forward. Please transition to use this compiler. Use '-diag-disable=10441' to disable this message."
+        }
+      ],
+      "truncated": false,
+      "execTime": 177,
+      "processExecutionResultTime": 0.05524899810552597,
+      "instructionSet": "amd64",
+      "compilationOptions": [
+        "-g",
+        "-o",
+        "/app/output.s",
+        "-S",
+        "-gxx-name=/opt/compiler-explorer/gcc-13.2.0/bin/g++",
+        "-O2",
+        "-xCORE-AVX2",
+        "-fp-model",
+        "precise",
+        "-no-fma",
+        "/app/example.c"
+      ],
+      "downloads": [],
+      "tools": [],
+      "asmSize": 3826,
+      "asm": [
+        {
+          "text": "  .section .text",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .file \"example.c\"",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .data",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .align 8",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .align 8",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .globl version",
+          "source": null,
+          "labels": [
+            {
+              "name": "version",
+              "range": {
+                "startCol": 10,
+                "endCol": 17
+              }
+            }
+          ]
+        },
+        {
+          "text": "version:",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .quad .L_2__STRING.0",
+          "source": null,
+          "labels": [
+            {
+              "name": ".L_2__STRING.0",
+              "range": {
+                "startCol": 9,
+                "endCol": 23
+              }
+            }
+          ]
+        },
+        {
+          "text": "  .type version,@object",
+          "source": null,
+          "labels": [
+            {
+              "name": "version",
+              "range": {
+                "startCol": 9,
+                "endCol": 16
+              }
+            }
+          ]
+        },
+        {
+          "text": "  .size version,8",
+          "source": null,
+          "labels": [
+            {
+              "name": "version",
+              "range": {
+                "startCol": 9,
+                "endCol": 16
+              }
+            }
+          ]
+        },
+        {
+          "text": "  .section .rodata.str1.4, \"aMS\",@progbits,1",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .align 4",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .align 4",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": ".L_2__STRING.0:",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .long 1702129225",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .long 693250156",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .long 724255520",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .long 1667458848",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .long 775106848",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .long 1869422642",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .word 25956",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .type .L_2__STRING.0,@object",
+          "source": null,
+          "labels": [
+            {
+              "name": ".L_2__STRING.0",
+              "range": {
+                "startCol": 9,
+                "endCol": 23
+              }
+            }
+          ]
+        },
+        {
+          "text": "  .size .L_2__STRING.0,27",
+          "source": null,
+          "labels": [
+            {
+              "name": ".L_2__STRING.0",
+              "range": {
+                "startCol": 9,
+                "endCol": 23
+              }
+            }
+          ]
+        },
+        {
+          "text": "  .data",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .section .note.GNU-stack, \"\"",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .file 1 \"/app/example.c\"",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .global version#",
+          "source": null,
+          "labels": [
+            {
+              "name": "version",
+              "range": {
+                "startCol": 11,
+                "endCol": 18
+              }
+            }
+          ]
+        },
+        {
+          "text": "  .section .debug_info",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .align 1",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .4byte 0x00000046",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .2byte 0x0004",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .4byte .debug_abbrev_seg",
+          "source": null,
+          "labels": [
+            {
+              "name": ".debug_abbrev_seg",
+              "range": {
+                "startCol": 10,
+                "endCol": 27
+              }
+            }
+          ]
+        },
+        {
+          "text": "  .byte 0x08",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x01",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .4byte .debug_str",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .4byte .debug_str+0x5",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .4byte .debug_str+0x14",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .4byte .debug_str+0x8e",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x01",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x01",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .4byte .debug_line_seg",
+          "source": null,
+          "labels": [
+            {
+              "name": ".debug_line_seg",
+              "range": {
+                "startCol": 10,
+                "endCol": 25
+              }
+            }
+          ]
+        },
+        {
+          "text": "  .byte 0x02",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x01",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x01",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .4byte .debug_str+0x103",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .4byte 0x00000038",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .2byte 0x0309",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte version",
+          "source": null,
+          "labels": [
+            {
+              "name": "version",
+              "range": {
+                "startCol": 10,
+                "endCol": 17
+              }
+            }
+          ]
+        },
+        {
+          "text": "  .byte 0x01",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x03",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .4byte 0x0000003d",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x04",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .4byte 0x00000042",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x05",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x01",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x06",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .4byte .debug_str+0x10b",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x00",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .section .debug_line",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": ".debug_line_seg:",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .align 1",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .section .debug_abbrev",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": ".debug_abbrev_seg:",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .align 1",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x01",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x11",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x01",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x1b",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x0e",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x03",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x0e",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x25",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x0e",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .2byte 0x7681",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x0e",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x13",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x0b",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x53",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x0c",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x10",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x17",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .2byte 0x0000",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x02",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x34",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x00",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x3b",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x0b",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x3a",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x0b",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x03",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x0e",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x49",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x13",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x02",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x18",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x3f",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x0c",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .2byte 0x0000",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x03",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x0f",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x00",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x49",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x13",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .2byte 0x0000",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x04",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x26",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x00",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x49",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x13",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .2byte 0x0000",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x05",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x24",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x00",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x0b",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x0b",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x3e",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x0b",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x03",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x0e",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .2byte 0x0000",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x00",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .section .debug_str,\"MS\",@progbits,1",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .align 1",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .4byte 0x7070612f",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x00",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x6178652f7070612f",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .4byte 0x656c706d",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .2byte 0x632e",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x00",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x2952286c65746e49",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x6c65746e49204320",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x4320343620295228",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x2072656c69706d6f",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x2063697373616c43",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x6c70706120726f66",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x736e6f6974616369",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x676e696e6e757220",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x65746e49206e6f20",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x2c3436202952286c",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x6e6f697372655620",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x30312e3132303220",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x646c69754220302e",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x3036303332303220",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x3030303030305f39",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .2byte 0x000a",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x612f206f2d20672d",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x757074756f2f7070",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x2d20532d20732e74",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x656d616e2d787867",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x6f632f74706f2f3d",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x652d72656c69706d",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x2f7265726f6c7078",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x322e33312d636367",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x672f6e69622f302e",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x2d20324f2d202b2b",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x56412d45524f4378",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x6d2d70662d203258",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x657270206c65646f",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x6f6e2d2065736963",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .4byte 0x616d662d",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x00",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .8byte 0x006e6f6973726576",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .4byte 0x72616863",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .byte 0x00",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  .section .text",
+          "source": null,
+          "labels": []
+        }
+      ],
+      "optOutput": [],
+      "labelDefinitions": {
+        "version": 7,
+        ".L_2__STRING.0": 14,
+        ".debug_line_seg": 61,
+        ".debug_abbrev_seg": 64
+      },
+      "parsingTime": 2,
+      "filteredCount": 35,
+      "popularArguments": {},
+      "queueTime": 5,
+      "lcccOracleOptions": {
+        "requested": "-O2 -march=haswell -fno-fast-math -ffp-contract=off",
+        "effective": "-O2 -xCORE-AVX2 -fp-model precise -no-fma"
+      }
+    }
+  }
+}

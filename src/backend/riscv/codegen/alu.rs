@@ -170,6 +170,7 @@ impl RiscvCodegen {
             (IrBinOp::LShr, false) => "srl",
             (IrBinOp::LShr, true) => "srlw",
             (IrBinOp::BitTest, _) => unreachable!("BitTest handled above"),
+            (IrBinOp::Bzhi, _) => crate::ir::ops::bzhi_outside_x86_64(),
             (IrBinOp::RotateLeft, _) | (IrBinOp::RotateRight, _) => {
                 unreachable!("rotate handled above")
             }

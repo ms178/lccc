@@ -222,6 +222,11 @@ pub enum IntrinsicOp {
     ///           If absent, behaves like 3-arg form (offset already includes chunk).
     /// ymm1 must already hold broadcasted A[i][k] (from BroadcastLoadF64).
     FmaF64x4HoistedSIB,
+    /// Same address/broadcast contract as FmaF64x4HoistedSIB, but multiply
+    /// and add round separately. x86-64 AVX2 only; no FMA requirement.
+    /// Reads B and C, writes C through args[0], and preserves hoisted ymm1.
+    /// Uses ymm0/ymm2 scratch; the allocator must quarantine xmm2.
+    MulAddF64x4HoistedSIB,
 
     // --- Vector loads for reduction patterns ---
     /// Load 4 packed doubles (256-bit unaligned): vmovupd
@@ -1739,7 +1744,7 @@ impl IntrinsicOp {
             | Psllwi256 | Psrlwi256 | Broadcast128to256 | Zext128to256
             | Insert128to256 | SetEpi16_256 | SetEpi32_256 | SetEpi64x256 | SetEpi8_256
             | Dpbusd256 | Dpbssd256 | Dpwuud256 | Aesenc256 | Vpclmulqdq256
-            | FmaF64x4 | FmaF64x4Hoisted | BroadcastLoadF64 | FmaF64x4SIB | FmaF64x4HoistedSIB
+            | FmaF64x4 | FmaF64x4Hoisted | BroadcastLoadF64 | FmaF64x4SIB | FmaF64x4HoistedSIB | MulAddF64x4HoistedSIB
             | LoadF64x4 | LoadI32x8 | AddF64x4 | MulF64x4 | AddI32x8
             | VecLoadF64x4 | VecLoadI32x8 | VecAddF64x4 | VecMulF64x4 | VecFmaF64x4 | VecMaddF64x4 | VecMaddF64x4Signed(..) | VecBroadcastF64x4 | VecAddI32x8 | VecMulI32x8 | VecBroadcastI32x8 | VecMaxI32x8
             | VecPackssdwI16x16 | VecSubI32x8 | VecAndI32x8 | VecOrI32x8 | VecXorI32x8
@@ -2045,7 +2050,10 @@ impl IntrinsicOp {
     pub fn writes_memory_via_args(&self) -> bool {
         matches!(
             self,
-            IntrinsicOp::StrictRecipMulAddF64x4
+            IntrinsicOp::FmaF64x4SIB
+                | IntrinsicOp::FmaF64x4HoistedSIB
+                | IntrinsicOp::MulAddF64x4HoistedSIB
+                | IntrinsicOp::StrictRecipMulAddF64x4
                 | IntrinsicOp::StrictRecipMulAddPackedF64x4
                 | IntrinsicOp::VecStoreI32x4
                 | IntrinsicOp::VecStoreI32x8
@@ -2072,7 +2080,15 @@ impl IntrinsicOp {
     pub fn may_read_memory(&self) -> bool {
         matches!(
             self,
-            IntrinsicOp::StrictRecipMulAddF64x4
+            IntrinsicOp::FmaF64x2
+                | IntrinsicOp::FmaF64x2Hoisted
+                | IntrinsicOp::FmaF64x4
+                | IntrinsicOp::FmaF64x4Hoisted
+                | IntrinsicOp::FmaF64x4SIB
+                | IntrinsicOp::FmaF64x4HoistedSIB
+                | IntrinsicOp::MulAddF64x4HoistedSIB
+                | IntrinsicOp::BroadcastLoadF64
+                | IntrinsicOp::StrictRecipMulAddF64x4
                 | IntrinsicOp::StrictRecipMulAddPackedF64x4
                 | IntrinsicOp::LoadF64x4
                 | IntrinsicOp::LoadF64x2
@@ -2699,6 +2715,30 @@ mod vector_width_tests {
 #[cfg(test)]
 mod memory_classification_tests {
     use super::IntrinsicOp as O;
+    #[test]
+    fn packed_sib_updates_read_and_write_argument_memory() {
+        use crate::ir::reexports::Instruction;
+        for op in [
+            O::FmaF64x4SIB,
+            O::FmaF64x4HoistedSIB,
+            O::MulAddF64x4HoistedSIB,
+        ] {
+            let inst = Instruction::Intrinsic {
+                dest: None,
+                op,
+                dest_ptr: None,
+                args: vec![],
+            };
+            assert!(op.may_read_memory());
+            assert!(op.writes_memory_via_args());
+            assert!(inst.may_write_memory());
+            assert!(!op.reads_pointer_arg());
+            assert!(!op.is_pure());
+            assert!(!op.produces_vector_value());
+            assert_eq!(op.vector_result_width(), None);
+        }
+    }
+
     #[test]
     fn strict_reciprocal_effects_and_scalar_result() {
         // Result width and vector-home classification must agree: one F64,

@@ -754,7 +754,7 @@ fn x87_encode(sign: bool, biased_exp: u16, mantissa64: u64) -> [u8; 16] {
 /// Shared by [`scaled_significand_to_f64`] and [`encode_x87_from_scaled`]: the
 /// two narrowing kernels used to carry byte-identical private copies, and a
 /// rounding rule that exists twice is a rounding rule that drifts.
-fn round_shift_half_even(m: u128, sh: i64) -> (u128, bool) {
+pub(super) fn round_shift_half_even(m: u128, sh: i64) -> (u128, bool) {
     if sh <= 0 {
         return (m, false);
     }
@@ -1018,99 +1018,7 @@ fn encode_f128(negative: bool, binary_exp: i32, mantissa113: u128) -> [u8; 16] {
 
 /// Parse a hex float string (0x..p..) to f128 format.
 fn parse_hex_float_to_f128(negative: bool, text: &str) -> [u8; 16] {
-    // Skip "0x" or "0X"
-    let text = &text[2..];
-
-    let bytes = text.as_bytes();
-    let mut hex_digits: Vec<u8> = Vec::with_capacity(32);
-    let mut decimal_point_offset: Option<usize> = None;
-    let mut i = 0;
-
-    while i < bytes.len() {
-        if bytes[i] == b'.' {
-            decimal_point_offset = Some(hex_digits.len());
-            i += 1;
-        } else if bytes[i].is_ascii_hexdigit() {
-            let d = if bytes[i] >= b'0' && bytes[i] <= b'9' {
-                bytes[i] - b'0'
-            } else if bytes[i] >= b'a' && bytes[i] <= b'f' {
-                bytes[i] - b'a' + 10
-            } else {
-                bytes[i] - b'A' + 10
-            };
-            hex_digits.push(d);
-            i += 1;
-        } else {
-            break;
-        }
-    }
-
-    // Parse binary exponent (p/P)
-    let mut exp2: i32 = 0;
-    if i < bytes.len() && (bytes[i] == b'p' || bytes[i] == b'P') {
-        i += 1;
-        let exp_neg = if i < bytes.len() && bytes[i] == b'-' {
-            i += 1;
-            true
-        } else {
-            if i < bytes.len() && bytes[i] == b'+' {
-                i += 1;
-            }
-            false
-        };
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            exp2 = exp2
-                .saturating_mul(10)
-                .saturating_add((bytes[i] - b'0') as i32);
-            i += 1;
-        }
-        if exp_neg {
-            exp2 = -exp2;
-        }
-    }
-
-    // Build the mantissa from hex digits (at most 32 hex digits = 128 bits)
-    let mut mantissa: u128 = 0;
-    let mut bits_read: u32 = 0;
-    for &d in &hex_digits {
-        if bits_read + 4 <= 128 {
-            mantissa = (mantissa << 4) | (d as u128);
-            bits_read += 4;
-        }
-    }
-
-    if mantissa == 0 {
-        return make_f128_zero(negative);
-    }
-
-    // Each hex digit after the point contributes 4 bits of binary fraction
-    let frac_hex_digits = if let Some(dp) = decimal_point_offset {
-        (hex_digits.len() - dp) as i32
-    } else {
-        0
-    };
-    let binary_exp = exp2 - frac_hex_digits * 4;
-
-    // Normalize mantissa to have bit 112 set (for 113-bit mantissa).
-    // The unbiased IEEE exponent is: binary_exp + (bl - 1), where bl is the
-    // actual bit length of the mantissa. This accounts for the position of the
-    // most significant bit relative to the binary point.
-    // Note: we use bl (actual bit length) not bits_used (total hex digit bits),
-    // since leading zero hex digits don't affect the exponent.
-    let bl = 128 - mantissa.leading_zeros();
-    let adj_exp = binary_exp + (bl as i32 - 1);
-    if bl > 113 {
-        // Too many bits, shift right (loses precision)
-        let excess = bl - 113;
-        mantissa >>= excess;
-        encode_f128(negative, adj_exp, mantissa)
-    } else if bl < 113 && bl > 0 {
-        let deficit = 113 - bl;
-        mantissa <<= deficit;
-        encode_f128(negative, adj_exp, mantissa)
-    } else {
-        encode_f128(negative, adj_exp, mantissa)
-    }
+    super::hex_float::parse_f128(text, negative)
 }
 
 /// Construct raw f128 bytes from sign, biased exponent, and stored mantissa (no implicit bit).

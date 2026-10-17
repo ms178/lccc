@@ -19,8 +19,8 @@
 //! respective callers.
 
 use super::const_arith;
-use super::types::target_is_32bit;
-use crate::frontend::parser::ast::{BinOp, Expr};
+use super::types::{target_is_32bit, target_ptr_size};
+use crate::frontend::parser::ast::{BinOp, Expr, TypeSpecifier};
 use crate::ir::reexports::IrConst;
 
 /// Evaluate a literal expression to an IrConst.
@@ -71,6 +71,59 @@ pub(crate) fn narrow_string_strlen(text: &str) -> usize {
     text.chars().take_while(|&c| c != '\0').count()
 }
 
+/// Whether `__builtin_constant_p(expr)` is 1 because `expr` is the address of
+/// a string literal, by GCC 16.2's rule (`fold_builtin_constant_p`, measured
+/// in static initializers): after stripping no-op conversions, the argument
+/// is a string literal, `&"s"`, `&"s"[0]`, or a conditional whose constant
+/// condition selects one. Pointer arithmetic (`"s" + 1`), dereferences
+/// (`"s"[0]`), the comma operator and `__func__` are not (GCC folds them to 0).
+///
+/// `cast_is_nop` decides whether a cast is a no-op conversion of a pointer:
+/// to a pointer type, or to an integer type as wide as a pointer
+/// (`(long)"s"` is 1, `(char)"s"` and, on i686, `(long long)"s"` are 0).
+pub fn is_string_literal_address(
+    expr: &Expr,
+    cast_is_nop: &dyn Fn(&TypeSpecifier) -> bool,
+    eval_fn: &dyn Fn(&Expr) -> Option<IrConst>,
+) -> bool {
+    let is_literal = |e: &Expr| {
+        matches!(
+            e,
+            Expr::StringLiteral(..) | Expr::WideStringLiteral(..) | Expr::Char16StringLiteral(..)
+        )
+    };
+    match expr {
+        e if is_literal(e) => true,
+        Expr::Cast(target, inner, ..) => {
+            cast_is_nop(target) && is_string_literal_address(inner, cast_is_nop, eval_fn)
+        }
+        Expr::AddressOf(inner, _) => match inner.as_ref() {
+            e if is_literal(e) => true,
+            Expr::ArraySubscript(base, index, _) => {
+                is_literal(base) && eval_fn(index).is_some_and(|i| i.is_zero())
+            }
+            _ => false,
+        },
+        Expr::Conditional(cond, then, els, _) => eval_fn(cond).is_some_and(|c| {
+            let taken = if c.is_nonzero() { then } else { els };
+            is_string_literal_address(taken, cast_is_nop, eval_fn)
+        }),
+        _ => false,
+    }
+}
+
+/// [`is_string_literal_address`]'s no-op test for casts spelled with builtin
+/// type names (typedefs need type resolution, which the sema evaluator has).
+fn builtin_cast_is_nop(target: &TypeSpecifier) -> bool {
+    let int_size = match target {
+        TypeSpecifier::Pointer(..) => return true,
+        TypeSpecifier::Long | TypeSpecifier::UnsignedLong => target_ptr_size(),
+        TypeSpecifier::LongLong | TypeSpecifier::UnsignedLongLong => 8,
+        _ => return false,
+    };
+    int_size == target_ptr_size()
+}
+
 /// Evaluate a compile-time builtin function call in a constant expression.
 ///
 /// Handles all pure builtins that can be folded at compile time:
@@ -112,7 +165,10 @@ pub fn eval_builtin_call(
             // Prove positive answers early, but do not cache an early zero.
             // A local/parameter may become constant after mem2reg, inlining,
             // and propagation; the IR IsConstant node must survive until then.
-            if args.first().is_some_and(|arg| eval_fn(arg).is_some()) {
+            if args.first().is_some_and(|arg| {
+                eval_fn(arg).is_some()
+                    || is_string_literal_address(arg, &builtin_cast_is_nop, eval_fn)
+            }) {
                 Some(IrConst::I32(1))
             } else {
                 None

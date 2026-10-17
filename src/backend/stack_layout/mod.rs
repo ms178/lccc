@@ -555,6 +555,80 @@ pub fn calculate_stack_space_common(
         }
     }
 
+    // Phase 7.6: constant-offset frame addresses (x86-64). A value defined
+    // exactly once by `GEP(base, const)`, whose base resolves through
+    // single-definition GEP/Copy links to an ordinary alloca, names a fixed
+    // frame location for the whole function. `resolve_slot_addr` addresses
+    // memory through it directly. Multi-definition values (copy webs) and
+    // over-aligned or slotless allocas are excluded: their address is either
+    // position-dependent or computed at run time.
+    state.frame_offset_aliases.clear();
+    if state.frame_gep_direct {
+        let mut defs: FxHashMap<u32, (u32, &Instruction)> = FxHashMap::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Some(dest) = inst.dest() {
+                    let entry = defs.entry(dest.0).or_insert((0, inst));
+                    entry.0 += 1;
+                    entry.1 = inst;
+                }
+            }
+        }
+        let resolve = |start: u32| -> Option<(u32, i64)> {
+            let mut cur = start;
+            let mut offset = 0i64;
+            for _ in 0..16 {
+                if state.is_alloca(cur) {
+                    return (cur != start).then_some((cur, offset));
+                }
+                let &(count, inst) = defs.get(&cur)?;
+                if count != 1 {
+                    return None;
+                }
+                match inst {
+                    Instruction::GetElementPtr {
+                        base,
+                        offset: Operand::Const(c),
+                        ..
+                    } => {
+                        offset = offset.checked_add(c.to_i64()?)?;
+                        cur = base.0;
+                    }
+                    Instruction::Copy {
+                        src: Operand::Value(v),
+                        ..
+                    } => cur = v.0,
+                    _ => return None,
+                }
+            }
+            None
+        };
+        let candidates: Vec<u32> = defs
+            .iter()
+            .filter(|(_, (count, inst))| {
+                *count == 1
+                    && matches!(
+                        inst,
+                        Instruction::GetElementPtr {
+                            offset: Operand::Const(_),
+                            ..
+                        }
+                    )
+            })
+            .map(|(dest, _)| *dest)
+            .collect();
+        let aliases: Vec<(u32, (u32, i64))> = candidates
+            .into_iter()
+            .filter_map(|dest| {
+                let (alloca, offset) = resolve(dest)?;
+                (state.value_locations.contains_key(&alloca)
+                    && state.alloca_over_align(alloca).is_none())
+                .then_some((dest, (alloca, offset)))
+            })
+            .collect();
+        state.frame_offset_aliases.extend(aliases);
+    }
+
     // Diagnostic: dump the full value→slot map (and the vector/defer sets) so
     // slot aliasing miscompiles can be root-caused from the layout alone.
     // Usage: CCC_DEBUG_SLOTS=1 lccc -O2 -c file.c

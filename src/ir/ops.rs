@@ -77,6 +77,20 @@ pub enum IrBinOp {
     /// to the identity rather than depending on an ISA's masking rules).
     RotateLeft,
     RotateRight,
+    /// Zero the high bits from an index on: `Bzhi(x, n)` with `k = n & 0xFF`
+    /// is `x` when `k >= W` and `x & ((1 << k) - 1)` otherwise -- exactly
+    /// x86 BMI2 `bzhi` and the `_bzhi_u32`/`_bzhi_u64` intrinsics (Intel SDM
+    /// "BZHI"; GCC's `__builtin_ia32_bzhi_si/_di`).  Only the low eight bits
+    /// of the index are read, and an index of W or more is the identity, so
+    /// the operation is total; it is NOT the C expression
+    /// `x & ((1 << n) - 1)`, whose shift is undefined from W on.
+    ///
+    /// Typed I32/U32/I64/U64 only.  Evaluating in a wider container and
+    /// truncating to W is exact: for `W <= k < container` the container
+    /// result `x & ((1 << k) - 1)` keeps every one of x's low W bits, and for
+    /// larger k both forms return x.  Only the x86-64 frontend creates it,
+    /// from the BMI2 builtins when BMI2 is enabled; no pass synthesizes it.
+    Bzhi,
 }
 
 impl IrBinOp {
@@ -123,6 +137,29 @@ pub fn rotate_within_bits(value: u128, amount: u128, bits: u32, left: bool) -> u
     } else {
         ((value >> amount) | (value << (bits - amount))) & mask
     }
+}
+
+/// `Bzhi` at container width `bits`: keep the low `index & 0xFF` bits of
+/// `value`, or all of them when that is `bits` or more (see
+/// [`IrBinOp::Bzhi`]).  Callers truncate the result to the operation's type.
+pub fn zero_high_bits_from(value: u128, index: u128, bits: u32) -> u128 {
+    let k = (index & 0xFF) as u32;
+    if k >= bits || k >= 128 {
+        value
+    } else {
+        value & ((1u128 << k) - 1)
+    }
+}
+
+/// The non-x86-64 backends' arm for [`IrBinOp::Bzhi`]: only the x86-64
+/// frontend creates it (from the BMI2 builtins) and no pass synthesizes it,
+/// so reaching another backend is a broken invariant, not an input error.
+/// One shared site keeps the invariant and its message in one place.
+#[cold]
+pub fn bzhi_outside_x86_64() -> ! {
+    unreachable!(
+        "Bzhi is created only by the x86-64 frontend (BMI2 builtins); no pass synthesizes it"
+    )
 }
 
 impl IrBinOp {
@@ -175,6 +212,7 @@ impl IrBinOp {
             IrBinOp::RotateRight => {
                 rotate_within_bits(lhs as u64 as u128, rhs as u64 as u128, 64, false) as i64
             }
+            IrBinOp::Bzhi => zero_high_bits_from(lhs as u64 as u128, rhs as u64 as u128, 64) as i64,
             IrBinOp::SDiv => {
                 if rhs == 0 {
                     return None;
@@ -225,6 +263,7 @@ impl IrBinOp {
             IrBinOp::RotateRight => {
                 rotate_within_bits(lhs as u128, rhs as u128, 128, false) as i128
             }
+            IrBinOp::Bzhi => zero_high_bits_from(lhs as u128, rhs as u128, 128) as i128,
             IrBinOp::SDiv => {
                 if rhs == 0 {
                     return None;

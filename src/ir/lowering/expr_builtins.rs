@@ -10,7 +10,7 @@
 use super::lower::Lowerer;
 use crate::common::source::Span;
 use crate::common::types::{AddressSpace, CType, IrType, target_is_32bit};
-use crate::frontend::parser::ast::{Expr, UnaryOp};
+use crate::frontend::parser::ast::{Expr, TypeSpecifier, UnaryOp};
 use crate::frontend::sema::builtins::{self, BuiltinIntrinsic, BuiltinKind};
 use crate::ir::reexports::{
     BasicBlock, CallInfo, Instruction, IntrinsicOp, IrBinOp, IrCmpOp, IrConst, IrUnaryOp, Operand,
@@ -479,6 +479,8 @@ impl Lowerer {
                         regparm: None,
                         is_pure: false,
                         is_const: false,
+                        // Spelled `__builtin_<name>`: the library function by definition.
+                        assume_library: true,
                         ret_eightbyte_classes: Vec::new(),
                         ret_is_f128_sse: false,
                     },
@@ -1067,6 +1069,8 @@ impl Lowerer {
                     }
                 }
             }
+            BuiltinIntrinsic::X86Bzhi32 => self.lower_bzhi_builtin(intrinsic, false, name, args),
+            BuiltinIntrinsic::X86Bzhi64 => self.lower_bzhi_builtin(intrinsic, true, name, args),
             // X86 SSE/AES/CRC intrinsics - delegated to lower_x86_intrinsic
             BuiltinIntrinsic::X86Lfence
             | BuiltinIntrinsic::X86Mfence
@@ -1396,6 +1400,7 @@ impl Lowerer {
                         regparm: None,
                         is_pure: false,
                         is_const: false,
+                        assume_library: false,
                         ret_eightbyte_classes: Vec::new(),
                         ret_is_f128_sse: false,
                     },
@@ -1667,6 +1672,8 @@ impl Lowerer {
                 regparm: None,
                 is_pure: false,
                 is_const: false,
+                // Spelled `__builtin___<name>_chk`: the fortified builtin by definition.
+                assume_library: true,
                 ret_eightbyte_classes: Vec::new(),
                 ret_is_f128_sse: false,
             },
@@ -1857,25 +1864,35 @@ impl Lowerer {
             return Some(Operand::Const(IrConst::I32(0)));
         };
         // If already a compile-time constant at lowering time, resolve immediately.
-        // String literals are constant addresses even though numeric const-eval
-        // intentionally has no IrConst representation for an address.
-        let constant_literal_subscript = matches!(
-            arg,
-            Expr::ArraySubscript(base, index, _)
-                if matches!(base.as_ref(),
-                    Expr::StringLiteral(..)
-                    | Expr::WideStringLiteral(..)
-                    | Expr::Char16StringLiteral(..))
-                && self.eval_const_expr(index).is_some()
-        );
-        if self.eval_const_expr(arg).is_some()
-            || constant_literal_subscript
-            || matches!(
-                arg,
+        // A string literal's address is constant even though numeric const-eval
+        // has no IrConst for an address (GCC's rule, shared with the static
+        // initializer evaluators). A character read from one at a constant
+        // index is the constant GCC -O1+ reports (`"x"[0]`, `*"x"`).
+        let is_literal = |e: &Expr| {
+            matches!(
+                e,
                 Expr::StringLiteral(..)
                     | Expr::WideStringLiteral(..)
                     | Expr::Char16StringLiteral(..)
             )
+        };
+        let constant_literal_char = match arg {
+            Expr::ArraySubscript(base, index, _) => {
+                is_literal(base) && self.eval_const_expr(index).is_some()
+            }
+            Expr::Deref(inner, _) => is_literal(inner),
+            _ => false,
+        };
+        let cast_is_nop = |target: &TypeSpecifier| {
+            let ty = self.type_spec_to_ctype(target);
+            matches!(ty, CType::Pointer(..))
+                || (ty.is_integer() && ty.size() == crate::common::types::target_ptr_size())
+        };
+        if self.eval_const_expr(arg).is_some()
+            || constant_literal_char
+            || crate::common::const_eval::is_string_literal_address(arg, &cast_is_nop, &|e| {
+                self.eval_const_expr(e)
+            })
         {
             return Some(Operand::Const(IrConst::I32(1)));
         }
@@ -2532,6 +2549,120 @@ impl Lowerer {
         );
     }
 
+    /// `__builtin_ia32_bzhi_si`/`_di`: BMI2 `bzhi` (see `IrBinOp::Bzhi` for
+    /// the exact semantics: index bits 7:0, identity from the width on).
+    ///
+    /// x86-64 lowers to the IR operation, which the backend emits as one
+    /// `bzhi` and which constant-folds and simplifies exactly.  i686 has no
+    /// `Bzhi` lowering, so `_si` becomes the equivalent select with every
+    /// shift count in range (`k & 31`); `_di` is 64-bit-only, as in GCC.  The
+    /// BMI2 permission is checked like every other x86 extension intrinsic.
+    fn lower_bzhi_builtin(
+        &mut self,
+        intrinsic: &BuiltinIntrinsic,
+        wide: bool,
+        name: &str,
+        args: &[Expr],
+    ) -> Option<Operand> {
+        let target = self.target;
+        let available = match target {
+            crate::backend::Target::X86_64 => true,
+            crate::backend::Target::I686 => !wide,
+            _ => false,
+        };
+        if !available {
+            let arch = match target {
+                crate::backend::Target::Aarch64 => "aarch64",
+                crate::backend::Target::Riscv64 => "riscv64",
+                crate::backend::Target::I686 => "i686",
+                other => other.triple(),
+            };
+            return self.reject_builtin_call(
+                format!("'{name}' is not available on {arch}"),
+                args,
+                8,
+            );
+        }
+        self.check_x86_intrinsic_feature(intrinsic, name, args);
+        let [src, index] = args else {
+            return self.reject_builtin_call(
+                format!("'{name}' takes exactly two arguments, {} given", args.len()),
+                args,
+                8,
+            );
+        };
+        let ty = if wide { IrType::U64 } else { IrType::U32 };
+        let src = self.lower_expr_with_type(src, ty);
+        let index = self.lower_expr_with_type(index, ty);
+        if target == crate::backend::Target::X86_64 {
+            let dest = self.fresh_value();
+            self.emit(Instruction::BinOp {
+                dest,
+                op: IrBinOp::Bzhi,
+                lhs: src,
+                rhs: index,
+                ty,
+            });
+            return Some(Operand::Value(dest));
+        }
+        // i686, 32-bit: k = index & 0xFF; k >= 32 ? src : src & ((1 << (k & 31)) - 1).
+        let k = self.fresh_value();
+        self.emit(Instruction::BinOp {
+            dest: k,
+            op: IrBinOp::And,
+            lhs: index,
+            rhs: Operand::Const(IrConst::from_i64(0xFF, ty)),
+            ty,
+        });
+        let count = self.fresh_value();
+        self.emit(Instruction::BinOp {
+            dest: count,
+            op: IrBinOp::And,
+            lhs: Operand::Value(k),
+            rhs: Operand::Const(IrConst::from_i64(31, ty)),
+            ty,
+        });
+        let bit = self.fresh_value();
+        self.emit(Instruction::BinOp {
+            dest: bit,
+            op: IrBinOp::Shl,
+            lhs: Operand::Const(IrConst::from_i64(1, ty)),
+            rhs: Operand::Value(count),
+            ty,
+        });
+        let mask = self.fresh_value();
+        self.emit(Instruction::BinOp {
+            dest: mask,
+            op: IrBinOp::Sub,
+            lhs: Operand::Value(bit),
+            rhs: Operand::Const(IrConst::from_i64(1, ty)),
+            ty,
+        });
+        let kept = self.fresh_value();
+        self.emit(Instruction::BinOp {
+            dest: kept,
+            op: IrBinOp::And,
+            lhs: src,
+            rhs: Operand::Value(mask),
+            ty,
+        });
+        let whole = self.emit_cmp_val(
+            IrCmpOp::Uge,
+            Operand::Value(k),
+            Operand::Const(IrConst::from_i64(32, ty)),
+            ty,
+        );
+        let dest = self.fresh_value();
+        self.emit(Instruction::Select {
+            dest,
+            cond: Operand::Value(whole),
+            true_val: src,
+            false_val: Operand::Value(kept),
+            ty,
+        });
+        Some(Operand::Value(dest))
+    }
+
     fn lower_x86_intrinsic(
         &mut self,
         intrinsic: &BuiltinIntrinsic,
@@ -3009,6 +3140,12 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
         B::X86Crc32_8 | B::X86Crc32_16 | B::X86Crc32_32 | B::X86Crc32_64 => IntrinsicRequirement {
             feature: F::Sse42,
             flag: "-msse4.2",
+            also: None,
+        },
+        // BMI2 BZHI (`_bzhi_u32`/`_bzhi_u64`).
+        B::X86Bzhi32 | B::X86Bzhi64 => IntrinsicRequirement {
+            feature: F::Bmi2,
+            flag: "-mbmi2",
             also: None,
         },
         // AES-NI, 128-bit forms (the `_mm_*`/`__builtin_ia32_*` spellings that

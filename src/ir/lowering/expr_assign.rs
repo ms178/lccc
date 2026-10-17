@@ -1332,66 +1332,10 @@ impl Lowerer {
         Operand::Value(lhs_ptr_val)
     }
 
-    /// True when a call returns an i686 integer ExtVector through GP words.
-    /// Those results are reconstructed into an addressable vector object by
-    /// `lower_function_call`, not exposed as a packed scalar carrier.
-    fn is_i686_ext_vector_gp_return_call(&self, expr: &Expr) -> bool {
-        if !crate::common::types::target_is_32bit() {
-            return false;
-        }
-        let Expr::FunctionCall(func_expr, _, _) = expr else {
-            return false;
-        };
-        let mut stripped = func_expr.as_ref();
-        while let Expr::Deref(inner, _) = stripped {
-            stripped = inner;
-        }
-        let ret_ct = if let Expr::Identifier(name, _) = stripped {
-            if self.is_func_ptr_variable(name) {
-                self.fptr_variable_sig(name)
-                    .and_then(|sig| sig.return_ctype.clone())
-            } else {
-                self.func_meta
-                    .sigs
-                    .get(name.as_str())
-                    .and_then(|sig| sig.return_ctype.clone())
-            }
-        } else {
-            self.call_return_ctype(func_expr)
-        };
-        ret_ct.is_some_and(|ct| ct.i686_ext_vector_gp_word_count().is_some())
-    }
-
     /// Check if an expression is a function call returning packed scalar vector data.
     pub(super) fn rhs_is_small_vector_call(&self, rhs: &Expr, vec_size: usize) -> bool {
-        if vec_size > 8 || self.is_i686_ext_vector_gp_return_call(rhs) {
-            return false; // Large/specially reconstructed vectors are already addressable.
-        }
         match rhs {
-            Expr::FunctionCall(func_expr, _, _) => {
-                // Check if it's a direct call to a known function with vector return
-                let stripped = {
-                    let mut e = func_expr.as_ref();
-                    while let Expr::Deref(inner, _) = e {
-                        e = inner;
-                    }
-                    e
-                };
-                if let Expr::Identifier(name, _) = stripped {
-                    if self.is_func_ptr_variable(name) {
-                        // Indirect call: small vectors returned in register
-                        return true;
-                    }
-                    if let Some(sig) = self.func_meta.sigs.get(name.as_str()) {
-                        // Direct call: check if sret/two_reg are None (small struct/vector return)
-                        return sig.sret_size.is_none() && sig.two_reg_ret_size.is_none();
-                    }
-                    // Unknown function: assume small vector returned in register
-                    return true;
-                }
-                // Indirect call through complex expression
-                true
-            }
+            Expr::FunctionCall(func_expr, _, _) => self.call_result_is_packed(func_expr, vec_size),
             _ => false,
         }
     }
@@ -1647,6 +1591,18 @@ impl Lowerer {
         let rhs_volatile = self.expr_access_is_volatile(rhs);
         let is_unsigned = elem_ct.is_unsigned();
         let cmp_op = Self::binop_to_cmp(op, is_unsigned);
+        // The result is a vector of signed integer lanes of the element's
+        // width (`CType::vector_comparison_result`): a float lane compares
+        // as F32/F64 but its all-ones mask is an I32/I64 bit pattern, not
+        // the float value `-1.0`.
+        let mask_ct = vec_ct
+            .vector_comparison_result()
+            .unwrap_or_else(|| vec_ct.clone());
+        let mask_ir_ty = match elem_ir_ty {
+            IrType::F32 => IrType::I32,
+            IrType::F64 => IrType::I64,
+            other => other,
+        };
 
         for lane in 0..num_elems {
             let lhs_elem = if let Some(scalar) = lhs_scalar {
@@ -1659,20 +1615,25 @@ impl Lowerer {
             } else {
                 self.load_vector_lane(rhs_val, &rhs_ct, lane, AddressSpace::Default, rhs_volatile)
             };
+            // Lane predicate -> all-ones/all-zeros mask. `Cmp` yields an I32
+            // 0/1 boolean (an ordered compare for float lanes, as for scalar
+            // `<`: NaN lanes are false, except `!=`); widen it to the
+            // same-width signed integer lane, then `0 - x` is all-ones for a
+            // true lane and 0 for a false one, at any lane width.
             let cond = self.emit_cmp_val(cmp_op, lhs_elem, rhs_elem, elem_ir_ty);
-            let cond_ext = self.emit_cast_val(Operand::Value(cond), IrType::I32, elem_ir_ty);
+            let cond_ext = self.emit_cast_val(Operand::Value(cond), IrType::I32, mask_ir_ty);
             let mask = self.emit_binop_val(
                 IrBinOp::Sub,
-                Operand::Const(Self::ir_zero_const(elem_ir_ty)),
+                Operand::Const(Self::ir_zero_const(mask_ir_ty)),
                 Operand::Value(cond_ext),
-                elem_ir_ty,
+                mask_ir_ty,
             );
             self.store_vector_lane(
                 result_alloca,
-                vec_ct,
+                &mask_ct,
                 lane,
                 Operand::Value(mask),
-                elem_ir_ty,
+                mask_ir_ty,
                 AddressSpace::Default,
                 false,
             );

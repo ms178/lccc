@@ -5,10 +5,11 @@
 //!
 //! * `passes::dead_statics` uses it to keep a symbol whose address the TU
 //!   references only from top-level `asm("...")`.
-//! * `common::builtin` (the A13/A14 symbol inventory) uses it to refuse a
-//!   synthesised library call when the same TU's top-level assembly defines
-//!   or redirects that symbol: the compiler cannot assume the library's
-//!   semantics for a name the user has redefined in assembly.
+//! * `passes::builtin_policy` (the A13/A14 symbol inventory) treats a name
+//!   the TU's top-level assembly mentions as opaque: no call to it is
+//!   assumed to be the library function, and no pass synthesizes a call
+//!   that could reach it.  A mention, not a parse: GAS defines symbols in
+//!   too many ways for an enumeration to be safe.
 //!
 //! Keeping one implementation means the two cannot disagree about what
 //! counts as a mention, and a miss is a shared, testable fact rather than

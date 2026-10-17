@@ -166,6 +166,8 @@ impl Lowerer {
                         result,
                     );
                 }
+                // Decided by sema; a static assertion generates nothing.
+                BlockItem::StaticAssert(_) => {}
                 BlockItem::NestedFunction(nf) => {
                     result.has_nested = true;
                     // Recurse: the nested function's own subtree, with its
@@ -1193,7 +1195,7 @@ fn collect_labels_compound(compound: &CompoundStmt, set: &mut FxHashSet<String>)
         match item {
             BlockItem::Statement(stmt) => collect_labels_stmt(stmt, set),
             BlockItem::NestedFunction(nf) => collect_labels_compound(&nf.body, set),
-            BlockItem::Declaration(_) => {}
+            BlockItem::Declaration(_) | BlockItem::StaticAssert(_) => {}
         }
     }
 }

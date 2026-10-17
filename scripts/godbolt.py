@@ -294,7 +294,7 @@ def compilation_error(data: Any) -> str | None:
 
 
 def compiler_flags(compiler_id: str, flags: str) -> str:
-    """Translate explicit Haswell and contraction-off options for classic ICC.
+    """Translate explicit Haswell, contraction-off and -fno-fast-math for classic ICC.
 
     This is option admission, not a claim of cross-vendor FP equivalence.
     Requested/effective flags are both retained. Arbitrary CPU names and
@@ -316,6 +316,18 @@ def compiler_flags(compiler_id: str, flags: str) -> str:
                or t.startswith("-fp-model") for t in tokens):
             raise GodboltError("ambiguous ICC FP options; refusing contraction translation")
         tokens = ["-no-fma" if t == "-ffp-contract=off" else t for t in tokens]
+        changed = True
+    # ICC classic rejects -fno-fast-math instead of honoring it. Its
+    # documented value-safe dialect is -fp-model precise. Contraction remains
+    # a separate caller option; this is not a strict-FENV claim.
+    if "-fno-fast-math" in tokens:
+        if any(t in ("-ffast-math", "-Ofast", "-funsafe-math-optimizations")
+               or t.startswith("-fp-model") for t in tokens):
+            raise GodboltError("ambiguous ICC FP options; refusing value-safety translation")
+        expanded = []
+        for t in tokens:
+            expanded.extend(["-fp-model", "precise"] if t == "-fno-fast-math" else [t])
+        tokens = expanded
         changed = True
     return shlex.join(tokens) if changed else flags
 

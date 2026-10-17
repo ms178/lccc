@@ -524,7 +524,9 @@ impl X86Codegen {
                                     EightbyteClass::Integer | EightbyteClass::NoClass => {
                                         needs_gp = true
                                     }
-                                    EightbyteClass::Sse => needs_fp = true,
+                                    EightbyteClass::Sse | EightbyteClass::SseUp => needs_fp = true,
+                                    // Read from the overflow area only.
+                                    EightbyteClass::Memory => {}
                                 }
                             }
                         }
@@ -758,18 +760,10 @@ impl X86Codegen {
                         // The same two predicates gate the expansion itself
                         // (generation.rs) and the parameter-home policy
                         // (regalloc.rs), so the three can never disagree.
-                        let inline_expanded = crate::backend::generation::inline_memcpy_len(
-                            name,
-                            &info.args,
-                            info.is_variadic,
-                        )
-                        .is_some()
-                            || crate::backend::generation::x86_inline_memset_len(
-                                name,
-                                &info.args,
-                                info.is_variadic,
-                            )
-                            .is_some();
+                        let inline_expanded =
+                            crate::backend::generation::inline_memcpy_len(name, info).is_some()
+                                || crate::backend::generation::x86_inline_memset_len(name, info)
+                                    .is_some();
                         if !inline_expanded {
                             has_calls = true;
                         }
@@ -3953,24 +3947,47 @@ impl X86Codegen {
                 ));
                 self.store_rax_to(dest);
             }
+            // Stay in the SSE domain: store_xmm_to copies XMM->XMM with
+            // movapd, XMM->slot with movss/movsd, XMM->GPR with movd/movq,
+            // and only falls back to %rax (invalidating the accumulator
+            // cache) for a home that is neither register nor slot.
             ParamClass::FloatReg { reg_idx } => {
-                if ty == IrType::F32 {
-                    self.state
-                        .out
-                        .emit_instr_reg_reg("    movd", xmm_regs[reg_idx], "eax");
-                    self.store_rax_to(dest);
+                // Width as before: only F32 moved 4 bytes; every other
+                // SSE-class scalar (F64, D32/D64 images) moved all 8.
+                let width = if ty == IrType::F32 {
+                    IrType::F32
                 } else {
-                    self.state
-                        .out
-                        .emit_instr_reg_reg("    movq", xmm_regs[reg_idx], "rax");
-                    self.store_rax_to(dest);
-                }
+                    IrType::F64
+                };
+                self.store_xmm_to(dest, xmm_regs[reg_idx], width);
             }
             ParamClass::StackScalar { offset } => {
                 let src = stack_base + offset;
+                let sr = self.slot_ref(src);
+                // An XMM-homed F32/F64 loads straight into its register:
+                // the %rax route (`movq 16(%rsp), %rax; movq %rax, %xmm4`)
+                // paid a GPR->XMM domain crossing per stack FP parameter and
+                // only survived the peephole when %rax was provably dead
+                // afterwards (never for the last one before `ret`, never for
+                // F32). A memory-source movss/movsd zeroes the upper lanes,
+                // so no stale lane is observable, and %rax is untouched, so
+                // the accumulator cache stays valid (as in store_xmm_to).
+                if matches!(ty, IrType::F32 | IrType::F64) {
+                    if let Some(&reg) = self.reg_assignments.get(&dest.0) {
+                        if is_xmm_reg(reg) {
+                            let mnemonic = if ty == IrType::F32 { "movss" } else { "movsd" };
+                            self.state.emit_fmt(format_args!(
+                                "    {} {}, %{}",
+                                mnemonic,
+                                sr,
+                                phys_reg_name(reg)
+                            ));
+                            return;
+                        }
+                    }
+                }
                 let load_instr = Self::mov_load_for_type(ty);
                 let reg = Self::load_dest_reg(ty);
-                let sr = self.slot_ref(src);
                 self.state
                     .emit_fmt(format_args!("    {} {}, {}", load_instr, sr, reg));
                 self.store_rax_to(dest);

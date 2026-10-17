@@ -53,15 +53,10 @@ pub enum Operand {
 pub enum DataValue {
     /// A literal integer value.
     Integer(i64),
-    /// A symbol reference, possibly with an addend: `sym` or `sym+4` or `sym-8`.
-    Symbol { name: String, addend: i64 },
-    /// A symbol difference: `sym_a - sym_b`, possibly with addend on sym_a.
-    SymbolDiff {
-        sym_a: String,
-        sym_b: String,
-        addend: i64,
-    },
-    /// A raw expression string that needs alias resolution at emit time.
+    /// Any operand naming a symbol, kept as written: the writer evaluates
+    /// it in GAS's section algebra (`ElfWriterBase::capture_expr`), so its
+    /// meaning never depends on where a textual split happened to cut it
+    /// (`2b + 1 - 1b` was once split into the "symbols" `2b + 1` and `1b`).
     Expression(String),
 }
 
@@ -172,7 +167,10 @@ pub enum Directive {
     /// `.ascii "str"` — string without null terminator (raw bytes)
     Ascii(Vec<u8>),
     /// `.comm sym, size[, align]`
+    /// `.comm sym, size[, align]`; align 0 = omitted (see `ElfWriterBase::declare_comm`).
     Comm { sym: String, size: u64, align: u64 },
+    /// `.lcomm sym, size`.
+    Lcomm { sym: String, size: u64 },
     /// `.local sym`
     Local(String),
     /// `.set sym, val` / `.equ sym, val`
@@ -185,6 +183,8 @@ pub enum Directive {
     Cfi,
     /// Other ignorable directives: .file, .loc, .ident, etc.
     Ignored,
+    /// `.org new-lc [, fill]` -- resolved by `ElfWriterBase::emit_org`.
+    Org { expr: String, fill: u8 },
     /// `.pushsection name, "flags", @type` — push current section and switch
     PushSection(SectionInfo),
     /// `.popsection` — pop section stack
@@ -481,7 +481,7 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
             Directive::Quad(values)
         }
 
-        ".zero" | ".space" => {
+        ".zero" | ".space" | ".skip" => {
             let parts: Vec<&str> = args.trim().split(',').collect();
             // GAS: a negative size emits nothing (`.zero -1` is a no-op);
             // the old `as usize` cast turned -1 into 2^64 bytes.
@@ -527,15 +527,15 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
             let size = size as u64;
             // GAS: overflow -> zero bytes, no diagnostic.
             let total_bytes = repeat.checked_mul(size.min(8)).unwrap_or_default();
-            // Refuse before the value≠0 branch materializes its Vec
-            // (same verdict as the writer's directive-fill cap).
-            if total_bytes > crate::backend::elf::MAX_DIRECTIVE_FILL as u64 {
-                return Err(format!(
-                    ".fill: {total_bytes} bytes exceed the {}-byte directive limit",
-                    crate::backend::elf::MAX_DIRECTIVE_FILL
-                ));
-            }
-            let total_bytes = total_bytes as usize;
+            // No byte cap here: nothing is materialised at parse time (zero
+            // runs become `Zero`, patterns a `Fill` descriptor), and the
+            // writer decides against the live section -- the PROGBITS
+            // ceiling and budget apply there, while a NOBITS run is a
+            // size (GAS 2.47: `.fill 1073741824,1,0` in `.bss` is a
+            // 1 GiB section). A parse-time cap refused exactly the
+            // NOBITS case the writer was built to accept.
+            let total_bytes = usize::try_from(total_bytes)
+                .map_err(|_| format!(".fill: {total_bytes} bytes exceed the addressable size"))?;
             if value == 0 {
                 Directive::Zero {
                     size: total_bytes,
@@ -559,25 +559,15 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
             Directive::Ascii(s)
         }
 
-        ".comm" => {
-            let parts: Vec<&str> = args.split(',').collect();
-            let sym = if !parts.is_empty() {
-                parts[0].trim().to_string()
-            } else {
-                String::new()
-            };
-            let size: u64 = if parts.len() >= 2 {
-                parts[1].trim().parse().unwrap_or(0)
-            } else {
-                0
-            };
-            let align: u64 = if parts.len() > 2 {
-                parts[2].trim().parse().unwrap_or(1)
-            } else {
-                1
-            };
-            Directive::Comm { sym, size, align }
-        }
+        ".comm" => match elf::parse_comm_args(".comm", args, true)? {
+            Some((sym, size, align)) => Directive::Comm { sym, size, align },
+            None => Directive::Ignored,
+        },
+        ".lcomm" => match elf::parse_comm_args(".lcomm", args, false)? {
+            Some((sym, size, _)) => Directive::Lcomm { sym, size },
+            None => Directive::Ignored,
+        },
+        ".base64" => Directive::Ascii(elf::parse_base64_args(args)?),
 
         ".local" => Directive::Local(args.trim().to_string()),
 
@@ -646,10 +636,15 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
         ".popsection" => Directive::PopSection,
         ".previous" => Directive::Previous,
 
+        // `.org` used to be dropped here on the theory that the kernel's
+        // ALTERNATIVE `.org . - (889b - 888b) + (887b - 886b)` pair is a mere
+        // assertion. It is not: a forward `.org` PADS (and GAS fails the
+        // backward one when a replacement outgrows the original), and every
+        // other `.org` -- `.byte 1; .org 8; .byte 2` -- lost its padding and
+        // shifted all later bytes (GAS 01 00*7 02, lccc 01 02).
         ".org" => {
-            // .org expressions like ". - (X) + (Y)" are used as size assertions
-            // in kernel alternative macros. Silently ignore them.
-            Directive::Ignored
+            let (expr, fill) = crate::backend::elf::parse_org_args(args)?;
+            Directive::Org { expr, fill }
         }
 
         ".incbin" => {
@@ -790,137 +785,16 @@ fn parse_data_values(args: &str) -> Result<Vec<DataValue>, String> {
     Ok(values)
 }
 
-/// Check if a string looks like a GNU numeric label reference (e.g. "2f", "1b", "42f").
-fn is_numeric_label_ref(s: &str) -> bool {
-    asm_preprocess::is_numeric_label_ref(s)
-}
-
-/// Strip balanced outer parentheses from an expression.
-/// E.g. "((1b) - .)" -> "(1b) - ." -> calls recursively until no outer parens.
-fn strip_outer_parens(s: &str) -> &str {
-    let s = s.trim();
-    if !s.starts_with('(') || !s.ends_with(')') {
-        return s;
-    }
-    // Check if the outer parens are balanced (the open paren at 0 matches the close at end)
-    let inner = &s[1..s.len() - 1];
-    let mut depth = 0i32;
-    for ch in inner.bytes() {
-        match ch {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth < 0 {
-                    return s; // Close paren inside doesn't match, outer parens aren't a pair
-                }
-            }
-            _ => {}
-        }
-    }
-    if depth == 0 {
-        strip_outer_parens(inner)
-    } else {
-        s
-    }
-}
-
-/// Parse a single data value: integer, symbol, symbol+offset, or symbol_diff.
+/// Parse a single data value: an integer, or an expression naming symbols.
 fn parse_single_data_value(s: &str) -> Result<DataValue, String> {
     let s = s.trim();
     if s.is_empty() {
         return Ok(DataValue::Integer(0));
     }
-
-    // Strip balanced outer parentheses (GCC wraps inline asm operands in parens,
-    // e.g. "((1b) - .)" for numeric label diff expressions)
-    let s = strip_outer_parens(s);
-
-    // First check if this could be a symbol difference: A - B
-    // The first char must be a symbol-start character (letter, _, .), a digit
-    // (for numeric label references like "2f - 1f"), or '(' for parenthesized symbols.
-    // However, if there are extra operators (/, *, <<, >>), this is a complex
-    // expression and should go through the Expression path instead.
-    let first = s.chars().next().unwrap();
-    let is_sym_start = first.is_ascii_alphabetic() || first == '_' || first == '.';
-    let could_be_numeric_ref = first.is_ascii_digit();
-    let starts_with_paren = first == '(';
-    let has_complex_ops =
-        s.contains('/') || s.contains('*') || s.contains("<<") || s.contains(">>");
-    if !has_complex_ops && (is_sym_start || could_be_numeric_ref || starts_with_paren) {
-        // Try to find a symbol difference expression
-        if let Some(minus_pos) = find_symbol_diff_minus(s) {
-            let sym_a_raw = strip_outer_parens(s[..minus_pos].trim());
-            let rest = s[minus_pos + 1..].trim();
-
-            // `A - B +/- K` is left-associative: K is an addend on the
-            // complete difference, never an embedded addend on B. Keeping
-            // `B-4` in sym_b would make the writer subtract `(B - 4)` and
-            // silently reverse the sign to `A - B + 4`.
-            let (sym_b_raw, addend) = parse_symbol_addend(rest)
-                .map_err(|_| format!("invalid symbol-difference addend in data expression: {s}"))?;
-            let sym_b = strip_outer_parens(&sym_b_raw);
-
-            // Verify sym_b looks like a symbol (or a numeric label ref)
-            if !sym_b.is_empty() {
-                let b_first = sym_b.chars().next().unwrap();
-                let b_is_sym = b_first.is_ascii_alphabetic() || b_first == '_' || b_first == '.';
-                if b_is_sym || is_numeric_label_ref(sym_b) {
-                    return Ok(DataValue::SymbolDiff {
-                        sym_a: sym_a_raw.to_string(),
-                        sym_b: sym_b.to_string(),
-                        addend,
-                    });
-                }
-            }
-        }
-
-        if is_sym_start {
-            // Not a symbol diff — parse as symbol reference with optional addend
-            let (sym, addend) = parse_symbol_addend(s)?;
-            return Ok(DataValue::Symbol { name: sym, addend });
-        } else if could_be_numeric_ref && is_numeric_label_ref(s) {
-            // Standalone numeric label reference like "2f" or "1b"
-            return Ok(DataValue::Symbol {
-                name: s.to_string(),
-                addend: 0,
-            });
-        } else if starts_with_paren {
-            // Parenthesized single symbol, e.g. "(1b)" or "(.Lfoo)"
-            let inner = strip_outer_parens(s);
-            if inner != s {
-                return parse_single_data_value(inner);
-            }
-        }
-    }
-
-    // Try to parse as constant+symbol (e.g., "0x80000000 + some_symbol")
-    // This handles cases where the constant comes before the symbol in an additive expression.
-    if could_be_numeric_ref || first == '(' {
-        for (i, c) in s.char_indices().skip(1) {
-            if c == '+' {
-                let left = s[..i].trim();
-                let right = s[i + 1..].trim();
-                if let Ok(offset) = parse_data_value_int(left) {
-                    // Check if right side looks like a symbol
-                    let r_first = right.chars().next().unwrap_or('\0');
-                    if r_first.is_ascii_alphabetic() || r_first == '_' || r_first == '.' {
-                        let (sym, extra_addend) = parse_symbol_addend(right)?;
-                        return Ok(DataValue::Symbol {
-                            name: sym,
-                            addend: offset + extra_addend,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    // Try to parse as integer; if it fails and contains symbol-like chars,
-    // store as a raw expression for alias resolution at emit time.
-    match parse_data_value_int(s) {
-        Ok(v) => Ok(DataValue::Integer(v)),
-        Err(_) => Ok(DataValue::Expression(s.to_string())),
-    }
+    Ok(match parse_data_value_int(s) {
+        Ok(v) => DataValue::Integer(v),
+        Err(_) => DataValue::Expression(s.to_string()),
+    })
 }
 
 /// Parse a data value as a plain integer (used by .byte, .zero fill, etc).
@@ -930,26 +804,6 @@ fn parse_data_value_int(s: &str) -> Result<i64, String> {
         return Ok(0);
     }
     asm_expr::parse_integer_expr(s)
-}
-
-/// Find the position of the '-' operator in a symbol difference expression.
-fn find_symbol_diff_minus(expr: &str) -> Option<usize> {
-    asm_preprocess::find_symbol_diff_minus(expr)
-}
-
-fn parse_symbol_addend(s: &str) -> Result<(String, i64), String> {
-    if let Some(pos) = s.find(['+', '-']) {
-        if pos > 0 {
-            let sym = s[..pos].trim();
-            let offset = parse_data_value_int(&s[pos..])
-                .map_err(|_| format!("unsupported symbolic data expression: {s}"))?;
-            if sym.is_empty() {
-                return Err(format!("missing symbol in data expression: {s}"));
-            }
-            return Ok((sym.to_string(), offset));
-        }
-    }
-    Ok((s.to_string(), 0))
 }
 
 fn parse_instruction(line: &str) -> Result<AsmStatement, String> {
@@ -1291,19 +1145,14 @@ mod tests {
     }
 
     #[test]
-    fn symbol_difference_trailing_addend_keeps_its_sign() {
-        for (expr, want) in [("A-B-4", -4), ("A - B + 4", 4), ("A-B", 0)] {
-            let value = parse_single_data_value(expr).expect("symbol difference must parse");
-            assert_eq!(
-                value,
-                DataValue::SymbolDiff {
-                    sym_a: "A".into(),
-                    sym_b: "B".into(),
-                    addend: want,
-                },
-                "{expr}"
-            );
+    fn symbolic_data_values_keep_their_text() {
+        // The writer evaluates the whole operand; the parser must not cut it
+        // (the trailing addend of `A - B - 4` once flipped sign that way).
+        for expr in ["A-B-4", "A - B + 4", "2b + 1 - 1b", "(e - s) >> 1"] {
+            let value = parse_single_data_value(expr).expect("must parse");
+            assert_eq!(value, DataValue::Expression(expr.into()), "{expr}");
         }
+        assert_eq!(parse_single_data_value("3*4+1"), Ok(DataValue::Integer(13)));
     }
 
     /// The RISC-V front end reaches the shared expansion ceilings.

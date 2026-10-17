@@ -943,7 +943,7 @@ fn latch_is_bit_iteration(func: &IrFunction, latch: usize) -> bool {
                     // still a pure bit loop, and classifying it as `other_arith`
                     // would veto a complete unroll that is profitable.
                     AShr | LShr | Shl | BitTest | RotateLeft | RotateRight => saw_shift = true,
-                    And | Or | Xor => saw_and = true,
+                    And | Or | Xor | Bzhi => saw_and = true,
                     Add | Sub | Mul | SDiv | UDiv | SRem | URem => other_arith = true,
                 }
             }
@@ -6385,6 +6385,7 @@ mod tests {
                 regparm: None,
                 is_pure: false,
                 is_const: false,
+                assume_library: false,
                 ret_eightbyte_classes: vec![],
                 ret_is_f128_sse: false,
             },

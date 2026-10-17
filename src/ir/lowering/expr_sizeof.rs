@@ -49,6 +49,12 @@ impl Lowerer {
             }
             return info.ty.size();
         }
+        // An enumerator has its enum's constant type (`enum { A, B = 1LL << 32 }`
+        // makes `sizeof A` 8). A file-scope enumerator cannot share its name
+        // with a global object, so a hit here is the innermost declaration.
+        if let Some(constant) = self.types.enum_constants.get(name) {
+            return self.ctype_size(&constant.ty);
+        }
         if let Some(ginfo) = self.globals.get(name) {
             // For arrays, prefer the actual allocation size from the module global
             // (handles implicit-size arrays like `int x[] = {1,2,3}` where
@@ -212,15 +218,16 @@ impl Lowerer {
     /// Get the sizeof for a binary operation expression.
     fn sizeof_binop(&self, op: &BinOp, lhs: &Expr, rhs: &Expr) -> usize {
         match op {
-            // Comparison/logical: result is int
-            BinOp::Eq
-            | BinOp::Ne
-            | BinOp::Lt
-            | BinOp::Le
-            | BinOp::Gt
-            | BinOp::Ge
-            | BinOp::LogicalAnd
-            | BinOp::LogicalOr => 4,
+            // A vector comparison is a lane mask as wide as its vector operand.
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => [lhs, rhs]
+                .into_iter()
+                .find_map(|side| {
+                    let ct = self.expr_ctype(side);
+                    ct.is_vector().then(|| ct.size())
+                })
+                .unwrap_or(4),
+            // Logical operators (and scalar comparisons above): int
+            BinOp::LogicalAnd | BinOp::LogicalOr => 4,
             // Pointer subtraction: result is ptrdiff_t
             BinOp::Sub
                 if self.sizeof_operand_is_pointer_like(lhs)

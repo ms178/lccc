@@ -862,8 +862,16 @@ impl Parser {
                 // defined (parsed inside-out) resolve in O(1) instead of
                 // re-walking the whole chain at every level. This is what
                 // keeps deep struct nesting linear instead of quadratic.
-                let align = Self::alignof_type_spec(&ts, Some(&self.struct_tag_alignments));
-                self.struct_tag_alignments.insert(tag.clone(), align);
+                // Only exact alignments are cached; an unknown one must stay
+                // unknown for later tag-only references too.
+                match Self::alignof_type_spec(&ts, Some(&self.struct_tag_alignments)) {
+                    Some(align) => {
+                        self.struct_tag_alignments.insert(tag.clone(), align);
+                    }
+                    None => {
+                        self.struct_tag_alignments.remove(tag);
+                    }
+                }
             }
             _ => {}
         }
@@ -1040,19 +1048,33 @@ impl Parser {
             }
             // C11 6.7.2.1: _Static_assert is allowed as a struct-declaration
             if matches!(self.peek(), TokenKind::StaticAssert) {
-                self.parse_static_assert();
+                if let Some(deferred) = self.parse_static_assert() {
+                    // Speculative parses (nested-function and cast lookahead)
+                    // can parse one member list twice inside an item; the
+                    // queue drains only between items, so the span identifies
+                    // a re-parse exactly.
+                    if !self
+                        .deferred_static_asserts
+                        .iter()
+                        .any(|queued| queued.span == deferred.span)
+                    {
+                        self.deferred_static_asserts.push(deferred);
+                    }
+                }
                 continue;
             }
             if let Some(type_spec) = self.parse_type_specifier() {
                 if matches!(self.peek(), TokenKind::Semicolon) {
                     // Anonymous field (e.g., anonymous struct/union)
                     let alignment = self.attrs.parsed_alignas.take();
+                    let alignas_type = self.attrs.parsed_alignas_type.take();
                     fields.push(StructFieldDecl {
                         type_spec,
                         name: None,
                         bit_width: None,
                         derived: Vec::new(),
                         alignment,
+                        alignas_type,
                         is_packed: false,
                         base_volatile: false,
                         object_volatile: false,
@@ -1138,6 +1160,9 @@ impl Parser {
         // Consume post-type qualifiers that may appear between type and declarator
         // in struct field declarations: e.g., "char _Alignas(32) c;"
         self.consume_struct_field_qualifiers(&mut alignas_from_type);
+        // A type-form `_Alignas` the parser could not size (in either
+        // position) is resolved by the layout builders.
+        let alignas_type = self.attrs.parsed_alignas_type.take();
 
         // Snapshot the field's address-space qualifier NOW (before the
         // declarator parser runs — the abstract-declarator path consumes and
@@ -1177,6 +1202,7 @@ impl Parser {
                     bit_width,
                     derived: Vec::new(),
                     alignment: alignas_from_type,
+                    alignas_type: alignas_type.clone(),
                     is_packed: false,
                     base_volatile: false,
                     object_volatile: false,
@@ -1214,9 +1240,12 @@ impl Parser {
             // Parse any additional trailing GCC __attribute__ (e.g., after bitfield width)
             let (extra_packed, extra_aligned, _, _, _) = self.parse_gcc_attributes();
 
-            // Combine alignment sources: explicit attribute on declarator,
-            // extra attribute after bitfield, or _Alignas from type specifier
-            let alignment = decl_aligned.or(extra_aligned).or(alignas_from_type);
+            // The strictest of every alignment source applies (C11 6.7.5p6;
+            // GCC's `aligned` attribute on a member only ever raises it).
+            let alignment = [decl_aligned, extra_aligned, alignas_from_type]
+                .into_iter()
+                .flatten()
+                .max();
             let is_packed = decl_packed || extra_packed;
 
             // For backward compatibility with downstream code that reads type_spec
@@ -1247,6 +1276,7 @@ impl Parser {
                 bit_width,
                 derived: field_derived,
                 alignment,
+                alignas_type: alignas_type.clone(),
                 is_packed,
                 base_volatile: decl_base_volatile,
                 object_volatile: decl_object_volatile,
@@ -1319,12 +1349,22 @@ impl Parser {
         }
 
         // Simple case: only Pointer and Array declarators. Fold into type_spec.
+        // The space mapping replicates `build_full_ctype_with_base` exactly
+        // (its `pointee_space_before`): the wrapper built at step i takes the
+        // space stored at derived[i-1] — the qualifier written after star j
+        // says the pointer values that the next-outer star points at live in
+        // that space (`struct sd * __seg_gs *sd` = the kernel's
+        // `struct sched_domain * __percpu *`: the first dereference reads %gs).
+        // The old code dropped every space, so field types lost %gs and
+        // `free_percpu(sdd->sd)` failed that GCC accepts.
         let mut result = base.clone();
+        let mut pending_space = AddressSpace::Default;
         let mut i = 0;
         while i < derived.len() {
             match &derived[i] {
-                DerivedDeclarator::Pointer(_) => {
-                    result = TypeSpecifier::Pointer(Box::new(result), AddressSpace::Default);
+                DerivedDeclarator::Pointer(space) => {
+                    result = TypeSpecifier::Pointer(Box::new(result), pending_space);
+                    pending_space = *space;
                     i += 1;
                 }
                 DerivedDeclarator::Array(_) => {

@@ -1,0 +1,73 @@
+{
+  "complete": true,
+  "metric": "bounded whole-program simulated Ir; not runtime",
+  "selected": [
+    "matmul",
+    "nbody"
+  ],
+  "results": {
+    "matmul": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -DN=48",
+      "metrics": {
+        "conditional_mispredicts": [
+          3576,
+          3576
+        ],
+        "d1_misses": [
+          3260,
+          3260
+        ],
+        "i1_misses": [
+          1489,
+          1489
+        ],
+        "indirect_mispredicts": [
+          260,
+          260
+        ],
+        "ir_mine": 338508,
+        "ir_ratio": 1.0,
+        "ir_ref": 338508,
+        "ll_misses": [
+          3900,
+          3900
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/scalar-callgrind/matmul/manifest.json"
+    },
+    "nbody": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -ffp-contract=off -lm -DSTEPS=1000",
+      "metrics": {
+        "conditional_mispredicts": [
+          3520,
+          3520
+        ],
+        "d1_misses": [
+          1935,
+          1935
+        ],
+        "i1_misses": [
+          1483,
+          1483
+        ],
+        "indirect_mispredicts": [
+          260,
+          260
+        ],
+        "ir_mine": 742242,
+        "ir_ratio": 1.0,
+        "ir_ref": 742242,
+        "ll_misses": [
+          3035,
+          3035
+        ]
+      },
+      "manifest": "/home/user/.cache/pr833-research/scalar-callgrind/nbody/manifest.json"
+    }
+  },
+  "failures": [],
+  "worst_first": [
+    "matmul",
+    "nbody"
+  ]
+}

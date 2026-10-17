@@ -926,6 +926,15 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         "__builtin_ia32_crc32di",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Crc32_64),
     );
+    // BMI2 BZHI (GCC's names; `_bzhi_u32`/`_bzhi_u64` in bmi2intrin.h).
+    m.insert(
+        "__builtin_ia32_bzhi_si",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Bzhi32),
+    );
+    m.insert(
+        "__builtin_ia32_bzhi_di",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Bzhi64),
+    );
 
     // x86 AES-NI builtins
     m.insert(
@@ -2977,6 +2986,9 @@ pub enum BuiltinIntrinsic {
     X86Crc32_16,
     X86Crc32_32,
     X86Crc32_64,
+    // BMI2 BZHI: `__builtin_ia32_bzhi_si` / `__builtin_ia32_bzhi_di`
+    X86Bzhi32,
+    X86Bzhi64,
     // AES-NI intrinsics
     X86Aesenc128,
     X86Aesenclast128,

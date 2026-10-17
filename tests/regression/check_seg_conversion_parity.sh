@@ -54,7 +54,11 @@ int __seg_gs **a;
 int **b;
 void take_gp(gp_t p);
 void take_q(int *p);
-void take_vp(void *p);'
+void take_vp(void *p);
+struct s_data { struct s * __seg_gs *sd; };
+extern struct s_data g_sdd;
+typedef unsigned long __seg_gs *ulp_gs_t;
+void take_gs_generic(void __seg_gs *p);'
 
 fail=0
 rows=0

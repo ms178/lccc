@@ -1,0 +1,1170 @@
+{
+  "tools": {
+    "lccc": {
+      "path": "/home/user/.cache/reference-source/target/fastbuild/lccc-riscv",
+      "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone\n",
+      "sha256": "ed380f945feb74587e1a2c324052679f60b9c5fdbdde3f49669d209342ff9ac6"
+    },
+    "clang": {
+      "path": "/home/user/.cache/oracles/clang-23.1.0/bin/clang-23",
+      "version": "clang version 23.1.0 (https://github.com/llvm/llvm-project.git ea7d852a70e8bdfaf601d6626a760f9771b2c4b4)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /home/user/.cache/oracles/clang-23.1.0/bin\n",
+      "sha256": "d9d167ada281dfaeb1fe996ecb26fe69d70684e4b2a3278759f7152123774793"
+    },
+    "linker": {
+      "path": "/home/user/.cache/oracles/clang-23.1.0/bin/lld",
+      "version": "LLD 23.1.0 (https://github.com/llvm/llvm-project.git ea7d852a70e8bdfaf601d6626a760f9771b2c4b4) (compatible with GNU linkers)\n",
+      "sha256": "2942deff1745d49972959fefc3caeab3e70a6f1ded78239f673edc5c749d7326"
+    },
+    "qemu": {
+      "path": "/usr/bin/qemu-riscv64",
+      "version": "qemu-riscv64 version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)\nCopyright (c) 2003-2025 Fabrice Bellard and the QEMU Project developers\n",
+      "sha256": "f2bb9b35eb97fc6b67c43a65d944ea9dcd7b1908df95faf28cea68511e762dc5"
+    }
+  },
+  "records": [
+    {
+      "case": "default",
+      "passed": false,
+      "commands": [
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-O2",
+            "-fPIC",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/shared.c",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/reference-source/target/fastbuild/lccc-riscv",
+            "-shared",
+            "-nostdlib",
+            "/tmp/rv-shared-loader-cusfosgp/shared.o",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.so"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/runner.s",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/runner.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/ld.lld",
+            "-m",
+            "elf64lriscv",
+            "-pie",
+            "-E",
+            "--dynamic-linker",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/tmp/rv-shared-loader-cusfosgp/runner.o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.so",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "qemu-riscv64",
+            "-L",
+            "/usr/riscv64-linux-gnu",
+            "/tmp/rv-shared-loader-cusfosgp/runner"
+          ],
+          "returncode": 91,
+          "output": ""
+        }
+      ],
+      "source": "int target=42;\nint *observed=&target;\nint *get_ptr(void){return &target;}\n",
+      "runner": ".option pic\n.text\n.globl _start\n_start:\n la t0,observed\n ld s0,0(t0)\n la s1,target\n bne s0,s1,.fail\n la t0,get_ptr\n jalr ra,t0,0\n bne a0,s0,.fail\n li a0,0\n j .exit\n.fail:\n li a0,91\n.exit:\n li a7,93\n ecall\n.data\n.globl target\ntarget: .word 99\n",
+      "file_sha256": {
+        "shared.o": "afa564a04f7ddaca674f364b88dfa9954b54809f75036dc8e844ae105cd75db1",
+        "shared.so": "3ee6b9fae93b37163ec05a481d575d1d18c1b45268249f2733fabdc838e47665",
+        "runner.o": "c36cd8ad5652c9b427522ae900913203d7940ba29b29d220d7efa5a12a87c996",
+        "runner": "347b20cb0e6da749906333c6d8edd5d10ab1da1e0878868bf1bf181b907afcb8"
+      },
+      "error": "command failed (91): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-cusfosgp/runner']: "
+    },
+    {
+      "case": "weak-definition",
+      "passed": false,
+      "commands": [
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-O2",
+            "-fPIC",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/shared.c",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/reference-source/target/fastbuild/lccc-riscv",
+            "-shared",
+            "-nostdlib",
+            "/tmp/rv-shared-loader-cusfosgp/shared.o",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.so"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/runner.s",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/runner.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/ld.lld",
+            "-m",
+            "elf64lriscv",
+            "-pie",
+            "-E",
+            "--dynamic-linker",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/tmp/rv-shared-loader-cusfosgp/runner.o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.so",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "qemu-riscv64",
+            "-L",
+            "/usr/riscv64-linux-gnu",
+            "/tmp/rv-shared-loader-cusfosgp/runner"
+          ],
+          "returncode": 91,
+          "output": ""
+        }
+      ],
+      "source": "__attribute__((weak)) int target=42;\nint *observed=&target;\nint *get_ptr(void){return &target;}\n",
+      "runner": ".option pic\n.text\n.globl _start\n_start:\n la t0,observed\n ld s0,0(t0)\n la s1,target\n bne s0,s1,.fail\n la t0,get_ptr\n jalr ra,t0,0\n bne a0,s0,.fail\n li a0,0\n j .exit\n.fail:\n li a0,91\n.exit:\n li a7,93\n ecall\n.data\n.globl target\ntarget: .word 99\n",
+      "file_sha256": {
+        "shared.o": "04f489314e0321041aa08faa03cb1bac3dcd73d63fa68d32a0e2872f8c82ce72",
+        "shared.so": "2d505a40c1d0b6a795cc5e0021a30ae155443004390517551c01ed9dc256e4b6",
+        "runner.o": "c36cd8ad5652c9b427522ae900913203d7940ba29b29d220d7efa5a12a87c996",
+        "runner": "347b20cb0e6da749906333c6d8edd5d10ab1da1e0878868bf1bf181b907afcb8"
+      },
+      "error": "command failed (91): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-cusfosgp/runner']: "
+    },
+    {
+      "case": "import",
+      "passed": false,
+      "commands": [
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-O2",
+            "-fPIC",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/shared.c",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/reference-source/target/fastbuild/lccc-riscv",
+            "-shared",
+            "-nostdlib",
+            "/tmp/rv-shared-loader-cusfosgp/shared.o",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.so"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/runner.s",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/runner.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/ld.lld",
+            "-m",
+            "elf64lriscv",
+            "-pie",
+            "-E",
+            "--dynamic-linker",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/tmp/rv-shared-loader-cusfosgp/runner.o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.so",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "qemu-riscv64",
+            "-L",
+            "/usr/riscv64-linux-gnu",
+            "/tmp/rv-shared-loader-cusfosgp/runner"
+          ],
+          "returncode": 127,
+          "output": "/tmp/rv-shared-loader-cusfosgp/runner: error while loading shared libraries: /tmp/rv-shared-loader-cusfosgp/shared.so: unexpected reloc type 0x06\n"
+        }
+      ],
+      "source": "extern int target;\nint *observed=&target;\nint *get_ptr(void){return &target;}\n",
+      "runner": ".option pic\n.text\n.globl _start\n_start:\n la t0,observed\n ld s0,0(t0)\n la s1,target\n bne s0,s1,.fail\n la t0,get_ptr\n jalr ra,t0,0\n bne a0,s0,.fail\n li a0,0\n j .exit\n.fail:\n li a0,91\n.exit:\n li a7,93\n ecall\n.data\n.globl target\ntarget: .word 99\n",
+      "file_sha256": {
+        "shared.o": "a9b5e0469579830a1a2ab14e4c49aa8c589cc6a064da99b6fe4421df51fa96e9",
+        "shared.so": "907071e250fb072f692170f2c8276d13091689e743361fd8587d0dc0e0c52402",
+        "runner.o": "c36cd8ad5652c9b427522ae900913203d7940ba29b29d220d7efa5a12a87c996",
+        "runner": "347b20cb0e6da749906333c6d8edd5d10ab1da1e0878868bf1bf181b907afcb8"
+      },
+      "error": "command failed (127): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-cusfosgp/runner']: /tmp/rv-shared-loader-cusfosgp/runner: error while loading shared libraries: /tmp/rv-shared-loader-cusfosgp/shared.so: unexpected reloc type 0x06\n"
+    },
+    {
+      "case": "weak-import",
+      "passed": false,
+      "commands": [
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-O2",
+            "-fPIC",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/shared.c",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/reference-source/target/fastbuild/lccc-riscv",
+            "-shared",
+            "-nostdlib",
+            "/tmp/rv-shared-loader-cusfosgp/shared.o",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.so"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/runner.s",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/runner.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/ld.lld",
+            "-m",
+            "elf64lriscv",
+            "-pie",
+            "-E",
+            "--dynamic-linker",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/tmp/rv-shared-loader-cusfosgp/runner.o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.so",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "qemu-riscv64",
+            "-L",
+            "/usr/riscv64-linux-gnu",
+            "/tmp/rv-shared-loader-cusfosgp/runner"
+          ],
+          "returncode": 127,
+          "output": "/tmp/rv-shared-loader-cusfosgp/runner: error while loading shared libraries: /tmp/rv-shared-loader-cusfosgp/shared.so: unexpected reloc type 0x06\n"
+        }
+      ],
+      "source": "extern __attribute__((weak)) int target;\nint *observed=&target;\nint *get_ptr(void){return &target;}\n",
+      "runner": ".option pic\n.text\n.globl _start\n_start:\n la t0,observed\n ld s0,0(t0)\n la s1,target\n bne s0,s1,.fail\n la t0,get_ptr\n jalr ra,t0,0\n bne a0,s0,.fail\n li a0,0\n j .exit\n.fail:\n li a0,91\n.exit:\n li a7,93\n ecall\n.data\n.globl target\ntarget: .word 99\n",
+      "file_sha256": {
+        "shared.o": "dc015988f1bd4792f29a1b521396a7db567dde01c7f2aae02e6ab188be748839",
+        "shared.so": "2ecfe81df6fa92c7c486606f2e2bc7e760be62ae9a8a8524a3ae1e511fb773bc",
+        "runner.o": "c36cd8ad5652c9b427522ae900913203d7940ba29b29d220d7efa5a12a87c996",
+        "runner": "347b20cb0e6da749906333c6d8edd5d10ab1da1e0878868bf1bf181b907afcb8"
+      },
+      "error": "command failed (127): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-cusfosgp/runner']: /tmp/rv-shared-loader-cusfosgp/runner: error while loading shared libraries: /tmp/rv-shared-loader-cusfosgp/shared.so: unexpected reloc type 0x06\n"
+    },
+    {
+      "case": "weak-missing",
+      "passed": false,
+      "commands": [
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-O2",
+            "-fPIC",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/shared.c",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/reference-source/target/fastbuild/lccc-riscv",
+            "-shared",
+            "-nostdlib",
+            "/tmp/rv-shared-loader-cusfosgp/shared.o",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.so"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/runner.s",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/runner.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/ld.lld",
+            "-m",
+            "elf64lriscv",
+            "-pie",
+            "-E",
+            "--dynamic-linker",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/tmp/rv-shared-loader-cusfosgp/runner.o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.so",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "qemu-riscv64",
+            "-L",
+            "/usr/riscv64-linux-gnu",
+            "/tmp/rv-shared-loader-cusfosgp/runner"
+          ],
+          "returncode": 127,
+          "output": "/tmp/rv-shared-loader-cusfosgp/runner: error while loading shared libraries: /tmp/rv-shared-loader-cusfosgp/shared.so: unexpected reloc type 0x06\n"
+        }
+      ],
+      "source": "extern __attribute__((weak)) int target;\nint *observed=&target;\nint *get_ptr(void){return &target;}\n",
+      "runner": ".option pic\n.text\n.globl _start\n_start:\n la t0,observed\n ld s0,0(t0)\n li t1,0\n bne s0,t1,.fail\n la t0,get_ptr\n jalr ra,t0,0\n bne a0,s0,.fail\n li a0,0\n j .exit\n.fail:\n li a0,91\n.exit:\n li a7,93\n ecall\n",
+      "file_sha256": {
+        "shared.o": "dc015988f1bd4792f29a1b521396a7db567dde01c7f2aae02e6ab188be748839",
+        "shared.so": "2ecfe81df6fa92c7c486606f2e2bc7e760be62ae9a8a8524a3ae1e511fb773bc",
+        "runner.o": "0f6defce806bb79d16afa944106671b4047f95e2eb27734c58103cbafea494c3",
+        "runner": "676e5be3c21d39493d1e708592befe7cfe52b8d355bb959b5ca5ff336cecf084"
+      },
+      "error": "command failed (127): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-cusfosgp/runner']: /tmp/rv-shared-loader-cusfosgp/runner: error while loading shared libraries: /tmp/rv-shared-loader-cusfosgp/shared.so: unexpected reloc type 0x06\n"
+    },
+    {
+      "case": "hidden",
+      "passed": true,
+      "commands": [
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-O2",
+            "-fPIC",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/shared.c",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/reference-source/target/fastbuild/lccc-riscv",
+            "-shared",
+            "-nostdlib",
+            "/tmp/rv-shared-loader-cusfosgp/shared.o",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.so"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/runner.s",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/runner.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/ld.lld",
+            "-m",
+            "elf64lriscv",
+            "-pie",
+            "-E",
+            "--dynamic-linker",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/tmp/rv-shared-loader-cusfosgp/runner.o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.so",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "qemu-riscv64",
+            "-L",
+            "/usr/riscv64-linux-gnu",
+            "/tmp/rv-shared-loader-cusfosgp/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        }
+      ],
+      "source": "__attribute__((visibility(\"hidden\"))) int target=42;\nint *observed=&target;\nint *get_ptr(void){return &target;}\n",
+      "runner": ".option pic\n.text\n.globl _start\n_start:\n la t0,observed\n ld s0,0(t0)\n lw t1,0(s0)\n li t2,42\n bne t1,t2,.fail\n la t0,get_ptr\n jalr ra,t0,0\n bne a0,s0,.fail\n li a0,0\n j .exit\n.fail:\n li a0,91\n.exit:\n li a7,93\n ecall\n.data\n.globl target\ntarget: .word 99\n",
+      "file_sha256": {
+        "shared.o": "23692823686e59a3d63aef91430999260b47c75ec0c34b1a543722dfd34fe5c7",
+        "shared.so": "59c8966d944b0e9e84bc229c95eefe9069e83758966a87dc6bfd32b00b6dfe77",
+        "runner.o": "284634892045d69e3895bf7780ad7796d18c12b6032ba18df9c808f76d1b2eb1",
+        "runner": "9dfca112499a5a46ee9add10b1564dc3bdfc0c815b4a445747d3dcf7a1ac568e"
+      }
+    },
+    {
+      "case": "protected",
+      "passed": true,
+      "commands": [
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-O2",
+            "-fPIC",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/shared.c",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/reference-source/target/fastbuild/lccc-riscv",
+            "-shared",
+            "-nostdlib",
+            "/tmp/rv-shared-loader-cusfosgp/shared.o",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.so"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/runner.s",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/runner.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/ld.lld",
+            "-m",
+            "elf64lriscv",
+            "-pie",
+            "-E",
+            "--dynamic-linker",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/tmp/rv-shared-loader-cusfosgp/runner.o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.so",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "qemu-riscv64",
+            "-L",
+            "/usr/riscv64-linux-gnu",
+            "/tmp/rv-shared-loader-cusfosgp/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        }
+      ],
+      "source": "__attribute__((visibility(\"protected\"))) int target=42;\nint *observed=&target;\nint *get_ptr(void){return &target;}\n",
+      "runner": ".option pic\n.text\n.globl _start\n_start:\n la t0,observed\n ld s0,0(t0)\n lw t1,0(s0)\n li t2,42\n bne t1,t2,.fail\n la t0,get_ptr\n jalr ra,t0,0\n bne a0,s0,.fail\n li a0,0\n j .exit\n.fail:\n li a0,91\n.exit:\n li a7,93\n ecall\n.data\n.globl target\ntarget: .word 99\n",
+      "file_sha256": {
+        "shared.o": "d6c381f3535e5a84f7f88b016074cc77c44647dfdb7288c85a200f4ca6b81844",
+        "shared.so": "59c8966d944b0e9e84bc229c95eefe9069e83758966a87dc6bfd32b00b6dfe77",
+        "runner.o": "284634892045d69e3895bf7780ad7796d18c12b6032ba18df9c808f76d1b2eb1",
+        "runner": "9dfca112499a5a46ee9add10b1564dc3bdfc0c815b4a445747d3dcf7a1ac568e"
+      }
+    },
+    {
+      "case": "local",
+      "passed": true,
+      "commands": [
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-O2",
+            "-fPIC",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/shared.c",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/reference-source/target/fastbuild/lccc-riscv",
+            "-shared",
+            "-nostdlib",
+            "/tmp/rv-shared-loader-cusfosgp/shared.o",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.so"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/runner.s",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/runner.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/ld.lld",
+            "-m",
+            "elf64lriscv",
+            "-pie",
+            "-E",
+            "--dynamic-linker",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/tmp/rv-shared-loader-cusfosgp/runner.o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.so",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "qemu-riscv64",
+            "-L",
+            "/usr/riscv64-linux-gnu",
+            "/tmp/rv-shared-loader-cusfosgp/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        }
+      ],
+      "source": "static int target=42;\nint *observed=&target;\nint *get_ptr(void){return &target;}\n",
+      "runner": ".option pic\n.text\n.globl _start\n_start:\n la t0,observed\n ld s0,0(t0)\n lw t1,0(s0)\n li t2,42\n bne t1,t2,.fail\n la t0,get_ptr\n jalr ra,t0,0\n bne a0,s0,.fail\n li a0,0\n j .exit\n.fail:\n li a0,91\n.exit:\n li a7,93\n ecall\n.data\n.globl target\ntarget: .word 99\n",
+      "file_sha256": {
+        "shared.o": "d134cebdcc4808ad3d9f060477ea197a1a28e5a77a57257af5e23949f5264632",
+        "shared.so": "6d7c15f95a90145798b84f7124d4023ca69a9c5130ad2c61622de24a478d7b32",
+        "runner.o": "284634892045d69e3895bf7780ad7796d18c12b6032ba18df9c808f76d1b2eb1",
+        "runner": "9dfca112499a5a46ee9add10b1564dc3bdfc0c815b4a445747d3dcf7a1ac568e"
+      }
+    },
+    {
+      "case": "weak-hidden-missing",
+      "passed": false,
+      "commands": [
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-O2",
+            "-fPIC",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/shared.c",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/reference-source/target/fastbuild/lccc-riscv",
+            "-shared",
+            "-nostdlib",
+            "/tmp/rv-shared-loader-cusfosgp/shared.o",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.so"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/runner.s",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/runner.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/ld.lld",
+            "-m",
+            "elf64lriscv",
+            "-pie",
+            "-E",
+            "--dynamic-linker",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/tmp/rv-shared-loader-cusfosgp/runner.o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.so",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "qemu-riscv64",
+            "-L",
+            "/usr/riscv64-linux-gnu",
+            "/tmp/rv-shared-loader-cusfosgp/runner"
+          ],
+          "returncode": 127,
+          "output": "/tmp/rv-shared-loader-cusfosgp/runner: error while loading shared libraries: /tmp/rv-shared-loader-cusfosgp/shared.so: unexpected reloc type 0x06\n"
+        }
+      ],
+      "source": "extern __attribute__((weak,visibility(\"hidden\"))) int target;\nint *observed=&target;\nint *get_ptr(void){return &target;}\n",
+      "runner": ".option pic\n.text\n.globl _start\n_start:\n la t0,observed\n ld s0,0(t0)\n li t1,0\n bne s0,t1,.fail\n la t0,get_ptr\n jalr ra,t0,0\n bne a0,s0,.fail\n li a0,0\n j .exit\n.fail:\n li a0,91\n.exit:\n li a7,93\n ecall\n.data\n.globl target\ntarget: .word 99\n",
+      "file_sha256": {
+        "shared.o": "9d5fceea9169d54e4abda910369e1b70326a11c670b0215b965c0715684bec47",
+        "shared.so": "2ecfe81df6fa92c7c486606f2e2bc7e760be62ae9a8a8524a3ae1e511fb773bc",
+        "runner.o": "fc2fc249004d74ab466f99b40569aba5ff510213801e4c016f3fd9e027637131",
+        "runner": "d959a89c414a1fb47ca7cad4f69954f38cf2eb0dc829c629897a716bc9ab53f7"
+      },
+      "error": "command failed (127): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-cusfosgp/runner']: /tmp/rv-shared-loader-cusfosgp/runner: error while loading shared libraries: /tmp/rv-shared-loader-cusfosgp/shared.so: unexpected reloc type 0x06\n"
+    },
+    {
+      "case": "weak-protected-missing",
+      "passed": false,
+      "commands": [
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-O2",
+            "-fPIC",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/shared.c",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/reference-source/target/fastbuild/lccc-riscv",
+            "-shared",
+            "-nostdlib",
+            "/tmp/rv-shared-loader-cusfosgp/shared.o",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.so"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/runner.s",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/runner.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/ld.lld",
+            "-m",
+            "elf64lriscv",
+            "-pie",
+            "-E",
+            "--dynamic-linker",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/tmp/rv-shared-loader-cusfosgp/runner.o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.so",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "qemu-riscv64",
+            "-L",
+            "/usr/riscv64-linux-gnu",
+            "/tmp/rv-shared-loader-cusfosgp/runner"
+          ],
+          "returncode": 127,
+          "output": "/tmp/rv-shared-loader-cusfosgp/runner: error while loading shared libraries: /tmp/rv-shared-loader-cusfosgp/shared.so: unexpected reloc type 0x06\n"
+        }
+      ],
+      "source": "extern __attribute__((weak,visibility(\"protected\"))) int target;\nint *observed=&target;\nint *get_ptr(void){return &target;}\n",
+      "runner": ".option pic\n.text\n.globl _start\n_start:\n la t0,observed\n ld s0,0(t0)\n li t1,0\n bne s0,t1,.fail\n la t0,get_ptr\n jalr ra,t0,0\n bne a0,s0,.fail\n li a0,0\n j .exit\n.fail:\n li a0,91\n.exit:\n li a7,93\n ecall\n.data\n.globl target\ntarget: .word 99\n",
+      "file_sha256": {
+        "shared.o": "10270172bc28ba4bd5628168d823b6ab744895dad3c7573d2a5cf31006754a70",
+        "shared.so": "2ecfe81df6fa92c7c486606f2e2bc7e760be62ae9a8a8524a3ae1e511fb773bc",
+        "runner.o": "fc2fc249004d74ab466f99b40569aba5ff510213801e4c016f3fd9e027637131",
+        "runner": "d959a89c414a1fb47ca7cad4f69954f38cf2eb0dc829c629897a716bc9ab53f7"
+      },
+      "error": "command failed (127): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-cusfosgp/runner']: /tmp/rv-shared-loader-cusfosgp/runner: error while loading shared libraries: /tmp/rv-shared-loader-cusfosgp/shared.so: unexpected reloc type 0x06\n"
+    },
+    {
+      "case": "absolute-default",
+      "passed": false,
+      "commands": [
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-O2",
+            "-fPIC",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/shared.c",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/absolute.s",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/absolute.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/reference-source/target/fastbuild/lccc-riscv",
+            "-shared",
+            "-nostdlib",
+            "/tmp/rv-shared-loader-cusfosgp/shared.o",
+            "/tmp/rv-shared-loader-cusfosgp/absolute.o",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.so"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/runner.s",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/runner.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/ld.lld",
+            "-m",
+            "elf64lriscv",
+            "-pie",
+            "-E",
+            "--dynamic-linker",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/tmp/rv-shared-loader-cusfosgp/runner.o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.so",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "qemu-riscv64",
+            "-L",
+            "/usr/riscv64-linux-gnu",
+            "/tmp/rv-shared-loader-cusfosgp/runner"
+          ],
+          "returncode": 91,
+          "output": ""
+        }
+      ],
+      "source": "extern int target;\nint *observed=&target;\nint *get_ptr(void){return &target;}\n",
+      "runner": ".option pic\n.text\n.globl _start\n_start:\n la t0,observed\n ld s0,0(t0)\n la s1,target\n bne s0,s1,.fail\n la t0,get_ptr\n jalr ra,t0,0\n bne a0,s0,.fail\n li a0,0\n j .exit\n.fail:\n li a0,91\n.exit:\n li a7,93\n ecall\n.data\n.globl target\ntarget: .word 99\n",
+      "definition": ".globl target\n.set target,256\n",
+      "file_sha256": {
+        "shared.o": "a9b5e0469579830a1a2ab14e4c49aa8c589cc6a064da99b6fe4421df51fa96e9",
+        "shared.so": "c2b4afdedc584a17310189bdcad808220ccb500732d04f68fc59542dce09a2d0",
+        "runner.o": "c36cd8ad5652c9b427522ae900913203d7940ba29b29d220d7efa5a12a87c996",
+        "runner": "347b20cb0e6da749906333c6d8edd5d10ab1da1e0878868bf1bf181b907afcb8"
+      },
+      "error": "command failed (91): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-cusfosgp/runner']: "
+    },
+    {
+      "case": "absolute-weak",
+      "passed": false,
+      "commands": [
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-O2",
+            "-fPIC",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/shared.c",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/absolute.s",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/absolute.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/reference-source/target/fastbuild/lccc-riscv",
+            "-shared",
+            "-nostdlib",
+            "/tmp/rv-shared-loader-cusfosgp/shared.o",
+            "/tmp/rv-shared-loader-cusfosgp/absolute.o",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.so"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/runner.s",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/runner.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/ld.lld",
+            "-m",
+            "elf64lriscv",
+            "-pie",
+            "-E",
+            "--dynamic-linker",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/tmp/rv-shared-loader-cusfosgp/runner.o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.so",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "qemu-riscv64",
+            "-L",
+            "/usr/riscv64-linux-gnu",
+            "/tmp/rv-shared-loader-cusfosgp/runner"
+          ],
+          "returncode": 91,
+          "output": ""
+        }
+      ],
+      "source": "extern int target;\nint *observed=&target;\nint *get_ptr(void){return &target;}\n",
+      "runner": ".option pic\n.text\n.globl _start\n_start:\n la t0,observed\n ld s0,0(t0)\n la s1,target\n bne s0,s1,.fail\n la t0,get_ptr\n jalr ra,t0,0\n bne a0,s0,.fail\n li a0,0\n j .exit\n.fail:\n li a0,91\n.exit:\n li a7,93\n ecall\n.data\n.globl target\ntarget: .word 99\n",
+      "definition": ".weak target\n.set target,256\n",
+      "file_sha256": {
+        "shared.o": "a9b5e0469579830a1a2ab14e4c49aa8c589cc6a064da99b6fe4421df51fa96e9",
+        "shared.so": "e2f87319e338590c2d8729ef4650fc1eec32b54d5f529422bc710991ecc743e2",
+        "runner.o": "c36cd8ad5652c9b427522ae900913203d7940ba29b29d220d7efa5a12a87c996",
+        "runner": "347b20cb0e6da749906333c6d8edd5d10ab1da1e0878868bf1bf181b907afcb8"
+      },
+      "error": "command failed (91): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-cusfosgp/runner']: "
+    },
+    {
+      "case": "absolute-protected",
+      "passed": false,
+      "commands": [
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-O2",
+            "-fPIC",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/shared.c",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/absolute.s",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/absolute.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/reference-source/target/fastbuild/lccc-riscv",
+            "-shared",
+            "-nostdlib",
+            "/tmp/rv-shared-loader-cusfosgp/shared.o",
+            "/tmp/rv-shared-loader-cusfosgp/absolute.o",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.so"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-cusfosgp/runner.s",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/runner.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "/home/user/.cache/oracles/clang-23.1.0/bin/ld.lld",
+            "-m",
+            "elf64lriscv",
+            "-pie",
+            "-E",
+            "--dynamic-linker",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/tmp/rv-shared-loader-cusfosgp/runner.o",
+            "/tmp/rv-shared-loader-cusfosgp/shared.so",
+            "-o",
+            "/tmp/rv-shared-loader-cusfosgp/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "qemu-riscv64",
+            "-L",
+            "/usr/riscv64-linux-gnu",
+            "/tmp/rv-shared-loader-cusfosgp/runner"
+          ],
+          "returncode": 91,
+          "output": ""
+        }
+      ],
+      "source": "extern int target;\nint *observed=&target;\nint *get_ptr(void){return &target;}\n",
+      "runner": ".option pic\n.text\n.globl _start\n_start:\n la t0,observed\n ld s0,0(t0)\n li t1,256\n bne s0,t1,.fail\n la t0,get_ptr\n jalr ra,t0,0\n bne a0,s0,.fail\n li a0,0\n j .exit\n.fail:\n li a0,91\n.exit:\n li a7,93\n ecall\n.data\n.globl target\ntarget: .word 99\n",
+      "definition": ".globl target\n.protected target\n.set target,256\n",
+      "file_sha256": {
+        "shared.o": "a9b5e0469579830a1a2ab14e4c49aa8c589cc6a064da99b6fe4421df51fa96e9",
+        "shared.so": "c2b4afdedc584a17310189bdcad808220ccb500732d04f68fc59542dce09a2d0",
+        "runner.o": "b7adfc3fa185304a6e6e104d1c20c0980d9f9057573746c48d7b33a96508c529",
+        "runner": "8b9c59043197d01bc2783c602a0cfbe8de6e13fc3b8386d60796cf91fc3a1866"
+      },
+      "error": "command failed (91): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-cusfosgp/runner']: "
+    }
+  ],
+  "loader": {
+    "path": "/usr/riscv64-linux-gnu/lib/ld-linux-riscv64-lp64d.so.1",
+    "sha256": "7e97103205227da46cf46b338dba685e4ecc9b6b652a48bb3dd927c3ec8d666f"
+  },
+  "passed": 3,
+  "failed": 10,
+  "skipped": 0
+}

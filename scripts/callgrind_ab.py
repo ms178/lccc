@@ -92,6 +92,36 @@ def parse_summary(path):
     return validate_events(dict(zip(events,totals)))
 
 
+def parse_region_totals(path):
+    """Read exclusive file totals for a client-controlled instrumentation region.
+
+    Callgrind 3.27.1 resets global counters on STOP_INSTRUMENTATION, so its
+    termination `summary` may be zero or unsigned-underflowed after ZERO_STATS.
+    The cost records and their final `totals` remain intact. This is a separate
+    parser, not a relaxation of the whole-process summary evidence contract.
+    Callgrind cost lists may elide trailing zero events; never missing headers,
+    duplicate fields, extra values, negative counts, or an empty/zero-Ir region.
+    """
+    path = Path(path)
+    if not path.is_file() or path.stat().st_size > 64 * 1024 * 1024:
+        raise ValueError('missing/oversized Callgrind region file')
+    events = totals = None
+    with path.open(encoding='utf-8', errors='strict') as stream:
+        for line in stream:
+            if line.startswith('events:'):
+                if events is not None:
+                    raise ValueError('duplicate Callgrind region events')
+                events = line.split()[1:]
+            elif line.startswith('totals:'):
+                if totals is not None:
+                    raise ValueError('duplicate Callgrind region totals')
+                totals = [int(v) for v in line.split()[1:]]
+    if (not events or not totals or len(totals) > len(events)
+            or len(set(events)) != len(events)):
+        raise ValueError('malformed Callgrind region events/totals')
+    return validate_events(dict(zip(events, totals + [0] * (len(events) - len(totals)))))
+
+
 def clear_process_record(prefix):
     paths = {suffix: Path(str(prefix) + '.' + suffix) for suffix in ('stdout', 'stderr', 'json')}
     for path in paths.values():

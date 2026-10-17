@@ -1,0 +1,476 @@
+{
+  "complete": true,
+  "metric": "bounded whole-program simulated Ir; not runtime",
+  "selected": [
+    "binary_trees",
+    "byte_load_reassembly",
+    "expat_siphash24",
+    "expat_xml_scan",
+    "linux_find_bit",
+    "linux_find_bit_scaled",
+    "lz4_match_extend",
+    "mandelbrot",
+    "sha256_transform",
+    "sieve",
+    "spectral_norm",
+    "sqlite_varint",
+    "strlen_bench",
+    "switch_dispatch",
+    "zlib_ng_adler32_combine"
+  ],
+  "results": {
+    "sieve": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=100000",
+      "metrics": {
+        "conditional_mispredicts": [
+          3527,
+          3527
+        ],
+        "d1_misses": [
+          51853,
+          51853
+        ],
+        "i1_misses": [
+          1360,
+          1360
+        ],
+        "indirect_mispredicts": [
+          242,
+          242
+        ],
+        "ir_mine": 1622402,
+        "ir_ratio": 1.0,
+        "ir_ref": 1622402,
+        "ll_misses": [
+          4466,
+          4466
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/pr-main/sieve/manifest.json"
+    },
+    "binary_trees": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DTREE_DEPTH=10",
+      "metrics": {
+        "conditional_mispredicts": [
+          207629,
+          207629
+        ],
+        "d1_misses": [
+          54331,
+          54331
+        ],
+        "i1_misses": [
+          1379,
+          1379
+        ],
+        "indirect_mispredicts": [
+          238,
+          238
+        ],
+        "ir_mine": 31600242,
+        "ir_ratio": 1.0,
+        "ir_ref": 31600242,
+        "ll_misses": [
+          4971,
+          4971
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/pr-main/binary_trees/manifest.json"
+    },
+    "spectral_norm": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=128",
+      "metrics": {
+        "conditional_mispredicts": [
+          8567,
+          8567
+        ],
+        "d1_misses": [
+          1934,
+          1935
+        ],
+        "i1_misses": [
+          1425,
+          1427
+        ],
+        "indirect_mispredicts": [
+          233,
+          233
+        ],
+        "ir_mine": 8258674,
+        "ir_ratio": 0.9521798677548778,
+        "ir_ref": 8673439,
+        "ll_misses": [
+          2972,
+          2975
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/pr-main/spectral_norm/manifest.json"
+    },
+    "mandelbrot": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DWIDTH=128 -DHEIGHT=128",
+      "metrics": {
+        "conditional_mispredicts": [
+          15479,
+          15479
+        ],
+        "d1_misses": [
+          1885,
+          1885
+        ],
+        "i1_misses": [
+          1354,
+          1354
+        ],
+        "indirect_mispredicts": [
+          232,
+          232
+        ],
+        "ir_mine": 6005594,
+        "ir_ratio": 1.0,
+        "ir_ref": 6005594,
+        "ll_misses": [
+          2897,
+          2897
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/pr-main/mandelbrot/manifest.json"
+    },
+    "strlen_bench": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DNSTRINGS=1000",
+      "metrics": {
+        "conditional_mispredicts": [
+          132011,
+          132015
+        ],
+        "d1_misses": [
+          221243,
+          221243
+        ],
+        "i1_misses": [
+          1386,
+          1386
+        ],
+        "indirect_mispredicts": [
+          251,
+          251
+        ],
+        "ir_mine": 9285449,
+        "ir_ratio": 0.9999998923046272,
+        "ir_ref": 9285450,
+        "ll_misses": [
+          5365,
+          5365
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/pr-main/strlen_bench/manifest.json"
+    },
+    "switch_dispatch": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=20000",
+      "metrics": {
+        "conditional_mispredicts": [
+          3289,
+          3289
+        ],
+        "d1_misses": [
+          1879,
+          1879
+        ],
+        "i1_misses": [
+          1360,
+          1360
+        ],
+        "indirect_mispredicts": [
+          18994,
+          18994
+        ],
+        "ir_mine": 553072,
+        "ir_ratio": 1.0,
+        "ir_ref": 553072,
+        "ll_misses": [
+          2903,
+          2903
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/pr-main/switch_dispatch/manifest.json"
+    },
+    "byte_load_reassembly": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+      "metrics": {
+        "conditional_mispredicts": [
+          23353,
+          23353
+        ],
+        "d1_misses": [
+          1959,
+          1959
+        ],
+        "i1_misses": [
+          1379,
+          1379
+        ],
+        "indirect_mispredicts": [
+          237,
+          237
+        ],
+        "ir_mine": 82410635,
+        "ir_ratio": 1.0,
+        "ir_ref": 82410635,
+        "ll_misses": [
+          2988,
+          2988
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/pr-main/byte_load_reassembly/manifest.json"
+    },
+    "zlib_ng_adler32_combine": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=10000",
+      "metrics": {
+        "conditional_mispredicts": [
+          5516,
+          5509
+        ],
+        "d1_misses": [
+          1911,
+          1912
+        ],
+        "i1_misses": [
+          1381,
+          1381
+        ],
+        "indirect_mispredicts": [
+          234,
+          234
+        ],
+        "ir_mine": 21844572,
+        "ir_ratio": 0.9523568536442761,
+        "ir_ref": 22937381,
+        "ll_misses": [
+          2944,
+          2946
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/pr-main/zlib_ng_adler32_combine/manifest.json"
+    },
+    "expat_xml_scan": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DXML_SIZE=16384 -DPASSES=4",
+      "metrics": {
+        "conditional_mispredicts": [
+          25495,
+          25495
+        ],
+        "d1_misses": [
+          2187,
+          2187
+        ],
+        "i1_misses": [
+          1368,
+          1368
+        ],
+        "indirect_mispredicts": [
+          232,
+          232
+        ],
+        "ir_mine": 1666776,
+        "ir_ratio": 1.0,
+        "ir_ref": 1666776,
+        "ll_misses": [
+          3167,
+          3167
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/pr-main/expat_xml_scan/manifest.json"
+    },
+    "expat_siphash24": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=1000",
+      "metrics": {
+        "conditional_mispredicts": [
+          116267,
+          116262
+        ],
+        "d1_misses": [
+          1898,
+          1898
+        ],
+        "i1_misses": [
+          1421,
+          1421
+        ],
+        "indirect_mispredicts": [
+          1429,
+          1429
+        ],
+        "ir_mine": 15209062,
+        "ir_ratio": 0.9999426690477421,
+        "ir_ref": 15209934,
+        "ll_misses": [
+          2972,
+          2972
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/pr-main/expat_siphash24/manifest.json"
+    },
+    "sqlite_varint": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DVALUE_COUNT=2048 -DPASSES=4",
+      "metrics": {
+        "conditional_mispredicts": [
+          12576,
+          12567
+        ],
+        "d1_misses": [
+          2234,
+          2234
+        ],
+        "i1_misses": [
+          1379,
+          1379
+        ],
+        "indirect_mispredicts": [
+          2054,
+          2054
+        ],
+        "ir_mine": 822698,
+        "ir_ratio": 0.9874323216538301,
+        "ir_ref": 833169,
+        "ll_misses": [
+          3211,
+          3211
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/pr-main/sqlite_varint/manifest.json"
+    },
+    "linux_find_bit": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=32",
+      "metrics": {
+        "conditional_mispredicts": [
+          11857,
+          11856
+        ],
+        "d1_misses": [
+          137235,
+          137235
+        ],
+        "i1_misses": [
+          1362,
+          1362
+        ],
+        "indirect_mispredicts": [
+          232,
+          232
+        ],
+        "ir_mine": 5958073,
+        "ir_ratio": 1.0000429687585235,
+        "ir_ref": 5957817,
+        "ll_misses": [
+          7003,
+          7003
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/pr-main/linux_find_bit/manifest.json"
+    },
+    "linux_find_bit_scaled": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=128",
+      "metrics": {
+        "conditional_mispredicts": [
+          36565,
+          36565
+        ],
+        "d1_misses": [
+          530617,
+          530617
+        ],
+        "i1_misses": [
+          1365,
+          1365
+        ],
+        "indirect_mispredicts": [
+          232,
+          232
+        ],
+        "ir_mine": 22941930,
+        "ir_ratio": 1.0000111587323575,
+        "ir_ref": 22941674,
+        "ll_misses": [
+          7005,
+          7005
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/pr-main/linux_find_bit_scaled/manifest.json"
+    },
+    "sha256_transform": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DBLOCK_COUNT=256 -DPASSES=2",
+      "metrics": {
+        "conditional_mispredicts": [
+          4877,
+          4374
+        ],
+        "d1_misses": [
+          1897,
+          1901
+        ],
+        "i1_misses": [
+          1386,
+          1387
+        ],
+        "indirect_mispredicts": [
+          236,
+          235
+        ],
+        "ir_mine": 1822197,
+        "ir_ratio": 0.9932886674309038,
+        "ir_ref": 1834509,
+        "ll_misses": [
+          2934,
+          2937
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/pr-main/sha256_transform/manifest.json"
+    },
+    "lz4_match_extend": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSRC_SIZE=16384 -DPASSES=2 -DMATCH_RICH=1",
+      "metrics": {
+        "conditional_mispredicts": [
+          8266,
+          8261
+        ],
+        "d1_misses": [
+          14191,
+          14191
+        ],
+        "i1_misses": [
+          1411,
+          1411
+        ],
+        "indirect_mispredicts": [
+          244,
+          244
+        ],
+        "ir_mine": 1153882,
+        "ir_ratio": 0.9882257221893922,
+        "ir_ref": 1167630,
+        "ll_misses": [
+          4415,
+          4415
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/pr-main/lz4_match_extend/manifest.json"
+    }
+  },
+  "failures": [],
+  "worst_first": [
+    "linux_find_bit",
+    "linux_find_bit_scaled",
+    "sieve",
+    "binary_trees",
+    "mandelbrot",
+    "switch_dispatch",
+    "byte_load_reassembly",
+    "expat_xml_scan",
+    "strlen_bench",
+    "expat_siphash24",
+    "sha256_transform",
+    "lz4_match_extend",
+    "sqlite_varint",
+    "zlib_ng_adler32_combine",
+    "spectral_norm"
+  ]
+}

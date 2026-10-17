@@ -1,0 +1,1804 @@
+{
+  "note": "Content identity inventory, NOT semantic review proof. Local diffs override API change statistics.",
+  "donor": "446d4e8eb1335475df626af4265d9f42da007fa1",
+  "main": "f07f4c514460e4116a574773cd84b69d185bf65e",
+  "counts": {
+    "synthesis-differs": 32,
+    "upstream-main": 181,
+    "exact-donor": 43
+  },
+  "files": [
+    {
+      "path": ".github/workflows/ci.yml",
+      "state": "synthesis-differs",
+      "donor_blob": "1e50953cdcdc0653cff0fd6a2f1280a5b13e615e",
+      "main_blob": "3178788d4caa3871239a58a43e5bfc7623322825",
+      "work_blob": "b7a92e44f274cf0e1625fe4a56ebb29f328af541"
+    },
+    {
+      "path": ".github/workflows/compiler-research.yml",
+      "state": "upstream-main",
+      "donor_blob": "e26bb2de148ab4f8613ff18ad32dca1a323959e6",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": ".github/workflows/oracle-delta.yml",
+      "state": "upstream-main",
+      "donor_blob": "e77250b6eb2aab4fa2db521f530ce4d1ca787de2",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/PR821-822-REDTEAM.md",
+      "state": "upstream-main",
+      "donor_blob": "3dd207b10a9c138058e623a46db0530a347a5b65",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/PR824-REDTEAM-2026-10-14.md",
+      "state": "upstream-main",
+      "donor_blob": "9091d6c28f534c0bcf91ce2e7b5804438ac004a5",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/PR829-830-COMPARATIVE-AUDIT.md",
+      "state": "upstream-main",
+      "donor_blob": "9b6faab11764030f8352e4c13098f0305351b096",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/PR829-830-ORACLE-FOLLOWUP.md",
+      "state": "upstream-main",
+      "donor_blob": "944bed86dd448ac9792356f1e06d404d963cd26c",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/PR832-ADVERSARIAL-AUDIT.md",
+      "state": "upstream-main",
+      "donor_blob": "69e3b0270d4ea875e05cbff3da35220014be9100",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/README.md",
+      "state": "upstream-main",
+      "donor_blob": "aed285c7d649e7f6e540458ceec68aaea9710d97",
+      "main_blob": "50471424d348f10f0fd7372602c2584a367839e9",
+      "work_blob": "50471424d348f10f0fd7372602c2584a367839e9"
+    },
+    {
+      "path": "engineering/evidence/pr821-822-redteam/INDEX.json",
+      "state": "upstream-main",
+      "donor_blob": "495a7ded790c2754281f8510aa8bfbf980212ef0",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr821-822-redteam/address-after.txt",
+      "state": "upstream-main",
+      "donor_blob": "fa79de9d5d3997af45cf5948b747cdf256a61170",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr821-822-redteam/asm-inputs-before.s",
+      "state": "upstream-main",
+      "donor_blob": "a2fe077a04df3e72cb65cf693c7b86379190528b",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr821-822-redteam/build-homes.txt",
+      "state": "upstream-main",
+      "donor_blob": "8c1b2491d6db54087dba8707cd135d418aca65cc",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr821-822-redteam/codegen-identity.json",
+      "state": "upstream-main",
+      "donor_blob": "5cbb33625534804bd25cb3269c4115787439eeb3",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr821-822-redteam/codegen-identity.txt",
+      "state": "upstream-main",
+      "donor_blob": "94a84461d21cd5049f7381c2b5cda30ece0e5c98",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr821-822-redteam/expat-attribution-aa.txt",
+      "state": "upstream-main",
+      "donor_blob": "cdbcf079cb81505e0c178cf12078b0a5b07493eb",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr821-822-redteam/expat-attribution-bb.txt",
+      "state": "upstream-main",
+      "donor_blob": "7f14209054f32334c5cd0383a22b27c062916d8e",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr821-822-redteam/f1-before.txt",
+      "state": "upstream-main",
+      "donor_blob": "a4c6cd2bc80bf8c31f188f3c5457b17edac37f91",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr821-822-redteam/f3-before.txt",
+      "state": "upstream-main",
+      "donor_blob": "5e05edc6939bd88ffff6b33f4b08fea9797889cb",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr821-822-redteam/godbolt-audit.txt",
+      "state": "upstream-main",
+      "donor_blob": "ec6b507f7e6b0a49134206acbb4e1cf8718ce8ba",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr821-822-redteam/i386-abi-after.txt",
+      "state": "upstream-main",
+      "donor_blob": "8abf3b608e70f07fe3f5302086aff9f6fc16efc1",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr821-822-redteam/i386-dynamic-before.txt",
+      "state": "upstream-main",
+      "donor_blob": "66799ee0e80d29ae31cbe4c2a267cd4fb2032731",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr821-822-redteam/i386-relent-mutation.txt",
+      "state": "upstream-main",
+      "donor_blob": "ee9b108a7f4487f5723e531f56d3147adee8627f",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr821-822-redteam/linker-fixtures-after.txt",
+      "state": "upstream-main",
+      "donor_blob": "637615798bda8cda1bb578cf7d2bbf51c210b9f8",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr821-822-redteam/linker-fixtures-before.txt",
+      "state": "upstream-main",
+      "donor_blob": "11f20cdbd0d9d030855aee4af4c7990bda2c445f",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr821-822-redteam/measurements.tar.gz",
+      "state": "upstream-main",
+      "donor_blob": "fb7fcd94cc17298c328a47b2e84e498f0decbbe3",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr821-822-redteam/memcheck.json",
+      "state": "upstream-main",
+      "donor_blob": "b842700918ad94598e5ae0b6b86f2f979dfc07d3",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr821-822-redteam/notype-after.txt",
+      "state": "upstream-main",
+      "donor_blob": "698b209b887b7c39f95d3952b1e99d6d558e753a",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr821-822-redteam/oracle-attempt-core-avx2.txt",
+      "state": "upstream-main",
+      "donor_blob": "2925909a646ea0d5901e2c73996de00470d09d65",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr821-822-redteam/oracle-attempt-v3.txt",
+      "state": "upstream-main",
+      "donor_blob": "54eecff1fc34b33c89b21132d2e02682113fdb77",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr821-822-redteam/oracle-final.txt",
+      "state": "upstream-main",
+      "donor_blob": "cd76fda916261aca4a79bdc0e298fe171cdb1f5f",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr821-822-redteam/popcount-after.txt",
+      "state": "upstream-main",
+      "donor_blob": "aeb577f472bf85272ddf43aca9882c9d1ceab19f",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr821-822-redteam/repeated-measurements.tar.gz",
+      "state": "upstream-main",
+      "donor_blob": "b0ac04c122627a3b4a951622648e9ac506935bca",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr821-822-redteam/workloads.tar.gz",
+      "state": "upstream-main",
+      "donor_blob": "da443962d0b6a906e72f4da3d13e9f5b1eb63545",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/EXTERNAL-RAW.json",
+      "state": "upstream-main",
+      "donor_blob": "84de672e968cefb8b98c76f8b05bbb956e8a954b",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/EXTERNAL-RAW.md",
+      "state": "upstream-main",
+      "donor_blob": "bab6f8ffb4863ae45ce3bc2b519e4ce6d46cd5c5",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/byte-inline-after.txt",
+      "state": "upstream-main",
+      "donor_blob": "95180377b5baf21856be473c1cbc4d065bb730e6",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/byte-inline-before.txt",
+      "state": "upstream-main",
+      "donor_blob": "88803bab4801a35d6ddb90dba9da0049ed7a97e3",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/byte-oracle-after.txt",
+      "state": "upstream-main",
+      "donor_blob": "525c21bc48f4a54883b5b5427de06b93c6dc92bd",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/ci-parity-after.txt",
+      "state": "upstream-main",
+      "donor_blob": "9d1a4142bd5ff676f319b2fb91981cb510a937b8",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/ci-parity-before.txt",
+      "state": "upstream-main",
+      "donor_blob": "2415a9a9cbefdef9b728025acd3a1533a9079662",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/gp-native-controls.txt",
+      "state": "upstream-main",
+      "donor_blob": "f1a0aec17d186cca66c6c2dc295b83dfadf6e98b",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/gp-operands-after.txt",
+      "state": "upstream-main",
+      "donor_blob": "a4d1e27597a1f78643a9b905ec653c725af00e1d",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/gp-operands-before.txt",
+      "state": "upstream-main",
+      "donor_blob": "2013f2f05a5b938daa2247a5f79a55a7a90c2fba",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/masked-copies-after.txt",
+      "state": "upstream-main",
+      "donor_blob": "0b46056824a08b762a2396f39e031cb5823d5fed",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/masked-copies-before.txt",
+      "state": "upstream-main",
+      "donor_blob": "d5ec94621342214c08916e35da770156a3eb8f8c",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/masked-native-controls.txt",
+      "state": "upstream-main",
+      "donor_blob": "93856140f9f85c46365d08ef3b8dffe176cedd54",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/memcheck-i386-host-before.txt",
+      "state": "upstream-main",
+      "donor_blob": "ff2fa3fb0c2c7da5d97abeeadadc3ddd02e86314",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/memcheck-measured.py",
+      "state": "upstream-main",
+      "donor_blob": "64bb6ac59aaaae761da2fb94edb5f7697e622695",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/oracle-dump-after.txt",
+      "state": "upstream-main",
+      "donor_blob": "7a83f3800239f9a3c77c04ac788ffecfa0df2338",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/oracle-dump-before.txt",
+      "state": "upstream-main",
+      "donor_blob": "8265bce20350176e425032a56394cb7cc49bb843",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/oracle-restored-index.json",
+      "state": "upstream-main",
+      "donor_blob": "4a9930e400a448927e4b0baf8dc70d9fdd02b015",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/oracle-versions.txt",
+      "state": "upstream-main",
+      "donor_blob": "ec6b507f7e6b0a49134206acbb4e1cf8718ce8ba",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-control-gate-after.txt",
+      "state": "upstream-main",
+      "donor_blob": "673a8a4e0ed5c21c59cedb9cb1910685f7f24b5a",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-control-gate-before.txt",
+      "state": "upstream-main",
+      "donor_blob": "ca03482a878e567b4598bf948416af476964f2f2",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-control-memcheck-m32-O2.txt",
+      "state": "upstream-main",
+      "donor_blob": "6fe62523bfd236e4d3d9bbb8646a7a62c969b74a",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-control-memcheck-m32-O3.txt",
+      "state": "upstream-main",
+      "donor_blob": "81039489c969a5e5feb9e71469dde96d050c599e",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-control-memcheck-m64-O2.txt",
+      "state": "upstream-main",
+      "donor_blob": "764500c58027dbc6daf0a114e35833ac1f71e79b",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-control-memcheck-m64-O3.txt",
+      "state": "upstream-main",
+      "donor_blob": "6ba4afa6e6c079648cbac730e1570d597217ce13",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-control-oracles.txt",
+      "state": "upstream-main",
+      "donor_blob": "1aa645325263134835ff49453e6b30110007cb0a",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-control-proof-unit.txt",
+      "state": "upstream-main",
+      "donor_blob": "877e629f20b484e3e5ac453bf84e6ed0da23bdfc",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-control-unsigned-after.txt",
+      "state": "upstream-main",
+      "donor_blob": "898c943404f313a0e1050f5426e5672a4cbf1c97",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-gcc16-after.txt",
+      "state": "upstream-main",
+      "donor_blob": "2d2c938f3a73d488049f82af43af5507190a169a",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-gcc16-before.txt",
+      "state": "upstream-main",
+      "donor_blob": "93d6c286cbc1bf2c55c6ccb567d6ddcddbd53a26",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-gcc16-unit.txt",
+      "state": "upstream-main",
+      "donor_blob": "daad028e22b8927cd43c90e1fd3426bb71fb2fb6",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-rotation-gate-after.txt",
+      "state": "upstream-main",
+      "donor_blob": "fe750e9696a62009a466d104f2af1c80f6eb6558",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-rotation-gate-before.txt",
+      "state": "upstream-main",
+      "donor_blob": "bd5a94d1c1b57552c0937b77b1ffa0a1e3063ba5",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-rotation-memcheck-m32-O2.txt",
+      "state": "upstream-main",
+      "donor_blob": "ac1036c67433c48f558a80da0821f1dbe4e51040",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-rotation-memcheck-m32-O3.txt",
+      "state": "upstream-main",
+      "donor_blob": "0edda91e4dfbbc61c504889c50e923fbbe03cd75",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-rotation-memcheck-m64-O2.txt",
+      "state": "upstream-main",
+      "donor_blob": "fab0039f4963f954fdfe2115c06abefd37b21095",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-rotation-memcheck-m64-O3.txt",
+      "state": "upstream-main",
+      "donor_blob": "77b87583c3b6b00f156f11594f05072c5a113fad",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-rotation-unit.txt",
+      "state": "upstream-main",
+      "donor_blob": "ccde61ba7e5553c76f6ad13268b3fad80850edcb",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-rotation-unsigned-after.txt",
+      "state": "upstream-main",
+      "donor_blob": "898c943404f313a0e1050f5426e5672a4cbf1c97",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-rotation-unsigned-enabled.txt",
+      "state": "upstream-main",
+      "donor_blob": "25c540cd9277a31ec86e9356dd7ce454bbe08a1e",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-s24-affine.txt",
+      "state": "upstream-main",
+      "donor_blob": "673a8a4e0ed5c21c59cedb9cb1910685f7f24b5a",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-s24-byte.txt",
+      "state": "upstream-main",
+      "donor_blob": "95180377b5baf21856be473c1cbc4d065bb730e6",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-s24-unsigned.txt",
+      "state": "upstream-main",
+      "donor_blob": "898c943404f313a0e1050f5426e5672a4cbf1c97",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-signed-control-before.txt",
+      "state": "upstream-main",
+      "donor_blob": "349781ff018685c7ff4632dbdf188a37487c0476",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-unsigned-after.txt",
+      "state": "upstream-main",
+      "donor_blob": "898c943404f313a0e1050f5426e5672a4cbf1c97",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-unsigned-before.txt",
+      "state": "upstream-main",
+      "donor_blob": "25c540cd9277a31ec86e9356dd7ce454bbe08a1e",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-unsigned-existing.txt",
+      "state": "upstream-main",
+      "donor_blob": "3420f9aa7cf58cb1802d84783d35f9c03d3f7250",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/pr824-unsigned-unit.txt",
+      "state": "upstream-main",
+      "donor_blob": "777c780d9f17cbe1ffa00400b44cafd2dd0ab20e",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/requested-worst15.json",
+      "state": "upstream-main",
+      "donor_blob": "f6575c73d117f0cc2e834a8f40339432bfe78e48",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/s17-vs-gcc-callgrind.json",
+      "state": "upstream-main",
+      "donor_blob": "08f5713e2c4eaedda8951e972aabc90df80692d9",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/s20-compiler-work.json",
+      "state": "upstream-main",
+      "donor_blob": "41dbf32e178cdd11a1a8c298f58ead342bfea795",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/s20-corpus-callgrind.json",
+      "state": "upstream-main",
+      "donor_blob": "06b216ff53831e94849031bf43bba499ec1c28a7",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/s20-memcheck.json",
+      "state": "upstream-main",
+      "donor_blob": "54df55077cc1f54150335c1c0bd4bf1374605704",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/s21-codegen-identity.json",
+      "state": "upstream-main",
+      "donor_blob": "71a5dfb647e943a46c75cd77749b7ab4790c50c8",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/s23-corpus-callgrind.json",
+      "state": "upstream-main",
+      "donor_blob": "5e1b038951619ae2f378d92dee1f622cf335ad76",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/s24-codegen-identity.json",
+      "state": "upstream-main",
+      "donor_blob": "64a0a1fb9af46cf12ff7d2dfca79cafe15c69466",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/s24-compiler-work.json",
+      "state": "upstream-main",
+      "donor_blob": "75032886919d5385cbe1b5108e8f35e43f059891",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/s24-corpus-callgrind.json",
+      "state": "upstream-main",
+      "donor_blob": "7481a12e11330d8034a79ab5136b45f30959c48e",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/s24-memcheck.json",
+      "state": "upstream-main",
+      "donor_blob": "68aefa0e0a7ba3ab549bb551d860944cddba05cb",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/s25-codegen-identity.json",
+      "state": "upstream-main",
+      "donor_blob": "41c8190f8c25a4e8a1e7c188e93fcfd928ae53a7",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/s25-compiler-work.json",
+      "state": "upstream-main",
+      "donor_blob": "42e287f091c2c2ab8579b4f940fdbb87b7bfdeb0",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/s25-default-corpus.json",
+      "state": "upstream-main",
+      "donor_blob": "dba68ec65cdedcddca4dc6cb1838751b5f55aa03",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/s25-invocations.json",
+      "state": "upstream-main",
+      "donor_blob": "4cb95d6a9fb9315b4c1781ab825a629e5b05791c",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/s25-memcheck.json",
+      "state": "upstream-main",
+      "donor_blob": "301eb04c5ef1ee612f25d06ab1411bffc63ebc73",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/s25-rotated-corpus.json",
+      "state": "upstream-main",
+      "donor_blob": "eb6ebfbc1526b4a8cc9233873311e1e279e40355",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/unsigned-corpus-callgrind.json",
+      "state": "upstream-main",
+      "donor_blob": "6e90e958df2d5cd1a589b1caed3022b04f95c8e8",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr824-redteam/unsigned-memcheck.json",
+      "state": "upstream-main",
+      "donor_blob": "75087d24f75a54859092c8c1ec176fdd9b34473c",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr829-830/accepted-vs-initial.json",
+      "state": "upstream-main",
+      "donor_blob": "427433a199ebff4ee9cc2df1fabdbdd2d492655b",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr829-830/byte-before.json",
+      "state": "upstream-main",
+      "donor_blob": "256cbe5c6aec7d96fe1cf34de28aca339620cf97",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr829-830/callgrind-comparisons.json",
+      "state": "upstream-main",
+      "donor_blob": "9d97f37ae844d75fae2bbb7673e7f2a913e15189",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr829-830/compiler-hashes.txt",
+      "state": "upstream-main",
+      "donor_blob": "8b088b95a814524229a28a740bd44cc9828f7f4d",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr829-830/compiler-work-s29.json",
+      "state": "upstream-main",
+      "donor_blob": "3045dd8d02a8353db02b64f5e793873a0146d106",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr829-830/fresh-evidence-summary.json",
+      "state": "upstream-main",
+      "donor_blob": "7abb28fd530c6af8f90084c417b38f4b2b850a75",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr829-830/fresh-vendor-version-probe.json",
+      "state": "upstream-main",
+      "donor_blob": "87a292b5e1e546f2aa4b85368e497363e90027a9",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr829-830/native-accepted.json",
+      "state": "upstream-main",
+      "donor_blob": "1e4ec830fcf5d1adbd79aa24fc70a0868d726e62",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr829-830/native-before.json",
+      "state": "upstream-main",
+      "donor_blob": "1533c6d989e4fded2dfc869b3ac34b61c9239f66",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr829-830/native-extended-summary.json",
+      "state": "upstream-main",
+      "donor_blob": "8d14f62101ca4f98274283be9eb019603c221631",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr829-830/native-initial-candidate.json",
+      "state": "upstream-main",
+      "donor_blob": "ef9a9ac509e78fe673347f22544684fc3c1f74ba",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr829-830/native-selected.json",
+      "state": "upstream-main",
+      "donor_blob": "b1db5e1f9114c8aba8d4fef994173dd009108567",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr829-830/native-verified.json",
+      "state": "upstream-main",
+      "donor_blob": "af1126b5a904903591e82eac32265c85020aef85",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr829-830/oracle-failure-controls.json",
+      "state": "upstream-main",
+      "donor_blob": "7a5c11b9bd5abdf0dbc549b9945696eb621a643e",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr829-830/riscv-loader-ours.json",
+      "state": "upstream-main",
+      "donor_blob": "72e0e290210f77c67aea9fdb6071c7c2c2d62a7d",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr829-830/riscv-loader-pr829.json",
+      "state": "upstream-main",
+      "donor_blob": "5a1e26880d4e32208307abe0763c02e47d970e31",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr829-830/riscv-loader-pr830.json",
+      "state": "upstream-main",
+      "donor_blob": "33c62b3a3d1cf2289e79d3aed39c42484d896971",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr829-830/riscv-ours.json",
+      "state": "upstream-main",
+      "donor_blob": "b12e568d91ef01df35b7ce4bc91a86513505cdf8",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr829-830/riscv-pr829.json",
+      "state": "upstream-main",
+      "donor_blob": "5e5f9a16ceb4675412f57fb67940479f757509c1",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr829-830/riscv-pr830.json",
+      "state": "upstream-main",
+      "donor_blob": "8230bfdb10364478b42c3a360b211cf10d6fa9e9",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr829-830/selected-vs-pr829.json",
+      "state": "upstream-main",
+      "donor_blob": "035d14c0826bea94ea4b5c881c7334b05f153e3e",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr829-830/vendor-worst15-summary.json",
+      "state": "upstream-main",
+      "donor_blob": "3a74166752aae4a94ddf50a51c5071b7b92a7772",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr829-830/verified-vs-pr829.json",
+      "state": "upstream-main",
+      "donor_blob": "107d917bc0347573b6d32ed839a0a63e6e849d10",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr832/ARTIFACTS.json",
+      "state": "upstream-main",
+      "donor_blob": "169f544c46da7118f027b8854400190324f42b16",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "engineering/evidence/pr832/requested-screening.json",
+      "state": "upstream-main",
+      "donor_blob": "2e1363956a6a3d8c25dcd1cda0e8f8449f3b3751",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "scripts/archive_checkpoint_history.py",
+      "state": "exact-donor",
+      "donor_blob": "ff79b16cd3683efb46b414c5f58bc4d2d16e3c62",
+      "main_blob": null,
+      "work_blob": "ff79b16cd3683efb46b414c5f58bc4d2d16e3c62"
+    },
+    {
+      "path": "scripts/benchmark_codegen.py",
+      "state": "upstream-main",
+      "donor_blob": "5196f1c3bee27387d15782881f602c1a4c156883",
+      "main_blob": "ea000855c4101ef6ae5470c1992a38050ec73653",
+      "work_blob": "ea000855c4101ef6ae5470c1992a38050ec73653"
+    },
+    {
+      "path": "scripts/callgrind_compiler.py",
+      "state": "upstream-main",
+      "donor_blob": "21014c717d9b418a59cd48d193662162464bd6b3",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "scripts/callgrind_corpus.py",
+      "state": "synthesis-differs",
+      "donor_blob": "2a3be88537b67cf7aafa60fc93c3162392ad96a1",
+      "main_blob": "b1a5e1851e245af1903abe6573c342ecb8c2e8d1",
+      "work_blob": "a5503021a524448453c9b5f5e80d308e32b2245a"
+    },
+    {
+      "path": "scripts/check_benchmark_outputs.py",
+      "state": "synthesis-differs",
+      "donor_blob": "2dfb07c273fe8c994de68be5d58363c6d08fa792",
+      "main_blob": null,
+      "work_blob": "892cbb8be142611cbff67dfcff0c581ddf97fb60"
+    },
+    {
+      "path": "scripts/check_benchmark_outputs.sh",
+      "state": "synthesis-differs",
+      "donor_blob": "7aff6e83eac1b50bcc2bdf8102e61810310819a7",
+      "main_blob": "248b33ac9738d89ebd641022262b1f798ca21d44",
+      "work_blob": "610f2334d5bef78fbae527cda9185b73480df603"
+    },
+    {
+      "path": "scripts/check_implicit_operand_matrix.py",
+      "state": "exact-donor",
+      "donor_blob": "402104e71edc3054e187643b0788f61dfd5785cc",
+      "main_blob": null,
+      "work_blob": "402104e71edc3054e187643b0788f61dfd5785cc"
+    },
+    {
+      "path": "scripts/check_licm_ordering.py",
+      "state": "upstream-main",
+      "donor_blob": "03a52847e0f8d079b2a90e6ad8d2c5bbbff4645c",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "scripts/check_readonly_reduction.py",
+      "state": "synthesis-differs",
+      "donor_blob": "7f8b2a2085c7071a37114abc55c290cdc1e8bef6",
+      "main_blob": null,
+      "work_blob": "2de76008e659d86dc4aa7a0c03d6eb5c6a98e91d"
+    },
+    {
+      "path": "scripts/check_strict_packed_recip.py",
+      "state": "exact-donor",
+      "donor_blob": "d4bfe268c4b40bb37944343bca8fe3f21d277ac6",
+      "main_blob": null,
+      "work_blob": "d4bfe268c4b40bb37944343bca8fe3f21d277ac6"
+    },
+    {
+      "path": "scripts/check_wrapv_oracles.py",
+      "state": "exact-donor",
+      "donor_blob": "6a78b5664ed8476a4ad2767d92c246876349db57",
+      "main_blob": null,
+      "work_blob": "6a78b5664ed8476a4ad2767d92c246876349db57"
+    },
+    {
+      "path": "scripts/ci_local.sh",
+      "state": "synthesis-differs",
+      "donor_blob": "bb3415e2d3b5b663f551eb5a186977c0ac45319c",
+      "main_blob": "402ab02ed82bd27207db9757166430736502730b",
+      "work_blob": "b372a5f2125269f92b591b4261d73a866947d4f4"
+    },
+    {
+      "path": "scripts/codegen_oracle.py",
+      "state": "exact-donor",
+      "donor_blob": "ac199302682b0ed92082f32049c6b0a605de7d72",
+      "main_blob": "3f66e11e98a82fe79b8086c914c8e8f3c30ff754",
+      "work_blob": "ac199302682b0ed92082f32049c6b0a605de7d72"
+    },
+    {
+      "path": "scripts/compare_optimizer_witnesses.py",
+      "state": "upstream-main",
+      "donor_blob": "dbd4e73a0cf5dcd6fcc36ff7a91eace456f5cbdc",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "scripts/expand_asm_fixture.py",
+      "state": "upstream-main",
+      "donor_blob": "cf8bace0dffe02dd3d0bee7c38330281fdcc9825",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "scripts/godbolt.py",
+      "state": "synthesis-differs",
+      "donor_blob": "63a5c230c8e85461cb305074ac2ba2f07ec469fe",
+      "main_blob": "2dff6e07738882cc553f4e3e11ac032957c275a1",
+      "work_blob": "b24e792b2fb16f02aa9289ad66d20c5ff6575e5a"
+    },
+    {
+      "path": "scripts/lccc_recover.py",
+      "state": "upstream-main",
+      "donor_blob": "359246f6b9b251c5dce58fe4d4015edf9f139878",
+      "main_blob": "d8f4e36991b9d1554b9ffe97e66cbb7b69663590",
+      "work_blob": "d8f4e36991b9d1554b9ffe97e66cbb7b69663590"
+    },
+    {
+      "path": "scripts/loop_density_oracle.py",
+      "state": "upstream-main",
+      "donor_blob": "e160dd03a40c420c5472d53b886c185490ac7945",
+      "main_blob": "8c01514f57422cfdf9ea7fa7f37adea09f22c1ff",
+      "work_blob": "8c01514f57422cfdf9ea7fa7f37adea09f22c1ff"
+    },
+    {
+      "path": "scripts/oracle_asm.py",
+      "state": "upstream-main",
+      "donor_blob": "742f3fba25e619b10172d211fec50284ab78db9f",
+      "main_blob": "781127175414a403464386e950f41c2bb733cfbe",
+      "work_blob": "781127175414a403464386e950f41c2bb733cfbe"
+    },
+    {
+      "path": "scripts/tight_loop_oracle.py",
+      "state": "synthesis-differs",
+      "donor_blob": "992e26157c71310932d775abf0a58fa0ebac875f",
+      "main_blob": "feed8050a6473c6205142c03fabb84d692292112",
+      "work_blob": "df890221b195450cf15769ab36c91dafc4899cd4"
+    },
+    {
+      "path": "scripts/tune_oracle.py",
+      "state": "synthesis-differs",
+      "donor_blob": "b7aaf8fcde5dac5183cf9182c40a93f8b4d48cc9",
+      "main_blob": "2740e3b565ffbda89d7885c8086e1f2b77a7e99e",
+      "work_blob": "28f70741afc33001b06f07c6f27b31bba2a19c7d"
+    },
+    {
+      "path": "scripts/verify_evidence_hashes.py",
+      "state": "upstream-main",
+      "donor_blob": "bbadc61e65b01c0d1f597d84ed8f2ef6e4be9ef8",
+      "main_blob": "69b13136d95c13efd88c1e7ce1d95a6e93c9ff93",
+      "work_blob": "69b13136d95c13efd88c1e7ce1d95a6e93c9ff93"
+    },
+    {
+      "path": "scripts/verify_preserved_checkpoint.py",
+      "state": "upstream-main",
+      "donor_blob": "22268128b5f5fd8e3ae0c410723f4b5493a6f25d",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "src/backend/arm/codegen/asm_emitter.rs",
+      "state": "upstream-main",
+      "donor_blob": "bc34bd39d89df21d725be52093a9fe69757283a9",
+      "main_blob": "a2f6736e13fad62e234cd389f970934f4d24a152",
+      "work_blob": "a2f6736e13fad62e234cd389f970934f4d24a152"
+    },
+    {
+      "path": "src/backend/arm/codegen/emit.rs",
+      "state": "upstream-main",
+      "donor_blob": "ae1655e7105bec350936d8d72f7ddf7d3811a16a",
+      "main_blob": "1103e0269a8e42046a6ad9a82be409705a99bf06",
+      "work_blob": "1103e0269a8e42046a6ad9a82be409705a99bf06"
+    },
+    {
+      "path": "src/backend/arm/linker/emit_shared.rs",
+      "state": "upstream-main",
+      "donor_blob": "d9e8da08317d9517256b897f3a8514ccb69c21c3",
+      "main_blob": "f1b135d3d5df7c52fa6caca8b49de65812bf969e",
+      "work_blob": "f1b135d3d5df7c52fa6caca8b49de65812bf969e"
+    },
+    {
+      "path": "src/backend/arm/linker/reloc.rs",
+      "state": "upstream-main",
+      "donor_blob": "f031945860fcc33923438882f21b8bc2f1c10de1",
+      "main_blob": "aa2442625c654c91ea2fc9b0f2fe1199bc4d4e13",
+      "work_blob": "aa2442625c654c91ea2fc9b0f2fe1199bc4d4e13"
+    },
+    {
+      "path": "src/backend/common.rs",
+      "state": "synthesis-differs",
+      "donor_blob": "383f4ba24bb1cd6eac0d93b04e6435531ea2575e",
+      "main_blob": "e37a8ca14d292cc515bd39ebbe0390d2fc33171c",
+      "work_blob": "a63a1f4591e87b64c7f29d1af7c4daf548f9c8ba"
+    },
+    {
+      "path": "src/backend/generation.rs",
+      "state": "upstream-main",
+      "donor_blob": "c10febeb19703e66808f95e46d433afef05d55a1",
+      "main_blob": "026fa5b8dd7b2fc73c6561a9e60a9d6edc871385",
+      "work_blob": "026fa5b8dd7b2fc73c6561a9e60a9d6edc871385"
+    },
+    {
+      "path": "src/backend/i686/codegen/asm_emitter.rs",
+      "state": "upstream-main",
+      "donor_blob": "43fb6384c9e61231156fc8d93c0396e57c9153f5",
+      "main_blob": "11d35f4292de515f4b4775e67cdbfefb30b284fc",
+      "work_blob": "11d35f4292de515f4b4775e67cdbfefb30b284fc"
+    },
+    {
+      "path": "src/backend/i686/linker/dynamic.rs",
+      "state": "synthesis-differs",
+      "donor_blob": "d6d7ea3bc6d824f4b65923816e02d558261a9fdc",
+      "main_blob": "e4a9e6a6296cc0f5f50f2f2031f7276d76003068",
+      "work_blob": "c2284f7263c5022ee07a1887b3c10b8de48f36ba"
+    },
+    {
+      "path": "src/backend/inline_asm.rs",
+      "state": "upstream-main",
+      "donor_blob": "8290681e3f56b977541d84e884d92a8fb790f2ac",
+      "main_blob": "ac6f6f4141e0186fdbbd849400a9309115223b47",
+      "work_blob": "ac6f6f4141e0186fdbbd849400a9309115223b47"
+    },
+    {
+      "path": "src/backend/mod.rs",
+      "state": "exact-donor",
+      "donor_blob": "f398079f7958aa3f77a6ef46e3ca10ba7fb29c06",
+      "main_blob": "b61fb5e41cfe7ee85664b876bd0c10141af7e432",
+      "work_blob": "f398079f7958aa3f77a6ef46e3ca10ba7fb29c06"
+    },
+    {
+      "path": "src/backend/regalloc.rs",
+      "state": "upstream-main",
+      "donor_blob": "44e197690015d6f1241e266459d0b0f0a3cf6c04",
+      "main_blob": "b60828f6237938c2c788438040cfd6be814a06e4",
+      "work_blob": "b60828f6237938c2c788438040cfd6be814a06e4"
+    },
+    {
+      "path": "src/backend/riscv/codegen/asm_emitter.rs",
+      "state": "upstream-main",
+      "donor_blob": "ed846ad37e7258ac09eaaff2fabc6b1442283ba6",
+      "main_blob": "5f8338abd53671791da8bdb97d555c793c1f5c9b",
+      "work_blob": "5f8338abd53671791da8bdb97d555c793c1f5c9b"
+    },
+    {
+      "path": "src/backend/riscv/linker/emit_shared.rs",
+      "state": "synthesis-differs",
+      "donor_blob": "f8a7ac24a6a40cee1a721398ffa70e12b09d5400",
+      "main_blob": "17c8b3bb51a0a39c14583c78dbb019a4a5e75856",
+      "work_blob": "c73f235df3a887afa8e3da304529231140408f8b"
+    },
+    {
+      "path": "src/backend/riscv/linker/reloc.rs",
+      "state": "synthesis-differs",
+      "donor_blob": "24aadc680ec1d3514f6ef0de6b72f83baa65a08a",
+      "main_blob": "6007fc475fcc76eee11d24aefb510f832471446f",
+      "work_blob": "1a1ec680a6b15640a9741796a08626f2bc75794d"
+    },
+    {
+      "path": "src/backend/riscv/linker/relocations.rs",
+      "state": "exact-donor",
+      "donor_blob": "d4f519427d420973864936d0f4de5db8888c9bce",
+      "main_blob": "6376b29d07c5638c84f0c8d985415ed3ba17a66c",
+      "work_blob": "d4f519427d420973864936d0f4de5db8888c9bce"
+    },
+    {
+      "path": "src/backend/riscv/linker/symbols.rs",
+      "state": "exact-donor",
+      "donor_blob": "74e7f53ed2d03840b29f29368cf4d8f57168eb47",
+      "main_blob": "37563ba64bc10cdf5e6460d62d30b278ed9e89f0",
+      "work_blob": "74e7f53ed2d03840b29f29368cf4d8f57168eb47"
+    },
+    {
+      "path": "src/backend/traits.rs",
+      "state": "upstream-main",
+      "donor_blob": "dc82c7b7907a8eb3be2582a91ad759f7ad2c1e6a",
+      "main_blob": "2934cbafffac831fce54ea0f3974eacebd80bbde",
+      "work_blob": "2934cbafffac831fce54ea0f3974eacebd80bbde"
+    },
+    {
+      "path": "src/backend/x86/codegen/asm_emitter.rs",
+      "state": "upstream-main",
+      "donor_blob": "f51e1edc65c98adce3c7f43ce2bb3d96277e381f",
+      "main_blob": "88a08087946616e3fd2aaf35e4546b9b3d8f5c8d",
+      "work_blob": "88a08087946616e3fd2aaf35e4546b9b3d8f5c8d"
+    },
+    {
+      "path": "src/backend/x86/codegen/intrinsics.rs",
+      "state": "synthesis-differs",
+      "donor_blob": "f7d78051bedc91b1f0700f37ab2da5dd0b199adc",
+      "main_blob": "1d36b88ad6ff352c20713ab113899ced2ff4dd2f",
+      "work_blob": "a50ca1490191e6ecabee6d41e220fcb62dc9c24d"
+    },
+    {
+      "path": "src/backend/x86/codegen/peephole/passes/dead_code.rs",
+      "state": "upstream-main",
+      "donor_blob": "b72db3a9f57bae7bdb07a3c14503b26602e95b05",
+      "main_blob": "9ceaf49748e6c45fe8f8942592aa0ccb1b7405f4",
+      "work_blob": "9ceaf49748e6c45fe8f8942592aa0ccb1b7405f4"
+    },
+    {
+      "path": "src/backend/x86/codegen/peephole/passes/dead_writes.rs",
+      "state": "exact-donor",
+      "donor_blob": "e44d78647a644e92250f014988e355c7e03ceded",
+      "main_blob": "437dd8fc98cfc6d4deadb23c18c1da2241a3d16d",
+      "work_blob": "e44d78647a644e92250f014988e355c7e03ceded"
+    },
+    {
+      "path": "src/backend/x86/codegen/peephole/passes/fp_liveness.rs",
+      "state": "synthesis-differs",
+      "donor_blob": "1985909b902676a20f1d037242bfe06cc199ecdf",
+      "main_blob": "6ee8d3768594553371c1495f11c8f9480cdbccc7",
+      "work_blob": "b277249ed02e3c8f092b8c6b7b3fc08d7c0a032f"
+    },
+    {
+      "path": "src/backend/x86/codegen/peephole/passes/helpers.rs",
+      "state": "exact-donor",
+      "donor_blob": "84cdd9d4686d7836cebf7564810d4208a2ff5d8e",
+      "main_blob": "696893b2a47599f8728b70f32b7177f64329c993",
+      "work_blob": "84cdd9d4686d7836cebf7564810d4208a2ff5d8e"
+    },
+    {
+      "path": "src/backend/x86/codegen/peephole/passes/load_op_fuse.rs",
+      "state": "upstream-main",
+      "donor_blob": "e6466df5eac417cd1b8f087d857d21d93c2db056",
+      "main_blob": "d96e5cbce37297e301ebb7fba4fe725ac0795fc6",
+      "work_blob": "d96e5cbce37297e301ebb7fba4fe725ac0795fc6"
+    },
+    {
+      "path": "src/backend/x86/codegen/peephole/passes/local_patterns.rs",
+      "state": "synthesis-differs",
+      "donor_blob": "d57643b8bd9993b90a50c8e7b318e92d46ae0c62",
+      "main_blob": "acdfb8c5882e467e68a6ad4afd8cb07f9c681c93",
+      "work_blob": "4d1d7d9461fc9f81cf9420e8ec828a1adc9ade2e"
+    },
+    {
+      "path": "src/backend/x86/codegen/peephole/passes/store_forwarding.rs",
+      "state": "exact-donor",
+      "donor_blob": "00ec17fcbf1ed8b7360c6c1e3179ff24fc534211",
+      "main_blob": "ee9431e301175e23769103f15497bf38c0b5d224",
+      "work_blob": "00ec17fcbf1ed8b7360c6c1e3179ff24fc534211"
+    },
+    {
+      "path": "src/backend/x86/codegen/peephole/passes/vector_copy.rs",
+      "state": "synthesis-differs",
+      "donor_blob": "7f58d451973e821b59202bbf77ad9a4a9285aee8",
+      "main_blob": "e661f83827bbcb07882d2d774519d0ca7eed08aa",
+      "work_blob": "7d7c5b7158fc15e01724f8b96e72246911052f3c"
+    },
+    {
+      "path": "src/backend/x86/codegen/peephole/types.rs",
+      "state": "exact-donor",
+      "donor_blob": "6f9313ad1b490a560d7bd630f3fe6f5583043d9d",
+      "main_blob": "e4932dafa13897b20a5d543cc58f05170e81029b",
+      "work_blob": "6f9313ad1b490a560d7bd630f3fe6f5583043d9d"
+    },
+    {
+      "path": "src/common/README.md",
+      "state": "synthesis-differs",
+      "donor_blob": "4e7b32c5d88bbfcb8dc1ac45e8cde6a24d7821e8",
+      "main_blob": "160dc76fce558ac5b0cebab97a195ad2c96708d7",
+      "work_blob": "cda8a26057cdb5d2b717fad34fbde3cdd452e97e"
+    },
+    {
+      "path": "src/common/temp_files.rs",
+      "state": "exact-donor",
+      "donor_blob": "10b3aa7c12c98c99b57fe4ad9a2ec7ca0217bb92",
+      "main_blob": "4d2525a6b8a27e55f9d4b8d260e1b1407a124973",
+      "work_blob": "10b3aa7c12c98c99b57fe4ad9a2ec7ca0217bb92"
+    },
+    {
+      "path": "src/driver/cli.rs",
+      "state": "exact-donor",
+      "donor_blob": "4e1cecb07ebef39b734a0c7de64ad6e88871220e",
+      "main_blob": "a07ebf352968e6e74f15e97d4a3a6907ac41a184",
+      "work_blob": "4e1cecb07ebef39b734a0c7de64ad6e88871220e"
+    },
+    {
+      "path": "src/driver/pipeline.rs",
+      "state": "exact-donor",
+      "donor_blob": "2d20370781c04ad31b6d1f12d1dbf7e1f60b3cd9",
+      "main_blob": "99be369185dfb6ac127694667ba3ffa8c3b305b8",
+      "work_blob": "2d20370781c04ad31b6d1f12d1dbf7e1f60b3cd9"
+    },
+    {
+      "path": "src/frontend/preprocessor/pipeline.rs",
+      "state": "exact-donor",
+      "donor_blob": "9c74fdc0050e353f00ccaf3888d70b6d6ab27513",
+      "main_blob": "0f8fa6ac1f53d64b2533e9a081582ed328f52579",
+      "work_blob": "9c74fdc0050e353f00ccaf3888d70b6d6ab27513"
+    },
+    {
+      "path": "src/frontend/preprocessor/pragmas.rs",
+      "state": "exact-donor",
+      "donor_blob": "ee3f7d78fe02dd95a6165b5238c7a185cf6ff4a7",
+      "main_blob": "bb406a32e69b3bd747145a94add6833f6298181e",
+      "work_blob": "ee3f7d78fe02dd95a6165b5238c7a185cf6ff4a7"
+    },
+    {
+      "path": "src/ir/intrinsics.rs",
+      "state": "upstream-main",
+      "donor_blob": "34e4ea16896e73ee63e724202e5cea824bc32ca1",
+      "main_blob": "872c59b1f1df1fb448d286917d668b9d4f782bbe",
+      "work_blob": "872c59b1f1df1fb448d286917d668b9d4f782bbe"
+    },
+    {
+      "path": "src/passes/backedge_pre.rs",
+      "state": "synthesis-differs",
+      "donor_blob": "cc23bf311ec2f71d161de99d92183aa3122302a5",
+      "main_blob": "2e5118d36a3eb8629beb0d54a3d844d1e404f405",
+      "work_blob": "43d29b62fd29129bb1901ae836008296888d436a"
+    },
+    {
+      "path": "src/passes/byte_load.rs",
+      "state": "upstream-main",
+      "donor_blob": "f3e3d72687ea0b0d9b8d409bdf303a88c8226740",
+      "main_blob": "bed8f67a39576c84b4307d0365d0a8666797c927",
+      "work_blob": "bed8f67a39576c84b4307d0365d0a8666797c927"
+    },
+    {
+      "path": "src/passes/constant_fold.rs",
+      "state": "exact-donor",
+      "donor_blob": "7df0682877e58abb8cbf34599c8e1d55472721e3",
+      "main_blob": "d202c3eb3a8b22a5af9750110fb70c45316d32df",
+      "work_blob": "7df0682877e58abb8cbf34599c8e1d55472721e3"
+    },
+    {
+      "path": "src/passes/dce.rs",
+      "state": "exact-donor",
+      "donor_blob": "8ad39ccd608f5ce192b816b2d2d2578559910910",
+      "main_blob": "21a2e715153f6e85cc27609e32a7458bd86d3a5d",
+      "work_blob": "8ad39ccd608f5ce192b816b2d2d2578559910910"
+    },
+    {
+      "path": "src/passes/expr_sink.rs",
+      "state": "exact-donor",
+      "donor_blob": "2652bfe4bcf6ba8580af8e3c459b2c25c05a2593",
+      "main_blob": "347fb5cc63104b43fd759014d2146c2f148fdc82",
+      "work_blob": "2652bfe4bcf6ba8580af8e3c459b2c25c05a2593"
+    },
+    {
+      "path": "src/passes/fp_const_hoist.rs",
+      "state": "exact-donor",
+      "donor_blob": "caa29cc5317bea31ce2eaf84775af88dea4bd12c",
+      "main_blob": "ecc15fa38b86ff42a29ace5cfc3151b4d3b6bf58",
+      "work_blob": "caa29cc5317bea31ce2eaf84775af88dea4bd12c"
+    },
+    {
+      "path": "src/passes/gvn.rs",
+      "state": "exact-donor",
+      "donor_blob": "aac5cec8b5a4037600e9abd8cb56249d1dd05bb4",
+      "main_blob": "223a8d0fbc3cf35245a64f860f642af44cb1d594",
+      "work_blob": "aac5cec8b5a4037600e9abd8cb56249d1dd05bb4"
+    },
+    {
+      "path": "src/passes/if_convert.rs",
+      "state": "exact-donor",
+      "donor_blob": "5a578d829a39fc2b9950e5889e00f3ba8f3eb6f8",
+      "main_blob": "34ab6cf506d4c7e6e56a860f262f831e75914ab5",
+      "work_blob": "5a578d829a39fc2b9950e5889e00f3ba8f3eb6f8"
+    },
+    {
+      "path": "src/passes/iv_strength_reduce.rs",
+      "state": "synthesis-differs",
+      "donor_blob": "ce7b5caf3951d93fcd90f273a0fd658a089ff52e",
+      "main_blob": "1ebbb98eb7d0311bab07f56f3739ce8ebacc3e5d",
+      "work_blob": "06d381c23c8b7773d7276f1c44d02d2b86460abb"
+    },
+    {
+      "path": "src/passes/iv_widen.rs",
+      "state": "synthesis-differs",
+      "donor_blob": "d7cd7e9da7d6de420f02fd6bdddc6ce79467d467",
+      "main_blob": "f6072995eecb836e23016f19188b70d55328e7a8",
+      "work_blob": "023e50a67f511a6a307791771000fa8cffc753d6"
+    },
+    {
+      "path": "src/passes/licm.rs",
+      "state": "exact-donor",
+      "donor_blob": "bcd32201e95db250da4ab620bdcb469dbde947aa",
+      "main_blob": "913d1959e8512dae4569a843652990df8e0a1f60",
+      "work_blob": "bcd32201e95db250da4ab620bdcb469dbde947aa"
+    },
+    {
+      "path": "src/passes/loop_bound.rs",
+      "state": "synthesis-differs",
+      "donor_blob": "e3a43b02ab5da07f7882c962efd25669a9d5c8c3",
+      "main_blob": null,
+      "work_blob": "35d3360684ae5465a9c668076b4d48cce4b5a38a"
+    },
+    {
+      "path": "src/passes/loop_rotate.rs",
+      "state": "upstream-main",
+      "donor_blob": "eefae1bb24b96f42c9a6aa118ad5464f5a16247d",
+      "main_blob": "6476abc996578350dd4262c82d0dd7bc58dfbd38",
+      "work_blob": "6476abc996578350dd4262c82d0dd7bc58dfbd38"
+    },
+    {
+      "path": "src/passes/mod.rs",
+      "state": "synthesis-differs",
+      "donor_blob": "ca9fec9c963db8c7b32981e88353cdb9869df0b3",
+      "main_blob": "7631c46ae5750a3eae5dacb713477d157b848529",
+      "work_blob": "6cf9c162def81d242091a1d74909922b10c3e851"
+    },
+    {
+      "path": "src/passes/simplify.rs",
+      "state": "exact-donor",
+      "donor_blob": "9a28051a68f2d2c0f3b6828374551a8207d692e9",
+      "main_blob": "995164a4f54914bfb2ebf50af16a7d1a166a0746",
+      "work_blob": "9a28051a68f2d2c0f3b6828374551a8207d692e9"
+    },
+    {
+      "path": "src/passes/slp_vectorizer.rs",
+      "state": "exact-donor",
+      "donor_blob": "72eed35452a4498cefd8521bfbc1d41c61adcac9",
+      "main_blob": "33f7676d4184d970f22b8c6352e747e9e0ca4df4",
+      "work_blob": "72eed35452a4498cefd8521bfbc1d41c61adcac9"
+    },
+    {
+      "path": "src/passes/vectorize.rs",
+      "state": "synthesis-differs",
+      "donor_blob": "34b592feb7203539a4aa5dd084cc55cce6b70db6",
+      "main_blob": "2bfd99750332cef059f3422f01057f791c0247f3",
+      "work_blob": "8a452b052f8c37c44b7b339f6170826e0893d098"
+    },
+    {
+      "path": "tests/benchmark/programs/tce_sum.c",
+      "state": "synthesis-differs",
+      "donor_blob": "0599a599b99575962d7f389f19b1ddcab86ae800",
+      "main_blob": "873e724f08a665e57908c8f472cd2141f1a1f4c0",
+      "work_blob": "76869ce2e7c82fbf7dbb494a503c2422f3d3997e"
+    },
+    {
+      "path": "tests/corpus/test_benchmark_output_gate.py",
+      "state": "upstream-main",
+      "donor_blob": "1c9a3cd44ba420bc07e45b369eba92fcd4fe7fa6",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "tests/corpus/test_callgrind_contracts.py",
+      "state": "upstream-main",
+      "donor_blob": "744d7ec26260da5fa894890c1300f05a84518365",
+      "main_blob": "4aaea73eacc93dba273fd84e47f2f8d43859f256",
+      "work_blob": "4aaea73eacc93dba273fd84e47f2f8d43859f256"
+    },
+    {
+      "path": "tests/corpus/test_compiler_work_profiles.py",
+      "state": "upstream-main",
+      "donor_blob": "6b25dc694eb08b8be46049ce9d5e8b88c21f48e4",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "tests/corpus/test_oracle_asm_verdict.py",
+      "state": "upstream-main",
+      "donor_blob": "1d417dda83764ef611643b73c850f760e9b52975",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "tests/corpus/test_oracle_survey_fail_closed.py",
+      "state": "upstream-main",
+      "donor_blob": "206669adbebd4d955800c49f3c16beae9734febd",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "tests/corpus/test_pr832_audit_contracts.py",
+      "state": "upstream-main",
+      "donor_blob": "6181a4753ed202f73c2e0189a971a40aef09377e",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "tests/corpus/test_recovery_contracts.py",
+      "state": "upstream-main",
+      "donor_blob": "3ee1baf6b802d8e14ac81d155167a5ef67a2035b",
+      "main_blob": "72b959754496421f831bcf3fecd795ee666c243d",
+      "work_blob": "72b959754496421f831bcf3fecd795ee666c243d"
+    },
+    {
+      "path": "tests/fixtures/implicit_operands.tsv",
+      "state": "exact-donor",
+      "donor_blob": "e4bcb0d3ef29666397a46bcd163108c9493f1323",
+      "main_blob": null,
+      "work_blob": "e4bcb0d3ef29666397a46bcd163108c9493f1323"
+    },
+    {
+      "path": "tests/linker/check_riscv_relocation_contract.py",
+      "state": "exact-donor",
+      "donor_blob": "a1beb61c983bad2dcb3a227d073b58cdd7d4a847",
+      "main_blob": "c80c1ce83803606d864396d9addceafdcc9a8bb7",
+      "work_blob": "a1beb61c983bad2dcb3a227d073b58cdd7d4a847"
+    },
+    {
+      "path": "tests/linker/check_riscv_shared_binding.py",
+      "state": "synthesis-differs",
+      "donor_blob": "c2bd0b5e469ea5b0fdbeb0b8ca61cf2ce81de0ef",
+      "main_blob": null,
+      "work_blob": "72e274e7ec505ce61bd9ba8f9fe19952590ecb67"
+    },
+    {
+      "path": "tests/linker/check_riscv_shared_loader.py",
+      "state": "synthesis-differs",
+      "donor_blob": "3bbcba67474df05d732ea145b3dd0b61a43a6d2f",
+      "main_blob": null,
+      "work_blob": "63bda7f1488f421ec324351d96806480b4a35cf5"
+    },
+    {
+      "path": "tests/linker/run_linker_tests.py",
+      "state": "synthesis-differs",
+      "donor_blob": "0f3d060d733a62ec6ab297ed35fcc1051ab06688",
+      "main_blob": "ebefc52e63ac6d67047fa28e90e330b481475680",
+      "work_blob": "db78237e23e22682181b4868897280b4e6f0d07f"
+    },
+    {
+      "path": "tests/linker/test_riscv_shared_binding.py",
+      "state": "synthesis-differs",
+      "donor_blob": "9afbd9a90cd6a16fa7691d0df1d8092e098fb057",
+      "main_blob": null,
+      "work_blob": "5cf57ab61102015812faf11a7a725bddb50c4a55"
+    },
+    {
+      "path": "tests/regression/affine_control_model.py",
+      "state": "upstream-main",
+      "donor_blob": "4c8a9b449c3c943147cb4185a5b8f460d5c9bb4f",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "tests/regression/affine_control_proof.c",
+      "state": "upstream-main",
+      "donor_blob": "73c8279a4f77123586d24c1321b31030e37c9fd6",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "tests/regression/byte_accessor_inline.c",
+      "state": "upstream-main",
+      "donor_blob": "e4ff66b80b3915d84e8addf256ec40483541cbba",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "tests/regression/check_affine_loop_fold.sh",
+      "state": "upstream-main",
+      "donor_blob": "4de94572310407577a7eb276199f07ae4a6ee9dc",
+      "main_blob": "ad48e63d5461380cc7beaad527bf0d0c0cfab5d3",
+      "work_blob": "ad48e63d5461380cc7beaad527bf0d0c0cfab5d3"
+    },
+    {
+      "path": "tests/regression/check_arm_address_contract.py",
+      "state": "upstream-main",
+      "donor_blob": "73475ceeff81188b4163f74fb73cbbb599dd08e4",
+      "main_blob": "e190d12a5bdc307dfc84098152dcbb296d7b4300",
+      "work_blob": "e190d12a5bdc307dfc84098152dcbb296d7b4300"
+    },
+    {
+      "path": "tests/regression/check_arm_popcount_contract.py",
+      "state": "upstream-main",
+      "donor_blob": "7725ccaa718a9366b9e8e3aceb4ec14a56c09bce",
+      "main_blob": "766deeec9eb594c8c204135e4a18e729c70204b6",
+      "work_blob": "766deeec9eb594c8c204135e4a18e729c70204b6"
+    },
+    {
+      "path": "tests/regression/check_byte_accessor_inline.sh",
+      "state": "upstream-main",
+      "donor_blob": "e7d9c6a0307775e2e419ef19c822fbf2ab8326fc",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "tests/regression/check_fp_environment.sh",
+      "state": "exact-donor",
+      "donor_blob": "26ed14afdd7a59f35eeca1460e2210d72b9c3cfc",
+      "main_blob": null,
+      "work_blob": "26ed14afdd7a59f35eeca1460e2210d72b9c3cfc"
+    },
+    {
+      "path": "tests/regression/check_fp_recurrence.sh",
+      "state": "synthesis-differs",
+      "donor_blob": "357e75085355d81ee3e1a14c53e46671f820f181",
+      "main_blob": "3f7ee11a91c59ea5caa53bd8a744dc7a44938fc9",
+      "work_blob": "63f734865fa2a7c93912b6a38dd0205a47c900fe"
+    },
+    {
+      "path": "tests/regression/check_linker_notype_code.sh",
+      "state": "upstream-main",
+      "donor_blob": "43bb4d4a9eab8042d9f3231e7aae746af26f07b7",
+      "main_blob": "cbd0bf17248e72347a36e2e7192fedf38425b247",
+      "work_blob": "cbd0bf17248e72347a36e2e7192fedf38425b247"
+    },
+    {
+      "path": "tests/regression/check_temp_symlink.sh",
+      "state": "exact-donor",
+      "donor_blob": "6098e075c6a4c075cce6054928770656ada8acee",
+      "main_blob": "e9137d696cb2aeba92ce6085f291c65d40feacab",
+      "work_blob": "6098e075c6a4c075cce6054928770656ada8acee"
+    },
+    {
+      "path": "tests/regression/check_unsigned_affine_loop.sh",
+      "state": "upstream-main",
+      "donor_blob": "5862defaa243cefc2d76baeafeba43ae1d3bf1e2",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "tests/regression/check_vex_flag_reads.sh",
+      "state": "synthesis-differs",
+      "donor_blob": "d1b89f06e3ff5aecbb9cc69183daeeecf1278d42",
+      "main_blob": "6af8effbe187025299c203ad7aa013c1c04a290f",
+      "work_blob": "5c8c3672449a9b71d7ede3561cd57522e671ae64"
+    },
+    {
+      "path": "tests/regression/fixtures/arm_popcount/asm_inputs.c",
+      "state": "upstream-main",
+      "donor_blob": "d400ec9a7c433a86fe223d73c2fdd921c9b11172",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "tests/regression/fixtures/licm-ordering/driver.c",
+      "state": "upstream-main",
+      "donor_blob": "741407efa3f6df9063edb9bf0241084785e7e34e",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "tests/regression/fixtures/licm-ordering/probe.c",
+      "state": "upstream-main",
+      "donor_blob": "cfb6bd965aaac16db83d6abee8ddd3fc9bdf0e49",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "tests/regression/fixtures/licm-ordering/shape-driver.c",
+      "state": "upstream-main",
+      "donor_blob": "e9b8c055d0c09b2a04ee2a5216738260d4e0e579",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "tests/regression/fixtures/peephole-vex-flags/gather-driver.c",
+      "state": "exact-donor",
+      "donor_blob": "ce1abf3f3c29f7385fae3b9bdb96f86675b48c56",
+      "main_blob": null,
+      "work_blob": "ce1abf3f3c29f7385fae3b9bdb96f86675b48c56"
+    },
+    {
+      "path": "tests/regression/fixtures/peephole-vex-flags/gather-witness.s",
+      "state": "exact-donor",
+      "donor_blob": "9222cd2859849bdc24a0118373a1b647a21d0232",
+      "main_blob": null,
+      "work_blob": "9222cd2859849bdc24a0118373a1b647a21d0232"
+    },
+    {
+      "path": "tests/regression/fixtures/peephole-vex-flags/gp-driver.c",
+      "state": "upstream-main",
+      "donor_blob": "d86f00ef0884328ddf62b3db1832f383bda47361",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "tests/regression/fixtures/peephole-vex-flags/gp-witness.s",
+      "state": "upstream-main",
+      "donor_blob": "b9903b893ae0729615b76eb254278a9aaa55a4a1",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "tests/regression/fixtures/peephole-vex-flags/masked-copy-driver.c",
+      "state": "upstream-main",
+      "donor_blob": "64126ea05f6dfadfcf32c61629bd41d041cd527e",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "tests/regression/fixtures/peephole-vex-flags/masked-copy-witness.s",
+      "state": "upstream-main",
+      "donor_blob": "a2955e040ade9c7ccf449eb3f45d7b7bb94f17ac",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "tests/regression/fp_recurrence/contract_shape.c",
+      "state": "upstream-main",
+      "donor_blob": "0b588c1d4bdc2d5e2dea68553b53ded0c16cf54a",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "tests/regression/implicit_muldiv16.c",
+      "state": "exact-donor",
+      "donor_blob": "fe8469e056102c9e7493de5405a77c6ba559075b",
+      "main_blob": null,
+      "work_blob": "fe8469e056102c9e7493de5405a77c6ba559075b"
+    },
+    {
+      "path": "tests/regression/implicit_muldiv16.flags",
+      "state": "exact-donor",
+      "donor_blob": "3a3b5796a69876437280f982a4da6a004f5ca070",
+      "main_blob": null,
+      "work_blob": "3a3b5796a69876437280f982a4da6a004f5ca070"
+    },
+    {
+      "path": "tests/regression/ivw_wrapv_range.c",
+      "state": "synthesis-differs",
+      "donor_blob": "511a14fb8b453146f7837ea6dfae671a43a41c64",
+      "main_blob": null,
+      "work_blob": "a3e958f7905e7cc23f8eb7f4b96bc17a2b561b4d"
+    },
+    {
+      "path": "tests/regression/ivw_wrapv_range.flags",
+      "state": "exact-donor",
+      "donor_blob": "6013ed97a10031c35effcc19779772b834322b3d",
+      "main_blob": null,
+      "work_blob": "6013ed97a10031c35effcc19779772b834322b3d"
+    },
+    {
+      "path": "tests/regression/readonly_reduction_guard.c",
+      "state": "exact-donor",
+      "donor_blob": "cafa75bfda2773db7c630ac95f34ea553781a691",
+      "main_blob": null,
+      "work_blob": "cafa75bfda2773db7c630ac95f34ea553781a691"
+    },
+    {
+      "path": "tests/regression/readonly_reduction_guard.flags",
+      "state": "exact-donor",
+      "donor_blob": "512368fdf5d9c1c611fd2eb04ea374507d459007",
+      "main_blob": null,
+      "work_blob": "512368fdf5d9c1c611fd2eb04ea374507d459007"
+    },
+    {
+      "path": "tests/regression/strict_packed_recip_bits.c",
+      "state": "exact-donor",
+      "donor_blob": "60f295e6c10080aae646bc7569f4cbdbc8ff2d1a",
+      "main_blob": null,
+      "work_blob": "60f295e6c10080aae646bc7569f4cbdbc8ff2d1a"
+    },
+    {
+      "path": "tests/regression/strict_packed_recip_bits.flags",
+      "state": "exact-donor",
+      "donor_blob": "3fbd692071edc3cc17e62429714f56ed68a34bdb",
+      "main_blob": null,
+      "work_blob": "3fbd692071edc3cc17e62429714f56ed68a34bdb"
+    },
+    {
+      "path": "tests/regression/strict_recip_traps.c",
+      "state": "exact-donor",
+      "donor_blob": "d59989ecf78094b5785dca36eb81cd35351990a0",
+      "main_blob": null,
+      "work_blob": "d59989ecf78094b5785dca36eb81cd35351990a0"
+    },
+    {
+      "path": "tests/regression/strict_recip_traps.flags",
+      "state": "exact-donor",
+      "donor_blob": "da2a1bab9f20aa5fbc407335d7e6af0da622d2e9",
+      "main_blob": null,
+      "work_blob": "da2a1bab9f20aa5fbc407335d7e6af0da622d2e9"
+    },
+    {
+      "path": "tests/regression/unsigned_affine_loop.c",
+      "state": "upstream-main",
+      "donor_blob": "f06ddb6b480caf77ff81d3ece313e6d3111b6ec7",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "tests/regression/unsigned_affine_model.py",
+      "state": "upstream-main",
+      "donor_blob": "e5fb3b6152c0ae6d712fc341419695c8338a3d08",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "tests/regression/wrapv_domains.c",
+      "state": "exact-donor",
+      "donor_blob": "299cef9811fa8342ba901afef58a74bb3de20e8e",
+      "main_blob": null,
+      "work_blob": "299cef9811fa8342ba901afef58a74bb3de20e8e"
+    },
+    {
+      "path": "tests/regression/wrapv_domains.flags",
+      "state": "exact-donor",
+      "donor_blob": "6013ed97a10031c35effcc19779772b834322b3d",
+      "main_blob": null,
+      "work_blob": "6013ed97a10031c35effcc19779772b834322b3d"
+    },
+    {
+      "path": "tests/workloads/expat-2.8.5/CTestTestfile.outcomes.cmake",
+      "state": "upstream-main",
+      "donor_blob": "3536e11dc6ad1f0073a78a420924732b13e86156",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "tests/workloads/expat-2.8.5/ctest-3.31.6-outcomes.xml",
+      "state": "upstream-main",
+      "donor_blob": "a7d50a4ec5dfc270e34fab41dbd846abe4fda8cb",
+      "main_blob": null,
+      "work_blob": null
+    },
+    {
+      "path": "tests/workloads/expat-2.8.5/junit_check.py",
+      "state": "upstream-main",
+      "donor_blob": "cadb9644d657bcc44b72123e8ab063ff16ee6412",
+      "main_blob": "e07cd48892610834bc212c15199ea2432c0cf532",
+      "work_blob": "e07cd48892610834bc212c15199ea2432c0cf532"
+    }
+  ]
+}

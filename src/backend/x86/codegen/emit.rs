@@ -13,8 +13,8 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
 use crate::delegate_to_impl;
 use crate::ir::reexports::{
-    AtomicOrdering, AtomicRmwOp, BlockId, Instruction, IntrinsicOp, IrBinOp, IrCmpOp, IrConst,
-    IrFunction, IrUnaryOp, Operand, Value,
+    AtomicOrdering, AtomicRmwOp, BlockId, CallInfo, Instruction, IntrinsicOp, IrBinOp, IrCmpOp,
+    IrConst, IrFunction, IrUnaryOp, Operand, Value,
 };
 use std::sync::Arc;
 
@@ -1411,6 +1411,7 @@ impl X86Codegen {
         // x86-64 tracks the %rax accumulator through the shared generic
         // passes: arm the sink's shadow-epoch validator for this target.
         state.enable_rax_epoch_discipline();
+        state.frame_gep_direct = std::env::var_os("CCC_NO_FRAME_GEP_DIRECT").is_none();
         Self {
             state,
             current_return_type: IrType::I64,
@@ -6661,7 +6662,9 @@ impl X86Codegen {
     ///   their canonical 32-bit promotion width, per the same convention
     ///   the load path's `narrow_defined_load` establishes);
     /// - integer/pointer return (or void) whose destination home is a GPR
-    ///   or a spill slot; dead/accumulator/xmm destinations stay behind;
+    ///   or a spill slot; dead/accumulator/xmm destinations stay behind; a
+    ///   register-returned aggregate only when all its eightbytes are
+    ///   INTEGER (an `[Sse]` aggregate comes back in %xmm0);
     /// - inline-memcpy candidates keep their interception in the dispatch
     ///   loop (an inlined fixed-size memcpy beats any call sequence);
     /// - the pure builder must produce an acyclic move plan.
@@ -6722,18 +6725,12 @@ impl X86Codegen {
         }
         // Inline fixed-size memcpy/__memcpy_chk must keep winning over any
         // call sequence (dispatch-loop interception, mirrored gate).
-        if crate::backend::generation::inline_memcpy_len(
-            direct_sym.unwrap_or(""),
-            &info.args,
-            info.is_variadic,
-        )
-        .is_some()
-        {
+        if crate::backend::generation::inline_memcpy_len(direct_sym.unwrap_or(""), info).is_some() {
             return false;
         }
         // Same mirrored gate for the fixed-size memset expansion.
         if self
-            .inline_memset_len(direct_sym.unwrap_or(""), &info.args, info.is_variadic)
+            .inline_memset_len(direct_sym.unwrap_or(""), info)
             .is_some()
         {
             return false;
@@ -6759,6 +6756,20 @@ impl X86Codegen {
             !ty.is_128bit() && !ty.is_float() && !ty.is_long_double() && ty.size() <= 8
         };
         if !width_ok(info.return_type) || info.arg_types.iter().any(|t| !width_ok(*t)) {
+            return false;
+        }
+        // An aggregate returned in registers is admitted only when every
+        // eightbyte is INTEGER (it comes back in %rax like a scalar). A
+        // `struct { float x, y; }` or 8-byte FP vector also travels as
+        // integer-width IR data, but its bits are in %xmm0 (`[Sse]`), and a
+        // one-XMM / x87 result has its own staging; those stay on the mature
+        // path, which honours `ret_eightbyte_classes`.
+        if info.ret_is_f128_sse
+            || info
+                .ret_eightbyte_classes
+                .iter()
+                .any(|c| *c != crate::common::types::EightbyteClass::Integer)
+        {
             return false;
         }
 
@@ -6984,6 +6995,7 @@ impl X86Codegen {
             args: typed_args,
             target,
             ret: plan.ret,
+            gp_arg_count: Some(plan.gp_arg_count),
         });
         self.machinst_buf_ir.push(inst.clone());
         self.flush_machinst();
@@ -7439,8 +7451,8 @@ impl ArchCodegen for X86Codegen {
     /// non-temporal path wins there.  Under `-mno-sse` every size that is
     /// not a libcall is still expanded (scalar stores / `rep stosb`), which
     /// is also what the kernel build requires (no libc).
-    fn inline_memset_len(&self, func: &str, args: &[Operand], is_variadic: bool) -> Option<usize> {
-        crate::backend::generation::x86_inline_memset_len(func, args, is_variadic)
+    fn inline_memset_len(&self, func: &str, info: &CallInfo) -> Option<usize> {
+        crate::backend::generation::x86_inline_memset_len(func, info)
     }
 
     fn fp_contract(&self) -> crate::common::fp_contract::FpContract {
@@ -10345,6 +10357,7 @@ mod machinst_window_tests {
                 }],
                 target: CallTarget::Direct("f".into()),
                 ret: None,
+                gp_arg_count: None,
             },
             MachInst::Ret,
             MachInst::Raw("lock cmpxchg16b (%rdi)".into()),

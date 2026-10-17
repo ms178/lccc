@@ -792,7 +792,11 @@ pub(super) fn is_self_move_fast(sb: &[u8]) -> bool {
         dst_end -= 1;
     }
     let dst = &dst[..dst_end];
-    src == dst && src.len() >= 2 && src[0] == b'%'
+    // Only GP MOVQ is an identity. XMM MOVQ zeros bits 127:64, even
+    // for identical source/destination, so it must remain an instruction.
+    src == dst
+        && src.starts_with(b"%r")
+        && std::str::from_utf8(src).is_ok_and(|name| register_family_fast(name) <= REG_GP_MAX)
 }
 
 /// Classify mov-family instructions for extension elimination.
@@ -1098,6 +1102,11 @@ pub(super) fn parse_fp_slot_move(s: &str) -> Option<(bool, &str, MoveSize)> {
     } else {
         return None;
     };
+    // EVEX writemasks change scalar-lane reads/writes. These are not plain
+    // full-load/store facts: leave them to conservative instruction effects.
+    if body.0.contains('{') {
+        return None;
+    }
     let (src, dst) = body.0.split_once(',')?;
     let src = src.trim();
     let dst = dst.trim();

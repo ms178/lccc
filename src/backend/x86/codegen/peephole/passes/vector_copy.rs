@@ -1505,6 +1505,304 @@ pub(super) fn eliminate_dead_vector_copies(store: &LineStore, infos: &mut [LineI
     changed
 }
 
+/// Scalar instructions whose result takes bits 127:W of the destination from
+/// the penultimate operand (`vaddsd %b, %a, %d`: d = [a.hi : a.lo + b.lo]).
+/// Their non-penultimate vector sources are read at most 64 bits wide.
+fn vex_scalar_upper_from_src1(mn: &str) -> bool {
+    matches!(
+        mn,
+        "vaddsd"
+            | "vsubsd"
+            | "vmulsd"
+            | "vdivsd"
+            | "vminsd"
+            | "vmaxsd"
+            | "vsqrtsd"
+            | "vroundsd"
+            | "vaddss"
+            | "vsubss"
+            | "vmulss"
+            | "vdivss"
+            | "vminss"
+            | "vmaxss"
+            | "vsqrtss"
+            | "vroundss"
+            | "vrcpss"
+            | "vrsqrtss"
+            | "vcvtss2sd"
+            | "vcvtsd2ss"
+            | "vcvtsi2sd"
+            | "vcvtsi2sdl"
+            | "vcvtsi2sdq"
+            | "vcvtsi2ss"
+            | "vcvtsi2ssl"
+            | "vcvtsi2ssq"
+    )
+}
+
+/// Legacy two-operand scalar instructions: the destination keeps its bits
+/// above the scalar lane, and any vector source is read at most 64 bits wide.
+fn legacy_scalar_merge(mn: &str) -> bool {
+    matches!(
+        mn,
+        "addsd"
+            | "subsd"
+            | "mulsd"
+            | "divsd"
+            | "minsd"
+            | "maxsd"
+            | "sqrtsd"
+            | "roundsd"
+            | "addss"
+            | "subss"
+            | "mulss"
+            | "divss"
+            | "minss"
+            | "maxss"
+            | "sqrtss"
+            | "roundss"
+            | "rcpss"
+            | "rsqrtss"
+            | "cvtss2sd"
+            | "cvtsd2ss"
+            | "cvtsi2sd"
+            | "cvtsi2sdl"
+            | "cvtsi2sdq"
+            | "cvtsi2ss"
+            | "cvtsi2ssl"
+            | "cvtsi2ssq"
+    )
+}
+
+/// Scalar FMA: every operand is read in its low lane only and the
+/// destination keeps its own bits above that lane.
+fn scalar_fma(mn: &str) -> bool {
+    let Some(rest) = ["vfmadd", "vfmsub", "vfnmadd", "vfnmsub"]
+        .iter()
+        .find_map(|p| mn.strip_prefix(p))
+    else {
+        return false;
+    };
+    matches!(
+        rest,
+        "132sd" | "213sd" | "231sd" | "132ss" | "213ss" | "231ss"
+    )
+}
+
+/// True when `text` spells vector register `n` at any width, on an exact
+/// digit boundary (`%xmm1` is not named by `%xmm15`).
+fn names_vec_reg(text: &str, n: u8) -> bool {
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(off) = text[from..].find('%') {
+        let at = from + off + 1;
+        from = at;
+        let Some(rest) = ["xmm", "ymm", "zmm"]
+            .iter()
+            .find_map(|w| text[at..].strip_prefix(w))
+        else {
+            continue;
+        };
+        let start = bytes.len() - rest.len();
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 && rest[..digits].parse::<u32>().ok() == Some(u32::from(n)) {
+            return true;
+        }
+        from = start;
+    }
+    false
+}
+
+/// What one line does to bits 127:64 of `%xmm<n>`, given that the line
+/// mentions the register.
+enum UpperFate {
+    /// Overwritten without being read: the old upper half is dead here.
+    Killed,
+    /// Neither read nor overwritten (low-lane reads, upper-preserving
+    /// writes into `n` itself): keep looking.
+    Carried,
+    /// Possibly read, copied elsewhere, or not modelled.
+    Observed,
+}
+
+fn upper64_fate(t: &str, n: u8) -> UpperFate {
+    let (mn, operands) = split_mn(t);
+    let ops = operand_list(operands);
+    let Some(last) = ops.len().checked_sub(1) else {
+        return UpperFate::Observed;
+    };
+    let mut mentions = Vec::with_capacity(ops.len());
+    for (k, op) in ops.iter().enumerate() {
+        match vec_operand(op) {
+            Some((num, W128)) if num == n => mentions.push(k),
+            // A wide spelling reads or writes the bits in question.
+            Some((num, _)) if num == n => return UpperFate::Observed,
+            // Named inside a compound operand (a VSIB index, say).
+            None if names_vec_reg(op, n) => return UpperFate::Observed,
+            _ => {}
+        }
+    }
+    let is_n = |k: usize| vec_operand(ops[k]) == Some((n, W128));
+    let is_vec = |k: usize| vec_operand(ops[k]).is_some();
+    let src_mentions = mentions.iter().any(|&k| k != last);
+    if reads_only_mnemonic(mn) {
+        return if matches!(mn, "comisd" | "ucomisd" | "vcomisd" | "vucomisd")
+            || matches!(mn, "comiss" | "ucomiss" | "vcomiss" | "vucomiss")
+        {
+            UpperFate::Carried
+        } else {
+            UpperFate::Observed
+        };
+    }
+    if is_n(last) {
+        return match mn {
+            // Zero-extending loads and moves; a 64/32-bit vector source is
+            // read in its low lane only.
+            "movq" | "vmovq" | "movd" | "vmovd" => UpperFate::Killed,
+            "movsd" | "movss" | "vmovsd" | "vmovss" if ops.len() == 2 => {
+                if is_vec(0) {
+                    // Register form merges: the destination keeps its upper.
+                    if mn.starts_with('v') {
+                        UpperFate::Observed
+                    } else {
+                        UpperFate::Carried
+                    }
+                } else {
+                    UpperFate::Killed
+                }
+            }
+            // `vmovsd %a, %b, %d`: d = [b.hi : a.lo].
+            "vmovsd" | "vmovss" if ops.len() == 3 => {
+                if is_n(1) {
+                    UpperFate::Carried
+                } else {
+                    UpperFate::Killed
+                }
+            }
+            "movapd" | "movaps" | "movupd" | "movups" | "movdqa" | "movdqu" | "vmovapd"
+            | "vmovaps" | "vmovupd" | "vmovups" | "vmovdqa" | "vmovdqu"
+                if ops.len() == 2 =>
+            {
+                if is_n(0) {
+                    UpperFate::Carried
+                } else {
+                    UpperFate::Killed
+                }
+            }
+            "xorpd" | "xorps" | "pxor" | "vxorpd" | "vxorps" | "vpxor"
+                if mentions.len() == ops.len() =>
+            {
+                UpperFate::Killed
+            }
+            _ if scalar_fma(mn) && ops.len() == 3 => UpperFate::Carried,
+            _ if legacy_scalar_merge(mn) => UpperFate::Carried,
+            _ if vex_scalar_upper_from_src1(mn) && ops.len() >= 3 => {
+                if is_n(last - 1) {
+                    UpperFate::Carried
+                } else {
+                    UpperFate::Killed
+                }
+            }
+            _ => UpperFate::Observed,
+        };
+    }
+    debug_assert!(src_mentions);
+    // `n` is only a source here.
+    match mn {
+        "movsd" | "movss" | "vmovsd" | "vmovss" | "movq" | "vmovq" | "movd" | "vmovd"
+            if ops.len() == 2 =>
+        {
+            UpperFate::Carried
+        }
+        "vmovsd" | "vmovss" if ops.len() == 3 && !is_n(1) => UpperFate::Carried,
+        "cvtsd2si" | "cvttsd2si" | "vcvtsd2si" | "vcvttsd2si" | "cvtss2si" | "cvttss2si"
+        | "vcvtss2si" | "vcvttss2si" | "cvtsd2siq" | "cvttsd2siq" | "vcvtsd2siq"
+        | "vcvttsd2siq" | "cvtss2siq" | "cvttss2siq" | "vcvtss2siq" | "vcvttss2siq"
+        | "cvtsd2sil" | "cvttsd2sil" | "vcvtsd2sil" | "vcvttsd2sil" | "cvtss2sil"
+        | "cvttss2sil" | "vcvtss2sil" | "vcvttss2sil" => UpperFate::Carried,
+        _ if scalar_fma(mn) && ops.len() == 3 => UpperFate::Carried,
+        _ if legacy_scalar_merge(mn) => UpperFate::Carried,
+        // The penultimate operand donates its upper half to another register.
+        _ if vex_scalar_upper_from_src1(mn) && ops.len() >= 3 && !is_n(last - 1) => {
+            UpperFate::Carried
+        }
+        _ => UpperFate::Observed,
+    }
+}
+
+/// Delete a legacy `movq %xmmN, %xmmN` whose only effect — zeroing bits
+/// 127:64 — no instruction can observe.
+///
+/// Store forwarding replaces a `movsd slot, %xmmN` reload of a value `%xmmN`
+/// still holds with this zeroing self-move, because the memory form zeroes
+/// the upper half and the register forms merge (Intel SDM, MOVSD/MOVQ). The
+/// replacement is exact, but on a scalar FP chain it is one more µop and one
+/// more cycle of latency (`movq` is not move-eliminated), and it usually
+/// guards nothing: the scalar code that follows reads the low lane only.
+///
+/// The proof is a forward scan inside the basic block. Lines that do not
+/// mention the register pass (barriers — labels, branches, calls, returns,
+/// pinned or implicit-effect lines — end the scan undecided). A mentioning
+/// line either overwrites bits 127:64 without reading them (the zeroing was
+/// dead: delete), leaves them in place unread (keep scanning), or may read or
+/// copy them (keep the move). VEX self-moves also zero bits 255:128 and are
+/// left alone.
+pub(super) fn eliminate_unobserved_zeroing_self_moves(
+    store: &LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    const SCAN_LIMIT: usize = 64;
+    let mut changed = false;
+    for i in 0..store.len() {
+        if infos[i].is_nop() || infos[i].pinned {
+            continue;
+        }
+        let t = infos[i].trimmed(store.get(i));
+        let Some(rest) = t.strip_prefix("movq ") else {
+            continue;
+        };
+        let ops = operand_list(rest);
+        let n = match (ops.as_slice(), ops.first().and_then(|o| vec_operand(o))) {
+            ([a, b], Some((n, W128))) if vec_operand(b) == Some((n, W128)) && a == b => n,
+            _ => continue,
+        };
+        let mut seen = 0;
+        let mut dead = false;
+        for k in i + 1..store.len() {
+            if infos[k].is_nop() {
+                continue;
+            }
+            let u = infos[k].trimmed(store.get(k));
+            if is_barrier(&infos[k], u) || infos[k].kind == LineKind::Directive {
+                if infos[k].kind == LineKind::Directive && benign_directive(u) {
+                    continue;
+                }
+                break;
+            }
+            seen += 1;
+            if seen > SCAN_LIMIT {
+                break;
+            }
+            if !names_vec_reg(u, n) {
+                continue;
+            }
+            match upper64_fate(u, n) {
+                UpperFate::Killed => {
+                    dead = true;
+                    break;
+                }
+                UpperFate::Carried => {}
+                UpperFate::Observed => break,
+            }
+        }
+        if dead {
+            mark_nop(&mut infos[i]);
+            changed = true;
+        }
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3447,5 +3745,117 @@ mod tests {
             vec!["vfmadd213sd %xmm2, %xmm1, %xmm0", "ret"],
             "three instructions to one, matching Clang and ICX"
         );
+    }
+}
+
+#[cfg(test)]
+mod zeroing_self_move_tests {
+    use super::*;
+
+    /// Run the pass over `body` (one function) and report whether the first
+    /// `movq %xmmN, %xmmN` line survived.
+    fn survives(body: &str) -> bool {
+        let asm = format!(".type f, @function\nf:\n{body}.size f, .-f\n");
+        let store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        eliminate_unobserved_zeroing_self_moves(&store, &mut infos);
+        let at = (0..store.len())
+            .find(|&i| {
+                let t = store.get(i).trim();
+                t.starts_with("movq %xmm") && {
+                    let ops = operand_list(&t[5..]);
+                    ops.len() == 2 && ops[0] == ops[1]
+                }
+            })
+            .expect("fixture has a self-move");
+        !infos[at].is_nop()
+    }
+
+    #[test]
+    fn killed_by_zero_extending_gp_transfer() {
+        // struct_copy: the reload became a self-move and the register is
+        // redefined by `movq %rax` before anything reads its upper half.
+        assert!(!survives(
+            "    movsd %xmm0, 56(%rsp)\n    movq %xmm0, %xmm0\n    vmulsd %xmm4, %xmm15, %xmm15\n    movq 72(%rsp), %rax\n    movq %rax, %xmm0\n    ret\n"
+        ));
+    }
+
+    #[test]
+    fn carried_through_scalar_fma_and_store_then_killed() {
+        assert!(!survives(
+            "    movq %xmm0, %xmm0\n    movsd 32(%rsp), %xmm1\n    vfmadd231sd %xmm1, %xmm1, %xmm0\n    movsd %xmm0, 32(%rsp)\n    xorpd %xmm0, %xmm0\n    ret\n"
+        ));
+        assert!(!survives(
+            "    movq %xmm0, %xmm0\n    vmulsd 16(%rsp), %xmm0, %xmm0\n    movq %xmm0, %xmm7\n    vsubsd %xmm14, %xmm11, %xmm0\n    ret\n"
+        ));
+    }
+
+    #[test]
+    fn packed_reader_observes_the_zeroed_half() {
+        assert!(survives(
+            "    movq %xmm0, %xmm0\n    vaddpd %xmm0, %xmm1, %xmm2\n    xorpd %xmm0, %xmm0\n    ret\n"
+        ));
+        assert!(survives(
+            "    movq %xmm0, %xmm0\n    movapd %xmm0, %xmm3\n    xorpd %xmm0, %xmm0\n    ret\n"
+        ));
+        assert!(survives(
+            "    movq %xmm0, %xmm0\n    unpcklpd %xmm0, %xmm1\n    xorpd %xmm0, %xmm0\n    ret\n"
+        ));
+    }
+
+    #[test]
+    fn vex_merge_source_donates_the_upper_half() {
+        // `vaddsd %xmm1, %xmm0, %xmm2` copies xmm0[127:64] into xmm2.
+        assert!(survives(
+            "    movq %xmm0, %xmm0\n    vaddsd %xmm1, %xmm0, %xmm2\n    xorpd %xmm0, %xmm0\n    ret\n"
+        ));
+        assert!(survives(
+            "    movq %xmm0, %xmm0\n    vmovsd %xmm1, %xmm0, %xmm2\n    xorpd %xmm0, %xmm0\n    ret\n"
+        ));
+        // As the scalar data operand it reads only the low lane.
+        assert!(!survives(
+            "    movq %xmm0, %xmm0\n    vaddsd %xmm0, %xmm1, %xmm2\n    xorpd %xmm0, %xmm0\n    ret\n"
+        ));
+    }
+
+    #[test]
+    fn barriers_and_unmodelled_text_keep_the_move() {
+        for tail in [
+            "    ret\n",
+            "    call g\n    xorpd %xmm0, %xmm0\n    ret\n",
+            ".L1:\n    xorpd %xmm0, %xmm0\n    ret\n",
+            "    jmp .L2\n",
+            "    vextractf128 $1, %ymm0, %xmm1\n    xorpd %xmm0, %xmm0\n    ret\n",
+            "    vgatherdpd %xmm2, (%rax,%xmm0,8), %xmm1\n    xorpd %xmm0, %xmm0\n    ret\n",
+            "    pshufd $78, %xmm0, %xmm1\n    xorpd %xmm0, %xmm0\n    ret\n",
+        ] {
+            assert!(
+                survives(&format!("    movq %xmm0, %xmm0\n{tail}")),
+                "must keep before {tail:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn register_numbers_match_on_digit_boundaries() {
+        // `%xmm10` is not `%xmm1`: its write proves nothing about xmm1.
+        assert!(survives(
+            "    movq %xmm1, %xmm1\n    movq %rax, %xmm10\n    vaddpd %xmm1, %xmm2, %xmm3\n    ret\n"
+        ));
+        assert!(!survives(
+            "    movq %xmm1, %xmm1\n    vaddpd %xmm10, %xmm2, %xmm3\n    movq %rax, %xmm1\n    ret\n"
+        ));
+    }
+
+    #[test]
+    fn vex_self_move_is_not_this_pass() {
+        let asm = ".type f, @function\nf:\n    vmovq %xmm0, %xmm0\n    movq %rax, %xmm0\n    ret\n.size f, .-f\n";
+        let store = LineStore::new(asm.to_owned());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(!eliminate_unobserved_zeroing_self_moves(&store, &mut infos));
     }
 }

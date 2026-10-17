@@ -262,7 +262,7 @@ impl Lexer {
             && (self.input[self.pos] == b'p' || self.input[self.pos] == b'P');
 
         if has_dot && after_dot_has_p || has_p {
-            return self.lex_hex_float(start, hex_start, has_dot);
+            return self.lex_hex_float(start, has_dot);
         }
 
         // Regular hex integer
@@ -278,71 +278,54 @@ impl Lexer {
     }
 
     /// Lex a hex float literal: 0x<int_hex>.<frac_hex>p<+/->exp
-    fn lex_hex_float(&mut self, start: usize, hex_start: usize, has_dot: bool) -> Token {
-        let int_hex = std::str::from_utf8(&self.input[hex_start..self.pos]).unwrap_or("0");
-
-        let frac_hex = if has_dot {
-            self.pos += 1; // skip '.'
-            let frac_start = self.pos;
+    fn lex_hex_float(&mut self, start: usize, has_dot: bool) -> Token {
+        if has_dot {
+            self.pos += 1;
             while self.pos < self.input.len() && self.input[self.pos].is_ascii_hexdigit() {
                 self.pos += 1;
             }
-            std::str::from_utf8(&self.input[frac_start..self.pos]).unwrap_or("")
-        } else {
-            ""
-        };
-
-        // Parse 'p'/'P' exponent (mandatory for hex floats)
-        let exp: i64 = if self.pos < self.input.len()
-            && (self.input[self.pos] == b'p' || self.input[self.pos] == b'P')
-        {
+        }
+        // Scan only; conversion uses integer guard/sticky rounding below.
+        // Accumulating into u64 or scaling with powi loses long significands,
+        // subnormal literals and huge exponents before the target rounding.
+        if self.pos < self.input.len() && matches!(self.input[self.pos], b'p' | b'P') {
             self.pos += 1;
-            let exp_neg = if self.pos < self.input.len() && self.input[self.pos] == b'-' {
+            if self.pos < self.input.len() && matches!(self.input[self.pos], b'+' | b'-') {
                 self.pos += 1;
-                true
-            } else {
-                if self.pos < self.input.len() && self.input[self.pos] == b'+' {
-                    self.pos += 1;
-                }
-                false
-            };
+            }
             let exp_start = self.pos;
             while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
                 self.pos += 1;
             }
-            let (eu, _) = Self::accumulate_digits(&self.input[exp_start..self.pos], 10);
-            let e: i64 = eu as i64;
-            if exp_neg { -e } else { e }
-        } else {
-            0
-        };
-
-        // Convert hex float to f64: value = (int_part + frac_part) * 2^exp
-        let int_val = u64::from_str_radix(int_hex, 16).unwrap_or(0) as f64;
-        let frac_val: f64 = if !frac_hex.is_empty() {
-            let frac_int = u64::from_str_radix(frac_hex, 16).unwrap_or(0) as f64;
-            frac_int / (16.0_f64).powi(frac_hex.len() as i32)
-        } else {
-            0.0
-        };
-        let value = (int_val + frac_val) * (2.0_f64).powi(exp as i32);
-
-        // Check float suffix: full _FloatN set (f128/q/f16/f32/f64/f32x/f64x),
-        // same as the decimal path. glibc uses `0x1p-65f128` literals.
+            if self.pos == exp_start {
+                self.emit_lex_diag(
+                    "hexadecimal floating constant requires an exponent",
+                    start,
+                    self.pos,
+                );
+            }
+        }
+        let number_end = self.pos;
         let (float_kind, _is_imaginary) = self.parse_float_suffix();
+        let hex_text = std::str::from_utf8(&self.input[start..number_end]).unwrap_or("0x0p0");
+        let value = crate::common::hex_float::parse_f64(hex_text, float_kind == 1);
         let span = Span::new(start as u32, self.pos as u32, self.file_id);
         match float_kind {
             1 => Token::new(TokenKind::FloatLiteralF32(value), span),
             2 => {
                 let hex_text = std::str::from_utf8(&self.input[start..self.pos]).unwrap_or("0x0p0");
-                let f128_bytes =
-                    crate::common::long_double::parse_long_double_to_f128_bytes(hex_text);
+                let f128_bytes = crate::common::hex_float::parse_long_double(
+                    hex_text,
+                    crate::common::types::target_long_double_is_f128(),
+                );
+                let value = crate::common::long_double::f128_bytes_to_f64(&f128_bytes);
                 Token::new(TokenKind::FloatLiteralLongDouble(value, f128_bytes), span)
             }
             3 => {
                 let hex_text = std::str::from_utf8(&self.input[start..self.pos]).unwrap_or("0x0p0");
                 let f128_bytes =
                     crate::common::long_double::parse_long_double_to_f128_bytes(hex_text);
+                let value = crate::common::long_double::f128_bytes_to_f64(&f128_bytes);
                 Token::new(TokenKind::FloatLiteralF128(value, f128_bytes), span)
             }
             _ => Token::new(TokenKind::FloatLiteral(value), span),
@@ -1579,6 +1562,63 @@ fn hex_digit_val(c: u8) -> u8 {
 #[cfg(test)]
 mod recovery_tests {
     use super::*;
+
+    #[test]
+    fn hexadecimal_literals_round_directly_to_their_token_type() {
+        let mut lexer = Lexer::new("0x1p-1074 0x1.000001000000000000001p0f 0x3p-16495Q", 0);
+        let tokens = lexer.tokenize();
+        assert!(lexer.diagnostics.is_empty());
+        assert!(matches!(tokens[0].kind, TokenKind::FloatLiteral(v) if v.to_bits() == 1));
+        assert!(
+            matches!(tokens[1].kind, TokenKind::FloatLiteralF32(v) if (v as f32).to_bits() == 0x3f800001)
+        );
+        assert!(
+            matches!(tokens[2].kind, TokenKind::FloatLiteralF128(_, bytes) if u128::from_le_bytes(bytes) == 2)
+        );
+    }
+
+    #[test]
+    fn hexadecimal_long_double_uses_target_precision_but_q_stays_quad() {
+        use crate::common::types::{set_target_long_double_is_f128, target_long_double_is_f128};
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                set_target_long_double_is_f128(self.0);
+            }
+        }
+        let _restore = Restore(target_long_double_is_f128());
+        let literal = format!("0x1.{}1{}1p0", "0".repeat(15), "0".repeat(40));
+        for quad in [false, true] {
+            set_target_long_double_is_f128(quad);
+            let mut lexer = Lexer::new(&format!("{literal}L {literal}Q"), 0);
+            let tokens = lexer.tokenize();
+            assert!(
+                matches!(tokens[0].kind, TokenKind::FloatLiteralLongDouble(_, bytes)
+                if bytes == crate::common::hex_float::parse_long_double(&literal, quad))
+            );
+            assert!(
+                matches!(tokens[1].kind, TokenKind::FloatLiteralF128(_, bytes)
+                if bytes == crate::common::hex_float::parse_f128(&literal, false))
+            );
+        }
+    }
+
+    #[test]
+    fn hexadecimal_wide_token_approximation_matches_its_rounded_carrier() {
+        let literal = format!("0x1.{}8{}1p0", "0".repeat(13), "0".repeat(40));
+        let mut lexer = Lexer::new(&format!("{literal}L {literal}Q"), 0);
+        let tokens = lexer.tokenize();
+        assert!(matches!(tokens[0].kind, TokenKind::FloatLiteralLongDouble(v, _) if v == 1.0));
+        assert!(matches!(tokens[1].kind, TokenKind::FloatLiteralF128(v, _) if v == 1.0));
+    }
+
+    #[test]
+    fn hexadecimal_literal_without_exponent_digits_is_diagnosed() {
+        let mut lexer = Lexer::new("0x1p+;", 0);
+        lexer.tokenize();
+        assert_eq!(lexer.diagnostics.len(), 1);
+        assert!(lexer.diagnostics[0].0.contains("requires an exponent"));
+    }
 
     #[test]
     fn unknown_byte_at_eof_has_exact_byte_and_span() {

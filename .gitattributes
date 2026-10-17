@@ -42,6 +42,15 @@ Makefile        text eol=lf
 *.ttf    binary
 *.eot    binary
 *.pdf    binary
+# Compressed evidence and archives: never subject to text=auto detection
+# (a compressed stream without a NUL in its first 8 KiB would otherwise be
+# EOL-normalized and corrupted).
+*.gz     binary
+*.xz     binary
+*.zst    binary
+*.zip    binary
+*.tar    binary
+*.bundle binary
 
 # Historical instrumentation is byte evidence, not formatted source. Preserve
 # Valgrind's trailing spaces and captured terminal blank lines verbatim.

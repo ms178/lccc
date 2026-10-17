@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Fail-closed wrapping-domain differential + Memcheck gate.
 
-Default: 24 wrapping-domain cases. --fixture signed-scale: 30 ABI/optimization
+Default: 30 wrapping-domain cases (24 wrapv_domains.c arms plus 6
+wrapv_reverse_sub.c arms: the reverse-subtraction affine witness).
+--fixture signed-scale: 30 ABI/optimization
 arms, each executing 16 real in-object signed-address wrap witnesses.
 --fixture canonical: 60 arms, 82 nonoverflowing raw-wide/explicit-cast cases, both policies.
 
@@ -26,6 +28,7 @@ import subprocess
 
 OPTS = ('-O0', '-O1', '-O2', '-O3', '-Os')
 POINTER_I128_PASS = 'pointer-to-int128 implementation-defined extension: PASS'
+REVERSE_SUB_PASS = '682afb0d'
 
 
 def main():
@@ -123,6 +126,38 @@ def main():
                             if not row['pass']:
                                 raise RuntimeError(
                                     f'FAIL: {name}/{abi}/{opt}/{case}; see {args.json}')
+
+            if args.fixture == 'domains':
+                # Reverse-subtraction witness (`k - i` IV forms under -fwrapv):
+                # one self-checking run per compiler and ABI, no parameters.
+                witness = root / 'tests/regression/wrapv_reverse_sub.c'
+                report['additional_sources'].setdefault(
+                    str(witness.relative_to(root)),
+                    hashlib.sha256(witness.read_bytes()).hexdigest())
+                for abi, flags in [('x64', []), ('x86', ['-m32', '-msse2'])]:
+                    binary = (args.work_dir / (name + '-' + abi + '-reverse-sub')).resolve()
+                    cmd = [cc, '-O2', '-fwrapv', *flags, str(witness), '-o', str(binary)]
+                    build = subprocess.run(cmd, capture_output=True, text=True,
+                                           timeout=60, env=environment)
+                    if build.returncode:
+                        raise RuntimeError(f'build failure: {cmd}\n{build.stderr}')
+                    log = args.work_dir / f'{name}-{abi}-reverse-sub.log'
+                    command = ['valgrind', '--error-exitcode=97', '--leak-check=full',
+                               '--log-file=' + str(log), str(binary)]
+                    run = subprocess.run(command, capture_output=True, text=True,
+                                         timeout=60, env=environment)
+                    row = dict(compiler=name, abi=abi, opt='-O2', policy='-fwrapv',
+                               fixture='wrapv_reverse_sub.c', build=cmd, command=command,
+                               status=run.returncode,
+                               binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
+                               stdout=run.stdout.strip(), stderr=run.stderr,
+                               memcheck=log.read_text())
+                    row['pass'] = run.returncode == 0 and row['stdout'] == REVERSE_SUB_PASS
+                    report['cases'].append(row)
+                    save()
+                    if not row['pass']:
+                        raise RuntimeError(
+                            f'FAIL: {name}/{abi}/reverse-sub; see {args.json}')
 
             if pointer_i128:
                 # C leaves pointer-to-integer results implementation-defined.

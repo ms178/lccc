@@ -1,0 +1,827 @@
+{
+  "complete": true,
+  "original_report_sha256": "649084a14935fe2fb8f244a8cc0d6964da956ffb39da051a887032739f8d57ac",
+  "original_hashes_sha256": "59f0b9c388ed9376cda3064470be0284fdab4ab5f7ada9a928de96f3f9366906",
+  "compiler_sha256": "bf00a7c79dd9c4e5c70cfb6517dee5c48c75ee4953006d00d030fbaa16e1a138",
+  "checks": [
+    {
+      "name": "arith_loop",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/arith_loop/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/arith_loop.c"
+      ],
+      "original_sha256": "3b73667e468ae1893d8cd13f53740d8b083fbc0ef245b7fe5db1aa359d8cb653",
+      "current_sha256": "3b73667e468ae1893d8cd13f53740d8b083fbc0ef245b7fe5db1aa359d8cb653",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "fib",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/fib/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/fib.c"
+      ],
+      "original_sha256": "2876e26a961bbdb16d0e2c3a2f8a23b013f17a313d880834127f48c3aac797dc",
+      "current_sha256": "2876e26a961bbdb16d0e2c3a2f8a23b013f17a313d880834127f48c3aac797dc",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "matmul",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/matmul/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/matmul.c"
+      ],
+      "original_sha256": "45a0e37f7a85b4010f6fccc60766350d2c794e45b2292cbbd58cc67e2f7bcf92",
+      "current_sha256": "45a0e37f7a85b4010f6fccc60766350d2c794e45b2292cbbd58cc67e2f7bcf92",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "qsort",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/qsort/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/qsort.c"
+      ],
+      "original_sha256": "fc92ada69ccbf4ca72a3ac8d217b09787e61bc6a348316fbddbc27ccfa593f06",
+      "current_sha256": "fc92ada69ccbf4ca72a3ac8d217b09787e61bc6a348316fbddbc27ccfa593f06",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "sieve",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/sieve/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/sieve.c"
+      ],
+      "original_sha256": "ed8872842b5e293ff362212db0788e910d53833c98d0810071bc6ba804af0089",
+      "current_sha256": "ed8872842b5e293ff362212db0788e910d53833c98d0810071bc6ba804af0089",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "tce_sum",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/tce_sum/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/tce_sum.c"
+      ],
+      "original_sha256": "94eaa19c0e24dcd162b4911872f82be7be9ad5fd59fbb390bf3080394efa5b2d",
+      "current_sha256": "94eaa19c0e24dcd162b4911872f82be7be9ad5fd59fbb390bf3080394efa5b2d",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "nbody",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/nbody/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/nbody.c",
+        "-lm"
+      ],
+      "original_sha256": "7c2bbcc369ff1f87330014bf70a94872e002aa3f53d1e67a2558735bd3789e8c",
+      "current_sha256": "7c2bbcc369ff1f87330014bf70a94872e002aa3f53d1e67a2558735bd3789e8c",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "binary_trees",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/binary_trees/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/binary_trees.c"
+      ],
+      "original_sha256": "bc439d083c992bbdc87f44ed3c94c4629b7827e3fc52fb9642cb08560a0d2ad6",
+      "current_sha256": "bc439d083c992bbdc87f44ed3c94c4629b7827e3fc52fb9642cb08560a0d2ad6",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "spectral_norm",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/spectral_norm/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/spectral_norm.c",
+        "-lm"
+      ],
+      "original_sha256": "3f84a0fe979b99fb7889e4ffd8f4625cca5559f0489dd566e1090a238ac1fbfa",
+      "current_sha256": "3f84a0fe979b99fb7889e4ffd8f4625cca5559f0489dd566e1090a238ac1fbfa",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "mandelbrot",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/mandelbrot/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/mandelbrot.c"
+      ],
+      "original_sha256": "841af7d6205a2ccd640b25f54803f79619cc0f6ac66d43263fbd4e60f4301100",
+      "current_sha256": "841af7d6205a2ccd640b25f54803f79619cc0f6ac66d43263fbd4e60f4301100",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "hash_table",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/hash_table/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/hash_table.c"
+      ],
+      "original_sha256": "e3ca6c47b7a775fd70617d3f215f0a3bfd1926582e7000d5567e0fb9eb51a8e5",
+      "current_sha256": "e3ca6c47b7a775fd70617d3f215f0a3bfd1926582e7000d5567e0fb9eb51a8e5",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "strlen_bench",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/strlen_bench/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/strlen_bench.c"
+      ],
+      "original_sha256": "2083e687ac25bb94faa3318e893cf491ccae739b1d469c956cc143c2a284fa3a",
+      "current_sha256": "2083e687ac25bb94faa3318e893cf491ccae739b1d469c956cc143c2a284fa3a",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "switch_dispatch",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/switch_dispatch/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/switch_dispatch.c"
+      ],
+      "original_sha256": "d7f55d1dbc2d87226b2f4866ebc256e3a0fc1906c90cc64d1944e8a8a4ed0877",
+      "current_sha256": "d7f55d1dbc2d87226b2f4866ebc256e3a0fc1906c90cc64d1944e8a8a4ed0877",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "struct_copy",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/struct_copy/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/struct_copy.c"
+      ],
+      "original_sha256": "1634e7e560596661e20fd17e01c8f3a6d8dff4bba8b4c2fcb32d56b0fd94d078",
+      "current_sha256": "1634e7e560596661e20fd17e01c8f3a6d8dff4bba8b4c2fcb32d56b0fd94d078",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "loop_patterns",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/loop_patterns/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/loop_patterns.c"
+      ],
+      "original_sha256": "bad38f7aaeada6330a192ced0b55d3599a087bbb1bcc4190572d80ed7a2ef36d",
+      "current_sha256": "bad38f7aaeada6330a192ced0b55d3599a087bbb1bcc4190572d80ed7a2ef36d",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "fannkuch",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/fannkuch/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/fannkuch.c"
+      ],
+      "original_sha256": "7b8cb95b48336255f7f0aa033fb132b9942618230caca1bbc68ad12ed68eae5b",
+      "current_sha256": "7b8cb95b48336255f7f0aa033fb132b9942618230caca1bbc68ad12ed68eae5b",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "ackermann",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/ackermann/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/ackermann.c"
+      ],
+      "original_sha256": "6aaae965a2a6a5d9cd552a81d83d367458b1018c1dee3fb3fbe8889a7d65cd03",
+      "current_sha256": "6aaae965a2a6a5d9cd552a81d83d367458b1018c1dee3fb3fbe8889a7d65cd03",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "constant_recursion",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/constant_recursion/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/constant_recursion.c"
+      ],
+      "original_sha256": "75edad9dc3322893f55d5d5b93a44740dd285d6799e9bedc855181fb9b43c88f",
+      "current_sha256": "75edad9dc3322893f55d5d5b93a44740dd285d6799e9bedc855181fb9b43c88f",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "bitops",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/bitops/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/bitops.c"
+      ],
+      "original_sha256": "9c6e79ee285cf25ed2b80b905d3eec0d2d59f711582ff284284a683d86af681a",
+      "current_sha256": "9c6e79ee285cf25ed2b80b905d3eec0d2d59f711582ff284284a683d86af681a",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "double_reduction",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/double_reduction/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/double_reduction.c"
+      ],
+      "original_sha256": "643ed0407f10f580e4540c2a9fb6a8078e396f4094340427da836d7828fca190",
+      "current_sha256": "643ed0407f10f580e4540c2a9fb6a8078e396f4094340427da836d7828fca190",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "ascii_case_fold",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/ascii_case_fold/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/ascii_case_fold.c"
+      ],
+      "original_sha256": "6e3c4c8966ee174b5288d8b7d63d323157fe5a6a2ba7da32a73e66e88b2c9069",
+      "current_sha256": "6e3c4c8966ee174b5288d8b7d63d323157fe5a6a2ba7da32a73e66e88b2c9069",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "binary_search",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/binary_search/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/binary_search.c"
+      ],
+      "original_sha256": "8902da688f35d0f0967fba11172dd57cdece19135891681de7d1440e169b8e51",
+      "current_sha256": "8902da688f35d0f0967fba11172dd57cdece19135891681de7d1440e169b8e51",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "ring_fifo",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/ring_fifo/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/ring_fifo.c"
+      ],
+      "original_sha256": "6ca8e8ecc26f058122306021295430fe17bf6206d2769ab8ff500b5de46d6898",
+      "current_sha256": "6ca8e8ecc26f058122306021295430fe17bf6206d2769ab8ff500b5de46d6898",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "aarch64_select_patterns",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/aarch64_select_patterns/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/aarch64_select_patterns.c"
+      ],
+      "original_sha256": "847c371947bf5d898c65755f0332e0eb09f7e53005658656170b89d556259596",
+      "current_sha256": "847c371947bf5d898c65755f0332e0eb09f7e53005658656170b89d556259596",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "histogram",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/histogram/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/histogram.c"
+      ],
+      "original_sha256": "4915f92ffa2185f730a30612eb991899f8722ca61bb1bc7faa0ebbaa1b97910d",
+      "current_sha256": "4915f92ffa2185f730a30612eb991899f8722ca61bb1bc7faa0ebbaa1b97910d",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "gzip_crc32",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/gzip_crc32/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/gzip_crc32.c"
+      ],
+      "original_sha256": "bbbb55c8fa21239e596691a2174d1d2d5f6286db7464c4672da379a690c4d328",
+      "current_sha256": "bbbb55c8fa21239e596691a2174d1d2d5f6286db7464c4672da379a690c4d328",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "libm_round_family",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/libm_round_family/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/libm_round_family.c"
+      ],
+      "original_sha256": "a8139287f033c100787bcb4b10ace76d9d622a8bfad015489866e2a6799484df",
+      "current_sha256": "a8139287f033c100787bcb4b10ace76d9d622a8bfad015489866e2a6799484df",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "tls_seg_access",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/tls_seg_access/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/tls_seg_access.c"
+      ],
+      "original_sha256": "a24d75e1a38582d531d45be700012d26e40c1d1bf88a0eeb0ef8f84598c37366",
+      "current_sha256": "896aa1ee4cbcd193c5c654008e0ef4fb76df2dd1308003acb22ceec6871e4646",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "percpu_ptr_walk",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/percpu_ptr_walk/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/percpu_ptr_walk.c"
+      ],
+      "original_sha256": "34d5e9ad0fd2bec819c3e7eb123a22f90000796395bc9746675c9531141ba53f",
+      "current_sha256": "34d5e9ad0fd2bec819c3e7eb123a22f90000796395bc9746675c9531141ba53f",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "byte_load_reassembly",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/byte_load_reassembly/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/byte_load_reassembly.c"
+      ],
+      "original_sha256": "c4718ca48e68deec3a2de958946926a40bbb398442e2092c45d878490d65db51",
+      "current_sha256": "c4718ca48e68deec3a2de958946926a40bbb398442e2092c45d878490d65db51",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "zlib_ng_adler32",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/zlib_ng_adler32/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/zlib_ng_adler32.c"
+      ],
+      "original_sha256": "20ef739233cd02930159a211ce4320c51ed00849f49566d0616b7788c36416b8",
+      "current_sha256": "20ef739233cd02930159a211ce4320c51ed00849f49566d0616b7788c36416b8",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "zlib_ng_adler32_combine",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/zlib_ng_adler32_combine/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/zlib_ng_adler32_combine.c"
+      ],
+      "original_sha256": "c1865c99ed468f281341360f412285d4e6425c2df74d527a52a7a40c6897e791",
+      "current_sha256": "c1865c99ed468f281341360f412285d4e6425c2df74d527a52a7a40c6897e791",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "expat_xml_scan",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/expat_xml_scan/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/expat_xml_scan.c"
+      ],
+      "original_sha256": "ac965487bc3c83c1339fa5fcfada6ff2c6b75e6c67076cf435ef8bc5bcb08050",
+      "current_sha256": "ac965487bc3c83c1339fa5fcfada6ff2c6b75e6c67076cf435ef8bc5bcb08050",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "expat_siphash24",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/expat_siphash24/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/expat_siphash24.c"
+      ],
+      "original_sha256": "59283128c1bfe050cafc7af3c69ff50979e7fc4b137ad91bd1c789826ea29df1",
+      "current_sha256": "59283128c1bfe050cafc7af3c69ff50979e7fc4b137ad91bd1c789826ea29df1",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "sqlite_varint",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/sqlite_varint/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/sqlite_varint.c"
+      ],
+      "original_sha256": "15c25e767cbbe55b057d414d7695594da3c817baea06a1ff106ad099f59ecee0",
+      "current_sha256": "15c25e767cbbe55b057d414d7695594da3c817baea06a1ff106ad099f59ecee0",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "linux_find_bit",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/linux_find_bit/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/linux_find_bit.c"
+      ],
+      "original_sha256": "9ebca9d6ce3f2785b9901b060d7976c87ba1129cb72e6b03290a77e4e6ea5d32",
+      "current_sha256": "9ebca9d6ce3f2785b9901b060d7976c87ba1129cb72e6b03290a77e4e6ea5d32",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "linux_find_bit_scaled",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/linux_find_bit_scaled/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/linux_find_bit.c",
+        "-DPASSES=65536"
+      ],
+      "original_sha256": "5162fed4d5138861e097de2666a427b5cb01fd2107b3061a682b30d14b552398",
+      "current_sha256": "5162fed4d5138861e097de2666a427b5cb01fd2107b3061a682b30d14b552398",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "glibc_memcmp",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/glibc_memcmp/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/glibc_memcmp.c"
+      ],
+      "original_sha256": "7e502e33ff8d48800e28a04cd23922f3c06f0a2a3b57edc5704f709785b16a43",
+      "current_sha256": "7e502e33ff8d48800e28a04cd23922f3c06f0a2a3b57edc5704f709785b16a43",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "chacha20_block",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/chacha20_block/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/chacha20_block.c"
+      ],
+      "original_sha256": "7d475ace18e42ce933be57a92578709fb8613a30f4a396b9f292ad0458ccb24d",
+      "current_sha256": "7d475ace18e42ce933be57a92578709fb8613a30f4a396b9f292ad0458ccb24d",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "sha256_transform",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/sha256_transform/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/sha256_transform.c"
+      ],
+      "original_sha256": "ea54773baa890293b7a3d4a1a0f1961117e958d0d9c9e5e2ba262951e44363d3",
+      "current_sha256": "ea54773baa890293b7a3d4a1a0f1961117e958d0d9c9e5e2ba262951e44363d3",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "linux_rbtree",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/linux_rbtree/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/linux_rbtree.c"
+      ],
+      "original_sha256": "484ff8041df6a250e5117d9e0fe4b140a579ff35d66486affa7b5e3588df33c8",
+      "current_sha256": "484ff8041df6a250e5117d9e0fe4b140a579ff35d66486affa7b5e3588df33c8",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "zstd_count",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/zstd_count/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/zstd_count.c"
+      ],
+      "original_sha256": "d80130ee773ea2dc05ab5e01402df876cd565b544c5ff226537c8e9cbfbf9fcf",
+      "current_sha256": "d80130ee773ea2dc05ab5e01402df876cd565b544c5ff226537c8e9cbfbf9fcf",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "lz4_compress",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/lz4_compress/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/lz4_compress.c"
+      ],
+      "original_sha256": "e1b2feb24002c489110da1d128bd1bc1ad8b1c9c943e273fd249adfde7c24661",
+      "current_sha256": "e1b2feb24002c489110da1d128bd1bc1ad8b1c9c943e273fd249adfde7c24661",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "lz4_match_extend",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/lz4_match_extend/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/lz4_compress.c",
+        "-DMATCH_RICH=1",
+        "-DPASSES=2048"
+      ],
+      "original_sha256": "e586093a420ac4f7b86dac6859f10564e2a71152e101f495523554cb8c038182",
+      "current_sha256": "e586093a420ac4f7b86dac6859f10564e2a71152e101f495523554cb8c038182",
+      "error": null,
+      "stderr": ""
+    },
+    {
+      "name": "glibc_strstr",
+      "command": [
+        "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "-I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-o",
+        "/home/user/.cache/audit829830/native-replay-v4/glibc_strstr/benchmark.bin",
+        "/home/user/.cache/lccc/tests/benchmark/programs/glibc_strstr.c"
+      ],
+      "original_sha256": "32aaf5a136d1e859d6cd2db633026f3e59e08fce479139c915637431b1d0a0ba",
+      "current_sha256": "32aaf5a136d1e859d6cd2db633026f3e59e08fce479139c915637431b1d0a0ba",
+      "error": null,
+      "stderr": ""
+    }
+  ],
+  "changed": [
+    "tls_seg_access"
+  ],
+  "failures": []
+}

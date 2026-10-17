@@ -60,13 +60,15 @@ impl Lowerer {
         let is_long_double_target = self.is_type_spec_long_double(type_spec);
         let is_bool_target = self.is_type_bool(type_spec);
 
-        match init {
+        // GCC's `folding_initializer`: see `Lowerer::folding_initializer`.
+        let outer = self.folding_initializer.replace(true);
+        let lowered = match init {
             Initializer::Expr(expr) => self.lower_global_init_expr(
                 expr,
                 type_spec,
                 base_ty,
                 is_array,
-                struct_layout,
+                obj_ty,
                 is_long_double_target,
                 is_bool_target,
             ),
@@ -93,7 +95,9 @@ impl Lowerer {
                     obj_ty,
                 )
             }
-        }
+        };
+        self.folding_initializer.set(outer);
+        lowered
     }
 }
 
@@ -110,7 +114,7 @@ impl Lowerer {
         type_spec: &TypeSpecifier,
         base_ty: IrType,
         is_array: bool,
-        _struct_layout: &Option<RcLayout>,
+        obj_ty: Option<&CType>,
         is_long_double_target: bool,
         is_bool_target: bool,
     ) -> GlobalInit {
@@ -124,7 +128,7 @@ impl Lowerer {
                     type_spec,
                     base_ty,
                     is_array,
-                    _struct_layout,
+                    obj_ty,
                     is_long_double_target,
                     is_bool_target,
                 );
@@ -140,6 +144,14 @@ impl Lowerer {
                     return init;
                 }
             }
+        }
+        // A vector from a constant vector expression (`v = (T){ ... }`). The
+        // object's own type decides: `type_spec` is only the declaration's
+        // base specifier (`T (*fp)(int) = f;` has base type `T`).
+        if let Some(vec_ct) = obj_ty.filter(|t| t.is_vector()) {
+            let mut bytes = vec![0u8; self.resolve_ctype_size(vec_ct)];
+            self.write_vector_expr_bytes(expr, vec_ct, &mut bytes, 0);
+            return GlobalInit::Array(bytes.iter().map(|&b| IrConst::I8(b as i8)).collect());
         }
 
         // Scalar constant
@@ -308,10 +320,18 @@ impl Lowerer {
         // Clang and ICX all report "initializer element is not constant"
         // (measured, including for `__builtin_cpu_supports`, which GCC refuses
         // to fold in constant contexts).  Diagnose instead of miscompiling.
+        self.diagnose_non_constant(expr);
+        GlobalInit::Zero
+    }
+
+    /// Report a static initializer element no constant form could lower.
+    /// Every lowering path ends here instead of storing zero: sema accepts
+    /// what GCC accepts, so reaching this is either a non-constant or a form
+    /// the lowering lacks, and both must be an error, never a silent 0.
+    pub(super) fn diagnose_non_constant(&self, expr: &Expr) {
         self.diagnostics
             .borrow_mut()
             .error("initializer element is not constant", expr.span());
-        GlobalInit::Zero
     }
 
     /// The operand of a folded global relational or logical expression: an
@@ -694,9 +714,16 @@ impl Lowerer {
 
         // Array with elements
         if is_array && elem_size > 0 {
+            // Array of vectors (`v4f a[] = ...`). The object's type decides:
+            // an array of pointers to vectors has base specifier `v4f` too.
+            if let Some(CType::Array(elem, _)) = obj_ty {
+                if elem.is_vector() {
+                    let len = total_size / self.resolve_ctype_size(elem).max(1);
+                    return self.lower_vector_array_init(items, elem, len);
+                }
+            }
             return self.lower_array_init(
                 items,
-                type_spec,
                 base_ty,
                 elem_size,
                 total_size,
@@ -712,12 +739,10 @@ impl Lowerer {
             return self.lower_struct_global_init(items, layout);
         }
 
-        // Vector initializer list: __attribute__((vector_size(N)))
-        {
-            let ctype = self.type_spec_to_ctype(type_spec);
-            if ctype.is_vector() {
-                return self.lower_vector_init(items, &ctype);
-            }
+        // Vector initializer list: __attribute__((vector_size(N))). The
+        // object's type decides, not the base specifier (`T *p = { &v };`).
+        if let Some(vec_ct) = obj_ty.filter(|t| t.is_vector()) {
+            return self.lower_vector_init(items, vec_ct);
         }
 
         // Scalar with braces: int x = { 1 }; or int x = {{{1}}};
@@ -744,7 +769,7 @@ impl Lowerer {
         for (index, init) in plan.elements.into_iter().enumerate() {
             let Some(init) = init else { continue };
             let offset = index.saturating_mul(vector_size);
-            self.write_vector_init_to_bytes(&mut bytes, offset, &plan.vector_type, &init);
+            self.write_vector_init_bytes(&init, &plan.vector_type, &mut bytes, offset);
         }
         GlobalInit::Array(
             bytes
@@ -803,7 +828,10 @@ impl Lowerer {
                 if let Initializer::Expr(expr) = &item.init {
                     self.eval_const_expr(expr)
                         .map(|v| v.coerce_to(base_ty))
-                        .unwrap_or_else(|| self.zero_const(base_ty))
+                        .unwrap_or_else(|| {
+                            self.diagnose_non_constant(expr);
+                            self.zero_const(base_ty)
+                        })
                 } else {
                     self.zero_const(base_ty)
                 }
@@ -823,12 +851,12 @@ impl Lowerer {
 
 impl Lowerer {
     /// Lower an array initializer list. Dispatches based on element type:
-    /// struct arrays, pointer arrays with relocations, vector arrays,
-    /// multi-dimensional arrays, and flat arrays.
+    /// struct arrays, pointer arrays with relocations, multi-dimensional
+    /// arrays, and flat arrays (arrays of vectors are dispatched by the
+    /// caller, which knows the object's type).
     fn lower_array_init(
         &mut self,
         items: &[InitializerItem],
-        type_spec: &TypeSpecifier,
         base_ty: IrType,
         elem_size: usize,
         total_size: usize,
@@ -865,14 +893,6 @@ impl Lowerer {
                 total_size,
                 array_dim_strides,
             );
-        }
-
-        // Vector array: e.g., __attribute__((vector_size(16))) arr[]
-        {
-            let ctype = self.type_spec_to_ctype(type_spec);
-            if ctype.is_vector() {
-                return self.lower_vector_array_init(items, &ctype, num_elems);
-            }
         }
 
         // Plain scalar array (possibly multi-dimensional)
@@ -1266,91 +1286,163 @@ impl Lowerer {
         }
     }
 
-    /// Lower an array of vectors, preserving each ext-vector's padded stride.
+    /// Lower a global array of vectors (`v4f a[N] = { ... }`) to its byte
+    /// image.
     fn lower_vector_array_init(
-        &mut self,
+        &self,
         items: &[InitializerItem],
-        vector_ct: &CType,
-        num_vectors: usize,
+        vec_ct: &CType,
+        num_elems: usize,
     ) -> GlobalInit {
-        let Some((elem_ct, lanes)) = vector_ct.vector_info() else {
-            return GlobalInit::Zero;
-        };
-        let elem_ir_ty = IrType::from_ctype(elem_ct);
-        let total_scalars = num_vectors.saturating_mul(lanes);
-        let mut values = vec![self.zero_const(elem_ir_ty); total_scalars];
-        for (arr_idx, item) in items.iter().enumerate().take(num_vectors) {
-            let base_offset = arr_idx * lanes;
-            match &item.init {
-                Initializer::Expr(expr) => self.collect_vector_scalars_from_expr(
-                    expr,
-                    elem_ir_ty,
-                    lanes,
-                    &mut values,
-                    base_offset,
-                ),
-                Initializer::List(sub_items) => self.collect_vector_scalars_from_items(
-                    sub_items,
-                    elem_ir_ty,
-                    lanes,
-                    &mut values,
-                    base_offset,
-                ),
-            }
-        }
-        if matches!(elem_ct, CType::Bool) {
-            values
-                .iter_mut()
-                .for_each(|value| *value = value.bool_normalize());
-        }
-        self.vector_values_to_global_init(vector_ct, values, num_vectors)
+        let vec_size = self.resolve_ctype_size(vec_ct);
+        let mut bytes = vec![0u8; vec_size * num_elems];
+        self.fill_array_of_vectors(items, vec_ct, num_elems, &mut bytes, 0);
+        GlobalInit::Array(bytes.iter().map(|&b| IrConst::I8(b as i8)).collect())
     }
 
-    /// Extract scalar values from a vector expression (compound literal or cast-wrapped).
-    fn collect_vector_scalars_from_expr(
+    /// Byte image of an array of `len` vectors at `offset`: element `i` takes
+    /// the vector initializer at position `i` (positional or `[i]`-designated).
+    pub(super) fn fill_array_of_vectors(
         &self,
-        expr: &Expr,
-        elem_ir_ty: IrType,
-        vec_num_elems: usize,
-        values: &mut [IrConst],
-        base_offset: usize,
+        items: &[InitializerItem],
+        vec_ct: &CType,
+        len: usize,
+        bytes: &mut [u8],
+        offset: usize,
     ) {
-        // Unwrap casts to find the inner compound literal
-        let inner = Self::strip_casts(expr);
-        if let Expr::CompoundLiteral(_ts, cl_init, _) = inner {
-            if let Initializer::List(sub_items) = cl_init.as_ref() {
-                self.collect_vector_scalars_from_items(
-                    sub_items,
-                    elem_ir_ty,
-                    vec_num_elems,
-                    values,
-                    base_offset,
-                );
-            }
-        }
-    }
-
-    /// Collect scalar values from initializer items into a vector slot.
-    fn collect_vector_scalars_from_items(
-        &self,
-        sub_items: &[InitializerItem],
-        elem_ir_ty: IrType,
-        vec_num_elems: usize,
-        values: &mut [IrConst],
-        base_offset: usize,
-    ) {
-        for (vi, sub) in sub_items.iter().enumerate() {
-            if vi >= vec_num_elems {
-                break;
-            }
-            if let Initializer::Expr(ref sub_expr) = sub.init {
-                if let Some(val) = self.eval_const_expr(sub_expr) {
-                    let expr_ty = self.get_expr_type(sub_expr);
-                    values[base_offset + vi] =
-                        self.coerce_const_to_type_with_src(val, elem_ir_ty, expr_ty);
+        let vec_size = self.resolve_ctype_size(vec_ct);
+        let mut pos = 0usize;
+        for item in items {
+            if let Some(Designator::Index(idx)) = item.designators.first() {
+                match self.eval_const_expr(idx).and_then(|c| c.to_usize()) {
+                    Some(i) => pos = i,
+                    None => {
+                        self.diagnose_non_constant(idx);
+                        continue;
+                    }
                 }
             }
+            if pos < len {
+                self.write_vector_init_bytes(&item.init, vec_ct, bytes, offset + pos * vec_size);
+            }
+            pos += 1;
         }
+    }
+
+    /// Write the byte image of a vector initializer at `offset`: a braced
+    /// list of lanes (`[i]`-designated or positional; unmentioned lanes stay
+    /// zero) or a constant vector expression.
+    pub(super) fn write_vector_init_bytes(
+        &self,
+        init: &Initializer,
+        vec_ct: &CType,
+        bytes: &mut [u8],
+        offset: usize,
+    ) {
+        match init {
+            Initializer::List(items) => self.write_vector_lanes(items, vec_ct, bytes, offset),
+            Initializer::Expr(e) => self.write_vector_expr_bytes(e, vec_ct, bytes, offset),
+        }
+    }
+
+    fn write_vector_lanes(
+        &self,
+        items: &[InitializerItem],
+        vec_ct: &CType,
+        bytes: &mut [u8],
+        offset: usize,
+    ) {
+        let Some((elem_ct, lanes)) = vec_ct.vector_info() else {
+            return;
+        };
+        let elem_ir_ty = IrType::from_ctype(elem_ct);
+        // Byte stride of one lane: the element size for `vector_size`, the
+        // padded stride for an ext-vector (x87 lanes take 16 bytes); `None`
+        // for a bit-packed `_Bool` ext-vector, whose lane `i` is bit `i % 8`
+        // of byte `i / 8`.
+        let lane_stride = vec_ct.vector_element_storage_size();
+        let is_bool = matches!(elem_ct, CType::Bool);
+        let mut pos = 0usize;
+        for item in items {
+            if let Some(Designator::Index(idx)) = item.designators.first() {
+                match self.eval_const_expr(idx).and_then(|c| c.to_usize()) {
+                    Some(i) => pos = i,
+                    None => {
+                        self.diagnose_non_constant(idx);
+                        continue;
+                    }
+                }
+            }
+            // A braced scalar (`{ 1 }`) initializes one lane.
+            let mut init = &item.init;
+            while let Initializer::List(inner) = init {
+                match inner.first() {
+                    Some(first) => init = &first.init,
+                    None => break,
+                }
+            }
+            if let (true, Initializer::Expr(e)) = (pos < lanes, init) {
+                let val = self.eval_const_expr(e).unwrap_or_else(|| {
+                    self.diagnose_non_constant(e);
+                    IrConst::I64(0)
+                });
+                let val =
+                    self.coerce_const_to_type_with_src(val, elem_ir_ty, self.get_expr_type(e));
+                let val = if is_bool { val.bool_normalize() } else { val };
+                match lane_stride {
+                    Some(stride) => {
+                        self.write_const_to_bytes(bytes, offset + pos * stride, &val, elem_ir_ty);
+                    }
+                    None => {
+                        if let Some(byte) = bytes.get_mut(offset + pos / 8) {
+                            let bit = 1u8 << (pos % 8);
+                            if val.is_nonzero() {
+                                *byte |= bit;
+                            } else {
+                                *byte &= !bit;
+                            }
+                        }
+                    }
+                }
+            }
+            pos += 1;
+        }
+    }
+
+    /// A constant vector expression (GCC 16.2's set): a compound literal of
+    /// the vector's type, a cast of one to that same type, or a cast of an
+    /// integer constant of the vector's size, which supplies its bits. Sema
+    /// rejects the rest (casts across vector types, vector arithmetic).
+    fn write_vector_expr_bytes(&self, e: &Expr, vec_ct: &CType, bytes: &mut [u8], offset: usize) {
+        let size = self.resolve_ctype_size(vec_ct);
+        match e {
+            Expr::CompoundLiteral(ts, init, _) if self.type_spec_to_ctype(ts) == *vec_ct => {
+                self.write_vector_init_bytes(init, vec_ct, bytes, offset);
+                return;
+            }
+            Expr::Cast(ts, inner, _, _) if self.type_spec_to_ctype(ts) == *vec_ct => {
+                match self.get_expr_ctype(inner) {
+                    Some(from) if from == *vec_ct => {
+                        self.write_vector_expr_bytes(inner, vec_ct, bytes, offset);
+                        return;
+                    }
+                    Some(from) if from.is_integer() && self.resolve_ctype_size(&from) == size => {
+                        if let Some(val) = self.eval_const_expr(inner) {
+                            self.write_const_to_bytes(
+                                bytes,
+                                offset,
+                                &val,
+                                IrType::from_ctype(&from),
+                            );
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        self.diagnose_non_constant(e);
     }
 
     /// Lower a plain scalar array (1D or multi-dimensional).
@@ -1444,97 +1536,11 @@ impl Lowerer {
         }
     }
 
-    /// Lower a vector initializer list to target object representation.
-    fn lower_vector_init(&mut self, items: &[InitializerItem], vector_ct: &CType) -> GlobalInit {
-        let Some((elem_ct, lanes)) = vector_ct.vector_info() else {
-            return GlobalInit::Zero;
-        };
-        let elem_ir_ty = IrType::from_ctype(elem_ct);
-        let mut values = vec![self.zero_const(elem_ir_ty); lanes];
-        for (idx, item) in items.iter().enumerate().take(lanes) {
-            let expr = match &item.init {
-                Initializer::Expr(expr) => Some(expr),
-                Initializer::List(sub_items) => Self::unwrap_nested_init_expr(sub_items),
-            };
-            if let Some(expr) = expr {
-                if let Some(value) = self.eval_const_expr(expr) {
-                    let expr_ty = self.get_expr_type(expr);
-                    let value = self.coerce_const_to_type_with_src(value, elem_ir_ty, expr_ty);
-                    values[idx] = if matches!(elem_ct, CType::Bool) {
-                        value.bool_normalize()
-                    } else {
-                        value
-                    };
-                }
-            }
-        }
-        self.vector_values_to_global_init(vector_ct, values, 1)
-    }
-
-    /// Convert logical scalar lanes into the target vector object's global
-    /// representation. Legacy `vector_size` remains an element array. Ext
-    /// vectors emit packed bool bytes or an explicit lane/padding sequence.
-    fn vector_values_to_global_init(
-        &self,
-        vector_ct: &CType,
-        values: Vec<IrConst>,
-        vector_count: usize,
-    ) -> GlobalInit {
-        let Some((elem_ct, lanes)) = vector_ct.vector_info() else {
-            return GlobalInit::Zero;
-        };
-        let CType::ExtVector(_, layout) = vector_ct else {
-            return GlobalInit::Array(values);
-        };
-        if layout.bitpacked_bool {
-            let total_bytes = layout.storage_size.saturating_mul(vector_count);
-            let mut bytes = vec![0u8; total_bytes];
-            for vector_idx in 0..vector_count {
-                for lane in 0..lanes {
-                    let at = vector_idx * lanes + lane;
-                    if values.get(at).is_some_and(IrConst::is_nonzero) {
-                        let byte_at = vector_idx * layout.storage_size + lane / 8;
-                        if let Some(byte) = bytes.get_mut(byte_at) {
-                            *byte |= 1 << (lane % 8);
-                        }
-                    }
-                }
-            }
-            return GlobalInit::Array(
-                bytes
-                    .into_iter()
-                    .map(|byte| IrConst::I8(byte as i8))
-                    .collect(),
-            );
-        }
-
-        // `GlobalInit::Compound` treats each scalar as a self-typed object,
-        // but U8/U16/U32 constants are represented by wider IrConst variants
-        // to preserve unsigned semantics. In a vector object that fallback can
-        // widen (for example) a U32 lane to the pointer width. Serialize the
-        // complete C object representation here instead: every byte is an I8
-        // element, so lane widths, x87 long-double payloads, and zero padding
-        // cannot be inferred from the pointer-sized vector carrier.
-        let byte_len = layout.storage_size.saturating_mul(vector_count);
-        let mut bytes = vec![0u8; byte_len];
-        let lane_stride = layout.element_storage_size;
-        let elem_ir_ty = IrType::from_ctype(elem_ct);
-        for vector_idx in 0..vector_count {
-            let vector_base = vector_idx.saturating_mul(layout.storage_size);
-            for lane in 0..lanes {
-                let at = vector_idx.saturating_mul(lanes).saturating_add(lane);
-                let lane_offset = vector_base.saturating_add(lane.saturating_mul(lane_stride));
-                if let Some(value) = values.get(at) {
-                    self.write_const_to_bytes(&mut bytes, lane_offset, value, elem_ir_ty);
-                }
-            }
-        }
-        GlobalInit::Array(
-            bytes
-                .into_iter()
-                .map(|byte| IrConst::I8(byte as i8))
-                .collect(),
-        )
+    /// Lower a global vector's braced initializer to its byte image.
+    fn lower_vector_init(&self, items: &[InitializerItem], vec_ct: &CType) -> GlobalInit {
+        let mut bytes = vec![0u8; self.resolve_ctype_size(vec_ct)];
+        self.write_vector_lanes(items, vec_ct, &mut bytes, 0);
+        GlobalInit::Array(bytes.iter().map(|&b| IrConst::I8(b as i8)).collect())
     }
 }
 
@@ -1565,6 +1571,20 @@ impl Lowerer {
                 }
             }
             Expr::Cast(_, inner, _, _) => self.eval_string_literal_addr_expr(inner),
+            // `c ? "a" : "b"` with a constant condition is the selected operand
+            // (the kernel's `__builtin_constant_p(MOD ": ...") ? MOD ": ..." : ...`).
+            Expr::Conditional(cond, then, els, _) => {
+                let taken = if self.eval_init_condition(cond)?.is_nonzero() {
+                    then
+                } else {
+                    els
+                };
+                self.eval_string_literal_addr_expr(taken)
+            }
+            Expr::Identifier(..) => {
+                let (name, _) = self.function_name_string(expr)?;
+                Some(GlobalInit::GlobalAddr(self.intern_string_literal(&name)))
+            }
             Expr::StringLiteral(s, _) => {
                 Some(GlobalInit::GlobalAddr(self.intern_string_literal(s)))
             }
@@ -1585,7 +1605,9 @@ impl Lowerer {
         offset_expr: &Expr,
         negate: bool,
     ) -> Option<GlobalInit> {
-        let (s, kind) = self.extract_string_literal(str_expr)?;
+        let (s, kind) = self
+            .extract_string_literal(str_expr)
+            .or_else(|| self.function_name_string(str_expr))?;
         let offset_val = self.eval_const_expr(offset_expr)?;
         let offset = self.const_to_i64(&offset_val)?;
         let byte_offset = if negate { -offset } else { offset };
@@ -1598,6 +1620,26 @@ impl Lowerer {
             Some(GlobalInit::GlobalAddr(label))
         } else {
             Some(GlobalInit::GlobalAddrOffset(label, byte_offset))
+        }
+    }
+
+    /// `__func__` (or `__FUNCTION__`/`__PRETTY_FUNCTION__`) inside a function,
+    /// possibly through casts: the same interned string the expression path
+    /// lowers it to, so `static const char *s = __func__;` compares equal to
+    /// `__func__`. An address base only -- the identifier is an array object,
+    /// not a string literal, so it never initializes a char array.
+    fn function_name_string(&self, expr: &Expr) -> Option<(String, StringLitKind)> {
+        match expr {
+            Expr::Identifier(name, _)
+                if crate::frontend::parser::ast::is_function_name_builtin(name) =>
+            {
+                Some((
+                    self.func_state.as_ref()?.name.clone(),
+                    StringLitKind::Narrow,
+                ))
+            }
+            Expr::Cast(_, inner, _, _) => self.function_name_string(inner),
+            _ => None,
         }
     }
 
@@ -2443,6 +2485,7 @@ impl Lowerer {
                     if let Some(addr) = self.eval_global_addr_expr(expr) {
                         elements.push(addr);
                     } else {
+                        self.diagnose_non_constant(expr);
                         elements.push(GlobalInit::Zero);
                     }
                 }
