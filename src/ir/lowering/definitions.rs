@@ -277,6 +277,10 @@ pub(super) enum LValueKind {
         bit_index: Value,
         address_space: AddressSpace,
     },
+    /// A `long double` lane of an ext vector: lanes are 10 bytes apart, so a
+    /// store must write the 80-bit image only (`store_x87_lane`); loads are
+    /// ordinary (the six bytes read past the lane are inside the object).
+    X87VectorLane(Value, AddressSpace),
 }
 
 /// An lvalue access: its address plus whether the ACCESS is C-`volatile`.

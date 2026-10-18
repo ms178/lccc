@@ -25,7 +25,7 @@ _Static_assert(sizeof(u32x3) == 16, "u32x3 is padded to sixteen bytes");
 _Static_assert(_Alignof(u32x3) == 16, "u32x3 alignment");
 _Static_assert(sizeof(ulong3) == (sizeof(long) == 4 ? 16 : 32), "ulong3 padded size");
 _Static_assert(_Alignof(ulong3) == (sizeof(long) == 4 ? 16 : 32), "ulong3 alignment");
-_Static_assert(sizeof(ld3) == 64, "long-double vector lanes use sixteen-byte storage");
+_Static_assert(sizeof(ld3) == 64, "long-double vector object size is 3*16 rounded to a power of two (lanes are 10 bytes apart inside it)");
 _Static_assert(_Alignof(ld3) == 64, "long-double vector alignment");
 _Static_assert(sizeof(u32x4_size) == 16, "vector_size retains its byte-size contract");
 _Static_assert(_Alignof(u32x4_size) == 16, "vector_size alignment remains independent");

@@ -2868,6 +2868,28 @@ impl SemanticAnalyzer {
 
         let key = match &base_ctype {
             CType::Struct(key) | CType::Union(key) => key.clone(),
+            CType::ExtVector(..) => {
+                // Clang ext-vector component access (`v.x`, `v.xyzw`, `v.s0`,
+                // `v.lo`): validate the spelling here so a typo or an
+                // out-of-range component is an error, not offset-0 garbage.
+                if base_ctype.ext_vector_swizzle(field_name).is_none() {
+                    let type_name = format!("{}", base_ctype);
+                    let lanes = base_ctype.vector_info().map_or(0, |(_, n)| n);
+                    let msg = if field_name
+                        .bytes()
+                        .all(|b| b"xyzwrgba".contains(&b) || b == b's' || b.is_ascii_hexdigit())
+                    {
+                        format!(
+                            "vector component access '{}' exceeds type '{}' ({} lanes)",
+                            field_name, type_name, lanes
+                        )
+                    } else {
+                        format!("illegal vector component name '{}'", field_name)
+                    };
+                    self.diagnostics.borrow_mut().error(msg, span);
+                }
+                return;
+            }
             _ => return, // Not a struct/union; skip check
         };
 

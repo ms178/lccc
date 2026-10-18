@@ -571,7 +571,7 @@ impl Lowerer {
         // the long double from %st(0); give it the aggregate's storage. The
         // two-lane `long double` ext vector also pops lane 1 from %st(1)
         // (`GetReturnF128Second`, as for `_Complex long double`) into the
-        // 32-byte, 32-aligned vector object.
+        // 32-byte, 32-aligned vector object (lanes at 0 and 10).
         if ret_abi.x87 || ret_abi.x87_pair {
             let lane1 = ret_abi.x87_pair.then(|| {
                 let lane1 = self.fresh_value();
@@ -596,14 +596,20 @@ impl Lowerer {
                 seg_override: AddressSpace::Default,
             });
             if let Some(lane1) = lane1 {
-                let lane1_ptr = self.emit_gep_offset(alloca, 16, IrType::F128);
-                self.emit(Instruction::Store {
-                    volatile: false,
-                    val: Operand::Value(lane1),
-                    ptr: lane1_ptr,
-                    ty: IrType::F128,
-                    seg_override: AddressSpace::Default,
-                });
+                // Lane 1 sits 10 bytes in (`X87_LANE_STRIDE`); a 16-byte
+                // F128 store there would be fine for the padding but the
+                // lane helper keeps one definition of the x87 lane image.
+                let lane1_ptr = self.emit_gep_offset(
+                    alloca,
+                    crate::common::types::X87_LANE_STRIDE,
+                    IrType::F128,
+                );
+                self.store_x87_lane(
+                    lane1_ptr,
+                    Operand::Value(lane1),
+                    false,
+                    AddressSpace::Default,
+                );
             }
             return Operand::Value(alloca);
         }

@@ -393,13 +393,22 @@ pub enum I386ExtVectorCarrier {
 /// This descriptor is only used for `ext_vector_type`, whose object may be
 /// padded beyond its logical lanes and whose `_Bool` lanes are bit-packed.
 
+/// Byte stride of a `long double` lane inside an ext vector: LLVM packs
+/// `<N x x86_fp80>` at the element's 80-bit size (see `ExtVectorLayout`).
+pub const X87_LANE_STRIDE: usize = 10;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ExtVectorLayout {
     pub lanes: usize,
     pub storage_size: usize,
     pub alignment: usize,
-    /// Byte stride of a non-bitpacked lane. On i686, long-double vector lanes
-    /// occupy 16 bytes although scalar sizeof(long double) is 12.
+    /// Byte stride of a non-bitpacked lane. `long double` lanes are the
+    /// LLVM vector layout of `<N x x86_fp80>`: elements are bit-packed at
+    /// their 80-bit *size*, not their 16/12-byte alloc size, so the stride
+    /// is 10 on both x86-64 and i686 (`X87_LANE_STRIDE`). The object size
+    /// still follows Clang's AST (`N * sizeof(long double)` rounded up to a
+    /// power of two: 16/32/64), which is why a `<3 x x86_fp80>` global is a
+    /// 32-byte ELF object inside a 64-byte C object.
     pub element_storage_size: usize,
     /// Clang stores `_Bool` ext-vector lanes as consecutive bits, least
     /// significant lane first within each byte.
@@ -408,9 +417,12 @@ pub struct ExtVectorLayout {
 
 impl ExtVectorLayout {
     /// Build the ext-vector layout for the target lccc currently emits code
-    /// for (x86-32 and x86-64). The power-of-two padded size, 16-byte x87
-    /// long-double lane stride, and bit-packed `_Bool` lanes are all measured
-    /// against clang-19 on Intel. Returns None for invalid lane types, zero
+    /// for (x86-32 and x86-64). The power-of-two padded size and bit-packed
+    /// `_Bool` lanes are measured against clang-19 on Intel; the 10-byte
+    /// x87 lane stride is LLVM's `<N x x86_fp80>` layout (the earlier
+    /// 16-byte stride was inferred from `sizeof` alone and made every
+    /// multi-lane `long double` vector disagree with Clang in memory and
+    /// across calls -- ABI-EXTVEC-LD-1). Returns None for invalid lane types, zero
     /// lanes, unsupported backends, or size overflow; callers are expected to
     /// treat None as "attribute not recognized on this target" and fall back
     /// to the scalar element (matching GCC's unknown-attribute semantics).
@@ -450,7 +462,7 @@ impl ExtVectorLayout {
                 | CType::Double
                 | CType::LongDouble => {
                     if matches!(element, CType::LongDouble) {
-                        16
+                        X87_LANE_STRIDE
                     } else {
                         element.size()
                     }
@@ -458,10 +470,13 @@ impl ExtVectorLayout {
                 _ => return None,
             }
         };
+        // The C object size is Clang's AST size: lanes times the scalar
+        // `sizeof` (16 on LP64, 12 on i686 for `long double`), rounded up
+        // to a power of two. For x87 lanes that is NOT the lane stride.
         let payload_size = if bitpacked_bool {
             lanes.checked_add(7)?.checked_div(8)?
         } else {
-            lanes.checked_mul(element_storage_size)?
+            lanes.checked_mul(element.size())?
         };
         let storage_size = payload_size.checked_next_power_of_two()?;
         if storage_size == 0 {
@@ -2458,6 +2473,80 @@ impl CType {
 
     /// Storage stride for one logical vector lane, or None for a packed bool
     /// ext-vector whose lane addresses are bit positions rather than bytes.
+    /// Resolve a Clang ext-vector component access (`v.x`, `v.zyx`, `v.rgb`,
+    /// `v.s03`, `v.lo`/`.hi`/`.even`/`.odd`) on this vector type to the lane
+    /// indices it names, in order. `None` when `self` is not an ext vector
+    /// or the spelling is not a component name for it (callers diagnose:
+    /// Clang says "illegal vector component name" / "vector component access
+    /// exceeds type"). Mirrors `Sema::CheckExtVectorComponent`: one naming
+    /// set per access (`xyzw`, `rgba`, or `s` followed by hex digits), every
+    /// index below the lane count; the four halving names stand alone.
+    pub fn ext_vector_swizzle(&self, name: &str) -> Option<Vec<usize>> {
+        let CType::ExtVector(_, layout) = self else {
+            return None;
+        };
+        let lanes = layout.lanes;
+        let idx: Vec<usize> = match name {
+            "lo" => (0..lanes / 2).collect(),
+            "hi" => (lanes / 2..lanes).collect(),
+            "even" => (0..lanes).step_by(2).collect(),
+            "odd" => (1..lanes).step_by(2).collect(),
+            _ => {
+                let bytes = name.as_bytes();
+                if bytes.is_empty() {
+                    return None;
+                }
+                if bytes[0] == b's' || bytes[0] == b'S' {
+                    if bytes.len() < 2 {
+                        return None;
+                    }
+                    bytes[1..]
+                        .iter()
+                        .map(|&b| (b as char).to_digit(16).map(|d| d as usize))
+                        .collect::<Option<Vec<_>>>()?
+                } else {
+                    let set: &[u8] = if bytes.iter().all(|b| b"xyzw".contains(b)) {
+                        b"xyzw"
+                    } else if bytes.iter().all(|b| b"rgba".contains(b)) {
+                        b"rgba"
+                    } else {
+                        return None;
+                    };
+                    bytes
+                        .iter()
+                        .map(|b| set.iter().position(|c| c == b))
+                        .collect::<Option<Vec<_>>>()?
+                }
+            }
+        };
+        if idx.is_empty() || idx.iter().any(|&i| i >= lanes) {
+            return None;
+        }
+        Some(idx)
+    }
+
+    /// The type of the component access `self.name`: the element type for a
+    /// single component, otherwise an ext vector of the element with as
+    /// many lanes as components named (`float4.xy` is `float2`).
+    pub fn ext_vector_swizzle_ctype(&self, name: &str) -> Option<CType> {
+        let lanes = self.ext_vector_swizzle(name)?;
+        let CType::ExtVector(elem, _) = self else {
+            return None;
+        };
+        if lanes.len() == 1 {
+            return Some((**elem).clone());
+        }
+        let layout = ExtVectorLayout::new(elem, lanes.len())?;
+        Some(CType::ExtVector(elem.clone(), layout))
+    }
+
+    /// An ext vector of `long double` lanes: lanes are 10 bytes apart (the
+    /// x87 80-bit image, `X87_LANE_STRIDE`), narrower than the 16-byte IR
+    /// `F128` store, so a lane store must write exactly 10 bytes.
+    pub fn is_x87_lane_vector(&self) -> bool {
+        matches!(self, CType::ExtVector(elem, _) if matches!(**elem, CType::LongDouble))
+    }
+
     pub fn vector_element_storage_size(&self) -> Option<usize> {
         match self {
             CType::Vector(elem, _) => Some(elem.size()),

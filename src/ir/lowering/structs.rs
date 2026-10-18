@@ -720,6 +720,21 @@ impl Lowerer {
                 // array[i].field
                 self.compute_array_element_addr(base, index)
             }
+            Expr::MemberAccess(inner_base, inner_field, _)
+            | Expr::PointerMemberAccess(inner_base, inner_field, _)
+                if self
+                    .vector_member_lanes(
+                        inner_base,
+                        inner_field,
+                        matches!(expr, Expr::PointerMemberAccess(..)),
+                    )
+                    .is_some_and(|(_, lanes)| lanes.len() > 1) =>
+            {
+                // `v.zy.x`: the swizzle is a fresh vector temporary; its
+                // address is what the outer access indexes.
+                let op = self.lower_expr(expr);
+                self.operand_to_value(op)
+            }
             Expr::MemberAccess(inner_base, inner_field, _) => {
                 // Nested member access: s.inner.field
                 // A field that follows a VLA member has a runtime offset
@@ -1108,6 +1123,14 @@ impl Lowerer {
         field_name: &str,
         is_pointer: bool,
     ) -> (usize, IrType, Option<(u32, u32)>) {
+        if self
+            .vector_member_lanes(base_expr, field_name, is_pointer)
+            .is_some()
+        {
+            let (offset, ir_ty, bf, _) =
+                self.resolve_member_access_with_ctype_impl(base_expr, field_name, is_pointer);
+            return (offset, ir_ty, bf);
+        }
         if let Some(layout) = self.get_member_layout(base_expr, is_pointer) {
             if let Some(fl) = layout.field_layout(field_name) {
                 let ir_ty = IrType::from_ctype(&fl.ty);
@@ -1486,12 +1509,40 @@ impl Lowerer {
     /// Resolve member access to get the CType of the field (not just the IrType).
     /// This is needed to check if a field is an array type (for array decay behavior).
     /// Handles both direct (s.field) and pointer (p->field) access.
+    /// `base.field` / `base->field` where the (pointed-to) base is a Clang
+    /// ext vector: the vector type and the lanes the component spelling
+    /// names (`v.x` -> [0], `v.zy` -> [2, 1]). `None` for anything else, so
+    /// every member-access resolver below falls through to struct lookup.
+    /// Without this, `v.x` on an ext vector silently resolved to "no such
+    /// field": offset 0, type int -- a miscompile with no diagnostic.
+    pub(super) fn vector_member_lanes(
+        &self,
+        base_expr: &Expr,
+        field_name: &str,
+        is_pointer: bool,
+    ) -> Option<(CType, Vec<usize>)> {
+        let base_ct = self.get_expr_ctype(base_expr)?;
+        let vec_ct = if is_pointer {
+            match base_ct {
+                CType::Pointer(inner, _) | CType::Array(inner, _) => *inner,
+                _ => return None,
+            }
+        } else {
+            base_ct
+        };
+        let lanes = vec_ct.ext_vector_swizzle(field_name)?;
+        Some((vec_ct, lanes))
+    }
+
     pub(super) fn resolve_member_field_ctype_impl(
         &self,
         base_expr: &Expr,
         field_name: &str,
         is_pointer: bool,
     ) -> Option<CType> {
+        if let Some((vec_ct, _)) = self.vector_member_lanes(base_expr, field_name, is_pointer) {
+            return vec_ct.ext_vector_swizzle_ctype(field_name);
+        }
         if let Some(layout) = self.get_member_layout(base_expr, is_pointer) {
             if let Some((_offset, ctype)) =
                 layout.field_offset(field_name, &*self.types.borrow_struct_layouts())
@@ -1528,6 +1579,16 @@ impl Lowerer {
         field_name: &str,
         is_pointer: bool,
     ) -> (usize, IrType, Option<(u32, u32)>, Option<CType>) {
+        if let Some((vec_ct, lanes)) = self.vector_member_lanes(base_expr, field_name, is_pointer) {
+            let ct = vec_ct.ext_vector_swizzle_ctype(field_name);
+            let ir_ty = ct.as_ref().map_or(IrType::I32, IrType::from_ctype);
+            let offset = if lanes.len() == 1 {
+                lanes[0] * vec_ct.vector_element_storage_size().unwrap_or(0)
+            } else {
+                0
+            };
+            return (offset, ir_ty, None, ct);
+        }
         if let Some(layout) = self.get_member_layout(base_expr, is_pointer) {
             if let Some(fl) = layout.field_layout(field_name) {
                 let ir_ty = IrType::from_ctype(&fl.ty);

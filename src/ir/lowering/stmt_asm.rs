@@ -70,7 +70,8 @@ impl Lowerer {
             let ptr = if let Some(lv) = self.lower_lvalue(&out.expr) {
                 match lv.kind {
                     crate::ir::lowering::definitions::LValueKind::Variable(v)
-                    | crate::ir::lowering::definitions::LValueKind::Address(v, _) => v,
+                    | crate::ir::lowering::definitions::LValueKind::Address(v, _)
+                    | crate::ir::lowering::definitions::LValueKind::X87VectorLane(v, _) => v,
                     crate::ir::lowering::definitions::LValueKind::PackedBoolVectorLane {
                         byte_addr: v,
                         ..
@@ -280,7 +281,8 @@ impl Lowerer {
                 if let Some(lv) = self.lower_lvalue(&inp.expr) {
                     let ptr = match lv.kind {
                         crate::ir::lowering::definitions::LValueKind::Variable(v)
-                        | crate::ir::lowering::definitions::LValueKind::Address(v, _) => v,
+                        | crate::ir::lowering::definitions::LValueKind::Address(v, _)
+                        | crate::ir::lowering::definitions::LValueKind::X87VectorLane(v, _) => v,
                         crate::ir::lowering::definitions::LValueKind::PackedBoolVectorLane {
                             byte_addr: v,
                             ..

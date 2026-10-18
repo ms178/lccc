@@ -147,6 +147,20 @@ AUD-VABI-2.)
 3. `ldx2`/`ldx3` arguments were MEMORY at 8/16-byte slot granularity; the
    32/64-byte slot rule arrived with ABI-EXTVEC-VA-1 and these shapes are
    now on it (same caller/callee code path as `u64x4`/`f64x8`).
+4. **Lane stride** (found by the first hosted re-measurement, which still
+   failed every multi-lane check in both directions while `ldx1` passed):
+   lccc laid `long double` lanes 16 bytes apart. Clang lowers the type to
+   LLVM's `<N x x86_fp80>`, whose elements are packed at their 80-bit
+   *size* — lane `i` is at byte `10*i` — while the C object keeps the AST
+   size `N * 16` rounded up to a power of two. That is exactly why a Clang
+   `ld3` global is a 32-byte ELF object (3 × 10, allocated as 32) inside a
+   64-byte C object, which `check_ext_vector_layout.sh` had recorded as an
+   "oracle limitation". `ExtVectorLayout` now uses `X87_LANE_STRIDE = 10`
+   (object size unchanged: 16/32/64; i686 too, 12 × N rounded). Because an
+   IR `F128` store writes 16 bytes, a lane store must write the 80-bit image
+   only (`store_x87_lane`: scratch + 10-byte copy; `LValueKind::X87VectorLane`
+   for `v[i] op= x`); lane loads stay direct (the six bytes read past a lane
+   are inside the object). Global initializers write 10-byte lanes.
 
 **Fix.** `SysvPassing::X87Pair` (`sysv_classify::classify_return`, two
 `long double` lanes; `arg_classes` → `[Memory]`), carried as
@@ -176,12 +190,29 @@ ABI-EXTVEC-LD-I386-1 below).
   Only returns of the two-lane shape are compared with the complex form:
   Clang passes the argument `byval align 32`, GCC passes a complex at 16.
 - `tests/regression/ext_vector_long_double_lanes.c` (lccc-only, exit-bit
-  self-check, -O0..-O3) and the unit test
+  self-check, -O0..-O3), `tests/regression/ext_vector_long_double_layout.c`
+  (lane bytes at `10*i` for globals and locals, stores in every lane order,
+  lane-to-lane copies, whole-vector arithmetic, -m32 too) and the unit test
   `sysv_classify::long_double_vector_tests` (one/two/three-lane
   argument and return classes).
 - Hosted re-measurement: the 35 x86-64 LD-1 rows are removed from
   `grid_expectations.txt`; the Clang legs run on CI and any residual is an
   unlisted failure to triage, not a row to re-add blind.
+
+**Found on the way — ext-vector component access was a silent miscompile.**
+`v.x`, `v.zyx`, `v.lo`, `p->y = ...` on any `ext_vector_type` resolved like
+a missing struct field: offset 0, type `int`, no diagnostic (`q.y = p.x` on
+a `double2` compiled to `movl (%rax), %eax; movl %eax, (%rdi)`). Implemented
+in the lowering (`CType::ext_vector_swizzle`, `vector_member_lanes`,
+`lower_vector_component_rvalue`, `vector_component_lvalue`,
+`try_lower_swizzle_assign`): `xyzw`/`rgba`/`sN…` naming sets, `lo`/`hi`/
+`even`/`odd`, through pointers, on rvalues and chained, single components
+as full lvalues (packed `_Bool` bits and 10-byte x87 lanes included),
+multi-component plain assignment (duplicate components rejected as in
+Clang), `sizeof(v.xy)`; sema diagnoses "illegal vector component name" and
+"vector component access exceeds type". Not implemented, diagnosed instead
+of miscompiled: compound assignment to a multi-component swizzle
+(`v.xy += w`). Test: `tests/regression/ext_vector_swizzle.c`.
 
 **Residual: ABI-EXTVEC-LD-I386-1** (6 rows, i386 `ldx3` only): `ident`/
 `kfour` cross legs at -O0 and `hash2` cross legs at -O2 disagree with Clang

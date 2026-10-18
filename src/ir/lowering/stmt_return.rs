@@ -62,7 +62,8 @@ impl Lowerer {
                 seg_override: seg,
             });
             if x87_pair {
-                let lane1_ptr = self.emit_gep_offset(addr, 16, IrType::F128);
+                let lane1_ptr =
+                    self.emit_gep_offset(addr, crate::common::types::X87_LANE_STRIDE, IrType::F128);
                 let lane1 = self.fresh_value();
                 self.emit(Instruction::Load {
                     volatile: false,

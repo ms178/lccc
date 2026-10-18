@@ -611,6 +611,9 @@ impl<'a> ExprTypeChecker<'a> {
                 }
                 None
             }
+            // Clang ext-vector component access: `v.x` is the element,
+            // `v.xy` a two-lane vector of it.
+            CType::ExtVector(..) => base_ctype.ext_vector_swizzle_ctype(field_name),
             _ => None,
         }
     }

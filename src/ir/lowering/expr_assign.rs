@@ -13,7 +13,103 @@ use crate::frontend::parser::ast::{BinOp, Expr};
 use crate::ir::reexports::{Instruction, IrBinOp, IrCmpOp, IrConst, IrUnaryOp, Operand, Value};
 
 impl Lowerer {
+    /// `v.yz = w` / `p->xy = w`: a multi-component ext-vector swizzle on the
+    /// left stores each named lane from the matching lane of the right-hand
+    /// vector. Clang forbids a repeated component on the left (`v.xx = w`).
+    /// `None` when `lhs` is not such a swizzle (or is a single component,
+    /// which is an ordinary element lvalue).
+    fn try_lower_swizzle_assign(&mut self, lhs: &Expr, rhs: &Expr) -> Option<Operand> {
+        let (base_expr, field_name, is_pointer) = match lhs {
+            Expr::MemberAccess(b, f, _) => (&**b, f.as_str(), false),
+            Expr::PointerMemberAccess(b, f, _) => (&**b, f.as_str(), true),
+            _ => return None,
+        };
+        let (vec_ct, lanes) = self.vector_member_lanes(base_expr, field_name, is_pointer)?;
+        if lanes.len() < 2 {
+            return None;
+        }
+        let result_ct = vec_ct.ext_vector_swizzle_ctype(field_name)?;
+        for (i, lane) in lanes.iter().enumerate() {
+            if lanes[..i].contains(lane) {
+                self.emit_error(
+                    format!(
+                        "vector is not assignable (contains duplicate components '{field_name}')"
+                    ),
+                    lhs.span(),
+                );
+                return Some(Operand::Const(IrConst::I64(0)));
+            }
+        }
+        let (elem_ct, _) = vec_ct.vector_info()?;
+        let elem_ir_ty = Self::vector_elem_ir_type(&elem_ct);
+        let rhs_ct = self.expr_ctype(rhs);
+        let addr_space = if is_pointer {
+            self.get_addr_space_of_ptr_expr(base_expr)
+        } else {
+            self.get_addr_space_of_struct_expr(base_expr)
+        };
+        let volatile = if is_pointer {
+            self.pointee_expr_is_volatile(base_expr)
+        } else {
+            self.expr_access_is_volatile(base_expr)
+        };
+        // Evaluate the right side first (C: the store is not sequenced
+        // before the operand evaluation), then the destination address.
+        let (rhs_ptr, rhs_scalar) = if rhs_ct.is_vector() {
+            (Some(self.vector_operand_ptr(rhs, &rhs_ct)), None)
+        } else {
+            let raw = self.lower_expr(rhs);
+            let raw_ty = self.value_ir_type(rhs);
+            (None, Some(self.emit_implicit_cast(raw, raw_ty, elem_ir_ty)))
+        };
+        let dest = self.vector_lane_addr_of_expr(base_expr, &vec_ct, 0, is_pointer);
+        for (i, &lane) in lanes.iter().enumerate() {
+            let v = match rhs_ptr {
+                Some(ptr) => {
+                    let src_ct = if rhs_ct.is_vector() {
+                        &rhs_ct
+                    } else {
+                        &result_ct
+                    };
+                    let v = self.load_vector_lane(ptr, src_ct, i, AddressSpace::Default, false);
+                    let src_elem = src_ct
+                        .vector_info()
+                        .map_or(elem_ir_ty, |(e, _)| Self::vector_elem_ir_type(&e));
+                    self.emit_implicit_cast(v, src_elem, elem_ir_ty)
+                }
+                None => rhs_scalar
+                    .clone()
+                    .unwrap_or(Operand::Const(IrConst::I64(0))),
+            };
+            self.store_vector_lane(dest, &vec_ct, lane, v, elem_ir_ty, addr_space, volatile);
+        }
+        // The value of the assignment is the right operand converted to
+        // the swizzle's type; callers that use it get a fresh vector.
+        let size = result_ct.size();
+        let align = self.ctype_align(&result_ct);
+        let out = self.emit_entry_alloca(IrType::Ptr, size, align, false);
+        if crate::ir::lowering::lower::vector_temp_needs_zero_init(&result_ct, lanes.len()) {
+            self.zero_init_alloca(out, size);
+        }
+        for (i, &lane) in lanes.iter().enumerate() {
+            let v = self.load_vector_lane(dest, &vec_ct, lane, addr_space, volatile);
+            self.store_vector_lane(
+                out,
+                &result_ct,
+                i,
+                v,
+                elem_ir_ty,
+                AddressSpace::Default,
+                false,
+            );
+        }
+        Some(Operand::Value(out))
+    }
+
     pub(super) fn lower_assign(&mut self, lhs: &Expr, rhs: &Expr) -> Operand {
+        if let Some(result) = self.try_lower_swizzle_assign(lhs, rhs) {
+            return result;
+        }
         // A file-scope register variable has no addressable storage. Stage the
         // assigned value into its fixed physical register with an empty inline
         // asm input constraint; this is the standard compiler representation
@@ -906,6 +1002,19 @@ impl Lowerer {
         // Vector compound assignment (element-wise)
         let lhs_ct = self.expr_ctype(lhs);
         if lhs_ct.is_vector() {
+            let swizzle = match lhs {
+                Expr::MemberAccess(b, f, _) => self.vector_member_lanes(b, f, false),
+                Expr::PointerMemberAccess(b, f, _) => self.vector_member_lanes(b, f, true),
+                _ => None,
+            };
+            if swizzle.is_some_and(|(_, lanes)| lanes.len() > 1) {
+                self.emit_error(
+                    "compound assignment to a multi-component vector swizzle is not supported; \
+                     write `v.xy = v.xy op w`",
+                    lhs.span(),
+                );
+                return Operand::Const(IrConst::I64(0));
+            }
             return self.lower_vector_compound_assign(op, lhs, rhs, &lhs_ct);
         }
 

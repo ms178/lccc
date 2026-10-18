@@ -23,9 +23,10 @@
 #     the two-lane `%st(0)/%st(1)` pair return (Clang: `<2 x x86_fp80>` is
 #     not an aggregate, so its MEMORY-class return goes "direct" to LLVM and
 #     is scalarized onto the x87 stack -- GCC's `_Complex long double`
-#     convention) was a hard compile error. `ldx2`/`ldx3` arguments now
-#     follow the ABI-EXTVEC-VA-1 slot rule (MEMORY at the vector's 32/64-byte
-#     alignment). The `hashva` `flaky` rows were the same defects seen
+#     convention) was a hard compile error, and the lanes were 16 bytes
+#     apart where Clang (LLVM's `<N x x86_fp80>`) packs them at 10.
+#     `ldx2`/`ldx3` arguments now follow the ABI-EXTVEC-VA-1 slot rule
+#     (MEMORY at the vector's 32/64-byte alignment). The `hashva` `flaky` rows were the same defects seen
 #     through va_arg; lccc <-> lccc is deterministic over 40 stack-shifted
 #     runs for all three shapes. GCC 16 compiles the x87 struct / complex
 #     side in check_gnu_vector_align_abi.sh (Part 4). The hosted Clang run

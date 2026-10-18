@@ -216,8 +216,10 @@ fi
 # -- exactly GCC's `_Complex long double` return. GCC compiles the struct /
 # complex side, lccc the ext-vector side, linked both ways; the values must
 # round-trip bit-exactly. (Arguments of the two-lane shape are not compared
-# with the complex form: Clang passes them `byval align 32`, GCC passes a
-# complex at 16; that slot alignment is covered by Part 1/2.)
+# with the complex form: Clang passes them `byval align 32` with lanes 10
+# bytes apart, GCC passes a complex at 16 with the parts 16 apart; the slot
+# alignment is covered by Part 1/2 and the lane stride by
+# ext_vector_long_double_layout.c.)
 cat > "$tmp/ld_lccc.c" <<'EOF2'
 typedef long double T1 __attribute__((ext_vector_type(1)));
 typedef long double T2 __attribute__((ext_vector_type(2)));
@@ -238,11 +240,10 @@ int lccc_calls_gcc(void) {
     if (g_ident1(a).x != 1.25L) bad |= 1;
     if (g_kfour1(3, a, b, c, d, 5).x != 1.25L + 5.0L + 16.0L + 64.0L + 3 + 5) bad |= 2;
     if (g_sum1(2, a, 0.5L, b) != 1.25L * 3 + 0.5L + 2.5L * 7 + 2) bad |= 4;
-    union { _Complex long double c; T2 v; } u;
-    u.c = g_mk2(4.0L, 0.5L);
-    if (u.v[0] != 8.0L || u.v[1] != 1.5L) bad |= 8;
-    u.c = g_ident2(u.c);
-    if (u.v[0] != 8.0L || u.v[1] != 1.5L) bad |= 16;
+    _Complex long double c = g_mk2(4.0L, 0.5L);
+    if (__real__ c != 8.0L || __imag__ c != 1.5L) bad |= 8;
+    c = g_ident2(c);
+    if (__real__ c != 8.0L || __imag__ c != 1.5L) bad |= 16;
     return bad;
 }
 EOF2
