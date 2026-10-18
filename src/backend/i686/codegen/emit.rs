@@ -2851,6 +2851,12 @@ impl ArchCodegen for I686Codegen {
         std::env::var_os("CCC_NO_BT_BRANCH_FUSION").is_none()
     }
 
+    fn supports_fused_cmp_select(&self) -> bool {
+        // `cmp; jCC .Lsel_true` instead of `setCC; movzbl; test; jne`
+        // (emit_fused_cmp_select_impl). Kill switch: CCC_NO_FUSED_CSEL.
+        true
+    }
+
     fn supports_load_cmp_mem_fold(&self) -> bool {
         // The accumulator-based i686 codegen otherwise loads a byte/word into
         // a register just to `testl` it; folding `*p != 0` into `cmpb $0,(mem)`
@@ -3534,6 +3540,7 @@ impl ArchCodegen for I686Codegen {
         fn emit_fused_cmp_branch(&mut self, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType, true_label: &str, false_label: &str) => emit_fused_cmp_branch_impl;
         fn emit_fused_bit_test_branch_blocks(&mut self, base: &Operand, index: &Operand, ty: IrType, true_block: BlockId, false_block: BlockId) => emit_fused_bit_test_branch_blocks_impl;
         fn emit_select(&mut self, dest: &Value, cond: &Operand, true_val: &Operand, false_val: &Operand, ty: IrType) => emit_select_impl;
+        fn emit_fused_cmp_select(&mut self, op: IrCmpOp, lhs: &Operand, rhs: &Operand, cmp_ty: IrType, true_val: &Operand, false_val: &Operand, dest: &Value, sel_ty: IrType) => emit_fused_cmp_select_impl;
         fn emit_f128_neg(&mut self, dest: &Value, src: &Operand) => emit_f128_neg_impl;
         // calls
         fn call_abi_config(&self) -> call_abi::CallAbiConfig => call_abi_config_impl;

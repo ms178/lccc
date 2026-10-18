@@ -6,7 +6,7 @@ use crate::backend::traits::ArchCodegen;
 use crate::common::fx_hash::FxHashMap;
 use crate::common::types::IrType;
 use crate::emit;
-use crate::ir::reexports::{Instruction, IrCmpOp, IrFunction, Operand, Value};
+use crate::ir::reexports::{Instruction, IrCmpOp, IrConst, IrFunction, Operand, Value};
 
 fn reg_for_type(reg: &str, ty: IrType) -> Option<&'static str> {
     match ty {
@@ -37,6 +37,37 @@ fn reg_for_type(reg: &str, ty: IrType) -> Option<&'static str> {
             "ebp" => Some("ebp"),
             _ => None,
         },
+    }
+}
+
+/// The immediate of an integer compare's constant operand.  A compare runs
+/// at <= 32 bits here, where the staging it replaces (`movl $v, %ecx`)
+/// means the low 32 bits of `v`; an `I64` constant in `[i32::MIN, u32::MAX]`
+/// (e.g. `0x80000000` against a `U32`) is that same 32-bit pattern, so it
+/// is an exact `$imm32` instead of a dead `%ecx` load.  Wider constants keep
+/// the staged path.
+fn cmp_imm32(op: &Operand) -> Option<i64> {
+    match op {
+        Operand::Const(IrConst::I64(v)) if *v > i32::MAX as i64 && *v <= u32::MAX as i64 => {
+            Some(*v as u32 as i32 as i64)
+        }
+        _ => I686Codegen::const_as_imm32(op),
+    }
+}
+
+/// The conditional jump taken when an integer compare holds.
+fn int_jcc(op: IrCmpOp) -> &'static str {
+    match op {
+        IrCmpOp::Eq => "je",
+        IrCmpOp::Ne => "jne",
+        IrCmpOp::Slt => "jl",
+        IrCmpOp::Sle => "jle",
+        IrCmpOp::Sgt => "jg",
+        IrCmpOp::Sge => "jge",
+        IrCmpOp::Ult => "jb",
+        IrCmpOp::Ule => "jbe",
+        IrCmpOp::Ugt => "ja",
+        IrCmpOp::Uge => "jae",
     }
 }
 
@@ -330,7 +361,7 @@ impl I686Codegen {
     /// `Some(signed)` when the compare may run at 32 bits (see
     /// `wide_cmp_kind`); the rhs counts as an immediate only when it IS one.
     fn wide_cmp_ok(&self, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) -> Option<bool> {
-        let rhs_is_imm = Self::const_as_imm32(rhs).is_some();
+        let rhs_is_imm = cmp_imm32(rhs).is_some();
         wide_cmp_kind(
             op,
             ty,
@@ -366,7 +397,7 @@ impl I686Codegen {
         let cmp_op = cmp_mnemonic(ty);
         let test_op = test_mnemonic(ty);
 
-        if let Some(imm) = Self::const_as_imm32(rhs) {
+        if let Some(imm) = cmp_imm32(rhs) {
             let imm = Self::normalize_cmp_imm(imm, ty);
             if imm == 0 {
                 emit!(self.state, "    {} %{}, %{}", test_op, lreg, lreg);
@@ -413,7 +444,7 @@ impl I686Codegen {
         let Some(signed) = self.wide_cmp_ok(op, lhs, rhs, ty) else {
             return false;
         };
-        if let Some(imm) = Self::const_as_imm32(rhs) {
+        if let Some(imm) = cmp_imm32(rhs) {
             let imm = wide_cmp_imm(imm, ty, signed);
             if imm == 0 {
                 emit!(self.state, "    testl %{}, %{}", lreg_32, lreg_32);
@@ -466,7 +497,7 @@ impl I686Codegen {
             return false;
         }
         let cmp_op = cmp_mnemonic(ty);
-        if let Some(imm) = Self::const_as_imm32(rhs) {
+        if let Some(imm) = cmp_imm32(rhs) {
             let imm = Self::normalize_cmp_imm(imm, ty);
             let sr = self.slot_ref(slot);
             emit!(self.state, "    {} ${}, {}", cmp_op, imm, sr);
@@ -739,7 +770,7 @@ impl I686Codegen {
 
         // Constant rhs: compare against the immediate directly instead of
         // staging it in %ecx (keeps %ecx clean across fused compares).
-        if let Some(imm) = Self::const_as_imm32(rhs) {
+        if let Some(imm) = cmp_imm32(rhs) {
             let (op32, test32, sub, imm) = match wide {
                 Some(signed) if lhs_reloads => {
                     ("cmpl", "testl", "eax", wide_cmp_imm(imm, ty, signed))
@@ -925,21 +956,50 @@ impl I686Codegen {
             self.emit_int_cmp_flags_staged(op, lhs, rhs, ty);
         }
 
-        let jcc = match op {
-            IrCmpOp::Eq => "je",
-            IrCmpOp::Ne => "jne",
-            IrCmpOp::Slt => "jl",
-            IrCmpOp::Sle => "jle",
-            IrCmpOp::Sgt => "jg",
-            IrCmpOp::Sge => "jge",
-            IrCmpOp::Ult => "jb",
-            IrCmpOp::Ule => "jbe",
-            IrCmpOp::Ugt => "ja",
-            IrCmpOp::Uge => "jae",
-        };
-        emit!(self.state, "    {} {}", jcc, true_label);
+        emit!(self.state, "    {} {}", int_jcc(op), true_label);
         emit!(self.state, "    jmp {}", false_label);
         self.state.reg_cache.invalidate_all();
+    }
+
+    /// Fused integer Cmp→Select (`supports_fused_cmp_select`): the compare's
+    /// flags drive `jCC .Lsel_true` directly — no `setCC`/`movzbl` boolean,
+    /// no re-test.  Generation calls this only for an ADJACENT compare (at
+    /// most a dead Copy/integer Cast between) whose result is used solely
+    /// by this select, and never for float, long-double, 128-bit or (on
+    /// this 32-bit target) I64/U64 compares (`detect_cmp_select_fusion`).
+    ///
+    /// Same flag emitters as the fused branch, so every narrow-compare and
+    /// load→memory-compare law carries over unchanged.  Register-allocator
+    /// safety: the compare stages through %ecx exactly as the skipped Cmp
+    /// would, one program point later.  Adjacency means every value live
+    /// across the Select point except its own destination is live across
+    /// the Cmp point too, which `collect_i686_scratch_hazard_points` already
+    /// keeps out of %ecx; the destination is written only by the arms, after
+    /// the compare has read its operands.  %edx is touched by neither.
+    pub(super) fn emit_fused_cmp_select_impl(
+        &mut self,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        cmp_ty: IrType,
+        true_val: &Operand,
+        false_val: &Operand,
+        dest: &Value,
+        sel_ty: IrType,
+    ) {
+        assert!(
+            cmp_ty.is_integer() && !super::emit::is_pair_scalar(cmp_ty),
+            "fused cmp-select reached the i686 backend with a {cmp_ty:?} compare"
+        );
+        let folded = self.take_load_cmp_fold(lhs, rhs, op);
+        if !folded && !self.emit_int_cmp_flags_direct(op, lhs, rhs, cmp_ty) {
+            self.emit_int_cmp_flags_staged(op, lhs, rhs, cmp_ty);
+        }
+        let label_id = self.state.next_label_id();
+        let true_label = format!(".Lsel_true_{}", label_id);
+        let end_label = format!(".Lsel_end_{}", label_id);
+        emit!(self.state, "    {} {}", int_jcc(op), true_label);
+        self.emit_select_arms(dest, true_val, false_val, sel_ty, &true_label, &end_label);
     }
 
     pub(super) fn emit_select_impl(
@@ -950,7 +1010,6 @@ impl I686Codegen {
         false_val: &Operand,
         ty: IrType,
     ) {
-        use crate::ir::reexports::IrConst;
         // Constant-fold wide conditions at compile time
         match cond {
             Operand::Const(IrConst::I64(v)) => {
@@ -973,35 +1032,7 @@ impl I686Codegen {
             let end_label = format!(".Lsel_end_{}", label_id);
             self.emit_load_operand(cond);
             self.emit_branch_nonzero(&true_label);
-            // When dest is register-allocated, materialize each arm DIRECTLY
-            // into that register (movl slot,%esi) instead of the
-            // load-to-%eax + movl %eax,%esi detour. The peephole cannot fuse
-            // these afterwards because the pair sits right before a label
-            // (deadness unprovable across the barrier), so the win must
-            // happen here. Falls back to the accumulator path per-arm.
-            let dest_phys = self.get_phys_reg_for_value(dest.0);
-            if let Some(d) = dest_phys {
-                if !self.emit_load_direct_to_phys_reg(false_val, d) {
-                    self.emit_load_operand(false_val);
-                    self.emit_store_result(dest);
-                }
-            } else {
-                self.emit_load_operand(false_val);
-                self.emit_store_result(dest);
-            }
-            self.emit_branch(&end_label);
-            self.state.emit_fmt(format_args!("{}:", true_label));
-            if let Some(d) = dest_phys {
-                if !self.emit_load_direct_to_phys_reg(true_val, d) {
-                    self.emit_load_operand(true_val);
-                    self.emit_store_result(dest);
-                }
-            } else {
-                self.emit_load_operand(true_val);
-                self.emit_store_result(dest);
-            }
-            self.state.emit_fmt(format_args!("{}:", end_label));
-            self.state.reg_cache.invalidate_acc();
+            self.emit_select_arms(dest, true_val, false_val, ty, &true_label, &end_label);
             return;
         }
 
@@ -1019,9 +1050,56 @@ impl I686Codegen {
         }
 
         self.emit_branch_nonzero(&true_label);
+        self.emit_select_arms(dest, true_val, false_val, ty, &true_label, &end_label);
+    }
+
+    /// The arms of a branchy select, entered right after the conditional
+    /// jump to `true_label`: the false arm falls through, the true arm
+    /// follows `true_label`, both meet at `end_label`.
+    fn emit_select_arms(
+        &mut self,
+        dest: &Value,
+        true_val: &Operand,
+        false_val: &Operand,
+        ty: IrType,
+        true_label: &str,
+        end_label: &str,
+    ) {
+        if !super::emit::is_pair_scalar(ty) {
+            // When dest is register-allocated, materialize each arm DIRECTLY
+            // into that register (movl slot,%esi) instead of the
+            // load-to-%eax + movl %eax,%esi detour. The peephole cannot fuse
+            // these afterwards because the pair sits right before a label
+            // (deadness unprovable across the barrier), so the win must
+            // happen here. Falls back to the accumulator path per-arm.
+            let dest_phys = self.get_phys_reg_for_value(dest.0);
+            if let Some(d) = dest_phys {
+                if !self.emit_load_direct_to_phys_reg(false_val, d) {
+                    self.emit_load_operand(false_val);
+                    self.emit_store_result(dest);
+                }
+            } else {
+                self.emit_load_operand(false_val);
+                self.emit_store_result(dest);
+            }
+            self.emit_branch(end_label);
+            self.state.emit_fmt(format_args!("{}:", true_label));
+            if let Some(d) = dest_phys {
+                if !self.emit_load_direct_to_phys_reg(true_val, d) {
+                    self.emit_load_operand(true_val);
+                    self.emit_store_result(dest);
+                }
+            } else {
+                self.emit_load_operand(true_val);
+                self.emit_store_result(dest);
+            }
+            self.state.emit_fmt(format_args!("{}:", end_label));
+            self.state.reg_cache.invalidate_acc();
+            return;
+        }
 
         self.emit_copy_value(dest, false_val);
-        self.emit_branch(&end_label);
+        self.emit_branch(end_label);
 
         self.state.emit_fmt(format_args!("{}:", true_label));
         self.emit_copy_value(dest, true_val);
